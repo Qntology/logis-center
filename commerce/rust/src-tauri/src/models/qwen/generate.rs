@@ -701,12 +701,26 @@ impl QwenVLGenerateModel {
             let len = logits_vec.len();
 
             if !gen_ids.is_empty() {
+                // 🌟 [CRITICAL FIX] 반복을 끊기 위해 페널티를 유지하되, JSON 필수 문법만 보호합니다.
                 let penalty = 1.2;
                 let mut set = std::collections::HashSet::new();
                 for &t in &gen_ids {
                     if !set.contains(&t) && (t as usize) < len {
-                        let logit = logits_vec[t as usize];
-                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
+                        let mut apply_rep_penalty = true;
+                        if is_strict_json {
+                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                let p = piece.trim();
+                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                    apply_rep_penalty = false;
+                                }
+                            }
+                        }
+
+                        if apply_rep_penalty {
+                            let logit = logits_vec[t as usize];
+                            logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        }
                         set.insert(t);
                     }
                 }

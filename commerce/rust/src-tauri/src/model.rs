@@ -1166,7 +1166,8 @@ impl LogisModel {
             params, 
             cancellation_token.clone(),
             session_id, // 🌟 SSD 저장 및 병합 캐시 활성화!
-            Some("inference".to_string())
+            Some("inference".to_string()),
+            None // 🌟 5번째 인자인 ignore_list 자리에 None을 명시적으로 추가합니다.
         ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
     }
 
@@ -1585,7 +1586,7 @@ impl LogisModel {
                         top_p: Some(1.0), 
                         ..Default::default()
                     };
-                    gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                    gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                 } else {
                     Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                 }
@@ -1656,7 +1657,7 @@ impl LogisModel {
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                        gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                     }
@@ -1742,7 +1743,7 @@ impl LogisModel {
                             model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.1), 
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_token.clone()), None, None).await?
+                        gen.generate(params, Some(cancel_token.clone()), None, None, None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
                     }
@@ -1839,7 +1840,7 @@ impl LogisModel {
                     model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
                     ..Default::default()
                 };
-                gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
             } else {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }

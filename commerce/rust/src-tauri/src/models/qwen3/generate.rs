@@ -376,6 +376,10 @@ impl Qwen3GenerateModel {
             // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
             if let Some(ignores) = ignore_list {
                 for ign in ignores {
+                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
+                        continue;
+                    }
+
                     let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
                     if ign_toks.is_empty() { continue; }
                     
@@ -390,11 +394,24 @@ impl Qwen3GenerateModel {
                     if overlap < ign_toks.len() {
                         let next_tok = ign_toks[overlap] as usize;
                         if next_tok < len {
+                            let mut apply_bias = false;
                             if overlap > 0 {
-                                // 이미 토큰 시퀀스가 일부 매칭되었다면 완성을 방지하기 위해 강하게 억제 (-10000.0)
-                                logits_vec[next_tok] -= 10000.0;
+                                apply_bias = true;
                             } else if gen_text.ends_with('"') || gen_text.ends_with(':') || gen_text.ends_with(": ") {
-                                // 🌟 [CRITICAL FIX] 따옴표가 없는 불량 JSON 출력을 대비하여 콜론(:) 감지 추가 및 패널티 대폭 상향 (-10000.0)
+                                apply_bias = true;
+                            }
+                            
+                            // 🌟 [최강 방어 로직] JSON 필수 문법(따옴표, 괄호 등)을 환각 방지(Bias) 억제 대상에서 면제합니다.
+                            if apply_bias && is_strict_json {
+                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
+                                    let p = piece.trim();
+                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                        apply_bias = false;
+                                    }
+                                }
+                            }
+
+                            if apply_bias {
                                 logits_vec[next_tok] -= 10000.0;
                             }
                         }
@@ -402,18 +419,31 @@ impl Qwen3GenerateModel {
                 }
             }
 
-            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
-            let penalty = self.generation_config.repetition_penalty;
+            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 연산합니다.
+            let penalty = self.generation_config.repetition_penalty; // 1.0으로 무효화하던 꼼수 제거!
             if penalty > 1.0 {
                 // 최근 512개 토큰에 대해서만 페널티를 적용하여 정상적인 문맥 훼손을 방지합니다.
                 let start_idx = generate.len().saturating_sub(512); 
                 for &t in &generate[start_idx..] {
                     let t_idx = t as usize;
                     if t_idx < len {
-                        if logits_vec[t_idx] <= 0.0 {
-                            logits_vec[t_idx] *= penalty;
-                        } else {
-                            logits_vec[t_idx] /= penalty;
+                        // 🌟 [추가] JSON 필수 문법이 반복 페널티를 먹고 붕괴하는 현상을 막기 위해 똑같이 보호합니다!
+                        let mut apply_rep_penalty = true;
+                        if is_strict_json {
+                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                let p = piece.trim();
+                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                    apply_rep_penalty = false;
+                                }
+                            }
+                        }
+
+                        if apply_rep_penalty {
+                            if logits_vec[t_idx] <= 0.0 {
+                                logits_vec[t_idx] *= penalty;
+                            } else {
+                                logits_vec[t_idx] /= penalty;
+                            }
                         }
                     }
                 }
@@ -466,7 +496,7 @@ impl Qwen3GenerateModel {
         Ok(res_text)
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, ignore_list: Option<&[String]>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, ignore_list: Option<&[String]>, semantic_target: Option<&str>) -> Result<String> {
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);
@@ -504,6 +534,46 @@ impl Qwen3GenerateModel {
         
         let mut gen_text = String::new();
 
+        // 🌟 [Semantic Activation Steering] 모델 내부 임베딩 코사인 유사도 벡터 바이어스 연산
+        let mut semantic_bias_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_target {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_bias = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        // F32 정밀도로 통일하여 연산 깨짐(NaN) 방어
+                        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
+                        
+                        // L2 정규화 후 Cosine Similarity 도출
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        let bias = sim.affine(3.0, 0.0)?; // 가중치 3.0배로 증폭하여 단어 생성 유도!
+                        Ok(bias)
+                    };
+                    
+                    match calc_bias() {
+                        Ok(bias) => {
+                            semantic_bias_tensor = Some(bias);
+                            println!("[SEMANTIC-BIAS] Generated Vector Bias for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-BIAS] Failed to calculate bias: {}", e),
+                    }
+                }
+            }
+        }
+
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
         let chunk_size = 256;
         let mut next_token = 0;
@@ -538,6 +608,14 @@ impl Qwen3GenerateModel {
             // 프리필이 완전히 끝나는 마지막 청크의 끝에서만 첫 번째 토큰을 샘플링합니다.
             if seqlen_offset == prompt_seq_len {
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                
+                // 🌟 계산해 둔 바이어스가 존재한다면 로짓 전체 배열에 1:1 매핑 합산
+                let logits = if let Some(ref bias) = semantic_bias_tensor {
+                    logits.broadcast_add(bias)?
+                } else {
+                    logits
+                };
+                
                 let mut logits_vec = logits.to_vec1::<f32>()?;
                 let len = logits_vec.len();
 
@@ -579,6 +657,13 @@ impl Qwen3GenerateModel {
             let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             
+            // 🌟 매 글자가 나올 때마다 타겟 방향으로 핸들을 꺾음 (Steering)
+            let logits = if let Some(ref bias) = semantic_bias_tensor {
+                logits.broadcast_add(bias)?
+            } else {
+                logits
+            };
+            
             let mut logits_vec = logits.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
@@ -602,6 +687,10 @@ impl Qwen3GenerateModel {
             // 🌟 [CRITICAL FIX] ignore_list에 등재된 잘못된 추출값의 토큰 시퀀스 생성을 억제(Bias)합니다.
             if let Some(ignores) = ignore_list {
                 for ign in ignores {
+                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
+                        continue;
+                    }
+
                     let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
                     if ign_toks.is_empty() { continue; }
                     
@@ -616,11 +705,24 @@ impl Qwen3GenerateModel {
                     if overlap < ign_toks.len() {
                         let next_tok = ign_toks[overlap] as usize;
                         if next_tok < len {
+                            let mut apply_bias = false;
                             if overlap > 0 {
-                                // 이미 토큰 시퀀스가 일부 매칭되었다면 완성을 방지하기 위해 강하게 억제 (-10000.0)
-                                logits_vec[next_tok] -= 10000.0;
+                                apply_bias = true;
                             } else if gen_text.ends_with('"') || gen_text.ends_with(':') || gen_text.ends_with(": ") {
-                                // 🌟 [CRITICAL FIX] 따옴표가 없는 불량 JSON 출력을 대비하여 콜론(:) 감지 추가 및 패널티 대폭 상향 (-10000.0)
+                                apply_bias = true;
+                            }
+                            
+                            // 🌟 [최강 방어 로직] JSON 필수 문법(따옴표, 괄호 등)을 환각 방지(Bias) 억제 대상에서 면제합니다.
+                            if apply_bias && is_strict_json {
+                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
+                                    let p = piece.trim();
+                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                        apply_bias = false;
+                                    }
+                                }
+                            }
+
+                            if apply_bias {
                                 logits_vec[next_tok] -= 10000.0;
                             }
                         }
@@ -628,18 +730,31 @@ impl Qwen3GenerateModel {
                 }
             }
 
-            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 로짓(Logits)에 직접 연산합니다.
-            let penalty = self.generation_config.repetition_penalty;
+            // 🌟 [CRITICAL FIX] 모델이 같은 문장을 무한 반복하는 현상(Loop)을 끊기 위해 페널티를 연산합니다.
+            let penalty = self.generation_config.repetition_penalty; // 1.0으로 무효화하던 꼼수 제거!
             if penalty > 1.0 {
                 // 최근 512개 토큰에 대해서만 페널티를 적용하여 정상적인 문맥 훼손을 방지합니다.
                 let start_idx = generate.len().saturating_sub(512); 
                 for &t in &generate[start_idx..] {
                     let t_idx = t as usize;
                     if t_idx < len {
-                        if logits_vec[t_idx] <= 0.0 {
-                            logits_vec[t_idx] *= penalty;
-                        } else {
-                            logits_vec[t_idx] /= penalty;
+                        // 🌟 [추가] JSON 필수 문법이 반복 페널티를 먹고 붕괴하는 현상을 막기 위해 똑같이 보호합니다!
+                        let mut apply_rep_penalty = true;
+                        if is_strict_json {
+                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                let p = piece.trim();
+                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                    apply_rep_penalty = false;
+                                }
+                            }
+                        }
+
+                        if apply_rep_penalty {
+                            if logits_vec[t_idx] <= 0.0 {
+                                logits_vec[t_idx] *= penalty;
+                            } else {
+                                logits_vec[t_idx] /= penalty;
+                            }
                         }
                     }
                 }

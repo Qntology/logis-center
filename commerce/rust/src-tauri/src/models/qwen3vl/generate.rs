@@ -82,12 +82,20 @@ impl Qwen3VLGenerateModel {
         let sample_len = mes.max_tokens.unwrap_or(1024);
         
         let is_strict_json = mes_render.contains("/no_think") || mes_render.contains("RETURN JSON ONLY") || mes_render.contains("Return ONLY");
+        
+        // 🌟 [CRITICAL FIX] 누락되어 있던 특수 토큰 ID 추출 로직을 추가합니다.
+        let think_token_id = self.tokenizer.text_encode_vec("<think>".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let open_bracket_id = self.tokenizer.text_encode_vec("{".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(123);
+        let lt_id = self.tokenizer.text_encode_vec("<".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        let enter_id = self.tokenizer.text_encode_vec("\n".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+
         let slash_id = self.tokenizer.text_encode_vec("/".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let double_slash_id = self.tokenizer.text_encode_vec("//".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
         let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).ok().and_then(|v: Vec<u32>| v.first().cloned()).unwrap_or(999999);
+        
         let mut gen_text = String::new();
 
-        for _ in 0..sample_len {
+        for i in 0..sample_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     break;
@@ -114,7 +122,41 @@ impl Qwen3VLGenerateModel {
             let mut logits_vec = logits.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
+            // 🌟 [CRITICAL FIX] Qwen3VL에도 Repetition Penalty 방어 로직을 추가하여 무한 반복과 JSON 파괴를 모두 막습니다.
+            if !generate.is_empty() {
+                let penalty = self.generation_config.repetition_penalty; 
+                if penalty > 1.0 {
+                    let start_at = generate.len().saturating_sub(64);
+                    let mut set = std::collections::HashSet::new();
+                    for &t in &generate[start_at..] {
+                        if !set.contains(&t) && (t as usize) < len {
+                            // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
+                            let mut apply_rep_penalty = true;
+                            if is_strict_json {
+                                if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                    let p = piece.trim();
+                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                        apply_rep_penalty = false;
+                                    }
+                                }
+                            }
+
+                            if apply_rep_penalty {
+                                let logit = logits_vec[t as usize];
+                                logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                            }
+                            set.insert(t);
+                        }
+                    }
+                }
+            }
+
+            // <think> 지속 억제
+            if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+
             if is_strict_json {
+                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 50.0; }
+                
                 let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
                 let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
                 
@@ -127,15 +169,52 @@ impl Qwen3VLGenerateModel {
                 }
             }
 
+            // 🌟 [CRITICAL FIX] JSON 강제 출력을 위해 첫 번째 토큰을 { 로 강제 고정합니다.
+            if i == 0 {
+                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
+                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
+                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                
+                if (open_bracket_id as usize) < len {
+                    let boost = if is_strict_json { 10000.0 } else { 20.0 };
+                    logits_vec[open_bracket_id as usize] += boost;
+                }
+            }
+
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &self.device)?;
-            let next_token = logit_processor.sample(&logits_tensor)?;
+            let mut next_token = logit_processor.sample(&logits_tensor)?;
+            
+            // 🌟 [CRITICAL FIX] 첫 번째 토큰 오버라이드
+            if i == 0 {
+                if is_strict_json {
+                    next_token = open_bracket_id;
+                } else if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                    next_token = enter_id;
+                }
+            }
+
             generate.push(next_token);
+            
+            let mut is_json_finished = false;
             
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
                 gen_text.push_str(&piece);
+                
+                // 🌟 JSON 닫힘 감지 조기 종료 (추론 속도 향상)
+                if is_strict_json && gen_text.contains('{') {
+                    let mut depth = 0;
+                    let mut has_started = false;
+                    for c in gen_text.chars() {
+                        if c == '{' { depth += 1; has_started = true; }
+                        else if c == '}' { depth -= 1; }
+                    }
+                    if has_started && depth == 0 && gen_text.trim_end().ends_with('}') {
+                        is_json_finished = true; 
+                    }
+                }
             }
 
-            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+            if is_json_finished || next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
                 break;
             }
             seqlen_offset += seq_len;

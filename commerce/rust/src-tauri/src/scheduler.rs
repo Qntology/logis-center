@@ -813,7 +813,7 @@ async fn process_task(
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A: Asking classification question...");
-                            gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -883,7 +883,7 @@ async fn process_task(
                         })
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                    max_tokens: Some(512),
+                    max_tokens: Some(256),
                     temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
@@ -910,7 +910,7 @@ async fn process_task(
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A-2: Asking detail classification... (Attempt {})", retry_count + 1);
-                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -922,47 +922,69 @@ async fn process_task(
                 detail_info = parsing::parse_json_from_llm(&res); 
                 
                 let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
-                let has_list_exists = target_obj.get("has_list").is_some();
-                let has_form_exists = target_obj.get("has_form").is_some();
 
-                if has_list_exists && has_form_exists {
+                // 🌟 [CRITICAL FIX] LLM이 따옴표를 넣어서 "false", "true" (문자열) 형태로 뱉었을 경우에도 안전하게 파싱하도록 헬퍼 함수를 적용합니다.
+                let parse_bool_robust = |val: Option<&serde_json::Value>| -> Option<bool> {
+                    val.and_then(|v| {
+                        if let Some(b) = v.as_bool() { Some(b) }
+                        else if let Some(s) = v.as_str() { Some(s.to_lowercase() == "true") }
+                        else { None }
+                    })
+                };
+
+                let detail_val = parse_bool_robust(target_obj.get("detail"))
+                    .or_else(|| parse_bool_robust(detail_info.get("detail")));
+
+                // 원본 텍스트에 강제로 true/false가 적혀있는지 확인하여 JSON 파싱 절단 사태를 방어합니다.
+                // 🌟 키 이름에 여백(" has_form" 등)이 들어간 경우를 대비해 res_clean으로 원시 문자열에서도 상태를 파악합니다.
+                let res_clean = res.to_lowercase().replace(" ", "").replace("\"", "").replace("'", "");
+                let raw_detail_true = res_clean.contains("detail:true");
+                let raw_has_list_true = res_clean.contains("has_list:true");
+                let raw_has_form_true = res_clean.contains("has_form:true");
+
+                let has_list_exists = target_obj.get("has_list").is_some() || res_clean.contains("has_list:");
+                let has_form_exists = target_obj.get("has_form").is_some() || res_clean.contains("has_form:");
+
+                // 🌟 [CRITICAL FIX] 사용자의 간절한 요청을 반영하여, detail 값이 존재하거나 원본 텍스트에 흔적이 있으면 
+                // has_list와 has_form이 누락되었더라도 즉시 올바른 답변으로 인정하고 루프를 완벽히 탈출(Pass)합니다!
+                if has_list_exists || has_form_exists {
+                    is_detail = detail_val.unwrap_or(raw_detail_true);
+                    
+                    // 만약 명시적으로 detail 값이 없고 has_list/has_form으로만 추론해야 할 경우
+                    let has_list = parse_bool_robust(target_obj.get("has_list")).unwrap_or(raw_has_list_true);
+                    let has_form = parse_bool_robust(target_obj.get("has_form")).unwrap_or(raw_has_form_true);
+                    
+                    // 🎯 요청하신 조건: has_form이 true면 무조건 is_detail을 true로 반영!
+                    if has_form { 
+                        is_detail = true; 
+                    } else if !has_list { 
+                        is_detail = true; 
+                    }
+                    
                     break;
                 } else {
                     retry_count += 1;
                     if retry_count >= 3 {
                         println!("[Scheduler] Max retries reached for Step A-2. Proceeding with best effort.");
+                        // 최후의 보루 추론
+                        let has_list = parse_bool_robust(target_obj.get("has_list")).unwrap_or(raw_has_list_true);
+                        let has_form = parse_bool_robust(target_obj.get("has_form")).unwrap_or(raw_has_form_true);
+                        
+                        // 🎯 최후의 보루에서도 동일하게 적용
+                        if has_form { 
+                            is_detail = true; 
+                        } else if !has_list { 
+                            is_detail = true; 
+                        }
                         break;
                     }
-                    println!("[Scheduler] ⚠️ Missing 'has_list' or 'has_form' in Step A-2. Retrying... ({}/3)", retry_count);
+                    println!("[Scheduler] ⚠️ Missing 'detail' OR ('has_list' & 'has_form') in Step A-2. Retrying... ({}/3)", retry_count);
                     
                     let mut ignore_val = res.trim().to_string();
                     if ignore_val.len() > 100 { ignore_val = ignore_val[..100].to_string(); }
                     ignore_list.push(ignore_val.clone());
                     ignore_list.push(format!(" {}", ignore_val));
                     ignore_list.push(ignore_val.to_lowercase());
-                }
-            }
-                
-            // 바뀐 프롬프트 스키마 형태 {"goods": {"detail": true}} 에 맞춘 파싱 로직 (그대로 유지)
-            is_detail = detail_info
-                .get(&page_type)
-                .and_then(|v| v.get("detail"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            
-            // (방어 로직 1) LLM이 가끔 depth를 무시하고 1차원에 바로 뱉을 경우 대비
-            if !is_detail {
-                is_detail = detail_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-            }
-
-            // 🌟 (방어 로직 2) LLM이 detail 필드를 생략했지만 프롬프트 규칙상 has_list=false, has_form=true 일 경우 논리적 추론
-            if !is_detail {
-                let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
-                let has_list = target_obj.get("has_list").and_then(|v| v.as_bool()).unwrap_or(true); // 보수적으로 기본값 true
-                let has_form = target_obj.get("has_form").and_then(|v| v.as_bool()).unwrap_or(false);
-                
-                if !has_list && has_form {
-                    is_detail = true;
                 }
             }
                 
@@ -976,7 +998,33 @@ async fn process_task(
     // 🌟 [CRITICAL FIX] 이어지는 추출 단계(Step B, List, Detail)에서 Qwen3를 그대로 재사용하므로, VRAM에서 강제로 모델을 내리지 않습니다.
     // secure_vram_relay 내부의 스마트 스위칭 로직이 모델 변경 여부를 감지하여 필요할 때만 교체합니다.
     // model.deep_purge_resources().await;
-    // wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+    
+    // 🌟 [KV CACHE CLEAR] 모델 본체는 살려두고, 이전 단계 연산으로 팽창한 KV 캐시만 제거하여 VRAM을 확보합니다.
+    {
+        let q3_clear_arc = model.qwen3_generator.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                gen.clear_kv_cache();
+            }
+        }).await;
+        
+        let gen_clear_arc = model.generator.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(gen) = gen_clear_arc.blocking_lock().as_mut() {
+                let _ = gen.clear_kv_cache();
+            }
+        }).await;
+
+        if !model.is_cpu_mode {
+            let dev = model.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() { let _ = dev.synchronize(); }
+            }).await;
+        }
+    }
+    
+    // VRAM이 OS에서 완전히 반환될 때까지 잠시 대기합니다.
+    wait_for_resources_settled(1200, 800, Some(&cancellation_token)).await?;
 
     let mut extracted_data = json!({});
 
@@ -1039,7 +1087,7 @@ async fn process_task(
                             let mut gen_guard = q3_gen_arc.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone), None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                                gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                             } else {
                                 Err(anyhow::anyhow!("Qwen3 generator missing"))
                             }
@@ -1414,7 +1462,8 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone()).await {
+                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 5개(ignore_list 추가)로 변경되었으므로 마지막 인자로 None을 전달합니다.
+                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
                             // JSON 응답에서 page_type에 맞는 선택자 추출
@@ -1714,7 +1763,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_meta), None).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
+                        gen.generate(params, Some(cancel_meta), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1735,7 +1784,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_info), None).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
+                        gen.generate(params, Some(cancel_info), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1756,7 +1805,7 @@ async fn process_task(
                             model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
-                        gen.generate(params, Some(cancel_data), None).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
+                        gen.generate(params, Some(cancel_data), None, None).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
                     } else {
                         Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                     }
@@ -1928,6 +1977,7 @@ async fn process_task(
                     let cancel_clone = cancellation_token.clone();
                     let sys_msg = system_message.clone();
                     let field_name_clone = field_name.clone();
+                    let field_name_for_closure = field_name_clone.clone(); // 🌟 [CRITICAL FIX] 클로저 내부로 들어갈 소유권 변수를 별도로 생성합니다.
                     let task_q = task_question.clone();
                     let ignore_list_clone = ignore_list.clone();
                     
@@ -1946,7 +1996,8 @@ async fn process_task(
                                 ..Default::default()
                             };
                             // 🌟 Qwen3 생성기에 ignore_list를 전달하여 환각 토큰 생성을 억제합니다.
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone)).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            // 🎯 [SEMANTIC STEERING] 추출 목표 대상인 필드명을 벡터 조향 타겟으로 직접 주입하여 해당 데이터 추출 확률을 극대화합니다!
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), Some(field_name_for_closure.as_str())).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                         }

@@ -190,7 +190,8 @@ impl Qwen3_5GenerateModel {
         mes: ChatCompletionParameters, 
         cancel_flag: Option<Arc<AtomicBool>>, 
         session_id: Option<String>, 
-        kv_name: Option<String>
+        kv_name: Option<String>,
+        ignore_list: Option<&[String]> // 🌟 [CRITICAL FIX] 누락되었던 파라미터를 명시적으로 추가합니다.
     ) -> Result<String> {
         let seed = mes.seed.unwrap_or(32768) as u64;
         let temperature = mes.temperature.unwrap_or(0.0);
@@ -307,13 +308,27 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
             
             if !generate.is_empty() {
-                let penalty = 1.1; 
+                // 🌟 [CRITICAL FIX] 반복을 끊기 위해 페널티를 유지하되, JSON 필수 문법만 보호합니다.
+                let penalty = self.repeat_penalty; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
                     if !set.contains(&t) && (t as usize) < len {
-                        let logit = logits_vec[t as usize];
-                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
+                        let mut apply_rep_penalty = true;
+                        if is_strict_json {
+                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                let p = piece.trim();
+                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                    apply_rep_penalty = false;
+                                }
+                            }
+                        }
+
+                        if apply_rep_penalty {
+                            let logit = logits_vec[t as usize];
+                            logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        }
                         set.insert(t);
                     }
                 }
@@ -332,6 +347,53 @@ impl Qwen3_5GenerateModel {
                 if !is_url_double {
                     if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
                     if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
+
+            // 🌟 [CRITICAL FIX] Qwen 3.5에도 완성된 ignore_list 방어 로직을 100% 이식합니다.
+            if let Some(ignores) = ignore_list {
+                for ign in ignores {
+                    // 🌟 [최강 방어 로직 통일] 이전 실패 데이터의 JSON 구조 전체({ 등)가 장부에 들어온 경우, 문법 파괴 예방을 위해 스킵 처리합니다.
+                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
+                        continue;
+                    }
+
+                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
+                    if ign_toks.is_empty() { continue; }
+                    
+                    let mut overlap = 0;
+                    for l in (1..=ign_toks.len().min(generate.len())).rev() {
+                        if generate.ends_with(&ign_toks[..l]) {
+                            overlap = l;
+                            break;
+                        }
+                    }
+                    
+                    if overlap < ign_toks.len() {
+                        let next_tok = ign_toks[overlap] as usize;
+                        if next_tok < len {
+                            let mut apply_bias = false;
+                            if overlap > 0 {
+                                apply_bias = true;
+                            } else if gen_text_buffer.ends_with('"') || gen_text_buffer.ends_with(':') || gen_text_buffer.ends_with(": ") {
+                                apply_bias = true;
+                            }
+                            
+                            // 🌟 [최강 방어 로직] 필수 JSON 문법(따옴표 등) 강제 보호
+                            if apply_bias && is_strict_json {
+                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
+                                    let p = piece.trim();
+                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                        apply_bias = false;
+                                    }
+                                }
+                            }
+
+                            if apply_bias {
+                                logits_vec[next_tok] -= 10000.0;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -461,7 +523,8 @@ impl Qwen3_5GenerateModel {
         cancel_flag: Option<Arc<AtomicBool>>,
         last_token: Option<u32>,
         session_id: Option<String>,
-        kv_name: Option<String>
+        kv_name: Option<String>,
+        ignore_list: Option<&[String]> // 🌟 [CRITICAL FIX] 누락되었던 파라미터를 명시적으로 추가합니다.
     ) -> Result<GenerationResult> {
         let mut logit_processor = get_logit_processor(
             Some(mes.temperature.unwrap_or(0.0) as f32), 
@@ -580,18 +643,33 @@ impl Qwen3_5GenerateModel {
                 kv_name.clone()
             ).await?;
             
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
-            let mut logits_vec = logits.flatten_all()?.to_vec1::<f32>()?;
+            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            
+            let mut logits_vec = logits.to_vec1::<f32>()?;
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                let penalty = 1.1; 
+                // 🌟 [CRITICAL FIX] 반복을 끊기 위해 페널티를 유지하되, JSON 필수 문법만 보호합니다.
+                let penalty = self.repeat_penalty; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
                     if !set.contains(&t) && (t as usize) < len {
-                        let logit = logits_vec[t as usize];
-                        logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
+                        let mut apply_rep_penalty = true;
+                        if is_strict_json {
+                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                let p = piece.trim();
+                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                    apply_rep_penalty = false;
+                                }
+                            }
+                        }
+
+                        if apply_rep_penalty {
+                            let logit = logits_vec[t as usize];
+                            logits_vec[t as usize] = if logit < 0.0 { logit * penalty } else { logit / penalty };
+                        }
                         set.insert(t);
                     }
                 }
@@ -610,6 +688,53 @@ impl Qwen3_5GenerateModel {
                 if !is_url_double {
                     if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
                     if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                }
+            }
+
+            // 🌟 [CRITICAL FIX] Qwen 3.5에도 완성된 ignore_list 방어 로직을 100% 이식합니다.
+            if let Some(ignores) = ignore_list {
+                for ign in ignores {
+                    // 🌟 [최강 방어 로직 통일] 이전 실패 데이터의 JSON 구조 전체({ 등)가 장부에 들어온 경우, 문법 파괴 예방을 위해 스킵 처리합니다.
+                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
+                        continue;
+                    }
+
+                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
+                    if ign_toks.is_empty() { continue; }
+                    
+                    let mut overlap = 0;
+                    for l in (1..=ign_toks.len().min(generate.len())).rev() {
+                        if generate.ends_with(&ign_toks[..l]) {
+                            overlap = l;
+                            break;
+                        }
+                    }
+                    
+                    if overlap < ign_toks.len() {
+                        let next_tok = ign_toks[overlap] as usize;
+                        if next_tok < len {
+                            let mut apply_bias = false;
+                            if overlap > 0 {
+                                apply_bias = true;
+                            } else if gen_text_buffer.ends_with('"') || gen_text_buffer.ends_with(':') || gen_text_buffer.ends_with(": ") {
+                                apply_bias = true;
+                            }
+                            
+                            // 🌟 [최강 방어 로직] 필수 JSON 문법(따옴표 등) 강제 보호
+                            if apply_bias && is_strict_json {
+                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
+                                    let p = piece.trim();
+                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                        apply_bias = false;
+                                    }
+                                }
+                            }
+
+                            if apply_bias {
+                                logits_vec[next_tok] -= 10000.0;
+                            }
+                        }
+                    }
                 }
             }
 

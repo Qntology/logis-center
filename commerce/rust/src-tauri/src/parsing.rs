@@ -813,7 +813,6 @@ Read the entire document from top to bottom, applying the following strict filte
     - has_footer: Boolean. True if the document contains a footer.
     - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
-    - detail: Boolean. True ONLY if has_list is false AND has_form is true.
     - title: String. Default '{TITLE}'.
     - language: String. Detect the language of PUG CONTENT and return ISO 639-1 code.
 
@@ -821,12 +820,11 @@ Read the entire document from top to bottom, applying the following strict filte
 {
   "{TYPE}": {
     "has_header": Boolean,
-    "title":String,
+    "title": String,
     "has_footer": Boolean,
     "language": String,
     "has_list": Boolean,
-    "has_form": Boolean,
-    "detail": Boolean
+    "has_form": Boolean
   }
 }
 
@@ -1584,7 +1582,8 @@ pub fn normalize_to_json_string(input: &str) -> String {
     }).to_string();
 
     // 2. Key quotes correction (key: -> "key":)
-    let re_keys = Regex::new(r"([{,])\s*([a-zA-Z0-9_]+)\s*:").unwrap();
+    // 🌟 [CRITICAL FIX] 줄 시작 지점(^), 중괄호({), 쉼표(,) 뒤에 나오는 Unquoted Key를 모두 확실히 잡아내어 따옴표로 감쌉니다.
+    let re_keys = Regex::new(r"(?m)(^|[{,])\s*([a-zA-Z0-9_]+)\s*:").unwrap();
     s = re_keys.replace_all(&s, "$1\"$2\":").to_string();
 
     // 3. Single quotes to double quotes for values

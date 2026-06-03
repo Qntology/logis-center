@@ -381,6 +381,11 @@ impl Qwen3Model {
         Ok(self.embed_tokens.forward(input_ids)?)
     }
 
+    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
+    pub fn get_embed_tokens(&self) -> Tensor {
+        self.embed_tokens.embeddings().clone()
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
