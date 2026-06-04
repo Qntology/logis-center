@@ -685,7 +685,7 @@
       },
       "model_name": { 
         "semantic": "model name model number", 
-        "bias": "{TYPE} name, {TYPE} title, {TYPE} model, Model-X, V2.0, SM-G998N", 
+        "bias": "{TYPE} name, {TYPE} title, {TYPE} model, Model-X, V2.0, SM-G998U", 
         "prejudice": "identifier, link, url address, code, sales status, exposure status, product name, item title, name, registration date, date published, payment method, type of payment, bank, account, deposit to, wire, card, credit card, brand name, manufacturer, product condition, used, detail description, body text, short description, summary, tags, keywords, origin country, country of manufacture, release date, launch date, manufacture date, production date, expiration date, expiry date, sale price, discount price, price, supply price, cost, wholesale price, currency, money unit, compare original price, retail price, list price, quantity, inventory, stock volume, low stock, stock warning, unit, unit name, tax status, tax, vat, tax code, main image, thumbnail, additional image, video, video url, carrier, courier, shipping fee, delivery cost, shipping method, form of delivery, shipping duration, days required, bundle shipping, combined shipping, width, thickness, height, vertical, length, weight, mass, options, variation, additional item, related item" 
       },
       "brand_name": { 
@@ -1212,7 +1212,7 @@
       },
       "recipient_address": { 
         "semantic": "收件地址 配送地 收方", 
-        "bias": "浙江省广州市天河区珠江新城789号, 四川省杭州市西湖区", 
+        "bias": "广东省广州市天河区珠江新城789号, 浙江省杭州市西湖区", 
         "prejudice": "标识符, 链接, 运单号, 快递单号, 订单号, 商品代码, 状态, 配送状态, 进度, 物流轨迹, 寄件人, 发货地, 订购人, 电子邮件, email, 发货人, 卖家, 姓名, 寄件人地址, 寄方, 联系方式, 手机号, 注册日, 接单日, 发货日, 配送日, 宽度, 高度, 长度, 重量, 质量, 承运商, 快递公司, 物流公司, 运费, 费用, 配送方式, 邮寄方式, 配送时间, 预计送达, 合并发货" 
       },
       "recipient_phone": { 
@@ -1428,12 +1428,12 @@
       },
       "card": { 
         "semantic": "信用卡 刷卡 支付卡", 
-        "bias": "國泰世華卡, 中国信託卡, 玉山卡, 台新卡, 富邦卡, 聯邦卡, 永豐卡", 
+        "bias": "國泰世華卡, 中國信託卡, 玉山卡, 台新卡, 富邦卡, 聯邦卡, 永豐卡", 
         "prejudice": "識別碼, 連結, 網址, 代碼, 銷售狀態, 顯示狀態, 商品名稱, 品名, 姓名, 註冊日, 作成日, 支付方式, 付款方式, 銀行, 帳戶, 匯款處, 轉帳, 型號, 品牌, 製造商, 商品狀態, 二手, 詳細說明, 內文, 簡短說明, 標籤, 關鍵字, 原產國, 產地, 發佈日期, 上市時間, 生產日期, 製造日, 有效期, 到期日, 售價, 折扣價, 價格, 供應價, 成本, 進貨價, 貨幣, 單位, 原價, 建議售價, 既存價格, 數量, 庫存, 庫存量, 庫存預警, 單位名稱, 含稅, 稅金, 營業稅, 稅務代碼, 主圖, 縮圖, 附加圖, 詳情圖, 影片, 動態, 承運商, 快遞公司, 運費, 配送費用, 配送方式, 配送型態, 配送時間, 預計送達, 同梱發貨, 合併發貨, 寬度, 高度, 長度, 重量, 規格, 選項, 附加商品, 關聯商品" 
       },
       "model_name": { 
         "semantic": "型號 款式", 
-        "bias": "{TYPE}名稱, {TYPE}標題, {TYPE}名字, Model-X, V2.0, SM-G998N", 
+        "bias": "{TYPE}名稱, {TYPE}標題, {TYPE}名字, Model-X, V2.0, SM-G9980", 
         "prejudice": "識別碼, 連結, 網址, 代碼, 銷售狀態, 顯示狀態, 商品名稱, 品名, 姓名, 註冊日, 作成日, 支付方式, 付款方式, 銀行, 帳戶, 匯款處, 轉帳, 信用卡, 刷卡, 品牌, 製造商, 商品狀態, 二手, 詳細說明, 內文, 簡短說明, 標籤, 關鍵字, 原產國, 產地, 發佈日期, 上市時間, 生產日期, 製造日, 有效期, 到期日, 售價, 折扣價, 價格, 供應價, 成本, 進貨價, 貨幣, 單位, 原價, 建議售價, 既存價格, 數量, 庫存, 庫存量, 庫存預警, 單位名稱, 含稅, 稅金, 營業稅, 稅務代碼, 主圖, 縮圖, 附加圖, 詳情圖, 影片, 動態, 承運商, 快遞公司, 運費, 配送費用, 配送方式, 配送型態, 配送時間, 預計送達, 同梱發貨, 合併發貨, 寬度, 高度, 長度, 重量, 規格, 選項, 附加商品, 關聯商品" 
       },
       "brand_name": { 
@@ -2027,7 +2027,7 @@
       },
       "sender_address": {
         "semantic": "注文者 差出人 住所 発送地 場所",
-        "bias": "東京都渋谷区六本木1-2-3, 大阪府大阪市中央区なんば4-5-6, 神奈川県横浜市西区",
+        "bias": "東京都港区六本木1-2-3, 大阪府大阪市中央区なんば4-5-6, 神奈川県横浜市西区",
         "prejudice": "識別子, リンク, 追跡番号, 伝票番号, お問い合わせ番号, 伝票, 送り状, 番号, コード, 配送状況, ステータス, 進行状況, 差出人, 発送元, 発送人, 依頼主, 販売者, 姓名, 氏名, お名前, 登録日, 受付日, 発送日, 出発日, 連絡先, 電話番号, 携帯番号, 携帯電話, 受取人, お届け先, 購入者, 横幅, 幅, 縦, 高さ, 長さ, 奥行き, 重量, 重さ, 宅配業者, 配送業者, 運送会社, 送料, 配送料, 運送料, 料金, 配送方法, 配送手段, 発送方法, 配送期間, お届け日数, 同梱発送, まとめ送り, 同梱, まとめ配送"
       },
       "sender_phone": {
