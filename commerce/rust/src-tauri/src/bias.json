@@ -765,7 +765,7 @@
       },
       "currency": { 
         "semantic": "currency money unit currency code", 
-        "bias": "USD, $, EUR, €, GBP, £, KRW", 
+        "bias": "USD, $, EUR, €, GBP, £, CAD", 
         "prejudice": "identifier, link, url address, code, sales status, exposure status, product name, item title, name, registration date, date published, payment method, type of payment, bank, account, deposit to, wire, card, credit card, model name, brand name, manufacturer, product condition, used, detail description, body text, short description, summary, tags, keywords, origin country, country of manufacture, release date, launch date, manufacture date, production date, expiration date, expiry date, sale price, discount price, price, supply price, cost, wholesale price, compare original price, retail price, list price, quantity, inventory, stock volume, low stock, stock warning, unit, unit name, tax status, tax, vat, tax code, main image, thumbnail, additional image, video, video url, carrier, courier, shipping fee, delivery cost, shipping method, form of delivery, shipping duration, days required, bundle shipping, combined shipping, width, thickness, height, vertical, length, weight, mass, options, variation, additional item, related item" 
       },
       "compare_at_price": { 
@@ -2280,7 +2280,7 @@
       },
       "model_name": { 
         "semantic": "modelo nombre del modelo", 
-        "bias": "{TYPE} nombre, {TYPE} título, Modelo X, V2.0, SM-G998N", 
+        "bias": "{TYPE} nombre, {TYPE} título, Modelo X, V2.0, SM-G998B", 
         "prejudice": "identificador, enlace, código artículo, sku, estado de venta, disponibilidad, nombre del producto, título, fecha de registro, método de pago, banco, cuenta, transferencia, tarjeta, crédito, débito, marca, fabricante, condición, nuevo, usado, descripción, detalle, descripción corta, resumen, etiquetas, palabras clave, país de origen, fecha de lanzamiento, fecha de fabricación, fecha de caducidad, vencimiento, gtin, ean, mpn, número de pieza, código de barras, precio de venta, rebaja, precio de suministro, costo, moneda, divisa, precio original, lista, cantidad, stock, existencias, umbral de stock bajo, alerta, unidad, pieza, impuestos incluidos, iva, código de impuestos, imagen principal, foto, imagen adicional, video, video clip, transportista, mensajería, costo de envío, método de envío, tiempo de entrega, envío combinado, ancho, altura, longitud, peso, opciones, variantes, productos adicionales, accesorios" 
       },
       "brand_name": { 
