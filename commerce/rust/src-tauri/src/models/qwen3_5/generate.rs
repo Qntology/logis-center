@@ -119,15 +119,8 @@ impl Qwen3_5GenerateModel {
 
         let tokenizer = model_gguf.build_tokenizer(Some(false), Some(false), Some(false))?;
         
-        // 🚀 mmproj_file 인자가 None이더라도, 같은 폴더에 다운로드된 mmproj-BF16.gguf 파일이 존재하면 자동으로 합체하도록 개선
-        let auto_mmproj = std::path::Path::new(model_file).with_file_name("mmproj-BF16.gguf");
-        let target_mmproj = if let Some(f) = mmproj_file {
-            Some(f.to_string())
-        } else if auto_mmproj.exists() {
-            Some(auto_mmproj.to_string_lossy().to_string())
-        } else {
-            None
-        };
+        // 외부에서 명시적으로 비전 가중치 경로를 지정했을 때만 로드하도록 제한하여 텍스트 전용 모드 최적화
+        let target_mmproj = mmproj_file.map(|f| f.to_string());
 
         let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = target_mmproj {
             let mut reader = std::fs::File::open(&mmproj_f)?;

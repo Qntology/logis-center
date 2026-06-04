@@ -844,15 +844,10 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
     let mut bias = String::from("detail has_list has_form true false");
     let prejudice = String::from("global navigation, menus, headers, footers, aside, search, filter.");
     
-    let page_type_key = match page_type {
-        "coupon" | "event" => "coupon_event",
-        _ => page_type,
-    };
-    
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             bias.push_str(" ");
             bias.push_str(&l_list.replace("{TYPE}", &localized_type));
@@ -870,12 +865,11 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
 }
 
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
-    let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::from("title name product");
     let mut prejudice = String::from("address location");
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(t_obj) = localized_obj.get("title") {
             if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {}", bias, b.replace("{TYPE}", &localized_type)); }
             if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {}", prejudice, p.replace("{TYPE}", &localized_type)); }
@@ -884,22 +878,98 @@ pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
     (bias, prejudice)
 }
 
-pub fn get_list_extraction_bias(page_type: &str, lang: &str) -> (String, String) {
-    let page_type_key = match page_type { "coupon" | "event" => "coupon_event", _ => page_type };
+pub fn get_list_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<(String, String, String, String)> {
+    let mut fields = Vec::new();
+    
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
-    let mut bias = String::new();
-    let mut prejudice = String::from("html body head script style footer header"); // 기본 HTML 태그 억제
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
-        if let Some(obj) = localized_obj.as_object() {
-            for (k, v) in obj {
-                if k == "layout_list" || k == "layout_form" { continue; }
-                if let Some(b) = v.get("bias").and_then(|s| s.as_str()) { bias.push_str(&b.replace("{TYPE}", &localized_type)); bias.push(' '); }
-                if let Some(p) = v.get("prejudice").and_then(|s| s.as_str()) { prejudice.push_str(&p.replace("{TYPE}", &localized_type)); prejudice.push(' '); }
+
+    let mut add = |key: &str, desc: String, en_bias: &str, en_prejudice: &str| {
+        let mut final_desc = desc;
+        let mut final_bias = en_bias.to_string();
+        let mut final_prejudice = en_prejudice.to_string();
+        
+        if let Some(localized_obj) = BIAS_DICT
+            .get(lang_code)
+            .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+            .and_then(|p| p.get(key))
+        {
+            if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
+                final_desc = format!("{} (Related keywords in document: {})", final_desc, semantic);
+            }
+            if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
+                final_bias = format!("{} {}", en_bias, bias_str.replace("{TYPE}", &localized_type));
+            }
+            if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
+                final_prejudice = format!("{} {}", en_prejudice, prejudice_str.replace("{TYPE}", &localized_type));
             }
         }
+        
+        fields.push((key.to_string(), final_desc, final_bias.trim().to_string(), final_prejudice.trim().to_string()));
+    };
+
+    // 상세페이지처럼 모든 필드를 훑지 않고, 리스트 모드에서 반드시 필요한 핵심 컬럼만 개별 타격하도록 최적화!
+    match page_type {
+        "tracking" => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. tracking number.", href), "id link tracking", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status delivery", "");
+            add("title", "- \"title\": String. tracking product title.".to_string(), "title product name", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("sender_name", "- \"sender_name\": String. sender name or buyer name or Seller name.".to_string(), "sender seller name", "");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient buyer name", "");
+            add("carrier", "- \"carrier\": String. carrier name translated into English.".to_string(), "carrier courier", "");
+        },
+        "goods" => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("code", "- \"code\": String. Displayed alphanumeric item code (SKU) shown as text in the table cell.".to_string(), "code sku item", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status condition", "");
+            add("title", "- \"title\": String. product name.".to_string(), "title name product", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("sale_price", "- \"sale_price\": Number. product sale price.".to_string(), "sale price discount", "");
+            add("supply_price", "- \"supply_price\": Number. product supply price.".to_string(), "supply price cost", "");
+            add("currency", "- \"currency\": String. ISO 4217 Currency Code.".to_string(), "currency", "");
+            add("quantity", "- \"quantity\": Number. product Inventory quantity.".to_string(), "quantity inventory stock", "");
+            add("stock_keeping_unit", "- \"stock_keeping_unit\": String. Stock Keeping Unit.".to_string(), "sku code", "");
+            add("main_image_url", "- \"main_image_url\": String. Main product image URL.".to_string(), "main image thumbnail", "");
+        },
+        "order" => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link order number", "");
+            add("tracking_number", "- \"tracking_number\": String. tracking number.".to_string(), "tracking number", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+            add("goods", "- \"goods\": [ { title:String. goods title., link:String. Refer to the ID to find a URL that includes a manage link., id:String. Refer to the goods no value from the link or an attribute or input value. } ]".to_string(), "goods product items", "");
+            add("sender_name", "- \"sender_name\": String. sender name or order name or buyer name.".to_string(), "sender buyer orderer name", "");
+            add("recipient_name", "- \"recipient_name\": String. recipient name.".to_string(), "recipient receiver name", "");
+            add("payment_method", "- \"payment_method\": String. Method of payment ('C.O.D.', 'CARD', 'BANK', 'PayPal', etc.).".to_string(), "payment method type", "");
+            add("payment_date", "- \"payment_date\": String. payment date(payment date or '').".to_string(), "payment date", "");
+        },
+        "coupon" | "event" => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("type", "- \"type\": String. coupon type('percentage' or 'fixed_amount' or 'free_shipping' or '').".to_string(), "type", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("title", "- \"title\": String. title.".to_string(), "title name", "");
+            add("started_at", "- \"started_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "start date time", "");
+            add("expired_at", "- \"expired_at\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "expire end date time", "");
+            add("code", format!("- \"code\": String. {} code used at checkout.", page_type), "code", "");
+            add("discount", "- \"discount\": Number. Discount value.".to_string(), "discount", "");
+            add("quantity", format!("- \"quantity\": Number. {} quantity.", page_type), "quantity amount", "");
+        },
+        "review" => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Refer to the ID value from the link.", href), "id link", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("name", "- \"name\": String. reviewer name.".to_string(), "name reviewer author", "");
+            add("title", "- \"title\": String. reviewer item title.".to_string(), "title subject product", "");
+            add("completed", "- \"completed\": boolean. order complete.".to_string(), "completed purchased", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration time", "");
+        },
+        _ => {
+            add("id,link", format!("- \"link\": String. '{}'\n- \"id\": String. Unique identifier.", href), "id link", "");
+            add("title", "- \"title\": String. General name or title.".to_string(), "title name", "");
+            add("status", "- \"status\": String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or \"\". Do not invent other words.".to_string(), "status state", "");
+            add("registration_date", "- \"registration_date\": String. yyyy-MM-ddThh:mm:ss.".to_string(), "date registration", "");
+        }
     }
-    (bias.trim().to_string(), prejudice.trim().to_string())
+    fields
 }
 
 pub fn get_vision_tracking_bias(lang: &str) -> (String, String) {
@@ -919,17 +989,12 @@ pub fn get_vision_tracking_bias(lang: &str) -> (String, String) {
 
 // 🌟 글로벌 언어를 한 번에 섞어 넣지 않고, 전달받은 언어 코드의 힌트만 생성합니다.
 pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) {
-    let page_type_key = match page_type {
-        "coupon" | "event" => "coupon_event",
-        _ => page_type,
-    };
-    
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     let mut list_words = String::new();
     let mut form_words = String::new();
     
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type_key).or_else(|| l.get("default"))) {
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
             list_words.push_str(&l_list.replace("{TYPE}", &localized_type));
         }
@@ -1447,234 +1512,7 @@ Read the entire document from top to bottom, applying the following strict filte
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
-pub fn list2json_meta(page_type: &str, href: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
-    let schema = r###"- "{TYPE}":Object.
-- "code":String. product code (Stock Keeping Unit).
-- "path":String. {HREF}.
-- "link":String. Refer to the ID to find a URL that includes a manage link.
-- "id":String. Refer to the ID value from the link."###.to_string();
 
-    let mut final_schema = schema;
-    if !item_pug.contains("href=") && !item_pug.contains("href=\"") {
-        final_schema = final_schema.lines()
-            .filter(|line| !line.contains("\"link\":") && !line.contains("\"path\":"))
-            .collect::<Vec<_>>()
-            .join("\n");
-    }
-
-    let mut final_pug = String::new();
-    if head_pug.trim_start().starts_with("thead") {
-        final_pug.push_str(head_pug);
-        if !head_pug.ends_with('\n') {
-            final_pug.push('\n');
-        }
-    } else {
-        final_pug.push_str("thead\n");
-        for line in head_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    if !item_pug.is_empty() {
-        final_pug.push_str("tbody\n");
-        for line in item_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    let pug_content = final_pug.trim_end().lines()
-        .map(|line| format!("    {}", line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let template = r###"[TASK]
-Extract ID and Link information from the provided Pug content into a single structured JSON object.
-
-[PUG CONTENT]
-{PUG_CONTENT}
-
-[CONTEXT]
-current Link: {HREF}
-Language: {LANGUAGE}
-
-[SCHEMA DEFINITIONS]
-{SCHEMA}
-
-[OUTPUT FORMAT]
-{...}
-
-[ACTION] RETURN JSON ONLY. 
-NO EXPLANATION. NO THINKING. /no_think"###;
-
-    template.replace("{SCHEMA}", &final_schema)
-            .replace("{TYPE}", page_type)
-            .replace("{HREF}", href)
-            .replace("{LANGUAGE}", language)
-            .replace("{PUG_CONTENT}", &pug_content)
-}
-
-pub fn list2json_info(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
-    let schema = match page_type {
-    "order" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. ENUM strictly one of ['draft', 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
-- "title":String. title."###.to_string(),
-
-    "goods" => r###"- "product":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. ENUM strictly one of ['draft', 'show', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
-- "code":String. product code (Stock Keeping Unit).
-- "title":String. title."###.to_string(),
-    
-    "tracking" | "review" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. ENUM strictly one of ['draft', 'progress', 'return', 'complete', 'error'] or "". Do not invent other words.
-- "title":String. author and content."###.to_string(),
-    
-    "coupon" | "event" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'expire', 'complete', 'error'] or "". Do not invent other words.
-- "title":String. title."###.to_string(),
-    
-        _ => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "registration_date":String. yyyy-MM-ddThh:mm:ss.
-- "status":String. ENUM strictly one of ['show', 'progress', 'hide', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'] or "". Do not invent other words.
-- "title":String. title."###.to_string()
-    };
-
-    let mut final_pug = String::new();
-    if head_pug.trim_start().starts_with("thead") {
-        final_pug.push_str(head_pug);
-        if !head_pug.ends_with('\n') {
-            final_pug.push('\n');
-        }
-    } else {
-        final_pug.push_str("thead\n");
-        for line in head_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    if !item_pug.is_empty() {
-        final_pug.push_str("tbody\n");
-        for line in item_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    let pug_content = final_pug.trim_end().lines()
-        .map(|line| format!("    {}", line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let template = r###"[TASK]
-Extract Status, Date, and Title information from the provided Pug content into a single structured JSON object.
-
-[PUG CONTENT]
-{PUG_CONTENT}
-
-[CONTEXT]
-Language: {LANGUAGE}
-
-[SCHEMA DEFINITIONS]
-{SCHEMA}
-
-[OUTPUT FORMAT]
-{...}
-
-[ACTION] RETURN JSON ONLY. 
-NO EXPLANATION. NO THINKING. /no_think"###;
-
-    template.replace("{SCHEMA}", &schema)
-            .replace("{TYPE}", page_type)
-            .replace("{LANGUAGE}", language)
-            .replace("{PUG_CONTENT}", &pug_content)
-}
-
-pub fn list2json_data(page_type: &str, language: &str, head_pug: &str, item_pug: &str) -> String {
-    let schema = match page_type {
-    "order" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
-- "sale_price":Number.. actual selling price(discounted price).
-- "tracking_number":String. tracking Number or shipping number.
-- "shipping_method":String. shipping method('standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid').
-- "shipping_fee":Number.. Cost of delivery."###.to_string(),
-
-    "goods" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "currency":String. ISO 4217 Currency Code(If the currency is not explicitly stated, infer the currency based on PUG CONTENT).
-- "compare_at_price":Number. product Original price for showing discounts(normal price, market price).
-- "supply_price":Number. supply price(wholesale price).
-- "sale_price":Number. actual selling price(discounted price)."###.to_string(),
-    
-    "tracking" | "review" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "additional_info":String. any other useful info."###.to_string(),
-    
-    "coupon" | "event" => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "started_at":String. yyyy-MM-ddThh:mm:ss.
-- "expired_at":String. yyyy-MM-ddThh:mm:ss."###.to_string(),
-    
-        _ => r###"- "{TYPE}":Object.
-- "summary":String. Extract the semantic payload while strictly ignoring all structural formatting tags.
-- "additional_info":String. any other useful info."###.to_string()
-    };
-
-    let mut final_pug = String::new();
-    if head_pug.trim_start().starts_with("thead") {
-        final_pug.push_str(head_pug);
-        if !head_pug.ends_with('\n') {
-            final_pug.push('\n');
-        }
-    } else {
-        final_pug.push_str("thead\n");
-        for line in head_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    if !item_pug.is_empty() {
-        final_pug.push_str("tbody\n");
-        for line in item_pug.lines() {
-            final_pug.push_str(&format!("    {}\n", line));
-        }
-    }
-
-    let pug_content = final_pug.trim_end().lines()
-        .map(|line| format!("    {}", line))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let template = r###"[TASK]
-Extract detailed information (excluding IDs and Links) from the provided Pug content into a single structured JSON object.
-
-[PUG CONTENT]
-{PUG_CONTENT}
-
-[CONTEXT]
-Language: {LANGUAGE}
-
-[SCHEMA DEFINITIONS]
-{SCHEMA}
-
-[OUTPUT FORMAT]
-{...}
-
-[ACTION] RETURN JSON ONLY. 
-NO EXPLANATION. NO THINKING. /no_think"###;
-
-    template.replace("{SCHEMA}", &schema)
-            .replace("{TYPE}", page_type)
-            .replace("{LANGUAGE}", language)
-            .replace("{PUG_CONTENT}", &pug_content)
-}
 
 /// Converts a JSON Value into a human-readable natural language narrative.
 /// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.

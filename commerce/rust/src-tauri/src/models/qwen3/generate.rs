@@ -234,6 +234,8 @@ impl Qwen3GenerateModel {
         cache_dir: Option<String>,
         cancel_flag: Option<Arc<AtomicBool>>,
         ignore_list: Option<&[String]>,
+        semantic_target: Option<&str>,
+        semantic_prejudice: Option<&str>,
     ) -> Result<String> {
         if is_prefill {
             self.clear_kv_cache();
@@ -276,6 +278,90 @@ impl Qwen3GenerateModel {
         
         let mut gen_text = String::new();
 
+        // 🌟 [Semantic Activation Steering] 모델 내부 임베딩 코사인 유사도 벡터 바이어스 연산
+        let mut semantic_bias_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_target {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_bias = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        // F32 정밀도로 통일하여 연산 깨짐(NaN) 방어
+                        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
+                        
+                        // L2 정규화 후 Cosine Similarity 도출
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
+                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        let one = Tensor::new(1.0f32, &self.device)?;
+                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+                        let bias = sim_relu.affine(10.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        Ok(bias)
+                    };
+                    
+                    match calc_bias() {
+                        Ok(bias) => {
+                            semantic_bias_tensor = Some(bias);
+                            println!("[SEMANTIC-BIAS] Generated Vector Bias for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-BIAS] Failed to calculate bias: {}", e),
+                    }
+                }
+            }
+        }
+
+        // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
+        let mut semantic_prejudice_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_prejudice {
+            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
+                if !target_ids.is_empty() {
+                    let calc_prej = || -> Result<Tensor> {
+                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+                        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+                        
+                        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+                        
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+                        
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
+                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        let one = Tensor::new(1.0f32, &self.device)?;
+                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        Ok(prejudice)
+                    };
+                    match calc_prej() {
+                        Ok(prej) => {
+                            semantic_prejudice_tensor = Some(prej);
+                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
+                    }
+                }
+            }
+        }
+
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
         let chunk_size = 256;
         let mut next_token = 0;
@@ -312,6 +398,21 @@ impl Qwen3GenerateModel {
             // 프리필이 완전히 끝나는 마지막 청크의 끝에서만 첫 번째 토큰을 샘플링합니다.
             if current_chunk_offset == prompt_seq_len {
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                
+                // 🌟 계산해 둔 바이어스가 존재한다면 로짓 전체 배열에 1:1 매핑 합산
+                let logits = if let Some(ref bias) = semantic_bias_tensor {
+                    logits.broadcast_add(bias)?
+                } else {
+                    logits
+                };
+
+                // 🌟 오답 진영 억제력(Sub) 적용
+                let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+                    logits.broadcast_sub(prej)?
+                } else {
+                    logits
+                };
+                
                 let mut logits_vec = logits.to_vec1::<f32>()?;
                 let len = logits_vec.len();
 
@@ -352,6 +453,20 @@ impl Qwen3GenerateModel {
             let single_input = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            
+            // 🌟 매 글자가 나올 때마다 타겟 방향으로 핸들을 꺾음 (Steering)
+            let logits = if let Some(ref bias) = semantic_bias_tensor {
+                logits.broadcast_add(bias)?
+            } else {
+                logits
+            };
+
+            // 🌟 오답 진영의 단어들은 아예 생성되지 못하도록 억제력(Sub)을 가합니다!
+            let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+                logits.broadcast_sub(prej)?
+            } else {
+                logits
+            };
             
             let mut logits_vec = logits.to_vec1::<f32>()?;
             let len = logits_vec.len();

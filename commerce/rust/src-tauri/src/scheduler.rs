@@ -792,7 +792,7 @@ async fn process_task(
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                     max_tokens: Some(16),
-                    temperature: Some(0.2), top_p: Some(0.95),
+                    temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -898,7 +898,7 @@ async fn process_task(
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
                     max_tokens: Some(128),
-                    temperature: Some(0.2), top_p: Some(0.95),
+                    temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
 
@@ -946,7 +946,7 @@ async fn process_task(
                     doc_lang = lang_val.to_lowercase();
                 }
 
-                // JSON Object의 Key 값을 순회하여 _form 접미사 혹은 form 정밀 탐색
+                // JSON Object의 Key 값을 순회하여 _form 접미사 혹은 form 정밀 탐색 
                 let mut form_bool = None;
                 if let Some(obj) = target_obj.as_object() {
                     for (k, v) in obj {
@@ -1076,7 +1076,7 @@ async fn process_task(
                             })
                         ],
                         model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                        max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
+                        max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
 
@@ -1474,7 +1474,7 @@ async fn process_task(
                         })],
                         model: "qwen3.5".to_string(),
                         max_tokens: Some(256), 
-                        temperature: Some(0.2), 
+                        temperature: Some(0.0), 
                         top_p: Some(0.95),
                         ..Default::default()
                     };
@@ -1687,14 +1687,9 @@ async fn process_task(
 
         let mut all_extracted_items = Vec::new();
         
-        // 병합 대기열을 위한 변수들
-        // let pending_merge: Option<serde_json::Value> = None;
-        // let merge_countdown = 0;
-
         let mut pug_list = {
             let clean_content = &clean_html_content;
             let document = scraper::Html::parse_document(clean_content);
-            
             
             parsing::split_doc_to_pug_list_advanced(
                 &document, 
@@ -1705,7 +1700,6 @@ async fn process_task(
             )
         };
 
-        
         // 2순위: 속성이 없을 경우 thead의 tr 태그 개수로 폴백(Fallback)하여 완벽하게 묶어냅니다.
         let group_size = if !thead_pug.is_empty() {
             let mut max_span = 1;
@@ -1743,9 +1737,20 @@ async fn process_task(
         if !pug_list.is_empty() {
             let total_items = pug_list.len();
 
-            // ==========================================
-            
-            // ==========================================
+            // 리스트 전용 스키마 정의를 호출하여 핵심 필드만 개별 추출
+            let fields = parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
+            let total_fields = fields.len();
+
+            // 환각 검증을 위한 문서 타이틀 추출
+            let doc_title = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                if let Ok(sel) = scraper::Selector::parse("title") {
+                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            };
+
             // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
@@ -1757,169 +1762,268 @@ async fn process_task(
                 
                 let payload = json!({ 
                     "task_id": task.id, 
-                    "category": format!("List Extraction ({}/{})", idx + 1, total_items), 
+                    "category": format!("List Item {}/{}", idx + 1, total_items), 
                     "summary": summary_msg, 
                     "spinner": "⠋" 
                 });
                 log_task_progress(app_handle, &task.id, &payload);
-                emit_term(&format!("[STAGE-3] {}", summary_msg));
+                emit_term(&format!("\n[STAGE-3] Processing List Item {}/{} ...", idx + 1, total_items));
 
-                let task_question_meta = parsing::list2json_meta(&page_type, &url, language, &thead_pug, item_pug);
-                let task_question_info = parsing::list2json_info(&page_type, language, &thead_pug, item_pug);
-                let task_question_data = parsing::list2json_data(&page_type, language, &thead_pug, item_pug);
-
+                // 헤더(Thead)와 개별 아이템(Item)의 PUG를 결합하여 검증 텍스트 생성
+                let full_item_pug = format!("{}\n{}", thead_pug, item_pug);
                 
-                let (list_bias, list_prej) = crate::parsing::get_list_extraction_bias(&page_type, &doc_lang);
+                let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: format!("[PUG CONTENT]\n{}", full_item_pug),
+                    name: None,
+                });
 
-                let q3_gen_meta = model.qwen3_generator.clone();
-                let cancel_meta = cancellation_token.clone();
-                let b_meta = list_bias.clone();
-                let p_meta = list_prej.clone();
-                let res_meta = tokio::task::spawn_blocking(move || {
-                    let mut gen_guard = q3_gen_meta.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        println!("[Scheduler] Qwen3 Extracting Item Meta {}/{}...", idx + 1, total_items);
-                        let params = ChatCompletionParameters {
-                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(task_question_meta),
-                                name: None,
-                            })],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
-                            ..Default::default()
-                        };
-                        gen.generate(params, Some(cancel_meta), None, Some(&b_meta), Some(&p_meta)).map_err(|e| anyhow::anyhow!("Qwen 3 Meta failed: {}", e))
-                    } else {
-                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                    }
-                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                let mut item_val = json!({});
+                let mut global_ignore_list: Vec<String> = Vec::new();
 
-                
-                let q3_gen_info = model.qwen3_generator.clone();
-                let cancel_info = cancellation_token.clone();
-                let b_info = list_bias.clone();
-                let p_info = list_prej.clone();
-                let res_info = tokio::task::spawn_blocking(move || {
-                    let mut gen_guard = q3_gen_info.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        println!("[Scheduler] Qwen3 Extracting Item Info {}/{}...", idx + 1, total_items);
-                        let params = ChatCompletionParameters {
-                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(task_question_info),
-                                name: None,
-                            })],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.2), top_p: Some(0.95),
-                            ..Default::default()
-                        };
-                        gen.generate(params, Some(cancel_info), None, Some(&b_info), Some(&p_info)).map_err(|e| anyhow::anyhow!("Qwen 3 Info failed: {}", e))
-                    } else {
-                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                    }
-                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
+                for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
+                    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                    
+                    let f_percent = (((f_idx as f32) / (total_fields as f32)) * 100.0) as i32;
+                    let f_summary_msg = format!("Extracting {} ({}%)...", field_name, f_percent);
+                    
+                    let payload = json!({ 
+                        "task_id": task.id, 
+                        "category": format!("List Item {}/{}", idx + 1, total_items), 
+                        "summary": f_summary_msg, 
+                        "spinner": "⠋" 
+                    });
+                    log_task_progress(app_handle, &task.id, &payload);
+                    emit_term(&format!("  ▶ {}", f_summary_msg));
 
-                
-                let q3_gen_data = model.qwen3_generator.clone();
-                let cancel_data = cancellation_token.clone();
-                let b_data = list_bias.clone();
-                let p_data = list_prej.clone();
-                let res_data = tokio::task::spawn_blocking(move || {
-                    let mut gen_guard = q3_gen_data.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        println!("[Scheduler] Qwen3 Extracting Item Data {}/{}...", idx + 1, total_items);
-                        let params = ChatCompletionParameters {
-                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(task_question_data),
-                                name: None,
-                            })],
-                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
-                            ..Default::default()
-                        };
-                        gen.generate(params, Some(cancel_data), None, Some(&b_data), Some(&p_data)).map_err(|e| anyhow::anyhow!("Qwen 3 Data failed: {}", e))
-                    } else {
-                        Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                    }
-                }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                    let task_question = parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, &doc_title);
+                    
+                    let mut ignore_list: Vec<String> = global_ignore_list.clone();
+                    let mut miss_counter = 0;
+                    
+                    loop {
+                        if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                match (res_meta, res_info, res_data) {
-                    (Ok(res_m), Ok(res_i), Ok(res_d)) => {
-                        let mut parsed_meta = parsing::parse_json_from_llm(&res_m);
-                        let mut parsed_info = parsing::parse_json_from_llm(&res_i);
-                        let mut parsed_data = parsing::parse_json_from_llm(&res_d);
+                        let q3_gen = model.qwen3_generator.clone();
+                        let cancel_clone = cancellation_token.clone();
+                        let sys_msg = system_message.clone();
                         
-                        let mut item_meta = if let Some(inner) = parsed_meta.get_mut(&page_type) { inner.take() } else { parsed_meta };
-                        let mut item_info = if let Some(inner) = parsed_info.get_mut(&page_type) { inner.take() } else { parsed_info };
-                        let mut item_data = if let Some(inner) = parsed_data.get_mut(&page_type) { inner.take() } else { parsed_data };
+                        let field_name_clone = field_name.clone();
+                        let bias_target_for_closure = bias_target.clone(); 
+                        let prejudice_target_for_closure = prejudice_target.clone(); 
                         
+                        let task_q = task_question.clone();
+                        let ignore_list_clone = ignore_list.clone();
                         
-                        if let (Some(m_obj), Some(i_obj)) = (item_meta.as_object_mut(), item_info.as_object_mut()) {
-                            for (k, v) in i_obj {
-                                m_obj.insert(k.clone(), v.clone());
-                            }
-                        }
-                        if let (Some(m_obj), Some(d_obj)) = (item_meta.as_object_mut(), item_data.as_object_mut()) {
-                            for (k, v) in d_obj {
-                                m_obj.insert(k.clone(), v.clone());
-                            }
-                        }
-
-                        
-                        // 영문이 포함된 상품코드(P000000S)가 파괴되지 않도록 알파벳을 보존합니다!
-                        if let Some(id_val) = item_meta.get("id").and_then(|v| v.as_str()) {
-                            let extracted = if let Some(idx) = id_val.rfind('=') {
-                                &id_val[idx + 1..]
+                        let res = tokio::task::spawn_blocking(move || {
+                            let mut gen_guard = q3_gen.blocking_lock();
+                            if let Some(gen) = gen_guard.as_mut() {
+                                let params = ChatCompletionParameters {
+                                    messages: vec![
+                                        sys_msg,
+                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                            name: None,
+                                        })
+                                    ],
+                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                    ..Default::default()
+                                };
+                                
+                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
+                                let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
+                                
+                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), b_target, p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                             } else {
-                                id_val
-                            };
-                            
-                            // aa.ts의 cleanNumber()와 동일하게 하이픈, 언더바, 온점, 쉼표만 제거
-                            let clean_str = extracted.replace("-", "").replace("_", "").replace(".", "").replace(",", "");
-                            if !clean_str.is_empty() {
-                                item_meta.as_object_mut().unwrap().insert("id".to_string(), json!(clean_str.trim()));
+                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                             }
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+
+                        // 환각 캐시를 즉시 제거하여 다음 재시도 시 방어
+                        let q3_clear_arc = model.qwen3_generator.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                gen.clear_kv_cache();
+                            }
+                        }).await;
+
+                        if !model.is_cpu_mode {
+                            let dev = model.device_config.device.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if dev.is_cuda() { let _ = dev.synchronize(); }
+                            }).await;
                         }
 
-                        let mut item_json = item_meta;
+                        match res {
+                            Ok(res_text) => {
+                                let mut parsed = parsing::parse_json_from_llm(&res_text);
+                                let mut parsed_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
 
-                        if !item_json.is_null() && (item_json.is_object() || item_json.is_array()) {
-                            
-                            if let Some(link_val) = item_json.get_mut("link") {
-                                if let Some(relative_path) = link_val.as_str() {
-                                    if let Ok(base_url) = url::Url::parse(&url) {
-                                        if let Ok(absolute_url) = base_url.join(relative_path) {
-                                            let path_query = format!("{}{}", absolute_url.path(), absolute_url.query().map(|q| format!("?{}", q)).unwrap_or_default());
-                                            *link_val = json!(path_query.to_lowercase());
+                                let mut requires_retry = false;
+                                let mut extracted_values_for_retry = Vec::new();
+                                
+                                let keys: Vec<&str> = field_name_clone.split(',').map(|s| s.trim()).collect();
+                                let mut found_valid_value = false;
+
+                                let skip_pug_match_fields = ["status", "payment_method", "payment_origin", "condition", "currency"];
+                                let is_enum_field = skip_pug_match_fields.iter().any(|&f| field_name_clone.contains(f));
+
+                                for k in &keys {
+                                    if let Some(val) = parsed_val.get(*k) {
+                                        let is_empty_val = match val {
+                                            serde_json::Value::Null => true,
+                                            serde_json::Value::String(s) => s.trim().is_empty() || s == "..." || s == "null",
+                                            serde_json::Value::Array(a) => a.is_empty(),
+                                            serde_json::Value::Object(o) => o.is_empty(),
+                                            _ => false,
+                                        };
+
+                                        if !is_empty_val {
+                                            found_valid_value = true;
+
+                                            let extracted_str = if val.is_string() {
+                                                val.as_str().unwrap_or("").trim().to_string()
+                                            } else if val.is_number() {
+                                                val.to_string()
+                                            } else {
+                                                String::new()
+                                            };
+
+                                            if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                                extracted_values_for_retry.push(extracted_str.clone());
+                                                
+                                                if !is_enum_field {
+                                                    let is_iso_date = extracted_str.contains('T') && extracted_str.len() >= 19;
+                                                    let is_url = extracted_str.starts_with("http") || extracted_str.starts_with('/');
+                                                    let is_boolean_str = extracted_str == "true" || extracted_str == "false";
+                                                    
+                                                    if !is_iso_date && !is_url && !is_boolean_str {
+                                                        let mut is_matched = full_item_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
+                                                        
+                                                        if !is_matched {
+                                                            let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                            if digits_only.len() >= 3 {
+                                                                let pug_digits: String = full_item_pug.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                                if pug_digits.contains(&digits_only) {
+                                                                    is_matched = true;
+                                                                }
+                                                            } else {
+                                                                let extracted_lower = extracted_str.to_lowercase();
+                                                                let pug_lower = full_item_pug.to_lowercase();
+                                                                if pug_lower.contains(&extracted_lower) {
+                                                                    is_matched = true;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if !is_matched {
+                                                            requires_retry = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
+
+                                if !found_valid_value {
+                                    requires_retry = true;
+                                }
+
+                                if requires_retry {
+                                    miss_counter += 1;
+                                    if miss_counter > 3 {
+                                        emit_term(&format!("    ⏭️ Skipping field {} due to persistent hallucination or empty value.", field_name_clone));
+                                        break; 
+                                    }
+                                    emit_term(&format!("    ⚠️ Hallucination or empty value detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
+                                    for ex_str in extracted_values_for_retry {
+                                        ignore_list.push(ex_str.clone());
+                                        ignore_list.push(format!(" {}", ex_str));
+                                        ignore_list.push(ex_str.to_lowercase());
+                                    }
+                                    if !found_valid_value {
+                                        for k in &keys {
+                                            ignore_list.push(format!("\"{}\": \"\"", k));
+                                            ignore_list.push(format!("\"{}\":\"\"", k));
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let mut extracted_results = Vec::new();
+                                for k in &keys {
+                                    if let Some(val) = parsed_val.get(*k) {
+                                        item_val.as_object_mut().unwrap().insert(k.to_string(), val.clone());
+                                        extracted_results.push(format!("\"{}\": {}", k, val));
+                                        
+                                        let val_str = if val.is_string() { val.as_str().unwrap().trim().to_string() }
+                                                      else if val.is_number() { val.to_string() }
+                                                      else { String::new() };
+                                        
+                                        if val_str.len() >= 5 && val_str != "null" && val_str != "true" && val_str != "false" {
+                                            if !global_ignore_list.contains(&val_str) {
+                                                global_ignore_list.push(val_str.clone());
+                                                global_ignore_list.push(format!(" {}", val_str));
+                                                global_ignore_list.push(val_str.to_lowercase());
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                for ck in ["has_header", "has_footer", "title", "language"] {
+                                    if let Some(val) = parsed_val.get(ck) {
+                                        item_val.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
+                                    }
+                                }
+
+                                if !extracted_results.is_empty() {
+                                    emit_term(&format!("    ✅ Extracted: {}", extracted_results.join(", ")));
+                                } else {
+                                    emit_term(&format!("    ✅ Extracted: (null or empty for {})", field_name_clone));
+                                }
+                                break;
+                            },
+                            Err(e) => {
+                                println!("[Scheduler] Error extracting list item field {}: {:?}", field_name_clone, e);
+                                break;
                             }
-                            
-                            emit_term(&format!("  ✅ Extracted Item: {}", serde_json::to_string(&item_json).unwrap_or_default()));
-                            all_extracted_items.push(item_json);
                         }
-                    },
-                    (Err(e), _, _) => println!("[Scheduler] Error extracting item meta: {:?}", e),
-                    (_, Err(e), _) => println!("[Scheduler] Error extracting item info: {:?}", e),
-                    (_, _, Err(e)) => println!("[Scheduler] Error extracting item data: {:?}", e),
-                }
+                    } // loop end
+                } // fields for loop end
 
-                let q3_clear_arc = model.qwen3_generator.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                        gen.clear_kv_cache();
+                // 포스트 프로세싱: id, link 등 병합
+                if let Some(id_val) = item_val.get("id").and_then(|v| v.as_str()) {
+                    let extracted = if let Some(idx) = id_val.rfind('=') {
+                        &id_val[idx + 1..]
+                    } else {
+                        id_val
+                    };
+                    
+                    let clean_str = extracted.replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                    if !clean_str.is_empty() {
+                        item_val.as_object_mut().unwrap().insert("id".to_string(), json!(clean_str.trim()));
                     }
-                }).await;
-                
-                
-                if !model.is_cpu_mode {
-                    let dev = model.device_config.device.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if dev.is_cuda() { let _ = dev.synchronize(); }
-                    }).await;
                 }
 
-                // IO 작업 대기
+                if !item_val.is_null() && (item_val.is_object() || item_val.is_array()) {
+                    if let Some(link_val) = item_val.get_mut("link") {
+                        if let Some(relative_path) = link_val.as_str() {
+                            if let Ok(base_url) = url::Url::parse(&url) {
+                                if let Ok(absolute_url) = base_url.join(relative_path) {
+                                    let path_query = format!("{}{}", absolute_url.path(), absolute_url.query().map(|q| format!("?{}", q)).unwrap_or_default());
+                                    *link_val = json!(path_query.to_lowercase());
+                                }
+                            }
+                        }
+                    }
+                    
+                    emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&item_val).unwrap_or_default()));
+                    all_extracted_items.push(item_val);
+                }
+                
                 crate::models::qwen::generate::wait_for_global_io().await;
 
-                // OS 커널 레벨에서 가비지 컬렉터 강제 호출
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1932,8 +2036,9 @@ async fn process_task(
                 unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            }
+            } // items for loop end
         }
+
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });
 
     } else {
@@ -2028,7 +2133,7 @@ async fn process_task(
                                         name: None,
                                     })
                                 ],
-                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.2), top_p: Some(0.95),
+                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                                 ..Default::default()
                             };
                             
@@ -2078,55 +2183,64 @@ async fn process_task(
 
                             for k in &keys {
                                 if let Some(val) = item_val.get(*k) {
-                                    let extracted_str = if val.is_string() {
-                                        val.as_str().unwrap_or("").trim().to_string()
-                                    } else if val.is_number() {
-                                        val.to_string() // 숫자형 데이터도 검증을 위해 문자열로 변환
-                                    } else {
-                                        String::new()
+                                    let is_empty_val = match val {
+                                        serde_json::Value::Null => true,
+                                        serde_json::Value::String(s) => s.trim().is_empty() || s == "..." || s == "null",
+                                        serde_json::Value::Array(a) => a.is_empty(),
+                                        serde_json::Value::Object(o) => o.is_empty(),
+                                        _ => false,
                                     };
 
-                                    if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                    if !is_empty_val {
                                         found_valid_value = true;
-                                        extracted_values_for_retry.push(extracted_str.clone());
-                                        
-                                        if !is_enum_field {
-                                            let is_iso_date = extracted_str.contains('T') && extracted_str.len() >= 19;
-                                            let is_url = extracted_str.starts_with("http") || extracted_str.starts_with('/');
-                                            let is_boolean_str = extracted_str == "true" || extracted_str == "false";
+
+                                        let extracted_str = if val.is_string() {
+                                            val.as_str().unwrap_or("").trim().to_string()
+                                        } else if val.is_number() {
+                                            val.to_string() // 숫자형 데이터도 검증을 위해 문자열로 변환
+                                        } else {
+                                            String::new()
+                                        };
+
+                                        if !extracted_str.is_empty() && extracted_str != "..." && extracted_str != "null" {
+                                            extracted_values_for_retry.push(extracted_str.clone());
                                             
-                                            if !is_iso_date && !is_url && !is_boolean_str {
-                                                // 1차: 완벽한 텍스트 포함 여부 (문자열 일치)
-                                                let mut is_matched = content_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
+                                            if !is_enum_field {
+                                                let is_iso_date = extracted_str.contains('T') && extracted_str.len() >= 19;
+                                                let is_url = extracted_str.starts_with("http") || extracted_str.starts_with('/');
+                                                let is_boolean_str = extracted_str == "true" || extracted_str == "false";
                                                 
-                                                // 2차: 전화번호, 가격 등 포맷(하이픈, 콤마, 띄어쓰기) 차이로 인한 불일치 극복을 위해 순수 숫자만 추출하여 검증
-                                                if !is_matched {
-                                                    let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                if !is_iso_date && !is_url && !is_boolean_str {
+                                                    // 1차: 완벽한 텍스트 포함 여부 (문자열 일치)
+                                                    let mut is_matched = content_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
                                                     
-                                                    // 숫자가 3자리 이상 포함된 데이터일 경우 숫자 연속성이 PUG에 존재하는지 확인
-                                                    if digits_only.len() >= 3 {
-                                                        let pug_digits: String = content_pug.chars().filter(|c| c.is_ascii_digit()).collect();
-                                                        if pug_digits.contains(&digits_only) {
-                                                            is_matched = true;
-                                                        }
-                                                    } else {
-                                                        // 숫자가 아니거나 너무 짧은데 완벽 매칭이 안됐다면 대소문자 무시 검색
-                                                        let extracted_lower = extracted_str.to_lowercase();
-                                                        let pug_lower = content_pug.to_lowercase();
-                                                        if pug_lower.contains(&extracted_lower) {
-                                                            is_matched = true;
+                                                    // 2차: 전화번호, 가격 등 포맷(하이픈, 콤마, 띄어쓰기) 차이로 인한 불일치 극복을 위해 순수 숫자만 추출하여 검증
+                                                    if !is_matched {
+                                                        let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                        
+                                                        // 숫자가 3자리 이상 포함된 데이터일 경우 숫자 연속성이 PUG에 존재하는지 확인
+                                                        if digits_only.len() >= 3 {
+                                                            let pug_digits: String = content_pug.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                            if pug_digits.contains(&digits_only) {
+                                                                is_matched = true;
+                                                            }
+                                                        } else {
+                                                            // 숫자가 아니거나 너무 짧은데 완벽 매칭이 안됐다면 대소문자 무시 검색
+                                                            let extracted_lower = extracted_str.to_lowercase();
+                                                            let pug_lower = content_pug.to_lowercase();
+                                                            if pug_lower.contains(&extracted_lower) {
+                                                                is_matched = true;
+                                                            }
                                                         }
                                                     }
-                                                }
 
-                                                // 010-0356789 같은 환각 전화번호는 2차 검증(숫자 배열)에서도 걸러져서 확실히 재시도됩니다!
-                                                if !is_matched {
-                                                    requires_retry = true;
+                                                    // 010-0356789 같은 환각 전화번호는 2차 검증(숫자 배열)에서도 걸러져서 확실히 재시도됩니다!
+                                                    if !is_matched {
+                                                        requires_retry = true;
+                                                    }
                                                 }
                                             }
                                         }
-                                    } else if !val.is_null() {
-                                        found_valid_value = true;
                                     }
                                 }
                             }
