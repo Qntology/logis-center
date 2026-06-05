@@ -976,7 +976,7 @@ pub fn get_separated_layout_bias(page_type: &str, lang: &str) -> (String, String
         form_bias = format!("{} detail form single input fields properties configuration input select textarea", localized_type);
     }
     if prejudice.trim().is_empty() {
-        prejudice = String::from("global navigation, menus, footers, aside, search, filter.");
+        prejudice = String::from("global navigation, menus, footers, aside, search, guide, tip, filter.");
     }
     
     (list_bias.trim().to_string(), form_bias.trim().to_string(), prejudice.trim().to_string())

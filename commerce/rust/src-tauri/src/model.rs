@@ -122,6 +122,7 @@ pub enum ModelSize {
     Qwen,    // 0.6B for Ingestion (기존 Small)
     Qwen3,   // Qwen3 Text Model (기존 Large, /qwen3/ 로직 전용)
     Qwen3_5, // 2B Qwen 3.5 (Text Optimized)
+    Granite, // 🌟 Granite 350m 추가됨
 }
 
 #[derive(Clone)]
@@ -130,6 +131,7 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
+    pub granite_generator: Arc<TokioMutex<Option<crate::models::granite4::generate::Granite4GenerateModel>>>, // 🌟 추가됨
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
@@ -139,9 +141,10 @@ pub struct LogisModel {
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
-    qwen_model_path: String,      // 🌟 (기존 small_model_path 대신 이름 맞춤)
-    qwen3_model_path: String,     // 🌟 Qwen3 모델 경로 추가
+    qwen_model_path: String,      
+    qwen3_model_path: String,     
     qwen3_5_model_path: String,
+    pub granite_model_path: String, // 🌟 경로 변수 추가됨
     embedding_path: std::path::PathBuf,
     pub device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
@@ -157,6 +160,8 @@ impl LogisModel {
         *q3_gen = None;
         let mut q35_gen = self.qwen3_5_generator.lock().await;
         *q35_gen = None;
+        let mut granite_gen = self.granite_generator.lock().await; // 🌟 추가됨
+        *granite_gen = None;
         
         let mut size = self.current_size.lock().await;
         *size = None;
@@ -202,6 +207,15 @@ impl LogisModel {
             let mut q35_gen = self.qwen3_5_generator.lock().await;
             if let Some(mut g) = q35_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator..."); //
+                g.clear_kv_cache();
+                drop(g);
+            }
+        }
+        
+        {
+            let mut granite_gen = self.granite_generator.lock().await;
+            if let Some(mut g) = granite_gen.take() {
+                println!("[DIAG-PURGE] Dropping Granite Generator..."); // 🌟 추가됨
                 g.clear_kv_cache();
                 drop(g);
             }
@@ -480,6 +494,7 @@ impl LogisModel {
                     },
                     ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
                     ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
+                    ModelSize::Granite => self.granite_generator.lock().await.is_some(),
                 };
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
@@ -508,6 +523,9 @@ impl LogisModel {
             },
             ModelSize::Qwen3_5 => {
                 self.ensure_qwen3_5(false).await?;
+            },
+            ModelSize::Granite => {
+                self.ensure_granite().await?;
             }
         }
 
@@ -704,6 +722,40 @@ impl LogisModel {
         Ok(())
     }
 
+    pub async fn ensure_granite(&self) -> anyhow::Result<()> {
+        let needs_load = { self.granite_generator.lock().await.is_none() };
+        if needs_load {
+            println!("[MODEL] Loading Granite 4.0 (350m GGUF) exclusively...");
+            self.unload_generator().await;
+            {
+                *self.current_size.lock().await = Some(ModelSize::Granite);
+            }
+            
+            let path = self.granite_model_path.clone();
+            let dev = self.device_config.device.clone();
+            let dtype = if self.is_cpu_mode { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
+            
+            let gen_result = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::models::granite4::generate::Granite4GenerateModel> {
+                crate::models::granite4::generate::Granite4GenerateModel::init_from_directory(std::path::Path::new(&path), Some(&dev), dtype)
+            }).await?;
+
+            match gen_result {
+                Ok(gen) => {
+                    println!("[MODEL] 🎉 Granite 4.0 Native Model loaded successfully!");
+                    *self.granite_generator.lock().await = Some(gen);
+                },
+                Err(e) => {
+                    println!("\n==================================================");
+                    println!("🚨 [CRITICAL ERROR] Granite 4.0 로딩 실패!");
+                    println!("원인: {:?}", e);
+                    println!("==================================================\n");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
     // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
     pub async fn check_embedding_downloaded(&self) -> anyhow::Result<()> {
@@ -814,6 +866,7 @@ impl LogisModel {
         let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-2B-Instruct-gguf"));
+        let granite_model_path = normalize_path(base_path.join("granite-4.0-h-350m-gguf")); // 🌟 추가됨
         let embedding_path = base_path.join("granite-embedding-97m-multilingual-r2");
 
         let max_tokens_limit = 65536; 
@@ -823,14 +876,16 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
+            granite_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가됨
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
-            qwen_model_path,    // 🌟 교체
-            qwen3_model_path,   // 🌟 교체
+            qwen_model_path,    
+            qwen3_model_path,   
             qwen3_5_model_path,
+            granite_model_path, // 🌟 추가됨
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,

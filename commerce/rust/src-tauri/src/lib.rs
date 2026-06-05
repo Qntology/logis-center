@@ -1558,11 +1558,13 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
     let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
     let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
+    let granite_dir = base_path.join("granite-4.0-h-350m-gguf"); // 🌟 추가됨
 
     Ok(serde_json::json!({
         "Qwen3": has_valid_model(&qwen3_dir),
         "Qwen3.5": has_valid_model(&qwen3_5_dir),
-        "Embedding": has_valid_model(&embed_dir)
+        "Embedding": has_valid_model(&embed_dir),
+        "Granite": has_valid_model(&granite_dir) // 🌟 추가됨
     }))
 }
 
@@ -1588,6 +1590,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
             "Qwen3" => "Qwen3-0.6B-Instruct-gguf",
             "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf",
             "Embedding" => "granite-embedding-97m-multilingual-r2",
+            "Granite" => "granite-4.0-h-350m-gguf", // 🌟 추가됨
             _ => "unknown"
         };
 
@@ -1608,6 +1611,10 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
             "Embedding" => vec![
                 // 🌟 사용자님이 config.json 등 기타 환경 파일은 직접 준비하셨으므로 model.safetensors 단일 파일만 집중 다운로드합니다.
                 ("https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/model.safetensors", "model.safetensors")
+            ],
+            "Granite" => vec![
+                // 🌟 Granite 4.0 350M GGUF 모델 자동 다운로드 추가
+                ("https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF/resolve/main/granite-4.0-h-350m-Q8_0.gguf", "granite-4.0-h-350m-Q8_0.gguf")
             ],
             _ => vec![]
         };

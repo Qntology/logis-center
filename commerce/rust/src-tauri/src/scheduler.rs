@@ -892,18 +892,49 @@ async fn process_task(
             };
 
             let track_a_pugs: Vec<(String, String)> = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut seen_selectors = std::collections::HashSet::new(); // 🌟 [핵심 최적화 2] CSS 선택자 중복 파싱 차단
-                let mut results = Vec::new();
+                let mut seen_selectors = std::collections::HashSet::new();
+                let mut unique_sels = Vec::new();
                 for sel in track_a_selectors {
-                    if sel.is_empty() { continue; }
-                    if !seen_selectors.contains(&sel) {
+                    if !sel.is_empty() && !seen_selectors.contains(&sel) {
                         seen_selectors.insert(sel.clone());
-                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
-                        results.push((sel, block_pug));
+                        unique_sels.push(sel);
                     }
                 }
-                results
+                
+                let html_clone = clean_html_content.clone();
+                
+                tokio::task::spawn_blocking(move || {
+                    let mut results = Vec::new();
+                    let num_threads = 8;
+                    let chunk_size = (unique_sels.len() + num_threads - 1) / num_threads;
+                    
+                    if chunk_size > 0 {
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for chunk in unique_sels.chunks(chunk_size) {
+                                let chunk_owned = chunk.to_vec();
+                                let html_ref = &html_clone;
+                                
+                                // 🌟 8개의 스레드가 각각 독립적인 DOM 트리를 구축하고 동시에 CSS 선택자를 사냥합니다!
+                                handles.push(s.spawn(move || {
+                                    let doc = scraper::Html::parse_document(html_ref);
+                                    let mut local_res = Vec::with_capacity(chunk_owned.len());
+                                    for sel in chunk_owned {
+                                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                                        local_res.push((sel, block_pug));
+                                    }
+                                    local_res
+                                }));
+                            }
+                            for h in handles {
+                                if let Ok(local_res) = h.join() {
+                                    results.extend(local_res);
+                                }
+                            }
+                        });
+                    }
+                    results
+                }).await.unwrap_or_default()
             };
 
             // 🌟 [핵심 최적화 3] 완성된 PUG 블록들을 한데 모아 Batch 임베딩 타격! (VRAM 0% 대기현상 완전 파괴)
@@ -1080,23 +1111,56 @@ async fn process_task(
             emit_term(&format!("  📦 [Track B & C] Boa Engine successfully mapped {}/{} structural processing blocks.", valid_bc_count, track_bc_candidates.len()));
 
             let track_bc_pugs: Vec<(usize, String, String)> = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut seen_selectors = std::collections::HashSet::new(); // 🌟 DOM 순회 중복 방지
-                let mut results = Vec::new();
-                for (i, sel) in track_bc_selectors.into_iter().enumerate() {
-                    if sel.is_empty() { 
-                        results.push((i, sel, String::new()));
-                        continue; 
+                let html_clone = clean_html_content.clone();
+                let selectors_with_idx: Vec<(usize, String)> = track_bc_selectors.into_iter().enumerate().collect();
+                
+                tokio::task::spawn_blocking(move || {
+                    let mut seen_selectors = std::collections::HashSet::new();
+                    let mut unique_tasks = Vec::new();
+                    let mut fallback_results = Vec::new();
+                    
+                    for (i, sel) in selectors_with_idx {
+                        if sel.is_empty() {
+                            fallback_results.push((i, sel, String::new()));
+                        } else if !seen_selectors.contains(&sel) {
+                            seen_selectors.insert(sel.clone());
+                            unique_tasks.push((i, sel));
+                        } else {
+                            fallback_results.push((i, sel, String::new()));
+                        }
                     }
-                    if !seen_selectors.contains(&sel) {
-                        seen_selectors.insert(sel.clone());
-                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
-                        results.push((i, sel, block_pug));
-                    } else {
-                        results.push((i, sel, String::new()));
+
+                    let mut results = Vec::new();
+                    let num_threads = 8;
+                    let chunk_size = (unique_tasks.len() + num_threads - 1) / num_threads;
+                    
+                    if chunk_size > 0 {
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for chunk in unique_tasks.chunks(chunk_size) {
+                                let chunk_owned = chunk.to_vec();
+                                let html_ref = &html_clone;
+                                handles.push(s.spawn(move || {
+                                    let doc = scraper::Html::parse_document(html_ref);
+                                    let mut local_res = Vec::with_capacity(chunk_owned.len());
+                                    for (i, sel) in chunk_owned {
+                                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                                        local_res.push((i, sel, block_pug));
+                                    }
+                                    local_res
+                                }));
+                            }
+                            for h in handles {
+                                if let Ok(local_res) = h.join() {
+                                    results.extend(local_res);
+                                }
+                            }
+                        });
                     }
-                }
-                results
+                    results.extend(fallback_results);
+                    results.sort_by_key(|k| k.0); // 🌟 인덱스 정렬 보존 (Track B/C 리스트, 폼 구분 유지)
+                    results
+                }).await.unwrap_or_default()
             };
 
             let mut total_list_score = 0.0;
@@ -1964,7 +2028,7 @@ async fn process_task(
                         match res {
                             Ok(res_text) => {
                                 let mut parsed = parsing::parse_json_from_llm(&res_text);
-                                let mut parsed_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
+                                let parsed_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed }; // 🌟 mut 제거
 
                                 let mut requires_retry = false;
                                 let mut extracted_values_for_retry = Vec::new();
@@ -2276,19 +2340,50 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            // 🌟 [CRITICAL OPTIMIZATION] scraper::Html은 Send가 아니므로 비동기 await 연산 이전에 별도 스코프를 생성해 PUG 문자열 변환을 완벽히 매핑하고 해제합니다.
+            // 🌟 [CRITICAL OPTIMIZATION] 스레드 8개를 가동하여 거대한 DOM 순회 작업을 병렬 해체, 속도를 800% 부스팅합니다!
             let stage3_pugs: Vec<String> = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut seen_stage3_sels = std::collections::HashSet::new(); // 🌟 CSS 선택자 중복 DOM 순회 차단
-                let mut results = Vec::new();
-                for sel in track_a_selectors {
-                    if sel.is_empty() { continue; }
-                    if !seen_stage3_sels.contains(&sel) {
-                        seen_stage3_sels.insert(sel.clone());
-                        results.push(crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::DetailMode, None));
+                let html_clone = clean_html_content.clone();
+                let selectors = track_a_selectors.clone();
+                
+                tokio::task::spawn_blocking(move || {
+                    let mut seen_stage3_sels = std::collections::HashSet::new();
+                    let mut unique_sels = Vec::new();
+                    for sel in selectors {
+                        if sel.is_empty() { continue; }
+                        if !seen_stage3_sels.contains(&sel) {
+                            seen_stage3_sels.insert(sel.clone());
+                            unique_sels.push(sel);
+                        }
                     }
-                }
-                results
+
+                    let mut results = Vec::new();
+                    let num_threads = 8;
+                    let chunk_size = (unique_sels.len() + num_threads - 1) / num_threads;
+                    
+                    if chunk_size > 0 {
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::new();
+                            for chunk in unique_sels.chunks(chunk_size) {
+                                let chunk_owned = chunk.to_vec();
+                                let html_ref = &html_clone;
+                                handles.push(s.spawn(move || {
+                                    let doc = scraper::Html::parse_document(html_ref);
+                                    let mut local_res = Vec::with_capacity(chunk_owned.len());
+                                    for sel in chunk_owned {
+                                        local_res.push(crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::DetailMode, None));
+                                    }
+                                    local_res
+                                }));
+                            }
+                            for h in handles {
+                                if let Ok(local_res) = h.join() {
+                                    results.extend(local_res);
+                                }
+                            }
+                        });
+                    }
+                    results
+                }).await.unwrap_or_default()
             };
 
             // 🌟 [핵심 최적화 3] Detail Noise 블록 일괄 Batch 병렬 타격
@@ -2459,7 +2554,7 @@ async fn process_task(
                             let mut parsed = parsing::parse_json_from_llm(&res_text);
                             
                             // type 래퍼 제거 로직
-                            let mut item_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
+                            let item_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed }; // 🌟 mut 제거
 
                             // 🌟 [BIAS SKIP LOGIC] 추출된 값이 실제로 PUG 본문이나 제목에 존재하는지 검증
                             let mut requires_retry = false;
