@@ -780,134 +780,28 @@ async fn process_task(
             }
         }
 
-        // --- STEP A: CLASSIFICATION (분류) ---
+        // --- STEP A: CLASSIFICATION (인메모리 초고속 벡터 및 유니코드 분별 가동) ---
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Classify)");
+            println!("[Scheduler] Starting PURE VECTOR DETERMINISTIC RELAY (Step A)");
             
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Cleaning global noise layouts...", "spinner": "⠋" }));
 
-            let type_prompt = parsing::page_type_prompt();
-            let task_question = format!("[TASK] Identify the page type.\n\n[INSTRUCTION]\n{}\n\n[ACTION] RETURN JSON ONLY.", type_prompt);
-            let snapshot_id = format!("{}_step_a", task.id);
-            
-            
-            if let Ok(mut w) = crate::ACTIVE_TASK_MEM.write() {
-                if let Some(task_val) = w.as_mut() {
-                    if let Some(obj) = task_val.as_object_mut() {
-                        obj.insert("step".to_string(), json!("Step A (Classification)"));
-                        obj.insert("session_id".to_string(), json!(snapshot_id.clone()));
-                        obj.insert("kv_path".to_string(), json!(kv_name.clone().unwrap_or_else(|| "tmp/kv/".to_string())));
-                    }
-                }
-            }
+            // 🌟 [UNIVERSAL FRONT CLEANUP] 페이지 성격을 오염시키는 LNB/GNB 메뉴, 푸터 등 글로벌 구역을 언어 감지 전에 원천 청소합니다.
+            let universal_prejudice = "global navigation, menus, footers, aside, search, filter.";
+            let universal_prej_emb = model.get_embedding(universal_prejudice.to_string()).await.unwrap_or(vec![0.0; 384]);
 
-            {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                let params = ChatCompletionParameters {
-                    messages: vec![
-                        // Base 캐시와 토큰을 100% 일치시키기 위해 System 메시지를 그대로 넣습니다.
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: system_content.clone(),
-                            name: None,
-                        }),
-                        // 질문은 User 메시지로 분리합니다. (이 부분 50토큰만 연산됨!)
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                            name: None,
-                        })
-                    ],
-                    model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                    // 🌟 [CRITICAL FIX] 토큰 한도를 32로 늘려 언어 코드(ko)가 중간에 잘리는 현상을 완벽히 방지합니다.
-                    max_tokens: Some(32),
-                    temperature: Some(0.0), top_p: Some(0.95),
-                    ..Default::default()
-                };
-
-                let res = if base_model_size == crate::model::ModelSize::Qwen {
-                    // [핵심] Step A가 아니라 '미리 구워둔 Base' 스냅샷을 불러옵니다!
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
-                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                        println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                        // 🎯 [SEMANTIC STEERING] 편향 주입 삭제
-                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), None).await?
-                    } else {
-                        return Err(anyhow::anyhow!("Qwen generator missing"));
-                    }
-                } else {
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
-                    let q3_gen_arc = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                        let mut gen_guard = q3_gen_arc.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            println!("[Scheduler] Qwen3 Step A: Asking classification question...");
-                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
-                        } else {
-                            Err(anyhow::anyhow!("Qwen3 generator missing"))
-                        }
-                    }).await??
-                };
-
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                
-                let type_info = parsing::parse_json_from_llm(&res); 
-                
-                if let Some(type_val) = type_info.get("type").and_then(|v| v.as_str()) {
-                    page_type = type_val.to_lowercase();
-                }
-                if let Some(lang_val) = type_info.get("language").and_then(|v| v.as_str()) {
-                    doc_lang = lang_val.trim().to_lowercase();
-                }
-
-                // 🌟 [CRITICAL FIX] bias.json (BIAS_DICT)에 해당 언어 코드가 등록되어 있지 않다면 심플하게 'ko'로 고정합니다.
-                if crate::parsing::BIAS_DICT.get(doc_lang.as_str()).is_none() {
-                    doc_lang = "ko".to_string();
-                }
-
-                println!("[Scheduler] Detected language in Step A: {}", doc_lang);
-            }
-            
-            if page_type.is_empty() || page_type == "unknown" { 
-                model.deep_purge_resources().await;
-                return Ok(()); 
-            }
-        }
-
-        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 판별) ---
-        {
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
-
-            // 🎯 [Track A: NOISE FILTER] Boa Engine을 통해 부모 엘리먼트를 찾고 뭉치 단위로 노이즈를 필터링합니다.
-            let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
-            let prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
-            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
-            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
-            
-            // 🌟 [CRITICAL FIX] 소유권 에러(E0506)를 방지하기 위해 String 복제본으로 소유권을 가집니다.
-            let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
-            let mut line_embeddings = Vec::new();
-            
-            // emit_term(&format!("\n[PRE-FILTER] Vectorizing context for Track A ({} lines)...", pug_lines.len()));
-            for (line_idx, line) in pug_lines.iter().enumerate() {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
+            let mut pre_pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
+            let mut pre_line_embeddings = Vec::new();
+            for line in &pre_pug_lines {
                 if line.trim().is_empty() {
-                    line_embeddings.push(vec![0.0; 384]);
+                    pre_line_embeddings.push(vec![0.0; 384]);
                     continue;
                 }
-                
-                // 🌟 진행 상황을 터미널에 낱낱이 출력하여 멈춘 것처럼 보이지 않게 합니다.
-                // emit_term(&format!("  [VECTORIZING] Track A Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
-                
                 let emb = model.get_embedding(line.to_string()).await.unwrap_or(vec![0.0; 384]);
-                line_embeddings.push(emb);
+                pre_line_embeddings.push(emb);
             }
 
-            // HTML 문서를 파싱하여 Nodes JSON 문자열을 바인딩하고, 스레드 안전성이 없는 scraper::Html 객체는 즉시 소멸하도록 생명주기를 블록 내로 한정합니다.
             let nodes_str = {
                 let document_for_boa = scraper::Html::parse_document(&clean_html_content);
                 let mut nodes_json = Vec::new();
@@ -937,37 +831,27 @@ async fn process_task(
                 }
                 serde_json::to_string(&nodes_json).unwrap_or_default()
             };
-            let js_template = get_boa_block_extractor_template(); // 🌟 Batch 처리용 템플릿 사용
+            let js_template = get_boa_block_extractor_template();
 
-            let mut wiped_indices = vec![false; pug_lines.len()];
-            let mut processed_blocks = std::collections::HashSet::new();
-
-            // 🌟 [최적화] 노이즈로 의심되는 텍스트 후보들을 먼저 싹 다 모읍니다.
+            let mut pre_wiped_indices = vec![false; pre_pug_lines.len()];
+            let mut pre_processed_blocks = std::collections::HashSet::new();
             let mut track_a_candidates = Vec::new();
-            let mut track_a_indices = Vec::new();
 
-            for line_idx in 0..pug_lines.len() {
-                if wiped_indices[line_idx] { continue; }
-                let line = &pug_lines[line_idx];
+            for line_idx in 0..pre_pug_lines.len() {
+                let line = &pre_pug_lines[line_idx];
                 if line.trim().is_empty() { continue; }
                 
-                let line_prej_score = cosine_similarity(&prej_emb, &line_embeddings[line_idx]);
-                
+                let line_prej_score = cosine_similarity(&universal_prej_emb, &pre_line_embeddings[line_idx]);
                 if line_prej_score > 0.55 {
                     let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
                     if !text_part.is_empty() {
                         track_a_candidates.push(text_part.to_string());
-                        track_a_indices.push(line_idx);
                     }
                 }
             }
 
-            // 🌟 [진행 로그 추가] 수집된 노이즈 후보군 개수를 명확히 보여줍니다.
-            emit_term(&format!("  🔍 [Track A] Identified {} potential noise lines. Resolving DOM parents via Boa...", track_a_candidates.len()));
-
-            // 🌟 [최적화] Boa Engine 1번만 켜서 전체 후보군의 부모 CSS Selector를 초고속으로 받아옵니다.
             let track_a_selectors: Vec<String> = {
-                let target_len = track_a_candidates.len(); 
+                let target_len = track_a_candidates.len();
                 let target_titles_str = serde_json::to_string(&track_a_candidates).unwrap_or_else(|_| "[]".to_string());
                 let js_code = js_template
                     .replace("NODES_PLACEHOLDER", &nodes_str)
@@ -986,44 +870,124 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            // 🌟 [결과 로그 추가] Boa Engine이 최종적으로 매칭해 낸 시맨틱 부모 뭉치의 개수를 출력합니다.
-            let valid_selectors_count = track_a_selectors.iter().filter(|s| !s.is_empty()).count();
-            emit_term(&format!("  📦 [Track A] Boa Engine successfully mapped {} structural parent blocks.", valid_selectors_count));
+            // 🌟 [CRITICAL FIX] scraper::Html 구조체가 비동기 await 지점을 넘지 않도록 별도 스코프 블록 내부에서 PUG 텍스트 변환을 완결지어 소유권을 분리합니다.
+            let track_a_pugs: Vec<(String, String)> = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                track_a_selectors.into_iter().map(|sel| {
+                    let block_pug = if sel.is_empty() { String::new() }
+                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None) };
+                    (sel, block_pug)
+                }).collect()
+            };
 
-            // 반환받은 Selector들을 통해 VRAM 임베딩을 수행합니다.
-            for (i, sel) in track_a_selectors.into_iter().enumerate() {
-                if sel.is_empty() { continue; }
-                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::NoAttributesMode, None);
-                
-                if block_pug.is_empty() || processed_blocks.contains(&block_pug) { continue; }
-                processed_blocks.insert(block_pug.clone());
+            for (sel, block_pug) in track_a_pugs {
+                if block_pug.is_empty() || pre_processed_blocks.contains(&block_pug) { continue; }
+                pre_processed_blocks.insert(block_pug.clone());
 
                 let block_emb = model.get_embedding(block_pug.clone()).await.unwrap_or(vec![0.0; 384]);
+                let block_prej_score = cosine_similarity(&universal_prej_emb, &block_emb);
                 
-                let block_prej_score = cosine_similarity(&prej_emb, &block_emb);
-                let block_list_score = cosine_similarity(&list_bias_emb, &block_emb);
-                let block_form_score = cosine_similarity(&form_bias_emb, &block_emb);
-                
-                if block_prej_score > block_list_score && block_prej_score > block_form_score {
-                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
-                        emit_term(&format!("  🚫 [NOISE BLOCK DELETED] Boa Engine Matched. Lines {}~{} (Prej: {:.4} > List: {:.4} & Form: {:.4})", start_idx + 1, end_idx + 1, block_prej_score, block_list_score, block_form_score));
+                if block_prej_score > 0.50 {
+                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pre_pug_lines, &block_pug) {
+                        emit_term(&format!("  🚫 [FRONT-CLEAN] Expunged Global Layout Block: '{}' (Lines {}~{})", sel, start_idx + 1, end_idx + 1));
                         for j in start_idx..=end_idx {
-                            wiped_indices[j] = true;
+                            pre_wiped_indices[j] = true;
                         }
                     }
                 }
             }
 
-            // Track A에 의해 청소된 결과물로 업데이트
-            let mut filtered_light_pug = String::new();
-            for (idx, line) in pug_lines.iter().enumerate() {
-                if !wiped_indices[idx] { filtered_light_pug.push_str(line); }
-                filtered_light_pug.push_str("\n");
+            let mut pre_filtered_pug = String::new();
+            for (idx, line) in pre_pug_lines.iter().enumerate() {
+                if !pre_wiped_indices[idx] { pre_filtered_pug.push_str(line); }
+                pre_filtered_pug.push_str("\n");
             }
-            light_pug = filtered_light_pug.trim_end().to_string();
+            light_pug = pre_filtered_pug.trim_end().to_string();
+
+            // 🌟 [클린 인계] 이제 노이즈 메뉴가 완벽히 소멸된 상태에서 안전하게 언어 및 카테고리를 식별합니다.
+            let mut ko_count = 0;
+            let mut ja_count = 0;
+            for c in light_pug.chars() {
+                let u = c as u32;
+                if u >= 0xAC00 && u <= 0xD7A3 { ko_count += 1; }
+                else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { ja_count += 1; }
+            }
             
+            doc_lang = if ko_count > 5 { "ko".to_string() }
+                       else if ja_count > 5 { "ja".to_string() }
+                       else { "en".to_string() };
+
+            println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
+
+            let doc_title = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                if let Ok(sel) = scraper::Selector::parse("title") {
+                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            };
+            
+            let sample_text = if doc_title.is_empty() {
+                light_pug.chars().take(1000).collect::<String>()
+            } else {
+                format!("{} {}", doc_title, light_pug.chars().take(500).collect::<String>())
+            };
+            
+            let sample_emb = model.get_embedding(sample_text).await.unwrap_or(vec![0.0; 384]);
+
+            // 🌟 [3단계] 확정된 언어셋 환경에 호환되는 6대 마스터 카테고리 앵커 바이어스 구문을 적재하여 벡터 판정을 실행합니다.
+            let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
+            let mut best_type = "".to_string();
+            let mut max_sim = -1.0;
+
+            for cat in &categories {
+                let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(cat, &doc_lang);
+                let anchor_text = format!("{} {} {}", cat, list_bias, form_bias);
+                let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                
+                let sim = cosine_similarity(&sample_emb, &anchor_emb);
+                if sim > max_sim {
+                    max_sim = sim;
+                    best_type = cat.to_string();
+                }
+            }
+
+            page_type = best_type;
+            println!("[Scheduler] Deterministic Classified Page Type: {}", page_type);
+
+            if page_type.is_empty() { 
+                return Ok(()); 
+            }
+        }
+
+        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 판별) ---
+        {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
+
+            // 🎯 [Track A: NOISE FILTER] Boa Engine을 통해 부모 엘리먼트를 찾고 뭉치 단위로 노이즈를 필터링합니다.
+            let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
+            
+            // 🌟 [CRITICAL OPTIMIZATION] 입구 지점에서 이미 완벽하게 대청소가 끝났으므로, 중복되던 Track A 노이즈 필터링 루프 전체를 원천 제거하고 순수하게 Track B & C 스코어 계산으로 직행합니다.
+            let prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
+            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            
+            let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
+            let mut line_embeddings = Vec::new();
+            
+            for line in &pug_lines {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                if line.trim().is_empty() {
+                    line_embeddings.push(vec![0.0; 384]);
+                    continue;
+                }
+                let emb = model.get_embedding(line.to_string()).await.unwrap_or(vec![0.0; 384]);
+                line_embeddings.push(emb);
+            }
+
             let system_content_a2 = format!("[PUG CONTENT]\n{}", light_pug);
-            
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
 
             // 🎯 Track B & C: 상세/리스트 판별 (Boa Engine 일괄 처리 최적화)
@@ -1058,6 +1022,38 @@ async fn process_task(
                 track_bc_indices.push(*idx);
             }
 
+            // 🌟 [CRITICAL FIX] Step A 블록이 닫히며 소멸한 DOM 구조 정보를 Step A-2 스코프 내부에 재생성하여 참조 결함을 해결합니다.
+            let nodes_str = {
+                let document_for_boa = scraper::Html::parse_document(&clean_html_content);
+                let mut nodes_json = Vec::new();
+                let mut node_to_idx = std::collections::HashMap::new();
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    node_to_idx.insert(node.id(), idx);
+                }
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    if let Some(el) = node.value().as_element() {
+                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                        let text: String = node.children()
+                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                            .collect::<Vec<_>>().join(" ").trim().to_string();
+                        nodes_json.push(serde_json::json!({
+                            "index": idx,
+                            "parentIndex": parent_idx,
+                            "tagName": el.name().to_string(),
+                            "id": el.id().unwrap_or("").to_string(),
+                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                            "text": text,
+                            "colspan": el.attr("colspan").unwrap_or("1"),
+                            "rowspan": el.attr("rowspan").unwrap_or("1")
+                        }));
+                    } else {
+                        nodes_json.push(serde_json::json!(serde_json::Value::Null));
+                    }
+                }
+                serde_json::to_string(&nodes_json).unwrap_or_default()
+            };
+            let js_template = get_boa_block_extractor_template();
+
             // Boa 엔진 1번 구동으로 10개의 선택자를 한 번에 추출합니다.
             let track_bc_selectors: Vec<String> = {
                 let target_len = track_bc_candidates.len(); 
@@ -1083,12 +1079,22 @@ async fn process_task(
             let valid_bc_count = track_bc_selectors.iter().filter(|s| !s.is_empty()).count();
             emit_term(&format!("  📦 [Track B & C] Boa Engine successfully mapped {}/{} structural processing blocks.", valid_bc_count, track_bc_candidates.len()));
 
+            // 🌟 [CRITICAL OPTIMIZATION] scraper::Html 객체가 비동기 await 지점을 넘어가지 않도록 분리된 동기 블록 스코프에서 미리 PUG 문장화 처리를 완료합니다.
+            let track_bc_pugs: Vec<(usize, String, String)> = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                track_bc_selectors.into_iter().enumerate().map(|(i, sel)| {
+                    let block_pug = if sel.is_empty() { String::new() }
+                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None) };
+                    (i, sel, block_pug)
+                }).collect()
+            };
+
             let mut total_list_score = 0.0;
             let mut processed_list_blocks = std::collections::HashSet::new();
             let mut total_form_score = 0.0;
             let mut processed_form_blocks = std::collections::HashSet::new();
 
-            for (i, sel) in track_bc_selectors.into_iter().enumerate() {
+            for (i, sel, block_pug) in track_bc_pugs {
                 let is_list_track = i < 5;
                 let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
 
@@ -1097,9 +1103,7 @@ async fn process_task(
                     emit_term(&format!("  ⚠️ [{}] Anchor Line {} failed to resolve a valid structural parent block via DOM.", track_name, track_bc_indices[i] + 1));
                     continue; 
                 }
-                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::NoAttributesMode, None);
                 
-                let is_list_track = i < 5;
                 if is_list_track {
                     if block_pug.is_empty() || processed_list_blocks.contains(&block_pug) { continue; }
                     processed_list_blocks.insert(block_pug.clone());
@@ -1117,18 +1121,20 @@ async fn process_task(
                     let final_score = (b_list_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_list_score += final_score;
-                        emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, b_list_score, b_prej_score, final_score));
+                        // 🌟 [로그 고도화] 획득 점수와 매칭된 블록의 실제 CSS Selector를 동시에 로깅합니다.
+                        emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_list_score, b_prej_score, final_score));
                     } else {
-                        emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, b_prej_score, b_list_score));
+                        emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_list_score));
                     }
                 } else {
                     let b_form_score = cosine_similarity(&form_bias_emb, &block_emb);
                     let final_score = (b_form_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_form_score += final_score;
-                        emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, b_form_score, b_prej_score, final_score));
+                        // 🌟 [로그 고도화] 획득 점수와 매칭된 블록의 실제 CSS Selector를 동시에 로깅합니다.
+                        emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_form_score, b_prej_score, final_score));
                     } else {
-                        emit_term(&format!("  ⚠️ [TRACK C (FORM)] Anchor: {} Ignored (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, b_prej_score, b_form_score));
+                        emit_term(&format!("  ⚠️ [TRACK C (FORM)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_form_score));
                     }
                 }
             }
@@ -2083,20 +2089,8 @@ async fn process_task(
                     all_extracted_items.push(item_val);
                 }
                 
+                // 🌟 [CRITICAL OPTIMIZATION] 동일 모델(Qwen3)을 연속 재사용하므로, 루프 내부에서 커널 워킹셋 메모리를 탈탈 비우고 대기하던 심각한 병목 가비지 코드를 원천 삭제하여 무지연 고속 순회 체계를 확립합니다.
                 crate::models::qwen::generate::wait_for_global_io().await;
-
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
-
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             } // items for loop end
         }
 
@@ -2231,11 +2225,16 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            for (i, sel) in track_a_selectors.into_iter().enumerate() {
-                if sel.is_empty() { continue; }
-                // 🌟 Stage 3에서는 반드시 PugMode::DetailMode를 사용합니다.
-                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::DetailMode, None);
-                
+            // 🌟 [CRITICAL OPTIMIZATION] scraper::Html은 Send가 아니므로 비동기 await 연산 이전에 별도 스코프를 생성해 PUG 문자열 변환을 완벽히 매핑하고 해제합니다.
+            let stage3_pugs: Vec<String> = {
+                let doc = scraper::Html::parse_document(&clean_html_content);
+                track_a_selectors.into_iter().map(|sel| {
+                    if sel.is_empty() { String::new() }
+                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::DetailMode, None) }
+                }).collect()
+            };
+
+            for block_pug in stage3_pugs {
                 if block_pug.is_empty() || processed_blocks.contains(&block_pug) { continue; }
                 processed_blocks.insert(block_pug.clone());
 
@@ -2702,6 +2701,20 @@ async fn process_task(
         
         // 1. Explicitly Unload to free VRAM for Embedding Model
         model.deep_purge_resources().await;
+        
+        // 🌟 [OS WIRE-TRIM] 인계 시점에 가비지 페이징을 완전히 회수하여 시스템 프리징 현상을 원천 차단합니다.
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
         // 2. Wait for VRAM to settle (Driver latency)
         wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
