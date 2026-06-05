@@ -1570,6 +1570,22 @@ impl LogisModel {
         Ok(vector)
     }
 
+    pub async fn get_embedding_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.ensure_embedding().await?;
+        let embedding_model_arc = self.embedding_model.clone();
+        
+        let vectors = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Vec<f32>>> {
+            let guard = embedding_model_arc.blocking_lock();
+            if let Some(model) = guard.as_ref() {
+                model.embed_batch(&texts).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+            } else {
+                Ok(vec![vec![0.0; 384]; texts.len()])
+            }
+        }).await??;
+
+        Ok(vectors)
+    }
+
     // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 2B graph2contexts)
     // [신규] Commerce 파이프라인: 2-Stage (2B 단일 모델 연속 처리)
     pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {

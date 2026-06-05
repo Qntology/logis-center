@@ -299,8 +299,9 @@ impl EmbeddingModel {
             let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
             let normalized = mean.broadcast_div(&norm).map_err(anyhow::Error::msg)?;
             
-            // Tensor가 BF16일 수 있으므로 f32 배열로 뽑아내기 전에 반드시 F32 타입으로 명시적 캐스팅을 수행합니다.
-            let normalized_f32 = normalized.to_dtype(candle_core::DType::F32).map_err(anyhow::Error::msg)?;
+            // 🌟 [CRITICAL FIX] VRAM(GPU)에 존재하는 최종 연산 결과 텐서를 시스템 메모리(CPU)로 안전하게 명시적 복사한 뒤, F32 배열로 캐스팅합니다.
+            let normalized_cpu = normalized.to_device(&Device::Cpu).map_err(anyhow::Error::msg)?;
+            let normalized_f32 = normalized_cpu.to_dtype(candle_core::DType::F32).map_err(anyhow::Error::msg)?;
             let vec: Vec<f32> = normalized_f32.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
             
             for (i, val) in vec.iter().enumerate() {
@@ -323,5 +324,41 @@ impl EmbeddingModel {
         }
 
         Ok(accumulated_vector)
+    }
+
+    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut results = vec![vec![0.0; 384]; texts.len()];
+        
+        // 🌟 [CRITICAL FIX] CPU-GPU 직렬 병목 현상 원천 해결!
+        // 8개의 병렬 스레드를 가동하여 VRAM의 CUDA 코어에 연산을 일괄 쏟아부어 GPU 사용률을 극대화합니다.
+        let num_threads = 8; 
+        let chunk_size = (texts.len() + num_threads - 1) / num_threads; 
+        
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            
+            for (chunk_idx, chunk) in texts.chunks(chunk_size).enumerate() {
+                let start_idx = chunk_idx * chunk_size;
+                handles.push(s.spawn(move || {
+                    let mut local_res = Vec::with_capacity(chunk.len());
+                    for text in chunk {
+                        local_res.push(self.embed(text).unwrap_or(vec![0.0; 384]));
+                    }
+                    (start_idx, local_res)
+                }));
+            }
+            
+            for handle in handles {
+                if let Ok((start_idx, local_res)) = handle.join() {
+                    for (i, vector) in local_res.into_iter().enumerate() {
+                        if start_idx + i < results.len() {
+                            results[start_idx + i] = vector;
+                        }
+                    }
+                }
+            }
+        });
+        
+        Ok(results)
     }
 }

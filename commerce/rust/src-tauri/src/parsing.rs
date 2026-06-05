@@ -939,8 +939,9 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
 }
 
 pub fn get_separated_layout_bias(page_type: &str, lang: &str) -> (String, String, String) {
-    let mut list_bias = String::from("has_list false");
-    let mut form_bias = String::from("detail has_form true");
+    // 영어 하드코딩을 제거하고 초기값을 비워 bias.json의 데이터를 100% 신뢰하도록 변경합니다.
+    let mut list_bias = String::new();
+    let mut form_bias = String::new();
     let mut prejudice = String::new();
     
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
@@ -949,34 +950,55 @@ pub fn get_separated_layout_bias(page_type: &str, lang: &str) -> (String, String
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list") {
             if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
-                list_bias.push_str(" ");
                 list_bias.push_str(&b.replace("{TYPE}", &localized_type));
             }
             if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
-                prejudice.push_str(" ");
                 prejudice.push_str(&p.replace("{TYPE}", &localized_type));
             }
         }
         if let Some(l_form) = localized_obj.get("layout_form") {
             if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
-                form_bias.push_str(" ");
                 form_bias.push_str(&b.replace("{TYPE}", &localized_type));
                 form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
             }
             if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
-                prejudice.push_str(" ");
+                if !prejudice.is_empty() { prejudice.push_str(" "); }
                 prejudice.push_str(&p.replace("{TYPE}", &localized_type));
             }
         }
-    } else {
-        form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
-    }
+    } 
     
+    // bias.json에서 데이터를 찾지 못한 예외적인 상황에만 적용되는 폴백(Fallback) 방어 로직
+    if list_bias.trim().is_empty() {
+        list_bias = format!("{} list catalog grid repeating multiple table rows items", localized_type);
+    }
+    if form_bias.trim().is_empty() {
+        form_bias = format!("{} detail form single input fields properties configuration input select textarea", localized_type);
+    }
     if prejudice.trim().is_empty() {
         prejudice = String::from("global navigation, menus, footers, aside, search, filter.");
     }
     
     (list_bias.trim().to_string(), form_bias.trim().to_string(), prejudice.trim().to_string())
+}
+
+pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
+    let mut full_bias = String::from(page_type);
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
+    
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
+        if let Some(obj) = localized_obj.as_object() {
+            for (_, v) in obj {
+                if let Some(b) = v.get("bias").and_then(|bv| bv.as_str()) {
+                    full_bias.push_str(" ");
+                    full_bias.push_str(&b.replace("{TYPE}", &localized_type));
+                }
+            }
+        }
+    }
+    
+    full_bias.trim().to_string()
 }
 
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {

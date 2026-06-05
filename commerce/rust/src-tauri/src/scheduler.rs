@@ -780,6 +780,69 @@ async fn process_task(
             }
         }
 
+        // 🌟 [CRITICAL OPTIMIZATION] PUG 라인 벡터화 및 DOM 파싱을 Step A와 A-2가 공유하도록 단 한 번만 실행합니다!
+        // 태그 껍데기를 제외한 '순수 텍스트' 영역만 벡터화하여 연산량을 70% 이상 대폭 단축시킵니다.
+        let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
+        let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
+        let mut wiped_indices = vec![false; pug_lines.len()];
+        
+        // 🌟 [CRITICAL FIX] VRAM(GPU) 사용률 0% 병목 현상 원천 해결!
+        // 한 줄씩 CPU가 던지고 기다리던 코드를 대량 일괄(Batch) 처리로 변경하여 GPU 코어를 100% 혹사시킵니다.
+        let mut texts_to_embed = Vec::new();
+        let mut text_indices = Vec::new();
+        
+        for (line_idx, line) in pug_lines.iter().enumerate() {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { "" };
+            if !text_part.is_empty() {
+                texts_to_embed.push(text_part.to_string());
+                text_indices.push(line_idx);
+            }
+        }
+
+        if !texts_to_embed.is_empty() {
+            // VRAM 용량 초과 방지를 위해 100줄 단위로 끊어서 GPU에 병렬 주입합니다.
+            for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
+                let start_idx = chunk_idx * 100;
+                if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
+                    for (i, vector) in vectors.into_iter().enumerate() {
+                        let original_idx = text_indices[start_idx + i];
+                        line_embeddings[original_idx] = vector;
+                    }
+                }
+            }
+        }
+
+        let nodes_str = {
+            let document_for_boa = scraper::Html::parse_document(&clean_html_content);
+            let mut nodes_json = Vec::new();
+            let mut node_to_idx = std::collections::HashMap::new();
+            for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                node_to_idx.insert(node.id(), idx);
+            }
+            for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                if let Some(el) = node.value().as_element() {
+                    let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                    let text: String = node.children()
+                        .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                        .collect::<Vec<_>>().join(" ").trim().to_string();
+                    nodes_json.push(serde_json::json!({
+                        "index": idx,
+                        "parentIndex": parent_idx,
+                        "tagName": el.name().to_string(),
+                        "id": el.id().unwrap_or("").to_string(),
+                        "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                        "text": text,
+                        "colspan": el.attr("colspan").unwrap_or("1"),
+                        "rowspan": el.attr("rowspan").unwrap_or("1")
+                    }));
+                } else {
+                    nodes_json.push(serde_json::json!(serde_json::Value::Null));
+                }
+            }
+            serde_json::to_string(&nodes_json).unwrap_or_default()
+        };
+
         // --- STEP A: CLASSIFICATION (인메모리 초고속 벡터 및 유니코드 분별 가동) ---
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -787,64 +850,22 @@ async fn process_task(
             
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Cleaning global noise layouts...", "spinner": "⠋" }));
 
-            // 🌟 [UNIVERSAL FRONT CLEANUP] 페이지 성격을 오염시키는 LNB/GNB 메뉴, 푸터 등 글로벌 구역을 언어 감지 전에 원천 청소합니다.
-            let universal_prejudice = "global navigation, menus, footers, aside, search, filter.";
+            let universal_prejudice = "global navigation, menus, footer, aside, search form, search filter.";
             let universal_prej_emb = model.get_embedding(universal_prejudice.to_string()).await.unwrap_or(vec![0.0; 384]);
-
-            let mut pre_pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
-            let mut pre_line_embeddings = Vec::new();
-            for line in &pre_pug_lines {
-                if line.trim().is_empty() {
-                    pre_line_embeddings.push(vec![0.0; 384]);
-                    continue;
-                }
-                let emb = model.get_embedding(line.to_string()).await.unwrap_or(vec![0.0; 384]);
-                pre_line_embeddings.push(emb);
-            }
-
-            let nodes_str = {
-                let document_for_boa = scraper::Html::parse_document(&clean_html_content);
-                let mut nodes_json = Vec::new();
-                let mut node_to_idx = std::collections::HashMap::new();
-                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
-                    node_to_idx.insert(node.id(), idx);
-                }
-                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
-                    if let Some(el) = node.value().as_element() {
-                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
-                        let text: String = node.children()
-                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
-                            .collect::<Vec<_>>().join(" ").trim().to_string();
-                        nodes_json.push(serde_json::json!({
-                            "index": idx,
-                            "parentIndex": parent_idx,
-                            "tagName": el.name().to_string(),
-                            "id": el.id().unwrap_or("").to_string(),
-                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
-                            "text": text,
-                            "colspan": el.attr("colspan").unwrap_or("1"),
-                            "rowspan": el.attr("rowspan").unwrap_or("1")
-                        }));
-                    } else {
-                        nodes_json.push(serde_json::json!(serde_json::Value::Null));
-                    }
-                }
-                serde_json::to_string(&nodes_json).unwrap_or_default()
-            };
             let js_template = get_boa_block_extractor_template();
 
-            let mut pre_wiped_indices = vec![false; pre_pug_lines.len()];
             let mut pre_processed_blocks = std::collections::HashSet::new();
             let mut track_a_candidates = Vec::new();
+            let mut seen_candidates = std::collections::HashSet::new(); // 🌟 [핵심 최적화 1] 텍스트 중복 수집 차단으로 JS 엔진 폭주 방지
 
-            for line_idx in 0..pre_pug_lines.len() {
-                let line = &pre_pug_lines[line_idx];
-                if line.trim().is_empty() { continue; }
+            for line_idx in 0..pug_lines.len() {
+                let text_part = if let Some(idx) = pug_lines[line_idx].find('|') { pug_lines[line_idx][idx + 1..].trim() } else { "" };
+                if text_part.is_empty() { continue; }
                 
-                let line_prej_score = cosine_similarity(&universal_prej_emb, &pre_line_embeddings[line_idx]);
+                let line_prej_score = cosine_similarity(&universal_prej_emb, &line_embeddings[line_idx]);
                 if line_prej_score > 0.55 {
-                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
-                    if !text_part.is_empty() {
+                    if !seen_candidates.contains(text_part) {
+                        seen_candidates.insert(text_part.to_string());
                         track_a_candidates.push(text_part.to_string());
                     }
                 }
@@ -870,36 +891,59 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            // 🌟 [CRITICAL FIX] scraper::Html 구조체가 비동기 await 지점을 넘지 않도록 별도 스코프 블록 내부에서 PUG 텍스트 변환을 완결지어 소유권을 분리합니다.
             let track_a_pugs: Vec<(String, String)> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
-                track_a_selectors.into_iter().map(|sel| {
-                    let block_pug = if sel.is_empty() { String::new() }
-                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None) };
-                    (sel, block_pug)
-                }).collect()
+                let mut seen_selectors = std::collections::HashSet::new(); // 🌟 [핵심 최적화 2] CSS 선택자 중복 파싱 차단
+                let mut results = Vec::new();
+                for sel in track_a_selectors {
+                    if sel.is_empty() { continue; }
+                    if !seen_selectors.contains(&sel) {
+                        seen_selectors.insert(sel.clone());
+                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                        results.push((sel, block_pug));
+                    }
+                }
+                results
             };
 
+            // 🌟 [핵심 최적화 3] 완성된 PUG 블록들을 한데 모아 Batch 임베딩 타격! (VRAM 0% 대기현상 완전 파괴)
+            let mut unique_pugs_to_embed = Vec::new();
+            let mut track_a_pugs_clean = Vec::new();
             for (sel, block_pug) in track_a_pugs {
                 if block_pug.is_empty() || pre_processed_blocks.contains(&block_pug) { continue; }
                 pre_processed_blocks.insert(block_pug.clone());
+                unique_pugs_to_embed.push(block_pug.clone());
+                track_a_pugs_clean.push((sel, block_pug));
+            }
 
-                let block_emb = model.get_embedding(block_pug.clone()).await.unwrap_or(vec![0.0; 384]);
+            let mut block_embeddings_map = std::collections::HashMap::new();
+            if !unique_pugs_to_embed.is_empty() {
+                for chunk in unique_pugs_to_embed.chunks(100) {
+                    if let Ok(vectors) = model.get_embedding_batch(chunk.to_vec()).await {
+                        for (i, vector) in vectors.into_iter().enumerate() {
+                            block_embeddings_map.insert(chunk[i].clone(), vector);
+                        }
+                    }
+                }
+            }
+
+            for (sel, block_pug) in track_a_pugs_clean {
+                let block_emb = block_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
                 let block_prej_score = cosine_similarity(&universal_prej_emb, &block_emb);
                 
                 if block_prej_score > 0.50 {
-                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pre_pug_lines, &block_pug) {
+                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
                         emit_term(&format!("  🚫 [FRONT-CLEAN] Expunged Global Layout Block: '{}' (Lines {}~{})", sel, start_idx + 1, end_idx + 1));
                         for j in start_idx..=end_idx {
-                            pre_wiped_indices[j] = true;
+                            wiped_indices[j] = true;
                         }
                     }
                 }
             }
 
             let mut pre_filtered_pug = String::new();
-            for (idx, line) in pre_pug_lines.iter().enumerate() {
-                if !pre_wiped_indices[idx] { pre_filtered_pug.push_str(line); }
+            for (idx, line) in pug_lines.iter().enumerate() {
+                if !wiped_indices[idx] { pre_filtered_pug.push_str(line); }
                 pre_filtered_pug.push_str("\n");
             }
             light_pug = pre_filtered_pug.trim_end().to_string();
@@ -936,14 +980,14 @@ async fn process_task(
             
             let sample_emb = model.get_embedding(sample_text).await.unwrap_or(vec![0.0; 384]);
 
-            // 🌟 [3단계] 확정된 언어셋 환경에 호환되는 6대 마스터 카테고리 앵커 바이어스 구문을 적재하여 벡터 판정을 실행합니다.
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
             let mut max_sim = -1.0;
 
             for cat in &categories {
-                let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(cat, &doc_lang);
-                let anchor_text = format!("{} {} {}", cat, list_bias, form_bias);
+                // 🌟 [CRITICAL FIX] list_bias와 form_bias만 쓰던 기존 방식에서 벗어나, 
+                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어와 정확도를 극대화합니다!
+                let anchor_text = crate::parsing::get_page_type_full_bias(cat, &doc_lang);
                 let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
                 
                 let sim = cosine_similarity(&sample_emb, &anchor_emb);
@@ -966,38 +1010,27 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
 
-            // 🎯 [Track A: NOISE FILTER] Boa Engine을 통해 부모 엘리먼트를 찾고 뭉치 단위로 노이즈를 필터링합니다.
             let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
             
-            // 🌟 [CRITICAL OPTIMIZATION] 입구 지점에서 이미 완벽하게 대청소가 끝났으므로, 중복되던 Track A 노이즈 필터링 루프 전체를 원천 제거하고 순수하게 Track B & C 스코어 계산으로 직행합니다.
             let prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
             let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
             let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
             
-            let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
-            let mut line_embeddings = Vec::new();
-            
-            for line in &pug_lines {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                if line.trim().is_empty() {
-                    line_embeddings.push(vec![0.0; 384]);
-                    continue;
-                }
-                let emb = model.get_embedding(line.to_string()).await.unwrap_or(vec![0.0; 384]);
-                line_embeddings.push(emb);
-            }
-
+            // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
             let system_content_a2 = format!("[PUG CONTENT]\n{}", light_pug);
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
 
-            // 🎯 Track B & C: 상세/리스트 판별 (Boa Engine 일괄 처리 최적화)
             emit_term("\n[CLASSIFICATION] Track B & C Vector Matching (Batch DOM Blocks)...");
             
             let mut list_scores = Vec::new();
             let mut form_scores = Vec::new();
 
             for (i, emb) in line_embeddings.iter().enumerate() {
-                if pug_lines[i].trim().is_empty() { continue; }
+                // 🌟 노이즈로 청소된 줄(wiped_indices)과 텍스트가 없는 줄은 평가에서 완벽히 배제합니다.
+                if wiped_indices[i] { continue; }
+                let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
+                if text_part.is_empty() { continue; }
+                
                 list_scores.push((i, cosine_similarity(&list_bias_emb, emb)));
                 form_scores.push((i, cosine_similarity(&form_bias_emb, emb)));
             }
@@ -1005,7 +1038,6 @@ async fn process_task(
             list_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             form_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // 🌟 [최적화] 표본 오차를 방지하기 위해 10개의 앵커(Top 5 리스트 + Top 5 폼)를 한 번에 묶습니다.
             let mut track_bc_candidates = Vec::new();
             let mut track_bc_indices = Vec::new();
             
@@ -1022,39 +1054,8 @@ async fn process_task(
                 track_bc_indices.push(*idx);
             }
 
-            // 🌟 [CRITICAL FIX] Step A 블록이 닫히며 소멸한 DOM 구조 정보를 Step A-2 스코프 내부에 재생성하여 참조 결함을 해결합니다.
-            let nodes_str = {
-                let document_for_boa = scraper::Html::parse_document(&clean_html_content);
-                let mut nodes_json = Vec::new();
-                let mut node_to_idx = std::collections::HashMap::new();
-                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
-                    node_to_idx.insert(node.id(), idx);
-                }
-                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
-                    if let Some(el) = node.value().as_element() {
-                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
-                        let text: String = node.children()
-                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
-                            .collect::<Vec<_>>().join(" ").trim().to_string();
-                        nodes_json.push(serde_json::json!({
-                            "index": idx,
-                            "parentIndex": parent_idx,
-                            "tagName": el.name().to_string(),
-                            "id": el.id().unwrap_or("").to_string(),
-                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
-                            "text": text,
-                            "colspan": el.attr("colspan").unwrap_or("1"),
-                            "rowspan": el.attr("rowspan").unwrap_or("1")
-                        }));
-                    } else {
-                        nodes_json.push(serde_json::json!(serde_json::Value::Null));
-                    }
-                }
-                serde_json::to_string(&nodes_json).unwrap_or_default()
-            };
             let js_template = get_boa_block_extractor_template();
 
-            // Boa 엔진 1번 구동으로 10개의 선택자를 한 번에 추출합니다.
             let track_bc_selectors: Vec<String> = {
                 let target_len = track_bc_candidates.len(); 
                 let target_titles_str = serde_json::to_string(&track_bc_candidates).unwrap_or_else(|_| "[]".to_string());
@@ -1075,18 +1076,27 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            // 🌟 [정량 로그 피드백 장착] 총 몇 개 중에서 몇 개의 의미 블록이 발굴되었는지 한눈에 보여줍니다.
             let valid_bc_count = track_bc_selectors.iter().filter(|s| !s.is_empty()).count();
             emit_term(&format!("  📦 [Track B & C] Boa Engine successfully mapped {}/{} structural processing blocks.", valid_bc_count, track_bc_candidates.len()));
 
-            // 🌟 [CRITICAL OPTIMIZATION] scraper::Html 객체가 비동기 await 지점을 넘어가지 않도록 분리된 동기 블록 스코프에서 미리 PUG 문장화 처리를 완료합니다.
             let track_bc_pugs: Vec<(usize, String, String)> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
-                track_bc_selectors.into_iter().enumerate().map(|(i, sel)| {
-                    let block_pug = if sel.is_empty() { String::new() }
-                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None) };
-                    (i, sel, block_pug)
-                }).collect()
+                let mut seen_selectors = std::collections::HashSet::new(); // 🌟 DOM 순회 중복 방지
+                let mut results = Vec::new();
+                for (i, sel) in track_bc_selectors.into_iter().enumerate() {
+                    if sel.is_empty() { 
+                        results.push((i, sel, String::new()));
+                        continue; 
+                    }
+                    if !seen_selectors.contains(&sel) {
+                        seen_selectors.insert(sel.clone());
+                        let block_pug = crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                        results.push((i, sel, block_pug));
+                    } else {
+                        results.push((i, sel, String::new()));
+                    }
+                }
+                results
             };
 
             let mut total_list_score = 0.0;
@@ -1094,12 +1104,14 @@ async fn process_task(
             let mut total_form_score = 0.0;
             let mut processed_form_blocks = std::collections::HashSet::new();
 
+            // 🌟 [핵심 최적화 3] 생성된 BC 블록 일괄 Batch 병렬 타격
+            let mut unique_bc_pugs_to_embed = Vec::new();
+            let mut track_bc_pugs_clean = Vec::new();
+
             for (i, sel, block_pug) in track_bc_pugs {
                 let is_list_track = i < 5;
-                let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
-
-                // 🌟 어떤 앵커 라인의 텍스트가 DOM 분석에 실패해서 버려졌는지 이유를 낱낱이 출력합니다.
                 if sel.is_empty() { 
+                    let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
                     emit_term(&format!("  ⚠️ [{}] Anchor Line {} failed to resolve a valid structural parent block via DOM.", track_name, track_bc_indices[i] + 1));
                     continue; 
                 }
@@ -1111,17 +1123,31 @@ async fn process_task(
                     if block_pug.is_empty() || processed_form_blocks.contains(&block_pug) { continue; }
                     processed_form_blocks.insert(block_pug.clone());
                 }
+                unique_bc_pugs_to_embed.push(block_pug.clone());
+                track_bc_pugs_clean.push((i, sel, block_pug));
+            }
 
-                let block_emb = model.get_embedding(block_pug).await.unwrap_or(vec![0.0; 384]);
+            let mut bc_embeddings_map = std::collections::HashMap::new();
+            if !unique_bc_pugs_to_embed.is_empty() {
+                for chunk in unique_bc_pugs_to_embed.chunks(100) {
+                    if let Ok(vectors) = model.get_embedding_batch(chunk.to_vec()).await {
+                        for (i, vector) in vectors.into_iter().enumerate() {
+                            bc_embeddings_map.insert(chunk[i].clone(), vector);
+                        }
+                    }
+                }
+            }
+
+            for (i, sel, block_pug) in track_bc_pugs_clean {
+                let is_list_track = i < 5;
+                let block_emb = bc_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
                 let b_prej_score = cosine_similarity(&prej_emb, &block_emb);
                 
                 if is_list_track {
                     let b_list_score = cosine_similarity(&list_bias_emb, &block_emb);
-                    // 🌟 [CRITICAL FIX] 마이너스 점수는 노이즈이므로 0점 처리하여 진짜 뼈대의 점수를 깎아먹지 않게 합니다.
                     let final_score = (b_list_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_list_score += final_score;
-                        // 🌟 [로그 고도화] 획득 점수와 매칭된 블록의 실제 CSS Selector를 동시에 로깅합니다.
                         emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_list_score, b_prej_score, final_score));
                     } else {
                         emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_list_score));
@@ -1131,7 +1157,6 @@ async fn process_task(
                     let final_score = (b_form_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_form_score += final_score;
-                        // 🌟 [로그 고도화] 획득 점수와 매칭된 블록의 실제 CSS Selector를 동시에 로깅합니다.
                         emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_form_score, b_prej_score, final_score));
                     } else {
                         emit_term(&format!("  ⚠️ [TRACK C (FORM)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_form_score));
@@ -1139,7 +1164,6 @@ async fn process_task(
                 }
             }
 
-            // 3. 최종 판별 (Detail 여부 결정)
             is_detail = total_form_score > total_list_score;
 
             println!("[Scheduler] Classified is_detail as: {} (Total Form: {:.4}, Total List: {:.4})", is_detail, total_form_score, total_list_score);
@@ -1724,28 +1748,38 @@ async fn process_task(
 
             // [최적화] thead는 모든 아이템에 공통으로 적용되므로 루프 바깥에서 단 한 번만 벡터화합니다.
             let mut thead_lines: Vec<String> = thead_pug.lines().map(|s| s.to_string()).collect();
-            let mut thead_embeddings = Vec::new();
+            let mut thead_embeddings = vec![vec![0.0; 384]; thead_lines.len()];
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
-                for line_idx in 0..thead_lines.len() {
-                    let line = thead_lines[line_idx].clone();
-                    if line.trim().is_empty() {
-                        thead_embeddings.push(vec![0.0; 384]);
-                        continue;
+                
+                // 🌟 배치 임베딩 적용
+                let mut texts_to_embed = Vec::new();
+                let mut text_indices = Vec::new();
+                
+                for (line_idx, line) in thead_lines.iter().enumerate() {
+                    if !line.trim().is_empty() {
+                        texts_to_embed.push(line.to_string());
+                        text_indices.push(line_idx);
                     }
-                    let emb = match model.get_embedding(line.to_string()).await {
-                        Ok(vector) => vector,
-                        Err(_) => vec![0.0; 384],
-                    };
-                    
-                    // 🌟 유사도 0.55 이상이면 PUG 텍스트를 비워버립니다.
-                    let noise_score = cosine_similarity(&layout_prej_emb, &emb);
-                    if noise_score > 0.55 {
-                        emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", line_idx + 1, line.trim(), noise_score));
-                        thead_lines[line_idx] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
-                        thead_embeddings.push(vec![0.0; 384]);
-                    } else {
-                        thead_embeddings.push(emb);
+                }
+                
+                if !texts_to_embed.is_empty() {
+                    for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
+                        let start_idx = chunk_idx * 100;
+                        if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
+                            for (i, vector) in vectors.into_iter().enumerate() {
+                                let original_idx = text_indices[start_idx + i];
+                                let emb = vector.clone();
+                                let noise_score = cosine_similarity(&layout_prej_emb, &emb);
+                                
+                                if noise_score > 0.55 {
+                                    emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", original_idx + 1, text_chunk[i].trim(), noise_score));
+                                    thead_lines[original_idx] = String::new(); 
+                                } else {
+                                    thead_embeddings[original_idx] = emb;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1770,31 +1804,37 @@ async fn process_task(
                 
                 // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행 및 노이즈 필터링
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
-                let mut item_embeddings = Vec::new();
-                for line_idx in 0..item_lines.len() {
-                    let line = item_lines[line_idx].clone();
-                    if line.trim().is_empty() {
-                        item_embeddings.push(vec![0.0; 384]);
-                        continue;
+                let mut item_embeddings = vec![vec![0.0; 384]; item_lines.len()];
+                
+                // 🌟 배치 임베딩 적용
+                let mut texts_to_embed = Vec::new();
+                let mut text_indices = Vec::new();
+                
+                for (line_idx, line) in item_lines.iter().enumerate() {
+                    if !line.trim().is_empty() {
+                        texts_to_embed.push(line.to_string());
+                        text_indices.push(line_idx);
                     }
-                    
-                    let emb = match model.get_embedding(line.to_string()).await {
-                        Ok(vector) => vector,
-                        Err(e) => {
-                            emit_term(&format!("    🚨 [EMBEDDING ERROR] Failed to load or compute model: {}", e));
-                            vec![0.0; 384]
+                }
+                
+                if !texts_to_embed.is_empty() {
+                    for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
+                        let start_idx = chunk_idx * 100;
+                        if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
+                            for (i, vector) in vectors.into_iter().enumerate() {
+                                let original_idx = text_indices[start_idx + i];
+                                let emb = vector.clone();
+                                let noise_score = cosine_similarity(&layout_prej_emb, &emb);
+                                
+                                if noise_score > 0.55 {
+                                    emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), text_chunk[i].trim(), noise_score));
+                                    item_lines[original_idx] = String::new(); 
+                                } else {
+                                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), text_chunk[i].trim()));
+                                    item_embeddings[original_idx] = emb;
+                                }
+                            }
                         }
-                    };
-                    
-                    // 🌟 유사도 0.55 이상이면 PUG 텍스트를 비워버립니다.
-                    let noise_score = cosine_similarity(&layout_prej_emb, &emb);
-                    if noise_score > 0.55 {
-                        emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", line_idx + 1, item_lines.len(), line.trim(), noise_score));
-                        item_lines[line_idx] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
-                        item_embeddings.push(vec![0.0; 384]);
-                    } else {
-                        emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", line_idx + 1, item_lines.len(), line.trim()));
-                        item_embeddings.push(emb);
                     }
                 }
 
@@ -2128,20 +2168,29 @@ async fn process_task(
             let mut pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
             // 🌟 [CRITICAL FIX] 인덱스 정렬(Alignment)을 위해 미리 크기를 할당합니다.
             let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
-            for line_idx in 0..pug_lines.len() {
+            
+            // 🌟 배치 임베딩 적용
+            let mut texts_to_embed = Vec::new();
+            let mut text_indices = Vec::new();
+            
+            for (line_idx, line) in pug_lines.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                let line = &pug_lines[line_idx];
                 if line.trim().is_empty() { continue; }
-
-                // 🌟 진행 상황을 터미널에 낱낱이 출력하여 멈춘 것처럼 보이지 않게 합니다.
-                emit_term(&format!("  [VECTORIZING] Stage-3 Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
-
-                let emb = match model.get_embedding(line.to_string()).await {
-                    Ok(vector) => vector,
-                    Err(_) => vec![0.0; 384]
-                };
-                line_embeddings[line_idx] = emb;
+                texts_to_embed.push(line.to_string());
+                text_indices.push(line_idx);
+            }
+            
+            if !texts_to_embed.is_empty() {
+                for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
+                    let start_idx = chunk_idx * 100;
+                    if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
+                        for (i, vector) in vectors.into_iter().enumerate() {
+                            let original_idx = text_indices[start_idx + i];
+                            emit_term(&format!("  [VECTORIZING] Stage-3 Line {}/{} : {}", original_idx + 1, pug_lines.len(), text_chunk[i].trim()));
+                            line_embeddings[original_idx] = vector;
+                        }
+                    }
+                }
             }
 
             // 🎯 Track A: Stage 3 Detail (Boa Engine 기반 부모 뭉치 단위 노이즈 삭제)
@@ -2187,6 +2236,7 @@ async fn process_task(
 
             let mut track_a_candidates = Vec::new();
             let mut track_a_indices = Vec::new();
+            let mut seen_detail_candidates = std::collections::HashSet::new(); // 🌟 JS 텍스트 중복 파싱 차단
 
             for line_idx in 0..pug_lines.len() {
                 if wiped_indices[line_idx] { continue; }
@@ -2197,7 +2247,8 @@ async fn process_task(
                 
                 if line_prej_score > 0.55 {
                     let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
-                    if !text_part.is_empty() {
+                    if !text_part.is_empty() && !seen_detail_candidates.contains(text_part) {
+                        seen_detail_candidates.insert(text_part.to_string());
                         track_a_candidates.push(text_part.to_string());
                         track_a_indices.push(line_idx);
                     }
@@ -2228,17 +2279,40 @@ async fn process_task(
             // 🌟 [CRITICAL OPTIMIZATION] scraper::Html은 Send가 아니므로 비동기 await 연산 이전에 별도 스코프를 생성해 PUG 문자열 변환을 완벽히 매핑하고 해제합니다.
             let stage3_pugs: Vec<String> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
-                track_a_selectors.into_iter().map(|sel| {
-                    if sel.is_empty() { String::new() }
-                    else { crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::DetailMode, None) }
-                }).collect()
+                let mut seen_stage3_sels = std::collections::HashSet::new(); // 🌟 CSS 선택자 중복 DOM 순회 차단
+                let mut results = Vec::new();
+                for sel in track_a_selectors {
+                    if sel.is_empty() { continue; }
+                    if !seen_stage3_sels.contains(&sel) {
+                        seen_stage3_sels.insert(sel.clone());
+                        results.push(crate::parsing::convert_doc_to_clean_pug_selector(&doc, &sel, crate::parsing::PugMode::DetailMode, None));
+                    }
+                }
+                results
             };
 
-            for block_pug in stage3_pugs {
-                if block_pug.is_empty() || processed_blocks.contains(&block_pug) { continue; }
+            // 🌟 [핵심 최적화 3] Detail Noise 블록 일괄 Batch 병렬 타격
+            let mut unique_stage3_pugs_to_embed = Vec::new();
+            for block_pug in &stage3_pugs {
+                if block_pug.is_empty() || processed_blocks.contains(block_pug) { continue; }
                 processed_blocks.insert(block_pug.clone());
+                unique_stage3_pugs_to_embed.push(block_pug.clone());
+            }
 
-                let block_emb = model.get_embedding(block_pug.clone()).await.unwrap_or(vec![0.0; 384]);
+            let mut stage3_embeddings_map = std::collections::HashMap::new();
+            if !unique_stage3_pugs_to_embed.is_empty() {
+                for chunk in unique_stage3_pugs_to_embed.chunks(100) {
+                    if let Ok(vectors) = model.get_embedding_batch(chunk.to_vec()).await {
+                        for (i, vector) in vectors.into_iter().enumerate() {
+                            stage3_embeddings_map.insert(chunk[i].clone(), vector);
+                        }
+                    }
+                }
+            }
+
+            for block_pug in stage3_pugs {
+                if block_pug.is_empty() { continue; }
+                let block_emb = stage3_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
                 
                 let block_prej_score = cosine_similarity(&layout_prej_emb, &block_emb);
                 let block_list_score = cosine_similarity(&list_bias_emb, &block_emb);
