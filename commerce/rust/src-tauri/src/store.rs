@@ -445,7 +445,7 @@ impl VectorStore {
             Field::new("digest", DataType::Utf8, true),
             Field::new("status", DataType::Int32, true), 
             Field::new("amount", DataType::Float32, true),
-            Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 768), true),
+            Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 384), true),
             Field::new("text", DataType::Utf8, false),
             Field::new("masked_text", DataType::Utf8, true),
             Field::new("data", DataType::Utf8, false),
@@ -598,13 +598,13 @@ impl VectorStore {
          
          
          let safe_vector = match vector {
-             Some(v) if v.len() == 768 => v,
-             _ => vec![0.0; 768],
+             Some(v) if v.len() == 384 => v,
+             _ => vec![0.0; 384],
          };
          let values_builder = Float32Array::from(safe_vector);
          
          let list_field = Field::new("item", DataType::Float32, true);
-         let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
+         let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 384, Arc::new(values_builder), None)?;
          let batch = RecordBatch::try_new(schema.clone(), vec![
                 Arc::new(StringArray::from(vec![final_id])), Arc::new(StringArray::from(vec![type_])),
                 Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),

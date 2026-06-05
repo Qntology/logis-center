@@ -601,9 +601,8 @@ impl QwenVLGenerateModel {
         Ok(total_toks)
     }
 
-    // 🌟 [CRITICAL FIX] semantic_target 파라미터를 명시적으로 추가합니다.
     // 🌟 [추가] semantic_prejudice 파라미터를 받습니다.
-    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>, semantic_target: Option<&str>, semantic_prejudice: Option<&str>) -> Result<String> {
+    pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>, semantic_prejudice: Option<&str>) -> Result<String> {
         let mut is_reference_snapshot = false;
         if let Some(s_id) = &session_id {
             let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
@@ -688,50 +687,6 @@ impl QwenVLGenerateModel {
         };
         
         let total_tokens_after_prefill = offset + input_ids.dim(1)?;
-    
-        // 🌟 [Semantic Activation Steering] 모델 내부 임베딩 코사인 유사도 벡터 바이어스 연산
-        let mut semantic_bias_tensor: Option<Tensor> = None;
-        if let Some(target_text) = semantic_target {
-            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
-                if !target_ids.is_empty() {
-                    let calc_bias = || -> Result<Tensor> {
-                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.text_device)?;
-                        // F32 정밀도로 통일하여 연산 깨짐(NaN) 방어
-                        let target_emb = self.qwen.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
-                        let target_emb_sum = target_emb.sum_keepdim(1)?;
-                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.text_device)?;
-                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
-                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        let all_embs = self.qwen.get_embed_tokens()?.to_dtype(DType::F32)?;
-                        
-                        // L2 정규화 후 Cosine Similarity 도출
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.text_device)?;
-                        let one = Tensor::new(1.0f32, &self.text_device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let bias = sim_relu.affine(10.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(bias)
-                    };
-                    
-                    match calc_bias() {
-                        Ok(bias) => {
-                            semantic_bias_tensor = Some(bias);
-                            println!("[SEMANTIC-BIAS] Generated Vector Bias for target: '{}'", target_text);
-                        }
-                        Err(e) => println!("[SEMANTIC-BIAS] Failed to calculate bias: {}", e),
-                    }
-                }
-            }
-        }
 
         // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
@@ -795,19 +750,12 @@ impl QwenVLGenerateModel {
             if let Some(flag) = &cancel_flag { if flag.load(std::sync::atomic::Ordering::Relaxed) { break; } }
             
             let logits_squeezed = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            
-            // 🌟 Steering 적용
-            let logits_steered = if let Some(ref bias) = semantic_bias_tensor {
-                logits_squeezed.broadcast_add(bias)?
-            } else {
-                logits_squeezed
-            };
 
             // 🌟 오답 진영 억제력(Sub) 적용
             let logits_steered = if let Some(ref prej) = semantic_prejudice_tensor {
-                logits_steered.broadcast_sub(prej)?
+                logits_squeezed.broadcast_sub(prej)?
             } else {
-                logits_steered
+                logits_squeezed
             };
 
             let mut logits_vec = logits_steered.flatten_all()?.to_vec1::<f32>()?;

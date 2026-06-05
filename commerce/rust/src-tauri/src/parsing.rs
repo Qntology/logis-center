@@ -572,32 +572,90 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 attributes_string.push_str(&format!("[{}]", other_attributes.join(" ")));
             }
 
-            output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
+            let should_output_text = *mode == PugMode::FullContent || *mode == PugMode::DetailMode || *mode == PugMode::TheadMode || *mode == PugMode::ListMode || *mode == PugMode::NoAttributesMode;
+            
+            let mut is_inline_text = false;
+            let mut inline_content = String::new();
 
-            if tag_name == "textarea" {
-                let mut text_content = String::new();
-                for child in node.children() {
-                    if let Node::Text(t) = child.value() { text_content.push_str(t); }
-                }
-                if !text_content.trim().is_empty() {
-                    for line in text_content.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            output.push_str(&format!("{}    | {}\n", indent, trimmed));
+            // 🌟 [CRITICAL FIX] 텍스트만 포함하는 태그(td, th, label, span, input 등)를 한 줄로 병합하여 PUG 컨텍스트 밀도를 비약적으로 높입니다.
+            if should_output_text {
+                if tag_name == "input" {
+                    if let Some(val) = element.attr("value") {
+                        let trimmed = val.trim();
+                        if !trimmed.is_empty() && !trimmed.contains('\n') {
+                            inline_content = trimmed.to_string();
+                            is_inline_text = true;
+                        }
+                    }
+                } else if tag_name == "textarea" {
+                    let mut text_buf = String::new();
+                    for child in node.children() {
+                        if let Node::Text(t) = child.value() { text_buf.push_str(t); }
+                    }
+                    let clean = text_buf.trim();
+                    if !clean.is_empty() && !clean.contains('\n') {
+                        inline_content = clean.to_string();
+                        is_inline_text = true;
+                    }
+                } else {
+                    if let Some(el_ref) = scraper::ElementRef::wrap(node) {
+                        // 🌟 [요구사항 완벽 반영] 하드코딩된 태그 리스트 검사를 완전히 삭제했습니다!
+                        // 어떤 태그이든 상관없이 모든 하위 텍스트를 긁어와 병합 검사를 무조건 실행합니다.
+                        let text_buf = el_ref.text().collect::<Vec<_>>().join(" ");
+                        let clean = text_buf.trim();
+                        
+                        // 텍스트가 존재하고, 줄바꿈이 없으며, 너무 길지 않은(150자 이내) 경우에만 인라인 압축을 허용합니다.
+                        if !clean.is_empty() && !clean.contains('\n') && clean.len() < 150 {
+                            let mut clean_text = clean.replace("\"", "'").replace("  ", " ");
+                            if let Ok(re) = regex::Regex::new(r"(\d{1,3}(?:,\d{3})+)(\.\d+)?") {
+                                clean_text = re.replace_all(&clean_text, |caps: &regex::Captures| {
+                                    let int_part = caps.get(1).map_or("", |m| m.as_str()).replace(",", "");
+                                    let dec_part = caps.get(2).map_or("", |m| m.as_str());
+                                    format!("{}{}", int_part, dec_part)
+                                }).to_string();
+                            }
+                            inline_content = clean_text;
+                            is_inline_text = true;
                         }
                     }
                 }
-            // 🌟 [개선 1] 0.6B 소형 모델을 위해 input 태그의 value 값을 PUG 텍스트 노드(|)로 강제 노출시켜 줍니다!
-            } else if tag_name == "input" {
-                if let Some(val) = element.attr("value") {
-                    let trimmed = val.trim();
-                    if !trimmed.is_empty() {
-                        output.push_str(&format!("{}    | {}\n", indent, trimmed));
-                    }
-                }
+            }
+
+            if is_inline_text {
+                // 태그 껍데기와 텍스트를 파이프(|) 기호와 함께 한 줄로 압축합니다. (예: td | 무통장)
+                output.push_str(&format!("{}{}{} | {}\n", indent, tag_name, attributes_string, inline_content));
             } else {
-                for child in node.children() {
-                    generate_pug_lines(child, indent_level + 1, output, mode, ctx);
+                output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
+
+                if tag_name == "textarea" {
+                    let mut text_content = String::new();
+                    for child in node.children() {
+                        if let Node::Text(t) = child.value() { text_content.push_str(t); }
+                    }
+                    if !text_content.trim().is_empty() {
+                        for line in text_content.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                output.push_str(&format!("{}    | {}\n", indent, trimmed));
+                            }
+                        }
+                    }
+                } else if tag_name == "input" {
+                    if let Some(val) = element.attr("value") {
+                        let trimmed = val.trim();
+                        if !trimmed.is_empty() {
+                            for line in trimmed.lines() {
+                                let t_line = line.trim();
+                                if !t_line.is_empty() {
+                                    output.push_str(&format!("{}    | {}\n", indent, t_line));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for child in node.children() {
+                        generate_pug_lines(child, indent_level + 1, output, mode, ctx);
+                    }
                 }
             }
 
@@ -1451,56 +1509,96 @@ pub fn get_detail_schema_fields(page_type: &str, href: &str, lang: &str) -> Vec<
     fields
 }
 
+// pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, title: &str) -> String {
+//     // 🌟 복수 키(예: "id,link") 대응을 위해 동적 JSON 포맷 생성
+//     let mut dynamic_output_keys = String::new();
+//     for key in field_name.split(',') {
+//         dynamic_output_keys.push_str(&format!("\"{}\": \"...\",\n", key.trim()));
+//     }
+//     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
+
+//     let template = r###"[TASK]
+// Analyze the provided PUG/HTML content from top to bottom to extract specific properties into a JSON object.
+
+// [CONTEXT]
+// Page Type: {TYPE}
+// Language: {LANGUAGE}
+
+// [FORCED DOCUMENT SCANNING LOGIC]
+// Read the entire document from top to bottom, applying the following strict filters and evaluations:
+
+// 1. IGNORE:
+//    - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
+//    - temporary placeholder (such as SKIP READ N, SKIP_READ_N, LINK_SKIP).
+// 2. TARGET:
+//    - Focus purely on the main data payload where the target properties are located.
+// 3. EVALUATE:
+//    - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
+//      A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+//      B. Does the main data area consist of a repeating multi-entity grid?
+//      C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
+
+// [SCHEMA DEFINITIONS]
+// - "has_header": Boolean. True if the document contains a header.
+// - "has_footer": Boolean. True if the document contains a footer.
+// - "title": String. Default '{TITLE}'.
+// - "language": String. Detect the language of PUG CONTENT and return ISO 639-1 code.
+// {FIELDS}
+
+// [EXTRACTION RULES]
+// 1. Return ONLY valid JSON.
+// 2. If the field is completely missing in the data, use null.
+// 3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
+// 4. Extract only numeric values for price, amount, weight, and dimensions.
+// 5. Do NOT make up data. Only extract what is present in the Pug structure.
+
+// [OUTPUT FORMAT]
+// {
+//     "has_header": Boolean,
+//     "title" : String,
+//     "has_footer": Boolean,
+//     "language": String,
+//     {DYNAMIC_KEYS}
+// }
+
+// [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+//     template.replace("{TYPE}", page_type)
+//             .replace("{LANGUAGE}", language)
+//             .replace("{FIELDS}", field_desc)
+//             .replace("{TITLE}", title)
+//             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
+// }
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, title: &str) -> String {
     // 🌟 복수 키(예: "id,link") 대응을 위해 동적 JSON 포맷 생성
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
-        dynamic_output_keys.push_str(&format!("\"{}\": \"...\",\n", key.trim()));
+        dynamic_output_keys.push_str(&format!("  \"{}\": \"...\",\n", key.trim()));
     }
     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
+    // 🌟 인메모리 벡터 검색으로 정제된 컨텍스트에 맞춘 최적화된 프롬프트
     let template = r###"[TASK]
-Analyze the provided PUG/HTML content from top to bottom to extract specific properties into a JSON object.
+Analyze the provided concentrated PUG/HTML context and extract specific properties into a JSON object.
 
 [CONTEXT]
 Page Type: {TYPE}
 Language: {LANGUAGE}
-
-[FORCED DOCUMENT SCANNING LOGIC]
-Read the entire document from top to bottom, applying the following strict filters and evaluations:
-
-1. IGNORE:
-   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter, form.
-   - temporary placeholder (such as SKIP READ N, SKIP_READ_N, LINK_SKIP).
-2. TARGET:
-   - Focus purely on the main data payload where the target properties are located.
-3. EVALUATE:
-   - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
-     A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
-     B. Does the main data area consist of a repeating multi-entity grid?
-     C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
+Document Title: {TITLE}
 
 [SCHEMA DEFINITIONS]
-- "has_header": Boolean. True if the document contains a header.
-- "has_footer": Boolean. True if the document contains a footer.
-- "title": String. Default '{TITLE}'.
-- "language": String. Detect the language of PUG CONTENT and return ISO 639-1 code.
 {FIELDS}
 
 [EXTRACTION RULES]
-1. Return ONLY valid JSON.
+1. Return ONLY valid JSON containing the requested keys.
 2. If the field is completely missing in the data, use null.
 3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
 4. Extract only numeric values for price, amount, weight, and dimensions.
-5. Do NOT make up data. Only extract what is present in the Pug structure.
+5. Do NOT make up data. Only extract what is present in the context.
 
 [OUTPUT FORMAT]
 {
-    "has_header": Boolean,
-    "title" : String,
-    "has_footer": Boolean,
-    "language": String,
-    {DYNAMIC_KEYS}
+{DYNAMIC_KEYS}
 }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;

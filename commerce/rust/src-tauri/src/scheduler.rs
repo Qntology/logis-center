@@ -404,6 +404,12 @@ async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
+    // 🌟 [CRITICAL FIX] 텍스트 추출 시작 단계에서는 임베딩 모델의 "파일 다운로드 여부"만 가볍게 확인합니다.
+    // 실제 텐서 메모리 로딩은 추후 AI가 분석을 끝내고 추출 단계(Stage 3)에 진입하여 모델이 '진짜 쓰일 때' 지연 로딩됩니다!
+    if task.r#type != "image_extraction" && task.r#type != "analytic_extraction" {
+        model.check_embedding_downloaded().await?;
+    }
+
     // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -802,8 +808,8 @@ async fn process_task(
 
                     if let Some(gen) = model.generator.lock().await.as_mut() {
                         println!("[Scheduler] 0.6B Step A: Asking classification question...");
-                        // 🎯 [SEMANTIC STEERING] 6가지 카테고리 단어망을 Bias로 주입하여 허튼소리를 원천 차단!
-                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), Some("order goods tracking review coupon event"), None).await?
+                        // 🎯 [SEMANTIC STEERING] 편향 주입 삭제
+                        gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone(), None).await?
                     } else {
                         return Err(anyhow::anyhow!("Qwen generator missing"));
                     }
@@ -815,7 +821,7 @@ async fn process_task(
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A: Asking classification question...");
-                            gen.generate(params, Some(cancel_clone), None, None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -902,7 +908,7 @@ async fn process_task(
                     ..Default::default()
                 };
 
-                let (detail_bias, detail_prej) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
+                let (_detail_bias, detail_prej) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
 
                 let res = if base_model_size == crate::model::ModelSize::Qwen {
                     model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
@@ -913,7 +919,6 @@ async fn process_task(
                             Some(cancellation_token.clone()), 
                             Some(snapshot_id_detail.clone()), 
                             kv_name.clone(),
-                            Some(&detail_bias),
                             Some(&detail_prej)
                         ).await?
                     } else {
@@ -924,13 +929,12 @@ async fn process_task(
                     let q3_gen_arc = model.qwen3_generator.clone();
                     let cancel_clone = cancellation_token.clone();
                     let ignore_list_clone = ignore_list.clone();
-                    let detail_bias_clone = detail_bias.clone(); 
                     let detail_prej_clone = detail_prej.clone();
                     tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                         let mut gen_guard = q3_gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             println!("[Scheduler] Qwen3 Step A-2 (Detail): Asking detail classification... (Attempt {})", retry_count + 1);
-                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(detail_bias_clone.as_str()), Some(detail_prej_clone.as_str())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(detail_prej_clone.as_str())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 generator missing"))
                         }
@@ -1086,13 +1090,12 @@ async fn process_task(
                             println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                             
                             // 🎯 [SEMANTIC STEERING] 상품 제목에 집중하도록 방향타 고정!
-                            let (title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                            let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                             gen.generate(
                                 params, 
                                 Some(cancellation_token.clone()), 
                                 Some(snapshot_id.clone()), 
                                 kv_name.clone(),
-                                Some(&title_bias),
                                 Some(&title_prej) 
                             ).await?
                         } else {
@@ -1102,12 +1105,12 @@ async fn process_task(
                         model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
                         let q3_gen_arc = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
-                        let (title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                        let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                             let mut gen_guard = q3_gen_arc.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone), None, Some(&title_bias), Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
+                                gen.generate(params, Some(cancel_clone), None, Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
                             } else {
                                 Err(anyhow::anyhow!("Qwen3 generator missing"))
                             }
@@ -1482,8 +1485,8 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_target)과 None(semantic_prejudice)을 추가로 전달합니다.
-                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None, None).await {
+                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_prejudice)을 추가로 전달합니다.
+                        if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
                             // JSON 응답에서 page_type에 맞는 선택자 추출
@@ -1754,6 +1757,24 @@ async fn process_task(
             // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
+            // [최적화] thead는 모든 아이템에 공통으로 적용되므로 루프 바깥에서 단 한 번만 벡터화합니다.
+            let thead_lines: Vec<&str> = thead_pug.lines().collect();
+            let mut thead_embeddings = Vec::new();
+            if !thead_lines.is_empty() {
+                emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
+                for (line_idx, line) in thead_lines.iter().enumerate() {
+                    if line.trim().is_empty() {
+                        thead_embeddings.push(vec![0.0; 384]);
+                        continue;
+                    }
+                    let emb = match model.get_embedding(line.to_string()).await {
+                        Ok(vector) => vector,
+                        Err(_) => vec![0.0; 384],
+                    };
+                    thead_embeddings.push(emb);
+                }
+            }
+
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
@@ -1769,19 +1790,78 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("\n[STAGE-3] Processing List Item {}/{} ...", idx + 1, total_items));
 
-                // 헤더(Thead)와 개별 아이템(Item)의 PUG를 결합하여 검증 텍스트 생성
+                // 헤더(Thead)와 개별 아이템(Item)의 PUG를 결합하여 검증 텍스트 생성 (나중의 본문 텍스트 검증용)
                 let full_item_pug = format!("{}\n{}", thead_pug, item_pug);
                 
-                let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: format!("[PUG CONTENT]\n{}", full_item_pug),
-                    name: None,
-                });
+                // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행
+                let item_lines: Vec<&str> = item_pug.lines().collect();
+                let mut item_embeddings = Vec::new();
+                for (line_idx, line) in item_lines.iter().enumerate() {
+                    if line.trim().is_empty() {
+                        item_embeddings.push(vec![0.0; 384]);
+                        continue;
+                    }
+                    
+                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", line_idx + 1, item_lines.len(), line.trim()));
+                    
+                    let emb = match model.get_embedding(line.to_string()).await {
+                        Ok(vector) => vector,
+                        Err(e) => {
+                            emit_term(&format!("    🚨 [EMBEDDING ERROR] Failed to load or compute model: {}", e));
+                            vec![0.0; 384]
+                        }
+                    };
+                    item_embeddings.push(emb);
+                }
 
                 let mut item_val = json!({});
                 let mut global_ignore_list: Vec<String> = Vec::new();
 
                 // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
+                    
+                    // 2. get_list_schema_fields의 bias_target 값을 임베딩하여 인메모리 코사인 유사도 검색
+                    let query_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                    
+                    // Header 영역 독립 매칭
+                    let mut best_thead_idx = 0;
+                    let mut best_thead_score = -1.0;
+                    for (i, emb) in thead_embeddings.iter().enumerate() {
+                        if thead_lines[i].trim().is_empty() { continue; }
+                        let score = cosine_similarity(&query_emb, emb);
+                        if score > best_thead_score {
+                            best_thead_score = score;
+                            best_thead_idx = i;
+                        }
+                    }
+                    let matched_thead_pug = extract_pug_context(&thead_lines, best_thead_idx);
+
+                    // Item 본문 영역 독립 매칭
+                    let mut best_item_idx = 0;
+                    let mut best_item_score = -1.0;
+                    for (i, emb) in item_embeddings.iter().enumerate() {
+                        if item_lines[i].trim().is_empty() { continue; }
+                        let score = cosine_similarity(&query_emb, emb);
+                        if score > best_item_score {
+                            best_item_score = score;
+                            best_item_idx = i;
+                        }
+                    }
+                    let matched_item_pug = extract_pug_context(&item_lines, best_item_idx);
+                    
+                    // 3. 찾은 Header 컨텍스트와 Item 컨텍스트를 하나로 결합
+                    let targeted_pug = if matched_thead_pug.is_empty() {
+                        matched_item_pug
+                    } else {
+                        format!("{}\n{}", matched_thead_pug, matched_item_pug)
+                    };
+                    
+                    emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4}\n{}", field_name, best_thead_score, best_item_score, targeted_pug));
+                    
+                    let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: format!("[PUG CONTENT]\n{}", targeted_pug),
+                        name: None,
+                    });
                     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                     
                     let f_percent = (((f_idx as f32) / (total_fields as f32)) * 100.0) as i32;
@@ -1831,9 +1911,8 @@ async fn process_task(
                                 };
                                 
                                 let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-                                let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
                                 
-                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), b_target, p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                             } else {
                                 Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                             }
@@ -2065,10 +2144,26 @@ async fn process_task(
             let _ = app_handle.emit("extraction-progress", &payload);
             emit_term(&format!("[STAGE-3] Extracting {} detailed fields individually...", total_fields));
 
-            let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: format!("[PUG CONTENT]\n{}", content_pug),
-                name: None,
-            });
+            // 1. PUG 각 개별줄 내용을 임베딩 모델로 384차원 인메모리 벡터 저장 (진행률 및 에러 로깅 추가)
+            let pug_lines: Vec<&str> = content_pug.lines().collect();
+            let mut line_embeddings = Vec::new();
+            for (line_idx, line) in pug_lines.iter().enumerate() {
+                if line.trim().is_empty() {
+                    line_embeddings.push(vec![0.0; 384]);
+                    continue;
+                }
+                
+                emit_term(&format!("  [VECTORIZING] Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
+                
+                let emb = match model.get_embedding(line.to_string()).await {
+                    Ok(vector) => vector,
+                    Err(e) => {
+                        emit_term(&format!("  🚨 [EMBEDDING ERROR] Failed to load or compute model: {}", e));
+                        vec![0.0; 384]
+                    }
+                };
+                line_embeddings.push(emb);
+            }
 
             // 문서 타이틀 추출 (환각 검증용)
             let doc_title = {
@@ -2087,6 +2182,30 @@ async fn process_task(
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
+                // 2. get_detail_schema_fields의 bias_target 값을 임베딩하여 인메모리 코사인 유사도 검색
+                let query_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                let mut best_idx = 0;
+                let mut best_score = -1.0;
+                
+                for (i, emb) in line_embeddings.iter().enumerate() {
+                    if pug_lines[i].trim().is_empty() { continue; }
+                    let score = cosine_similarity(&query_emb, emb);
+                    if score > best_score {
+                        best_score = score;
+                        best_idx = i;
+                    }
+                }
+                
+                // 3. 찾은 컨텍스트 블록으로 추론을 위한 시스템 메시지 동적 조립
+                let targeted_pug = extract_pug_context(&pug_lines, best_idx);
+                
+                emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_pug));
+                
+                let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: format!("[PUG CONTENT]\n{}", targeted_pug),
+                    name: None,
+                });
+
                 let percent = (((idx as f32) / (total_fields as f32)) * 100.0) as i32;
                 let summary_msg = format!("Extracting {} ({}%)...", field_name, percent);
                 
@@ -2139,9 +2258,9 @@ async fn process_task(
                             
                             // 🌟 [CRITICAL FIX] Prejudice(오답 밀어내기) 파라미터를 Qwen3 모델에 전달합니다!
                             let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-                            let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
+                            // let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
                             
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), b_target, p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
                             Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                         }
@@ -2550,7 +2669,7 @@ async fn process_task(
                     
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
                     let masked_tracking_text = tracking_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
-                    let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                    let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 384]);
                     
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
@@ -2743,7 +2862,7 @@ async fn process_task(
                                 }
                                 let merged_text = parsing::json_to_natural_language(&foreign_data);
                                 let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
-                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                 
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                 foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
@@ -2940,7 +3059,7 @@ async fn process_task(
                                     if needs_update {
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
                                         let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
-                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 768]);
+                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                         
                                         foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                         foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
@@ -3168,7 +3287,7 @@ async fn update_team_base_metrics(
         Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
         _ => (
             json!({ "base": { "pages": {} } }).to_string(),
-            vec![0.0; 768],
+            vec![0.0; 384],
             "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()
         )
     };
@@ -3308,3 +3427,41 @@ async fn update_team_base_metrics(
 }
 
 
+// [IN-MEMORY VECTOR SEARCH] 코사인 유사도 계산 및 PUG 부모 컨텍스트 추출
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
+}
+
+fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
+    if lines.is_empty() { return String::new(); }
+    let mut parent_idx = target_idx;
+    let target_indent = lines[target_idx].chars().take_while(|c| c.is_whitespace()).count();
+    
+    // 1. 위로 거슬러 올라가며 들여쓰기가 더 적은(부모) 노드를 찾습니다.
+    for i in (0..target_idx).rev() {
+        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        if indent < target_indent && !lines[i].trim().is_empty() {
+            parent_idx = i;
+            break;
+        }
+    }
+
+    let parent_indent = lines[parent_idx].chars().take_while(|c| c.is_whitespace()).count();
+    let mut context_lines = vec![lines[parent_idx]];
+    
+    // 2. 부모 노드의 하위(자식) 노드들을 모두 긁어옵니다.
+    for i in (parent_idx + 1)..lines.len() {
+        if lines[i].trim().is_empty() { continue; }
+        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        // 다시 부모와 같거나 밖으로 나가는 들여쓰기를 만나면 블록 종료
+        if indent <= parent_indent {
+            break;
+        }
+        context_lines.push(lines[i]);
+    }
+    
+    context_lines.join("\n")
+}

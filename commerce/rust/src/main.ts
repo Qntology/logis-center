@@ -4430,6 +4430,21 @@ listen("download_error", (event: any) => {
     alert(`Error downloading ${payload.model}: ${payload.error}`);
 });
 
+// 🌟 [추가] 임베딩 모델 등 필수 파일 누락 시 알림 및 탭 이동 처리
+let hasAlertedMissingModel = false;
+listen("app_error_alert", (event: any) => {
+    if (!hasAlertedMissingModel) {
+        hasAlertedMissingModel = true;
+        alert(event.payload.message);
+        
+        // 다운로드 UI가 있는 세팅 탭으로 즉시 화면 자동 전환
+        openWidget("settings"); 
+        
+        // 검색창 입력 등 연속 호출로 인한 무한 팝업 스팸을 막기 위해 10초간 방어
+        setTimeout(() => { hasAlertedMissingModel = false; }, 10000); 
+    }
+});
+
 document.getElementById("btn-download-all-models")?.addEventListener("click", async () => {
     const missing = TARGET_MODELS.filter(m => !modelStatus[m]);
     if (missing.length === 0) {

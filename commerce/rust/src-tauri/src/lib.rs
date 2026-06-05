@@ -362,17 +362,17 @@ async fn search_documents(
         let is_task_active = crate::ACTIVE_TASK_MEM.read().unwrap().is_some();
         if is_task_active {
             println!("[DB-SEARCH] Background task is active. Skipping embedding model load to prevent VRAM overflow.");
-            vec![0.0; 768]
+            vec![0.0; 384]
         } else {
             let model_opt = { state.model.lock().await.as_ref().cloned() }; 
             if let Some(model) = model_opt {
-                model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
+                model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384])
             } else {
-                vec![0.0; 768]
+                vec![0.0; 384]
             }
         }
     } else {
-        vec![0.0; 768]
+        vec![0.0; 384]
     };
 
     if let Some(store) = store_opt {
@@ -821,7 +821,7 @@ async fn ai_search_complex(
                 };
 
                 let sql_filter = convert_conditions_to_sql(ctx);
-                let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
+                let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 384]);
                 
                 
                 // Commerce 모드에서는 FTS(MATCH)를 활성화하여 벡터 검색과 동시에 실행합니다.
@@ -945,7 +945,7 @@ async fn deep_research_command(
     
     if let Some(store) = store_guard.as_ref() {
         // General search for context
-        let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
+        let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
         
         if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None, false).await {
             let docs: Vec<String> = results.iter()
@@ -1543,12 +1543,12 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     let app_dir = crate::utils::get_app_dir();
     let base_path = app_dir.join("models");
 
-    // 특정 폴더 내에 10MB 이상의 GGUF 파일이 존재하는지 검사 (이름 무관)
-    let has_gguf = |dir: &std::path::PathBuf| -> bool {
+    // 🌟 [CRITICAL FIX] 특정 폴더 내에 10MB 이상의 GGUF 또는 SAFETENSORS 파일이 존재하는지 검사하도록 조건 확장
+    let has_valid_model = |dir: &std::path::PathBuf| -> bool {
         if let Ok(entries) = std::fs::read_dir(dir) {
             entries.flatten().any(|e| {
-                e.path().extension().map_or(false, |ext| ext == "gguf") && 
-                e.metadata().map(|m| m.len()).unwrap_or(0) > 10_000_000
+                let is_model_ext = e.path().extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors");
+                is_model_ext && e.metadata().map(|m| m.len()).unwrap_or(0) > 10_000_000
             })
         } else {
             false
@@ -1557,12 +1557,12 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
     let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
-    let embed_dir = base_path.join("embeddinggemma-300m");
+    let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
 
     Ok(serde_json::json!({
-        "Qwen3": has_gguf(&qwen3_dir),
-        "Qwen3.5": has_gguf(&qwen3_5_dir),
-        "Embedding": has_gguf(&embed_dir)
+        "Qwen3": has_valid_model(&qwen3_dir),
+        "Qwen3.5": has_valid_model(&qwen3_5_dir),
+        "Embedding": has_valid_model(&embed_dir)
     }))
 }
 
@@ -1587,7 +1587,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
         let folder_name = match model_name.as_str() {
             "Qwen3" => "Qwen3-0.6B-Instruct-gguf",
             "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf",
-            "Embedding" => "embeddinggemma-300m",
+            "Embedding" => "granite-embedding-97m-multilingual-r2",
             _ => "unknown"
         };
 
@@ -1606,7 +1606,8 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf", "Qwen3.5-2B-Q8_0.gguf")
             ],
             "Embedding" => vec![
-                ("https://huggingface.co/unsloth/embeddinggemma-300m-GGUF/resolve/main/embeddinggemma-300m-Q4_0.gguf", "embeddinggemma-300m-Q4_0.gguf")
+                // 🌟 사용자님이 config.json 등 기타 환경 파일은 직접 준비하셨으므로 model.safetensors 단일 파일만 집중 다운로드합니다.
+                ("https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/model.safetensors", "model.safetensors")
             ],
             _ => vec![]
         };
@@ -1619,7 +1620,9 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
             let file_path = dir_path.join(filename);
             let tmp_path = dir_path.join(format!("{}.tmp", filename));
             
-            let min_size = if filename.ends_with(".gguf") { 10_000_000 } else { 0 };
+            // 🌟 [CRITICAL FIX] safetensors 확장자도 최소 10MB 용량 검사를 통과해야 완료로 인정하도록 수정하여,
+            // 과거에 실패하여 생긴 껍데기 파일 때문에 다운로드가 중간에 완료 처리되는 헛바퀴 버그를 고쳤습니다.
+            let min_size = if filename.ends_with(".gguf") || filename.ends_with(".safetensors") { 10_000_000 } else { 0 };
             if file_path.exists() && std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > min_size {
                 let percent = (((file_idx as f64 + 1.0) / total_files as f64) * 100.0) as u32;
                 let _ = app_handle.emit("download_progress", serde_json::json!({"model": model_name, "percent": percent}));
