@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 
 // 🌟 [다국어 지원] 빌드 시점에 bias.json 파일을 읽어와 메모리에 영구 등재합니다.
-static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
+pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
     let json_str = include_str!("bias.json");
     serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
 });
@@ -900,26 +900,83 @@ pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
 
 pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
     let mut bias = String::from("detail has_list has_form true false");
-    let prejudice = String::from("global navigation, menus, headers, footers, aside, search, filter.");
+    let mut prejudice = String::new(); // 🌟 초기화
     
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
-        if let Some(l_list) = localized_obj.get("layout_list").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
-            bias.push_str(" ");
-            bias.push_str(&l_list.replace("{TYPE}", &localized_type));
+        if let Some(l_list) = localized_obj.get("layout_list") {
+            if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
+                bias.push_str(" ");
+                bias.push_str(&b.replace("{TYPE}", &localized_type));
+            }
+            if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
         }
-        if let Some(l_form) = localized_obj.get("layout_form").and_then(|v| v.get("bias")).and_then(|v| v.as_str()) {
-            bias.push_str(" ");
-            bias.push_str(&l_form.replace("{TYPE}", &localized_type));
-            bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
+        if let Some(l_form) = localized_obj.get("layout_form") {
+            if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
+                bias.push_str(" ");
+                bias.push_str(&b.replace("{TYPE}", &localized_type));
+                bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
+            }
+            if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
         }
     } else {
         bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
     }
     
-    (bias.trim().to_string(), prejudice)
+    if prejudice.trim().is_empty() {
+        prejudice = String::from("global navigation, menus, footers, aside, search, filter.");
+    }
+    
+    (bias.trim().to_string(), prejudice.trim().to_string())
+}
+
+pub fn get_separated_layout_bias(page_type: &str, lang: &str) -> (String, String, String) {
+    let mut list_bias = String::from("has_list false");
+    let mut form_bias = String::from("detail has_form true");
+    let mut prejudice = String::new();
+    
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
+    
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
+        if let Some(l_list) = localized_obj.get("layout_list") {
+            if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
+                list_bias.push_str(" ");
+                list_bias.push_str(&b.replace("{TYPE}", &localized_type));
+            }
+            if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
+        }
+        if let Some(l_form) = localized_obj.get("layout_form") {
+            if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
+                form_bias.push_str(" ");
+                form_bias.push_str(&b.replace("{TYPE}", &localized_type));
+                form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
+            }
+            if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
+                prejudice.push_str(" ");
+                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            }
+        }
+    } else {
+        form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
+    }
+    
+    if prejudice.trim().is_empty() {
+        prejudice = String::from("global navigation, menus, footers, aside, search, filter.");
+    }
+    
+    (list_bias.trim().to_string(), form_bias.trim().to_string(), prejudice.trim().to_string())
 }
 
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
@@ -1716,6 +1773,9 @@ pub fn normalize_to_json_string(input: &str) -> String {
          .replace('’', "'")
          .replace('，', ",")
          .replace('：', ":");
+
+    // 🌟 [LLM ESCAPE FIX] Qwen 모델이 JSON 내부에서 "has_list\":false 처럼 큰따옴표 앞에 오염시킨 백슬래시(\)를 원천 제거합니다.
+    s = s.replace("\\\"", "\"");
 
     // 1. Backticks to quotes
     let re_backtick = Regex::new(r"`([\s\S]*?)`").unwrap();

@@ -128,11 +128,11 @@ pub enum ModelSize {
 pub struct LogisModel {
     pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
-    // 🌟 [복구 완료] 사용자님이 원하시던 오리지널 Qwen3 텍스트 전용 로직을 띄웁니다!
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+    pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
 
     pub is_cpu_mode: bool, 
     pub is_disk_swap: bool,
@@ -207,12 +207,15 @@ impl LogisModel {
             }
         }
         
-        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model...");
+        println!("[DIAG-PURGE] Step 2: Clearing Embedding Model & Cache...");
         {
             let mut emb = self.embedding_model.lock().await;
             if let Some(e) = emb.take() { 
                 drop(e); 
             }
+            // 🌟 램 누수 방지를 위해 캐시도 깔끔하게 비워줍니다.
+            let mut cache = self.embedding_cache.lock().await;
+            cache.clear();
         }
         
         println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
@@ -821,6 +824,7 @@ impl LogisModel {
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
+            embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
@@ -1533,20 +1537,37 @@ impl LogisModel {
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
+        // 🌟 1. 메모리 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산 원천 차단)
+        {
+            let cache = self.embedding_cache.lock().await;
+            if let Some(vector) = cache.get(&text) {
+                return Ok(vector.clone());
+            }
+        }
+
         // Ensure embedding model is loaded (and generator is unloaded)
         self.ensure_embedding().await?;
 
         let embedding_model_arc = self.embedding_model.clone();
+        let text_clone = text.clone();
         
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+        let vector = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
             let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
-                model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+                model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
             } else {
                 // Fallback to zeros if model failed to load
                 Ok(vec![0.0; 384])
             }
-        }).await?
+        }).await??;
+
+        // 🌟 2. 새로 연산된 벡터를 해시맵 캐시에 저장하여 다음 루프 때 재사용합니다.
+        {
+            let mut cache = self.embedding_cache.lock().await;
+            cache.insert(text, vector.clone());
+        }
+
+        Ok(vector)
     }
 
     // [신규] Commerce 파이프라인: 2-Stage (0.6B para2graph -> 2B graph2contexts)

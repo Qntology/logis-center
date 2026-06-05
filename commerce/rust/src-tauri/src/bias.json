@@ -4,12 +4,12 @@
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
         "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 배송목록, 송장출력내역, 배송현황, 미배송리스트, 일괄발송", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
-        "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 송장수정, 단일배송조회, 배송지오류수정, 반품처리, 상세조회, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 송장수정, 단일배송조회, 배송지오류수정, 반품처리, 상세조회", 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "식별자, 링크, 운송장번호, 송장", 
@@ -116,12 +116,12 @@
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
         "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 상품목록, 진열관리, 재고관리, 일괄수정, 품절처리, 카테고리분류", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
         "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 상품등록, 상품수정, 옵션추가, 상세설명에디터, 썸네일등록, 연관상품설정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "식별자, 링크, 주소", 
@@ -328,12 +328,12 @@
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
         "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 주문목록, 결제내역, 취소/환불목록, 전체주문, 발주관리, 일괄처리, 선택건", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
         "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 주문상세, 상세정보, 배송지수정, 부분취소, 결제수정, 수령인변경, 관리자메모, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "식별자, 링크, 주문번호", 
@@ -425,12 +425,12 @@
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
         "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 리뷰목록, 상품평관리, 평점리스트, 일괄승인, 미답변게시글", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
         "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 리뷰상세, 답변작성, 블라인드처리, 적립금지급, 단일조회, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "식별자, 링크, 주소", 
@@ -464,8 +464,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 쿠폰목록, 발급현황, 사용내역조회", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 쿠폰목록, 발급현황, 사용내역조회", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "식별자, 링크, 주소", "bias": "{TYPE}식별자, {TYPE}번호, {TYPE}코드, EVT-001, COUPON_9921", "prejudice": "정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
       "type": { "semantic": "타입, 종류, 종류명", "bias": "정액할인, 정률할인, 무료배송, 사은품증정", "prejudice": "식별자, 링크, 주소, 번호, 코드, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
       "status": { "semantic": "상태, 진행상태", "bias": "{TYPE}상태, {TYPE}진행상황, 진행중, 종료, 대기중, 발급중, 발급마감", "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
@@ -488,8 +488,8 @@
       "registration_date": { "semantic": "등록일, 생성일", "bias": "{TYPE}일자, {TYPE}날짜, {TYPE}등록일, 2026-02-15", "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소" }
     },
     "event": {
-      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 쿠폰목록, 발급현황, 사용내역조회", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 쿠폰목록, 발급현황, 사용내역조회", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "식별자, 링크, 주소", "bias": "{TYPE}식별자, {TYPE}번호, {TYPE}코드, EVT-001, COUPON_9921", "prejudice": "정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
       "type": { "semantic": "타입, 종류, 종류명", "bias": "정액할인, 정률할인, 무료배송, 사은품증정", "prejudice": "식별자, 링크, 주소, 번호, 코드, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
       "status": { "semantic": "상태, 진행상태", "bias": "{TYPE}상태, {TYPE}진행상황, 진행중, 종료, 대기중, 발급중, 발급마감", "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소, 등록일, 생성일" },
@@ -512,8 +512,8 @@
       "registration_date": { "semantic": "등록일, 생성일", "bias": "{TYPE}일자, {TYPE}날짜, {TYPE}등록일, 2026-02-15", "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소" }
     },
     "default": {
-      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 목록, 리스트, 표, 일괄", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 상세, 폼, 입력, 수정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 목록, 리스트, 표, 일괄", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 상세, 폼, 입력, 수정, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "식별자, 링크, 주소", "bias": "{TYPE}식별자, {TYPE}번호, {TYPE}코드, ID-001, 12345, /path/to/resource", "prejudice": "제목, 이름, 공지사항, 상품안내, 이벤트, 정상, 대기, 오류, 완료, 상태, 진행상황" },
       "title": { "semantic": "제목, 이름", "bias": "{TYPE}명, {TYPE}제목, {TYPE}이름, 공지사항, 상품안내, 이벤트", "prejudice": "식별자, 링크, 주소, 번호, 코드, 정상, 대기, 오류, 완료, 상태, 진행상황" },
       "status": { "semantic": "상태", "bias": "{TYPE}상태, {TYPE}진행상황, 정상, 대기, 오류, 완료", "prejudice": "식별자, 링크, 주소, 번호, 코드, 제목, 이름, 공지사항, 상품안내, 이벤트" }
@@ -524,12 +524,12 @@
       "layout_list": { 
         "semantic": "List or table page listing multiple items", 
         "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, shipping list, print labels, delivery status, pending shipments, bulk dispatch", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Form page for displaying or entering details of a single item", 
         "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, edit tracking, track single, fix address error, process return, detailed view, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identifier link tracking number tracking", 
@@ -636,12 +636,12 @@
       "layout_list": { 
         "semantic": "List or table page listing multiple items", 
         "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, product list, display management, inventory management, bulk edit, out of stock process, category classification", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Form page for displaying or entering details of a single item", 
         "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, add product, edit product, add option, description editor, upload thumbnail, related products, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identifier link url address", 
@@ -878,12 +878,12 @@
       "layout_list": { 
         "semantic": "List or table page listing multiple items", 
         "bias": "{TYPE} list, {TYPE} table, {TYPE} bulk, order list, payment history, cancellations list, all orders, order dispatch management, bulk process, selected items", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Form page for displaying or entering details of a single item", 
         "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, order details, full information, update shipping address, partial cancel, edit payment, change recipient, admin memo, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identifier link order number order id purchase code", 
@@ -975,12 +975,12 @@
       "layout_list": { 
         "semantic": "List or table page listing multiple items", 
         "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, review list, product reviews management, rating list, bulk approve, unanswered posts", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Form page for displaying or entering details of a single item", 
         "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, review detail, write reply, hide post, blind review, issue reward points, single review query, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identifier link url address", 
@@ -1014,8 +1014,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, coupon list, issuance status, usage history list", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form board or page for displaying or entering details of a single item", "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, create coupon, set conditions, edit discount rate, single coupon issue, target group setup, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, coupon list, issuance status, usage history list", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Form board or page for displaying or entering details of a single item", "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, create coupon, set conditions, edit discount rate, single coupon issue, target group setup, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifier link url address", "bias": "{TYPE} identifier, {TYPE} number, {TYPE} code, EVT-001, COUPON_9921", "prejudice": "fixed discount, percentage discount, free shipping, type, category, category name, status, progress, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
       "type": { "semantic": "type category classification promotion name", "bias": "Percentage Discount, Fixed Amount, Free Shipping, Buy One Get One, BOGO, Free Gift", "prejudice": "identifier, link, url address, number, code, status, progress, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
       "status": { "semantic": "status campaign progress promotion state", "bias": "{TYPE} status, {TYPE} state, Active, Expired, Upcoming, Paused, Issuing, Ended, Fully Redeemed", "prejudice": "identifier, link, url address, number, code, fixed discount, percentage discount, free shipping, type, category, category name, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
@@ -1038,8 +1038,8 @@
       "registration_date": { "semantic": "registration date date created system date", "bias": "{TYPE} date, {TYPE} time, {TYPE} registration date, 2026-02-15", "prejudice": "identifier, link, url address, number, code, fixed discount, percentage discount, free shipping, type, category, category name, status, progress, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue" }
     },
     "event": {
-      "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, campaign management list, event history", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Form board or page for displaying or entering details of a single item", "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, edit campaign, target group setup, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "List or table page listing multiple items", "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, campaign management list, event history", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Form board or page for displaying or entering details of a single item", "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, edit campaign, target group setup, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifier link url address", "bias": "{TYPE} identifier, {TYPE} number, {TYPE} code, EVT-001, COUPON_9921", "prejudice": "fixed discount, percentage discount, free shipping, type, category, category name, status, progress, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
       "type": { "semantic": "type category classification promotion name", "bias": "Percentage Discount, Fixed Amount, Free Shipping, Buy One Get One, BOGO, Free Gift", "prejudice": "identifier, link, url address, number, code, status, progress, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
       "status": { "semantic": "status campaign progress promotion state", "bias": "{TYPE} status, {TYPE} state, Active, Expired, Upcoming, Paused, Issuing, Ended, Fully Redeemed", "prejudice": "identifier, link, url address, number, code, fixed discount, percentage discount, free shipping, type, category, category name, coupon name, campaign title, start date, start time, issue date, end date, expiration, deadline, promo code, coupon number, discount amount, discount rate, quantity, amount issued, usage limit, max usage, limit per user, new customer, signup discount, first purchase, first order, min order amount, payment condition, max order amount, max discount, discount limit, region restrictions, delivery block, phone number, contact, inquiry, address, location, venue, registration date, date created" },
@@ -1065,12 +1065,12 @@
       "layout_list": { 
         "semantic": "List or table page listing multiple items", 
         "bias": "{TYPE} list, {TYPE} table, {TYPE} grid, {TYPE} bulk, list, table, grid, bulk group", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Form page for displaying or entering details of a single item", 
         "bias": "{TYPE} detail, {TYPE} form, {TYPE} input, {TYPE} edit, details page, form element, input box, edit panel, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identifier link url resource path", 
@@ -1094,12 +1094,12 @@
       "layout_list": { 
         "semantic": "列出多个项目的列表、表格页面", 
         "bias": "{TYPE}列表, {TYPE}表格, {TYPE}批量, 发货列表, 面单打印, 配送状态, 待发货列表, 批量发货", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "显示或输入单个项目详细信息的表单页面", 
         "bias": "{TYPE}详情, {TYPE}表单, {TYPE}修改, 面单修改, 单个物流查询, 地址报错修改, 退件处理, 详情查询, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "标识符 链接 运单号 快递单号", 
@@ -1208,12 +1208,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 配送清單, 運單列印內文, 配送現況, 未配送清單, 批量發貨", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 運單修改, 單一配送查詢, 地址錯誤修改, 退貨處理, 詳情查詢, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 運單號 追蹤號", 
@@ -1320,12 +1320,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 商品列表, 陳列管理, 庫存管理, 批量修改, 售罄處理, 分類管理", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 商品發布, 商品修改, 新增選項, 詳情編輯器, 上傳主圖, 關聯商品, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 網址", 
@@ -1532,12 +1532,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 訂單列表, 支付紀錄, 取銷/退款列表, 全部訂單, 出貨管理, 批量處理, 選中項", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 訂單詳情, 詳細資訊, 修改收件地址, 部分取消, 支付修改, 更改收件人, 管理員備註, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 訂單號", 
@@ -1629,12 +1629,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 評價列表, 評分管理, 評分清單, 批量審核, 待回覆留言", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 評價詳情, 寫回覆, 隱藏評價, 發放積分, 單個查詢, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 網址", 
@@ -1671,12 +1671,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 優惠券列表, 發放情況, 使用紀錄清單", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 創建優惠券, 條件設置, 填寫折扣, 單獨發放, 目標人群, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 網址", 
@@ -1783,12 +1783,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 活動紀錄, 特色企劃清單", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 修改活動, 目標人群, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 網址", 
@@ -1895,12 +1895,12 @@
       "layout_list": { 
         "semantic": "列出多個項目的列表、表格、清單頁面", 
         "bias": "{TYPE}列表, {TYPE}清單, {TYPE}表格, {TYPE}批量, 列表, 清單, 表格, 批量", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "顯示或輸入單個項目詳細資訊的表單頁面", 
         "bias": "{TYPE}詳情, {TYPE}表單, {TYPE}輸入, {TYPE}修改, 詳情, 表單, 輸入, 修改, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "識別碼 連結 網址", 
@@ -1924,12 +1924,12 @@
       "layout_list": {
         "semantic": "複数の項目を羅列するリスト、テーブルページ",
         "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 配送一覧 伝票出力 配送状況 未配送リスト 一括発送",
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "単一項目の詳細情報を表示または入力するフォームページ",
         "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 伝票修正 単一配送照会 配送先エラー修正 返品処理 詳細照会",
-        "prejudice": "global, navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "識別子 リンク 追跡番号 伝票番号 お問い合わせ番号",
@@ -2036,12 +2036,12 @@
       "layout_list": {
         "semantic": "複数の項目を羅列するリスト、テーブルページ",
         "bias": "{TYPE}一覧 {TYPE}リスト {TYPE}一括 商品一覧 陳列管理 在庫管理 一括修正 品切れ処理 カテゴリ分類",
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "単一項目の詳細情報を表示または入力するフォームページ",
         "bias": "{TYPE}詳細 {TYPE}フォーム {TYPE}修正 商品登録 商品修正 オプション追加 詳細説明 サムネイル登録 関連商品",
-        "prejudice": "global, navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "識別子 リンク URL",
@@ -2055,12 +2055,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista de envíos, imprimir etiquetas, estado de entrega, envíos pendientes, despacho masivo", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, editar seguimiento, rastrear paquete, corregir dirección, procesar devolución, vista detallada, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace número de seguimiento guía", 
@@ -2167,12 +2167,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista de productos, gestión de inventario, edición masiva, agotado, categorías", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, añadir producto, editar producto, opciones, editor de descripción, subir miniatura, productos relacionados, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace", 
@@ -2409,12 +2409,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista de pedidos, historial de pagos, cancelaciones, proceso masivo, seleccionados", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, detalles del pedido, actualizar envío, cancelación parcial, editar destinatario, nota del administrador, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace número de pedido orden", 
@@ -2506,12 +2506,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista de cupones, estado de emisión, historial de uso", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, crear cupón, establecer condiciones, tasa de descuento, emisión única, configuración de público, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace", 
@@ -2618,12 +2618,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, historial de eventos, lista de promociones", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, editar evento, configuración de público, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace", 
@@ -2730,12 +2730,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista de reseñas, gestionar valoraciones, aprobar masivamente, sin respuesta", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, detalles de la reseña, escribir respuesta, ocultar, recompensa, vista individual, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace", 
@@ -2772,12 +2772,12 @@
       "layout_list": { 
         "semantic": "Página de lista o tabla que muestra múltiples elementos", 
         "bias": "{TYPE} lista, {TYPE} tabla, {TYPE} masivo, lista, tabla, cuadrícula, masivo", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Página de formulario para mostrar o ingresar detalles de un solo elemento", 
         "bias": "{TYPE} detalle, {TYPE} formulario, {TYPE} editar, detalle, formulario, entrada, editar, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificador enlace", 
@@ -2801,12 +2801,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista de envios, imprimir etiquetas, status de entrega, envios pendentes, despacho em massa",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, editar rastreamento, rastrear pacote, corrigir endereço, processar devolução, vista detalhada, {TYPE}, input, {TYPE}, select, {TYPE}, textarea",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link número de rastreamento guia",
@@ -2913,12 +2913,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista de produtos, gestão de inventário, edição em massa, esgotado, categorias",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, adicionar produto, editar produto, opções, editor de descrição, enviar miniatura, produtos relacionados, {TYPE}, input, {TYPE}, select, {TYPE}, textarea",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link",
@@ -3125,12 +3125,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista de pedidos, histórico de pagamentos, cancelamentos, processo em massa, selecionados",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, detalhes do pedido, atualizar envio, cancelamento parcial, editar destinatário, nota do administrador, {TYPE}, input, {TYPE}, select, {TYPE}, textarea",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link número do pedido ordem",
@@ -3222,12 +3222,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista de cupons, histórico de eventos, status de emissão, campanhas, histórico de uso",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, criar cupom, definir condições, editar evento, taxa de desconto, emissão única, configurações de público, {TYPE}, input, {TYPE}, select, {TYPE}, textarea",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link",
@@ -3334,12 +3334,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista de cupons, histórico de eventos, status de emissão, campanhas, histórico de uso",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, criar cupom, definir condições, editar evento, taxa de desconto, emissão única, configurações de público, {TYPE}, input, {TYPE}, select, {TYPE}, textarea",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link",
@@ -3446,12 +3446,12 @@
       "layout_list": {
         "semantic": "Página de lista ou tabela que mostra vários itens",
         "bias": "{TYPE} lista, {TYPE} tabela, {TYPE} em massa, lista, tabela, grade, em massa",
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Página de formulário para exibir ou inserir detalhes de um único item",
         "bias": "{TYPE} detalhe, {TYPE} formulário, {TYPE} editar, detalhe, formulário, entrada, editar",
-        "prejudice": "global navigation, menus, headers, footers, aside."
+        "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
         "semantic": "identificador link",
@@ -3475,12 +3475,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Versandliste, Rechnungsdruckhistorie, Lieferstatus, Nicht-Lieferliste, Sammelversand", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Rechnungsänderung, Einzelne Sendungsverfolgung, Lieferadressenfehler-Korrektur, Retourenabwicklung, Detailansicht, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Sendungsnummer Rechnung", 
@@ -3587,12 +3587,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Produktliste, Display-Verarbeitung, Bestandsverwaltung, Massenaktualisierung, Ausverkauft-Bearbeitung, Kategorieklassifizierung", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Produktregistrierung, Produktbearbeitung, Option hinzufügen, Detailbeschreibungs-Editor, Thumbnail-Registrierung, Verknüpfte Produkte einstellen, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Adresse", 
@@ -3799,12 +3799,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Bestellliste, Zahlungsdetails, Stornierungs-/Erstattungsliste, Alle Bestellungen, Disposition, Sammelbearbeitung, Ausgewählte Fälle", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Bestelldetails, Detailinformationen, Lieferadresse bearbeiten, Teilstornierung, Zahlung bearbeiten, Empfänger ändern, Administrator-Notiz, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Bestellnummer", 
@@ -3896,12 +3896,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Bewertungsliste, Produktbewertungs-Verwaltung, Bewertungsübersicht, Sammelgenehmigung, Unbeantwortete Beiträge", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Bewertungsdetails, Antwort verfassen, Ausblenden, Prämie auszahlen, Einzelabfrage, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Adresse", 
@@ -3938,12 +3938,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Gutscheinliste, Ausgabestatus, Nutzungshistorie-Abfrage", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Gutschein erstellen, Bedingungen festlegen, Rabattsatz eingeben, Einzelausgabe, Zielgruppen-Einstellung, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Adresse", 
@@ -4050,12 +4050,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Event-Historie, Aktionsliste", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Event bearbeiten, Zielgruppen-Einstellung, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Adresse", 
@@ -4162,12 +4162,12 @@
       "layout_list": { 
         "semantic": "Listen- oder Tabellenseite, die mehrere Elemente auflistet", 
         "bias": "{TYPE}liste, {TYPE}-Liste, {TYPE}tabelle, {TYPE}-Tabelle, {TYPE} pauschal, Liste, Tabelle, Raster, Pauschal", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formularseite zur Anzeige oder Eingabe von Details eines einzelnen Elements", 
         "bias": "{TYPE}details, {TYPE}-Details, {TYPE}formular, {TYPE}-Formular, {TYPE}eingabe, {TYPE}-Eingabe, {TYPE}bearbeiten, {TYPE}-Bearbeitung, Details, Formular, Eingabe, Bearbeitung, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Identifikator Link Adresse", 
@@ -4188,8 +4188,8 @@
   },
   "fr": {
     "tracking": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'expéditions imprimer étiquettes statut de livraison expéditions en attente envoi groupé", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier modifier suivi suivre colis corriger adresse traiter retour vue détaillée", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'expéditions imprimer étiquettes statut de livraison expéditions en attente envoi groupé", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier modifier suivi suivre colis corriger adresse traiter retour vue détaillée", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien numéro de suivi", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code 1Z9999999999999999, 6A12345678901, FR123456789", "prejudice": "numéro de commande code article" },
       "status": { "semantic": "statut état de livraison", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En transit, En cours de livraison, Livré, En attente, Retourné à l'expéditeur, Exception", "prejudice": "" },
       "title": { "semantic": "titre nom du produit", "bias": "{TYPE} titre {TYPE} nom Écouteurs sans fil, T-shirt en coton, Montre connectée", "prejudice": "adresse de livraison destinataire" },
@@ -4212,8 +4212,8 @@
       "bundle_shipping": { "semantic": "expédition groupée", "bias": "Expédition Groupée, Non Groupée", "prejudice": "" }
     },
     "goods": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de produits gestion des stocks édition en masse rupture de stock catégories", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier ajouter produit modifier produit options éditeur de description télécharger miniature produits associés", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de produits gestion des stocks édition en masse rupture de stock catégories", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier ajouter produit modifier produit options éditeur de description télécharger miniature produits associés", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code PROD-001, ITEM_9921, /product/123", "prejudice": "" },
       "code": { "semantic": "code article sku", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code SKU-12345, ABC-9981, FR-001", "prejudice": "numéro de suivi numéro de commande" },
       "status": { "semantic": "statut disponibilité", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En stock, Épuisé, Précommande, Fin de série, Masqué", "prejudice": "" },
@@ -4262,8 +4262,8 @@
       "additional_goods": { "semantic": "produits associés", "bias": "Coque, Câble USB", "prejudice": "produit principal" }
     },
     "order": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de commandes historique des paiements annulations traitement en masse sélectionnés", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de la commande mettre à jour l'expédition annulation partielle modifier le destinataire note de l'administrateur", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de commandes historique des paiements annulations traitement en masse sélectionnés", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de la commande mettre à jour l'expédition annulation partielle modifier le destinataire note de l'administrateur", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien numéro de commande", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code ORD-12345, #1001, PO-99982", "prejudice": "numéro de suivi code article" },
       "tracking_number": { "semantic": "numéro de suivi", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code 1Z9999999999999999, 6A12345678901", "prejudice": "numéro de commande numéro de paiement" },
       "status": { "semantic": "statut de la commande", "bias": "{TYPE} statut {TYPE} état {TYPE} progression En traitement, Expédié, Livré, Annulé, Remboursé", "prejudice": "" },
@@ -4283,8 +4283,8 @@
       "payment_origin": { "semantic": "source de paiement", "bias": "Stripe, PayPal Checkout, PayPlug", "prejudice": "" }
     },
     "coupon": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de coupons historique des événements statut d'émission campagnes historique d'utilisation", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de coupons historique des événements statut d'émission campagnes historique d'utilisation", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code EVT-001, COUPON_9921", "prejudice": "code promo" },
       "type": { "semantic": "type catégorie", "bias": "Remise Fixe, Pourcentage, Livraison Gratuite, 2 pour 1", "prejudice": "statut" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Actif, Terminé, Programmé, Épuisé", "prejudice": "type catégorie" },
@@ -4307,8 +4307,8 @@
       "registration_date": { "semantic": "date de création", "bias": "{TYPE} date {TYPE} heure 2026-02-15", "prejudice": "date de début date de fin" }
     },
     "event": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de coupons historique des événements statut d'émission campagnes historique d'utilisation", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste de coupons historique des événements statut d'émission campagnes historique d'utilisation", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier créer coupon définir conditions modifier événement taux de remise émission unique paramètres de la cible", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code EVT-001, COUPON_9921", "prejudice": "code promo" },
       "type": { "semantic": "type catégorie", "bias": "Remise Fixe, Pourcentage, Livraison Gratuite, 2 pour 1", "prejudice": "statut" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Actif, Terminé, Programmé, Épuisé", "prejudice": "type catégorie" },
@@ -4331,8 +4331,8 @@
       "registration_date": { "semantic": "date de création", "bias": "{TYPE} date {TYPE} heure 2026-02-15", "prejudice": "date de début date de fin" }
     },
     "review": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'avis gérer les évaluations approuver en masse sans réponse", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de l'avis rédiger une réponse masquer récompense vue individuelle", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste d'avis gérer les évaluations approuver en masse sans réponse", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détails de l'avis rédiger une réponse masquer récompense vue individuelle", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code REV-001, 9921, /review/123", "prejudice": "" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Approuvé, En attente, Rejeté, Masqué", "prejudice": "" },
       "name": { "semantic": "évaluateur", "bias": "{TYPE} nom {TYPE} titre Pierre Bernard, Sylvie Dubois", "prejudice": "titre sujet" },
@@ -4341,8 +4341,8 @@
       "registration_date": { "semantic": "date", "bias": "{TYPE} date {TYPE} heure 2026-03-15", "prejudice": "" }
     },
     "default": {
-      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste tableau grille en masse", "prejudice": "global navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détail formulaire entrée modifier", "prejudice": "global navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Page de liste ou de tableau affichant plusieurs éléments", "bias": "{TYPE} liste {TYPE} tableau {TYPE} en masse liste tableau grille en masse", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Page de formulaire pour afficher ou saisir les détails d'un seul élément", "bias": "{TYPE} détail {TYPE} formulaire {TYPE} modifier détail formulaire entrée modifier", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identifiant lien", "bias": "{TYPE} identifiant {TYPE} numéro {TYPE} code ID-001, 12345, /path/to/resource", "prejudice": "" },
       "title": { "semantic": "titre", "bias": "{TYPE} titre {TYPE} nom Annonce, Guide Produit, Événement Spécial", "prejudice": "" },
       "status": { "semantic": "statut", "bias": "{TYPE} statut {TYPE} état {TYPE} progression Normal, En attente, Erreur, Terminé", "prejudice": "" }
@@ -4353,12 +4353,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, verzendlijst, labels afdrukken, leveringsstatus, in afwachting, bulkverzending", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, tracking bewerken, pakket volgen, adres corrigeren, retour verwerken, detailweergave, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link trackingnummer", 
@@ -4465,12 +4465,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, productlijst, voorraadbeheer, bulkbewerking, uitverkocht, categorieën", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, product toevoegen, product bewerken, opties, beschrijving editor, miniatuur uploaden, gerelateerde producten, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link url", 
@@ -4707,12 +4707,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, bestellijst, betalingsgeschiedenis, annuleringen, bulkverwerking, geselecteerde", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, besteldetails, verzending bijwerken, gedeeltelijke annulering, ontvanger bewerken, beheerdersnotitie, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link bestelnummer", 
@@ -4804,12 +4804,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, beoordelingenlijst, beoordelingen beheren, bulk goedkeuren, onbeantwoord", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, beoordelingsdetails, antwoord schrijven, verbergen, beloning, individuele weergave, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link", 
@@ -4846,12 +4846,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, couponlijst, uitgiftestatus, gebruiksgeschiedenis", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, coupon aanmaken, voorwaarden instellen, kortingspercentage, enkele uitgifte, doelgroepinstellingen, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link", 
@@ -4958,12 +4958,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, evenementgeschiedenis, campagnes, promotielijst", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, evenement bewerken, doelgroepinstellingen, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link", 
@@ -5070,12 +5070,12 @@
       "layout_list": { 
         "semantic": "Lijst of tabel pagina met meerdere items", 
         "bias": "{TYPE} lijst, {TYPE} tabel, {TYPE} bulk, lijst, tabel, raster, bulk", 
-        "prejudice": "global navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Formulierpagina voor het bekijken of invoeren van details van één item", 
         "bias": "{TYPE} detail, {TYPE} formulier, {TYPE} bewerken, detail formulier, invoer bewerken, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatie link", 
@@ -5099,12 +5099,12 @@
       "layout_list": { 
         "semantic": "Pagina di elenco o tabella contenente più voci", 
         "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, lista di spedizione, storico stampa fatture, stato della spedizione, elenco non consegnati, invio in blocco", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", 
         "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, modifica fattura, tracciamento spedizione singola, correzione errore indirizzo, gestione resi, visualizzazione dettagliata, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatore link numero di tracciamento fattura", 
@@ -5211,12 +5211,12 @@
       "layout_list": { 
         "semantic": "Pagina di elenco o tabella contenente più voci", 
         "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco prodotti, gestione esposizione, gestione inventario, modifica in blocco, gestione esauriti, classificazione categorie", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", 
         "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, registrazione prodotto, modifica prodotto, aggiunta opzione, editor descrizione dettagliata, caricamento miniatura, impostazione prodotti correlati, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatore link indirizzo", 
@@ -5423,12 +5423,12 @@
       "layout_list": { 
         "semantic": "Pagina di elenco o tabella contenente più voci", 
         "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, lista ordini, cronologia pagamenti, elenco cancellazioni/rimborsi, tutti gli ordini, gestione spedizione ordini, elaborazione in blocco, articoli selezionati", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", 
         "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, dettagli ordine, informazioni dettagliate, modifica indirizzo di consegna, cancellazione parziale, modifica pagamento, cambio destinatario, nota amministratore, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatore link numero ordine", 
@@ -5520,12 +5520,12 @@
       "layout_list": { 
         "semantic": "Pagina di elenco o tabella contenente più voci", 
         "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco recensioni, gestione recensioni prodotti, elenco valutazioni, approvazione in blocco, post senza risposta", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", 
         "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, dettagli recensione, scrivi risposta, gestione oscuramento, assegnazione punti, query singola, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "identificatore link indirizzo", 
@@ -5559,8 +5559,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco coupon, stato di emissione, ricerca storico utilizzi", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, creazione coupon, impostazione condizioni, inserimento tasso di sconto, emissione singola, impostazione target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco coupon, stato di emissione, ricerca storico utilizzi", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, creazione coupon, impostazione condizioni, inserimento tasso di sconto, emissione singola, impostazione target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identificatore link indirizzo", "bias": "identificatore {TYPE}, numero {TYPE}, codice {TYPE}, EVT-001, COUPON_9921", "prejudice": "sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
       "type": { "semantic": "tipo classe nome classe", "bias": "Sconto fisso, Sconto percentuale, Spedizione gratuita, Omaggio incluso", "prejudice": "identificatore, link, indirizzo, numero, codice, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantidade emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
       "status": { "semantic": "stato stato avanzamento", "bias": "stato {TYPE}, avanzamento {TYPE}, in corso, terminato, in attesa, in emissione, emissione terminata", "prejudice": "identificatore, link, indirizzo, numero, codice, sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
@@ -5583,8 +5583,8 @@
       "registration_date": { "semantic": "data di registrazione data di creazione", "bias": "data {TYPE}, data {TYPE}, data di registrazione {TYPE}, 2026-02-15", "prejudice": "identificatore, link, indirizzo, numero, codice, sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo" }
     },
     "event": {
-      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, storico eventi, elenco promozioni", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, modifica evento, impostazione target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, storico eventi, elenco promozioni", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, modifica evento, impostazione target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identificatore link indirizzo", "bias": "identificatore {TYPE}, numero {TYPE}, codice {TYPE}, EVT-001, COUPON_9921", "prejudice": "sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
       "type": { "semantic": "tipo classe nome classe", "bias": "Sconto fisso, Sconto percentuale, Spedizione gratuita, Omaggio incluso", "prejudice": "identificatore, link, indirizzo, numero, codice, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
       "status": { "semantic": "stato stato avanzamento", "bias": "stato {TYPE}, avanzamento {TYPE}, in corso, terminato, in attesa, in emissione, emissione terminata", "prejudice": "identificatore, link, indirizzo, numero, codice, sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo, data di registrazione, data di creazione" },
@@ -5607,8 +5607,8 @@
       "registration_date": { "semantic": "data di registrazione data di creazione", "bias": "data {TYPE}, data {TYPE}, data di registrazione {TYPE}, 2026-02-15", "prejudice": "identificatore, link, indirizzo, numero, codice, sconto fisso, sconto percentuale, spedizione gratuita, tipo, classe, nome classe, avanzamento, nome coupon, nome evento, data di inizio, data e ora di inizio, data di emissione, data di fine, data di scadenza, termine, numero coupon, importo dello sconto, tasso di sconto, quantità, quantità emessa, limite di utilizzo, utilizzo massimo, limite di utilizzo per persona, nuovo cliente, nuova registrazione, primo acquisto, primo ordine, importo minimo dell'ordine, condizione di pagamento, importo massimo dell'ordine, importo massimo dello sconto, limite di sconto, restrizioni regionali, consegna non disponibile, numero di telefono, contatto, richieste, indirizzo, posizione, luogo" }
     },
     "default": {
-      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco, lista, tabella, blocco", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, dettaglio, modulo, input, modifica, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Pagina di elenco o tabella contenente più voci", "bias": "lista {TYPE}, elenco {TYPE}, tabella {TYPE}, lotto {TYPE}, elenco, lista, tabella, blocco", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Pagina del modulo per visualizzare o inserire informazioni dettagliate su una singola voce", "bias": "dettaglio {TYPE}, modulo {TYPE}, inserimento {TYPE}, modifica {TYPE}, dettaglio, modulo, input, modifica, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "identificatore link indirizzo", "bias": "identificatore {TYPE}, numero {TYPE}, codice {TYPE}, ID-001, 12345, /path/to/resource", "prejudice": "titolo, nome, avviso, guida ai prodotti, evento, normale, in attesa, errore, completato, stato, avanzamento" },
       "title": { "semantic": "titolo nome", "bias": "nome {TYPE}, titolo {TYPE}, nome {TYPE}, avviso, guida ai prodotti, evento", "prejudice": "identificatore, link, indirizzo, numero, codice, normale, in attesa, errore, completato, stato, avanzamento" },
       "status": { "semantic": "stato", "bias": "stato {TYPE}, avanzamento {TYPE}, normale, in attesa, errore, completato", "prejudice": "identificatore, link, indirizzo, numero, codice, titolo, nome, avviso, guida ai prodotti, evento" }
@@ -5619,12 +5619,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar Pengiriman, Riwayat Cetak Resi, Status Pengiriman, Daftar Belum Dikirim, Pengiriman Massal", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Ubah Resi, Lacak Pengiriman Tunggal, Perbaikan Alamat Salah, Proses Retur, Cek Detail, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link nomor resi resi", 
@@ -5731,12 +5731,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar Produk, Manajemen Pajangan, Manajemen Stok, Ubah Massal, Proses Produk Habis, Klasifikasi Kategori", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Tambah Produk, Ubah Produk, Tambah Opsi, Editor Deskripsi Detail, Upload Gambar Mini, Pengaturan Produk Terkait, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link alamat URL", 
@@ -5943,12 +5943,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar Pesanan, Riwayat Pembayaran, Daftar Pembatalan/Refund, Semua Pesanan, Manajemen Pengiriman, Proses Massal, Item Terpilih", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Detail Pesanan, Informasi Detail, Ubah Alamat Pengiriman, Pembatalan Sebagian, Ubah Pembayaran, Ganti Penerima, Catatan Admin, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link nomor pesanan", 
@@ -6040,12 +6040,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar Ulasan, Manajemen Ulasan Produk, List Rating, Persetujuan Massal, Postingan Belum Dijawab", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Detail Ulasan, Tulis Jawaban, Sembunyikan Ulasan, Beri Poin Reward, Cek Ulasan Tunggal, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link alamat", 
@@ -6082,12 +6082,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar Kupon, Status Penerbitan, Riwayat Penggunaan", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Pembuatan Kupon, Pengaturan Syarat, Input Persentase Diskon, Penerbitan Tunggal, Pengaturan Target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link alamat", 
@@ -6194,12 +6194,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Riwayat Event, List Promo", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Ubah Event, Pengaturan Target, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link alamat", 
@@ -6306,12 +6306,12 @@
       "layout_list": { 
         "semantic": "Halaman daftar, tabel, atau list yang menampilkan banyak item", 
         "bias": "Daftar {TYPE}, List {TYPE}, Tabel {TYPE}, Massal {TYPE}, Daftar, List, Tabel, Massal", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman formulir untuk menampilkan atau memasukkan informasi detail item tunggal", 
         "bias": "Detail {TYPE}, Formulir {TYPE}, Input {TYPE}, Ubah {TYPE}, Detail, Formulir, Input, Ubah, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Pengidentifikasi link alamat", 
@@ -6335,12 +6335,12 @@
       "layout_list": { 
         "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", 
         "bias": "Senarai {TYPE}, jadual {TYPE}, grid {TYPE}, pukal {TYPE}, senarai penghantaran, cetak label, status penghantaran, penghantaran tertunda, penghantaran pukal", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", 
         "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, kemas kini penjejakan, jejak tunggal, pembetulan ralat alamat, proses pulangan, paparan terperinci, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "pautan pengidentifikasi nombor penjejakan invois", 
@@ -6447,12 +6447,12 @@
       "layout_list": { 
         "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", 
         "bias": "Senarai {TYPE}, jadual {TYPE}, grid {TYPE}, pukal {TYPE}, senarai produk, pengurusan paparan, pengurusan inventori, kemas kini pukal, proses kehabisan stok, klasifikasi kategori", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", 
         "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, tambah produk, kemas kini produk, tambah pilihan, editor penjelasan, muat naik lakaran kecil, tetapan produk berkaitan, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "pautan pengidentifikasi alamat", 
@@ -6659,12 +6659,12 @@
       "layout_list": { 
         "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", 
         "bias": "Senarai {TYPE}, jadual {TYPE}, grid {TYPE}, pukal {TYPE}, senarai pesanan, sejarah pembayaran, senarai pembatalan/pemulangan wang, semua pesanan, pengurusan pengeluaran pesanan, proses pukal, item terpilih", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", 
         "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, butiran pesanan, maklumat terperinci, kemas kini alamat penghantaran, batal sebahagian, kemas kini pembayaran, tukar penerima, memo admin, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "pengidentifikasi pautan nombor pesanan", 
@@ -6756,12 +6756,12 @@
       "layout_list": { 
         "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", 
         "bias": "Senarai {TYPE}, jadual {TYPE}, grid {TYPE}, pukal {TYPE}, senarai ulasan, pengurusan penilaian produk, senarai penilaian, kelulusan pukal, hantaran tanpa jawapan", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", 
         "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, butiran ulasan, tulis jawapan, proses buta, berikan mata ganjaran, pertanyaan tunggal, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "pengidentifikasi pautan alamat", 
@@ -6795,8 +6795,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai kupon, status pengeluaran, pertanyaan sejarah penggunaan", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, cipta kupon, tetapan syarat, input kadar diskaun, pengeluaran tunggal, tetapan sasaran, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai kupon, status pengeluaran, pertanyaan sejarah penggunaan", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, cipta kupon, tetapan syarat, input kadar diskaun, pengeluaran tunggal, tetapan sasaran, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi pautan alamat", "bias": "Pengidentifikasi {TYPE}, nombor {TYPE}, kod {TYPE}, EVT-001, COUPON_9921", "prejudice": "diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
       "type": { "semantic": "jenis klasifikasi nama jenis", "bias": "Diskaun Tetap, Diskaun Peratusan, Penghantaran Percuma, Hadiah Percuma", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
       "status": { "semantic": "status kemajuan status", "bias": "Status {TYPE}, kemajuan {TYPE}, Sedang Berjalan, Tamat, Menunggu, Sedang Dikeluarkan, Pengeluaran Ditutup", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
@@ -6819,8 +6819,8 @@
       "registration_date": { "semantic": "tarikh pendaftaran tarikh dicipta", "bias": "Tarikh {TYPE}, masa {TYPE}, tarikh pendaftaran {TYPE}, 2026-02-15", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat" }
     },
     "event": {
-      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai acara, senarai pameran khas", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, kemas kini acara, tetapan sasaran, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai acara, senarai pameran khas", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, kemas kini acara, tetapan sasaran, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "pengidentifikasi pautan alamat", "bias": "Pengidentifikasi {TYPE}, nombor {TYPE}, kod {TYPE}, EVT-001, COUPON_9921", "prejudice": "diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
       "type": { "semantic": "jenis kategori nama jenis", "bias": "Diskaun Fixed, Diskaun Peratusan, Penghantaran Percuma, Hadiah Percuma", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
       "status": { "semantic": "status kemajuan status", "bias": "Status {TYPE}, kemajuan {TYPE}, Sedang Berjalan, Tamat, Menunggu, Sedang Dikeluarkan, Pengeluaran Ditutup", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat, tarikh pendaftaran, tarikh dicipta" },
@@ -6843,8 +6843,8 @@
       "registration_date": { "semantic": "tarikh pendaftaran tarikh dicipta", "bias": "Tarikh {TYPE}, masa {TYPE}, tarikh pendaftaran {TYPE}, 2026-02-15", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, diskaun tetap, diskaun peratusan, penghantaran percuma, jenis, kategori, nama jenis, kemajuan, nama kupon, nama acara, tarikh mula, masa mula, tarikh dikeluarkan, tarikh tamat, tarikh luput, tarikh akhir, nombor kupon, jumlah diskaun, kadar diskaun, kuantiti, jumlah dikeluarkan, had penggunaan, penggunaan maksimum, had per pengguna, pelanggan baru, pendaftaran baru, pembelian pertama, pesanan pertama, jumlah pesanan minimum, syarat pembayaran, jumlah pesanan maksimum, jumlah diskaun maksimum, had diskaun, sekatan wilayah, sekatan penghantaran, nombor telefon, hubungan, pertanyaan, alamat, lokasi, tempat" }
     },
     "default": {
-      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai, jadual, pukal", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, butiran, borang, input, kemas kini, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "Halaman senarai, jadual, atau grid yang menyenaraikan pelbagai item", "bias": "Senarai {TYPE}, jadual {TYPE}, pukal {TYPE}, senarai, jadual, pukal", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "Halaman borang untuk memaparkan atau memasukkan maklumat terperinci item tunggal", "bias": "Butiran {TYPE}, borang {TYPE}, input {TYPE}, kemas kini {TYPE}, butiran, borang, input, kemas kini, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "alamat pautan pengidentifikasi", "bias": "Pengidentifikasi {TYPE}, nombor {TYPE}, kod {TYPE}, ID-001, 12345, /path/to/resource", "prejudice": "tajuk, nama, pengumuman, panduan produk, acara, normal, menunggu, ralat, selesai, status, kemajuan" },
       "title": { "semantic": "tajuk nama", "bias": "Nama {TYPE}, tajuk {TYPE}, nama {TYPE}, pengumuman, panduan produk, acara", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, normal, menunggu, ralat, selesai, status, kemajuan" },
       "status": { "semantic": "status", "bias": "Status {TYPE}, kemajuan {TYPE}, normal, menunggu, ralat, selesai", "prejudice": "pengidentifikasi, pautan, alamat, nombor, kod, tajuk, nama, pengumuman, panduan produk, acara" }
@@ -6855,12 +6855,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách giao hàng, Lịch sử in hóa đơn, Tình trạng giao hàng, Danh sách chưa giao, Gửi hàng loạt", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Sửa hóa đơn, Tra cứu giao hàng đơn lẻ, Sửa lỗi địa chỉ nhận, Xử lý trả hàng, Tra cứu chi tiết, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết số vận đơn hóa đơn", 
@@ -6967,12 +6967,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách sản phẩm, Quản lý trưng bày, Quản lý kho, Sửa hàng loạt, Xử lý hết hàng, Phân loại danh mục", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Đăng ký sản phẩm, Sửa sản phẩm, Thêm tùy chọn, Trình chỉnh sửa mô tả chi tiết, Đăng ký ảnh thu nhỏ, Thiết lập sản phẩm liên quan, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết địa chỉ", 
@@ -7179,12 +7179,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách đơn hàng, Lịch sử thanh toán, Danh sách hủy/hoàn tiền, Toàn bộ đơn hàng, Quản lý đặt hàng, Xử lý hàng loạt, Mục chọn", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Chi tiết đơn hàng, Thông tin chi tiết, Sửa địa chỉ nhận, Hủy một phần, Sửa thanh toán, Thay đổi người nhận, Ghi chú quản trị, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết số đơn hàng", 
@@ -7276,12 +7276,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách đánh giá, Quản lý bình luận, Danh sách điểm số, Duyệt hàng loạt, Bài viết chưa trả lời", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Chi tiết đánh giá, Viết câu trả lời, Xử lý ẩn bài viết, Trao điểm thưởng, Tra cứu đơn lẻ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết địa chỉ", 
@@ -7318,12 +7318,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách phiếu giảm giá, Tình trạng phát hành, Tra cứu lịch sử sử dụng", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Tạo phiếu giảm giá, Thiết lập điều kiện, Nhập tỷ lệ giảm giá, Phát hành đơn lẻ, Thiết lập mục tiêu, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết địa chỉ", 
@@ -7430,12 +7430,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị many mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Lịch sử sự kiện, Danh sách triển lãm đặc biệt", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Sửa sự kiện, Thiết lập mục tiêu, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết địa chỉ", 
@@ -7542,12 +7542,12 @@
       "layout_list": { 
         "semantic": "Trang danh sách, bảng hiển thị nhiều mục", 
         "bias": "Danh sách {TYPE}, Liệt kê {TYPE}, Bảng {TYPE}, Hàng loạt {TYPE}, Danh sách, Liệt kê, Bảng, Hàng loạt", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "Trang biểu mẫu hiển thị hoặc nhập thông tin chi tiết của một mục duy nhất", 
         "bias": "Chi tiết {TYPE}, Biểu mẫu {TYPE}, Nhập {TYPE}, Sửa {TYPE}, Chi tiết, Biểu mẫu, Nhập, Sửa, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "Mã định danh liên kết địa chỉ", 
@@ -7571,12 +7571,12 @@
       "layout_list": { 
         "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", 
         "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการจัดส่ง, ประวัติการพิมพ์ใบปะหน้า, สถานะการจัดส่ง, รายการยังไม่จัดส่ง, จัดส่งแบบกลุ่ม", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", 
         "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, แก้ไขใบปะหน้า, ตรวจสอบการจัดส่งรายเดี่ยว, แก้ไขข้อผิดพลาดที่อยู่จัดส่ง, จัดการคืนสินค้า, ตรวจสอบรายละเอียด, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ตัวระบุ ลิงก์ หมายเลขติดตามพัสดุ ใบปะหน้า", 
@@ -7683,12 +7683,12 @@
       "layout_list": { 
         "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", 
         "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการสินค้า, การจัดการแสดงสินค้า, การจัดการคลังสินค้า, แก้ไขแบบกลุ่ม, จัดการสินค้าหมด, การจัดหมวดหมู่", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", 
         "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, ลงทะเบียนสินค้า, แก้ไขสินค้า, เพิ่มตัวเลือก, ตัวแก้ไขรายละเอียดสินค้า, ลงทะเบียนรูปภาพตัวอย่าง, ตั้งค่าสินค้าที่เกี่ยวข้อง, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ตัวระบุ ลิงก์ ที่อยู่", 
@@ -7895,12 +7895,12 @@
       "layout_list": { 
         "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", 
         "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการสั่งซื้อ, ประวัติการชำระเงิน, รายการยกเลิก/คืนเงิน, รายการสั่งซื้อทั้งหมด, การจัดการคำสั่งซื้อ, การประมวลผลแบบกลุ่ม, รายการที่เลือก", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", 
         "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, รายละเอียดการสั่งซื้อ, ข้อมูลโดยละเอียด, แก้ไขที่อยู่จัดส่ง, ยกเลิกบางส่วน, แก้ไขการชำระเงิน, เปลี่ยนแปลงผู้รับ, บันทึกของผู้ดูแลระบบ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ตัวระบุ ลิงก์ หมายเลขสั่งซื้อ", 
@@ -7992,12 +7992,12 @@
       "layout_list": { 
         "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", 
         "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการรีวิว, การจัดการความเห็นเกี่ยวกับสินค้า, รายการคะแนนรีวิว, อนุมัติแบบกลุ่ม, โพสต์ที่ยังไม่มีการตอบกลับ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", 
         "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, รายละเอียดรีวิว, เขียนคำตอบ, ซ่อนความเห็น(บลายด์), มอบคะแนนสะสม, ตรวจสอบรายละเอียดรายเดี่ยว, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ตัวระบุ ลิงก์ ที่อยู่", 
@@ -8031,8 +8031,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการคูปอง, สถานะการออกคูปอง, ตรวจสอบประวัติการใช้งาน", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, สร้างคูปอง, ตั้งค่าเงื่อนไข, กรอกอัตราส่วนลด, ออกคูปองเดี่ยว, ตั้งค่ากลุ่มเป้าหมาย, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการคูปอง, สถานะการออกคูปอง, ตรวจสอบประวัติการใช้งาน", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, สร้างคูปอง, ตั้งค่าเงื่อนไข, กรอกอัตราส่วนลด, ออกคูปองเดี่ยว, ตั้งค่ากลุ่มเป้าหมาย, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ ที่อยู่", "bias": "ตัวระบุ{TYPE}, หมายเลข{TYPE}, รหัส{TYPE}, EVT-001, COUPON_9921", "prejudice": "ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
       "type": { "semantic": "ประเภท ชนิด ชื่อชนิดสินค้า", "bias": "ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, มอบของสมนาคุณ", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
       "status": { "semantic": "สถานะ ความคืบหน้าสถานะ", "bias": "สถานะ{TYPE}, ความคืบหน้า{TYPE}, กำลังดำเนินการ, สิ้นสุด, กำลังรอขั้นตอน, กำลังออกคูปอง, ปิดรับการออกคูปอง", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
@@ -8055,8 +8055,8 @@
       "registration_date": { "semantic": "วันที่ลงทะเบียน วันที่สร้าง", "bias": "วันที่{TYPE}, วันเวลา{TYPE}, วันที่ลงทะเบียน{TYPE}, 2026-02-15", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่" }
     },
     "event": {
-      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการคูปอง, สถานะการออกคูปอง, ตรวจสอบประวัติการใช้งาน", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, สร้างคูปอง, ตั้งค่าเงื่อนไข, กรอกอัตราส่วนลด, ออกคูปองเดี่ยว, ตั้งค่ากลุ่มเป้าหมาย, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการคูปอง, สถานะการออกคูปอง, ตรวจสอบประวัติการใช้งาน", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, สร้างคูปอง, ตั้งค่าเงื่อนไข, กรอกอัตราส่วนลด, ออกคูปองเดี่ยว, ตั้งค่ากลุ่มเป้าหมาย, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ ที่อยู่", "bias": "ตัวระบุ{TYPE}, หมายเลข{TYPE}, รหัส{TYPE}, EVT-001, COUPON_9921", "prejudice": "ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
       "type": { "semantic": "ประเภท ชนิด ชื่อชนิดสินค้า", "bias": "ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, มอบของสมนาคุณ", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
       "status": { "semantic": "สถานะ ความคืบหน้าสถานะ", "bias": "สถานะ{TYPE}, ความคืบหน้า{TYPE}, กำลังดำเนินการ, สิ้นสุด, กำลังรอขั้นตอน, กำลังออกคูปอง, ปิดรับการออกคูปอง", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่, วันที่ลงทะเบียน, วันที่สร้าง" },
@@ -8079,8 +8079,8 @@
       "registration_date": { "semantic": "暗号일자 วันที่ลงทะเบียน วันที่สร้าง", "bias": "วันที่{TYPE}, วันเวลา{TYPE}, วันที่ลงทะเบียน{TYPE}, 2026-02-15", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ส่วนลดคงที่, ส่วนลดตามสัดส่วน, จัดส่งฟรี, ประเภท, ชนิด, ชื่อชนิดสินค้า, ความคืบหน้า, ชื่อคูปอง, ชื่ออีเวนต์, วันที่เริ่ม, วันเวลาเริ่มต้น, วันที่ออกคูปอง, วันที่สิ้นสุด, วันหมดอายุ, วันปิดรับ, หมายเลขคูปอง, จำนวนส่วนลด, อัตราส่วนลด, จำนวน, จำนวนที่ออก, ข้อจำกัดการใช้งาน, การใช้งานสูงสุด, จำกัดการใช้งานต่อคน, ลูกค้าใหม่, สมัครสมาชิกใหม่, ซื้อครั้งแรก, สั่งซื้อครั้งแรก, ยอดสั่งซื้อขั้นต่ำ, เงื่อนไขการชำระเงิน, ยอดสั่งซื้อสูงสุด, จำนวนส่วนลดสูงสุด, วงเงินส่วนลดสูงสุด, ข้อจำกัดพื้นที่, ไม่สามารถจัดส่งได้, เบอร์โทรศัพท์, ข้อมูลติดต่อ, ช่องทางสอบถาม, ที่อยู่, ตำแหน่ง, สถานที่" }
     },
     "default": {
-      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการ, ลิสต์, ตาราง, ทั้งหมด", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, รายละเอียด, ฟอร์ม, กรอกข้อมูล, แก้ไข, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "หน้าตาราง รายการ หรือหน้าเพจที่แสดงรายการหลายรายการ", "bias": "รายการ{TYPE}, ลิสต์{TYPE}, ตาราง{TYPE}, ทั้งหมด{TYPE}, รายการ, ลิสต์, ตาราง, ทั้งหมด", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "หน้าฟอร์มสำหรับแสดงหรือกรอกข้อมูลรายละเอียดของรายการเดียว", "bias": "รายละเอียด{TYPE}, ฟอร์ม{TYPE}, กรอกข้อมูล{TYPE}, แก้ไข{TYPE}, รายละเอียด, ฟอร์ม, กรอกข้อมูล, แก้ไข, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ตัวระบุ ลิงก์ ที่อยู่", "bias": "ตัวระบุ{TYPE}, หมายเลข{TYPE}, รหัส{TYPE}, ID-001, 12345, /path/to/resource", "prejudice": "หัวข้อ, ชื่อ, ประกาศสำคัญ, ข้อมูลสินค้า, อีเวนต์, ปกติ, กำลังรอขั้นตอน, ข้อผิดพลาด, เสร็จสิ้น, สถานะ, ความคืบหน้า" },
       "title": { "semantic": "หัวข้อ ชื่อ", "bias": "ชื่อ{TYPE}, หัวข้อ{TYPE}, ชื่อเรียก{TYPE}, ประกาศสำคัญ, ข้อมูลสินค้า, อีเวนต์", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, ปกติ, กำลังรอขั้นตอน, ข้อผิดพลาด, เสร็จสิ้น, สถานะ, ความคืบหน้า" },
       "status": { "semantic": "สถานะ", "bias": "สถานะ{TYPE}, ความคืบหน้า{TYPE}, ปกติ, กำลังรอขั้นตอน, ข้อผิดพลาด, เสร็จสิ้น", "prejudice": "ตัวระบุ, ลิงก์, ที่อยู่, หมายเลข, รหัส, หัวข้อ, ชื่อ, ประกาศสำคัญ, ข้อมูลสินค้า, อีเวนต์" }
@@ -8091,12 +8091,12 @@
       "layout_list": { 
         "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", 
         "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة الشحن، سجل طباعة البوالص، حالة التوصيل، قائمة الشحنات غير المسلمة، إرسال جماعي", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", 
         "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تعديل البوليصة، تتبع شحنة واحدة، تصحيح خطأ العنوان، معالجة المرتجعات، استعلام تفصيلي، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "رابط المعرف، رقم التتبع، بوليصة الشحن", 
@@ -8203,12 +8203,12 @@
       "layout_list": { 
         "semantic": "صفحة قائمة، جدول، أو لائحة تعرض عناصر متعددة", 
         "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة المنتجات، إدارة العرض، إدارة المخزون، تعديل جماعي، معالجة النفاد، تصنيف الفئات", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", 
         "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تسجيل منتج، تعديل منتج، إضافة خيار، محرر الوصف التفصيلي، تسجيل صورة مصغرة، إعداد المنتجات ذات الصلة، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "المعرف، الرابط، العنوان", 
@@ -8415,12 +8415,12 @@
       "layout_list": { 
         "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", 
         "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة الطلبات، سجل الدفع، قائمة الإلغاء/الاسترداد، إجمالي الطلبات، إدارة أوامر الشراء، معالجة جماعية، العناصر المحددة", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", 
         "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تفاصيل الطلب، معلومات تفصيلية، تعديل عنوان التوصيل، إلغاء جزئي، تعديل الدفع، تغيير المستلم، ملاحظة المسؤول، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "المعرف، الرابط، رقم الطلب", 
@@ -8512,12 +8512,12 @@
       "layout_list": { 
         "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", 
         "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة المراجعات، إدارة تقييمات المنتجات، قائمة الدرجات، موافقة جماعية، منشورات بدون رد", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", 
         "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تفاصيل المراجعة، كتابة الرد، حجب المنشور، صرف النقاط، استعلام فردي، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "المعرف، الرابط، العنوان", 
@@ -8551,8 +8551,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة الكوبونات، حالة الإصدار، استعلام عن سجل الاستخدام", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، إنشاء كوبون، إعداد الشروط، إدخال نسبة الخصم، إصدار فردي، إعداد الفئة المستهدفة، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة الكوبونات، حالة الإصدار، استعلام عن سجل الاستخدام", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، إنشاء كوبون، إعداد الشروط، إدخال نسبة الخصم، إصدار فردي، إعداد الفئة المستهدفة، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "المعرف، الرابط، العنوان", "bias": "معرف {TYPE}، رقم {TYPE}، رمز {TYPE}، EVT-001، COUPON_9921", "prejudice": "خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
       "type": { "semantic": "النوع، الصنف، اسم الصنف", "bias": "خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، تقديم هدية مجانية", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
       "status": { "semantic": "الحالة، حالة التقدم", "bias": "حالة {TYPE}، تقدم {TYPE}، جاري، منتهي، قيد الانتظار، جاري الإصدار، انتهى الإصدار", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
@@ -8575,8 +8575,8 @@
       "registration_date": { "semantic": "تاريخ التسجيل، تاريخ الإنشاء", "bias": "تاريخ {TYPE}، تاريخ {TYPE}، تاريخ تسجيل {TYPE}، 2026-02-15", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان" }
     },
     "event": {
-      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، سجل الفعاليات، قائمة المعارض الترويجية", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تعديل الفعالية، إعداد الفئة المستهدفة، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، سجل الفعاليات، قائمة المعارض الترويجية", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تعديل الفعالية، إعداد الفئة المستهدفة، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "المعرف، الرابط، العنوان", "bias": "معرف {TYPE}، رقم {TYPE}، رمز {TYPE}، EVT-001، COUPON_9921", "prejudice": "خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
       "type": { "semantic": "النوع، الصنف، اسم الصنف", "bias": "خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، تقديم هدية مجانية", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
       "status": { "semantic": "الحالة، حالة التقدم", "bias": "حالة {TYPE}، تقدم {TYPE}، جاري، منتهي، قيد الانتظار، جاري الإصدار، انتهى الإصدار", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم., الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان، تاريخ التسجيل، تاريخ الإنشاء" },
@@ -8599,8 +8599,8 @@
       "registration_date": { "semantic": "تاريخ التسجيل، تاريخ الإنشاء", "bias": "تاريخ {TYPE}، تاريخ {TYPE}، تاريخ تسجيل {TYPE}، 2026-02-15", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، خصم بمبلغ ثابت، خصم بنسبة مئوية، شحن مجاني، النوع، الصنف، اسم الصنف، حالة التقدم، اسم الكوبون، اسم الفعالية، تاريخ البدء، وقت البدء، تاريخ الإصدار، تاريخ الانتهاء، تاريخ الصلاحية، الموعد النهائي، رقم الكوبون، قيمة الخصم، نسبة الخصم، الكمية، كمية الإصدار، حد الاستخدام، الحد الأقصى للاستخدام، حد الاستخدام للشخص الواحد، عميل جديد، تسجيل جديد، أول شراء، أول طلب، الحد الأدنى لمبلغ الطلب، شرط الدفع، الحد الأقصى لمبلغ الطلب، الحد الأقصى لمبلغ الخصم، سقف الخصم، القيود الإقليمية، تعذر التوصيل، رقم الهاتف، بيانات الاتصال، جهة الاستفسار، العنوان، الموقع، المكان" }
     },
     "default": {
-      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة، لائحة، جدول، دفعة", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تفاصيل، نموذج، إدخال، تعديل، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "قائمة أو جدول يعرض عناصر متعددة، صفحة قائمة", "bias": "قائمة {TYPE}، لائحة {TYPE}، جدول {TYPE}، دفعة {TYPE}، قائمة، لائحة، جدول، دفعة", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "صفحة نموذج لعرض أو إدخال تفاصيل عنصر واحد", "bias": "تفاصيل {TYPE}، نموذج {TYPE}، إدخال {TYPE}، تعديل {TYPE}، تفاصيل، نموذج، إدخال، تعديل، {TYPE}، input، {TYPE}، select، {TYPE}، textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "المعرف، الرابط، العنوان", "bias": "معرف {TYPE}، رقم {TYPE}، رمز {TYPE}، ID-001، 12345، /path/to/resource", "prejudice": "العنوان، الاسم، الإعلانات، دليل المنتجات، الفعالية، عادي، قيد الانتظار، خطأ، مكتمل، الحالة، تقدم سير العمل" },
       "title": { "semantic": "العنوان، الاسم", "bias": "اسم {TYPE}، عنوان {TYPE}، اسم {TYPE}، الإعلانات، دليل المنتجات، الفعالية", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، عادي، قيد الانتظار، خطأ، مكتمل، الحالة، تقدم سير العمل" },
       "status": { "semantic": "الحالة", "bias": "حالة {TYPE}، تقدم {TYPE}، عادي، قيد الانتظار، خطأ، مكتمل", "prejudice": "المعرف، الرابط، العنوان، الرقم، الرمز، العنوان، الاسم، الإعلانات، دليل المنتجات، الفعالية" }
@@ -8611,12 +8611,12 @@
       "layout_list": { 
         "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", 
         "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, விநியோகப் பட்டியல், இன்வாய்ஸ் அச்சிடுதல், விநியோக நிலை, விநியோகிக்கப்படாத பட்டியல், மொத்த அனுப்புதல்", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", 
         "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, இன்வாய்ஸ் திருத்தம், ஒற்றை விநியோக வினவல், விநியோக முகவரி பிழை திருத்தம், திரும்புதல் செயலாக்கம், விரிவான வினவல், {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "அடையாளங்காட்டி இணைப்பு கண்காணிப்பு எண் இன்வாய்ஸ்", 
@@ -8723,12 +8723,12 @@
       "layout_list": { 
         "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", 
         "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, தயாரிப்பு பட்டியல், காட்சி மேலாண்மை, சரக்கு மேலாண்மை, மொத்த திருத்தம், கையிருப்பு இல்லா செயலாக்கம், வகை வகைப்பாடு", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", 
         "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, தயாரிப்பு பதிவு, தயாரிப்பு திருத்தம், விருப்பத்தைச் சேர்த்தல், விரிவான விளக்க எடிட்டர், சிறுபடம் பதிவு, தொடர்புடைய தயாரிப்பு அமைப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "அடையாளங்காட்டி இணைப்பு முகவரி", 
@@ -8935,12 +8935,12 @@
       "layout_list": { 
         "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", 
         "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, ஆர்டர் பட்டியல், கட்டண விவரங்கள், ரத்து/திரும்பப்பெறுதல் பட்டியல், அனைத்து ஆர்டர்கள், ஆர்டர் மேலாண்மை, மொத்த செயலாக்கம், தேர்ந்தெடுக்கப்பட்ட உருப்படிகள்", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", 
         "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, ஆர்டர் விவரம், விரிவான தகவல், விநியோக முகவரி திருத்தம், பகுதி ரத்து, கட்டண திருத்தம், பெறுநர் மாற்றம், நிர்வாகி குறிப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "அடையாளங்காட்டி இணைப்பு ஆர்டர் எண்", 
@@ -9032,12 +9032,12 @@
       "layout_list": { 
         "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", 
         "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, விமர்சனப் பட்டியல், தயாரிப்பு மதிப்புரை மேலாண்மை, மதிப்பீட்டு பட்டியல், மொத்த ஒப்புதல், பதிலளிக்கப்படாத இடுகைகள்", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", 
         "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, விமர்சன விவரம், பதில் எழுதுதல், மறைக்கப்பட்ட செயலாக்கம், புள்ளிகள் வழங்குதல், ஒற்றை வினவல், {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "அடையாளங்காட்டி இணைப்பு முகவரி", 
@@ -9071,8 +9071,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, கூப்பன் பட்டியல், வழங்கல் நிலை, பயன்பாட்டு வரலாற்று வினவல்", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, கூப்பன் உருவாக்கம், நிபந்தனை அமைப்பு, தள்ளுபடி விகித உள்ளீடு, ஒற்றை வழங்கல், இலக்கு அமைப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, கூப்பன் பட்டியல், வழங்கல் நிலை, பயன்பாட்டு வரலாற்று வினவல்", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, கூப்பன் உருவாக்கம், நிபந்தனை அமைப்பு, தள்ளுபடி விகித உள்ளீடு, ஒற்றை வழங்கல், இலக்கு அமைப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு முகவரி", "bias": "{TYPE} அடையாளங்காட்டி, {TYPE} எண், {TYPE} குறியீடு, EVT-001, COUPON_9921", "prejudice": "நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், முன்னேற்றம், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
       "type": { "semantic": "வகை இனம் இனப் பெயர்", "bias": "நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், இலவச பரிசு வழங்கல்", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, முன்னேற்றம், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
       "status": { "semantic": "நிலை முன்னேற்ற நிலை", "bias": "{TYPE} நிலை, {TYPE} முன்னேற்றம், செயல்பாட்டில் உள்ளது, முடிந்தது, காத்திருப்பு, வழங்கலில் உள்ளது, வழங்கல் முடிந்தது", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
@@ -9095,8 +9095,8 @@
       "registration_date": { "semantic": "பதிவு தேதி உருவாக்கப்பட்ட தேதி", "bias": "{TYPE} தேதி, {TYPE} நாள், {TYPE} பதிவு தேதி, 2026-02-15", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், முன்னேற்ற நிலை, கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்சப் பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம்" }
     },
     "event": {
-      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, நிகழ்வு வரலாறு, கண்காட்சி பட்டியல்", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, நிகழ்வு திருத்தம், இலக்கு அமைப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, நிகழ்வு வரலாறு, கண்காட்சி பட்டியல்", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, நிகழ்வு திருத்தம், இலக்கு அமைப்பு, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு முகவரி", "bias": "{TYPE} அடையாளங்காட்டி, {TYPE} எண், {TYPE} குறியீடு, EVT-001, COUPON_9921", "prejudice": "நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், முன்னேற்றம், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
       "type": { "semantic": "வகை இனம் இனப் பெயர்", "bias": "நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், இலவச பரிசு வழங்கல்", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, முன்னேற்றம், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
       "status": { "semantic": "நிலை முன்னேற்ற நிலை", "bias": "{TYPE} நிலை, {TYPE} முன்னேற்றம், செயல்பாட்டில் உள்ளது, முடிந்தது, காத்திருப்பு, வழங்கலில் உள்ளது, வழங்கல் முடிந்தது", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்ச பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம், பதிவு தேதி, உருவாக்கப்பட்ட தேதி" },
@@ -9119,8 +9119,8 @@
       "registration_date": { "semantic": "பதிவு தேதி உருவாக்கப்பட்ட தேதி", "bias": "{TYPE} தேதி, {TYPE} நாள், {TYPE} பதிவு தேதி, 2026-02-15", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, நிலையான தள்ளுபடி, சதவீத தள்ளுபடி, இலவச விநியோகம், வகை, இனம், இனப் பெயர், முன்னேற்ற நிலை, கூப்பன் பெயர், நிகழ்வு பெயர், தொடக்க நாள், தொடக்க நேரம், வழங்கல் தேதி, முடிவு நாள், காலாவதி தேதி, முடிவு நாள், கூப்பன் எண், தள்ளுபடி தொகை, தள்ளுபடி விகிதம், அளவு, வழங்கல் அளவு, பயன்பாட்டு வரம்பு, அதிகபட்சப் பயன்பாடு, ஒரு நபருக்கான பயன்பாட்டு வரம்பு, புதிய வாடிக்கையாளர், புதிய பதிவு, முதல் கொள்முதல், முதல் ஆர்டர், குறைந்தபட்ச ஆர்டர் தொகை, கட்டண நிபந்தனை, அதிகபட்ச ஆர்டர் தொகை, அதிகபட்ச தள்ளுபடி தொகை, தள்ளுபடி வரம்பு, பிராந்திய வரம்பு, விநியோகிக்க முடியாது, தொலைபேசி எண், தொடர்பு எண், விசாரணை இடம், முகவரி, இருப்பிடம், இடம்" }
     },
     "default": {
-      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, பட்டியல், லிஸ்ட், அட்டவணை, மொத்தமாக", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, விவரம், படிவம், உள்ளீடு, திருத்தம், {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "பல உருப்படிகளைப் பட்டியலிடும் பட்டியல், அட்டவணை, பக்கப் பட்டியல்", "bias": "{TYPE} பட்டியல், {TYPE} லிஸ்ட், {TYPE} அட்டவணை, {TYPE} மொத்தமாக, பட்டியல், லிஸ்ட், அட்டவணை, மொத்தமாக", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ஒற்றை உருப்படியின் விரிவான தகவலைக் காண்பிக்கும் அல்லது உள்ளிடும் படிவப் பக்கம்", "bias": "{TYPE} விவரம், {TYPE} படிவம், {TYPE} உள்ளீடு, {TYPE} திருத்து, விவரம், படிவம், உள்ளீடு, திருத்தம், {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "அடையாளங்காட்டி இணைப்பு முகவரி", "bias": "{TYPE} அடையாளங்காட்டி, {TYPE} எண், {TYPE} குறியீடு, ID-001, 12345, /path/to/resource", "prejudice": "தலைப்பு, பெயர், அறிவிப்புகள், தயாரிப்பு வழிகாட்டி, நிகழ்வு, சாதாரணம், காத்திருப்பு, பிழை, முடிந்தது, நிலை, முன்னேற்றம்" },
       "title": { "semantic": "தலைப்பு பெயர்", "bias": "{TYPE} பெயர், {TYPE} தலைப்பு, {TYPE} பெயர், அறிவிப்புகள், தயாரிப்பு வழிகாட்டி, நிகழ்வு", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, சாதாரணம், காத்திருப்பு, பிழை, முடிந்தது, நிலை, முன்னேற்றம்" },
       "status": { "semantic": "நிலை", "bias": "{TYPE} நிலை, {TYPE} முன்னேற்றம், சாதாரணம், காத்திருப்பு, பிழை, முடிந்தது", "prejudice": "அடையாளங்காட்டி, இணைப்பு, முகவரி, எண், குறியீடு, தலைப்பு, பெயர், அறிவிப்புகள், தயாரிப்பு வழிகாட்டி, நிகழ்வு" }
@@ -9131,12 +9131,12 @@
       "layout_list": { 
         "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", 
         "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, షిప్పింగ్ జాబితా, లేబుల్ ప్రింట్ హిస్టరీ, డెలివరీ స్థితి, డెలివరీ కాని వాటి జాబితా, బల్క్ డిస్పాచ్", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ఒకే వస్తువు యొక్క వివరణాత్మక సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", 
         "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, వేబిల్ సవరణ, సింగిల్ డెలివరీ ట్రాకింగ్, चिరునామా లోపం సవరణ, రిటర్న్ ప్రాసెస్, వివరణాత్మక శోధన, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ఐడెంటిఫైయర్ లింక్ ట్రాకింగ్ నంబర్ వేబిల్", 
@@ -9243,12 +9243,12 @@
       "layout_list": { 
         "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", 
         "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, వస్తువుల జాబితా, ప్రదర్శన నిర్వహణ, ఇన్వెంటరీ నిర్వహణ, బల్క్ సవరణ, అవుట్ ఆఫ్ స్టాక్ ప్రాసెస్, కేటగిరీ వర్గీకరణ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ఒకే వస్తువు యొక్క వివరణాత్మక సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", 
         "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, ఉత్పత్తి నమోదు, ఉత్పత్తి సవరణ, ఆప్షన్ జోడింపు, వివరణ ఎడిటర్, థంబ్‌నెయిల్ నమోదు, సంబంధిత ఉత్పత్తి సెట్టింగ్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ఐడెంటిఫైయర్ లింక్ చిరునామా", 
@@ -9455,12 +9455,12 @@
       "layout_list": { 
         "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", 
         "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, ఆర్డర్ల జాబితా, చెల్లింపుల చరిత్ర, రద్దు/రీఫండ్ల జాబితా, మొత్తం ఆర్డర్లు, డిస్పాచ్ నిర్వహణ, బల్క్ ప్రాసెస్, ఎంచుకున్న ఐటమ్స్", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", 
         "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, ఆర్డర్ వివరాలు, పూర్తి సమాచారం, డెలివరీ చిరునామా మార్పు, పాక్షిక రద్దు, చెల్లింపు సవరణ, గ్రహీత మార్పు, అడ్మిన్ నోట్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ఐడెంటిఫైయర్ లింక్ ఆర్డర్ నంబర్", 
@@ -9552,12 +9552,12 @@
       "layout_list": { 
         "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", 
         "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, రివ్యూల జాబితా, రేటింగ్స్ నిర్వహణ, స్కోర్ల జాబితా, బల్క్ అప్రూవల్, సమాధానం ఇవ్వని పోస్ట్‌లు", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", 
         "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, రివ్యూ వివరాలు, సమాధానం రాయడం, బ్లైండ్/హైడ్ ప్రాసెస్, రివార్డ్ పాయింట్ల జారీ, సింగిల్ శోధన, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ఐడెంటిఫైయర్ లింక్ చిరునామా", 
@@ -9591,8 +9591,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, కూపన్ల జాబితా, జారీ స్థితి, వినియోగ చరిత్ర శోధన", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, కూపన్ సృష్టి, నిబంధనల సెట్టింగ్, తగ్గింపు నమోదు, సింగిల్ ఇష్యూ, టార్గెట్ సెట్టింగ్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, కూపన్ల జాబితా, జారీ స్థితి, వినియోగ చరిత్ర శోధన", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, కూపన్ సృష్టి, నిబంధనల సెట్టింగ్, తగ్గింపు నమోదు, సింగిల్ ఇష్యూ, టార్గెట్ సెట్టింగ్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ఐడెంటిఫైయర్ లింక్ చిరునామా", "bias": "{TYPE} ఐడెంటిఫైయర్, {TYPE} నంబర్, {TYPE} కోడ్, EVT-001, COUPON_9921", "prejudice": "స్థిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు परिమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
       "type": { "semantic": "రకం రకం పేరు కేటగిరీ", "bias": "స్థిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, బహుమతి ఆఫర్", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
       "status": { "semantic": "స్థితి పురోగతి స్థితి", "bias": "{TYPE} స్థితి, {TYPE} పురోగతి, లైవ్/నడుస్తోంది, ముగిసింది, పెండింగ్, జారీ అవుతోంది, జారీ ముగిసింది", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, स्थిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
@@ -9615,8 +9615,8 @@
       "registration_date": { "semantic": "నమోదు తేదీ సృష్టించిన తేదీ", "bias": "{TYPE} తేదీ, {TYPE} తేదీ, {TYPE} నమోదు తేదీ, 2026-02-15", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, स्थిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్" }
     },
     "event": {
-      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, ఈవెంట్ చరిత్ర, ప్రత్యేక ప్రదర్శన జాబితా", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, ఈవెంట్ సవరణ, టార్గెట్ సెట్టింగ్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, ఈవెంట్ చరిత్ర, ప్రత్యేక ప్రదర్శన జాబితా", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, ఈవెంట్ సవరణ, టార్గెట్ సెట్టింగ్, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ఐడెంటిఫైయర్ లింక్ చిరునామా", "bias": "{TYPE} ఐడెంటిఫైయర్, {TYPE} నంబర్, {TYPE} కోడ్, EVT-001, COUPON_9921", "prejudice": "స్థిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
       "type": { "semantic": "రకం రకం పేరు కేటగిరీ", "bias": "స్థిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, బహుమతి ఆఫర్", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, <b>विనియోగ పరిమితి</b>, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
       "status": { "semantic": "స్థితి పురోగతి స్థితి", "bias": "{TYPE} స్థితి, {TYPE} పురోగతి, లైవ్/నడుస్తోంది, ముగిసింది, పెండింగ్, జారీ అవుతోంది, జారీ ముగిసింది", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, स्थిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్, నమోదు తేదీ, సృష్టించిన తేదీ" },
@@ -9639,8 +9639,8 @@
       "registration_date": { "semantic": "నమోదు తేదీ సృష్టించిన తేదీ", "bias": "{TYPE} తేదీ, {TYPE} తేదీ, {TYPE} నమోదు తేదీ, 2026-02-15", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, स्थిర తగ్గింపు, శాతం తగ్గింపు, ఉచిత షిప్పింగ్, రకం, రకం పేరు, కేటగిరీ, పురోగతి స్థితి, కూపన్ పేరు, ఈవెంట్ పేరు, ప్రారంభ తేదీ, ప్రారంభ సమయం, జారీ తేదీ, ముగింపు తేదీ, గడువు తేదీ, చివరి తేదీ, కూపన్ కోడ్, తగ్గింపు మొత్తం, తగ్గింపు శాతం, పరిమాణం, జారీ చేసిన సంఖ్య, వినియోగ పరిమితి, గరిష్ట వినియోగం, ఒక వ్యక్తికి పరిమితి, కొత్త కస్టమర్, కొత్త యూజర్, మొదటి కొనుగోలు, మొదటి ఆర్డర్, కనిష్ట ఆర్డర్ మొత్తం, చెల్లింపు నిబంధన, గరిష్ట ఆర్డర్ మొత్తం, గరిష్ట తగ్గింపు మొత్తం, తగ్గింపు పరిమితి, ప్రాంతీయ పరిమితి, డెలివరీ లేని ప్రాంతాలు, ఫోన్ నంబర్, పరిచయం, హెల్ప్‌లైన్, చిరునామా, స్థలం, లొకేషన్" }
     },
     "default": {
-      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, జాబితా, లిస్ట్, పట్టిక, బల్క్", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, వివరాలు, ఫారమ్, ఇన్‌పుట్, సవరణ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "బహుళ వస్తువులను జాబితా చేసే పేజీ, పట్టిక లేదా లిస్ట్ పేజీ", "bias": "{TYPE} జాబితా, {TYPE} లిస్ట్, {TYPE} పట్టిక, {TYPE} బల్క్, జాబితా, లిస్ట్, పట్టిక, బల్క్", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "ఒకే వస్తువు యొక్క వివరణాत्मक సమాచారాన్ని చూపించే లేదా నమోదు చేసే ఫారమ్ పేజీ", "bias": "{TYPE} వివరాలు, {TYPE} ఫారమ్, {TYPE} ఇన్‌పుట్, {TYPE} సవరణ, వివరాలు, ఫారమ్, ఇన్‌పుట్, సవరణ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ఐడెంటిఫైయర్ లింక్ చిరునామా", "bias": "{TYPE} ఐడెంటిఫైయర్, {TYPE} నంబర్, {TYPE} కోడ్, ID-001, 12345, /path/to/resource", "prejudice": "శీర్షిక, పేరు, నోటీసు, ఉత్పత్తి గైడ్, ఈవెంట్, సాధారణం, పెండింగ్, లోపం, పూర్తయింది, స్థితి, పురోగతి" },
       "title": { "semantic": "శీర్షిక పేరు", "bias": "{TYPE} పేరు, {TYPE} శీర్షిక, {TYPE} పేరు, నోటీసు, ఉత్పత్తి గైడ్, ఈవెంట్", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, సాధారణం, పెండింగ్, లోపం, పూర్తయింది, స్థితి, పురోగతి" },
       "status": { "semantic": "స్థితి", "bias": "{TYPE} స్థితి, {TYPE} పురోగతి, సాధారణం, పెండింగ్, లోపం, పూర్తయింది", "prejudice": "ఐడెంటిఫైయర్, లింక్, చిరునామా, సంఖ్య, కోడ్, శీర్షిక, పేరు, నోటీసు, ఉత్పత్తి గైడ్, ఈవెంట్" }
@@ -9651,12 +9651,12 @@
       "layout_list": { 
         "semantic": "ಹಲವಾರು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ರವಾನೆ ಪಟ್ಟಿ, ಇನ್‌ವಾಯ್ಸ್ ಪ್ರಿಂಟ್ ವಿವರ, ಡೆಲಿವರಿ ಸ್ಥಿತಿ, ಬಾಕಿ ಇರುವ ರವಾನೆಗಳು, ಬಲ್ಕ್ ರವಾನೆ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ಇನ್‌ವಾಯ್ಸ್ ತಿದ್ದುಪಡಿ, ಸಿಂಗಲ್ ಡೆಲಿವರಿ ಟ್ರ್ಯಾಕಿಂಗ್, ವಿಳಾಸ ದೋಷ ತಿದ್ದುಪಡಿ, ರಿಟರ್ನ್ ಪ್ರಕ್ರಿಯೆ, ವಿವರವಾದ ವೀಕ್ಷಣೆ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ಟ್ರ್ಯಾಕಿಂಗ್ ಸಂಖ್ಯೆ ಇನ್‌ವಾಯ್ಸ್ AWBN", 
@@ -9763,12 +9763,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ಉತ್ಪನ್ನಗಳ ಪಟ್ಟಿ, ಪ್ರದರ್ಶನ ನಿರ್ವಹಣೆ, ದಾಸ್ತಾನು ನಿರ್ವಹಣೆ, ಬಲ್ಕ್ ತಿದ್ದುಪಡಿ, ಸ್ಟಾಕ್ ಇಲ್ಲದಿರುವ ಪ್ರಕ್ರಿಯೆ, ಕ್ಯಾಟಗರಿ ವರ್ಗೀಕರಣ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ಉತ್ಪನ್ನ ನೋಂದಣಿ, ಉತ್ಪನ್ನ ತಿದ್ದುಪಡಿ, ಆಯ್ಕೆ ಸೇರ್ಪಡೆ, ವಿವರಣೆ ಎಡಿಟರ್, ಥಂಬ್‌ನೇಲ್ ಅಪ್‌ಲೋಡ್, ಸಂಬಂಧಿತ ಉತ್ಪನ್ನಗಳ ಸೆಟ್ಟಿಂಗ್, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ವಿಳಾಸ URL", 
@@ -9950,12 +9950,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ಆರ್ಡರ್ ಪಟ್ಟಿ, ಪಾವತಿ ಇತಿಹಾಸ, ರದ್ದತಿ/ಮರುಪಾವತಿ ಪಟ್ಟಿ, ಎಲ್ಲಾ ಆರ್ಡರ್‌ಗಳು, ಆರ್ಡರ್ ವಿತರಣೆ ನಿರ್ವಹಣೆ, ಬಲ್ಕ್ ಪ್ರಕ್ರಿಯೆ, ಆಯ್ಕೆ ಮಾಡಿದ ಐಟಂಗಳು", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ಆರ್ಡರ್ ವಿವರಗಳು, ವಿವರವಾದ ಮಾಹಿತಿ, ಡೆಲಿವರಿ ವಿಳಾಸ ತಿದ್ದುಪಡಿ, ಭಾಗಶಃ ರದ್ದತಿ, ಪಾವತಿ ತಿದ್ದುಪಡಿ, ರಿಸೀವರ್ ಬದಲಾವಣೆ, ನಿರ್ವಾಹಕರ ಮೆಮೊ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ಆರ್ಡರ್ ಸಂಖ್ಯೆ ಬುಕಿಂಗ್ ಐಡಿ", 
@@ -10047,12 +10047,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ರೇಟಿಂಗ್ ಪಟ್ಟಿ, ವಿಮರ್ಶೆ ಪಟ್ಟಿ, ಉತ್ಪನ್ನ ವಿಮರ್ಶೆ ನಿರ್ವಹಣೆ, ಬಲ್ಕ್ ಅನುಮೋದನೆ, ಉತ್ತರಿಸದ ಪೋಸ್ಟ್‌ಗಳು", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ವಿಮರ್ಶೆ ವಿವರಗಳು, ಪ್ರತ್ಯುತ್ತರ ಬರೆಯಿರಿ, ಬ್ಲೈಂಡ್ ಪ್ರಕ್ರಿಯೆ, ರಿವಾರ್ಡ್ ಪಾಯಿಂಟ್‌ಗಳ ವಿತರಣೆ, ಏಕ ವೀಕ್ಷಣೆ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ವಿಳಾಸ", 
@@ -10089,12 +10089,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ಕೂಪನ್ ಪಟ್ಟಿ, ವಿತರಣಾ ಸ್ಥಿತಿ, ಬಳಕೆಯ ಇತಿಹಾಸ ವೀಕ್ಷಣೆ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ಕೂಪನ್ ರಚನೆ, ಷರತ್ತುಗಳ ಸೆಟ್ಟಿಂಗ್, ರಿಯಾಯಿತಿ ದರ ನಮೂದು, ಏಕ ವಿತರಣೆ, ಟಾರ್ಗೆಟ್ ಸೆಟ್ಟಿಂಗ್, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ವಿಳಾಸ PROMO", 
@@ -10201,12 +10201,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ಈವೆಂಟ್ ಇತಿಹಾಸ, ವಿಶೇಷ ಕ್ಯಾಂಪೇನ್ ಪಟ್ಟಿ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ಈವೆಂಟ್ ತಿದ್ದುಪಡಿ, ಟಾರ್ಗೆಟ್ ಗ್ರೂಪ್ ಸೆಟ್ಟಿಂಗ್, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ವಿಳಾಸ", 
@@ -10313,12 +10313,12 @@
       "layout_list": { 
         "semantic": "ಬಹು ಐಟಂಗಳನ್ನು ಪಟ್ಟಿ ಮಾಡುವ ಪಟ್ಟಿ, ಕೋಷ್ಟಕ, ಲಿಸ್ಟ್ ಪುಟ", 
         "bias": "{TYPE} ಪಟ್ಟಿ, {TYPE} ಲಿಸ್ಟ್, {TYPE} ಕೋಷ್ಟಕ, {TYPE} ಬಲ್ಕ್, ಪಟ್ಟಿ, ಲಿಸ್ಟ್, ಕೋಷ್ಟಕ, ಬಲ್ಕ್", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "ಏಕ ಐಟಂನ ವಿವರವಾದ ಮಾಹಿತಿಯನ್ನು ಪ್ರದರ್ಶಿಸುವ ಅಥವಾ ನಮೂದಿಸುವ ಫಾರ್ಮ್ ಪುಟ", 
         "bias": "{TYPE} ವಿವರ, {TYPE} ಫಾರ್ಮ್, {TYPE} ಇನ್‌ಪುಟ್, {TYPE} ತಿದ್ದುಪಡಿ, ವಿವರ, ಫಾರ್ಮ್, ಇನ್‌ಪುಟ್, ತಿದ್ದುಪಡಿ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ಐಡೆಂಟಿಫೈಯರ್ ಲಿಂಕ್ ವಿಳಾಸ", 
@@ -10342,12 +10342,12 @@
       "layout_list": { 
         "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", 
         "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, ડિલિવરી સૂચિ, લેબલ પ્રિન્ટ વિગતો, ડિલિવરી સ્થિતિ, બાકી ડિલિવરી લિસ્ટ, બલ્ક ડિસ્પેચ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", 
         "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, ઇન્વોઇસ ફેરફાર, સિંગલ ડિલિવરી ટ્રેકિંગ, સરનામું ભૂલ સુધારણા, રિટર્ન પ્રક્રિયા, વિગતવાર પ્રક્રિયા, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ઓળખકર્તા લિંક ટ્રેકિંગ નંબર ઇન્વોઇસ", 
@@ -10454,12 +10454,12 @@
       "layout_list": { 
         "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", 
         "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, ઉત્પાદન સૂચિ, પ્રદર્શન સંચાલન, ઇન્વેન્ટરી મેનેજમેન્ટ, બલ્ક ફેરફાર, આઉટ ઓફ STOCK પ્રક્રિયા, શ્રેણી વર્ગીકરણ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", 
         "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, ઉત્પાદન નોંધણી, ઉત્પાદન ફેરફાર, વિકલ્પ ઉમેરો, વિગતવાર વર્ણન સંપાદક, થંબનેલ અપલોડ, સંબંધિત ઉત્પાદનો, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ઓળખકર્તા લિંક સરનામું", 
@@ -10666,12 +10666,12 @@
       "layout_list": { 
         "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", 
         "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, ઓર્ડર સૂચિ, ચુકવણી ઇતિહાસ, રદ્દીકરણ/રિફંડ સૂચિ, તમામ ઓર્ડર, ડિસ્પેચ મેનેજમેન્ટ, બલ્ક પ્રક્રિયા, પસંદ કરેલી વસ્તુઓ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", 
         "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, ઓર્ડર વિગતો, સંતોષકારક માહિતી, શિપિંગ સરનામું બદલો, આંશિક રદ, ચુકવણી ફેરફાર, મેળવનાર બદલો, એડમિન મેમો, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ઓળખકર્તા લિંક ઓર્ડર નંબર", 
@@ -10763,12 +10763,12 @@
       "layout_list": { 
         "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", 
         "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, સમીક્ષા સૂચિ, ઉત્પાદન સમીક્ષા સંચાલન, રેટિંગ સૂચિ, બલ્ક મંજૂરી, બિન-જવાબી પોસ્ટ્સ", 
-        "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", 
         "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, સમીક્ષા વિગતો, જવાબ લખો, બ્લાઇન્ડ પ્રક્રિયા, પુરસ્કાર પોઇન્ટ્સ જારી કરો, સિંગલ ક્વેરી, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
-        "prejudice": "global, navigation, menus, headers, footers, aside." 
+        "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
         "semantic": "ઓળખકર્તા લિંક સરનામું", 
@@ -10802,8 +10802,8 @@
       }
     },
     "coupon": {
-      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, કૂપન સૂચિ, જારી કરવાની સ્થિતિ, વપરાશ ઇતિહાસ", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, કૂપન બનાવો, શરતો સેટ કરો, ડિસ્કાઉન્ટ રેટ દાખલ કરો, સિંગલ કૂપન ઇશ્યૂ, લક્ષ્ય જૂથ સેટઅપ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, કૂપન સૂચિ, જારી કરવાની સ્થિતિ, વપરાશ ઇતિહાસ", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, કૂપન બનાવો, શરતો સેટ કરો, ડિસ્કાઉન્ટ રેટ દાખલ કરો, સિંગલ કૂપન ઇશ્યૂ, લક્ષ્ય જૂથ સેટઅપ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક સરનામું", "bias": "{TYPE} ઓળખકર્તા, {TYPE} નંબર, {TYPE} કોડ, EVT-001, COUPON_9921", "prejudice": "નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ,減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
       "type": { "semantic": "પ્રકાર શ્રેણી વર્ગીકરણ", "bias": "નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, મફત ભેટ", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
       "status": { "semantic": "સ્થિતિ પ્રગતિ સ્થિતિ", "bias": "{TYPE} સ્થિતિ, {TYPE} પ્રગતિ, સક્રિય, સમાપ્ત, બાકી, જારી પ્રક્રિયામાં, જારી કરવાનું બંધ", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોน નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
@@ -10826,8 +10826,8 @@
       "registration_date": { "semantic": "નોંધણી તારીખ નિર્માણ તારીખ", "bias": "{TYPE} તારીખ, {TYPE} તારીખ, {TYPE} નોંધણી તારીખ, 2026-02-15", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ" }
     },
     "event": {
-      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, ઇવેન્ટ ઇતિહાસ, પ્રદર્શન સૂચિ", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, ઇવેન્ટ ફેરફાર, લક્ષ્ય જૂથ સેટઅપ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, ઇવેન્ટ ઇતિહાસ, પ્રદર્શન સૂચિ", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, ઇવેન્ટ ફેરફાર, લક્ષ્ય જૂથ સેટઅપ, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક સરનામું", "bias": "{TYPE} ઓળખકર્તા, {TYPE} નંબર, {TYPE} કોડ, EVT-001, COUPON_9921", "prejudice": "નિશ્чિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, มફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
       "type": { "semantic": "પ્રકાર શ્રેણી વર્ગીકરણ", "bias": "નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, મફત ભેટ", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
       "status": { "semantic": "સ્થિતિ પ્રગતિ સ્થિતિ", "bias": "{TYPE} સ્થિતિ, {TYPE} પ્રગતિ, સક્રિય, સમાપ્ત, બાકી, જારી પ્રક્રિયામાં, જારી કરવાનું બંધ", "prejudice": "ઓળખકર્તા, લિંк, સરનામું, નંબર, કોડ, નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ มર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર રકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ, નોંધણી તારીખ, નિર્માણ તારીખ" },
@@ -10850,8 +10850,8 @@
       "registration_date": { "semantic": "નોંધણી તારીખ નિર્માણ તારીખ", "bias": "{TYPE} તારીખ, {TYPE} તારીખ, {TYPE} નોંધણી તારીખ, 2026-02-15", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, નિશ્ચિત ડિસ્કાઉન્ટ, ટકાવારી ડિસ્કાઉન્ટ, મફત શિપિંગ, પ્રકાર, શ્રેણી, શ્રેણી નામ, પ્રગતિ સ્થિતિ, કૂપન નામ, ઇવેન્ટ નામ, શરૂઆત તારીખ, શરૂઆત સમય, જારી તારીખ, સમાપ્તિ તારીખ, સમાપ્તિ અવધિ, અંતિમ તારીખ, કૂપન નંબર, ડિસ્કાઉન્ટ રકમ, 減મેળ, જથ્થો, જારી રકમ, વપરાશ મર્યાદા, મહત્તમ વપરાશ, વ્યક્તિ દીઠ વપરાશ મર્યાદા, નવા ગ્રાહક, નવી નોંધણી, પ્રથમ ખરીદી, પ્રથમ ઓર્ડર, ન્યૂનતમ ઓર્ડર રકમ, ચુકવણી શરત, મહત્તમ ઓર્ડર ਰકમ, મહત્તમ ડિસ્કાઉન્ટ રકમ, ડિસ્કાઉન્ટ મર્યાદા, પ્રાદેશિક પ્રતિબંધો, ડિલિવરી અપ્રાપ્ય, ફોન નંબર, સંપર્ક, પૂછપરછ, સરનામું, સ્થાન, સ્થળ" }
     },
     "default": {
-      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, સૂચિ, લિસ્ટ, કોષ્ટક, બલ્ક", "prejudice": "global, navigation, menus, headers, footers, aside, search, filter." },
-      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, વિગત, ફોર્મ, ઇનપુટ, ફેરફાર, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global, navigation, menus, headers, footers, aside." },
+      "layout_list": { "semantic": "બહુવિધ વસ્તુઓની સૂચિબદ્ધ કરતું સૂચિ અથવા કોષ્ટક પૃષ્ઠ", "bias": "{TYPE} સૂચિ, {TYPE} લિસ્ટ, {TYPE} કોષ્ટક, {TYPE} બલ્ક, સૂચિ, લિસ્ટ, કોષ્ટક, બલ્ક", "prejudice": "global navigation, menus, footers, aside." },
+      "layout_form": { "semantic": "એક જ વસ્તુની વિગતો પ્રદર્શિત કરવા અથવા દાખલ કરવા માટેનું ફોર્મ પૃષ્ઠ", "bias": "{TYPE} વિગત, {TYPE} ફોર્મ, {TYPE} ઇનપુટ, {TYPE} ફેરફાર, વિગત, ફોર્મ, ઇનપુટ, ફેરફાર, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", "prejudice": "global navigation, menus, footers, aside." },
       "id,link": { "semantic": "ઓળખકર્તા લિંક સરનામું", "bias": "{TYPE} ઓળખકર્તા, {TYPE} નંબર, {TYPE} કોડ, ID-001, 12345, /path/to/resource", "prejudice": "શીર્ષક, નામ, જાહેરાત, ઉત્પાદન માર્ગદર્શિકા, ઇવેન્ટ, સામાન્ય, બાકી, ભૂલ, પૂર્ણ, સ્થિતિ, પ્રગતિ" },
       "title": { "semantic": "શીર્ષક નામ", "bias": "{TYPE} નામ, {TYPE} શીર્ષક, {TYPE} નામ, જાહેરાત, ઉત્પાદન માર્ગદર્શિકા, ઇવેન્ટ", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, સામાન્ય, બાકી, ભૂલ, પૂર્ણ, સ્થિતિ, પ્રગતિ" },
       "status": { "semantic": "સ્થિતિ", "bias": "{TYPE} સ્થિતિ, {TYPE} પ્રગતિ, સામાન્ય, બાકી, ભૂલ, પૂર્ણ", "prejudice": "ઓળખકર્તા, લિંક, સરનામું, નંબર, કોડ, શીર્ષક, નામ, જાહેરાત, ઉત્પાદન માર્ગદર્શિકા, ઇવેન્ટ" }

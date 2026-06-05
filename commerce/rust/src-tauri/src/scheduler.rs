@@ -287,6 +287,28 @@ pub async fn start_background_worker(
     });
 }
 
+// 추출된 DOM 뭉치가 실제 원본 PUG의 몇 번째 줄부터 몇 번째 줄까지인지 정확하게 매핑합니다.
+pub fn find_block_indices_in_pug<S: AsRef<str>>(full_lines: &[S], block_pug: &str) -> Option<(usize, usize)> {
+    let b_lines: Vec<&str> = block_pug.lines().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if b_lines.is_empty() { return None; }
+    
+    for i in 0..full_lines.len() {
+        if full_lines[i].as_ref().trim() == b_lines[0] {
+            let mut match_count = 1;
+            let mut j = i + 1;
+            let mut k = 1;
+            while j < full_lines.len() && k < b_lines.len() {
+                if full_lines[j].as_ref().trim().is_empty() { j += 1; continue; }
+                if full_lines[j].as_ref().trim() == b_lines[k] { match_count += 1; k += 1; } 
+                else { break; }
+                j += 1;
+            }
+            if match_count == b_lines.len() { return Some((i, j - 1)); }
+        }
+    }
+    None
+}
+
 async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
@@ -797,7 +819,8 @@ async fn process_task(
                         })
                     ],
                     model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                    max_tokens: Some(16),
+                    // 🌟 [CRITICAL FIX] 토큰 한도를 32로 늘려 언어 코드(ko)가 중간에 잘리는 현상을 완벽히 방지합니다.
+                    max_tokens: Some(32),
                     temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
@@ -831,22 +854,20 @@ async fn process_task(
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
                 let type_info = parsing::parse_json_from_llm(&res); 
-                    
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").trim().to_lowercase();                
                 
-                // 🌟 Step A에서 페이지 타입과 함께 language 값도 파싱하여 전역 변수(doc_lang)에 저장합니다.
-                if let Some(l) = type_info.get("language").and_then(|s| s.as_str()) {
-                    doc_lang = l.trim().to_lowercase();
-                    println!("[Scheduler] Detected language in Step A: {}", doc_lang);
+                if let Some(type_val) = type_info.get("type").and_then(|v| v.as_str()) {
+                    page_type = type_val.to_lowercase();
                 }
-                
-                if page_type.is_empty() {
-                    page_type = match task.r#type.as_str() {
-                        "image_extraction" => "tracking".to_string(),
-                        _ => "unknown".to_string(),
-                    };
+                if let Some(lang_val) = type_info.get("language").and_then(|v| v.as_str()) {
+                    doc_lang = lang_val.trim().to_lowercase();
                 }
-                println!("[Scheduler] Classified as: {}", page_type);
+
+                // 🌟 [CRITICAL FIX] bias.json (BIAS_DICT)에 해당 언어 코드가 등록되어 있지 않다면 심플하게 'ko'로 고정합니다.
+                if crate::parsing::BIAS_DICT.get(doc_lang.as_str()).is_none() {
+                    doc_lang = "ko".to_string();
+                }
+
+                println!("[Scheduler] Detected language in Step A: {}", doc_lang);
             }
             
             if page_type.is_empty() || page_type == "unknown" { 
@@ -859,155 +880,264 @@ async fn process_task(
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
+
+            // 🎯 [Track A: NOISE FILTER] Boa Engine을 통해 부모 엘리먼트를 찾고 뭉치 단위로 노이즈를 필터링합니다.
+            let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
+            let prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
+            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
             
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining document structure...", "spinner": "⠋" }));
-
-            // HTML 문서를 파싱하여 <head> 내부의 <title> 텍스트를 추출
-            let document_title = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                if let Ok(sel) = scraper::Selector::parse("title") {
-                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            };
-
-            let parse_bool_robust = |val: Option<&serde_json::Value>| -> Option<bool> {
-                val.and_then(|v| {
-                    if let Some(b) = v.as_bool() { Some(b) }
-                    else if let Some(s) = v.as_str() { Some(s.to_lowercase() == "true") }
-                    else { None }
-                })
-            };
-
-            let detail_prompt = parsing::is_detail_prompt(&page_type, &document_title, &doc_lang);
-            let task_question_detail = format!("{}\n\n[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think", detail_prompt);
-            let snapshot_id_detail = format!("{}_step_a2_detail", task.id); 
-
-            let mut retry_count = 0;
-            let mut ignore_list: Vec<String> = Vec::new();
-            let mut raw_has_form = false;
-
-            loop {
+            // 🌟 [CRITICAL FIX] 소유권 에러(E0506)를 방지하기 위해 String 복제본으로 소유권을 가집니다.
+            let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
+            let mut line_embeddings = Vec::new();
+            
+            // emit_term(&format!("\n[PRE-FILTER] Vectorizing context for Track A ({} lines)...", pug_lines.len()));
+            for (line_idx, line) in pug_lines.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-                let params = ChatCompletionParameters {
-                    messages: vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: system_content.clone(), 
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(task_question_detail.clone()),
-                            name: None,
-                        })
-                    ],
-                    model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                    max_tokens: Some(128),
-                    temperature: Some(0.0), top_p: Some(0.95),
-                    ..Default::default()
-                };
+                if line.trim().is_empty() {
+                    line_embeddings.push(vec![0.0; 384]);
+                    continue;
+                }
+                
+                // 🌟 진행 상황을 터미널에 낱낱이 출력하여 멈춘 것처럼 보이지 않게 합니다.
+                // emit_term(&format!("  [VECTORIZING] Track A Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
+                
+                let emb = model.get_embedding(line.to_string()).await.unwrap_or(vec![0.0; 384]);
+                line_embeddings.push(emb);
+            }
 
-                let (_detail_bias, detail_prej) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
-
-                let res = if base_model_size == crate::model::ModelSize::Qwen {
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                        println!("[Scheduler] 0.6B (Qwen) Step A-2 (Detail): Asking detail classification... (Attempt {})", retry_count + 1);
-                        gen.generate(
-                            params, 
-                            Some(cancellation_token.clone()), 
-                            Some(snapshot_id_detail.clone()), 
-                            kv_name.clone(),
-                            Some(&detail_prej)
-                        ).await?
+            // HTML 문서를 파싱하여 Nodes JSON 문자열을 바인딩하고, 스레드 안전성이 없는 scraper::Html 객체는 즉시 소멸하도록 생명주기를 블록 내로 한정합니다.
+            let nodes_str = {
+                let document_for_boa = scraper::Html::parse_document(&clean_html_content);
+                let mut nodes_json = Vec::new();
+                let mut node_to_idx = std::collections::HashMap::new();
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    node_to_idx.insert(node.id(), idx);
+                }
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    if let Some(el) = node.value().as_element() {
+                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                        let text: String = node.children()
+                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                            .collect::<Vec<_>>().join(" ").trim().to_string();
+                        nodes_json.push(serde_json::json!({
+                            "index": idx,
+                            "parentIndex": parent_idx,
+                            "tagName": el.name().to_string(),
+                            "id": el.id().unwrap_or("").to_string(),
+                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                            "text": text,
+                            "colspan": el.attr("colspan").unwrap_or("1"),
+                            "rowspan": el.attr("rowspan").unwrap_or("1")
+                        }));
                     } else {
-                        return Err(anyhow::anyhow!("Qwen generator missing"));
+                        nodes_json.push(serde_json::json!(serde_json::Value::Null));
                     }
-                } else {
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
-                    let q3_gen_arc = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    let ignore_list_clone = ignore_list.clone();
-                    let detail_prej_clone = detail_prej.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                        let mut gen_guard = q3_gen_arc.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            println!("[Scheduler] Qwen3 Step A-2 (Detail): Asking detail classification... (Attempt {})", retry_count + 1);
-                            gen.generate(params, Some(cancel_clone), Some(ignore_list_clone.as_slice()), Some(detail_prej_clone.as_str())).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e))
-                        } else {
-                            Err(anyhow::anyhow!("Qwen3 generator missing"))
-                        }
-                    }).await??
-                };
+                }
+                serde_json::to_string(&nodes_json).unwrap_or_default()
+            };
+            let js_template = get_boa_block_extractor_template(); // 🌟 Batch 처리용 템플릿 사용
+
+            let mut wiped_indices = vec![false; pug_lines.len()];
+            let mut processed_blocks = std::collections::HashSet::new();
+
+            // 🌟 [최적화] 노이즈로 의심되는 텍스트 후보들을 먼저 싹 다 모읍니다.
+            let mut track_a_candidates = Vec::new();
+            let mut track_a_indices = Vec::new();
+
+            for line_idx in 0..pug_lines.len() {
+                if wiped_indices[line_idx] { continue; }
+                let line = &pug_lines[line_idx];
+                if line.trim().is_empty() { continue; }
                 
-                println!("[DEBUG-SCHED] Step A-2 (Detail) Raw Response: '{}'", res);
+                let line_prej_score = cosine_similarity(&prej_emb, &line_embeddings[line_idx]);
                 
-                let detail_info = parsing::parse_json_from_llm(&res); 
-                let target_obj = detail_info.get(&page_type).unwrap_or(&detail_info);
-
-                if let Some(lang_val) = target_obj.get("language").and_then(|v| v.as_str()) {
-                    doc_lang = lang_val.to_lowercase();
-                }
-
-                // JSON Object의 Key 값을 순회하여 _form 접미사 혹은 form 정밀 탐색 
-                let mut form_bool = None;
-                if let Some(obj) = target_obj.as_object() {
-                    for (k, v) in obj {
-                        if k.ends_with("_form") || k == "form" {
-                            if let Some(b) = parse_bool_robust(Some(v)) {
-                                form_bool = Some(b);
-                                break;
-                            }
-                        }
+                if line_prej_score > 0.55 {
+                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
+                    if !text_part.is_empty() {
+                        track_a_candidates.push(text_part.to_string());
+                        track_a_indices.push(line_idx);
                     }
-                }
-                if form_bool.is_none() {
-                    if let Some(obj) = detail_info.as_object() {
-                        for (k, v) in obj {
-                            if k.ends_with("_form") || k == "form" {
-                                if let Some(b) = parse_bool_robust(Some(v)) {
-                                    form_bool = Some(b);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let res_clean = res.to_lowercase().replace(" ", "").replace("\"", "").replace("'", "");
-                let form_key_exists = form_bool.is_some() 
-                    || res_clean.contains("form:") 
-                    || res_clean.contains("_form:");
-
-                if form_key_exists {
-                    raw_has_form = form_bool.unwrap_or_else(|| {
-                        res_clean.contains("form:true") || res_clean.contains("_form:true")
-                    });
-                    break;
-                } else {
-                    retry_count += 1;
-                    if retry_count >= 3 {
-                        println!("[Scheduler] Max retries reached for Step A-2 (Detail). Proceeding with best effort.");
-                        raw_has_form = res_clean.contains("has_form:true");
-                        break;
-                    }
-                    println!("[Scheduler] ⚠️ Missing 'has_form' in Step A-2 (Detail). Retrying... ({}/3)", retry_count);
-                    let mut ignore_val = res.trim().to_string();
-                    if ignore_val.len() > 100 { ignore_val = ignore_val[..100].to_string(); }
-                    ignore_list.push(ignore_val.clone());
-                    ignore_list.push(format!(" {}", ignore_val));
-                    ignore_list.push(ignore_val.to_lowercase());
                 }
             }
 
-            // ==========================================
-            // 3. 최종 판별 (Detail 여부 결정)
-            // ==========================================
-            // 이게 detail의 has_form True면 무조건 detail = true고 아니면 detail = false로 가야되
-            is_detail = raw_has_form;
+            // 🌟 [진행 로그 추가] 수집된 노이즈 후보군 개수를 명확히 보여줍니다.
+            emit_term(&format!("  🔍 [Track A] Identified {} potential noise lines. Resolving DOM parents via Boa...", track_a_candidates.len()));
 
-            println!("[Scheduler] Classified is_detail as: {} (has_form: {})", is_detail, raw_has_form);
+            // 🌟 [최적화] Boa Engine 1번만 켜서 전체 후보군의 부모 CSS Selector를 초고속으로 받아옵니다.
+            let track_a_selectors: Vec<String> = {
+                let target_len = track_a_candidates.len(); 
+                let target_titles_str = serde_json::to_string(&track_a_candidates).unwrap_or_else(|_| "[]".to_string());
+                let js_code = js_template
+                    .replace("NODES_PLACEHOLDER", &nodes_str)
+                    .replace("TARGET_TITLES_PLACEHOLDER", &target_titles_str);
+
+                tokio::task::spawn_blocking(move || {
+                    let mut context = boa_engine::Context::default();
+                    if let Ok(val) = context.eval(boa_engine::Source::from_bytes(js_code.as_bytes())) {
+                        if let Some(res_str) = val.as_string().map(|s| s.to_std_string_escaped()) {
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&res_str) {
+                                return arr;
+                            }
+                        }
+                    }
+                    vec![String::new(); target_len]
+                }).await.unwrap_or_else(|_| vec![String::new(); target_len])
+            };
+
+            // 🌟 [결과 로그 추가] Boa Engine이 최종적으로 매칭해 낸 시맨틱 부모 뭉치의 개수를 출력합니다.
+            let valid_selectors_count = track_a_selectors.iter().filter(|s| !s.is_empty()).count();
+            emit_term(&format!("  📦 [Track A] Boa Engine successfully mapped {} structural parent blocks.", valid_selectors_count));
+
+            // 반환받은 Selector들을 통해 VRAM 임베딩을 수행합니다.
+            for (i, sel) in track_a_selectors.into_iter().enumerate() {
+                if sel.is_empty() { continue; }
+                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                
+                if block_pug.is_empty() || processed_blocks.contains(&block_pug) { continue; }
+                processed_blocks.insert(block_pug.clone());
+
+                let block_emb = model.get_embedding(block_pug.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                let block_prej_score = cosine_similarity(&prej_emb, &block_emb);
+                let block_list_score = cosine_similarity(&list_bias_emb, &block_emb);
+                let block_form_score = cosine_similarity(&form_bias_emb, &block_emb);
+                
+                if block_prej_score > block_list_score && block_prej_score > block_form_score {
+                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
+                        emit_term(&format!("  🚫 [NOISE BLOCK DELETED] Boa Engine Matched. Lines {}~{} (Prej: {:.4} > List: {:.4} & Form: {:.4})", start_idx + 1, end_idx + 1, block_prej_score, block_list_score, block_form_score));
+                        for j in start_idx..=end_idx {
+                            wiped_indices[j] = true;
+                        }
+                    }
+                }
+            }
+
+            // Track A에 의해 청소된 결과물로 업데이트
+            let mut filtered_light_pug = String::new();
+            for (idx, line) in pug_lines.iter().enumerate() {
+                if !wiped_indices[idx] { filtered_light_pug.push_str(line); }
+                filtered_light_pug.push_str("\n");
+            }
+            light_pug = filtered_light_pug.trim_end().to_string();
+            
+            let system_content_a2 = format!("[PUG CONTENT]\n{}", light_pug);
+            
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
+
+            // 🎯 Track B & C: 상세/리스트 판별 (Boa Engine 일괄 처리 최적화)
+            emit_term("\n[CLASSIFICATION] Track B & C Vector Matching (Batch DOM Blocks)...");
+            
+            let mut list_scores = Vec::new();
+            let mut form_scores = Vec::new();
+
+            for (i, emb) in line_embeddings.iter().enumerate() {
+                if pug_lines[i].trim().is_empty() { continue; }
+                list_scores.push((i, cosine_similarity(&list_bias_emb, emb)));
+                form_scores.push((i, cosine_similarity(&form_bias_emb, emb)));
+            }
+
+            list_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            form_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // 🌟 [최적화] 표본 오차를 방지하기 위해 10개의 앵커(Top 5 리스트 + Top 5 폼)를 한 번에 묶습니다.
+            let mut track_bc_candidates = Vec::new();
+            let mut track_bc_indices = Vec::new();
+            
+            for (idx, _) in list_scores.iter().take(5) {
+                let line = &pug_lines[*idx];
+                let text = if let Some(p) = line.find('|') { line[p + 1..].trim() } else { line.trim() };
+                track_bc_candidates.push(text.to_string());
+                track_bc_indices.push(*idx);
+            }
+            for (idx, _) in form_scores.iter().take(5) {
+                let line = &pug_lines[*idx];
+                let text = if let Some(p) = line.find('|') { line[p + 1..].trim() } else { line.trim() };
+                track_bc_candidates.push(text.to_string());
+                track_bc_indices.push(*idx);
+            }
+
+            // Boa 엔진 1번 구동으로 10개의 선택자를 한 번에 추출합니다.
+            let track_bc_selectors: Vec<String> = {
+                let target_len = track_bc_candidates.len(); 
+                let target_titles_str = serde_json::to_string(&track_bc_candidates).unwrap_or_else(|_| "[]".to_string());
+                let js_code = js_template
+                    .replace("NODES_PLACEHOLDER", &nodes_str)
+                    .replace("TARGET_TITLES_PLACEHOLDER", &target_titles_str);
+
+                tokio::task::spawn_blocking(move || {
+                    let mut context = boa_engine::Context::default();
+                    if let Ok(val) = context.eval(boa_engine::Source::from_bytes(js_code.as_bytes())) {
+                        if let Some(res_str) = val.as_string().map(|s| s.to_std_string_escaped()) {
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&res_str) {
+                                return arr;
+                            }
+                        }
+                    }
+                    vec![String::new(); target_len]
+                }).await.unwrap_or_else(|_| vec![String::new(); target_len])
+            };
+
+            // 🌟 [정량 로그 피드백 장착] 총 몇 개 중에서 몇 개의 의미 블록이 발굴되었는지 한눈에 보여줍니다.
+            let valid_bc_count = track_bc_selectors.iter().filter(|s| !s.is_empty()).count();
+            emit_term(&format!("  📦 [Track B & C] Boa Engine successfully mapped {}/{} structural processing blocks.", valid_bc_count, track_bc_candidates.len()));
+
+            let mut total_list_score = 0.0;
+            let mut processed_list_blocks = std::collections::HashSet::new();
+            let mut total_form_score = 0.0;
+            let mut processed_form_blocks = std::collections::HashSet::new();
+
+            for (i, sel) in track_bc_selectors.into_iter().enumerate() {
+                let is_list_track = i < 5;
+                let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
+
+                // 🌟 어떤 앵커 라인의 텍스트가 DOM 분석에 실패해서 버려졌는지 이유를 낱낱이 출력합니다.
+                if sel.is_empty() { 
+                    emit_term(&format!("  ⚠️ [{}] Anchor Line {} failed to resolve a valid structural parent block via DOM.", track_name, track_bc_indices[i] + 1));
+                    continue; 
+                }
+                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::NoAttributesMode, None);
+                
+                let is_list_track = i < 5;
+                if is_list_track {
+                    if block_pug.is_empty() || processed_list_blocks.contains(&block_pug) { continue; }
+                    processed_list_blocks.insert(block_pug.clone());
+                } else {
+                    if block_pug.is_empty() || processed_form_blocks.contains(&block_pug) { continue; }
+                    processed_form_blocks.insert(block_pug.clone());
+                }
+
+                let block_emb = model.get_embedding(block_pug).await.unwrap_or(vec![0.0; 384]);
+                let b_prej_score = cosine_similarity(&prej_emb, &block_emb);
+                
+                if is_list_track {
+                    let b_list_score = cosine_similarity(&list_bias_emb, &block_emb);
+                    // 🌟 [CRITICAL FIX] 마이너스 점수는 노이즈이므로 0점 처리하여 진짜 뼈대의 점수를 깎아먹지 않게 합니다.
+                    let final_score = (b_list_score - b_prej_score).max(0.0);
+                    if final_score > 0.0 {
+                        total_list_score += final_score;
+                        emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, b_list_score, b_prej_score, final_score));
+                    } else {
+                        emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, b_prej_score, b_list_score));
+                    }
+                } else {
+                    let b_form_score = cosine_similarity(&form_bias_emb, &block_emb);
+                    let final_score = (b_form_score - b_prej_score).max(0.0);
+                    if final_score > 0.0 {
+                        total_form_score += final_score;
+                        emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, b_form_score, b_prej_score, final_score));
+                    } else {
+                        emit_term(&format!("  ⚠️ [TRACK C (FORM)] Anchor: {} Ignored (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, b_prej_score, b_form_score));
+                    }
+                }
+            }
+
+            // 3. 최종 판별 (Detail 여부 결정)
+            is_detail = total_form_score > total_list_score;
+
+            println!("[Scheduler] Classified is_detail as: {} (Total Form: {:.4}, Total List: {:.4})", is_detail, total_form_score, total_list_score);
+            emit_term(&format!("  ✅ Determined Detail Page: {}", is_detail));
         } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
     } // 🌟 [CRITICAL FIX] 누락된 if !skip_ai_analysis 블록 닫기 괄호를 복구합니다!
 
@@ -1208,182 +1338,7 @@ async fn process_task(
                     let nodes_str = serde_json::to_string(&nodes_json)?;
                     let titles_str = serde_json::to_string(&titles)?;
 
-                    let js_template = r##"
-                        const nodes = NODES_PLACEHOLDER;
-                        const titles = TITLES_PLACEHOLDER;
-                        
-                        function cleanClassList(classes, stripNumbers = false) {
-                            if (!classes) return [];
-                            const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
-                            return classes
-                                .filter(c => {
-                                    const lowerC = c.toLowerCase();
-                                    return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
-                                })
-                                .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
-                                .sort();
-                        }
-
-                        function getSignature(node, includeId = true) {
-                            if (!node || !node.tagName) return "";
-                            let s = node.tagName;
-                            if (includeId && node.id) s += "#" + node.id;
-                            const cls = cleanClassList(node.classes);
-                            if (cls.length > 0) {
-                                s += "." + [...new Set(cls)].join(".");
-                            }
-                            return s;
-                        }
-
-                        function getChildren(pIdx) { 
-                            return nodes.filter(n => n && n.parentIndex === pIdx); 
-                        }
-
-                        function calculateSimilarity(nodeA, nodeB) {
-                            if (nodeA.tagName !== nodeB.tagName) return 0;
-                            
-                            
-                            // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
-                            if (nodeA.tagName === 'tr') {
-                                const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
-                                const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
-                                
-                                const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
-                                const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
-                                
-                                // 두 행의 가로 칸 수(colspan 총합)가 2칸 이상 차이난다면 구조가 아예 다른 것입니다.
-                                if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) {
-                                    return 0;
-                                }
-                            }
-                            
-                            
-                            if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
-                                if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
-                            }
-
-                            const clsA = cleanClassList(nodeA.classes, true);
-                            const clsB = cleanClassList(nodeB.classes, true);
-                            if (clsA.length === 0 && clsB.length === 0) return 100;
-                            
-                            let matchCount = 0;
-                            clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
-                            return clsA.length ? (matchCount / clsA.length) * 100 : 0;
-                        }
-
-                        function detect(tIdx) {
-                            let cur = tIdx;
-                            for (let i = 0; i < 15; i++) {
-                                const node = nodes[cur];
-                                if (!node) break;
-                                
-                                const pIdx = node.parentIndex;
-                                if (pIdx === undefined || pIdx === -1) break;
-                                
-                                if (node.tagName === "td" || node.tagName === "th") {
-                                    
-                                    // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
-                                    if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
-                                        cur = pIdx;
-                                        continue;
-                                    }
-                                    
-                                    const pNode = nodes[pIdx];
-                                    if (pNode && pNode.tagName === "tr") {
-                                        const gpIdx = pNode.parentIndex; 
-                                        if (gpIdx !== undefined && gpIdx !== -1) {
-                                            const trSiblings = getChildren(gpIdx);
-                                            const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
-                                            
-                                            // 부모(tr)가 유사한 구조의 다른 형제(tr)들을 여럿 거느리고 있다면 진짜 세로 리스트입니다.
-                                            if (similarTrs.length >= 2) {
-                                                cur = pIdx;
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                const parentNode = nodes[pIdx];
-                                const siblings = getChildren(pIdx);
-                                
-                                const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
-
-                                if (similarSiblings.length >= 2) {
-                                    let finalParent = parentNode;
-                                    let walkIdx = pIdx;
-                                    for(let j=0; j<5; j++) {
-                                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
-                                        if (gIdx !== -1 && nodes[gIdx]) {
-                                            const grand = nodes[gIdx];
-                                            if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
-                                                finalParent = grand;
-                                                if (grand.id || grand.tagName === "table") break;
-                                            }
-                                            walkIdx = gIdx;
-                                        }
-                                    }
-
-                                    const parentSig = getSignature(finalParent, true);
-                                    const uniqueSigs = [];
-                                    similarSiblings.forEach(s => {
-                                        const sig = getSignature(s, false);
-                                        if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
-                                    });
-
-                                    const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
-
-                                    return { 
-                                        parent: parentSig, 
-                                        itemSelector: fullSelector,
-                                        matchCount: similarSiblings.length
-                                    };
-                                }
-                                cur = pIdx;
-                            }
-                            return null;
-                        }
-
-                        let matches = [];
-                        for (let i = 0; i < titles.length; i++) {
-                            let t = titles[i].toLowerCase().replace(/\s+/g, ' ');
-                            let potentialMatches = [];
-                            
-                            // 깨진 문자(\uFFFD)가 포함되어 있는지 확인합니다.
-                            if (t.includes('\uFFFD')) {
-                                // 깨진 경우: 쪼개서 조각들로 유연하게 검색
-                                let chunks = t.split(/[\uFFFD]+/).map(c => c.trim()).filter(c => c.length > 1);
-                                if (chunks.length === 0) continue;
-                                
-                                potentialMatches = nodes.filter(n => {
-                                    if (!n || !n.text) return false;
-                                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
-                                    return chunks.every(chunk => nText.includes(chunk));
-                                });
-                            } else {
-                                // 온전한 경우: 전체 문자열을 하나의 컬렉션으로 취급하여 정확하게 포함 여부 검색
-                                potentialMatches = nodes.filter(n => {
-                                    if (!n || !n.text) return false;
-                                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
-                                    return nText.includes(t);
-                                });
-                            }
-                            
-                            if (potentialMatches.length > 0) {
-                                // 부모 노드(body, tr 등)를 배제하고, 텍스트 길이가 가장 짧은(가장 타이트한) 진짜 제목 단일 노드만 추출합니다.
-                                potentialMatches.sort((a, b) => a.text.length - b.text.length);
-                                matches = [potentialMatches[0]];
-                                break;
-                            }
-                        }
-                        
-                        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
-                        if (matches.length > 0) {
-                            const d = detect(matches[0].index);
-                            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
-                        }
-                        JSON.stringify(res);
-                    "##;
+                    let js_template = get_boa_js_template();
 
 
                     let js_code = js_template
@@ -1757,12 +1712,17 @@ async fn process_task(
             // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
+            // 🌟 [NOISE FILTER] bias.json의 layout_list.prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
+            let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
+            let layout_prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
+
             // [최적화] thead는 모든 아이템에 공통으로 적용되므로 루프 바깥에서 단 한 번만 벡터화합니다.
-            let thead_lines: Vec<&str> = thead_pug.lines().collect();
+            let mut thead_lines: Vec<String> = thead_pug.lines().map(|s| s.to_string()).collect();
             let mut thead_embeddings = Vec::new();
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
-                for (line_idx, line) in thead_lines.iter().enumerate() {
+                for line_idx in 0..thead_lines.len() {
+                    let line = thead_lines[line_idx].clone();
                     if line.trim().is_empty() {
                         thead_embeddings.push(vec![0.0; 384]);
                         continue;
@@ -1771,7 +1731,16 @@ async fn process_task(
                         Ok(vector) => vector,
                         Err(_) => vec![0.0; 384],
                     };
-                    thead_embeddings.push(emb);
+                    
+                    // 🌟 유사도 0.55 이상이면 PUG 텍스트를 비워버립니다.
+                    let noise_score = cosine_similarity(&layout_prej_emb, &emb);
+                    if noise_score > 0.55 {
+                        emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", line_idx + 1, line.trim(), noise_score));
+                        thead_lines[line_idx] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
+                        thead_embeddings.push(vec![0.0; 384]);
+                    } else {
+                        thead_embeddings.push(emb);
+                    }
                 }
             }
 
@@ -1793,16 +1762,15 @@ async fn process_task(
                 // 헤더(Thead)와 개별 아이템(Item)의 PUG를 결합하여 검증 텍스트 생성 (나중의 본문 텍스트 검증용)
                 let full_item_pug = format!("{}\n{}", thead_pug, item_pug);
                 
-                // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행
-                let item_lines: Vec<&str> = item_pug.lines().collect();
+                // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행 및 노이즈 필터링
+                let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 let mut item_embeddings = Vec::new();
-                for (line_idx, line) in item_lines.iter().enumerate() {
+                for line_idx in 0..item_lines.len() {
+                    let line = item_lines[line_idx].clone();
                     if line.trim().is_empty() {
                         item_embeddings.push(vec![0.0; 384]);
                         continue;
                     }
-                    
-                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", line_idx + 1, item_lines.len(), line.trim()));
                     
                     let emb = match model.get_embedding(line.to_string()).await {
                         Ok(vector) => vector,
@@ -1811,11 +1779,25 @@ async fn process_task(
                             vec![0.0; 384]
                         }
                     };
-                    item_embeddings.push(emb);
+                    
+                    // 🌟 유사도 0.55 이상이면 PUG 텍스트를 비워버립니다.
+                    let noise_score = cosine_similarity(&layout_prej_emb, &emb);
+                    if noise_score > 0.55 {
+                        emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", line_idx + 1, item_lines.len(), line.trim(), noise_score));
+                        item_lines[line_idx] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
+                        item_embeddings.push(vec![0.0; 384]);
+                    } else {
+                        emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", line_idx + 1, item_lines.len(), line.trim()));
+                        item_embeddings.push(emb);
+                    }
                 }
 
                 let mut item_val = json!({});
                 let mut global_ignore_list: Vec<String> = Vec::new();
+                
+                // 🌟 String 벡터를 &str 배열로 참조 변환하여 이후 컨텍스트 추출기에 완벽 호환되게 연결합니다.
+                let thead_lines_ref: Vec<&str> = thead_lines.iter().map(|s| s.as_str()).collect();
+                let item_lines_ref: Vec<&str> = item_lines.iter().map(|s| s.as_str()).collect();
 
                 // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
@@ -1827,27 +1809,27 @@ async fn process_task(
                     let mut best_thead_idx = 0;
                     let mut best_thead_score = -1.0;
                     for (i, emb) in thead_embeddings.iter().enumerate() {
-                        if thead_lines[i].trim().is_empty() { continue; }
+                        if thead_lines_ref[i].trim().is_empty() { continue; }
                         let score = cosine_similarity(&query_emb, emb);
                         if score > best_thead_score {
                             best_thead_score = score;
                             best_thead_idx = i;
                         }
                     }
-                    let matched_thead_pug = extract_pug_context(&thead_lines, best_thead_idx);
+                    let matched_thead_pug = extract_pug_context(&thead_lines_ref, best_thead_idx);
 
                     // Item 본문 영역 독립 매칭
                     let mut best_item_idx = 0;
                     let mut best_item_score = -1.0;
                     for (i, emb) in item_embeddings.iter().enumerate() {
-                        if item_lines[i].trim().is_empty() { continue; }
+                        if item_lines_ref[i].trim().is_empty() { continue; }
                         let score = cosine_similarity(&query_emb, emb);
                         if score > best_item_score {
                             best_item_score = score;
                             best_item_idx = i;
                         }
                     }
-                    let matched_item_pug = extract_pug_context(&item_lines, best_item_idx);
+                    let matched_item_pug = extract_pug_context(&item_lines_ref, best_item_idx);
                     
                     // 3. 찾은 Header 컨텍스트와 Item 컨텍스트를 하나로 결합
                     let targeted_pug = if matched_thead_pug.is_empty() {
@@ -2136,6 +2118,10 @@ async fn process_task(
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+            // 🌟 [NOISE FILTER] bias.json의 prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
+            let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
+            let layout_prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
+
             // (이전 답변에서 생성된 parsing.rs의 get_detail_schema_fields를 호출합니다)
             let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
@@ -2144,26 +2130,139 @@ async fn process_task(
             let _ = app_handle.emit("extraction-progress", &payload);
             emit_term(&format!("[STAGE-3] Extracting {} detailed fields individually...", total_fields));
 
-            // 1. PUG 각 개별줄 내용을 임베딩 모델로 384차원 인메모리 벡터 저장 (진행률 및 에러 로깅 추가)
-            let pug_lines: Vec<&str> = content_pug.lines().collect();
-            let mut line_embeddings = Vec::new();
-            for (line_idx, line) in pug_lines.iter().enumerate() {
-                if line.trim().is_empty() {
-                    line_embeddings.push(vec![0.0; 384]);
-                    continue;
-                }
-                
-                emit_term(&format!("  [VECTORIZING] Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
-                
+            // 1. PUG 각 개별줄 내용을 임베딩 모델로 384차원 인메모리 벡터 저장 및 노이즈 필터링 적용
+            let mut pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
+            // 🌟 [CRITICAL FIX] 인덱스 정렬(Alignment)을 위해 미리 크기를 할당합니다.
+            let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
+            for line_idx in 0..pug_lines.len() {
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+                let line = &pug_lines[line_idx];
+                if line.trim().is_empty() { continue; }
+
+                // 🌟 진행 상황을 터미널에 낱낱이 출력하여 멈춘 것처럼 보이지 않게 합니다.
+                emit_term(&format!("  [VECTORIZING] Stage-3 Line {}/{} : {}", line_idx + 1, pug_lines.len(), line.trim()));
+
                 let emb = match model.get_embedding(line.to_string()).await {
                     Ok(vector) => vector,
-                    Err(e) => {
-                        emit_term(&format!("  🚨 [EMBEDDING ERROR] Failed to load or compute model: {}", e));
-                        vec![0.0; 384]
-                    }
+                    Err(_) => vec![0.0; 384]
                 };
-                line_embeddings.push(emb);
+                line_embeddings[line_idx] = emb;
             }
+
+            // 🎯 Track A: Stage 3 Detail (Boa Engine 기반 부모 뭉치 단위 노이즈 삭제)
+            let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
+            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            
+            let mut wiped_indices = vec![false; pug_lines.len()];
+            let mut processed_blocks = std::collections::HashSet::new();
+
+            // Boa 엔진용 HTML 노드 JSON 생성 (Stage 3 컨텍스트 용)
+            let nodes_str_detail = {
+                let document_for_boa = scraper::Html::parse_document(&clean_html_content);
+                let mut nodes_json = Vec::new();
+                let mut node_to_idx = std::collections::HashMap::new();
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    node_to_idx.insert(node.id(), idx);
+                }
+                for (idx, node) in document_for_boa.tree.root().descendants().enumerate() {
+                    if let Some(el) = node.value().as_element() {
+                        let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
+                        let text: String = node.children()
+                            .filter_map(|child| child.value().as_text().map(|t| t.to_string()))
+                            .collect::<Vec<_>>().join(" ").trim().to_string();
+                        nodes_json.push(serde_json::json!({
+                            "index": idx,
+                            "parentIndex": parent_idx,
+                            "tagName": el.name().to_string(),
+                            "id": el.id().unwrap_or("").to_string(),
+                            "classes": el.attr("class").unwrap_or("").split_whitespace().collect::<Vec<_>>(),
+                            "text": text,
+                            "colspan": el.attr("colspan").unwrap_or("1"),
+                            "rowspan": el.attr("rowspan").unwrap_or("1")
+                        }));
+                    } else {
+                        nodes_json.push(serde_json::json!(serde_json::Value::Null));
+                    }
+                }
+                serde_json::to_string(&nodes_json).unwrap_or_default()
+            };
+            
+            let js_template_detail = get_boa_block_extractor_template(); // 🌟 Batch 처리용 템플릿 사용
+
+            let mut track_a_candidates = Vec::new();
+            let mut track_a_indices = Vec::new();
+
+            for line_idx in 0..pug_lines.len() {
+                if wiped_indices[line_idx] { continue; }
+                let line = &pug_lines[line_idx];
+                if line.trim().is_empty() { continue; }
+                
+                let line_prej_score = cosine_similarity(&layout_prej_emb, &line_embeddings[line_idx]);
+                
+                if line_prej_score > 0.55 {
+                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
+                    if !text_part.is_empty() {
+                        track_a_candidates.push(text_part.to_string());
+                        track_a_indices.push(line_idx);
+                    }
+                }
+            }
+
+            // 🌟 Boa 엔진 1번으로 Stage 3 노이즈 후보군 일괄 처리
+            let track_a_selectors: Vec<String> = {
+                let target_len = track_a_candidates.len(); // 🌟 [CRITICAL FIX] 클로저 이동 전 길이 미리 추출
+                let target_titles_str = serde_json::to_string(&track_a_candidates).unwrap_or_else(|_| "[]".to_string());
+                let js_code = js_template_detail
+                    .replace("NODES_PLACEHOLDER", &nodes_str_detail)
+                    .replace("TARGET_TITLES_PLACEHOLDER", &target_titles_str);
+
+                tokio::task::spawn_blocking(move || {
+                    let mut context = boa_engine::Context::default();
+                    if let Ok(val) = context.eval(boa_engine::Source::from_bytes(js_code.as_bytes())) {
+                        if let Some(res_str) = val.as_string().map(|s| s.to_std_string_escaped()) {
+                            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&res_str) {
+                                return arr;
+                            }
+                        }
+                    }
+                    vec![String::new(); target_len]
+                }).await.unwrap_or_else(|_| vec![String::new(); target_len])
+            };
+
+            for (i, sel) in track_a_selectors.into_iter().enumerate() {
+                if sel.is_empty() { continue; }
+                // 🌟 Stage 3에서는 반드시 PugMode::DetailMode를 사용합니다.
+                let block_pug = crate::parsing::convert_to_clean_pug_selector(&clean_html_content, &sel, crate::parsing::PugMode::DetailMode, None);
+                
+                if block_pug.is_empty() || processed_blocks.contains(&block_pug) { continue; }
+                processed_blocks.insert(block_pug.clone());
+
+                let block_emb = model.get_embedding(block_pug.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                let block_prej_score = cosine_similarity(&layout_prej_emb, &block_emb);
+                let block_list_score = cosine_similarity(&list_bias_emb, &block_emb);
+                let block_form_score = cosine_similarity(&form_bias_emb, &block_emb);
+                
+                if block_prej_score > block_list_score && block_prej_score > block_form_score {
+                    if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
+                        emit_term(&format!("  🚫 [NOISE BLOCK DELETED] Boa Matched. Lines {}~{} (Prej: {:.4} > List: {:.4} & Form: {:.4})", start_idx + 1, end_idx + 1, block_prej_score, block_list_score, block_form_score));
+                        for j in start_idx..=end_idx {
+                            pug_lines[j] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
+                            wiped_indices[j] = true;
+                        }
+                    }
+                }
+            }
+
+            for line_idx in 0..pug_lines.len() {
+                if !wiped_indices[line_idx] && !pug_lines[line_idx].trim().is_empty() {
+                    emit_term(&format!("  [FILTERED PUG] Line {} : {}", line_idx + 1, pug_lines[line_idx].trim()));
+                }
+            }
+            
+            let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
 
             // 문서 타이틀 추출 (환각 검증용)
             let doc_title = {
@@ -2188,7 +2287,7 @@ async fn process_task(
                 let mut best_score = -1.0;
                 
                 for (i, emb) in line_embeddings.iter().enumerate() {
-                    if pug_lines[i].trim().is_empty() { continue; }
+                    if pug_lines_ref[i].trim().is_empty() { continue; }
                     let score = cosine_similarity(&query_emb, emb);
                     if score > best_score {
                         best_score = score;
@@ -2197,7 +2296,7 @@ async fn process_task(
                 }
                 
                 // 3. 찾은 컨텍스트 블록으로 추론을 위한 시스템 메시지 동적 조립
-                let targeted_pug = extract_pug_context(&pug_lines, best_idx);
+                let targeted_pug = extract_pug_context(&pug_lines_ref, best_idx);
                 
                 emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_pug));
                 
@@ -3275,6 +3374,326 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
     Ok(())
 }
 
+pub fn get_boa_js_template() -> &'static str {
+    r##"
+        const nodes = NODES_PLACEHOLDER;
+        const titles = TITLES_PLACEHOLDER;
+        
+        function cleanClassList(classes, stripNumbers = false) {
+            if (!classes) return [];
+            const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
+            return classes
+                .filter(c => {
+                    const lowerC = c.toLowerCase();
+                    return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                })
+                .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
+                .sort();
+        }
+
+        function getSignature(node, includeId = true) {
+            if (!node || !node.tagName) return "";
+            let s = node.tagName;
+            if (includeId && node.id) s += "#" + node.id;
+            const cls = cleanClassList(node.classes);
+            if (cls.length > 0) {
+                s += "." + [...new Set(cls)].join(".");
+            }
+            return s;
+        }
+
+        function getChildren(pIdx) { 
+            return nodes.filter(n => n && n.parentIndex === pIdx); 
+        }
+
+        function calculateSimilarity(nodeA, nodeB) {
+            if (nodeA.tagName !== nodeB.tagName) return 0;
+            
+            
+            // (예: 일반 데이터 행 vs colspan=10 인 안내/합계 행)
+            if (nodeA.tagName === 'tr') {
+                const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                
+                const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                
+                // 두 행의 가로 칸 수(colspan 총합)가 2칸 이상 차이난다면 구조가 아예 다른 것입니다.
+                if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) {
+                    return 0;
+                }
+            }
+            
+            
+            if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
+                if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
+            }
+
+            const clsA = cleanClassList(nodeA.classes, true);
+            const clsB = cleanClassList(nodeB.classes, true);
+            if (clsA.length === 0 && clsB.length === 0) return 100;
+            
+            let matchCount = 0;
+            clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+            return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+        }
+
+        function detect(tIdx) {
+            let cur = tIdx;
+            for (let i = 0; i < 15; i++) {
+                const node = nodes[cur];
+                if (!node) break;
+                
+                const pIdx = node.parentIndex;
+                if (pIdx === undefined || pIdx === -1) break;
+                
+                if (node.tagName === "td" || node.tagName === "th") {
+                    
+                    // 이는 단일 항목이 아니라 복잡한 그리드의 부속품입니다. 묻지도 따지지도 않고 부모(tr)로 올라갑니다.
+                    if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
+                        cur = pIdx;
+                        continue;
+                    }
+                    
+                    const pNode = nodes[pIdx];
+                    if (pNode && pNode.tagName === "tr") {
+                        const gpIdx = pNode.parentIndex; 
+                        if (gpIdx !== undefined && gpIdx !== -1) {
+                            const trSiblings = getChildren(gpIdx);
+                            const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
+                            
+                            // 부모(tr)가 유사한 구조의 다른 형제(tr)들을 여럿 거느리고 있다면 진짜 세로 리스트입니다.
+                            if (similarTrs.length >= 2) {
+                                cur = pIdx;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                const parentNode = nodes[pIdx];
+                const siblings = getChildren(pIdx);
+                
+                const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+
+                if (similarSiblings.length >= 2) {
+                    let finalParent = parentNode;
+                    let walkIdx = pIdx;
+                    for(let j=0; j<5; j++) {
+                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                        if (gIdx !== -1 && nodes[gIdx]) {
+                            const grand = nodes[gIdx];
+                            if (grand.id || ["table", "ul", "ol", "nav"].includes(grand.tagName)) {
+                                finalParent = grand;
+                                if (grand.id || grand.tagName === "table") break;
+                            }
+                            walkIdx = gIdx;
+                        }
+                    }
+
+                    const parentSig = getSignature(finalParent, true);
+                    const uniqueSigs = [];
+                    similarSiblings.forEach(s => {
+                        const sig = getSignature(s, false);
+                        if (!uniqueSigs.includes(sig)) uniqueSigs.push(sig);
+                    });
+
+                    const fullSelector = uniqueSigs.map(sig => parentSig + " " + sig).join(", ");
+
+                    return { 
+                        parent: parentSig, 
+                        itemSelector: fullSelector,
+                        matchCount: similarSiblings.length
+                    };
+                }
+                cur = pIdx;
+            }
+            return null;
+        }
+
+        let matches = [];
+        for (let i = 0; i < titles.length; i++) {
+            let t = titles[i].toLowerCase().replace(/\s+/g, ' ');
+            let potentialMatches = [];
+            
+            // 깨진 문자(\uFFFD)가 포함되어 있는지 확인합니다.
+            if (t.includes('\uFFFD')) {
+                // 깨진 경우: 쪼개서 조각들로 유연하게 검색
+                let chunks = t.split(/[\uFFFD]+/).map(c => c.trim()).filter(c => c.length > 1);
+                if (chunks.length === 0) continue;
+                
+                potentialMatches = nodes.filter(n => {
+                    if (!n || !n.text) return false;
+                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                    return chunks.every(chunk => nText.includes(chunk));
+                });
+            } else {
+                // 온전한 경우: 전체 문자열을 하나의 컬렉션으로 취급하여 정확하게 포함 여부 검색
+                potentialMatches = nodes.filter(n => {
+                    if (!n || !n.text) return false;
+                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                    return nText.includes(t);
+                });
+            }
+            
+            if (potentialMatches.length > 0) {
+                // 부모 노드(body, tr 등)를 배제하고, 텍스트 길이가 가장 짧은(가장 타이트한) 진짜 제목 단일 노드만 추출합니다.
+                potentialMatches.sort((a, b) => a.text.length - b.text.length);
+                matches = [potentialMatches[0]];
+                break;
+            }
+        }
+        
+        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
+        if (matches.length > 0) {
+            const d = detect(matches[0].index);
+            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+        }
+        JSON.stringify(res);
+    "##
+}
+
+// 🌟 [CRITICAL OPTIMIZATION] 여러 개의 텍스트 타겟을 한 번의 JS 엔진 구동으로 일괄(Batch) 역추적하여 반환하는 템플릿입니다.
+pub fn get_boa_block_extractor_template() -> &'static str {
+    r##"
+        const nodes = NODES_PLACEHOLDER;
+        const targetTitles = TARGET_TITLES_PLACEHOLDER;
+        
+        function cleanClassList(classes, stripNumbers = false) {
+            if (!classes) return [];
+            const skip = ['active', 'selected', 'on', 'current', 'focus', 'hover', 'enabled', 'disabled'];
+            return classes
+                .filter(c => {
+                    const lowerC = c.toLowerCase();
+                    return !skip.includes(lowerC) && c.indexOf('__') === -1 && !/^[a-z0-9]{8,}$/.test(c);
+                })
+                .map(c => stripNumbers ? c.replace(/\d+$/, '') : c)
+                .sort();
+        }
+
+        function getSignature(node, includeId = true) {
+            if (!node || !node.tagName) return "";
+            let s = node.tagName;
+            if (includeId && node.id) s += "#" + node.id;
+            const cls = cleanClassList(node.classes);
+            if (cls.length > 0) {
+                s += "." + [...new Set(cls)].join(".");
+            }
+            return s;
+        }
+
+        function getChildren(pIdx) { 
+            return nodes.filter(n => n && n.parentIndex === pIdx); 
+        }
+
+        function calculateSimilarity(nodeA, nodeB) {
+            if (nodeA.tagName !== nodeB.tagName) return 0;
+            if (nodeA.tagName === 'tr') {
+                const aKids = getChildren(nodeA.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                const bKids = getChildren(nodeB.index).filter(n => n.tagName === 'td' || n.tagName === 'th');
+                const aColspan = aKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                const bColspan = bKids.reduce((sum, k) => sum + parseInt(k.colspan || '1', 10), 0);
+                if (aColspan > 0 && bColspan > 0 && Math.abs(aColspan - bColspan) > 1) { return 0; }
+            }
+            if (nodeA.tagName === 'td' || nodeA.tagName === 'th') {
+                if (nodeA.colspan !== nodeB.colspan || nodeA.rowspan !== nodeB.rowspan) return 0;
+            }
+            const clsA = cleanClassList(nodeA.classes, true);
+            const clsB = cleanClassList(nodeB.classes, true);
+            if (clsA.length === 0 && clsB.length === 0) return 100;
+            let matchCount = 0;
+            clsA.forEach(c => { if (clsB.includes(c)) matchCount++; });
+            return clsA.length ? (matchCount / clsA.length) * 100 : 0;
+        }
+
+        function detect(tIdx) {
+            let cur = tIdx;
+            let fallbackParent = null;
+            for (let i = 0; i < 15; i++) {
+                const node = nodes[cur];
+                if (!node) break;
+                const pIdx = node.parentIndex;
+                if (pIdx === undefined || pIdx === -1) break;
+
+                const parentNode = nodes[pIdx];
+                if (parentNode && !fallbackParent) {
+                    // 🌟 단독으로 배치된 Form 이나 고유 ID 클래스가 있는 시맨틱 컨테이너를 백업 부모로 동적 추적합니다.
+                    if (parentNode.id || (parentNode.classes && parentNode.classes.length > 0) || ["form", "table", "nav", "tbody", "fieldset"].includes(parentNode.tagName)) {
+                        fallbackParent = parentNode;
+                    }
+                }
+                
+                if (node.tagName === "td" || node.tagName === "th") {
+                    if (parseInt(node.colspan || '1', 10) > 1 || parseInt(node.rowspan || '1', 10) > 1) {
+                        cur = pIdx; continue;
+                    }
+                    const pNode = nodes[pIdx];
+                    if (pNode && pNode.tagName === "tr") {
+                        const gpIdx = pNode.parentIndex; 
+                        if (gpIdx !== undefined && gpIdx !== -1) {
+                            const trSiblings = getChildren(gpIdx);
+                            const similarTrs = trSiblings.filter(s => calculateSimilarity(pNode, s) >= 60);
+                            if (similarTrs.length >= 2) { cur = pIdx; continue; }
+                        }
+                    }
+                }
+                const siblings = getChildren(pIdx);
+                const similarSiblings = siblings.filter(s => calculateSimilarity(node, s) >= 60);
+                if (similarSiblings.length >= 2) {
+                    let finalParent = parentNode;
+                    let walkIdx = pIdx;
+                    for(let j=0; j<5; j++) {
+                        let gIdx = nodes[walkIdx] ? nodes[walkIdx].parentIndex : -1;
+                        if (gIdx !== -1 && nodes[gIdx]) {
+                            const grand = nodes[gIdx];
+                            if (grand.id || ["table", "ul", "ol", "nav", "form"].includes(grand.tagName)) {
+                                finalParent = grand;
+                                if (grand.id || grand.tagName === "table" || grand.tagName === "form") break;
+                            }
+                            walkIdx = gIdx;
+                        }
+                    }
+                    return getSignature(finalParent, true);
+                }
+                cur = pIdx;
+            }
+            // 🌟 형제 노드 반복 패턴이 없는 독자적인 레이아웃일 경우 추적 수집된 시맨틱 백업 부모 블록을 안전하게 반환합니다.
+            if (fallbackParent) { return getSignature(fallbackParent, true); }
+            return null;
+        }
+
+        let finalResults = [];
+        for (let k = 0; k < targetTitles.length; k++) {
+            let t = targetTitles[k].toLowerCase().replace(/\s+/g, ' ');
+            let potentialMatches = [];
+            if (t.includes('\uFFFD')) {
+                let chunks = t.split(/[\uFFFD]+/).map(c => c.trim()).filter(c => c.length > 1);
+                if (chunks.length > 0) {
+                    potentialMatches = nodes.filter(n => {
+                        if (!n || !n.text) return false;
+                        let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                        return chunks.every(chunk => nText.includes(chunk));
+                    });
+                }
+            } else {
+                potentialMatches = nodes.filter(n => {
+                    if (!n || !n.text) return false;
+                    let nText = n.text.toLowerCase().replace(/\s+/g, ' ');
+                    return nText.includes(t);
+                });
+            }
+            
+            let parentSel = "";
+            if (potentialMatches.length > 0) {
+                potentialMatches.sort((a, b) => a.text.length - b.text.length);
+                const d = detect(potentialMatches[0].index);
+                if (d && d !== "body") { parentSel = d; }
+            }
+            finalResults.push(parentSel);
+        }
+        JSON.stringify(finalResults);
+    "##
+}
 
 async fn update_team_base_metrics(
     store: &crate::store::VectorStore,
