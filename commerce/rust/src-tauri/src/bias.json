@@ -115,7 +115,7 @@
     "goods": {
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
-        "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 상품목록, 진열관리, 재고관리, 일괄수정, 품절처리, 카테고리분류", 
+        "bias": "상품목록, 상품리스트, 진열관리, 재고관리", 
         "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
@@ -327,12 +327,12 @@
     "order": {
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
-        "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 주문목록, 결제내역, 취소/환불목록, 전체주문, 발주관리, 일괄처리, 선택건", 
+        "bias": "주문리스트, 주문표, 주문목록, 결제내역, 주문취소/환불목록, 전체주문, 발주관리", 
         "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
-        "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 주문상세, 상세정보, 배송지수정, 부분취소, 결제수정, 수령인변경, 관리자메모, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
+        "bias": "주문상세, 주문폼, 주문입력, 주문수정, 주문상세, 상세정보, 배송지수정, 부분취소, 결제수정, 수령인변경, 관리자메모", 
         "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
@@ -424,12 +424,12 @@
     "review": {
       "layout_list": { 
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지", 
-        "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 리뷰목록, 상품평관리, 평점리스트, 일괄승인, 미답변게시글", 
+        "bias": "{TYPE}목록, {TYPE}리스트, {TYPE}표, {TYPE}일괄, 리뷰목록, 평점리스트, 일괄승인, 미답변게시글", 
         "prejudice": "global navigation, menus, footers, aside." 
       },
       "layout_form": { 
         "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지", 
-        "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 리뷰상세, 답변작성, 블라인드처리, 적립금지급, 단일조회, {TYPE}, input, {TYPE}, select, {TYPE}, textarea", 
+        "bias": "{TYPE}상세, {TYPE}폼, {TYPE}입력, {TYPE}수정, 리뷰상세, 답변작성, 블라인드처리", 
         "prejudice": "global navigation, menus, footers, aside." 
       },
       "id,link": { 
