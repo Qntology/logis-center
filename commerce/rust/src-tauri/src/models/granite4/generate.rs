@@ -228,8 +228,8 @@ impl Granite4GenerateModel {
         for msg in &params.messages {
             match msg {
                 crate::openai_types::ChatCompletionRequestMessage::System(sys) => {
-                    // 🌟 [CRITICAL FIX] Granite 4.0 전용 Instruct 포맷(<|start_of_role|>...)으로 변경하여 모델이 지시를 정상적으로 이해하게 합니다.
-                    prompt.push_str(&format!("<|start_of_role|>system<|end_of_role|>\n{}<|end_of_text|>\n", sys.content));
+                    // 🌟 [CRITICAL FIX] Granite 4.0 전용 Instruct 포맷(<|start_of_role|>...) 적용 시 불필요한 줄바꿈(\n)을 제거하여 EOS 환각을 방지합니다.
+                    prompt.push_str(&format!("<|start_of_role|>system<|end_of_role|>{}<|end_of_text|>\n", sys.content));
                 }
                 crate::openai_types::ChatCompletionRequestMessage::User(user) => {
                     let text = match &user.content {
@@ -244,7 +244,7 @@ impl Granite4GenerateModel {
                             combined
                         }
                     };
-                    prompt.push_str(&format!("<|start_of_role|>user<|end_of_role|>\n{}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>\n", text));
+                    prompt.push_str(&format!("<|start_of_role|>user<|end_of_role|>{}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>", text));
                 }
                 _ => {}
             }
@@ -294,11 +294,14 @@ impl Granite4GenerateModel {
                         let all_normalized = all_embs.broadcast_div(&all_norm)?;
 
                         let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        // Threshold 노이즈 게이트 + Exponential 증폭
-                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        // 🌟 [CRITICAL FIX] 350M 초소형 모델의 "임베딩 차원 밀집(Curse of Dimensionality)" 현상 방어
+                        // 파라미터가 작을수록 단어 간 코사인 유사도 평균값이 높습니다. 
+                        // 임계값을 0.65에서 0.85로 대폭 높이고, 형벌(Penalty) 배수를 15.0에서 5.0으로 낮추어 
+                        // JSON 쌍따옴표(")나 콜론(:) 같은 필수 구조 문자들이 오답으로 휩쓸려 삭제(EOS 유발)되는 현상을 원천 차단합니다.
+                        let threshold = Tensor::new(0.85f32, &self.device)?;
                         let one = Tensor::new(1.0f32, &self.device)?;
                         let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        let prejudice = sim_relu.affine(5.0, 0.0)?.exp()?.broadcast_sub(&one)?;
                         Ok(prejudice)
                     };
                     match calc_prej() {
@@ -357,6 +360,19 @@ impl Granite4GenerateModel {
                             let _ = dev.synchronize();
                         }).await;
                     }
+
+                    // 🌟 [CRITICAL OPTIMIZATION] Qwen 3.5의 OS 레벨 가비지 컬렉션 매크로 이식
+                    // 프리필 도중 OS가 붙잡고 있는 수 기가바이트의 찌꺼기 RAM을 강제로 토해내게 만듭니다.
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    }
+                    #[cfg(target_os = "linux")]
+                    unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                    #[cfg(target_os = "macos")]
+                    unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
                     // VRAM 누수 방지 비동기 양보
                     // 🌟 [CRITICAL FIX] 워커 스레드 기아 상태 방어: 
@@ -418,6 +434,25 @@ impl Granite4GenerateModel {
                         break;
                     }
                 }
+            }
+
+            // 🌟 [CRITICAL OPTIMIZATION] Qwen 3.5 최적화 이식: 15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환
+            if step > 0 && step % 15 == 0 {
+                if self.device.is_cuda() {
+                    let dev = self.device.clone();
+                    let _ = tokio::task::spawn_blocking(move || { let _ = dev.synchronize(); }).await;
+                }
+
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
             }
 
             // 비동기 양보로 시스템 프리징 방지

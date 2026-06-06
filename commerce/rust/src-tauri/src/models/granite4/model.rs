@@ -11,7 +11,8 @@ pub struct GraniteMoeHybridRotaryEmbedding {
 impl GraniteMoeHybridRotaryEmbedding {
     pub fn new(config: &GraniteMoeHybridConfig, device: &candle_core::Device) -> Result<Self> {
         let dim = config.hidden_size / config.num_attention_heads;
-        let max_seq_len = config.max_position_embeddings;
+        // 🌟 [CRITICAL FIX] 긴 문맥(Context Length) 입력을 처리하기 위해 고정된 짧은 버퍼 한도를 128k 크기로 강제 확장합니다.
+        let max_seq_len = config.max_position_embeddings.max(131072);
         let rope_theta = if let Some(rope_params) = &config.rope_parameters {
             // 🌟 클로저의 매개변수 v의 타입을 명시하여 E0282 에러 해결
             rope_params.get("rope_theta").and_then(|v: &serde_json::Value| v.as_f64()).unwrap_or(10000.0)
@@ -135,15 +136,33 @@ impl GraniteMoeHybridAttention {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+    // 🌟 [CRITICAL FIX] position_embeddings 매개변수를 추가합니다.
+    pub fn forward(&self, xs: &Tensor, seqlen_offset: usize, position_embeddings: Option<&(Tensor, Tensor)>) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         let query = self.q_proj.forward(xs)?;
         let key = self.k_proj.forward(xs)?;
         let value = self.v_proj.forward(xs)?;
 
-        let query = query.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let mut query = query.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let mut key = key.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let mut value = value.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+
+        // 🌟 [CRITICAL FIX] KV 캐시에 들어가기 전에, 현재 토큰들의 Query와 Key에 대한 Rotary Position Embedding (RoPE) 회전 연산을 적용합니다!
+        // 이 부분이 누락되면 모델이 단어의 위치(순서)를 인지하지 못해 무조건 첫 단어로 EOS를 뱉고 종료(응답 잘림)해 버립니다.
+        if let Some((cos, sin)) = position_embeddings {
+            let cos = cos.to_dtype(query.dtype())?.unsqueeze(0)?.unsqueeze(0)?; 
+            let sin = sin.to_dtype(query.dtype())?.unsqueeze(0)?.unsqueeze(0)?; 
+            
+            let q_half1 = query.narrow(3, 0, self.head_dim / 2)?;
+            let q_half2 = query.narrow(3, self.head_dim / 2, self.head_dim / 2)?;
+            let q_rot = Tensor::cat(&[&q_half2.neg()?, &q_half1], 3)?;
+            query = query.broadcast_mul(&cos)?.broadcast_add(&q_rot.broadcast_mul(&sin)?)?;
+
+            let k_half1 = key.narrow(3, 0, self.head_dim / 2)?;
+            let k_half2 = key.narrow(3, self.head_dim / 2, self.head_dim / 2)?;
+            let k_rot = Tensor::cat(&[&k_half2.neg()?, &k_half1], 3)?;
+            key = key.broadcast_mul(&cos)?.broadcast_add(&k_rot.broadcast_mul(&sin)?)?;
+        }
 
         let mut cache = self.kv_cache.lock().unwrap();
         if let Some((prev_k, prev_v)) = cache.take() {
@@ -154,10 +173,8 @@ impl GraniteMoeHybridAttention {
             value = Tensor::cat(&[&prev_v, &value], 2)?.contiguous()?;
         }
 
-        // 🌟 [CRITICAL FIX] VRAM 보호를 위해 Attention KV 캐시 역시 FP8(F8E4M3) 압축 저장 적용
-        let k_save = if key.device().is_cuda() { key.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| key.clone()) } else { key.clone() };
-        let v_save = if value.device().is_cuda() { value.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| value.clone()) } else { value.clone() };
-        *cache = Some((k_save, v_save));
+        // 🌟 [CRITICAL FIX] Qwen 3.5 대조 결과: 어텐션 캐시 역시 VRAM 내에서는 원본 정밀도(BF16)를 유지해야 환각(빈값/EOS)이 발생하지 않습니다.
+        *cache = Some((key.clone(), value.clone()));
 
         let key_rep = crate::utils::tensor_utils::repeat_kv(key, self.num_key_value_groups)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
@@ -307,7 +324,9 @@ impl GraniteMoeHybridMambaLayer {
         };
         
         let conv1d = candle_nn::Conv1d::new(conv1d_weight, conv1d_bias, candle_nn::Conv1dConfig {
-            padding: conv_kernel_size - 1,
+            // 🌟 [CRITICAL FIX] 과거의 기억(prev_conv)을 수동으로 이어붙여(Padding) Causal 상태를 직접 만드므로,
+            // 엔진 내부의 자동 패딩을 0으로 꺼주어야 텐서가 2배로 밀려나 기억이 파괴되는 현상을 원천 차단할 수 있습니다!
+            padding: 0,
             groups: conv_dim,
             stride: 1,
             dilation: 1,
@@ -357,14 +376,12 @@ impl GraniteMoeHybridMambaLayer {
         // 🌟 [CRITICAL FIX] narrow 이후 contiguous()를 반드시 호출하여 메모리 블록을 재정렬하고 파편화를 방지합니다.
         let next_conv = hs_bc_t_padded.narrow(2, hs_bc_t_padded.dim(2)? - (k_size - 1), k_size - 1)?.contiguous()?;
         
-        // VRAM 환경인 경우 Conv State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.
-        let next_conv = if next_conv.device().is_cuda() {
-            next_conv.to_dtype(candle_core::DType::F8E4M3).unwrap_or(next_conv)
-        } else { next_conv };
+        // 🌟 [CRITICAL FIX] Qwen 3.5 대조 결과: VRAM 내부에서 FP8 압축 시 모델의 문맥 기억이 완전히 파괴되어 EOS를 반환합니다. 압축 로직을 전면 폐기합니다.
         *conv_cache = Some(next_conv);
         
         let hs_bc_conv = self.conv1d.forward(&hs_bc_t_padded)?;
-        let hs_bc_conv = hs_bc_conv.narrow(2, hs_bc_conv.dim(2)? - seq_len, seq_len)?;
+        // 🌟 [CRITICAL FIX] 내부 패딩이 0이 되었으므로, hs_bc_conv의 길이는 정확히 seq_len과 100% 일치하게 나옵니다.
+        // 과거 토큰의 오프셋을 억지로 잘라내던 narrow 코드를 삭제하여 시계열 인덱스(Causal Alignment)를 완벽히 맞춥니다.
         let hs_bc_act = candle_nn::ops::silu(&hs_bc_conv)?.transpose(1, 2)?.contiguous()?; 
 
         let hs = hs_bc_act.narrow(2, 0, self.intermediate_size)?;
@@ -420,14 +437,17 @@ impl GraniteMoeHybridMambaLayer {
             // 🌟 128 토큰 단위마다 불필요하게 팽창된 포인터 캐시를 명시적으로 잘라주어 메모리 단편화를 방지합니다.
             if t > 0 && t % 128 == 0 {
                 ssm_state = ssm_state.contiguous()?;
+                
+                // 🌟 [CRITICAL OPTIMIZATION] 프리필(Prefill) 시 CPU가 너무 빨리 루프를 돌아 수백만 개의 CUDA 커널이 
+                // 대기열(Queue)에 쌓이면서 시스템 RAM이 100%로 치솟는 OOM 프리징 현상을 방어합니다.
+                if seq_len > 1 && ssm_state.device().is_cuda() {
+                    let _ = ssm_state.device().synchronize();
+                }
             }
         }
 
-        // 🌟 [CRITICAL FIX] VRAM 환경인 경우 Recurrent State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.
-        let ssm_to_save = if ssm_state.device().is_cuda() {
-            ssm_state.to_dtype(candle_core::DType::F8E4M3).unwrap_or(ssm_state.clone())
-        } else { ssm_state.clone() };
-        *rec_cache = Some(ssm_to_save);
+        // 🌟 [CRITICAL FIX] Qwen 3.5 대조 결과: Mamba의 핵심인 누적 기억(ssm_state)을 FP8로 손실 압축하면 모델이 즉시 뇌사 상태에 빠집니다. 원본(F32)을 유지합니다.
+        *rec_cache = Some(ssm_state);
 
         let scan_output = Tensor::stack(&out_ys, 1)?.to_dtype(hidden_states.dtype())?;
         let gated_output = self.norm.forward(&scan_output, Some(&gate))?;
@@ -480,7 +500,8 @@ impl GraniteMoeHybridDecoderLayer {
         })
     }
 
-    pub fn forward(&self, hidden_states: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+    // 🌟 [CRITICAL FIX] position_embeddings 파라미터를 추가로 받아들입니다.
+    pub fn forward(&self, hidden_states: &Tensor, seqlen_offset: usize, position_embeddings: Option<&(Tensor, Tensor)>) -> Result<Tensor> {
         let mut residual = hidden_states.clone();
         let mut current_state = self.input_layernorm.forward(hidden_states)?;
 
@@ -488,7 +509,8 @@ impl GraniteMoeHybridDecoderLayer {
         if let Some(mamba) = &self.mamba {
             current_state = mamba.forward(&current_state)?;
         } else if let Some(attn) = &self.self_attn {
-            current_state = attn.forward(&current_state, seqlen_offset)?;
+            // 🌟 Multi-Head Attention으로 위치 인코딩을 주입합니다!
+            current_state = attn.forward(&current_state, seqlen_offset, position_embeddings)?;
         }
 
         // 잔차 연결 (스칼라 곱 호환성 보정)
@@ -552,8 +574,20 @@ impl GraniteMoeHybridModel {
         let emb_mult = Tensor::new(self.embedding_multiplier as f32, inputs_embeds.device())?.to_dtype(inputs_embeds.dtype())?;
         let mut hidden_states = inputs_embeds.broadcast_mul(&emb_mult)?;
 
+        // 🌟 [CRITICAL FIX] 누락되어 있던 RoPE(위치 인코딩) 텐서를 현재 시퀀스 길이와 오프셋에 맞게 동적으로 계산합니다.
+        let seq_len = input_ids.dim(1)?;
+        let position_embeddings = if let Some(rope) = &self.rotary_emb {
+            let (cos, sin) = rope.forward(seqlen_offset + seq_len)?;
+            let cos = cos.narrow(0, seqlen_offset, seq_len)?;
+            let sin = sin.narrow(0, seqlen_offset, seq_len)?;
+            Some((cos, sin))
+        } else {
+            None
+        };
+
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states, seqlen_offset)?;
+            // 🌟 하위 레이어로 위치 인코딩 정보를 함께 전달합니다.
+            hidden_states = layer.forward(&hidden_states, seqlen_offset, position_embeddings.as_ref())?;
         }
         
         self.norm.forward(&hidden_states)
