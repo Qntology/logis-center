@@ -46,7 +46,7 @@ let isExtracting = false;
 
 // 🚀 모델 다운로드 관련 상태 관리 변수 추가
 let modelStatus: Record<string, boolean> = {};
-const TARGET_MODELS = ['Qwen3', 'Qwen3.5', 'Embedding', 'Granite'];
+const TARGET_MODELS = ['Qwen3', 'Qwen3.5', 'Embedding'];
 let lastSearchedQuery = "";
 // 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
 let isBrowserRunning = false;

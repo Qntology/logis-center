@@ -566,8 +566,8 @@ async fn process_task(
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
     // 1. 정확한 토큰 수 측정을 위해 Tokenizer 로드 (파일 경로 탐색)
-    let base_path = std::fs::canonicalize("models").unwrap_or_default();
-    let tokenizer_path = base_path.join("granite-4.0-h-350m-gguf").to_string_lossy().to_string();
+    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap_or_default();
+    let tokenizer_path = base_path.join("Qwen3-0.6B-Instruct-gguf").to_string_lossy().to_string();
     
     // 1. 모델이 실제로 받게 될 전체 서식을 먼저 만듭니다. (scheduler.rs 539라인 참고)
     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", light_pug);
@@ -592,7 +592,7 @@ async fn process_task(
     let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
     } else {
-        crate::model::ModelSize::Granite
+        crate::model::ModelSize::Qwen3
     };
 
     println!("[DEBUG-PUG] Generated PUG. Length: {}. Token Count: {}. Selected Model: {:?}. Snippet: {}...", 
@@ -1238,15 +1238,15 @@ async fn process_task(
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 🌟 [CRITICAL FIX] 이어지는 추출 단계(Step B, List, Detail)에서 Granite를 그대로 재사용하므로, VRAM에서 강제로 모델을 내리지 않습니다.
+    // 🌟 [CRITICAL FIX] 이어지는 추출 단계(Step B, List, Detail)에서 Qwen3를 그대로 재사용하므로, VRAM에서 강제로 모델을 내리지 않습니다.
     // secure_vram_relay 내부의 스마트 스위칭 로직이 모델 변경 여부를 감지하여 필요할 때만 교체합니다.
     // model.deep_purge_resources().await;
     
     // 🌟 [KV CACHE CLEAR] 모델 본체는 살려두고, 이전 단계 연산으로 팽창한 KV 캐시만 제거하여 VRAM을 확보합니다.
     {
-        let granite_clear_arc = model.granite_generator.clone();
+        let q3_clear_arc = model.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Some(gen) = granite_clear_arc.blocking_lock().as_mut() {
+            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
                 gen.clear_kv_cache();
             }
         }).await;
@@ -1326,22 +1326,19 @@ async fn process_task(
                             return Err(anyhow::anyhow!("Qwen generator missing"));
                         }
                     } else {
-                        model.secure_vram_relay(crate::model::ModelSize::Granite, None, Some(cancellation_token.clone()), false, None).await?;
+                        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                        let q3_gen_arc = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
                         let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                        
-                        // 🌟 [CRITICAL FIX] Granite의 비동기 제너레이터를 위해 spawn_blocking 껍데기를 완전히 제거합니다.
-                        let res_str = {
-                            let mut gen_guard = model.granite_generator.lock().await;
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                            let mut gen_guard = q3_gen_arc.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
-                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Granite)...");
-                                let p_target = if title_prej.is_empty() { None } else { Some(title_prej.as_str()) };
-                                gen.generate(params, Some(cancel_clone), None, None, p_target).await.map_err(|e| anyhow::anyhow!("Granite failed: {}", e))?
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
+                                gen.generate(params, Some(cancel_clone), None, Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
                             } else {
-                                return Err(anyhow::anyhow!("Granite generator missing"));
+                                Err(anyhow::anyhow!("Qwen3 generator missing"))
                             }
-                        };
-                        res_str
+                        }).await??
                     };
                     
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
@@ -1806,8 +1803,8 @@ async fn process_task(
                 }
             };
 
-            // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Granite 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
-            model.secure_vram_relay(crate::model::ModelSize::Granite, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             // 🌟 [NOISE FILTER] bias.json의 layout_list.prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
             let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
@@ -1979,36 +1976,47 @@ async fn process_task(
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                        let field_name_clone = field_name.clone();
+                        let q3_gen = model.qwen3_generator.clone();
+                        let cancel_clone = cancellation_token.clone();
+                        let sys_msg = system_message.clone();
                         
-                        // 🌟 [CRITICAL FIX] 비동기 함수(await) 호출을 위해 spawn_blocking과 불필요한 변수 복제를 전면 삭제합니다.
-                        let res = {
-                            let mut gen_guard = model.granite_generator.lock().await;
+                        let field_name_clone = field_name.clone();
+                        let bias_target_for_closure = bias_target.clone(); 
+                        let prejudice_target_for_closure = prejudice_target.clone(); 
+                        
+                        let task_q = task_question.clone();
+                        let ignore_list_clone = ignore_list.clone();
+                        
+                        let res = tokio::task::spawn_blocking(move || {
+                            let mut gen_guard = q3_gen.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 let params = ChatCompletionParameters {
                                     messages: vec![
-                                        system_message.clone(),
+                                        sys_msg,
                                         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
                                             name: None,
                                         })
                                     ],
-                                    model: "granite".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                                     ..Default::default()
                                 };
                                 
-                                let p_target = if prejudice_target.is_empty() { None } else { Some(prejudice_target.as_str()) };
+                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
                                 
-                                gen.generate(params, Some(cancellation_token.clone()), None, None, p_target).await.map_err(|e| anyhow::anyhow!("Granite field extraction failed: {}", e))
+                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                             } else {
-                                Err(anyhow::anyhow!("Granite Generator not available"))
+                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                             }
-                        };
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
                         // 환각 캐시를 즉시 제거하여 다음 재시도 시 방어
-                        if let Some(gen) = model.granite_generator.lock().await.as_mut() {
-                            gen.clear_kv_cache();
-                        }
+                        let q3_clear_arc = model.qwen3_generator.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                gen.clear_kv_cache();
+                            }
+                        }).await;
 
                         if !model.is_cpu_mode {
                             let dev = model.device_config.device.clone();
@@ -2203,8 +2211,8 @@ async fn process_task(
         };
 
         if !content_pug.trim().is_empty() {
-            // 모델 스위칭 딜레이 없이, 가장 가벼운 모델인 Granite 하나만으로 필드별 순차 추출(Loop)을 진행합니다!
-            model.secure_vram_relay(crate::model::ModelSize::Granite, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+            // 모델 스위칭 딜레이 없이, 가장 가벼운 모델인 Qwen3 하나만으로 필드별 순차 추출(Loop)을 진행합니다!
+            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -2487,38 +2495,52 @@ async fn process_task(
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                    let field_name_clone = field_name.clone();
+                    let q3_gen = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let sys_msg = system_message.clone();
                     
-                    // 🌟 [CRITICAL FIX] 비동기 함수(await) 호출을 위해 spawn_blocking과 불필요한 변수 복제를 전면 삭제합니다.
-                    let res = {
-                        let mut gen_guard = model.granite_generator.lock().await;
+                    let field_name_clone = field_name.clone();
+                    let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
+                    
+                    // 🌟 [CRITICAL FIX] 다국어 Prejudice(배제) 타겟 클로저용 변수 생성
+                    let prejudice_target_for_closure = prejudice_target.clone(); 
+                    
+                    let task_q = task_question.clone();
+                    let ignore_list_clone = ignore_list.clone();
+                    
+                    let res = tokio::task::spawn_blocking(move || {
+                        let mut gen_guard = q3_gen.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
                             let params = ChatCompletionParameters {
                                 messages: vec![
-                                    system_message.clone(),
+                                    sys_msg,
                                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                        content: ChatCompletionRequestUserMessageContent::Text(task_q),
                                         name: None,
                                     })
                                 ],
-                                model: "granite".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
                                 ..Default::default()
                             };
                             
-                            // 🌟 [CRITICAL FIX] Prejudice(오답 밀어내기) 파라미터를 Granite 모델에 전달합니다!
-                            let p_target = if prejudice_target.is_empty() { None } else { Some(prejudice_target.as_str()) };
+                            // 🌟 [CRITICAL FIX] Prejudice(오답 밀어내기) 파라미터를 Qwen3 모델에 전달합니다!
+                            let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
+                            // let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
                             
-                            gen.generate(params, Some(cancellation_token.clone()), None, None, p_target).await.map_err(|e| anyhow::anyhow!("Granite field extraction failed: {}", e))
+                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
-                            Err(anyhow::anyhow!("Granite Generator not available"))
+                            Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                         }
-                    };
+                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
                     // 🌟 [개선 2] 한 번의 생성이 끝날 때마다 (성공/실패 무관하게) 즉시 KV 캐시를 초기화하여, 
                     // 다음 재시도 시 모델이 과거의 환각 데이터를 바탕으로 헛소리를 이어가는 것을 원천 차단합니다!
-                    if let Some(gen) = model.granite_generator.lock().await.as_mut() {
-                        gen.clear_kv_cache();
-                    }
+                    let q3_clear_arc = model.qwen3_generator.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                            gen.clear_kv_cache();
+                        }
+                    }).await;
 
                     if !model.is_cpu_mode {
                         let dev = model.device_config.device.clone();
