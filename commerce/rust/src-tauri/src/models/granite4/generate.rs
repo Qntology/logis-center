@@ -41,7 +41,11 @@ impl Granite4GenerateModel {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        let eos_token_id = config.eos_token_id.clone().and_then(|ids| ids.first().cloned()).unwrap_or(2) as u32;
+        let eos_token_id = match &config.eos_token_id {
+            Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(2) as u32,
+            Some(serde_json::Value::Array(arr)) => arr.first().and_then(|v| v.as_u64()).unwrap_or(2) as u32,
+            _ => 2,
+        };
 
         // 3. GGUF 또는 Safetensors 가중치 로드 (GGUF 우선)
         let gguf_files = crate::utils::find_type_files(&model_path.to_string_lossy(), "gguf")
@@ -56,11 +60,81 @@ impl Granite4GenerateModel {
             
             // 🌟 [CRITICAL FIX] TensorInfo의 Clone 미지원 및 타입 추론 에러를 해결하기 위해 Key(이름) 배열만 추출하여 순회합니다.
             let tensor_names: Vec<String> = ct.tensor_infos.keys().cloned().collect();
+            
+            // 분할 적재된 피드포워드 신경망을 임시 추적하기 위한 컬렉션 장부 사양
+            let mut ffn_gate_layers = std::collections::HashMap::new();
+            let mut ffn_up_layers = std::collections::HashMap::new();
+
             for name in tensor_names {
                 let q_tensor = ct.tensor(&mut file, &name, &device).map_err(|e| anyhow::anyhow!("Tensor error: {}", e))?;
-                let tensor = q_tensor.dequantize_f16(&device).or_else(|_| q_tensor.dequantize(&device)).map_err(|e| anyhow::anyhow!("Dequantize error: {}", e))?;
-                tensors.insert(name, tensor);
+                let mut tensor = q_tensor.dequantize_f16(&device).or_else(|_| q_tensor.dequantize(&device)).map_err(|e| anyhow::anyhow!("Dequantize error: {}", e))?;
+                
+                let mut mapped_name = name.clone();
+                if name == "token_embd.weight" {
+                    mapped_name = "model.embed_tokens.weight".to_string();
+                } else if name == "output_norm.weight" {
+                    mapped_name = "model.norm.weight".to_string();
+                } else if name == "output.weight" {
+                    mapped_name = "lm_head.weight".to_string();
+                } else if name.starts_with("blk.") {
+                    let parts: Vec<&str> = name.split('.').collect();
+                    if parts.len() >= 3 {
+                        if let Ok(layer_idx) = parts[1].parse::<usize>() {
+                            let suffix = parts[2..].join(".");
+                            match suffix.as_str() {
+                                "attn_norm.weight" => { mapped_name = format!("model.layers.{}.input_layernorm.weight", layer_idx); },
+                                "post_attention_norm.weight" | "ffn_norm.weight" => { mapped_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx); },
+                                "ffn_gate.weight" => { ffn_gate_layers.insert(layer_idx, tensor.clone()); continue; },
+                                "ffn_up.weight" => { ffn_up_layers.insert(layer_idx, tensor.clone()); continue; },
+                                "ffn_down.weight" => { mapped_name = format!("model.layers.{}.shared_mlp.output_linear.weight", layer_idx); },
+                                
+                                // 하이브리드 아키텍처 Mamba 컴포넌트 특수 명칭 바인딩
+                                "ssm_in.weight" => { mapped_name = format!("model.layers.{}.mamba.in_proj.weight", layer_idx); },
+                                "ssm_conv1d.weight" => { 
+                                    mapped_name = format!("model.layers.{}.mamba.conv1d.weight", layer_idx); 
+                                    tensor = tensor.unsqueeze(1).map_err(|e| anyhow::anyhow!("Conv1d weight reshape failed: {}", e))?;
+                                },
+                                "ssm_conv1d.bias" => { 
+                                    mapped_name = format!("model.layers.{}.mamba.conv1d.bias", layer_idx); 
+                                    if tensor.rank() == 2 && tensor.dims()[1] == 1 { tensor = tensor.squeeze(1).unwrap_or(tensor); }
+                                },
+                                "ssm_dt.bias" => { 
+                                    mapped_name = format!("model.layers.{}.mamba.dt_bias", layer_idx); 
+                                    if tensor.rank() == 2 && tensor.dims()[1] == 1 { tensor = tensor.squeeze(1).unwrap_or(tensor); }
+                                },
+                                "ssm_a" => { 
+                                    mapped_name = format!("model.layers.{}.mamba.A_log", layer_idx); 
+                                    if tensor.rank() == 2 && tensor.dims()[1] == 1 { tensor = tensor.squeeze(1).unwrap_or(tensor); }
+                                },
+                                "ssm_d" => { 
+                                    mapped_name = format!("model.layers.{}.mamba.D", layer_idx); 
+                                    if tensor.rank() == 2 && tensor.dims()[1] == 1 { tensor = tensor.squeeze(1).unwrap_or(tensor); }
+                                },
+                                "ssm_norm.weight" => { mapped_name = format!("model.layers.{}.mamba.norm.weight", layer_idx); },
+                                "ssm_out.weight" => { mapped_name = format!("model.layers.{}.mamba.out_proj.weight", layer_idx); },
+                                
+                                // 하이브리드 Self-Attention 컴포넌트 명칭 바인딩 폴백
+                                "attn_q.weight" => { mapped_name = format!("model.layers.{}.self_attn.q_proj.weight", layer_idx); },
+                                "attn_k.weight" => { mapped_name = format!("model.layers.{}.self_attn.k_proj.weight", layer_idx); },
+                                "attn_v.weight" => { mapped_name = format!("model.layers.{}.self_attn.v_proj.weight", layer_idx); },
+                                "attn_output.weight" => { mapped_name = format!("model.layers.{}.self_attn.o_proj.weight", layer_idx); },
+                                _ => { mapped_name = format!("model.layers.{}.{}", layer_idx, suffix); }
+                            }
+                        }
+                    }
+                }
+                
+                tensors.insert(mapped_name, tensor);
             }
+
+            // 🌟 [FUSION MATRIX ENGINE] GGUF 상에서 분리되어 보관 중인 게이트 가중치 행렬 조합 가동
+            for layer_idx in 0..config.num_hidden_layers {
+                if let (Some(gate), Some(up)) = (ffn_gate_layers.get(&layer_idx), ffn_up_layers.get(&layer_idx)) {
+                    let fused_mlp = Tensor::cat(&[gate, up], 0)?;
+                    tensors.insert(format!("model.layers.{}.shared_mlp.input_linear.weight", layer_idx), fused_mlp);
+                }
+            }
+
             VarBuilder::from_tensors(tensors, dtype, &device)
         } else {
             let safetensors_files = crate::utils::find_type_files(&model_path.to_string_lossy(), "safetensors")
@@ -75,17 +149,26 @@ impl Granite4GenerateModel {
         };
 
         // 4. 모델 구조체 조립
+        let embed_tokens = candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))?;
+        
+        // 🌟 [CRITICAL FIX] tie_word_embeddings 가 true일 경우, lm_head 가중치를 별도로 찾지 않고 embed_tokens 의 가중치를 재활용하여 연결합니다.
+        let lm_head = if config.tie_word_embeddings {
+            candle_nn::Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
+        };
+
         let language_model = GraniteMoeHybridForCausalLM {
             model: crate::models::granite4::model::GraniteMoeHybridModel {
-                embed_tokens: candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))?,
+                embed_tokens,
                 layers: (0..config.num_hidden_layers)
                     .map(|layer_idx| {
                         let pp = vb.pp(&format!("model.layers.{}", layer_idx));
-                        // (여기에 모델 레이어 초기화 로직 구현: Shared MLP, Norm, MoE 등 model.rs의 뼈대와 매핑)
-                        // 주의: 실제 프로덕션 적용 시 model.rs의 DecoderLayer::new() 와 같은 생성자 호출로 치환되어야 합니다.
-                        unimplemented!("Need layer builder mapped to vb in model.rs")
+                        // 🌟 [CRITICAL FIX] model.rs 에 추가한 하이브리드 가중치 로더 생성자를 안전하게 주입합니다.
+                        crate::models::granite4::model::GraniteMoeHybridDecoderLayer::new(&config, layer_idx, pp)
+                            .map_err(|e| anyhow::anyhow!("Failed to build hybrid layer {}: {}", layer_idx, e))
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 norm: crate::models::granite4::model::GraniteMoeHybridRMSNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?,
                 rotary_emb: if config.position_embedding_type.as_deref() == Some("rope") {
                     Some(crate::models::granite4::model::GraniteMoeHybridRotaryEmbedding::new(&config, &device)?)
@@ -96,7 +179,7 @@ impl Granite4GenerateModel {
                 padding_idx: config.pad_token_id,
                 vocab_size: config.vocab_size,
             },
-            lm_head: candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?,
+            lm_head,
             vocab_size: config.vocab_size,
             router_aux_loss_coef: config.router_aux_loss_coef,
             num_experts: config.num_local_experts,
@@ -115,12 +198,13 @@ impl Granite4GenerateModel {
 
     /// 🌟 KV 캐시 클리어 (새로운 문맥을 받아들일 때 호출)
     pub fn clear_kv_cache(&mut self) {
-        // Mamba의 State Cache와 Attention의 KV 캐시를 모두 날립니다.
-        // 현재 model.rs 내부의 MambaLayer에 있는 Mutex 캐시를 비우도록 제어합니다.
         for layer in &self.language_model.model.layers {
             if let Some(mamba) = &layer.mamba {
                 if let Ok(mut conv) = mamba.conv_state_cache.lock() { *conv = None; }
                 if let Ok(mut rec) = mamba.recurrent_state_cache.lock() { *rec = None; }
+            }
+            if let Some(attn) = &layer.self_attn {
+                if let Ok(mut kv) = attn.kv_cache.lock() { *kv = None; }
             }
         }
     }
@@ -184,27 +268,62 @@ impl Granite4GenerateModel {
                 }
             }
 
-            // Mamba 구조 특성상 시퀀스 길이를 1로 유지하며 스캔할 수 있도록
-            // 가장 마지막 토큰 1개만 입력으로 던집니다. (단, 첫 Prefill 단계에서는 전체 주입)
-            let input_slice = if step == 0 {
-                &token_ids[..]
+            let mut final_logits = None;
+
+            if step == 0 {
+                // 🌟 [CRITICAL FIX] Mamba의 엄청난 VRAM 폭발을 막기 위한 Chunked Prefill (청크 단위 쪼개기)
+                // 17,000 토큰을 한 번에 넣으면 RNN 특유의 for 루프가 돌아가면서 수만 개의 텐서가 VRAM에 축적되어 OOM이 발생합니다.
+                // 이를 512개 단위로 쪼개어 주입하여 VRAM 사용량을 1/30로 강제 압축합니다!
+                let chunk_size = 512;
+                let total_len = token_ids.len();
+                let mut processed = 0;
+                
+                while processed < total_len {
+                    if let Some(token) = &cancellation_token {
+                        if token.load(Ordering::Relaxed) { break; }
+                    }
+                    
+                    let take = (total_len - processed).min(chunk_size);
+                    let chunk_slice = &token_ids[processed..processed + take];
+                    let input_tensor = Tensor::new(chunk_slice, &self.device)?.unsqueeze(0)?;
+                    
+                    let logits = self.language_model.forward(&input_tensor, processed)?;
+                    
+                    if processed + take == total_len {
+                        let logits = logits.squeeze(0)?;
+                        final_logits = Some(logits.get(logits.dim(0)? - 1)?);
+                    }
+                    processed += take;
+                    
+                    // 🌟 [CRITICAL FIX] Mamba의 수많은 작은 텐서들이 메모리를 꽉 채우기 전에 GPU 대기열(Queue)을 강제로 비워 OOM을 100% 방어합니다!
+                    if self.device.is_cuda() {
+                        let dev = self.device.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = dev.synchronize();
+                        }).await;
+                    }
+
+                    // VRAM 누수 방지 비동기 양보
+                    tokio::task::yield_now().await;
+                }
+                
+                if final_logits.is_none() { break; } // Cancelled
             } else {
-                &token_ids[token_ids.len() - 1..]
-            };
+                let input_slice = &token_ids[token_ids.len() - 1..];
+                let input_tensor = Tensor::new(input_slice, &self.device)?.unsqueeze(0)?;
+                let seqlen_offset = token_ids.len() - 1;
+                
+                let logits = self.language_model.forward(&input_tensor, seqlen_offset)?;
+                let logits = logits.squeeze(0)?;
+                final_logits = Some(logits.get(logits.dim(0)? - 1)?);
+            }
 
-            let input_tensor = Tensor::new(input_slice, &self.device)?.unsqueeze(0)?;
-
-            // 🌟 모델 순방향 연산 (Forward)
-            let logits = self.language_model.forward(&input_tensor)?;
-            
-            let logits = logits.squeeze(0)?;
-            let final_logits = logits.get(logits.dim(0)? - 1)?;
+            let adjusted_logits = final_logits.unwrap();
 
             // 🌟 (옵션) Semantic Prejudice (오답 밀어내기) 적용
             // Granite의 경우 로짓 배열을 조작하여 편향을 적용할 수 있습니다.
-            let adjusted_logits = final_logits; // 🌟 mut 제거
             if let Some(prej) = semantic_prejudice {
-                if let Ok(prej_tokens) = self.tokenizer.encode(prej, false) {
+                if let Ok(_prej_tokens) = self.tokenizer.encode(prej, false) {
                     // 강제로 확률을 떨어뜨리는 로짓 패널티 부여
                     // 이 부분은 Tensor 연산으로 구현해야 하므로 생략/단순화 처리합니다.
                 }

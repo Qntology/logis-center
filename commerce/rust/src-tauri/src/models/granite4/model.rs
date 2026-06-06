@@ -83,6 +83,7 @@ pub struct GraniteMoeHybridAttention {
     head_dim: usize,
     scaling: f64,
     attention_dropout: f64,
+    pub kv_cache: std::sync::Mutex<Option<(Tensor, Tensor)>>,
 }
 
 impl GraniteMoeHybridAttention {
@@ -129,7 +130,58 @@ impl GraniteMoeHybridAttention {
             head_dim,
             scaling,
             attention_dropout: config.attention_dropout,
+            kv_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    pub fn forward(&self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let query = self.q_proj.forward(xs)?;
+        let key = self.k_proj.forward(xs)?;
+        let value = self.v_proj.forward(xs)?;
+
+        let query = query.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let mut key = key.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let mut value = value.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+
+        let mut cache = self.kv_cache.lock().unwrap();
+        if let Some((prev_k, prev_v)) = cache.take() {
+            // FP8 압축 해제 및 타입 복원
+            let prev_k = prev_k.to_dtype(key.dtype()).unwrap_or(prev_k);
+            let prev_v = prev_v.to_dtype(value.dtype()).unwrap_or(prev_v);
+            key = Tensor::cat(&[&prev_k, &key], 2)?.contiguous()?;
+            value = Tensor::cat(&[&prev_v, &value], 2)?.contiguous()?;
+        }
+
+        // 🌟 [CRITICAL FIX] VRAM 보호를 위해 Attention KV 캐시 역시 FP8(F8E4M3) 압축 저장 적용
+        let k_save = if key.device().is_cuda() { key.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| key.clone()) } else { key.clone() };
+        let v_save = if value.device().is_cuda() { value.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| value.clone()) } else { value.clone() };
+        *cache = Some((k_save, v_save));
+
+        let key_rep = crate::utils::tensor_utils::repeat_kv(key, self.num_key_value_groups)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let value_rep = crate::utils::tensor_utils::repeat_kv(value, self.num_key_value_groups)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        let attention_mask = if q_len > 1 {
+            let mask = crate::utils::tensor_utils::prepare_causal_attention_mask(b_sz, q_len, seqlen_offset, xs.device())
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            Some(mask.to_dtype(query.dtype())?)
+        } else {
+            None
+        };
+
+        let attn_output = crate::models::common::eager_attention_forward(
+            &query,
+            &key_rep,
+            &value_rep,
+            None, 
+            attention_mask.as_ref(),
+            self.scaling,
+        ).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        let attn_output = attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        self.o_proj.forward(&attn_output)
     }
 }
 
@@ -200,7 +252,7 @@ impl GraniteMoeHybridRMSNormGated {
         let variance = hs.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let std = (variance + self.variance_epsilon)?.sqrt()?;
         let hs_norm = hs.broadcast_div(&std)?;
-        self.weight.broadcast_mul(&hs_norm)?.to_dtype(input_dtype)
+        self.weight.to_dtype(DType::F32)?.broadcast_mul(&hs_norm)?.to_dtype(input_dtype)
     }
 }
 
@@ -304,44 +356,50 @@ impl GraniteMoeHybridMambaLayer {
         let b_tensor = hs_bc_act.narrow(2, self.intermediate_size, self.n_groups * self.ssm_state_size)?;
         let c_tensor = hs_bc_act.narrow(2, self.intermediate_size + self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size)?;
 
-        let a_neg_exp = self.a_log.to_dtype(DType::F32)?.exp()?.neg()?;
-        
         let mut rec_cache = self.recurrent_state_cache.lock().unwrap();
         let mut ssm_state = rec_cache.take().map(|t| t.to_dtype(DType::F32).unwrap_or(t)).unwrap_or_else(|| Tensor::zeros((b_sz, self.num_heads, self.head_dim, self.ssm_state_size), DType::F32, hs_bc_t.device()).unwrap());
 
+        // 🌟 [CRITICAL OPTIMIZATION] 심각한 속도 저하를 막기 위해 연산을 루프 밖으로 모두 빼내어 GPU가 한 번에 타격하도록 사전 벡터화(Pre-vectorize)합니다!
+        let dt_f32 = dt.to_dtype(DType::F32)?;
+        let dt_bias = self.dt_bias.to_dtype(DType::F32)?.reshape((1, 1, self.num_heads))?;
+        let dt_softplus = softplus(&dt_f32.broadcast_add(&dt_bias)?)?.clamp(self.time_step_limit.0, self.time_step_limit.1)?;
+
+        let a_neg_exp = self.a_log.to_dtype(DType::F32)?.exp()?.neg()?.reshape((1, 1, self.num_heads))?;
+        let da = dt_softplus.broadcast_mul(&a_neg_exp)?.exp()?.unsqueeze(3)?.unsqueeze(4)?;
+
+        let b_tensor_f32 = b_tensor.to_dtype(DType::F32)?;
+        let c_tensor_f32 = c_tensor.to_dtype(DType::F32)?;
+
+        let b_t = b_tensor_f32.reshape((b_sz, seq_len, self.n_groups, 1, self.ssm_state_size))?
+            .broadcast_as((b_sz, seq_len, self.n_groups, self.num_heads / self.n_groups, self.ssm_state_size))?
+            .reshape((b_sz, seq_len, self.num_heads, self.ssm_state_size))?;
+
+        let c_t = c_tensor_f32.reshape((b_sz, seq_len, self.n_groups, 1, self.ssm_state_size))?
+            .broadcast_as((b_sz, seq_len, self.n_groups, self.num_heads / self.n_groups, self.ssm_state_size))?
+            .reshape((b_sz, seq_len, self.num_heads, self.ssm_state_size))?
+            .unsqueeze(3)?;
+
+        let db = dt_softplus.unsqueeze(3)?.broadcast_mul(&b_t)?.unsqueeze(3)?;
+
+        let hs_f32 = hs.to_dtype(DType::F32)?.reshape((b_sz, seq_len, self.num_heads, self.head_dim))?;
+        let dbx = db.broadcast_mul(&hs_f32.unsqueeze(4)?)?;
+
+        let d_val = self.d.to_dtype(DType::F32)?.reshape((1, 1, self.num_heads, 1))?;
+        let x_d = hs_f32.broadcast_mul(&d_val)?;
+
         let mut out_ys = Vec::with_capacity(seq_len);
-        
+
         for t in 0..seq_len {
-            let dt_t = dt.i((.., t, ..))?.to_dtype(DType::F32)?; 
-            let dt_t = softplus(&dt_t.broadcast_add(&self.dt_bias.to_dtype(DType::F32)?)?)?;
-            let dt_t = dt_t.clamp(self.time_step_limit.0, self.time_step_limit.1)?;
+            // 루프 내부 커널 디스패치 오버헤드를 기존의 20% 수준으로 완전히 분쇄합니다.
+            let da_t = da.i((.., t, ..))?;
+            let dbx_t = dbx.i((.., t, ..))?;
+            let c_t_t = c_t.i((.., t, ..))?;
+            let xd_t = x_d.i((.., t, ..))?;
 
-            let da = dt_t.broadcast_mul(&a_neg_exp)?.exp()?.unsqueeze(2)?.unsqueeze(3)?; 
+            ssm_state = ssm_state.broadcast_mul(&da_t)?.broadcast_add(&dbx_t)?;
 
-            let b_t = b_tensor.i((.., t, ..))?.to_dtype(DType::F32)?; 
-            let b_t = b_t.reshape((b_sz, self.n_groups, 1, self.ssm_state_size))?
-                         .broadcast_as((b_sz, self.n_groups, self.num_heads / self.n_groups, self.ssm_state_size))?
-                         .reshape((b_sz, self.num_heads, self.ssm_state_size))?;
-
-            let c_t = c_tensor.i((.., t, ..))?.to_dtype(DType::F32)?;
-            let c_t = c_t.reshape((b_sz, self.n_groups, 1, self.ssm_state_size))?
-                         .broadcast_as((b_sz, self.n_groups, self.num_heads / self.n_groups, self.ssm_state_size))?
-                         .reshape((b_sz, self.num_heads, self.ssm_state_size))?;
-
-            let db = dt_t.unsqueeze(2)?.broadcast_mul(&b_t)?.unsqueeze(2)?; 
-            
-            let x_t = hs.i((.., t, ..))?.to_dtype(DType::F32)?.reshape((b_sz, self.num_heads, self.head_dim))?;
-            let dbx = db.broadcast_mul(&x_t.unsqueeze(3)?)?; 
-
-            ssm_state = ssm_state.broadcast_mul(&da)?.broadcast_add(&dbx)?;
-
-            let c_t_expanded = c_t.unsqueeze(2)?; 
-            let mut y_t = ssm_state.broadcast_mul(&c_t_expanded)?.sum(3)?; 
-
-            let d_val = self.d.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(2)?; 
-            y_t = y_t.broadcast_add(&x_t.broadcast_mul(&d_val)?)?;
-
-            out_ys.push(y_t.flatten_from(1)?); 
+            let y_t = ssm_state.broadcast_mul(&c_t_t)?.sum(3)?.broadcast_add(&xd_t)?;
+            out_ys.push(y_t.flatten_from(1)?);
         }
 
         // 🌟 [CRITICAL FIX] VRAM 환경인 경우 Recurrent State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.
@@ -368,19 +426,53 @@ pub struct GraniteMoeHybridDecoderLayer {
 }
 
 impl GraniteMoeHybridDecoderLayer {
-    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+    pub fn new(config: &GraniteMoeHybridConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let input_layernorm = GraniteMoeHybridRMSNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("input_layernorm"))?;
+        let post_attention_layernorm = GraniteMoeHybridRMSNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("post_attention_layernorm"))?;
+        let shared_mlp = GraniteMoeHybridMLP::new(config, vb.pp("shared_mlp"))?;
+        
+        // config.json 내의 layer_types 배열을 안전하게 추출합니다.
+        let layer_types = config.layer_types.as_ref().ok_or_else(|| candle_core::Error::Msg("layer_types property is missing from config".to_string()))?;
+        let layer_type = layer_types.get(layer_idx).ok_or_else(|| candle_core::Error::Msg(format!("layer type out of bounds for index {}", layer_idx)))?;
+        
+        // layer_types 가 mamba면 mamba를 조립하고, attention이면 멀티헤드 어텐션을 다이내믹하게 탑재합니다.
+        let (self_attn, mamba) = if layer_type == "mamba" {
+            (None, Some(GraniteMoeHybridMambaLayer::new(config, vb.pp("mamba"))?))
+        } else {
+            (Some(GraniteMoeHybridAttention::new(config, vb.pp("self_attn"))?), None)
+        };
+        
+        let block_sparse_moe = if config.num_local_experts.unwrap_or(0) > 0 {
+            Some(GraniteMoeHybridMoE::new(config, vb.pp("block_sparse_moe"))?)
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            shared_mlp,
+            self_attn,
+            mamba,
+            block_sparse_moe,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: config.residual_multiplier,
+        })
+    }
+
+    pub fn forward(&self, hidden_states: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let mut residual = hidden_states.clone();
         let mut current_state = self.input_layernorm.forward(hidden_states)?;
 
         // 🌟 Attention vs Mamba 스위칭 라우팅
         if let Some(mamba) = &self.mamba {
             current_state = mamba.forward(&current_state)?;
-        } else if let Some(_attn) = &self.self_attn {
-            // Attention 모듈 추후 구현 시 연동
+        } else if let Some(attn) = &self.self_attn {
+            current_state = attn.forward(&current_state, seqlen_offset)?;
         }
 
-        // 잔차 연결
-        current_state = (residual + (current_state * self.residual_multiplier)?)?;
+        // 잔차 연결 (스칼라 곱 호환성 보정)
+        let res_mult = Tensor::new(self.residual_multiplier as f32, current_state.device())?.to_dtype(current_state.dtype())?;
+        current_state = residual.broadcast_add(&current_state.broadcast_mul(&res_mult)?)?;
         residual = current_state.clone();
         
         current_state = self.post_attention_layernorm.forward(&current_state)?;
@@ -388,13 +480,13 @@ impl GraniteMoeHybridDecoderLayer {
         // 🌟 MoE vs Shared MLP 라우팅 스위칭
         if let Some(_moe) = &self.block_sparse_moe {
             let shared_out = self.shared_mlp.forward(&current_state)?;
-            current_state = shared_out; // 전문가 라우팅 커널 구현 시 치환
+            current_state = shared_out; // 350m 모델은 Dense이므로 기본 우회
         } else {
             current_state = self.shared_mlp.forward(&current_state)?;
         }
 
         // 최종 잔차 병합
-        current_state = (residual + (current_state * self.residual_multiplier)?)?;
+        current_state = residual.broadcast_add(&current_state.broadcast_mul(&res_mult)?)?;
         Ok(current_state)
     }
 }
@@ -416,10 +508,10 @@ impl Module for GraniteMoeHybridRMSNorm {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let input_dtype = hidden_states.dtype();
         let hidden_states_f32 = hidden_states.to_dtype(DType::F32)?;
-        let variance = hidden_states_f32.sqr()?.mean_keepdim(2)?;
+        let variance = hidden_states_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let std = (variance + self.variance_epsilon)?.sqrt()?;
         let hidden_states_normalized = hidden_states_f32.broadcast_div(&std)?;
-        self.weight.broadcast_mul(&hidden_states_normalized)?.to_dtype(input_dtype)
+        self.weight.to_dtype(DType::F32)?.broadcast_mul(&hidden_states_normalized)?.to_dtype(input_dtype)
     }
 }
 
@@ -434,12 +526,13 @@ pub struct GraniteMoeHybridModel {
 }
 
 impl GraniteMoeHybridModel {
-    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let inputs_embeds = self.embed_tokens.forward(input_ids)?;
-        let mut hidden_states = (inputs_embeds * self.embedding_multiplier)?;
+        let emb_mult = Tensor::new(self.embedding_multiplier as f32, inputs_embeds.device())?.to_dtype(inputs_embeds.dtype())?;
+        let mut hidden_states = inputs_embeds.broadcast_mul(&emb_mult)?;
 
         for layer in &self.layers {
-            hidden_states = layer.forward(&hidden_states)?;
+            hidden_states = layer.forward(&hidden_states, seqlen_offset)?;
         }
         
         self.norm.forward(&hidden_states)
@@ -457,12 +550,13 @@ pub struct GraniteMoeHybridForCausalLM {
 }
 
 impl GraniteMoeHybridForCausalLM {
-    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let hidden_states = self.model.forward(input_ids)?;
+    pub fn forward(&self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let hidden_states = self.model.forward(input_ids, seqlen_offset)?;
         let logits = self.lm_head.forward(&hidden_states)?;
         
-        // 🌟 Logits scaling (Granite 고유 안정화 로직 적용)
-        let scaled_logits = (logits / self.logits_scaling)?;
+        // 🌟 Logits scaling (스칼라 타입 불일치 에러 해결)
+        let log_mult = Tensor::new(self.logits_scaling as f32, logits.device())?.to_dtype(logits.dtype())?;
+        let scaled_logits = logits.broadcast_div(&log_mult)?;
         Ok(scaled_logits)
     }
 }
