@@ -378,7 +378,9 @@ impl Granite4GenerateModel {
             // 🌟 [CRITICAL FIX] 사전에 생성해둔 Semantic Prejudice(척력) 텐서를 현재 스텝의 로짓(Logits)에서 빼주어
             // 환각을 유발하는 오답 진영의 단어들이 모델의 입에서 나오는 것을 물리적으로 원천 차단합니다!
             if let Some(ref prej) = semantic_prejudice_tensor {
-                adjusted_logits = adjusted_logits.broadcast_sub(prej)?;
+                // 🌟 [CRITICAL FIX] 로짓(BF16/F16)과 척력 텐서(F32) 간의 타입 불일치(dtype mismatch) 패닉을 해결하기 위해 타입을 동기화합니다.
+                let prej_casted = prej.to_dtype(adjusted_logits.dtype())?;
+                adjusted_logits = adjusted_logits.broadcast_sub(&prej_casted)?;
             }
 
             // 🌟 [CRITICAL FIX] Qwen 방식 적용: JSON 모드일 경우 무조건 첫 토큰을 `{` 로 강제하여 
