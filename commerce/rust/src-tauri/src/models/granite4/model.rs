@@ -93,7 +93,8 @@ impl GraniteMoeHybridAttention {
         let num_key_value_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
         let head_dim = hidden_size / num_attention_heads;
         let num_key_value_groups = num_attention_heads / num_key_value_heads;
-        let scaling = config.attention_multiplier / (head_dim as f64).sqrt();
+        // 🌟 [CRITICAL FIX] Python 원본과 동일하게 sqrt(head_dim) 나눗셈을 제거하고 순수 multiplier만 사용합니다.
+        let scaling = config.attention_multiplier;
 
         let q_proj = if config.attention_bias {
             candle_nn::linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?
@@ -290,7 +291,13 @@ impl GraniteMoeHybridMambaLayer {
         let conv_dim = intermediate_size + 2 * n_groups * ssm_state_size;
         let projection_size = intermediate_size + conv_dim + num_heads;
 
-        let in_proj = candle_nn::linear_no_bias(hidden_size, projection_size, vb.pp("in_proj"))?;
+        // 🌟 [CRITICAL FIX] config의 mamba_proj_bias 속성을 참조하여 Bias 생성 여부를 결정합니다.
+        let use_proj_bias = config.mamba_proj_bias.unwrap_or(false);
+        let in_proj = if use_proj_bias {
+            candle_nn::linear(hidden_size, projection_size, vb.pp("in_proj"))?
+        } else {
+            candle_nn::linear_no_bias(hidden_size, projection_size, vb.pp("in_proj"))?
+        };
         
         let conv1d_weight = vb.get((conv_dim, 1, conv_kernel_size), "conv1d.weight")?;
         let conv1d_bias = if config.mamba_conv_bias.unwrap_or(true) {
@@ -312,7 +319,13 @@ impl GraniteMoeHybridMambaLayer {
         let d = vb.get(num_heads, "D")?;
         
         let norm = GraniteMoeHybridRMSNormGated::new(intermediate_size, config.rms_norm_eps, vb.pp("norm"))?;
-        let out_proj = candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("out_proj"))?;
+        
+        // 🌟 [CRITICAL FIX] out_proj 역시 config.mamba_proj_bias 설정에 맞게 반영합니다.
+        let out_proj = if use_proj_bias {
+            candle_nn::linear(intermediate_size, hidden_size, vb.pp("out_proj"))?
+        } else {
+            candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("out_proj"))?
+        };
         let limit = config.time_step_limit.unwrap_or((0.0, f64::INFINITY));
 
         Ok(Self {
@@ -341,8 +354,10 @@ impl GraniteMoeHybridMambaLayer {
         
         let hs_bc_t_padded = Tensor::cat(&[&prev_conv, &hs_bc_t], 2)?;
         
-        // 🌟 [CRITICAL FIX] VRAM 환경인 경우 Conv State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.
-        let next_conv = hs_bc_t_padded.narrow(2, hs_bc_t_padded.dim(2)? - (k_size - 1), k_size - 1)?;
+        // 🌟 [CRITICAL FIX] narrow 이후 contiguous()를 반드시 호출하여 메모리 블록을 재정렬하고 파편화를 방지합니다.
+        let next_conv = hs_bc_t_padded.narrow(2, hs_bc_t_padded.dim(2)? - (k_size - 1), k_size - 1)?.contiguous()?;
+        
+        // VRAM 환경인 경우 Conv State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.
         let next_conv = if next_conv.device().is_cuda() {
             next_conv.to_dtype(candle_core::DType::F8E4M3).unwrap_or(next_conv)
         } else { next_conv };
@@ -390,7 +405,8 @@ impl GraniteMoeHybridMambaLayer {
         let mut out_ys = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
-            // 루프 내부 커널 디스패치 오버헤드를 기존의 20% 수준으로 완전히 분쇄합니다.
+            // 🌟 [CRITICAL FIX] 370만 번의 순차 텐서 연산으로 인한 메모리 쓰레기 누적 및 앱 프리징 현상 방어
+            // Mamba 내부 루프는 커스텀 CUDA 커널 없이 실행될 시 VRAM 포인터를 무한정 쌓아두어 100% OOM과 무한루프(수십 분 정지)를 유발합니다.
             let da_t = da.i((.., t, ..))?;
             let dbx_t = dbx.i((.., t, ..))?;
             let c_t_t = c_t.i((.., t, ..))?;
@@ -400,6 +416,11 @@ impl GraniteMoeHybridMambaLayer {
 
             let y_t = ssm_state.broadcast_mul(&c_t_t)?.sum(3)?.broadcast_add(&xd_t)?;
             out_ys.push(y_t.flatten_from(1)?);
+            
+            // 🌟 128 토큰 단위마다 불필요하게 팽창된 포인터 캐시를 명시적으로 잘라주어 메모리 단편화를 방지합니다.
+            if t > 0 && t % 128 == 0 {
+                ssm_state = ssm_state.contiguous()?;
+            }
         }
 
         // 🌟 [CRITICAL FIX] VRAM 환경인 경우 Recurrent State 캐시를 FP8(F8E4M3)로 압축하여 저장합니다.

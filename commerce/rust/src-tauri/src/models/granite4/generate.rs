@@ -1,5 +1,6 @@
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+// 🌟 [CRITICAL FIX] Embedding 등의 모듈에서 .forward() 메서드를 사용하기 위해 Module 트레잇을 추가로 임포트합니다.
+use candle_core::{DType, Device, Tensor, Module};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
@@ -218,13 +219,17 @@ impl Granite4GenerateModel {
         _kv_name: Option<String>,
         semantic_prejudice: Option<&str>,
     ) -> Result<String> {
+        // 🌟 [CRITICAL FIX] 캐시를 비우지 않아 발생하는 Attention Shape Mismatch 및 환각 폭주 현상 원천 차단
+        self.clear_kv_cache();
+        
         let mut prompt = String::new();
         
         // 1. OpenAI 규격의 메시지를 단일 프롬프트 텍스트로 합칩니다.
         for msg in &params.messages {
             match msg {
                 crate::openai_types::ChatCompletionRequestMessage::System(sys) => {
-                    prompt.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys.content));
+                    // 🌟 [CRITICAL FIX] Granite 4.0 전용 Instruct 포맷(<|start_of_role|>...)으로 변경하여 모델이 지시를 정상적으로 이해하게 합니다.
+                    prompt.push_str(&format!("<|start_of_role|>system<|end_of_role|>\n{}<|end_of_text|>\n", sys.content));
                 }
                 crate::openai_types::ChatCompletionRequestMessage::User(user) => {
                     let text = match &user.content {
@@ -239,7 +244,7 @@ impl Granite4GenerateModel {
                             combined
                         }
                     };
-                    prompt.push_str(&format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", text));
+                    prompt.push_str(&format!("<|start_of_role|>user<|end_of_role|>\n{}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>\n", text));
                 }
                 _ => {}
             }
@@ -255,7 +260,57 @@ impl Granite4GenerateModel {
         let top_p = params.top_p.unwrap_or(0.9);
 
         let mut logits_processor = LogitsProcessor::new(299792458, Some(temp), Some(top_p));
-        let mut generated_text = String::new();
+        // 🌟 [CRITICAL FIX] 한국어(CJK) 등 다바이트 문자가 단일 토큰 디코딩 시 깨지거나 무시되어 빈 문자열이 되는 현상을 막기 위해,
+        // 토큰을 배열에 모아두었다가 디코딩 루프가 끝난 뒤 한 번에 전체를 디코딩하도록 변경합니다.
+        let mut generated_tokens = Vec::new();
+
+        // 🌟 [CRITICAL FIX] Qwen3/3.5의 JSON 강제 출력(Forcing) 및 괄호 감지 로직을 Granite 모델에 이식합니다.
+        // 프롬프트에 JSON 전용 지시어가 있다면, 모델이 답변을 회피하고 빈 줄만 뱉는 것을 물리적으로 차단합니다.
+        let is_strict_json = prompt.contains("/no_think") || prompt.contains("RETURN JSON ONLY") || prompt.contains("Return ONLY");
+        let open_bracket_id = self.tokenizer.encode("{", false).map(|v| *v.get_ids().first().unwrap_or(&123)).unwrap_or(123);
+        let mut gen_text_buffer = String::new();
+
+        // 🌟 [CRITICAL FIX] Qwen3/3.5의 Semantic Prejudice (오답 진영 억제력) 생성 로직을 완벽하게 이식합니다.
+        // 전체 단어장(Embedding)을 대상으로 코사인 유사도를 계산하고 임계값을 넘는 노이즈 단어들의 확률을 깎아냅니다.
+        let mut semantic_prejudice_tensor: Option<Tensor> = None;
+        if let Some(target_text) = semantic_prejudice {
+            if let Ok(target_tokens) = self.tokenizer.encode(target_text, false) {
+                let target_ids = target_tokens.get_ids();
+                if !target_ids.is_empty() {
+                    let calc_prej = || -> Result<Tensor> {
+                        let target_tensor = Tensor::new(target_ids, &self.device)?.unsqueeze(0)?;
+                        let target_emb = self.language_model.model.embed_tokens.forward(&target_tensor)?.to_dtype(DType::F32)?;
+                        let target_emb_sum = target_emb.sum_keepdim(1)?;
+                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+
+                        let all_embs = self.language_model.model.embed_tokens.embeddings().to_dtype(DType::F32)?;
+                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+
+                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+                        let all_norm = all_sqr.sqrt()?;
+                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+
+                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        // Threshold 노이즈 게이트 + Exponential 증폭
+                        let threshold = Tensor::new(0.65f32, &self.device)?;
+                        let one = Tensor::new(1.0f32, &self.device)?;
+                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+                        Ok(prejudice)
+                    };
+                    match calc_prej() {
+                        Ok(prej) => {
+                            semantic_prejudice_tensor = Some(prej);
+                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
+                        }
+                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
+                    }
+                }
+            }
+        }
 
         println!("[GENERATE] Granite4 Decoding started. Context length: {}", token_ids.len());
 
@@ -304,10 +359,10 @@ impl Granite4GenerateModel {
                     }
 
                     // VRAM 누수 방지 비동기 양보
-                    tokio::task::yield_now().await;
+                    // 🌟 [CRITICAL FIX] 워커 스레드 기아 상태 방어: 
+                    // 단일 청크 연산이 너무 무거워 yield_now() 만으로는 UI 스레드가 살아나지 못하므로 10ms 슬립을 강제 주입합니다.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                
-                if final_logits.is_none() { break; } // Cancelled
             } else {
                 let input_slice = &token_ids[token_ids.len() - 1..];
                 let input_tensor = Tensor::new(input_slice, &self.device)?.unsqueeze(0)?;
@@ -318,19 +373,22 @@ impl Granite4GenerateModel {
                 final_logits = Some(logits.get(logits.dim(0)? - 1)?);
             }
 
-            let adjusted_logits = final_logits.unwrap();
+            let mut adjusted_logits = final_logits.unwrap();
 
-            // 🌟 (옵션) Semantic Prejudice (오답 밀어내기) 적용
-            // Granite의 경우 로짓 배열을 조작하여 편향을 적용할 수 있습니다.
-            if let Some(prej) = semantic_prejudice {
-                if let Ok(_prej_tokens) = self.tokenizer.encode(prej, false) {
-                    // 강제로 확률을 떨어뜨리는 로짓 패널티 부여
-                    // 이 부분은 Tensor 연산으로 구현해야 하므로 생략/단순화 처리합니다.
-                }
+            // 🌟 [CRITICAL FIX] 사전에 생성해둔 Semantic Prejudice(척력) 텐서를 현재 스텝의 로짓(Logits)에서 빼주어
+            // 환각을 유발하는 오답 진영의 단어들이 모델의 입에서 나오는 것을 물리적으로 원천 차단합니다!
+            if let Some(ref prej) = semantic_prejudice_tensor {
+                adjusted_logits = adjusted_logits.broadcast_sub(prej)?;
             }
 
-            // 🌟 샘플링
-            let next_token = logits_processor.sample(&adjusted_logits)?;
+            // 🌟 [CRITICAL FIX] Qwen 방식 적용: JSON 모드일 경우 무조건 첫 토큰을 `{` 로 강제하여 
+            // 모델이 헛소리를 하거나 빈 줄(\n)을 뱉고 EOS로 종료해버리는 현상을 완벽히 제압합니다!
+            let next_token = if step == 0 && is_strict_json {
+                open_bracket_id
+            } else {
+                logits_processor.sample(&adjusted_logits)?
+            };
+            
             token_ids.push(next_token);
 
             // EOS 토큰을 만나면 종료
@@ -338,14 +396,34 @@ impl Granite4GenerateModel {
                 break;
             }
 
-            // 토큰을 디코딩하여 문자열에 이어붙입니다.
-            if let Ok(decoded_token) = self.tokenizer.decode(&[next_token], true) {
-                generated_text.push_str(&decoded_token);
+            // 🌟 [CRITICAL FIX] 다바이트 문자열 디코딩 깨짐을 막기 위해 생성된 토큰을 배열에 모아둡니다.
+            generated_tokens.push(next_token);
+
+            // 🌟 [CRITICAL FIX] Qwen3/3.5의 JSON 균형(Balanced) 조기 종료 로직 이식
+            if let Ok(piece) = self.tokenizer.decode(&[next_token], true) {
+                gen_text_buffer.push_str(&piece);
+
+                if is_strict_json && gen_text_buffer.contains('{') {
+                    let mut depth = 0;
+                    let mut has_started = false;
+                    for c in gen_text_buffer.chars() {
+                        if c == '{' { depth += 1; has_started = true; }
+                        else if c == '}' { depth -= 1; }
+                    }
+                    // 중괄호 짝이 완벽하게 맞물려 닫히는 즉시 추론을 종료하여 VRAM과 시간을 절약합니다.
+                    if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        println!("[GENERATE] Balanced JSON detected. Stopping early.");
+                        break;
+                    }
+                }
             }
 
             // 비동기 양보로 시스템 프리징 방지
             tokio::task::yield_now().await;
         }
+
+        // 🌟 [CRITICAL FIX] 루프가 종료된 후 배열 전체를 한 번에 디코딩하여 한국어 깨짐 현상을 원천 차단합니다.
+        let generated_text = self.tokenizer.decode(&generated_tokens, true).unwrap_or_default();
 
         println!("[GENERATE] Granite4 Decoding finished.");
         Ok(generated_text)
