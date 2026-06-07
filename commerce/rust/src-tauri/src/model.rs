@@ -1625,26 +1625,29 @@ impl LogisModel {
         let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
         let mut layout_embs = std::collections::HashMap::new();
 
-        let mut biases_to_embed = Vec::new();
-        let mut bias_mappings = Vec::new();
+        let mut texts_to_embed = Vec::new();
+        let mut emb_mappings = Vec::new();
 
-        // 1. 모든 카테고리의 bias 텍스트와 매핑 정보를 순차적으로 수집
+        // 1. 모든 카테고리의 bias 및 prejudice 텍스트와 매핑 정보를 순차적으로 수집
         for cat in &categories {
-            let (list_bias, form_bias, _) = crate::parsing::get_combinatorial_layout_bias(&[cat], &query_lang);
+            let (list_bias, form_bias, prejudice) = crate::parsing::get_combinatorial_layout_bias(&[cat], &query_lang);
             
-            biases_to_embed.push(list_bias);
-            bias_mappings.push((cat.to_string(), "list"));
+            // 🌟 [핵심 변경] list와 form 키워드를 하나의 문장으로 합쳐 단일 bias로 취급합니다.
+            let combined_bias = format!("{} {}", list_bias, form_bias);
             
-            biases_to_embed.push(form_bias);
-            bias_mappings.push((cat.to_string(), "form"));
+            texts_to_embed.push(combined_bias);
+            emb_mappings.push((cat.to_string(), "bias"));
+
+            texts_to_embed.push(prejudice);
+            emb_mappings.push((cat.to_string(), "prejudice"));
         }
 
         // 2. 단 한 번의 배치 호출로 모든 임베딩 벡터를 한 장바구니에 획득
-        let embedded_biases = self.get_embedding_batch(biases_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; categories.len() * 2]);
+        let embedded_texts = self.get_embedding_batch(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; categories.len() * 2]);
 
         // 3. 획득한 벡터와 카테고리 키 값을 매칭하여 해시맵에 일괄 삽입
-        for (i, (cat, bias_type)) in bias_mappings.into_iter().enumerate() {
-            layout_embs.insert(format!("{}_{}", cat, bias_type), embedded_biases[i].clone());
+        for (i, (cat, emb_type)) in emb_mappings.into_iter().enumerate() {
+            layout_embs.insert(format!("{}_{}", cat, emb_type), embedded_texts[i].clone());
         }
 
         fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1678,13 +1681,15 @@ impl LogisModel {
 
                 let mut scores = std::collections::HashMap::new();
                 for cat in &categories {
-                    let list_emb = layout_embs.get(&format!("{}_list", cat)).cloned().unwrap_or(vec![0.0; 384]);
-                    let form_emb = layout_embs.get(&format!("{}_form", cat)).cloned().unwrap_or(vec![0.0; 384]);
+                    let bias_emb = layout_embs.get(&format!("{}_bias", cat)).cloned().unwrap_or(vec![0.0; 384]);
+                    let prej_emb = layout_embs.get(&format!("{}_prejudice", cat)).cloned().unwrap_or(vec![0.0; 384]);
                     
-                    let list_score = cosine_similarity(&test_emb, &list_emb);
-                    let form_score = cosine_similarity(&test_emb, &form_emb);
+                    let bias_score = cosine_similarity(&test_emb, &bias_emb);
+                    let prej_score = cosine_similarity(&test_emb, &prej_emb);
 
-                    scores.insert(cat.to_string(), list_score + form_score);
+                    // 🌟 [우선순위 조정] 단일 Bias 점수에서 Prejudice(노이즈) 점수를 차감하여 문맥의 순도를 높입니다.
+                    let final_base_score = (bias_score - prej_score).max(0.0);
+                    scores.insert(cat.to_string(), final_base_score);
                 }
                 raw_spans.push(SpanData { start, end, text: test_text, scores });
             }
