@@ -1696,24 +1696,28 @@ impl LogisModel {
                         field_scores.push(field_score);
                     }
 
-                    // 🌟 [멀티 패스 스코어 평균화] 
-                    // 필드 개수가 많은 도메인이 무조건 점수가 낮아지는 현상(희석)을 막기 위해,
-                    // 해당 문구와 가장 강하게 매칭된 상위 3개 속성 점수의 "평균(Average)"을 최종 문맥 점수로 산출합니다.
+                    // 🌟 [멀티 패스 스코어 평가]
                     field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    let top_k = field_scores.len().min(3);
-                    let mut sum_top_scores = 0.0;
                     
-                    for i in 0..top_k {
-                        sum_top_scores += field_scores[i];
+                    // 🌟 [진정한 멀티패스 반영: 동적 감쇠 누적 합산 (Decaying Sum)]
+                    // 상위 N개 점수를 동적으로 순회하며 가중치를 반감(1.0, 0.5, 0.25, 0.125...)시켜 합산합니다.
+                    // 무한히 더해도 최대값이 수렴하므로, 필드 개수가 많은(예: 40개) 도메인이 
+                    // 잡음(Noise)을 끌어모아 점수를 뻥튀기하는 현상을 수학적으로 완벽히 차단합니다.
+                    let mut multi_pass_score = 0.0;
+                    let mut weight = 1.0;
+                    
+                    // 🌟 상위 5개까지만 유의미한 멀티패스 공명으로 인정하여 합산합니다.
+                    let max_pass = field_scores.len().min(5);
+                    for i in 0..max_pass {
+                        multi_pass_score += field_scores[i] * weight;
+                        weight *= 0.5; // 다음 순위의 필드 점수는 반영 비율을 절반으로 깎습니다.
                     }
                     
-                    let avg_base_score = if top_k > 0 { sum_top_scores / (top_k as f32) } else { 0.0 };
-                    
-                    // 🌟 [단어 개수 가중치] 단어가 많이 합쳐질수록 문맥이 명확해지므로 길이에 비례하여 가중치를 부여합니다.
-                    // 2단어는 1.0(기본값), 그 이후부터 단어당 5%씩 가산점을 줍니다. (예: 6단어 = 1.2배)
+                    // 🌟 [단어 개수 가중치 상향] 단어가 많이 합쳐질수록 문맥이 명확해지므로 길이에 비례하여 가중치를 부여합니다.
+                    // 파편이 긴 문장을 잡아먹는 현상(NMS Battle 하극상)을 완벽히 막기 위해 가산점을 단어당 15%로 대폭 상향합니다.
                     let word_count = end - start;
-                    let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.05); 
-                    let weighted_base_score = avg_base_score * length_weight;
+                    let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.15); 
+                    let weighted_base_score = multi_pass_score * length_weight;
                     
                     scores.insert(cat.to_string(), weighted_base_score);
                 }
@@ -1769,20 +1773,22 @@ impl LogisModel {
 
             let current_best_cat = contextual_scores[0].0.clone();
             let current_max_contextual_score = contextual_scores[0].1;
-            let original_base_score = *target.scores.get(&current_best_cat).unwrap_or(&0.0);
 
-            // 🌟 기본 결합도가 유의미한 수준(0.45 이상)일 때만 수집 바구니에 저장
-            if original_base_score > 0.45 {
+            // 🌟 [커트라인 완전 해제] original_base_score 및 0.45 커트라인을 제거했습니다.
+            // 최소한의 유사도(0.0 초과)만 있다면 모두 후보군으로 올리고, 길이와 문맥이 반영된 NMS 배틀을 통해 최강자만 살아남게 합니다.
+            if current_max_contextual_score > 0.0 {
                 let mut intersecting_categories: Vec<String> = Vec::new();
                 for (cat_name, c_score) in &contextual_scores {
-                    let base_s = *target.scores.get(cat_name).unwrap_or(&0.0);
-                    if *c_score >= current_max_contextual_score - 0.25 && base_s > 0.40 {
+                    if *c_score >= current_max_contextual_score - 0.25 && *c_score > 0.0 {
                         intersecting_categories.push(cat_name.clone());
                     }
                 }
                 if intersecting_categories.is_empty() {
                     intersecting_categories.push(current_best_cat.clone());
                 }
+
+                // 🌟 유효 텍스트 후보군 출력 (Base Score 출력 제거)
+                emit_term(&format!("  🟢 [CANDIDATE] '{}' -> Domain: {} (Context Score: {:.4})", target.text, current_best_cat, current_max_contextual_score));
 
                 evaluated_spans.push(EvaluatedSpan {
                     start: target.start,
@@ -1791,7 +1797,7 @@ impl LogisModel {
                     best_cat: current_best_cat,
                     context_score: current_max_contextual_score,
                     intersecting: intersecting_categories,
-                    base_score: original_base_score,
+                    base_score: 0.0, // 구조체 호환성을 위해 0.0으로 고정
                 });
             }
         }
@@ -1801,22 +1807,29 @@ impl LogisModel {
 
         let mut final_selected_spans: Vec<EvaluatedSpan> = Vec::new();
 
+        emit_term("\n  ⚔️ [NMS BATTLE] Resolving Overlaps...");
+
         for span in evaluated_spans {
             let mut is_overlapped = false;
+            let mut winner_text = String::new();
 
             // 이미 승리하여 선택된 상위 점수의 스팬들과 현재 스팬이 교차하는지 검사합니다.
             for selected in &final_selected_spans {
                 let overlaps = span.start < selected.end && span.end > selected.start;
                 
                 if overlaps {
-                    // 동일한 단어 개수이든, 개수가 다르든 교차가 발생하면 무조건 점수가 낮은 현재 스팬은 패배하여 탈락합니다.
+                    // 점수가 낮은 현재 스팬은 패배하여 탈락합니다.
                     is_overlapped = true;
+                    winner_text = selected.text.clone();
                     break;
                 }
             }
 
             if !is_overlapped {
+                emit_term(&format!("    👑 [WINNER] '{}' (Score: {:.4}) survives.", span.text, span.context_score));
                 final_selected_spans.push(span);
+            } else {
+                emit_term(&format!("    💀 [DEFEAT] '{}' is absorbed by higher score winner '{}'.", span.text, winner_text));
             }
         }
 
@@ -1824,7 +1837,8 @@ impl LogisModel {
         final_selected_spans.sort_by(|a, b| a.start.cmp(&b.start));
 
         for span in final_selected_spans {
-            emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4}, Base: {:.4})", span.intersecting, span.text, span.context_score, span.base_score));
+            // 🌟 Base Score 출력을 제거하고 Context Score만 깔끔하게 보여줍니다.
+            emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", span.intersecting, span.text, span.context_score));
 
             context_arr.push(json!({
                 "type": span.best_cat,
