@@ -750,7 +750,26 @@ async fn ai_search_complex(
         model_guard.as_ref().unwrap().clone() 
     }; 
 
-    
+    // 🌟 [CRITICAL FIX] GPU VRAM을 활용한 이중 모델(Qwen3 + Embedding) 사전 상주(Preload) 및 찌꺼기 정리
+    // Qwen3가 current_size로 등록된 상태에서 ensure_embedding을 호출하면 VRAM 정리를 건너뛰게 됩니다.
+    if !model.is_cpu_mode {
+        emit_term("[VRAM-SETUP] GPU 모드 감지됨. Qwen3 및 Embedding 모델 동시 상주 준비 (병렬 로딩)...");
+        
+        // 🌟 [최적화] 두 모델을 순차적으로 기다리지 않고, tokio::join!을 통해 병렬(동시) 로딩하여 대기 시간을 절반으로 줄입니다.
+        let _ = tokio::join!(
+            model.ensure_qwen3(),
+            model.ensure_embedding()
+        );
+        
+        // 두 모델이 VRAM에 안정적으로 올라간 상태에서 Qwen3의 남은 KV 캐시만 비워 연산 공간을 확보합니다.
+        let q3_clear_arc = model.qwen3_generator.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                gen.clear_kv_cache();
+            }
+        }).await;
+    }
+
     if let Some(store) = store_opt.as_ref() {
         let _ = store.update_task_status(&task_id, 1).await; // 1: Processing
         

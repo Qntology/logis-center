@@ -1610,17 +1610,42 @@ impl LogisModel {
         self.ensure_embedding().await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // 🌟 [CRITICAL FIX] 사용자 질의(Query) 자체의 유니코드 언어를 선행 감지하여 정확한 bias 데이터를 호출합니다.
-        let mut ko_count = 0;
-        let mut ja_count = 0;
+        // 🌟 [CRITICAL FIX] 52개 글로벌 언어 및 유니코드 블록 완벽 감지 로직
+        // 특수 문자가 감지되면 해당 언어(ru, ar, hi 등)를 강제 지정하고,
+        // 알파벳(라틴) 기반이면 프론트엔드에서 전달받은 정확한 locale(language)을 신뢰하여 폴백(Fallback)합니다.
+        let mut lang_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut latin_count = 0;
+        
         for c in query.chars() {
             let u = c as u32;
-            if u >= 0xAC00 && u <= 0xD7A3 { ko_count += 1; }
-            else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { ja_count += 1; }
+            if u >= 0xAC00 && u <= 0xD7A3 { *lang_counts.entry("ko").or_insert(0) += 1; } // Korean
+            else if u >= 0x3040 && u <= 0x30FF { *lang_counts.entry("ja").or_insert(0) += 1; } // Japanese
+            else if u >= 0x4E00 && u <= 0x9FFF { *lang_counts.entry("zh").or_insert(0) += 1; } // Chinese
+            else if u >= 0x0400 && u <= 0x052F { *lang_counts.entry("ru").or_insert(0) += 1; } // Cyrillic (ru, bg, uk, kk, sr)
+            else if u >= 0x0600 && u <= 0x06FF { *lang_counts.entry("ar").or_insert(0) += 1; } // Arabic (ar, fa, ur)
+            else if u >= 0x0E00 && u <= 0x0E7F { *lang_counts.entry("th").or_insert(0) += 1; } // Thai
+            else if u >= 0x0370 && u <= 0x03FF { *lang_counts.entry("el").or_insert(0) += 1; } // Greek
+            else if u >= 0x0590 && u <= 0x05FF { *lang_counts.entry("he").or_insert(0) += 1; } // Hebrew
+            else if u >= 0x0900 && u <= 0x097F { *lang_counts.entry("hi").or_insert(0) += 1; } // Devanagari (hi, mr)
+            else if u >= 0x0980 && u <= 0x09FF { *lang_counts.entry("bn").or_insert(0) += 1; } // Bengali
+            else if u >= 0x0C00 && u <= 0x0C7F { *lang_counts.entry("te").or_insert(0) += 1; } // Telugu
+            else if u >= 0x1780 && u <= 0x17FF { *lang_counts.entry("km").or_insert(0) += 1; } // Khmer
+            else if (u >= 0x0041 && u <= 0x005A) || (u >= 0x0061 && u <= 0x007A) || (u >= 0x00C0 && u <= 0x024F) || (u >= 0x1E00 && u <= 0x1EFF) { 
+                latin_count += 1; // Latin-based (en, es, fr, de, pt, vi, nl, it, etc.)
+            }
         }
-        let query_lang = if ko_count > 2 { "ko".to_string() }
-                         else if ja_count > 2 { "ja".to_string() }
-                         else { "en".to_string() };
+        
+        let query_lang = if !lang_counts.is_empty() {
+            lang_counts.into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(lang, count)| if count > 1 { lang.to_string() } else { language.to_string() })
+                .unwrap_or_else(|| language.to_string())
+        } else if latin_count > 1 {
+            // 알파벳 언어권인 경우 UI의 정확한 국가 언어 설정값을 승계합니다.
+            language.to_string()
+        } else {
+            "en".to_string()
+        };
 
         let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
         let mut layout_embs = std::collections::HashMap::new();
@@ -2012,6 +2037,26 @@ impl LogisModel {
                     metric_bias_texts.push(b_text);
                     metric_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
                 }
+
+                // 🌟 [5차 분기] 상대적 시간 의도(Time Filters) 매칭
+                let time_keys = vec![
+                    "today", "yesterday", "this_month", "last_month", 
+                    "this_year", "last_year", "recently", 
+                    "spring", "summer", "autumn", "winter"
+                ];
+                let mut time_bias_texts = Vec::new();
+                let mut time_prej_texts = Vec::new();
+
+                for tk in &time_keys {
+                    let mut b_text = String::new();
+                    let mut p_text = String::new();
+                    if let Some(t_obj) = crate::parsing::BIAS_DICT.get("time_filters").and_then(|o| o.get(*tk)) {
+                        if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
+                        if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    }
+                    time_bias_texts.push(b_text);
+                    time_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
+                }
                 
                 // Batch Embedding (Bias & Prejudice) 동시 장전
                 let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
@@ -2022,6 +2067,10 @@ impl LogisModel {
 
                 let metric_bias_embs = self.get_embedding_batch(metric_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
                 let metric_prej_embs = self.get_embedding_batch(metric_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
+
+                // 🌟 시간 의도 벡터도 일괄 연산에 포함
+                let time_bias_embs = self.get_embedding_batch(time_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
+                let time_prej_embs = self.get_embedding_batch(time_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
 
                 // Plinko Game: Sliding Window Cliff Detection over words
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2090,12 +2139,12 @@ impl LogisModel {
                 for (k, v) in &plinko_map {
                     let combined_chunk = v.join(" | ");
                     
-                    // 🌟 Triple Plinko: 연산자(Operator) 및 메트릭(Metric Type) 판별 벡터 매칭 진행
+                    // 🌟 Triple Plinko: 연산자(Operator), 메트릭(Metric Type), 시간 의도(Time Intent) 판별 벡터 매칭 진행
                     let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
                     
                     // 연산자 매칭
-                    let mut best_op = "eq"; // Fallback: 기본적으로는 같음(Exact Match)으로 취급
-                    let mut best_op_score = 0.20; // 노이즈 컷오프 임계값
+                    let mut best_op = "eq"; // Fallback
+                    let mut best_op_score = 0.20; 
                     for i in 0..op_keys.len() {
                         let b_score = cosine_similarity(&chunk_emb, &op_bias_embs[i]);
                         let p_score = cosine_similarity(&chunk_emb, &op_prej_embs[i]);
@@ -2119,44 +2168,46 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 찾아낸 연산자를 메모리에 기록해 둡니다.
+                    // 🌟 상대적 시간 의도(Time Intent) 매칭 및 로그 출력
+                    let mut best_time_intent = "none";
+                    let mut best_time_score = 0.20; // 🌟 다국어 임베딩의 교차언어 점수 하락을 고려해 컷오프를 0.20으로 낮춥니다.
+                    let mut time_debug_logs = Vec::new();
+
+                    for i in 0..time_keys.len() {
+                        let b_score = cosine_similarity(&chunk_emb, &time_bias_embs[i]);
+                        let p_score = cosine_similarity(&chunk_emb, &time_prej_embs[i]);
+                        let score = b_score - p_score;
+                        
+                        // 🌟 로그를 위해 모든 시간 필터의 점수를 기록합니다.
+                        time_debug_logs.push(format!("{}:{:.4}", time_keys[i], score));
+
+                        if score > best_time_score {
+                            best_time_score = score;
+                            best_time_intent = time_keys[i];
+                        }
+                    }
+
+                    // 터미널에 해당 단어의 시간 필터별 벡터 유사도 점수 전체를 출력합니다.
+                    emit_term(&format!("    🔍 [TIME VECTOR DEBUG] '{}' -> {}", combined_chunk, time_debug_logs.join(", ")));
+
+                    // 찾아낸 연산자를 메모리에 기록해 둡니다.
                     prop_to_op.insert(k.clone(), best_op.to_string());
 
-                    // 🌟 [CRITICAL FIX] LLM에게 속성, 연산자와 더불어 수치 유형(Metric Type)까지 가이드(HINT)로 제공합니다!
-                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]\n", combined_chunk, k, best_op, best_metric));
+                    // 🌟 [CRITICAL FIX] LLM에게 시간 의도(Time Intent)와 메트릭 유형을 명시적으로 가이드합니다.
+                    let time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
+                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]{}\n", combined_chunk, k, best_op, best_metric, time_guide));
                 }
                 
-                emit_term(&format!("  🎯 [PLINKO MAP] \n{}", fragments_text.trim()));
+                emit_term(&format!("  🎯 [PLINKO MAP (VECTOR GUIDE)] \n{}", fragments_text.trim()));
 
-                // 5. LLM Normalization (Dumb Parser Mode)
+                // 5. LLM Normalization (Advanced Parser Mode with Vector Guide)
                 if !fragments_text.is_empty() {
-                    let prompt_final = format!(r###"[TASK]
-Act as a deterministic semantic parser.
-Extract ONLY the numerical digits or exact string values from the mapped text fragments.
-Translate natural language numbers into digits.
+                    // 🌟 [CRITICAL FIX] 현재 시간 및 언어/국가 컨텍스트 생성
+                    let now = chrono::Local::now();
+                    let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
 
-[MAPPED FRAGMENTS]
-{}
-
-[RULES]
-1. For numeric/string properties, extract the target value from the text and place it directly as the value in the "condition" object. Do NOT wrap it with operators.
-2. If the property is 'status', output it at the root level using standard enums (draft, progress, hide, stop, cancel, refund, return, exchange, expire, complete, error).
-3. DO NOT invent properties not present in the mapped fragments.
-
-[SCHEMA DEFINITIONS]
-- "status": String (Optional).
-- "condition": Object.
-  - "[property_name]": Number or String. The extracted target value.
-
-[OUTPUT FORMAT]
-{{
-  "status": "String",
-  "condition": {{
-    "[property_name]": "Number or String"
-  }}
-}}
-
-[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###, fragments_text);
+                    // 🌟 [CRITICAL FIX] 벡터 매칭 결과를 가이드(HINT)로 삼아 extract_numeric_conditions 프롬프트 호출 (language 전달)
+                    let prompt_final = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &fragments_text, &time_context, language);
 
                     let gen_arc = self.qwen3_generator.clone();
                     let cancel_clone = cancel_token.clone();
@@ -2180,7 +2231,11 @@ Translate natural language numbers into digits.
                         }
                     }).await??;
 
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE]\n{}", res_llm.trim()));
+                    
                     let final_json = crate::parsing::parse_json_from_llm(&res_llm);
+                    
+                    emit_term(&format!("  ✅ [EXTRACTED DATA]\n{}", serde_json::to_string_pretty(&final_json).unwrap_or_default()));
                     
                     if let Some(obj) = seg.as_object_mut() {
                         if let Some(status_val) = final_json.get("status") {

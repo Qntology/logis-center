@@ -68,6 +68,63 @@
       "prejudice": "top, highest, best, upper, most, maximum, peak, rank, leader, equal, many, often, popular"
     }
   },
+  "time_filters": {
+    "today": {
+      "semantic": "current day, today",
+      "bias": "today, current day, this day, right now",
+      "prejudice": "yesterday, tomorrow, last week, next month, past, future, year"
+    },
+    "yesterday": {
+      "semantic": "previous day, yesterday",
+      "bias": "yesterday, previous day, day before today",
+      "prejudice": "today, tomorrow, last week, next month, future, year"
+    },
+    "this_month": {
+      "semantic": "current month",
+      "bias": "this month, current month",
+      "prejudice": "last month, next month, today, yesterday, year"
+    },
+    "last_month": {
+      "semantic": "previous month",
+      "bias": "last month, previous month",
+      "prejudice": "this month, next month, today, yesterday, year"
+    },
+    "this_year": {
+      "semantic": "current year",
+      "bias": "this year, current year",
+      "prejudice": "last year, next year, month, day"
+    },
+    "last_year": {
+      "semantic": "previous year",
+      "bias": "last year, previous year",
+      "prejudice": "this year, next year, month, day"
+    },
+    "recently": {
+      "semantic": "recent past, lately",
+      "bias": "recently, lately, these days, recent times, past few days",
+      "prejudice": "future, exactly today, tomorrow, next year, long ago, ancient"
+    },
+    "spring": {
+      "semantic": "spring season",
+      "bias": "spring, springtime",
+      "prejudice": "summer, autumn, winter, yesterday, today, tomorrow"
+    },
+    "summer": {
+      "semantic": "summer season",
+      "bias": "summer, summertime",
+      "prejudice": "spring, autumn, winter, yesterday, today, tomorrow"
+    },
+    "autumn": {
+      "semantic": "autumn season, fall",
+      "bias": "autumn, fall",
+      "prejudice": "spring, summer, winter, yesterday, today, tomorrow"
+    },
+    "winter": {
+      "semantic": "winter season",
+      "bias": "winter, wintertime",
+      "prejudice": "spring, summer, autumn, yesterday, today, tomorrow"
+    }
+  },
   "ko": {
     "tracking": {
       "layout_list": {
