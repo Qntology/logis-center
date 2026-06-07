@@ -327,11 +327,19 @@ impl EmbeddingModel {
     }
 
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() { return Ok(Vec::new()); }
+        
         let mut results = vec![vec![0.0; 384]; texts.len()];
         
-        // 🌟 [CRITICAL FIX] CPU-GPU 직렬 병목 현상 원천 해결!
-        // 8개의 병렬 스레드를 가동하여 VRAM의 CUDA 코어에 연산을 일괄 쏟아부어 GPU 사용률을 극대화합니다.
-        let num_threads = 8; 
+        // 🌟 [CRITICAL FIX] 장치(Device) 타입에 따른 스레드 동적 분기 및 VRAM 최적화
+        // GPU(CUDA)일 경우 워프 스케줄링 한계와 PCIe 대역폭 병목을 방지하기 위해 가장 이상적인 3개로 제한합니다.
+        // CPU일 경우 스레드 경합(Thread Contention)과 L3 캐시 오염을 막기 위해 무조건 1개(직렬)로 강제 고정합니다.
+        let num_threads = if self.device.is_cpu() {
+            1
+        } else {
+            3.min(texts.len())
+        }.max(1); 
+        
         let chunk_size = (texts.len() + num_threads - 1) / num_threads; 
         
         std::thread::scope(|s| {
@@ -358,6 +366,11 @@ impl EmbeddingModel {
                 }
             }
         });
+        
+        // 🌟 [MEMORY CLEAR] 임베딩 배치 연산 종료 후 즉각적인 VRAM 동기화 및 가비지 텐서 회수
+        if !self.device.is_cpu() {
+            let _ = self.device.synchronize();
+        }
         
         Ok(results)
     }

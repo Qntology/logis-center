@@ -1,4 +1,41 @@
 {
+  "operators": {
+    "eq": {
+      "semantic": "exact match, equal",
+      "bias": "exactly, equal, same, precisely, identical",
+      "prejudice": "less, under, below, maximum, greater, over, above, minimum, top, highest, bottom, lowest"
+    },
+    "lte": {
+      "semantic": "less than or equal to, maximum",
+      "bias": "less than or equal, maximum, up to, no more than, within",
+      "prejudice": "greater, over, above, minimum, more than, starting from, top, highest, bottom, lowest"
+    },
+    "lt": {
+      "semantic": "less than, strictly under",
+      "bias": "less than, under, below, cheaper than, lower than",
+      "prejudice": "greater, over, above, minimum, more than, starting from, equal, top, highest, bottom, lowest"
+    },
+    "gte": {
+      "semantic": "greater than or equal to, minimum",
+      "bias": "greater than or equal, minimum, starting from, at least",
+      "prejudice": "less, under, below, maximum, up to, no more than, within, top, highest, bottom, lowest"
+    },
+    "gt": {
+      "semantic": "greater than, strictly over",
+      "bias": "greater than, over, above, more than, exceeds",
+      "prejudice": "less, under, below, maximum, up to, no more than, within, equal, top, highest, bottom, lowest"
+    },
+    "top": {
+      "semantic": "top, highest, maximum percentile, rank ascending",
+      "bias": "top, highest, best, upper, most, maximum, peak, rank, leader",
+      "prejudice": "bottom, lowest, worst, under, least, minimum, below, drop, equal"
+    },
+    "bottom": {
+      "semantic": "bottom, lowest, minimum percentile, rank descending",
+      "bias": "bottom, lowest, worst, under, least, minimum, drop, trailing",
+      "prejudice": "top, highest, best, upper, most, maximum, peak, rank, leader, equal"
+    }
+  },
   "ko": {
     "tracking": {
       "layout_list": {

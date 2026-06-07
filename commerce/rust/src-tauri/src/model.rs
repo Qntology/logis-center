@@ -1600,232 +1600,354 @@ impl LogisModel {
         emit_term("[ENGINE] 🚀 Starting Commerce Search Pipeline...");
         
         // ----------------------------------------------------
-        // Stage 1: 세그먼트 분할 (para2graph) - Qwen3 (0.6B) 사용
+        // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
         // ----------------------------------------------------
-        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
-        let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Analyzing semantic intent...", "spinner": "⠋" });
+        emit_term("[STAGE-1] Loading Embedding Model for Semantic Chunking...");
+        let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Segmenting semantic intents...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
+        self.ensure_embedding().await?;
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // 🌟 [CRITICAL FIX] 사용자 질의(Query) 자체의 유니코드 언어를 선행 감지하여 정확한 bias 데이터를 호출합니다.
+        let mut ko_count = 0;
+        let mut ja_count = 0;
+        for c in query.chars() {
+            let u = c as u32;
+            if u >= 0xAC00 && u <= 0xD7A3 { ko_count += 1; }
+            else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { ja_count += 1; }
+        }
+        let query_lang = if ko_count > 2 { "ko".to_string() }
+                         else if ja_count > 2 { "ja".to_string() }
+                         else { "en".to_string() };
+
+        let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
+        let mut cat_embs = std::collections::HashMap::new();
+        for cat in &categories {
+            // 🌟 [1차 분기] 도메인 감지: layout_list와 layout_form만 합쳐서 해당 카테고리의 대표 레이아웃(Domain) 지표로 삼습니다.
+            let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(cat, &query_lang);
+            let combined_layout_bias = format!("{} {}", list_bias, form_bias);
+            let emb = self.get_embedding(combined_layout_bias).await.unwrap_or(vec![0.0; 384]);
+            cat_embs.insert(cat.to_string(), emb);
+        }
+
+        fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+            let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
+        }
+
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let mut context_arr = Vec::new();
+        let mut current_chunk_words = Vec::new();
+        let mut prev_max_score = -1.0;
+        let mut best_cat_for_chunk = String::new();
+
+        for word in words {
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
+            let mut test_words = current_chunk_words.clone();
+            test_words.push(word);
+            let test_text = test_words.join(" ");
+            let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+            let mut current_max_score = -1.0;
+            let mut current_best_cat = String::new();
+
+            for (cat, emb) in &cat_embs {
+                let score = cosine_similarity(&test_emb, emb);
+                if score > current_max_score {
+                    current_max_score = score;
+                    current_best_cat = cat.to_string();
+                }
+            }
+
+            // 🌟 [핵심 분할 방어 로직] 1~2어절까지는 무조건 합치고, 3번째 어절(current_chunk_words.len() >= 2)부터 절벽 하락을 감지하여 자릅니다!
+            if current_chunk_words.len() >= 2 && current_max_score < prev_max_score {
+                emit_term(&format!("  ✂️ [CLIFF CUT] Score dropped ({:.4} -> {:.4}). Finalizing chunk: [{}] '{}'", prev_max_score, current_max_score, best_cat_for_chunk, current_chunk_words.join(" ")));
+                
+                context_arr.push(json!({
+                    "type": best_cat_for_chunk.clone(),
+                    "text": current_chunk_words.join(" ")
+                }));
+                
+                // 새로운 단어로 맥락을 다시 리셋하여 측정을 시작합니다.
+                current_chunk_words = vec![word];
+                let reset_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                let mut reset_max = -1.0;
+                let mut reset_cat = String::new();
+                for (cat, emb) in &cat_embs {
+                    let score = cosine_similarity(&reset_emb, emb);
+                    if score > reset_max {
+                        reset_max = score;
+                        reset_cat = cat.to_string();
+                    }
+                }
+                prev_max_score = reset_max;
+                best_cat_for_chunk = reset_cat;
+            } else {
+                // 맥락 점수가 유지되거나 상승하거나, 아직 1~2어절이라면 계속 어절을 이어 붙입니다 (Accumulate)
+                current_chunk_words.push(word);
+                prev_max_score = current_max_score;
+                best_cat_for_chunk = current_best_cat;
+                emit_term(&format!("  📈 [ACCUMULATE] Current max: {:.4} ({}) -> '{}'", current_max_score, best_cat_for_chunk, test_text));
+            }
+        }
+
+        // 반복이 끝나고 남은 마지막 청크 덩어리를 밀어넣습니다.
+        if !current_chunk_words.is_empty() {
+            emit_term(&format!("  ✂️ [FINAL CUT] Finalizing chunk: [{}] '{}'", best_cat_for_chunk, current_chunk_words.join(" ")));
+            context_arr.push(json!({
+                "type": best_cat_for_chunk,
+                "text": current_chunk_words.join(" ")
+            }));
+        }
+
+        let mut segments = json!({
+            "original_text": query.clone(),
+            "context": context_arr
+        });
+        
+        // Stage 1 완료 후 최종 분할된 맥락 트리 전체를 출력합니다.
+        emit_term("\n=======================================");
+        emit_term("[STAGE-1 RESULT] 🧩 Semantic Chunking Complete:");
+        emit_term(&serde_json::to_string_pretty(&segments).unwrap_or_default());
+        emit_term("=======================================\n");
+
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // ----------------------------------------------------
+        // Stage 2 & 3: Double Plinko Attribute/Operator Mapping & LLM Normalization
+        // ----------------------------------------------------
+        emit_term("[STAGE-2] Extracting attributes via Double Vector Plinko & LLM Normalization...");
+        
         self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        let prompt1 = crate::parsing::para2graph(language);
-        let task_question_1 = format!("{}\n\nQuery: {}", prompt1, query);
-        
-        let mut segments = serde_json::json!({});
-        let max_retries = 2; 
-
-        for attempt in 1..=max_retries {
-            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            
-            emit_term(&format!("[STAGE-1] Generating intent segment... (Attempt {}/{})", attempt, max_retries));
-            
-            let gen_arc = self.qwen3_generator.clone();
-            let task_q = task_question_1.clone();
-            let cancel_clone = cancel_token.clone();
-            
-            let res1 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                let mut gen_guard = gen_arc.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![
-                            crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(task_q),
-                                name: None,
-                            })
-                        ],
-                        model: "qwen3".to_string(),
-                        max_tokens: Some(256),
-                        temperature: Some(1.0), 
-                        // 🌟 [CRITICAL FIX] top_k(80) 효과를 온전히 보려면 top_p를 1.0으로 개방해야 합니다.
-                        // (0.95일 경우 상위 5~10개 토큰 선에서 먼저 잘려버려 top_k 80이 무시되는 것처럼 보입니다)
-                        top_p: Some(1.0), 
-                        ..Default::default()
-                    };
-                    gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
-                } else {
-                    Err(anyhow::anyhow!("Qwen3 Generator is missing"))
-                }
-            }).await??;
-
-            emit_term(&format!("[STAGE-1 RESULT]\n{}", res1)); // 🌟 AI가 뱉어낸 JSON 응답을 UI 터미널에 그대로 꽂아버립니다!
-            
-            segments = crate::parsing::parse_json_from_llm(&res1);
-            let plan_str = segments.get("segmented_plan").and_then(|v| v.as_str()).unwrap_or("");
-            let ctx_len = segments.get("context").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-            let intended_segments = if plan_str.is_empty() { 0 } else { plan_str.matches('|').count() + 1 };
-
-            if attempt < max_retries && ctx_len == 1 && intended_segments > 1 { continue; } else { break; }
-        }
-
-        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-            // 🌟 [CRITICAL FIX] retain은 & 참조자만 전달하므로, 수정을 위한 루프를 별도로 분리합니다. (E0596 해결)
-            for seg in ctx_arr.iter_mut() {
-                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
-                if let Some(obj) = seg.as_object_mut() {
-                    obj.insert("type".to_string(), serde_json::json!(seg_type));
-                }
-            }
-            
-            // 그 다음 삭제 여부 판별 진행
-            ctx_arr.retain(|seg| {
-                let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
-                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or(""); // 이미 위에서 정리됨
-                
-                !text.is_empty() && !seg_type.is_empty()
-            });
-        }
-
-        // 🌟 [CRITICAL FIX] 변수명 오타 수정: cancellation_token -> cancel_token (E0425 해결)
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // ----------------------------------------------------
-        // Stage 1.5: 수치/연산자 추출 - Qwen3 (0.6B) 연속 사용
-        // ----------------------------------------------------
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
-                // 🌟 루프 도중에도 취소 버튼을 누르면 즉시 멈춥니다!
                 if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-                let payload = json!({ "task_id": task_id, "category": format!("Stage 1.5 ({}/{})", idx+1, total_segments), "summary": "Extracting filter conditions...", "spinner": "⠋" });
+                let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Mapping attributes...", "spinner": "⠋" });
                 let _ = app_handle.emit("extraction-progress", &payload);
                 crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
                 let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let prompt1_5 = crate::parsing::extract_numeric_conditions(&current_text, &query, &seg_type, metrics_json);
                 
-                let gen_arc = self.qwen3_generator.clone();
-                let cancel_clone = cancel_token.clone();
+                // 🌟 [2차 분기] 세부 속성 매칭: 해당 도메인 타입의 Schema Field(Property Bias/Prej) 로드
+                let fields = crate::parsing::get_detail_schema_fields(&seg_type, "", language);
                 
-                let res1_5 = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                    let mut gen_guard = gen_arc.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        let params = crate::openai_types::ChatCompletionParameters {
-                            messages: vec![
-                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt1_5),
-                                    name: None,
-                                })
-                            ],
-                            model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
-                            ..Default::default()
-                        };
-                        gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
-                    } else {
-                        Err(anyhow::anyhow!("Qwen3 Generator is missing"))
-                    }
-                }).await??;
+                let mut prop_keys = Vec::new();
+                let mut bias_texts = Vec::new();
+                let mut prej_texts = Vec::new();
+                
+                for (key, _, bias, prej) in fields {
+                    prop_keys.push(key);
+                    bias_texts.push(bias);
+                    prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                }
 
-                let mut conditions_json = crate::parsing::parse_json_from_llm(&res1_5);
-                if let Some(cond_wrapper) = conditions_json.get_mut("condition").and_then(|v| v.as_object_mut()) {
-                    for (_, val_obj) in cond_wrapper.iter_mut() {
-                        if let Some(is_pct) = val_obj.get("is_percent").and_then(|v| v.as_bool()) {
-                            if is_pct {
-                                if let Some(v_str) = val_obj.get("value").and_then(|v| v.as_str()) {
-                                    let numeric_only: String = v_str.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
-                                    if !numeric_only.is_empty() { val_obj["value"] = json!(numeric_only); }
-                                }
-                            }
+                // 🌟 [3차 분기] 연산자 매칭: Operators Schema Field(Bias/Prej) 로드 (top, bottom 포함)
+                let op_keys = vec!["eq", "lte", "lt", "gte", "gt", "top", "bottom"];
+                let mut op_bias_texts = Vec::new();
+                let mut op_prej_texts = Vec::new();
+
+                for op in &op_keys {
+                    let mut b_text = String::new();
+                    let mut p_text = String::new();
+                    if let Some(op_obj) = crate::parsing::BIAS_DICT.get("operators").and_then(|o| o.get(*op)) {
+                        if let Some(b) = op_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
+                        if let Some(p) = op_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    }
+                    op_bias_texts.push(b_text);
+                    op_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
+                }
+                
+                // Batch Embedding (Bias & Prejudice) 동시 장전
+                let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
+                let prej_embs = self.get_embedding_batch(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
+                
+                let op_bias_embs = self.get_embedding_batch(op_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
+                let op_prej_embs = self.get_embedding_batch(op_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
+
+                // Plinko Game: Sliding Window Cliff Detection over words
+                let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                let words: Vec<&str> = current_text.split_whitespace().collect();
+                
+                let mut current_chunk = Vec::new();
+                let mut prev_max_score = -1.0;
+                let mut best_prop_for_chunk = String::new();
+
+                for word in words {
+                    let mut test_chunk = current_chunk.clone();
+                    test_chunk.push(word);
+                    let test_text = test_chunk.join(" ");
+                    let test_emb = self.get_embedding(test_text).await.unwrap_or(vec![0.0; 384]);
+
+                    let mut current_max = -1.0;
+                    let mut current_best = String::new();
+
+                    for i in 0..prop_keys.len() {
+                        let b_score = cosine_similarity(&test_emb, &bias_embs[i]);
+                        let p_score = cosine_similarity(&test_emb, &prej_embs[i]);
+                        let score = b_score - p_score;
+                        if score > current_max {
+                            current_max = score;
+                            current_best = prop_keys[i].clone();
                         }
                     }
-                }
-                if let Some(obj) = seg.as_object_mut() {
-                    if let Some(cond_val) = conditions_json.get("condition") { obj.insert("condition".to_string(), cond_val.clone()); } 
-                    else { obj.insert("condition".to_string(), conditions_json); }
-                }
 
-                crate::models::qwen::generate::wait_for_global_io().await;
-                
-                // 🌟 [신규 추가] GPU 비동기 연산 찌꺼기 강제 동기화
-                if !self.is_cpu_mode {
-                    let dev = self.device_config.device.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if dev.is_cuda() { let _ = dev.synchronize(); }
-                    }).await;
-                }
-
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
-            }
-        }
-
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // ----------------------------------------------------
-        // Stage 2: 조건 최종 병합 추출 (graph2contexts) - Qwen 3.5 (2B) 사용
-        // ----------------------------------------------------
-        let payload = json!({ "task_id": task_id, "category": "Stage 2", "summary": "Switching to 2B model...", "spinner": "⠋" });
-        let _ = app_handle.emit("extraction-progress", &payload);
-
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancel_token.clone()), false, None).await?;
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-            let total_segments = ctx_arr.len();
-
-            for (idx, seg) in ctx_arr.iter_mut().enumerate() {
-                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Extracting final attributes...", "spinner": "⠋" });
-                let _ = app_handle.emit("extraction-progress", &payload);
-                crate::scheduler::log_task_progress(app_handle, task_id, &payload);
-
-                tokio::task::yield_now().await; 
-
-                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let prompt2 = crate::parsing::graph2contexts(&current_text, &seg_type);
-                
-                let res2 = {
-                    if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-                        let params = crate::openai_types::ChatCompletionParameters {
-                            messages: vec![
-                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt2),
-                                    name: None,
-                                })
-                            ],
-                            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.1), 
-                            ..Default::default()
-                        };
-                        // 🌟 [CRITICAL FIX] 파라미터가 늘었으므로 None을 추가합니다.
-                        gen.generate(params, Some(cancel_token.clone()), None, None, None, None).await?
+                    // Score Drop (Cliff) = Cut & Drop into Slot
+                    if current_max < prev_max_score && !current_chunk.is_empty() {
+                        if prev_max_score > 0.10 && !best_prop_for_chunk.is_empty() {
+                            plinko_map.entry(best_prop_for_chunk.clone()).or_default().push(current_chunk.join(" "));
+                        }
+                        
+                        // Reset Window
+                        current_chunk = vec![word];
+                        let reset_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        let mut r_max = -1.0;
+                        let mut r_best = String::new();
+                        for i in 0..prop_keys.len() {
+                            let score = cosine_similarity(&reset_emb, &bias_embs[i]) - cosine_similarity(&reset_emb, &prej_embs[i]);
+                            if score > r_max {
+                                r_max = score;
+                                r_best = prop_keys[i].clone();
+                            }
+                        }
+                        prev_max_score = r_max;
+                        best_prop_for_chunk = r_best;
                     } else {
-                        return Err(anyhow::anyhow!("Qwen 3.5 Generator is missing"));
+                        current_chunk.push(word);
+                        prev_max_score = current_max;
+                        best_prop_for_chunk = current_best;
                     }
-                };
+                }
+                
+                // Sweep remaining chunk
+                if !current_chunk.is_empty() && prev_max_score > 0.10 && !best_prop_for_chunk.is_empty() {
+                    plinko_map.entry(best_prop_for_chunk).or_default().push(current_chunk.join(" "));
+                }
 
-                let attributes_json = crate::parsing::parse_json_from_llm(&res2);
-                if let Some(obj) = seg.as_object_mut() {
+                // Formatting Plinko Fragments & Double Plinko for Operators
+                let mut fragments_text = String::new();
+                // 🌟 임베딩 모델이 찾아낸 Operator를 저장해둘 Rust 메모리 해시맵
+                let mut prop_to_op: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+                for (k, v) in &plinko_map {
+                    let combined_chunk = v.join(" | ");
                     
-                    // 🌟 [CRITICAL FIX] 변경된 중첩 JSON 구조에 맞게 seg_type 키 내부의 객체에서 속성들을 꺼내옵니다.
-                    // 만약 LLM이 래퍼({TYPE})를 생략하고 바로 status, substantial을 뱉었을 경우를 대비해 Fallback(attributes_json 자체)도 적용합니다.
-                    let inner_obj = attributes_json.get(&seg_type).unwrap_or(&attributes_json);
+                    // 🌟 Double Plinko: 연산자 판별 벡터 매칭 진행
+                    let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let mut best_op = "eq"; // Fallback: 기본적으로는 같음(Exact Match)으로 취급
+                    let mut best_op_score = 0.20; // 노이즈 컷오프 임계값
+                    
+                    for i in 0..op_keys.len() {
+                        let b_score = cosine_similarity(&chunk_emb, &op_bias_embs[i]);
+                        let p_score = cosine_similarity(&chunk_emb, &op_prej_embs[i]);
+                        let score = b_score - p_score;
+                        if score > best_op_score {
+                            best_op_score = score;
+                            best_op = op_keys[i];
+                        }
+                    }
 
-                    let status_val = inner_obj.get("status").cloned().unwrap_or(serde_json::Value::Null);
-                    let substantial_val = inner_obj.get("substantial").cloned().unwrap_or(serde_json::Value::Null);
-                    let find_val = inner_obj.get("find").cloned().unwrap_or(serde_json::Value::Null);
+                    // 🌟 찾아낸 연산자를 메모리에 기록해 둡니다.
+                    prop_to_op.insert(k.clone(), best_op.to_string());
 
-                    obj.insert("status".to_string(), status_val);
-                    obj.insert("substantial".to_string(), substantial_val);
-                    obj.insert("find".to_string(), find_val);
+                    // 🌟 LLM에게는 연산자를 숨기고 오직 텍스트만 전달합니다.
+                    fragments_text.push_str(&format!("{}: \"{}\"\n", k, combined_chunk));
+                }
+                
+                emit_term(&format!("  🎯 [PLINKO MAP] \n{}", fragments_text.trim()));
+
+                // 5. LLM Normalization (Dumb Parser Mode)
+                if !fragments_text.is_empty() {
+                    let prompt_final = format!(r###"[TASK]
+Act as a deterministic semantic parser.
+Extract ONLY the numerical digits or exact string values from the mapped text fragments.
+Translate natural language numbers into digits.
+
+[MAPPED FRAGMENTS]
+{}
+
+[RULES]
+1. For numeric/string properties, extract the target value from the text and place it directly as the value in the "condition" object. Do NOT wrap it with operators.
+2. If the property is 'status', output it at the root level using standard enums (draft, progress, hide, stop, cancel, refund, return, exchange, expire, complete, error).
+3. DO NOT invent properties not present in the mapped fragments.
+
+[SCHEMA DEFINITIONS]
+- "status": String (Optional).
+- "condition": Object.
+  - "[property_name]": Number or String. The extracted target value.
+
+[OUTPUT FORMAT]
+{{
+  "status": "String",
+  "condition": {{
+    "[property_name]": "Number or String"
+  }}
+}}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###, fragments_text);
+
+                    let gen_arc = self.qwen3_generator.clone();
+                    let cancel_clone = cancel_token.clone();
+                    
+                    let res_llm = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                        let mut gen_guard = gen_arc.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            let params = crate::openai_types::ChatCompletionParameters {
+                                messages: vec![
+                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_final),
+                                        name: None,
+                                    })
+                                ],
+                                model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                                ..Default::default()
+                            };
+                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                        } else {
+                            Err(anyhow::anyhow!("Qwen3 Generator is missing"))
+                        }
+                    }).await??;
+
+                    let final_json = crate::parsing::parse_json_from_llm(&res_llm);
+                    
+                    if let Some(obj) = seg.as_object_mut() {
+                        if let Some(status_val) = final_json.get("status") {
+                            obj.insert("status".to_string(), status_val.clone());
+                        }
+                        
+                        // 🌟 LLM이 뽑아준 "값"과 Rust 메모리에 저장해둔 "연산자(operator)"를 여기서 최종 조립합니다.
+                        if let Some(cond_val) = final_json.get("condition").and_then(|v| v.as_object()) {
+                            let mut structured_cond = serde_json::Map::new();
+                            for (k, val) in cond_val {
+                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                structured_cond.insert(k.clone(), json!({
+                                    "operator": op,
+                                    "value": val.clone()
+                                }));
+                            }
+                            obj.insert("condition".to_string(), json!(structured_cond));
+                        } else {
+                            obj.insert("condition".to_string(), json!({}));
+                        }
+                    }
+                } else {
+                    if let Some(obj) = seg.as_object_mut() {
+                        obj.insert("condition".to_string(), json!({}));
+                    }
                 }
 
                 crate::models::qwen::generate::wait_for_global_io().await;
                 
-                // 🌟 [신규 추가] GPU 비동기 연산 찌꺼기 강제 동기화
                 if !self.is_cpu_mode {
                     let dev = self.device_config.device.clone();
                     let _ = tokio::task::spawn_blocking(move || {
