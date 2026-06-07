@@ -1628,12 +1628,12 @@ impl LogisModel {
         let mut texts_to_embed = Vec::new();
         let mut emb_mappings = Vec::new();
 
-        // 🌟 [변경] get_combinatorial_layout_bias 제거. 
-        // 대신 get_detail_schema_fields를 호출하여 해당 카테고리의 "모든 세부 속성"의 Bias/Prejudice를 수집합니다.
+        // 🌟 [변경] Stage 1 멀티패스 전용 함수인 get_multi_pass_contexts를 호출하여
+        // layout_list, layout_form 및 core_intent를 포함한 100% 모든 속성을 수집합니다.
         for cat in &categories {
-            let fields = crate::parsing::get_detail_schema_fields(cat, "", &query_lang);
+            let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
             
-            for (key, _desc, bias, prejudice) in fields {
+            for (key, bias, prejudice) in contexts {
                 texts_to_embed.push(bias);
                 emb_mappings.push((cat.to_string(), format!("{}_bias", key)));
 
@@ -1682,10 +1682,10 @@ impl LogisModel {
 
                 let mut scores = std::collections::HashMap::new();
                 for cat in &categories {
-                    let fields = crate::parsing::get_detail_schema_fields(cat, "", &query_lang);
+                    let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
                     let mut field_scores = Vec::new();
 
-                    for (key, _desc, _bias, _prejudice) in fields {
+                    for (key, _bias, _prejudice) in contexts {
                         let bias_emb = layout_embs.get(&format!("{}_{}_bias", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
                         let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
                         

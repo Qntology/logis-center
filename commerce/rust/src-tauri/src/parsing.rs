@@ -1450,7 +1450,65 @@ NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TEXT}", current_text)
 }
 
+// 🌟 [STAGE-1 전용 멀티패스 컨텍스트 추출기]
+// LLM 스키마용(get_detail_schema_fields)과 분리하여, bias.json의 모든 속성(layout_list 등 포함)과
+// 추상적 검색 의도(Core Intent)를 100% 동적으로 긁어모아 벡터 매칭의 해상도를 극대화합니다.
+pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, String, String)> {
+    let mut contexts = Vec::new();
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
 
+    let inject_domain = |text: &str| -> String {
+        if text.trim().is_empty() { return String::new(); }
+        text.split(',')
+            .map(|s| format!("{} {} {}", page_type, localized_type, s.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // 1. 추상적 메타 검색 의도 (Core Intent) 강제 주입
+    let core_intent = match page_type {
+        "tracking" => "tracking, logistics, fulfillment, shipment, dispatch, delivery",
+        "goods" => "goods, product, catalog, exposure, traffic, page views, clicks",
+        "order" => "order, purchase, sales, conversion rate, volume, checkout, payment, refund",
+        "coupon" | "event" => "event, promotion, campaign, exhibition, seasonal, discount, voucher",
+        "review" => "review, feedback, rating, customer, complaint",
+        _ => ""
+    };
+    if !core_intent.is_empty() {
+        contexts.push((
+            "core_search_intent".to_string(),
+            inject_domain(core_intent),
+            String::new()
+        ));
+    }
+
+    // 2. bias.json 내부의 모든 Key(layout_list, layout_form, 세부 속성 전체)를 하드코딩 없이 동적 순회
+    if let Some(localized_obj) = BIAS_DICT
+        .get(lang_code)
+        .or_else(|| BIAS_DICT.get("en"))
+        .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+        .and_then(|p| p.as_object())
+    {
+        for (key, val) in localized_obj {
+            let mut final_bias = String::new();
+            let mut final_prej = String::new();
+
+            if let Some(b) = val.get("bias").and_then(|v| v.as_str()) {
+                final_bias = inject_domain(&b.replace("{TYPE}", &localized_type));
+            }
+            if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+                final_prej = inject_domain(&p.replace("{TYPE}", &localized_type));
+            }
+
+            if !final_bias.is_empty() {
+                contexts.push((key.to_string(), final_bias, final_prej));
+            }
+        }
+    }
+
+    contexts
+}
 
 
 // 🌟 [CRITICAL FIX] 4개의 반환값(String, String, String, String)으로 확장하여 prejudice를 스케줄러로 넘깁니다.
