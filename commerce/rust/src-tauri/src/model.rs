@@ -1836,16 +1836,102 @@ impl LogisModel {
         // 프론트엔드로 보내기 위해 최종 생존한 문맥들을 원래 문장의 단어 순서대로 재정렬합니다.
         final_selected_spans.sort_by(|a, b| a.start.cmp(&b.start));
 
-        for span in final_selected_spans {
-            // 🌟 Base Score 출력을 제거하고 Context Score만 깔끔하게 보여줍니다.
-            emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", span.intersecting, span.text, span.context_score));
+        // 🌟 [4차 패스] Gap Bridging & Score Battle (고아 단어 구출 및 양방향 흡수 대결)
+        // NMS 배틀에서 탈락하여 붕 떠버린 단어(Gap)들을 양쪽 승자 문맥에 각각 붙여보고, 더 높은 멀티패스 점수를 내는 쪽이 흡수합니다.
+        if !final_selected_spans.is_empty() {
+            emit_term("\n  🌉 [GAP BRIDGING] Rescuing orphaned words via Score Battle...");
+            
+            let mut final_bounds: Vec<(usize, usize, String, f32, Vec<String>)> = final_selected_spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.best_cat, s.context_score, s.intersecting))
+                .collect();
 
-            context_arr.push(json!({
-                "type": span.best_cat,
-                "types": span.intersecting,
-                "text": span.text,
-                "score": span.context_score
-            }));
+            // 1. 왼쪽 끝(Left Edge) 고아 단어 무조건 흡수 (예: 문장 맨 앞의 "여름")
+            if final_bounds[0].0 > 0 {
+                let gap_start = 0;
+                let gap_end = final_bounds[0].0;
+                let gap_text = words[gap_start..gap_end].join(" ");
+                emit_term(&format!("    🛠️ [LEFT EDGE] '{}' is absorbed by '{}'", gap_text, words[final_bounds[0].0..final_bounds[0].1].join(" ")));
+                final_bounds[0].0 = 0;
+            }
+
+            // 2. 중간(Gap) 고아 단어 양방향 점수 대결 흡수 (예: "20%에", "속하지만")
+            for i in 0..(final_bounds.len() - 1) {
+                let gap_start = final_bounds[i].1;
+                let gap_end = final_bounds[i+1].0;
+
+                if gap_start < gap_end {
+                    let gap_text = words[gap_start..gap_end].join(" ");
+
+                    // 대결 A: 왼쪽 승자가 흡수했을 때의 멀티패스 점수 계산
+                    let left_cat = &final_bounds[i].2;
+                    let left_test_text = words[final_bounds[i].0..gap_end].join(" ");
+                    let left_emb = self.get_embedding(left_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let left_contexts = crate::parsing::get_multi_pass_contexts(left_cat, &query_lang);
+                    
+                    let mut left_scores = Vec::new();
+                    for (key, _bias, _prej) in left_contexts {
+                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", left_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", left_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        left_scores.push((cosine_similarity(&left_emb, &bias_emb) - cosine_similarity(&left_emb, &prej_emb)).max(0.0));
+                    }
+                    left_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut left_score = 0.0;
+                    let mut weight = 1.0;
+                    for j in 0..left_scores.len().min(5) { left_score += left_scores[j] * weight; weight *= 0.5; }
+
+                    // 대결 B: 오른쪽 승자가 흡수했을 때의 멀티패스 점수 계산
+                    let right_cat = &final_bounds[i+1].2;
+                    let right_test_text = words[gap_start..final_bounds[i+1].1].join(" ");
+                    let right_emb = self.get_embedding(right_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let right_contexts = crate::parsing::get_multi_pass_contexts(right_cat, &query_lang);
+                    
+                    let mut right_scores = Vec::new();
+                    for (key, _bias, _prej) in right_contexts {
+                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", right_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", right_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        right_scores.push((cosine_similarity(&right_emb, &bias_emb) - cosine_similarity(&right_emb, &prej_emb)).max(0.0));
+                    }
+                    right_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut right_score = 0.0;
+                    let mut weight = 1.0;
+                    for j in 0..right_scores.len().min(5) { right_score += right_scores[j] * weight; weight *= 0.5; }
+
+                    // ⚔️ 대결 결과 판정 및 최종 흡수
+                    if left_score >= right_score {
+                        emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> LEFT WINS! (Left: {:.4} > Right: {:.4})", gap_text, left_score, right_score));
+                        final_bounds[i].1 = gap_end; 
+                        final_bounds[i].3 = left_score; // 점수 갱신
+                    } else {
+                        emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> RIGHT WINS! (Right: {:.4} > Left: {:.4})", gap_text, right_score, left_score));
+                        final_bounds[i+1].0 = gap_start; 
+                        final_bounds[i+1].3 = right_score; // 점수 갱신
+                    }
+                }
+            }
+
+            // 3. 오른쪽 끝(Right Edge) 고아 단어 무조건 흡수 (예: 문장 맨 끝의 "시급해")
+            let last_idx = final_bounds.len() - 1;
+            if final_bounds[last_idx].1 < words.len() {
+                let gap_start = final_bounds[last_idx].1;
+                let gap_end = words.len();
+                let gap_text = words[gap_start..gap_end].join(" ");
+                emit_term(&format!("    🛠️ [RIGHT EDGE] '{}' is absorbed by '{}'", gap_text, words[final_bounds[last_idx].0..final_bounds[last_idx].1].join(" ")));
+                final_bounds[last_idx].1 = words.len();
+            }
+
+            // 4. 최종 조립된 결과를 배열에 삽입
+            for (start, end, best_cat, context_score, intersecting) in final_bounds {
+                let final_text = words[start..end].join(" ");
+                emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", intersecting, final_text, context_score));
+
+                context_arr.push(json!({
+                    "type": best_cat,
+                    "types": intersecting,
+                    "text": final_text,
+                    "score": context_score
+                }));
+            }
         }
 
         let mut segments = json!({
@@ -1895,7 +1981,7 @@ impl LogisModel {
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                 }
 
-                // 🌟 [3차 분기] 연산자 매칭: Operators Schema Field(Bias/Prej) 로드 (top, bottom 포함)
+                // 🌟 [3차 분기] 연산자 매칭: Operators Schema Field(Bias/Prej) 로드
                 let op_keys = vec!["eq", "lte", "lt", "gte", "gt", "top", "bottom"];
                 let mut op_bias_texts = Vec::new();
                 let mut op_prej_texts = Vec::new();
@@ -1910,6 +1996,22 @@ impl LogisModel {
                     op_bias_texts.push(b_text);
                     op_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
                 }
+
+                // 🌟 [4차 분기] 수치/단위 메트릭(Metric Type) 매칭: metrics Schema Field 로드
+                let metric_keys = vec!["date", "time", "price", "discount", "quantity", "ratio"];
+                let mut metric_bias_texts = Vec::new();
+                let mut metric_prej_texts = Vec::new();
+
+                for metric in &metric_keys {
+                    let mut b_text = String::new();
+                    let mut p_text = String::new();
+                    if let Some(m_obj) = crate::parsing::BIAS_DICT.get("metrics").and_then(|o| o.get(*metric)) {
+                        if let Some(b) = m_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
+                        if let Some(p) = m_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    }
+                    metric_bias_texts.push(b_text);
+                    metric_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
+                }
                 
                 // Batch Embedding (Bias & Prejudice) 동시 장전
                 let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
@@ -1917,6 +2019,9 @@ impl LogisModel {
                 
                 let op_bias_embs = self.get_embedding_batch(op_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
                 let op_prej_embs = self.get_embedding_batch(op_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
+
+                let metric_bias_embs = self.get_embedding_batch(metric_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
+                let metric_prej_embs = self.get_embedding_batch(metric_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
 
                 // Plinko Game: Sliding Window Cliff Detection over words
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -1985,11 +2090,12 @@ impl LogisModel {
                 for (k, v) in &plinko_map {
                     let combined_chunk = v.join(" | ");
                     
-                    // 🌟 Double Plinko: 연산자 판별 벡터 매칭 진행
+                    // 🌟 Triple Plinko: 연산자(Operator) 및 메트릭(Metric Type) 판별 벡터 매칭 진행
                     let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+                    
+                    // 연산자 매칭
                     let mut best_op = "eq"; // Fallback: 기본적으로는 같음(Exact Match)으로 취급
                     let mut best_op_score = 0.20; // 노이즈 컷오프 임계값
-                    
                     for i in 0..op_keys.len() {
                         let b_score = cosine_similarity(&chunk_emb, &op_bias_embs[i]);
                         let p_score = cosine_similarity(&chunk_emb, &op_prej_embs[i]);
@@ -2000,11 +2106,24 @@ impl LogisModel {
                         }
                     }
 
+                    // 수치 유형(Metric Type) 매칭
+                    let mut best_metric = "string"; // Fallback
+                    let mut best_metric_score = 0.20;
+                    for i in 0..metric_keys.len() {
+                        let b_score = cosine_similarity(&chunk_emb, &metric_bias_embs[i]);
+                        let p_score = cosine_similarity(&chunk_emb, &metric_prej_embs[i]);
+                        let score = b_score - p_score;
+                        if score > best_metric_score {
+                            best_metric_score = score;
+                            best_metric = metric_keys[i];
+                        }
+                    }
+
                     // 🌟 찾아낸 연산자를 메모리에 기록해 둡니다.
                     prop_to_op.insert(k.clone(), best_op.to_string());
 
-                    // 🌟 LLM에게는 연산자를 숨기고 오직 텍스트만 전달합니다.
-                    fragments_text.push_str(&format!("{}: \"{}\"\n", k, combined_chunk));
+                    // 🌟 [CRITICAL FIX] LLM에게 속성, 연산자와 더불어 수치 유형(Metric Type)까지 가이드(HINT)로 제공합니다!
+                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]\n", combined_chunk, k, best_op, best_metric));
                 }
                 
                 emit_term(&format!("  🎯 [PLINKO MAP] \n{}", fragments_text.trim()));

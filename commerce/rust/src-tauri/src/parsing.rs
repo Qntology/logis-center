@@ -1284,48 +1284,47 @@ pub fn para2graph(language: &str) -> String {
     template.replace("{LANG}", language)
 }
 
-// --- File: src/parsing.rs ---
-
-// ==============================================
-// [Zone: src/parsing.rs 교체 코드]
-// ==============================================
-pub fn extract_numeric_conditions(current: &str, input: &str, seg_type: &str, metrics_json: &str) -> String {
+pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str) -> String {
     let template = r###"[Task]
 Act as a deterministic semantic parser.
-You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format based on the provided schema.
+You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+- CRITICAL RULES FOR RELATIVE TIME (Translate from any language):
+  * "Today" or "Yesterday" -> Output exact day boundaries (start and end) matching the context.
+  * "Last month" or "Previous month" -> Output condition covering the 1st to the last day of the previous month.
+  * "Last year" -> Output condition covering Jan 1st to Dec 31st of the previous year.
+  * "Recently", "Lately", or "These days" -> Use operator 'gte' mapping exactly to [Current Date - 30 Days].
+  * All dates MUST be converted to absolute ISO 8601 strings based on the provided Current Time.
 
 [DATABASE METRICS CONTEXT]
-Use these current database min/max bounds to resolve any relative, proportional, or comparative queries into absolute numeric values.
 Metrics: {METRICS}
+- CRITICAL RULES FOR FUZZY ADJECTIVES (Translate from any language):
+  * If the query implies "many", "often", "popular", "best", or "high" without a specific number, map the operator to 'top' and set percent_total to 20.
+  * If the query implies "few", "rarely", "unpopular", "worst", or "low", map the operator to 'bottom' and set percent_total to 20.
+  * You MUST use the Metrics data to calculate the exact absolute threshold for these percentiles.
+
+[VECTOR MATCHING GUIDE (HINT)]
+The system has pre-calculated vector similarities for properties, operators, and metric types. Use this as a strong guide, but correct it if it semantically makes no sense:
+- Metric Type gives a crucial hint about the data (date, time, price, discount, quantity, ratio). 
+- If Metric Type is 'ratio', extract a percentage logic. If 'date', extract a date logic, etc.
+{GUIDE}
 
 [SCHEMA DEFINITION]
-- operator: A string representing the comparison operator. Allowed values:
-  * 'gt': Strictly greater than
-  * 'gte': Greater than or equal to
-  * 'lt': Strictly less than
-  * 'lte': Less than or equal to
-  * 'eq': Exact match
-
-[TRANSFORMATION LOGIC - MANDATORY EXECUTION]
-1. ATTRIBUTE EXTRACTION: Identify the context of the numbers or comparative words in the text to determine the property type.
-2. RELATIVE VALUE CALCULATION (CRITICAL): 
-   - If the query contains relative conditions, percentages, or comparative adjectives, you MUST use the [DATABASE METRICS CONTEXT] to calculate the EXACT absolute numeric threshold. 
-   - Do NOT output percentages or descriptive text in the `value` field. Always compute and output the final absolute number derived from the min/max metrics.
-3. OPERATOR SELECTION: Map the semantic intent to 'gt', 'gte', 'lt', 'lte', or 'eq'.
-
-[FULL QUERY CONTEXT]
-{INPUT}
+- operator: Allowed values: 'gt', 'gte', 'lt', 'lte', 'eq', 'contains', 'top', 'bottom'
 
 [CURRENT CHUNK TO ANALYZE]
 {CURRENT}
 
 [OUTPUT FORMAT]
 {
+  "status": "String (Optional, e.g., 'progress', 'cancel', 'refund' etc.)",
   "condition": {
-    "{TYPE}": {
+    "[proper_property_name_from_schema]": {
       "is_percent": Boolean,
-      "percent_total": is_percent === true ? 100 : 0,
-      "value": "...",
+      "percent_total": Number (if is_percent is true),
+      "value": "Absolute String or Number",
       "operator": "..."
     }
   }
@@ -1333,12 +1332,12 @@ Metrics: {METRICS}
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
 
-    template.replace("{INPUT}", input)
-            .replace("{CURRENT}", current)
+    template.replace("{CURRENT}", current)
             .replace("{TYPE}", seg_type)
             .replace("{METRICS}", metrics_json)
+            .replace("{GUIDE}", vector_guide)
+            .replace("{TIME_CONTEXT}", time_context)
 }
-// ==============================================
 
 pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     

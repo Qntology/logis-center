@@ -1,4 +1,36 @@
 {
+  "metrics": {
+    "date": {
+      "semantic": "calendar date, day, month, year, season",
+      "bias": "date, day, month, year, today, yesterday, tomorrow, season, period, last month, last year, recently, lately, this week, this year",
+      "prejudice": "price, cost, money, percentage, amount, quantity, volume, ratio"
+    },
+    "time": {
+      "semantic": "clock time, hour, minute, duration",
+      "bias": "time, hour, minute, second, duration, o'clock",
+      "prejudice": "price, cost, money, percentage, amount, quantity, volume, date, year"
+    },
+    "price": {
+      "semantic": "price, cost, money, currency",
+      "bias": "price, cost, amount, dollars, won, fee, expensive, cheap",
+      "prejudice": "date, time, percentage, ratio, rate, quantity, volume, weight"
+    },
+    "discount": {
+      "semantic": "discount, sale, price reduction",
+      "bias": "discount, off, sale, coupon, reduced, markdown, save",
+      "prejudice": "date, time, quantity, volume, weight, original price"
+    },
+    "quantity": {
+      "semantic": "quantity, count, volume, traffic, inventory",
+      "bias": "quantity, count, volume, views, clicks, items, total, amount, stock",
+      "prejudice": "date, time, price, cost, money, percentage, ratio, rate"
+    },
+    "ratio": {
+      "semantic": "percentage, ratio, rate, proportion, probability",
+      "bias": "percent, %, ratio, rate, conversion, proportion, probability",
+      "prejudice": "date, time, price, cost, money, quantity, volume, weight"
+    }
+  },
   "operators": {
     "eq": {
       "semantic": "exact match, equal",
@@ -12,7 +44,7 @@
     },
     "lt": {
       "semantic": "less than, strictly under",
-      "bias": "less than, under, below, cheaper than, lower than",
+      "bias": "less than, under, below, cheaper than, lower than, fewer",
       "prejudice": "greater, over, above, minimum, more than, starting from, equal, top, highest, bottom, lowest"
     },
     "gte": {
@@ -22,18 +54,18 @@
     },
     "gt": {
       "semantic": "greater than, strictly over",
-      "bias": "greater than, over, above, more than, exceeds",
+      "bias": "greater than, over, above, more than, exceeds, higher, expensive, heavy",
       "prejudice": "less, under, below, maximum, up to, no more than, within, equal, top, highest, bottom, lowest"
     },
     "top": {
       "semantic": "top, highest, maximum percentile, rank ascending",
-      "bias": "top, highest, best, upper, most, maximum, peak, rank, leader",
-      "prejudice": "bottom, lowest, worst, under, least, minimum, below, drop, equal"
+      "bias": "top, highest, best, upper, most, maximum, peak, rank, leader, many, often, popular, frequent",
+      "prejudice": "bottom, lowest, worst, under, least, minimum, below, drop, equal, few, rarely, unpopular"
     },
     "bottom": {
       "semantic": "bottom, lowest, minimum percentile, rank descending",
-      "bias": "bottom, lowest, worst, under, least, minimum, drop, trailing",
-      "prejudice": "top, highest, best, upper, most, maximum, peak, rank, leader, equal"
+      "bias": "bottom, lowest, worst, under, least, minimum, drop, trailing, few, rarely, unpopular, infrequent",
+      "prejudice": "top, highest, best, upper, most, maximum, peak, rank, leader, equal, many, often, popular"
     }
   },
   "ko": {
