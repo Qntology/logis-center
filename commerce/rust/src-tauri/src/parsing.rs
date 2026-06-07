@@ -1038,8 +1038,17 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
     let localized_type = get_localized_page_type(page_type, lang);
 
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
-        let mut final_bias = en_bias.to_string();
-        let mut final_prejudice = en_prejudice.to_string();
+        // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
+        let inject_domain = |text: &str, domain: &str| -> String {
+            if text.trim().is_empty() { return String::new(); }
+            text.split(',')
+                .map(|s| format!("{} {}", domain, s.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut final_bias = inject_domain(en_bias, page_type);
+        let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
         
         if let Some(localized_obj) = BIAS_DICT
@@ -1051,10 +1060,12 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
                 semantic_desc = semantic.to_string();
             }
             if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
-                final_bias = format!("{} {}", en_bias, bias_str.replace("{TYPE}", &localized_type));
+                let localized_b = inject_domain(&bias_str.replace("{TYPE}", &localized_type), page_type);
+                final_bias = if final_bias.is_empty() { localized_b } else { format!("{}, {}", final_bias, localized_b) };
             }
             if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
-                final_prejudice = format!("{} {}", en_prejudice, prejudice_str.replace("{TYPE}", &localized_type));
+                let localized_p = inject_domain(&prejudice_str.replace("{TYPE}", &localized_type), page_type);
+                final_prejudice = if final_prejudice.is_empty() { localized_p } else { format!("{}, {}", final_prejudice, localized_p) };
             }
         }
         
@@ -1450,8 +1461,17 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
     let localized_type = get_localized_page_type(page_type, lang);
     
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
-        let mut final_bias = en_bias.to_string();
-        let mut final_prejudice = en_prejudice.to_string();
+        // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
+        let inject_domain = |text: &str, domain: &str| -> String {
+            if text.trim().is_empty() { return String::new(); }
+            text.split(',')
+                .map(|s| format!("{} {}", domain, s.trim()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut final_bias = inject_domain(en_bias, page_type);
+        let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
         
         if let Some(localized_obj) = BIAS_DICT
@@ -1463,10 +1483,12 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                 semantic_desc = semantic.to_string();
             }
             if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
-                final_bias = format!("{} {}", en_bias, bias_str.replace("{TYPE}", &localized_type));
+                let localized_b = inject_domain(&bias_str.replace("{TYPE}", &localized_type), page_type);
+                final_bias = if final_bias.is_empty() { localized_b } else { format!("{}, {}", final_bias, localized_b) };
             }
             if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
-                final_prejudice = format!("{} {}", en_prejudice, prejudice_str.replace("{TYPE}", &localized_type));
+                let localized_p = inject_domain(&prejudice_str.replace("{TYPE}", &localized_type), page_type);
+                final_prejudice = if final_prejudice.is_empty() { localized_p } else { format!("{}, {}", final_prejudice, localized_p) };
             }
         }
         

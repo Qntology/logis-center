@@ -1708,13 +1708,32 @@ impl LogisModel {
                     }
                     
                     let avg_base_score = if top_k > 0 { sum_top_scores / (top_k as f32) } else { 0.0 };
-                    scores.insert(cat.to_string(), avg_base_score);
+                    
+                    // 🌟 [단어 개수 가중치] 단어가 많이 합쳐질수록 문맥이 명확해지므로 길이에 비례하여 가중치를 부여합니다.
+                    // 2단어는 1.0(기본값), 그 이후부터 단어당 5%씩 가산점을 줍니다. (예: 6단어 = 1.2배)
+                    let word_count = end - start;
+                    let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.05); 
+                    let weighted_base_score = avg_base_score * length_weight;
+                    
+                    scores.insert(cat.to_string(), weighted_base_score);
                 }
                 raw_spans.push(SpanData { start, end, text: test_text, scores });
             }
         }
 
         // 🌟 [2차 패스] 앞뒤 교차 문장 점수 합산을 통한 최종 컨텍스트 점수 도출
+        // 🌟 [2차 패스] 앞뒤 교차 문장 점수 합산 및 임시 목록 저장
+        struct EvaluatedSpan {
+            start: usize,
+            end: usize,
+            text: String,
+            best_cat: String,
+            context_score: f32,
+            intersecting: Vec<String>,
+            base_score: f32,
+        }
+        let mut evaluated_spans = Vec::new();
+
         for i in 0..raw_spans.len() {
             let target = &raw_spans[i];
             let mut contextual_scores: Vec<(String, f32)> = Vec::new();
@@ -1765,15 +1784,54 @@ impl LogisModel {
                     intersecting_categories.push(current_best_cat.clone());
                 }
 
-                emit_term(&format!("  📈 [CROSS MATCH] Intersection: {:?} -> '{}' (Context Score: {:.4}, Base: {:.4})", intersecting_categories, target.text, current_max_contextual_score, original_base_score));
-
-                context_arr.push(json!({
-                    "type": current_best_cat,
-                    "types": intersecting_categories,
-                    "text": target.text.clone(),
-                    "score": current_max_contextual_score
-                }));
+                evaluated_spans.push(EvaluatedSpan {
+                    start: target.start,
+                    end: target.end,
+                    text: target.text.clone(),
+                    best_cat: current_best_cat,
+                    context_score: current_max_contextual_score,
+                    intersecting: intersecting_categories,
+                    base_score: original_base_score,
+                });
             }
+        }
+
+        // 🌟 [3차 패스] 오버랩(교차) 충돌 해결 (길이 가중치가 포함된 최종 점수 기준 내림차순 정렬)
+        evaluated_spans.sort_by(|a, b| b.context_score.partial_cmp(&a.context_score).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut final_selected_spans: Vec<EvaluatedSpan> = Vec::new();
+
+        for span in evaluated_spans {
+            let mut is_overlapped = false;
+
+            // 이미 승리하여 선택된 상위 점수의 스팬들과 현재 스팬이 교차하는지 검사합니다.
+            for selected in &final_selected_spans {
+                let overlaps = span.start < selected.end && span.end > selected.start;
+                
+                if overlaps {
+                    // 동일한 단어 개수이든, 개수가 다르든 교차가 발생하면 무조건 점수가 낮은 현재 스팬은 패배하여 탈락합니다.
+                    is_overlapped = true;
+                    break;
+                }
+            }
+
+            if !is_overlapped {
+                final_selected_spans.push(span);
+            }
+        }
+
+        // 프론트엔드로 보내기 위해 최종 생존한 문맥들을 원래 문장의 단어 순서대로 재정렬합니다.
+        final_selected_spans.sort_by(|a, b| a.start.cmp(&b.start));
+
+        for span in final_selected_spans {
+            emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4}, Base: {:.4})", span.intersecting, span.text, span.context_score, span.base_score));
+
+            context_arr.push(json!({
+                "type": span.best_cat,
+                "types": span.intersecting,
+                "text": span.text,
+                "score": span.context_score
+            }));
         }
 
         let mut segments = json!({
