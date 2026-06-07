@@ -309,6 +309,111 @@ pub fn find_block_indices_in_pug<S: AsRef<str>>(full_lines: &[S], block_pug: &st
     None
 }
 
+#[derive(Debug, Clone)]
+struct GridCell {
+    row: usize,
+    col: usize,
+    rowspan: usize,
+    colspan: usize,
+    text: String,
+    line_indices: Vec<usize>,
+}
+
+fn parse_pug_grid(lines: &[String]) -> Vec<GridCell> {
+    let mut cells = Vec::new();
+    let mut current_row = 0;
+    let mut occupied = std::collections::HashSet::new();
+    
+    let mut i = 0;
+    let mut in_tr = false;
+    let mut tr_indent = 0;
+    
+    let re_row = regex::Regex::new(r#"rowspan="(\d+)""#).unwrap();
+    let re_col = regex::Regex::new(r#"colspan="(\d+)""#).unwrap();
+    
+    while i < lines.len() {
+        let line = &lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() { i += 1; continue; }
+        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        
+        if trimmed.starts_with("tr") && (trimmed.len() == 2 || trimmed.starts_with("tr[") || trimmed.starts_with("tr ")) {
+            if in_tr { current_row += 1; }
+            in_tr = true;
+            tr_indent = indent;
+            i += 1;
+            continue;
+        }
+        
+        if in_tr && indent <= tr_indent && !trimmed.starts_with("tr") {
+            in_tr = false;
+            current_row += 1;
+        }
+        
+        if trimmed.starts_with("th") || trimmed.starts_with("td") {
+            let is_tag = trimmed.starts_with("th[") || trimmed.starts_with("th ") || trimmed == "th" ||
+                         trimmed.starts_with("td[") || trimmed.starts_with("td ") || trimmed == "td" ||
+                         trimmed.starts_with("th|") || trimmed.starts_with("td|");
+                         
+            if is_tag {
+                let mut rowspan = 1;
+                let mut colspan = 1;
+                
+                if let Some(cap) = re_row.captures(trimmed) { rowspan = cap[1].parse().unwrap_or(1); }
+                if let Some(cap) = re_col.captures(trimmed) { colspan = cap[1].parse().unwrap_or(1); }
+                
+                let mut current_col = 0;
+                while occupied.contains(&(current_row, current_col)) {
+                    current_col += 1;
+                }
+                
+                for r in 0..rowspan {
+                    for c in 0..colspan {
+                        occupied.insert((current_row + r, current_col + c));
+                    }
+                }
+                
+                let mut text_acc = String::new();
+                let mut line_indices = vec![i];
+                
+                if let Some(idx) = trimmed.find('|') {
+                    text_acc.push_str(trimmed[idx + 1..].trim());
+                    text_acc.push(' ');
+                }
+                
+                let cell_indent = indent;
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let sub_line = &lines[j];
+                    let sub_trim = sub_line.trim();
+                    if sub_trim.is_empty() { j += 1; continue; }
+                    let sub_indent = sub_line.chars().take_while(|c| c.is_whitespace()).count();
+                    
+                    if sub_indent <= cell_indent { break; }
+                    
+                    if let Some(idx) = sub_trim.find('|') {
+                        text_acc.push_str(sub_trim[idx + 1..].trim());
+                        text_acc.push(' ');
+                    }
+                    
+                    line_indices.push(j);
+                    j += 1;
+                }
+                
+                cells.push(GridCell {
+                    row: current_row, col: current_col, rowspan, colspan,
+                    text: text_acc.trim().to_string(), line_indices
+                });
+                
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    cells
+}
+
 async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
@@ -1003,33 +1108,56 @@ async fn process_task(
                 }
             };
             
-            let sample_text = if doc_title.is_empty() {
-                light_pug.chars().take(1000).collect::<String>()
+            // 🌟 [CRITICAL FIX] 1000자 자르기를 전면 폐지하고, 타이틀을 독립적으로 벡터화합니다.
+            let title_emb = if !doc_title.is_empty() {
+                model.get_embedding(doc_title.clone()).await.unwrap_or(vec![0.0; 384])
             } else {
-                format!("{} {}", doc_title, light_pug.chars().take(500).collect::<String>())
+                vec![0.0; 384]
             };
-            
-            let sample_emb = model.get_embedding(sample_text).await.unwrap_or(vec![0.0; 384]);
 
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
-            let mut max_sim = -1.0;
+            let mut max_total_score = -1.0;
 
             for cat in &categories {
-                // 🌟 [CRITICAL FIX] list_bias와 form_bias만 쓰던 기존 방식에서 벗어나, 
-                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어와 정확도를 극대화합니다!
+                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어옵니다.
                 let anchor_text = crate::parsing::get_page_type_full_bias(cat, &doc_lang);
                 let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
                 
-                let sim = cosine_similarity(&sample_emb, &anchor_emb);
-                if sim > max_sim {
-                    max_sim = sim;
+                let mut total_sim = 0.0;
+                
+                // 1. 타이틀 점수 합산 (타이틀은 페이지 정체성에 매우 중요하므로 5배 가중치 부여)
+                if !doc_title.is_empty() {
+                    let title_sim = cosine_similarity(&title_emb, &anchor_emb);
+                    if title_sim > 0.0 {
+                        total_sim += title_sim * 5.0; 
+                    }
+                }
+
+                // 2. 문서 전체를 끝까지 읽고 판단 (노이즈가 제거된 모든 유효 라인 순회)
+                for (i, emb) in line_embeddings.iter().enumerate() {
+                    // 노이즈로 판정되어 삭제될 줄(wiped_indices)은 철저히 배제합니다.
+                    if wiped_indices[i] { continue; } 
+                    
+                    let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
+                    if text_part.is_empty() { continue; }
+
+                    let sim = cosine_similarity(&anchor_emb, emb);
+                    
+                    // 연관성이 뚜렷한 라인(임계치 0.25 초과)의 점수만 누적하여 전체 페이지의 카테고리 밀도를 정밀 측정합니다.
+                    if sim > 0.25 {
+                        total_sim += sim;
+                    }
+                }
+
+                if total_sim > max_total_score {
+                    max_total_score = total_sim;
                     best_type = cat.to_string();
                 }
             }
 
             page_type = best_type;
-            println!("[Scheduler] Deterministic Classified Page Type: {}", page_type);
+            println!("[Scheduler] Deterministic Classified Page Type: {} (Max Score: {:.4})", page_type, max_total_score);
 
             if page_type.is_empty() { 
                 return Ok(()); 
@@ -1512,9 +1640,9 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Analyzing table header structure...", "spinner": "⠋" }));
                     
                     
-                    let ref_row_context_size = ref_row.len() + 3000;
+                    let ref_row_context_size = ref_row.len() + 2000;
                     let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
-                    let thead_light_pug = model.truncate_pug_context(&full_pug, false, 2000, Some(ref_row_context_size)).await;
+                    let thead_light_pug = model.truncate_pug_context(&full_pug, false, 0, Some(ref_row_context_size)).await;
 
                     println!("ref_row: {}", ref_row);
                     
@@ -1813,6 +1941,22 @@ async fn process_task(
             // [최적화] thead는 모든 아이템에 공통으로 적용되므로 루프 바깥에서 단 한 번만 벡터화합니다.
             let mut thead_lines: Vec<String> = thead_pug.lines().map(|s| s.to_string()).collect();
             let mut thead_embeddings = vec![vec![0.0; 384]; thead_lines.len()];
+            
+            // 🌟 [GRID ALIGNMENT] thead 파싱 및 컬럼 인덱스별 헤더 텍스트 머지
+            let thead_cells = parse_pug_grid(&thead_lines);
+            let mut header_cols: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+            for cell in &thead_cells {
+                for c in cell.col..(cell.col + cell.colspan) {
+                    let existing = header_cols.entry(c).or_insert(String::new());
+                    if !existing.is_empty() && !cell.text.is_empty() {
+                        existing.push_str(" > ");
+                    }
+                    if !cell.text.is_empty() {
+                        existing.push_str(&cell.text);
+                    }
+                }
+            }
+
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
                 
@@ -1868,6 +2012,29 @@ async fn process_task(
                 
                 // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행 및 노이즈 필터링
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
+                
+                // 🌟 [GRID ALIGNMENT] tbody 아이템 셀 파싱 및 thead 헤더 텍스트 융합
+                let item_cells = parse_pug_grid(&item_lines);
+                let mut line_enriched_texts = vec![String::new(); item_lines.len()];
+                
+                for cell in &item_cells {
+                    let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
+                    for &line_idx in &cell.line_indices {
+                        let original_text = if let Some(p) = item_lines[line_idx].find('|') {
+                            item_lines[line_idx][p + 1..].trim()
+                        } else {
+                            ""
+                        };
+                        if !original_text.is_empty() {
+                            line_enriched_texts[line_idx] = if h_text.is_empty() {
+                                original_text.to_string()
+                            } else {
+                                format!("{} | {}", h_text, original_text)
+                            };
+                        }
+                    }
+                }
+
                 let mut item_embeddings = vec![vec![0.0; 384]; item_lines.len()];
                 
                 // 🌟 배치 임베딩 적용
@@ -1876,8 +2043,17 @@ async fn process_task(
                 
                 for (line_idx, line) in item_lines.iter().enumerate() {
                     if !line.trim().is_empty() {
-                        texts_to_embed.push(line.to_string());
-                        text_indices.push(line_idx);
+                        let enriched = &line_enriched_texts[line_idx];
+                        let target_text = if enriched.is_empty() {
+                            if let Some(p) = line.find('|') { line[p + 1..].trim() } else { "" }
+                        } else {
+                            enriched.as_str()
+                        };
+
+                        if !target_text.is_empty() {
+                            texts_to_embed.push(target_text.to_string());
+                            text_indices.push(line_idx);
+                        }
                     }
                 }
                 
@@ -1912,43 +2088,50 @@ async fn process_task(
                 // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
                     
-                    // 2. get_list_schema_fields의 bias_target 값을 임베딩하여 인메모리 코사인 유사도 검색
-                    let query_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                    // 2. Bias와 Prejudice 임베딩 (인메모리 코사인 검색용)
+                    let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let prej_emb = if prejudice_target.trim().is_empty() { 
+                        vec![0.0; 384] 
+                    } else { 
+                        model.get_embedding(prejudice_target.clone()).await.unwrap_or(vec![0.0; 384]) 
+                    };
                     
                     // Header 영역 독립 매칭
                     let mut best_thead_idx = 0;
                     let mut best_thead_score = -1.0;
                     for (i, emb) in thead_embeddings.iter().enumerate() {
                         if thead_lines_ref[i].trim().is_empty() { continue; }
-                        let score = cosine_similarity(&query_emb, emb);
-                        if score > best_thead_score {
-                            best_thead_score = score;
+                        let b_score = cosine_similarity(&bias_emb, emb);
+                        let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                        let final_score = b_score - p_score;
+
+                        if final_score > best_thead_score {
+                            best_thead_score = final_score;
                             best_thead_idx = i;
                         }
                     }
-                    let matched_thead_pug = extract_pug_context(&thead_lines_ref, best_thead_idx);
-
-                    // Item 본문 영역 독립 매칭
+                    // 🌟 [CRITICAL FIX] extract_pug_context Slicing 비활성화!
+                    // 점수 기반 검색은 로그 출력 및 검증용으로만 계산하고, 실제 LLM에게는 rowspan/colspan 구조적 대칭성이 
+                    // 완벽하게 보존된 전체 블록(full_item_pug)을 무조건 넘깁니다.
+                    
                     let mut best_item_idx = 0;
                     let mut best_item_score = -1.0;
                     for (i, emb) in item_embeddings.iter().enumerate() {
                         if item_lines_ref[i].trim().is_empty() { continue; }
-                        let score = cosine_similarity(&query_emb, emb);
-                        if score > best_item_score {
-                            best_item_score = score;
+                        let b_score = cosine_similarity(&bias_emb, emb);
+                        let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                        let final_score = b_score - p_score;
+
+                        if final_score > best_item_score {
+                            best_item_score = final_score;
                             best_item_idx = i;
                         }
                     }
-                    let matched_item_pug = extract_pug_context(&item_lines_ref, best_item_idx);
                     
-                    // 3. 찾은 Header 컨텍스트와 Item 컨텍스트를 하나로 결합
-                    let targeted_pug = if matched_thead_pug.is_empty() {
-                        matched_item_pug
-                    } else {
-                        format!("{}\n{}", matched_thead_pug, matched_item_pug)
-                    };
+                    // 리스트 아이템은 크기가 작으므로 특정 줄만 잘라서 던지지 않고, 전체를 던져 환각을 100% 원천 방어합니다.
+                    let targeted_pug = full_item_pug.clone();
                     
-                    emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4}\n{}", field_name, best_thead_score, best_item_score, targeted_pug));
+                    emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4} (Using full structure)", field_name, best_thead_score, best_item_score));
                     
                     let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                         content: format!("[PUG CONTENT]\n{}", targeted_pug),
@@ -2449,22 +2632,36 @@ async fn process_task(
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                // 2. get_detail_schema_fields의 bias_target 값을 임베딩하여 인메모리 코사인 유사도 검색
-                let query_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                // 2. Bias와 Prejudice 임베딩 (인메모리 코사인 검색용)
+                let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                let prej_emb = if prejudice_target.trim().is_empty() { 
+                    vec![0.0; 384] 
+                } else { 
+                    model.get_embedding(prejudice_target.clone()).await.unwrap_or(vec![0.0; 384]) 
+                };
+                
                 let mut best_idx = 0;
                 let mut best_score = -1.0;
                 
                 for (i, emb) in line_embeddings.iter().enumerate() {
                     if pug_lines_ref[i].trim().is_empty() { continue; }
-                    let score = cosine_similarity(&query_emb, emb);
-                    if score > best_score {
-                        best_score = score;
+                    let b_score = cosine_similarity(&bias_emb, emb);
+                    let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                    let final_score = b_score - p_score;
+
+                    if final_score > best_score {
+                        best_score = final_score;
                         best_idx = i;
                     }
                 }
                 
-                // 3. 찾은 컨텍스트 블록으로 추론을 위한 시스템 메시지 동적 조립
-                let targeted_pug = extract_pug_context(&pug_lines_ref, best_idx);
+                // 3. 찾은 컨텍스트 블록으로 추론을 위한 시스템 메시지 동적 조립 및 Fallback 처리
+                let targeted_pug = if best_score < 0.25 {
+                    emit_term(&format!("  ⚠️ [FALLBACK] Field: '{}' | Best Score ({:.4}) is too low. Using full context.", field_name, best_score));
+                    content_pug.clone()
+                } else {
+                    extract_pug_context(&pug_lines_ref, best_idx)
+                };
                 
                 emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_pug));
                 
@@ -2710,15 +2907,27 @@ async fn process_task(
     // --- DB OPS & SIDE EFFECTS ---
     
     let search_mode_str = search_mode.clone();
+    let doc_lang_str = doc_lang.clone(); // 🌟 다국어 Currency 매핑을 위한 변수 복제
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
             
             if obj.get("mode").is_none() { obj.insert("mode".to_string(), json!(search_mode_str.clone())); }
             
-            // 통화 대문자 변환
-            if let Some(c) = obj.get("currency").and_then(|v| v.as_str()) {
-                obj.insert("currency".to_string(), json!(c.to_uppercase()));
+            // 🌟 [CRITICAL FIX] 통화 대문자 변환 및 국가 언어 기반 기본 통화 자동 매핑 (Fallback)
+            let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if currency_val.is_empty() || currency_val == "null" {
+                let default_currency = match doc_lang_str.as_str() {
+                    "ko" => "KRW",
+                    "ja" => "JPY",
+                    "zh" | "zh-tw" | "zh-hk" => "CNY",
+                    "en" => "USD",
+                    "de" | "fr" | "it" | "es" | "nl" => "EUR",
+                    _ => "USD",
+                };
+                obj.insert("currency".to_string(), json!(default_currency));
+            } else {
+                obj.insert("currency".to_string(), json!(currency_val.to_uppercase()));
             }
             
             // 수량 정수형 캐스팅
