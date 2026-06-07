@@ -1628,24 +1628,25 @@ impl LogisModel {
         let mut texts_to_embed = Vec::new();
         let mut emb_mappings = Vec::new();
 
-        // 1. 모든 카테고리의 bias 및 prejudice 텍스트와 매핑 정보를 순차적으로 수집
+        // 🌟 [변경] get_combinatorial_layout_bias 제거. 
+        // 대신 get_detail_schema_fields를 호출하여 해당 카테고리의 "모든 세부 속성"의 Bias/Prejudice를 수집합니다.
         for cat in &categories {
-            let (list_bias, form_bias, prejudice) = crate::parsing::get_combinatorial_layout_bias(&[cat], &query_lang);
+            let fields = crate::parsing::get_detail_schema_fields(cat, "", &query_lang);
             
-            // 🌟 [핵심 변경] list와 form 키워드를 하나의 문장으로 합쳐 단일 bias로 취급합니다.
-            let combined_bias = format!("{} {}", list_bias, form_bias);
-            
-            texts_to_embed.push(combined_bias);
-            emb_mappings.push((cat.to_string(), "bias"));
+            for (key, _desc, bias, prejudice) in fields {
+                texts_to_embed.push(bias);
+                emb_mappings.push((cat.to_string(), format!("{}_bias", key)));
 
-            texts_to_embed.push(prejudice);
-            emb_mappings.push((cat.to_string(), "prejudice"));
+                let final_prej = if prejudice.trim().is_empty() { "random unrelated noise".to_string() } else { prejudice };
+                texts_to_embed.push(final_prej);
+                emb_mappings.push((cat.to_string(), format!("{}_prejudice", key)));
+            }
         }
 
         // 2. 단 한 번의 배치 호출로 모든 임베딩 벡터를 한 장바구니에 획득
-        let embedded_texts = self.get_embedding_batch(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; categories.len() * 2]);
+        let embedded_texts = self.get_embedding_batch(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; emb_mappings.len()]);
 
-        // 3. 획득한 벡터와 카테고리 키 값을 매칭하여 해시맵에 일괄 삽입
+        // 3. 획득한 벡터와 카테고리/키 값을 매칭하여 해시맵에 일괄 삽입
         for (i, (cat, emb_type)) in emb_mappings.into_iter().enumerate() {
             layout_embs.insert(format!("{}_{}", cat, emb_type), embedded_texts[i].clone());
         }
@@ -1681,15 +1682,33 @@ impl LogisModel {
 
                 let mut scores = std::collections::HashMap::new();
                 for cat in &categories {
-                    let bias_emb = layout_embs.get(&format!("{}_bias", cat)).cloned().unwrap_or(vec![0.0; 384]);
-                    let prej_emb = layout_embs.get(&format!("{}_prejudice", cat)).cloned().unwrap_or(vec![0.0; 384]);
-                    
-                    let bias_score = cosine_similarity(&test_emb, &bias_emb);
-                    let prej_score = cosine_similarity(&test_emb, &prej_emb);
+                    let fields = crate::parsing::get_detail_schema_fields(cat, "", &query_lang);
+                    let mut field_scores = Vec::new();
 
-                    // 🌟 [우선순위 조정] 단일 Bias 점수에서 Prejudice(노이즈) 점수를 차감하여 문맥의 순도를 높입니다.
-                    let final_base_score = (bias_score - prej_score).max(0.0);
-                    scores.insert(cat.to_string(), final_base_score);
+                    for (key, _desc, _bias, _prejudice) in fields {
+                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
+                        
+                        let bias_score = cosine_similarity(&test_emb, &bias_emb);
+                        let prej_score = cosine_similarity(&test_emb, &prej_emb);
+
+                        let field_score = (bias_score - prej_score).max(0.0);
+                        field_scores.push(field_score);
+                    }
+
+                    // 🌟 [멀티 패스 스코어 평균화] 
+                    // 필드 개수가 많은 도메인이 무조건 점수가 낮아지는 현상(희석)을 막기 위해,
+                    // 해당 문구와 가장 강하게 매칭된 상위 3개 속성 점수의 "평균(Average)"을 최종 문맥 점수로 산출합니다.
+                    field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let top_k = field_scores.len().min(3);
+                    let mut sum_top_scores = 0.0;
+                    
+                    for i in 0..top_k {
+                        sum_top_scores += field_scores[i];
+                    }
+                    
+                    let avg_base_score = if top_k > 0 { sum_top_scores / (top_k as f32) } else { 0.0 };
+                    scores.insert(cat.to_string(), avg_base_score);
                 }
                 raw_spans.push(SpanData { start, end, text: test_text, scores });
             }
