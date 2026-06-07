@@ -1169,11 +1169,11 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
 
-            let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
+            let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_combinatorial_layout_bias(&[&page_type], &doc_lang);
             
-            let prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
-            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
-            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            let prej_emb: Vec<f32> = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0f32; 384]);
+            let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
+            let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             
             // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
             let system_content_a2 = format!("[PUG CONTENT]\n{}", light_pug);
@@ -2441,9 +2441,9 @@ async fn process_task(
             }
 
             // 🎯 Track A: Stage 3 Detail (Boa Engine 기반 부모 뭉치 단위 노이즈 삭제)
-            let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(&page_type, &doc_lang);
-            let list_bias_emb = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0; 384]);
-            let form_bias_emb = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0; 384]);
+            let (list_bias, form_bias, _) = crate::parsing::get_combinatorial_layout_bias(&[&page_type], &doc_lang);
+            let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
+            let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             
             let mut wiped_indices = vec![false; pug_lines.len()];
             let mut processed_blocks = std::collections::HashSet::new();

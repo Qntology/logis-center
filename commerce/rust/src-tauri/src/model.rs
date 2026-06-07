@@ -1623,13 +1623,28 @@ impl LogisModel {
                          else { "en".to_string() };
 
         let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
-        let mut cat_embs = std::collections::HashMap::new();
+        let mut layout_embs = std::collections::HashMap::new();
+
+        let mut biases_to_embed = Vec::new();
+        let mut bias_mappings = Vec::new();
+
+        // 1. 모든 카테고리의 bias 텍스트와 매핑 정보를 순차적으로 수집
         for cat in &categories {
-            // 🌟 [1차 분기] 도메인 감지: layout_list와 layout_form만 합쳐서 해당 카테고리의 대표 레이아웃(Domain) 지표로 삼습니다.
-            let (list_bias, form_bias, _) = crate::parsing::get_separated_layout_bias(cat, &query_lang);
-            let combined_layout_bias = format!("{} {}", list_bias, form_bias);
-            let emb = self.get_embedding(combined_layout_bias).await.unwrap_or(vec![0.0; 384]);
-            cat_embs.insert(cat.to_string(), emb);
+            let (list_bias, form_bias, _) = crate::parsing::get_combinatorial_layout_bias(&[cat], &query_lang);
+            
+            biases_to_embed.push(list_bias);
+            bias_mappings.push((cat.to_string(), "list"));
+            
+            biases_to_embed.push(form_bias);
+            bias_mappings.push((cat.to_string(), "form"));
+        }
+
+        // 2. 단 한 번의 배치 호출로 모든 임베딩 벡터를 한 장바구니에 획득
+        let embedded_biases = self.get_embedding_batch(biases_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; categories.len() * 2]);
+
+        // 3. 획득한 벡터와 카테고리 키 값을 매칭하여 해시맵에 일괄 삽입
+        for (i, (cat, bias_type)) in bias_mappings.into_iter().enumerate() {
+            layout_embs.insert(format!("{}_{}", cat, bias_type), embedded_biases[i].clone());
         }
 
         fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1641,68 +1656,100 @@ impl LogisModel {
 
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut context_arr = Vec::new();
-        let mut current_chunk_words = Vec::new();
-        let mut prev_max_score = -1.0;
-        let mut best_cat_for_chunk = String::new();
 
-        for word in words {
-            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        // 🌟 [1차 패스] 최소 2단어 이상(2-gram)의 교차 윈도우 스팬 및 카테고리별 기본 점수 수집
+        struct SpanData {
+            start: usize,
+            end: usize,
+            text: String,
+            scores: std::collections::HashMap<String, f32>,
+        }
+        let mut raw_spans = Vec::new();
+
+        for start in 0..words.len() {
+            let max_end = words.len().min(start + 8);
             
-            let mut test_words = current_chunk_words.clone();
-            test_words.push(word);
-            let test_text = test_words.join(" ");
-            let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
-
-            let mut current_max_score = -1.0;
-            let mut current_best_cat = String::new();
-
-            for (cat, emb) in &cat_embs {
-                let score = cosine_similarity(&test_emb, emb);
-                if score > current_max_score {
-                    current_max_score = score;
-                    current_best_cat = cat.to_string();
-                }
-            }
-
-            // 🌟 [핵심 분할 방어 로직] 1~2어절까지는 무조건 합치고, 3번째 어절(current_chunk_words.len() >= 2)부터 절벽 하락을 감지하여 자릅니다!
-            if current_chunk_words.len() >= 2 && current_max_score < prev_max_score {
-                emit_term(&format!("  ✂️ [CLIFF CUT] Score dropped ({:.4} -> {:.4}). Finalizing chunk: [{}] '{}'", prev_max_score, current_max_score, best_cat_for_chunk, current_chunk_words.join(" ")));
+            // 🌟 [단어 수 제한] start + 2 로 설정하여 단일 단어(1단어)는 배제합니다.
+            for end in (start + 2)..=max_end {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                context_arr.push(json!({
-                    "type": best_cat_for_chunk.clone(),
-                    "text": current_chunk_words.join(" ")
-                }));
-                
-                // 새로운 단어로 맥락을 다시 리셋하여 측정을 시작합니다.
-                current_chunk_words = vec![word];
-                let reset_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
-                let mut reset_max = -1.0;
-                let mut reset_cat = String::new();
-                for (cat, emb) in &cat_embs {
-                    let score = cosine_similarity(&reset_emb, emb);
-                    if score > reset_max {
-                        reset_max = score;
-                        reset_cat = cat.to_string();
-                    }
+                let test_text = words[start..end].join(" ");
+                let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                let mut scores = std::collections::HashMap::new();
+                for cat in &categories {
+                    let list_emb = layout_embs.get(&format!("{}_list", cat)).cloned().unwrap_or(vec![0.0; 384]);
+                    let form_emb = layout_embs.get(&format!("{}_form", cat)).cloned().unwrap_or(vec![0.0; 384]);
+                    
+                    let list_score = cosine_similarity(&test_emb, &list_emb);
+                    let form_score = cosine_similarity(&test_emb, &form_emb);
+
+                    scores.insert(cat.to_string(), list_score + form_score);
                 }
-                prev_max_score = reset_max;
-                best_cat_for_chunk = reset_cat;
-            } else {
-                // 맥락 점수가 유지되거나 상승하거나, 아직 1~2어절이라면 계속 어절을 이어 붙입니다 (Accumulate)
-                current_chunk_words.push(word);
-                prev_max_score = current_max_score;
-                best_cat_for_chunk = current_best_cat;
-                emit_term(&format!("  📈 [ACCUMULATE] Current max: {:.4} ({}) -> '{}'", current_max_score, best_cat_for_chunk, test_text));
+                raw_spans.push(SpanData { start, end, text: test_text, scores });
             }
         }
 
-        // 반복이 끝나고 남은 마지막 청크 덩어리를 밀어넣습니다.
-        if !current_chunk_words.is_empty() {
-            emit_term(&format!("  ✂️ [FINAL CUT] Finalizing chunk: [{}] '{}'", best_cat_for_chunk, current_chunk_words.join(" ")));
-            context_arr.push(json!({
-                "type": best_cat_for_chunk,
-                "text": current_chunk_words.join(" ")
-            }));
+        // 🌟 [2차 패스] 앞뒤 교차 문장 점수 합산을 통한 최종 컨텍스트 점수 도출
+        for i in 0..raw_spans.len() {
+            let target = &raw_spans[i];
+            let mut contextual_scores: Vec<(String, f32)> = Vec::new();
+
+            for cat in &categories {
+                let base_score = *target.scores.get(*cat).unwrap_or(&0.0);
+                
+                let mut prev_bonus = 0.0;
+                let mut next_bonus = 0.0;
+                
+                for j in 0..raw_spans.len() {
+                    if i == j { continue; }
+                    let other = &raw_spans[j];
+                    let o_score = *other.scores.get(*cat).unwrap_or(&0.0);
+                    
+                    // 앞쪽 교차 문장: 시작점이 앞서면서 현재 문장과 겹침
+                    if other.start < target.start && other.end > target.start {
+                        if o_score > prev_bonus { prev_bonus = o_score; }
+                    }
+                    // 뒤쪽 교차 문장: 끝점이 뒤서면서 현재 문장과 겹침
+                    if other.end > target.end && other.start < target.end {
+                        if o_score > next_bonus { next_bonus = o_score; }
+                    }
+                }
+                
+                // 중심 점수에 앞뒤 교차 점수를 50% 가중치로 합산하여 자연스러운 의미 뭉치 우선순위 상향
+                let final_context_score = base_score + (prev_bonus * 0.5) + (next_bonus * 0.5);
+                contextual_scores.push((cat.to_string(), final_context_score));
+            }
+
+            // 최종 합산 점수 기준 내림차순 정렬
+            contextual_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let current_best_cat = contextual_scores[0].0.clone();
+            let current_max_contextual_score = contextual_scores[0].1;
+            let original_base_score = *target.scores.get(&current_best_cat).unwrap_or(&0.0);
+
+            // 🌟 기본 결합도가 유의미한 수준(0.45 이상)일 때만 수집 바구니에 저장
+            if original_base_score > 0.45 {
+                let mut intersecting_categories: Vec<String> = Vec::new();
+                for (cat_name, c_score) in &contextual_scores {
+                    let base_s = *target.scores.get(cat_name).unwrap_or(&0.0);
+                    if *c_score >= current_max_contextual_score - 0.25 && base_s > 0.40 {
+                        intersecting_categories.push(cat_name.clone());
+                    }
+                }
+                if intersecting_categories.is_empty() {
+                    intersecting_categories.push(current_best_cat.clone());
+                }
+
+                emit_term(&format!("  📈 [CROSS MATCH] Intersection: {:?} -> '{}' (Context Score: {:.4}, Base: {:.4})", intersecting_categories, target.text, current_max_contextual_score, original_base_score));
+
+                context_arr.push(json!({
+                    "type": current_best_cat,
+                    "types": intersecting_categories,
+                    "text": target.text.clone(),
+                    "score": current_max_contextual_score
+                }));
+            }
         }
 
         let mut segments = json!({

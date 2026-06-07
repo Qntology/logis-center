@@ -940,48 +940,62 @@ pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
     (bias.trim().to_string(), prejudice.trim().to_string())
 }
 
-pub fn get_separated_layout_bias(page_type: &str, lang: &str) -> (String, String, String) {
-    // 영어 하드코딩을 제거하고 초기값을 비워 bias.json의 데이터를 100% 신뢰하도록 변경합니다.
-    let mut list_bias = String::new();
-    let mut form_bias = String::new();
-    let mut prejudice = String::new();
+pub fn get_combinatorial_layout_bias(active_types: &[&str], lang: &str) -> (String, String, String) {
+    let mut combined_list_bias = String::new();
+    let mut combined_form_bias = String::new();
+    let mut combined_prejudice = std::collections::HashSet::new();
     
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
-    let localized_type = get_localized_page_type(page_type, lang);
-    
-    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
-        if let Some(l_list) = localized_obj.get("layout_list") {
-            if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
-                list_bias.push_str(&b.replace("{TYPE}", &localized_type));
+
+    // 1. 인입된 모든 활성 도메인 트랙을 순회하며 바이어스 융합 매트릭스 빌드
+    for page_type in active_types {
+        let localized_type = get_localized_page_type(page_type, lang);
+        
+        if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(*page_type).or_else(|| l.get("default"))) {
+            // List 성격의 교차 키워드 누적 합산
+            if let Some(l_list) = localized_obj.get("layout_list") {
+                if let Some(b) = l_list.get("bias").and_then(|v| v.as_str()) {
+                    if !combined_list_bias.is_empty() { combined_list_bias.push_str(" "); }
+                    combined_list_bias.push_str(&b.replace("{TYPE}", &localized_type));
+                }
+                if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
+                    combined_prejudice.insert(p.replace("{TYPE}", &localized_type));
+                }
             }
-            if let Some(p) = l_list.get("prejudice").and_then(|v| v.as_str()) {
-                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
+            // Form 성격의 교차 키워드 누적 합산
+            if let Some(l_form) = localized_obj.get("layout_form") {
+                if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
+                    if !combined_form_bias.is_empty() { combined_form_bias.push_str(" "); }
+                    combined_form_bias.push_str(&b.replace("{TYPE}", &localized_type));
+                    combined_form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
+                }
+                if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
+                    combined_prejudice.insert(p.replace("{TYPE}", &localized_type));
+                }
             }
+        } else {
+            // 폴백 키워드도 누적합 행렬에 부드럽게 통합 유도
+            combined_list_bias.push_str(&format!(" {} list catalog grid repeating table rows items", localized_type));
+            combined_form_bias.push_str(&format!(" {} detail form single input fields properties configuration", localized_type));
         }
-        if let Some(l_form) = localized_obj.get("layout_form") {
-            if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
-                form_bias.push_str(&b.replace("{TYPE}", &localized_type));
-                form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
-            }
-            if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
-                if !prejudice.is_empty() { prejudice.push_str(" "); }
-                prejudice.push_str(&p.replace("{TYPE}", &localized_type));
-            }
-        }
-    } 
-    
-    // bias.json에서 데이터를 찾지 못한 예외적인 상황에만 적용되는 폴백(Fallback) 방어 로직
-    if list_bias.trim().is_empty() {
-        list_bias = format!("{} list catalog grid repeating multiple table rows items", localized_type);
     }
-    if form_bias.trim().is_empty() {
-        form_bias = format!("{} detail form single input fields properties configuration input select textarea", localized_type);
+
+    // 2. 만약 활성 레이아웃이 비어있을 때를 대비한 기본 방어선 구축
+    if combined_list_bias.trim().is_empty() {
+        combined_list_bias = String::from("list catalog grid repeating multiple table rows items");
     }
-    if prejudice.trim().is_empty() {
-        prejudice = String::from("global navigation, menus, footers, aside, search, guide, tip, filter.");
+    if combined_form_bias.trim().is_empty() {
+        combined_form_bias = String::from("detail form single input fields properties configuration input select textarea");
     }
     
-    (list_bias.trim().to_string(), form_bias.trim().to_string(), prejudice.trim().to_string())
+    // 3. 중복 제거된 배제(Prejudice) 단어 배열을 단일 텍스트 구문으로 압축 조립
+    let mut prej_vec: Vec<String> = combined_prejudice.into_iter().collect();
+    if prej_vec.is_empty() {
+        prej_vec.push(String::from("global navigation, menus, footers, aside, search, guide, tip, filter."));
+    }
+    let final_prejudice = prej_vec.join(" ");
+
+    (combined_list_bias.trim().to_string(), combined_form_bias.trim().to_string(), final_prejudice.trim().to_string())
 }
 
 pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
