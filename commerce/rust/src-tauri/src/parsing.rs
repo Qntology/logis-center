@@ -1285,82 +1285,88 @@ pub fn para2graph(language: &str) -> String {
 }
 
 // 🌟 벡터 매칭 결과와 언어(국가) 코드를 입력받아 동적으로 완벽한 날짜 필터를 생성합니다.
-pub fn get_deterministic_time_guide(vector_guide: &str, lang: &str) -> String {
-    use chrono::{Datelike, TimeZone, Duration};
-    let now = chrono::Local::now();
+pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> String {
+    use chrono::{Datelike, Utc, Duration, FixedOffset, TimeZone};
+    
+    // 🌟 [CRITICAL FIX] 50개 언어 코드를 기반으로 해당 언어권의 대표 UTC Offset(분) 및 남반구(계절 반전) 여부를 매핑합니다.
+    let (offset_minutes, is_southern) = match lang_code.to_lowercase().as_str() {
+        "sq" | "ca" | "hr" | "cs" | "da" | "nl" | "fr" | "de" | "hu" | "it" | "no" | "pl" | "sr" | "sk" | "sl" | "es" | "sv" => (60, false), // UTC+1
+        "bg" | "et" | "fi" | "el" | "he" | "lv" | "lt" | "ro" | "uk" => (120, false), // UTC+2
+        "ar" | "tr" | "ru" | "sw" => (180, lang_code.to_lowercase() == "sw"), // UTC+3 (스와힐리어는 남반구/적도 기준)
+        "fa" => (210, false), // UTC+3:30
+        "az" | "ka" => (240, false), // UTC+4
+        "kk" | "ur" | "uz" => (300, false), // UTC+5
+        "hi" | "mr" | "te" => (330, false), // UTC+5:30
+        "bn" => (360, false), // UTC+6
+        "id" | "km" | "th" | "vi" => (420, false), // UTC+7
+        "zh" | "ms" | "tl" => (480, false), // UTC+8
+        "ja" | "ko" => (540, false), // UTC+9
+        "pt" => (-180, true), // UTC-3 (브라질 등 남반구 포르투갈어권 대표)
+        "is" | "en" => (0, false), // UTC+0 (영어는 기본 북반구/UTC0로 설정)
+        _ => (540, false), // 매칭 안 될 경우 기본값 (한국 KST)
+    };
+
+    let offset = FixedOffset::east_opt(offset_minutes * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
+    let now = Utc::now().with_timezone(&offset);
     let mut guide = String::new();
 
-    // 🌟 [계절 엔진] 언어/국가 코드를 기반으로 남반구 여부를 판별합니다. (남미 아프리카 등 52개국 대응 확장)
-    let lang_lower = lang.to_lowercase();
-    let is_southern = lang_lower.ends_with("-au") || lang_lower.ends_with("-nz") 
-                   || lang_lower.ends_with("-ar") || lang_lower.ends_with("-za") 
-                   || lang_lower.ends_with("-cl") || lang_lower.ends_with("-pe") 
-                   || lang_lower.ends_with("-uy") || lang_lower.ends_with("-br") 
-                   || lang_lower == "pt-br";
-
+    // 🌟 [CRITICAL FIX] 다국어 계절(Season) 기간 매핑 (남반구/북반구 반전 완벽 적용 및 created_at 쌍방향 주입)
     let mut start_m = 0;
     let mut end_m = 0;
+    let mut start_y = now.year();
+    let mut end_y = now.year();
 
-    if vector_guide.contains("Time Intent [spring]") {
-        if is_southern { start_m = 9; end_m = 11; } else { start_m = 3; end_m = 5; }
-    } else if vector_guide.contains("Time Intent [summer]") {
-        if is_southern { start_m = 12; end_m = 2; } else { start_m = 6; end_m = 8; }
-    } else if vector_guide.contains("Time Intent [autumn]") {
-        if is_southern { start_m = 3; end_m = 5; } else { start_m = 9; end_m = 11; }
-    } else if vector_guide.contains("Time Intent [winter]") {
-        if is_southern { start_m = 6; end_m = 8; } else { start_m = 12; end_m = 2; }
+    if is_southern {
+        if vector_guide.contains("Season Intent [spring]") { start_m = 9; end_m = 11; }
+        else if vector_guide.contains("Season Intent [summer]") { start_m = 12; end_m = 2; if now.month() <= 2 { start_y -= 1; } else { end_y += 1; } }
+        else if vector_guide.contains("Season Intent [autumn]") { start_m = 3; end_m = 5; }
+        else if vector_guide.contains("Season Intent [winter]") { start_m = 6; end_m = 8; }
+    } else {
+        if vector_guide.contains("Season Intent [spring]") { start_m = 3; end_m = 5; }
+        else if vector_guide.contains("Season Intent [summer]") { start_m = 6; end_m = 8; }
+        else if vector_guide.contains("Season Intent [autumn]") { start_m = 9; end_m = 11; }
+        else if vector_guide.contains("Season Intent [winter]") { start_m = 12; end_m = 2; if now.month() <= 2 { start_y -= 1; } else { end_y += 1; } }
     }
 
     if start_m != 0 {
-        let mut start_y = now.year();
-        let mut end_y = now.year();
-
-        if start_m > end_m { 
-            if now.month() <= end_m { start_y -= 1; } else { end_y += 1; }
-        } else {
-            if now.month() < start_m { start_y -= 1; end_y -= 1; }
-        }
-
         let end_day = match end_m {
             2 => if end_y % 4 == 0 && (end_y % 100 != 0 || end_y % 400 == 0) { 29 } else { 28 },
             4 | 6 | 9 | 11 => 30,
             _ => 31,
         };
-
-        // 🌟 [CRITICAL FIX] 도메인 조건(if event or coupon)을 폐지하고, 무조건 started_at 과 expired_at 쌍(Pair)을 강제 주입하여 LLM의 누락(환각)을 완벽 차단합니다!
-        return format!("- [DETERMINISTIC OVERRIDE] Vector detected Season. You MUST inject BOTH properties exactly like this and ignore single date fields:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", start_y, start_m, end_y, end_m, end_day);
+        return format!("- [DETERMINISTIC OVERRIDE] Vector detected Season. You MUST inject BOTH properties exactly like this into the 'condition' object:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", start_y, start_m, end_y, end_m, end_day);
     }
 
-    // 기존 단일 시간 필터 로직도 쌍(Pair) 주입 가이드로 업그레이드
+    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 언어권별 로컬 시간대(`now`)를 기준으로 작동하며, started_at 대신 created_at을 주입합니다.
     if vector_guide.contains("Time Intent [today]") {
         let date_str = now.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Today'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Today'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
     } else if vector_guide.contains("Time Intent [yesterday]") {
         let yesterday = now - Duration::days(1);
         let date_str = yesterday.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Yesterday'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Yesterday'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
     } else if vector_guide.contains("Time Intent [this_month]") {
-        let end_date = chrono::Local.with_ymd_and_hms(
+        let end_date = offset.with_ymd_and_hms(
             if now.month() == 12 { now.year() + 1 } else { now.year() },
             if now.month() == 12 { 1 } else { now.month() + 1 },
             1, 0, 0, 0
         ).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Month'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", now.year(), now.month(), now.year(), now.month(), end_date.day());
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Month'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", now.year(), now.month(), now.year(), now.month(), end_date.day());
     } else if vector_guide.contains("Time Intent [last_month]") {
         let (y, m) = if now.month() == 1 { (now.year() - 1, 12) } else { (now.year(), now.month() - 1) };
         let next_m = if m == 12 { 1 } else { m + 1 };
         let next_y = if m == 12 { y + 1 } else { y };
-        let end_date = chrono::Local.with_ymd_and_hms(next_y, next_m, 1, 0, 0, 0).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Month'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", y, m, y, m, end_date.day());
+        let end_date = offset.with_ymd_and_hms(next_y, next_m, 1, 0, 0, 0).unwrap() - Duration::seconds(1);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Month'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", y, m, y, m, end_date.day());
     } else if vector_guide.contains("Time Intent [this_year]") {
         let y = now.year();
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Year'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Year'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
     } else if vector_guide.contains("Time Intent [last_year]") {
         let y = now.year() - 1;
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Year'. You MUST strictly use:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Year'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
     } else if vector_guide.contains("Time Intent [recently]") {
         let past = now - Duration::days(30);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Recently'. You MUST strictly use 'gte' with date \"{}T00:00:00\".", past.format("%Y-%m-%d"));
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Recently'. You MUST strictly use 'gte' with date \"{}T00:00:00\" for 'created_at'.", past.format("%Y-%m-%d"));
     }
 
     guide
@@ -1408,10 +1414,15 @@ The system has pre-calculated vector similarities for properties, operators, and
 {
   "status": "String (Optional, e.g., 'progress', 'cancel', 'refund' etc.)",
   "condition": {
-    "[proper_property_name_from_schema]": {
+    "[property_1]": {
       "is_percent": Boolean,
       "percent_total": Number (if is_percent is true),
       "value": "Absolute String or Number",
+      "operator": "..."
+    },
+    "[property_2]": {
+      "is_percent": false,
+      "value": "...",
       "operator": "..."
     }
   }

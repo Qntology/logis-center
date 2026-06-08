@@ -484,6 +484,17 @@ impl LogisModel {
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
                     return Ok(());
+                } else {
+                    // 🌟 [CRITICAL FIX] Background에서 로딩 중이라 객체(is_some)는 없지만, current_size는 target_size로 등록된 상태!
+                    // 여기서 무식하게 deep_purge를 호출하면 백그라운드 로딩이 파괴되므로, 각 ensure 함수의 대기(Wait) 루프로 안전하게 진입시킵니다.
+                    drop(current); // 락 해제
+                    println!("[RELAY] {:?} is currently loading in background. Waiting for synchronization...", target_size);
+                    match target_size {
+                        ModelSize::Qwen => { self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?; },
+                        ModelSize::Qwen3 => { self.ensure_qwen3().await?; },
+                        ModelSize::Qwen3_5 => { self.ensure_qwen3_5(false).await?; }
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -546,6 +557,21 @@ impl LogisModel {
     pub async fn ensure_qwen3(&self) -> anyhow::Result<()> {
         let needs_load = { self.qwen3_generator.lock().await.is_none() };
         if needs_load {
+            // 🌟 [CRITICAL FIX] 백그라운드에서 이미 로딩이 시작되었는지 확인하고, 진행 중이라면 완료될 때까지 안전하게 대기합니다.
+            {
+                let size_guard = self.current_size.lock().await;
+                if *size_guard == Some(ModelSize::Qwen3) {
+                    drop(size_guard);
+                    println!("[MODEL] Qwen3 is currently loading in background. Waiting for synchronization...");
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if self.qwen3_generator.lock().await.is_some() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
             self.unload_generator().await;
             {
@@ -1977,9 +2003,6 @@ impl LogisModel {
         // ----------------------------------------------------
         emit_term("[STAGE-2] Extracting attributes via Double Vector Plinko & LLM Normalization...");
         
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
 
@@ -2038,24 +2061,38 @@ impl LogisModel {
                     metric_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
                 }
 
-                // 🌟 [5차 분기] 상대적 시간 의도(Time Filters) 매칭
-                let time_keys = vec![
-                    "today", "yesterday", "this_month", "last_month", 
-                    "this_year", "last_year", "recently", 
-                    "spring", "summer", "autumn", "winter"
-                ];
+                // 🌟 [5차 분기-A] 상대적 시간 의도(Time Filters) 매칭 (bias.json 100% 의존)
+                let time_keys = vec!["today", "yesterday", "this_month", "last_month", "this_year", "last_year", "recently"];
                 let mut time_bias_texts = Vec::new();
                 let mut time_prej_texts = Vec::new();
 
                 for tk in &time_keys {
-                    let mut b_text = String::new();
-                    let mut p_text = String::new();
+                    // 🌟 [CRITICAL FIX] 두 텍스트가 완벽히 일치하여 0.0000으로 상쇄되는 현상을 막기 위해 서로 다른 고유값을 부여합니다.
+                    let mut b_text = format!("{} time period indicator", tk); 
+                    let mut p_text = format!("different opposite time not {}", tk);
                     if let Some(t_obj) = crate::parsing::BIAS_DICT.get("time_filters").and_then(|o| o.get(*tk)) {
                         if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
                         if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
                     }
                     time_bias_texts.push(b_text);
-                    time_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
+                    time_prej_texts.push(p_text);
+                }
+
+                // 🌟 [5차 분기-B] 계절 의도(Season Filters) 매칭 (bias.json 100% 의존)
+                let season_keys = vec!["spring", "summer", "autumn", "winter"];
+                let mut season_bias_texts = Vec::new();
+                let mut season_prej_texts = Vec::new();
+
+                for sk in &season_keys {
+                    // 🌟 [CRITICAL FIX] 두 텍스트가 완벽히 일치하여 0.0000으로 상쇄되는 현상을 막기 위해 서로 다른 고유값을 부여합니다.
+                    let mut b_text = format!("{} season weather", sk); 
+                    let mut p_text = format!("other different seasons not {}", sk);
+                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("season_filters").and_then(|o| o.get(*sk)) {
+                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
+                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    }
+                    season_bias_texts.push(b_text);
+                    season_prej_texts.push(p_text);
                 }
                 
                 // Batch Embedding (Bias & Prejudice) 동시 장전
@@ -2068,9 +2105,12 @@ impl LogisModel {
                 let metric_bias_embs = self.get_embedding_batch(metric_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
                 let metric_prej_embs = self.get_embedding_batch(metric_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
 
-                // 🌟 시간 의도 벡터도 일괄 연산에 포함
+                // 🌟 시간 및 계절 의도 벡터 일괄 연산
                 let time_bias_embs = self.get_embedding_batch(time_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
                 let time_prej_embs = self.get_embedding_batch(time_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
+
+                let season_bias_embs = self.get_embedding_batch(season_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
+                let season_prej_embs = self.get_embedding_batch(season_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
 
                 // Plinko Game: Sliding Window Cliff Detection over words
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2131,15 +2171,152 @@ impl LogisModel {
                     plinko_map.entry(best_prop_for_chunk).or_default().push(current_chunk.join(" "));
                 }
 
+                // 🌟 [STAGE-1 계승] 시간(Time)과 계절(Season) 판별에 Stage 1의 '슬라이딩 윈도우 + NMS 교차 검증' 로직을 도입하여 정밀도를 극대화합니다!
+                let temporal_words: Vec<&str> = current_text.split_whitespace().collect();
+                
+                #[derive(Clone)]
+                struct TemporalSpan {
+                    start: usize,
+                    end: usize,
+                    text: String,
+                    best_intent: String,
+                    group: String,
+                    score: f32,
+                }
+                let mut temp_raw_spans = Vec::new();
+
+                emit_term(&format!("  🔍 [PASS 1: SLIDING WINDOW] Analayzing chunks for '{}'", current_text));
+
+                // 🌟 1차 패스: 슬라이딩 윈도우 (1~4단어 조합으로 쪼개서 타격)
+                for start in 0..temporal_words.len() {
+                    let max_end = temporal_words.len().min(start + 4);
+                    for end in (start + 1)..=max_end {
+                        let test_text = temporal_words[start..end].join(" ");
+                        let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                        
+                        // 🌟 [CRITICAL FIX] 시간/계절 판별에 Prejudice(배제) 차감 로직을 적용하여 정확도를 높입니다.
+                        // 차감 로직으로 인해 점수가 마이너스(-)로 떨어지더라도 덜 마이너스인(가장 연관성 높은) 값을 
+                        // 무조건 찾아 우선순위(NMS) 배틀에 참전시킬 수 있도록 기본 임계값을 -2.0으로 하향 조정합니다.
+                        let mut best_time_score = -2.0;
+                        let mut best_time_intent = String::from("none");
+                        for i in 0..time_keys.len() {
+                            let b_score = cosine_similarity(&test_emb, &time_bias_embs[i]);
+                            let p_score = cosine_similarity(&test_emb, &time_prej_embs[i]);
+                            let score = b_score - p_score;
+                            if score > best_time_score { best_time_score = score; best_time_intent = time_keys[i].to_string(); }
+                        }
+
+                        let mut best_season_score = -2.0;
+                        let mut best_season_intent = String::from("none");
+                        for i in 0..season_keys.len() {
+                            let b_score = cosine_similarity(&test_emb, &season_bias_embs[i]);
+                            let p_score = cosine_similarity(&test_emb, &season_prej_embs[i]);
+                            let score = b_score - p_score;
+                            if score > best_season_score { best_season_score = score; best_season_intent = season_keys[i].to_string(); }
+                        }
+
+                        let word_count = end - start;
+                        let length_weight = 1.0 + ((word_count as f32 - 1.0) * 0.15); 
+                        
+                        // Time 후보 독립 등록 (임계값을 넘은 경우에만)
+                        if best_time_intent != "none" {
+                            let weighted_time_score = best_time_score * length_weight;
+                            emit_term(&format!("    🔹 [RAW-TIME] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, best_time_intent, best_time_score, length_weight, weighted_time_score));
+                            temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: best_time_intent, group: "Time".to_string(), score: weighted_time_score });
+                        }
+
+                        // Season 후보 독립 등록 (임계값을 넘은 경우에만)
+                        if best_season_intent != "none" {
+                            let weighted_season_score = best_season_score * length_weight;
+                            emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, best_season_intent, best_season_score, length_weight, weighted_season_score));
+                            temp_raw_spans.push(TemporalSpan { start, end, text: test_text, best_intent: best_season_intent, group: "Season".to_string(), score: weighted_season_score });
+                        }
+                    }
+                }
+
+                // 🌟 2차 패스: 앞뒤 교차 문장(Context) 점수 합산
+                emit_term("  🔄 [PASS 2: CONTEXT ADJUSTMENT] Merging adjacent scores...");
+                let mut temp_evaluated_spans = Vec::new();
+                
+                for i in 0..temp_raw_spans.len() {
+                    let target = &temp_raw_spans[i];
+                    let mut prev_bonus = 0.0;
+                    let mut next_bonus = 0.0;
+
+                    for j in 0..temp_raw_spans.len() {
+                        if i == j { continue; }
+                        let other = &temp_raw_spans[j];
+                        // 🌟 [CRITICAL FIX] Time은 Time끼리, Season은 Season끼리만 문맥 보너스를 교환하도록 그룹 조건을 추가합니다.
+                        if other.group == target.group && other.best_intent == target.best_intent {
+                            if other.start < target.start && other.end > target.start && other.score > prev_bonus { prev_bonus = other.score; }
+                            if other.end > target.end && other.start < target.end && other.score > next_bonus { next_bonus = other.score; }
+                        }
+                    }
+                    
+                    let final_context_score = target.score + (prev_bonus * 0.5) + (next_bonus * 0.5);
+                    
+                    emit_term(&format!("    🔸 [ADJUSTED-{}] '{}' -> {} (Score: {:.4} + Bonus: {:.4} = {:.4})", 
+                        target.group.to_uppercase(), target.text, target.best_intent, target.score, (prev_bonus * 0.5) + (next_bonus * 0.5), final_context_score));
+
+                    temp_evaluated_spans.push(TemporalSpan {
+                        start: target.start, end: target.end, text: target.text.clone(),
+                        best_intent: target.best_intent.clone(), group: target.group.clone(), score: final_context_score
+                    });
+                }
+
+                // 🌟 3차 패스: NMS 오버랩(교차) 충돌 해결
+                temp_evaluated_spans.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+                let mut final_temporal_spans: Vec<TemporalSpan> = Vec::new();
+
+                emit_term("  ⚔️ [PASS 3: NMS BATTLE] Resolving Overlaps...");
+                for span in temp_evaluated_spans {
+                    let mut is_overlapped = false;
+                    for selected in &final_temporal_spans {
+                        if span.start < selected.end && span.end > selected.start {
+                            // Time과 Season이 서로 그룹이 다르면 공존 허용 (예: "올해 여름")
+                            if span.group != selected.group {
+                                continue;
+                            }
+                            is_overlapped = true;
+                            break;
+                        }
+                    }
+                    
+                    if !is_overlapped {
+                        emit_term(&format!("    👑 [WINNER] '{}' -> {} (Score: {:.4})", span.text, span.best_intent, span.score));
+                        final_temporal_spans.push(span);
+                    } else {
+                        emit_term(&format!("    💀 [DEFEAT] '{}' -> {} (Absorbed)", span.text, span.best_intent));
+                    }
+                }
+
+                let mut best_time_intent = String::from("none");
+                let mut best_season_intent = String::from("none");
+                let mut battle_logs = Vec::new();
+
+                for span in &final_temporal_spans {
+                    battle_logs.push(format!("'{}'->{}:{:.4}", span.text, span.best_intent, span.score));
+                    if span.group == "Time" && best_time_intent == "none" { best_time_intent = span.best_intent.clone(); }
+                    if span.group == "Season" && best_season_intent == "none" { best_season_intent = span.best_intent.clone(); }
+                }
+
+                if battle_logs.is_empty() {
+                    battle_logs.push("No temporal intents found".to_string());
+                }
+
+                emit_term(&format!("  ✅ [GLOBAL TEMPORAL BATTLE (NMS)] {}", battle_logs.join(" | ")));
+
+                let time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
+                let season_guide = if best_season_intent != "none" { format!(", Season Intent [{}]", best_season_intent) } else { "".to_string() };
+
                 // Formatting Plinko Fragments & Double Plinko for Operators
                 let mut fragments_text = String::new();
-                // 🌟 임베딩 모델이 찾아낸 Operator를 저장해둘 Rust 메모리 해시맵
                 let mut prop_to_op: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
                 for (k, v) in &plinko_map {
                     let combined_chunk = v.join(" | ");
                     
-                    // 🌟 Triple Plinko: 연산자(Operator), 메트릭(Metric Type), 시간 의도(Time Intent) 판별 벡터 매칭 진행
+                    // 🌟 Double Plinko: 연산자(Operator), 메트릭(Metric Type) 판별 벡터 매칭 진행
                     let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
                     
                     // 연산자 매칭
@@ -2168,40 +2345,26 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 상대적 시간 의도(Time Intent) 매칭 및 로그 출력
-                    let mut best_time_intent = "none";
-                    let mut best_time_score = 0.20; // 🌟 다국어 임베딩의 교차언어 점수 하락을 고려해 컷오프를 0.20으로 낮춥니다.
-                    let mut time_debug_logs = Vec::new();
-
-                    for i in 0..time_keys.len() {
-                        let b_score = cosine_similarity(&chunk_emb, &time_bias_embs[i]);
-                        let p_score = cosine_similarity(&chunk_emb, &time_prej_embs[i]);
-                        let score = b_score - p_score;
-                        
-                        // 🌟 로그를 위해 모든 시간 필터의 점수를 기록합니다.
-                        time_debug_logs.push(format!("{}:{:.4}", time_keys[i], score));
-
-                        if score > best_time_score {
-                            best_time_score = score;
-                            best_time_intent = time_keys[i];
-                        }
-                    }
-
-                    // 터미널에 해당 단어의 시간 필터별 벡터 유사도 점수 전체를 출력합니다.
-                    emit_term(&format!("    🔍 [TIME VECTOR DEBUG] '{}' -> {}", combined_chunk, time_debug_logs.join(", ")));
-
-                    // 찾아낸 연산자를 메모리에 기록해 둡니다.
                     prop_to_op.insert(k.clone(), best_op.to_string());
 
-                    // 🌟 [CRITICAL FIX] LLM에게 시간 의도(Time Intent)와 메트릭 유형을 명시적으로 가이드합니다.
-                    let time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
-                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]{}\n", combined_chunk, k, best_op, best_metric, time_guide));
+                    // 🌟 전역(Global)에서 판별한 시간/계절 가이드를 각 청크에 동일하게 적용합니다.
+                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]{}{}\n", combined_chunk, k, best_op, best_metric, time_guide, season_guide));
                 }
                 
                 emit_term(&format!("  🎯 [PLINKO MAP (VECTOR GUIDE)] \n{}", fragments_text.trim()));
 
+                // 🌟 [LOGGING FIX] extract_numeric_conditions 진입 전에 시간/계절 확정 가이드를 터미널 로그로 즉시 출력합니다.
+                let deterministic_guide_log = crate::parsing::get_deterministic_time_guide(&fragments_text, language);
+                if !deterministic_guide_log.is_empty() {
+                    emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
+                }
+
                 // 5. LLM Normalization (Advanced Parser Mode with Vector Guide)
                 if !fragments_text.is_empty() {
+                    // 🌟 [CRITICAL FIX] 임베딩 모델(Embedding)을 유지하기 위해 VRAM을 날리는 secure_vram_relay 대신 ensure_qwen3() 직접 호출!
+                    self.ensure_qwen3().await?;
+                    if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                    
                     // 🌟 [CRITICAL FIX] 현재 시간 및 언어/국가 컨텍스트 생성
                     let now = chrono::Local::now();
                     let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);

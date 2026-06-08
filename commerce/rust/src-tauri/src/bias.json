@@ -71,58 +71,60 @@
   "time_filters": {
     "today": {
       "semantic": "current day, today",
-      "bias": "today, current day, this day, right now",
-      "prejudice": "yesterday, tomorrow, last week, next month, past, future, year"
+      "bias": "today, current day, this day, right now, present 24 hours, instantaneous",
+      "prejudice": "yesterday, tomorrow, last week, next month, past, future, year, month, ago, history"
     },
     "yesterday": {
       "semantic": "previous day, yesterday",
-      "bias": "yesterday, previous day, day before today",
-      "prejudice": "today, tomorrow, last week, next month, future, year"
+      "bias": "yesterday, previous day, day before today, past 24 hours, one day ago",
+      "prejudice": "today, tomorrow, last week, next month, future, year, month, now, current, present"
     },
     "this_month": {
       "semantic": "current month",
-      "bias": "this month, current month",
-      "prejudice": "last month, next month, today, yesterday, year"
+      "bias": "this month, current month, present 30 days, current calendar month",
+      "prejudice": "last month, next month, today, yesterday, year, week, day, specific hour, exact minute"
     },
     "last_month": {
       "semantic": "previous month",
-      "bias": "last month, previous month",
-      "prejudice": "this month, next month, today, yesterday, year"
+      "bias": "last month, previous month, past 30 days, preceding calendar month",
+      "prejudice": "this month, next month, today, yesterday, year, week, day, future, present"
     },
     "this_year": {
       "semantic": "current year",
-      "bias": "this year, current year",
-      "prejudice": "last year, next year, month, day"
+      "bias": "this year, current year, present 365 days, ongoing twelve months",
+      "prejudice": "last year, next year, month, day, week, specific hour, exact minute, ago"
     },
     "last_year": {
       "semantic": "previous year",
-      "bias": "last year, previous year",
-      "prejudice": "this year, next year, month, day"
+      "bias": "last year, previous year, past 365 days, preceding twelve months",
+      "prejudice": "this year, next year, month, day, week, future, today, tomorrow, present"
     },
     "recently": {
       "semantic": "recent past, lately",
-      "bias": "recently, lately, these days, recent times, past few days",
-      "prejudice": "future, exactly today, tomorrow, next year, long ago, ancient"
-    },
+      "bias": "recently, lately, these days, recent times, past few days, short while ago",
+      "prejudice": "future, exactly today, tomorrow, next year, long ago, ancient, decade, century"
+    }
+  },
+  "season_filters": {
     "spring": {
       "semantic": "spring season",
-      "bias": "spring, springtime",
-      "prejudice": "summer, autumn, winter, yesterday, today, tomorrow"
+      "bias": "spring, springtime, vernal equinox, blooming, flowers, sprout, thaw, rebirth, blossom",
+      "prejudice": "summer, autumn, winter, fall, heat, hot, scorcher, cold, freezing, snow, ice, frost, harvest, falling leaves"
     },
     "summer": {
       "semantic": "summer season",
-      "bias": "summer, summertime",
-      "prejudice": "spring, autumn, winter, yesterday, today, tomorrow"
+      "bias": "summer, summertime, summer solstice, heat, hot, warm, beach, sunny, sweat",
+      "prejudice": "spring, autumn, winter, fall, cold, freezing, snow, ice, frost, blooming, harvest, sprout"
     },
     "autumn": {
       "semantic": "autumn season, fall",
-      "bias": "autumn, fall",
-      "prejudice": "spring, summer, winter, yesterday, today, tomorrow"
+      "bias": "autumn, fall, autumnal equinox, falling leaves, harvest, foliage, breeze",
+      "prejudice": "spring, summer, winter, heat, hot, warm, blooming, blossom, snow, freezing, ice, frost"
     },
     "winter": {
       "semantic": "winter season",
-      "bias": "winter, wintertime",
-      "prejudice": "spring, summer, autumn, yesterday, today, tomorrow"
+      "bias": "winter, wintertime, winter solstice, cold, freezing, snow, ice, frost, chill, blizzard",
+      "prejudice": "spring, summer, autumn, fall, heat, hot, warm, sunny, beach, blooming, blossom, harvest"
     }
   },
   "ko": {
