@@ -2062,34 +2062,43 @@ impl LogisModel {
                 }
 
                 // 🌟 [5차 분기-A] 상대적 시간 의도(Time Filters) 매칭 (bias.json 100% 의존)
-                let time_keys = vec!["today", "yesterday", "this_month", "last_month", "this_year", "last_year", "recently"];
+                // 🌟 [5차 분기-A] 상대적 시간 의도(Time Filters) 매칭 (bias.json 100% 동적 추출)
+                let time_keys: Vec<String> = crate::parsing::BIAS_DICT
+                    .get("time_filters")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_else(|| vec!["today".to_string(), "yesterday".to_string(), "this_month".to_string(), "last_month".to_string(), "this_year".to_string(), "last_year".to_string(), "recently".to_string()]);
                 let mut time_bias_texts = Vec::new();
                 let mut time_prej_texts = Vec::new();
 
                 for tk in &time_keys {
-                    // 🌟 [CRITICAL FIX] 두 텍스트가 완벽히 일치하여 0.0000으로 상쇄되는 현상을 막기 위해 서로 다른 고유값을 부여합니다.
-                    let mut b_text = format!("{} time period indicator", tk); 
-                    let mut p_text = format!("different opposite time not {}", tk);
-                    if let Some(t_obj) = crate::parsing::BIAS_DICT.get("time_filters").and_then(|o| o.get(*tk)) {
-                        if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
-                        if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    // 🌟 [Option 2] 벡터 공간에서 다른 의도와 혼동되지 않도록 강력한 'Context Prefix'를 주입합니다.
+                    let mut b_text = format!("Time context: {} period", tk); 
+                    let mut p_text = format!("Time context: opposite not {}", tk);
+                    if let Some(t_obj) = crate::parsing::BIAS_DICT.get("time_filters").and_then(|o| o.get(tk.clone())) {
+                        if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Time context: {}", b); }
+                        if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Time context: {}", p); }
                     }
                     time_bias_texts.push(b_text);
                     time_prej_texts.push(p_text);
                 }
 
                 // 🌟 [5차 분기-B] 계절 의도(Season Filters) 매칭 (bias.json 100% 의존)
-                let season_keys = vec!["spring", "summer", "autumn", "winter"];
+                let season_keys: Vec<String> = crate::parsing::BIAS_DICT
+                    .get("season_filters")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
                 let mut season_bias_texts = Vec::new();
                 let mut season_prej_texts = Vec::new();
 
                 for sk in &season_keys {
-                    // 🌟 [CRITICAL FIX] 두 텍스트가 완벽히 일치하여 0.0000으로 상쇄되는 현상을 막기 위해 서로 다른 고유값을 부여합니다.
-                    let mut b_text = format!("{} season weather", sk); 
-                    let mut p_text = format!("other different seasons not {}", sk);
-                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("season_filters").and_then(|o| o.get(*sk)) {
-                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
-                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
+                    // 🌟 [Option 2] 계절 데이터에도 강력한 도메인 접두사를 주입하여 다른 계절의 배제 단어들과 거리를 벌립니다.
+                    let mut b_text = format!("Season context: {} weather", sk); 
+                    let mut p_text = format!("Season context: not {}", sk);
+                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("season_filters").and_then(|o| o.get(sk.clone())) {
+                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Season context: {}", b); }
+                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Season context: {}", p); }
                     }
                     season_bias_texts.push(b_text);
                     season_prej_texts.push(p_text);
@@ -2194,42 +2203,40 @@ impl LogisModel {
                         let test_text = temporal_words[start..end].join(" ");
                         let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
                         
-                        // 🌟 [CRITICAL FIX] 시간/계절 판별에 Prejudice(배제) 차감 로직을 적용하여 정확도를 높입니다.
-                        // 차감 로직으로 인해 점수가 마이너스(-)로 떨어지더라도 덜 마이너스인(가장 연관성 높은) 값을 
-                        // 무조건 찾아 우선순위(NMS) 배틀에 참전시킬 수 있도록 기본 임계값을 -2.0으로 하향 조정합니다.
-                        let mut best_time_score = -2.0;
-                        let mut best_time_intent = String::from("none");
+                        // 🌟 [CRITICAL FIX] 단 하나의 최고점만 뽑고 버리는 병목 현상을 완전히 제거했습니다.
+                        // 한글 하드코딩 없이 bias.json의 모든 의도를 벡터 유사도(bias - prejudice)로 100% 평가하며,
+                        // 임계값(-2.0)을 넘는 모든 후보를 로그에 출력하고 우선순위(NMS) 배틀에 전부 참전시킵니다.
+                        let word_count = end - start;
+                        let length_weight = 1.0 + ((word_count as f32 - 1.0) * 0.15); 
+
                         for i in 0..time_keys.len() {
                             let b_score = cosine_similarity(&test_emb, &time_bias_embs[i]);
                             let p_score = cosine_similarity(&test_emb, &time_prej_embs[i]);
-                            let score = b_score - p_score;
-                            if score > best_time_score { best_time_score = score; best_time_intent = time_keys[i].to_string(); }
+                            
+                            // 🌟 [Option 1] 단어 수(word_count)가 적을수록 문맥이 부족해 Prejudice(배제)에 과도하게 타격받는 현상을 방지합니다.
+                            let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+                            let score = b_score - (p_score * p_weight);
+                            
+                            if score > 0.05 {
+                                let weighted_time_score = score * length_weight;
+                                emit_term(&format!("    🔹 [RAW-TIME] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, time_keys[i], score, length_weight, weighted_time_score));
+                                temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: time_keys[i].to_string(), group: "Time".to_string(), score: weighted_time_score });
+                            }
                         }
 
-                        let mut best_season_score = -2.0;
-                        let mut best_season_intent = String::from("none");
                         for i in 0..season_keys.len() {
                             let b_score = cosine_similarity(&test_emb, &season_bias_embs[i]);
                             let p_score = cosine_similarity(&test_emb, &season_prej_embs[i]);
-                            let score = b_score - p_score;
-                            if score > best_season_score { best_season_score = score; best_season_intent = season_keys[i].to_string(); }
-                        }
-
-                        let word_count = end - start;
-                        let length_weight = 1.0 + ((word_count as f32 - 1.0) * 0.15); 
-                        
-                        // Time 후보 독립 등록 (임계값을 넘은 경우에만)
-                        if best_time_intent != "none" {
-                            let weighted_time_score = best_time_score * length_weight;
-                            emit_term(&format!("    🔹 [RAW-TIME] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, best_time_intent, best_time_score, length_weight, weighted_time_score));
-                            temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: best_time_intent, group: "Time".to_string(), score: weighted_time_score });
-                        }
-
-                        // Season 후보 독립 등록 (임계값을 넘은 경우에만)
-                        if best_season_intent != "none" {
-                            let weighted_season_score = best_season_score * length_weight;
-                            emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, best_season_intent, best_season_score, length_weight, weighted_season_score));
-                            temp_raw_spans.push(TemporalSpan { start, end, text: test_text, best_intent: best_season_intent, group: "Season".to_string(), score: weighted_season_score });
+                            
+                            // 🌟 [Option 1] '여름' 같은 짧은 단어가 'autumn'의 배제 단어에 포함되어 점수가 음수로 곤두박질치는 환각을 방지합니다.
+                            let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+                            let score = b_score - (p_score * p_weight);
+                            
+                            if score > 0.05 {
+                                let weighted_season_score = score * length_weight;
+                                emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, season_keys[i], score, length_weight, weighted_season_score));
+                                temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: season_keys[i].to_string(), group: "Season".to_string(), score: weighted_season_score });
+                            }
                         }
                     }
                 }
@@ -2286,7 +2293,8 @@ impl LogisModel {
                         emit_term(&format!("    👑 [WINNER] '{}' -> {} (Score: {:.4})", span.text, span.best_intent, span.score));
                         final_temporal_spans.push(span);
                     } else {
-                        emit_term(&format!("    💀 [DEFEAT] '{}' -> {} (Absorbed)", span.text, span.best_intent));
+                        // 🌟 [LOGGING FIX] 패배하여 흡수(Absorbed)된 항목들도 원래의 점수를 로그에 함께 출력합니다.
+                        emit_term(&format!("    💀 [DEFEAT] '{}' -> {} (Absorbed: {:.4})", span.text, span.best_intent, span.score));
                     }
                 }
 
@@ -2353,24 +2361,84 @@ impl LogisModel {
                 
                 emit_term(&format!("  🎯 [PLINKO MAP (VECTOR GUIDE)] \n{}", fragments_text.trim()));
 
-                // 🌟 [LOGGING FIX] extract_numeric_conditions 진입 전에 시간/계절 확정 가이드를 터미널 로그로 즉시 출력합니다.
-                let deterministic_guide_log = crate::parsing::get_deterministic_time_guide(&fragments_text, language);
+                // 🌟 [CRITICAL FIX] 시간/계절 판별 시 벡터 매칭의 환각을 완전히 차단하기 위해 LLM에게 직접 의도를 추출하도록 강제합니다.
+                self.ensure_qwen3().await?;
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+                // 🌟 시간 문맥(현재 시간)을 분리된 프롬프트에 제공하기 위해 미리 생성합니다.
+                let now = chrono::Local::now();
+                let time_context_for_intent = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
+
+                let time_prompt = crate::parsing::extract_time_intent_prompt(&current_text, &time_context_for_intent);
+                let season_prompt = crate::parsing::extract_season_intent_prompt(&current_text);
+                
+                let q3_for_temp = self.qwen3_generator.clone();
+                let cancel_for_temp = cancel_token.clone();
+                
+                // 🌟 분리된 2개의 프롬프트를 단일 블로킹 스レッド 내에서 순차적으로 호출하여 오염을 막습니다.
+                let (time_res_llm, season_res_llm) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+                    let mut gen_guard = q3_for_temp.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        // 1. Time Intent 추출
+                        let params_time = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![
+                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(time_prompt),
+                                    name: None,
+                                })
+                            ],
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
+                            ..Default::default()
+                        };
+                        let t_res = gen.generate(params_time, Some(cancel_for_temp.clone()), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Time Inference failed: {}", e))?;
+
+                        // 2. Season Intent 추출
+                        let params_season = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![
+                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(season_prompt),
+                                    name: None,
+                                })
+                            ],
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
+                            ..Default::default()
+                        };
+                        let s_res = gen.generate(params_season, Some(cancel_for_temp), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Season Inference failed: {}", e))?;
+
+                        Ok((t_res, s_res))
+                    } else {
+                        Err(anyhow::anyhow!("Qwen3 Generator is missing"))
+                    }
+                }).await??;
+
+                let time_json = crate::parsing::parse_json_from_llm(&time_res_llm);
+                let season_json = crate::parsing::parse_json_from_llm(&season_res_llm);
+                
+                let mut llm_temporal_guide = String::new();
+                if let Some(ti) = time_json.get("time_intent").and_then(|v| v.as_str()) {
+                    if !ti.is_empty() && ti != "null" { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", ti)); }
+                }
+                if let Some(si) = season_json.get("season_intent").and_then(|v| v.as_str()) {
+                    if !si.is_empty() && si != "null" { llm_temporal_guide.push_str(&format!("Season Intent [{}]", si)); }
+                }
+
+                emit_term(&format!("  🤖 [LLM TIME INTENT]\n  {}", time_res_llm.trim()));
+                emit_term(&format!("  🤖 [LLM SEASON INTENT]\n  {}", season_res_llm.trim()));
+
+                // 🌟 LLM이 강제 선택한 의도를 바탕으로 최종 Deterministic Time Guide(달력 SQL 필터)를 획득합니다.
+                let deterministic_guide_log = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
                 if !deterministic_guide_log.is_empty() {
                     emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
                 }
 
                 // 5. LLM Normalization (Advanced Parser Mode with Vector Guide)
                 if !fragments_text.is_empty() {
-                    // 🌟 [CRITICAL FIX] 임베딩 모델(Embedding)을 유지하기 위해 VRAM을 날리는 secure_vram_relay 대신 ensure_qwen3() 직접 호출!
-                    self.ensure_qwen3().await?;
-                    if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                    
-                    // 🌟 [CRITICAL FIX] 현재 시간 및 언어/국가 컨텍스트 생성
                     let now = chrono::Local::now();
                     let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
 
-                    // 🌟 [CRITICAL FIX] 벡터 매칭 결과를 가이드(HINT)로 삼아 extract_numeric_conditions 프롬프트 호출 (language 전달)
-                    let prompt_final = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &fragments_text, &time_context, language);
+                    // 🌟 [CRITICAL FIX] 벡터 매칭 가이드와 LLM 시간 가이드를 병합하여 최종 조건 추출 프롬프트 호출
+                    let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
+                    let prompt_final = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language);
 
                     let gen_arc = self.qwen3_generator.clone();
                     let cancel_clone = cancel_token.clone();

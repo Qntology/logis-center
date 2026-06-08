@@ -1372,6 +1372,72 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> Stri
     guide
 }
 
+// 🌟 [신규 추가] 문장에서 시간(Time) 의도를 배열 내에서만 엄격하게 강제 선택하도록 하는 독립된 프롬프트 (현재 시간 컨텍스트 주입)
+pub fn extract_time_intent_prompt(text: &str, time_context: &str) -> String {
+    let time_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("time_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec!["today".to_string(), "yesterday".to_string(), "this_month".to_string(), "last_month".to_string(), "this_year".to_string(), "last_year".to_string(), "recently".to_string()]);
+
+    let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact relative time intent based on the Current Time Context.
+You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[AVAILABLE TIME INTENTS]
+{TIME_ARRAY}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[OUTPUT FORMAT]
+{
+  "time_intent": "String or null"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TIME_CONTEXT}", time_context)
+            .replace("{TIME_ARRAY}", &time_arr_str)
+            .replace("{TEXT}", text)
+}
+
+// 🌟 [신규 추가] 문장에서 계절(Season) 의도를 배열 내에서만 엄격하게 강제 선택하도록 하는 독립된 프롬프트
+pub fn extract_season_intent_prompt(text: &str) -> String {
+    let season_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("season_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
+
+    let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact seasonal intent.
+You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+
+[AVAILABLE SEASON INTENTS]
+{SEASON_ARRAY}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[OUTPUT FORMAT]
+{
+  "season_intent": "String or null"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{SEASON_ARRAY}", &season_arr_str)
+            .replace("{TEXT}", text)
+}
+
 pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str) -> String {
     // 🌟 텍스트(current) 대신 벡터 매칭 결과(vector_guide)와 언어(lang)를 기반으로 날짜를 완벽하게 계산합니다.
     let deterministic_time = get_deterministic_time_guide(vector_guide, lang);
@@ -1388,8 +1454,7 @@ You must extract, transform, and normalize data from the natural language input 
 
 [SYSTEM TIME & LOCALE CONTEXT]
 {TIME_CONTEXT}
-- If a [DETERMINISTIC OVERRIDE] is provided above, you MUST use the exact ISO 8601 strings and operators provided. Do not calculate it yourself.
-- If no override is provided, and you see explicit exact dates (e.g. 2026-05-01), use them.
+- If explicit exact dates are mentioned in the text, use them.
 
 [DATABASE METRICS CONTEXT]
 Metrics: {METRICS}
@@ -1412,7 +1477,7 @@ The system has pre-calculated vector similarities for properties, operators, and
 
 [OUTPUT FORMAT]
 {
-  "status": "String (Optional, e.g., 'progress', 'cancel', 'refund' etc.)",
+  "status": "String (Optional)",
   "condition": {
     "[property_1]": {
       "is_percent": Boolean,
