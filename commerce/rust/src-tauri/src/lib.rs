@@ -420,13 +420,12 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
                 "amount", "status", "type", "created_at", "updated_at",
                 "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
                 "shipping_date", "delivery_date", "weight",
-                
-                "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date"
+                "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date",
+                "started_at", "expired_at" // 🌟 [CRITICAL FIX] 이벤트/쿠폰 필터링용 날짜 컬럼 복구
             ];
             
             let mapped_key = match key.as_str() {
                 "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
-                
                 "document_number" | "tracking_number" => "no",
                 "supplier_name" | "shipper_name" => "sender_name",
                 "buyer_name" | "consignee_name" => "recipient_name",
@@ -435,6 +434,16 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
                 "location_port_of_loading" => "pol",
                 "location_port_of_discharge" => "pod",
                 "incoterms_code" => "incoterms",
+                // 🌟 [CRITICAL FIX] 불필요한 가상 키워드를 완전히 제거하고 started_at과 expired_at으로 단일 통일시켰습니다.
+                // coupon/event 도메인은 DB 고유의 started_at, expired_at 컬럼을 원본 보호하고 그 외 도메인은 전부 created_at 컬럼으로 연결합니다.
+                "started_at" | "expired_at" => {
+                    let t = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "event" || t == "coupon" {
+                        if key == "started_at" { "started_at" } else { "expired_at" }
+                    } else {
+                        "created_at"
+                    }
+                },
                 k if valid_cols.contains(&k) => k,
                 _ => "" 
             };

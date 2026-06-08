@@ -1334,39 +1334,40 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> Stri
             4 | 6 | 9 | 11 => 30,
             _ => 31,
         };
-        return format!("- [DETERMINISTIC OVERRIDE] Vector detected Season. You MUST inject BOTH properties exactly like this into the 'condition' object:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", start_y, start_m, end_y, end_m, end_day);
+        // 🌟 [CRITICAL FIX] DB 스키마와 완벽 일치하도록 started_at과 expired_at으로 최종 변환합니다.
+        return format!("- [DETERMINISTIC OVERRIDE] Vector detected Season. You MUST inject BOTH properties exactly like this into the 'condition' object:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", start_y, start_m, end_y, end_m, end_day);
     }
 
-    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 언어권별 로컬 시간대(`now`)를 기준으로 작동하며, started_at 대신 created_at을 주입합니다.
+    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 started_at과 expired_at 2중 키 세트로 단일 통일하여 매핑합니다.
     if vector_guide.contains("Time Intent [today]") {
         let date_str = now.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Today'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Today'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
     } else if vector_guide.contains("Time Intent [yesterday]") {
         let yesterday = now - Duration::days(1);
         let date_str = yesterday.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Yesterday'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Yesterday'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
     } else if vector_guide.contains("Time Intent [this_month]") {
         let end_date = offset.with_ymd_and_hms(
             if now.month() == 12 { now.year() + 1 } else { now.year() },
             if now.month() == 12 { 1 } else { now.month() + 1 },
             1, 0, 0, 0
         ).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Month'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", now.year(), now.month(), now.year(), now.month(), end_date.day());
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Month'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", now.year(), now.month(), now.year(), now.month(), end_date.day());
     } else if vector_guide.contains("Time Intent [last_month]") {
         let (y, m) = if now.month() == 1 { (now.year() - 1, 12) } else { (now.year(), now.month() - 1) };
         let next_m = if m == 12 { 1 } else { m + 1 };
         let next_y = if m == 12 { y + 1 } else { y };
         let end_date = offset.with_ymd_and_hms(next_y, next_m, 1, 0, 0, 0).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Month'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", y, m, y, m, end_date.day());
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Month'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", y, m, y, m, end_date.day());
     } else if vector_guide.contains("Time Intent [this_year]") {
         let y = now.year();
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Year'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Year'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
     } else if vector_guide.contains("Time Intent [last_year]") {
         let y = now.year() - 1;
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Year'. You MUST strictly use:\n  \"created_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Year'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
     } else if vector_guide.contains("Time Intent [recently]") {
         let past = now - Duration::days(30);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Recently'. You MUST strictly use 'gte' with date \"{}T00:00:00\" for 'created_at'.", past.format("%Y-%m-%d"));
+        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Recently'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", past.format("%Y-%m-%d"), now.format("%Y-%m-%d"));
     }
 
     guide
@@ -1467,6 +1468,12 @@ Metrics: {METRICS}
 The system has pre-calculated vector similarities for properties, operators, and metric types. Use this as a strong guide, but correct it if it semantically makes no sense:
 - Metric Type gives a crucial hint about the data (date, time, price, discount, quantity, ratio). 
 - If Metric Type is 'ratio', extract a percentage logic. If 'date', extract a date logic, etc.
+- TEMPORAL & SEASON CORRECTION RULES:
+  1. Vectors often hallucinate seasons. If the text explicitly contains a season word, IGNORE the Vector Guide's Season Intent and select the exact season yourself from the [LOCALE CALENDAR REFERENCE].
+  2. If a Season is detected, check the Time Intent (or explicit time text):
+     - If Time Intent implies the past, map the season to the PREVIOUS year's dates.
+     - If Time Intent implies the present, map the season to the CURRENT year's dates.
+     - Output BOTH 'started_at' (gte) and 'expired_at' (lte) to form a date range.
 {GUIDE}
 
 [SCHEMA DEFINITION]
