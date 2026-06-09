@@ -1689,6 +1689,22 @@ pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, Stri
         }
     }
 
+    // 🌟 [CRITICAL FIX] "ignore" 도메인일 경우 bias.json 최상단의 데이터를 직접 가져옵니다.
+    if page_type == "ignore" {
+        if let Some(ignore_obj) = BIAS_DICT.get("ignore").and_then(|p| p.as_object()) {
+            let s_bias = ignore_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+            let s_prej = ignore_obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+            if !s_bias.is_empty() {
+                contexts.push((
+                    "ignore".to_string(),
+                    s_bias.to_string(),
+                    s_prej.to_string()
+                ));
+            }
+        }
+        return contexts;
+    }
+
     // 2. bias.json 내부의 모든 Key(layout_list, layout_form, 세부 속성 전체)를 하드코딩 없이 동적 순회
     if let Some(localized_obj) = BIAS_DICT
         .get(lang_code)

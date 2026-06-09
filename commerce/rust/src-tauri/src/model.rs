@@ -1673,7 +1673,7 @@ impl LogisModel {
             "en".to_string()
         };
 
-        let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
+        let categories = ["order", "goods", "tracking", "review", "coupon", "event", "ignore"];
         let mut layout_embs = std::collections::HashMap::new();
 
         let mut texts_to_embed = Vec::new();
@@ -2556,11 +2556,21 @@ impl LogisModel {
                 let mut master_text = String::new();
                 let mut master_status = json!("");
                 let mut master_type = String::new();
+                
+                let mut final_contexts = Vec::new(); // 🌟 분리 보존을 위한 새 배열
 
                 for seg in ctx_arr.iter() {
+                    let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    
+                    // 🌟 [CRITICAL FIX] "ignore"는 상거래 검색 조건이 아니므로 병합(Merge)하지 않고 독립된 개체로 따로 빼둡니다.
+                    if seg_type == "ignore" {
+                        final_contexts.push(seg.clone());
+                        continue;
+                    }
+
                     // 첫 번째 유효한 도메인 타입을 마스터로 고정
                     if master_type.is_empty() {
-                        master_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        master_type = seg_type.to_string();
                     }
                     
                     // 텍스트는 띄어쓰기로 이어 붙임
@@ -2598,19 +2608,24 @@ impl LogisModel {
                     }
                 }
                 
-                if master_type.is_empty() { master_type = "goods".to_string(); }
+                // 만약 모든 청크가 ignore가 아니었다면 마스터 컨텍스트를 추가합니다.
+                if !master_text.is_empty() || !master_type.is_empty() {
+                    if master_type.is_empty() { master_type = "goods".to_string(); }
 
-                // 덮어쓰기: 모든 세그먼트를 1개의 마스터 객체로 압축
-                let master_ctx = json!({
-                    "type": master_type,
-                    "text": master_text,
-                    "status": master_status,
-                    "condition": master_condition
-                });
+                    let master_ctx = json!({
+                        "type": master_type,
+                        "text": master_text,
+                        "status": master_status,
+                        "condition": master_condition
+                    });
+                    
+                    // 마스터 컨텍스트를 배열의 맨 앞에 삽입
+                    final_contexts.insert(0, master_ctx);
+                }
                 
-                *ctx_arr = vec![master_ctx];
+                *ctx_arr = final_contexts;
                 
-                emit_term(&format!("  ✅ [MASTER MERGED CONTEXT]\n{}", serde_json::to_string_pretty(&ctx_arr[0]).unwrap_or_default()));
+                emit_term(&format!("  ✅ [MASTER MERGED CONTEXT]\n{}", serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()));
             }
         }
 

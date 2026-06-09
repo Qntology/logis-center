@@ -843,6 +843,10 @@ async fn ai_search_complex(
                 
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 
+                // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
+                if ctx_type == "ignore" {
+                    continue;
+                }
                 
                 let target_table = match ctx_type {
                     "member" | "team" | "user" => "users",

@@ -19,6 +19,11 @@
       "prejudice": "detail page, list, delete, register, edit, update, UI, layout"
     }
   },
+  "ignore": {
+    "semantic": "System commands, analytical requests, urgency markers, and conversational fillers that do not correspond to actual database column values. These must be ignored in database filtering.",
+    "bias": "analyze, analysis, urgent, ASAP, quickly, immediately, hurry, reason, cause, why, show me, display, separate them, list out, report, statistics, investigate, figure out, find out, please, tell me, summarize, explain, insight, overview, details on why, what happened, drill down, break down",
+    "prejudice": "id, link, status, price, quantity, address, date, code, name, product, order, shipping, carrier, tracking number, refund, exchange, dimensions, weight, currency"
+  },
   "metrics": {
     "date": {
       "semantic": "calendar date, day, month, year, season",
