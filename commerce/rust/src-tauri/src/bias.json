@@ -1,4 +1,24 @@
 {
+  "insight": {
+    "conversion_insight": {
+      "target_domain": ["order"],
+      "semantic": "Sales performance analysis including conversion rate, checkout abandonment, and funnel analysis",
+      "bias": "conversion rate, CVR, checkout abandonment, bounce rate, sales funnel, customer journey, AOV, purchase conversion",
+      "prejudice": "page views, impressions, traffic sources, CTR, click-through rate"
+    },
+    "traffic_insight": {
+      "target_domain": ["goods", "event"],
+      "semantic": "Traffic, impression, and user engagement analysis",
+      "bias": "page views, impressions, click-through rate, CTR, traffic, unique visitors, sessions, engagement rate",
+      "prejudice": "payment, refund, cancellation, shipping, conversion rate, CVR, checkout, AOV, acquisition"
+    },
+    "general_insight": {
+      "target_domain": ["order", "goods", "tracking", "review", "coupon", "event"],
+      "semantic": "Diagnostic analytics, root cause analysis, and general statistical reporting",
+      "bias": "root cause analysis, RCA, diagnostic analytics, statistics, report, KPI, dashboard, variance analysis, anomaly investigation, insights",
+      "prejudice": "detail page, list, delete, register, edit, update, UI, layout"
+    }
+  },
   "metrics": {
     "date": {
       "semantic": "calendar date, day, month, year, season",
@@ -109,22 +129,51 @@
     "spring": {
       "semantic": "spring season",
       "bias": "spring, springtime, vernal equinox, blooming, flowers, sprout, thaw, rebirth, blossom",
-      "prejudice": "summer, autumn, winter, fall, heat, hot, scorcher, cold, freezing, snow, ice, frost, harvest, falling leaves"
+      "prejudice": "summer, autumn, winter, fall, heat, hot, scorcher, cold, freezing, snow, ice, frost, harvest, falling leaves",
+      "exact_match": [
+        "spring", "봄", "春", "春天", "primavera", "printemps", "frühling", "весна", "الربيع", "वसंत", 
+        "pranverë", "yaz", "বসন্ত", "пролет", "proljeće", "jaro", "forår", "lente", "voorjaar", "kevad", 
+        "kevät", "გაზაფხული", "άνοιξη", "אביב", "tavasz", "vor", "musim semi", "kөктем", "រដូវផ្ការីក", 
+        "pavasaris", "musim bunga", "vår", "بهار", "wiosna", "primăvară", "пролеће", "jar", "pomlad", 
+        "majira ya kuchipua", "tagsibol", "వసంత", "ฤดูใบไม้ผลิ", "ilkbahar", "bahar", "mùa xuân", "bahor", "بہار"
+      ]
     },
     "summer": {
       "semantic": "summer season",
       "bias": "summer, summertime, summer solstice, heat, hot, warm, beach, sunny, sweat",
-      "prejudice": "spring, autumn, winter, fall, cold, freezing, snow, ice, frost, blooming, harvest, sprout"
+      "prejudice": "spring, autumn, winter, fall, cold, freezing, snow, ice, frost, blooming, harvest, sprout",
+      "exact_match": [
+        "summer", "여름", "夏", "夏天", "verano", "été", "sommer", "лето", "صيف", "गर्मी", 
+        "verë", "yay", "গ্রীষ্ম", "лято", "estiu", "ljeto", "léto", "zomer", "suvi", "kesä", 
+        "ზაფხული", "καλοκαίρι", "קיץ", "nyár", "sumar", "musim panas", "estate", "жаз", "រដូវក្តៅ", 
+        "vasara", "उन्हाळा", "تابستان", "lato", "vară", "leto", "poletje", "majira ya joto", "tag-araw", 
+        "tag-init", "వేసవి", "ฤดูร้อน", "yaz", "літо", "موسم گرما", "yoz", "mùa hè", "mùa hạ"
+      ]
     },
     "autumn": {
       "semantic": "autumn season, fall",
       "bias": "autumn, autumnal equinox, falling leaves, foliage, breeze",
-      "prejudice": "spring, summer, winter, heat, hot, warm, blooming, blossom, snow, freezing, ice, frost"
+      "prejudice": "spring, summer, winter, heat, hot, warm, blooming, blossom, snow, freezing, ice, frost",
+      "exact_match": [
+        "autumn", "fall", "가을", "秋", "秋天", "otoño", "automne", "herbst", "осень", "خريف", 
+        "पतझड़", "vjeshtë", "payız", "শরৎ", "есен", "tardor", "jesen", "podzim", "efterår", "herfst", 
+        "najaar", "sügis", "syksy", "შემოდგომა", "φθινόπωρο", "סתיו", "ősz", "haust", "musim gugur", 
+        "autunno", "күз", "រដូវស្លឹកឈើជ្រุះ", "rudens", "ruduo", "musim luruh", "høst", "پاییز", "jesień", 
+        "outono", "toamnă", "vuli", "höst", "taglagas", "శరదృతువు", "ฤดูใบไม้ร่วง", "sonbahar", "güz", 
+        "осінь", "خزاں", "kuz", "mùa thu"
+      ]
     },
     "winter": {
       "semantic": "winter season",
       "bias": "winter, wintertime, winter solstice, cold, freezing, snow, ice, frost, chill, blizzard",
-      "prejudice": "spring, summer, autumn, fall, heat, hot, warm, sunny, beach, blooming, blossom, harvest"
+      "prejudice": "spring, summer, autumn, fall, heat, hot, warm, sunny, beach, blooming, blossom, harvest",
+      "exact_match": [
+        "winter", "겨울", "冬", "冬天", "invierno", "hiver", "зима", "شتاء", "सर्दी", "dimër", 
+        "qış", "শীত", "hivern", "zima", "talv", "talvi", "ზამთარი", "χειμώνας", "חורף", "tél", 
+        "vetur", "musim dingin", "inverno", "қыс", "រដូវរងារ", "ziema", "žiema", "musim sejuk", "हिवाळा", 
+        "زمستان", "iarnă", "majira ya baridi", "taglamig", "చలికాలం", "ฤดูหนาว", "kış", "موسم سرما", 
+        "qish", "mùa đông"
+      ]
     }
   },
   "ko": {

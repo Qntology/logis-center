@@ -1080,6 +1080,22 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
         fields.push((key.to_string(), final_desc, final_bias.trim().to_string(), final_prejudice.trim().to_string()));
     };
 
+    // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 읽어 현재 page_type이 target_domain에 포함된 경우에만 스키마에 추가합니다.
+    if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
+        for (insight_key, insight_val) in insight_obj {
+            let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+            }).unwrap_or_default();
+
+            // target_domain이 비어있거나(전역), 현재 page_type이 포함된 경우에만 add
+            if target_domains.is_empty() || target_domains.contains(&page_type) {
+                let s_bias = insight_val.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+                let s_prej = insight_val.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+                add(insight_key, "String", s_bias, s_prej);
+            }
+        }
+    }
+
     match page_type {
         "tracking" => {
             add("id,link", "", "id link tracking", "");
@@ -1652,6 +1668,27 @@ pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, Stri
         ));
     }
 
+    // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 순회하며 특정 도메인(page_type)에만 통계/분석 편향 점수를 폭발시킵니다.
+    if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
+        for (insight_key, insight_val) in insight_obj {
+            let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+            }).unwrap_or_default();
+
+            if target_domains.is_empty() || target_domains.contains(&page_type) {
+                let s_bias = insight_val.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+                let s_prej = insight_val.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+                if !s_bias.is_empty() {
+                    contexts.push((
+                        insight_key.to_string(),
+                        inject_domain(s_bias),
+                        inject_domain(s_prej)
+                    ));
+                }
+            }
+        }
+    }
+
     // 2. bias.json 내부의 모든 Key(layout_list, layout_form, 세부 속성 전체)를 하드코딩 없이 동적 순회
     if let Some(localized_obj) = BIAS_DICT
         .get(lang_code)
@@ -1729,6 +1766,22 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
         
         fields.push((key.to_string(), final_desc, final_bias.trim().to_string(), final_prejudice.trim().to_string()));
     };
+
+    // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 읽어 현재 page_type이 target_domain에 포함된 경우에만 스키마에 추가합니다.
+    if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
+        for (insight_key, insight_val) in insight_obj {
+            let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
+            }).unwrap_or_default();
+
+            // target_domain이 비어있거나(전역), 현재 page_type이 포함된 경우에만 add
+            if target_domains.is_empty() || target_domains.contains(&page_type) {
+                let s_bias = insight_val.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+                let s_prej = insight_val.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+                add(insight_key, "String", s_bias, s_prej);
+            }
+        }
+    }
 
     match page_type {
         "tracking" => {

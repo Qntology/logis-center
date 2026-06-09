@@ -2091,17 +2091,30 @@ impl LogisModel {
                     .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
                 let mut season_bias_texts = Vec::new();
                 let mut season_prej_texts = Vec::new();
+                let mut season_exact_matches: Vec<Vec<String>> = Vec::new(); // 🌟 신규: 다국어 Exact Match 캐시
 
                 for sk in &season_keys {
                     // 🌟 [Option 2] 계절 데이터에도 강력한 도메인 접두사를 주입하여 다른 계절의 배제 단어들과 거리를 벌립니다.
                     let mut b_text = format!("Season context: {} weather", sk); 
                     let mut p_text = format!("Season context: not {}", sk);
+                    let mut exact_words = Vec::new(); // 🌟 추가
+
                     if let Some(s_obj) = crate::parsing::BIAS_DICT.get("season_filters").and_then(|o| o.get(sk.clone())) {
                         if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Season context: {}", b); }
                         if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Season context: {}", p); }
+                        
+                        // 🌟 신규: exact_match 배열을 추출하여 소문자로 변환해 저장
+                        if let Some(arr) = s_obj.get("exact_match").and_then(|v| v.as_array()) {
+                            for v in arr {
+                                if let Some(s) = v.as_str() {
+                                    exact_words.push(s.to_lowercase());
+                                }
+                            }
+                        }
                     }
                     season_bias_texts.push(b_text);
                     season_prej_texts.push(p_text);
+                    season_exact_matches.push(exact_words); // 🌟 신규
                 }
                 
                 // Batch Embedding (Bias & Prejudice) 동시 장전
@@ -2230,11 +2243,25 @@ impl LogisModel {
                             
                             // 🌟 [Option 1] '여름' 같은 짧은 단어가 'autumn'의 배제 단어에 포함되어 점수가 음수로 곤두박질치는 환각을 방지합니다.
                             let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
-                            let score = b_score - (p_score * p_weight);
+                            let mut score = b_score - (p_score * p_weight);
                             
+                            // 🌟 [EXACT MATCH BOOST] 다국어 직접 매칭 (가중치 폭발)
+                            let test_lower = test_text.to_lowercase();
+                            let mut exact_hit = false;
+                            for keyword in &season_exact_matches[i] {
+                                if test_lower.contains(keyword) {
+                                    exact_hit = true;
+                                    break;
+                                }
+                            }
+                            if exact_hit {
+                                score += 0.4; // 🌟 직접 매칭 시 0.4의 고정 가산점 (NMS 배틀 무조건 압승)
+                            }
+
                             if score > 0.05 {
                                 let weighted_season_score = score * length_weight;
-                                emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, season_keys[i], score, length_weight, weighted_season_score));
+                                emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4}){}", 
+                                    test_text, season_keys[i], score, length_weight, weighted_season_score, if exact_hit { " [🔥 EXACT MATCH]" } else { "" }));
                                 temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: season_keys[i].to_string(), group: "Season".to_string(), score: weighted_season_score });
                             }
                         }
@@ -2387,7 +2414,7 @@ impl LogisModel {
                                     name: None,
                                 })
                             ],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
                         let t_res = gen.generate(params_time, Some(cancel_for_temp.clone()), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Time Inference failed: {}", e))?;
@@ -2400,7 +2427,7 @@ impl LogisModel {
                                     name: None,
                                 })
                             ],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.01),
+                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                             ..Default::default()
                         };
                         let s_res = gen.generate(params_season, Some(cancel_for_temp), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Season Inference failed: {}", e))?;
@@ -2453,7 +2480,7 @@ impl LogisModel {
                                         name: None,
                                     })
                                 ],
-                                model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                                model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
                                 ..Default::default()
                             };
                             gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
@@ -2483,9 +2510,13 @@ impl LogisModel {
                                     "value": val.clone()
                                 }));
                             }
-                            obj.insert("condition".to_string(), json!(structured_cond));
+                            obj.insert("condition".to_string(), json!(structured_cond.clone()));
+                            
+                            // 🌟 [추가] 벡터 매칭(연산자)과 LLM(추출 값)이 최종 병합된 결과 로그 출력
+                            emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&structured_cond).unwrap_or_default()));
                         } else {
                             obj.insert("condition".to_string(), json!({}));
+                            emit_term("  🚀 [FINAL MERGED CONDITION]\n{}");
                         }
                     }
                 } else {
@@ -2513,6 +2544,73 @@ impl LogisModel {
                 unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
                 #[cfg(target_os = "macos")]
                 unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            }
+        }
+
+        // 🌟 [CRITICAL FIX] 분할된 컨텍스트(Segment)들의 추출 결과를 Rust 메모리에서 하나의 마스터 객체로 완벽히 취합(Merge)합니다.
+        // 이를 통해 앞단에서 조각난 맥락(예: '구매 전환율이' + '1% 미만인')이 하나의 강력한 AND 조건으로 결합되어 DB 검색 시 정보 유실을 원천 차단합니다.
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            if ctx_arr.len() > 1 {
+                emit_term("[STAGE-3] Merging all fragmented conditions into a single master context...");
+                let mut master_condition = serde_json::Map::new();
+                let mut master_text = String::new();
+                let mut master_status = json!("");
+                let mut master_type = String::new();
+
+                for seg in ctx_arr.iter() {
+                    // 첫 번째 유효한 도메인 타입을 마스터로 고정
+                    if master_type.is_empty() {
+                        master_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    }
+                    
+                    // 텍스트는 띄어쓰기로 이어 붙임
+                    let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        if !master_text.is_empty() { master_text.push_str(" "); }
+                        master_text.push_str(text);
+                    }
+                    
+                    // 상태값 병합 (첫 번째 유효값 우선)
+                    if let Some(status) = seg.get("status") {
+                        let s_str = status.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && master_status.as_str().unwrap_or("").is_empty() {
+                            master_status = status.clone();
+                        }
+                    }
+                    
+                    // 추출된 조건(Condition) 객체들 병합
+                    if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
+                        for (k, v) in cond {
+                            // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
+                            let is_empty = match v.get("value") {
+                                Some(serde_json::Value::String(s)) => s.trim().is_empty() || s == "null",
+                                Some(serde_json::Value::Null) => true,
+                                Some(serde_json::Value::Object(o)) => {
+                                    o.get("value").and_then(|val| val.as_str()).map_or(false, |s| s.trim().is_empty() || s == "null")
+                                },
+                                _ => false,
+                            };
+                            
+                            if !is_empty {
+                                master_condition.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                
+                if master_type.is_empty() { master_type = "goods".to_string(); }
+
+                // 덮어쓰기: 모든 세그먼트를 1개의 마스터 객체로 압축
+                let master_ctx = json!({
+                    "type": master_type,
+                    "text": master_text,
+                    "status": master_status,
+                    "condition": master_condition
+                });
+                
+                *ctx_arr = vec![master_ctx];
+                
+                emit_term(&format!("  ✅ [MASTER MERGED CONTEXT]\n{}", serde_json::to_string_pretty(&ctx_arr[0]).unwrap_or_default()));
             }
         }
 
@@ -2565,7 +2663,7 @@ impl LogisModel {
                             name: None,
                         })
                     ],
-                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.01),
+                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
                 gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
