@@ -2022,11 +2022,19 @@ impl LogisModel {
                 let mut prop_keys = Vec::new();
                 let mut bias_texts = Vec::new();
                 let mut prej_texts = Vec::new();
+                let mut prop_types = std::collections::HashMap::new(); // 🌟 스키마 타입 저장용 맵 추가
                 
-                for (key, _, bias, prej) in fields {
-                    prop_keys.push(key);
+                for (key, desc, bias, prej) in fields {
+                    prop_keys.push(key.clone());
                     bias_texts.push(bias);
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                    
+                    // 🌟 [DB SCHEMA CHECK] 스키마 설명(desc)에서 실제 데이터 타입을 추출합니다.
+                    let type_str = if desc.contains("Number") { "Number" }
+                                   else if desc.contains("Boolean") { "Boolean" }
+                                   else if desc.contains("Array") { "Array" }
+                                   else { "String" };
+                    prop_types.insert(key, type_str);
                 }
 
                 // 🌟 [3차 분기] 연산자 매칭: Operators Schema Field(Bias/Prej) 로드
@@ -2116,6 +2124,49 @@ impl LogisModel {
                     season_prej_texts.push(p_text);
                     season_exact_matches.push(exact_words); // 🌟 신규
                 }
+
+                // 🌟 [6차 분기] Status, Substantial, Find 의도 매칭 추가
+                let status_keys: Vec<String> = crate::parsing::BIAS_DICT.get("status_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
+                let mut status_bias_texts = Vec::new();
+                let mut status_prej_texts = Vec::new();
+                for sk in &status_keys {
+                    let mut b_text = format!("Status context: {}", sk); 
+                    let mut p_text = format!("Status context: not {}", sk);
+                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("status_filters").and_then(|o| o.get(sk.clone())) {
+                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Status context: {}", b); }
+                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Status context: {}", p); }
+                    }
+                    status_bias_texts.push(b_text);
+                    status_prej_texts.push(p_text);
+                }
+                
+                let substantial_keys: Vec<String> = crate::parsing::BIAS_DICT.get("substantial_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
+                let mut substantial_bias_texts = Vec::new();
+                let mut substantial_prej_texts = Vec::new();
+                for sk in &substantial_keys {
+                    let mut b_text = format!("Substantial context: {}", sk); 
+                    let mut p_text = format!("Substantial context: not {}", sk);
+                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("substantial_filters").and_then(|o| o.get(sk.clone())) {
+                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Substantial context: {}", b); }
+                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Substantial context: {}", p); }
+                    }
+                    substantial_bias_texts.push(b_text);
+                    substantial_prej_texts.push(p_text);
+                }
+
+                let find_keys: Vec<String> = crate::parsing::BIAS_DICT.get("find_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
+                let mut find_bias_texts = Vec::new();
+                let mut find_prej_texts = Vec::new();
+                for sk in &find_keys {
+                    let mut b_text = format!("Find context: {}", sk); 
+                    let mut p_text = format!("Find context: not {}", sk);
+                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("find_filters").and_then(|o| o.get(sk.clone())) {
+                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Find context: {}", b); }
+                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Find context: {}", p); }
+                    }
+                    find_bias_texts.push(b_text);
+                    find_prej_texts.push(p_text);
+                }
                 
                 // Batch Embedding (Bias & Prejudice) 동시 장전
                 let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
@@ -2133,6 +2184,16 @@ impl LogisModel {
 
                 let season_bias_embs = self.get_embedding_batch(season_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
                 let season_prej_embs = self.get_embedding_batch(season_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
+
+                // 🌟 Status, Substantial, Find 의도 벡터 일괄 연산
+                let status_bias_embs = self.get_embedding_batch(status_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; status_keys.len()]);
+                let status_prej_embs = self.get_embedding_batch(status_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; status_keys.len()]);
+                
+                let substantial_bias_embs = self.get_embedding_batch(substantial_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; substantial_keys.len()]);
+                let substantial_prej_embs = self.get_embedding_batch(substantial_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; substantial_keys.len()]);
+                
+                let find_bias_embs = self.get_embedding_batch(find_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; find_keys.len()]);
+                let find_prej_embs = self.get_embedding_batch(find_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; find_keys.len()]);
 
                 // Plinko Game: Sliding Window Cliff Detection over words
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2341,8 +2402,67 @@ impl LogisModel {
 
                 emit_term(&format!("  ✅ [GLOBAL TEMPORAL BATTLE (NMS)] {}", battle_logs.join(" | ")));
 
-                let time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
+                // 🌟 [IGNORE VECTOR CHECK] 추가: 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 한 번 더 검증
+                let chunk_full_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                let mut is_ignore_chunk = false;
+                if let Some(ignore_obj) = crate::parsing::BIAS_DICT.get("ignore").and_then(|p| p.as_object()) {
+                    let s_bias = ignore_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+                    let s_prej = ignore_obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+                    if !s_bias.is_empty() {
+                        let ignore_bias_emb = self.get_embedding(s_bias.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        let ignore_prej_emb = self.get_embedding(s_prej.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        
+                        let b_score = cosine_similarity(&chunk_full_emb, &ignore_bias_emb);
+                        let p_score = cosine_similarity(&chunk_full_emb, &ignore_prej_emb);
+                        let ignore_score = b_score - p_score;
+                        
+                        if ignore_score > 0.4 {
+                            emit_term(&format!("  🚫 [IGNORE VECTOR CHECK] Chunk '{}' identified as IGNORE (Score: {:.4}). Skipping LLM processing.", current_text, ignore_score));
+                            is_ignore_chunk = true;
+                        }
+                    }
+                }
+                
+                if is_ignore_chunk {
+                    if let Some(obj) = seg.as_object_mut() {
+                        obj.insert("type".to_string(), json!("ignore")); // 마스터 병합에서 빠지도록 타입 강제 변환
+                        obj.insert("condition".to_string(), json!({}));
+                    }
+                    continue;
+                }
+
+                let mut time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
                 let season_guide = if best_season_intent != "none" { format!(", Season Intent [{}]", best_season_intent) } else { "".to_string() };
+
+                // 🌟 Status, Substantial, Find Vector Matching
+                let mut best_status = String::new();
+                let mut best_status_score = 0.15;
+                for i in 0..status_keys.len() {
+                    let b = cosine_similarity(&chunk_full_emb, &status_bias_embs[i]);
+                    let p = cosine_similarity(&chunk_full_emb, &status_prej_embs[i]);
+                    if b - p > best_status_score { best_status_score = b - p; best_status = status_keys[i].clone(); }
+                }
+
+                let mut best_sub = String::new();
+                let mut best_sub_score = 0.15;
+                for i in 0..substantial_keys.len() {
+                    let b = cosine_similarity(&chunk_full_emb, &substantial_bias_embs[i]);
+                    let p = cosine_similarity(&chunk_full_emb, &substantial_prej_embs[i]);
+                    if b - p > best_sub_score { best_sub_score = b - p; best_sub = substantial_keys[i].clone(); }
+                }
+
+                let mut best_find = String::new();
+                let mut best_find_score = 0.15;
+                for i in 0..find_keys.len() {
+                    let b = cosine_similarity(&chunk_full_emb, &find_bias_embs[i]);
+                    let p = cosine_similarity(&chunk_full_emb, &find_prej_embs[i]);
+                    if b - p > best_find_score { best_find_score = b - p; best_find = find_keys[i].clone(); }
+                }
+
+                if !best_status.is_empty() { time_guide.push_str(&format!(", Status Suggests [{}]", best_status)); }
+                if !best_sub.is_empty() { time_guide.push_str(&format!(", Substantial Suggests [{}]", best_sub)); }
+                if !best_find.is_empty() { time_guide.push_str(&format!(", Find Suggests [{}]", best_find)); }
 
                 // Formatting Plinko Fragments & Double Plinko for Operators
                 let mut fragments_text = String::new();
@@ -2377,6 +2497,19 @@ impl LogisModel {
                         if score > best_metric_score {
                             best_metric_score = score;
                             best_metric = metric_keys[i];
+                        }
+                    }
+
+                    // 🌟 [SCHEMA OVERRIDE] Vector 모델의 예측을 실제 DB 스키마 검증으로 덮어씁니다.
+                    let actual_db_type = prop_types.get(k).copied().unwrap_or("String");
+                    
+                    // DB 스키마가 숫자(Number)가 아니라면 강력하게 배제합니다.
+                    if actual_db_type != "Number" {
+                        // 날짜 관련 필드는 예외적으로 허용 (Vector가 잡았거나, 필드명에 date/time이 들어간 경우)
+                        let is_date_field = k.contains("date") || k.contains("time") || k.ends_with("_at");
+                        if !is_date_field {
+                            emit_term(&format!("  ⏭️ [SCHEMA SKIP] Property [{}] is strictly defined as '{}' in DB schema. Skipping numeric extraction.", k, actual_db_type));
+                            continue;
                         }
                     }
 
@@ -2453,7 +2586,7 @@ impl LogisModel {
                 emit_term(&format!("  🤖 [LLM SEASON INTENT]\n  {}", season_res_llm.trim()));
 
                 // 🌟 LLM이 강제 선택한 의도를 바탕으로 최종 Deterministic Time Guide(달력 SQL 필터)를 획득합니다.
-                let deterministic_guide_log = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
+                let (deterministic_guide_log, deterministic_json) = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
                 if !deterministic_guide_log.is_empty() {
                     emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
                 }
@@ -2465,59 +2598,160 @@ impl LogisModel {
 
                     // 🌟 [CRITICAL FIX] 벡터 매칭 가이드와 LLM 시간 가이드를 병합하여 최종 조건 추출 프롬프트 호출
                     let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
-                    let prompt_final = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language);
+                    
+                    let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language);
+                    let prompt_status = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &combined_guide);
+                    let prompt_substantial = crate::parsing::extract_substantial_intent_prompt(&current_text, &combined_guide);
+                    let prompt_find = crate::parsing::extract_find_intent_prompt(&current_text, &combined_guide);
 
                     let gen_arc = self.qwen3_generator.clone();
                     let cancel_clone = cancel_token.clone();
                     
-                    let res_llm = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                    let (res_numeric, res_status, res_substantial, res_find) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String, String, String)> {
                         let mut gen_guard = gen_arc.blocking_lock();
                         if let Some(gen) = gen_guard.as_mut() {
-                            let params = crate::openai_types::ChatCompletionParameters {
-                                messages: vec![
-                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_final),
-                                        name: None,
-                                    })
-                                ],
-                                model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
-                                ..Default::default()
+                            let mut get_res = |prompt_text: String| -> anyhow::Result<String> {
+                                let params = crate::openai_types::ChatCompletionParameters {
+                                    messages: vec![
+                                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_text),
+                                            name: None,
+                                        })
+                                    ],
+                                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
+                                    ..Default::default()
+                                };
+                                gen.generate(params, Some(cancel_clone.clone()), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
                             };
-                            gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                            
+                            let r_num = get_res(prompt_numeric)?;
+                            let r_stat = get_res(prompt_status)?;
+                            let r_sub = get_res(prompt_substantial)?;
+                            let r_find = get_res(prompt_find)?;
+                            
+                            Ok((r_num, r_stat, r_sub, r_find))
                         } else {
                             Err(anyhow::anyhow!("Qwen3 Generator is missing"))
                         }
                     }).await??;
 
-                    emit_term(&format!("  🤖 [LLM RAW RESPONSE]\n{}", res_llm.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - NUMERIC]\n{}", res_numeric.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - STATUS]\n{}", res_status.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - SUBSTANTIAL]\n{}", res_substantial.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - FIND]\n{}", res_find.trim()));
                     
-                    let final_json = crate::parsing::parse_json_from_llm(&res_llm);
+                    let final_numeric_json = crate::parsing::parse_json_from_llm(&res_numeric);
+                    let final_status_json = crate::parsing::parse_json_from_llm(&res_status);
+                    let final_substantial_json = crate::parsing::parse_json_from_llm(&res_substantial);
+                    let final_find_json = crate::parsing::parse_json_from_llm(&res_find);
                     
-                    emit_term(&format!("  ✅ [EXTRACTED DATA]\n{}", serde_json::to_string_pretty(&final_json).unwrap_or_default()));
+                    emit_term(&format!("  ✅ [EXTRACTED DATA (NUMERIC RAW)]\n{}", serde_json::to_string_pretty(&final_numeric_json).unwrap_or_default()));
                     
                     if let Some(obj) = seg.as_object_mut() {
-                        if let Some(status_val) = final_json.get("status") {
+                        if let Some(status_val) = final_status_json.get("status") {
                             obj.insert("status".to_string(), status_val.clone());
+                        }
+                        if let Some(sub_val) = final_substantial_json.get("substantial") {
+                            obj.insert("substantial".to_string(), sub_val.clone());
+                        }
+                        if let Some(find_val) = final_find_json.get("find") {
+                            obj.insert("find".to_string(), find_val.clone());
                         }
                         
                         // 🌟 LLM이 뽑아준 "값"과 Rust 메모리에 저장해둔 "연산자(operator)"를 여기서 최종 조립합니다.
-                        if let Some(cond_val) = final_json.get("condition").and_then(|v| v.as_object()) {
-                            let mut structured_cond = serde_json::Map::new();
-                            for (k, val) in cond_val {
-                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
-                                structured_cond.insert(k.clone(), json!({
-                                    "operator": op,
-                                    "value": val.clone()
-                                }));
+                        let mut structured_cond = serde_json::Map::new();
+                        
+                        // YAML 배열 형태("condition": [ {"property": "price", "operator": "gt", "value": 1000} ]) 대응
+                        if let Some(cond_arr) = final_numeric_json.get("condition").and_then(|v| v.as_array()) {
+                            for item in cond_arr {
+                                if let Some(item_obj) = item.as_object() {
+                                    // 🌟 [CRITICAL FIX] LLM이 property_name 이나 property 필드로 평탄화해서 주는 경우를 우선 처리
+                                    if let Some(prop_val) = item_obj.get("property").or_else(|| item_obj.get("property_name")).and_then(|v| v.as_str()) {
+                                        let k = prop_val.to_string();
+                                        
+                                        if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                            continue;
+                                        }
+
+                                        let op = item_obj.get("operator").and_then(|v| v.as_str())
+                                            .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq"));
+                                        
+                                        let mut final_val_obj = serde_json::Map::new();
+                                        for (ik, iv) in item_obj {
+                                            if ik != "property" && ik != "property_name" {
+                                                final_val_obj.insert(ik.clone(), iv.clone());
+                                            }
+                                        }
+                                        
+                                        if !final_val_obj.contains_key("operator") {
+                                            final_val_obj.insert("operator".to_string(), json!(op));
+                                        }
+                                        
+                                        structured_cond.insert(k, json!(final_val_obj));
+                                    } else {
+                                        // 구형 프롬프트: {"price": {"operator": "gt", "value": 1000}} 대응
+                                        for (k, val) in item_obj {
+                                            if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                                continue;
+                                            }
+
+                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                            let mut final_val_obj = val.clone();
+
+                                            if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                                if !v_obj.contains_key("operator") {
+                                                    v_obj.insert("operator".to_string(), json!(op));
+                                                }
+                                            } else {
+                                                final_val_obj = json!({
+                                                    "operator": op,
+                                                    "value": val.clone()
+                                                });
+                                            }
+                                            structured_cond.insert(k.clone(), final_val_obj);
+                                        }
+                                    }
+                                }
                             }
-                            obj.insert("condition".to_string(), json!(structured_cond.clone()));
-                            
-                            // 🌟 [추가] 벡터 매칭(연산자)과 LLM(추출 값)이 최종 병합된 결과 로그 출력
-                            emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&structured_cond).unwrap_or_default()));
-                        } else {
-                            obj.insert("condition".to_string(), json!({}));
-                            emit_term("  🚀 [FINAL MERGED CONDITION]\n{}");
+                        } else if let Some(cond_val) = final_numeric_json.get("condition").and_then(|v| v.as_object()) {
+                            // 혹시라도 구형 프롬프트(객체 반환)로 응답했을 경우의 방어 로직
+                            for (k, val) in cond_val {
+                                if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                    continue;
+                                }
+
+                                if val.is_object() {
+                                    let mut final_val_obj = val.clone();
+                                    if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                        if !v_obj.contains_key("operator") {
+                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                            v_obj.insert("operator".to_string(), json!(op));
+                                        }
+                                    }
+                                    structured_cond.insert(k.clone(), final_val_obj);
+                                } else {
+                                    let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                    structured_cond.insert(k.clone(), json!({
+                                        "operator": op,
+                                        "value": val.clone()
+                                    }));
+                                }
+                            }
                         }
+
+                        // 🌟 [CRITICAL FIX] Deterministic JSON(확정된 기간)이 있다면 여기서 강력하게 덮어씌워서 LLM 환각을 원천 차단합니다!
+                        if let Some(det_json) = &deterministic_json {
+                            if let Some(det_obj) = det_json.as_object() {
+                                for (k, v) in det_obj {
+                                    structured_cond.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        
+                        obj.insert("condition".to_string(), json!(structured_cond.clone()));
+                        
+                        // 🌟 [추가] 벡터 매칭(연산자)과 LLM(추출 값) + 확정 날짜가 최종 병합된 결과 로그 출력
+                        emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&structured_cond).unwrap_or_default()));
                     }
                 } else {
                     if let Some(obj) = seg.as_object_mut() {
@@ -2555,6 +2789,8 @@ impl LogisModel {
                 let mut master_condition = serde_json::Map::new();
                 let mut master_text = String::new();
                 let mut master_status = json!("");
+                let mut master_substantial = json!("");
+                let mut master_find = json!("");
                 let mut master_type = String::new();
                 
                 let mut final_contexts = Vec::new(); // 🌟 분리 보존을 위한 새 배열
@@ -2587,6 +2823,18 @@ impl LogisModel {
                             master_status = status.clone();
                         }
                     }
+                    if let Some(sub) = seg.get("substantial") {
+                        let s_str = sub.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && master_substantial.as_str().unwrap_or("").is_empty() {
+                            master_substantial = sub.clone();
+                        }
+                    }
+                    if let Some(find) = seg.get("find") {
+                        let s_str = find.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && master_find.as_str().unwrap_or("").is_empty() {
+                            master_find = find.clone();
+                        }
+                    }
                     
                     // 추출된 조건(Condition) 객체들 병합
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
@@ -2616,6 +2864,8 @@ impl LogisModel {
                         "type": master_type,
                         "text": master_text,
                         "status": master_status,
+                        "substantial": master_substantial,
+                        "find": master_find,
                         "condition": master_condition
                     });
                     

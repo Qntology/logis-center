@@ -1301,8 +1301,9 @@ pub fn para2graph(language: &str) -> String {
 }
 
 // 🌟 벡터 매칭 결과와 언어(국가) 코드를 입력받아 동적으로 완벽한 날짜 필터를 생성합니다.
-pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> String {
+pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> (String, Option<serde_json::Value>) {
     use chrono::{Datelike, Utc, Duration, FixedOffset, TimeZone};
+    use serde_json::json;
     
     // 🌟 [CRITICAL FIX] 50개 언어 코드를 기반으로 해당 언어권의 대표 UTC Offset(분) 및 남반구(계절 반전) 여부를 매핑합니다.
     let (offset_minutes, is_southern) = match lang_code.to_lowercase().as_str() {
@@ -1325,6 +1326,7 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> Stri
     let offset = FixedOffset::east_opt(offset_minutes * 60).unwrap_or(FixedOffset::east_opt(0).unwrap());
     let now = Utc::now().with_timezone(&offset);
     let mut guide = String::new();
+    let mut condition_json = None;
 
     // 🌟 [CRITICAL FIX] 다국어 계절(Season) 기간 매핑 (남반구/북반구 반전 완벽 적용 및 created_at 쌍방향 주입)
     let mut start_m = 0;
@@ -1350,43 +1352,92 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> Stri
             4 | 6 | 9 | 11 => 30,
             _ => 31,
         };
-        // 🌟 [CRITICAL FIX] DB 스키마와 완벽 일치하도록 started_at과 expired_at으로 최종 변환합니다.
-        return format!("- [DETERMINISTIC OVERRIDE] Vector detected Season. You MUST inject BOTH properties exactly like this into the 'condition' object:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", start_y, start_m, end_y, end_m, end_day);
+        // 🌟 [CRITICAL FIX] LLM에게 추출을 맡기지 않고 확정 JSON 객체를 생성합니다.
+        let start_val = format!("{:04}-{:02}-01T00:00:00", start_y, start_m);
+        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", end_y, end_m, end_day);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Season detected. DO NOT extract date properties (like started_at, expired_at, date). The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
+        return (guide, condition_json);
     }
 
-    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 started_at과 expired_at 2중 키 세트로 단일 통일하여 매핑합니다.
+    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 LLM 추론을 우회하여 확정 JSON으로 반환합니다.
     if vector_guide.contains("Time Intent [today]") {
         let date_str = now.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Today'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        let start_val = format!("{}T00:00:00", date_str);
+        let end_val = format!("{}T23:59:59", date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Today' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [yesterday]") {
         let yesterday = now - Duration::days(1);
         let date_str = yesterday.format("%Y-%m-%d");
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Yesterday'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", date_str, date_str);
+        let start_val = format!("{}T00:00:00", date_str);
+        let end_val = format!("{}T23:59:59", date_str);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Yesterday' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [this_month]") {
         let end_date = offset.with_ymd_and_hms(
             if now.month() == 12 { now.year() + 1 } else { now.year() },
             if now.month() == 12 { 1 } else { now.month() + 1 },
             1, 0, 0, 0
         ).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Month'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", now.year(), now.month(), now.year(), now.month(), end_date.day());
+        let start_val = format!("{:04}-{:02}-01T00:00:00", now.year(), now.month());
+        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", now.year(), now.month(), end_date.day());
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'This Month' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [last_month]") {
         let (y, m) = if now.month() == 1 { (now.year() - 1, 12) } else { (now.year(), now.month() - 1) };
         let next_m = if m == 12 { 1 } else { m + 1 };
         let next_y = if m == 12 { y + 1 } else { y };
         let end_date = offset.with_ymd_and_hms(next_y, next_m, 1, 0, 0, 0).unwrap() - Duration::seconds(1);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Month'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-{:02}-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-{:02}-{:02}T23:59:59\" }}", y, m, y, m, end_date.day());
+        let start_val = format!("{:04}-{:02}-01T00:00:00", y, m);
+        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", y, m, end_date.day());
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Last Month' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [this_year]") {
         let y = now.year();
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'This Year'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        let start_val = format!("{:04}-01-01T00:00:00", y);
+        let end_val = format!("{:04}-12-31T23:59:59", y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'This Year' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [last_year]") {
         let y = now.year() - 1;
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Last Year'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{:04}-01-01T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{:04}-12-31T23:59:59\" }}", y, y);
+        let start_val = format!("{:04}-01-01T00:00:00", y);
+        let end_val = format!("{:04}-12-31T23:59:59", y);
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Last Year' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     } else if vector_guide.contains("Time Intent [recently]") {
         let past = now - Duration::days(30);
-        guide = format!("- [DETERMINISTIC OVERRIDE] Vector detected 'Recently'. You MUST strictly use BOTH:\n  \"started_at\": {{ \"operator\": \"gte\", \"value\": \"{}T00:00:00\" }}\n  \"expired_at\": {{ \"operator\": \"lte\", \"value\": \"{}T23:59:59\" }}", past.format("%Y-%m-%d"), now.format("%Y-%m-%d"));
+        let start_val = format!("{}T00:00:00", past.format("%Y-%m-%d"));
+        let end_val = format!("{}T23:59:59", now.format("%Y-%m-%d"));
+        guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Recently' detected. DO NOT extract date properties. The system will auto-inject them.");
+        condition_json = Some(json!({
+            "started_at": { "operator": "gte", "value": start_val },
+            "expired_at": { "operator": "lte", "value": end_val }
+        }));
     }
 
-    guide
+    (guide, condition_json)
 }
 
 // 🌟 [신규 추가] 문장에서 시간(Time) 의도를 배열 내에서만 엄격하게 강제 선택하도록 하는 독립된 프롬프트 (현재 시간 컨텍스트 주입)
@@ -1457,7 +1508,7 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
 
 pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str) -> String {
     // 🌟 텍스트(current) 대신 벡터 매칭 결과(vector_guide)와 언어(lang)를 기반으로 날짜를 완벽하게 계산합니다.
-    let deterministic_time = get_deterministic_time_guide(vector_guide, lang);
+    let (deterministic_time, _) = get_deterministic_time_guide(vector_guide, lang);
     
     let final_time_context = if !deterministic_time.is_empty() {
         format!("{}\n{}", time_context, deterministic_time)
@@ -1467,7 +1518,7 @@ pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &
 
     let template = r###"[Task]
 Act as a deterministic semantic parser.
-You must extract, transform, and normalize data from the natural language input into the strictly defined JSON output format.
+You must extract, transform, and normalize numeric and property conditions from the natural language input into the strictly defined JSON output format.
 
 [SYSTEM TIME & LOCALE CONTEXT]
 {TIME_CONTEXT}
@@ -1493,27 +1544,20 @@ The system has pre-calculated vector similarities for properties, operators, and
 {GUIDE}
 
 [SCHEMA DEFINITION]
-- operator: Allowed values: 'gt', 'gte', 'lt', 'lte', 'eq', 'contains', 'top', 'bottom'
+Extract the following numeric/property conditions if semantically present in the text:
+condition:
+  - property: String
+    is_percent: Boolean
+    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'contains' | 'top' | 'bottom'
+    percent_total: Number (if is_percent is true)
+    value: Number or String
 
 [CURRENT CHUNK TO ANALYZE]
 {CURRENT}
 
 [OUTPUT FORMAT]
 {
-  "status": "String (Optional)",
-  "condition": {
-    "[property_1]": {
-      "is_percent": Boolean,
-      "percent_total": Number (if is_percent is true),
-      "value": "Absolute String or Number",
-      "operator": "..."
-    },
-    "[property_2]": {
-      "is_percent": false,
-      "value": "...",
-      "operator": "..."
-    }
-  }
+  "condition": [...]
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
@@ -1525,114 +1569,221 @@ The system has pre-calculated vector similarities for properties, operators, and
             .replace("{TIME_CONTEXT}", &final_time_context)
 }
 
-pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
+// pub fn graph2contexts(current_text: &str, seg_type: &str) -> String {
     
+//     let status_options = match seg_type {
+//         "tracking" => "* 'draft': Shipment preparation or pending pickup.
+//     * 'progress': Currently in transit or out for delivery.
+//     * 'return': Returning to sender.
+//     * 'complete': Successfully delivered to the recipient.
+//     * 'error': Delivery exception, lost, or failed.",
+//         "goods" => "* 'draft': Product is being created, not yet published.
+//     * 'show': Visible and available for sale on storefront.
+//     * 'hide': Hidden from the storefront.
+//     * 'progress': Currently being restocked or updated.
+//     * 'stop': Sales temporarily suspended.
+//     * 'cancel': Product discontinued or cancelled.
+//     * 'refund': Related to refunded inventory.
+//     * 'return': Related to returned inventory.
+//     * 'exchange': Related to exchanged inventory.
+//     * 'expire': Product expired.
+//     * 'complete': Completely sold out or finished lifecycle.
+//     * 'error': Data or system error.",
+//         "order" => "* 'draft': Pending payment or in cart.
+//     * 'progress': Order processing or preparing for shipment.
+//     * 'stop': Order on hold.
+//     * 'cancel': Order cancelled before fulfillment.
+//     * 'refund': Payment refunded.
+//     * 'return': Items returned by customer.
+//     * 'exchange': Items being exchanged.
+//     * 'expire': Payment window expired.
+//     * 'complete': Order fully fulfilled and closed.
+//     * 'error': Payment or processing error.",
+//         "coupon" | "event" => "* 'show': Visible to customers.
+//     * 'progress': Currently active and running.
+//     * 'hide': Hidden from customers.
+//     * 'stop': Temporarily paused.
+//     * 'cancel': Terminated early.
+//     * 'expire': Passed its expiration date.
+//     * 'complete': Successfully finished its run.
+//     * 'error': Configuration error.",
+//         "review" => "* 'progress': Under moderation or pending approval.
+//     * 'stop': Blocked or suspended review.
+//     * 'cancel': Deleted or withdrawn by user.
+//     * 'refund': Associated with a refunded order.
+//     * 'return': Associated with a returned order.
+//     * 'exchange': Associated with an exchanged order.
+//     * 'expire': Review period expired.
+//     * 'complete': Published and visible.
+//     * 'error': Rejected or marked as spam.",
+//         _ => "* 'show': Visible state.
+//     * 'progress': Active/Processing state.
+//     * 'remove': Deleted state.
+//     * 'hide': Hidden state.
+//     * 'stop': Paused/Stopped state.
+//     * 'cancel': Cancelled state.
+//     * 'refund': Refunded state.
+//     * 'return': Returned state.
+//     * 'exchange': Exchanged state.
+//     * 'expire': Expired state.
+//     * 'complete': Finished/Completed state.
+//     * 'error': Error state."
+//     };
+
+//     let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
+
+// [CURRENT SEGMENT]
+// {TEXT}
+
+// [SCHEMA DEFINITIONS]
+// {TYPE}:
+//   - status: String. Choose one:
+//     {STATUS_OPTIONS}
+//     * '': If none logically apply.
+//   - substantial: String. Choose one:
+//     * 'size': Physical dimensions or volume.
+//     * 'weight': Mass or heaviness.
+//     * 'shipping_fee': Cost of delivery.
+//     * 'shipping_duration': Time taken for delivery.
+//     * 'sale_price': Final selling price to the customer.
+//     * 'supply_price': Wholesale or original cost.
+//     * 'low_stock_threshold': Minimum inventory alert level.
+//     * 'discount': Amount or percentage of price reduction.
+//     * 'min_order_amount': Minimum spend required to trigger an action.
+//     * 'max_discount_amount': Maximum cap for a discount.
+//     * 'usage_limit': Maximum number of times usable globally.
+//     * 'usage_per': Maximum number of times usable per user.
+//   - find: String. Choose one:
+//     * 'many': High quantity, count, or volume.
+//     * 'few': Low quantity, count, or volume.
+//     * 'much': High financial value, price, or amount.
+//     * 'little': Low financial value, price, or amount.
+//     * 'heavy': High physical weight.
+//     * 'light': Low physical weight.
+
+// [OUTPUT FORMAT]
+// {
+//   "{TYPE}" : {
+//     "status": "...",
+//     "substantial": "...",
+//     "find": "..."
+//   }
+// }
+
+// [ACTION] RETURN STRICTLY VALID JSON ONLY.
+// NO EXPLANATION. NO THINKING. /no_think"###;
+
+    
+//     template.replace("{STATUS_OPTIONS}", status_options)
+//             .replace("{TYPE}", seg_type)
+//             .replace("{TEXT}", current_text)
+// }
+
+pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
     let status_options = match seg_type {
-        "tracking" => "* 'draft': Shipment preparation or pending pickup.
-    * 'progress': Currently in transit or out for delivery.
-    * 'return': Returning to sender.
-    * 'complete': Successfully delivered to the recipient.
-    * 'error': Delivery exception, lost, or failed.",
-        "goods" => "* 'draft': Product is being created, not yet published.
-    * 'show': Visible and available for sale on storefront.
-    * 'hide': Hidden from the storefront.
-    * 'progress': Currently being restocked or updated.
-    * 'stop': Sales temporarily suspended.
-    * 'cancel': Product discontinued or cancelled.
-    * 'refund': Related to refunded inventory.
-    * 'return': Related to returned inventory.
-    * 'exchange': Related to exchanged inventory.
-    * 'expire': Product expired.
-    * 'complete': Completely sold out or finished lifecycle.
-    * 'error': Data or system error.",
-        "order" => "* 'draft': Pending payment or in cart.
-    * 'progress': Order processing or preparing for shipment.
-    * 'stop': Order on hold.
-    * 'cancel': Order cancelled before fulfillment.
-    * 'refund': Payment refunded.
-    * 'return': Items returned by customer.
-    * 'exchange': Items being exchanged.
-    * 'expire': Payment window expired.
-    * 'complete': Order fully fulfilled and closed.
-    * 'error': Payment or processing error.",
-        "coupon" | "event" => "* 'show': Visible to customers.
-    * 'progress': Currently active and running.
-    * 'hide': Hidden from customers.
-    * 'stop': Temporarily paused.
-    * 'cancel': Terminated early.
-    * 'expire': Passed its expiration date.
-    * 'complete': Successfully finished its run.
-    * 'error': Configuration error.",
-        "review" => "* 'progress': Under moderation or pending approval.
-    * 'stop': Blocked or suspended review.
-    * 'cancel': Deleted or withdrawn by user.
-    * 'refund': Associated with a refunded order.
-    * 'return': Associated with a returned order.
-    * 'exchange': Associated with an exchanged order.
-    * 'expire': Review period expired.
-    * 'complete': Published and visible.
-    * 'error': Rejected or marked as spam.",
-        _ => "* 'show': Visible state.
-    * 'progress': Active/Processing state.
-    * 'remove': Deleted state.
-    * 'hide': Hidden state.
-    * 'stop': Paused/Stopped state.
-    * 'cancel': Cancelled state.
-    * 'refund': Refunded state.
-    * 'return': Returned state.
-    * 'exchange': Exchanged state.
-    * 'expire': Expired state.
-    * 'complete': Finished/Completed state.
-    * 'error': Error state."
+        "tracking" => "* 'draft': Shipment preparation or pending pickup.\n    * 'progress': Currently in transit or out for delivery.\n    * 'return': Returning to sender.\n    * 'complete': Successfully delivered to the recipient.\n    * 'error': Delivery exception, lost, or failed.",
+        "goods" => "* 'draft': Product is being created, not yet published.\n    * 'show': Visible and available for sale on storefront.\n    * 'hide': Hidden from the storefront.\n    * 'progress': Currently being restocked or updated.\n    * 'stop': Sales temporarily suspended.\n    * 'cancel': Product discontinued or cancelled.\n    * 'refund': Related to refunded inventory.\n    * 'return': Related to returned inventory.\n    * 'exchange': Related to exchanged inventory.\n    * 'expire': Product expired.\n    * 'complete': Completely sold out or finished lifecycle.\n    * 'error': Data or system error.",
+        "order" => "* 'draft': Pending payment or in cart.\n    * 'progress': Order processing or preparing for shipment.\n    * 'stop': Order on hold.\n    * 'cancel': Order cancelled before fulfillment.\n    * 'refund': Payment refunded.\n    * 'return': Items returned by customer.\n    * 'exchange': Items being exchanged.\n    * 'expire': Payment window expired.\n    * 'complete': Order fully fulfilled and closed.\n    * 'error': Payment or processing error.",
+        "coupon" | "event" => "* 'show': Visible to customers.\n    * 'progress': Currently active and running.\n    * 'hide': Hidden from customers.\n    * 'stop': Temporarily paused.\n    * 'cancel': Terminated early.\n    * 'expire': Passed its expiration date.\n    * 'complete': Successfully finished its run.\n    * 'error': Configuration error.",
+        "review" => "* 'progress': Under moderation or pending approval.\n    * 'stop': Blocked or suspended review.\n    * 'cancel': Deleted or withdrawn by user.\n    * 'refund': Associated with a refunded order.\n    * 'return': Associated with a returned order.\n    * 'exchange': Associated with an exchanged order.\n    * 'expire': Review period expired.\n    * 'complete': Published and visible.\n    * 'error': Rejected or marked as spam.",
+        _ => "* 'show': Visible state.\n    * 'progress': Active/Processing state.\n    * 'remove': Deleted state.\n    * 'hide': Hidden state.\n    * 'stop': Paused/Stopped state.\n    * 'cancel': Cancelled state.\n    * 'refund': Refunded state.\n    * 'return': Returned state.\n    * 'exchange': Exchanged state.\n    * 'expire': Expired state.\n    * 'complete': Finished/Completed state.\n    * 'error': Error state."
     };
 
-    let template = r###"Analyze the specific text segment and extract the logical attributes based on the defined schema.
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for status.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
 
-[CURRENT SEGMENT]
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
 {TEXT}
 
 [SCHEMA DEFINITIONS]
-{TYPE}:
-  - status: String. Choose one:
-    {STATUS_OPTIONS}
-    * '': If none logically apply.
-  - substantial: String. Choose one:
-    * 'size': Physical dimensions or volume.
-    * 'weight': Mass or heaviness.
-    * 'shipping_fee': Cost of delivery.
-    * 'shipping_duration': Time taken for delivery.
-    * 'sale_price': Final selling price to the customer.
-    * 'supply_price': Wholesale or original cost.
-    * 'low_stock_threshold': Minimum inventory alert level.
-    * 'discount': Amount or percentage of price reduction.
-    * 'min_order_amount': Minimum spend required to trigger an action.
-    * 'max_discount_amount': Maximum cap for a discount.
-    * 'usage_limit': Maximum number of times usable globally.
-    * 'usage_per': Maximum number of times usable per user.
-  - find: String. Choose one:
-    * 'many': High quantity, count, or volume.
-    * 'few': Low quantity, count, or volume.
-    * 'much': High financial value, price, or amount.
-    * 'little': Low financial value, price, or amount.
-    * 'heavy': High physical weight.
-    * 'light': Low physical weight.
+- status: String. Choose one:
+{STATUS_OPTIONS}
+  * '': If none logically apply.
 
 [OUTPUT FORMAT]
 {
-  "{TYPE}" : {
-    "status": "...",
-    "substantial": "...",
-    "find": "..."
-  }
+  "status": "String or empty"
 }
 
-[ACTION] RETURN STRICTLY VALID JSON ONLY.
-NO EXPLANATION. NO THINKING. /no_think"###;
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
-    
     template.replace("{STATUS_OPTIONS}", status_options)
-            .replace("{TYPE}", seg_type)
             .replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
+}
+
+pub fn extract_substantial_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for substantial.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
+
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+- substantial: String. Choose one:
+  * 'size': Physical dimensions or volume.
+  * 'weight': Mass or heaviness.
+  * 'shipping_fee': Cost of delivery.
+  * 'shipping_duration': Time taken for delivery.
+  * 'sale_price': Final selling price to the customer.
+  * 'supply_price': Wholesale or original cost.
+  * 'low_stock_threshold': Minimum inventory alert level.
+  * 'discount': Amount or percentage of price reduction.
+  * 'min_order_amount': Minimum spend required to trigger an action.
+  * 'max_discount_amount': Maximum cap for a discount.
+  * 'usage_limit': Maximum number of times usable globally.
+  * 'usage_per': Maximum number of times usable per user.
+  * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "substantial": "String or empty"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
+}
+
+pub fn extract_find_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for find.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
+
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+- find: String. Choose one:
+  * 'many': High quantity, count, or volume.
+  * 'few': Low quantity, count, or volume.
+  * 'much': High financial value, price, or amount.
+  * 'little': Low financial value, price, or amount.
+  * 'heavy': High physical weight.
+  * 'light': Low physical weight.
+  * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "find": "String or empty"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
 }
 
 // 🌟 [STAGE-1 전용 멀티패스 컨텍스트 추출기]
@@ -1841,7 +1992,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("manufacturer", "String", "manufacturer", "");
             add("release_date", "String", "release date", "");
             add("manufacture_date", "String", "manufacture date", "");
-            add("expiration_date", "String", "expiration date", "");
+            add("expired_at", "String", "expiration date", "");
             add("gtin", "String", "gtin barcode", "");
             add("mpn", "String", "mpn part number", "");
             add("barcode", "String", "barcode", "");
