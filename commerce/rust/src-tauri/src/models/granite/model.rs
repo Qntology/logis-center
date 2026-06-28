@@ -273,6 +273,7 @@ impl GraniteMoE {
 }
 
 // Mamba parts
+#[derive(Clone)]
 pub struct MambaLayerCache {
     pub conv_state: Tensor,
     pub ssm_state: Tensor,
@@ -531,6 +532,7 @@ pub enum DecoderLayer {
     Mamba(MambaBlock),
 }
 
+#[derive(Clone)]
 pub struct GraniteHybridCache {
     pub attention_caches: Vec<(Tensor, Tensor)>,
     pub mamba_caches: Vec<MambaLayerCache>,
