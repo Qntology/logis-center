@@ -1,8 +1,8 @@
 use anyhow::Result;
 use lancedb::{Connection, connect};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, Array};
-use arrow_schema::{DataType, Field, Schema};
+use lancedb::arrow::arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, Array, Int32Array, BooleanArray};
+use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use serde_json::{Value, json};
@@ -190,7 +190,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![text.to_string()])),
                 Arc::new(StringArray::from(vec![data.unwrap_or("").to_string()])),
                 Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
-                Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(Int32Array::from(vec![status.unwrap_or(0)])),
                 Arc::new(Int64Array::from(vec![now])),
                 Arc::new(Int64Array::from(vec![0])), // updated_at
             ],
@@ -225,7 +225,7 @@ impl VectorStore {
             let texts = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
             let datas = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
             let task_ids = batch.column(10).as_any().downcast_ref::<StringArray>().unwrap();
-            let statuses = batch.column(11).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let statuses = batch.column(11).as_any().downcast_ref::<Int32Array>().unwrap();
             let createds = batch.column(12).as_any().downcast_ref::<Int64Array>().unwrap();
             let updateds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
 
@@ -267,7 +267,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![task.data_json])),
                 Arc::new(Int64Array::from(vec![task.created_at])),
                 Arc::new(Int64Array::from(vec![task.updated_at])),
-                Arc::new(arrow_array::Int32Array::from(vec![task.status])),
+                Arc::new(Int32Array::from(vec![task.status])),
             ],
         )?;
         table.add(vec![batch]).execute().await?;
@@ -291,7 +291,7 @@ impl VectorStore {
             let datas = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
             let crs = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
             let ups = batch.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
-            let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let sts = batch.column(10).as_any().downcast_ref::<Int32Array>().unwrap();
             for i in 0..batch.num_rows() {
                 tasks.push(Task {
                     id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: froms.value(i).to_string(), 
@@ -322,7 +322,7 @@ impl VectorStore {
             let datas = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
             let crs = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
             let ups = batch.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
-            let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let sts = batch.column(10).as_any().downcast_ref::<Int32Array>().unwrap();
             for i in 0..batch.num_rows() {
                 tasks.push(Task {
                     id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: froms.value(i).to_string(), 
@@ -610,10 +610,10 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
-                Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
+                Arc::new(Int32Array::from(vec![status])), Arc::new(Float32Array::from(vec![amount])),
                 Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![masked_text_content])), Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
-                Arc::new(StringArray::from(vec![mode_str])), Arc::new(arrow_array::BooleanArray::from(vec![Some(is_masked_val)])),
+                Arc::new(StringArray::from(vec![mode_str])), Arc::new(BooleanArray::from(vec![Some(is_masked_val)])),
          ])?;
          table.add(vec![batch]).execute().await?;
          Ok(())
@@ -656,7 +656,7 @@ impl VectorStore {
             let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
             let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
             let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
-            let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let statuses = batch.column(8).as_any().downcast_ref::<Int32Array>().unwrap();
             let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
             let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
             let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
@@ -665,7 +665,7 @@ impl VectorStore {
             let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
             let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
             let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
-            let maskeds = batch.column(17).as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
+            let maskeds = batch.column(17).as_any().downcast_ref::<BooleanArray>().unwrap();
             
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
@@ -704,7 +704,7 @@ impl VectorStore {
         let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
         let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
         let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
-        let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let statuses = batch.column(8).as_any().downcast_ref::<Int32Array>().unwrap();
         let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
         let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
         let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
@@ -713,7 +713,7 @@ impl VectorStore {
         let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
         let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
         let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
-        let maskeds = batch.column(17).as_any().downcast_ref::<arrow_array::BooleanArray>().unwrap();
+        let maskeds = batch.column(17).as_any().downcast_ref::<BooleanArray>().unwrap();
 
         Ok(Some(TradeDocument { 
             id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
