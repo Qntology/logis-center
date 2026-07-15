@@ -248,8 +248,23 @@ class GlobalTaskManager {
         this.activeRefs.clear();
         this.queue = [];
         this.backendQueued = []; // 🌟 전체 초기화 반영
-        await kvRemove("sys_lock");
-        await appDb.table("ts_queue").clear(); // 🌟 완전 초기화 시 Dexie도 비움
+        
+        // 🌟 Dexie DB 완전 초기화 (모든 테이블 비우기)
+        try {
+            await appDb.table("ts_queue").clear();
+            await appDb.table("kv_store").clear();
+            console.log("[QUEUE] Dexie DB tables fully cleared.");
+        } catch (e) {
+            console.error("[QUEUE] Dexie DB clear error:", e);
+        }
+
+        // 🌟 LanceDB 전면 초기화 호출 (새로고침 전에 백엔드 초기화가 완료되도록 대기)
+        try {
+            await invoke("reset_lancedb");
+            console.log("[QUEUE] LanceDB fully reset.");
+        } catch (e) {
+            console.error("[QUEUE] LanceDB reset error:", e);
+        }
     }
 }
 
@@ -1022,7 +1037,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 const visibilityIcon = isHidden ? "show" : "hide";
                 
                 // 🌟 [CRITICAL FIX] 기존 CSS 레이아웃을 파괴하지 않도록 절대 위치(absolute)를 사용하여 우측 상단에 버튼을 배치합니다.
-                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}" style="position: absolute; right: 10px; top: 10px; background: none; border: none; cursor: pointer; font-size: 10px; text-decoration: underline; color: #888; z-index: 10;">${visibilityIcon}</button>`;
+                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}" style="position: absolute; right: 10px; top: 1px; background: none; border: none; cursor: pointer; font-size: 10px; text-decoration: underline; color: #888; z-index: 10;">${visibilityIcon}</button>`;
 
                 // 🌟 [CRITICAL FIX] 실수로 누락했던 visibilityBtn 변수를 content 문자열 맨 끝에 다시 포함시킵니다!
                 const opacityStyle = isHidden ? 'opacity: 0.3;' : 'opacity: 1;';

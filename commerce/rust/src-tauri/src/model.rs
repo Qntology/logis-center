@@ -1709,7 +1709,128 @@ impl LogisModel {
             if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
         }
 
-        let words: Vec<&str> = query.split_whitespace().collect();
+        // 🌟 [추가] Stanza 기반 형태소 분석으로 검색어(query) 정밀 분할 반영
+        let mut ext_words_string: Vec<String> = Vec::new();
+        
+        let stanza_lang_code = match query_lang.as_str() {
+            "korean" | "ko" => "ko",
+            "english" | "en" => "en",
+            "japanese" | "ja" => "ja",
+            "chinese" | "zh" | "zh-tw" | "zh-hk" => "zh-hans",
+            "french" | "fr" => "fr",
+            "german" | "de" => "de",
+            "spanish" | "es" => "es",
+            "italian" | "it" => "it",
+            "portuguese" | "pt" => "pt",
+            "dutch" | "nl" => "nl",
+            "russian" | "ru" => "ru",
+            "arabic" | "ar" => "ar",
+            "thai" | "th" => "th",
+            "hindi" | "hi" => "hi",
+            "bengali" | "bn" => "bn",
+            "greek" | "el" => "el",
+            "hebrew" | "he" => "he",
+            "vietnamese" | "vi" => "vi",
+            _ => "en",
+        };
+
+        let stanza_base_dir = crate::utils::get_app_dir().join("models").join("stanza");
+        let stanza_lang_dir = stanza_base_dir.join(stanza_lang_code);
+
+        if stanza_lang_dir.exists() {
+            emit_term(&format!("[STANZA] 🧠 Loading Stanza ONNX models for Search Query ('{}')...", stanza_lang_code));
+            
+            struct UnsafePipelineWrapper(crate::scheduler::StanzaPipeline);
+            unsafe impl Send for UnsafePipelineWrapper {}
+            
+            let base_dir_clone = stanza_base_dir.clone();
+            let lang_code_clone = stanza_lang_code.to_string();
+            
+            let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<UnsafePipelineWrapper>>();
+            std::thread::spawn(move || {
+                let res = crate::scheduler::StanzaPipeline::new(base_dir_clone, &lang_code_clone).map(UnsafePipelineWrapper);
+                let _ = tx.send(res);
+            });
+            
+            let pipeline_res = rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("OS 스레드 통신 채널이 끊어졌습니다.")));
+
+            match pipeline_res {
+                Ok(wrapper) => {
+                    let mut stanza = wrapper.0;
+                    let chars: Vec<char> = query.chars().collect();
+                    
+                    if !chars.is_empty() {
+                        let seq_len = chars.len();
+                        let mut char_ids = Vec::with_capacity(seq_len);
+                        for c in &chars {
+                            let id = *stanza.preprocessor.char_vocab.get(c).unwrap_or(&stanza.preprocessor.char_unk_id);
+                            char_ids.push(id);
+                        }
+                        
+                        if let Ok(char_tensor) = ndarray::Array2::from_shape_vec((1, seq_len), char_ids) {
+                            let char_features = ndarray::Array3::<i64>::zeros((1, seq_len, 5));
+                            let seq_lengths = ndarray::Array1::<i64>::from_vec(vec![seq_len as i64]);
+                            
+                            let mut tensor_pool = std::collections::HashMap::new();
+                            tensor_pool.insert("char_tensor", char_tensor.into_dyn());
+                            tensor_pool.insert("char_features", char_features.into_dyn());
+                            tensor_pool.insert("seq_lengths", seq_lengths.into_dyn());
+                            
+                            let mut tok_inputs = Vec::new();
+                            for input_meta in &stanza.tokenize_session.inputs {
+                                let exact_name = input_meta.name.clone();
+                                if let Some(tensor) = tensor_pool.get(exact_name.as_str()) {
+                                    tok_inputs.push(tensor.clone());
+                                } else {
+                                    emit_term(&format!("[STANZA-WARN] Tokenizer 모델에 정의되지 않은 입력 생략: {}", exact_name));
+                                }
+                            }
+                            
+                            match stanza.tokenize_session.run::<'_, '_, '_, i64, f32, _>(tok_inputs) {
+                                Ok(outputs) => {
+                                    let output_tensor = &outputs[0];
+                                    let shape = output_tensor.shape();
+                                    let num_classes = *shape.last().unwrap() as usize;
+                                    let is_3d = shape.len() == 3;
+                                    
+                                    let mut current_word = String::new();
+                                    for i in 0..seq_len {
+                                        current_word.push(chars[i]);
+                                        
+                                        let mut max_val = std::f32::MIN;
+                                        let mut max_idx = 0;
+                                        for c_idx in 0..num_classes {
+                                            let val = if is_3d { output_tensor[[0, i, c_idx]] } else { output_tensor[[i, c_idx]] };
+                                            if val > max_val { max_val = val; max_idx = c_idx; }
+                                        }
+                                        
+                                        if max_idx > 0 || i == seq_len - 1 {
+                                            let token_str = current_word.trim().to_string();
+                                            if !token_str.is_empty() {
+                                                ext_words_string.push(token_str);
+                                            }
+                                            current_word.clear();
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    emit_term(&format!("[STANZA-ERROR] Tokenizer run failed: {:?}", e));
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    emit_term(&format!("[STANZA] ⚠️ Failed to load Stanza models for '{}' (상세 원인): {:?}", stanza_lang_code, e));
+                }
+            }
+        }
+
+        if ext_words_string.is_empty() {
+            ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
+        }
+
+        let words: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
         let mut context_arr = Vec::new();
 
         // 🌟 [1차 패스] 최소 2단어 이상(2-gram)의 교차 윈도우 스팬 및 카테고리별 기본 점수 수집

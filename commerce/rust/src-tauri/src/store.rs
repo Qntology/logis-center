@@ -851,6 +851,21 @@ impl VectorStore {
         }
         Ok(None)
     }
+
+    pub async fn reset_database(&self) -> Result<()> {
+        let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages"];
+        for name in tables {
+            let _ = self.conn.drop_table(name, &[]).await;
+            let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, name));
+        }
+        println!("[Store] LanceDB all tables dropped for factory reset.");
+        
+        // 테이블 초기화 함수 재호출하여 빈 껍데기로 복구
+        self.init_task_table().await?;
+        self.init_all_tables().await?;
+        
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

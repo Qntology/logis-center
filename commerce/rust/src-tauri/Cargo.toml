@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
-tauri = { version = "2.9.5", features = [] }
+tauri = { version = "2.10.1", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -30,7 +30,7 @@ futures = "0.3"
 uuid = { version = "1.4", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"
-tauri-plugin-dialog = "2"
+tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
@@ -70,6 +70,9 @@ rand_chacha = "0.3"
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
 libc = "0.2"
 boa_engine = { path = "../crates/boa-engine/core/engine" }
+onnxruntime = { path = "../crates/onnxruntime" }
+ndarray = "0.15.1"
+whatlang = "0.18.0"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "./direct-storage" }
@@ -97,4 +100,4 @@ opt-level = 3   # 실행 속도 최대
 strip = true      # 모든 심볼 제거 (함수 이름 등 삭제)
 lto = true        # 전체 프로그램 최적화 (코드 분석을 훨씬 어렵게 함)
 panic = "abort"   # 에러 발생 시 정보를 남기지 않음
-codegen-units = 16 # 빌드 속도 개선
+codegen-units = 1 # 빌드 속도 개선

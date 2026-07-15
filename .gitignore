@@ -11,6 +11,8 @@
 *.safetensors
 *.crdownload
 *.bin
+*.dll
+*.onnx
 
 aha-main/
 
