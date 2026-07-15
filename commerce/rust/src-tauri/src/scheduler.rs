@@ -2404,6 +2404,32 @@ async fn process_task(
                     }
                 }
 
+                // 🌟 [CRITICAL FIX] LLM에게 노이즈가 제거된 [VECTORIZING] 텍스트들만 모아서 전달하여 완벽한 추출 환경 구성
+                let mut json_contexts = Vec::new();
+                for (line_idx, line) in item_lines.iter().enumerate() {
+                    if !line.trim().is_empty() {
+                        let enriched = &line_enriched_texts[line_idx];
+                        let target_text = if enriched.is_empty() {
+                            if let Some(p) = line.find('|') { line[p + 1..].trim() } else { line.trim() }
+                        } else {
+                            enriched.as_str()
+                        };
+                        if !target_text.is_empty() {
+                            if let Some(idx) = target_text.find('|') {
+                                json_contexts.push(json!({
+                                    "metadata": target_text[..idx].trim(),
+                                    "value": target_text[idx + 1..].trim()
+                                }));
+                            } else {
+                                json_contexts.push(json!({
+                                    "value": target_text.trim()
+                                }));
+                            }
+                        }
+                    }
+                }
+                let filtered_full_item_pug = serde_json::to_string_pretty(&json_contexts).unwrap_or_default();
+
                 let mut item_val = json!({});
                 let mut global_ignore_list: Vec<String> = Vec::new();
                 
@@ -2454,13 +2480,14 @@ async fn process_task(
                         }
                     }
                     
-                    // 리스트 아이템은 크기가 작으므로 특정 줄만 잘라서 던지지 않고, 전체를 던져 환각을 100% 원천 방어합니다.
-                    let targeted_pug = full_item_pug.clone();
+                    // 🌟 [개선] 리스트 아이템은 크기가 작으므로 특정 줄만 잘라서 던지지 않고, 
+                    // 노이즈가 완벽히 필터링된 직관적인 Key-Value 묶음(filtered_full_item_pug)을 통째로 던집니다.
+                    let targeted_pug = filtered_full_item_pug.clone();
                     
-                    emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4} (Using full structure)", field_name, best_thead_score, best_item_score));
+                    emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4} (Using filtered structure)", field_name, best_thead_score, best_item_score));
                     
                     let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: format!("[PUG CONTENT]\n{}", targeted_pug),
+                        content: format!("[JSON CONTEXT]\n{}", targeted_pug),
                         name: None,
                     });
                     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -2477,7 +2504,27 @@ async fn process_task(
                     log_task_progress(app_handle, &task.id, &payload);
                     emit_term(&format!("  ▶ {}", f_summary_msg));
 
-                    let task_question = parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, &doc_title);
+                    let mut metadata_str = String::new();
+                    let mut target_data_str = String::new();
+                    for line in targeted_pug.lines() {
+                        if let Some(idx) = line.find('|') {
+                            metadata_str.push_str(line[..idx].trim());
+                            metadata_str.push_str("\n");
+                            target_data_str.push_str(line[idx + 1..].trim());
+                            target_data_str.push_str("\n");
+                        } else {
+                            target_data_str.push_str(line.trim());
+                            target_data_str.push_str("\n");
+                        }
+                    }
+                    let metadata_str = metadata_str.trim();
+                    let target_data_str = target_data_str.trim();
+
+                    let task_question = if field_name.contains("status") {
+                        parsing::extract_status_intent_prompt(&targeted_pug, &page_type, &bias_target)
+                    } else {
+                        parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
+                    };
                     
                     let mut ignore_list: Vec<String> = global_ignore_list.clone();
                     let mut miss_counter = 0;
@@ -2988,11 +3035,31 @@ async fn process_task(
                 } else {
                     extract_pug_context(&pug_lines_ref, best_idx)
                 };
+
+                let mut json_contexts = Vec::new();
+                for line in targeted_pug.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    if let Some(idx) = trimmed.find('|') {
+                        let meta = trimmed[..idx].trim();
+                        // 껍데기 HTML 태그명(td, th 등)이 있으면 제거하고 순수 메타데이터 텍스트만 추출
+                        let clean_meta = meta.split('[').next().unwrap_or(meta).trim();
+                        json_contexts.push(json!({
+                            "metadata": clean_meta,
+                            "value": trimmed[idx + 1..].trim()
+                        }));
+                    } else {
+                        json_contexts.push(json!({
+                            "value": trimmed
+                        }));
+                    }
+                }
+                let targeted_json_context = serde_json::to_string_pretty(&json_contexts).unwrap_or_default();
                 
-                emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_pug));
+                emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_json_context));
                 
                 let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: format!("[PUG CONTENT]\n{}", targeted_pug),
+                    content: format!("[JSON CONTEXT]\n{}", targeted_json_context),
                     name: None,
                 });
 
@@ -3009,7 +3076,27 @@ async fn process_task(
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
                 // 🌟 [CRITICAL FIX] 새롭게 추가된 title 파라미터 규격에 맞춰 &doc_title을 주입합니다.
-                let task_question = parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, &doc_title);
+                let mut metadata_str = String::new();
+                let mut target_data_str = String::new();
+                for line in targeted_pug.lines() {
+                    if let Some(idx) = line.find('|') {
+                        metadata_str.push_str(line[..idx].trim());
+                        metadata_str.push_str("\n");
+                        target_data_str.push_str(line[idx + 1..].trim());
+                        target_data_str.push_str("\n");
+                    } else {
+                        target_data_str.push_str(line.trim());
+                        target_data_str.push_str("\n");
+                    }
+                }
+                let metadata_str = metadata_str.trim();
+                let target_data_str = target_data_str.trim();
+
+                let task_question = if field_name.contains("status") {
+                    parsing::extract_status_intent_prompt(&targeted_pug, &page_type, &bias_target)
+                } else {
+                    parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
+                };
                 
                 // 🌟 [BIAS SKIP LOGIC] 본문에 존재하지 않는 잘못된 추출값 기록용 리스트 및 카운터
                 let mut ignore_list: Vec<String> = global_ignore_list.clone(); // 🌟 매 필드마다 전역 리스트를 복사하여 누적 시작

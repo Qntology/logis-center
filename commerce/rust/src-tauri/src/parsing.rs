@@ -2135,7 +2135,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
 //             .replace("{TITLE}", title)
 //             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 // }
-pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, title: &str) -> String {
+pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
     // 🌟 복수 키(예: "id,link") 대응을 위해 동적 JSON 포맷 생성
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
@@ -2145,15 +2145,18 @@ pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc
 
     // 🌟 인메모리 벡터 검색으로 정제된 컨텍스트에 맞춘 최적화된 프롬프트
     let template = r###"[TASK]
-Analyze the provided concentrated PUG/HTML context and extract specific properties into a JSON object.
+Analyze the provided concentrated context and extract specific properties into a JSON object.
 
 [CONTEXT]
 Page Type: {TYPE}
 Language: {LANGUAGE}
-Document Title: {TITLE}
+Metadata: {METADATA}
 
 [SCHEMA DEFINITIONS]
 {FIELDS}
+
+[TARGET DATA]
+{TARGET_DATA}
 
 [EXTRACTION RULES]
 1. Return ONLY valid JSON containing the requested keys.
@@ -2171,8 +2174,9 @@ Document Title: {TITLE}
 
     template.replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
+            .replace("{METADATA}", metadata)
             .replace("{FIELDS}", field_desc)
-            .replace("{TITLE}", title)
+            .replace("{TARGET_DATA}", target_data)
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
