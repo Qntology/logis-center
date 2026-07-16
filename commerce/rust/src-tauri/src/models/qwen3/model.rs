@@ -219,7 +219,7 @@ impl Qwen3DecoderLayer {
             if let Some(cache) = self.fp8_cache.take() {
                 let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 
-                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F8E4M3) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
+                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F4) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
                 let k_restored = cache.k_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.k_fp8.clone());
                 let v_restored = cache.v_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.v_fp8.clone());
                 
@@ -250,9 +250,9 @@ impl Qwen3DecoderLayer {
 
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
-            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F8E4M3) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
-            let k_fp8 = k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone());
-            let v_fp8 = v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone());
+            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F4) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
+            let k_fp8 = k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k.clone());
+            let v_fp8 = v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v.clone());
             
             self.fp8_cache = Some(Fp8VramKVCache {
                 k_fp8,

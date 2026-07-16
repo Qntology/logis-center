@@ -499,14 +499,14 @@ impl AttentionBlock {
         let k = k.reshape((b, s, self.cfg.num_key_value_heads(), self.cfg.head_dim()))?.transpose(1, 2)?;
         let v = v.reshape((b, s, self.cfg.num_key_value_heads(), self.cfg.head_dim()))?.transpose(1, 2)?;
         
-        // 🌟 [FP8 Compression] Update simple KV cache with On-the-fly F8E4M3 Quantization
+        // 🌟 [FP8 Compression] Update simple KV cache with On-the-fly F4 Quantization
         let target_dtype = k.dtype(); 
         
         let (k, v) = if kv_cache.0.dim(2)? == 0 {
             // 최초 저장 시 FP8로 압축하여 보관
             *kv_cache = (
-                k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone()), 
-                v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone())
+                k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k.clone()), 
+                v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v.clone())
             );
             (k, v) // 현재 연산에는 원본 사용
         } else {
@@ -520,8 +520,8 @@ impl AttentionBlock {
             
             // 3. 업데이트된 전체 캐시를 다시 FP8로 압축하여 VRAM 장부에 저장
             *kv_cache = (
-                k_new.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_new.clone()), 
-                v_new.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_new.clone())
+                k_new.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k_new.clone()), 
+                v_new.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v_new.clone())
             );
             
             (k_new, v_new) // 현재 연산에는 복원된 텐서 사용

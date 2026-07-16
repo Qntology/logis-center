@@ -385,7 +385,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 let v_contig = v_aligned.contiguous().unwrap_or(v_aligned);
 
                                 // /qwen/ 은 F32 로직, /qwen3/, /qwen3_5/ 은 FP8 로직으로 동적 분기
-                                let target_dtype = if k_contig.dtype() == DType::F8E4M3 { DType::F8E4M3 } else { DType::F32 };
+                                let target_dtype = if k_contig.dtype() == DType::F4 { DType::F4 } else { DType::F32 };
                                 src.k_data = k_contig.to_dtype(target_dtype).unwrap_or_else(|_| k_contig.clone());
                                 src.v_data = v_contig.to_dtype(target_dtype).unwrap_or_else(|_| v_contig.clone());
                             }
@@ -434,7 +434,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                         let dev = &Device::Cpu;
                                         // 저장된 파일의 DType을 감지하여 FP8, F32 모두 호환되도록 로드합니다.
                                         let saved_dtype = match kd.dtype() {
-                                            safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                            safetensors::Dtype::F64 => DType::F4,
                                             safetensors::Dtype::F32 => DType::F32,
                                             safetensors::Dtype::F16 => DType::F16,
                                             _ => DType::BF16,

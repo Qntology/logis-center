@@ -956,12 +956,12 @@ impl Qwen3_5Attention {
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
                                                     
                                                     let saved_dtype = match kd.dtype() {
-                                                        safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                        safetensors::Dtype::F64 => DType::F4,
                                                         safetensors::Dtype::F32 => DType::F32,
                                                         safetensors::Dtype::F16 => DType::F16,
                                                         _ => DType::BF16,
                                                     };
-                                                    // 🌟 [버그 수정] F8E4M3/F32로 저장된 텐서를 무조건 BF16으로 읽어와서 파괴되는 현상을 고쳤습니다.
+                                                    // 🌟 [버그 수정] F4/F32로 저장된 텐서를 무조건 BF16으로 읽어와서 파괴되는 현상을 고쳤습니다.
                                                     let mut kd_t = Tensor::from_raw_buffer(kd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap();
                                                     let mut vd_t = Tensor::from_raw_buffer(vd.data(), saved_dtype, &meta_os, &Device::Cpu).unwrap();
                                                     
@@ -1930,8 +1930,8 @@ impl Qwen3_5TextModel {
                     // 🌟 [FP8 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP8 압축을 마친 뒤 RAM으로 내립니다.
                     // Qwen 계열(qwen, qwen3, qwen3_5) 모두 Attention forward 시에 to_device와 to_dtype 코어가 존재하여
                     // VRAM 재진입 시 자동으로 원래의 BF16/F32 정밀도로 복구됩니다.
-                    let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
-                    let merged_v_cpu = merged_v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+                    let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+                    let merged_v_cpu = merged_v_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
                     // 3. CPU(RAM)로 무사히 넘어온 거대 텐서를 다시 원래 블록 크기대로 썰어서 캐시에 재할당
                     let mut current_offset = 0;

@@ -773,7 +773,7 @@ impl QuantizedQwenVLTextAttention {
                                                 
                                                 // 이 한 줄의 수정으로 System RAM 점유율이 50% 이상 박살 납니다.
                                                 let saved_dtype = match kd.dtype() {
-                                                    safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                                                    safetensors::Dtype::F64 => DType::F4,
                                                     safetensors::Dtype::F32 => DType::F32,
                                                     safetensors::Dtype::F16 => DType::F16,
                                                     _ => DType::BF16,
@@ -906,7 +906,7 @@ impl QuantizedQwenVLTextAttention {
         let original_shape = t.shape().dims().to_vec();
         
         // 🌟 [동적 타입 분기] SSD 저장소 맵으로 넘기기 직전에도 F32/FP8 원본 정밀도를 절대 파괴하지 않고 보존합니다.
-        let target_dtype = match t.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+        let target_dtype = match t.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
         let t_compressed = t.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
         Ok((t_compressed, original_shape))
     }
@@ -1108,7 +1108,7 @@ impl QuantizedQwenVLTextAttention {
                         
                         let dev = &Device::Cpu;
                         let saved_dtype = match kd.dtype() {
-                            safetensors::Dtype::F8_E4M3 => DType::F8E4M3,
+                            safetensors::Dtype::F64 => DType::F4,
                             safetensors::Dtype::F32 => DType::F32,
                             safetensors::Dtype::F16 => DType::F16,
                             _ => DType::BF16,
@@ -1182,7 +1182,7 @@ impl QuantizedQwenVLTextAttention {
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
             
             // 🌟 [동적 타입 분기] 공용 모듈 사용을 고려하여 텐서 고유의 DType(FP8, BF16, F32)을 감지하여 보존합니다.
-            let target_dtype = match mk.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+            let target_dtype = match mk.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
             let mk_cpu = mk.contiguous()?.to_dtype(target_dtype)?.to_device(dev)?;
             let mv_cpu = mv.contiguous()?.to_dtype(target_dtype)?.to_device(dev)?;
             
@@ -1228,7 +1228,7 @@ impl QuantizedQwenVLTextAttention {
             let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
             
             // 🌟 [동적 타입 분기]
-            let target_dtype = match merged_k.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+            let target_dtype = match merged_k.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
             let merged_k_cpu = merged_k.to_dtype(target_dtype)?.to_device(dev)?;
             let merged_v_cpu = merged_v.to_dtype(target_dtype)?.to_device(dev)?;
             
@@ -2152,7 +2152,7 @@ impl QuantizedQwenVLTextModel {
                     let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
                     
                     // 🌟 [FP8 Compression] 긴 문맥 OOM 억제를 위한 강제 RAM 대피 시에도 VRAM에서 FP8로 선압축합니다.
-                    let target_dtype = match merged_k.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+                    let target_dtype = match merged_k.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
                     let merged_k_cpu = merged_k.to_dtype(target_dtype)?.to_device(&Device::Cpu)?;
                     let merged_v_cpu = merged_v.to_dtype(target_dtype)?.to_device(&Device::Cpu)?;
                     
@@ -2360,7 +2360,7 @@ impl QuantizedQwenVLTextModel {
 
                 // 🌟 [FP8 Compression] 전체 활성 블록을 디스크로 보낼 때 VRAM 안에서 먼저 FP8로 캐스팅해 RAM으로 보냅니다.
                 // SSD 저장 로직(LayerKVDump) 내부에서 백그라운드 스레드가 이를 다시 원래의 BF16으로 무손실 복구해 저장하게 됩니다.
-                let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+                let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
                 let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
                 let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2492,7 +2492,7 @@ impl QuantizedQwenVLTextModel {
             let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
             // 🌟 [FP8 Compression] 디코딩 롤백 시 단일 레이어 VRAM 완전 철수 과정에서도 GPU 코어로 초고속 FP8 압축합니다.
-            let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F8E4M3 => candle_core::DType::F8E4M3, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+            let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
             let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
             let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
