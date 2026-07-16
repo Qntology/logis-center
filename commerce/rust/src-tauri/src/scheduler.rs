@@ -490,9 +490,22 @@ pub async fn start_background_worker(
                                 m.deep_purge_resources().await;
                             }
                             *model_lock = None;
+                            
+                            // 마지막 RAM, VRAM 초기화 반영
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                            }
+                            #[cfg(target_os = "linux")]
+                            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                            #[cfg(target_os = "macos")]
+                            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
                         }
                         
                         let store_guard = store.lock().await;
+                        
                         if let Some(db) = store_guard.as_ref() {
                             let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
                             let _ = db.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Task Completed")).await;
@@ -514,6 +527,18 @@ pub async fn start_background_worker(
                                 m.deep_purge_resources().await;
                             }
                             *model_lock = None;
+
+                            // 에러 발생 시에도 마지막 RAM, VRAM 초기화 반영
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                            }
+                            #[cfg(target_os = "linux")]
+                            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                            #[cfg(target_os = "macos")]
+                            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
                         }
 
                         if err_msg.contains("Task cancelled") {
@@ -1209,6 +1234,9 @@ async fn process_task(
                     gen.prefill_only(raw_system_prefix, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
                 }
             }
+            
+            // Qwen 모델을 VRAM에 올리고 사용하지 않을 때 즉시 내림 (임베딩 사용 준비)
+            model.deep_purge_resources().await;
         }
 
         // 🌟 [CRITICAL OPTIMIZATION] PUG 라인 벡터화 및 DOM 파싱을 Step A와 A-2가 공유하도록 단 한 번만 실행합니다!
@@ -1692,9 +1720,8 @@ async fn process_task(
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 🌟 [CRITICAL FIX] 이어지는 추출 단계(Step B, List, Detail)에서 Qwen3를 그대로 재사용하므로, VRAM에서 강제로 모델을 내리지 않습니다.
-    // secure_vram_relay 내부의 스마트 스위칭 로직이 모델 변경 여부를 감지하여 필요할 때만 교체합니다.
-    // model.deep_purge_resources().await;
+    // 임베딩 모델을 VRAM에 올리고 사용하지 않을 때 즉시 내림
+    model.deep_purge_resources().await;
     
     // 🌟 [KV CACHE CLEAR] 모델 본체는 살려두고, 이전 단계 연산으로 팽창한 KV 캐시만 제거하여 VRAM을 확보합니다.
     {
@@ -1834,6 +1861,9 @@ async fn process_task(
                     }
                     println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                 }
+
+                // 다른 LLM 모델(Qwen/Qwen3)을 VRAM에 올리고 사용하지 않을 때 즉시 내림
+                model.deep_purge_resources().await;
 
                 if titles.is_empty() {
                     
@@ -2050,6 +2080,9 @@ async fn process_task(
                 }
             }
         }
+
+        // 다른 LLM 모델(Qwen 3.5)을 VRAM에 올리고 사용하지 않을 때 즉시 내림
+        model.deep_purge_resources().await;
 
         // 3. 최종 결정된 selector를 사용하여 head PUG를 추출합니다.
         if !final_thead_selector.is_empty() && final_thead_selector != "..." {
@@ -2625,20 +2658,36 @@ async fn process_task(
                                                     let is_boolean_str = extracted_str == "true" || extracted_str == "false";
                                                     
                                                     if !is_iso_date && !is_url && !is_boolean_str {
-                                                        let mut is_matched = full_item_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
+                                                        let mut is_matched = doc_title.contains(&extracted_str);
                                                         
                                                         if !is_matched {
+                                                            let extracted_lower = extracted_str.to_lowercase();
                                                             let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
-                                                            if digits_only.len() >= 3 {
-                                                                let pug_digits: String = full_item_pug.chars().filter(|c| c.is_ascii_digit()).collect();
-                                                                if pug_digits.contains(&digits_only) {
-                                                                    is_matched = true;
-                                                                }
-                                                            } else {
-                                                                let extracted_lower = extracted_str.to_lowercase();
-                                                                let pug_lower = full_item_pug.to_lowercase();
-                                                                if pug_lower.contains(&extracted_lower) {
-                                                                    is_matched = true;
+                                                            
+                                                            for ctx_val in &json_contexts {
+                                                                if let Some(target_val_str) = ctx_val.get("value").and_then(|v| v.as_str()) {
+                                                                    let target_lower = target_val_str.to_lowercase();
+                                                                    
+                                                                    if target_lower.contains(&extracted_lower) {
+                                                                        if digits_only.len() > 0 && digits_only.len() < 3 && extracted_str.len() == digits_only.len() {
+                                                                            let tokens: Vec<&str> = target_lower.split(|c: char| !c.is_alphanumeric()).collect();
+                                                                            if tokens.contains(&extracted_lower.as_str()) {
+                                                                                is_matched = true;
+                                                                                break;
+                                                                            }
+                                                                        } else {
+                                                                            is_matched = true;
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    if !is_matched && digits_only.len() >= 3 {
+                                                                        let target_digits: String = target_val_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                                        if target_digits.contains(&digits_only) {
+                                                                            is_matched = true;
+                                                                            break;
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -3207,25 +3256,36 @@ async fn process_task(
                                                 let is_boolean_str = extracted_str == "true" || extracted_str == "false";
                                                 
                                                 if !is_iso_date && !is_url && !is_boolean_str {
-                                                    // 1차: 완벽한 텍스트 포함 여부 (문자열 일치)
-                                                    let mut is_matched = content_pug.contains(&extracted_str) || doc_title.contains(&extracted_str);
+                                                    let mut is_matched = doc_title.contains(&extracted_str);
                                                     
-                                                    // 2차: 전화번호, 가격 등 포맷(하이픈, 콤마, 띄어쓰기) 차이로 인한 불일치 극복을 위해 순수 숫자만 추출하여 검증
                                                     if !is_matched {
+                                                        let extracted_lower = extracted_str.to_lowercase();
                                                         let digits_only: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
                                                         
-                                                        // 숫자가 3자리 이상 포함된 데이터일 경우 숫자 연속성이 PUG에 존재하는지 확인
-                                                        if digits_only.len() >= 3 {
-                                                            let pug_digits: String = content_pug.chars().filter(|c| c.is_ascii_digit()).collect();
-                                                            if pug_digits.contains(&digits_only) {
-                                                                is_matched = true;
-                                                            }
-                                                        } else {
-                                                            // 숫자가 아니거나 너무 짧은데 완벽 매칭이 안됐다면 대소문자 무시 검색
-                                                            let extracted_lower = extracted_str.to_lowercase();
-                                                            let pug_lower = content_pug.to_lowercase();
-                                                            if pug_lower.contains(&extracted_lower) {
-                                                                is_matched = true;
+                                                        for ctx_val in &json_contexts {
+                                                            if let Some(target_val_str) = ctx_val.get("value").and_then(|v| v.as_str()) {
+                                                                let target_lower = target_val_str.to_lowercase();
+                                                                
+                                                                if target_lower.contains(&extracted_lower) {
+                                                                    if digits_only.len() > 0 && digits_only.len() < 3 && extracted_str.len() == digits_only.len() {
+                                                                        let tokens: Vec<&str> = target_lower.split(|c: char| !c.is_alphanumeric()).collect();
+                                                                        if tokens.contains(&extracted_lower.as_str()) {
+                                                                            is_matched = true;
+                                                                            break;
+                                                                        }
+                                                                    } else {
+                                                                        is_matched = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                
+                                                                if !is_matched && digits_only.len() >= 3 {
+                                                                    let target_digits: String = target_val_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                                    if target_digits.contains(&digits_only) {
+                                                                        is_matched = true;
+                                                                        break;
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }

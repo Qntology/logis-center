@@ -115,7 +115,7 @@ pub struct Config {
     pub num_experts_per_tok: usize,
     pub position_embedding_type: String,
     #[serde(default)]
-    pub use_fp8_kv: bool,
+    pub use_fp4_kv: bool,
 }
 
 impl Config {
@@ -499,18 +499,18 @@ impl AttentionBlock {
         let k = k.reshape((b, s, self.cfg.num_key_value_heads(), self.cfg.head_dim()))?.transpose(1, 2)?;
         let v = v.reshape((b, s, self.cfg.num_key_value_heads(), self.cfg.head_dim()))?.transpose(1, 2)?;
         
-        // 🌟 [FP8 Compression] Update simple KV cache with On-the-fly F4 Quantization
+        // 🌟 [FP4 Compression] Update simple KV cache with On-the-fly F4 Quantization
         let target_dtype = k.dtype(); 
         
         let (k, v) = if kv_cache.0.dim(2)? == 0 {
-            // 최초 저장 시 FP8로 압축하여 보관
+            // 최초 저장 시 FP4로 압축하여 보관
             *kv_cache = (
                 k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k.clone()), 
                 v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v.clone())
             );
             (k, v) // 현재 연산에는 원본 사용
         } else {
-            // 1. 기존 압축된 FP8 캐시를 연산 및 결합을 위해 원래 타입(BF16/F32)으로 임시 복원
+            // 1. 기존 압축된 FP4 캐시를 연산 및 결합을 위해 원래 타입(BF16/F32)으로 임시 복원
             let k_prev = kv_cache.0.to_dtype(target_dtype).unwrap_or_else(|_| kv_cache.0.clone());
             let v_prev = kv_cache.1.to_dtype(target_dtype).unwrap_or_else(|_| kv_cache.1.clone());
             
@@ -518,7 +518,7 @@ impl AttentionBlock {
             let k_new = Tensor::cat(&[&k_prev, &k], 2)?;
             let v_new = Tensor::cat(&[&v_prev, &v], 2)?;
             
-            // 3. 업데이트된 전체 캐시를 다시 FP8로 압축하여 VRAM 장부에 저장
+            // 3. 업데이트된 전체 캐시를 다시 FP4로 압축하여 VRAM 장부에 저장
             *kv_cache = (
                 k_new.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k_new.clone()), 
                 v_new.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v_new.clone())

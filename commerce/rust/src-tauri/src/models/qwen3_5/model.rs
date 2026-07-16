@@ -1927,7 +1927,7 @@ impl Qwen3_5TextModel {
                     let merged_k_gpu = candle_core::Tensor::cat(&gpu_k_list, 2).unwrap_or_else(|_| gpu_k_list[0].clone());
                     let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
-                    // 🌟 [FP8 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP8 압축을 마친 뒤 RAM으로 내립니다.
+                    // 🌟 [FP4 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP4 압축을 마친 뒤 RAM으로 내립니다.
                     // Qwen 계열(qwen, qwen3, qwen3_5) 모두 Attention forward 시에 to_device와 to_dtype 코어가 존재하여
                     // VRAM 재진입 시 자동으로 원래의 BF16/F32 정밀도로 복구됩니다.
                     let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());

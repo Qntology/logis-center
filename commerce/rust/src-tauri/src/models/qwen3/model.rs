@@ -145,9 +145,9 @@ impl Qwen3Attention {
 }
 
 #[derive(Clone)]
-pub struct Fp8VramKVCache {
-    pub k_fp8: Tensor,
-    pub v_fp8: Tensor,
+pub struct Fp4VramKVCache {
+    pub k_fp4: Tensor,
+    pub v_fp4: Tensor,
 }
 
 pub struct Qwen3DecoderLayer {
@@ -156,7 +156,7 @@ pub struct Qwen3DecoderLayer {
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    pub fp8_cache: Option<Fp8VramKVCache>, // 🌟 [FP8 Compression] RAM으로 내리지 않고 VRAM 내에서 FP8로 압축하여 상주
+    pub fp4_cache: Option<Fp4VramKVCache>, // 🌟 [FP4 Compression] RAM으로 내리지 않고 VRAM 내에서 FP4로 압축하여 상주
 }
 
 impl Qwen3DecoderLayer {
@@ -202,7 +202,7 @@ impl Qwen3DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            fp8_cache: None,
+            fp4_cache: None,
         })
     }
 
@@ -214,14 +214,14 @@ impl Qwen3DecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // 🌟 [FP8 Compression] VRAM에 보관 중이던 FP8 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
+        // 🌟 [FP4 Compression] VRAM에 보관 중이던 FP4 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
         if self.self_attn.kv_cache.is_none() {
-            if let Some(cache) = self.fp8_cache.take() {
+            if let Some(cache) = self.fp4_cache.take() {
                 let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 
-                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F4) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
-                let k_restored = cache.k_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.k_fp8.clone());
-                let v_restored = cache.v_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.v_fp8.clone());
+                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP4(F4) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
+                let k_restored = cache.k_fp4.to_dtype(target_dtype).unwrap_or_else(|_| cache.k_fp4.clone());
+                let v_restored = cache.v_fp4.to_dtype(target_dtype).unwrap_or_else(|_| cache.v_fp4.clone());
                 
                 self.self_attn.kv_cache = Some((k_restored, v_restored));
             }
@@ -231,7 +231,7 @@ impl Qwen3DecoderLayer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
         
-        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 상태로 VRAM에 보존합니다.
+        // 🌟 [FP4 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP4 압축 상태로 VRAM에 보존합니다.
         // RAM-VRAM 스왑 없이 순수 VRAM 내에서 용량을 50% 절약합니다.
         self.compress_kv_in_vram()?;
         
@@ -245,18 +245,18 @@ impl Qwen3DecoderLayer {
 
     pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
-        self.fp8_cache = None;
+        self.fp4_cache = None;
     }
 
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
-            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F4) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
-            let k_fp8 = k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k.clone());
-            let v_fp8 = v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v.clone());
+            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP4(F4) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
+            let k_fp4 = k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k.clone());
+            let v_fp4 = v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v.clone());
             
-            self.fp8_cache = Some(Fp8VramKVCache {
-                k_fp8,
-                v_fp8,
+            self.fp4_cache = Some(Fp4VramKVCache {
+                k_fp4,
+                v_fp4,
             });
         }
         Ok(())
@@ -265,11 +265,11 @@ impl Qwen3DecoderLayer {
     pub fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
         if let Some(cache) = &self.self_attn.kv_cache {
             Some(cache.clone())
-        } else if let Some(fp8_cache) = &self.fp8_cache {
+        } else if let Some(fp4_cache) = &self.fp4_cache {
             // 스냅샷 저장을 위해 호출될 경우, 원래 타입으로 복원하여 반환
             let target_dtype = candle_core::DType::F32; // 저장용 기본 타입
-            if let Ok(k) = fp8_cache.k_fp8.to_dtype(target_dtype) {
-                if let Ok(v) = fp8_cache.v_fp8.to_dtype(target_dtype) {
+            if let Ok(k) = fp4_cache.k_fp4.to_dtype(target_dtype) {
+                if let Ok(v) = fp4_cache.v_fp4.to_dtype(target_dtype) {
                     return Some((k, v));
                 }
             }
@@ -281,7 +281,7 @@ impl Qwen3DecoderLayer {
 
     pub fn set_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
         self.self_attn.kv_cache = cache;
-        self.fp8_cache = None;
+        self.fp4_cache = None;
     }
 }
 
