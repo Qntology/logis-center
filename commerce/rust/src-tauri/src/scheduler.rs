@@ -2239,10 +2239,11 @@ async fn process_task(
             )
         };
 
-        // 2순위: 속성이 없을 경우 thead의 tr 태그 개수로 폴백(Fallback)하여 완벽하게 묶어냅니다.
-        let group_size = if !thead_pug.is_empty() {
+        // 2순위: 본문 아이템이 여러 줄(tr)로 구성된 경우 완벽하게 묶어냅니다.
+        let mut group_size = if !thead_pug.is_empty() {
             let mut max_span = 1;
-            if let Ok(re) = regex::Regex::new(r#"(?:colspan|rowspan)="(\d+)""#) {
+            // [CRITICAL FIX] colspan은 가로 병합이므로 세로 행 그룹화에 포함하면 다중 병합 오류가 발생합니다. rowspan만 추출합니다.
+            if let Ok(re) = regex::Regex::new(r#"rowspan="(\d+)""#) {
                 for cap in re.captures_iter(&thead_pug) {
                     if let Ok(val) = cap[1].parse::<usize>() {
                         if val > max_span {
@@ -2265,12 +2266,26 @@ async fn process_task(
         };
 
         if group_size > 1 && !pug_list.is_empty() {
-            let mut grouped = Vec::new();
-            for chunk in pug_list.chunks(group_size) {
-                grouped.push(chunk.join("\n"));
+            // [CRITICAL FIX] 이미 split_doc_to_pug_list_advanced 내부에서 병합되어 반환된 경우 이중 병합을 방지합니다.
+            let first_item_tr_count = pug_list.first()
+                .map(|p| p.lines().filter(|l| {
+                    let indent = l.chars().take_while(|c| c.is_whitespace()).count();
+                    indent == 0 && (l.starts_with("tr") || l.starts_with("tr["))
+                }).count())
+                .unwrap_or(1);
+
+            // 이미 PUG 문자열 내부에 tr 태그가 group_size 만큼(혹은 그 이상) 존재한다면, 이미 완벽하게 그룹화된 상태입니다.
+            if first_item_tr_count >= group_size || first_item_tr_count > 1 {
+                println!("[Scheduler] 🌟 Items are already grouped ({} trs per item). Skipping manual chunking.", first_item_tr_count);
+                group_size = 1;
+            } else {
+                let mut grouped = Vec::new();
+                for chunk in pug_list.chunks(group_size) {
+                    grouped.push(chunk.join("\n"));
+                }
+                pug_list = grouped;
+                println!("[Scheduler] 🌟 Grouped multi-row items: {} rows per item. Total items reduced to {}.", group_size, pug_list.len());
             }
-            pug_list = grouped;
-            println!("[Scheduler] 🌟 Grouped multi-row items: {} rows per item. Total items reduced to {}.", group_size, pug_list.len());
         }
 
         if !pug_list.is_empty() {
