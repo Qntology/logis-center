@@ -280,6 +280,15 @@ impl StanzaPreprocessor {
     }
 }
 
+static STANZA_ENV: once_cell::sync::Lazy<&'static onnxruntime::environment::Environment> = once_cell::sync::Lazy::new(|| {
+    Box::leak(Box::new(
+        onnxruntime::environment::Environment::builder()
+            .with_name("stanza_global_env")
+            .build()
+            .expect("Failed to initialize global ONNX Runtime Environment")
+    ))
+});
+
 // 🌟 [추가] ONNX Runtime 세션을 초기화하고 보유하는 파이프라인 구조체
 pub struct StanzaPipeline {
     pub preprocessor: StanzaPreprocessor,
@@ -302,13 +311,8 @@ impl StanzaPipeline {
 
         let total_start_time = std::time::Instant::now();
 
-        // onnxruntime 0.0.14 요구사항: Environment 할당 (static으로 메모리 릭(Leak)하여 생명주기 문제 우회)
-        let env = Box::leak(Box::new(
-            Environment::builder()
-                .with_name("stanza_env")
-                .build()
-                .map_err(|e| anyhow::anyhow!("Env error: {}", e))?
-        ));
+        // onnxruntime 0.0.14 요구사항: Environment 전역 싱글톤 사용 (메모리 릭 방지)
+        let env = *STANZA_ENV;
 
         // 🌟 [onnxruntime 0.0.14 버그 우회] 
         // 구버전 라이브러리의 설계 결함으로 인해, 파일 경로 문자열의 수명(Lifetime)이 

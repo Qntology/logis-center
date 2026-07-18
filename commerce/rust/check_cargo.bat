@@ -1,5 +1,9 @@
 @echo off
-call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-set "NVCC_CCBIN=C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64\cl.exe"
+chcp 65001 > nul
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set "PYTHONIOENCODING=utf-8"
+
+:: 2. CUDA 13.x 용 표준 전처리 가속 플래그 설정 (CCCL 빌드 에러 방지)
+set "NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor"
 cd src-tauri
 cargo check

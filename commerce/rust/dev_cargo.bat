@@ -1,7 +1,10 @@
 @echo off
 chcp 65001 > nul
-call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 set "PYTHONIOENCODING=utf-8"
+
+:: 2. CUDA 13.x 용 표준 전처리 가속 플래그 설정 (CCCL 빌드 에러 방지)
+set "NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor"
 
 :: [AMD ROCm/HIP]
 set "CANDLE_HIP=1"
@@ -10,9 +13,7 @@ set "PATH=%HIP_PATH%\bin;%PATH%"
 
 cd src-tauri
 
-rem DirectStorage 및 아까 모아둔 CUDA DLL 경로를 임시로 PATH에 추가 (Dev 모드 실행을 위함)
-set "PATH=%PATH%;%CD%\microsoft.direct3d.directstorage.1.3.0\native\bin\x64"
-set "PATH=%PATH%;%CD%\dlls"
+set "PATH=%CD%\dlls;%PATH%"
 
 echo [DEV] Starting Tauri application (Development Mode)...
 
