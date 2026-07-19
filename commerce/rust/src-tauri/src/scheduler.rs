@@ -1752,7 +1752,7 @@ async fn process_task(
     }
     
     // VRAM이 OS에서 완전히 반환될 때까지 잠시 대기합니다.
-    wait_for_resources_settled(1200, 800, Some(&cancellation_token)).await?;
+    wait_for_resources_settled(1200, 800, Some(&cancellation_token), model.device_config.gpu_id as u32).await?;
 
     let mut extracted_data = json!({});
 
@@ -3587,7 +3587,7 @@ async fn process_task(
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
         // 2. Wait for VRAM to settle (Driver latency)
-        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+        wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
     // [PARITY] ID Generation
@@ -4174,7 +4174,7 @@ pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_
     let _ = app.emit("extraction-progress", &final_payload);
 }
 
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>, target_gpu_id: u32) -> Result<()> {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
     
@@ -4189,7 +4189,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
     let mut last_report = std::time::Instant::now();
     let start_time = std::time::Instant::now();
 
-    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB)...", target_vram_mb);
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB) on GPU {}...", target_vram_mb, target_gpu_id);
 
     loop {
         if let Some(token) = cancellation_token {
@@ -4204,14 +4204,10 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         let mut has_gpu = false;
 
         if let Some(ref nvml_inst) = nvml {
-            if let Ok(count) = nvml_inst.device_count() {
-                for i in 0..count {
-                    if let Ok(dev) = nvml_inst.device_by_index(i) {
-                        if let Ok(mem) = dev.memory_info() {
-                            if mem.free > current_vram { current_vram = mem.free; }
-                            has_gpu = true;
-                        }
-                    }
+            if let Ok(dev) = nvml_inst.device_by_index(target_gpu_id) {
+                if let Ok(mem) = dev.memory_info() {
+                    current_vram = mem.free;
+                    has_gpu = true;
                 }
             }
         }

@@ -39,7 +39,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "dlls/*.dll": "."
+      "dlls/**/*": "dlls"
     }
   }
 }
