@@ -818,10 +818,11 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            // [STABILITY] Use persistent global CUDA device (Synchronous Singleton)
-            let persistent_dev = utils::get_cuda_device(config.gpu_id);
-            config.device = persistent_dev;
-            println!("🚀 [MODEL] Running in default mode ({})", config.name);
+            // 🌟 [CRITICAL FIX] VRAM 즉각 해제를 위해 전역 캐싱(Singleton) 디바이스 사용을 중단하고 매번 새 컨텍스트를 생성합니다.
+            // utils::get_cuda_device는 내부에 메모리 풀(Caching Allocator)을 영구 보존하므로 작업 관리자에서 VRAM이 떨어지지 않는 주범입니다.
+            let fresh_dev = candle_core::Device::new_cuda(config.gpu_id as usize).unwrap_or(candle_core::Device::Cpu);
+            config.device = fresh_dev;
+            println!("🚀 [MODEL] Running in default mode ({}) with Fresh CUDA Context", config.name);
         }
 
         let app_dir = crate::utils::get_app_dir();
