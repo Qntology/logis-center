@@ -113,9 +113,7 @@ pub struct Config {
     // MoE configuration
     pub num_local_experts: usize,
     pub num_experts_per_tok: usize,
-    pub position_embedding_type: String,
-    #[serde(default)]
-    pub use_fp4_kv: bool,
+    pub position_embedding_type: String
 }
 
 impl Config {
