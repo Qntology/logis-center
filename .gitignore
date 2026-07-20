@@ -14,7 +14,8 @@
 *.dll
 *.onnx
 dlls/
-
+dist_cuda/
+dist_rocm/
 aha-main/
 
 # Virtual Environment
