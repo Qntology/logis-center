@@ -1590,15 +1590,61 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
         }
     };
     
+    // 🌟 [추가] Stanza 모델 체크용 함수 추가
+    let has_valid_stanza = |dir: &std::path::PathBuf| -> bool {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            entries.flatten().any(|e| {
+                e.path().extension().map_or(false, |ext| ext == "onnx") && e.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000
+            })
+        } else {
+            false
+        }
+    };
+
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
     let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
+    let granite_dir = base_path.join("granite-4.0-h-350m");
     let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
 
-    Ok(serde_json::json!({
-        "Qwen3": has_valid_model(&qwen3_dir),
-        "Qwen3.5": has_valid_model(&qwen3_5_dir),
-        "Embedding": has_valid_model(&embed_dir)
-    }))
+    let mut status_map = serde_json::Map::new();
+    status_map.insert("Qwen3".to_string(), serde_json::json!(has_valid_model(&qwen3_dir)));
+    status_map.insert("Qwen3.5".to_string(), serde_json::json!(has_valid_model(&qwen3_5_dir)));
+    status_map.insert("Granite".to_string(), serde_json::json!(has_valid_model(&granite_dir)));
+    status_map.insert("Embedding".to_string(), serde_json::json!(has_valid_model(&embed_dir)));
+
+    let supported_stanza_langs = [
+        "korean", "english", "japanese", "chinese", "french", "german", "spanish", 
+        "italian", "portuguese", "dutch", "russian", "arabic", "thai", "hindi", 
+        "bengali", "greek", "hebrew", "vietnamese"
+    ];
+
+    for lang in supported_stanza_langs.iter() {
+        let lang_code = match *lang {
+            "korean" => "ko",
+            "english" => "en",
+            "japanese" => "ja",
+            "chinese" => "zh-hans",
+            "french" => "fr",
+            "german" => "de",
+            "spanish" => "es",
+            "italian" => "it",
+            "portuguese" => "pt",
+            "dutch" => "nl",
+            "russian" => "ru",
+            "arabic" => "ar",
+            "thai" => "th",
+            "hindi" => "hi",
+            "bengali" => "bn",
+            "greek" => "el",
+            "hebrew" => "he",
+            "vietnamese" => "vi",
+            _ => "en",
+        };
+        let stanza_dir = base_path.join(format!("stanza/{}", lang_code));
+        status_map.insert(format!("stanza_{}", lang), serde_json::json!(has_valid_stanza(&stanza_dir)));
+    }
+
+    Ok(serde_json::Value::Object(status_map))
 }
 
 #[tauri::command]
@@ -1619,11 +1665,39 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
     tokio::task::spawn(async move {
         let base_path = app_dir_clone.join("models");
 
-        let folder_name = match model_name.as_str() {
-            "Qwen3" => "Qwen3-0.6B-Instruct-gguf",
-            "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf",
-            "Embedding" => "granite-embedding-97m-multilingual-r2",
-            _ => "unknown"
+        // 🌟 [수정] stanza 다운로드 경로 동적 맵핑 (models/stanza/{lang} 구조 지원)
+        let folder_name = if model_name.starts_with("stanza_") {
+            let lang = model_name.replace("stanza_", "");
+            let lang_code = match lang.as_str() {
+                "korean" => "ko",
+                "english" => "en",
+                "japanese" => "ja",
+                "chinese" => "zh-hans",
+                "french" => "fr",
+                "german" => "de",
+                "spanish" => "es",
+                "italian" => "it",
+                "portuguese" => "pt",
+                "dutch" => "nl",
+                "russian" => "ru",
+                "arabic" => "ar",
+                "thai" => "th",
+                "hindi" => "hi",
+                "bengali" => "bn",
+                "greek" => "el",
+                "hebrew" => "he",
+                "vietnamese" => "vi",
+                _ => "en",
+            };
+            format!("stanza/{}", lang_code)
+        } else {
+            match model_name.as_str() {
+                "Qwen3" => "Qwen3-0.6B-Instruct-gguf".to_string(),
+                "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf".to_string(),
+                "Embedding" => "granite-embedding-97m-multilingual-r2".to_string(),
+                "Granite" => "granite-4.0-h-350m".to_string(),
+                _ => "unknown".to_string()
+            }
         };
 
         let dir_path = base_path.join(folder_name);
@@ -1632,19 +1706,54 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
             return;
         }
         
-        let files_to_download = match model_name.as_str() {
-            "Qwen3" => vec![
-                ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0.gguf")
-            ],
-            "Qwen3.5" => vec![
-                ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-BF16.gguf", "mmproj-BF16.gguf"),
-                ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf", "Qwen3.5-2B-Q8_0.gguf")
-            ],
-            "Embedding" => vec![
-                // 🌟 사용자님이 config.json 등 기타 환경 파일은 직접 준비하셨으므로 model.safetensors 단일 파일만 집중 다운로드합니다.
-                ("https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/model.safetensors", "model.safetensors")
-            ],
-            _ => vec![]
+        // 🌟 [수정] 문자열 타입(String)으로 변환하여 다국어 url을 생성할 수 있도록 확장
+        let files_to_download: Vec<(String, String)> = if model_name.starts_with("stanza_") {
+            let lang = model_name.replace("stanza_", "");
+            let lang_code = match lang.as_str() {
+                "korean" => "ko",
+                "english" => "en",
+                "japanese" => "ja",
+                "chinese" => "zh-hans",
+                "french" => "fr",
+                "german" => "de",
+                "spanish" => "es",
+                "italian" => "it",
+                "portuguese" => "pt",
+                "dutch" => "nl",
+                "russian" => "ru",
+                "arabic" => "ar",
+                "thai" => "th",
+                "hindi" => "hi",
+                "bengali" => "bn",
+                "greek" => "el",
+                "hebrew" => "he",
+                "vietnamese" => "vi",
+                _ => "en",
+            };
+            vec![
+                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/vocab.json", lang_code), "vocab.json".to_string()),
+                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/pos.onnx", lang_code), "pos.onnx".to_string()),
+                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/tokenizer.onnx", lang_code), "tokenizer.onnx".to_string()),
+                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/depparse.onnx", lang_code), "depparse.onnx".to_string()),
+                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/lemma.onnx", lang_code), "lemma.onnx".to_string()),
+            ]
+        } else {
+            match model_name.as_str() {
+                "Qwen3" => vec![
+                    ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf".to_string(), "Qwen3-0.6B-Q8_0.gguf".to_string())
+                ],
+                "Qwen3.5" => vec![
+                    ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-BF16.gguf".to_string(), "mmproj-BF16.gguf".to_string()),
+                    ("https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf".to_string(), "Qwen3.5-2B-Q8_0.gguf".to_string())
+                ],
+                "Embedding" => vec![
+                    ("https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
+                ],
+                "Granite" => vec![
+                    ("https://huggingface.co/ibm-granite/granite-4.0-h-350m/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
+                ],
+                _ => vec![]
+            }
         };
 
         let total_files = files_to_download.len();
@@ -1655,8 +1764,6 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
             let file_path = dir_path.join(filename);
             let tmp_path = dir_path.join(format!("{}.tmp", filename));
             
-            // 🌟 [CRITICAL FIX] safetensors 확장자도 최소 10MB 용량 검사를 통과해야 완료로 인정하도록 수정하여,
-            // 과거에 실패하여 생긴 껍데기 파일 때문에 다운로드가 중간에 완료 처리되는 헛바퀴 버그를 고쳤습니다.
             let min_size = if filename.ends_with(".gguf") || filename.ends_with(".safetensors") { 10_000_000 } else { 0 };
             if file_path.exists() && std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0) > min_size {
                 let percent = (((file_idx as f64 + 1.0) / total_files as f64) * 100.0) as u32;
@@ -1664,7 +1771,16 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 continue;
             }
 
-            match client.get(*url).send().await {
+            // 🌟 [추가] 다운로드 링크 터미널 로깅 및 UI 이벤트 발송
+            println!("[DOWNLOAD] 다운로드 시작: {} (URL: {})", filename, url);
+            let _ = app_handle.emit("download_progress", serde_json::json!({
+                "model": model_name,
+                "percent": 0,
+                "message": format!("다운로드 중: {} (URL: {})", filename, url)
+            }));
+
+            // 🌟 [수정] url이 &String 이므로 역참조(*) 없이 그대로 전달합니다.
+            match client.get(url).send().await {
                 Ok(res) => {
                     if !res.status().is_success() {
                         let _ = app_handle.emit("download_error", serde_json::json!({"model": model_name, "error": format!("HTTP {}", res.status())}));
@@ -1719,6 +1835,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
     Ok("Started".to_string())
 }
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

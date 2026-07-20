@@ -46,7 +46,14 @@ let isExtracting = false;
 
 // 🚀 모델 다운로드 관련 상태 관리 변수 추가
 let modelStatus: Record<string, boolean> = {};
-const TARGET_MODELS = ['Qwen3', 'Qwen3.5', 'Embedding'];
+const TARGET_MODELS = [
+    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite',
+    'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
+    'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
+    'stanza_portuguese', 'stanza_dutch', 'stanza_russian', 'stanza_arabic',
+    'stanza_thai', 'stanza_hindi', 'stanza_bengali', 'stanza_greek',
+    'stanza_hebrew', 'stanza_vietnamese'
+];
 let lastSearchedQuery = "";
 // 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
 let isBrowserRunning = false;
@@ -4347,6 +4354,13 @@ async function updateModelStatusUI() {
         const isDownloaded = modelStatus[m];
         const safeId = m.replace(/[\s\(\)]+/g, '-');
         
+        // 🌟 [추가] stanza_ prefix 변환 로직
+        let displayName = m;
+        if (m.startsWith('stanza_')) {
+            const lang = m.replace('stanza_', '');
+            displayName = `Stanza ${lang.charAt(0).toUpperCase() + lang.slice(1)}`;
+        }
+        
         const row = document.createElement("div");
         row.style.display = "flex";
         row.style.flexDirection = "column";
@@ -4361,7 +4375,8 @@ async function updateModelStatusUI() {
         topRow.style.alignItems = "center";
 
         const nameSpan = document.createElement("span");
-        nameSpan.innerText = m;
+        // 🌟 [수정] 모델명 뒤에 / apache 2.0 고정 노출
+        nameSpan.innerText = `${displayName} / apache 2.0`;
         nameSpan.style.fontSize = "0.75rem";
         nameSpan.style.fontWeight = "bold";
 

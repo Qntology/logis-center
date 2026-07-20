@@ -364,11 +364,11 @@ tr:hover { background: rgba(0,0,0,0.05); }
 [data-tab="settings"]{font-family: 'Noto Color Emoji' !important;}
 [data-tab="settings"][class*="active-spinner-mode"]{font-family:monospace; }
 
+#list-view{position: relative; height: 100%;}
 
 .chat-container, .list-container {
     position: relative;
     height: 100%;
-    overflow: hidden; 
 }
 
 .chat-scroll, .list-scroll {

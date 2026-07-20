@@ -59,7 +59,7 @@
                  </div>
                </div>
 
-               <div id="list-scroll-container" class="list-container" style="height: 450px; overflow: hidden; padding: 0 10px; position: relative;">
+               <div id="list-scroll-container" class="list-container" style="padding: 0 10px; position: relative;">
                  <div id="list-scroll" class="list-scroll">
                     <div id="list-pull-top" class="chat-pull-loader">
                         <span class="spinner"></span> sync updates...
@@ -86,6 +86,11 @@
                                 <input type="checkbox" id="cloud-mode-toggle" style="cursor: pointer;" disabled title="Login required to use Cloud AI" />
                             </div>
                             
+                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 8px;">
+                                <button id="btn-logout" class="primary-btn" style="width: 100%;">Sign Out</button>
+                                <button id="btn-reset-db" class="primary-btn" style="width: 100%; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);">Initialize Local DB</button>
+                            </div>
+                            
                             <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1);">
                                 <h3 style="font-size: 0.8rem; margin-bottom: 5px; color: #333;">Model Download</h3>
                                 <p style="font-size: 0.7rem; color: #666; margin-bottom: 10px;">Download required AI models for offline processing.</p>
@@ -94,10 +99,75 @@
                                 <div id="model-list-container" style="display: flex; flex-direction: column; gap: 8px;"></div>
                             </div>
 
-                            <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1); display: flex; flex-direction: column; gap: 8px;">
-                                <button id="btn-logout" class="primary-btn" style="width: 100%;">Sign Out</button>
-                                <button id="btn-reset-db" class="primary-btn" style="width: 100%; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3);">Initialize Local DB</button>
+                            <div id="license" style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed rgba(0,0,0,0.1);">
+                                <h3 style="font-size: 0.8rem; margin-bottom: 5px; color: #333;">Open Source Licenses</h3>
+                                <ul style="font-size: 0.65rem; color: #666; max-height: 150px; overflow-y: auto; padding-left: 20px; background: rgba(0,0,0,0.02); border-radius: 4px; padding-top: 8px; padding-bottom: 8px; margin-bottom: 0;">
+                                    <li>ahash <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>anyhow <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>arrow-array <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>arrow-schema <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>base64 <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>boa_engine <span style="color: #999; font-size: 0.9em;">(Unlicense OR MIT)</span></li>
+                                    <li>candle-core <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>candle-flash-attn <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>candle-nn <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>candle-transformers <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>chrono <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>chromiumoxide <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>direct-storage <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>dirs <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>drag <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>ego-tree <span style="color: #999; font-size: 0.9em;">(ISC OR MIT)</span></li>
+                                    <li>encoding_rs <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>ethers-core <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>ethers-signers <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>fantoccini <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>flate2 <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>futures <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>half <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>image <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>io-uring <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>lancedb <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>libc <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>memmap2 <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>metal <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>mimalloc <span style="color: #999; font-size: 0.9em;">(MIT)</span></li>
+                                    <li>minijinja <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>ndarray <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>num <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>nvml-wrapper <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>once_cell <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>onnxruntime <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>rand <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>rand_chacha <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>rayon <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>rcgen <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>regex <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>reqwest <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>safetensors <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>scraper <span style="color: #999; font-size: 0.9em;">(ISC)</span></li>
+                                    <li>serde <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>serde_json <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>sysinfo <span style="color: #999; font-size: 0.9em;">(MIT)</span></li>
+                                    <li>tauri <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tauri-build <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tauri-plugin-dialog <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tauri-plugin-fs <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tauri-plugin-opener <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tauri-plugin-shell <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>tokenizers <span style="color: #999; font-size: 0.9em;">(Apache-2.0)</span></li>
+                                    <li>tokio <span style="color: #999; font-size: 0.9em;">(MIT)</span></li>
+                                    <li>url <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>uuid <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>webrtc <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>whatlang <span style="color: #999; font-size: 0.9em;">(MIT)</span></li>
+                                    <li>which <span style="color: #999; font-size: 0.9em;">(MIT)</span></li>
+                                    <li>windows <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                    <li>windows-sys <span style="color: #999; font-size: 0.9em;">(MIT OR Apache-2.0)</span></li>
+                                </ul>
                             </div>
+
+                        </div>
 
                         </div>
 
