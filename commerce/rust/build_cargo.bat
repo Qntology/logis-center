@@ -11,7 +11,8 @@ cd src-tauri
 
 set "PATH=%CD%\dlls;%PATH%"
 
-echo [DEV] Starting Tauri application (Development Mode)...
+echo [BUILD] Compiling and bundling Tauri application (Release and UTF-8 Mode)...
 
-:: build 대신 dev 명령어를 사용하여 디버깅 모드로 앱을 실행합니다.
-cargo tauri dev -- --features cuda
+:: cargo build 대신 cargo tauri build를 사용하여 .msi 번들링까지 수행합니다.
+:: 기존 컴파일 캐시를 재사용하기 위해 -- --features cuda 옵션을 그대로 유지합니다.
+cargo tauri build -- --features cuda
