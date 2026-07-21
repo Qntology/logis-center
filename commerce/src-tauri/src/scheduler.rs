@@ -300,8 +300,57 @@ pub struct StanzaPipeline {
 // (로컬 라이브러리 onnxruntime crate 자체에 Send/Sync를 구현하였으므로 더 이상 unsafe 래퍼가 필요 없습니다!)
 
 impl StanzaPipeline {
-    pub fn new<P: AsRef<Path>>(base_dir: P, lang: &str) -> anyhow::Result<Self> {
+    /// Stanza 파이프라인에 필요한 필수 모델 파일들의 존재 여부를 체크하고,
+    /// 디렉터리나 파일이 없을 경우 원격 서버에서 자동으로 다운로드합니다.
+    pub async fn ensure_models_downloaded<P: AsRef<Path>>(lang_dir: P, lang: &str) -> anyhow::Result<()> {
+        let dir = lang_dir.as_ref();
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("Stanza 모델 디렉터리 생성 실패 {:?}: {}", dir, e))?;
+        }
+
+        let required_files = [
+            "vocab.json",
+            "tokenizer.onnx",
+            "pos.onnx",
+            "lemma.onnx",
+        ];
+
+        // Stanza ONNX 모델 파일 저장 원격 Base URL
+        let remote_base_url = format!("https://huggingface.co/stanfordnlp/stanza-{}/resolve/main/onnx", lang);
+
+        for file_name in required_files.iter() {
+            let file_path = dir.join(file_name);
+            if !file_path.exists() {
+                println!("[STANZA] 필수 모델 파일이 존재하지 않습니다: {:?}. 다운로드를 시작합니다...", file_path);
+                let download_url = format!("{}/{}", remote_base_url, file_name);
+
+                let response = reqwest::get(&download_url).await
+                    .map_err(|e| anyhow::anyhow!("{} 다운로드 요청 실패: {}", file_name, e))?;
+
+                if !response.status().is_success() {
+                    return Err(anyhow::anyhow!("{} 다운로드 실패 (HTTP 상태 코드: {})", file_name, response.status()));
+                }
+
+                let bytes = response.bytes().await
+                    .map_err(|e| anyhow::anyhow!("{} 응답 데이터 읽기 실패: {}", file_name, e))?;
+
+                std::fs::write(&file_path, &bytes)
+                    .map_err(|e| anyhow::anyhow!("{} 파일 저장 실패 ({:?}): {}", file_name, file_path, e))?;
+
+                println!("[STANZA] ✅ 다운로드 완료: {:?}", file_path);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn new<P: AsRef<Path>>(base_dir: P, lang: &str) -> anyhow::Result<Self> {
         let lang_dir = base_dir.as_ref().join(lang);
+
+        // 🌟 [자동 다운로드 검사] 세션 생성 전 필요한 모델 파일 존재 여부 검사 및 다운로드 실행
+        Self::ensure_models_downloaded(&lang_dir, lang).await?;
+
         let vocab_path = lang_dir.join("vocab.json");
         let tokenize_path = lang_dir.join("tokenizer.onnx");
         let pos_path = lang_dir.join("pos.onnx");
