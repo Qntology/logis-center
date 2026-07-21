@@ -1747,13 +1747,11 @@ impl LogisModel {
             let base_dir_clone = stanza_base_dir.clone();
             let lang_code_clone = stanza_lang_code.to_string();
             
-            let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<UnsafePipelineWrapper>>();
-            std::thread::spawn(move || {
-                let res = crate::scheduler::StanzaPipeline::new(base_dir_clone, &lang_code_clone).map(UnsafePipelineWrapper);
-                let _ = tx.send(res);
-            });
-            
-            let pipeline_res = rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("OS 스레드 통신 채널이 끊어졌습니다.")));
+            // StanzaPipeline::new는 async 함수이므로 await를 호출하여 결과를 기다려야 합니다.
+            // 불필요한 OS 스레드 생성(std::thread::spawn) 및 채널을 제거하고, 현재의 비동기 런타임에서 직접 처리합니다.
+            let pipeline_res = crate::scheduler::StanzaPipeline::new(base_dir_clone, &lang_code_clone)
+                .await
+                .map(UnsafePipelineWrapper);
 
             match pipeline_res {
                 Ok(wrapper) => {
