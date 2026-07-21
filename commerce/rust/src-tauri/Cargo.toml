@@ -1,7 +1,7 @@
 [package]
 name = "rust"
 version = "0.1.0"
-description = "A Tauri App"
+description = "logis.center"
 authors = ["che"]
 edition = "2021"
 

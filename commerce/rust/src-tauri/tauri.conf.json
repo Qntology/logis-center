@@ -1,8 +1,8 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
+  "$schema": "https://schema.logis.center/config/2",
+  "productName": "logis.center",
   "version": "0.1.0",
-  "identifier": "com.hp.tauri-app",
+  "identifier": "app.logis.center",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "tauri-app",
+        "title": "logis.center",
         "width": 380,
         "height": 80,
         "decorations": false,
@@ -39,7 +39,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "dlls/**/*": "dlls"
+      "dlls/*": "."
     }
   }
 }
