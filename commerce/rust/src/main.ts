@@ -54,13 +54,15 @@ const TARGET_MODELS = [
     'stanza_thai', 'stanza_hindi', 'stanza_bengali', 'stanza_greek',
     'stanza_hebrew', 'stanza_vietnamese'
 ];
-let lastSearchedQuery = "";
+export let lastSearchedQuery = "";
 // 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
 let isBrowserRunning = false;
 let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
-import "./dexie.min.js";
+if (!(window as any).Dexie) {
+    console.error("🚨 [ERROR] Dexie library is missing! public 폴더 안의 파일들은 반드시 절대경로(/)로 불러와야 합니다.");
+}
 const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
