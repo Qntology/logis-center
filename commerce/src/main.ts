@@ -4799,7 +4799,11 @@ async function initDevicePreference() {
 
     // 1. Check GPU Availability
     try {
-        const hasGpu = await invoke<boolean>("check_gpu_availability");
+        const gpuInfo = await invoke<any>("check_gpu_availability");
+        // 호환성을 위해 boolean이 반환될 경우와 객체가 반환될 경우를 모두 처리
+        const hasGpu = typeof gpuInfo === "boolean" ? gpuInfo : gpuInfo.has_gpu;
+        const vendor = typeof gpuInfo === "object" ? gpuInfo.vendor : "none";
+
         if (!hasGpu) {
             forceCpuToggle.disabled = true;
             forceCpuToggle.checked = true;
@@ -4810,6 +4814,25 @@ async function initDevicePreference() {
             const savedPrefStr = await kvGet("force_cpu_mode");
             const savedPref = savedPrefStr === "true";
             forceCpuToggle.checked = savedPref;
+        }
+
+        // 🌟 [추가] GPU 라이선스 표기 제어 로직 (NVIDIA, AMD에 따라 표시 전환)
+        const cudaLicense = document.getElementById("cuda-license");
+        const rocmLicense = document.getElementById("rocm-license");
+        const gpuLicenseContainer = document.getElementById("gpu-license-container");
+
+        if (cudaLicense && rocmLicense && gpuLicenseContainer) {
+            if (vendor === "nvidia") {
+                cudaLicense.style.display = "block";
+                rocmLicense.style.display = "none";
+                gpuLicenseContainer.style.display = "block";
+            } else if (vendor === "amd") {
+                cudaLicense.style.display = "none";
+                rocmLicense.style.display = "block";
+                gpuLicenseContainer.style.display = "block";
+            } else {
+                gpuLicenseContainer.style.display = "none";
+            }
         }
     } catch (e) {
         console.error("[WIDGET] Failed to check GPU status:", e);

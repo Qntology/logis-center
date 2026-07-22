@@ -1553,9 +1553,31 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
 }
 
 #[tauri::command]
-async fn check_gpu_availability() -> bool {
+async fn check_gpu_availability() -> serde_json::Value {
     let config = crate::utils::get_optimal_device_config();
-    !config.is_cpu
+    let mut vendor = "none";
+
+    if !config.is_cpu {
+        vendor = "amd"; // 기본적으로 CPU가 아니면 AMD(ROCm)로 가정
+
+        // NVIDIA GPU 여부 판별 (nvml-wrapper 사용)
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            if nvml_wrapper::Nvml::init().is_ok() {
+                vendor = "nvidia";
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            vendor = "apple";
+        }
+    }
+
+    serde_json::json!({
+        "has_gpu": !config.is_cpu,
+        "vendor": vendor
+    })
 }
 
 #[tauri::command]

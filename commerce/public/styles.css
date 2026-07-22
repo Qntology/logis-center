@@ -305,10 +305,12 @@ body {
 
 /* Inner Layouts */
 .header-row {
+  position: relative; z-index: 1;
   display: flex;
   justify-content: space-between;
   align-items: center;
   border-bottom: 1px solid var(--glass-border);
+  background-color: #fff;
 }
 .header-row>div{margin: 0 0.5rem;}
 
@@ -347,7 +349,8 @@ button.primary-btn {
   border-radius: 12px;
 }
 
-.tab-content { display: none; height: 100%; overflow-y: auto; }
+#settings-panel{overflow: hidden; overflow-y: scroll; position: absolute; left: 0; top: 0; right: 0; height: calc(100% - 50px);}
+.tab-content { display: none; height: 100%; overflow-y: hidden; }
 .tab-content.active { display: block; }
 
 /* Custom Scrollbar */
@@ -399,6 +402,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     flex-shrink: 0;
     opacity: 0;
     transition: opacity 0.2s;
+    pointer-events: none;
 }
 
 #chat-pull-top, #list-pull-top {
