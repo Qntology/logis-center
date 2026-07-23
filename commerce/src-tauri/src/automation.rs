@@ -617,6 +617,15 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
                         
                         const clone = document.documentElement.cloneNode(true);
                         
+                        document.querySelectorAll('iframe').forEach(iframe => {
+                            try {
+                                if (iframe.contentDocument && iframe.contentDocument.documentElement) {
+                                    const iframeClone = iframe.contentDocument.documentElement.cloneNode(true);
+                                    clone.appendChild(iframeClone);
+                                }
+                            } catch(e) {}
+                        });
+
                         document.querySelectorAll('[data-logis-original-style]').forEach(el => {
                             const original = el.getAttribute('data-logis-original-style');
                             if (original) {

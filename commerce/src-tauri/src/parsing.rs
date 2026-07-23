@@ -43,7 +43,7 @@ pub fn sanitize_llm_input(text: &str) -> String {
 
 pub fn pre_clean_html(html: &str) -> String {
     // 1. 주석 제거
-    let re_comm = Regex::new(r"(?s)").unwrap();
+    let re_comm = Regex::new(r"(?s)<!--.*?-->").unwrap();
     let html = re_comm.replace_all(html, "");
 
     // 2. 불필요한 태그 및 내부 콘텐츠 통째로 제거
