@@ -4439,7 +4439,9 @@ pub fn get_boa_js_template() -> &'static str {
             return null;
         }
 
-        let matches = [];
+        let bestResult = { "parent": "body", "itemSelector": "div", "matchCount": 0 };
+        let firstMatchD = null;
+        
         for (let i = 0; i < titles.length; i++) {
             let t = titles[i].toLowerCase().replace(/\s+/g, ' ');
             let potentialMatches = [];
@@ -4467,17 +4469,23 @@ pub fn get_boa_js_template() -> &'static str {
             if (potentialMatches.length > 0) {
                 // 부모 노드(body, tr 등)를 배제하고, 텍스트 길이가 가장 짧은(가장 타이트한) 진짜 제목 단일 노드만 추출합니다.
                 potentialMatches.sort((a, b) => a.text.length - b.text.length);
-                matches = [potentialMatches[0]];
-                break;
+                let d = detect(potentialMatches[0].index);
+                if (d) {
+                    if (!firstMatchD) firstMatchD = d;
+                    // 형제 노드가 가장 많은(리스트에 가장 가까운) 결과를 최우선으로 저장
+                    if (d.matchCount > bestResult.matchCount) {
+                        bestResult = { "parent": d.parent, "itemSelector": d.itemSelector, "matchCount": d.matchCount };
+                    }
+                }
             }
         }
         
-        let res = { "parent": "body", "itemSelector": "div", "matchCount": matches.length };
-        if (matches.length > 0) {
-            const d = detect(matches[0].index);
-            if (d) { res.parent = d.parent; res.itemSelector = d.itemSelector; }
+        // 반복 구조(matchCount > 0)를 하나도 못 찾았다면 첫 번째로 찾은 구조라도 사용
+        if (bestResult.matchCount === 0 && firstMatchD) {
+            bestResult = { "parent": firstMatchD.parent, "itemSelector": firstMatchD.itemSelector, "matchCount": firstMatchD.matchCount };
         }
-        JSON.stringify(res);
+        
+        JSON.stringify(bestResult);
     "##
 }
 
