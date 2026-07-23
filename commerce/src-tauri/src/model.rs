@@ -1543,7 +1543,7 @@ impl LogisModel {
         // Smart Resize for VRAM stability
         let master_img = full_img_raw.resize(1024, u32::MAX, image::imageops::FilterType::Triangle);
         
-        let prompt = get_image_extraction_prompt("kr", "korean", "tracking", "");
+        let prompt = crate::prompts::get_image_extraction_prompt("kr", "korean", "tracking", "");
         
         let response = self.run_inference_with_spinner(
             "You are a highly precise document data extraction assistant.", // 🌟 System 주입
@@ -1741,7 +1741,7 @@ impl LogisModel {
         if stanza_lang_dir.exists() {
             emit_term(&format!("[STANZA] 🧠 Loading Stanza ONNX models for Search Query ('{}')...", stanza_lang_code));
             
-            struct UnsafePipelineWrapper(crate::scheduler::StanzaPipeline);
+            struct UnsafePipelineWrapper(crate::stanza::StanzaPipeline);
             unsafe impl Send for UnsafePipelineWrapper {}
             
             let base_dir_clone = stanza_base_dir.clone();
@@ -1749,7 +1749,7 @@ impl LogisModel {
             
             // StanzaPipeline::new는 async 함수이므로 await를 호출하여 결과를 기다려야 합니다.
             // 불필요한 OS 스레드 생성(std::thread::spawn) 및 채널을 제거하고, 현재의 비동기 런타임에서 직접 처리합니다.
-            let pipeline_res = crate::scheduler::StanzaPipeline::new(base_dir_clone, &lang_code_clone)
+            let pipeline_res = crate::stanza::StanzaPipeline::new(base_dir_clone, &lang_code_clone)
                 .await
                 .map(UnsafePipelineWrapper);
 
@@ -3215,29 +3215,6 @@ impl LogisModel {
 //   "conditions.incoterms_code": { "desc": "Incoterms (FOB, CIF)", "type": "String" }
 // }"###.to_string()
 //     }
-}
-
-pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
-    if page_type == "tracking" {
-        let template = r###"[TASK]
-Convert the shipping label image to fit the structured JSON format. 
-
-[CONTEXT]
-Region: {REGION}
-Recipient Address: {ADDRESS}
-Current Language: {LANGUAGE}
-
-[INSTRUCTION]
-1. Extract the tracking_number. It should be selected from numbers matching barcodes or QR codes, filtered by region, excluding telephone formats or order numbers.
-2. Set recipient_match to true if the label address matches the context address (ignoring floor levels).
-3. Extract all visible barcodes into an array.
-
-[OUTPUT FORMAT]
-{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }"###;
-        template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
-    } else {
-        String::new()
-    }
 }
 
 fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {

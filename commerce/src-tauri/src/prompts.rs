@@ -1,0 +1,609 @@
+pub fn page_type_prompt() -> String { 
+    r###"[TASK]
+Based on the provided Pug template, identify the primary category of this webpage and its main language.
+
+[SCHEMA DEFINITIONS]
+- type: The main category. Must be one of:
+  - "order": Order list, Order history, Order details, Checkout success.
+  - "goods": Product list, product detail.
+  - "tracking": Shipment tracking status, delivery history.
+  - "review": Product reviews, feedback list.
+  - "coupon": Coupon list, discount events.
+  - "event": Promotion pages, event announcements.
+  - "": If none of the above match.
+- language: ISO 639-1 language code.
+
+[OUTPUT FORMAT]
+{
+    "type": "String",
+    "language": "String"
+}"###.to_string() 
+}
+
+pub fn extract_titles_prompt(page_type: &str) -> String {
+    let (category_desc, titles_desc, title_desc) = match page_type {
+        "goods" => ("product", "product titles", "product title"),
+        "order" => ("product", "order product titles", "order product title"),
+        "tracking" => ("product", "tracking product titles", "tracking product title"),
+        "review" => ("title", "review titles", "review title"),
+        "coupon" => ("title", "coupon titles", "coupon title"),
+        "event" => ("title", "event titles", "event title"),
+        _ => ("title", "titles", "title"),
+    };
+
+    let template = r###"[TASK]
+Find all the {TITLES} from the following PUG/HTML content.
+
+[SCHEMA DEFINITIONS]
+{ 
+  {CATEGORY} : ["{TITLE}"]
+}
+
+[OUTPUT FORMAT]
+{ {CATEGORY} : [...] }
+
+RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{CATEGORY}", category_desc)
+            .replace("{TITLES}", titles_desc)
+            .replace("{TITLE}", title_desc)
+            .replace("{TYPE}", page_type)
+}
+
+pub fn get_trade_doc_classification_prompt() -> String {
+    r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
+Return JSON exactly like: {"doc_type": "BL"}
+NO EXPLANATION."###.to_string()
+}
+
+pub fn get_trade_category_schema(category: &str, _doc_type: &str) -> String {
+    let schema = match category {
+        "header" => r#"{
+  "document_type": "CLASSIFIED TYPE {String}",
+  "document_number": "Primary Identifier (B/L No, Invoice No) {String}",
+  "issue_date": "Date of Creation (YYYY-MM-DD) {String}",
+  "reference_number": "Export Ref, Booking No, PO No {String}"
+}"#,
+        "parties" => r#"{
+  "supplier_name": "Shipper, Seller, Exporter {String}",
+  "supplier_address": "Address of Supplier {String}",
+  "buyer_name": "Consignee, Buyer, Importer {String}",
+  "buyer_address": "Address of Buyer {String}",
+  "notify_party_name": "Notify Party Name {String}"
+}"#,
+        "logistics" => r#"{
+  "vehicle_name": "Vessel Name, Flight No {String}",
+  "voyage_number": "Voyage No {String}",
+  "location_port_of_loading": "POL, Airport of Departure {String}",
+  "location_port_of_discharge": "POD, Airport of Destination {String}"
+}"#,
+        "conditions" => r#"{
+  "incoterms_code": "FOB, CIF, EXW, DDP {String}",
+  "freight_payment_term": "Freight Prepaid, Freight Collect {String}"
+}"#,
+        "financials" => r#"{
+  "currency_code": "Currency Symbol (USD, EUR) {String}",
+  "amount_total": "Grand Total Amount {Number}"
+}"#,
+        "cargo" => r#"{
+  "package_count": "Total Quantity (NOT Money) {Number}",
+  "weight_gross": "Total Gross Weight {Number}",
+  "volume_measurement": "Total Volume (CBM) {Number}",
+  "marks_and_numbers": "Marks & Nos {String}"
+}"#,
+        "items" => r#"[ {
+  "description": "Description of Goods {String}",
+  "quantity": "Line Item Quantity {Number}",
+  "hs_code": "HS Code / Tariff No {String}"
+} ]"#,
+        "containers" => r#"[ {
+  "container_number": "Container No (4 char + 7 digit) {String}",
+  "seal_number": "Seal No {String}",
+  "type_description": "Type (20GP, 40HC) {String}"
+} ]"#,
+        _ => "{}"
+    };
+
+    format!("RULES: Follow comments strictly. Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{}", category.to_uppercase(), schema)
+}
+
+pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+    let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
+Extract the logistics filters from the natural language query into the JSON format.
+
+[SCHEMA DEFINITION]
+Extract the following tracking/trade properties if semantically present in the text:
+- "no": Tracking number, B/L number, Invoice number.
+- "status": Shipping status (draft, progress, return, complete, error).
+- "vessel": Vessel name, Flight No, or Carrier.
+- "pol": Port of Loading, Origin, Departure point.
+- "pod": Port of Discharge, Destination, Arrival point.
+- "sender_name": Shipper, Seller, or Exporter name.
+- "recipient_name": Consignee, Buyer, or Importer name.
+- "incoterms": Incoterms (e.g., FOB, CIF, EXW).
+- "weight": Cargo or gross weight.
+- "amount": Total financial amount or price.
+
+[TRANSFORMATION LOGIC]
+For EVERY extracted field, wrap it in an operator object:
+{ "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
+- Use "contains" for text fields, names, ports, vessels.
+- Use "eq" for strict identifiers or status.
+
+[QUERY]
+{QUERY}
+
+[OUTPUT FORMAT]
+{ "<property_name>": { "operator": "...", "value": "..." } }
+JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
+}
+
+pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
+    if page_type == "tracking" || page_type == "goods" {
+        let template = r###"[TASK]
+Convert the image to fit the structured JSON format. 
+
+[CONTEXT]
+Region: {REGION}
+Recipient Address: {ADDRESS}
+Current Language: {LANGUAGE}
+
+[INSTRUCTION]
+1. Extract the tracking_number or document number.
+2. Set recipient_match to true if the label address matches the context address.
+3. Extract all visible barcodes into an array.
+
+[OUTPUT FORMAT]
+{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }"###;
+        template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
+    } else {
+        String::new()
+    }
+}
+
+pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_content: &str, reference_row: &str) -> String {
+    let template = r###"[PUG CONTENT]
+{PUG_CONTENT}
+
+[Reference: Row Structure]
+{REFERENCE_ROW}
+
+[Instruction]
+Locate the main table wrapper, its body container, and its corresponding header container within the [PUG CONTENT].
+
+[Rules]
+1. Tag Agnostic: Do NOT assume traditional <table> tags. The structure could be built using <div>, <ul>/<li>, or other semantic tags. Analyze logically.
+2. Fill out the `table` selector FIRST to logically establish the common parent wrapper that encompasses both the header (thead) and the items (tbody).
+3. The `tbody` selector is exactly "{ITEM_SELECTOR}". Return it as provided.
+4. Provide the final exact CSS selector for the `thead` based on your analysis within that table wrapper.
+
+[Expected Output Format]
+{
+  "{TYPE}" : {
+    "tbody" : {
+      "selector" : "{ITEM_SELECTOR}"
+    },
+    "table" : {
+        "selector" : "..."
+    },
+    "thead" : {
+      "selector" : "..."
+    }
+  }
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{ITEM_SELECTOR}", item_selector)
+            .replace("{PUG_CONTENT}", pug_content)
+            .replace("{REFERENCE_ROW}", reference_row)
+}
+
+pub fn analytic_report_prompt() -> String {
+    r###"[TASK]
+You are a User Behavior Analysis Expert. Interpret raw HTML interactions to understand the user's specific intent and analyze the selection context within a list or a group of items.
+
+Analyze the parallel arrays of 'Clicked HTML' (the selected element) and 'Related HTML' (the surrounding structure).
+If 'Previous Analysis' is provided, use it to infer the user's behavioral flow and connect past actions with the current click.
+
+[ANALYSIS GUIDELINES & CHAIN OF THOUGHT]
+Fill out the JSON keys in the exact order specified below. Use 'analysis_*' keys to logically establish the context before finalizing the outputs.
+
+1. analysis_target: Identify the primary entity name and its key attributes from the Clicked HTML.
+2. analysis_surroundings: Identify the neighboring items or alternatives displayed in the Related HTML that were NOT selected.
+3. action: Determine the specific user intent for clicking the item. Must explicitly include the primary entity name and key attributes. Output as a short verb phrase.
+4. relate: Summarize the surrounding unselected items to capture the context of the choice. Do not summarize the clicked item itself in this field.
+5. summary: Provide a detailed explanation of what the user aimed to accomplish on this page. Must explicitly reference the extracted primary entity and its key attributes.
+
+[OUTPUT FORMAT]
+{
+    "actions": {
+        "https://hostname.com/pathname?search=parameter": {
+            "records": [
+                {
+                    "id": "...",
+                    "analysis_target": "...",
+                    "analysis_surroundings": "...",
+                    "relate": [...],
+                    "action": "..."
+                }
+            ],
+            "summary": "..."
+        }
+    },
+    "cross_action_flow": "...",
+    "intent_evolution": "...",
+    "consistent_preferences": "..."
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+}
+
+pub fn is_detail_prompt(page_type: &str, title: &str, lang: &str) -> String {
+    let (list_hints, form_hints) = crate::parsing::get_layout_prompt_hints(page_type, lang);
+
+    let template = r###"[TASK]
+Analyze the provided PUG/HTML content from top to bottom.
+
+[ENTITY CONTEXT: {TYPE}]
+Language Context: {LANGUAGE}
+You are evaluating a page managing this specific domain entity. Use this context to conceptually understand the abstract structures:
+- has_form: A property configuration interface. It features a large overarching form dedicated to inputting or updating the specific attributes of ONE primary entity.{FORM_HINTS}
+- has_list: A catalog or inventory interface dedicated to displaying, filtering, or batch-processing multiple DIFFERENT primary entities.{LIST_HINTS}
+
+[FORCED DOCUMENT SCANNING LOGIC]
+Read the entire document from top to bottom, applying the following strict filters and evaluations:
+
+1. IGNORE:
+   - Strictly ignore global navigation, menus, headers, footers, aside, search, filter.
+2. TARGET:
+   - Focus purely on the main data payload where "{TYPE}", or actual items are listed.
+3. EVALUATE:
+   - You MUST evaluate the concluding elements at the very bottom of the main content area first. Check for the following:
+     A. Does the page terminate with dataset navigation (pagination, "next/prev") or bulk-action execution elements?
+     B. Does the main data area consist of a repeating multi-entity grid?
+     C. Does the main data area contain an extensive configuration/input form (inputs, textareas, image uploads, save buttons) for a single entity?
+
+[SCHEMA DEFINITIONS]
+- {TYPE}:
+    - has_header: Boolean. True if the document contains a header.
+    - title: String. Default '{TITLE}'.
+    - has_footer: Boolean. True if the document contains a footer.
+    - language: String. Default '{LANGUAGE}'.
+    - has_list: Boolean. True if the document contains a multi-entity grid, OR if the bottom of main content area has dataset navigation/bulk controls.
+    - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
+
+[OUTPUT FORMAT]
+{
+  "{TYPE}": {
+    "has_header": Boolean,
+    "title": String,
+    "has_footer": Boolean,
+    "language": String,
+    "has_list": Boolean,
+    "has_form": Boolean
+  }
+}
+
+JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+    
+    template.replace("{TYPE}", page_type)
+        .replace("{TITLE}", title)
+        .replace("{LANGUAGE}", lang)
+        .replace("{FORM_HINTS}", &form_hints)
+        .replace("{LIST_HINTS}", &list_hints)
+}
+
+pub fn para2graph(language: &str) -> String {
+    let template = r###"Translate and convert the given natural language search query into English, then segment it into the specified JSON dataset structure.
+
+[DOCUMENT SCANNING & STRICT SEGMENTATION LOGIC]
+1. EXACT COPY: Copy the full original input into 'original_text' without changing anything.
+2. TRANSLATE & TAGGED PIPE PLANNING: Translate the query into English. In the 'segmented_plan' field, prefix every translated segment with its assigned type tag in brackets, separated by pipes ('|'). Structure it strictly as '[tag1] english chunk1 | [tag2] english chunk2'.
+3. MAXIMAL GROUPING: Group all contiguous words belonging to the same type into a SINGLE English segment. DO NOT split subjects from their numeric conditions. Break the segment ONLY when the type logically shifts.
+4. STRICT ARRAY MAPPING: For EVERY tagged English segment in 'segmented_plan', create exactly one object in the 'context' array sequentially.
+
+[SCHEMA DEFINITIONS]
+- original_text: String. The exact, unaltered full natural language input.
+- segmented_plan: String. Translated English text with '[type] english text | ' format inserted strictly at type boundaries.
+- context:
+  - 'text': String. The translated English chunk.
+  - 'language': String. Default '{LANG}'.
+  - 'type': String. Choose one:
+    * 'order': Intent to measure sales performance or direct transactions. Triggers: conversion rate, sales volume, checkout, payment, cancellation, refund. (RULE: If the context measures buying success or revenue, classify as 'order' even if the word 'product' or 'item' is present).
+    * 'goods': Intent to describe product catalog data, exposure, or traffic metrics. Triggers: page views, clicks, physical attributes, stock limits, unit prices. (RULE: Focuses on item specifications and customer traffic before the actual purchase).
+    * 'tracking': Intent to manage logistics and fulfillment. Triggers: shipment status, dispatch, delivery duration, courier information.
+    * 'review': Intent to analyze the voice of the customer. Triggers: feedback, ratings, reviews, CS messages, complaints.
+    * 'coupon': Intent to manage specific discount vouchers. Triggers: coupon codes, issuance limits, discount amounts applied via coupons.
+    * 'event': Intent to manage marketing campaigns or analyze broad operational trends. Triggers: promotions, exhibitions, seasonal sales, overarching managerial analysis requests.
+    * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "original_text": "String",
+  "segmented_plan": "String",
+  "context": [...]
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+    template.replace("{LANG}", language)
+}
+
+pub fn extract_time_intent_prompt(text: &str, time_context: &str) -> String {
+    let time_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("time_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec!["today".to_string(), "yesterday".to_string(), "this_month".to_string(), "last_month".to_string(), "this_year".to_string(), "last_year".to_string(), "recently".to_string()]);
+
+    let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact relative time intent based on the Current Time Context.
+You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[AVAILABLE TIME INTENTS]
+{TIME_ARRAY}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[OUTPUT FORMAT]
+{
+  "time_intent": "String or null"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TIME_CONTEXT}", time_context)
+            .replace("{TIME_ARRAY}", &time_arr_str)
+            .replace("{TEXT}", text)
+}
+
+pub fn extract_season_intent_prompt(text: &str) -> String {
+    let season_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("season_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
+
+    let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact seasonal intent.
+You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+
+[AVAILABLE SEASON INTENTS]
+{SEASON_ARRAY}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[OUTPUT FORMAT]
+{
+  "season_intent": "String or null"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{SEASON_ARRAY}", &season_arr_str)
+            .replace("{TEXT}", text)
+}
+
+pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str) -> String {
+    let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(vector_guide, lang);
+    
+    let final_time_context = if !deterministic_time.is_empty() {
+        format!("{}\n{}", time_context, deterministic_time)
+    } else {
+        time_context.to_string()
+    };
+
+    let template = r###"[Task]
+Act as a deterministic semantic parser.
+You must extract, transform, and normalize numeric and property conditions from the natural language input into the strictly defined JSON output format.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+- If explicit exact dates are mentioned in the text, use them.
+
+[DATABASE METRICS CONTEXT]
+Metrics: {METRICS}
+- CRITICAL RULES FOR FUZZY ADJECTIVES (Translate from any language):
+  * If the query implies "many", "often", "popular", "best", or "high" without a specific number, map the operator to 'top' and set percent_total to 20.
+  * If the query implies "few", "rarely", "unpopular", "worst", or "low", map the operator to 'bottom' and set percent_total to 20.
+  * You MUST use the Metrics data to calculate the exact absolute threshold for these percentiles.
+
+[VECTOR MATCHING GUIDE (HINT)]
+The system has pre-calculated vector similarities for properties, operators, and metric types. Use this as a strong guide, but correct it if it semantically makes no sense:
+- Metric Type gives a crucial hint about the data (date, time, price, discount, quantity, ratio). 
+- If Metric Type is 'ratio', extract a percentage logic. If 'date', extract a date logic, etc.
+- TEMPORAL & SEASON CORRECTION RULES:
+  1. Vectors often hallucinate seasons. If the text explicitly contains a season word, IGNORE the Vector Guide's Season Intent and select the exact season yourself from the [LOCALE CALENDAR REFERENCE].
+  2. If a Season is detected, check the Time Intent (or explicit time text):
+     - If Time Intent implies the past, map the season to the PREVIOUS year's dates.
+     - If Time Intent implies the present, map the season to the CURRENT year's dates.
+     - Output BOTH 'started_at' (gte) and 'expired_at' (lte) to form a date range.
+{GUIDE}
+
+[SCHEMA DEFINITION]
+Extract the following numeric/property conditions if semantically present in the text:
+condition:
+  - property: String
+    is_percent: Boolean
+    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'contains' | 'top' | 'bottom'
+    percent_total: Number (if is_percent is true)
+    value: Number or String
+
+[CURRENT CHUNK TO ANALYZE]
+{CURRENT}
+
+[OUTPUT FORMAT]
+{
+  "condition": [...]
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{CURRENT}", current)
+            .replace("{TYPE}", seg_type)
+            .replace("{METRICS}", metrics_json)
+            .replace("{GUIDE}", vector_guide)
+            .replace("{TIME_CONTEXT}", &final_time_context)
+}
+
+pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
+    let status_options = match seg_type {
+        "tracking" => "* 'draft': Shipment preparation or pending pickup.\n    * 'progress': Currently in transit or out for delivery.\n    * 'return': Returning to sender.\n    * 'complete': Successfully delivered to the recipient.\n    * 'error': Delivery exception, lost, or failed.",
+        "goods" => "* 'draft': Product is being created, not yet published.\n    * 'show': Visible and available for sale on storefront.\n    * 'hide': Hidden from the storefront.\n    * 'progress': Currently being restocked or updated.\n    * 'stop': Sales temporarily suspended.\n    * 'cancel': Product discontinued or cancelled.\n    * 'refund': Related to refunded inventory.\n    * 'return': Related to returned inventory.\n    * 'exchange': Related to exchanged inventory.\n    * 'expire': Product expired.\n    * 'complete': Completely sold out or finished lifecycle.\n    * 'error': Data or system error.",
+        "order" => "* 'draft': Pending payment or in cart.\n    * 'progress': Order processing or preparing for shipment.\n    * 'stop': Order on hold.\n    * 'cancel': Order cancelled before fulfillment.\n    * 'refund': Payment refunded.\n    * 'return': Items returned by customer.\n    * 'exchange': Items being exchanged.\n    * 'expire': Payment window expired.\n    * 'complete': Order fully fulfilled and closed.\n    * 'error': Payment or processing error.",
+        "coupon" | "event" => "* 'show': Visible to customers.\n    * 'progress': Currently active and running.\n    * 'hide': Hidden from customers.\n    * 'stop': Temporarily paused.\n    * 'cancel': Terminated early.\n    * 'expire': Passed its expiration date.\n    * 'complete': Successfully finished its run.\n    * 'error': Configuration error.",
+        "review" => "* 'progress': Under moderation or pending approval.\n    * 'stop': Blocked or suspended review.\n    * 'cancel': Deleted or withdrawn by user.\n    * 'refund': Associated with a refunded order.\n    * 'return': Associated with a returned order.\n    * 'exchange': Associated with an exchanged order.\n    * 'expire': Review period expired.\n    * 'complete': Published and visible.\n    * 'error': Rejected or marked as spam.",
+        _ => "* 'show': Visible state.\n    * 'progress': Active/Processing state.\n    * 'remove': Deleted state.\n    * 'hide': Hidden state.\n    * 'stop': Paused/Stopped state.\n    * 'cancel': Cancelled state.\n    * 'refund': Refunded state.\n    * 'return': Returned state.\n    * 'exchange': Exchanged state.\n    * 'expire': Expired state.\n    * 'complete': Finished/Completed state.\n    * 'error': Error state."
+    };
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for status.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
+
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+- status: String. Choose one:
+{STATUS_OPTIONS}
+  * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "status": "String or empty"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{STATUS_OPTIONS}", status_options)
+            .replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
+}
+
+pub fn extract_substantial_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for substantial.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
+
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+- substantial: String. Choose one:
+  * 'size': Physical dimensions or volume.
+  * 'weight': Mass or heaviness.
+  * 'shipping_fee': Cost of delivery.
+  * 'shipping_duration': Time taken for delivery.
+  * 'sale_price': Final selling price to the customer.
+  * 'supply_price': Wholesale or original cost.
+  * 'low_stock_threshold': Minimum inventory alert level.
+  * 'discount': Amount or percentage of price reduction.
+  * 'min_order_amount': Minimum spend required to trigger an action.
+  * 'max_discount_amount': Maximum cap for a discount.
+  * 'usage_limit': Maximum number of times usable globally.
+  * 'usage_per': Maximum number of times usable per user.
+  * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "substantial": "String or empty"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
+}
+
+pub fn extract_find_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for find.
+You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
+
+[VECTOR MATCHING GUIDE]
+{VECTOR_GUIDE}
+
+[TEXT TO ANALYZE]
+{TEXT}
+
+[SCHEMA DEFINITIONS]
+- find: String. Choose one:
+  * 'many': High quantity, count, or volume.
+  * 'few': Low quantity, count, or volume.
+  * 'much': High financial value, price, or amount.
+  * 'little': Low financial value, price, or amount.
+  * 'heavy': High physical weight.
+  * 'light': Low physical weight.
+  * '': If none logically apply.
+
+[OUTPUT FORMAT]
+{
+  "find": "String or empty"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template.replace("{TEXT}", current_text)
+            .replace("{VECTOR_GUIDE}", vector_guide)
+}
+
+pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
+    let mut dynamic_output_keys = String::new();
+    for key in field_name.split(',') {
+        dynamic_output_keys.push_str(&format!("  \"{}\": \"...\",\n", key.trim()));
+    }
+    let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
+
+    let template = r###"[TASK]
+Analyze the provided concentrated context and extract specific properties into a JSON object.
+
+[CONTEXT]
+Page Type: {TYPE}
+Language: {LANGUAGE}
+Metadata: {METADATA}
+
+[SCHEMA DEFINITIONS]
+{FIELDS}
+
+[TARGET DATA]
+{TARGET_DATA}
+
+[EXTRACTION RULES]
+1. Return ONLY valid JSON containing the requested keys.
+2. If the field is completely missing in the data, use null.
+3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
+4. Extract only numeric values for price, amount, weight, and dimensions.
+5. Do NOT make up data. Only extract what is present in the context.
+
+[OUTPUT FORMAT]
+{
+{DYNAMIC_KEYS}
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{LANGUAGE}", language)
+            .replace("{METADATA}", metadata)
+            .replace("{FIELDS}", field_desc)
+            .replace("{TARGET_DATA}", target_data)
+            .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
+}
