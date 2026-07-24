@@ -1637,48 +1637,56 @@ impl LogisModel {
         self.ensure_embedding().await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // 🌟 [CRITICAL FIX] 52개 글로벌 언어 및 유니코드 블록 완벽 감지 로직
-        // 특수 문자가 감지되면 해당 언어(ru, ar, hi 등)를 강제 지정하고,
-        // 알파벳(라틴) 기반이면 프론트엔드에서 전달받은 정확한 locale(language)을 신뢰하여 폴백(Fallback)합니다.
-        let mut lang_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        let mut latin_count = 0;
-        
-        for c in query.chars() {
-            let u = c as u32;
-            if u >= 0xAC00 && u <= 0xD7A3 { *lang_counts.entry("ko").or_insert(0) += 1; } // Korean
-            else if u >= 0x3040 && u <= 0x30FF { *lang_counts.entry("ja").or_insert(0) += 1; } // Japanese
-            else if u >= 0x4E00 && u <= 0x9FFF { *lang_counts.entry("zh").or_insert(0) += 1; } // Chinese
-            else if u >= 0x0400 && u <= 0x052F { *lang_counts.entry("ru").or_insert(0) += 1; } // Cyrillic (ru, bg, uk, kk, sr)
-            else if u >= 0x0600 && u <= 0x06FF { *lang_counts.entry("ar").or_insert(0) += 1; } // Arabic (ar, fa, ur)
-            else if u >= 0x0E00 && u <= 0x0E7F { *lang_counts.entry("th").or_insert(0) += 1; } // Thai
-            else if u >= 0x0370 && u <= 0x03FF { *lang_counts.entry("el").or_insert(0) += 1; } // Greek
-            else if u >= 0x0590 && u <= 0x05FF { *lang_counts.entry("he").or_insert(0) += 1; } // Hebrew
-            else if u >= 0x0900 && u <= 0x097F { *lang_counts.entry("hi").or_insert(0) += 1; } // Devanagari (hi, mr)
-            else if u >= 0x0980 && u <= 0x09FF { *lang_counts.entry("bn").or_insert(0) += 1; } // Bengali
-            else if u >= 0x0C00 && u <= 0x0C7F { *lang_counts.entry("te").or_insert(0) += 1; } // Telugu
-            else if u >= 0x1780 && u <= 0x17FF { *lang_counts.entry("km").or_insert(0) += 1; } // Khmer
-            else if (u >= 0x0041 && u <= 0x005A) || (u >= 0x0061 && u <= 0x007A) || (u >= 0x00C0 && u <= 0x024F) || (u >= 0x1E00 && u <= 0x1EFF) { 
-                latin_count += 1; // Latin-based (en, es, fr, de, pt, vi, nl, it, etc.)
-            }
-        }
-        
-        let query_lang = if !lang_counts.is_empty() {
-            lang_counts.into_iter()
-                .max_by_key(|&(_, count)| count)
-                .map(|(lang, count)| if count > 1 { lang.to_string() } else { language.to_string() })
-                .unwrap_or_else(|| language.to_string())
-        } else if latin_count > 1 {
-            // 알파벳 언어권인 경우 UI의 정확한 국가 언어 설정값을 승계합니다.
-            language.to_string()
-        } else {
-            "en".to_string()
-        };
+        // 🌟 [CRITICAL FIX] whatlang을 이용한 글로벌 언어 감지 로직 적용
+        // 감지된 언어가 신뢰할만하면 프로젝트 내부 ISO-639 코드 체계로 변환, 그 외의 경우 UI의 language로 폴백
+        let query_lang = whatlang::detect(&query)
+            .map(|info| match info.lang() {
+                whatlang::Lang::Kor => "ko".to_string(),
+                whatlang::Lang::Jpn => "ja".to_string(),
+                whatlang::Lang::Cmn => "zh-hans".to_string(),
+                whatlang::Lang::Rus => "ru".to_string(),
+                whatlang::Lang::Ara => "ar".to_string(),
+                whatlang::Lang::Tha => "th".to_string(),
+                whatlang::Lang::Ell => "el".to_string(),
+                whatlang::Lang::Heb => "he".to_string(),
+                whatlang::Lang::Hin => "hi".to_string(),
+                whatlang::Lang::Ben => "bn".to_string(),
+                whatlang::Lang::Tel => "te".to_string(),
+                whatlang::Lang::Khm => "km".to_string(),
+                whatlang::Lang::Eng => "en".to_string(),
+                whatlang::Lang::Fra => "fr".to_string(),
+                whatlang::Lang::Deu => "de".to_string(),
+                whatlang::Lang::Spa => "es".to_string(),
+                whatlang::Lang::Ita => "it".to_string(),
+                whatlang::Lang::Por => "pt".to_string(),
+                whatlang::Lang::Nld => "nl".to_string(),
+                whatlang::Lang::Vie => "vi".to_string(),
+                _ => language.to_string(),
+            })
+            .unwrap_or_else(|| language.to_string());
 
-        let categories = ["order", "goods", "tracking", "review", "coupon", "event", "ignore"];
+        let intent_anchors = vec![
+            ("order", "measure sales performance or direct transactions, conversion rate, sales volume, checkout, payment, cancellation, refund, purchase, buy"),
+            ("goods", "product catalog data, exposure, traffic metrics, page views, clicks, physical attributes, stock limits, unit prices, items, find, search clothes"),
+            ("tracking", "manage logistics and fulfillment, shipment status, dispatch, delivery duration, courier information, tracking number, parcel"),
+            ("review", "analyze the voice of the customer, feedback, ratings, reviews, CS messages, complaints, bad quality, good product"),
+            ("coupon", "manage specific discount vouchers, coupon codes, issuance limits, discount amounts applied via coupons, promotion code"),
+            ("event", "manage marketing campaigns, analyze broad operational trends, promotions, exhibitions, seasonal sales"),
+            ("ignore", "ignore, system prompt, stop, cancel, do nothing, irrelevant noise"),
+        ];
+
+        let categories = ["order", "goods", "tracking", "review", "coupon", "event", ""];
         let mut layout_embs = std::collections::HashMap::new();
+        let mut anchor_embs = std::collections::HashMap::new();
 
         let mut texts_to_embed = Vec::new();
         let mut emb_mappings = Vec::new();
+
+        // 🌟 intent_anchors 임베딩 수집 추가
+        for (cat, text) in &intent_anchors {
+            texts_to_embed.push(text.to_string());
+            emb_mappings.push((cat.to_string(), "anchor".to_string()));
+        }
 
         // 🌟 [변경] Stage 1 멀티패스 전용 함수인 get_multi_pass_contexts를 호출하여
         // layout_list, layout_form 및 core_intent를 포함한 100% 모든 속성을 수집합니다.
@@ -1700,7 +1708,11 @@ impl LogisModel {
 
         // 3. 획득한 벡터와 카테고리/키 값을 매칭하여 해시맵에 일괄 삽입
         for (i, (cat, emb_type)) in emb_mappings.into_iter().enumerate() {
-            layout_embs.insert(format!("{}_{}", cat, emb_type), embedded_texts[i].clone());
+            if emb_type == "anchor" {
+                anchor_embs.insert(cat, embedded_texts[i].clone());
+            } else {
+                layout_embs.insert(format!("{}_{}", cat, emb_type), embedded_texts[i].clone());
+            }
         }
 
         fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -1709,6 +1721,18 @@ impl LogisModel {
             let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
         }
+
+        // 🌟 [추가] 서술어구(verb_expression) 타이브레이커 가이드 벡터 생성
+        let mut prefixed_verb_b_vals = Vec::new();
+        for lang in [query_lang.as_str(), "english"] {
+            let verb_val = crate::parsing::BIAS_DICT.get("verb").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("verb, predicate");
+            let expr_val = crate::parsing::BIAS_DICT.get("expression").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("idiom, phrase");
+            let combined_verb_expr = format!("{}, {}", verb_val, expr_val);
+            let prefixed = combined_verb_expr.split(',').map(|s| format!("{} {}", lang, s.trim())).collect::<Vec<_>>().join(", ");
+            prefixed_verb_b_vals.push(prefixed);
+        }
+        let combined_verb_b_val = prefixed_verb_b_vals.join(", ");
+        let verb_emb = self.get_embedding(combined_verb_b_val).await.unwrap_or_else(|_| vec![0.0; 384]);
 
         // 🌟 [추가] Stanza 기반 형태소 분석으로 검색어(query) 정밀 분할 반영
         let mut ext_words_string: Vec<String> = Vec::new();
@@ -1839,6 +1863,7 @@ impl LogisModel {
             text: String,
             scores: std::collections::HashMap<String, f32>,
         }
+        emit_term(&format!("  🔎 [INPUT WORDS] 분할된 단어 목록: {:?}", words));
         let mut raw_spans = Vec::new();
 
         for start in 0..words.len() {
@@ -1850,6 +1875,13 @@ impl LogisModel {
                 
                 let test_text = words[start..end].join(" ");
                 let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                // 🌟 [추가] Verb Penalty 및 단어 길이 가중치 계산
+                let word_count = end - start;
+                let v_sim = cosine_similarity(&test_emb, &verb_emb);
+                let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+                let verb_penalty = v_sim * beta;
+                let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
 
                 let mut scores = std::collections::HashMap::new();
                 for cat in &categories {
@@ -1863,9 +1895,17 @@ impl LogisModel {
                         let bias_score = cosine_similarity(&test_emb, &bias_emb);
                         let prej_score = cosine_similarity(&test_emb, &prej_emb);
 
-                        let field_score = (bias_score - prej_score).max(0.0);
+                        // 🌟 [수정] penalty_weight 및 verb_penalty를 적용한 강화된 점수 차감
+                        let field_score = (bias_score - (prej_score * penalty_weight) - verb_penalty).max(0.0);
                         field_scores.push(field_score);
                     }
+
+                    // 🌟 2. Intent Anchor 점수 합산 (해당 카테고리의 anchor가 있다면)
+                    let anchor_score = if let Some(anchor_emb) = anchor_embs.get(*cat) {
+                        cosine_similarity(&test_emb, anchor_emb).max(0.0)
+                    } else {
+                        0.0
+                    };
 
                     // 🌟 [멀티 패스 스코어 평가]
                     field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -1884,6 +1924,9 @@ impl LogisModel {
                         weight *= 0.5; // 다음 순위의 필드 점수는 반영 비율을 절반으로 깎습니다.
                     }
                     
+                    // 🌟 [Intent Anchors 반영] 멀티패스 스코어에 Anchor 스코어를 결합 (가중치 조절 가능, 여기선 0.5 적용)
+                    multi_pass_score += anchor_score * 0.5;
+                    
                     // 🌟 [단어 개수 가중치 상향] 단어가 많이 합쳐질수록 문맥이 명확해지므로 길이에 비례하여 가중치를 부여합니다.
                     // 파편이 긴 문장을 잡아먹는 현상(NMS Battle 하극상)을 완벽히 막기 위해 가산점을 단어당 15%로 대폭 상향합니다.
                     let word_count = end - start;
@@ -1892,7 +1935,70 @@ impl LogisModel {
                     
                     scores.insert(cat.to_string(), weighted_base_score);
                 }
+                
+                // 🌟 [DEBUG LOG] 1차 슬라이딩 윈도우(기초 점수) 평가 결과 출력
+                let mut raw_score_log = String::new();
+                let mut sorted_raw: Vec<(&String, &f32)> = scores.iter().filter(|(k, _)| !k.is_empty()).collect();
+                sorted_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                
+                for (cat, score) in sorted_raw.iter().take(3) {
+                    raw_score_log.push_str(&format!("{}: {:.4} | ", cat, score));
+                }
+                emit_term(&format!("    🔍 [RAW-CHUNK] '{}' -> Top: {}", test_text, raw_score_log.trim_end_matches(" | ")));
+
                 raw_spans.push(SpanData { start, end, text: test_text, scores });
+            }
+        }
+
+        // 🌟 [신규: 서브 도메인 동적 승급 (Sub-Domain Dynamic Boost) 분석 및 개선]
+        // 각 서브 도메인(review, coupon, event)의 대표 키워드(layout_list, layout_form)를 결합하여 Bias로 삼고,
+        // '나머지 모든 카테고리'의 대표 키워드를 결합하여 Prejudice(차감 대상)로 삼아 쿼리와의 유사도를 검증합니다.
+        let query_emb = self.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
+        let mut sub_domain_boosts = std::collections::HashMap::new();
+        
+        // 1. 모든 카테고리에 대해 layout_list, layout_form의 bias 값 추출
+        let all_cats = ["order", "goods", "tracking", "review", "coupon", "event"];
+        let mut cat_core_texts = std::collections::HashMap::new();
+        
+        for cat in &all_cats {
+            let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
+            let mut core_text = String::new();
+            for (key, bias, _) in contexts {
+                if key == "layout_list" || key == "layout_form" {
+                    core_text.push_str(&bias);
+                    core_text.push_str(", ");
+                }
+            }
+            cat_core_texts.insert(cat.to_string(), core_text);
+        }
+
+        // 2. review, coupon, event 카테고리에 대해 각각 bias와 (나머지 카테고리의 합인) prejudice를 계산
+        let target_cats = ["review", "coupon", "event"];
+        for target_cat in &target_cats {
+            let core_bias = cat_core_texts.get(*target_cat).cloned().unwrap_or_default();
+            
+            let mut core_prej = String::new();
+            for other_cat in &all_cats {
+                if other_cat != target_cat {
+                    if let Some(other_text) = cat_core_texts.get(*other_cat) {
+                        core_prej.push_str(other_text);
+                    }
+                }
+            }
+
+            if !core_bias.is_empty() && !core_prej.is_empty() {
+                let cat_emb = self.get_embedding(core_bias).await.unwrap_or(vec![0.0; 384]);
+                let prej_emb = self.get_embedding(core_prej).await.unwrap_or(vec![0.0; 384]); // 🌟 타 도메인 전체를 prejudice로 사용
+                
+                let b_sim = cosine_similarity(&query_emb, &cat_emb);
+                let p_sim = cosine_similarity(&query_emb, &prej_emb);
+                let sim = b_sim - p_sim; // 🌟 bias 유사도에서 prejudice(타 도메인) 유사도 차감
+                
+                // 🌟 [CRITICAL FIX] 임계값을 0.55로 엄격하게 상향 설정하여 무관한 쿼리가 승급되지 않도록 완벽 차단합니다.
+                if sim > 0.55 { 
+                    sub_domain_boosts.insert(target_cat.to_string(), true);
+                    emit_term(&format!("  🚀 [SUB-DOMAIN BOOST] '{}' 핵심 키워드가 쿼리와 높은 유사도(Bias: {:.4} - Prej: {:.4} = Final: {:.4})를 보여 우선순위가 상향됩니다.", target_cat, b_sim, p_sim, sim));
+                }
             }
         }
 
@@ -1942,15 +2048,44 @@ impl LogisModel {
             // 최종 합산 점수 기준 내림차순 정렬
             contextual_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            let current_best_cat = contextual_scores[0].0.clone();
+            let mut current_best_cat = contextual_scores[0].0.clone();
             let current_max_contextual_score = contextual_scores[0].1;
 
-            // 🌟 [커트라인 완전 해제] original_base_score 및 0.45 커트라인을 제거했습니다.
-            // 최소한의 유사도(0.0 초과)만 있다면 모두 후보군으로 올리고, 길이와 문맥이 반영된 NMS 배틀을 통해 최강자만 살아남게 합니다.
+            // 🌟 [도메인 우선순위 정의 헬퍼]
+            let get_priority = |cat: &str| -> i32 {
+                if sub_domain_boosts.contains_key(cat) {
+                    return 1; // 🌟 쿼리 벡터 매칭 기반 동적 승급
+                }
+                match cat {
+                    "goods" | "order" | "tracking" => 1, // 상위(핵심) 도메인
+                    _ => 2, // review, coupon, event 등 부가 도메인
+                }
+            };
+
+            // 🌟 [계층적 도메인 승급 (Hierarchical Promotion)] 
+            // 1등이 부가 도메인(review 등)이더라도, 핵심 도메인(goods 등)이 유효 오차 범위 내에 있다면 우선권을 부여하여 강제 승급!
+            if get_priority(&current_best_cat) > 1 {
+                for (cat_name, c_score) in &contextual_scores {
+                    if get_priority(cat_name) == 1 && *c_score >= current_max_contextual_score - 0.20 && *c_score > 0.4 {
+                        current_best_cat = cat_name.clone();
+                        emit_term(&format!("    🚀 [HIERARCHY PROMOTION] 핵심 도메인 우선순위 발동! '{}' -> '{}' 로 승급 (Score: {:.4})", target.text, current_best_cat, c_score));
+                        break;
+                    }
+                }
+            }
+
+            // 🌟 [커트라인 완전 해제] 최소한의 유사도(0.0 초과)만 있다면 모두 후보군으로 올리고, 길이와 문맥이 반영된 NMS 배틀을 통해 최강자만 살아남게 합니다.
             if current_max_contextual_score > 0.0 {
                 let mut intersecting_categories: Vec<String> = Vec::new();
+                let mut detailed_score_log = String::new();
+                
                 for (cat_name, c_score) in &contextual_scores {
-                    if *c_score >= current_max_contextual_score - 0.25 && *c_score > 0.0 {
+                    // 유의미한 점수가 있는 모든 도메인의 점수를 기록
+                    if *c_score > 0.0 {
+                        detailed_score_log.push_str(&format!("{}: {:.4} | ", cat_name, c_score));
+                    }
+                    // 🌟 [다중 허용 확장] 오차 범위를 넓혀 서브 도메인들도 다중 태그로 편입되도록 허용 (-0.30 오차)
+                    if *c_score >= current_max_contextual_score - 0.30 && *c_score > 0.10 {
                         intersecting_categories.push(cat_name.clone());
                     }
                 }
@@ -1958,8 +2093,9 @@ impl LogisModel {
                     intersecting_categories.push(current_best_cat.clone());
                 }
 
-                // 🌟 유효 텍스트 후보군 출력 (Base Score 출력 제거)
+                // 🌟 유효 텍스트 후보군 출력 (카테고리별 상세 점수 포함)
                 emit_term(&format!("  🟢 [CANDIDATE] '{}' -> Domain: {} (Context Score: {:.4})", target.text, current_best_cat, current_max_contextual_score));
+                emit_term(&format!("      📊 [SCORES] {}", detailed_score_log.trim_end_matches(" | ")));
 
                 evaluated_spans.push(EvaluatedSpan {
                     start: target.start,
@@ -1973,34 +2109,62 @@ impl LogisModel {
             }
         }
 
-        // 🌟 [3차 패스] 오버랩(교차) 충돌 해결 (길이 가중치가 포함된 최종 점수 기준 내림차순 정렬)
-        evaluated_spans.sort_by(|a, b| b.context_score.partial_cmp(&a.context_score).unwrap_or(std::cmp::Ordering::Equal));
+        // 🌟 [3차 패스] 오버랩(교차) 충돌 해결 (계층적 도메인 우선순위 및 길이 가중치 점수 정렬)
+        let get_priority = |cat: &str| -> i32 {
+            if sub_domain_boosts.contains_key(cat) {
+                return 1; // 🌟 쿼리 벡터 매칭 기반 동적 승급
+            }
+            match cat {
+                "goods" | "order" | "tracking" => 1, // 상위(핵심) 도메인
+                _ => 2, // review, coupon, event 등 부가 도메인
+            }
+        };
+
+        evaluated_spans.sort_by(|a, b| {
+            let a_pri = get_priority(&a.best_cat);
+            let b_pri = get_priority(&b.best_cat);
+            
+            // 1. 계층적 우선순위 (상위 도메인 승리) -> 2. 점수 -> 3. 길이
+            a_pri.cmp(&b_pri)
+                .then(b.context_score.partial_cmp(&a.context_score).unwrap_or(std::cmp::Ordering::Equal))
+                .then(b.text.len().cmp(&a.text.len()))
+        });
 
         let mut final_selected_spans: Vec<EvaluatedSpan> = Vec::new();
 
-        emit_term("\n  ⚔️ [NMS BATTLE] Resolving Overlaps...");
+        emit_term("\n  ⚔️ [NMS BATTLE] Resolving Overlaps with Hierarchical Absorption...");
 
         for span in evaluated_spans {
             let mut is_overlapped = false;
             let mut winner_text = String::new();
 
             // 이미 승리하여 선택된 상위 점수의 스팬들과 현재 스팬이 교차하는지 검사합니다.
-            for selected in &final_selected_spans {
+            for selected in &mut final_selected_spans {
                 let overlaps = span.start < selected.end && span.end > selected.start;
                 
                 if overlaps {
-                    // 점수가 낮은 현재 스팬은 패배하여 탈락합니다.
                     is_overlapped = true;
                     winner_text = selected.text.clone();
+                    
+                    // 🌟 [계층적 흡수 & 다중 허용] 패배한 조각의 후보 카테고리(intersecting) 및 best_cat을 승자에게 병합
+                    for cat in &span.intersecting {
+                        if !selected.intersecting.contains(cat) {
+                            selected.intersecting.push(cat.clone());
+                        }
+                    }
+                    if !selected.intersecting.contains(&span.best_cat) {
+                        selected.intersecting.push(span.best_cat.clone());
+                        emit_term(&format!("    ♻️ [ABSORBED] 패배한 '{}'의 '{}' 도메인이 승자 '{}'에게 다중 태그로 병합되었습니다.", span.text, span.best_cat, winner_text));
+                    }
                     break;
                 }
             }
 
             if !is_overlapped {
-                emit_term(&format!("    👑 [WINNER] '{}' (Score: {:.4}) survives.", span.text, span.context_score));
+                emit_term(&format!("    👑 [WINNER] '{}' -> {} (Score: {:.4}) survives.", span.text, span.best_cat, span.context_score));
                 final_selected_spans.push(span);
             } else {
-                emit_term(&format!("    💀 [DEFEAT] '{}' is absorbed by higher score winner '{}'.", span.text, winner_text));
+                emit_term(&format!("    💀 [DEFEAT] '{}' is absorbed by higher priority/score winner '{}'.", span.text, winner_text));
             }
         }
 
@@ -2073,10 +2237,20 @@ impl LogisModel {
                         emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> LEFT WINS! (Left: {:.4} > Right: {:.4})", gap_text, left_score, right_score));
                         final_bounds[i].1 = gap_end; 
                         final_bounds[i].3 = left_score; // 점수 갱신
+                        // 패자쪽(오른쪽)의 best_cat을 승자 쪽에 추가
+                        let right_cat = final_bounds[i+1].2.clone();
+                        if !final_bounds[i].4.contains(&right_cat) {
+                            final_bounds[i].4.push(right_cat);
+                        }
                     } else {
                         emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> RIGHT WINS! (Right: {:.4} > Left: {:.4})", gap_text, right_score, left_score));
                         final_bounds[i+1].0 = gap_start; 
                         final_bounds[i+1].3 = right_score; // 점수 갱신
+                        // 패자쪽(왼쪽)의 best_cat을 승자 쪽에 추가
+                        let left_cat = final_bounds[i].2.clone();
+                        if !final_bounds[i+1].4.contains(&left_cat) {
+                            final_bounds[i+1].4.push(left_cat);
+                        }
                     }
                 }
             }
@@ -2092,8 +2266,16 @@ impl LogisModel {
             }
 
             // 4. 최종 조립된 결과를 배열에 삽입
-            for (start, end, best_cat, context_score, intersecting) in final_bounds {
+            for (start, end, best_cat, context_score, mut intersecting) in final_bounds {
                 let final_text = words[start..end].join(" ");
+                
+                // 🌟 types 배열에 best_cat이 무조건 포함되도록 보장하고 중복 제거
+                if !intersecting.contains(&best_cat) {
+                    intersecting.push(best_cat.clone());
+                }
+                intersecting.sort();
+                intersecting.dedup();
+                
                 emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", intersecting, final_text, context_score));
 
                 context_arr.push(json!({
@@ -2402,6 +2584,10 @@ impl LogisModel {
                         // 임계값(-2.0)을 넘는 모든 후보를 로그에 출력하고 우선순위(NMS) 배틀에 전부 참전시킵니다.
                         let word_count = end - start;
                         let length_weight = 1.0 + ((word_count as f32 - 1.0) * 0.15); 
+                        
+                        let v_sim = cosine_similarity(&test_emb, &verb_emb);
+                        let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+                        let verb_penalty = v_sim * beta;
 
                         for i in 0..time_keys.len() {
                             let b_score = cosine_similarity(&test_emb, &time_bias_embs[i]);
@@ -2409,7 +2595,7 @@ impl LogisModel {
                             
                             // 🌟 [Option 1] 단어 수(word_count)가 적을수록 문맥이 부족해 Prejudice(배제)에 과도하게 타격받는 현상을 방지합니다.
                             let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
-                            let score = b_score - (p_score * p_weight);
+                            let score = b_score - (p_score * p_weight) - verb_penalty;
                             
                             if score > 0.05 {
                                 let weighted_time_score = score * length_weight;
@@ -2424,7 +2610,7 @@ impl LogisModel {
                             
                             // 🌟 [Option 1] '여름' 같은 짧은 단어가 'autumn'의 배제 단어에 포함되어 점수가 음수로 곤두박질치는 환각을 방지합니다.
                             let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
-                            let mut score = b_score - (p_score * p_weight);
+                            let mut score = b_score - (p_score * p_weight) - verb_penalty;
                             
                             // 🌟 [EXACT MATCH BOOST] 다국어 직접 매칭 (가중치 폭발)
                             let test_lower = test_text.to_lowercase();
@@ -2525,6 +2711,12 @@ impl LogisModel {
                 // 🌟 [IGNORE VECTOR CHECK] 추가: 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 한 번 더 검증
                 let chunk_full_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
                 
+                let chunk_word_count = current_text.split_whitespace().count();
+                let v_sim = cosine_similarity(&chunk_full_emb, &verb_emb);
+                let beta = if chunk_word_count <= 2 { 0.05 } else { 0.10 };
+                let verb_penalty = v_sim * beta;
+                let penalty_weight = if chunk_word_count <= 2 { 0.3 } else { 0.7 };
+
                 let mut is_ignore_chunk = false;
                 if let Some(ignore_obj) = crate::parsing::BIAS_DICT.get("ignore").and_then(|p| p.as_object()) {
                     let s_bias = ignore_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("");
@@ -2533,9 +2725,10 @@ impl LogisModel {
                         let ignore_bias_emb = self.get_embedding(s_bias.to_string()).await.unwrap_or(vec![0.0; 384]);
                         let ignore_prej_emb = self.get_embedding(s_prej.to_string()).await.unwrap_or(vec![0.0; 384]);
                         
+                        // Ignore is usually a verb! We DO NOT apply verb_penalty here.
                         let b_score = cosine_similarity(&chunk_full_emb, &ignore_bias_emb);
                         let p_score = cosine_similarity(&chunk_full_emb, &ignore_prej_emb);
-                        let ignore_score = b_score - p_score;
+                        let ignore_score = b_score - (p_score * penalty_weight);
                         
                         if ignore_score > 0.4 {
                             emit_term(&format!("  🚫 [IGNORE VECTOR CHECK] Chunk '{}' identified as IGNORE (Score: {:.4}). Skipping LLM processing.", current_text, ignore_score));
@@ -2561,7 +2754,8 @@ impl LogisModel {
                 for i in 0..status_keys.len() {
                     let b = cosine_similarity(&chunk_full_emb, &status_bias_embs[i]);
                     let p = cosine_similarity(&chunk_full_emb, &status_prej_embs[i]);
-                    if b - p > best_status_score { best_status_score = b - p; best_status = status_keys[i].clone(); }
+                    let score = b - (p * penalty_weight) - verb_penalty;
+                    if score > best_status_score { best_status_score = score; best_status = status_keys[i].clone(); }
                 }
 
                 let mut best_sub = String::new();
@@ -2569,7 +2763,8 @@ impl LogisModel {
                 for i in 0..substantial_keys.len() {
                     let b = cosine_similarity(&chunk_full_emb, &substantial_bias_embs[i]);
                     let p = cosine_similarity(&chunk_full_emb, &substantial_prej_embs[i]);
-                    if b - p > best_sub_score { best_sub_score = b - p; best_sub = substantial_keys[i].clone(); }
+                    let score = b - (p * penalty_weight) - verb_penalty;
+                    if score > best_sub_score { best_sub_score = score; best_sub = substantial_keys[i].clone(); }
                 }
 
                 let mut best_find = String::new();
@@ -2577,7 +2772,8 @@ impl LogisModel {
                 for i in 0..find_keys.len() {
                     let b = cosine_similarity(&chunk_full_emb, &find_bias_embs[i]);
                     let p = cosine_similarity(&chunk_full_emb, &find_prej_embs[i]);
-                    if b - p > best_find_score { best_find_score = b - p; best_find = find_keys[i].clone(); }
+                    let score = b - (p * penalty_weight) - verb_penalty;
+                    if score > best_find_score { best_find_score = score; best_find = find_keys[i].clone(); }
                 }
 
                 if !best_status.is_empty() { time_guide.push_str(&format!(", Status Suggests [{}]", best_status)); }
@@ -2594,13 +2790,19 @@ impl LogisModel {
                     // 🌟 Double Plinko: 연산자(Operator), 메트릭(Metric Type) 판별 벡터 매칭 진행
                     let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
                     
+                    let chunk_word_count = v.len();
+                    let v_sim = cosine_similarity(&chunk_emb, &verb_emb);
+                    let beta = if chunk_word_count <= 2 { 0.05 } else { 0.10 };
+                    let verb_penalty = v_sim * beta;
+                    let penalty_weight = if chunk_word_count <= 2 { 0.3 } else { 0.7 };
+
                     // 연산자 매칭
                     let mut best_op = "eq"; // Fallback
                     let mut best_op_score = 0.20; 
                     for i in 0..op_keys.len() {
                         let b_score = cosine_similarity(&chunk_emb, &op_bias_embs[i]);
                         let p_score = cosine_similarity(&chunk_emb, &op_prej_embs[i]);
-                        let score = b_score - p_score;
+                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
                         if score > best_op_score {
                             best_op_score = score;
                             best_op = op_keys[i];
@@ -2613,7 +2815,7 @@ impl LogisModel {
                     for i in 0..metric_keys.len() {
                         let b_score = cosine_similarity(&chunk_emb, &metric_bias_embs[i]);
                         let p_score = cosine_similarity(&chunk_emb, &metric_prej_embs[i]);
-                        let score = b_score - p_score;
+                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
                         if score > best_metric_score {
                             best_metric_score = score;
                             best_metric = metric_keys[i];
