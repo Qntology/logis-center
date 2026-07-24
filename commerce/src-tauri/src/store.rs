@@ -750,10 +750,13 @@ impl VectorStore {
              // AI Deep Search(엔터/돋보기)일 때는 SDK 내장 full_text_search API를 호출합니다.
              if use_fts {
                  
-                 // ngram_max_length가 3인데 4글자 이상을 검색하면 엔진 내부에 토큰이 없어 100% 매칭에 실패합니다.
-                 // 검색어를 반드시 큰따옴표("")로 감싸 Phrase Query(구문 검색)로 강제 변환해야 
-                 // Tantivy 쿼리 파서가 검색어 자체도 N-gram으로 쪼개서(예: "대한민국" -> "대한민" + "한민국") 정확히 찾아냅니다!
-                 let fts_query_str = format!("\"{}\"", query_text.replace("\"", "\\\""));
+                 // [CRITICAL FIX] 전체 검색어를 하나의 큰따옴표로 묶으면("베이지 가디건") 정확한 구문(Exact Phrase) 매칭이 되어 검색이 실패합니다.
+                 // 띄어쓰기 단위로 쪼개어 각각 큰따옴표로 묶어 다중 N-gram 구문 검색("베이지" "가디건")이 되도록 수정합니다.
+                 let fts_query_str = query_text
+                     .split_whitespace()
+                     .map(|w| format!("\"{}\"", w.replace("\"", "\\\"")))
+                     .collect::<Vec<_>>()
+                     .join(" ");
                  
                  // 공식 문서에 따른 FTS 전용 메서드 체이닝
                  q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));

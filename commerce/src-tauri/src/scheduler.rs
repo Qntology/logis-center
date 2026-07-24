@@ -593,7 +593,13 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let clean_html_content = parsing::pre_clean_html(&raw_html_content);
+    let mut clean_html_content = parsing::pre_clean_html(&raw_html_content);
+    
+    // 🌟 [CRITICAL FIX 1] UI 요소의 title 속성이 상품명으로 환각(Hallucination)되는 것을 원천 차단하기 위해,
+    // 정규식을 사용하여 모든 title="..." 속성 자체를 제거합니다. (jQuery의 removeAttr("title")과 동일한 효과)
+    if let Ok(re) = regex::Regex::new(r#"(?i)\s+title\s*=\s*(["']).*?\1"#) {
+        clean_html_content = re.replace_all(&clean_html_content, "").to_string();
+    }
     
     let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
