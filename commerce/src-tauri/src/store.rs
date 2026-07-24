@@ -814,7 +814,32 @@ impl VectorStore {
          
          let start = offset.min(final_list.len());
          let end = (start + limit).min(final_list.len());
-         Ok(final_list[start..end].to_vec())
+         let result_slice = final_list[start..end].to_vec();
+
+         // 🌟 [추가] 검색 결과를 JSON 포맷으로 터미널에 로그 출력
+         let json_log = serde_json::json!({
+             "query_text": query_text,
+             "filter": filter,
+             "use_fts": use_fts,
+             "total_found": final_list.len(),
+             "returned": result_slice.len(),
+             "results": result_slice.iter().map(|(id, text, score)| {
+                 // 🌟 [개선] text가 JSON 문자열이면 예쁘게 객체로 파싱해서 출력하고, 아니면 원래 문자열로 출력
+                 let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
+                 
+                 serde_json::json!({
+                     "id": id,
+                     "text": parsed_text,
+                     "score": score
+                 })
+             }).collect::<Vec<_>>()
+         });
+         println!("\n=======================================");
+         println!("[STORE] 🔎 Search Results (JSON):");
+         println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
+         println!("=======================================\n");
+
+         Ok(result_slice)
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {

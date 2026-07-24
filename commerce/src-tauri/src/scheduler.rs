@@ -2339,7 +2339,9 @@ async fn process_task(
                                     }
                                 }
                                 
-                                for ck in ["has_header", "has_footer", "title", "language"] {
+                                // 공통 속성(has_header, language 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
+                                // [CRITICAL FIX] "title"을 제거하여 정상 추출된 상품명이 다른 필드 추출 시 HTML 페이지 기본 타이틀로 덮어씌워지는 환각 버그 방지
+                                for ck in ["has_header", "has_footer", "language"] {
                                     if let Some(val) = parsed_val.get(ck) {
                                         item_val.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
                                     }
@@ -2943,8 +2945,9 @@ async fn process_task(
                                 }
                             }
                             
-                            // 공통 속성(has_header, title 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
-                            for ck in ["has_header", "has_footer", "title", "language"] {
+                            // 공통 속성(has_header, language 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
+                            // [CRITICAL FIX] "title"을 제거하여 정상 추출된 상품명이 다른 필드 추출 시 HTML 페이지 기본 타이틀로 덮어씌워지는 환각 버그 방지
+                            for ck in ["has_header", "has_footer", "language"] {
                                 if let Some(val) = item_val.get(ck) {
                                     extracted_data.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
                                 }
