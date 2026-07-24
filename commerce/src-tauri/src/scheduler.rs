@@ -536,7 +536,32 @@ async fn process_task(
     }
 
     // [MEMORY] Fetch and process directly in memory
-    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+    let raw_html_content = if task.r#type == "document_extraction" {
+        let file_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
+        let ext = task_data.get("document_ext").and_then(|s| s.as_str()).unwrap_or("");
+        
+        let payload = json!({ 
+            "task_id": task.id, 
+            "category": "Document Parsing", 
+            "summary": format!("Parsing {} file format...", ext.to_uppercase()), 
+            "spinner": "📄" 
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        
+        // 🌟 [수정] 새로 작성된 extract_document_text 동기 함수 호출 (await 제거)
+        let extracted_text = crate::parsers::extract_document_text(file_path).unwrap_or_else(|e| format!("Document Parsing Error: {}", e));
+        
+        // 🌟 기존 AI 파이프라인에서 HTML 태그 기반 구조 분석을 하므로, 줄바꿈 단위로 div 태그로 감싼 가짜 HTML 구조를 생성합니다.
+        // 문서 텍스트 내부의 <, > 기호가 HTML 파서를 붕괴시키지 않도록 이스케이프 처리를 병행합니다.
+        let fake_html = extracted_text.lines()
+            .map(|line| {
+                let safe_line = line.replace("<", "&lt;").replace(">", "&gt;");
+                format!("<div>{}</div>", safe_line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("<html><body>{}</body></html>", fake_html)
+    } else if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         let content = raw_html.to_string();
         if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
         content

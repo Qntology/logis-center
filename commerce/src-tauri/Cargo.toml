@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
+csv = "1.4.0"
 tauri = { version = "2.10.1", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,6 +24,9 @@ tokio = { version = "1", features = ["full"] }
 image = { version = "0.25", features = ["jpeg", "png"] }
 base64 = "0.22"
 anyhow = "1.0"
+calamine = "0.36.0"
+quick-xml = "0.41.0"
+zip = "8.6.0"
 regex = "1"
 encoding_rs = "0.8"
 flate2 = "1.0"
@@ -79,10 +83,10 @@ direct-storage = { path = "../crates/direct-storage" }
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Security", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6"
+io-uring = "0.7.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = "0.29"
+metal = "0.33.0"
 
 [features]
 default = ["cuda"]
