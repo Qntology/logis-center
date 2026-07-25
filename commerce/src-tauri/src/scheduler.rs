@@ -2333,6 +2333,50 @@ async fn process_task(
                 // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
                     
+                    // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
+                    let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
+                    let mut bypassed_values = Vec::new();
+                    for k in &keys {
+                        for hint in &pre_mapped_hints {
+                            if let Some(t_col) = hint.get("target_column").and_then(|v| v.as_str()) {
+                                if t_col == *k {
+                                    if let Some(e_val) = hint.get("extracted_value").and_then(|v| v.as_str()) {
+                                        bypassed_values.push((k.to_string(), e_val.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !bypassed_values.is_empty() {
+                        let f_percent = (((f_idx as f32) / (total_fields as f32)) * 100.0) as i32;
+                        let f_summary_msg = format!("Extracting {} ({}%)...", field_name, f_percent);
+                        let payload = json!({ 
+                            "task_id": task.id, 
+                            "category": format!("List Item {}/{}", idx + 1, total_items), 
+                            "summary": f_summary_msg, 
+                            "spinner": "⠋" 
+                        });
+                        log_task_progress(app_handle, &task.id, &payload);
+                        emit_term(&format!("  ▶ {}", f_summary_msg));
+
+                        let mut extracted_results = Vec::new();
+                        for (k, val_str) in bypassed_values {
+                            item_val.as_object_mut().unwrap().insert(k.clone(), json!(val_str));
+                            extracted_results.push(format!("\"{}\": \"{}\"", k, val_str));
+                            
+                            if val_str.len() >= 5 && val_str != "null" && val_str != "true" && val_str != "false" {
+                                if !global_ignore_list.contains(&val_str) {
+                                    global_ignore_list.push(val_str.clone());
+                                    global_ignore_list.push(format!(" {}", val_str));
+                                    global_ignore_list.push(val_str.to_lowercase());
+                                }
+                            }
+                        }
+                        emit_term(&format!("    ⚡ [PRE-MAP BYPASS] Successfully mapped without LLM: {}", extracted_results.join(", ")));
+                        continue; // LLM 호출 로직을 완벽하게 건너뛰고 다음 필드로 넘어갑니다!
+                    }
+
                     let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
                     
                     // Header 영역 독립 매칭
@@ -3087,6 +3131,50 @@ async fn process_task(
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
+                // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
+                let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
+                let mut bypassed_values = Vec::new();
+                for k in &keys {
+                    for hint in &pre_mapped_hints {
+                        if let Some(t_col) = hint.get("target_column").and_then(|v| v.as_str()) {
+                            if t_col == *k {
+                                if let Some(e_val) = hint.get("extracted_value").and_then(|v| v.as_str()) {
+                                    bypassed_values.push((k.to_string(), e_val.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !bypassed_values.is_empty() {
+                    let percent = (((idx as f32) / (total_fields as f32)) * 100.0) as i32;
+                    let summary_msg = format!("Extracting {} ({}%)...", field_name, percent);
+                    let payload = json!({ 
+                        "task_id": task.id, 
+                        "category": format!("Detail Extraction ({}/{})", idx + 1, total_fields), 
+                        "summary": summary_msg, 
+                        "spinner": "⠋" 
+                    });
+                    log_task_progress(app_handle, &task.id, &payload);
+                    emit_term(&format!("[STAGE-3] {}", summary_msg));
+
+                    let mut extracted_results = Vec::new();
+                    for (k, val_str) in bypassed_values {
+                        extracted_data.as_object_mut().unwrap().insert(k.clone(), json!(val_str));
+                        extracted_results.push(format!("\"{}\": \"{}\"", k, val_str));
+                        
+                        if val_str.len() >= 5 && val_str != "null" && val_str != "true" && val_str != "false" {
+                            if !global_ignore_list.contains(&val_str) {
+                                global_ignore_list.push(val_str.clone());
+                                global_ignore_list.push(format!(" {}", val_str));
+                                global_ignore_list.push(val_str.to_lowercase());
+                            }
+                        }
+                    }
+                    emit_term(&format!("    ⚡ [PRE-MAP BYPASS] Successfully mapped without LLM: {}", extracted_results.join(", ")));
+                    continue; // LLM 호출 로직을 완벽하게 건너뛰고 다음 필드로 넘어갑니다!
+                }
+
                 let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[idx];
                 
                 let mut best_idx = 0;
