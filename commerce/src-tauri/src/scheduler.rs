@@ -1050,16 +1050,36 @@ async fn process_task(
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
 
+            // 🌟 [핵심 반영 1] 사용자의 요청에 따라 카테고리별 layout_list + layout_form을 Bias로, 
+            // 타 카테고리의 layout 합산을 Prejudice로 지정하여 상호 배타적 벡터 분류를 수행합니다.
+            let mut cat_embeddings = Vec::new();
             for cat in &categories {
-                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어옵니다.
-                let anchor_text = crate::parsing::get_page_type_full_bias(cat, &doc_lang);
-                let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                let (list_b, form_b, _) = crate::parsing::get_combinatorial_layout_bias(&[*cat], &doc_lang);
+                let cat_bias = format!("{} {}", list_b, form_b);
                 
+                let mut prej_texts = Vec::new();
+                for other_cat in &categories {
+                    if cat != other_cat {
+                        let (o_list, o_form, _) = crate::parsing::get_combinatorial_layout_bias(&[*other_cat], &doc_lang);
+                        prej_texts.push(format!("{} {}", o_list, o_form));
+                    }
+                }
+                let cat_prej = prej_texts.join(" , ");
+                
+                let b_emb = model.get_embedding(cat_bias).await.unwrap_or(vec![0.0; 384]);
+                let p_emb = model.get_embedding(cat_prej).await.unwrap_or(vec![0.0; 384]);
+                
+                cat_embeddings.push((cat.to_string(), b_emb, p_emb));
+            }
+
+            for (cat, b_emb, p_emb) in &cat_embeddings {
                 let mut total_sim = 0.0;
                 
-                // 1. 타이틀 점수 합산 (타이틀은 페이지 정체성에 매우 중요하므로 5배 가중치 부여)
+                // 1. 타이틀 점수 합산 (Bias 증가, Prejudice 차감)
                 if !doc_title.is_empty() {
-                    let title_sim = cosine_similarity(&title_emb, &anchor_emb);
+                    let b_sim = cosine_similarity(&title_emb, b_emb);
+                    let p_sim = cosine_similarity(&title_emb, p_emb);
+                    let title_sim = b_sim - p_sim;
                     if title_sim > 0.0 {
                         total_sim += title_sim * 5.0; 
                     }
@@ -1073,10 +1093,12 @@ async fn process_task(
                     let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                     if text_part.is_empty() { continue; }
 
-                    let sim = cosine_similarity(&anchor_emb, emb);
+                    let b_sim = cosine_similarity(b_emb, emb);
+                    let p_sim = cosine_similarity(p_emb, emb);
+                    let sim = b_sim - p_sim;
                     
-                    // 연관성이 뚜렷한 라인(임계치 0.25 초과)의 점수만 누적하여 전체 페이지의 카테고리 밀도를 정밀 측정합니다.
-                    if sim > 0.25 {
+                    // 연관성이 뚜렷한 라인(Bias-Prej 점수가 0.15 초과)의 점수만 누적
+                    if sim > 0.15 {
                         total_sim += sim;
                     }
                 }
@@ -1875,9 +1897,12 @@ async fn process_task(
             for item_pug in &pug_list {
                 let mut seen_in_this_item = std::collections::HashSet::new();
                 for line in item_pug.lines() {
-                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
-                    if !text_part.is_empty() && text_part.len() > 2 {
-                        seen_in_this_item.insert(text_part.to_string());
+                    // [해결] HTML 구조 태그(tr 등)가 텍스트로 오인되지 않도록 '|' 기호 이후의 텍스트만 추출합니다.
+                    if let Some(idx) = line.find('|') {
+                        let text_part = line[idx + 1..].trim();
+                        if !text_part.is_empty() && text_part.len() > 2 {
+                            seen_in_this_item.insert(text_part.to_string());
+                        }
                     }
                 }
                 for text in seen_in_this_item {
@@ -1923,6 +1948,27 @@ async fn process_task(
 
             // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+
+            // 🌟 [핵심 반영 1] 필드별 상호 배타적(Competitive) Bias/Prejudice 사전 계산 루프 (List Mode)
+            // 별도의 for 루프에서 타 필드의 bias를 현재 필드의 prejudice로 합산하여 code, id, no 등의 컬럼 식별력을 극대화합니다.
+            let mut field_embeddings = Vec::new();
+            for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
+                let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                let mut dynamic_prej_texts = Vec::new();
+                if !predefined_prej.trim().is_empty() {
+                    dynamic_prej_texts.push(predefined_prej.clone());
+                }
+                for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
+                    if f_idx != other_idx {
+                        dynamic_prej_texts.push(other_bias.clone()); // 타 필드의 bias를 오답 밀어내기(Prejudice)로 활용
+                    }
+                }
+                let combined_prej = dynamic_prej_texts.join(" , ");
+                let prej_emb = model.get_embedding(combined_prej.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                field_embeddings.push((bias_emb, prej_emb, combined_prej));
+            }
 
             // 🌟 [NOISE FILTER] bias.json의 layout_list.prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
             let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
@@ -1974,8 +2020,15 @@ async fn process_task(
                                 let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
                                 let is_short = original_text.len() <= 3;
                                 
-                                // 임계값을 높이고(0.6), 숫자나 짧은 핵심 텍스트는 노이즈 탈락에서 강제 보호합니다.
-                                if noise_score > 0.6 && !has_digit && !is_short {
+                                // th, td, tr, input 등 테이블/폼 구조를 나타내는 태그 문자열 강제 보호
+                                let is_structure_tag = original_text.starts_with("th") 
+                                    || original_text.starts_with("td") 
+                                    || original_text.starts_with("tr") 
+                                    || original_text.starts_with("input")
+                                    || original_text.starts_with("div");
+                                
+                                // 임계값을 높이고(0.6), 숫자, 짧은 핵심 텍스트, 구조 태그는 노이즈 탈락에서 강제 보호합니다.
+                                if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag {
                                     emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", original_idx + 1, original_text, noise_score));
                                     thead_lines[original_idx] = String::new(); 
                                 } else {
@@ -2011,10 +2064,13 @@ async fn process_task(
                 // 🌟 [핵심 개선: 1차 탈락 적용] 추출된 반복 UI 요소(Boilerplate)를 PUG 컨텍스트에서 완전히 삭제합니다.
                 for i in 0..item_lines.len() {
                     let line = &item_lines[i];
-                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
-                    if boilerplate_texts.contains(text_part) {
-                        emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
-                        item_lines[i] = String::new();
+                    if let Some(idx) = line.find('|') {
+                        let text_part = line[idx + 1..].trim();
+                        if boilerplate_texts.contains(text_part) {
+                            emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
+                            // [해결] 라인 전체를 삭제하면 td 구조가 날아가 컬럼이 밀립니다. HTML 태그 뼈대(예: 'td | ')만 남겨 구조를 유지합니다!
+                            item_lines[i] = format!("{} ", &line[..=idx]);
+                        }
                     }
                 }
 
@@ -2075,8 +2131,15 @@ async fn process_task(
                                 let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
                                 let is_short = original_text.len() <= 3;
                                 
-                                // 임계값을 높이고(0.6), 숫자나 짧은 핵심 텍스트는 노이즈 탈락에서 강제 보호합니다.
-                                if noise_score > 0.6 && !has_digit && !is_short {
+                                // th, td, tr, input 등 테이블/폼 구조를 나타내는 태그 문자열 강제 보호
+                                let is_structure_tag = original_text.starts_with("th") 
+                                    || original_text.starts_with("td") 
+                                    || original_text.starts_with("tr") 
+                                    || original_text.starts_with("input")
+                                    || original_text.starts_with("div");
+                                
+                                // 임계값을 높이고(0.6), 숫자, 짧은 핵심 텍스트, 구조 태그는 노이즈 탈락에서 강제 보호합니다.
+                                if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag {
                                     emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
                                     item_lines[original_idx] = String::new(); 
                                 } else {
@@ -2123,24 +2186,102 @@ async fn process_task(
                 let thead_lines_ref: Vec<&str> = thead_lines.iter().map(|s| s.as_str()).collect();
                 let item_lines_ref: Vec<&str> = item_lines.iter().map(|s| s.as_str()).collect();
 
+                // 🌟 [핵심 반영 2] 필드별 상호 배타적 Bias/Prejudice 벡터 사전 계산 (별도 루프)
+                let mut field_embeddings = Vec::new();
+                for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
+                    let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                    
+                    let mut dynamic_prej_texts = Vec::new();
+                    if !predefined_prej.trim().is_empty() {
+                        dynamic_prej_texts.push(predefined_prej.clone());
+                    }
+                    for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
+                        if f_idx != other_idx {
+                            dynamic_prej_texts.push(other_bias.clone()); // 타 필드의 bias를 prejudice로 편입
+                        }
+                    }
+                    let combined_prej = dynamic_prej_texts.join(" , ");
+                    let prej_emb = model.get_embedding(combined_prej.clone()).await.unwrap_or(vec![0.0; 384]);
+                    
+                    field_embeddings.push((bias_emb, prej_emb, combined_prej));
+                }
+
+                // 🌟 [핵심 반영 3] Item 라인별 Pre-mapping 수행
+                // 각 라인이 id, code, no 중 어떤 컬럼인지 미리 체크하여 시스템 프롬프트용 힌트로 결합합니다.
+                let mut pre_mapped_hints = Vec::new();
+                
+                // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
+                let mut url_pool = String::new();
+                if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+                    for line in &item_lines_ref {
+                        for cap in href_re.captures_iter(line) {
+                            if let Some(m) = cap.get(1) {
+                                url_pool.push_str(&m.as_str().to_lowercase());
+                                url_pool.push_str(" ");
+                            }
+                        }
+                    }
+                }
+
+                for (i, emb) in item_embeddings.iter().enumerate() {
+                    if item_lines_ref[i].trim().is_empty() { continue; }
+                    let target_text = if !line_enriched_texts[i].is_empty() { &line_enriched_texts[i] } else { item_lines_ref[i] };
+                    let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { target_text.trim() };
+                    if clean_text.is_empty() { continue; }
+
+                    let mut best_field = "";
+                    let mut best_score = 0.15; // 임계값
+                    
+                    for (f_idx, (fname, _, _, _)) in fields.iter().enumerate() {
+                        let (bias_emb, prej_emb, _) = &field_embeddings[f_idx];
+                        let b_score = cosine_similarity(bias_emb, emb);
+                        let p_score = cosine_similarity(prej_emb, emb);
+                        let score = b_score - p_score;
+                        
+                        if score > best_score {
+                            best_score = score;
+                            best_field = fname;
+                        }
+                    }
+                    
+                    // 🌟 [CRITICAL FIX] 개발 로직: 추출된 값이 a 태그의 href 주소 내부에 포함되어 있는지 정확히 확인
+                    if best_field == "id" || best_field == "code" || best_field == "stock_keeping_unit" {
+                        if !clean_text.is_empty() && url_pool.contains(&clean_text.to_lowercase()) {
+                            best_field = "id";
+                        } else {
+                            best_field = "code";
+                        }
+                    }
+                    
+                    if !best_field.is_empty() {
+                        // 🌟 LLM 인식률 극대화를 위해 단순 문자열이 아닌 JSON 객체 포맷으로 전환 구축
+                        pre_mapped_hints.push(json!({
+                            "target_column": best_field,
+                            "extracted_value": clean_text
+                        }));
+                        emit_term(&format!("    🔍 [PRE-MAP] Item Line {} mapped to '{}' (Score: {:.4})", i + 1, best_field, best_score));
+                    }
+                }
+                
+                // 🌟 JSON 배열 형태로 예쁘게 렌더링하여 프롬프트 컨텍스트에 완벽 주입
+                let pre_mapped_context = if !pre_mapped_hints.is_empty() {
+                    serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
                 // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
                     
-                    // 2. Bias와 Prejudice 임베딩 (인메모리 코사인 검색용)
-                    let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
-                    let prej_emb = if prejudice_target.trim().is_empty() { 
-                        vec![0.0; 384] 
-                    } else { 
-                        model.get_embedding(prejudice_target.clone()).await.unwrap_or(vec![0.0; 384]) 
-                    };
+                    let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
                     
                     // Header 영역 독립 매칭
                     let mut best_thead_idx = 0;
                     let mut best_thead_score = -1.0;
                     for (i, emb) in thead_embeddings.iter().enumerate() {
                         if thead_lines_ref[i].trim().is_empty() { continue; }
-                        let b_score = cosine_similarity(&bias_emb, emb);
-                        let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                        let b_score = cosine_similarity(bias_emb, emb);
+                        let p_score = cosine_similarity(prej_emb, emb);
                         let final_score = b_score - p_score;
 
                         if final_score > best_thead_score {
@@ -2148,16 +2289,13 @@ async fn process_task(
                             best_thead_idx = i;
                         }
                     }
-                    // 🌟 [CRITICAL FIX] extract_pug_context Slicing 비활성화!
-                    // 점수 기반 검색은 로그 출력 및 검증용으로만 계산하고, 실제 LLM에게는 rowspan/colspan 구조적 대칭성이 
-                    // 완벽하게 보존된 전체 블록(full_item_pug)을 무조건 넘깁니다.
                     
                     let mut best_item_idx = 0;
                     let mut best_item_score = -1.0;
                     for (i, emb) in item_embeddings.iter().enumerate() {
                         if item_lines_ref[i].trim().is_empty() { continue; }
-                        let b_score = cosine_similarity(&bias_emb, emb);
-                        let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                        let b_score = cosine_similarity(bias_emb, emb);
+                        let p_score = cosine_similarity(prej_emb, emb);
                         let final_score = b_score - p_score;
 
                         if final_score > best_item_score {
@@ -2166,14 +2304,24 @@ async fn process_task(
                         }
                     }
                     
-                    // 🌟 [개선] 리스트 아이템은 크기가 작으므로 특정 줄만 잘라서 던지지 않고, 
-                    // 노이즈가 완벽히 필터링된 직관적인 Key-Value 묶음(filtered_full_item_pug)을 통째로 던집니다.
                     let targeted_pug = filtered_full_item_pug.clone();
                     
                     emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4} (Using filtered structure)", field_name, best_thead_score, best_item_score));
                     
+                    let mut final_context_str = format!("[JSON CONTEXT]\n{}", targeted_pug);
+                    if !pre_mapped_context.is_empty() {
+                        final_context_str.push_str(&format!("\n\n[PRE-MAPPED COLUMNS]\nThe embedding model explicitly mapped the following values to specific columns. Use this mapping as your absolute primary reference:\n{}", pre_mapped_context));
+                    } else if best_item_score > 0.15 {
+                        let matched_line = if line_enriched_texts[best_item_idx].is_empty() {
+                            item_lines_ref[best_item_idx].trim()
+                        } else {
+                            line_enriched_texts[best_item_idx].as_str()
+                        };
+                        final_context_str.push_str(&format!("\n\n[VECTOR MATCH RESULT]\nThe embedding model explicitly matched this field to the following data:\n\"{}\"", matched_line));
+                    }
+
                     let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: format!("[JSON CONTEXT]\n{}", targeted_pug),
+                        content: final_context_str,
                         name: None,
                     });
                     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -2223,8 +2371,10 @@ async fn process_task(
                         let sys_msg = system_message.clone();
                         
                         let field_name_clone = field_name.clone();
-                        let bias_target_for_closure = bias_target.clone(); 
-                        let prejudice_target_for_closure = prejudice_target.clone(); 
+                        let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
+                        
+                        // 🌟 [CRITICAL FIX] 강력해진 타 필드 오답 페널티를 LLM Logit Bias 제어 변수에도 할당
+                        let prejudice_target_for_closure = dynamic_prej_str.clone();
                         
                         let task_q = task_question.clone();
                         let ignore_list_clone = ignore_list.clone();
@@ -2424,17 +2574,60 @@ async fn process_task(
                 } // fields for loop end
 
                 // 포스트 프로세싱: id, link 등 병합
-                if let Some(id_val) = item_val.get("id").and_then(|v| v.as_str()) {
-                    let extracted = if let Some(idx) = id_val.rfind('=') {
-                        &id_val[idx + 1..]
-                    } else {
-                        id_val
-                    };
+                let mut temp_id = item_val.get("id").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
+                let mut temp_code = item_val.get("code").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
+                
+                // 🌟 [CRITICAL FIX] 개발 로직: 추출된 결과(JSON)를 PUG/HTML 텍스트 기반으로 검증 및 스왑
+                if !temp_id.is_empty() || !temp_code.is_empty() {
+                    let mut url_pool = String::new();
+                    if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+                        for line in &item_lines_ref {
+                            for cap in href_re.captures_iter(line) {
+                                if let Some(m) = cap.get(1) {
+                                    url_pool.push_str(&m.as_str().to_lowercase());
+                                    url_pool.push_str(" ");
+                                }
+                            }
+                        }
+                    }
                     
+                    let id_in_url = !temp_id.is_empty() && url_pool.contains(&temp_id.to_lowercase());
+                    let code_in_url = !temp_code.is_empty() && url_pool.contains(&temp_code.to_lowercase());
+
+                    if !id_in_url && code_in_url {
+                        let swap = temp_id.clone();
+                        temp_id = temp_code.clone();
+                        temp_code = swap;
+                        emit_term("  🔄 [DEV-LOGIC] Swapped 'id' and 'code' based on URL presence in PUG.");
+                    } else if !temp_id.is_empty() && !id_in_url {
+                        if temp_code.is_empty() {
+                            temp_code = temp_id.clone();
+                        }
+                        temp_id = String::new();
+                        emit_term("  🔄 [DEV-LOGIC] Moved 'id' to 'code' because it was NOT found in any URL link.");
+                    }
+                }
+
+                if !temp_id.is_empty() {
+                    let extracted = if let Some(idx) = temp_id.rfind('=') {
+                        &temp_id[idx + 1..]
+                    } else {
+                        &temp_id
+                    };
                     let clean_str = extracted.replace("-", "").replace("_", "").replace(".", "").replace(",", "");
                     if !clean_str.is_empty() {
                         item_val.as_object_mut().unwrap().insert("id".to_string(), json!(clean_str.trim()));
+                    } else {
+                        item_val.as_object_mut().unwrap().remove("id");
                     }
+                } else {
+                    item_val.as_object_mut().unwrap().remove("id");
+                }
+
+                if !temp_code.is_empty() {
+                    item_val.as_object_mut().unwrap().insert("code".to_string(), json!(temp_code.trim()));
+                } else {
+                    item_val.as_object_mut().unwrap().remove("code");
                 }
 
                 if !item_val.is_null() && (item_val.is_object() || item_val.is_array()) {
@@ -2702,6 +2895,88 @@ async fn process_task(
                 }
             };
 
+            // 🌟 [핵심 반영 4] 필드별 상호 배타적 Bias/Prejudice 벡터 사전 계산 (Detail Mode)
+            let mut field_embeddings = Vec::new();
+            for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
+                let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                let mut dynamic_prej_texts = Vec::new();
+                if !predefined_prej.trim().is_empty() {
+                    dynamic_prej_texts.push(predefined_prej.clone());
+                }
+                for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
+                    if f_idx != other_idx {
+                        dynamic_prej_texts.push(other_bias.clone());
+                    }
+                }
+                let combined_prej = dynamic_prej_texts.join(" , ");
+                let prej_emb = model.get_embedding(combined_prej.clone()).await.unwrap_or(vec![0.0; 384]);
+                
+                field_embeddings.push((bias_emb, prej_emb, combined_prej));
+            }
+
+            // 🌟 [핵심 반영 5] Detail 라인별 Pre-mapping 수행
+            let mut pre_mapped_hints = Vec::new();
+            
+            // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
+            let mut url_pool = String::new();
+            if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+                for line in &pug_lines_ref {
+                    for cap in href_re.captures_iter(line) {
+                        if let Some(m) = cap.get(1) {
+                            url_pool.push_str(&m.as_str().to_lowercase());
+                            url_pool.push_str(" ");
+                        }
+                    }
+                }
+            }
+
+            for (i, emb) in line_embeddings.iter().enumerate() {
+                if pug_lines_ref[i].trim().is_empty() { continue; }
+                let clean_text = if let Some(idx) = pug_lines_ref[i].find('|') { pug_lines_ref[i][idx + 1..].trim() } else { pug_lines_ref[i].trim() };
+                if clean_text.is_empty() { continue; }
+
+                let mut best_field = "";
+                let mut best_score = 0.15; // 임계값
+                
+                for (f_idx, (fname, _, _, _)) in fields.iter().enumerate() {
+                    let (bias_emb, prej_emb, _) = &field_embeddings[f_idx];
+                    let b_score = cosine_similarity(bias_emb, emb);
+                    let p_score = cosine_similarity(prej_emb, emb);
+                    let score = b_score - p_score;
+                    
+                    if score > best_score {
+                        best_score = score;
+                        best_field = fname;
+                    }
+                }
+                
+                // 🌟 [CRITICAL FIX] 개발 로직: 추출된 값이 a 태그의 href 주소 내부에 포함되어 있는지 정확히 확인
+                if best_field == "id" || best_field == "code" || best_field == "stock_keeping_unit" {
+                    if !clean_text.is_empty() && url_pool.contains(&clean_text.to_lowercase()) {
+                        best_field = "id";
+                    } else {
+                        best_field = "code";
+                    }
+                }
+
+                if !best_field.is_empty() {
+                    // 🌟 LLM 인식률 극대화를 위해 단순 문자열이 아닌 JSON 객체 포맷으로 전환 구축
+                    pre_mapped_hints.push(json!({
+                        "target_column": best_field,
+                        "extracted_value": clean_text
+                    }));
+                    emit_term(&format!("    🔍 [PRE-MAP] Detail Line {} mapped to '{}' (Score: {:.4})", i + 1, best_field, best_score));
+                }
+            }
+            
+            // 🌟 JSON 배열 형태로 예쁘게 렌더링하여 프롬프트 컨텍스트에 완벽 주입
+            let pre_mapped_context = if !pre_mapped_hints.is_empty() {
+                serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
             let mut global_ignore_list: Vec<String> = Vec::new(); // 🌟 전역 무시 리스트 추가
 
             // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
@@ -2709,21 +2984,15 @@ async fn process_task(
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                // 2. Bias와 Prejudice 임베딩 (인메모리 코사인 검색용)
-                let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
-                let prej_emb = if prejudice_target.trim().is_empty() { 
-                    vec![0.0; 384] 
-                } else { 
-                    model.get_embedding(prejudice_target.clone()).await.unwrap_or(vec![0.0; 384]) 
-                };
+                let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[idx];
                 
                 let mut best_idx = 0;
                 let mut best_score = -1.0;
                 
                 for (i, emb) in line_embeddings.iter().enumerate() {
                     if pug_lines_ref[i].trim().is_empty() { continue; }
-                    let b_score = cosine_similarity(&bias_emb, emb);
-                    let p_score = if prejudice_target.trim().is_empty() { 0.0 } else { cosine_similarity(&prej_emb, emb) };
+                    let b_score = cosine_similarity(bias_emb, emb);
+                    let p_score = cosine_similarity(prej_emb, emb);
                     let final_score = b_score - p_score;
 
                     if final_score > best_score {
@@ -2762,8 +3031,16 @@ async fn process_task(
                 
                 emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' | Score: {:.4}\n{}", field_name, best_score, targeted_json_context));
                 
+                let mut final_context_str = format!("[JSON CONTEXT]\n{}", targeted_json_context);
+                if !pre_mapped_context.is_empty() {
+                    final_context_str.push_str(&format!("\n\n[PRE-MAPPED COLUMNS]\nThe embedding model explicitly mapped the following values to specific columns. Use this mapping as your absolute primary reference:\n{}", pre_mapped_context));
+                } else if best_score >= 0.25 {
+                    let matched_line = pug_lines_ref[best_idx].trim();
+                    final_context_str.push_str(&format!("\n\n[VECTOR MATCH RESULT]\nThe embedding model explicitly matched this field to the following data:\n\"{}\"", matched_line));
+                }
+
                 let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: format!("[JSON CONTEXT]\n{}", targeted_json_context),
+                    content: final_context_str,
                     name: None,
                 });
 
@@ -2814,10 +3091,8 @@ async fn process_task(
                     let sys_msg = system_message.clone();
                     
                     let field_name_clone = field_name.clone();
-                    let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
-                    
-                    // 🌟 [CRITICAL FIX] 다국어 Prejudice(배제) 타겟 클로저용 변수 생성
-                    let prejudice_target_for_closure = prejudice_target.clone(); 
+                    let bias_target_for_closure = bias_target.clone(); 
+                    let prejudice_target_for_closure = dynamic_prej_str.clone(); // 🌟 강력해진 타 필드 오답 페널티를 Logit-bias에 주입
                     
                     let task_q = task_question.clone();
                     let ignore_list_clone = ignore_list.clone();
