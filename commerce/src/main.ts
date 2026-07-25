@@ -1742,7 +1742,7 @@ async function syncData() {
 
             // 🌟 [추가] '대기 중' 멤버 정화(Cleanup) 로직
             // 서버에서 받은 결과 중 정식 멤버(member/user)가 있는지 확인합니다.
-            const realMembers = response.results.filter(item => item.type === "member" || item.type === "user");
+            const realMembers = response.results.filter((item: any) => item.type === "member" || item.type === "user");
             if (realMembers.length > 0) {
                 const localUsers = await Select["users"]({});
                 // 로컬에 저장된 'pending_invite_'로 시작하는 가짜 데이터들을 찾습니다.
@@ -1751,7 +1751,7 @@ async function syncData() {
                 for (const pending of pendingInvites) {
                     const pendingEmail = pending.data?.email;
                     // 서버에서 온 정식 멤버 중 이메일(혹은 이름)이 일치하는 사람이 있는지 대조
-                    const isNowMember = realMembers.some(m => {
+                    const isNowMember = realMembers.some((m: any) => {
                         // 서버 데이터(m) 내부에 이메일 정보가 있거나, 이름이 이메일 아이디와 같은지 확인
                         return m.to === pending.from || (m.data && m.data.email === pendingEmail);
                     });
@@ -2858,7 +2858,7 @@ async function startWebRtcOfferer(baseIp: string, seed: number) {
     }
 
     try {
-        const result = await Promise.any(scanPromises);
+        const result = await (Promise as any).any(scanPromises);
         await peerConn.setRemoteDescription({ type: 'answer', sdp: result.answerSdp });
         console.log(`[SYNC] Connected to ${result.targetIp} successfully via Auto Scan!`);
     } catch (e) {
