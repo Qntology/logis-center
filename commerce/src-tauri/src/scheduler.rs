@@ -593,13 +593,7 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let mut clean_html_content = parsing::pre_clean_html(&raw_html_content);
-    
-    // 🌟 [CRITICAL FIX 1] UI 요소의 title 속성이 상품명으로 환각(Hallucination)되는 것을 원천 차단하기 위해,
-    // 정규식을 사용하여 모든 title="..." 속성 자체를 제거합니다. (jQuery의 removeAttr("title")과 동일한 효과)
-    if let Ok(re) = regex::Regex::new(r#"(?i)\s+title\s*=\s*(["']).*?\1"#) {
-        clean_html_content = re.replace_all(&clean_html_content, "").to_string();
-    }
+    let clean_html_content = parsing::pre_clean_html(&raw_html_content);
     
     let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
@@ -1874,6 +1868,45 @@ async fn process_task(
         if !pug_list.is_empty() {
             let total_items = pug_list.len();
 
+            // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직]
+            // "상품 상세보기", "구매하기" 등 모든 리스트 아이템에 동일하게 반복 등장하는 텍스트는
+            // 상품명이 아닌 버튼/UI 요소이므로 LLM 추출 전에 미리 전역에서 탈락(Drop) 시킵니다.
+            let mut text_frequency: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for item_pug in &pug_list {
+                let mut seen_in_this_item = std::collections::HashSet::new();
+                for line in item_pug.lines() {
+                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
+                    if !text_part.is_empty() && text_part.len() > 2 {
+                        seen_in_this_item.insert(text_part.to_string());
+                    }
+                }
+                for text in seen_in_this_item {
+                    *text_frequency.entry(text).or_insert(0) += 1;
+                }
+            }
+
+            let mut boilerplate_texts = std::collections::HashSet::new();
+            if total_items >= 2 {
+                // 아이템의 80% 이상에서 동일하게 등장하면 구조적 UI 요소로 간주
+                let threshold = (total_items as f32 * 0.8).ceil() as usize; 
+                
+                // 🌟 특정 문자셋이나 글자 수 제한 없이 순수하게 숫자(1,000 등) 데이터 구조인지를 판별합니다.
+                // 숫자가 아닌 문자(공백, 원, $, 기호 등)가 앞뒤로 몇 글자가 오든 허용하며, "상품 상세보기"처럼 숫자가 아예 없는 문구만 탈락시킵니다.
+                let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
+
+                for (text, count) in text_frequency {
+                    if count >= threshold {
+                        // 정규식을 만족하는 숫자 형태의 데이터는 탈락(Drop)에서 완벽히 제외합니다.
+                        let is_numeric_data = re_numeric.is_match(&text);
+                        
+                        if !is_numeric_data && text.len() > 3 {
+                            boilerplate_texts.insert(text.clone());
+                            emit_term(&format!("[Scheduler] 🚫 전역 중복 텍스트 사전 탈락(Drop): '{}' ({} / {} 아이템에서 발견)", text, count, total_items));
+                        }
+                    }
+                }
+            }
+
             // 리스트 전용 스키마 정의를 호출하여 핵심 필드만 개별 추출
             let fields = parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
@@ -1937,8 +1970,13 @@ async fn process_task(
                                 let emb = vector.clone();
                                 let noise_score = cosine_similarity(&layout_prej_emb, &emb);
                                 
-                                if noise_score > 0.55 {
-                                    emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", original_idx + 1, text_chunk[i].trim(), noise_score));
+                                let original_text = text_chunk[i].trim();
+                                let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
+                                let is_short = original_text.len() <= 3;
+                                
+                                // 임계값을 높이고(0.6), 숫자나 짧은 핵심 텍스트는 노이즈 탈락에서 강제 보호합니다.
+                                if noise_score > 0.6 && !has_digit && !is_short {
+                                    emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", original_idx + 1, original_text, noise_score));
                                     thead_lines[original_idx] = String::new(); 
                                 } else {
                                     thead_embeddings[original_idx] = emb;
@@ -1970,7 +2008,17 @@ async fn process_task(
                 // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행 및 노이즈 필터링
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 
-                // 🌟 [GRID ALIGNMENT] tbody 아이템 셀 파싱 및 thead 헤더 텍스트 융합
+                // 🌟 [핵심 개선: 1차 탈락 적용] 추출된 반복 UI 요소(Boilerplate)를 PUG 컨텍스트에서 완전히 삭제합니다.
+                for i in 0..item_lines.len() {
+                    let line = &item_lines[i];
+                    let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { line.trim() };
+                    if boilerplate_texts.contains(text_part) {
+                        emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
+                        item_lines[i] = String::new();
+                    }
+                }
+
+                // 🌟 [GRID ALIGNMENT] tbody 아이템 셀 파싱 및 thead 헤더 텍스트 융합 (rowspan, colspan 구조 매칭 포함)
                 let item_cells = parse_pug_grid(&item_lines);
                 let mut line_enriched_texts = vec![String::new(); item_lines.len()];
                 
@@ -2023,11 +2071,16 @@ async fn process_task(
                                 let emb = vector.clone();
                                 let noise_score = cosine_similarity(&layout_prej_emb, &emb);
                                 
-                                if noise_score > 0.55 {
-                                    emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), text_chunk[i].trim(), noise_score));
+                                let original_text = text_chunk[i].trim();
+                                let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
+                                let is_short = original_text.len() <= 3;
+                                
+                                // 임계값을 높이고(0.6), 숫자나 짧은 핵심 텍스트는 노이즈 탈락에서 강제 보호합니다.
+                                if noise_score > 0.6 && !has_digit && !is_short {
+                                    emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
                                     item_lines[original_idx] = String::new(); 
                                 } else {
-                                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), text_chunk[i].trim()));
+                                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), original_text));
                                     item_embeddings[original_idx] = emb;
                                 }
                             }
@@ -2041,10 +2094,12 @@ async fn process_task(
                     if !line.trim().is_empty() {
                         let enriched = &line_enriched_texts[line_idx];
                         let target_text = if enriched.is_empty() {
-                            if let Some(p) = line.find('|') { line[p + 1..].trim() } else { line.trim() }
+                            // [수정] '|' 기호가 없다면 PUG의 구조 태그(td, tr 등)이므로 절대로 LLM에 넘기지 않고 빈 문자열 처리합니다.
+                            if let Some(p) = line.find('|') { line[p + 1..].trim() } else { "" }
                         } else {
                             enriched.as_str()
                         };
+
                         if !target_text.is_empty() {
                             if let Some(idx) = target_text.find('|') {
                                 json_contexts.push(json!({
