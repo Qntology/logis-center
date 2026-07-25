@@ -1912,8 +1912,8 @@ async fn process_task(
 
             let mut boilerplate_texts = std::collections::HashSet::new();
             if total_items >= 2 {
-                // 아이템의 80% 이상에서 동일하게 등장하면 구조적 UI 요소로 간주
-                let threshold = (total_items as f32 * 0.8).ceil() as usize; 
+                // 아이템의 70% 이상에서 동일하게 등장하면 구조적 UI 요소로 간주
+                let threshold = (total_items as f32 * 0.7).ceil() as usize; 
                 
                 // 🌟 특정 문자셋이나 글자 수 제한 없이 순수하게 숫자(1,000 등) 데이터 구조인지를 판별합니다.
                 // 숫자가 아닌 문자(공백, 원, $, 기호 등)가 앞뒤로 몇 글자가 오든 허용하며, "상품 상세보기"처럼 숫자가 아예 없는 문구만 탈락시킵니다.
