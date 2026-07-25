@@ -2040,6 +2040,75 @@ async fn process_task(
                 }
             }
 
+            // --- [핵심 최적화: LLM 기반 Thead Column Pre-Mapping (루프 밖에서 1회만 수행)] ---
+            let mut unique_headers = Vec::new();
+            for (_, h_text) in &header_cols {
+                let clean_h = h_text.trim();
+                if !clean_h.is_empty() && !unique_headers.contains(&clean_h.to_string()) {
+                    unique_headers.push(clean_h.to_string());
+                }
+            }
+
+            let mut header_to_field_map = std::collections::HashMap::new();
+
+            if !unique_headers.is_empty() {
+                let mut items_str = String::new();
+                for (idx, h_text) in unique_headers.iter().enumerate() {
+                    items_str.push_str(&format!("{}. {}\n", idx + 1, h_text));
+                }
+
+                let mut handles = Vec::new();
+                for (fname, fdesc, _, _) in &fields {
+                    let mapping_prompt = crate::parsing::column_mapping_prompt(fname, fdesc, &items_str);
+                    let q3_gen = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let fname_clone = fname.clone();
+                    
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let mut gen_guard = q3_gen.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            let params = crate::openai_types::ChatCompletionParameters {
+                                messages: vec![
+                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(mapping_prompt),
+                                        name: None,
+                                    })
+                                ],
+                                model: "qwen3".to_string(), max_tokens: Some(64), temperature: Some(0.0), top_p: Some(0.95),
+                                ..Default::default()
+                            };
+                            let res = gen.generate(params, Some(cancel_clone), None, None);
+                            (fname_clone, res)
+                        } else {
+                            (fname_clone, Err(anyhow::anyhow!("LLM Generator not available")))
+                        }
+                    }));
+                }
+
+                for h in handles {
+                    if let Ok((fname, Ok(res_text))) = h.await {
+                        let parsed = crate::parsing::parse_json_from_llm(&res_text);
+                        if let Some(result_val) = parsed.get("result").and_then(|v| if v.is_number() { v.as_u64() } else { v.as_str().and_then(|s| s.parse::<u64>().ok()) }) {
+                            let idx = result_val as usize;
+                            if idx > 0 && idx <= unique_headers.len() {
+                                let matched_header = unique_headers[idx - 1].clone();
+                                header_to_field_map.insert(matched_header.clone(), fname.clone());
+                                emit_term(&format!("    ✨ [THEAD-MAP] Header '{}' mapped to Schema Field '{}'", matched_header, fname));
+                            }
+                        }
+                    }
+                }
+
+                // 환각 캐시 비우기
+                let q3_clear_arc = model.qwen3_generator.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                        gen.clear_kv_cache();
+                    }
+                }).await;
+            }
+            // ----------------------------------------------------------------------------------
+
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
@@ -2206,8 +2275,7 @@ async fn process_task(
                     field_embeddings.push((bias_emb, prej_emb, combined_prej));
                 }
 
-                // 🌟 [핵심 반영 3] Item 라인별 Pre-mapping 수행
-                // 각 라인이 id, code, no 중 어떤 컬럼인지 미리 체크하여 시스템 프롬프트용 힌트로 결합합니다.
+                // 🌟 [핵심 반영 3] Item 라인별 Pre-mapping 수행 (사전 매핑된 Thead 정보 활용하여 LLM 100% 우회)
                 let mut pre_mapped_hints = Vec::new();
                 
                 // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
@@ -2223,43 +2291,35 @@ async fn process_task(
                     }
                 }
 
-                for (i, emb) in item_embeddings.iter().enumerate() {
-                    if item_lines_ref[i].trim().is_empty() { continue; }
-                    let target_text = if !line_enriched_texts[i].is_empty() { &line_enriched_texts[i] } else { item_lines_ref[i] };
-                    let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { target_text.trim() };
-                    if clean_text.is_empty() { continue; }
+                // 사전에 LLM으로 1회만 매핑해둔 Thead 기반 힌트 초고속 적용
+                for cell in &item_cells {
+                    let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
+                    let clean_h = h_text.trim();
+                    if !clean_h.is_empty() {
+                        if let Some(best_field) = header_to_field_map.get(clean_h) {
+                            for &line_idx in &cell.line_indices {
+                                let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
+                                let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { target_text.trim() };
+                                if clean_text.is_empty() || clean_text.len() < 2 { continue; }
 
-                    let mut best_field = "";
-                    let mut best_score = 0.15; // 임계값
-                    
-                    for (f_idx, (fname, _, _, _)) in fields.iter().enumerate() {
-                        let (bias_emb, prej_emb, _) = &field_embeddings[f_idx];
-                        let b_score = cosine_similarity(bias_emb, emb);
-                        let p_score = cosine_similarity(prej_emb, emb);
-                        let score = b_score - p_score;
-                        
-                        if score > best_score {
-                            best_score = score;
-                            best_field = fname;
+                                let mut final_field = best_field.clone();
+                                
+                                // URL 풀 검증 로직 적용
+                                if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
+                                    if url_pool.contains(&clean_text.to_lowercase()) {
+                                        final_field = "id".to_string();
+                                    } else {
+                                        final_field = "code".to_string();
+                                    }
+                                }
+
+                                pre_mapped_hints.push(json!({
+                                    "target_column": final_field,
+                                    "extracted_value": clean_text
+                                }));
+                                emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' via Header '{}'", line_idx + 1, final_field, clean_h));
+                            }
                         }
-                    }
-                    
-                    // 🌟 [CRITICAL FIX] 개발 로직: 추출된 값이 a 태그의 href 주소 내부에 포함되어 있는지 정확히 확인
-                    if best_field == "id" || best_field == "code" || best_field == "stock_keeping_unit" {
-                        if !clean_text.is_empty() && url_pool.contains(&clean_text.to_lowercase()) {
-                            best_field = "id";
-                        } else {
-                            best_field = "code";
-                        }
-                    }
-                    
-                    if !best_field.is_empty() {
-                        // 🌟 LLM 인식률 극대화를 위해 단순 문자열이 아닌 JSON 객체 포맷으로 전환 구축
-                        pre_mapped_hints.push(json!({
-                            "target_column": best_field,
-                            "extracted_value": clean_text
-                        }));
-                        emit_term(&format!("    🔍 [PRE-MAP] Item Line {} mapped to '{}' (Score: {:.4})", i + 1, best_field, best_score));
                     }
                 }
                 
@@ -2915,7 +2975,7 @@ async fn process_task(
                 field_embeddings.push((bias_emb, prej_emb, combined_prej));
             }
 
-            // 🌟 [핵심 반영 5] Detail 라인별 Pre-mapping 수행
+            // 🌟 [핵심 반영 5] Detail 라인별 Pre-mapping 수행 (LLM 기반 구조 분석 - 필드별 독립 호출)
             let mut pre_mapped_hints = Vec::new();
             
             // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
@@ -2931,43 +2991,86 @@ async fn process_task(
                 }
             }
 
-            for (i, emb) in line_embeddings.iter().enumerate() {
+            let mut text_candidates = Vec::new();
+            for (i, _) in line_embeddings.iter().enumerate() {
                 if pug_lines_ref[i].trim().is_empty() { continue; }
                 let clean_text = if let Some(idx) = pug_lines_ref[i].find('|') { pug_lines_ref[i][idx + 1..].trim() } else { pug_lines_ref[i].trim() };
-                if clean_text.is_empty() { continue; }
+                if clean_text.is_empty() || clean_text.len() < 2 { continue; }
+                text_candidates.push((i, clean_text.to_string()));
+            }
 
-                let mut best_field = "";
-                let mut best_score = 0.15; // 임계값
-                
-                for (f_idx, (fname, _, _, _)) in fields.iter().enumerate() {
-                    let (bias_emb, prej_emb, _) = &field_embeddings[f_idx];
-                    let b_score = cosine_similarity(bias_emb, emb);
-                    let p_score = cosine_similarity(prej_emb, emb);
-                    let score = b_score - p_score;
+            if !text_candidates.is_empty() {
+                let mut items_str = String::new();
+                let max_candidates = text_candidates.len().min(100);
+                for list_idx in 0..max_candidates {
+                    items_str.push_str(&format!("{}. {}\n", list_idx + 1, text_candidates[list_idx].1));
+                }
+
+                // 각 필드별로 병렬 LLM 호출을 통해 매핑 수행
+                let mut handles = Vec::new();
+                for (fname, fdesc, _, _) in &fields {
+                    let mapping_prompt = crate::parsing::column_mapping_prompt(fname, fdesc, &items_str);
+                    let q3_gen = model.qwen3_generator.clone();
+                    let cancel_clone = cancellation_token.clone();
+                    let fname_clone = fname.clone();
                     
-                    if score > best_score {
-                        best_score = score;
-                        best_field = fname;
-                    }
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let mut gen_guard = q3_gen.blocking_lock();
+                        if let Some(gen) = gen_guard.as_mut() {
+                            let params = crate::openai_types::ChatCompletionParameters {
+                                messages: vec![
+                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(mapping_prompt),
+                                        name: None,
+                                    })
+                                ],
+                                model: "qwen3".to_string(), max_tokens: Some(64), temperature: Some(0.0), top_p: Some(0.95),
+                                ..Default::default()
+                            };
+                            let res = gen.generate(params, Some(cancel_clone), None, None);
+                            (fname_clone, res)
+                        } else {
+                            (fname_clone, Err(anyhow::anyhow!("LLM Generator not available")))
+                        }
+                    }));
                 }
-                
-                // 🌟 [CRITICAL FIX] 개발 로직: 추출된 값이 a 태그의 href 주소 내부에 포함되어 있는지 정확히 확인
-                if best_field == "id" || best_field == "code" || best_field == "stock_keeping_unit" {
-                    if !clean_text.is_empty() && url_pool.contains(&clean_text.to_lowercase()) {
-                        best_field = "id";
-                    } else {
-                        best_field = "code";
+
+                for h in handles {
+                    if let Ok((best_field, Ok(res_text))) = h.await {
+                        let parsed = crate::parsing::parse_json_from_llm(&res_text);
+                        if let Some(result_val) = parsed.get("result").and_then(|v| if v.is_number() { v.as_u64() } else { v.as_str().and_then(|s| s.parse::<u64>().ok()) }) {
+                            let idx = result_val as usize;
+                            if idx > 0 && idx <= max_candidates {
+                                let clean_text = &text_candidates[idx - 1].1;
+                                let original_line_idx = text_candidates[idx - 1].0;
+
+                                let mut final_field = best_field.clone();
+                                
+                                // URL 풀 검증 로직은 그대로 유지
+                                if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
+                                    if url_pool.contains(&clean_text.to_lowercase()) {
+                                        final_field = "id".to_string();
+                                    } else {
+                                        final_field = "code".to_string();
+                                    }
+                                }
+
+                                pre_mapped_hints.push(json!({
+                                    "target_column": final_field,
+                                    "extracted_value": clean_text
+                                }));
+                                emit_term(&format!("    🔍 [LLM-PRE-MAP] Detail Line {} mapped to '{}'", original_line_idx + 1, final_field));
+                            }
+                        }
                     }
                 }
 
-                if !best_field.is_empty() {
-                    // 🌟 LLM 인식률 극대화를 위해 단순 문자열이 아닌 JSON 객체 포맷으로 전환 구축
-                    pre_mapped_hints.push(json!({
-                        "target_column": best_field,
-                        "extracted_value": clean_text
-                    }));
-                    emit_term(&format!("    🔍 [PRE-MAP] Detail Line {} mapped to '{}' (Score: {:.4})", i + 1, best_field, best_score));
-                }
+                let q3_clear_arc = model.qwen3_generator.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                        gen.clear_kv_cache();
+                    }
+                }).await;
             }
             
             // 🌟 JSON 배열 형태로 예쁘게 렌더링하여 프롬프트 컨텍스트에 완벽 주입

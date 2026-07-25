@@ -607,3 +607,27 @@ Metadata: {METADATA}
             .replace("{TARGET_DATA}", target_data)
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
+
+pub fn column_mapping_prompt(field_name: &str, field_desc: &str, items: &str) -> String {
+    let template = r###"[TASK]
+Identify the most appropriate numbered item for the given schema field based on its context.
+If no item is suitable for this field, return 0.
+
+[SCHEMA FIELD]
+Name: {FIELD_NAME}
+Description: {FIELD_DESC}
+
+[CANDIDATE ITEMS]
+{ITEMS}
+
+[OUTPUT FORMAT]
+{
+  "result": Number
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{FIELD_NAME}", field_name)
+            .replace("{FIELD_DESC}", field_desc)
+            .replace("{ITEMS}", items)
+}
