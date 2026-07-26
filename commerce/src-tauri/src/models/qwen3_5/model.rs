@@ -838,8 +838,14 @@ impl Qwen3_5Attention {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
 
-                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?.contiguous()?);
+                        let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
+                        let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
+
+                        let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
+                        let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
+
+                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -863,7 +869,8 @@ impl Qwen3_5Attention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(k_piece); inner.v_cache = Some(v_piece);
+                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
+                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -901,7 +908,7 @@ impl Qwen3_5Attention {
                 let mut inner = block.inner.write().unwrap(); 
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if inner.location == KVLocation::VRAM {
-                        (k.clone(), v.clone(), false) // VRAM에 있다면 그대로 씀
+                        (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()), false) // VRAM에 있다면 복원해서 씀
                     } else {
                         // RAM에 있다면 GPU로 잠깐 복사해서 씀
                         (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, true)
@@ -1930,8 +1937,9 @@ impl Qwen3_5TextModel {
                     // 🌟 [FP4 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP4 압축을 마친 뒤 RAM으로 내립니다.
                     // Qwen 계열(qwen, qwen3, qwen3_5) 모두 Attention forward 시에 to_device와 to_dtype 코어가 존재하여
                     // VRAM 재진입 시 자동으로 원래의 BF16/F32 정밀도로 복구됩니다.
-                    let merged_k_cpu = merged_k_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
-                    let merged_v_cpu = merged_v_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
+                    let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
+                    let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
+                    let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
                     // 3. CPU(RAM)로 무사히 넘어온 거대 텐서를 다시 원래 블록 크기대로 썰어서 캐시에 재할당
                     let mut current_offset = 0;

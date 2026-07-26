@@ -650,9 +650,15 @@ impl QuantizedQwenVLTextAttention {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
 
+                        let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
+                        let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
+
                         // [CRITICAL FIX] 병합(cat) 후 메모리 재정렬(contiguous) 오버헤드 완벽 제거!
-                        inner.k_cache = Some(Tensor::cat(&[&pk, &k_piece], 2)?.contiguous()?);
-                        inner.v_cache = Some(Tensor::cat(&[&pv, &v_piece], 2)?.contiguous()?);
+                        let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
+                        let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
+                        
+                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
@@ -678,7 +684,8 @@ impl QuantizedQwenVLTextAttention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(k_piece); inner.v_cache = Some(v_piece);
+                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
+                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -720,7 +727,7 @@ impl QuantizedQwenVLTextAttention {
                 let mut inner = block.inner.write().unwrap();
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if inner.location == KVLocation::VRAM {
-                        (k.clone(), v.clone(), false) // VRAM에 있다면 그대로 씀
+                        (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()), false) // VRAM에 있다면 복원해서 씀
                     } else {
                         // RAM에 있다면 GPU로 잠깐 복사해서 씀 (원본은 냅둠)
                         (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, true)
@@ -906,8 +913,8 @@ impl QuantizedQwenVLTextAttention {
         let original_shape = t.shape().dims().to_vec();
         
         // 🌟 [동적 타입 분기] SSD 저장소 맵으로 넘기기 직전에도 F32/FP4 원본 정밀도를 절대 파괴하지 않고 보존합니다.
-        let target_dtype = match t.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
-        let t_compressed = t.to_dtype(target_dtype)?.to_device(&Device::Cpu)?.contiguous()?;
+        let target_dtype = if t.device().is_cuda() || t.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
+        let t_compressed = t.to_dtype(target_dtype).unwrap_or_else(|_| t.clone()).to_device(&Device::Cpu)?.contiguous()?;
         Ok((t_compressed, original_shape))
     }
 
@@ -1148,8 +1155,10 @@ impl QuantizedQwenVLTextAttention {
                                 let target_device = self.q_proj.device();
                                 let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
                                 
-                                inner.k_cache = Some(k_raw.to_device(target_device)?.to_dtype(target_dtype)?);
-                                inner.v_cache = Some(v_raw.to_device(target_device)?.to_dtype(target_dtype)?);
+                                let k_gpu = k_raw.to_device(target_device)?;
+                                let v_gpu = v_raw.to_device(target_device)?;
+                                inner.k_cache = Some(if target_device.is_cuda() { k_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| k_gpu.clone()) } else { k_gpu.to_dtype(target_dtype)? });
+                                inner.v_cache = Some(if target_device.is_cuda() { v_gpu.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| v_gpu.clone()) } else { v_gpu.to_dtype(target_dtype)? });
                                 
                                 inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
                                 reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
@@ -1182,9 +1191,9 @@ impl QuantizedQwenVLTextAttention {
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
             
             // 🌟 [동적 타입 분기] 공용 모듈 사용을 고려하여 텐서 고유의 DType(FP4, BF16, F32)을 감지하여 보존합니다.
-            let target_dtype = match mk.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
-            let mk_cpu = mk.contiguous()?.to_dtype(target_dtype)?.to_device(dev)?;
-            let mv_cpu = mv.contiguous()?.to_dtype(target_dtype)?.to_device(dev)?;
+            let target_dtype = if mk.device().is_cuda() || mk.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
+            let mk_cpu = mk.contiguous()?.to_dtype(target_dtype).unwrap_or_else(|_| mk.clone()).to_device(dev)?;
+            let mv_cpu = mv.contiguous()?.to_dtype(target_dtype).unwrap_or_else(|_| mv.clone()).to_device(dev)?;
             
             let mut current_pos = 0;
             for block in &mut self.kv_blocks {
@@ -1228,9 +1237,9 @@ impl QuantizedQwenVLTextAttention {
             let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
             
             // 🌟 [동적 타입 분기]
-            let target_dtype = match merged_k.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
-            let merged_k_cpu = merged_k.to_dtype(target_dtype)?.to_device(dev)?;
-            let merged_v_cpu = merged_v.to_dtype(target_dtype)?.to_device(dev)?;
+            let target_dtype = if merged_k.device().is_cuda() || merged_k.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
+            let merged_k_cpu = merged_k.to_dtype(target_dtype).unwrap_or_else(|_| merged_k.clone()).to_device(dev)?;
+            let merged_v_cpu = merged_v.to_dtype(target_dtype).unwrap_or_else(|_| merged_v.clone()).to_device(dev)?;
             
             let mut current_pos = 0;
             for (i, &idx) in target_idxs.iter().enumerate() {
@@ -2360,7 +2369,7 @@ impl QuantizedQwenVLTextModel {
 
                 // 🌟 [FP4 Compression] 전체 활성 블록을 디스크로 보낼 때 VRAM 안에서 먼저 FP4로 캐스팅해 RAM으로 보냅니다.
                 // SSD 저장 로직(LayerKVDump) 내부에서 백그라운드 스레드가 이를 다시 원래의 BF16으로 무손실 복구해 저장하게 됩니다.
-                let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+                let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
                 let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
                 let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2492,7 +2501,7 @@ impl QuantizedQwenVLTextModel {
             let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
             // 🌟 [FP4 Compression] 디코딩 롤백 시 단일 레이어 VRAM 완전 철수 과정에서도 GPU 코어로 초고속 FP4 압축합니다.
-            let target_dtype = match merged_k_gpu.dtype() { candle_core::DType::F64 => candle_core::DType::F4, candle_core::DType::F32 => candle_core::DType::F32, _ => candle_core::DType::BF16 };
+            let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
             let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
             let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 

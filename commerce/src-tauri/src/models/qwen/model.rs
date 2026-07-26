@@ -655,12 +655,20 @@ impl QwenVLTextAttention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let prev_k_res = prev_k.to_dtype(target_dtype).unwrap_or_else(|_| prev_k.clone());
+                let prev_v_res = prev_v.to_dtype(target_dtype).unwrap_or_else(|_| prev_v.clone());
+                let key_states = Tensor::cat(&[&prev_k_res, &key_states], 2)?;
+                let value_states = Tensor::cat(&[&prev_v_res, &value_states], 2)?;
                 (key_states, value_states)
             }
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        self.kv_cache = Some(if xs.device().is_cuda() { 
+            (key_states.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| key_states.clone()), 
+             value_states.to_dtype(candle_core::DType::F4).unwrap_or_else(|_| value_states.clone())) 
+        } else { 
+            (key_states.clone(), value_states.clone()) 
+        });
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
