@@ -822,6 +822,9 @@ async fn process_task(
         let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
         let mut wiped_indices = vec![false; pug_lines.len()];
         
+        // 🌟 [격리 보장] Step A의 노이즈 청소 로직이 원본 PUG를 훼손하여 Step B에 영향을 주지 않도록 독립된 변수로 분리합니다.
+        let mut filtered_light_pug = light_pug.clone();
+        
         // 🌟 [CRITICAL FIX] VRAM(GPU) 사용률 0% 병목 현상 원천 해결!
         // 한 줄씩 CPU가 던지고 기다리던 코드를 대량 일괄(Batch) 처리로 변경하여 GPU 코어를 100% 혹사시킵니다.
         let mut texts_to_embed = Vec::new();
@@ -1013,12 +1016,12 @@ async fn process_task(
                 if !wiped_indices[idx] { pre_filtered_pug.push_str(line); }
                 pre_filtered_pug.push_str("\n");
             }
-            light_pug = pre_filtered_pug.trim_end().to_string();
+            filtered_light_pug = pre_filtered_pug.trim_end().to_string();
 
             // 🌟 [클린 인계] 이제 노이즈 메뉴가 완벽히 소멸된 상태에서 안전하게 언어 및 카테고리를 식별합니다.
             let mut ko_count = 0;
             let mut ja_count = 0;
-            for c in light_pug.chars() {
+            for c in filtered_light_pug.chars() {
                 let u = c as u32;
                 if u >= 0xAC00 && u <= 0xD7A3 { ko_count += 1; }
                 else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { ja_count += 1; }
@@ -1107,7 +1110,7 @@ async fn process_task(
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             
             // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
-            let system_content_a2 = format!("[PUG CONTENT]\n{}", light_pug);
+            let system_content_a2 = format!("[PUG CONTENT]\n{}", filtered_light_pug);
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
 
             emit_term("\n[CLASSIFICATION] Track B & C Vector Matching (Batch DOM Blocks)...");
