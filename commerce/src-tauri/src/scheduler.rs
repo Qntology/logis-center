@@ -1050,36 +1050,16 @@ async fn process_task(
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
 
-            // 🌟 [핵심 반영 1] 사용자의 요청에 따라 카테고리별 layout_list + layout_form을 Bias로, 
-            // 타 카테고리의 layout 합산을 Prejudice로 지정하여 상호 배타적 벡터 분류를 수행합니다.
-            let mut cat_embeddings = Vec::new();
             for cat in &categories {
-                let (list_b, form_b, _) = crate::parsing::get_combinatorial_layout_bias(&[*cat], &doc_lang);
-                let cat_bias = format!("{} {}", list_b, form_b);
+                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어옵니다.
+                let anchor_text = crate::parsing::get_page_type_full_bias(cat, &doc_lang);
+                let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
                 
-                let mut prej_texts = Vec::new();
-                for other_cat in &categories {
-                    if cat != other_cat {
-                        let (o_list, o_form, _) = crate::parsing::get_combinatorial_layout_bias(&[*other_cat], &doc_lang);
-                        prej_texts.push(format!("{} {}", o_list, o_form));
-                    }
-                }
-                let cat_prej = prej_texts.join(" , ");
-                
-                let b_emb = model.get_embedding(cat_bias).await.unwrap_or(vec![0.0; 384]);
-                let p_emb = model.get_embedding(cat_prej).await.unwrap_or(vec![0.0; 384]);
-                
-                cat_embeddings.push((cat.to_string(), b_emb, p_emb));
-            }
-
-            for (cat, b_emb, p_emb) in &cat_embeddings {
                 let mut total_sim = 0.0;
                 
-                // 1. 타이틀 점수 합산 (Bias 증가, Prejudice 차감)
+                // 1. 타이틀 점수 합산 (타이틀은 페이지 정체성에 매우 중요하므로 5배 가중치 부여)
                 if !doc_title.is_empty() {
-                    let b_sim = cosine_similarity(&title_emb, b_emb);
-                    let p_sim = cosine_similarity(&title_emb, p_emb);
-                    let title_sim = b_sim - p_sim;
+                    let title_sim = cosine_similarity(&title_emb, &anchor_emb);
                     if title_sim > 0.0 {
                         total_sim += title_sim * 5.0; 
                     }
@@ -1093,12 +1073,10 @@ async fn process_task(
                     let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                     if text_part.is_empty() { continue; }
 
-                    let b_sim = cosine_similarity(b_emb, emb);
-                    let p_sim = cosine_similarity(p_emb, emb);
-                    let sim = b_sim - p_sim;
+                    let sim = cosine_similarity(&anchor_emb, emb);
                     
-                    // 연관성이 뚜렷한 라인(Bias-Prej 점수가 0.15 초과)의 점수만 누적
-                    if sim > 0.15 {
+                    // 연관성이 뚜렷한 라인(임계치 0.25 초과)의 점수만 누적하여 전체 페이지의 카테고리 밀도를 정밀 측정합니다.
+                    if sim > 0.25 {
                         total_sim += sim;
                     }
                 }
