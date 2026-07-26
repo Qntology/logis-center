@@ -1019,17 +1019,29 @@ async fn process_task(
             filtered_light_pug = pre_filtered_pug.trim_end().to_string();
 
             // 🌟 [클린 인계] 이제 노이즈 메뉴가 완벽히 소멸된 상태에서 안전하게 언어 및 카테고리를 식별합니다.
-            let mut ko_count = 0;
-            let mut ja_count = 0;
-            for c in filtered_light_pug.chars() {
-                let u = c as u32;
-                if u >= 0xAC00 && u <= 0xD7A3 { ko_count += 1; }
-                else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { ja_count += 1; }
-            }
-            
-            doc_lang = if ko_count > 5 { "ko".to_string() }
-                       else if ja_count > 5 { "ja".to_string() }
-                       else { "en".to_string() };
+            doc_lang = whatlang::detect(&filtered_light_pug)
+                .map(|info| match info.lang() {
+                    whatlang::Lang::Kor => "ko".to_string(),
+                    whatlang::Lang::Eng => "en".to_string(),
+                    whatlang::Lang::Jpn => "ja".to_string(),
+                    whatlang::Lang::Cmn => "zh-hans".to_string(),
+                    whatlang::Lang::Fra => "fr".to_string(),
+                    whatlang::Lang::Deu => "de".to_string(),
+                    whatlang::Lang::Spa => "es".to_string(),
+                    whatlang::Lang::Ita => "it".to_string(),
+                    whatlang::Lang::Por => "pt".to_string(),
+                    whatlang::Lang::Nld => "nl".to_string(),
+                    whatlang::Lang::Rus => "ru".to_string(),
+                    whatlang::Lang::Ara => "ar".to_string(),
+                    whatlang::Lang::Tha => "th".to_string(),
+                    whatlang::Lang::Hin => "hi".to_string(),
+                    whatlang::Lang::Ben => "bn".to_string(),
+                    whatlang::Lang::Ell => "el".to_string(),
+                    whatlang::Lang::Heb => "he".to_string(),
+                    whatlang::Lang::Vie => "vi".to_string(),
+                    _ => "en".to_string(),
+                })
+                .unwrap_or_else(|| "en".to_string());
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 
@@ -3496,10 +3508,13 @@ async fn process_task(
                 let default_currency = match doc_lang_str.as_str() {
                     "ko" => "KRW",
                     "ja" => "JPY",
-                    "zh" | "zh-tw" | "zh-hk" => "CNY",
-                    "en" => "USD",
-                    "de" | "fr" | "it" | "es" | "nl" => "EUR",
-                    _ => "USD",
+                    "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
+                    "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
+                    "ru" => "RUB",
+                    "th" => "THB",
+                    "vi" => "VND",
+                    "hi" | "bn" => "INR",
+                    "en" | _ => "USD",
                 };
                 obj.insert("currency".to_string(), json!(default_currency));
             } else {
