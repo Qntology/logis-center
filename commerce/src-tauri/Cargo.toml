@@ -1,5 +1,5 @@
 [package]
-name = "rust"
+name = "logis-center"
 version = "0.1.0"
 description = "logis.center"
 authors = ["che"]

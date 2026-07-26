@@ -598,6 +598,20 @@ impl QwenVLGenerateModel {
             wait_for_global_io().await; 
             println!("[PREFILL-SAVE] Confirm: Block 0 to 42 are safely on SSD.");
         }
+
+        // 🌟 [종료 직후 메모리 즉각 강제 반환]
+        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
         Ok(total_toks)
     }
 
@@ -906,6 +920,22 @@ impl QwenVLGenerateModel {
         if let Some(s_id) = &session_id {
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
         }
+
+        // 🌟 [종료 직후 메모리 즉각 강제 반환] 
+        // 80% -> 65% 로 브라우저를 켤 때만 메모리가 OS로 반환되는 지연(Lazy Free) 현상을 타파합니다.
+        // 생성이 종료된 직후에 GPU 동기화 및 OS 메모리 반환을 찔러 넣어 사용자가 즉각 65%를 볼 수 있게 합니다.
+        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+
         Ok(gen_text)
     }
 

@@ -1704,6 +1704,22 @@ impl Qwen3_5TextModel {
                         if idx + 1 >= total_blocks { continue; } 
                         
                         let mut inner = block.inner.write().unwrap();
+
+                        // 🌟 [VRAM 즉시 반환 (Early Offloading) - Qwen 3.5]
+                        // 과거 블록이 VRAM에 남아 OS에 80%~85% 메모리를 점유하는 현상을 끊어냅니다.
+                        // 브라우저 켤 때 65%로 떨어지던 그 메모리 반환 효과를 디코딩 루프마다 선제적으로 트리거합니다.
+                        if inner.location == KVLocation::VRAM {
+                            let k = inner.k_cache.take();
+                            let v = inner.v_cache.take();
+                            if let (Some(k_t), Some(v_t)) = (k, v) {
+                                let target_dtype = if k_t.device().is_cuda() || k_t.dtype() == candle_core::DType::F4 { candle_core::DType::F4 } else { candle_core::DType::F32 };
+                                inner.k_cache = Some(k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
+                                inner.v_cache = Some(v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
+                                inner.location = KVLocation::RAM;
+                                if idx < reg.len() { reg[idx].location[l_idx] = KVLocation::RAM; }
+                            }
+                        }
+
                         if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
                             garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
                             inner.location = KVLocation::SSD;
