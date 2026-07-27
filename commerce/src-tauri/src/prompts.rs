@@ -457,15 +457,63 @@ condition:
             .replace("{GUIDE}", vector_guide)
             .replace("{TIME_CONTEXT}", &final_time_context)
 }
-
 pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
     let status_options = match seg_type {
-        "tracking" => "* 'draft': Shipment preparation or pending pickup.\n    * 'progress': Currently in transit or out for delivery.\n    * 'return': Returning to sender.\n    * 'complete': Successfully delivered to the recipient.\n    * 'error': Delivery exception, lost, or failed.",
-        "goods" => "* 'draft': Product is being created, not yet published.\n    * 'show': Visible and available for sale on storefront.\n    * 'hide': Hidden from the storefront.\n    * 'progress': Currently being restocked or updated.\n    * 'stop': Sales temporarily suspended.\n    * 'cancel': Product discontinued or cancelled.\n    * 'refund': Related to refunded inventory.\n    * 'return': Related to returned inventory.\n    * 'exchange': Related to exchanged inventory.\n    * 'expire': Product expired.\n    * 'complete': Completely sold out or finished lifecycle.\n    * 'error': Data or system error.",
-        "order" => "* 'draft': Pending payment or in cart.\n    * 'progress': Order processing or preparing for shipment.\n    * 'stop': Order on hold.\n    * 'cancel': Order cancelled before fulfillment.\n    * 'refund': Payment refunded.\n    * 'return': Items returned by customer.\n    * 'exchange': Items being exchanged.\n    * 'expire': Payment window expired.\n    * 'complete': Order fully fulfilled and closed.\n    * 'error': Payment or processing error.",
-        "coupon" | "event" => "* 'show': Visible to customers.\n    * 'progress': Currently active and running.\n    * 'hide': Hidden from customers.\n    * 'stop': Temporarily paused.\n    * 'cancel': Terminated early.\n    * 'expire': Passed its expiration date.\n    * 'complete': Successfully finished its run.\n    * 'error': Configuration error.",
-        "review" => "* 'progress': Under moderation or pending approval.\n    * 'stop': Blocked or suspended review.\n    * 'cancel': Deleted or withdrawn by user.\n    * 'refund': Associated with a refunded order.\n    * 'return': Associated with a returned order.\n    * 'exchange': Associated with an exchanged order.\n    * 'expire': Review period expired.\n    * 'complete': Published and visible.\n    * 'error': Rejected or marked as spam.",
-        _ => "* 'show': Visible state.\n    * 'progress': Active/Processing state.\n    * 'remove': Deleted state.\n    * 'hide': Hidden state.\n    * 'stop': Paused/Stopped state.\n    * 'cancel': Cancelled state.\n    * 'refund': Refunded state.\n    * 'return': Returned state.\n    * 'exchange': Exchanged state.\n    * 'expire': Expired state.\n    * 'complete': Finished/Completed state.\n    * 'error': Error state."
+        "tracking" => r#"* 'draft': Shipment preparation or pending pickup.
+* 'progress': Currently in transit or out for delivery.
+* 'return': Returning to sender.
+* 'complete': Successfully delivered to the recipient."#,
+
+        "goods" => r#"* 'draft': Product is being created, not yet published.
+* 'show': Visible and available for sale on storefront.
+* 'hide': Hidden from the storefront.
+* 'progress': Currently being restocked or updated.
+* 'stop': Sales temporarily suspended.
+* 'cancel': Product discontinued or cancelled.
+* 'refund': Related to refunded inventory.
+* 'return': Related to returned inventory.
+* 'exchange': Related to exchanged inventory.
+* 'expire': Product expired.
+* 'complete': Completely sold out or finished lifecycle."#,
+
+        "order" => r#"* 'draft': Pending payment or in cart.
+* 'progress': Order processing or preparing for shipment.
+* 'stop': Order on hold.
+* 'cancel': Order cancelled before fulfillment.
+* 'refund': Payment refunded.
+* 'return': Items returned by customer.
+* 'exchange': Items being exchanged.
+* 'expire': Payment window expired.
+* 'complete': Order fully fulfilled and closed."#,
+
+        "coupon" | "event" => r#"* 'show': Visible to customers.
+* 'progress': Currently active and running.
+* 'hide': Hidden from customers.
+* 'stop': Temporarily paused.
+* 'cancel': Terminated early.
+* 'expire': Passed its expiration date.
+* 'complete': Successfully finished its run."#,
+
+        "review" => r#"* 'progress': Under moderation or pending approval.
+* 'stop': Blocked or suspended review.
+* 'cancel': Deleted or withdrawn by user.
+* 'refund': Associated with a refunded order.
+* 'return': Associated with a returned order.
+* 'exchange': Associated with an exchanged order.
+* 'expire': Review period expired.
+* 'complete': Published and visible."#,
+
+        _ => r#"* 'show': Visible state.
+* 'progress': Active/Processing state.
+* 'remove': Deleted state.
+* 'hide': Hidden state.
+* 'stop': Paused/Stopped state.
+* 'cancel': Cancelled state.
+* 'refund': Refunded state.
+* 'return': Returned state.
+* 'exchange': Exchanged state.
+* 'expire': Expired state.
+* 'complete': Finished/Completed state."#,
     };
 
     let template = r###"[TASK]
@@ -490,9 +538,10 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
-    template.replace("{STATUS_OPTIONS}", status_options)
-            .replace("{TEXT}", current_text)
-            .replace("{VECTOR_GUIDE}", vector_guide)
+    template
+        .replace("{STATUS_OPTIONS}", status_options)
+        .replace("{TEXT}", current_text)
+        .replace("{VECTOR_GUIDE}", vector_guide)
 }
 
 pub fn extract_substantial_intent_prompt(current_text: &str, vector_guide: &str) -> String {

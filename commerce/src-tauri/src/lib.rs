@@ -864,8 +864,9 @@ async fn ai_search_complex(
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 384]);
                 
                 
-                // Commerce 모드에서는 FTS(MATCH)를 활성화하여 벡터 검색과 동시에 실행합니다.
-                let use_fts = search_mode == "commerce";
+                // 🌟 [CRITICAL FIX] 엔터(Deep Search) 시에는 도메인(search_mode)과 무관하게 무조건 FTS 엔진을 가동하도록 true로 강제합니다.
+                // 프론트엔드에서는 타이핑 중(Live Search)일 때만 false로 넘겨서 ILIKE 부분 검색을 수행하게 됩니다.
+                let use_fts = true; 
                 let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone(), use_fts).await;
                 
                 let final_results = match search_result {

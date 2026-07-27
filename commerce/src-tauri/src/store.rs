@@ -732,48 +732,68 @@ impl VectorStore {
     }
     
     pub async fn search_items(&self, _table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
-         
-         // 100% 통합 FTS 인덱스가 구축된 "items" 마스터 테이블로만 쿼리를 강제 라우팅하여 중앙 검색을 수행합니다.
+         // 100% 통합 인덱스가 구축된 "items" 마스터 테이블로 라우팅
          let target = "items";
          let table = self.conn.open_table(target).execute().await?;
+         
+         // 🌟 3개의 트랙에서 찾은 문서 ID를 Key로 하여, 점수를 누적(Stacking)할 HashMap
          let mut combined = std::collections::HashMap::new();
-         
-         
          let fetch_limit = limit + offset;
 
+         // =======================================================
+         // 🌟 [Track 1] Column Matching (SQL Filter)
+         // =======================================================
+         // LLM이 뽑아낸 속성 조건(예: brand_name = '가디건') 및 보안 스코프를 독립 실행. 가장 높은 가중치(+3.0) 부여.
+         if let Some(ref f) = filter {
+             if !f.trim().is_empty() {
+                 let q = table.query().only_if(f);
+                 if let Ok(res) = q.limit(fetch_limit).execute().await {
+                     if let Ok(batches) = res.try_collect::<Vec<_>>().await {
+                         for b in batches {
+                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                             let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+                             for i in 0..b.num_rows() {
+                                 combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), 3.0));
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+
+         // =======================================================
+         // 🌟 [Track 2] Native Full Text Search (Tantivy 역인덱스)
+         // =======================================================
+         // 전체 본문(text, data)에서 단어를 찾는 진짜 FTS 엔진을 단독 실행. (가중치 +2.0)
          if !query_text.is_empty() {
-             
-             let sql_clean = query_text.replace("'", "''");
              let mut q = table.query();
              
-             
-             // AI Deep Search(엔터/돋보기)일 때는 SDK 내장 full_text_search API를 호출합니다.
              if use_fts {
-                 
-                 // [CRITICAL FIX] 전체 검색어를 하나의 큰따옴표로 묶으면("베이지 가디건") 정확한 구문(Exact Phrase) 매칭이 되어 검색이 실패합니다.
-                 // 띄어쓰기 단위로 쪼개어 각각 큰따옴표로 묶어 다중 N-gram 구문 검색("베이지" "가디건")이 되도록 수정합니다.
+                 // LanceDB Native FTS 구문 (Tantivy 엔진)
                  let fts_query_str = query_text
                      .split_whitespace()
                      .map(|w| format!("\"{}\"", w.replace("\"", "\\\"")))
                      .collect::<Vec<_>>()
                      .join(" ");
-                 
-                 // 공식 문서에 따른 FTS 전용 메서드 체이닝
                  q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));
                  
-                 // 추가 필터(status, type 등)가 존재하면 AND 조건으로 체이닝
-                 if let Some(ref f) = filter {
-                     q = q.only_if(f);
-                 }
+                 // [보안 필수] 타 부서/팀 데이터를 긁어오지 못하도록 기본 필터 체이닝
+                 if let Some(ref f) = filter { q = q.only_if(f); } 
              } else {
-                 // 기존 ILIKE 스캔 로직 유지 + 마스킹 텍스트까지 포함
-                 let text_filter = format!("(masked_text ILIKE '%{}%' OR text ILIKE '%{}%' OR data ILIKE '%{}%')", sql_clean, sql_clean, sql_clean);
+                 // 타이핑 중(Live Search)일 때 미완성 단어를 잡기 위한 ILIKE Fallback
+                 let sql_clean = query_text.replace("'", "''");
+                 let words: Vec<&str> = sql_clean.split_whitespace().collect();
+                 let mut ilike_conditions = Vec::new();
+                 for w in words {
+                     ilike_conditions.push(format!("(masked_text ILIKE '%{}%' OR text ILIKE '%{}%' OR data ILIKE '%{}%')", w, w, w));
+                 }
+                 let text_filter = ilike_conditions.join(" AND ");
+                 
                  let final_filter = if let Some(ref f) = filter {
-                     format!("({}) AND {}", f, text_filter)
-                 } else {
-                     text_filter
-                 };
-                 q = q.only_if(final_filter);
+                     if text_filter.is_empty() { f.to_string() } else { format!("({}) AND ({})", f, text_filter) }
+                 } else { text_filter };
+                 
+                 if !final_filter.is_empty() { q = q.only_if(final_filter); }
              }
              
              if let Ok(res) = q.limit(fetch_limit).execute().await {
@@ -781,45 +801,59 @@ impl VectorStore {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
                         let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-                        for i in 0..b.num_rows() { combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), 1.0)); }
+                        for i in 0..b.num_rows() {
+                            let id = ids.value(i).to_string();
+                            // 기존에 [Track 1]에서 찾은 문서라면 점수를 누적(+2.0), 아니면 새로 삽입
+                            if let Some((_, s)) = combined.get_mut(&id) { *s += 2.0; }
+                            else { combined.insert(id, (txs.value(i).to_string(), 2.0)); }
+                        }
                     }
                 }
              }
          }
          
-         // LanceDB가 아직 내용이 없는 빈 껍데기(Draft) 문서들을 완벽 일치(거리 0)로 착각하여 
-         // 스크롤 시 무더기로 반환하는 현상을 원천 차단합니다.
+         // =======================================================
+         // 🌟 [Track 3] Vector Search (시맨틱 의미 기반 검색)
+         // =======================================================
+         // 단어가 달라도 문맥적 의미가 통하는 문서를 찾아 타이브레이커 점수를 가산합니다. (가중치 +1.0 미만)
          let is_empty_vec = query_vec.iter().all(|&x| x == 0.0);
          
          if !is_empty_vec {
              let mut vq = table.query();
-             if let Some(ref f) = filter { vq = vq.only_if(f); }
-             let vres = vq.limit(fetch_limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
+             if let Some(ref f) = filter { vq = vq.only_if(f); } // 보안 스코프 유지
              
-             
-             // HashMap에 담을 때 순서가 뒤섞이는 것을 막기 위해, 순위(rank)에 따라 점수를 미세하게 깎아서 고유 정렬 순서를 보존합니다.
-             let mut rank = 0;
-             for b in vres {
-                 let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
-                 let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-                 for i in 0..b.num_rows() {
-                     let id = ids.value(i).to_string();
-                     let vec_score = 0.5 - (rank as f32 * 0.001);
-                     if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; } 
-                     else { combined.insert(id, (txs.value(i).to_string(), vec_score)); }
-                     rank += 1;
+             if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
+                 if let Ok(vres) = vq_with_vector.execute().await {
+                     if let Ok(batches) = vres.try_collect::<Vec<_>>().await {
+                         let mut rank = 0;
+                         for b in batches {
+                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
+                             let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+                             for i in 0..b.num_rows() {
+                                 let id = ids.value(i).to_string();
+                                 // 벡터 거리(Rank)에 따라 미세하게 점수를 차등 지급하여 완벽한 정렬 유도
+                                 let vec_score = 1.0 - (rank as f32 * 0.001);
+                                 if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; } 
+                                 else { combined.insert(id, (txs.value(i).to_string(), vec_score)); }
+                                 rank += 1;
+                             }
+                         }
+                     }
                  }
              }
          }
+         
+         // =======================================================
+         // 🌟 최종 결과 도출 (합산 점수 내림차순 정렬)
+         // =======================================================
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-         
          
          let start = offset.min(final_list.len());
          let end = (start + limit).min(final_list.len());
          let result_slice = final_list[start..end].to_vec();
 
-         // 🌟 [추가] 검색 결과를 JSON 포맷으로 터미널에 로그 출력
+         // 🌟 검색 결과를 JSON 포맷으로 터미널에 로그 출력
          let json_log = serde_json::json!({
              "query_text": query_text,
              "filter": filter,
@@ -827,9 +861,7 @@ impl VectorStore {
              "total_found": final_list.len(),
              "returned": result_slice.len(),
              "results": result_slice.iter().map(|(id, text, score)| {
-                 // 🌟 [개선] text가 JSON 문자열이면 예쁘게 객체로 파싱해서 출력하고, 아니면 원래 문자열로 출력
                  let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
-                 
                  serde_json::json!({
                      "id": id,
                      "text": parsed_text,
@@ -838,7 +870,7 @@ impl VectorStore {
              }).collect::<Vec<_>>()
          });
          println!("\n=======================================");
-         println!("[STORE] 🔎 Search Results (JSON):");
+         println!("[STORE] 🔎 3-Track Hybrid Search Results:");
          println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
          println!("=======================================\n");
 

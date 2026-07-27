@@ -574,6 +574,10 @@ impl LogisModel {
 
             println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
             self.unload_generator().await;
+            
+            // 🌟 [VRAM FIX] 메모리에 남아있는 이전 모델의 텐서 찌꺼기와 캐시를 OS 레벨에서 완벽하게 날려 VRAM을 확보합니다.
+            self.deep_purge_resources().await;
+            
             {
                 *self.current_size.lock().await = Some(ModelSize::Qwen3);
             }
@@ -697,6 +701,9 @@ impl LogisModel {
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
             self.unload_generator().await; 
+            
+            // 🌟 [VRAM FIX] 메모리에 남아있는 이전 모델의 텐서 찌꺼기와 캐시를 OS 레벨에서 완벽하게 날려 VRAM을 확보합니다.
+            self.deep_purge_resources().await;
             
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
@@ -2327,6 +2334,12 @@ impl LogisModel {
                 let mut prop_types = std::collections::HashMap::new(); // 🌟 스키마 타입 저장용 맵 추가
                 
                 for (key, desc, bias, prej) in fields {
+                    // 🌟 [추가] url, link 관련 속성은 추출 대상 및 Plinko 슬롯에서 완전히 배제
+                    let lower_key = key.to_lowercase();
+                    if lower_key.contains("url") || lower_key.contains("link") {
+                        continue;
+                    }
+
                     prop_keys.push(key.clone());
                     bias_texts.push(bias);
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
@@ -2339,165 +2352,53 @@ impl LogisModel {
                     prop_types.insert(key, type_str);
                 }
 
-                // 🌟 [3차 분기] 연산자 매칭: Operators Schema Field(Bias/Prej) 로드
-                let op_keys = vec!["eq", "lte", "lt", "gte", "gt", "top", "bottom"];
-                let mut op_bias_texts = Vec::new();
-                let mut op_prej_texts = Vec::new();
+                // 🌟 [3차 분기] 동적 필터 카테고리 일괄 로드 (bias.json 구조 완전 동기화)
+                let filter_categories = vec![
+                    "operators", "metrics", "time_filters", "season_filters", 
+                    "status_filters", "substantial_filters", "find_filters"
+                ];
 
-                for op in &op_keys {
-                    let mut b_text = String::new();
-                    let mut p_text = String::new();
-                    if let Some(op_obj) = crate::parsing::BIAS_DICT.get("operators").and_then(|o| o.get(*op)) {
-                        if let Some(b) = op_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
-                        if let Some(p) = op_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
-                    }
-                    op_bias_texts.push(b_text);
-                    op_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
+                #[derive(Clone)]
+                struct DynamicFilterDef {
+                    category: String,
+                    key: String,
                 }
+                
+                let mut dynamic_filter_defs = Vec::new();
+                let mut dynamic_bias_texts = Vec::new();
+                let mut dynamic_prej_texts = Vec::new();
 
-                // 🌟 [4차 분기] 수치/단위 메트릭(Metric Type) 매칭: metrics Schema Field 로드
-                let metric_keys = vec!["date", "time", "price", "discount", "quantity", "ratio"];
-                let mut metric_bias_texts = Vec::new();
-                let mut metric_prej_texts = Vec::new();
-
-                for metric in &metric_keys {
-                    let mut b_text = String::new();
-                    let mut p_text = String::new();
-                    if let Some(m_obj) = crate::parsing::BIAS_DICT.get("metrics").and_then(|o| o.get(*metric)) {
-                        if let Some(b) = m_obj.get("bias").and_then(|v| v.as_str()) { b_text = b.to_string(); }
-                        if let Some(p) = m_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = p.to_string(); }
-                    }
-                    metric_bias_texts.push(b_text);
-                    metric_prej_texts.push(if p_text.trim().is_empty() { "random unrelated noise".to_string() } else { p_text });
-                }
-
-                // 🌟 [5차 분기-A] 상대적 시간 의도(Time Filters) 매칭 (bias.json 100% 의존)
-                // 🌟 [5차 분기-A] 상대적 시간 의도(Time Filters) 매칭 (bias.json 100% 동적 추출)
-                let time_keys: Vec<String> = crate::parsing::BIAS_DICT
-                    .get("time_filters")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| obj.keys().cloned().collect())
-                    .unwrap_or_else(|| vec!["today".to_string(), "yesterday".to_string(), "this_month".to_string(), "last_month".to_string(), "this_year".to_string(), "last_year".to_string(), "recently".to_string()]);
-                let mut time_bias_texts = Vec::new();
-                let mut time_prej_texts = Vec::new();
-
-                for tk in &time_keys {
-                    // 🌟 [Option 2] 벡터 공간에서 다른 의도와 혼동되지 않도록 강력한 'Context Prefix'를 주입합니다.
-                    let mut b_text = format!("Time context: {} period", tk); 
-                    let mut p_text = format!("Time context: opposite not {}", tk);
-                    if let Some(t_obj) = crate::parsing::BIAS_DICT.get("time_filters").and_then(|o| o.get(tk.clone())) {
-                        if let Some(b) = t_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Time context: {}", b); }
-                        if let Some(p) = t_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Time context: {}", p); }
-                    }
-                    time_bias_texts.push(b_text);
-                    time_prej_texts.push(p_text);
-                }
-
-                // 🌟 [5차 분기-B] 계절 의도(Season Filters) 매칭 (bias.json 100% 의존)
-                let season_keys: Vec<String> = crate::parsing::BIAS_DICT
-                    .get("season_filters")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| obj.keys().cloned().collect())
-                    .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
-                let mut season_bias_texts = Vec::new();
-                let mut season_prej_texts = Vec::new();
-                let mut season_exact_matches: Vec<Vec<String>> = Vec::new(); // 🌟 신규: 다국어 Exact Match 캐시
-
-                for sk in &season_keys {
-                    // 🌟 [Option 2] 계절 데이터에도 강력한 도메인 접두사를 주입하여 다른 계절의 배제 단어들과 거리를 벌립니다.
-                    let mut b_text = format!("Season context: {} weather", sk); 
-                    let mut p_text = format!("Season context: not {}", sk);
-                    let mut exact_words = Vec::new(); // 🌟 추가
-
-                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("season_filters").and_then(|o| o.get(sk.clone())) {
-                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Season context: {}", b); }
-                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Season context: {}", p); }
-                        
-                        // 🌟 신규: exact_match 배열을 추출하여 소문자로 변환해 저장
-                        if let Some(arr) = s_obj.get("exact_match").and_then(|v| v.as_array()) {
-                            for v in arr {
-                                if let Some(s) = v.as_str() {
-                                    exact_words.push(s.to_lowercase());
-                                }
+                for cat in &filter_categories {
+                    if let Some(obj) = crate::parsing::BIAS_DICT.get(*cat).and_then(|v| v.as_object()) {
+                        for (k, v) in obj {
+                            let mut b_text = format!("{} context: {}", cat, k); 
+                            let mut p_text = format!("{} context: not {}", cat, k);
+                            
+                            if let Some(b) = v.get("bias").and_then(|val| val.as_str()) { 
+                                b_text = format!("{} context: {}", cat, b); 
                             }
+                            if let Some(p) = v.get("prejudice").and_then(|val| val.as_str()) { 
+                                p_text = format!("{} context: {}", cat, p); 
+                            }
+                            
+                            dynamic_filter_defs.push(DynamicFilterDef { 
+                                category: cat.to_string(), 
+                                key: k.to_string() 
+                            });
+                            dynamic_bias_texts.push(b_text);
+                            dynamic_prej_texts.push(p_text);
                         }
                     }
-                    season_bias_texts.push(b_text);
-                    season_prej_texts.push(p_text);
-                    season_exact_matches.push(exact_words); // 🌟 신규
                 }
 
-                // 🌟 [6차 분기] Status, Substantial, Find 의도 매칭 추가
-                let status_keys: Vec<String> = crate::parsing::BIAS_DICT.get("status_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
-                let mut status_bias_texts = Vec::new();
-                let mut status_prej_texts = Vec::new();
-                for sk in &status_keys {
-                    let mut b_text = format!("Status context: {}", sk); 
-                    let mut p_text = format!("Status context: not {}", sk);
-                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("status_filters").and_then(|o| o.get(sk.clone())) {
-                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Status context: {}", b); }
-                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Status context: {}", p); }
-                    }
-                    status_bias_texts.push(b_text);
-                    status_prej_texts.push(p_text);
-                }
-                
-                let substantial_keys: Vec<String> = crate::parsing::BIAS_DICT.get("substantial_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
-                let mut substantial_bias_texts = Vec::new();
-                let mut substantial_prej_texts = Vec::new();
-                for sk in &substantial_keys {
-                    let mut b_text = format!("Substantial context: {}", sk); 
-                    let mut p_text = format!("Substantial context: not {}", sk);
-                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("substantial_filters").and_then(|o| o.get(sk.clone())) {
-                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Substantial context: {}", b); }
-                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Substantial context: {}", p); }
-                    }
-                    substantial_bias_texts.push(b_text);
-                    substantial_prej_texts.push(p_text);
-                }
-
-                let find_keys: Vec<String> = crate::parsing::BIAS_DICT.get("find_filters").and_then(|v| v.as_object()).map(|obj| obj.keys().cloned().collect()).unwrap_or_default();
-                let mut find_bias_texts = Vec::new();
-                let mut find_prej_texts = Vec::new();
-                for sk in &find_keys {
-                    let mut b_text = format!("Find context: {}", sk); 
-                    let mut p_text = format!("Find context: not {}", sk);
-                    if let Some(s_obj) = crate::parsing::BIAS_DICT.get("find_filters").and_then(|o| o.get(sk.clone())) {
-                        if let Some(b) = s_obj.get("bias").and_then(|v| v.as_str()) { b_text = format!("Find context: {}", b); }
-                        if let Some(p) = s_obj.get("prejudice").and_then(|v| v.as_str()) { p_text = format!("Find context: {}", p); }
-                    }
-                    find_bias_texts.push(b_text);
-                    find_prej_texts.push(p_text);
-                }
-                
-                // Batch Embedding (Bias & Prejudice) 동시 장전
+                // Batch Embedding 동시 장전 (스키마 프로퍼티 + 동적 필터들)
                 let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
                 let prej_embs = self.get_embedding_batch(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
                 
-                let op_bias_embs = self.get_embedding_batch(op_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
-                let op_prej_embs = self.get_embedding_batch(op_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; op_keys.len()]);
+                let dynamic_bias_embs = self.get_embedding_batch(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
+                let dynamic_prej_embs = self.get_embedding_batch(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
 
-                let metric_bias_embs = self.get_embedding_batch(metric_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
-                let metric_prej_embs = self.get_embedding_batch(metric_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; metric_keys.len()]);
-
-                // 🌟 시간 및 계절 의도 벡터 일괄 연산
-                let time_bias_embs = self.get_embedding_batch(time_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
-                let time_prej_embs = self.get_embedding_batch(time_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; time_keys.len()]);
-
-                let season_bias_embs = self.get_embedding_batch(season_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
-                let season_prej_embs = self.get_embedding_batch(season_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; season_keys.len()]);
-
-                // 🌟 Status, Substantial, Find 의도 벡터 일괄 연산
-                let status_bias_embs = self.get_embedding_batch(status_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; status_keys.len()]);
-                let status_prej_embs = self.get_embedding_batch(status_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; status_keys.len()]);
-                
-                let substantial_bias_embs = self.get_embedding_batch(substantial_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; substantial_keys.len()]);
-                let substantial_prej_embs = self.get_embedding_batch(substantial_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; substantial_keys.len()]);
-                
-                let find_bias_embs = self.get_embedding_batch(find_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; find_keys.len()]);
-                let find_prej_embs = self.get_embedding_batch(find_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; find_keys.len()]);
-
-                // Plinko Game: Sliding Window Cliff Detection over words
+                // 🌟 Plinko Game (1st Depth): Sliding Window Cliff Detection over words
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
                 let words: Vec<&str> = current_text.split_whitespace().collect();
                 
@@ -2505,11 +2406,20 @@ impl LogisModel {
                 let mut prev_max_score = -1.0;
                 let mut best_prop_for_chunk = String::new();
 
+                emit_term(&format!("  🎯 [PLINKO GAME (1st)] Starting Sliding Window Cliff Detection for '{}'", current_text));
+
                 for word in words {
                     let mut test_chunk = current_chunk.clone();
                     test_chunk.push(word);
                     let test_text = test_chunk.join(" ");
-                    let test_emb = self.get_embedding(test_text).await.unwrap_or(vec![0.0; 384]);
+                    let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                    // 🌟 [추가] 1차 핀볼(속성 매칭)에도 동사 페널티(verb_penalty) 및 단어 길이 가중치 적용
+                    let word_count = test_chunk.len();
+                    let v_sim = cosine_similarity(&test_emb, &verb_emb);
+                    let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+                    let verb_penalty = v_sim * beta;
+                    let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
 
                     let mut current_max = -1.0;
                     let mut current_best = String::new();
@@ -2517,33 +2427,56 @@ impl LogisModel {
                     for i in 0..prop_keys.len() {
                         let b_score = cosine_similarity(&test_emb, &bias_embs[i]);
                         let p_score = cosine_similarity(&test_emb, &prej_embs[i]);
-                        let score = b_score - p_score;
+                        
+                        // 🌟 [수정] 단순 차감이 아닌, 페널티 가중치와 동사 페널티를 결합하여 노이즈 차단
+                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
+                        
                         if score > current_max {
                             current_max = score;
                             current_best = prop_keys[i].clone();
                         }
                     }
 
+                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> Match: [{}] (Score: {:.4})", test_text, current_best, current_max));
+
                     // Score Drop (Cliff) = Cut & Drop into Slot
                     if current_max < prev_max_score && !current_chunk.is_empty() {
-                        if prev_max_score > 0.10 && !best_prop_for_chunk.is_empty() {
+                        emit_term(&format!("    📉 [CLIFF DETECTED] Score dropped ({:.4} -> {:.4}). End of semantic chunk.", prev_max_score, current_max));
+                        
+                        // 🌟 임계값을 0.10에서 0.05로 대폭 완화하여 단문(1단어 등)이 무시되는 현상을 막습니다.
+                        if prev_max_score > 0.05 && !best_prop_for_chunk.is_empty() {
+                            emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
                             plinko_map.entry(best_prop_for_chunk.clone()).or_default().push(current_chunk.join(" "));
+                        } else {
+                            emit_term(&format!("      🗑️ [SKIPPED] Score {:.4} is too low. Ignored.", prev_max_score));
                         }
                         
                         // Reset Window
                         current_chunk = vec![word];
                         let reset_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        
+                        // 🌟 [추가] 리셋 윈도우의 단일 단어에도 동사 페널티 일관되게 적용
+                        let r_v_sim = cosine_similarity(&reset_emb, &verb_emb);
+                        let r_verb_penalty = r_v_sim * 0.05;
+                        let r_penalty_weight = 0.3;
+
                         let mut r_max = -1.0;
                         let mut r_best = String::new();
                         for i in 0..prop_keys.len() {
-                            let score = cosine_similarity(&reset_emb, &bias_embs[i]) - cosine_similarity(&reset_emb, &prej_embs[i]);
+                            let b_score = cosine_similarity(&reset_emb, &bias_embs[i]);
+                            let p_score = cosine_similarity(&reset_emb, &prej_embs[i]);
+                            
+                            // 🌟 [수정] 페널티 가중치 적용
+                            let score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
+                            
                             if score > r_max {
                                 r_max = score;
                                 r_best = prop_keys[i].clone();
                             }
                         }
                         prev_max_score = r_max;
-                        best_prop_for_chunk = r_best;
+                        best_prop_for_chunk = r_best.clone(); // 🌟 [COMPILATION FIX] 소유권 이동(move) 방지를 위해 clone() 추가
+                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> Top Property: {} (Score: {:.4})", word, r_best, r_max));
                     } else {
                         current_chunk.push(word);
                         prev_max_score = current_max;
@@ -2552,169 +2485,16 @@ impl LogisModel {
                 }
                 
                 // Sweep remaining chunk
-                if !current_chunk.is_empty() && prev_max_score > 0.10 && !best_prop_for_chunk.is_empty() {
+                if !current_chunk.is_empty() && prev_max_score > 0.05 && !best_prop_for_chunk.is_empty() {
+                    emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to property [{}] (Score: {:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score));
                     plinko_map.entry(best_prop_for_chunk).or_default().push(current_chunk.join(" "));
                 }
 
-                // 🌟 [STAGE-1 계승] 시간(Time)과 계절(Season) 판별에 Stage 1의 '슬라이딩 윈도우 + NMS 교차 검증' 로직을 도입하여 정밀도를 극대화합니다!
-                let temporal_words: Vec<&str> = current_text.split_whitespace().collect();
-                
-                #[derive(Clone)]
-                struct TemporalSpan {
-                    start: usize,
-                    end: usize,
-                    text: String,
-                    best_intent: String,
-                    group: String,
-                    score: f32,
-                }
-                let mut temp_raw_spans = Vec::new();
-
-                emit_term(&format!("  🔍 [PASS 1: SLIDING WINDOW] Analayzing chunks for '{}'", current_text));
-
-                // 🌟 1차 패스: 슬라이딩 윈도우 (1~4단어 조합으로 쪼개서 타격)
-                for start in 0..temporal_words.len() {
-                    let max_end = temporal_words.len().min(start + 4);
-                    for end in (start + 1)..=max_end {
-                        let test_text = temporal_words[start..end].join(" ");
-                        let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                        
-                        // 🌟 [CRITICAL FIX] 단 하나의 최고점만 뽑고 버리는 병목 현상을 완전히 제거했습니다.
-                        // 한글 하드코딩 없이 bias.json의 모든 의도를 벡터 유사도(bias - prejudice)로 100% 평가하며,
-                        // 임계값(-2.0)을 넘는 모든 후보를 로그에 출력하고 우선순위(NMS) 배틀에 전부 참전시킵니다.
-                        let word_count = end - start;
-                        let length_weight = 1.0 + ((word_count as f32 - 1.0) * 0.15); 
-                        
-                        let v_sim = cosine_similarity(&test_emb, &verb_emb);
-                        let beta = if word_count <= 2 { 0.05 } else { 0.10 };
-                        let verb_penalty = v_sim * beta;
-
-                        for i in 0..time_keys.len() {
-                            let b_score = cosine_similarity(&test_emb, &time_bias_embs[i]);
-                            let p_score = cosine_similarity(&test_emb, &time_prej_embs[i]);
-                            
-                            // 🌟 [Option 1] 단어 수(word_count)가 적을수록 문맥이 부족해 Prejudice(배제)에 과도하게 타격받는 현상을 방지합니다.
-                            let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
-                            let score = b_score - (p_score * p_weight) - verb_penalty;
-                            
-                            if score > 0.05 {
-                                let weighted_time_score = score * length_weight;
-                                emit_term(&format!("    🔹 [RAW-TIME] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4})", test_text, time_keys[i], score, length_weight, weighted_time_score));
-                                temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: time_keys[i].to_string(), group: "Time".to_string(), score: weighted_time_score });
-                            }
-                        }
-
-                        for i in 0..season_keys.len() {
-                            let b_score = cosine_similarity(&test_emb, &season_bias_embs[i]);
-                            let p_score = cosine_similarity(&test_emb, &season_prej_embs[i]);
-                            
-                            // 🌟 [Option 1] '여름' 같은 짧은 단어가 'autumn'의 배제 단어에 포함되어 점수가 음수로 곤두박질치는 환각을 방지합니다.
-                            let p_weight = if word_count <= 2 { 0.3 } else { 0.7 };
-                            let mut score = b_score - (p_score * p_weight) - verb_penalty;
-                            
-                            // 🌟 [EXACT MATCH BOOST] 다국어 직접 매칭 (가중치 폭발)
-                            let test_lower = test_text.to_lowercase();
-                            let mut exact_hit = false;
-                            for keyword in &season_exact_matches[i] {
-                                if test_lower.contains(keyword) {
-                                    exact_hit = true;
-                                    break;
-                                }
-                            }
-                            if exact_hit {
-                                score += 0.4; // 🌟 직접 매칭 시 0.4의 고정 가산점 (NMS 배틀 무조건 압승)
-                            }
-
-                            if score > 0.05 {
-                                let weighted_season_score = score * length_weight;
-                                emit_term(&format!("    🔹 [RAW-SEASON] '{}' -> {} (Base: {:.4} * W: {:.2} = {:.4}){}", 
-                                    test_text, season_keys[i], score, length_weight, weighted_season_score, if exact_hit { " [🔥 EXACT MATCH]" } else { "" }));
-                                temp_raw_spans.push(TemporalSpan { start, end, text: test_text.clone(), best_intent: season_keys[i].to_string(), group: "Season".to_string(), score: weighted_season_score });
-                            }
-                        }
-                    }
-                }
-
-                // 🌟 2차 패스: 앞뒤 교차 문장(Context) 점수 합산
-                emit_term("  🔄 [PASS 2: CONTEXT ADJUSTMENT] Merging adjacent scores...");
-                let mut temp_evaluated_spans = Vec::new();
-                
-                for i in 0..temp_raw_spans.len() {
-                    let target = &temp_raw_spans[i];
-                    let mut prev_bonus = 0.0;
-                    let mut next_bonus = 0.0;
-
-                    for j in 0..temp_raw_spans.len() {
-                        if i == j { continue; }
-                        let other = &temp_raw_spans[j];
-                        // 🌟 [CRITICAL FIX] Time은 Time끼리, Season은 Season끼리만 문맥 보너스를 교환하도록 그룹 조건을 추가합니다.
-                        if other.group == target.group && other.best_intent == target.best_intent {
-                            if other.start < target.start && other.end > target.start && other.score > prev_bonus { prev_bonus = other.score; }
-                            if other.end > target.end && other.start < target.end && other.score > next_bonus { next_bonus = other.score; }
-                        }
-                    }
-                    
-                    let final_context_score = target.score + (prev_bonus * 0.5) + (next_bonus * 0.5);
-                    
-                    emit_term(&format!("    🔸 [ADJUSTED-{}] '{}' -> {} (Score: {:.4} + Bonus: {:.4} = {:.4})", 
-                        target.group.to_uppercase(), target.text, target.best_intent, target.score, (prev_bonus * 0.5) + (next_bonus * 0.5), final_context_score));
-
-                    temp_evaluated_spans.push(TemporalSpan {
-                        start: target.start, end: target.end, text: target.text.clone(),
-                        best_intent: target.best_intent.clone(), group: target.group.clone(), score: final_context_score
-                    });
-                }
-
-                // 🌟 3차 패스: NMS 오버랩(교차) 충돌 해결
-                temp_evaluated_spans.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-                let mut final_temporal_spans: Vec<TemporalSpan> = Vec::new();
-
-                emit_term("  ⚔️ [PASS 3: NMS BATTLE] Resolving Overlaps...");
-                for span in temp_evaluated_spans {
-                    let mut is_overlapped = false;
-                    for selected in &final_temporal_spans {
-                        if span.start < selected.end && span.end > selected.start {
-                            // Time과 Season이 서로 그룹이 다르면 공존 허용 (예: "올해 여름")
-                            if span.group != selected.group {
-                                continue;
-                            }
-                            is_overlapped = true;
-                            break;
-                        }
-                    }
-                    
-                    if !is_overlapped {
-                        emit_term(&format!("    👑 [WINNER] '{}' -> {} (Score: {:.4})", span.text, span.best_intent, span.score));
-                        final_temporal_spans.push(span);
-                    } else {
-                        // 🌟 [LOGGING FIX] 패배하여 흡수(Absorbed)된 항목들도 원래의 점수를 로그에 함께 출력합니다.
-                        emit_term(&format!("    💀 [DEFEAT] '{}' -> {} (Absorbed: {:.4})", span.text, span.best_intent, span.score));
-                    }
-                }
-
-                let mut best_time_intent = String::from("none");
-                let mut best_season_intent = String::from("none");
-                let mut battle_logs = Vec::new();
-
-                for span in &final_temporal_spans {
-                    battle_logs.push(format!("'{}'->{}:{:.4}", span.text, span.best_intent, span.score));
-                    if span.group == "Time" && best_time_intent == "none" { best_time_intent = span.best_intent.clone(); }
-                    if span.group == "Season" && best_season_intent == "none" { best_season_intent = span.best_intent.clone(); }
-                }
-
-                if battle_logs.is_empty() {
-                    battle_logs.push("No temporal intents found".to_string());
-                }
-
-                emit_term(&format!("  ✅ [GLOBAL TEMPORAL BATTLE (NMS)] {}", battle_logs.join(" | ")));
-
-                // 🌟 [IGNORE VECTOR CHECK] 추가: 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 한 번 더 검증
+                // 🌟 [IGNORE VECTOR CHECK] 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 검증
                 let chunk_full_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                
                 let chunk_word_count = current_text.split_whitespace().count();
                 let v_sim = cosine_similarity(&chunk_full_emb, &verb_emb);
                 let beta = if chunk_word_count <= 2 { 0.05 } else { 0.10 };
-                let verb_penalty = v_sim * beta;
                 let penalty_weight = if chunk_word_count <= 2 { 0.3 } else { 0.7 };
 
                 let mut is_ignore_chunk = false;
@@ -2725,7 +2505,6 @@ impl LogisModel {
                         let ignore_bias_emb = self.get_embedding(s_bias.to_string()).await.unwrap_or(vec![0.0; 384]);
                         let ignore_prej_emb = self.get_embedding(s_prej.to_string()).await.unwrap_or(vec![0.0; 384]);
                         
-                        // Ignore is usually a verb! We DO NOT apply verb_penalty here.
                         let b_score = cosine_similarity(&chunk_full_emb, &ignore_bias_emb);
                         let p_score = cosine_similarity(&chunk_full_emb, &ignore_prej_emb);
                         let ignore_score = b_score - (p_score * penalty_weight);
@@ -2745,169 +2524,112 @@ impl LogisModel {
                     continue;
                 }
 
-                let mut time_guide = if best_time_intent != "none" { format!(", Time Intent [{}]", best_time_intent) } else { "".to_string() };
-                let season_guide = if best_season_intent != "none" { format!(", Season Intent [{}]", best_season_intent) } else { "".to_string() };
-
-                // 🌟 Status, Substantial, Find Vector Matching
-                let mut best_status = String::new();
-                let mut best_status_score = 0.15;
-                for i in 0..status_keys.len() {
-                    let b = cosine_similarity(&chunk_full_emb, &status_bias_embs[i]);
-                    let p = cosine_similarity(&chunk_full_emb, &status_prej_embs[i]);
-                    let score = b - (p * penalty_weight) - verb_penalty;
-                    if score > best_status_score { best_status_score = score; best_status = status_keys[i].clone(); }
-                }
-
-                let mut best_sub = String::new();
-                let mut best_sub_score = 0.15;
-                for i in 0..substantial_keys.len() {
-                    let b = cosine_similarity(&chunk_full_emb, &substantial_bias_embs[i]);
-                    let p = cosine_similarity(&chunk_full_emb, &substantial_prej_embs[i]);
-                    let score = b - (p * penalty_weight) - verb_penalty;
-                    if score > best_sub_score { best_sub_score = score; best_sub = substantial_keys[i].clone(); }
-                }
-
-                let mut best_find = String::new();
-                let mut best_find_score = 0.15;
-                for i in 0..find_keys.len() {
-                    let b = cosine_similarity(&chunk_full_emb, &find_bias_embs[i]);
-                    let p = cosine_similarity(&chunk_full_emb, &find_prej_embs[i]);
-                    let score = b - (p * penalty_weight) - verb_penalty;
-                    if score > best_find_score { best_find_score = score; best_find = find_keys[i].clone(); }
-                }
-
-                if !best_status.is_empty() { time_guide.push_str(&format!(", Status Suggests [{}]", best_status)); }
-                if !best_sub.is_empty() { time_guide.push_str(&format!(", Substantial Suggests [{}]", best_sub)); }
-                if !best_find.is_empty() { time_guide.push_str(&format!(", Find Suggests [{}]", best_find)); }
-
-                // Formatting Plinko Fragments & Double Plinko for Operators
+                // 🌟 Formatting Plinko Fragments & [2차 선택] Double Plinko for All Dynamic Filters
                 let mut fragments_text = String::new();
                 let mut prop_to_op: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+                let mut best_status_global = String::new();
+                let mut best_sub_global = String::new();
+                let mut best_find_global = String::new();
+                let mut best_time_global = String::new();
+                let mut best_season_global = String::new();
+
+                emit_term("\n  🎯 [DOUBLE PLINKO (2nd)] Matching attributes and operators...");
 
                 for (k, v) in &plinko_map {
                     let combined_chunk = v.join(" | ");
                     
-                    // 🌟 Double Plinko: 연산자(Operator), 메트릭(Metric Type) 판별 벡터 매칭 진행
                     let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let cw_count = v.len();
+                    let v_sim_local = cosine_similarity(&chunk_emb, &verb_emb);
+                    let local_beta = if cw_count <= 2 { 0.05 } else { 0.10 };
+                    let local_vp = v_sim_local * local_beta;
+                    let local_pw = if cw_count <= 2 { 0.3 } else { 0.7 };
+
+                    let mut best_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+                    let mut best_matches: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+                    // 커트라인 초기화 (카테고리별로 점수 한계 설정)
+                    for cat in &filter_categories {
+                        best_scores.insert(cat.to_string(), 0.15);
+                    }
+
+                    // 🌟 Part 1에서 준비된 통합 벡터(dynamic_filter_defs) 순회
+                    for i in 0..dynamic_filter_defs.len() {
+                        let def = &dynamic_filter_defs[i];
+                        let b_score = cosine_similarity(&chunk_emb, &dynamic_bias_embs[i]);
+                        let p_score = cosine_similarity(&chunk_emb, &dynamic_prej_embs[i]);
+                        let score = b_score - (p_score * local_pw) - local_vp;
+
+                        if score > *best_scores.get(&def.category).unwrap_or(&0.15) {
+                            best_scores.insert(def.category.clone(), score);
+                            best_matches.insert(def.category.clone(), def.key.clone());
+                        }
+                    }
+
+                    let best_op = best_matches.get("operators").cloned().unwrap_or_else(|| "eq".to_string());
+                    let best_metric = best_matches.get("metrics").cloned().unwrap_or_else(|| "string".to_string());
                     
-                    let chunk_word_count = v.len();
-                    let v_sim = cosine_similarity(&chunk_emb, &verb_emb);
-                    let beta = if chunk_word_count <= 2 { 0.05 } else { 0.10 };
-                    let verb_penalty = v_sim * beta;
-                    let penalty_weight = if chunk_word_count <= 2 { 0.3 } else { 0.7 };
-
-                    // 연산자 매칭
-                    let mut best_op = "eq"; // Fallback
-                    let mut best_op_score = 0.20; 
-                    for i in 0..op_keys.len() {
-                        let b_score = cosine_similarity(&chunk_emb, &op_bias_embs[i]);
-                        let p_score = cosine_similarity(&chunk_emb, &op_prej_embs[i]);
-                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
-                        if score > best_op_score {
-                            best_op_score = score;
-                            best_op = op_keys[i];
-                        }
-                    }
-
-                    // 수치 유형(Metric Type) 매칭
-                    let mut best_metric = "string"; // Fallback
-                    let mut best_metric_score = 0.20;
-                    for i in 0..metric_keys.len() {
-                        let b_score = cosine_similarity(&chunk_emb, &metric_bias_embs[i]);
-                        let p_score = cosine_similarity(&chunk_emb, &metric_prej_embs[i]);
-                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
-                        if score > best_metric_score {
-                            best_metric_score = score;
-                            best_metric = metric_keys[i];
-                        }
-                    }
+                    if let Some(s) = best_matches.get("status_filters") { best_status_global = s.clone(); }
+                    if let Some(s) = best_matches.get("substantial_filters") { best_sub_global = s.clone(); }
+                    if let Some(s) = best_matches.get("find_filters") { best_find_global = s.clone(); }
+                    if let Some(s) = best_matches.get("time_filters") { best_time_global = s.clone(); }
+                    if let Some(s) = best_matches.get("season_filters") { best_season_global = s.clone(); }
 
                     // 🌟 [SCHEMA OVERRIDE] Vector 모델의 예측을 실제 DB 스키마 검증으로 덮어씁니다.
                     let actual_db_type = prop_types.get(k).copied().unwrap_or("String");
                     
-                    // DB 스키마가 숫자(Number)가 아니라면 강력하게 배제합니다.
+                    let mut final_op = best_op.clone();
+                    let mut final_metric = best_metric.clone();
+
+                    // DB 스키마가 숫자나 날짜가 아닌 일반 문자열(String)인 경우
+                    // 아예 통째로 스킵(continue)하지 않고, 연산자를 'contains'(부분 일치/FTS) 및 'string'으로 강제 고정하여 문맥에 포함시킵니다.
                     if actual_db_type != "Number" {
-                        // 날짜 관련 필드는 예외적으로 허용 (Vector가 잡았거나, 필드명에 date/time이 들어간 경우)
                         let is_date_field = k.contains("date") || k.contains("time") || k.ends_with("_at");
                         if !is_date_field {
-                            emit_term(&format!("  ⏭️ [SCHEMA SKIP] Property [{}] is strictly defined as '{}' in DB schema. Skipping numeric extraction.", k, actual_db_type));
-                            continue;
+                            // 🌟 [FTS FIX] 상품명, 카테고리 등 텍스트 검색은 'eq'가 아닌 'contains'로 처리해야 정상적인 Full Text Search 결과가 나옵니다.
+                            emit_term(&format!("    ⏭️ [SCHEMA ADJUST] Property [{}] is strictly defined as '{}'. Adjusting operator to 'contains' (FTS).", k, actual_db_type));
+                            final_op = "contains".to_string();
+                            final_metric = "string".to_string();
                         }
                     }
 
-                    prop_to_op.insert(k.clone(), best_op.to_string());
+                    prop_to_op.insert(k.clone(), final_op.clone());
 
-                    // 🌟 전역(Global)에서 판별한 시간/계절 가이드를 각 청크에 동일하게 적용합니다.
-                    fragments_text.push_str(&format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]{}{}\n", combined_chunk, k, best_op, best_metric, time_guide, season_guide));
+                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]", combined_chunk, k, final_op, final_metric);
+                    emit_term(&format!("    🧲 {}", guide_log));
+                    fragments_text.push_str(&format!("{}\n", guide_log));
                 }
                 
+                // Vector-based Time/Season Guide 조립
+                let mut llm_temporal_guide = String::new();
+                if !best_time_global.is_empty() { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", best_time_global)); }
+                if !best_season_global.is_empty() { llm_temporal_guide.push_str(&format!("Season Intent [{}]", best_season_global)); }
+                
+                if !best_status_global.is_empty() { fragments_text.push_str(&format!("Global Status Suggests [{}]\n", best_status_global)); }
+                if !best_sub_global.is_empty() { fragments_text.push_str(&format!("Global Substantial Suggests [{}]\n", best_sub_global)); }
+                if !best_find_global.is_empty() { fragments_text.push_str(&format!("Global Find Suggests [{}]\n", best_find_global)); }
+
+                emit_term(&format!("\n  🎯 [FINAL VECTOR GUIDE FOR LLM] \n{}", fragments_text.trim()));
+
+                // Vector 기반으로 도출된 의도를 바탕으로 Deterministic Time Guide(달력 SQL 필터) 획득
+                let (deterministic_guide_log, deterministic_json) = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
+                if !deterministic_guide_log.is_empty() {
+                    emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
+                }
+                
+                // Vector-based Time/Season Guide 조립
+                let mut llm_temporal_guide = String::new();
+                if !best_time_global.is_empty() { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", best_time_global)); }
+                if !best_season_global.is_empty() { llm_temporal_guide.push_str(&format!("Season Intent [{}]", best_season_global)); }
+                
+                if !best_status_global.is_empty() { fragments_text.push_str(&format!("Global Status Suggests [{}]\n", best_status_global)); }
+                if !best_sub_global.is_empty() { fragments_text.push_str(&format!("Global Substantial Suggests [{}]\n", best_sub_global)); }
+                if !best_find_global.is_empty() { fragments_text.push_str(&format!("Global Find Suggests [{}]\n", best_find_global)); }
+
                 emit_term(&format!("  🎯 [PLINKO MAP (VECTOR GUIDE)] \n{}", fragments_text.trim()));
 
-                // 🌟 [CRITICAL FIX] 시간/계절 판별 시 벡터 매칭의 환각을 완전히 차단하기 위해 LLM에게 직접 의도를 추출하도록 강제합니다.
-                self.ensure_qwen3().await?;
-                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                // 🌟 시간 문맥(현재 시간)을 분리된 프롬프트에 제공하기 위해 미리 생성합니다.
-                let now = chrono::Local::now();
-                let time_context_for_intent = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
-
-                let time_prompt = crate::parsing::extract_time_intent_prompt(&current_text, &time_context_for_intent);
-                let season_prompt = crate::parsing::extract_season_intent_prompt(&current_text);
-                
-                let q3_for_temp = self.qwen3_generator.clone();
-                let cancel_for_temp = cancel_token.clone();
-                
-                // 🌟 분리된 2개의 프롬프트를 단일 블로킹 스レッド 내에서 순차적으로 호출하여 오염을 막습니다.
-                let (time_res_llm, season_res_llm) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-                    let mut gen_guard = q3_for_temp.blocking_lock();
-                    if let Some(gen) = gen_guard.as_mut() {
-                        // 1. Time Intent 추출
-                        let params_time = crate::openai_types::ChatCompletionParameters {
-                            messages: vec![
-                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(time_prompt),
-                                    name: None,
-                                })
-                            ],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
-                            ..Default::default()
-                        };
-                        let t_res = gen.generate(params_time, Some(cancel_for_temp.clone()), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Time Inference failed: {}", e))?;
-
-                        // 2. Season Intent 추출
-                        let params_season = crate::openai_types::ChatCompletionParameters {
-                            messages: vec![
-                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(season_prompt),
-                                    name: None,
-                                })
-                            ],
-                            model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
-                            ..Default::default()
-                        };
-                        let s_res = gen.generate(params_season, Some(cancel_for_temp), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Season Inference failed: {}", e))?;
-
-                        Ok((t_res, s_res))
-                    } else {
-                        Err(anyhow::anyhow!("Qwen3 Generator is missing"))
-                    }
-                }).await??;
-
-                let time_json = crate::parsing::parse_json_from_llm(&time_res_llm);
-                let season_json = crate::parsing::parse_json_from_llm(&season_res_llm);
-                
-                let mut llm_temporal_guide = String::new();
-                if let Some(ti) = time_json.get("time_intent").and_then(|v| v.as_str()) {
-                    if !ti.is_empty() && ti != "null" { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", ti)); }
-                }
-                if let Some(si) = season_json.get("season_intent").and_then(|v| v.as_str()) {
-                    if !si.is_empty() && si != "null" { llm_temporal_guide.push_str(&format!("Season Intent [{}]", si)); }
-                }
-
-                emit_term(&format!("  🤖 [LLM TIME INTENT]\n  {}", time_res_llm.trim()));
-                emit_term(&format!("  🤖 [LLM SEASON INTENT]\n  {}", season_res_llm.trim()));
-
-                // 🌟 LLM이 강제 선택한 의도를 바탕으로 최종 Deterministic Time Guide(달력 SQL 필터)를 획득합니다.
+                // Vector 기반으로 도출된 의도를 바탕으로 Deterministic Time Guide(달력 SQL 필터) 획득
                 let (deterministic_guide_log, deterministic_json) = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
                 if !deterministic_guide_log.is_empty() {
                     emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
@@ -2925,6 +2647,10 @@ impl LogisModel {
                     let prompt_status = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &combined_guide);
                     let prompt_substantial = crate::parsing::extract_substantial_intent_prompt(&current_text, &combined_guide);
                     let prompt_find = crate::parsing::extract_find_intent_prompt(&current_text, &combined_guide);
+
+                    // 🌟 [CRITICAL FIX] 여기서 Qwen3 모델을 안전하게 단독으로 불러옵니다! (이전 스레드 병렬 로딩으로 인한 임베딩 파괴 버그 방지)
+                    // LLM Normalization(텍스트 분석)을 수행하기 직전이므로 가장 완벽하고 적절한 타이밍입니다.
+                    self.ensure_qwen3().await?;
 
                     let gen_arc = self.qwen3_generator.clone();
                     let cancel_clone = cancel_token.clone();
