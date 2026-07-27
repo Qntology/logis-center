@@ -2292,7 +2292,7 @@ async fn process_task(
                         if let Some(best_field) = header_to_field_map.get(clean_h) {
                             for &line_idx in &cell.line_indices {
                                 let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
-                                let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { target_text.trim() };
+                                let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
                                 if clean_text.is_empty() || clean_text.len() < 2 { continue; }
 
                                 let mut final_field = best_field.clone();
@@ -2328,13 +2328,23 @@ async fn process_task(
                     
                     // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
                     let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
-                    let mut bypassed_values = Vec::new();
+                    let mut bypassed_values: Vec<(String, String)> = Vec::new();
                     for k in &keys {
                         for hint in &pre_mapped_hints {
                             if let Some(t_col) = hint.get("target_column").and_then(|v| v.as_str()) {
                                 if t_col == *k {
                                     if let Some(e_val) = hint.get("extracted_value").and_then(|v| v.as_str()) {
-                                        bypassed_values.push((k.to_string(), e_val.to_string()));
+                                        let clean_e_val = e_val.trim();
+                                        if !clean_e_val.is_empty() {
+                                            if let Some(existing) = bypassed_values.iter_mut().find(|(key, _)| key == *k) {
+                                                if !existing.1.contains(clean_e_val) {
+                                                    existing.1.push_str(" ");
+                                                    existing.1.push_str(clean_e_val);
+                                                }
+                                            } else {
+                                                bypassed_values.push((k.to_string(), clean_e_val.to_string()));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3031,7 +3041,7 @@ async fn process_task(
             let mut text_candidates = Vec::new();
             for (i, _) in line_embeddings.iter().enumerate() {
                 if pug_lines_ref[i].trim().is_empty() { continue; }
-                let clean_text = if let Some(idx) = pug_lines_ref[i].find('|') { pug_lines_ref[i][idx + 1..].trim() } else { pug_lines_ref[i].trim() };
+                let clean_text = if let Some(idx) = pug_lines_ref[i].find('|') { pug_lines_ref[i][idx + 1..].trim() } else { "" };
                 if clean_text.is_empty() || clean_text.len() < 2 { continue; }
                 text_candidates.push((i, clean_text.to_string()));
             }
@@ -3126,13 +3136,23 @@ async fn process_task(
                 
                 // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
                 let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
-                let mut bypassed_values = Vec::new();
+                let mut bypassed_values: Vec<(String, String)> = Vec::new();
                 for k in &keys {
                     for hint in &pre_mapped_hints {
                         if let Some(t_col) = hint.get("target_column").and_then(|v| v.as_str()) {
                             if t_col == *k {
                                 if let Some(e_val) = hint.get("extracted_value").and_then(|v| v.as_str()) {
-                                    bypassed_values.push((k.to_string(), e_val.to_string()));
+                                    let clean_e_val = e_val.trim();
+                                    if !clean_e_val.is_empty() {
+                                        if let Some(existing) = bypassed_values.iter_mut().find(|(key, _)| key == *k) {
+                                            if !existing.1.contains(clean_e_val) {
+                                                existing.1.push_str(" ");
+                                                existing.1.push_str(clean_e_val);
+                                            }
+                                        } else {
+                                            bypassed_values.push((k.to_string(), clean_e_val.to_string()));
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -2122,7 +2122,7 @@ impl QuantizedQwenVLTextModel {
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && current_kv_len < 1024 { return Ok(()); }
 
-        let vram_limit = 1; 
+        let vram_limit = 8; 
         let mut vram_evicted = false;
 
         {
