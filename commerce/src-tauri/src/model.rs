@@ -2653,12 +2653,7 @@ impl LogisModel {
                         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                         
                         let combined = chunks.join(" ");
-                        let prompt = format!(
-                            "Given the text '{}' and the property '{}', determine if this property is correct. \
-                             If not, suggest the correct property name from the schema. \
-                             Response format: {{\"correct\": true/false, \"suggested_property\": \"...\"}}",
-                            combined, prop
-                        );
+                        let prompt = crate::prompts::verify_property_mapping_prompt(&combined, prop);
                         
                         // Granite H 350M 호출
                         if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
@@ -2803,12 +2798,7 @@ impl LogisModel {
                     for (prop, op) in &prop_to_op {
                         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                         
-                        let prompt = format!(
-                            "For the property '{}' with current operator '{}', is this operator correct? \
-                             Valid operators: eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in \
-                             Response format: {{\"correct\": true/false, \"suggested_operator\": \"...\"}}",
-                            prop, op
-                        );
+                        let prompt = crate::prompts::verify_operator_mapping_prompt(prop, op);
                         
                         if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
                             if let Ok(result) = serde_json::from_str::<Value>(&response) {

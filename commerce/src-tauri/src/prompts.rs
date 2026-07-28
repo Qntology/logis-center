@@ -356,7 +356,7 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
 
 [OUTPUT FORMAT]
 {
-  "time_intent": "String or null"
+  "time_intent": String
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -387,7 +387,7 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
 
 [OUTPUT FORMAT]
 {
-  "season_intent": "String or null"
+  "season_intent": String
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -533,7 +533,7 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 
 [OUTPUT FORMAT]
 {
-  "status": "String or empty"
+  "status": String
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -573,7 +573,7 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 
 [OUTPUT FORMAT]
 {
-  "substantial": "String or empty"
+  "substantial": String
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -605,7 +605,7 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 
 [OUTPUT FORMAT]
 {
-  "find": "String or empty"
+  "find": String
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -679,4 +679,45 @@ Description: {FIELD_DESC}
     template.replace("{FIELD_NAME}", field_name)
             .replace("{FIELD_DESC}", field_desc)
             .replace("{ITEMS}", items)
+}
+
+pub fn verify_property_mapping_prompt(text: &str, property: &str) -> String {
+    let template = r###"[TASK]
+Given the text '{TEXT}' and the property '{PROPERTY}', determine if this property is correct.
+If not, suggest the correct property name from the schema.
+
+[OUTPUT FORMAT]
+{"correct": Boolean, "suggested_property": String}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{TEXT}", text)
+            .replace("{PROPERTY}", property)
+}
+
+pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String {
+    let valid_ops: Vec<String> = crate::parsing::BIAS_DICT
+        .get("operators")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec![
+            "eq".to_string(), "neq".to_string(), "gt".to_string(), "gte".to_string(), 
+            "lt".to_string(), "lte".to_string(), "contains".to_string(), 
+            "not_contains".to_string(), "top".to_string(), "bottom".to_string()
+        ]);
+    
+    let valid_ops_str = valid_ops.join(", ");
+
+    let template = r###"[TASK]
+For the property '{PROPERTY}' with current operator '{OPERATOR}', is this operator correct?
+Valid operators: {VALID_OPS}
+
+[OUTPUT FORMAT]
+{"correct": Boolean, "suggested_operator": String}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{PROPERTY}", property)
+            .replace("{OPERATOR}", operator)
+            .replace("{VALID_OPS}", &valid_ops_str)
 }
