@@ -764,26 +764,11 @@ async fn ai_search_complex(
         model_guard.as_ref().unwrap().clone() 
     }; 
 
-    // 🌟 [CRITICAL FIX] GPU VRAM을 활용한 이중 모델(Qwen3 + Embedding) 사전 상주(Preload) 및 찌꺼기 정리
-    // Qwen3가 current_size로 등록된 상태에서 ensure_embedding을 호출하면 VRAM 정리를 건너뛰게 됩니다.
+    // 🌟 [CRITICAL FIX] 백그라운드에서 Qwen3를 미리 로드하면 내부의 deep_purge_resources가
+    // 메인 스레드가 사용 중인 임베딩 모델을 파괴하여 VRAM/메모리 충돌(panic 또는 0점 반환)을 유발합니다.
+    // 따라서 병렬 꼼수를 제거하고, 필요한 시점에 순차적으로 모델을 로드하여 안정성을 100% 보장합니다.
     if !model.is_cpu_mode {
-        emit_term("[VRAM-SETUP] GPU 모드 감지됨. Qwen3(백그라운드) 및 Embedding(포그라운드) 병렬 로딩 개시...");
-        
-        // 🌟 [최적화] Qwen3는 백그라운드 스레드로 던져 로딩을 진행시키고 메인 작업 흐름을 차단하지 않습니다.
-        let model_for_qwen = model.clone();
-        tokio::spawn(async move {
-            let _ = model_for_qwen.ensure_qwen3().await;
-            
-            // 로딩 직후 캐시 정리도 백그라운드에서 조용히 수행
-            let q3_clear_arc = model_for_qwen.qwen3_generator.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                    gen.clear_kv_cache();
-                }
-            }).await;
-        });
-
-        // 🌟 메인 스레드는 비교적 가벼운 임베딩 모델만 로딩 후 곧바로 대기 없이 Stage 1 검색으로 진입합니다!
+        emit_term("[VRAM-SETUP] GPU 모드 감지됨. 임베딩 모델 단독 로딩 개시...");
         let _ = model.ensure_embedding().await;
     }
 

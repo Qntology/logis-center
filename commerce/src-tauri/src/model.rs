@@ -242,10 +242,9 @@ impl LogisModel {
         println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
         #[cfg(target_os = "windows")]
         unsafe {
-            use windows_sys::Win32::System::Threading::*;
-            use windows_sys::Win32::System::Memory::*;
-            let current_process = GetCurrentProcess();
-            let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
         #[cfg(target_os = "linux")]
         unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
@@ -312,11 +311,14 @@ impl LogisModel {
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
-                    use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
-                    use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
                     let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
+                #[cfg(target_os = "linux")]
+                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+                #[cfg(target_os = "macos")]
+                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+                
                 has_flushed_ram = true;
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 continue;
@@ -2931,10 +2933,16 @@ impl LogisModel {
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
+        // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
+        emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
+        self.unload_embedding().await;
+        self.unload_generator().await;
+        self.deep_purge_resources().await;
+
         Ok(segments)
     }
 
-    // [신규] Shipping 파이프라인 (빠른 단일 처리)
+// [신규] Shipping 파이프라인 (빠른 단일 처리)
     pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
         // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
         let app_handle_clone = app_handle.clone();
