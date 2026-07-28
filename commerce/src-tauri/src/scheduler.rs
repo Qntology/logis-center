@@ -169,18 +169,6 @@ pub async fn start_background_worker(
                                 m.deep_purge_resources().await;
                             }
                             *model_lock = None;
-                            
-                            // 마지막 RAM, VRAM 초기화 반영
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                            }
-                            #[cfg(target_os = "linux")]
-                            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                            #[cfg(target_os = "macos")]
-                            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
                         }
                         
                         let store_guard = store.lock().await;
@@ -206,18 +194,6 @@ pub async fn start_background_worker(
                                 m.deep_purge_resources().await;
                             }
                             *model_lock = None;
-
-                            // 에러 발생 시에도 마지막 RAM, VRAM 초기화 반영
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                            }
-                            #[cfg(target_os = "linux")]
-                            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                            #[cfg(target_os = "macos")]
-                            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
                         }
 
                         if err_msg.contains("Task cancelled") {
@@ -3691,18 +3667,6 @@ async fn process_task(
         // 1. Explicitly Unload to free VRAM for Embedding Model
         model.deep_purge_resources().await;
         
-        // 🌟 [OS WIRE-TRIM] 인계 시점에 가비지 페이징을 완전히 회수하여 시스템 프리징 현상을 원천 차단합니다.
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
-
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
         // 2. Wait for VRAM to settle (Driver latency)

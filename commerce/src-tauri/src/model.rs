@@ -164,10 +164,30 @@ impl LogisModel {
     }
 
     pub async fn unload_embedding(&self) {
-        let mut emb = self.embedding_model.lock().await;
-        if emb.is_some() {
-            *emb = None;
-            println!("[MODEL] Embedding Model unloaded to free VRAM.");
+        {
+            let mut emb = self.embedding_model.lock().await;
+            if emb.is_some() {
+                *emb = None;
+                println!("[MODEL] Embedding Model unloaded to free VRAM.");
+            }
+        }
+        
+        // 🌟 [추가] RAM 확보를 위해 임베딩 텍스트 캐시 완전 삭제
+        {
+            let mut cache = self.embedding_cache.lock().await;
+            cache.clear();
+            println!("[MODEL] Embedding Memory Cache cleared to free RAM.");
+        }
+
+        // 🌟 [추가] VRAM 해제를 위해 CUDA 디바이스 동기화 및 메모리 풀 초기화
+        if !self.is_cpu_mode {
+            // candle의 Device 자체에 내장된 안전한 동기화 메서드 사용 (컴파일 에러 해결)
+            if self.device_config.device.is_cuda() {
+                let _ = self.device_config.device.synchronize();
+            }
+            // 이전 CUDA 컨텍스트의 캐시 풀을 OS로 강제 반환시키기 위한 유도 장치
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            println!("[MODEL] CUDA Context synchronized and memory pool flushed.");
         }
     }
 
@@ -218,6 +238,12 @@ impl LogisModel {
             cache.clear();
         }
         
+        // 🌟 [CRITICAL FIX] 모델 사이즈 상태값도 완벽하게 초기화하여 Relay 시스템 꼬임 방지
+        {
+            let mut size = self.current_size.lock().await;
+            *size = None;
+        }
+
         println!("[DIAG-PURGE] Step 3: Synchronizing CUDA Context...");
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
@@ -237,6 +263,9 @@ impl LogisModel {
                 Err(_) => println!("[DIAG-PURGE] CUDA Sync Timeout! Continuing purge."),
                 _ => println!("[DIAG-PURGE] CUDA Sync Panicked or Failed."),
             }
+
+            // 🌟 [추가] 기존에 할당된 CUDA 메모리 풀을 OS에 즉시 반환시키기 위한 컨텍스트 덮어쓰기
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
         }
 
         println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
@@ -502,11 +531,16 @@ impl LogisModel {
         }
         
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        
+        // 🌟 [CRITICAL FIX] size 상태값도 초기화하여 락 꼬임 방지
+        {
+            *self.current_size.lock().await = None;
+        }
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+            self.wait_for_vram_settle(1200, 5, cancel_token.clone()).await?;
         }
 
         match target_size {
@@ -575,9 +609,9 @@ impl LogisModel {
             }
 
             println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
-            self.unload_generator().await;
             
-            // 🌟 [VRAM FIX] 메모리에 남아있는 이전 모델의 텐서 찌꺼기와 캐시를 OS 레벨에서 완벽하게 날려 VRAM을 확보합니다.
+            // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
+            // 바로 deep_purge_resources만 단독 호출하여 VRAM을 100% 안전하게 날려줍니다.
             self.deep_purge_resources().await;
             
             {
@@ -702,9 +736,8 @@ impl LogisModel {
 
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
-            self.unload_generator().await; 
             
-            // 🌟 [VRAM FIX] 메모리에 남아있는 이전 모델의 텐서 찌꺼기와 캐시를 OS 레벨에서 완벽하게 날려 VRAM을 확보합니다.
+            // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
             self.deep_purge_resources().await;
             
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
@@ -1634,6 +1667,23 @@ impl LogisModel {
         };
 
         emit_term("[ENGINE] 🚀 Starting Commerce Search Pipeline...");
+
+        // 🌟 [최초 초기화] VRAM 확보 및 불필요한 제너레이터 선제적 언로드 (캔슬 개입 포함)
+        emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model...");
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        
+        // 🌟 [CRITICAL FIX] scheduler.rs의 *model_lock = None; 구조 완벽 이식
+        {
+            *self.generator.lock().await = None;
+            *self.qwen3_generator.lock().await = None;
+            *self.qwen3_5_generator.lock().await = None;
+            *self.embedding_model.lock().await = None;
+            *self.current_size.lock().await = None;
+        }
+        self.deep_purge_resources().await;
+        self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
+
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         
         // ----------------------------------------------------
         // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
@@ -2637,6 +2687,9 @@ impl LogisModel {
                     emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
                 }
 
+                // 🌟 [VRAM/RAM 최적화] 임베딩 연산(벡터 매칭)이 모두 끝났으므로 LLM 추론을 시작하기 전에 명시적으로 해제합니다.
+                self.unload_embedding().await;
+
                 // 5. LLM Normalization (Advanced Parser Mode with Vector Guide)
                 if !fragments_text.is_empty() {
                     let now = chrono::Local::now();
@@ -2935,14 +2988,35 @@ impl LogisModel {
 
         // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
         emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
-        self.unload_embedding().await;
-        self.unload_generator().await;
+        
+        // 🌟 [CRITICAL FIX] scheduler.rs와 완벽히 동일한 수준의 VRAM 초기화 적용
+        // 모든 모델 객체 참조를 명시적으로 해제하여 메모리 누수를 원천 차단합니다.
+        {
+            *self.generator.lock().await = None;
+            *self.qwen3_generator.lock().await = None;
+            *self.qwen3_5_generator.lock().await = None;
+            *self.embedding_model.lock().await = None;
+            *self.current_size.lock().await = None;
+        }
         self.deep_purge_resources().await;
+
+        // 🌟 [강화된 VRAM 초기화] CUDA 메모리 캐시 강제 비우기 (컴파일 에러 해결 적용)
+        if !self.is_cpu_mode {
+            if self.device_config.device.is_cuda() {
+                let _ = self.device_config.device.synchronize();
+            }
+            // 새 컨텍스트를 할당하여 기존 메모리 풀을 OS로 반환시킵니다.
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+        }
+
+        // 🌟 [CRITICAL FIX] scheduler.rs의 함수 대신 model.rs에 내장된 강력한 VRAM 스마트 폴링 모니터(self.wait_for_vram_settle)를 호출합니다.
+        // 내부에서 OS 메모리 강제 반환을 폭격하여 VRAM을 0으로 만듭니다.
+        self.wait_for_vram_settle(1200, 10, Some(cancel_token.clone())).await.ok();
 
         Ok(segments)
     }
 
-// [신규] Shipping 파이프라인 (빠른 단일 처리)
+    // [신규] Shipping 파이프라인 (빠른 단일 처리)
     pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
         // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
         let app_handle_clone = app_handle.clone();
