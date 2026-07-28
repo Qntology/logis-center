@@ -777,20 +777,47 @@ impl LogisModel {
     }
 
     pub async fn call_granite_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let gen_arc = self.granite_generator.clone();
-        let prompt_str = prompt.to_string();
-        let device = self.device_config.device.clone();
+        let gen_arc_e = self.granite_generator.clone();
+        
+        // 🌟 Granite 템플릿(시스템 프롬프트 포함)을 적용하여 e_prompt_text 생성
+        let e_sys = "You are a precise evaluation assistant. Return strictly the requested JSON format.";
+        let e_user = prompt;
+        let e_prompt_text = format!("<|start_of_role|>system<|end_of_role|>{}\n<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>{}\n<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>", e_sys, e_user);
+        
+        let dev_e = self.device_config.device.clone();
+        let is_cpu = self.is_cpu_mode;
         
         let response = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = gen_arc.blocking_lock();
+            let mut gen_guard = gen_arc_e.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                gen.generate(&prompt_str, 50, &device, cancel_token)
-                    .map_err(|e| anyhow::anyhow!("Granite inference failed: {}", e))
+                // KV 캐시 초기화 (메모리 누수 방지)
+                gen.clear_kv_cache();
+                
+                // 컴파일 에러 해결: map_err를 catch_unwind 내부로 이동시켜 anyhow::Error 타입으로 통일
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gen.generate(&e_prompt_text, 256, &dev_e, cancel_token)
+                        .map_err(|e| anyhow::anyhow!("Granite inference failed: {}", e))
+                })).unwrap_or_else(|_| Err(anyhow::anyhow!("Granite generator panicked")));
+                
+                // 생성 종료 후 KV 캐시 즉시 비우기
+                gen.clear_kv_cache();
+                
+                res
             } else {
                 Err(anyhow::anyhow!("Granite model not loaded"))
             }
         }).await??;
         
+        // CUDA VRAM 동기화 및 강제 해제 (GPU 모드일 때만)
+        if !is_cpu {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || { 
+                if dev.is_cuda() { 
+                    let _ = dev.synchronize(); 
+                } 
+            }).await;
+        }
+
         Ok(response)
     }
 
