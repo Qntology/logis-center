@@ -122,6 +122,7 @@ pub enum ModelSize {
     Qwen,    // 0.6B for Ingestion (기존 Small)
     Qwen3,   // Qwen3 Text Model (기존 Large, /qwen3/ 로직 전용)
     Qwen3_5, // 2B Qwen 3.5 (Text Optimized)
+    Granite, // Granite H 350M
 }
 
 #[derive(Clone)]
@@ -130,6 +131,7 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
+    pub granite_generator: Arc<TokioMutex<Option<crate::models::granite::generate::GraniteGenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
@@ -157,6 +159,8 @@ impl LogisModel {
         *q3_gen = None;
         let mut q35_gen = self.qwen3_5_generator.lock().await;
         *q35_gen = None;
+        let mut granite_gen = self.granite_generator.lock().await;
+        *granite_gen = None;
         
         let mut size = self.current_size.lock().await;
         *size = None;
@@ -223,6 +227,14 @@ impl LogisModel {
             if let Some(mut g) = q35_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator..."); //
                 g.clear_kv_cache();
+                drop(g);
+            }
+        }
+
+        {
+            let mut granite_gen = self.granite_generator.lock().await;
+            if let Some(mut g) = granite_gen.take() {
+                println!("[DIAG-PURGE] Dropping Granite Generator...");
                 drop(g);
             }
         }
@@ -511,6 +523,7 @@ impl LogisModel {
                     },
                     ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
                     ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
+                    ModelSize::Granite => self.granite_generator.lock().await.is_some(),
                 };
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
@@ -523,7 +536,8 @@ impl LogisModel {
                     match target_size {
                         ModelSize::Qwen => { self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?; },
                         ModelSize::Qwen3 => { self.ensure_qwen3().await?; },
-                        ModelSize::Qwen3_5 => { self.ensure_qwen3_5(false).await?; }
+                        ModelSize::Qwen3_5 => { self.ensure_qwen3_5(false).await?; },
+                        ModelSize::Granite => { self.ensure_granite_model().await?; }
                     }
                     return Ok(());
                 }
@@ -555,6 +569,9 @@ impl LogisModel {
             },
             ModelSize::Qwen3_5 => {
                 self.ensure_qwen3_5(false).await?;
+            },
+            ModelSize::Granite => {
+                self.ensure_granite_model().await?;
             }
         }
 
@@ -721,6 +738,60 @@ impl LogisModel {
         // *current_size_guard = Some(size); // 위에서 미리 등록했으므로 생략 가능
         
         Ok(())
+    }
+
+    pub async fn ensure_granite_model(&self) -> anyhow::Result<()> {
+        let granite_dir = crate::utils::get_app_dir().join("models").join("granite-4.0-h-350m");
+        let weights_path = granite_dir.join("model.safetensors");
+        
+        if !weights_path.exists() {
+            let err_msg = "Granite model is missing. Please go to the Settings tab and download the required models.";
+            println!("[MODEL] 🚨 {}", err_msg);
+            use tauri::Emitter;
+            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({ "message": err_msg }));
+            return Err(anyhow::anyhow!(err_msg));
+        }
+
+        // 현재 로드된 모델이 Granite이면 건너뜀
+        {
+            let current = self.current_size.lock().await;
+            if *current == Some(ModelSize::Granite) {
+                return Ok(());
+            }
+        }
+        
+        // 기존 모델 언로드
+        self.deep_purge_resources().await;
+        
+        // Granite H 350M 로드
+        let model = crate::models::granite::generate::GraniteGenerateModel::init(
+            &granite_dir.to_string_lossy(),
+            Some(&self.device_config.device),
+            None
+        )?;
+        
+        *self.granite_generator.lock().await = Some(model);
+        *self.current_size.lock().await = Some(ModelSize::Granite);
+        
+        Ok(())
+    }
+
+    pub async fn call_granite_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        let gen_arc = self.granite_generator.clone();
+        let prompt_str = prompt.to_string();
+        let device = self.device_config.device.clone();
+        
+        let response = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = gen_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                gen.generate(&prompt_str, 50, &device, cancel_token)
+                    .map_err(|e| anyhow::anyhow!("Granite inference failed: {}", e))
+            } else {
+                Err(anyhow::anyhow!("Granite model not loaded"))
+            }
+        }).await??;
+        
+        Ok(response)
     }
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
@@ -892,6 +963,7 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
+            granite_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             is_cpu_mode: config.is_cpu,
@@ -2542,6 +2614,47 @@ impl LogisModel {
                     plinko_map.entry(best_prop_for_chunk).or_default().push(current_chunk.join(" "));
                 }
 
+                // Granite H 350M으로 1차 매핑 검증
+                if !plinko_map.is_empty() {
+                    emit_term("    🧠 [GRANITE VERIFICATION (1st)] Verifying property mappings...");
+                    // Granite H 350M 로드
+                    self.ensure_granite_model().await?;
+                    
+                    // plinko_map의 각 항목을 Granite H 350M으로 검증
+                    let mut validated_map = std::collections::HashMap::new();
+                    for (prop, chunks) in &plinko_map {
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        
+                        let combined = chunks.join(" ");
+                        let prompt = format!(
+                            "Given the text '{}' and the property '{}', determine if this property is correct. \
+                             If not, suggest the correct property name from the schema. \
+                             Response format: {{\"correct\": true/false, \"suggested_property\": \"...\"}}",
+                            combined, prop
+                        );
+                        
+                        // Granite H 350M 호출
+                        if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
+                            if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                                if result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", prop, combined));
+                                    validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                                } else if let Some(suggested) = result.get("suggested_property").and_then(|v| v.as_str()) {
+                                    emit_term(&format!("      🔄 Property [{}] corrected to [{}] for '{}'", prop, suggested, combined));
+                                    validated_map.entry(suggested.to_string()).or_insert_with(Vec::new).push(combined);
+                                } else {
+                                    validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                                }
+                            } else {
+                                validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                            }
+                        } else {
+                            validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                        }
+                    }
+                    plinko_map = validated_map;
+                }
+
                 // 🌟 [IGNORE VECTOR CHECK] 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 검증
                 let chunk_full_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
                 let chunk_word_count = current_text.split_whitespace().count();
@@ -2652,6 +2765,40 @@ impl LogisModel {
                     emit_term(&format!("    🧲 {}", guide_log));
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
+
+                // Granite H 350M으로 2차 매핑 검증
+                if !prop_to_op.is_empty() {
+                    emit_term("    🧠 [GRANITE VERIFICATION (2nd)] Verifying operators...");
+                    self.ensure_granite_model().await?;
+                    
+                    // 속성별 operator 검증
+                    let mut validated_prop_to_op = prop_to_op.clone();
+                    for (prop, op) in &prop_to_op {
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        
+                        let prompt = format!(
+                            "For the property '{}' with current operator '{}', is this operator correct? \
+                             Valid operators: eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in \
+                             Response format: {{\"correct\": true/false, \"suggested_operator\": \"...\"}}",
+                            prop, op
+                        );
+                        
+                        if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
+                            if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                                if !result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                    if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
+                                        emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
+                                        validated_prop_to_op.insert(prop.clone(), suggested.to_string());
+                                    }
+                                } else {
+                                    emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                                }
+                            }
+                        }
+                    }
+                    
+                    prop_to_op = validated_prop_to_op;
+                }
                 
                 // Vector-based Time/Season Guide 조립
                 let mut llm_temporal_guide = String::new();
@@ -2703,40 +2850,14 @@ impl LogisModel {
                     let prompt_substantial = crate::parsing::extract_substantial_intent_prompt(&current_text, &combined_guide);
                     let prompt_find = crate::parsing::extract_find_intent_prompt(&current_text, &combined_guide);
 
-                    // 🌟 [CRITICAL FIX] 여기서 Qwen3 모델을 안전하게 단독으로 불러옵니다! (이전 스레드 병렬 로딩으로 인한 임베딩 파괴 버그 방지)
-                    // LLM Normalization(텍스트 분석)을 수행하기 직전이므로 가장 완벽하고 적절한 타이밍입니다.
-                    self.ensure_qwen3().await?;
+                    // 🌟 [CRITICAL FIX] Qwen3 대신 Granite H 350M 모델을 사용하여 메모리 사용량을 줄이고 통일화합니다.
+                    self.ensure_granite_model().await?;
 
-                    let gen_arc = self.qwen3_generator.clone();
-                    let cancel_clone = cancel_token.clone();
-                    
-                    let (res_numeric, res_status, res_substantial, res_find) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String, String, String)> {
-                        let mut gen_guard = gen_arc.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            let mut get_res = |prompt_text: String| -> anyhow::Result<String> {
-                                let params = crate::openai_types::ChatCompletionParameters {
-                                    messages: vec![
-                                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_text),
-                                            name: None,
-                                        })
-                                    ],
-                                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.2), top_p: Some(0.95),
-                                    ..Default::default()
-                                };
-                                gen.generate(params, Some(cancel_clone.clone()), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
-                            };
-                            
-                            let r_num = get_res(prompt_numeric)?;
-                            let r_stat = get_res(prompt_status)?;
-                            let r_sub = get_res(prompt_substantial)?;
-                            let r_find = get_res(prompt_find)?;
-                            
-                            Ok((r_num, r_stat, r_sub, r_find))
-                        } else {
-                            Err(anyhow::anyhow!("Qwen3 Generator is missing"))
-                        }
-                    }).await??;
+                    // call_granite_model을 통해 순차적으로 LLM Normalization 수행
+                    let res_numeric = self.call_granite_model(&prompt_numeric, Some(cancel_token.clone())).await?;
+                    let res_status = self.call_granite_model(&prompt_status, Some(cancel_token.clone())).await?;
+                    let res_substantial = self.call_granite_model(&prompt_substantial, Some(cancel_token.clone())).await?;
+                    let res_find = self.call_granite_model(&prompt_find, Some(cancel_token.clone())).await?;
 
                     emit_term(&format!("  🤖 [LLM RAW RESPONSE - NUMERIC]\n{}", res_numeric.trim()));
                     emit_term(&format!("  🤖 [LLM RAW RESPONSE - STATUS]\n{}", res_status.trim()));

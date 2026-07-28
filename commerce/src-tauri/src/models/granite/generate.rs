@@ -22,6 +22,25 @@ impl GraniteGenerateModel {
         }
     }
 
+    pub fn init(model_path: &str, device: Option<&candle_core::Device>, _dtype: Option<candle_core::DType>) -> anyhow::Result<Self> {
+        let dev = device.unwrap_or(&candle_core::Device::Cpu);
+        
+        let config_path = std::path::PathBuf::from(model_path).join("config.json");
+        let config_str = std::fs::read_to_string(config_path)?;
+        let cfg: crate::models::granite::model::Config = serde_json::from_str(&config_str)?;
+
+        let tokenizer_path = std::path::PathBuf::from(model_path).join("tokenizer.json");
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+
+        let weights_path = std::path::PathBuf::from(model_path).join("model.safetensors");
+        let dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        let vb = unsafe { candle_nn::VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, dev)? };
+        
+        let model = GraniteMoeHybrid::load(vb, &cfg)?;
+        
+        Ok(Self::new(model, tokenizer))
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.cache = None;
     }
