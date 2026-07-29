@@ -2042,15 +2042,76 @@ impl LogisModel {
                                         let mut dropped_log = Vec::new();
                                         let mut filtered_words = Vec::new();
 
+                                        // 🌟 [수정] 한글 하드코딩 배열을 제거하고 Stanza의 lemma_session을 직접 사용하여 동적으로 커팅합니다.
+                                        let mut lemma_words: Vec<String> = vec![String::new(); valid_len];
+                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session) {
+                                            if let Ok(lemma_outputs) = stanza.lemma_session.run::<'_, '_, '_, i64, f32, _>(lemma_inputs) {
+                                                let output_tensor = &lemma_outputs[0];
+                                                let shape = output_tensor.shape();
+                                                
+                                                if shape.len() == 4 {
+                                                    let max_char_len = shape[2] as usize;
+                                                    let num_classes = shape[3] as usize;
+                                                    
+                                                    for i in 0..valid_len {
+                                                        let mut lemma_str = String::new();
+                                                        for j in 0..max_char_len {
+                                                            let mut max_val = std::f32::MIN;
+                                                            let mut max_idx = 0;
+                                                            for c in 0..num_classes {
+                                                                let val = output_tensor[[0, i, j, c]];
+                                                                if val > max_val { max_val = val; max_idx = c; }
+                                                            }
+                                                            if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(max_idx as i64)) {
+                                                                // 패딩이나 특수 토큰('<', '>')은 제외하고 실제 문자만 조합
+                                                                if ch != '<' && ch != '>' && ch != '_' {
+                                                                    lemma_str.push(ch);
+                                                                }
+                                                            }
+                                                        }
+                                                        lemma_words[i] = lemma_str.trim().to_string();
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         for (i, word) in ext_words_string.iter().enumerate() {
                                             let tag = pos_tags[i];
-                                            debug_pos_log.push(format!("{}({})", word, tag));
+                                            let lemma = if let Some(l) = lemma_words.get(i) { l.clone() } else { String::new() };
                                             
-                                            // 해당 단어가 드롭 태그(예: VERB)에 속하면 제거
+                                            debug_pos_log.push(format!("{}(tag:{}, lemma:{})", word, tag, lemma));
+                                            
+                                            // 1차: 기본 품사(동사, 조사 등) 드롭
                                             if drop_tags.contains(&tag) {
                                                 dropped_log.push(format!("{}({})", word, tag));
-                                            } else {
-                                                filtered_words.push(word.clone());
+                                                continue;
+                                            }
+
+                                            let mut clean_word = word.clone();
+                                            let mut is_stripped = false;
+
+                                            // 2차: Stanza 모델에서 도출된 Lemma를 있는 그대로 활용하여 한 덩어리로 묶인 꼬리 자르기
+                                            // 형태소 분석기가 실패해서 "가디건찾아줘"가 한 단어로 들어왔을 때, 
+                                            // Lemma가 "찾아줘" 혹은 "찾다" 등으로 도출되면 해당 문자열을 찾아 정확하게 도려냅니다.
+                                            if !lemma.is_empty() && word.ends_with(&lemma) && word.len() > lemma.len() {
+                                                let new_len = word.len() - lemma.len();
+                                                clean_word = word[..new_len].to_string();
+                                                is_stripped = true;
+                                            } else if !lemma.is_empty() && word.contains(&lemma) && word.len() > lemma.len() {
+                                                if let Some(idx) = word.rfind(&lemma) {
+                                                    if idx >= 3 { // 최소 1글자(UTF-8 3바이트 이상) 보장하여 명사 원형 보호
+                                                        clean_word = word[..idx].to_string();
+                                                        is_stripped = true;
+                                                    }
+                                                }
+                                            }
+
+                                            if is_stripped {
+                                                dropped_log.push(format!("{}(Lemma-Stripped->{})", word, clean_word));
+                                            }
+
+                                            if !clean_word.trim().is_empty() {
+                                                filtered_words.push(clean_word);
                                             }
                                         }
                                         
