@@ -2668,31 +2668,39 @@ impl LogisModel {
                     prop_types.insert(key, type_str);
                 }
 
-                // 🌟 [글로벌 속성 동적 확장] bias.json을 완전 순회(루트 및 서브 객체 포함)하여 color, metrics 등의 단일 속성을 누락 없이 동적 수집합니다.
+                // 🌟 [글로벌 속성 동적 확장] 뎁스(Depth)에 무관하게 bias.json 전체를 깊이 우선 탐색(Stack DFS)으로 순회하여 속성을 추출합니다.
                 let mut loaded_globals = Vec::new();
                 if let Some(root_obj) = crate::parsing::BIAS_DICT.as_object() {
+                    let mut stack: Vec<(String, &Value)> = Vec::new();
+                    
+                    let excluded_keys = [
+                        "ignore", "insight", 
+                        "sq", "ar", "az", "bn", "bg", "ca", "zh", "hr", "cs", "da", 
+                        "nl", "en", "et", "fi", "fr", "ka", "de", "el", "he", "hi", 
+                        "hu", "is", "id", "it", "ja", "kk", "km", "ko", "lv", "lt", 
+                        "ms", "mr", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", 
+                        "sl", "es", "sw", "sv", "tl", "te", "th", "tr", "uk", "ur", 
+                        "uz", "vi"
+                    ];
+
+                    // 1. 루트 레벨 객체들을 필터링하여 스택에 삽입
                     for (g_key, g_val) in root_obj {
-                        // 언어별 스키마와 시스템 제어 키워드는 제외합니다. (추가된 다국어 코드 포함)
-                        let excluded_keys = [
-                            "ignore", "insight", 
-                            "sq", "ar", "az", "bn", "bg", "ca", "zh", "hr", "cs", "da", 
-                            "nl", "en", "et", "fi", "fr", "ka", "de", "el", "he", "hi", 
-                            "hu", "is", "id", "it", "ja", "kk", "km", "ko", "lv", "lt", 
-                            "ms", "mr", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", 
-                            "sl", "es", "sw", "sv", "tl", "te", "th", "tr", "uk", "ur", 
-                            "uz", "vi"
-                        ];
-                        if excluded_keys.contains(&g_key.as_str()) { continue; }
-                        
-                        if let Some(obj) = g_val.as_object() {
-                            // 1) 해당 노드가 직접 속성인 경우 (예: color)
+                        if !excluded_keys.contains(&g_key.as_str()) {
+                            stack.push((g_key.clone(), g_val));
+                        }
+                    }
+
+                    // 2. 스택 기반 뎁스 프리(Depth-Free) 무한 탐색 루프
+                    while let Some((node_key, node_val)) = stack.pop() {
+                        if let Some(obj) = node_val.as_object() {
+                            // 현재 객체가 속성 스키마의 필수 조건 3가지를 가졌다면 추출 (1단이든 2단이든 무조건 걸림)
                             if obj.contains_key("semantic") && obj.contains_key("bias") && obj.contains_key("prejudice") {
-                                if !prop_keys.contains(&g_key.to_string()) {
+                                if !prop_keys.contains(&node_key) {
                                     let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
                                     let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                     let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
                                     
-                                    prop_keys.push(g_key.to_string());
+                                    prop_keys.push(node_key.clone());
                                     bias_texts.push(bias);
                                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                                     
@@ -2700,32 +2708,13 @@ impl LogisModel {
                                                    else if desc.contains("Boolean") { "Boolean" }
                                                    else if desc.contains("Array") { "Array" }
                                                    else { "String" };
-                                    prop_types.insert(g_key.to_string(), type_str);
-                                    loaded_globals.push(g_key.to_string());
+                                    prop_types.insert(node_key.clone(), type_str);
+                                    loaded_globals.push(node_key);
                                 }
                             } else {
-                                // 2) 해당 노드가 그룹 컨테이너인 경우 (예: metrics 하위의 price, quantity 등)
-                                for (sub_key, sub_val) in obj {
-                                    if let Some(sub_obj) = sub_val.as_object() {
-                                        if sub_obj.contains_key("semantic") && sub_obj.contains_key("bias") && sub_obj.contains_key("prejudice") {
-                                            if !prop_keys.contains(&sub_key.to_string()) {
-                                                let desc = sub_obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
-                                                let bias = sub_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                let prej = sub_obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
-                                                
-                                                prop_keys.push(sub_key.to_string());
-                                                bias_texts.push(bias);
-                                                prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
-                                                
-                                                let type_str = if desc.contains("Number") { "Number" }
-                                                               else if desc.contains("Boolean") { "Boolean" }
-                                                               else if desc.contains("Array") { "Array" }
-                                                               else { "String" };
-                                                prop_types.insert(sub_key.to_string(), type_str);
-                                                loaded_globals.push(sub_key.to_string());
-                                            }
-                                        }
-                                    }
+                                // 필수 조건이 없는 일반 컨테이너 객체(예: metrics)라면 하위 객체들을 스택에 넣어 계속 파고듦
+                                for (sub_k, sub_v) in obj {
+                                    stack.push((sub_k.clone(), sub_v));
                                 }
                             }
                         }
