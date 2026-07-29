@@ -1888,14 +1888,13 @@ impl LogisModel {
                     let chars: Vec<char> = query.chars().collect();
                     
                     let whitespace_split: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+                    let mut stanza_split: Vec<String> = Vec::new();
 
-                    // 🌟 [CRITICAL FIX] "베이지 가디건 찾아줘"를 "베이", "지 가디건"으로 파괴하는 Stanza 토크나이저 한계 극복!
-                    // 사용자가 이미 띄어쓰기를 입력했다면(단어가 2개 이상) 멍청한 토크나이저를 건너뛰고 공백 분할을 바로 채택합니다.
-                    // 띄어쓰기가 아예 없는 경우(예: "베이지가디건찾아줘")에만 최후의 수단으로 토크나이저를 가동합니다.
-                    if whitespace_split.len() > 1 {
-                        emit_term("  💡 [STANZA-INFO] 공백이 포함된 검색어이므로 Tokenizer를 생략하고 띄어쓰기 기반 분할을 안전하게 우선 적용합니다.");
-                        ext_words_string = whitespace_split;
-                    } else if !chars.is_empty() {
+                    // 🌟 [CRITICAL FIX] "베이지 가디건" (공백 트랙)과 "베이", "지" (형태소 트랙)을 모두 살리는 투트랙(Dual-Track) 전략!
+                    // 두 가지 방식으로 자른 단어들을 하나의 배열로 합쳐서 Plinko 윈도우에 던지면, 
+                    // NMS 배틀이 알아서 문맥(Context Score)이 더 높은 진짜 덩어리를 승자로 채택하게 됩니다.
+                    
+                    if !chars.is_empty() {
                         let seq_len = chars.len();
                         let mut char_ids = Vec::with_capacity(seq_len);
                         for c in &chars {
@@ -1971,7 +1970,7 @@ impl LogisModel {
                                         if max_idx > 0 || i == seq_len - 1 {
                                             let token_str = current_word.trim().to_string();
                                             if !token_str.is_empty() {
-                                                ext_words_string.push(token_str);
+                                                stanza_split.push(token_str);
                                             }
                                             current_word.clear();
                                         }
@@ -1994,10 +1993,23 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 띄어쓰기도 없었고 토크나이저도 실패한 경우의 최후 방어선
-                    if ext_words_string.is_empty() {
-                        emit_term("  💡 [STANZA-INFO] 기본 공백 기반 분할 알고리즘으로 우회 적용되었습니다.");
-                        ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
+                    // 🌟 투트랙 병합 로직 (Dual-Track Merge)
+                    // 1번 트랙: 공백 분할 (예: "베이지", "가디건", "찾아줘")
+                    // 2번 트랙: Stanza 분할 (예: "베이", "지", "가디건", "찾아줘")
+                    if stanza_split.is_empty() {
+                        ext_words_string = whitespace_split;
+                    } else if whitespace_split == stanza_split {
+                        ext_words_string = whitespace_split;
+                        emit_term("  💡 [STANZA-INFO] 공백 분할과 Tokenizer 분할 결과가 동일하여 단일 트랙으로 진행합니다.");
+                    } else {
+                        emit_term("  💡 [STANZA-INFO] 공백 분할(Track 1)과 Tokenizer 분할(Track 2)을 모두 투입하여 듀얼 트랙으로 진행합니다.");
+                        ext_words_string = whitespace_split;
+                        
+                        // 두 트랙이 섞이면서 생기는 의미 없는 교차 윈도우("찾아줘 베이")를 
+                        // POS 태거에서 걸러지도록 유도하기 위해 파이프라인(|) 더미를 하나 삽입하여 경계를 분리합니다.
+                        ext_words_string.push("|".to_string());
+                        
+                        ext_words_string.extend(stanza_split);
                     }
 
                     // 🌟 [STANZA POS 사전 필터링 & 로그 출력]
@@ -2656,28 +2668,56 @@ impl LogisModel {
                     prop_types.insert(key, type_str);
                 }
 
-                // 🌟 [글로벌 속성 동적 확장] bias.json 최상단(Root)에 존재하는 속성 중, 구조적 키워드가 아닌 단일 속성(color 등)을 Duck-typing으로 동적 수집합니다.
+                // 🌟 [글로벌 속성 동적 확장] bias.json을 완전 순회(루트 및 서브 객체 포함)하여 color, metrics 등의 단일 속성을 누락 없이 동적 수집합니다.
+                let mut loaded_globals = Vec::new();
                 if let Some(root_obj) = crate::parsing::BIAS_DICT.as_object() {
                     for (g_key, g_val) in root_obj {
+                        // 언어별 스키마와 시스템 제어 키워드는 제외합니다.
+                        if g_key == "ko" || g_key == "en" || g_key == "ja" || g_key == "zh" || g_key == "ignore" { continue; }
+                        
                         if let Some(obj) = g_val.as_object() {
-                            // 하위 객체가 semantic, bias, prejudice를 모두 가지고 있다면 독립적인 추출 속성으로 간주합니다.
+                            // 1) 해당 노드가 직접 속성인 경우 (예: color)
                             if obj.contains_key("semantic") && obj.contains_key("bias") && obj.contains_key("prejudice") {
-                                // 단, 'ignore' 같은 시스템 제어용 키워드는 속성 매칭에서 제외합니다.
-                                if g_key == "ignore" { continue; }
-
-                                let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
-                                let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
-                                
-                                prop_keys.push(g_key.to_string());
-                                bias_texts.push(bias);
-                                prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
-                                
-                                let type_str = if desc.contains("Number") { "Number" }
-                                               else if desc.contains("Boolean") { "Boolean" }
-                                               else if desc.contains("Array") { "Array" }
-                                               else { "String" };
-                                prop_types.insert(g_key.to_string(), type_str);
+                                if !prop_keys.contains(&g_key.to_string()) {
+                                    let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
+                                    let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
+                                    
+                                    prop_keys.push(g_key.to_string());
+                                    bias_texts.push(bias);
+                                    prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                                    
+                                    let type_str = if desc.contains("Number") { "Number" }
+                                                   else if desc.contains("Boolean") { "Boolean" }
+                                                   else if desc.contains("Array") { "Array" }
+                                                   else { "String" };
+                                    prop_types.insert(g_key.to_string(), type_str);
+                                    loaded_globals.push(g_key.to_string());
+                                }
+                            } else {
+                                // 2) 해당 노드가 그룹 컨테이너인 경우 (예: metrics 하위의 price, quantity 등)
+                                for (sub_key, sub_val) in obj {
+                                    if let Some(sub_obj) = sub_val.as_object() {
+                                        if sub_obj.contains_key("semantic") && sub_obj.contains_key("bias") && sub_obj.contains_key("prejudice") {
+                                            if !prop_keys.contains(&sub_key.to_string()) {
+                                                let desc = sub_obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
+                                                let bias = sub_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let prej = sub_obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
+                                                
+                                                prop_keys.push(sub_key.to_string());
+                                                bias_texts.push(bias);
+                                                prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                                                
+                                                let type_str = if desc.contains("Number") { "Number" }
+                                                               else if desc.contains("Boolean") { "Boolean" }
+                                                               else if desc.contains("Array") { "Array" }
+                                                               else { "String" };
+                                                prop_types.insert(sub_key.to_string(), type_str);
+                                                loaded_globals.push(sub_key.to_string());
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2779,7 +2819,18 @@ impl LogisModel {
                     let current_second_best = candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
                     let current_second = candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
 
-                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4})", test_text, current_best, current_max, current_second_best, current_second));
+                    let mut global_scores_log = String::new();
+                    if !loaded_globals.is_empty() {
+                        let mut g_scores = Vec::new();
+                        for g_key in &loaded_globals {
+                            if let Some(c) = candidates.iter().find(|x| &x.0 == g_key) {
+                                g_scores.push(format!("{}: {:.4}", g_key, c.1));
+                            }
+                        }
+                        global_scores_log = format!(" | Globals: {}", g_scores.join(", "));
+                    }
+
+                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4}){}", test_text, current_best, current_max, current_second_best, current_second, global_scores_log));
 
                     // Score Drop (Cliff) = Cut & Drop into Slot
                     if current_max < prev_max_score && !current_chunk.is_empty() {
@@ -2824,11 +2875,22 @@ impl LogisModel {
                         let r_second = r_candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
                         let r_second_best = r_candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
 
+                        let mut r_global_scores_log = String::new();
+                        if !loaded_globals.is_empty() {
+                            let mut r_g_scores = Vec::new();
+                            for g_key in &loaded_globals {
+                                if let Some(c) = r_candidates.iter().find(|x| &x.0 == g_key) {
+                                    r_g_scores.push(format!("{}: {:.4}", g_key, c.1));
+                                }
+                            }
+                            r_global_scores_log = format!(" | Globals: {}", r_g_scores.join(", "));
+                        }
+
                         prev_max_score = r_max;
                         prev_second_score = r_second;
                         best_prop_for_chunk = r_best.clone();
                         second_prop_for_chunk = r_second_best.clone();
-                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4})", word, r_best, r_max, r_second_best, r_second));
+                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4}){}", word, r_best, r_max, r_second_best, r_second, r_global_scores_log));
                     } else {
                         current_chunk.push(word);
                         prev_max_score = current_max;
