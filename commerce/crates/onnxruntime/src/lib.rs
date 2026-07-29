@@ -549,3 +549,150 @@ mod test {
         assert_eq!("foo", char_p_to_string(ptr).unwrap());
     }
 }
+
+pub mod mixed {
+    use super::*;
+    use crate::tensor::ort_tensor::OrtTensor;
+    use crate::tensor::ort_owned_tensor::{OrtOwnedTensor, OrtOwnedTensorExtractor};
+    use crate::memory::MemoryInfo;
+    use ndarray::ArrayD;
+    use std::ffi::CString;
+    use std::ptr;
+
+    pub enum DynInput {
+        I64(ArrayD<i64>),
+        F32(ArrayD<f32>),
+    }
+
+    pub trait SessionMixedExt {
+        fn run_mixed<'t, 'm>(
+            &'m mut self,
+            mixed_inputs: Vec<(&str, DynInput)>,
+            output_names: Vec<&str>,
+        ) -> std::result::Result<Vec<OrtOwnedTensor<'t, 'm, f32, ndarray::IxDyn>>, String>;
+    }
+
+    impl SessionMixedExt for crate::session::Session<'_> {
+        fn run_mixed<'t, 'm>(
+            &'m mut self,
+            mixed_inputs: Vec<(&str, DynInput)>,
+            output_names: Vec<&str>,
+        ) -> std::result::Result<Vec<OrtOwnedTensor<'t, 'm, f32, ndarray::IxDyn>>, String> {
+            // 🌟 1. E0515 에러 해결: MemoryInfo를 정적(static)으로 생성하여 반환 수명 불일치 원천 차단
+            static mut GLOBAL_MEMORY_INFO: *mut MemoryInfo = ptr::null_mut();
+            static GLOBAL_MEMORY_INFO_INIT: std::sync::Once = std::sync::Once::new();
+            
+            let memory_info: &'static MemoryInfo = unsafe {
+                GLOBAL_MEMORY_INFO_INIT.call_once(|| {
+                    let info = MemoryInfo::new(AllocatorType::Arena, MemType::Default)
+                        .expect("Failed to create MemoryInfo");
+                    GLOBAL_MEMORY_INFO = Box::into_raw(Box::new(info));
+                });
+                &*GLOBAL_MEMORY_INFO
+            };
+            
+            let mut allocator_ptr: *mut onnxruntime_sys::OrtAllocator = ptr::null_mut();
+            unsafe {
+                crate::error::call_ort(|ort| ort.GetAllocatorWithDefaultOptions.unwrap()(&mut allocator_ptr))
+            }.map_err(|e| format!("GetAllocator Error: {:?}", e))?;
+
+            let mut ort_tensors_i64 = Vec::new();
+            let mut ort_tensors_f32 = Vec::new();
+            let mut input_names_ptr = Vec::new();
+            let mut input_values_ptr = Vec::new();
+            let mut _input_names_cstring = Vec::new();
+
+            for (name, dyn_input) in mixed_inputs {
+                let cname = CString::new(name).map_err(|e| format!("CString NulError: {:?}", e))?;
+                input_names_ptr.push(cname.as_ptr());
+                _input_names_cstring.push(cname);
+
+                match dyn_input {
+                    DynInput::I64(arr) => {
+                        let tensor = OrtTensor::from_array(memory_info, allocator_ptr, arr)
+                            .map_err(|e| format!("OrtTensor i64 Error: {:?}", e))?;
+                        input_values_ptr.push(tensor.c_ptr);
+                        ort_tensors_i64.push(tensor);
+                    },
+                    DynInput::F32(arr) => {
+                        let tensor = OrtTensor::from_array(memory_info, allocator_ptr, arr)
+                            .map_err(|e| format!("OrtTensor f32 Error: {:?}", e))?;
+                        input_values_ptr.push(tensor.c_ptr);
+                        ort_tensors_f32.push(tensor);
+                    }
+                }
+            }
+
+            let mut output_names_ptr = Vec::new();
+            let mut _output_names_cstring = Vec::new();
+            for name in &output_names {
+                let cname = CString::new(*name).map_err(|e| format!("CString NulError: {:?}", e))?;
+                output_names_ptr.push(cname.as_ptr());
+                _output_names_cstring.push(cname);
+            }
+
+            let mut output_tensor_ptrs: Vec<*mut onnxruntime_sys::OrtValue> = vec![ptr::null_mut(); output_names.len()];
+            let run_options_ptr: *mut onnxruntime_sys::OrtRunOptions = ptr::null_mut();
+
+            // 🌟 2. Private Field 및 메모리 레이아웃 우회 (Safe Mirroring): 
+            // onnxruntime 0.0.14 버전의 Session 구조체는 session_ptr이 완전 private입니다.
+            // Rust 컴파일러의 필드 재배치(Field Reordering)로 인한 STATUS_ACCESS_VIOLATION 크래시를 완벽히 막기 위해,
+            // 대상 구조체와 100% 동일한 타입 구성을 가진 거울(Mirror) 구조체를 선언하여 안전하게 포인터 레이아웃을 매핑합니다.
+            #[allow(dead_code)]
+            struct SessionMirror<'a> {
+                session_ptr: *mut onnxruntime_sys::OrtSession,
+                allocator_ptr: *mut onnxruntime_sys::OrtAllocator,
+                memory_info: &'a crate::memory::MemoryInfo,
+                inputs: Vec<crate::session::Input>,
+                outputs: Vec<crate::session::Output>,
+            }
+            
+            let session_ptr: *mut onnxruntime_sys::OrtSession = unsafe {
+                let mirror = &*(self as *const _ as *const SessionMirror);
+                mirror.session_ptr
+            };
+
+            let status = unsafe {
+                crate::g_ort().Run.unwrap()(
+                    session_ptr,
+                    run_options_ptr,
+                    input_names_ptr.as_ptr(),
+                    input_values_ptr.as_ptr() as *const *const onnxruntime_sys::OrtValue,
+                    input_values_ptr.len() as _, // 🌟 3. OS 호환성 에러 해결: as _ 를 통해 Windows rsize_t, Linux size_t 자동 추론
+                    output_names_ptr.as_ptr(),
+                    output_names.len() as _,
+                    output_tensor_ptrs.as_mut_ptr(),
+                )
+            };
+            crate::error::status_to_result(status).map_err(|e| format!("Run failed: {:?}", e))?;
+
+            let mut owned_tensors = Vec::new();
+            for ptr in output_tensor_ptrs {
+                let mut tensor_info_ptr: *mut onnxruntime_sys::OrtTensorTypeAndShapeInfo = ptr::null_mut();
+                let status = unsafe { crate::g_ort().GetTensorTypeAndShape.unwrap()(ptr, &mut tensor_info_ptr) };
+                crate::error::status_to_result(status).map_err(|e| format!("GetTensorTypeAndShape Error: {:?}", e))?;
+                
+                let mut num_dims = 0;
+                let status = unsafe { crate::g_ort().GetDimensionsCount.unwrap()(tensor_info_ptr, &mut num_dims) };
+                crate::error::status_to_result(status).map_err(|e| format!("GetDimensionsCount Error: {:?}", e))?;
+                
+                let mut node_dims: Vec<i64> = vec![0; num_dims as usize];
+                let status = unsafe { crate::g_ort().GetDimensions.unwrap()(tensor_info_ptr, node_dims.as_mut_ptr(), num_dims) };
+                crate::error::status_to_result(status).map_err(|e| format!("GetDimensions Error: {:?}", e))?;
+                
+                unsafe { crate::g_ort().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr) };
+
+                let shape: Vec<usize> = node_dims.iter().map(|&d| d as usize).collect();
+                let dyn_shape = ndarray::IxDyn(&shape);
+
+                let mut extractor = OrtOwnedTensorExtractor::new(memory_info, dyn_shape);
+                extractor.tensor_ptr = ptr;
+                
+                let owned_tensor = extractor.extract::<f32>().map_err(|e| format!("Extract Error: {:?}", e))?;
+                owned_tensors.push(owned_tensor);
+            }
+
+            Ok(owned_tensors)
+        }
+    }
+}
