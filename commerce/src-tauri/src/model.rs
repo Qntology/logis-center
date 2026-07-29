@@ -2902,11 +2902,34 @@ impl LogisModel {
                         // 🌟 LLM이 뽑아준 "값"과 Rust 메모리에 저장해둔 "연산자(operator)"를 여기서 최종 조립합니다.
                         let mut structured_cond = serde_json::Map::new();
                         
-                        // YAML 배열 형태("condition": [ {"property": "price", "operator": "gt", "value": 1000} ]) 대응
-                        if let Some(cond_arr) = final_numeric_json.get("condition").and_then(|v| v.as_array()) {
+                        // 객체 형태("condition": { "price": {"operator": "gt", "value": 1000} }) 메인 대응
+                        if let Some(cond_val) = final_numeric_json.get("condition").and_then(|v| v.as_object()) {
+                            for (k, val) in cond_val {
+                                if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                    continue;
+                                }
+
+                                if val.is_object() {
+                                    let mut final_val_obj = val.clone();
+                                    if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                        if !v_obj.contains_key("operator") {
+                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                            v_obj.insert("operator".to_string(), json!(op));
+                                        }
+                                    }
+                                    structured_cond.insert(k.clone(), final_val_obj);
+                                } else {
+                                    let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                    structured_cond.insert(k.clone(), json!({
+                                        "operator": op,
+                                        "value": val.clone()
+                                    }));
+                                }
+                            }
+                        } else if let Some(cond_arr) = final_numeric_json.get("condition").and_then(|v| v.as_array()) {
+                            // 구형 프롬프트(배열 반환)로 응답했을 경우의 방어 로직
                             for item in cond_arr {
                                 if let Some(item_obj) = item.as_object() {
-                                    // 🌟 [CRITICAL FIX] LLM이 property_name 이나 property 필드로 평탄화해서 주는 경우를 우선 처리
                                     if let Some(prop_val) = item_obj.get("property").or_else(|| item_obj.get("property_name")).and_then(|v| v.as_str()) {
                                         let k = prop_val.to_string();
                                         
@@ -2930,7 +2953,6 @@ impl LogisModel {
                                         
                                         structured_cond.insert(k, json!(final_val_obj));
                                     } else {
-                                        // 구형 프롬프트: {"price": {"operator": "gt", "value": 1000}} 대응
                                         for (k, val) in item_obj {
                                             if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
                                                 continue;
@@ -2952,30 +2974,6 @@ impl LogisModel {
                                             structured_cond.insert(k.clone(), final_val_obj);
                                         }
                                     }
-                                }
-                            }
-                        } else if let Some(cond_val) = final_numeric_json.get("condition").and_then(|v| v.as_object()) {
-                            // 혹시라도 구형 프롬프트(객체 반환)로 응답했을 경우의 방어 로직
-                            for (k, val) in cond_val {
-                                if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
-                                    continue;
-                                }
-
-                                if val.is_object() {
-                                    let mut final_val_obj = val.clone();
-                                    if let Some(v_obj) = final_val_obj.as_object_mut() {
-                                        if !v_obj.contains_key("operator") {
-                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
-                                            v_obj.insert("operator".to_string(), json!(op));
-                                        }
-                                    }
-                                    structured_cond.insert(k.clone(), final_val_obj);
-                                } else {
-                                    let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
-                                    structured_cond.insert(k.clone(), json!({
-                                        "operator": op,
-                                        "value": val.clone()
-                                    }));
                                 }
                             }
                         }

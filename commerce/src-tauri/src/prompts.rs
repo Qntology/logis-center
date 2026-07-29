@@ -435,18 +435,18 @@ The system has pre-calculated vector similarities for properties, operators, and
 [SCHEMA DEFINITION]
 Extract the following numeric/property conditions if semantically present in the text:
 condition:
-  - property: String
-    is_percent: Boolean
-    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'contains' | 'top' | 'bottom'
-    percent_total: Number (if is_percent is true)
-    value: Number or String
+  - property: String.
+  - is_percent: Boolean.
+  - operator: String. 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'contains' | 'top' | 'bottom'
+  - percent_total: Number. (if is_percent is true)
+  - value: Number.
 
 [CURRENT CHUNK TO ANALYZE]
 {CURRENT}
 
 [OUTPUT FORMAT]
 {
-  "condition": [...]
+  "condition": condition
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
@@ -462,7 +462,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
         "tracking" => r#"* 'draft': Shipment preparation or pending pickup.
 * 'progress': Currently in transit or out for delivery.
 * 'return': Returning to sender.
-* 'complete': Successfully delivered to the recipient."#,
+* 'complete': Successfully delivered to the recipient.
+* '': If none logically apply."#,
 
         "goods" => r#"* 'draft': Product is being created, not yet published.
 * 'show': Visible and available for sale on storefront.
@@ -474,7 +475,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
 * 'return': Related to returned inventory.
 * 'exchange': Related to exchanged inventory.
 * 'expire': Product expired.
-* 'complete': Completely sold out or finished lifecycle."#,
+* 'complete': Completely sold out or finished lifecycle.
+* '': If none logically apply."#,
 
         "order" => r#"* 'draft': Pending payment or in cart.
 * 'progress': Order processing or preparing for shipment.
@@ -484,7 +486,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
 * 'return': Items returned by customer.
 * 'exchange': Items being exchanged.
 * 'expire': Payment window expired.
-* 'complete': Order fully fulfilled and closed."#,
+* 'complete': Order fully fulfilled and closed.
+* '': If none logically apply."#,
 
         "coupon" | "event" => r#"* 'show': Visible to customers.
 * 'progress': Currently active and running.
@@ -492,7 +495,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
 * 'stop': Temporarily paused.
 * 'cancel': Terminated early.
 * 'expire': Passed its expiration date.
-* 'complete': Successfully finished its run."#,
+* 'complete': Successfully finished its run.
+* '': If none logically apply."#,
 
         "review" => r#"* 'progress': Under moderation or pending approval.
 * 'stop': Blocked or suspended review.
@@ -501,7 +505,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
 * 'return': Associated with a returned order.
 * 'exchange': Associated with an exchanged order.
 * 'expire': Review period expired.
-* 'complete': Published and visible."#,
+* 'complete': Published and visible.
+* '': If none logically apply."#,
 
         _ => r#"* 'show': Visible state.
 * 'progress': Active/Processing state.
@@ -513,7 +518,8 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_g
 * 'return': Returned state.
 * 'exchange': Exchanged state.
 * 'expire': Expired state.
-* 'complete': Finished/Completed state."#,
+* 'complete': Finished/Completed state.
+* '': If none logically apply."#,
     };
 
     let template = r###"[TASK]
