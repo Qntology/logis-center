@@ -1887,7 +1887,15 @@ impl LogisModel {
                     let mut stanza = wrapper.0;
                     let chars: Vec<char> = query.chars().collect();
                     
-                    if !chars.is_empty() {
+                    let whitespace_split: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+
+                    // 🌟 [CRITICAL FIX] "베이지 가디건 찾아줘"를 "베이", "지 가디건"으로 파괴하는 Stanza 토크나이저 한계 극복!
+                    // 사용자가 이미 띄어쓰기를 입력했다면(단어가 2개 이상) 멍청한 토크나이저를 건너뛰고 공백 분할을 바로 채택합니다.
+                    // 띄어쓰기가 아예 없는 경우(예: "베이지가디건찾아줘")에만 최후의 수단으로 토크나이저를 가동합니다.
+                    if whitespace_split.len() > 1 {
+                        emit_term("  💡 [STANZA-INFO] 공백이 포함된 검색어이므로 Tokenizer를 생략하고 띄어쓰기 기반 분할을 안전하게 우선 적용합니다.");
+                        ext_words_string = whitespace_split;
+                    } else if !chars.is_empty() {
                         let seq_len = chars.len();
                         let mut char_ids = Vec::with_capacity(seq_len);
                         for c in &chars {
@@ -1986,7 +1994,7 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 [CRITICAL FIX] Tokenizer가 띄어쓰기 기준으로 제대로 자르지 못했거나 실패한 경우 Fallback으로 공백 기반 분할을 선행합니다.
+                    // 🌟 띄어쓰기도 없었고 토크나이저도 실패한 경우의 최후 방어선
                     if ext_words_string.is_empty() {
                         emit_term("  💡 [STANZA-INFO] 기본 공백 기반 분할 알고리즘으로 우회 적용되었습니다.");
                         ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
