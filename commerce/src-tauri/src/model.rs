@@ -2686,6 +2686,7 @@ impl LogisModel {
                     // 1. 루트 레벨 객체들을 필터링하여 스택에 삽입
                     for (g_key, g_val) in root_obj {
                         if !excluded_keys.contains(&g_key.as_str()) {
+                            // emit_term(&format!("  root Property '{}' loaded for 1st Plinko.", g_key));
                             stack.push((g_key.clone(), g_val));
                         }
                     }
@@ -2694,8 +2695,11 @@ impl LogisModel {
                     while let Some((node_key, node_val)) = stack.pop() {
                         if let Some(obj) = node_val.as_object() {
                             // 현재 객체가 속성 스키마의 필수 조건 3가지를 가졌다면 추출 (1단이든 2단이든 무조건 걸림)
+
                             if obj.contains_key("semantic") && obj.contains_key("bias") && obj.contains_key("prejudice") {
                                 if !prop_keys.contains(&node_key) {
+                                    // emit_term(&format!("  child Property '{}' loaded for 1st Plinko.", node_key));
+
                                     let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
                                     let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                     let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
@@ -2724,7 +2728,7 @@ impl LogisModel {
                 // 🌟 [3차 분기] 동적 필터 카테고리 일괄 로드 (bias.json 구조 완전 동기화)
                 let filter_categories = vec![
                     "operators", "metrics", "time_filters", "season_filters", 
-                    "status_filters", "substantial_filters", "find_filters"
+                    "status_filters", "substantial_filters", "find_filters", "option_filters"
                 ];
 
                 #[derive(Clone)]
