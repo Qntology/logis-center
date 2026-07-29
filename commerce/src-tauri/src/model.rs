@@ -2689,7 +2689,7 @@ impl LogisModel {
                     let current_second_best = candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
                     let current_second = candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
 
-                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> Match: [{}] (Score: {:.4})", test_text, current_best, current_max));
+                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4})", test_text, current_best, current_max, current_second_best, current_second));
 
                     // Score Drop (Cliff) = Cut & Drop into Slot
                     if current_max < prev_max_score && !current_chunk.is_empty() {
@@ -2738,7 +2738,7 @@ impl LogisModel {
                         prev_second_score = r_second;
                         best_prop_for_chunk = r_best.clone();
                         second_prop_for_chunk = r_second_best.clone();
-                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> Top Property: {} (Score: {:.4})", word, r_best, r_max));
+                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4})", word, r_best, r_max, r_second_best, r_second));
                     } else {
                         current_chunk.push(word);
                         prev_max_score = current_max;
@@ -2751,7 +2751,7 @@ impl LogisModel {
                 // Sweep remaining chunk
                 if !current_chunk.is_empty() {
                     if prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
-                        emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to property [{}] (Score: {:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score));
+                        emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score, second_prop_for_chunk, prev_second_score));
                         plinko_matches.push(PlinkoMatch {
                             chunk: current_chunk.join(" "),
                             best_prop: best_prop_for_chunk.clone(),
