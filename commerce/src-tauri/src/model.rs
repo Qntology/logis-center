@@ -2672,8 +2672,17 @@ impl LogisModel {
                 let mut loaded_globals = Vec::new();
                 if let Some(root_obj) = crate::parsing::BIAS_DICT.as_object() {
                     for (g_key, g_val) in root_obj {
-                        // 언어별 스키마와 시스템 제어 키워드는 제외합니다.
-                        if g_key == "ko" || g_key == "en" || g_key == "ja" || g_key == "zh" || g_key == "ignore" { continue; }
+                        // 언어별 스키마와 시스템 제어 키워드는 제외합니다. (추가된 다국어 코드 포함)
+                        let excluded_keys = [
+                            "ignore", "insight", 
+                            "sq", "ar", "az", "bn", "bg", "ca", "zh", "hr", "cs", "da", 
+                            "nl", "en", "et", "fi", "fr", "ka", "de", "el", "he", "hi", 
+                            "hu", "is", "id", "it", "ja", "kk", "km", "ko", "lv", "lt", 
+                            "ms", "mr", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", 
+                            "sl", "es", "sw", "sv", "tl", "te", "th", "tr", "uk", "ur", 
+                            "uz", "vi"
+                        ];
+                        if excluded_keys.contains(&g_key.as_str()) { continue; }
                         
                         if let Some(obj) = g_val.as_object() {
                             // 1) 해당 노드가 직접 속성인 경우 (예: color)
@@ -2763,7 +2772,8 @@ impl LogisModel {
                 }
 
                 // Batch Embedding 동시 장전 (스키마 프로퍼티 + 동적 필터들)
-                let bias_embs = self.get_embedding_batch(bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
+                // 🌟 [CRITICAL FIX] bias_texts는 이후 루프(Plinko)에서도 원본 텍스트 매칭을 위해 계속 사용되므로 .clone()을 사용하여 소유권 이동(Move) 에러를 방지합니다.
+                let bias_embs = self.get_embedding_batch(bias_texts.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
                 let prej_embs = self.get_embedding_batch(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
                 
                 let dynamic_bias_embs = self.get_embedding_batch(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
@@ -2809,7 +2819,18 @@ impl LogisModel {
                         let p_score = cosine_similarity(&test_emb, &prej_embs[i]);
                         
                         // 🌟 [수정] 단순 차감이 아닌, 페널티 가중치와 동사 페널티를 결합하여 노이즈 차단
-                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
+                        let mut score = b_score - (p_score * penalty_weight) - verb_penalty;
+                        
+                        // 🌟 [CRITICAL FIX: Embedding Dilution 방어 부스트]
+                        // bias.json의 color나 metrics 항목처럼 값(bias)이 너무 길면 벡터 매칭 점수가 심하게 떨어집니다.
+                        // 이를 해결하기 위해 사용자가 입력한 단어(청크)가 해당 속성의 bias 텍스트에 물리적으로 포함될 경우 강력한 가산점을 부여합니다.
+                        let chunk_clean = test_text.replace(" ", "").to_lowercase();
+                        let bias_clean = bias_texts[i].replace(" ", "").to_lowercase();
+                        
+                        if chunk_clean.chars().count() >= 2 && bias_clean.contains(&chunk_clean) {
+                            score += 0.5; // 강제 1순위 승급을 위한 보너스 점수
+                        }
+
                         candidates.push((prop_keys[i].clone(), score));
                     }
                     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2865,7 +2886,16 @@ impl LogisModel {
                             let p_score = cosine_similarity(&reset_emb, &prej_embs[i]);
                             
                             // 🌟 [수정] 페널티 가중치 적용
-                            let score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
+                            let mut score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
+                            
+                            // 🌟 [CRITICAL FIX: Embedding Dilution 방어 부스트 (리셋 윈도우)]
+                            let word_clean = word.replace(" ", "").to_lowercase();
+                            let bias_clean = bias_texts[i].replace(" ", "").to_lowercase();
+                            
+                            if word_clean.chars().count() >= 2 && bias_clean.contains(&word_clean) {
+                                score += 0.5;
+                            }
+
                             r_candidates.push((prop_keys[i].clone(), score));
                         }
                         r_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
