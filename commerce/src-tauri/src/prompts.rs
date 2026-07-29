@@ -701,6 +701,35 @@ If not, suggest the correct property name from the schema.
             .replace("{PROPERTY}", property)
 }
 
+pub fn granite_verify_property_with_alternatives_prompt(
+    text: &str,
+    first_choice: &str,
+    first_score: f32,
+    second_choice: &str,
+    second_score: f32,
+) -> String {
+    let template = r###"[TASK]
+Text: "{TEXT}"
+First choice: "{FIRST}" (score: {FIRST_SCORE})
+Second choice: "{SECOND}" (score: {SECOND_SCORE})
+
+Instructions:
+1. If the first choice is correct for this text, set "correct": true and "suggested_property": "{FIRST}".
+2. If the first choice is wrong but the second choice is better, set "correct": false and "suggested_property": "{SECOND}".
+3. If neither choice is correct, set "correct": false and suggest a different property from the schema.
+
+[OUTPUT FORMAT]
+{"correct": Boolean, "suggested_property": String}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{TEXT}", text)
+            .replace("{FIRST}", first_choice)
+            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+            .replace("{SECOND}", second_choice)
+            .replace("{SECOND_SCORE}", &format!("{:.4}", second_score))
+}
+
 pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String {
     let valid_ops: Vec<String> = crate::parsing::BIAS_DICT
         .get("operators")

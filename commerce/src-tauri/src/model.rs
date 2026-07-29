@@ -2001,7 +2001,13 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 [STANZA POS 사전 필터링 (scheduler.rs 로직 이식)]
+                    // 🌟 [CRITICAL FIX] Tokenizer가 띄어쓰기 기준으로 제대로 자르지 못했거나 실패한 경우 Fallback으로 공백 기반 분할을 선행합니다.
+                    if ext_words_string.is_empty() {
+                        emit_term("[STANZA] ⚠️ Stanza Tokenizer returned empty result. Falling back to whitespace splitting.");
+                        ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
+                    }
+
+                    // 🌟 [STANZA POS 사전 필터링 & 로그 출력]
                     // "찾아줘", "알려줘" 등 무의미한 동사(VERB), 조사(ADP) 등을 Plinko 벡터 매칭 전에 원천 차단합니다.
                     if !ext_words_string.is_empty() {
                         let ext_words_refs: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
@@ -2023,50 +2029,62 @@ impl LogisModel {
                             padded_chunk.push("<pad>");
                         }
 
-                        if let Ok(pos_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session) {
-                            if let Ok(pos_outputs) = stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
-                                let output_tensor = &pos_outputs[0];
-                                let shape = output_tensor.shape();
-                                let mut pos_tags = Vec::new();
+                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session) {
+                            Ok(pos_inputs) => {
+                                match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
+                                    Ok(pos_outputs) => {
+                                        let output_tensor = &pos_outputs[0];
+                                        let shape = output_tensor.shape();
+                                        let mut pos_tags = Vec::new();
 
-                                let num_classes = if shape.len() == 3 { shape[2] as usize } else { shape[1] as usize };
-                                for i in 0..valid_len {
-                                    let mut max_val = std::f32::MIN;
-                                    let mut max_idx = 0;
-                                    for c in 0..num_classes {
-                                        let val = if shape.len() == 3 { output_tensor[[0, i, c]] } else { output_tensor[[i, c]] };
-                                        if val > max_val { max_val = val; max_idx = c; }
+                                        let num_classes = if shape.len() == 3 { shape[2] as usize } else { shape[1] as usize };
+                                        for i in 0..valid_len {
+                                            let mut max_val = std::f32::MIN;
+                                            let mut max_idx = 0;
+                                            for c in 0..num_classes {
+                                                let val = if shape.len() == 3 { output_tensor[[0, i, c]] } else { output_tensor[[i, c]] };
+                                                if val > max_val { max_val = val; max_idx = c; }
+                                            }
+                                            let tag = stanza.preprocessor.upos_vocab.get(max_idx as usize).map(|s| s.as_str()).unwrap_or("X");
+                                            pos_tags.push(tag);
+                                        }
+
+                                        // 🌟 [로그 추가] 형태소 분석 결과 전체 로그 출력
+                                        let mut debug_pos_log = Vec::new();
+                                        let drop_tags = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+                                        let mut dropped_log = Vec::new();
+                                        let mut filtered_words = Vec::new();
+
+                                        for (i, word) in ext_words_string.iter().enumerate() {
+                                            let tag = pos_tags[i];
+                                            debug_pos_log.push(format!("{}({})", word, tag));
+                                            
+                                            // 해당 단어가 드롭 태그(예: VERB)에 속하면 제거
+                                            if drop_tags.contains(&tag) {
+                                                dropped_log.push(format!("{}({})", word, tag));
+                                            } else {
+                                                filtered_words.push(word.clone());
+                                            }
+                                        }
+                                        
+                                        emit_term(&format!("  🧠 [STANZA-POS-LOG] 검색어 형태소 분석 결과: {:?}", debug_pos_log));
+
+                                        if !dropped_log.is_empty() {
+                                            emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 무의미한 단어 사전 제거 완료: {:?}", dropped_log));
+                                        }
+                                        
+                                        // 🌟 필터링 결과가 전부 다 날아가버리면 원본을 유지 (과잉 삭제로 인한 크래시 방어)
+                                        if !filtered_words.is_empty() {
+                                            ext_words_string = filtered_words;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        emit_term(&format!("  ⚠️ [STANZA-POS-ERROR] POS session run failed: {:?}", e));
                                     }
-                                    let tag = stanza.preprocessor.upos_vocab.get(max_idx as usize).map(|s| s.as_str()).unwrap_or("X");
-                                    pos_tags.push(tag);
                                 }
-
-                                // 🌟 무의미한 형태소 기각 태그 설정
-                                // ADJ(형용사 - 예: 베이지색)나 NOUN(명사 - 가디건)은 커머스 검색 핵심이므로 보존합니다.
-                                // VERB(찾아줘, 알려줘, 보여줘) 및 각종 조사/기호를 제거합니다.
-                                let drop_tags = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
-                                let mut dropped_log = Vec::new();
-                                let mut filtered_words = Vec::new();
-
-                                for (i, word) in ext_words_string.iter().enumerate() {
-                                    let tag = pos_tags[i];
-                                    
-                                    // 해당 단어가 드롭 태그(예: VERB)에 속하면 제거
-                                    if drop_tags.contains(&tag) {
-                                        dropped_log.push(format!("{}({})", word, tag));
-                                    } else {
-                                        filtered_words.push(word.clone());
-                                    }
-                                }
-
-                                if !dropped_log.is_empty() {
-                                    emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 무의미한 단어 사전 제거 완료: {:?}", dropped_log));
-                                }
-                                
-                                // 🌟 필터링 결과가 전부 다 날아가버리면 원본을 유지 (과잉 삭제로 인한 크래시 방어)
-                                if !filtered_words.is_empty() {
-                                    ext_words_string = filtered_words;
-                                }
+                            },
+                            Err(e) => {
+                                emit_term(&format!("  ⚠️ [STANZA-POS-ERROR] POS encode_to_tensor failed: {:?}", e));
                             }
                         }
                     }
@@ -2075,6 +2093,8 @@ impl LogisModel {
                     emit_term(&format!("[STANZA] ⚠️ Failed to load Stanza models for '{}' (상세 원인): {:?}", stanza_lang_code, e));
                 }
             }
+        } else {
+            emit_term(&format!("[STANZA] ⚠️ Stanza model directory not found: {:?}. Falling back to whitespace splitting.", stanza_lang_dir));
         }
 
         if ext_words_string.is_empty() {
@@ -2620,12 +2640,22 @@ impl LogisModel {
                 let dynamic_prej_embs = self.get_embedding_batch(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
 
                 // 🌟 Plinko Game (1st Depth): Sliding Window Cliff Detection over words
+                struct PlinkoMatch {
+                    chunk: String,
+                    best_prop: String,
+                    best_score: f32,
+                    second_prop: String,
+                    second_score: f32,
+                }
+                let mut plinko_matches: Vec<PlinkoMatch> = Vec::new();
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
                 let words: Vec<&str> = current_text.split_whitespace().collect();
                 
                 let mut current_chunk = Vec::new();
                 let mut prev_max_score = -1.0;
+                let mut prev_second_score = -1.0;
                 let mut best_prop_for_chunk = String::new();
+                let mut second_prop_for_chunk = String::new();
 
                 emit_term(&format!("  🎯 [PLINKO GAME (1st)] Starting Sliding Window Cliff Detection for '{}'", current_text));
 
@@ -2642,8 +2672,7 @@ impl LogisModel {
                     let verb_penalty = v_sim * beta;
                     let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
 
-                    let mut current_max = -1.0;
-                    let mut current_best = String::new();
+                    let mut candidates: Vec<(String, f32)> = Vec::new();
 
                     for i in 0..prop_keys.len() {
                         let b_score = cosine_similarity(&test_emb, &bias_embs[i]);
@@ -2651,12 +2680,14 @@ impl LogisModel {
                         
                         // 🌟 [수정] 단순 차감이 아닌, 페널티 가중치와 동사 페널티를 결합하여 노이즈 차단
                         let score = b_score - (p_score * penalty_weight) - verb_penalty;
-                        
-                        if score > current_max {
-                            current_max = score;
-                            current_best = prop_keys[i].clone();
-                        }
+                        candidates.push((prop_keys[i].clone(), score));
                     }
+                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    let current_best = candidates.first().map(|c| c.0.clone()).unwrap_or_default();
+                    let current_max = candidates.first().map(|c| c.1).unwrap_or(-1.0);
+                    let current_second_best = candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
+                    let current_second = candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
 
                     emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> Match: [{}] (Score: {:.4})", test_text, current_best, current_max));
 
@@ -2664,12 +2695,18 @@ impl LogisModel {
                     if current_max < prev_max_score && !current_chunk.is_empty() {
                         emit_term(&format!("    📉 [CLIFF DETECTED] Score dropped ({:.4} -> {:.4}). End of semantic chunk.", prev_max_score, current_max));
                         
-                        // 🌟 임계값을 0.10에서 0.05로 대폭 완화하여 단문(1단어 등)이 무시되는 현상을 막습니다.
-                        if prev_max_score > 0.05 && !best_prop_for_chunk.is_empty() {
+                        // 🌟 임계값을 0.20으로 상향 조정하여 무의미한 단어가 특정 속성으로 맵핑되는 현상 방지
+                        if prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
                             emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
-                            plinko_map.entry(best_prop_for_chunk.clone()).or_default().push(current_chunk.join(" "));
+                            plinko_matches.push(PlinkoMatch {
+                                chunk: current_chunk.join(" "),
+                                best_prop: best_prop_for_chunk.clone(),
+                                best_score: prev_max_score,
+                                second_prop: second_prop_for_chunk.clone(),
+                                second_score: prev_second_score,
+                            });
                         } else {
-                            emit_term(&format!("      🗑️ [SKIPPED] Score {:.4} is too low. Ignored.", prev_max_score));
+                            emit_term(&format!("      🗑️ [SKIPPED] Score {:.4} is too low (Threshold: 0.20). Ignored.", prev_max_score));
                         }
                         
                         // Reset Window
@@ -2681,70 +2718,87 @@ impl LogisModel {
                         let r_verb_penalty = r_v_sim * 0.05;
                         let r_penalty_weight = 0.3;
 
-                        let mut r_max = -1.0;
-                        let mut r_best = String::new();
+                        let mut r_candidates: Vec<(String, f32)> = Vec::new();
                         for i in 0..prop_keys.len() {
                             let b_score = cosine_similarity(&reset_emb, &bias_embs[i]);
                             let p_score = cosine_similarity(&reset_emb, &prej_embs[i]);
                             
                             // 🌟 [수정] 페널티 가중치 적용
                             let score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
-                            
-                            if score > r_max {
-                                r_max = score;
-                                r_best = prop_keys[i].clone();
-                            }
+                            r_candidates.push((prop_keys[i].clone(), score));
                         }
+                        r_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        
+                        let r_max = r_candidates.first().map(|c| c.1).unwrap_or(-1.0);
+                        let r_best = r_candidates.first().map(|c| c.0.clone()).unwrap_or_default();
+                        let r_second = r_candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
+                        let r_second_best = r_candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
+
                         prev_max_score = r_max;
-                        best_prop_for_chunk = r_best.clone(); // 🌟 [COMPILATION FIX] 소유권 이동(move) 방지를 위해 clone() 추가
+                        prev_second_score = r_second;
+                        best_prop_for_chunk = r_best.clone();
+                        second_prop_for_chunk = r_second_best.clone();
                         emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> Top Property: {} (Score: {:.4})", word, r_best, r_max));
                     } else {
                         current_chunk.push(word);
                         prev_max_score = current_max;
+                        prev_second_score = current_second;
                         best_prop_for_chunk = current_best;
+                        second_prop_for_chunk = current_second_best;
                     }
                 }
                 
                 // Sweep remaining chunk
-                if !current_chunk.is_empty() && prev_max_score > 0.05 && !best_prop_for_chunk.is_empty() {
-                    emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to property [{}] (Score: {:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score));
-                    plinko_map.entry(best_prop_for_chunk).or_default().push(current_chunk.join(" "));
+                if !current_chunk.is_empty() {
+                    if prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
+                        emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to property [{}] (Score: {:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score));
+                        plinko_matches.push(PlinkoMatch {
+                            chunk: current_chunk.join(" "),
+                            best_prop: best_prop_for_chunk.clone(),
+                            best_score: prev_max_score,
+                            second_prop: second_prop_for_chunk.clone(),
+                            second_score: prev_second_score,
+                        });
+                    } else {
+                        emit_term(&format!("    🗑️ [SWEEP SKIPPED] Final chunk '{}' score {:.4} is too low (Threshold: 0.20). Ignored.", current_chunk.join(" "), prev_max_score));
+                    }
                 }
 
                 // Granite H 350M으로 1차 매핑 검증
-                if !plinko_map.is_empty() {
+                if !plinko_matches.is_empty() {
                     emit_term("    🧠 [GRANITE VERIFICATION (1st)] Verifying property mappings...");
                     // Granite H 350M 로드
                     self.ensure_granite_model().await?;
                     
-                    // plinko_map의 각 항목을 Granite H 350M으로 검증
-                    let mut validated_map = std::collections::HashMap::new();
-                    for (prop, chunks) in &plinko_map {
+                    // plinko_matches의 각 항목을 Granite H 350M으로 검증 (2순위 속성까지 LLM에 제공)
+                    let mut validated_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                    for pm in &plinko_matches {
                         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                         
-                        let combined = chunks.join(" ");
-                        let prompt = crate::prompts::verify_property_mapping_prompt(&combined, prop);
+                        let prompt = crate::prompts::granite_verify_property_with_alternatives_prompt(
+                            &pm.chunk, &pm.best_prop, pm.best_score, &pm.second_prop, pm.second_score
+                        );
                         
                         // Granite H 350M 호출
                         if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
                                 if result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", prop, combined));
-                                    validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                                    emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", pm.best_prop, pm.chunk));
+                                    validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
                                 } else if let Some(suggested) = result.get("suggested_property").and_then(|v| v.as_str()) {
-                                    emit_term(&format!("      🔄 Property [{}] corrected to [{}] for '{}'", prop, suggested, combined));
-                                    validated_map.entry(suggested.to_string()).or_insert_with(Vec::new).push(combined);
+                                    emit_term(&format!("      🔄 Property [{}] corrected to [{}] for '{}'", pm.best_prop, suggested, pm.chunk));
+                                    validated_map.entry(suggested.to_string()).or_insert_with(Vec::new).push(pm.chunk.clone());
                                 } else {
-                                    validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                                    validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
                                 }
                             } else {
-                                validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                                validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
                             }
                         } else {
-                            validated_map.entry(prop.clone()).or_insert_with(Vec::new).push(combined);
+                            validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
                         }
                     }
-                    plinko_map = validated_map;
+                    plinko_map = validated_map; // 🌟 2단계 진행을 위해 복구
                 }
 
                 // 🌟 [IGNORE VECTOR CHECK] 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 검증
