@@ -122,7 +122,6 @@ pub enum ModelSize {
     Qwen,    // 0.6B for Ingestion (기존 Small)
     Qwen3,   // Qwen3 Text Model (기존 Large, /qwen3/ 로직 전용)
     Qwen3_5, // 2B Qwen 3.5 (Text Optimized)
-    Granite, // Granite H 350M
 }
 
 #[derive(Clone)]
@@ -131,7 +130,6 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
-    pub granite_generator: Arc<TokioMutex<Option<crate::models::granite::generate::GraniteGenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
@@ -159,8 +157,6 @@ impl LogisModel {
         *q3_gen = None;
         let mut q35_gen = self.qwen3_5_generator.lock().await;
         *q35_gen = None;
-        let mut granite_gen = self.granite_generator.lock().await;
-        *granite_gen = None;
         
         let mut size = self.current_size.lock().await;
         *size = None;
@@ -227,14 +223,6 @@ impl LogisModel {
             if let Some(mut g) = q35_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator..."); //
                 g.clear_kv_cache();
-                drop(g);
-            }
-        }
-
-        {
-            let mut granite_gen = self.granite_generator.lock().await;
-            if let Some(mut g) = granite_gen.take() {
-                println!("[DIAG-PURGE] Dropping Granite Generator...");
                 drop(g);
             }
         }
@@ -523,7 +511,6 @@ impl LogisModel {
                     },
                     ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
                     ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
-                    ModelSize::Granite => self.granite_generator.lock().await.is_some(),
                 };
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
@@ -537,7 +524,6 @@ impl LogisModel {
                         ModelSize::Qwen => { self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?; },
                         ModelSize::Qwen3 => { self.ensure_qwen3().await?; },
                         ModelSize::Qwen3_5 => { self.ensure_qwen3_5(false).await?; },
-                        ModelSize::Granite => { self.ensure_granite_model().await?; }
                     }
                     return Ok(());
                 }
@@ -570,9 +556,6 @@ impl LogisModel {
             ModelSize::Qwen3_5 => {
                 self.ensure_qwen3_5(false).await?;
             },
-            ModelSize::Granite => {
-                self.ensure_granite_model().await?;
-            }
         }
 
         println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
@@ -740,85 +723,38 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn ensure_granite_model(&self) -> anyhow::Result<()> {
-        let granite_dir = crate::utils::get_app_dir().join("models").join("granite-4.0-h-350m");
-        let weights_path = granite_dir.join("model.safetensors");
+    pub async fn call_qwen3_verification_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        // Qwen3 로드 보장
+        self.ensure_qwen3().await?;
         
-        if !weights_path.exists() {
-            let err_msg = "Granite model is missing. Please go to the Settings tab and download the required models.";
-            println!("[MODEL] 🚨 {}", err_msg);
-            use tauri::Emitter;
-            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({ "message": err_msg }));
-            return Err(anyhow::anyhow!(err_msg));
-        }
-
-        // 현재 로드된 모델이 Granite이면 건너뜀
-        {
-            let current = self.current_size.lock().await;
-            if *current == Some(ModelSize::Granite) {
-                return Ok(());
-            }
-        }
+        let gen_arc = self.qwen3_generator.clone();
+        let cancel_clone = cancel_token.clone();
+        let prompt_string = prompt.to_string();
         
-        // 기존 모델 언로드
-        self.deep_purge_resources().await;
-        
-        // Granite H 350M 로드
-        let model = crate::models::granite::generate::GraniteGenerateModel::init(
-            &granite_dir.to_string_lossy(),
-            Some(&self.device_config.device),
-            None
-        )?;
-        
-        *self.granite_generator.lock().await = Some(model);
-        *self.current_size.lock().await = Some(ModelSize::Granite);
-        
-        Ok(())
-    }
-
-    pub async fn call_granite_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let gen_arc_e = self.granite_generator.clone();
-        
-        // 🌟 Granite 템플릿(시스템 프롬프트 포함)을 적용하여 e_prompt_text 생성
-        let e_sys = "You are a precise evaluation assistant. Return strictly the requested JSON format.";
-        let e_user = prompt;
-        let e_prompt_text = format!("<|start_of_role|>system<|end_of_role|>{}\n<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>{}\n<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>", e_sys, e_user);
-        
-        let dev_e = self.device_config.device.clone();
-        let is_cpu = self.is_cpu_mode;
-        
-        let response = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = gen_arc_e.blocking_lock();
+        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                // KV 캐시 초기화 (메모리 누수 방지)
-                gen.clear_kv_cache();
-                
-                // 컴파일 에러 해결: map_err를 catch_unwind 내부로 이동시켜 anyhow::Error 타입으로 통일
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    gen.generate(&e_prompt_text, 256, &dev_e, cancel_token)
-                        .map_err(|e| anyhow::anyhow!("Granite inference failed: {}", e))
-                })).unwrap_or_else(|_| Err(anyhow::anyhow!("Granite generator panicked")));
-                
-                // 생성 종료 후 KV 캐시 즉시 비우기
-                gen.clear_kv_cache();
-                
-                res
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![
+                        crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: "You are a precise evaluation assistant. Return strictly the requested JSON format.".to_string(),
+                            name: None,
+                        }),
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_string),
+                            name: None,
+                        })
+                    ],
+                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+                    ..Default::default()
+                };
+                gen.generate(params, cancel_clone, None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
             } else {
-                Err(anyhow::anyhow!("Granite model not loaded"))
+                Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }
         }).await??;
         
-        // CUDA VRAM 동기화 및 강제 해제 (GPU 모드일 때만)
-        if !is_cpu {
-            let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || { 
-                if dev.is_cuda() { 
-                    let _ = dev.synchronize(); 
-                } 
-            }).await;
-        }
-
-        Ok(response)
+        Ok(res)
     }
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
@@ -990,7 +926,6 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
-            granite_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             is_cpu_mode: config.is_cpu,
@@ -1104,7 +1039,10 @@ impl LogisModel {
 
                     // Step C: 구역별 분할 크롭 및 LLM 타격
                     for (idx, (cat, top, bot)) in missions.iter().enumerate() {
-                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) { return Err(anyhow!("Cancelled")); }
+                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                            emit_term("🛑 Task cancelled by user. Terminating safely.");
+                            return Ok(());
+                        }
                         
                         let crop_y = (h as f32 * top) as u32;
                         let crop_h = (h as f32 * (bot - top)) as u32;
@@ -1769,7 +1707,10 @@ impl LogisModel {
 
         // 🌟 [최초 초기화] VRAM 확보 및 불필요한 제너레이터 선제적 언로드 (캔슬 개입 포함)
         emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model...");
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
         
         // 🌟 [CRITICAL FIX] scheduler.rs의 *model_lock = None; 구조 완벽 이식
         {
@@ -1782,7 +1723,10 @@ impl LogisModel {
         self.deep_purge_resources().await;
         self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
 
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
         
         // ----------------------------------------------------
         // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
@@ -1793,7 +1737,10 @@ impl LogisModel {
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
         self.ensure_embedding().await?;
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
 
         // 🌟 [CRITICAL FIX] whatlang을 이용한 글로벌 언어 감지 로직 적용
         // 감지된 언어가 신뢰할만하면 프로젝트 내부 ISO-639 코드 체계로 변환, 그 외의 경우 UI의 language로 폴백
@@ -1949,27 +1896,45 @@ impl LogisModel {
                         }
                         
                         if let Ok(char_tensor) = ndarray::Array2::from_shape_vec((1, seq_len), char_ids) {
-                            let char_features = ndarray::Array3::<i64>::zeros((1, seq_len, 5));
+                            // 🌟 [CRITICAL FIX] 모델이 요구하는 feature_dim을 직접 읽어와서 동적 생성 (한국어는 0)
+                            let mut feature_dim = 0;
+                            for input_meta in &stanza.tokenize_session.inputs {
+                                if input_meta.name == "f" || input_meta.name == "char_features" {
+                                    if let Some(&Some(d)) = input_meta.dimensions.get(2) {
+                                        feature_dim = d as usize;
+                                    }
+                                }
+                            }
+                            // 🌟 [디버깅 & 픽스] feature_dim이 0일 경우 빈 텐서가 생성되어 ONNX Runtime에서 Shape 에러가 발생할 수 있으므로 최소 1 이상의 더미 차원을 부여합니다.
+                            if feature_dim == 0 {
+                                feature_dim = 32;
+                            }
+                            
+                            let char_features = ndarray::Array3::<i64>::zeros((1, seq_len, feature_dim));
                             let seq_lengths = ndarray::Array1::<i64>::from_vec(vec![seq_len as i64]);
                             
                             let mut tensor_pool = std::collections::HashMap::new();
+                            tensor_pool.insert("x", char_tensor.clone().into_dyn());
+                            tensor_pool.insert("f", char_features.clone().into_dyn());
                             tensor_pool.insert("char_tensor", char_tensor.into_dyn());
                             tensor_pool.insert("char_features", char_features.into_dyn());
                             tensor_pool.insert("seq_lengths", seq_lengths.into_dyn());
                             
-                            let mut tok_inputs = Vec::new();
+                            let mut tok_inputs_i64 = Vec::new();
+                            let mut tok_inputs_f32 = Vec::new();
                             for input_meta in &stanza.tokenize_session.inputs {
                                 let exact_name = input_meta.name.clone();
                                 if let Some(tensor) = tensor_pool.get(exact_name.as_str()) {
-                                    tok_inputs.push(tensor.clone());
+                                    tok_inputs_i64.push(tensor.clone());
+                                    tok_inputs_f32.push(tensor.mapv(|x| x as f32));
                                 } else {
                                     emit_term(&format!("[STANZA-WARN] Tokenizer 모델에 정의되지 않은 입력 생략: {}", exact_name));
                                 }
                             }
                             
-                            match stanza.tokenize_session.run::<'_, '_, '_, i64, f32, _>(tok_inputs) {
-                                Ok(outputs) => {
-                                    let output_tensor = &outputs[0];
+                            macro_rules! process_tok_outputs {
+                                ($outputs:expr) => {
+                                    let output_tensor = &$outputs[0];
                                     let shape = output_tensor.shape();
                                     let num_classes = *shape.last().unwrap() as usize;
                                     let is_3d = shape.len() == 3;
@@ -1993,9 +1958,31 @@ impl LogisModel {
                                             current_word.clear();
                                         }
                                     }
-                                },
-                                Err(e) => {
-                                    emit_term(&format!("[STANZA-ERROR] Tokenizer run failed: {:?}", e));
+                                }
+                            }
+
+                            let mut fallback_to_f32 = false;
+                            let mut i64_err_msg = String::new();
+                            {
+                                match stanza.tokenize_session.run::<'_, '_, '_, i64, f32, _>(tok_inputs_i64) {
+                                    Ok(outputs) => {
+                                        process_tok_outputs!(outputs);
+                                    },
+                                    Err(e) => {
+                                        i64_err_msg = format!("{:?}", e);
+                                        fallback_to_f32 = true;
+                                    }
+                                }
+                            }
+                            if fallback_to_f32 {
+                                match stanza.tokenize_session.run::<'_, '_, '_, f32, f32, _>(tok_inputs_f32) {
+                                    Ok(outputs) => {
+                                        process_tok_outputs!(outputs);
+                                    },
+                                    Err(e) => {
+                                        // 🌟 [디버깅 & 픽스] onnxruntime-rs 0.0.14의 한계 (동종 타입만 전달 가능) 및 혼합 타입(i64, f32) 에러 로깅 처리
+                                        emit_term(&format!("  ⚠️ [STANZA-WARN] Tokenizer ONNX 모델의 입력 타입 제약으로 인해 실행을 우회합니다.\n    - i64 Run Error: {}\n    - f32 Run Error: {:?}", i64_err_msg, e));
+                                    }
                                 }
                             }
                         }
@@ -2003,7 +1990,7 @@ impl LogisModel {
 
                     // 🌟 [CRITICAL FIX] Tokenizer가 띄어쓰기 기준으로 제대로 자르지 못했거나 실패한 경우 Fallback으로 공백 기반 분할을 선행합니다.
                     if ext_words_string.is_empty() {
-                        emit_term("[STANZA] ⚠️ Stanza Tokenizer returned empty result. Falling back to whitespace splitting.");
+                        emit_term("  💡 [STANZA-INFO] 기본 공백 기반 분할 알고리즘으로 우회 적용되었습니다.");
                         ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
                     }
 
@@ -2119,7 +2106,10 @@ impl LogisModel {
             
             // 🌟 [단어 수 제한] start + 2 로 설정하여 단일 단어(1단어)는 배제합니다.
             for end in (start + 2)..=max_end {
-                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                    emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                    return Ok(json!({ "context": [], "cancelled": true }));
+                }
                 
                 let test_text = words[start..end].join(" ");
                 let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
@@ -2546,7 +2536,10 @@ impl LogisModel {
         emit_term(&serde_json::to_string_pretty(&segments).unwrap_or_default());
         emit_term("=======================================\n");
 
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
 
         // ----------------------------------------------------
         // Stage 2 & 3: Double Plinko Attribute/Operator Mapping & LLM Normalization
@@ -2557,7 +2550,10 @@ impl LogisModel {
             let total_segments = ctx_arr.len();
 
             for (idx, seg) in ctx_arr.iter_mut().enumerate() {
-                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                    emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                    return Ok(json!({ "context": [], "cancelled": true }));
+                }
 
                 let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Mapping attributes...", "spinner": "⠋" });
                 let _ = app_handle.emit("extraction-progress", &payload);
@@ -2591,6 +2587,33 @@ impl LogisModel {
                                    else if desc.contains("Array") { "Array" }
                                    else { "String" };
                     prop_types.insert(key, type_str);
+                }
+
+                // 🌟 [글로벌 속성 동적 확장] bias.json 최상단(Root)에 존재하는 속성 중, 구조적 키워드가 아닌 단일 속성(color 등)을 Duck-typing으로 동적 수집합니다.
+                if let Some(root_obj) = crate::parsing::BIAS_DICT.as_object() {
+                    for (g_key, g_val) in root_obj {
+                        if let Some(obj) = g_val.as_object() {
+                            // 하위 객체가 semantic, bias, prejudice를 모두 가지고 있다면 독립적인 추출 속성으로 간주합니다.
+                            if obj.contains_key("semantic") && obj.contains_key("bias") && obj.contains_key("prejudice") {
+                                // 단, 'ignore' 같은 시스템 제어용 키워드는 속성 매칭에서 제외합니다.
+                                if g_key == "ignore" { continue; }
+
+                                let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
+                                let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
+                                
+                                prop_keys.push(g_key.to_string());
+                                bias_texts.push(bias);
+                                prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                                
+                                let type_str = if desc.contains("Number") { "Number" }
+                                               else if desc.contains("Boolean") { "Boolean" }
+                                               else if desc.contains("Array") { "Array" }
+                                               else { "String" };
+                                prop_types.insert(g_key.to_string(), type_str);
+                            }
+                        }
+                    }
                 }
 
                 // 🌟 [3차 분기] 동적 필터 카테고리 일괄 로드 (bias.json 구조 완전 동기화)
@@ -2764,27 +2787,53 @@ impl LogisModel {
                     }
                 }
 
-                // Granite H 350M으로 1차 매핑 검증
+                // Qwen3로 1차 매핑 검증
                 if !plinko_matches.is_empty() {
-                    emit_term("    🧠 [GRANITE VERIFICATION (1st)] Verifying property mappings...");
-                    // Granite H 350M 로드
-                    self.ensure_granite_model().await?;
+                    emit_term("    🧠 [QWEN3 VERIFICATION (1st)] Verifying property mappings...");
+                    // Qwen3 로드
+                    self.ensure_qwen3().await?;
                     
-                    // plinko_matches의 각 항목을 Granite H 350M으로 검증 (2순위 속성까지 LLM에 제공)
+                    // plinko_matches의 각 항목을 Qwen3로 검증 (2순위 속성까지 LLM에 제공)
                     let mut validated_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                    let all_props_str = prop_keys.join(", ");
+                    
                     for pm in &plinko_matches {
-                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                            return Ok(json!({ "context": [], "cancelled": true }));
+                        }
                         
-                        let prompt = crate::prompts::granite_verify_property_with_alternatives_prompt(
+                        let prompt = crate::prompts::verify_property_with_alternatives_prompt(
                             &pm.chunk, &pm.best_prop, pm.best_score, &pm.second_prop, pm.second_score
                         );
                         
-                        // Granite H 350M 호출
-                        if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
+                        // Qwen3 호출
+                        if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
                                 if result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", pm.best_prop, pm.chunk));
-                                    validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
+                                    // 기존 로직과 함께 suggested_properties 도 확인
+                                    let mut final_props = vec![pm.best_prop.clone()];
+                                    if let Some(arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
+                                        if !arr.is_empty() {
+                                            final_props.clear();
+                                            for p in arr {
+                                                if let Some(s) = p.as_str() { final_props.push(s.to_string()); }
+                                            }
+                                        }
+                                    }
+                                    emit_term(&format!("      ✅ Property {:?} confirmed for '{}'", final_props, pm.chunk));
+                                    for prop in final_props {
+                                        validated_map.entry(prop).or_insert_with(Vec::new).push(pm.chunk.clone());
+                                    }
+                                } else if let Some(suggested_arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
+                                    let mut suggested_list = Vec::new();
+                                    for s in suggested_arr {
+                                        if let Some(s_str) = s.as_str() {
+                                            validated_map.entry(s_str.to_string()).or_insert_with(Vec::new).push(pm.chunk.clone());
+                                            suggested_list.push(s_str.to_string());
+                                        }
+                                    }
+                                    emit_term(&format!("      🔄 Property [{}] corrected to {:?} for '{}'", pm.best_prop, suggested_list, pm.chunk));
                                 } else if let Some(suggested) = result.get("suggested_property").and_then(|v| v.as_str()) {
                                     emit_term(&format!("      🔄 Property [{}] corrected to [{}] for '{}'", pm.best_prop, suggested, pm.chunk));
                                     validated_map.entry(suggested.to_string()).or_insert_with(Vec::new).push(pm.chunk.clone());
@@ -2912,19 +2961,22 @@ impl LogisModel {
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
 
-                // Granite H 350M으로 2차 매핑 검증
+                // Qwen3로 2차 매핑 검증
                 if !prop_to_op.is_empty() {
-                    emit_term("    🧠 [GRANITE VERIFICATION (2nd)] Verifying operators...");
-                    self.ensure_granite_model().await?;
+                    emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
+                    self.ensure_qwen3().await?;
                     
                     // 속성별 operator 검증
                     let mut validated_prop_to_op = prop_to_op.clone();
                     for (prop, op) in &prop_to_op {
-                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                            return Ok(json!({ "context": [], "cancelled": true }));
+                        }
                         
                         let prompt = crate::prompts::verify_operator_mapping_prompt(prop, op);
                         
-                        if let Ok(response) = self.call_granite_model(&prompt, Some(cancel_token.clone())).await {
+                        if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
                                 if !result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
                                     if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
@@ -2983,22 +3035,44 @@ impl LogisModel {
                     let now = chrono::Local::now();
                     let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
 
+                    // 🌟 [명시적 타입 선언] 추출될 속성(Property)의 스키마 타입에 따라 Number 인지 String 인지 정확하게 결정합니다.
+                    let mut matched_types = Vec::new();
+                    for k in prop_to_op.keys() {
+                        let t = prop_types.get(k).copied().unwrap_or("String");
+                        matched_types.push(t);
+                    }
+                    matched_types.sort();
+                    matched_types.dedup();
+                    
+                    let value_type_str = if matched_types.is_empty() {
+                        "String".to_string()
+                    } else if matched_types.len() == 1 {
+                        matched_types[0].to_string()
+                    } else {
+                        let mut type_conditions = Vec::new();
+                        for k in prop_to_op.keys() {
+                            let t = prop_types.get(k).copied().unwrap_or("String");
+                            type_conditions.push(format!("{} (if property is '{}')", t, k));
+                        }
+                        type_conditions.join(", ")
+                    };
+
                     // 🌟 [CRITICAL FIX] 벡터 매칭 가이드와 LLM 시간 가이드를 병합하여 최종 조건 추출 프롬프트 호출
                     let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
                     
-                    let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language);
+                    let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language, &value_type_str);
                     let prompt_status = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &combined_guide);
                     let prompt_substantial = crate::parsing::extract_substantial_intent_prompt(&current_text, &combined_guide);
                     let prompt_find = crate::parsing::extract_find_intent_prompt(&current_text, &combined_guide);
 
-                    // 🌟 [CRITICAL FIX] Qwen3 대신 Granite H 350M 모델을 사용하여 메모리 사용량을 줄이고 통일화합니다.
-                    self.ensure_granite_model().await?;
+                    // 🌟 [CRITICAL FIX] Qwen3 모델을 사용하여 메모리 사용량을 줄이고 통일화합니다.
+                    self.ensure_qwen3().await?;
 
-                    // call_granite_model을 통해 순차적으로 LLM Normalization 수행
-                    let res_numeric = self.call_granite_model(&prompt_numeric, Some(cancel_token.clone())).await?;
-                    let res_status = self.call_granite_model(&prompt_status, Some(cancel_token.clone())).await?;
-                    let res_substantial = self.call_granite_model(&prompt_substantial, Some(cancel_token.clone())).await?;
-                    let res_find = self.call_granite_model(&prompt_find, Some(cancel_token.clone())).await?;
+                    // call_qwen3_verification_model을 통해 순차적으로 LLM Normalization 수행
+                    let res_numeric = self.call_qwen3_verification_model(&prompt_numeric, Some(cancel_token.clone())).await?;
+                    let res_status = self.call_qwen3_verification_model(&prompt_status, Some(cancel_token.clone())).await?;
+                    let res_substantial = self.call_qwen3_verification_model(&prompt_substantial, Some(cancel_token.clone())).await?;
+                    let res_find = self.call_qwen3_verification_model(&prompt_find, Some(cancel_token.clone())).await?;
 
                     emit_term(&format!("  🤖 [LLM RAW RESPONSE - NUMERIC]\n{}", res_numeric.trim()));
                     emit_term(&format!("  🤖 [LLM RAW RESPONSE - STATUS]\n{}", res_status.trim()));
@@ -3301,7 +3375,10 @@ impl LogisModel {
 
         emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
         self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
 
         emit_term(&format!("[STAGE-1] Extracting shipping filters from query: '{}'", query));
         let prompt = crate::parsing::extract_shipping_conditions(&query, language);
@@ -3370,7 +3447,10 @@ impl LogisModel {
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
         // 🌟 취소 버튼 즉시 반응 대응
-        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
 
         // [TODO] 향후 여기에 통계 분석 전용 프롬프트 및 LLM 추론 로직 (Graph2Metrics 등) 추가 예정
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 임시 대기

@@ -396,7 +396,7 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
             .replace("{TEXT}", text)
 }
 
-pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str) -> String {
+pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str, value_type: &str) -> String {
     let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(vector_guide, lang);
     
     let final_time_context = if !deterministic_time.is_empty() {
@@ -438,8 +438,8 @@ condition:
   - property: String.
   - is_percent: Boolean.
   - operator: String. 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'contains' | 'top' | 'bottom'
-  - percent_total: Number. (if is_percent is true)
-  - value: Number.
+  - percent_total: Number.
+  - value: {VALUE_TYPE}.
 
 [CURRENT CHUNK TO ANALYZE]
 {CURRENT}
@@ -456,6 +456,7 @@ condition:
             .replace("{METRICS}", metrics_json)
             .replace("{GUIDE}", vector_guide)
             .replace("{TIME_CONTEXT}", &final_time_context)
+            .replace("{VALUE_TYPE}", value_type)
 }
 pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
     let status_options = match seg_type {
@@ -693,7 +694,7 @@ Given the text '{TEXT}' and the property '{PROPERTY}', determine if this propert
 If not, suggest the correct property name from the schema.
 
 [OUTPUT FORMAT]
-{"correct": Boolean, "suggested_property": String}
+{"correct": Boolean, "suggested_properties": ["String", "String"]}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -701,7 +702,7 @@ If not, suggest the correct property name from the schema.
             .replace("{PROPERTY}", property)
 }
 
-pub fn granite_verify_property_with_alternatives_prompt(
+pub fn verify_property_with_alternatives_prompt(
     text: &str,
     first_choice: &str,
     first_score: f32,
