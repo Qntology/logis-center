@@ -1920,13 +1920,23 @@ impl LogisModel {
                             tensor_pool.insert("char_features", char_features.into_dyn());
                             tensor_pool.insert("seq_lengths", seq_lengths.into_dyn());
                             
-                            let mut tok_inputs_i64 = Vec::new();
-                            let mut tok_inputs_f32 = Vec::new();
-                            for input_meta in &stanza.tokenize_session.inputs {
-                                let exact_name = input_meta.name.clone();
+                            use onnxruntime::mixed::{DynInput, SessionMixedExt};
+
+                            // 🌟 [CRITICAL FIX] E0597 & E0502 해결:
+                            // tokenize_session.inputs 와 outputs 에 대한 불변 참조(immutable borrow)를 
+                            // run_mixed 의 가변 참조(mutable borrow)와 분리하기 위해 
+                            // 문자열을 별도의 로컬 캐시(Vec<String>)로 복제하여 라이프타임을 독립시킵니다.
+                            let input_names_cache: Vec<String> = stanza.tokenize_session.inputs.iter().map(|i| i.name.clone()).collect();
+                            let mut mixed_inputs = Vec::new();
+                            
+                            for exact_name in &input_names_cache {
                                 if let Some(tensor) = tensor_pool.get(exact_name.as_str()) {
-                                    tok_inputs_i64.push(tensor.clone());
-                                    tok_inputs_f32.push(tensor.mapv(|x| x as f32));
+                                    // 🌟 [핵심] f32를 요구하는 피처 텐서와 i64를 요구하는 문자 텐서를 구분하여 다이나믹 타입으로 묶어버립니다.
+                                    if exact_name == "f" || exact_name == "char_features" {
+                                        mixed_inputs.push((exact_name.as_str(), DynInput::F32(tensor.mapv(|x| x as f32))));
+                                    } else {
+                                        mixed_inputs.push((exact_name.as_str(), DynInput::I64(tensor.clone())));
+                                    }
                                 } else {
                                     emit_term(&format!("[STANZA-WARN] Tokenizer 모델에 정의되지 않은 입력 생략: {}", exact_name));
                                 }
@@ -1961,28 +1971,16 @@ impl LogisModel {
                                 }
                             }
 
-                            let mut fallback_to_f32 = false;
-                            let mut i64_err_msg = String::new();
-                            {
-                                match stanza.tokenize_session.run::<'_, '_, '_, i64, f32, _>(tok_inputs_i64) {
-                                    Ok(outputs) => {
-                                        process_tok_outputs!(outputs);
-                                    },
-                                    Err(e) => {
-                                        i64_err_msg = format!("{:?}", e);
-                                        fallback_to_f32 = true;
-                                    }
-                                }
-                            }
-                            if fallback_to_f32 {
-                                match stanza.tokenize_session.run::<'_, '_, '_, f32, f32, _>(tok_inputs_f32) {
-                                    Ok(outputs) => {
-                                        process_tok_outputs!(outputs);
-                                    },
-                                    Err(e) => {
-                                        // 🌟 [디버깅 & 픽스] onnxruntime-rs 0.0.14의 한계 (동종 타입만 전달 가능) 및 혼합 타입(i64, f32) 에러 로깅 처리
-                                        emit_term(&format!("  ⚠️ [STANZA-WARN] Tokenizer ONNX 모델의 입력 타입 제약으로 인해 실행을 우회합니다.\n    - i64 Run Error: {}\n    - f32 Run Error: {:?}", i64_err_msg, e));
-                                    }
+                            // 🌟 [문제 해결] 핑퐁 로직을 완전히 파기하고, 자체 구현한 확장 메서드(run_mixed)를 통해 혼합 타입을 C API 직통으로 발사합니다!
+                            let out_names_cache: Vec<String> = stanza.tokenize_session.outputs.iter().map(|o| o.name.clone()).collect();
+                            let out_names: Vec<&str> = out_names_cache.iter().map(|s| s.as_str()).collect();
+                            match stanza.tokenize_session.run_mixed(mixed_inputs, out_names) {
+                                Ok(outputs) => {
+                                    emit_term("[STANZA] ✅ Tokenizer ONNX 혼합 타입(Mixed) 추론 100% 성공!");
+                                    process_tok_outputs!(outputs);
+                                },
+                                Err(e) => {
+                                    emit_term(&format!("  ⚠️ [STANZA-WARN] Tokenizer ONNX 혼합 타입 실행 실패: {:?}", e));
                                 }
                             }
                         }
