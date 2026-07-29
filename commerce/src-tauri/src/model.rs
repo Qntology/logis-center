@@ -2000,6 +2000,76 @@ impl LogisModel {
                             }
                         }
                     }
+
+                    // 🌟 [STANZA POS 사전 필터링 (scheduler.rs 로직 이식)]
+                    // "찾아줘", "알려줘" 등 무의미한 동사(VERB), 조사(ADP) 등을 Plinko 벡터 매칭 전에 원천 차단합니다.
+                    if !ext_words_string.is_empty() {
+                        let ext_words_refs: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
+                        let mut chunk_size = ext_words_refs.len();
+                        
+                        for input_meta in &stanza.pos_session.inputs {
+                            let dims = &input_meta.dimensions;
+                            if dims.len() == 2 && dims.get(1) == Some(&Some(32)) {
+                                if let Some(&Some(fixed_seq)) = dims.get(0) {
+                                    chunk_size = fixed_seq as usize;
+                                }
+                            }
+                        }
+                        if chunk_size == 0 { chunk_size = ext_words_refs.len(); }
+
+                        let mut padded_chunk = ext_words_refs.clone();
+                        let valid_len = padded_chunk.len();
+                        while padded_chunk.len() < chunk_size {
+                            padded_chunk.push("<pad>");
+                        }
+
+                        if let Ok(pos_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session) {
+                            if let Ok(pos_outputs) = stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
+                                let output_tensor = &pos_outputs[0];
+                                let shape = output_tensor.shape();
+                                let mut pos_tags = Vec::new();
+
+                                let num_classes = if shape.len() == 3 { shape[2] as usize } else { shape[1] as usize };
+                                for i in 0..valid_len {
+                                    let mut max_val = std::f32::MIN;
+                                    let mut max_idx = 0;
+                                    for c in 0..num_classes {
+                                        let val = if shape.len() == 3 { output_tensor[[0, i, c]] } else { output_tensor[[i, c]] };
+                                        if val > max_val { max_val = val; max_idx = c; }
+                                    }
+                                    let tag = stanza.preprocessor.upos_vocab.get(max_idx as usize).map(|s| s.as_str()).unwrap_or("X");
+                                    pos_tags.push(tag);
+                                }
+
+                                // 🌟 무의미한 형태소 기각 태그 설정
+                                // ADJ(형용사 - 예: 베이지색)나 NOUN(명사 - 가디건)은 커머스 검색 핵심이므로 보존합니다.
+                                // VERB(찾아줘, 알려줘, 보여줘) 및 각종 조사/기호를 제거합니다.
+                                let drop_tags = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+                                let mut dropped_log = Vec::new();
+                                let mut filtered_words = Vec::new();
+
+                                for (i, word) in ext_words_string.iter().enumerate() {
+                                    let tag = pos_tags[i];
+                                    
+                                    // 해당 단어가 드롭 태그(예: VERB)에 속하면 제거
+                                    if drop_tags.contains(&tag) {
+                                        dropped_log.push(format!("{}({})", word, tag));
+                                    } else {
+                                        filtered_words.push(word.clone());
+                                    }
+                                }
+
+                                if !dropped_log.is_empty() {
+                                    emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 무의미한 단어 사전 제거 완료: {:?}", dropped_log));
+                                }
+                                
+                                // 🌟 필터링 결과가 전부 다 날아가버리면 원본을 유지 (과잉 삭제로 인한 크래시 방어)
+                                if !filtered_words.is_empty() {
+                                    ext_words_string = filtered_words;
+                                }
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     emit_term(&format!("[STANZA] ⚠️ Failed to load Stanza models for '{}' (상세 원인): {:?}", stanza_lang_code, e));
