@@ -1936,6 +1936,47 @@ btnSubmit?.addEventListener("click", async () => {
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
+    // 🌟 [추가] 검색 진행 중 UI 변경 및 초기화
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    if (resultH3) {
+        resultH3.innerHTML = `searching<strong class="count" style="cursor:pointer; margin-left:10px; color:#ef4444;" id="cancel-search-btn">Cancel</strong>`;
+        const cancelBtn = document.getElementById("cancel-search-btn");
+        if (cancelBtn) {
+            cancelBtn.addEventListener("click", async () => {
+                if (confirm("정말 검색을 취소하시겠습니까?")) {
+                    const targetTaskId = activeTaskId || taskId;
+                    if (targetTaskId) {
+                        GlobalTaskManager.cancelledTasks.add(targetTaskId);
+                    }
+                    activeTaskId = null;
+                    GlobalTaskManager.isBusy = false;
+                    GlobalTaskManager.currentTaskId = null;
+                    GlobalTaskManager.currentTaskPayload = null;
+
+                    isSearching = false; 
+                    stopSpinner();
+                    
+                    if (btnSubmit) btnSubmit.style.display = "flex";
+                    
+                    try {
+                        await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
+                        await GlobalTaskManager.release(targetTaskId, targetTaskId);
+                    } catch (e) { 
+                        console.error("Stop failed:", e); 
+                    }
+                    
+                    if (resultH3) {
+                        const count = document.querySelectorAll('#doc-list .logis-result').length;
+                        resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
+                    }
+                }
+            });
+        }
+    }
+    
+    // 🌟 [추가] 검색 시작 전 기존 리스트 싹 비우기 (append 방지 및 뷰 클리어)
+    if (docListContainer) docListContainer.innerHTML = "";
+    
     // 🌟 [수정] 검색 시 설정(채팅) 탭으로 화면을 전환합니다.
     openWidget("settings");
 
@@ -2276,41 +2317,74 @@ listen("extraction-progress", async (event: any) => {
         // 🌟 버튼 UI 즉시 갱신 및 스피너 중단
         stopSpinner();
         updateExtractButtonVisibility();
+        
+        // 🌟 [추가] 에러이거나 취소된 경우 H3 복원
+        if (payload.task_id.startsWith("search_") && payload.category !== "Done") {
+             const resultH3 = document.querySelector('.nav-section.search h3');
+             if (resultH3 && resultH3.textContent?.includes("searching")) {
+                 const count = document.querySelectorAll('#doc-list .logis-result').length;
+                 resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
+             }
+        }
 
         // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
             const response = payload.data; 
-            if (aiResultsArea && aiResultsContent) {
-                aiResultsArea.style.display = "block";
-                aiResultsTitle.innerText = "🧠 AI Deep Analysis";
-                
-                let html = `<div><strong>Query Intent:</strong>`;
-                if (response.structured && response.structured.context) {
-                    response.structured.context.forEach((ctx: any) => {
-                        html += `<div>• ${ctx.text} <span>[${ctx.type}]</span></div>`;
-                    });
-                }
-                html += `</div>`;
-                
-                if(!response.results || response.results.length === 0) {
-                    html += `<div class="empty">No matching data found</div>`;
-                } else {
-                    html += response.results.map((res: any) => 
-                        `<div>
-                           <div>
-                             <strong>${res.context_type} (Score: ${res.score.toFixed(2)})</strong>
-                             <button class="link-btn" onclick="document.dispatchEvent(new CustomEvent('show-doc', {detail:'${res.id}'}))">View Detail</button>
-                           </div>
-                           <div>${res.text}</div>
-                         </div>`
-                    ).join("");
-                }
-                aiResultsContent.innerHTML = html;
-                aiResultsArea.scrollIntoView({ behavior: 'smooth' });
 
-                // 🌟 추가된 코드: 생성된 검색 결과 HTML을 로컬 DB에 영구 저장합니다.
-                kvSet(`search_res_${payload.task_id}`, html).catch(e => console.error("Failed to cache search result:", e));
+            // 🌟 [추가] 검색 완료 시 자동으로 리스트 탭으로 화면을 전환하여 결과를 보여줍니다.
+            openWidget("list");
+            if (listView) listView.style.display = "block";
+            if (detailView) detailView.style.display = "none";
+            
+            // 🌟 [추가] 검색어와 카운트 H3에 업데이트
+            const resultH3 = document.querySelector('.nav-section.search h3');
+            if (resultH3) {
+                let queryText = "";
+                if (response.structured && response.structured.original_text) {
+                    queryText = response.structured.original_text;
+                }
+                if (!queryText) {
+                    const queryEl = document.getElementById(`${payload.task_id}_query`);
+                    if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                }
+                
+                let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
+                if (currentSearchMode === "commerce") displayMode = "Goods";
+                
+                // 검색 결과 개수를 여기서 직접 카운트 (추가될 개수)
+                const countStr = response.results ? response.results.length : 0;
+                resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
             }
+
+            // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
+            if (response.results && response.results.length > 0) {
+                if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
+                
+                let docs: any[] = [];
+                for (const res of response.results) {
+                    try {
+                        // 백엔드에서 원본 문서를 가져와서 카드 렌더링에 적합하게 준비합니다.
+                        const fullDoc = await invoke<any>("get_document", { uuid: res.id });
+                        if (fullDoc) {
+                            if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
+                                try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
+                            }
+                            docs.push(fullDoc);
+                        }
+                    } catch (e) {
+                        console.error("Failed to fetch document for search result:", e);
+                    }
+                }
+                
+                if (docs.length > 0) {
+                    upsertListItems(docs, 'append');
+                } else {
+                    if (docListContainer) docListContainer.innerHTML = `<div class="empty">No detailed documents found.</div>`;
+                }
+            } else {
+                if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
+            }
+            updateResultCount(); // 🌟 카운트 갱신 반영
         }
     }
 
@@ -2496,7 +2570,11 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                 // 🌟 [CRITICAL FIX] 프론트엔드 최신화 버그 해결! 서버 동기화(네트워크 상태)와 무관하게, 백엔드 로컬 통계가 갱신되었으므로 무조건 즉시 UI를 새로고침합니다.
                 await renderNavigation();
                 if (currentTab === "list") {
-                    refreshList();
+                    // 🌟 [로직 충돌 수정] AI 검색(ai_search) 완료 시에는 전용 리스너에서 직접 결과를 화면에 그려줍니다.
+                    // 여기서 refreshList()를 호출하면 전체 리스트 불러오기(10개)가 중첩되어 20개로 늘어나는 Race Condition 버그가 발생하므로 제외합니다.
+                    if (!(payload.task_id && payload.task_id.startsWith("search_"))) {
+                        refreshList();
+                    }
                 }
                 
                 // 🌟 UI를 100% 최신 상태로 바꾼 뒤에 백그라운드에서 조용히 서버와 동기화를 진행합니다.
@@ -2734,7 +2812,11 @@ listRefreshBtn?.addEventListener("click", refreshList);
 btnDeleteSelected?.addEventListener("click", async () => {
     if (selectedUuids.size === 0) return;
     if (await ask(`Delete ${selectedUuids.size} documents?`, { title: "Confirm Delete", kind: "warning" })) {
-        try { await invoke("delete_documents", { uuids: Array.from(selectedUuids) }); refreshList(); } catch (e) { console.error(e); }
+        try { 
+            await invoke("delete_documents", { uuids: Array.from(selectedUuids) }); 
+            await refreshList(); 
+            updateResultCount();
+        } catch (e) { console.error(e); }
     }
 });
 
@@ -3202,18 +3284,6 @@ async function handleTaskClick(el: HTMLElement) {
         openWidget("list");
         listView.style.display = "block";
         detailView.style.display = "none";
-        if (aiResultsArea) {
-            // 🌟 추가된 코드: 클릭한 테스크 ID에 해당하는 과거 검색 결과를 불러와 복구합니다.
-            const savedHtml = await kvGet(`search_res_${taskId}`);
-            if (savedHtml && aiResultsContent) {
-                aiResultsContent.innerHTML = savedHtml;
-            } else if (aiResultsContent) {
-                aiResultsContent.innerHTML = `<div class="empty">This search result has expired or was not saved.</div>`;
-            }
-
-            aiResultsArea.style.display = "block";
-            aiResultsArea.scrollIntoView({ behavior: 'smooth' });
-        }
         return;
     }
 
@@ -3469,7 +3539,8 @@ btnDetailDelete?.addEventListener("click", async () => {
             
             detailView.style.display = "none"; 
             listView.style.display = "block"; 
-            refreshList(); 
+            await refreshList(); 
+            updateResultCount();
         }
     } catch (e) { 
         console.error("[WIDGET] Deletion process failed:", e); 
@@ -3625,6 +3696,22 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         }
         
         if (!isSync) stopSpinner();
+
+        // 🌟 [추가] 최초 로딩 및 일반 리스트 동기화 후 카운트 반영
+        updateResultCount();
+    }
+}
+
+// 🌟 [추가] 리스트 결과 개수 카운트 업데이트 헬퍼 함수
+function updateResultCount() {
+    const h3El = document.querySelector('.nav-section.search h3');
+    if (h3El && h3El.textContent?.includes("searching")) {
+        return; // 검색 중일 때는 카운트 업데이트 무시
+    }
+    const countEl = document.querySelector('.nav-section.search h3 strong.count');
+    if (countEl) {
+        const count = document.querySelectorAll('#doc-list .logis-result').length;
+        countEl.textContent = count > 0 ? `(${count})` : "";
     }
 }
 

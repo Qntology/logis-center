@@ -3431,8 +3431,16 @@ impl LogisModel {
                             // 구형 프롬프트(배열 반환)로 응답했을 경우의 방어 로직
                             for item in cond_arr {
                                 if let Some(item_obj) = item.as_object() {
-                                    if let Some(prop_val) = item_obj.get("property").or_else(|| item_obj.get("property_name")).and_then(|v| v.as_str()) {
-                                        let k = prop_val.to_string();
+                                    let mut prop_val_opt = None;
+                                    for (ik, iv) in item_obj {
+                                        if ik.trim() == "property" || ik.trim() == "property_name" {
+                                            prop_val_opt = iv.as_str();
+                                            break;
+                                        }
+                                    }
+
+                                    if let Some(prop_val) = prop_val_opt {
+                                        let k = prop_val.trim().to_string();
                                         
                                         if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
                                             continue;
@@ -3443,8 +3451,9 @@ impl LogisModel {
                                         
                                         let mut final_val_obj = serde_json::Map::new();
                                         for (ik, iv) in item_obj {
-                                            if ik != "property" && ik != "property_name" {
-                                                final_val_obj.insert(ik.clone(), iv.clone());
+                                            let ik_trimmed = ik.trim();
+                                            if ik_trimmed != "property" && ik_trimmed != "property_name" {
+                                                final_val_obj.insert(ik_trimmed.to_string(), iv.clone());
                                             }
                                         }
                                         
@@ -3455,11 +3464,12 @@ impl LogisModel {
                                         structured_cond.insert(k, json!(final_val_obj));
                                     } else {
                                         for (k, val) in item_obj {
-                                            if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                            let k_trimmed = k.trim();
+                                            if deterministic_json.is_some() && (k_trimmed == "started_at" || k_trimmed == "expired_at" || k_trimmed == "registration_date" || k_trimmed == "date") {
                                                 continue;
                                             }
 
-                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                            let op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq");
                                             let mut final_val_obj = val.clone();
 
                                             if let Some(v_obj) = final_val_obj.as_object_mut() {
@@ -3472,7 +3482,7 @@ impl LogisModel {
                                                     "value": val.clone()
                                                 });
                                             }
-                                            structured_cond.insert(k.clone(), final_val_obj);
+                                            structured_cond.insert(k_trimmed.to_string(), final_val_obj);
                                         }
                                     }
                                 }
@@ -3535,13 +3545,13 @@ impl LogisModel {
                 
                 let mut final_contexts = Vec::new(); // 🌟 분리 보존을 위한 새 배열
                 
-                // 각 세그먼트별로 추출된 조건들을 담는 리스트 (세그먼트 간은 AND, 내부 원소들은 OR)
-                let mut seg_conditions_list: Vec<Vec<(String, Value)>> = Vec::new();
+                // 🌟 [CRITICAL FIX] 불필요한 N:N 조합(Cartesian)을 완전히 제거하고, 모든 세그먼트의 조건을 하나의 마스터 컨디션으로 완벽하게 병합합니다.
+                let mut master_condition = serde_json::Map::new();
 
                 for seg in ctx_arr.iter() {
                     let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     
-                    // 🌟 [CRITICAL FIX] "ignore"는 상거래 검색 조건이 아니므로 병합(Merge)하지 않고 독립된 개체로 따로 빼둡니다.
+                    // "ignore"는 상거래 검색 조건이 아니므로 병합(Merge)하지 않고 독립된 개체로 따로 빼둡니다.
                     if seg_type == "ignore" {
                         final_contexts.push(seg.clone());
                         continue;
@@ -3552,11 +3562,17 @@ impl LogisModel {
                         master_type = seg_type.to_string();
                     }
                     
-                    // 텍스트는 띄어쓰기로 이어 붙임
+                    // 텍스트는 띄어쓰기로 이어 붙이되 중복 단어 제거
                     let text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     if !text.is_empty() {
-                        if !master_text.is_empty() { master_text.push_str(" "); }
-                        master_text.push_str(text);
+                        let words: Vec<&str> = text.split_whitespace().filter(|&w| w != "|").collect();
+                        let mut master_words: Vec<&str> = master_text.split_whitespace().collect();
+                        for word in words {
+                            if !master_words.contains(&word) {
+                                master_words.push(word);
+                            }
+                        }
+                        master_text = master_words.join(" ");
                     }
                     
                     // 상태값 병합 (첫 번째 유효값 우선)
@@ -3579,9 +3595,8 @@ impl LogisModel {
                         }
                     }
                     
-                    // 추출된 조건(Condition) 객체들 수집
+                    // 추출된 조건(Condition) 객체들을 단일 맵으로 병합
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
-                        let mut current_seg_conds = Vec::new();
                         for (k, v) in cond {
                             // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
                             let is_empty = match v.get("value") {
@@ -3594,11 +3609,8 @@ impl LogisModel {
                             };
                             
                             if !is_empty {
-                                current_seg_conds.push((k.clone(), v.clone()));
+                                master_condition.insert(k.clone(), v.clone());
                             }
-                        }
-                        if !current_seg_conds.is_empty() {
-                            seg_conditions_list.push(current_seg_conds);
                         }
                     }
                 }
@@ -3607,44 +3619,17 @@ impl LogisModel {
                 if !master_text.is_empty() || !master_type.is_empty() {
                     if master_type.is_empty() { master_type = "goods".to_string(); }
 
-                    let mut combined_conditions = Vec::new();
+                    let master_ctx = json!({
+                        "type": master_type,
+                        "text": master_text,
+                        "status": master_status,
+                        "substantial": master_substantial,
+                        "find": master_find,
+                        "condition": master_condition
+                    });
                     
-                    fn generate_combinations(
-                        groups: &[Vec<(String, Value)>],
-                        current: usize,
-                        current_cond: serde_json::Map<String, Value>,
-                        results: &mut Vec<serde_json::Map<String, Value>>
-                    ) {
-                        if current >= groups.len() {
-                            results.push(current_cond);
-                            return;
-                        }
-                        
-                        for (k, v) in &groups[current] {
-                            let mut next_cond = current_cond.clone();
-                            next_cond.insert(k.clone(), v.clone());
-                            generate_combinations(groups, current + 1, next_cond, results);
-                        }
-                    }
-
-                    if seg_conditions_list.is_empty() {
-                        combined_conditions.push(serde_json::Map::new());
-                    } else {
-                        generate_combinations(&seg_conditions_list, 0, serde_json::Map::new(), &mut combined_conditions);
-                    }
-
-                    // 🌟 생성된 N:N 조합만큼 여러 개의 컨텍스트를 배열의 맨 앞에 삽입
-                    for cond in combined_conditions.into_iter().rev() {
-                        let master_ctx = json!({
-                            "type": master_type,
-                            "text": master_text,
-                            "status": master_status,
-                            "substantial": master_substantial,
-                            "find": master_find,
-                            "condition": cond
-                        });
-                        final_contexts.insert(0, master_ctx);
-                    }
+                    // 단 하나의 완벽하게 병합된 컨텍스트를 맨 앞에 삽입
+                    final_contexts.insert(0, master_ctx);
                 }
                 
                 *ctx_arr = final_contexts;
