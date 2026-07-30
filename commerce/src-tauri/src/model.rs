@@ -3103,6 +3103,7 @@ impl LogisModel {
                 let mut best_find_global = String::new();
                 let mut best_time_global = String::new();
                 let mut best_season_global = String::new();
+                let mut filter_candidates: std::collections::HashMap<String, Vec<(String, f32)>> = std::collections::HashMap::new();
 
                 emit_term("\n  🎯 [DOUBLE PLINKO (2nd)] Matching attributes and operators...");
 
@@ -3116,13 +3117,7 @@ impl LogisModel {
                     let local_vp = v_sim_local * local_beta;
                     let local_pw = if cw_count <= 2 { 0.3 } else { 0.7 };
 
-                    let mut best_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-                    let mut best_matches: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-                    // 커트라인 초기화 (카테고리별로 점수 한계 설정)
-                    for cat in &filter_categories {
-                        best_scores.insert(cat.to_string(), 0.15);
-                    }
+                    let mut local_filter_candidates: std::collections::HashMap<String, Vec<(String, f32)>> = std::collections::HashMap::new();
 
                     // 🌟 Part 1에서 준비된 통합 벡터(dynamic_filter_defs) 순회
                     for i in 0..dynamic_filter_defs.len() {
@@ -3131,20 +3126,29 @@ impl LogisModel {
                         let p_score = cosine_similarity(&chunk_emb, &dynamic_prej_embs[i]);
                         let score = b_score - (p_score * local_pw) - local_vp;
 
-                        if score > *best_scores.get(&def.category).unwrap_or(&0.15) {
-                            best_scores.insert(def.category.clone(), score);
-                            best_matches.insert(def.category.clone(), def.key.clone());
+                        if score > 0.15 {
+                            local_filter_candidates.entry(def.category.clone()).or_insert_with(Vec::new).push((def.key.clone(), score));
                         }
                     }
 
-                    let best_op = best_matches.get("operators").cloned().unwrap_or_else(|| "eq".to_string());
-                    let best_metric = best_matches.get("metrics").cloned().unwrap_or_else(|| "string".to_string());
+                    for (_, cands) in local_filter_candidates.iter_mut() {
+                        cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+
+                    let best_op = local_filter_candidates.get("operators").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "eq".to_string());
+                    let best_metric = local_filter_candidates.get("metrics").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "string".to_string());
                     
-                    if let Some(s) = best_matches.get("status_filters") { best_status_global = s.clone(); }
-                    if let Some(s) = best_matches.get("substantial_filters") { best_sub_global = s.clone(); }
-                    if let Some(s) = best_matches.get("find_filters") { best_find_global = s.clone(); }
-                    if let Some(s) = best_matches.get("time_filters") { best_time_global = s.clone(); }
-                    if let Some(s) = best_matches.get("season_filters") { best_season_global = s.clone(); }
+                    if let Some(c) = local_filter_candidates.get("status_filters").and_then(|c| c.first()) { best_status_global = c.0.clone(); }
+                    if let Some(c) = local_filter_candidates.get("substantial_filters").and_then(|c| c.first()) { best_sub_global = c.0.clone(); }
+                    if let Some(c) = local_filter_candidates.get("find_filters").and_then(|c| c.first()) { best_find_global = c.0.clone(); }
+                    if let Some(cands) = local_filter_candidates.get("time_filters") {
+                        if let Some(c) = cands.first() { best_time_global = c.0.clone(); }
+                        filter_candidates.insert("time_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("season_filters") {
+                        if let Some(c) = cands.first() { best_season_global = c.0.clone(); }
+                        filter_candidates.insert("season_filters".to_string(), cands.clone());
+                    }
 
                     // 🌟 [SCHEMA OVERRIDE] Vector 모델의 예측을 실제 DB 스키마 검증으로 덮어씁니다.
                     let actual_db_type = prop_types.get(k).copied().unwrap_or("String");
@@ -3220,30 +3224,72 @@ impl LogisModel {
                     emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
                 }
                 
-                // Vector-based Time/Season Guide 조립
-                let mut llm_temporal_guide = String::new();
-                if !best_time_global.is_empty() { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", best_time_global)); }
-                if !best_season_global.is_empty() { llm_temporal_guide.push_str(&format!("Season Intent [{}]", best_season_global)); }
-                
                 if !best_status_global.is_empty() { fragments_text.push_str(&format!("Global Status Suggests [{}]\n", best_status_global)); }
                 if !best_sub_global.is_empty() { fragments_text.push_str(&format!("Global Substantial Suggests [{}]\n", best_sub_global)); }
                 if !best_find_global.is_empty() { fragments_text.push_str(&format!("Global Find Suggests [{}]\n", best_find_global)); }
 
-                emit_term(&format!("  🎯 [PLINKO MAP (VECTOR GUIDE)] \n{}", fragments_text.trim()));
-
-                // Vector 기반으로 도출된 의도를 바탕으로 Deterministic Time Guide(달력 SQL 필터) 획득
-                let (deterministic_guide_log, deterministic_json) = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
-                if !deterministic_guide_log.is_empty() {
-                    emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
-                }
+                emit_term(&format!("\n  🎯 [FINAL VECTOR GUIDE FOR LLM] \n{}", fragments_text.trim()));
 
                 // 🌟 [VRAM/RAM 최적화] 임베딩 연산(벡터 매칭)이 모두 끝났으므로 LLM 추론을 시작하기 전에 명시적으로 해제합니다.
                 self.unload_embedding().await;
+
+                let mut deterministic_json = None;
+                let mut llm_temporal_guide = String::new();
 
                 // 5. LLM Normalization (Advanced Parser Mode with Vector Guide)
                 if !fragments_text.is_empty() {
                     let now = chrono::Local::now();
                     let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
+
+                    // 🌟 [CRITICAL FIX] Qwen3 모델을 먼저 로드합니다.
+                    self.ensure_qwen3().await?;
+
+                    // 🌟 [QWEN3 VERIFICATION: TIME & SEASON] Plinko에서 대충 잡힌 시간/시즌을 LLM으로 2차 검증하여 환각을 원천 차단합니다.
+                    let mut verified_time = String::new();
+                    let mut verified_season = String::new();
+
+                    if let Some(time_cands) = filter_candidates.get("time_filters") {
+                        if !time_cands.is_empty() {
+                            let first_choice = &time_cands[0].0;
+                            let first_score = time_cands[0].1;
+                            let alternatives: Vec<(String, f32)> = time_cands.iter().skip(1).take(3).cloned().collect();
+                            
+                            let prompt_time = crate::parsing::extract_time_intent_prompt(&current_text, &time_context, first_choice, first_score, &alternatives);
+                            if let Ok(res_time) = self.call_qwen3_verification_model(&prompt_time, Some(cancel_token.clone())).await {
+                                let final_time_json = crate::parsing::parse_json_from_llm(&res_time);
+                                if let Some(t) = final_time_json.get("time_intent").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() { verified_time = t.to_string(); }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(season_cands) = filter_candidates.get("season_filters") {
+                        if !season_cands.is_empty() {
+                            let first_choice = &season_cands[0].0;
+                            let first_score = season_cands[0].1;
+                            let alternatives: Vec<(String, f32)> = season_cands.iter().skip(1).take(3).cloned().collect();
+                            
+                            let prompt_season = crate::parsing::extract_season_intent_prompt(&current_text, first_choice, first_score, &alternatives);
+                            if let Ok(res_season) = self.call_qwen3_verification_model(&prompt_season, Some(cancel_token.clone())).await {
+                                let final_season_json = crate::parsing::parse_json_from_llm(&res_season);
+                                if let Some(s) = final_season_json.get("season_intent").and_then(|v| v.as_str()) {
+                                    if !s.is_empty() { verified_season = s.to_string(); }
+                                }
+                            }
+                        }
+                    }
+
+                    if !verified_time.is_empty() { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", verified_time)); }
+                    if !verified_season.is_empty() { llm_temporal_guide.push_str(&format!("Season Intent [{}]", verified_season)); }
+
+                    // Vector 기반으로 도출되고 LLM으로 검증된 의도를 바탕으로 Deterministic Time Guide(달력 SQL 필터) 획득
+                    let (deterministic_guide_log, det_json_res) = crate::parsing::get_deterministic_time_guide(&llm_temporal_guide, language);
+                    deterministic_json = det_json_res;
+
+                    if !deterministic_guide_log.is_empty() {
+                        emit_term(&format!("  ⏳ [DETERMINISTIC TIME GUIDE]\n  {}", deterministic_guide_log.replace("\n", "\n  ")));
+                    }
 
                     // 🌟 [명시적 타입 선언] 추출될 속성(Property)의 스키마 타입에 따라 Number 인지 String 인지 정확하게 결정합니다.
                     let mut matched_types = Vec::new();

@@ -332,18 +332,26 @@ pub fn para2graph(language: &str) -> String {
     template.replace("{LANG}", language)
 }
 
-pub fn extract_time_intent_prompt(text: &str, time_context: &str) -> String {
-    let time_keys: Vec<String> = crate::parsing::BIAS_DICT
+pub fn extract_time_intent_prompt(text: &str, time_context: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
+    let mut time_keys: Vec<String> = crate::parsing::BIAS_DICT
         .get("time_filters")
         .and_then(|v| v.as_object())
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_else(|| vec!["today".to_string(), "yesterday".to_string(), "this_month".to_string(), "last_month".to_string(), "this_year".to_string(), "last_year".to_string(), "recently".to_string()]);
+    
+    // 시간 의도가 아닐 경우를 대비해 빈 문자열 선택지를 추가합니다.
+    time_keys.push("".to_string());
 
     let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
 
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
     let template = r###"[TASK]
 Analyze the given text and extract the exact relative time intent based on the Current Time Context.
-You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+You MUST strictly choose ONLY from the provided array. If none logically apply, return "". Do not invent any other values.
 
 [SYSTEM TIME & LOCALE CONTEXT]
 {TIME_CONTEXT}
@@ -352,11 +360,18 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
 {TIME_ARRAY}
 
 [TEXT TO ANALYZE]
-{TEXT}
+Text: "{TEXT}"
+First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
+{ALTERNATIVES}
+
+[INSTRUCTIONS]
+1. If the 'First choice' is semantically correct for this text, return it.
+2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
+3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [AVAILABLE TIME INTENTS] array, or return "" if it's not a time filter.
 
 [OUTPUT FORMAT]
 {
-  "time_intent": String
+  "time_intent": "String"
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -364,36 +379,57 @@ You MUST strictly choose ONLY from the provided array. Do not invent any other v
     template.replace("{TIME_CONTEXT}", time_context)
             .replace("{TIME_ARRAY}", &time_arr_str)
             .replace("{TEXT}", text)
+            .replace("{FIRST}", first_choice)
+            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+            .replace("{ALTERNATIVES}", &alt_str)
 }
 
-pub fn extract_season_intent_prompt(text: &str) -> String {
-    let season_keys: Vec<String> = crate::parsing::BIAS_DICT
+pub fn extract_season_intent_prompt(text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
+    let mut season_keys: Vec<String> = crate::parsing::BIAS_DICT
         .get("season_filters")
         .and_then(|v| v.as_object())
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_else(|| vec!["spring".to_string(), "summer".to_string(), "autumn".to_string(), "winter".to_string()]);
+    
+    // 계절 의도가 아닐 경우를 대비해 빈 문자열 선택지를 추가합니다.
+    season_keys.push("".to_string());
 
     let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
 
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
     let template = r###"[TASK]
 Analyze the given text and extract the exact seasonal intent.
-You MUST strictly choose ONLY from the provided array. Do not invent any other values.
+You MUST strictly choose ONLY from the provided array. If none logically apply, return "". Do not invent any other values.
 
 [AVAILABLE SEASON INTENTS]
 {SEASON_ARRAY}
 
 [TEXT TO ANALYZE]
-{TEXT}
+Text: "{TEXT}"
+First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
+{ALTERNATIVES}
+
+[INSTRUCTIONS]
+1. If the 'First choice' is semantically correct for this text, return it.
+2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
+3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [AVAILABLE SEASON INTENTS] array, or return "" if it's not a season filter.
 
 [OUTPUT FORMAT]
 {
-  "season_intent": String
+  "season_intent": "String"
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{SEASON_ARRAY}", &season_arr_str)
             .replace("{TEXT}", text)
+            .replace("{FIRST}", first_choice)
+            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+            .replace("{ALTERNATIVES}", &alt_str)
 }
 
 pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str, value_type: &str) -> String {
