@@ -732,7 +732,7 @@ impl LogisModel {
                             name: None,
                         })
                     ],
-                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.1), top_p: Some(0.95),
                     ..Default::default()
                 };
                 gen.generate(params, cancel_clone, None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
@@ -1821,6 +1821,17 @@ impl LogisModel {
         let combined_verb_b_val = prefixed_verb_b_vals.join(", ");
         let verb_emb = self.get_embedding(combined_verb_b_val).await.unwrap_or_else(|_| vec![0.0; 384]);
 
+        // 🌟 [추가] 연산자(Operator) 타이브레이커 가이드 벡터 생성 (하드코딩 방지용)
+        let mut op_b_vals = Vec::new();
+        if let Some(ops) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
+            for (_, v) in ops {
+                if let Some(b) = v.get("bias").and_then(|val| val.as_str()) {
+                    op_b_vals.push(b.to_string());
+                }
+            }
+        }
+        let operator_emb = self.get_embedding(op_b_vals.join(", ")).await.unwrap_or_else(|_| vec![0.0; 384]);
+
         // 🌟 [추가] Stanza 기반 형태소 분석으로 검색어(query) 정밀 분할 반영
         let mut ext_words_string: Vec<String> = Vec::new();
         
@@ -2815,10 +2826,13 @@ impl LogisModel {
                     // 🌟 [추가] 현재 단어의 벡터를 추출하여 기준 명령어 벡터와의 코사인 유사도를 확인합니다.
                     let word_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
                     let action_sim = cosine_similarity(&word_emb, &action_verb_emb);
+                    let op_sim = cosine_similarity(&word_emb, &operator_emb);
+                    let has_digit = word.chars().any(|c| c.is_ascii_digit());
 
-                    // 유사도가 임계값(0.55) 이상이면 검색 명령어로 간주하여 속성 맵핑에서 배제합니다.
-                    if word != "|" && action_sim > 0.55 {
-                        emit_term(&format!("    🚫 [ACTION VERB IGNORED] '{}' acts as a search verb (Sim: {:.4}). Skipping Plinko mapping.", word, action_sim));
+                    // 🌟 [CRITICAL FIX] 하드코딩된 문자열 매칭 대신, 동적으로 생성된 연산자(Operator) 유사도를 비교하고 숫자가 포함된 경우 배제합니다.
+                    // 유사도가 임계값(0.55) 이상이더라도, 연산자 의미가 더 강하거나(op_sim > action_sim) 숫자가 포함되어 있다면 검색 명령어로 오인하여 삭제하지 않습니다.
+                    if word != "|" && !has_digit && action_sim > 0.55 && action_sim > op_sim {
+                        emit_term(&format!("    🚫 [ACTION VERB IGNORED] '{}' acts as a search verb (Sim: {:.4}, OpSim: {:.4}). Skipping Plinko mapping.", word, action_sim, op_sim));
                         
                         // 이전에 쌓인 청크가 유효하다면 즉시 강제 Cliff(저장) 처리하여 슬롯에 안전하게 넣습니다.
                         if !current_chunk.is_empty() && prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
@@ -3100,6 +3114,7 @@ impl LogisModel {
                 // 🌟 Formatting Plinko Fragments & [2차 선택] Double Plinko for All Dynamic Filters
                 let mut fragments_text = String::new();
                 let mut prop_to_op: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut prop_to_exact_val: std::collections::HashMap<String, String> = std::collections::HashMap::new(); // 🌟 숫자 할루시네이션 방지용 원본 값 저장소
 
                 let mut best_status_global = String::new();
                 let mut best_sub_global = String::new();
@@ -3178,6 +3193,24 @@ impl LogisModel {
                             final_op = "contains".to_string();
                             final_metric = "string".to_string();
                         }
+                    } else {
+                        // 🌟 [CRITICAL FIX] 숫자인 경우, 텍스트에서 실제 숫자를 미리 추출하여 LLM 환각을 방지합니다.
+                        // 연산자(Operator)는 하드코딩 문자열 매칭 대신, 위에서 Double Plinko 연산을 통해 도출된 best_op 벡터 결과를 순수하게 신뢰합니다.
+                        final_op = best_op.clone();
+
+                        // 숫자 값 100% 원본 추출 (소수점 포함)
+                        let numeric_chars: String = combined_chunk.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
+                        
+                        // 청크에 숫자가 안 담겼을 경우를 대비해 전체 텍스트(current_text)도 참조하여 확실하게 잡아냅니다.
+                        let final_numeric = if numeric_chars.is_empty() {
+                            current_text.chars().filter(|c| c.is_digit(10) || *c == '.').collect()
+                        } else {
+                            numeric_chars
+                        };
+
+                        if !final_numeric.is_empty() {
+                            prop_to_exact_val.insert(k.clone(), final_numeric);
+                        }
                     }
 
                     prop_to_op.insert(k.clone(), final_op.clone());
@@ -3186,11 +3219,21 @@ impl LogisModel {
                     if final_op != "contains" { 
                         if let Some(cands) = local_filter_candidates.get("operators") {
                             let alts: Vec<String> = cands.iter().skip(1).take(2).map(|c| format!("{} ({:.2})", c.0, c.1)).collect();
-                            if !alts.is_empty() { op_alts = format!(" [Alts: {}]", alts.join(", ")); }
+                            // 🌟 [CRITICAL FIX] LLM 프롬프트 가이드 문자열에서 Operator 대괄호([]) 안에 불필요한 Alts 정보가 중첩되어 들어가면 LLM이 5000을 500으로 헷갈리는 환각 증세가 발생합니다. 대괄호 밖으로 완전히 분리합니다.
+                            if !alts.is_empty() { op_alts = format!(" (Alts: {})", alts.join(", ")); }
                         }
                     }
 
-                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}{}], Metric Type [{}]", combined_chunk, k, final_op, op_alts, final_metric);
+                    // 🌟 [CRITICAL FIX] 숫자가 포함된 청크("5000원")를 LLM이 "500"으로 환각 파싱하는 것을 방지하기 위해, Rust에서 원본 숫자를 추출하여 명시적으로 가이드에 꽂아 넣습니다.
+                    let mut exact_value_guide = String::new();
+                    if actual_db_type == "Number" {
+                        let numeric_chars: String = combined_chunk.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
+                        if !numeric_chars.is_empty() {
+                            exact_value_guide = format!(", Exact Value [{}]", numeric_chars);
+                        }
+                    }
+
+                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}]{}, Metric Type [{}]{}", combined_chunk, k, final_op, op_alts, final_metric, exact_value_guide);
                     emit_term(&format!("    🧲 {}", guide_log));
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
@@ -3403,89 +3446,134 @@ impl LogisModel {
                         // 🌟 LLM이 뽑아준 "값"과 Rust 메모리에 저장해둔 "연산자(operator)"를 여기서 최종 조립합니다.
                         let mut structured_cond = serde_json::Map::new();
                         
-                        // 객체 형태("condition": { "price": {"operator": "gt", "value": 1000} }) 메인 대응
-                        if let Some(cond_val) = final_numeric_json.get("condition").and_then(|v| v.as_object()) {
-                            for (k, val) in cond_val {
-                                if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
-                                    continue;
-                                }
+                        // 🌟 [CRITICAL FIX] LLM이 배열이 아닌 단일 객체로 반환했을 때 필터가 망가지는 현상을 막기 위해 파싱을 배열 폼으로 통일합니다.
+                        let condition_json = final_numeric_json.get("condition");
+                        let mut cond_items = Vec::new();
 
-                                if val.is_object() {
-                                    let mut final_val_obj = val.clone();
-                                    if let Some(v_obj) = final_val_obj.as_object_mut() {
-                                        if !v_obj.contains_key("operator") {
-                                            let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
-                                            v_obj.insert("operator".to_string(), json!(op));
-                                        }
+                        if let Some(arr) = condition_json.and_then(|v| v.as_array()) {
+                            cond_items = arr.clone();
+                        } else if let Some(obj) = condition_json.and_then(|v| v.as_object()) {
+                            // LLM이 { "property": "...", "operator": "...", "value": "..." } 포맷을 단일 객체로 뱉었을 경우 배열로 감싸서 넘깁니다.
+                            if obj.contains_key("property") || obj.contains_key("property_name") {
+                                cond_items.push(json!(obj));
+                            } else {
+                                // { "price": { "operator": "lt", "value": 5000 } } 맵 포맷일 경우
+                                for (k, v) in obj {
+                                    if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                        continue;
                                     }
-                                    structured_cond.insert(k.clone(), final_val_obj);
-                                } else {
-                                    let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
-                                    structured_cond.insert(k.clone(), json!({
-                                        "operator": op,
-                                        "value": val.clone()
-                                    }));
+                                    if v.is_object() {
+                                        let mut final_val_obj = v.clone();
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            if !v_obj.contains_key("operator") {
+                                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                                v_obj.insert("operator".to_string(), json!(op));
+                                            }
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if let Some(exact_val) = prop_to_exact_val.get(k) {
+                                                v_obj.insert("value".to_string(), json!(exact_val));
+                                            }
+                                        }
+                                        structured_cond.insert(k.clone(), final_val_obj);
+                                    } else {
+                                        let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                        let final_value = prop_to_exact_val.get(k).map(|v| json!(v)).unwrap_or_else(|| v.clone());
+                                        structured_cond.insert(k.clone(), json!({
+                                            "operator": op,
+                                            "value": final_value
+                                        }));
+                                    }
                                 }
                             }
-                        } else if let Some(cond_arr) = final_numeric_json.get("condition").and_then(|v| v.as_array()) {
-                            // 구형 프롬프트(배열 반환)로 응답했을 경우의 방어 로직
-                            for item in cond_arr {
-                                if let Some(item_obj) = item.as_object() {
-                                    let mut prop_val_opt = None;
-                                    for (ik, iv) in item_obj {
-                                        if ik.trim() == "property" || ik.trim() == "property_name" {
-                                            prop_val_opt = iv.as_str();
-                                            break;
-                                        }
+                        }
+
+                        // 단일화된 배열(cond_items) 처리
+                        for item in cond_items {
+                            if let Some(item_obj) = item.as_object() {
+                                let mut prop_val_opt = None;
+                                for (ik, iv) in item_obj {
+                                    if ik.trim() == "property" || ik.trim() == "property_name" {
+                                        prop_val_opt = iv.as_str();
+                                        break;
+                                    }
+                                }
+
+                                if let Some(prop_val) = prop_val_opt {
+                                    let k = prop_val.trim().to_string();
+                                    
+                                    if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                        continue;
                                     }
 
-                                    if let Some(prop_val) = prop_val_opt {
-                                        let k = prop_val.trim().to_string();
-                                        
-                                        if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                    let op = item_obj.get("operator").and_then(|v| v.as_str())
+                                        .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq"));
+                                    
+                                    let mut final_val_obj = serde_json::Map::new();
+                                    for (ik, iv) in item_obj {
+                                        let ik_trimmed = ik.trim();
+                                        if ik_trimmed != "property" && ik_trimmed != "property_name" {
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if ik_trimmed == "value" {
+                                                if let Some(exact_val) = prop_to_exact_val.get(&k) {
+                                                    final_val_obj.insert(ik_trimmed.to_string(), json!(exact_val));
+                                                    continue;
+                                                }
+                                            }
+                                            final_val_obj.insert(ik_trimmed.to_string(), iv.clone());
+                                        }
+                                    }
+                                    
+                                    if !final_val_obj.contains_key("operator") {
+                                        final_val_obj.insert("operator".to_string(), json!(op));
+                                    }
+                                    if !final_val_obj.contains_key("value") {
+                                        if let Some(exact_val) = prop_to_exact_val.get(&k) {
+                                            final_val_obj.insert("value".to_string(), json!(exact_val));
+                                        }
+                                    }
+                                    
+                                    structured_cond.insert(k, json!(final_val_obj));
+                                } else {
+                                    for (k, val) in item_obj {
+                                        let k_trimmed = k.trim();
+                                        if deterministic_json.is_some() && (k_trimmed == "started_at" || k_trimmed == "expired_at" || k_trimmed == "registration_date" || k_trimmed == "date") {
                                             continue;
                                         }
 
-                                        let op = item_obj.get("operator").and_then(|v| v.as_str())
-                                            .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq"));
-                                        
-                                        let mut final_val_obj = serde_json::Map::new();
-                                        for (ik, iv) in item_obj {
-                                            let ik_trimmed = ik.trim();
-                                            if ik_trimmed != "property" && ik_trimmed != "property_name" {
-                                                final_val_obj.insert(ik_trimmed.to_string(), iv.clone());
-                                            }
-                                        }
-                                        
-                                        if !final_val_obj.contains_key("operator") {
-                                            final_val_obj.insert("operator".to_string(), json!(op));
-                                        }
-                                        
-                                        structured_cond.insert(k, json!(final_val_obj));
-                                    } else {
-                                        for (k, val) in item_obj {
-                                            let k_trimmed = k.trim();
-                                            if deterministic_json.is_some() && (k_trimmed == "started_at" || k_trimmed == "expired_at" || k_trimmed == "registration_date" || k_trimmed == "date") {
-                                                continue;
-                                            }
+                                        let op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq");
+                                        let mut final_val_obj = val.clone();
 
-                                            let op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq");
-                                            let mut final_val_obj = val.clone();
-
-                                            if let Some(v_obj) = final_val_obj.as_object_mut() {
-                                                if !v_obj.contains_key("operator") {
-                                                    v_obj.insert("operator".to_string(), json!(op));
-                                                }
-                                            } else {
-                                                final_val_obj = json!({
-                                                    "operator": op,
-                                                    "value": val.clone()
-                                                });
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            if !v_obj.contains_key("operator") {
+                                                v_obj.insert("operator".to_string(), json!(op));
                                             }
-                                            structured_cond.insert(k_trimmed.to_string(), final_val_obj);
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if let Some(exact_val) = prop_to_exact_val.get(k_trimmed) {
+                                                v_obj.insert("value".to_string(), json!(exact_val));
+                                            }
+                                        } else {
+                                            let final_value = prop_to_exact_val.get(k_trimmed).map(|v| json!(v)).unwrap_or_else(|| val.clone());
+                                            final_val_obj = json!({
+                                                "operator": op,
+                                                "value": final_value
+                                            });
                                         }
+                                        structured_cond.insert(k_trimmed.to_string(), final_val_obj);
                                     }
                                 }
+                            }
+                        }
+
+                        // 🌟 [CRITICAL RECOVERY] LLM이 배열에서 특정 키를 통째로 누락(환각)시켰을 경우를 대비해, 
+                        // Rust에서 명시적으로 찾아둔 숫자값(prop_to_exact_val)을 강제로 쑤셔 넣습니다.
+                        for (k, exact_val) in &prop_to_exact_val {
+                            if !structured_cond.contains_key(k) {
+                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                structured_cond.insert(k.clone(), json!({
+                                    "operator": op,
+                                    "value": exact_val
+                                }));
+                                emit_term(&format!("      ⚠️ [RECOVERY] LLM missed property [{}]. Forcefully recovered with exact value [{}].", k, exact_val));
                             }
                         }
 

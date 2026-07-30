@@ -420,35 +420,49 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
+
+            // let valid_cols = [
+            //     "amount", "status", "type", "created_at", "updated_at",
+            //     "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
+            //     "shipping_date", "delivery_date", "weight",
+            //     "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date",
+            //     "started_at", "expired_at" // 🌟 [CRITICAL FIX] 이벤트/쿠폰 필터링용 날짜 컬럼 복구
+            // ];
             
+            // let mapped_key = match key.as_str() {
+            //     "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
+            //     "document_number" | "tracking_number" => "no",
+            //     "supplier_name" | "shipper_name" => "sender_name",
+            //     "buyer_name" | "consignee_name" => "recipient_name",
+            //     "amount_total" | "total_amount" => "amount",
+            //     "vehicle_name" | "flight_no" => "vessel",
+            //     "location_port_of_loading" => "pol",
+            //     "location_port_of_discharge" => "pod",
+            //     "incoterms_code" => "incoterms",
+            //     // 🌟 [CRITICAL FIX] 불필요한 가상 키워드를 완전히 제거하고 started_at과 expired_at으로 단일 통일시켰습니다.
+            //     // coupon/event 도메인은 DB 고유의 started_at, expired_at 컬럼을 원본 보호하고 그 외 도메인은 전부 created_at 컬럼으로 연결합니다.
+            //     "started_at" | "expired_at" => {
+            //         let t = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            //         if t == "event" || t == "coupon" {
+            //             if key == "started_at" { "started_at" } else { "expired_at" }
+            //         } else {
+            //             "created_at"
+            //         }
+            //     },
+            //     k if valid_cols.contains(&k) => k,
+            //     _ => "" 
+            // };
+            
+            // 🌟 [CRITICAL FIX] LanceDB 스키마(store.rs)에 실제로 물리적으로 존재하는 컬럼만 명시해야 SQL 에러(Fallback)를 방지할 수 있습니다!
+            // 가상 컬럼(weight, no, started_at 등)이 SQL에 포함되면 DataFusion 쿼리가 실패하여 모든 필터(5000원 등)가 통째로 초기화되는 치명적 버그 수정.
             let valid_cols = [
-                "amount", "status", "type", "created_at", "updated_at",
-                "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
-                "shipping_date", "delivery_date", "weight",
-                "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date",
-                "started_at", "expired_at" // 🌟 [CRITICAL FIX] 이벤트/쿠폰 필터링용 날짜 컬럼 복구
+                "amount", "status", "type", "created_at", "updated_at", "mode", "is_masked"
             ];
             
             let mapped_key = match key.as_str() {
-                "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
-                "document_number" | "tracking_number" => "no",
-                "supplier_name" | "shipper_name" => "sender_name",
-                "buyer_name" | "consignee_name" => "recipient_name",
-                "amount_total" | "total_amount" => "amount",
-                "vehicle_name" | "flight_no" => "vessel",
-                "location_port_of_loading" => "pol",
-                "location_port_of_discharge" => "pod",
-                "incoterms_code" => "incoterms",
-                // 🌟 [CRITICAL FIX] 불필요한 가상 키워드를 완전히 제거하고 started_at과 expired_at으로 단일 통일시켰습니다.
-                // coupon/event 도메인은 DB 고유의 started_at, expired_at 컬럼을 원본 보호하고 그 외 도메인은 전부 created_at 컬럼으로 연결합니다.
-                "started_at" | "expired_at" => {
-                    let t = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if t == "event" || t == "coupon" {
-                        if key == "started_at" { "started_at" } else { "expired_at" }
-                    } else {
-                        "created_at"
-                    }
-                },
+                "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" | "amount_total" | "total_amount" | "shipping_fee" => "amount",
+                "started_at" | "shipping_date" | "issue_date" | "order_date" | "registration_date" | "release_date" | "manufacture_date" | "payment_date" => "created_at",
+                "expired_at" | "delivery_date" => "updated_at",
                 k if valid_cols.contains(&k) => k,
                 _ => "" 
             };
@@ -457,9 +471,13 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
 
             if let Some(op_str) = val_obj.get("operator").and_then(|v| v.as_str()) {
                 if let Some(val_val) = val_obj.get("value") {
-                    let operator = match op_str {
-                        "gt" => ">", "gte" => ">=", "lt" => "<", "lte" => "<=", "eq" => "=", _ => "="
-                    };
+                    // 🌟 [CRITICAL FIX] LLM이 "lt [Alts: lte, gte]" 처럼 쓰레기 값을 포함해서 주더라도 앞부분만 파싱하여 안전하게 추출 및 변환합니다.
+                    let clean_op = op_str.trim().to_lowercase();
+                    let operator = if clean_op.starts_with("gte") { ">=" }
+                    else if clean_op.starts_with("gt") { ">" }
+                    else if clean_op.starts_with("lte") { "<=" }
+                    else if clean_op.starts_with("lt") { "<" }
+                    else { "=" };
                     
                     let val_str = if val_val.is_number() {
                         val_val.to_string()
