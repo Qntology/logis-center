@@ -3370,12 +3370,12 @@ impl LogisModel {
             }
         }
 
-        // 🌟 [CRITICAL FIX] 분할된 컨텍스트(Segment)들의 추출 결과를 Rust 메모리에서 하나의 마스터 객체로 완벽히 취합(Merge)합니다.
-        // 이를 통해 앞단에서 조각난 맥락(예: '구매 전환율이' + '1% 미만인')이 하나의 강력한 AND 조건으로 결합되어 DB 검색 시 정보 유실을 원천 차단합니다.
+        // 🌟 [CRITICAL FIX] 분할된 컨텍스트(Segment)들의 추출 결과를 Rust 메모리에서 취합하되,
+        // 각 세그먼트의 다중 후보 프로퍼티(1순위, 2순위 등)를 N:N 조합(Cartesian Product)으로 분할하여
+        // 여러 개의 마스터 컨텍스트를 생성하도록 개선합니다.
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
-            if ctx_arr.len() > 1 {
-                emit_term("[STAGE-3] Merging all fragmented conditions into a single master context...");
-                let mut master_condition = serde_json::Map::new();
+            if !ctx_arr.is_empty() {
+                emit_term("[STAGE-3] Merging and generating N:N combinatorial contexts...");
                 let mut master_text = String::new();
                 let mut master_status = json!("");
                 let mut master_substantial = json!("");
@@ -3383,6 +3383,9 @@ impl LogisModel {
                 let mut master_type = String::new();
                 
                 let mut final_contexts = Vec::new(); // 🌟 분리 보존을 위한 새 배열
+                
+                // 각 세그먼트별로 추출된 조건들을 담는 리스트 (세그먼트 간은 AND, 내부 원소들은 OR)
+                let mut seg_conditions_list: Vec<Vec<(String, Value)>> = Vec::new();
 
                 for seg in ctx_arr.iter() {
                     let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -3425,8 +3428,9 @@ impl LogisModel {
                         }
                     }
                     
-                    // 추출된 조건(Condition) 객체들 병합
+                    // 추출된 조건(Condition) 객체들 수집
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
+                        let mut current_seg_conds = Vec::new();
                         for (k, v) in cond {
                             // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
                             let is_empty = match v.get("value") {
@@ -3439,8 +3443,11 @@ impl LogisModel {
                             };
                             
                             if !is_empty {
-                                master_condition.insert(k.clone(), v.clone());
+                                current_seg_conds.push((k.clone(), v.clone()));
                             }
+                        }
+                        if !current_seg_conds.is_empty() {
+                            seg_conditions_list.push(current_seg_conds);
                         }
                     }
                 }
@@ -3449,22 +3456,49 @@ impl LogisModel {
                 if !master_text.is_empty() || !master_type.is_empty() {
                     if master_type.is_empty() { master_type = "goods".to_string(); }
 
-                    let master_ctx = json!({
-                        "type": master_type,
-                        "text": master_text,
-                        "status": master_status,
-                        "substantial": master_substantial,
-                        "find": master_find,
-                        "condition": master_condition
-                    });
+                    let mut combined_conditions = Vec::new();
                     
-                    // 마스터 컨텍스트를 배열의 맨 앞에 삽입
-                    final_contexts.insert(0, master_ctx);
+                    fn generate_combinations(
+                        groups: &[Vec<(String, Value)>],
+                        current: usize,
+                        current_cond: serde_json::Map<String, Value>,
+                        results: &mut Vec<serde_json::Map<String, Value>>
+                    ) {
+                        if current >= groups.len() {
+                            results.push(current_cond);
+                            return;
+                        }
+                        
+                        for (k, v) in &groups[current] {
+                            let mut next_cond = current_cond.clone();
+                            next_cond.insert(k.clone(), v.clone());
+                            generate_combinations(groups, current + 1, next_cond, results);
+                        }
+                    }
+
+                    if seg_conditions_list.is_empty() {
+                        combined_conditions.push(serde_json::Map::new());
+                    } else {
+                        generate_combinations(&seg_conditions_list, 0, serde_json::Map::new(), &mut combined_conditions);
+                    }
+
+                    // 🌟 생성된 N:N 조합만큼 여러 개의 컨텍스트를 배열의 맨 앞에 삽입
+                    for cond in combined_conditions.into_iter().rev() {
+                        let master_ctx = json!({
+                            "type": master_type,
+                            "text": master_text,
+                            "status": master_status,
+                            "substantial": master_substantial,
+                            "find": master_find,
+                            "condition": cond
+                        });
+                        final_contexts.insert(0, master_ctx);
+                    }
                 }
                 
                 *ctx_arr = final_contexts;
                 
-                emit_term(&format!("  ✅ [MASTER MERGED CONTEXT]\n{}", serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()));
+                emit_term(&format!("  ✅ [N:N COMBINATORIAL CONTEXTS]\n{}", serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()));
             }
         }
 
