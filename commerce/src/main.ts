@@ -566,7 +566,19 @@ function switchTab(tabName: string) {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
     
-    if (tabName === "list") refreshList(); 
+    // 🌟 [추가] 리스트 탭으로 이동 시 검색 결과 화면이었다면 전체 리스트로 복구합니다.
+    if (tabName === "list") {
+        const resultH3 = document.querySelector('.nav-section.search h3');
+        const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+        
+        // 🌟 [CRITICAL FIX] 검색이 진행 중(isSearching)일 때는 절대 초기화(refreshList)를 방지하여 검색 화면 및 진행 상태(Cancel 버튼)가 날아가는 것을 막습니다!
+        // 또한 일반 리스트 상태일 때는 탭을 전환한다고 굳이 초기화하지 않아 무한스크롤 상태를 보존합니다.
+        if (isShowingSearchResult && !isSearching) {
+            if (searchInput) searchInput.value = "";
+            if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+            refreshList(); 
+        }
+    }
     if (tabName === "automation") initBrowserDropdown();
 }
 
@@ -807,9 +819,19 @@ const handleSearchInteraction = () => {
         settingsToggle.dispatchEvent(new Event("change")); // UI 원상복구 이벤트 트리거
     }
 
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+
     // [UI-FIX] If the panel is already expanded, don't refresh the navigation or clear the list.
     // This prevents annoying UI flickering when the user just wants to type in the search bar.
     if (isExpanded && currentTab === "list") {
+        // 🌟 [수정] 검색 결과가 표시된 상태에서 검색창을 클릭했다면 다시 전체 리스트로 복구합니다.
+        // 🌟 [CRITICAL FIX] 단, 현재 검색이 진행 중(isSearching)이라면 초기화하지 않고 그대로 둡니다.
+        if (isShowingSearchResult && !isSearching) {
+            if (searchInput) searchInput.value = "";
+            if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+            refreshList();
+        }
         return;
     }
 
@@ -821,7 +843,11 @@ const handleSearchInteraction = () => {
         renderNavigation();
         if (listScrollContainer) listScrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
     }
-    if (!searchInput.value) {
+    
+    // 🌟 [CRITICAL FIX] 검색 진행 중일 때는 하단 초기화 로직도 타지 않도록 완벽히 방어합니다.
+    if (!isSearching && (!searchInput.value || isShowingSearchResult)) {
+        if (searchInput) searchInput.value = "";
+        if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
         if (docListContainer) docListContainer.innerHTML = "";
         cachedDocs = [];
         currentPage = 0;
@@ -1933,6 +1959,9 @@ btnSubmit?.addEventListener("click", async () => {
     // 🌟 [CRITICAL FIX] 검색 버튼 숨김 (번개 버튼은 독립적인 추출 대기열 노출 조건을 따르도록 강제 숨김 코드를 제거합니다)
     if (btnSubmit) btnSubmit.style.display = "none";
 
+    // 🌟 [CRITICAL FIX] 버튼을 누른 직후, 전역 플래그를 참(true)으로 고정하여 탭 전환 등 기타 UI 이벤트에 의해 초기화되는 것을 즉시 차단합니다!
+    isSearching = true;
+
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
     
@@ -1943,7 +1972,8 @@ btnSubmit?.addEventListener("click", async () => {
         const cancelBtn = document.getElementById("cancel-search-btn");
         if (cancelBtn) {
             cancelBtn.addEventListener("click", async () => {
-                if (confirm("정말 검색을 취소하시겠습니까?")) {
+                const confirmed = await ask("정말 검색을 취소하시겠습니까?", { title: "Cancel Search", kind: "warning" });
+                if (confirmed) {
                     const targetTaskId = activeTaskId || taskId;
                     if (targetTaskId) {
                         GlobalTaskManager.cancelledTasks.add(targetTaskId);
@@ -1969,6 +1999,9 @@ btnSubmit?.addEventListener("click", async () => {
                         const count = document.querySelectorAll('#doc-list .logis-result').length;
                         resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
                     }
+
+                    // 🌟 [추가] 검색 취소 후 텅 빈 화면에 원래 리스트(기본값)를 다시 렌더링합니다.
+                    refreshList();
                 }
             });
         }
@@ -2369,6 +2402,14 @@ listen("extraction-progress", async (event: any) => {
                             if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
                                 try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
                             }
+                            
+                            // 🌟 [CRITICAL FIX] 검색 결과를 기존 카드 템플릿(UI)에 반영하기 위해 데이터 덮어쓰기
+                            fullDoc.text = res.text || fullDoc.text;
+                            if (fullDoc.data) {
+                                fullDoc.data.search_score = res.score;
+                                fullDoc.data.search_context = res.context_type;
+                            }
+                            
                             docs.push(fullDoc);
                         }
                     } catch (e) {
@@ -2378,11 +2419,14 @@ listen("extraction-progress", async (event: any) => {
                 
                 if (docs.length > 0) {
                     upsertListItems(docs, 'append');
+                    hasMore = false; // 🌟 [CRITICAL FIX] AI 검색 결과는 단발성 고정 셋이므로 스크롤을 통한 전체 리스트 더 불러오기를 원천 차단합니다!
                 } else {
                     if (docListContainer) docListContainer.innerHTML = `<div class="empty">No detailed documents found.</div>`;
+                    hasMore = false;
                 }
             } else {
                 if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
+                hasMore = false; // 🌟 결과가 없을 때도 추가 불러오기 방지
             }
             updateResultCount(); // 🌟 카운트 갱신 반영
         }
@@ -3918,6 +3962,28 @@ document.getElementById("btn-settings-back")?.addEventListener("click", collapse
 // 🌟 [수정] 세팅 패널이 열려있을 때는 세팅을 닫고 리스트로 복귀하며, 일반 리스트 상태일 때는 위젯을 닫습니다.
 btnListBack?.addEventListener("click", () => {
     const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+    
+    // 🌟 [추가] 검색 결과가 표시된 상태에서 뒤로가기 버튼 클릭 시 위젯을 닫지 않고 전체 리스트로 복구합니다.
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+    
+    // 🌟 [CRITICAL FIX] 검색이 진행 중(isSearching)일 때는 리스트 초기화를 막습니다.
+    if (isShowingSearchResult && !isSearching) {
+        if (searchInput) searchInput.value = "";
+        if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+        refreshList();
+        return; // 검색 복구만 수행하고 위젯은 닫지 않음
+    } else if (isSearching) {
+        // 🌟 진행 중일 때는 화면(결과, 상태)을 보존한 채로 패널만 닫거나 위젯을 축소합니다.
+        if (settingsToggle && settingsToggle.checked) {
+            settingsToggle.checked = false;
+            settingsToggle.dispatchEvent(new Event("change"));
+        } else {
+            collapseWidget();
+        }
+        return;
+    }
+
     if (settingsToggle && settingsToggle.checked) {
         settingsToggle.checked = false;
         settingsToggle.dispatchEvent(new Event("change")); // 세팅 패널 닫기 이벤트 트리거
