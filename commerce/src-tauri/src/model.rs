@@ -2683,10 +2683,13 @@ impl LogisModel {
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                     
                     // 🌟 [DB SCHEMA CHECK] 스키마 설명(desc)에서 실제 데이터 타입을 추출합니다.
-                    // 언더바(_)를 제거하고 price, amount, quantity 등이 포함되어 있으면 Number 타입으로 자동 인식합니다.
-                    let clean_k = lower_key.replace("_", "");
-                    let type_str = if desc.contains("Number") || clean_k.contains("price") || clean_k.contains("amount") || clean_k.contains("quantity") || clean_k.contains("discount") || clean_k.contains("fee") || clean_k.contains("weight") || clean_k.contains("width") || clean_k.contains("height") || clean_k.contains("length") || clean_k.contains("limit") { "Number" }
-                                   else if desc.contains("Boolean") || clean_k.contains("only") || clean_k.contains("included") { "Boolean" }
+                    // 언더바(_)를 기준으로 단어를 분리(split)하여 price, amount, quantity 등 특정 키워드가 독립적으로 존재하는지 검사하여 Number/Boolean 타입을 자동 인식합니다.
+                    let parts: Vec<&str> = lower_key.split('_').collect();
+                    let is_number = parts.iter().any(|&p| ["price", "amount", "quantity", "discount", "fee", "weight", "width", "height", "length", "limit"].contains(&p));
+                    let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
+
+                    let type_str = if desc.contains("Number") || is_number { "Number" }
+                                   else if desc.contains("Boolean") || is_boolean { "Boolean" }
                                    else if desc.contains("Array") { "Array" }
                                    else { "String" };
                     prop_types.insert(key, type_str);
@@ -2732,10 +2735,14 @@ impl LogisModel {
                                     bias_texts.push(bias);
                                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                                     
-                                    // 언더바(_)를 제거하고 price, amount, quantity 등이 포함되어 있으면 Number 타입으로 자동 인식합니다.
-                                    let clean_k = node_key.replace("_", "").to_lowercase();
-                                    let type_str = if desc.contains("Number") || clean_k.contains("price") || clean_k.contains("amount") || clean_k.contains("quantity") || clean_k.contains("discount") || clean_k.contains("fee") || clean_k.contains("weight") || clean_k.contains("width") || clean_k.contains("height") || clean_k.contains("length") || clean_k.contains("limit") { "Number" }
-                                                   else if desc.contains("Boolean") || clean_k.contains("only") || clean_k.contains("included") { "Boolean" }
+                                    // 언더바(_)를 기준으로 단어를 분리(split)하여 price, amount, quantity 등 특정 키워드가 독립적으로 존재하는지 검사하여 Number/Boolean 타입을 자동 인식합니다.
+                                    let node_key_lower = node_key.to_lowercase();
+                                    let parts: Vec<&str> = node_key_lower.split('_').collect();
+                                    let is_number = parts.iter().any(|&p| ["price", "amount", "quantity", "discount", "fee", "weight", "width", "height", "length", "limit"].contains(&p));
+                                    let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
+
+                                    let type_str = if desc.contains("Number") || is_number { "Number" }
+                                                   else if desc.contains("Boolean") || is_boolean { "Boolean" }
                                                    else if desc.contains("Array") { "Array" }
                                                    else { "String" };
                                     prop_types.insert(node_key.clone(), type_str);
