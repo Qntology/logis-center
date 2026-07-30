@@ -1975,23 +1975,19 @@ impl LogisModel {
                         }
                     }
 
-                    // 🌟 투트랙 병합 로직 (Dual-Track Merge)
-                    // 1번 트랙: 공백 분할 (예: "베이지", "가디건", "찾아줘")
-                    // 2번 트랙: Stanza 분할 (예: "베이", "지", "가디건", "찾아줘")
+                    // 🌟 단일 트랙 병합 로직 (Single-Track Merge)
+                    // Dual-Track 배열 이어붙이기는 NMS Battle에서 인덱스 좌표계를 파괴하여(1번 트랙과 2번 트랙이 겹치지 않는 별개의 문장으로 인식됨)
+                    // 문장이 두 번 반복되거나 "이", "벤트로" 같은 파편이 결과에 중복 결합되는 치명적 버그를 유발합니다.
+                    // 임베딩 모델이 자체 서브워드 토크나이저를 내장하고 있으므로, 어절(공백) 단위 분할인 whitespace_split을 기준으로 
+                    // Stanza의 POS/Lemma 필터링만 적용하는 것이 가장 정확합니다.
                     if stanza_split.is_empty() {
                         ext_words_string = whitespace_split;
                     } else if whitespace_split == stanza_split {
                         ext_words_string = whitespace_split;
                         emit_term("  💡 [STANZA-INFO] 공백 분할과 Tokenizer 분할 결과가 동일하여 단일 트랙으로 진행합니다.");
                     } else {
-                        emit_term("  💡 [STANZA-INFO] 공백 분할(Track 1)과 Tokenizer 분할(Track 2)을 모두 투입하여 듀얼 트랙으로 진행합니다.");
+                        emit_term("  💡 [STANZA-INFO] Stanza 토크나이저의 과잉 분할(예: 이벤트로 -> 이+벤트로) 방지 및 NMS 좌표계 보호를 위해 공백 분할(Whitespace)을 메인 트랙으로 사용합니다.");
                         ext_words_string = whitespace_split;
-                        
-                        // 두 트랙이 섞이면서 생기는 의미 없는 교차 윈도우("찾아줘 베이")를 
-                        // POS 태거에서 걸러지도록 유도하기 위해 파이프라인(|) 더미를 하나 삽입하여 경계를 분리합니다.
-                        ext_words_string.push("|".to_string());
-                        
-                        ext_words_string.extend(stanza_split);
                     }
 
                     // 🌟 [STANZA POS 사전 필터링 & 로그 출력]
@@ -2676,8 +2672,10 @@ impl LogisModel {
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                     
                     // 🌟 [DB SCHEMA CHECK] 스키마 설명(desc)에서 실제 데이터 타입을 추출합니다.
-                    let type_str = if desc.contains("Number") { "Number" }
-                                   else if desc.contains("Boolean") { "Boolean" }
+                    // 언더바(_)를 제거하고 price, amount, quantity 등이 포함되어 있으면 Number 타입으로 자동 인식합니다.
+                    let clean_k = lower_key.replace("_", "");
+                    let type_str = if desc.contains("Number") || clean_k.contains("price") || clean_k.contains("amount") || clean_k.contains("quantity") || clean_k.contains("discount") || clean_k.contains("fee") || clean_k.contains("weight") || clean_k.contains("width") || clean_k.contains("height") || clean_k.contains("length") || clean_k.contains("limit") { "Number" }
+                                   else if desc.contains("Boolean") || clean_k.contains("only") || clean_k.contains("included") { "Boolean" }
                                    else if desc.contains("Array") { "Array" }
                                    else { "String" };
                     prop_types.insert(key, type_str);
@@ -2723,8 +2721,10 @@ impl LogisModel {
                                     bias_texts.push(bias);
                                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                                     
-                                    let type_str = if desc.contains("Number") { "Number" }
-                                                   else if desc.contains("Boolean") { "Boolean" }
+                                    // 언더바(_)를 제거하고 price, amount, quantity 등이 포함되어 있으면 Number 타입으로 자동 인식합니다.
+                                    let clean_k = node_key.replace("_", "").to_lowercase();
+                                    let type_str = if desc.contains("Number") || clean_k.contains("price") || clean_k.contains("amount") || clean_k.contains("quantity") || clean_k.contains("discount") || clean_k.contains("fee") || clean_k.contains("weight") || clean_k.contains("width") || clean_k.contains("height") || clean_k.contains("length") || clean_k.contains("limit") { "Number" }
+                                                   else if desc.contains("Boolean") || clean_k.contains("only") || clean_k.contains("included") { "Boolean" }
                                                    else if desc.contains("Array") { "Array" }
                                                    else { "String" };
                                     prop_types.insert(node_key.clone(), type_str);
