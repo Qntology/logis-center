@@ -150,19 +150,6 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
-    pub async fn unload_generator(&self) {
-        let mut gen = self.generator.lock().await;
-        *gen = None;
-        let mut q3_gen = self.qwen3_generator.lock().await; 
-        *q3_gen = None;
-        let mut q35_gen = self.qwen3_5_generator.lock().await;
-        *q35_gen = None;
-        
-        let mut size = self.current_size.lock().await;
-        *size = None;
-        println!("[MODEL] All generators (Active) destroyed."); 
-    }
-
     pub async fn unload_embedding(&self) {
         {
             let mut emb = self.embedding_model.lock().await;
@@ -1712,14 +1699,7 @@ impl LogisModel {
             return Ok(json!({ "context": [], "cancelled": true }));
         }
         
-        // 🌟 [CRITICAL FIX] scheduler.rs의 *model_lock = None; 구조 완벽 이식
-        {
-            *self.generator.lock().await = None;
-            *self.qwen3_generator.lock().await = None;
-            *self.qwen3_5_generator.lock().await = None;
-            *self.embedding_model.lock().await = None;
-            *self.current_size.lock().await = None;
-        }
+        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
         self.deep_purge_resources().await;
         self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
 
@@ -3680,15 +3660,7 @@ impl LogisModel {
         // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
         emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
         
-        // 🌟 [CRITICAL FIX] scheduler.rs와 완벽히 동일한 수준의 VRAM 초기화 적용
-        // 모든 모델 객체 참조를 명시적으로 해제하여 메모리 누수를 원천 차단합니다.
-        {
-            *self.generator.lock().await = None;
-            *self.qwen3_generator.lock().await = None;
-            *self.qwen3_5_generator.lock().await = None;
-            *self.embedding_model.lock().await = None;
-            *self.current_size.lock().await = None;
-        }
+        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
         self.deep_purge_resources().await;
 
         // 🌟 [강화된 VRAM 초기화] CUDA 메모리 캐시 강제 비우기 (컴파일 에러 해결 적용)

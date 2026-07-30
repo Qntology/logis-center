@@ -154,7 +154,7 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     {
         let mut model_guard = state.model.lock().await;
         if let Some(m) = model_guard.as_ref() {
-            m.unload_generator().await;
+            m.deep_purge_resources().await;
         }
         *model_guard = None;
     }
@@ -749,7 +749,7 @@ async fn ai_search_complex(
         if let Some(m) = model_guard.as_ref() {
             let wants_cpu = device_preference.as_deref() == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
-                m.unload_generator().await;
+                m.deep_purge_resources().await;
                 *model_guard = None;
             }
         }
@@ -940,7 +940,7 @@ async fn deep_research_command(
         let wants_cpu = device_preference.as_deref() == Some("cpu");
         if m.is_cpu_mode != wants_cpu {
             println!("[DEEP-RESEARCH] Device preference mismatch. Reloading model...");
-            m.unload_generator().await;
+            m.deep_purge_resources().await;
             *model_guard = None;
         }
     }
