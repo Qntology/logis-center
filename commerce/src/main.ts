@@ -1888,6 +1888,13 @@ function isQueryActive(text: string): boolean {
         const el = bubbles[i] as HTMLElement;
         const status = parseInt(el.dataset.status || "0");
         const taskId = el.id;
+
+        // 🌟 [CRITICAL FIX] 이미 Cancel 버튼을 눌러 취소된 작업(블랙리스트)이라면 중복 검사에서 즉시 제외하여 
+        // 새로운 검색어가 막히는 버그를 원천 차단합니다!
+        if (GlobalTaskManager.cancelledTasks.has(taskId)) {
+            continue;
+        }
+
         // 🌟 상태가 1(Processing)이거나 10(Queued)일 때만 활성 상태로 간주
         if ((status === 1 || status === 10) && taskId.startsWith("search_")) {
             const queryEl = document.getElementById(`${taskId}_query`);
@@ -1977,6 +1984,18 @@ btnSubmit?.addEventListener("click", async () => {
                     const targetTaskId = activeTaskId || taskId;
                     if (targetTaskId) {
                         GlobalTaskManager.cancelledTasks.add(targetTaskId);
+
+                        // 🌟 [CRITICAL FIX] 화면에 남아있는 취소된 태스크의 말풍선(DOM) 상태를 2(Stopped)로 변경하여
+                        // isQueryActive 검사에서 중복 진행 중으로 오인받지 않도록 시각적/구조적으로 확실히 처리합니다!
+                        const el = document.getElementById(targetTaskId);
+                        if (el) {
+                            el.dataset.status = "2";
+                            const statusBar = el.querySelector('.status-bar');
+                            if (statusBar) statusBar.innerHTML = `<span style="color:#ef4444;">❌ STOPPED</span>`;
+                        }
+                        const queryEl = document.getElementById(`${targetTaskId}_query`);
+                        if (queryEl) queryEl.dataset.status = "2";
+                        await kvRemove(`term_${targetTaskId}`);
                     }
                     activeTaskId = null;
                     GlobalTaskManager.isBusy = false;
@@ -2474,6 +2493,10 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                 isExtracting = true;
             }
             startSpinner();
+        } else if (!spinnerInterval) {
+            // 🌟 [CRITICAL FIX] 이미 activeTaskId가 일치하여 입양(Adoption) 블록을 건너뛰었더라도,
+            // 스피너가 돌고 있지 않다면 강제로 스피너를 가동시켜 무반응(멈춤) 버그를 방지합니다.
+            startSpinner();
         }
     }
 
@@ -2521,7 +2544,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
 
     // 🌟 [CRITICAL FIX] 대기열 상태(10)와 진행 상태(1)를 엄격히 구분합니다.
     let statusCode = 1; 
-    
+        
     if (isTerminal) {
         if (payload.category === "Done") statusCode = 9;
         else if (payload.category === "Error") statusCode = 6;
@@ -2563,25 +2586,28 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     // 🌟 [CRITICAL FIX] 1차 스피너 및 전역 상태 종료 처리 
     // 사용자가 현재 무슨 화면을 보고 있든, 작업이 끝났다면 무조건 전역 락을 풀고 스피너를 정지시킵니다!
     if (isTerminal) {
-        // 🌟 [Lock 해제 보강] 어떤 경로로든 종료 상태가 되면 락을 확실히 제거합니다.
-        const currentLock = await kvGet("sys_lock");
-        if (currentLock === tId || !currentLock) {
-            await kvRemove("sys_lock");
+        // 🌟 [CRITICAL FIX] 과거의 로그(History)를 불러올 때 터미널 이벤트가 현재 진행 중인 작업을 끄는 것을 완벽 차단!
+        // 오직 현재 활성화된 작업(activeTaskId)이 종료되었을 때만 글로벌 락을 해제합니다.
+        if (tId === activeTaskId || !activeTaskId) {
+            const currentLock = await kvGet("sys_lock");
+            if (currentLock === tId || !currentLock) {
+                await kvRemove("sys_lock");
+            }
+            
+            isExtracting = false;
+            isSearching = false;
+            stopSpinner();
+            
+            if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
+            if (currentImage) {
+                currentImage = null; 
+                if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
+                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
+                if (searchInput) searchInput.disabled = false; 
+                if (btnSubmit) btnSubmit.style.display = "flex"; 
+            }
+            updateExtractButtonVisibility(); 
         }
-        
-        isExtracting = false;
-        isSearching = false;
-        stopSpinner();
-        
-        if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
-        if (currentImage) {
-            currentImage = null; 
-            if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
-            if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
-            if (searchInput) searchInput.disabled = false; 
-            if (btnSubmit) btnSubmit.style.display = "flex"; 
-        }
-        updateExtractButtonVisibility(); 
 
         // 🌟 [CRITICAL FIX] 전처리가 완료되면 자동으로 메뉴 카운트와 리스트를 리프레시!
         if (payload.category === "Done") {

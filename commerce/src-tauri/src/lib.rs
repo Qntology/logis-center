@@ -655,6 +655,11 @@ async fn ai_search_complex(
     emit_term(&format!("   - 검색 모드: {}", search_mode));
     emit_term("==================================================\n");
 
+    // 🌟 [CRITICAL FIX] 이전 작업 취소로 인해 굳어있던 취소 토큰(Cancellation Token)을 무조건 초기화하여
+    // 스케줄러 큐를 타지 않고 직접 호출되는 검색 커맨드가 튕겨나가지 않도록 완벽히 방어합니다!
+    state.cancellation_token.store(false, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(false);
+
     let cancel_token = state.cancellation_token.clone();
     
     let store_opt = {
