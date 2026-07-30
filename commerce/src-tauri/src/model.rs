@@ -2638,7 +2638,7 @@ impl LogisModel {
                 let _ = app_handle.emit("extraction-progress", &payload);
                 crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
-                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let mut current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 
                 // 🌟 [2차 분기] 세부 속성 매칭: 해당 도메인 타입의 Schema Field(Property Bias/Prej) 로드
@@ -2777,8 +2777,7 @@ impl LogisModel {
                     chunk: String,
                     best_prop: String,
                     best_score: f32,
-                    second_prop: String,
-                    second_score: f32,
+                    alternatives: Vec<(String, f32)>,
                 }
                 let mut plinko_matches: Vec<PlinkoMatch> = Vec::new();
                 let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2786,13 +2785,48 @@ impl LogisModel {
                 
                 let mut current_chunk = Vec::new();
                 let mut prev_max_score = -1.0;
-                let mut prev_second_score = -1.0;
                 let mut best_prop_for_chunk = String::new();
-                let mut second_prop_for_chunk = String::new();
+                let mut prev_alternatives: Vec<(String, f32)> = Vec::new();
 
                 emit_term(&format!("  🎯 [PLINKO GAME (1st)] Starting Sliding Window Cliff Detection for '{}'", current_text));
 
+                // 🌟 [개선] 다국어(52개국어)의 검색/요청 의미를 갖는 단어들을 모두 기준 벡터(Centroid)에 포함시켜 하드코딩 매칭 없이 벡터만으로 완벽한 시맨틱 필터링을 수행합니다.
+                let action_verbs = "find, search, query, get, question, request, 찾아, 알려줘, 보여줘, 조사, 결과, 답변, 대답, 말해, 검색, 해줘, 질문, 질의, 요청, 확인, 알아봐, 찾아봐, 가져와, 설명, 요약, 추천, 정보, gjej, kërko, pyet, merr, ابحث, بحث, استعلام, الحصول, tap, axtarış, sorğu, əldə et, খুঁজুন, অনুসন্ধান, প্রশ্ন, পান, намери, търси, заявка, получи, trobar, cercar, consulta, obtenir, 找, 搜索, 查询, 获取, 给我看, 告诉我, nađi, pretraži, upit, dobij, najít, hledat, dotaz, získat, søg, forespørgsel, hent, vind, zoek, zoekopdracht, krijg, leia, otsi, päring, saada, löydä, etsi, kysely, hae, trouver, chercher, requête, obtenir, montre-moi, dis-moi, იპოვე, ძებნა, მოთხოვნა, მიიღე, finden, suchen, abfrage, bekommen, zeig mir, sag mir, βρες, αναζήτηση, ερώτημα, πάρε, מצא, חפש, שאילתה, קבל, खोजें, खोज, क्वेरी, प्राप्त करें, talál, keres, lekérdezés, kap, finna, leita, fyrirspurn, fá, temukan, cari, kueri, dapatkan, trova, cerca, ottieni, mostrami, dimmi, 見つける, 検索, クエリ, 取得, 教えて, 見せて, табу, іздеу, сұрау, алу, ស្វែងរក, ស្រាវជ្រាវ, សំណួរ, ទទួលបាន, atrast, meklēt, vaicājums, iegūt, rasti, ieškoti, užklausa, gauti, carian, pertanyaan, शोधा, शोध, मिळवा, finn, søk, spørring, پیدا کردن, جستجو, پرس و جو, گرفتن, znajdź, szukaj, zapytanie, pobierz, encontrar, pesquisar, obter, mostre-me, diga-me, găsește, caută, interogare, obține, найти, поиск, запрос, получить, покажи, расскажи, нађи, претрага, упит, добиј, nájsť, hľadať, dopyt, získať, najdi, iskanji, poizvedba, dobi, buscar, obtener, muéstrame, dime, tafuta, utafutaji, swali, pata, hitta, sök, fråga, hämta, hanapin, maghanap, kunin, కనుగొనండి, శోధన, ప్రశ్న, పొందండి, ค้นหา, ค้น, คิวรี, รับ, bul, ara, sorgu, al, знайти, пошук, запит, отримати, تلاش, تلاش کریں, استفسار, حاصل کریں, topish, qidirish, so'rov, olish, tìm, tìm kiếm, truy vấn, lấy, cho tôi xem, nói cho tôi";
+                let action_verb_emb = self.get_embedding(action_verbs.to_string()).await.unwrap_or(vec![0.0; 384]);
+
+                let mut retained_words = Vec::new();
+
                 for word in words {
+                    // 🌟 [추가] 현재 단어의 벡터를 추출하여 기준 명령어 벡터와의 코사인 유사도를 확인합니다.
+                    let word_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                    let action_sim = cosine_similarity(&word_emb, &action_verb_emb);
+
+                    // 유사도가 임계값(0.55) 이상이면 검색 명령어로 간주하여 속성 맵핑에서 배제합니다.
+                    if word != "|" && action_sim > 0.55 {
+                        emit_term(&format!("    🚫 [ACTION VERB IGNORED] '{}' acts as a search verb (Sim: {:.4}). Skipping Plinko mapping.", word, action_sim));
+                        
+                        // 이전에 쌓인 청크가 유효하다면 즉시 강제 Cliff(저장) 처리하여 슬롯에 안전하게 넣습니다.
+                        if !current_chunk.is_empty() && prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
+                            emit_term(&format!("    📉 [FORCED CLIFF] Action verb intercepted. End of semantic chunk."));
+                            emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
+                            plinko_matches.push(PlinkoMatch {
+                                chunk: current_chunk.join(" "),
+                                best_prop: best_prop_for_chunk.clone(),
+                                best_score: prev_max_score,
+                                alternatives: prev_alternatives.clone(),
+                            });
+                        }
+                        
+                        // 윈도우 완전 초기화 (명령어 단어는 버림)
+                        current_chunk = Vec::new();
+                        prev_max_score = -1.0;
+                        best_prop_for_chunk = String::new();
+                        prev_alternatives = Vec::new();
+                        continue;
+                    }
+
+                    retained_words.push(word);
+
                     let mut test_chunk = current_chunk.clone();
                     test_chunk.push(word);
                     let test_text = test_chunk.join(" ");
@@ -2830,8 +2864,7 @@ impl LogisModel {
                     
                     let current_best = candidates.first().map(|c| c.0.clone()).unwrap_or_default();
                     let current_max = candidates.first().map(|c| c.1).unwrap_or(-1.0);
-                    let current_second_best = candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
-                    let current_second = candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
+                    let current_alternatives: Vec<(String, f32)> = candidates.iter().skip(1).take(5).cloned().collect();
 
                     let mut global_scores_log = String::new();
                     if !loaded_globals.is_empty() {
@@ -2844,7 +2877,9 @@ impl LogisModel {
                         global_scores_log = format!(" | Globals: {}", g_scores.join(", "));
                     }
 
-                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4}){}", test_text, current_best, current_max, current_second_best, current_second, global_scores_log));
+                    let sec_prop = current_alternatives.first().map(|c| c.0.clone()).unwrap_or_default();
+                    let sec_score = current_alternatives.first().map(|c| c.1).unwrap_or(-1.0);
+                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4}){}", test_text, current_best, current_max, sec_prop, sec_score, global_scores_log));
 
                     // Score Drop (Cliff) = Cut & Drop into Slot
                     if current_max < prev_max_score && !current_chunk.is_empty() {
@@ -2857,8 +2892,7 @@ impl LogisModel {
                                 chunk: current_chunk.join(" "),
                                 best_prop: best_prop_for_chunk.clone(),
                                 best_score: prev_max_score,
-                                second_prop: second_prop_for_chunk.clone(),
-                                second_score: prev_second_score,
+                                alternatives: prev_alternatives.clone(),
                             });
                         } else {
                             emit_term(&format!("      🗑️ [SKIPPED] Score {:.4} is too low (Threshold: 0.20). Ignored.", prev_max_score));
@@ -2895,8 +2929,9 @@ impl LogisModel {
                         
                         let r_max = r_candidates.first().map(|c| c.1).unwrap_or(-1.0);
                         let r_best = r_candidates.first().map(|c| c.0.clone()).unwrap_or_default();
-                        let r_second = r_candidates.get(1).map(|c| c.1).unwrap_or(-1.0);
-                        let r_second_best = r_candidates.get(1).map(|c| c.0.clone()).unwrap_or_default();
+                        let r_alts: Vec<(String, f32)> = r_candidates.iter().skip(1).take(5).cloned().collect();
+                        let r_sec_prop = r_alts.first().map(|c| c.0.clone()).unwrap_or_default();
+                        let r_sec_score = r_alts.first().map(|c| c.1).unwrap_or(-1.0);
 
                         let mut r_global_scores_log = String::new();
                         if !loaded_globals.is_empty() {
@@ -2910,40 +2945,56 @@ impl LogisModel {
                         }
 
                         prev_max_score = r_max;
-                        prev_second_score = r_second;
                         best_prop_for_chunk = r_best.clone();
-                        second_prop_for_chunk = r_second_best.clone();
-                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4}){}", word, r_best, r_max, r_second_best, r_second, r_global_scores_log));
+                        prev_alternatives = r_alts;
+                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4}){}", word, r_best, r_max, r_sec_prop, r_sec_score, r_global_scores_log));
                     } else {
                         current_chunk.push(word);
                         prev_max_score = current_max;
-                        prev_second_score = current_second;
                         best_prop_for_chunk = current_best;
-                        second_prop_for_chunk = current_second_best;
+                        prev_alternatives = current_alternatives;
                     }
                 }
                 
                 // Sweep remaining chunk
                 if !current_chunk.is_empty() {
                     if prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
-                        emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score, second_prop_for_chunk, prev_second_score));
+                        let sec_prop = prev_alternatives.first().map(|c| c.0.clone()).unwrap_or_default();
+                        let sec_score = prev_alternatives.first().map(|c| c.1).unwrap_or(-1.0);
+                        emit_term(&format!("    🧹 [SWEEP REMAINING] Final chunk '{}' belongs to 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4})", current_chunk.join(" "), best_prop_for_chunk, prev_max_score, sec_prop, sec_score));
                         plinko_matches.push(PlinkoMatch {
                             chunk: current_chunk.join(" "),
                             best_prop: best_prop_for_chunk.clone(),
                             best_score: prev_max_score,
-                            second_prop: second_prop_for_chunk.clone(),
-                            second_score: prev_second_score,
+                            alternatives: prev_alternatives.clone(),
                         });
                     } else {
                         emit_term(&format!("    🗑️ [SWEEP SKIPPED] Final chunk '{}' score {:.4} is too low (Threshold: 0.20). Ignored.", current_chunk.join(" "), prev_max_score));
                     }
                 }
 
+                // 🌟 [CRITICAL FIX] 검색 명령어(Action Verb)로 걸러진 단어들을 current_text에서 원천 제거하여 LLM 및 LanceDB 쿼리에 유입되지 않도록 합니다.
+                current_text = retained_words.join(" ");
+                if let Some(obj) = seg.as_object_mut() {
+                    obj.insert("text".to_string(), json!(current_text));
+                }
+
                 // Qwen3로 1차 매핑 검증
                 if !plinko_matches.is_empty() {
                     emit_term("    🧠 [QWEN3 VERIFICATION (1st)] Verifying property mappings...");
-                    // Qwen3 로드
-                    self.ensure_qwen3().await?;
+                    
+                    let mut needs_llm = false;
+                    for pm in &plinko_matches {
+                        if pm.best_score < 0.70 {
+                            needs_llm = true;
+                            break;
+                        }
+                    }
+                    
+                    if needs_llm {
+                        // Qwen3 로드 (검증이 필요한 항목이 하나라도 있을 때만 LLM을 올림)
+                        self.ensure_qwen3().await?;
+                    }
                     
                     // plinko_matches의 각 항목을 Qwen3로 검증 (2순위 속성까지 LLM에 제공)
                     let mut validated_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
@@ -2955,8 +3006,15 @@ impl LogisModel {
                             return Ok(json!({ "context": [], "cancelled": true }));
                         }
                         
+                        // 🌟 [추가] Trust Threshold: Plinko 점수가 0.70 이상이면 LLM 생략하고 바로 통과
+                        if pm.best_score >= 0.70 {
+                            emit_term(&format!("      ⚡ [BYPASS] High confidence ({:.4} >= 0.70). Property [{}] auto-confirmed for '{}'", pm.best_score, pm.best_prop, pm.chunk));
+                            validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
+                            continue;
+                        }
+                        
                         let prompt = crate::prompts::verify_property_with_alternatives_prompt(
-                            &pm.chunk, &pm.best_prop, pm.best_score, &pm.second_prop, pm.second_score
+                            &pm.chunk, &pm.best_prop, pm.best_score, &pm.alternatives
                         );
                         
                         // Qwen3 호출
@@ -3113,37 +3171,37 @@ impl LogisModel {
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
 
-                // Qwen3로 2차 매핑 검증
-                if !prop_to_op.is_empty() {
-                    emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
-                    self.ensure_qwen3().await?;
+                // // Qwen3로 2차 매핑 검증
+                // if !prop_to_op.is_empty() {
+                //     emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
+                //     self.ensure_qwen3().await?;
                     
-                    // 속성별 operator 검증
-                    let mut validated_prop_to_op = prop_to_op.clone();
-                    for (prop, op) in &prop_to_op {
-                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
-                            return Ok(json!({ "context": [], "cancelled": true }));
-                        }
+                //     // 속성별 operator 검증
+                //     let mut validated_prop_to_op = prop_to_op.clone();
+                //     for (prop, op) in &prop_to_op {
+                //         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                //             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                //             return Ok(json!({ "context": [], "cancelled": true }));
+                //         }
                         
-                        let prompt = crate::prompts::verify_operator_mapping_prompt(prop, op);
+                //         let prompt = crate::prompts::verify_operator_mapping_prompt(prop, op);
                         
-                        if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
-                            if let Ok(result) = serde_json::from_str::<Value>(&response) {
-                                if !result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
-                                        emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
-                                        validated_prop_to_op.insert(prop.clone(), suggested.to_string());
-                                    }
-                                } else {
-                                    emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
-                                }
-                            }
-                        }
-                    }
+                //         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                //             if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                //                 if !result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
+                //                     if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
+                //                         emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
+                //                         validated_prop_to_op.insert(prop.clone(), suggested.to_string());
+                //                     }
+                //                 } else {
+                //                     emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                //                 }
+                //             }
+                //         }
+                //     }
                     
-                    prop_to_op = validated_prop_to_op;
-                }
+                //     prop_to_op = validated_prop_to_op;
+                // }
                 
                 // Vector-based Time/Season Guide 조립
                 let mut llm_temporal_guide = String::new();

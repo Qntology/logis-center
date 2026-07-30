@@ -1203,36 +1203,34 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> (Str
             4 | 6 | 9 | 11 => 30,
             _ => 31,
         };
-        // 🌟 [CRITICAL FIX] LLM에게 추출을 맡기지 않고 확정 JSON 객체를 생성합니다.
-        let start_val = format!("{:04}-{:02}-01T00:00:00", start_y, start_m);
-        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", end_y, end_m, end_day);
+        // 🌟 [CRITICAL FIX] LLM에게 추출을 맡기지 않고 확정 JSON 객체를 생성합니다. (밀리세컨드 Timestamp 적용)
+        let start_ts = offset.with_ymd_and_hms(start_y, start_m, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(end_y, end_m, end_day, 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Season detected. DO NOT extract date properties (like started_at, expired_at, date). The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
         return (guide, condition_json);
     }
 
-    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 LLM 추론을 우회하여 확정 JSON으로 반환합니다.
+    // 🌟 [CRITICAL FIX] 상대적 시간(Time) 로직도 LLM 추론을 우회하여 확정 JSON으로 반환합니다. (밀리세컨드 Timestamp 적용)
     if vector_guide.contains("Time Intent [today]") {
-        let date_str = now.format("%Y-%m-%d");
-        let start_val = format!("{}T00:00:00", date_str);
-        let end_val = format!("{}T23:59:59", date_str);
+        let start_ts = offset.with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(now.year(), now.month(), now.day(), 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Today' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [yesterday]") {
         let yesterday = now - Duration::days(1);
-        let date_str = yesterday.format("%Y-%m-%d");
-        let start_val = format!("{}T00:00:00", date_str);
-        let end_val = format!("{}T23:59:59", date_str);
+        let start_ts = offset.with_ymd_and_hms(yesterday.year(), yesterday.month(), yesterday.day(), 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(yesterday.year(), yesterday.month(), yesterday.day(), 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Yesterday' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [this_month]") {
         let end_date = offset.with_ymd_and_hms(
@@ -1240,51 +1238,51 @@ pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> (Str
             if now.month() == 12 { 1 } else { now.month() + 1 },
             1, 0, 0, 0
         ).unwrap() - Duration::seconds(1);
-        let start_val = format!("{:04}-{:02}-01T00:00:00", now.year(), now.month());
-        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", now.year(), now.month(), end_date.day());
+        let start_ts = offset.with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = end_date.timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'This Month' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [last_month]") {
         let (y, m) = if now.month() == 1 { (now.year() - 1, 12) } else { (now.year(), now.month() - 1) };
         let next_m = if m == 12 { 1 } else { m + 1 };
         let next_y = if m == 12 { y + 1 } else { y };
         let end_date = offset.with_ymd_and_hms(next_y, next_m, 1, 0, 0, 0).unwrap() - Duration::seconds(1);
-        let start_val = format!("{:04}-{:02}-01T00:00:00", y, m);
-        let end_val = format!("{:04}-{:02}-{:02}T23:59:59", y, m, end_date.day());
+        let start_ts = offset.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = end_date.timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Last Month' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [this_year]") {
         let y = now.year();
-        let start_val = format!("{:04}-01-01T00:00:00", y);
-        let end_val = format!("{:04}-12-31T23:59:59", y);
+        let start_ts = offset.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(y, 12, 31, 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'This Year' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [last_year]") {
         let y = now.year() - 1;
-        let start_val = format!("{:04}-01-01T00:00:00", y);
-        let end_val = format!("{:04}-12-31T23:59:59", y);
+        let start_ts = offset.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(y, 12, 31, 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Last Year' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     } else if vector_guide.contains("Time Intent [recently]") {
         let past = now - Duration::days(30);
-        let start_val = format!("{}T00:00:00", past.format("%Y-%m-%d"));
-        let end_val = format!("{}T23:59:59", now.format("%Y-%m-%d"));
+        let start_ts = offset.with_ymd_and_hms(past.year(), past.month(), past.day(), 0, 0, 0).unwrap().timestamp_millis();
+        let end_ts = offset.with_ymd_and_hms(now.year(), now.month(), now.day(), 23, 59, 59).unwrap().timestamp_millis();
         guide = format!("- [DETERMINISTIC OVERRIDE] Time intent 'Recently' detected. DO NOT extract date properties. The system will auto-inject them.");
         condition_json = Some(json!({
-            "started_at": { "operator": "gte", "value": start_val },
-            "expired_at": { "operator": "lte", "value": end_val }
+            "started_at": { "operator": "gte", "value": start_ts },
+            "expired_at": { "operator": "lte", "value": end_ts }
         }));
     }
 

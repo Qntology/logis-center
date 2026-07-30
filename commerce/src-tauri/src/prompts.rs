@@ -706,18 +706,21 @@ pub fn verify_property_with_alternatives_prompt(
     text: &str,
     first_choice: &str,
     first_score: f32,
-    second_choice: &str,
-    second_score: f32,
+    alternatives: &[(String, f32)],
 ) -> String {
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
     let template = r###"[TASK]
 Text: "{TEXT}"
 First choice: "{FIRST}" (score: {FIRST_SCORE})
-Second choice: "{SECOND}" (score: {SECOND_SCORE})
-
+{ALTERNATIVES}
 Instructions:
 1. If the first choice is correct for this text, set "correct": true and "suggested_property": "{FIRST}".
-2. If the first choice is wrong but the second choice is better, set "correct": false and "suggested_property": "{SECOND}".
-3. If neither choice is correct, set "correct": false and suggest a different property from the schema.
+2. If the first choice is wrong, evaluate the Alternative choices in order. If one of them is correct, set "correct": false and "suggested_property": "<the correct alternative>".
+3. If neither the first choice nor any alternatives are correct, set "correct": false and suggest a different property from the schema.
 
 [OUTPUT FORMAT]
 {"correct": Boolean, "suggested_property": String}
@@ -727,8 +730,7 @@ Instructions:
     template.replace("{TEXT}", text)
             .replace("{FIRST}", first_choice)
             .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{SECOND}", second_choice)
-            .replace("{SECOND_SCORE}", &format!("{:.4}", second_score))
+            .replace("{ALTERNATIVES}", &alt_str)
 }
 
 pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String {
