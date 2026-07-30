@@ -3250,6 +3250,12 @@ impl LogisModel {
                              emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
                              return Ok(json!({ "context": [], "cancelled": true }));
                          }
+
+                         // 🌟 [CRITICAL FIX] 문자열 검색(FTS)용 연산자인 'contains'는 LLM이 문맥을 오해하여 'eq'로 바꾸지 못하도록 검증을 우회합니다.
+                         if op == "contains" {
+                             emit_term(&format!("      ⚡ [BYPASS] Operator [{}] is FTS. Bypassing verification for [{}]", op, prop));
+                             continue;
+                         }
                         
                          let prompt = crate::prompts::verify_operator_mapping_prompt(&current_text, prop, op);
                         
@@ -3374,15 +3380,17 @@ impl LogisModel {
                     matched_types.sort();
                     matched_types.dedup();
                     
+                    // 🌟 [CRITICAL FIX] String 타입일 경우 JSON 값이 큰따옴표에 제대로 감싸지도록 프롬프트 가이드를 "\"String\"" 형태로 교정합니다.
                     let value_type_str = if matched_types.is_empty() {
-                        "String".to_string()
+                        "\"String\"".to_string()
                     } else if matched_types.len() == 1 {
-                        matched_types[0].to_string()
+                        if matched_types[0] == "String" { "\"String\"".to_string() } else { "Number".to_string() }
                     } else {
                         let mut type_conditions = Vec::new();
                         for k in prop_to_op.keys() {
                             let t = prop_types.get(k).copied().unwrap_or("String");
-                            type_conditions.push(format!("{} (if property is '{}')", t, k));
+                            let t_quoted = if t == "String" { "\"String\"" } else { "Number" };
+                            type_conditions.push(format!("{} (if property is '{}')", t_quoted, k));
                         }
                         type_conditions.join(", ")
                     };
@@ -3507,13 +3515,19 @@ impl LogisModel {
                                         continue;
                                     }
 
-                                    let op = item_obj.get("operator").and_then(|v| v.as_str())
-                                        .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq"));
+                                    // 🌟 [CRITICAL FIX] 유효하지 않은 프로퍼티 이름(LLM 환각) 무시
+                                    if !prop_to_op.contains_key(&k) {
+                                        emit_term(&format!("      ⚠️ [DISCARD] LLM hallucinated invalid property name: [{}]. Discarding.", k));
+                                        continue;
+                                    }
+
+                                    let mut op = item_obj.get("operator").and_then(|v| v.as_str())
+                                        .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq")).to_string();
                                     
                                     let mut final_val_obj = serde_json::Map::new();
                                     for (ik, iv) in item_obj {
                                         let ik_trimmed = ik.trim();
-                                        if ik_trimmed != "property" && ik_trimmed != "property_name" {
+                                        if ik_trimmed != "property" && ik_trimmed != "property_name" && ik_trimmed != "operator" {
                                             // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
                                             if ik_trimmed == "value" {
                                                 if let Some(exact_val) = prop_to_exact_val.get(&k) {
@@ -3524,10 +3538,26 @@ impl LogisModel {
                                             final_val_obj.insert(ik_trimmed.to_string(), iv.clone());
                                         }
                                     }
-                                    
-                                    if !final_val_obj.contains_key("operator") {
-                                        final_val_obj.insert("operator".to_string(), json!(op));
+
+                                    // 🌟 [CRITICAL FIX] 숫자가 없어서 value가 빈 값인데 연산자가 부등호일 경우 퍼지(Fuzzy) 표현으로 간주하여 강제 교정
+                                    let actual_db_type = prop_types.get(&k).copied().unwrap_or("String");
+                                    if actual_db_type == "Number" {
+                                        let val_is_empty = final_val_obj.get("value").and_then(|v| v.as_str()).map_or(false, |s| s.trim().is_empty());
+                                        if val_is_empty && !prop_to_exact_val.contains_key(&k) {
+                                            if op == "gt" || op == "gte" {
+                                                op = "top".to_string();
+                                                final_val_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                final_val_obj.insert("is_percent".to_string(), json!(true));
+                                            } else if op == "lt" || op == "lte" {
+                                                op = "bottom".to_string();
+                                                final_val_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                final_val_obj.insert("is_percent".to_string(), json!(true));
+                                            }
+                                        }
                                     }
+                                    
+                                    final_val_obj.insert("operator".to_string(), json!(op));
+                                    
                                     if !final_val_obj.contains_key("value") {
                                         if let Some(exact_val) = prop_to_exact_val.get(&k) {
                                             final_val_obj.insert("value".to_string(), json!(exact_val));
@@ -3542,13 +3572,16 @@ impl LogisModel {
                                             continue;
                                         }
 
-                                        let op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq");
+                                        let mut op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq").to_string();
                                         let mut final_val_obj = val.clone();
 
                                         if let Some(v_obj) = final_val_obj.as_object_mut() {
                                             if !v_obj.contains_key("operator") {
                                                 v_obj.insert("operator".to_string(), json!(op));
+                                            } else {
+                                                op = v_obj.get("operator").and_then(|v| v.as_str()).unwrap_or(&op).to_string();
                                             }
+
                                             // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
                                             if let Some(exact_val) = prop_to_exact_val.get(k_trimmed) {
                                                 v_obj.insert("value".to_string(), json!(exact_val));
@@ -3560,6 +3593,26 @@ impl LogisModel {
                                                 "value": final_value
                                             });
                                         }
+
+                                        // 퍼지 변환 동일 적용
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            let actual_db_type = prop_types.get(k_trimmed).copied().unwrap_or("String");
+                                            if actual_db_type == "Number" {
+                                                let val_is_empty = v_obj.get("value").and_then(|v| v.as_str()).map_or(false, |s| s.trim().is_empty());
+                                                if val_is_empty && !prop_to_exact_val.contains_key(k_trimmed) {
+                                                    if op == "gt" || op == "gte" {
+                                                        v_obj.insert("operator".to_string(), json!("top"));
+                                                        v_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                        v_obj.insert("is_percent".to_string(), json!(true));
+                                                    } else if op == "lt" || op == "lte" {
+                                                        v_obj.insert("operator".to_string(), json!("bottom"));
+                                                        v_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                        v_obj.insert("is_percent".to_string(), json!(true));
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         structured_cond.insert(k_trimmed.to_string(), final_val_obj);
                                     }
                                 }
@@ -3569,7 +3622,7 @@ impl LogisModel {
                         // 🌟 [CRITICAL RECOVERY] LLM이 배열에서 특정 키를 통째로 누락(환각)시켰을 경우를 대비해, 
                         // Rust에서 명시적으로 찾아둔 숫자값(prop_to_exact_val)을 강제로 쑤셔 넣습니다.
                         for (k, exact_val) in &prop_to_exact_val {
-                            if k != "contains" && !structured_cond.contains_key(k) {
+                            if !structured_cond.contains_key(k) {
                                 let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
                                 structured_cond.insert(k.clone(), json!({
                                     "operator": op,
@@ -3647,9 +3700,16 @@ impl LogisModel {
                         continue;
                     }
 
-                    // 첫 번째 유효한 도메인 타입을 마스터로 고정
+                    // 첫 번째 유효한 도메인 타입을 마스터로 고정하되, 핵심 도메인(goods, order, tracking) 우선권 부여
                     if master_type.is_empty() {
                         master_type = seg_type.to_string();
+                    } else {
+                        let is_core_now = seg_type == "goods" || seg_type == "order" || seg_type == "tracking";
+                        let is_master_core = master_type == "goods" || master_type == "order" || master_type == "tracking";
+                        if is_core_now && !is_master_core {
+                            emit_term(&format!("    🔄 [MASTER TYPE] 부가 도메인({})에서 핵심 도메인({})으로 마스터 타입 승급!", master_type, seg_type));
+                            master_type = seg_type.to_string();
+                        }
                     }
                     
                     // 텍스트는 띄어쓰기로 이어 붙이되 중복 단어 제거
@@ -3689,7 +3749,7 @@ impl LogisModel {
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
                         for (k, v) in cond {
                             // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
-                            let is_empty = match v.get("value") {
+                            let mut is_empty = match v.get("value") {
                                 Some(serde_json::Value::String(s)) => s.trim().is_empty() || s == "null",
                                 Some(serde_json::Value::Null) => true,
                                 Some(serde_json::Value::Object(o)) => {
@@ -3697,6 +3757,13 @@ impl LogisModel {
                                 },
                                 _ => false,
                             };
+                            
+                            // 🌟 [CRITICAL FIX] top, bottom 연산자이거나 is_percent가 true인 경우 value가 비어있더라도 UI 표시를 위해 유효한 조건으로 인정합니다.
+                            if let Some(op) = v.get("operator").and_then(|o| o.as_str()) {
+                                if op == "top" || op == "bottom" {
+                                    is_empty = false;
+                                }
+                            }
                             
                             if !is_empty {
                                 master_condition.insert(k.clone(), v.clone());

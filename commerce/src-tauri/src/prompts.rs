@@ -450,8 +450,8 @@ You must extract, transform, and normalize numeric and property conditions from 
 [DATABASE METRICS CONTEXT]
 Metrics: {METRICS}
 - CRITICAL RULES FOR FUZZY ADJECTIVES (Translate from any language):
-  * If the query implies "many", "often", "popular", "best", or "high" without a specific number, map the operator to 'top' and set percent_total to 20.
-  * If the query implies "few", "rarely", "unpopular", "worst", or "low", map the operator to 'bottom' and set percent_total to 20.
+  * If the query implies "many", "often", "popular", "best", or "high" without a specific number, you MUST IGNORE the Vector Guide's operator and map the operator to 'top' and set percent_total to 20.
+  * If the query implies "few", "rarely", "unpopular", "worst", or "low" without a specific number, you MUST IGNORE the Vector Guide's operator and map the operator to 'bottom' and set percent_total to 20.
   * You MUST use the Metrics data to calculate the exact absolute threshold for these percentiles.
 
 [VECTOR MATCHING GUIDE (HINT)]

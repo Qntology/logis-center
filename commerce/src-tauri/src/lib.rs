@@ -473,6 +473,12 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
                 if let Some(val_val) = val_obj.get("value") {
                     // 🌟 [CRITICAL FIX] LLM이 "lt [Alts: lte, gte]" 처럼 쓰레기 값을 포함해서 주더라도 앞부분만 파싱하여 안전하게 추출 및 변환합니다.
                     let clean_op = op_str.trim().to_lowercase();
+                    
+                    // 🌟 [CRITICAL FIX] top, bottom, contains 연산자는 LanceDB 물리적 SQL 필터에서 지원하지 않으므로 무시하여 문법 에러(Crash)를 방지합니다. (UI에는 노출됨)
+                    if clean_op == "top" || clean_op == "bottom" || clean_op == "contains" || clean_op == "not_contains" {
+                        continue;
+                    }
+
                     let operator = if clean_op.starts_with("gte") { ">=" }
                     else if clean_op.starts_with("gt") { ">" }
                     else if clean_op.starts_with("lte") { "<=" }
@@ -865,27 +871,112 @@ async fn ai_search_complex(
                     "member" | "team" | "user" => "users",
                     "page" | "pages" => "pages",
                     "talk" => "talks",
-                    _ => "items", // Shipping, Commerce, Sales 등 모든 메인 문서는 items 테이블에 있습니다.
+                    "sales" | "goods" | "order" => "sales",
+                    "tracking" | "shipping" | "receiving" => "tracking",
+                    "event" | "coupon" | "review" => "event",
+                    _ => "items",
                 };
 
                 let sql_filter = convert_conditions_to_sql(ctx);
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 384]);
                 
-                
-                // 🌟 [CRITICAL FIX] 엔터(Deep Search) 시에는 도메인(search_mode)과 무관하게 무조건 FTS 엔진을 가동하도록 true로 강제합니다.
-                // 프론트엔드에서는 타이핑 중(Live Search)일 때만 false로 넘겨서 ILIKE 부분 검색을 수행하게 됩니다.
                 let use_fts = true; 
                 let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone(), use_fts).await;
                 
                 let final_results = match search_result {
                     Ok(res) => res,
                     Err(_) => {
-                        store.search_items(target_table, text, emb, 5, 0, None, use_fts).await.unwrap_or_default()
+                        store.search_items(target_table, text, emb.clone(), 5, 0, None, use_fts).await.unwrap_or_default()
                     }
                 };
 
                 for (id, content, score) in final_results {
-                    all_results.push(json!({ "id": id, "text": content, "score": score, "context_type": ctx_type }));
+                    // 결과 배열 내 중복 방어
+                    let is_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&id));
+                    if !is_dup {
+                        all_results.push(json!({ "id": id.clone(), "text": content.clone(), "score": score, "context_type": ctx_type, "relation": "primary" }));
+                    }
+
+                    // 🌟 [N:N 양방향 관계형 교차 검색 로직]
+                    if let Ok(json_content) = serde_json::from_str::<serde_json::Value>(&content) {
+                        // 🌟 [CRITICAL FIX] scheduler.rs에서 index는 숫자(Number)로 저장되므로 안전하게 String으로 변환합니다.
+                        let self_index = match json_content.get("index") {
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                            _ => String::new(),
+                        };
+                        let commerce_tables = vec!["sales", "tracking", "event", "items"];
+                        
+                        // 1. 정방향 쿼리 (Forward Propagation)
+                        // 현재 도출된 아이템의 index 값을 참조하고 있는 타 도메인(이벤트, 리뷰, 배송 등) 데이터 강제 추출
+                        if !self_index.is_empty() {
+                            for tbl in &commerce_tables {
+                                if *tbl != target_table {
+                                    // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
+                                    let rel_filter = format!("data LIKE '%{}%'", self_index);
+                                    if let Ok(rel_results) = store.search_items(tbl, text, emb.clone(), 2, 0, Some(rel_filter), false).await {
+                                        for (r_id, r_content, r_score) in rel_results {
+                                            let is_r_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&r_id));
+                                            if !is_r_dup {
+                                                all_results.push(json!({ "id": r_id, "text": r_content, "score": r_score * 0.9, "context_type": tbl, "relation": "forward" }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. 역방향 쿼리 (Backward Propagation)
+                        // 현재 도출된 데이터 내부에 타 도메인의 index나 id가 존재하면 그 외부 데이터를 역으로 다시 찾음
+                        // 🌟 [CRITICAL FIX] scheduler.rs가 실제로 삽입하는 속성 키들로 완벽 교체
+                        let ref_keys = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
+                        for key in ref_keys {
+                            // 🌟 [CRITICAL FIX] scheduler.rs에서 goods, order 등은 index_val(숫자)로 매핑되므로 Number 변환 필수
+                            let ref_val = match json_content.get(key) {
+                                Some(serde_json::Value::String(s)) => s.clone(),
+                                Some(serde_json::Value::Number(n)) => n.to_string(),
+                                _ => String::new(),
+                            };
+
+                            if !ref_val.is_empty() {
+                                for tbl in &commerce_tables {
+                                    // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
+                                    let bwd_filter = format!("data LIKE '%{}%'", ref_val);
+                                    if let Ok(bwd_results) = store.search_items(tbl, text, emb.clone(), 2, 0, Some(bwd_filter), false).await {
+                                        for (b_id, b_content, b_score) in bwd_results {
+                                            let is_b_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&b_id));
+                                            if !is_b_dup {
+                                                all_results.push(json!({ "id": b_id.clone(), "text": b_content.clone(), "score": b_score * 0.85, "context_type": tbl, "relation": "backward" }));
+                                                
+                                                // 3. 역방향으로 획득한 상위 데이터에서 한번 더 정방향 하위 연관(N:N) 시도 (2 Depth 체이닝)
+                                                if let Ok(b_json) = serde_json::from_str::<serde_json::Value>(&b_content) {
+                                                    // 🌟 [CRITICAL FIX] 2 Depth 체이닝 시에도 숫자형 index 방어 추가
+                                                    let b_index = match b_json.get("index") {
+                                                        Some(serde_json::Value::String(s)) => s.clone(),
+                                                        Some(serde_json::Value::Number(n)) => n.to_string(),
+                                                        _ => String::new(),
+                                                    };
+                                                    
+                                                    if !b_index.is_empty() {
+                                                        // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
+                                                        let depth2_filter = format!("data LIKE '%{}%'", b_index);
+                                                        if let Ok(d2_results) = store.search_items("items", text, emb.clone(), 1, 0, Some(depth2_filter), false).await {
+                                                            for (d2_id, d2_content, d2_score) in d2_results {
+                                                                let is_d2_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&d2_id));
+                                                                if !is_d2_dup {
+                                                                    all_results.push(json!({ "id": d2_id, "text": d2_content, "score": d2_score * 0.8, "context_type": "items", "relation": "backward_chained" }));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
