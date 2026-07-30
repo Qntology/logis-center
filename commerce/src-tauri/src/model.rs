@@ -3206,14 +3206,7 @@ impl LogisModel {
                         final_op = best_op.clone();
 
                         // 숫자 값 100% 원본 추출 (소수점 포함)
-                        let numeric_chars: String = combined_chunk.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
-                        
-                        // 청크에 숫자가 안 담겼을 경우를 대비해 전체 텍스트(current_text)도 참조하여 확실하게 잡아냅니다.
-                        let final_numeric = if numeric_chars.is_empty() {
-                            current_text.chars().filter(|c| c.is_digit(10) || *c == '.').collect()
-                        } else {
-                            numeric_chars
-                        };
+                        let final_numeric: String = combined_chunk.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
 
                         if !final_numeric.is_empty() {
                             prop_to_exact_val.insert(k.clone(), final_numeric);
@@ -3245,37 +3238,39 @@ impl LogisModel {
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
 
-                // // Qwen3로 2차 매핑 검증
-                // if !prop_to_op.is_empty() {
-                //     emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
-                //     self.ensure_qwen3().await?;
+                // Qwen3로 2차 매핑 검증
+                if !prop_to_op.is_empty() {
+                     emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
+                     self.ensure_qwen3().await?;
                     
-                //     // 속성별 operator 검증
-                //     let mut validated_prop_to_op = prop_to_op.clone();
-                //     for (prop, op) in &prop_to_op {
-                //         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                //             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
-                //             return Ok(json!({ "context": [], "cancelled": true }));
-                //         }
+                     // 속성별 operator 검증
+                     let mut validated_prop_to_op = prop_to_op.clone();
+                     for (prop, op) in &prop_to_op {
+                         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                             return Ok(json!({ "context": [], "cancelled": true }));
+                         }
                         
-                //         let prompt = crate::prompts::verify_operator_mapping_prompt(prop, op);
+                         let prompt = crate::prompts::verify_operator_mapping_prompt(&current_text, prop, op);
                         
-                //         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
-                //             if let Ok(result) = serde_json::from_str::<Value>(&response) {
-                //                 if !result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
-                //                     if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
-                //                         emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
-                //                         validated_prop_to_op.insert(prop.clone(), suggested.to_string());
-                //                     }
-                //                 } else {
-                //                     emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
-                //                 }
-                //             }
-                //         }
-                //     }
+                         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                                 if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
+                                     if suggested != op {
+                                         emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
+                                         validated_prop_to_op.insert(prop.clone(), suggested.to_string());
+                                     } else {
+                                         emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                                     }
+                                 } else {
+                                     emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                                 }
+                             }
+                         }
+                     }
                     
-                //     prop_to_op = validated_prop_to_op;
-                // }
+                     prop_to_op = validated_prop_to_op;
+                }
                 
                 // Vector-based Time/Season Guide 조립
                 let mut llm_temporal_guide = String::new();
@@ -3574,7 +3569,7 @@ impl LogisModel {
                         // 🌟 [CRITICAL RECOVERY] LLM이 배열에서 특정 키를 통째로 누락(환각)시켰을 경우를 대비해, 
                         // Rust에서 명시적으로 찾아둔 숫자값(prop_to_exact_val)을 강제로 쑤셔 넣습니다.
                         for (k, exact_val) in &prop_to_exact_val {
-                            if !structured_cond.contains_key(k) {
+                            if k != "contains" && !structured_cond.contains_key(k) {
                                 let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
                                 structured_cond.insert(k.clone(), json!({
                                     "operator": op,

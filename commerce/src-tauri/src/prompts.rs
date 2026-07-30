@@ -892,7 +892,7 @@ Instructions:
             .replace("{CANDIDATES}", &cands_str)
 }
 
-pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String {
+pub fn verify_operator_mapping_prompt(text: &str, property: &str, operator: &str) -> String {
     let valid_ops: Vec<String> = crate::parsing::BIAS_DICT
         .get("operators")
         .and_then(|v| v.as_object())
@@ -906,7 +906,8 @@ pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String 
     let valid_ops_str = valid_ops.join(", ");
 
     let template = r###"[TASK]
-For the property '{PROPERTY}' with current operator '{OPERATOR}', suggest the most correct operator.
+Given the text "{TEXT}", the property '{PROPERTY}' currently has the operator '{OPERATOR}'.
+Suggest the most correct operator based on the context of the text.
 If the current operator is already correct, just return it.
 Valid operators: {VALID_OPS}
 
@@ -915,7 +916,8 @@ Valid operators: {VALID_OPS}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
-    template.replace("{PROPERTY}", property)
+    template.replace("{TEXT}", text)
+            .replace("{PROPERTY}", property)
             .replace("{OPERATOR}", operator)
             .replace("{VALID_OPS}", &valid_ops_str)
 }
