@@ -912,9 +912,8 @@ async fn ai_search_complex(
                         if !self_index.is_empty() {
                             for tbl in &commerce_tables {
                                 if *tbl != target_table {
-                                    // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
-                                    let rel_filter = format!("data LIKE '%{}%'", self_index);
-                                    if let Ok(rel_results) = store.search_items(tbl, text, emb.clone(), 2, 0, Some(rel_filter), false).await {
+                                    // 🌟 [최적화] 느린 LIKE 스캔 대신 초고속 FTS(역인덱스)로 교체하고, 벡터 검색(emb)을 배제하여 정확한 식별자 매칭(eq 유사)을 유도합니다.
+                                    if let Ok(rel_results) = store.search_items(tbl, &self_index, vec![0.0; 384], 2, 0, None, true).await {
                                         for (r_id, r_content, r_score) in rel_results {
                                             let is_r_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&r_id));
                                             if !is_r_dup {
@@ -940,9 +939,8 @@ async fn ai_search_complex(
 
                             if !ref_val.is_empty() {
                                 for tbl in &commerce_tables {
-                                    // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
-                                    let bwd_filter = format!("data LIKE '%{}%'", ref_val);
-                                    if let Ok(bwd_results) = store.search_items(tbl, text, emb.clone(), 2, 0, Some(bwd_filter), false).await {
+                                    // 🌟 [최적화] 역방향 탐색도 LIKE 스캔 대신 초고속 FTS(역인덱스)로 교체합니다.
+                                    if let Ok(bwd_results) = store.search_items(tbl, &ref_val, vec![0.0; 384], 2, 0, None, true).await {
                                         for (b_id, b_content, b_score) in bwd_results {
                                             let is_b_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&b_id));
                                             if !is_b_dup {
@@ -958,9 +956,8 @@ async fn ai_search_complex(
                                                     };
                                                     
                                                     if !b_index.is_empty() {
-                                                        // 🌟 [CRITICAL FIX] DB 컬럼명 'data' 적용
-                                                        let depth2_filter = format!("data LIKE '%{}%'", b_index);
-                                                        if let Ok(d2_results) = store.search_items("items", text, emb.clone(), 1, 0, Some(depth2_filter), false).await {
+                                                        // 🌟 [최적화] 2 Depth 탐색도 LIKE 스캔 대신 FTS로 교체하여 부하 최소화
+                                                        if let Ok(d2_results) = store.search_items("items", &b_index, vec![0.0; 384], 1, 0, None, true).await {
                                                             for (d2_id, d2_content, d2_score) in d2_results {
                                                                 let is_d2_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&d2_id));
                                                                 if !is_d2_dup {
