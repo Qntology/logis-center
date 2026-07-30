@@ -919,3 +919,36 @@ Valid operators: {VALID_OPS}
             .replace("{OPERATOR}", operator)
             .replace("{VALID_OPS}", &valid_ops_str)
 }
+
+pub fn verify_category_with_alternatives_prompt(
+    text: &str,
+    first_choice: &str,
+    first_score: f32,
+    alternatives: &[String],
+) -> String {
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for prop in alternatives.iter() {
+        if prop != first_choice {
+            cands_str.push_str(&format!("- \"{}\"\n", prop));
+        }
+    }
+
+    let template = r###"[TASK]
+Text: "{TEXT}"
+
+[CANDIDATE CATEGORIES]
+{CANDIDATES}
+
+Instructions:
+1. Evaluate all [CANDIDATE CATEGORIES] equally based on the text.
+2. Choose the category that best matches the text context.
+3. Return the best-fitting category as "suggested_category".
+
+[OUTPUT FORMAT]
+{"suggested_category": "String"}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{TEXT}", text)
+            .replace("{CANDIDATES}", &cands_str)
+}

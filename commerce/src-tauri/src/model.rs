@@ -1731,11 +1731,13 @@ impl LogisModel {
         // ----------------------------------------------------
         // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
         // ----------------------------------------------------
-        emit_term("[STAGE-1] Loading Embedding Model for Semantic Chunking...");
+        emit_term("[STAGE-1] Loading Models (Embedding & Qwen3) for Commerce Pipeline...");
         let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Segmenting semantic intents...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::scheduler::log_task_progress(app_handle, task_id, &payload);
 
+        // 🌟 [최적화] 파이프라인 중간에 모델을 교체하며 발생하는 Ping-Pong 로드를 방지하기 위해, 최초에 Qwen3와 Embedding 모델을 한 번에 모두 로드합니다.
+        self.ensure_qwen3().await?;
         self.ensure_embedding().await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
@@ -2583,7 +2585,20 @@ impl LogisModel {
             }
 
             // 4. 최종 조립된 결과를 배열에 삽입
-            for (start, end, best_cat, context_score, mut intersecting) in final_bounds {
+            let mut needs_category_llm = false;
+            for (_, _, _, _, intersecting) in &final_bounds {
+                if intersecting.len() > 1 {
+                    needs_category_llm = true;
+                    break;
+                }
+            }
+            
+            if needs_category_llm {
+                emit_term("    🧠 [QWEN3 VERIFICATION (STAGE-1)] Verifying domain categories...");
+                // 이미 최초에 로드되었으므로 생략
+            }
+
+            for (start, end, mut best_cat, context_score, mut intersecting) in final_bounds {
                 let final_text = words[start..end].join(" ");
                 
                 // 🌟 types 배열에 best_cat이 무조건 포함되도록 보장하고 중복 제거
@@ -2593,6 +2608,26 @@ impl LogisModel {
                 intersecting.sort();
                 intersecting.dedup();
                 
+                // 🌟 [추가] Qwen3를 이용한 카테고리(Type) 확정 로직
+                if intersecting.len() > 1 {
+                    let prompt = crate::prompts::verify_category_with_alternatives_prompt(
+                        &final_text, &best_cat, context_score, &intersecting
+                    );
+                    
+                    if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                        if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                            if let Some(suggested) = result.get("suggested_category").and_then(|v| v.as_str()) {
+                                if intersecting.contains(&suggested.to_string()) && best_cat != suggested {
+                                    emit_term(&format!("      🔄 Category corrected/confirmed from [{}] to [{}] for '{}'", best_cat, suggested, final_text));
+                                    best_cat = suggested.to_string();
+                                } else {
+                                    emit_term(&format!("      ✅ Category [{}] confirmed for '{}'", best_cat, final_text));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", intersecting, final_text, context_score));
 
                 context_arr.push(json!({
@@ -2992,8 +3027,7 @@ impl LogisModel {
                     }
                     
                     if needs_llm {
-                        // Qwen3 로드 (검증이 필요한 항목이 하나라도 있을 때만 LLM을 올림)
-                        self.ensure_qwen3().await?;
+                        // 이미 최초에 로드되었으므로 생략
                     }
                     
                     // plinko_matches의 각 항목을 Qwen3로 검증 (2순위 속성까지 LLM에 제공)
@@ -3236,8 +3270,8 @@ impl LogisModel {
 
                 emit_term(&format!("\n  🎯 [FINAL VECTOR GUIDE FOR LLM] \n{}", fragments_text.trim()));
 
-                // 🌟 [VRAM/RAM 최적화] 임베딩 연산(벡터 매칭)이 모두 끝났으므로 LLM 추론을 시작하기 전에 명시적으로 해제합니다.
-                self.unload_embedding().await;
+                // 🌟 [VRAM 최적화 수정] 루프 안에서 임베딩 모델을 언로드하면 다음 세그먼트에서 다시 로드하는 Ping-Pong이 발생하므로 삭제합니다.
+                // 파이프라인이 모두 종료된 후 마지막에 일괄적으로 deep_purge_resources를 통해 해제합니다.
 
                 let mut deterministic_json = None;
                 let mut llm_temporal_guide = String::new();
@@ -3247,8 +3281,7 @@ impl LogisModel {
                     let now = chrono::Local::now();
                     let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
 
-                    // 🌟 [CRITICAL FIX] Qwen3 모델을 먼저 로드합니다.
-                    self.ensure_qwen3().await?;
+                    // 이미 최초에 Qwen3를 로드했으므로 ensure_qwen3() 호출 생략
 
                     // 🌟 [QWEN3 VERIFICATION: TIME & SEASON] Plinko에서 대충 잡힌 시간/시즌을 LLM으로 2차 검증하여 환각을 원천 차단합니다.
                     let mut verified_time = String::new();
