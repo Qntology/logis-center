@@ -3020,22 +3020,7 @@ impl LogisModel {
                         // Qwen3 호출
                         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
-                                if result.get("correct").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    // 기존 로직과 함께 suggested_properties 도 확인
-                                    let mut final_props = vec![pm.best_prop.clone()];
-                                    if let Some(arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
-                                        if !arr.is_empty() {
-                                            final_props.clear();
-                                            for p in arr {
-                                                if let Some(s) = p.as_str() { final_props.push(s.to_string()); }
-                                            }
-                                        }
-                                    }
-                                    emit_term(&format!("      ✅ Property {:?} confirmed for '{}'", final_props, pm.chunk));
-                                    for prop in final_props {
-                                        validated_map.entry(prop).or_insert_with(Vec::new).push(pm.chunk.clone());
-                                    }
-                                } else if let Some(suggested_arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
+                                if let Some(suggested_arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
                                     let mut suggested_list = Vec::new();
                                     for s in suggested_arr {
                                         if let Some(s_str) = s.as_str() {
@@ -3043,9 +3028,13 @@ impl LogisModel {
                                             suggested_list.push(s_str.to_string());
                                         }
                                     }
-                                    emit_term(&format!("      🔄 Property [{}] corrected to {:?} for '{}'", pm.best_prop, suggested_list, pm.chunk));
+                                    if !suggested_list.is_empty() {
+                                        emit_term(&format!("      🔄 Property [{}] corrected/confirmed as {:?} for '{}'", pm.best_prop, suggested_list, pm.chunk));
+                                    } else {
+                                        validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());
+                                    }
                                 } else if let Some(suggested) = result.get("suggested_property").and_then(|v| v.as_str()) {
-                                    emit_term(&format!("      🔄 Property [{}] corrected to [{}] for '{}'", pm.best_prop, suggested, pm.chunk));
+                                    emit_term(&format!("      🔄 Property [{}] corrected/confirmed as [{}] for '{}'", pm.best_prop, suggested, pm.chunk));
                                     validated_map.entry(suggested.to_string()).or_insert_with(Vec::new).push(pm.chunk.clone());
                                 } else {
                                     validated_map.entry(pm.best_prop.clone()).or_insert_with(Vec::new).push(pm.chunk.clone());

@@ -344,9 +344,9 @@ pub fn extract_time_intent_prompt(text: &str, time_context: &str, first_choice: 
 
     let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
 
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
@@ -361,13 +361,14 @@ You MUST strictly choose ONLY from the provided array. If none logically apply, 
 
 [TEXT TO ANALYZE]
 Text: "{TEXT}"
-First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE INTENTS]
+{CANDIDATES}
 
 [INSTRUCTIONS]
-1. If the 'First choice' is semantically correct for this text, return it.
-2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
-3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [AVAILABLE TIME INTENTS] array, or return "" if it's not a time filter.
+1. STRICT RULE: You MUST return "" (empty string) if the Text DOES NOT explicitly contain temporal words. Do NOT guess or infer time based on context.
+2. Evaluate all [CANDIDATE INTENTS] equally. If one of them matches the explicit text perfectly, return it.
+3. If none of the candidates match, but the text explicitly mentions time, choose the best fit from [AVAILABLE TIME INTENTS]. Otherwise, return "".
 
 [OUTPUT FORMAT]
 {
@@ -379,9 +380,7 @@ First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
     template.replace("{TIME_CONTEXT}", time_context)
             .replace("{TIME_ARRAY}", &time_arr_str)
             .replace("{TEXT}", text)
-            .replace("{FIRST}", first_choice)
-            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{ALTERNATIVES}", &alt_str)
+            .replace("{CANDIDATES}", &cands_str)
 }
 
 pub fn extract_season_intent_prompt(text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
@@ -396,9 +395,9 @@ pub fn extract_season_intent_prompt(text: &str, first_choice: &str, first_score:
 
     let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
 
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
@@ -410,13 +409,14 @@ You MUST strictly choose ONLY from the provided array. If none logically apply, 
 
 [TEXT TO ANALYZE]
 Text: "{TEXT}"
-First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE INTENTS]
+{CANDIDATES}
 
 [INSTRUCTIONS]
-1. If the 'First choice' is semantically correct for this text, return it.
-2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
-3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [AVAILABLE SEASON INTENTS] array, or return "" if it's not a season filter.
+1. STRICT RULE: You MUST return "" (empty string) if the Text DOES NOT explicitly contain season-related words. Do NOT guess the season just because it's a specific clothing or item name.
+2. Evaluate all [CANDIDATE INTENTS] equally. If one of them matches the explicit text perfectly, return it.
+3. If none of the candidates match, but the text explicitly mentions a season, choose the best fit from [AVAILABLE SEASON INTENTS]. Otherwise, return "".
 
 [OUTPUT FORMAT]
 {
@@ -427,9 +427,7 @@ First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
 
     template.replace("{SEASON_ARRAY}", &season_arr_str)
             .replace("{TEXT}", text)
-            .replace("{FIRST}", first_choice)
-            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{ALTERNATIVES}", &alt_str)
+            .replace("{CANDIDATES}", &cands_str)
 }
 
 pub fn extract_numeric_conditions(current: &str, seg_type: &str, metrics_json: &str, vector_guide: &str, time_context: &str, lang: &str, value_type: &str) -> String {
@@ -561,9 +559,9 @@ pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, first_ch
 * '': If none logically apply."#,
     };
 
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
@@ -576,13 +574,14 @@ You MUST strictly choose ONLY from the provided array. If none logically apply, 
 
 [TEXT TO ANALYZE]
 Text: "{TEXT}"
-First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE INTENTS]
+{CANDIDATES}
 
 [INSTRUCTIONS]
-1. If the 'First choice' is semantically correct for this text, return it.
-2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
-3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a status filter.
+1. Evaluate all [CANDIDATE INTENTS] equally. If one of them is semantically correct for this text, return it.
+2. If none of the candidates match, but the text explicitly dictates a status state, choose a valid intent from the [SCHEMA DEFINITIONS] array.
+3. Otherwise, return "".
 
 [OUTPUT FORMAT]
 {
@@ -594,9 +593,7 @@ First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
     template
         .replace("{STATUS_OPTIONS}", status_options)
         .replace("{TEXT}", current_text)
-        .replace("{FIRST}", first_choice)
-        .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-        .replace("{ALTERNATIVES}", &alt_str)
+        .replace("{CANDIDATES}", &cands_str)
 }
 
 // 🌟 [추가] scheduler.rs 전용 3개 인자 레거시 함수
@@ -694,9 +691,9 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 }
 
 pub fn extract_substantial_intent_prompt(current_text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
@@ -721,13 +718,14 @@ You MUST strictly choose ONLY from the provided array. If none logically apply, 
 
 [TEXT TO ANALYZE]
 Text: "{TEXT}"
-First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE INTENTS]
+{CANDIDATES}
 
 [INSTRUCTIONS]
-1. If the 'First choice' is semantically correct for this text, return it.
-2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
-3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a substantial filter.
+1. Evaluate all [CANDIDATE INTENTS] equally. If one of them is semantically correct for this text, return it.
+2. If none of the candidates match, but the text explicitly dictates a substantial state, choose a valid intent from the [SCHEMA DEFINITIONS] array.
+3. Otherwise, return "".
 
 [OUTPUT FORMAT]
 {
@@ -737,15 +735,13 @@ First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{TEXT}", current_text)
-            .replace("{FIRST}", first_choice)
-            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{ALTERNATIVES}", &alt_str)
+            .replace("{CANDIDATES}", &cands_str)
 }
 
 pub fn extract_find_intent_prompt(current_text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
@@ -764,13 +760,14 @@ You MUST strictly choose ONLY from the provided array. If none logically apply, 
 
 [TEXT TO ANALYZE]
 Text: "{TEXT}"
-First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE INTENTS]
+{CANDIDATES}
 
 [INSTRUCTIONS]
-1. If the 'First choice' is semantically correct for this text, return it.
-2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
-3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a find filter.
+1. Evaluate all [CANDIDATE INTENTS] equally. If one of them is semantically correct for this text, return it.
+2. If none of the candidates match, but the text explicitly dictates a find state, choose a valid intent from the [SCHEMA DEFINITIONS] array.
+3. Otherwise, return "".
 
 [OUTPUT FORMAT]
 {
@@ -780,9 +777,7 @@ First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{TEXT}", current_text)
-            .replace("{FIRST}", first_choice)
-            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{ALTERNATIVES}", &alt_str)
+            .replace("{CANDIDATES}", &cands_str)
 }
 
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
@@ -854,11 +849,11 @@ Description: {FIELD_DESC}
 
 pub fn verify_property_mapping_prompt(text: &str, property: &str) -> String {
     let template = r###"[TASK]
-Given the text '{TEXT}' and the property '{PROPERTY}', determine if this property is correct.
-If not, suggest the correct property name from the schema.
+Given the text '{TEXT}' and the current property '{PROPERTY}', suggest the most accurate property name(s) from the schema.
+If the current property is already correct, just return it in the array.
 
 [OUTPUT FORMAT]
-{"correct": Boolean, "suggested_properties": ["String", "String"]}
+{"suggested_properties": ["String", "String"]}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -872,29 +867,29 @@ pub fn verify_property_with_alternatives_prompt(
     first_score: f32,
     alternatives: &[(String, f32)],
 ) -> String {
-    let mut alt_str = String::new();
-    for (i, (prop, score)) in alternatives.iter().enumerate() {
-        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    let mut cands_str = format!("- \"{}\" (Vector Score: {:.4})\n", first_choice, first_score);
+    for (prop, score) in alternatives.iter() {
+        cands_str.push_str(&format!("- \"{}\" (Vector Score: {:.4})\n", prop, score));
     }
 
     let template = r###"[TASK]
 Text: "{TEXT}"
-First choice: "{FIRST}" (score: {FIRST_SCORE})
-{ALTERNATIVES}
+
+[CANDIDATE PROPERTIES]
+{CANDIDATES}
+
 Instructions:
-1. If the first choice is correct for this text, set "correct": true and "suggested_property": "{FIRST}".
-2. If the first choice is wrong, evaluate the Alternative choices in order. If one of them is correct, set "correct": false and "suggested_property": "<the correct alternative>".
-3. If neither the first choice nor any alternatives are correct, set "correct": false and suggest a different property from the schema.
+1. Evaluate all [CANDIDATE PROPERTIES] equally based on the text.
+2. Return the best-fitting property as "suggested_property".
+3. If none of the candidates are correct, suggest a completely different property from the schema.
 
 [OUTPUT FORMAT]
-{"correct": Boolean, "suggested_property": String}
+{"suggested_property": "String"}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{TEXT}", text)
-            .replace("{FIRST}", first_choice)
-            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
-            .replace("{ALTERNATIVES}", &alt_str)
+            .replace("{CANDIDATES}", &cands_str)
 }
 
 pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String {
@@ -911,11 +906,12 @@ pub fn verify_operator_mapping_prompt(property: &str, operator: &str) -> String 
     let valid_ops_str = valid_ops.join(", ");
 
     let template = r###"[TASK]
-For the property '{PROPERTY}' with current operator '{OPERATOR}', is this operator correct?
+For the property '{PROPERTY}' with current operator '{OPERATOR}', suggest the most correct operator.
+If the current operator is already correct, just return it.
 Valid operators: {VALID_OPS}
 
 [OUTPUT FORMAT]
-{"correct": Boolean, "suggested_operator": String}
+{"suggested_operator": "String"}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
