@@ -457,7 +457,9 @@ Metrics: {METRICS}
   * You MUST use the Metrics data to calculate the exact absolute threshold for these percentiles.
 
 [VECTOR MATCHING GUIDE (HINT)]
-The system has pre-calculated vector similarities for properties, operators, and metric types. Use this as a strong guide, but correct it if it semantically makes no sense:
+The system has pre-calculated vector similarities for properties, operators, and metric types, including 1st choices and Alternatives.
+- If the 1st choice operator/metric makes semantic sense, use it.
+- If the 1st choice is wrong, consider the Alternatives provided.
 - Metric Type gives a crucial hint about the data (date, time, price, discount, quantity, ratio). 
 - If Metric Type is 'ratio', extract a percentage logic. If 'date', extract a date logic, etc.
 - TEMPORAL & SEASON CORRECTION RULES:
@@ -494,7 +496,111 @@ condition:
             .replace("{TIME_CONTEXT}", &final_time_context)
             .replace("{VALUE_TYPE}", value_type)
 }
-pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
+pub fn extract_status_intent_prompt(current_text: &str, seg_type: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
+    let status_options = match seg_type {
+        "tracking" => r#"* 'draft': Shipment preparation or pending pickup.
+* 'progress': Currently in transit or out for delivery.
+* 'return': Returning to sender.
+* 'complete': Successfully delivered to the recipient.
+* '': If none logically apply."#,
+
+        "goods" => r#"* 'draft': Product is being created, not yet published.
+* 'show': Visible and available for sale on storefront.
+* 'hide': Hidden from the storefront.
+* 'progress': Currently being restocked or updated.
+* 'stop': Sales temporarily suspended.
+* 'cancel': Product discontinued or cancelled.
+* 'refund': Related to refunded inventory.
+* 'return': Related to returned inventory.
+* 'exchange': Related to exchanged inventory.
+* 'expire': Product expired.
+* 'complete': Completely sold out or finished lifecycle.
+* '': If none logically apply."#,
+
+        "order" => r#"* 'draft': Pending payment or in cart.
+* 'progress': Order processing or preparing for shipment.
+* 'stop': Order on hold.
+* 'cancel': Order cancelled before fulfillment.
+* 'refund': Payment refunded.
+* 'return': Items returned by customer.
+* 'exchange': Items being exchanged.
+* 'expire': Payment window expired.
+* 'complete': Order fully fulfilled and closed.
+* '': If none logically apply."#,
+
+        "coupon" | "event" => r#"* 'show': Visible to customers.
+* 'progress': Currently active and running.
+* 'hide': Hidden from customers.
+* 'stop': Temporarily paused.
+* 'cancel': Terminated early.
+* 'expire': Passed its expiration date.
+* 'complete': Successfully finished its run.
+* '': If none logically apply."#,
+
+        "review" => r#"* 'progress': Under moderation or pending approval.
+* 'stop': Blocked or suspended review.
+* 'cancel': Deleted or withdrawn by user.
+* 'refund': Associated with a refunded order.
+* 'return': Associated with a returned order.
+* 'exchange': Associated with an exchanged order.
+* 'expire': Review period expired.
+* 'complete': Published and visible.
+* '': If none logically apply."#,
+
+        _ => r#"* 'show': Visible state.
+* 'progress': Active/Processing state.
+* 'remove': Deleted state.
+* 'hide': Hidden state.
+* 'stop': Paused/Stopped state.
+* 'cancel': Cancelled state.
+* 'refund': Refunded state.
+* 'return': Returned state.
+* 'exchange': Exchanged state.
+* 'expire': Expired state.
+* 'complete': Finished/Completed state.
+* '': If none logically apply."#,
+    };
+
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
+    let template = r###"[TASK]
+Analyze the given text and extract the exact semantic intent for status.
+You MUST strictly choose ONLY from the provided array. If none logically apply, return "". Do not invent any other values.
+
+[SCHEMA DEFINITIONS]
+- status: String. Choose one:
+{STATUS_OPTIONS}
+
+[TEXT TO ANALYZE]
+Text: "{TEXT}"
+First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
+{ALTERNATIVES}
+
+[INSTRUCTIONS]
+1. If the 'First choice' is semantically correct for this text, return it.
+2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
+3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a status filter.
+
+[OUTPUT FORMAT]
+{
+  "status": "String"
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template
+        .replace("{STATUS_OPTIONS}", status_options)
+        .replace("{TEXT}", current_text)
+        .replace("{FIRST}", first_choice)
+        .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+        .replace("{ALTERNATIVES}", &alt_str)
+}
+
+// 🌟 [추가] scheduler.rs 전용 3개 인자 레거시 함수
+pub fn extract_status_intent_legacy_prompt(current_text: &str, seg_type: &str, vector_guide: &str) -> String {
     let status_options = match seg_type {
         "tracking" => r#"* 'draft': Shipment preparation or pending pickup.
 * 'progress': Currently in transit or out for delivery.
@@ -576,7 +682,7 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
 
 [OUTPUT FORMAT]
 {
-  "status": String
+  "status": "String"
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
@@ -587,16 +693,15 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
         .replace("{VECTOR_GUIDE}", vector_guide)
 }
 
-pub fn extract_substantial_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+pub fn extract_substantial_intent_prompt(current_text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
     let template = r###"[TASK]
 Analyze the given text and extract the exact semantic intent for substantial.
-You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
-
-[VECTOR MATCHING GUIDE]
-{VECTOR_GUIDE}
-
-[TEXT TO ANALYZE]
-{TEXT}
+You MUST strictly choose ONLY from the provided array. If none logically apply, return "". Do not invent any other values.
 
 [SCHEMA DEFINITIONS]
 - substantial: String. Choose one:
@@ -614,27 +719,38 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
   * 'usage_per': Maximum number of times usable per user.
   * '': If none logically apply.
 
+[TEXT TO ANALYZE]
+Text: "{TEXT}"
+First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
+{ALTERNATIVES}
+
+[INSTRUCTIONS]
+1. If the 'First choice' is semantically correct for this text, return it.
+2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
+3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a substantial filter.
+
 [OUTPUT FORMAT]
 {
-  "substantial": String
+  "substantial": "String"
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{TEXT}", current_text)
-            .replace("{VECTOR_GUIDE}", vector_guide)
+            .replace("{FIRST}", first_choice)
+            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+            .replace("{ALTERNATIVES}", &alt_str)
 }
 
-pub fn extract_find_intent_prompt(current_text: &str, vector_guide: &str) -> String {
+pub fn extract_find_intent_prompt(current_text: &str, first_choice: &str, first_score: f32, alternatives: &[(String, f32)]) -> String {
+    let mut alt_str = String::new();
+    for (i, (prop, score)) in alternatives.iter().enumerate() {
+        alt_str.push_str(&format!("Alternative {}: \"{}\" (score: {:.4})\n", i + 1, prop, score));
+    }
+
     let template = r###"[TASK]
 Analyze the given text and extract the exact semantic intent for find.
-You MUST strictly choose ONLY from the provided array and use the Vector Matching Guide. Do not invent any other values.
-
-[VECTOR MATCHING GUIDE]
-{VECTOR_GUIDE}
-
-[TEXT TO ANALYZE]
-{TEXT}
+You MUST strictly choose ONLY from the provided array. If none logically apply, return "". Do not invent any other values.
 
 [SCHEMA DEFINITIONS]
 - find: String. Choose one:
@@ -646,15 +762,27 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
   * 'light': Low physical weight.
   * '': If none logically apply.
 
+[TEXT TO ANALYZE]
+Text: "{TEXT}"
+First choice (Vector Predicted): "{FIRST}" (score: {FIRST_SCORE})
+{ALTERNATIVES}
+
+[INSTRUCTIONS]
+1. If the 'First choice' is semantically correct for this text, return it.
+2. If the 'First choice' is wrong, evaluate the Alternative choices in order. If one is correct, return it.
+3. If neither the first choice nor any alternatives match the text, choose a valid intent from the [SCHEMA DEFINITIONS] array, or return "" if it's not a find filter.
+
 [OUTPUT FORMAT]
 {
-  "find": String
+  "find": "String"
 }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
     template.replace("{TEXT}", current_text)
-            .replace("{VECTOR_GUIDE}", vector_guide)
+            .replace("{FIRST}", first_choice)
+            .replace("{FIRST_SCORE}", &format!("{:.4}", first_score))
+            .replace("{ALTERNATIVES}", &alt_str)
 }
 
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {

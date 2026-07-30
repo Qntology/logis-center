@@ -3138,9 +3138,18 @@ impl LogisModel {
                     let best_op = local_filter_candidates.get("operators").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "eq".to_string());
                     let best_metric = local_filter_candidates.get("metrics").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "string".to_string());
                     
-                    if let Some(c) = local_filter_candidates.get("status_filters").and_then(|c| c.first()) { best_status_global = c.0.clone(); }
-                    if let Some(c) = local_filter_candidates.get("substantial_filters").and_then(|c| c.first()) { best_sub_global = c.0.clone(); }
-                    if let Some(c) = local_filter_candidates.get("find_filters").and_then(|c| c.first()) { best_find_global = c.0.clone(); }
+                    if let Some(cands) = local_filter_candidates.get("status_filters") {
+                        if let Some(c) = cands.first() { best_status_global = c.0.clone(); }
+                        filter_candidates.insert("status_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("substantial_filters") {
+                        if let Some(c) = cands.first() { best_sub_global = c.0.clone(); }
+                        filter_candidates.insert("substantial_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("find_filters") {
+                        if let Some(c) = cands.first() { best_find_global = c.0.clone(); }
+                        filter_candidates.insert("find_filters".to_string(), cands.clone());
+                    }
                     if let Some(cands) = local_filter_candidates.get("time_filters") {
                         if let Some(c) = cands.first() { best_time_global = c.0.clone(); }
                         filter_candidates.insert("time_filters".to_string(), cands.clone());
@@ -3170,7 +3179,15 @@ impl LogisModel {
 
                     prop_to_op.insert(k.clone(), final_op.clone());
 
-                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}], Metric Type [{}]", combined_chunk, k, final_op, final_metric);
+                    let mut op_alts = String::new();
+                    if final_op != "contains" { 
+                        if let Some(cands) = local_filter_candidates.get("operators") {
+                            let alts: Vec<String> = cands.iter().skip(1).take(2).map(|c| format!("{} ({:.2})", c.0, c.1)).collect();
+                            if !alts.is_empty() { op_alts = format!(" [Alts: {}]", alts.join(", ")); }
+                        }
+                    }
+
+                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}{}], Metric Type [{}]", combined_chunk, k, final_op, op_alts, final_metric);
                     emit_term(&format!("    🧲 {}", guide_log));
                     fragments_text.push_str(&format!("{}\n", guide_log));
                 }
@@ -3258,7 +3275,12 @@ impl LogisModel {
                             if let Ok(res_time) = self.call_qwen3_verification_model(&prompt_time, Some(cancel_token.clone())).await {
                                 let final_time_json = crate::parsing::parse_json_from_llm(&res_time);
                                 if let Some(t) = final_time_json.get("time_intent").and_then(|v| v.as_str()) {
-                                    if !t.is_empty() { verified_time = t.to_string(); }
+                                    if !t.is_empty() { 
+                                        verified_time = t.to_string(); 
+                                        emit_term(&format!("  🕒 [LLM-VERIFIED TIME] Time Intent explicitly confirmed as: '{}'", verified_time));
+                                    } else {
+                                        emit_term("  🕒 [LLM-VERIFIED TIME] Time Intent rejected (Empty).");
+                                    }
                                 }
                             }
                         }
@@ -3274,7 +3296,12 @@ impl LogisModel {
                             if let Ok(res_season) = self.call_qwen3_verification_model(&prompt_season, Some(cancel_token.clone())).await {
                                 let final_season_json = crate::parsing::parse_json_from_llm(&res_season);
                                 if let Some(s) = final_season_json.get("season_intent").and_then(|v| v.as_str()) {
-                                    if !s.is_empty() { verified_season = s.to_string(); }
+                                    if !s.is_empty() { 
+                                        verified_season = s.to_string(); 
+                                        emit_term(&format!("  🌤️ [LLM-VERIFIED SEASON] Season Intent explicitly confirmed as: '{}'", verified_season));
+                                    } else {
+                                        emit_term("  🌤️ [LLM-VERIFIED SEASON] Season Intent rejected (Empty).");
+                                    }
                                 }
                             }
                         }
@@ -3317,9 +3344,27 @@ impl LogisModel {
                     let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
                     
                     let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language, &value_type_str);
-                    let prompt_status = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &combined_guide);
-                    let prompt_substantial = crate::parsing::extract_substantial_intent_prompt(&current_text, &combined_guide);
-                    let prompt_find = crate::parsing::extract_find_intent_prompt(&current_text, &combined_guide);
+                    
+                    let prompt_status = if let Some(cands) = filter_candidates.get("status_filters").filter(|c| !c.is_empty()) {
+                        let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                        crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &cands[0].0, cands[0].1, &alternatives)
+                    } else {
+                        crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, "", 0.0, &[])
+                    };
+                    
+                    let prompt_substantial = if let Some(cands) = filter_candidates.get("substantial_filters").filter(|c| !c.is_empty()) {
+                        let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                        crate::parsing::extract_substantial_intent_prompt(&current_text, &cands[0].0, cands[0].1, &alternatives)
+                    } else {
+                        crate::parsing::extract_substantial_intent_prompt(&current_text, "", 0.0, &[])
+                    };
+
+                    let prompt_find = if let Some(cands) = filter_candidates.get("find_filters").filter(|c| !c.is_empty()) {
+                        let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                        crate::parsing::extract_find_intent_prompt(&current_text, &cands[0].0, cands[0].1, &alternatives)
+                    } else {
+                        crate::parsing::extract_find_intent_prompt(&current_text, "", 0.0, &[])
+                    };
 
                     // 🌟 [CRITICAL FIX] Qwen3 모델을 사용하여 메모리 사용량을 줄이고 통일화합니다.
                     self.ensure_qwen3().await?;

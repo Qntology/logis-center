@@ -2438,7 +2438,7 @@ async fn process_task(
                     let target_data_str = target_data_str.trim();
 
                     let task_question = if field_name.contains("status") {
-                        parsing::extract_status_intent_prompt(&targeted_pug, &page_type, &bias_target)
+                        parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
                     } else {
                         parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                     };
@@ -3254,7 +3254,7 @@ async fn process_task(
                 let target_data_str = target_data_str.trim();
 
                 let task_question = if field_name.contains("status") {
-                    parsing::extract_status_intent_prompt(&targeted_pug, &page_type, &bias_target)
+                    parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
                 } else {
                     parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                 };
