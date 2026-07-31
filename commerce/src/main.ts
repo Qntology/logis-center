@@ -9,6 +9,32 @@ import { item2html, selector } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
+// 🌟 [추가] 어디서든 데이터를 Dexie에 동기화할 수 있도록 전역 헬퍼로 승격
+const enrichForIndex = (docs: any[]) => docs.map(d => {
+    const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
+    return { 
+        ...d, 
+        no: parsed.no?.toString(), 
+        code: parsed.code?.toString(), 
+        tracking_number: parsed.tracking_number?.toString(), 
+        goods: parsed.goods?.toString(), 
+        order: parsed.order?.toString(), 
+        tracking: parsed.tracking?.toString(), 
+        stock_keeping_unit: parsed.stock_keeping_unit?.toString(), 
+        barcode: parsed.barcode?.toString(), 
+        index: parsed.index?.toString(),
+        status: d.status ?? parsed.status ?? 0,
+        amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
+        mode: d.mode ?? parsed.mode ?? 'commerce',
+        is_masked: d.is_masked ?? parsed.is_masked ?? false,
+        text: d.text ?? parsed.text ?? "",
+        masked_text: d.masked_text ?? parsed.masked_text ?? "",
+        created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
+        updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
+        data: parsed
+    };
+});
+
 // Access global libs
 const ethers = (window as any).ethers;
 const blockies = (window as any).blockies;
@@ -1769,33 +1795,6 @@ async function syncData() {
                 
                 const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r));
 
-                // 🌟 [Tauri Bridge -> Dexie] Rust에서 받은 최신 데이터를 로컬 Dexie DB에 일괄 동기화 (빠른 eq 쿼리 목적)
-                const enrichForIndex = (docs: any[]) => docs.map(d => {
-                    const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
-                    return { 
-                        ...d, 
-                        no: parsed.no?.toString(), 
-                        code: parsed.code?.toString(), 
-                        tracking_number: parsed.tracking_number?.toString(), 
-                        goods: parsed.goods?.toString(), 
-                        order: parsed.order?.toString(), 
-                        tracking: parsed.tracking?.toString(), 
-                        stock_keeping_unit: parsed.stock_keeping_unit?.toString(), 
-                        barcode: parsed.barcode?.toString(), 
-                        index: parsed.index?.toString(),
-                        // 🌟 [CRITICAL FIX] LanceDB의 물리적 컬럼 데이터를 Dexie 루트에 100% 동기화 (UI 및 인덱싱 보호)
-                        status: d.status ?? parsed.status ?? 0,
-                        amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
-                        mode: d.mode ?? parsed.mode ?? 'commerce',
-                        is_masked: d.is_masked ?? parsed.is_masked ?? false,
-                        text: d.text ?? parsed.text ?? "",
-                        masked_text: d.masked_text ?? parsed.masked_text ?? "",
-                        created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
-                        updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
-                        data: parsed
-                    };
-                });
-
                 if (newUsers.length > 0) await appDb.table("users").bulkPut(newUsers);
                 if (newPages.length > 0) await appDb.table("pages").bulkPut(newPages);
                 if (newItems.length > 0) await appDb.table("items").bulkPut(enrichForIndex(newItems));
@@ -2395,20 +2394,21 @@ listen("extraction-progress", async (event: any) => {
     if (isTerminal && payload.task_id) {
         console.log(`[QUEUE] Terminal state reached for ${payload.task_id}. Releasing and checking next.`);
         
-        // 🌟 [최종 교정] 전역 상태를 먼저 false로 변경해야 updateExtractButtonVisibility가 버튼을 그립니다.
+        // 🌟 [CRITICAL FIX] 검색 완료(Done) 시점에 isSearching을 미리 false로 풀면, openWidget("list") 내부에서 
+        // refreshList()가 발동하여 검색 결과를 전부 날려버리는 Race Condition이 발생합니다!
+        // 따라서 추출 상태(isExtracting)만 먼저 풀고, 검색 상태(isSearching)는 UI 렌더링이 100% 끝난 최하단에서 풉니다.
         if (payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) {
             isExtracting = false;
         } 
-        if (payload.task_id.startsWith("search_")) {
-            isSearching = false;
-        }
 
         // 🌟 큐 매니저 릴리즈 (비동기로 Dexie 업데이트 후 processNext 호출됨)
         await GlobalTaskManager.release(payload.task_id, payload.task_id);
         
-        // 🌟 버튼 UI 즉시 갱신 및 스피너 중단
-        stopSpinner();
-        updateExtractButtonVisibility();
+        // 🌟 버튼 UI 즉시 갱신 및 스피너 중단 (검색 모드가 아닐 때만 선반영)
+        if (!isSearching) {
+            stopSpinner();
+            updateExtractButtonVisibility();
+        }
         
         // 🌟 [추가] 에러이거나 취소된 경우 H3 복원
         if (payload.task_id.startsWith("search_") && payload.category !== "Done") {
@@ -2417,13 +2417,17 @@ listen("extraction-progress", async (event: any) => {
                  const count = document.querySelectorAll('#doc-list .logis-result').length;
                  resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
              }
+             // 에러나 취소 시에는 여기서 락을 해제합니다.
+             isSearching = false;
+             stopSpinner();
+             updateExtractButtonVisibility();
         }
 
         // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
             const response = payload.data; 
 
-            // 🌟 [추가] 검색 완료 시 자동으로 리스트 탭으로 화면을 전환하여 결과를 보여줍니다.
+            // 🌟 [CRITICAL FIX] isSearching = true 인 상태에서 탭을 전환해야 초기화(refreshList)가 방어됩니다!
             openWidget("list");
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
@@ -2448,6 +2452,8 @@ listen("extraction-progress", async (event: any) => {
                 resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
             }
 
+            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 원본 검색 결과 수: ${response.results ? response.results.length : 0}`);
+
             // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
             if (response.results && response.results.length > 0) {
                 if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
@@ -2455,29 +2461,38 @@ listen("extraction-progress", async (event: any) => {
                 let docs: any[] = [];
                 for (const res of response.results) {
                     try {
-                        // 백엔드에서 원본 문서를 가져와서 카드 렌더링에 적합하게 준비합니다.
-                        const fullDoc = await invoke<any>("get_document", { uuid: res.id });
-                        if (fullDoc) {
-                            if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
-                                try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
-                            }
-                            
-                            // 🌟 [CRITICAL FIX] 검색 결과를 기존 카드 템플릿(UI)에 반영하기 위해 데이터 덮어쓰기
-                            fullDoc.text = res.text || fullDoc.text;
-                            if (fullDoc.data) {
-                                fullDoc.data.search_score = res.score;
-                                fullDoc.data.search_context = res.context_type;
-                            }
-                            
-                            docs.push(fullDoc);
+                        // 🌟 [CRITICAL FIX] 백엔드가 이미 전체 JSON 데이터를 res.text에 담아 보냈으므로, 
+                        // 프론트엔드에서 get_document를 건건이 재호출(N+1 쿼리)하여 렌더링 병목(두 번 쿼리)이 발생하는 현상을 원천 차단합니다!
+                        let parsedData: any = {};
+                        try { parsedData = JSON.parse(res.text); } catch(e) {}
+                        
+                        let fullDoc: any = { 
+                            id: res.id, 
+                            uuid: res.id,
+                            type: parsedData.type || res.context_type || "unknown",
+                            data: parsedData,
+                            text: res.text,
+                            created_at: parsedData.created_at || 0,
+                            updated_at: parsedData.updated_at || 0
+                        };
+                        
+                        // 검색 점수 및 컨텍스트 병합
+                        if (fullDoc.data) {
+                            fullDoc.data.search_score = res.score;
+                            fullDoc.data.search_context = res.context_type;
                         }
+                        
+                        docs.push(fullDoc);
                     } catch (e) {
-                        console.error("Failed to fetch document for search result:", e);
+                        console.error("Failed to process search result:", e);
                     }
                 }
+                
+                console.log(`[SEARCH-DEBUG] 1차 파싱 완료. 기본 문서 수: ${docs.length}`);
 
                 // 🌟 [Dexie DB 기반 초고속 N:N 양방향 교차 검색 위임]
                 if (appDb && docs.length > 0) {
+                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay) 시작...`);
                     const relayDocs = new Map();
 
                     for (const doc of docs) {
@@ -2560,10 +2575,13 @@ listen("extraction-progress", async (event: any) => {
                         }
                     }
                     
+                    console.log(`[SEARCH-DEBUG] 연관 교차 검색으로 추가된 문서 수: ${relayDocs.size}`);
                     // 연관 문서들을 최종 화면 렌더링 배열에 병합
                     docs.push(...Array.from(relayDocs.values()));
                 }
                 
+                console.log(`[SEARCH-DEBUG] 화면에 렌더링될 최종 문서 수(docs.length): ${docs.length}`);
+
                 if (docs.length > 0) {
                     upsertListItems(docs, 'append');
                     hasMore = false; // 🌟 [CRITICAL FIX] AI 검색 결과는 단발성 고정 셋이므로 스크롤을 통한 전체 리스트 더 불러오기를 원천 차단합니다!
@@ -2575,7 +2593,15 @@ listen("extraction-progress", async (event: any) => {
                 if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
                 hasMore = false; // 🌟 결과가 없을 때도 추가 불러오기 방지
             }
+            
+            console.log(`[SEARCH-DEBUG] 렌더링 직후 H3 DOM 카운트 동기화 시도 (updateResultCount)`);
             updateResultCount(); // 🌟 카운트 갱신 반영
+            
+            // 🌟 [CRITICAL FIX] 검색 결과 DOM 렌더링이 완벽하게 끝난 이 시점에 드디어 락을 해제합니다!
+            isSearching = false;
+            stopSpinner();
+            updateExtractButtonVisibility();
+            console.log(`[SEARCH-DEBUG] 글로벌 락 해제 완료 (isSearching = false)`);
         }
     }
 
@@ -3753,6 +3779,20 @@ async function refreshList() {
 }
 
 async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
+    // 🌟 [CRITICAL FIX] AI 검색 중이거나 검색 결과가 화면에 고정된 상태에서는
+    // 백그라운드 자동 동기화(isSync)나 스크롤에 의한 일반 리스트 덮어쓰기가 난입하여 카운트가 23개 등으로 뻥튀기되는 경합(Race Condition)을 완벽 차단합니다!
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+    
+    if (isSearching || isShowingSearchResult) {
+        // 단, 사용자가 검색창을 지우고 강제 초기화(reset=true)를 요청한 경우는 정상 목록을 불러와야 하므로 예외 처리합니다.
+        if (reset && !isSearching) {
+            isLoading = false;
+        } else {
+            return;
+        }
+    }
+
     if (reset) {
         currentPage = 0; hasMore = true;
         if (docListContainer) docListContainer.innerHTML = "";
@@ -3858,8 +3898,27 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             });
         }
 
+        // 🌟 [CRITICAL FIX] N:N 교차 검색(Dexie)을 돌리기 전에, 로컬에서 방금 파싱된 최신 데이터를 Dexie DB에 동기화해줍니다! (Local Cache Warming)
+        if (appDb && docs.length > 0) {
+            try {
+                await appDb.table("items").bulkPut(enrichForIndex(docs));
+            } catch (e) {
+                console.error("[Dexie] Local cache update failed:", e);
+            }
+        }
+
         // 🌟 [CRITICAL FIX] 데이터를 불러오는 동안 사용자가 검색어를 변경했거나 지웠다면, 과거 데이터가 화면에 렌더링되어 혼선을 주는 것을 즉시 차단합니다.
         if (textQuery !== (searchInput?.value.trim() || "")) {
+            return;
+        }
+
+        // 🌟 [CRITICAL FIX] 백그라운드에서 대기하던 일반 리스트 로딩이 끝났을 때,
+        // 이미 AI 검색이 진행 중이거나 검색 결과가 화면에 렌더링된 상태(H3 태그가 Search로 변경됨)라면,
+        // 일반 문서 5개가 검색 결과 18개 밑에 강제로 들러붙어 23개로 뻥튀기되는 경합(Race Condition)을 완벽 차단합니다!
+        const currentH3 = document.querySelector('.nav-section.search h3');
+        const currentlyShowingSearch = currentH3 && currentH3.textContent?.toLowerCase().includes("search");
+        if ((isSearching || currentlyShowingSearch) && !textQuery && !isSync) {
+            console.log(`[SEARCH-DEBUG] 일반 리스트 백그라운드 로딩이 완료되었으나, 현재 검색 결과가 활성화되어 있어 덮어쓰기를 원천 차단합니다.`);
             return;
         }
 
@@ -3909,7 +3968,10 @@ function updateResultCount() {
     const countEl = document.querySelector('.nav-section.search h3 strong.count');
     if (countEl) {
         const count = document.querySelectorAll('#doc-list .logis-result').length;
+        console.log(`[SEARCH-DEBUG] DOM 업데이트 감지: 현재 화면에 표시된 카드 개수 = ${count}`);
         countEl.textContent = count > 0 ? `(${count})` : "";
+    } else {
+        console.log(`[SEARCH-DEBUG] DOM 업데이트 실패: H3 카운트 요소(strong.count)를 찾을 수 없습니다.`);
     }
 }
 
@@ -4476,33 +4538,6 @@ async function initSession() {
         await GlobalTaskManager.loadQueue();
         
         const data = await invoke<any>("mark_ui_ready");
-
-        // 🌟 [Tauri Bridge -> Dexie] 로컬 Dexie DB 고속 쿼리(eq)를 위해 내부 속성 평탄화 헬퍼 적용
-        const enrichForIndex = (docs: any[]) => docs.map(d => {
-            const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
-            return {
-                ...d,
-                no: parsed.no?.toString(),
-                code: parsed.code?.toString(),
-                tracking_number: parsed.tracking_number?.toString(),
-                goods: parsed.goods?.toString(),
-                order: parsed.order?.toString(),
-                tracking: parsed.tracking?.toString(),
-                stock_keeping_unit: parsed.stock_keeping_unit?.toString(),
-                barcode: parsed.barcode?.toString(),
-                index: parsed.index?.toString(),
-                // 🌟 [CRITICAL FIX] LanceDB의 물리적 컬럼 데이터를 Dexie 루트에 100% 동기화 (UI 및 인덱싱 보호)
-                status: d.status ?? parsed.status ?? 0,
-                amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
-                mode: d.mode ?? parsed.mode ?? 'commerce',
-                is_masked: d.is_masked ?? parsed.is_masked ?? false,
-                text: d.text ?? parsed.text ?? "",
-                masked_text: d.masked_text ?? parsed.masked_text ?? "",
-                created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
-                updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
-                data: parsed
-            };
-        });
 
         // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드의 데이터를 로컬 Dexie DB로 즉시 밀어넣어 고속 쿼리(eq) 준비
         try {
