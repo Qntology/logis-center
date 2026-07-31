@@ -878,15 +878,21 @@ async fn ai_search_complex(
                 };
 
                 let sql_filter = convert_conditions_to_sql(ctx);
+                let mode_filter = format!("mode = '{}'", search_mode);
+                let final_sql_filter = match sql_filter {
+                    Some(f) => Some(format!("({}) AND {}", f, mode_filter)),
+                    None => Some(mode_filter.clone()),
+                };
+
                 let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 384]);
                 
                 let use_fts = true; 
-                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, sql_filter.clone(), use_fts).await;
+                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, final_sql_filter.clone(), use_fts).await;
                 
                 let final_results = match search_result {
                     Ok(res) => res,
                     Err(_) => {
-                        store.search_items(target_table, text, emb.clone(), 5, 0, None, use_fts).await.unwrap_or_default()
+                        store.search_items(target_table, text, emb.clone(), 5, 0, Some(mode_filter.clone()), use_fts).await.unwrap_or_default()
                     }
                 };
 
@@ -897,83 +903,8 @@ async fn ai_search_complex(
                         all_results.push(json!({ "id": id.clone(), "text": content.clone(), "score": score, "context_type": ctx_type, "relation": "primary" }));
                     }
 
-                    // 🌟 [N:N 양방향 관계형 교차 검색 로직]
-                    if let Ok(json_content) = serde_json::from_str::<serde_json::Value>(&content) {
-                        // 🌟 [CRITICAL FIX] scheduler.rs에서 index는 숫자(Number)로 저장되므로 안전하게 String으로 변환합니다.
-                        let self_index = match json_content.get("index") {
-                            Some(serde_json::Value::String(s)) => s.clone(),
-                            Some(serde_json::Value::Number(n)) => n.to_string(),
-                            _ => String::new(),
-                        };
-                        let commerce_tables = vec!["sales", "tracking", "event", "items"];
-                        
-                        // 1. 정방향 쿼리 (Forward Propagation)
-                        // 현재 도출된 아이템의 index 값을 참조하고 있는 타 도메인(이벤트, 리뷰, 배송 등) 데이터 강제 추출
-                        if !self_index.is_empty() {
-                            for tbl in &commerce_tables {
-                                if *tbl != target_table {
-                                    // 🌟 [최적화] 느린 LIKE 스캔 대신 초고속 FTS(역인덱스)로 교체하고, 벡터 검색(emb)을 배제하여 정확한 식별자 매칭(eq 유사)을 유도합니다.
-                                    if let Ok(rel_results) = store.search_items(tbl, &self_index, vec![0.0; 384], 2, 0, None, true).await {
-                                        for (r_id, r_content, r_score) in rel_results {
-                                            let is_r_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&r_id));
-                                            if !is_r_dup {
-                                                all_results.push(json!({ "id": r_id, "text": r_content, "score": r_score * 0.9, "context_type": tbl, "relation": "forward" }));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // 2. 역방향 쿼리 (Backward Propagation)
-                        // 현재 도출된 데이터 내부에 타 도메인의 index나 id가 존재하면 그 외부 데이터를 역으로 다시 찾음
-                        // 🌟 [CRITICAL FIX] scheduler.rs가 실제로 삽입하는 속성 키들로 완벽 교체
-                        let ref_keys = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
-                        for key in ref_keys {
-                            // 🌟 [CRITICAL FIX] scheduler.rs에서 goods, order 등은 index_val(숫자)로 매핑되므로 Number 변환 필수
-                            let ref_val = match json_content.get(key) {
-                                Some(serde_json::Value::String(s)) => s.clone(),
-                                Some(serde_json::Value::Number(n)) => n.to_string(),
-                                _ => String::new(),
-                            };
-
-                            if !ref_val.is_empty() {
-                                for tbl in &commerce_tables {
-                                    // 🌟 [최적화] 역방향 탐색도 LIKE 스캔 대신 초고속 FTS(역인덱스)로 교체합니다.
-                                    if let Ok(bwd_results) = store.search_items(tbl, &ref_val, vec![0.0; 384], 2, 0, None, true).await {
-                                        for (b_id, b_content, b_score) in bwd_results {
-                                            let is_b_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&b_id));
-                                            if !is_b_dup {
-                                                all_results.push(json!({ "id": b_id.clone(), "text": b_content.clone(), "score": b_score * 0.85, "context_type": tbl, "relation": "backward" }));
-                                                
-                                                // 3. 역방향으로 획득한 상위 데이터에서 한번 더 정방향 하위 연관(N:N) 시도 (2 Depth 체이닝)
-                                                if let Ok(b_json) = serde_json::from_str::<serde_json::Value>(&b_content) {
-                                                    // 🌟 [CRITICAL FIX] 2 Depth 체이닝 시에도 숫자형 index 방어 추가
-                                                    let b_index = match b_json.get("index") {
-                                                        Some(serde_json::Value::String(s)) => s.clone(),
-                                                        Some(serde_json::Value::Number(n)) => n.to_string(),
-                                                        _ => String::new(),
-                                                    };
-                                                    
-                                                    if !b_index.is_empty() {
-                                                        // 🌟 [최적화] 2 Depth 탐색도 LIKE 스캔 대신 FTS로 교체하여 부하 최소화
-                                                        if let Ok(d2_results) = store.search_items("items", &b_index, vec![0.0; 384], 1, 0, None, true).await {
-                                                            for (d2_id, d2_content, d2_score) in d2_results {
-                                                                let is_d2_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&d2_id));
-                                                                if !is_d2_dup {
-                                                                    all_results.push(json!({ "id": d2_id, "text": d2_content, "score": d2_score * 0.8, "context_type": "items", "relation": "backward_chained" }));
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
+                    // 프론트엔드(Dexie DB)로 역할을 위임합니다.
                 }
             }
         }
@@ -1464,7 +1395,16 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
-                obj.insert("type".to_string(), serde_json::json!(type_str));
+                obj.insert("type".to_string(), serde_json::json!(type_str.clone()));
+                
+                // 🌟 [CRITICAL FIX] Dexie DB에서 최상단(Root)으로 꺼내졌던 스키마 컬럼들을 
+                // 다시 Rust의 JSON 페이로드(내부 속성)로 안전하게 복원하여 LanceDB 컬럼에 매핑 시 누락되지 않도록 동기화합니다.
+                if let Some(status) = item.get("status") { obj.insert("status".to_string(), status.clone()); }
+                if let Some(amount) = item.get("amount") { obj.insert("amount".to_string(), amount.clone()); }
+                if let Some(mode) = item.get("mode") { obj.insert("mode".to_string(), mode.clone()); }
+                if let Some(is_masked) = item.get("is_masked") { obj.insert("is_masked".to_string(), is_masked.clone()); }
+                if let Some(created_at) = item.get("created_at") { obj.insert("created_at".to_string(), created_at.clone()); }
+                if let Some(updated_at) = item.get("updated_at") { obj.insert("updated_at".to_string(), updated_at.clone()); }
             }
 
             

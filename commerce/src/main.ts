@@ -66,10 +66,17 @@ if (!(window as any).Dexie) {
 const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
-appDb.version(1).stores({
+
+appDb.version(3).stores({
     ts_queue: 'taskId, type',
-    kv_store: 'key' // 추가된 통합 키-값(Key-Value) 저장소
+    kv_store: 'key',
+    // 교차 검색에 사용되는 refKeys 및 index를 인덱스로 등록하여 풀스캔 병목을 방지합니다.
+    items: 'id, type, ref, cc, bcc, domain, origin, no, code, tracking_number, goods, order, tracking, stock_keeping_unit, barcode, index',
+    pages: 'id, type, ref, cc, bcc, domain, origin',
+    users: 'id, type, ref, cc, bcc, domain, origin',
+    talks: 'id, task_id'
 });
+(window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
 
 // 기존 localStorage를 대체할 Dexie 헬퍼 함수
 async function kvGet(key: string): Promise<any> {
@@ -1760,6 +1767,39 @@ async function syncData() {
                     return r.type === "pages" || r.type === "page" || d.node !== undefined || d.item !== undefined;
                 });
                 
+                const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r));
+
+                // 🌟 [Tauri Bridge -> Dexie] Rust에서 받은 최신 데이터를 로컬 Dexie DB에 일괄 동기화 (빠른 eq 쿼리 목적)
+                const enrichForIndex = (docs: any[]) => docs.map(d => {
+                    const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
+                    return { 
+                        ...d, 
+                        no: parsed.no?.toString(), 
+                        code: parsed.code?.toString(), 
+                        tracking_number: parsed.tracking_number?.toString(), 
+                        goods: parsed.goods?.toString(), 
+                        order: parsed.order?.toString(), 
+                        tracking: parsed.tracking?.toString(), 
+                        stock_keeping_unit: parsed.stock_keeping_unit?.toString(), 
+                        barcode: parsed.barcode?.toString(), 
+                        index: parsed.index?.toString(),
+                        // 🌟 [CRITICAL FIX] LanceDB의 물리적 컬럼 데이터를 Dexie 루트에 100% 동기화 (UI 및 인덱싱 보호)
+                        status: d.status ?? parsed.status ?? 0,
+                        amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
+                        mode: d.mode ?? parsed.mode ?? 'commerce',
+                        is_masked: d.is_masked ?? parsed.is_masked ?? false,
+                        text: d.text ?? parsed.text ?? "",
+                        masked_text: d.masked_text ?? parsed.masked_text ?? "",
+                        created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
+                        updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
+                        data: parsed
+                    };
+                });
+
+                if (newUsers.length > 0) await appDb.table("users").bulkPut(newUsers);
+                if (newPages.length > 0) await appDb.table("pages").bulkPut(newPages);
+                if (newItems.length > 0) await appDb.table("items").bulkPut(enrichForIndex(newItems));
+
                 // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
                 // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
             } else {
@@ -2434,6 +2474,94 @@ listen("extraction-progress", async (event: any) => {
                     } catch (e) {
                         console.error("Failed to fetch document for search result:", e);
                     }
+                }
+
+                // 🌟 [Dexie DB 기반 초고속 N:N 양방향 교차 검색 위임]
+                if (appDb && docs.length > 0) {
+                    const relayDocs = new Map();
+
+                    for (const doc of docs) {
+                        const parsedData = doc.data || {};
+                        const selfIndex = parsedData.index?.toString();
+
+                        // 1. 정방향: 내 index를 포함하는 연관 문서 검색 (DB 인덱스 활용)
+                        if (selfIndex) {
+                            const forwardMatches = await appDb.table("items")
+                                .where("index").equals(selfIndex)
+                                .or("order").equals(selfIndex)
+                                .or("goods").equals(selfIndex)
+                                .or("tracking").equals(selfIndex)
+                                .toArray();
+
+                            for (const match of forwardMatches) {
+                                if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id)) {
+                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
+                                    dData.search_context = match.type;
+                                    match.data = dData;
+                                    relayDocs.set(match.id, match);
+                                }
+                            }
+                        }
+
+                        // 2. 역방향: 내부에 포함된 외래키를 통해 부모 문서 검색 (DB 인덱스 활용)
+                        const refKeys = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
+                        for (const key of refKeys) {
+                            const rawRef = parsedData[key];
+                            if (rawRef !== undefined && rawRef !== null && rawRef !== "") {
+                                const refStr = rawRef.toString();
+                                const refNum = !isNaN(Number(rawRef)) ? Number(rawRef) : null;
+
+                                // 🌟 [타입 방어 쿼리] 숫자형과 문자열 형식을 모두 인덱스 검색 대상에 포함
+                                let queryCollection = appDb.table("items").where("index").equals(refStr);
+                                if (refNum !== null) {
+                                    queryCollection = queryCollection.or("index").equals(refNum);
+                                }
+
+                                const targetCols = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
+                                for (const col of targetCols) {
+                                    queryCollection = queryCollection.or(col).equals(refStr);
+                                    if (refNum !== null) {
+                                        queryCollection = queryCollection.or(col).equals(refNum);
+                                    }
+                                }
+
+                                const backwardMatches = await queryCollection.toArray();
+
+                                for (const match of backwardMatches) {
+                                    if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id) && match.id !== doc.id) {
+                                        const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
+                                        dData.search_context = match.type;
+                                        dData.relation = "backward"; // Rust 패리티 연관 관계 명시
+                                        match.data = dData;
+                                        relayDocs.set(match.id, match);
+
+                                        // 3. 역방향으로 획득한 상위 데이터에서 한번 더 정방향 하위 연관 시도 (2 Depth 체이닝)
+                                        const bIndex = dData.index?.toString();
+                                        if (bIndex) {
+                                            const d2Matches = await appDb.table("items")
+                                                .where("goods").equals(bIndex)
+                                                .or("order").equals(bIndex)
+                                                .or("tracking").equals(bIndex)
+                                                .toArray();
+
+                                            for (const d2Match of d2Matches) {
+                                                if (!docs.some(d => d.id === d2Match.id) && !relayDocs.has(d2Match.id) && d2Match.id !== match.id && d2Match.id !== doc.id) {
+                                                    const d2Data = typeof d2Match.json_data === 'string' ? JSON.parse(d2Match.json_data) : (d2Match.data || d2Match);
+                                                    d2Data.search_context = d2Match.type;
+                                                    d2Data.relation = "backward_chained"; // Rust 패리티 연관 관계 명시
+                                                    d2Match.data = d2Data;
+                                                    relayDocs.set(d2Match.id, d2Match);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 연관 문서들을 최종 화면 렌더링 배열에 병합
+                    docs.push(...Array.from(relayDocs.values()));
                 }
                 
                 if (docs.length > 0) {
@@ -4348,6 +4476,42 @@ async function initSession() {
         await GlobalTaskManager.loadQueue();
         
         const data = await invoke<any>("mark_ui_ready");
+
+        // 🌟 [Tauri Bridge -> Dexie] 로컬 Dexie DB 고속 쿼리(eq)를 위해 내부 속성 평탄화 헬퍼 적용
+        const enrichForIndex = (docs: any[]) => docs.map(d => {
+            const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
+            return {
+                ...d,
+                no: parsed.no?.toString(),
+                code: parsed.code?.toString(),
+                tracking_number: parsed.tracking_number?.toString(),
+                goods: parsed.goods?.toString(),
+                order: parsed.order?.toString(),
+                tracking: parsed.tracking?.toString(),
+                stock_keeping_unit: parsed.stock_keeping_unit?.toString(),
+                barcode: parsed.barcode?.toString(),
+                index: parsed.index?.toString(),
+                // 🌟 [CRITICAL FIX] LanceDB의 물리적 컬럼 데이터를 Dexie 루트에 100% 동기화 (UI 및 인덱싱 보호)
+                status: d.status ?? parsed.status ?? 0,
+                amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
+                mode: d.mode ?? parsed.mode ?? 'commerce',
+                is_masked: d.is_masked ?? parsed.is_masked ?? false,
+                text: d.text ?? parsed.text ?? "",
+                masked_text: d.masked_text ?? parsed.masked_text ?? "",
+                created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
+                updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
+                data: parsed
+            };
+        });
+
+        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드의 데이터를 로컬 Dexie DB로 즉시 밀어넣어 고속 쿼리(eq) 준비
+        try {
+            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(data.users);
+            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(data.pages);
+            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(enrichForIndex(data.items));
+        } catch(dbErr) {
+            console.error("[Dexie] Initial sync failed:", dbErr);
+        }
 
         // 🌟 [CRITICAL FIX] 백엔드에서 실제로 실행 중인 작업이 있다면 프론트엔드 큐 매니저를 바쁨(Busy) 상태로 잠급니다!
         // 이렇게 해야 대기열에 있던 검색 작업이 새로고침 즉시 백엔드로 뚫고 들어가는 것을 막을 수 있습니다.

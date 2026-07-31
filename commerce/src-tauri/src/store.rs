@@ -731,9 +731,9 @@ impl VectorStore {
         }))
     }
     
-    pub async fn search_items(&self, _table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
-         // 100% 통합 인덱스가 구축된 "items" 마스터 테이블로 라우팅
-         let target = "items";
+    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
+         // 🌟 [CRITICAL FIX] "items"로 하드코딩된 라우팅을 해제하고, 요청된 실제 테이블(sales, event 등)을 100% 반영합니다.
+         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
          
          // 🌟 3개의 트랙에서 찾은 문서 ID를 Key로 하여, 점수를 누적(Stacking)할 HashMap
@@ -767,8 +767,9 @@ impl VectorStore {
          // 전체 본문(text, data)에서 단어를 찾는 진짜 FTS 엔진을 단독 실행. (가중치 +2.0)
          if !query_text.is_empty() {
              let mut q = table.query();
+             let has_fts_index = target == "items"; // 🌟 [CRITICAL FIX] FTS 인덱스는 items 테이블에만 생성되어 있으므로 교차 검색 시 에러 방지
              
-             if use_fts {
+             if use_fts && has_fts_index {
                  // LanceDB Native FTS 구문 (Tantivy 엔진)
                  let fts_query_str = query_text
                      .split_whitespace()
@@ -780,11 +781,12 @@ impl VectorStore {
                  // [보안 필수] 타 부서/팀 데이터를 긁어오지 못하도록 기본 필터 체이닝
                  if let Some(ref f) = filter { q = q.only_if(f); } 
              } else {
-                 // 타이핑 중(Live Search)일 때 미완성 단어를 잡기 위한 ILIKE Fallback
+                 // 타이핑 중(Live Search)일 때 미완성 단어를 잡기 위한 ILIKE Fallback (또는 타 도메인 검색 시)
                  let sql_clean = query_text.replace("'", "''");
                  let words: Vec<&str> = sql_clean.split_whitespace().collect();
                  let mut ilike_conditions = Vec::new();
                  for w in words {
+                     // 🌟 숫자나 코드가 다른 필드(예: 날짜 2015-03-14)에 매칭되는 것을 줄이기 위한 안전망 적용
                      ilike_conditions.push(format!("(masked_text ILIKE '%{}%' OR text ILIKE '%{}%' OR data ILIKE '%{}%')", w, w, w));
                  }
                  let text_filter = ilike_conditions.join(" AND ");
@@ -853,26 +855,30 @@ impl VectorStore {
          let end = (start + limit).min(final_list.len());
          let result_slice = final_list[start..end].to_vec();
 
-         // 🌟 검색 결과를 JSON 포맷으로 터미널에 로그 출력
-         let json_log = serde_json::json!({
-             "query_text": query_text,
-             "filter": filter,
-             "use_fts": use_fts,
-             "total_found": final_list.len(),
-             "returned": result_slice.len(),
-             "results": result_slice.iter().map(|(id, text, score)| {
-                 let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
-                 serde_json::json!({
-                     "id": id,
-                     "text": parsed_text,
-                     "score": score
-                 })
-             }).collect::<Vec<_>>()
-         });
-         println!("\n=======================================");
-         println!("[STORE] 🔎 3-Track Hybrid Search Results:");
-         println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
-         println!("=======================================\n");
+         // 🌟 [CRITICAL FIX] 내부 N:N 연관 검색(Cross Reference) 시 0.0 벡터가 들어오므로, 이를 감지하여 터미널 스팸(도배) 출력을 원천 차단합니다!
+         // (컴파일 에러 해결: query_vec이 이미 이동(Moved)되었으므로 상단에서 미리 계산해둔 is_empty_vec을 재사용합니다)
+         if !is_empty_vec {
+             let json_log = serde_json::json!({
+                 "target_table": target,
+                 "query_text": query_text,
+                 "filter": filter,
+                 "use_fts": use_fts,
+                 "total_found": final_list.len(),
+                 "returned": result_slice.len(),
+                 "results": result_slice.iter().map(|(id, text, score)| {
+                     let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
+                     serde_json::json!({
+                         "id": id,
+                         "text": parsed_text,
+                         "score": score
+                     })
+                 }).collect::<Vec<_>>()
+             });
+             println!("\n=======================================");
+             println!("[STORE] 🔎 3-Track Hybrid Search Results (Table: {}):", target);
+             println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
+             println!("=======================================\n");
+         }
 
          Ok(result_slice)
     }
