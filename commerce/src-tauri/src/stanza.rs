@@ -162,7 +162,7 @@ impl StanzaPreprocessor {
     }
 
     /// 품사 태깅(pos.onnx)을 위해 분할된 단어 배열을 Word 텐서와 Wordchar(길이) 텐서로 변환합니다.
-    pub fn encode_to_tensor(&self, words: &[&str], session: &Session<'static>, pos_ids: Option<&[i64]>) -> Result<Vec<ndarray::ArrayD<i64>>, anyhow::Error> {
+    pub fn encode_to_tensor(&self, words: &[&str], session: &Session<'static>, pos_ids: Option<&[i64]>, lemma_ids: Option<&[i64]>) -> Result<Vec<ndarray::ArrayD<i64>>, anyhow::Error> {
         let seq_len = words.len();
         
         // 🌟 [CRITICAL FIX] 빈 배열(seq_len == 0)이 주어지면 ONNX LSTM Reshape 노드에서 치명적인 에러가 발생하므로 사전에 차단합니다.
@@ -227,18 +227,41 @@ impl StanzaPreprocessor {
         tensor_pool.insert("pretrained", pre_tensor.clone());
         tensor_pool.insert("pre", pre_tensor.clone());
         
-        let pos_tensor = ndarray::Array2::<i64>::zeros((1, seq_len)).into_dyn();
         let pos_1d_tensor = if let Some(ids) = pos_ids {
             ndarray::Array1::from_vec(ids.to_vec()).into_dyn()
         } else {
             ndarray::Array1::<i64>::zeros(seq_len).into_dyn()
-        }; // 🌟 실제 POS 태그 ID 수신 가능하도록 개선
+        }; // 🌟 실제 POS 태그 ID 수신 (1D)
         
-        tensor_pool.insert("pos", pos_1d_tensor.clone()); // 🌟 1D로 변경
-        tensor_pool.insert("upos", pos_tensor.clone());
-        tensor_pool.insert("lemma", pos_tensor.clone()); // 🌟 [CRITICAL FIX] word_tensor 사용 시 Out of Bounds 에러 발생 방지 (0으로 채워진 안전한 pos_tensor 사용)
+        // 🌟 [CRITICAL FIX] Depparse를 위해 upos는 2D 텐서 (1, seq_len) 형태로 변환하여 제공해야 함
+        let upos_2d_tensor = if let Some(ids) = pos_ids {
+            ndarray::Array2::from_shape_vec((1, seq_len), ids.to_vec())
+                .unwrap_or_else(|_| ndarray::Array2::<i64>::zeros((1, seq_len)))
+                .into_dyn()
+        } else {
+            ndarray::Array2::<i64>::zeros((1, seq_len)).into_dyn()
+        };
+
+        // 🌟 [CRITICAL FIX] Depparse를 위해 lemma_ids를 수신하여 2D 텐서로 매핑
+        let lemma_2d_tensor = if let Some(ids) = lemma_ids {
+            ndarray::Array2::from_shape_vec((1, seq_len), ids.to_vec())
+                .unwrap_or_else(|_| ndarray::Array2::<i64>::zeros((1, seq_len)))
+                .into_dyn()
+        } else {
+            word_tensor.clone() // 🌟 Lemma가 없을 경우 기본 word_tensor로 Fallback하여 차원 에러 방지
+        };
+
+        tensor_pool.insert("pos", pos_1d_tensor.clone()); // Lemma 모델 용 1D
+        tensor_pool.insert("upos", upos_2d_tensor.clone()); // Depparse 모델 용 2D
+        tensor_pool.insert("lemma", lemma_2d_tensor.clone()); // Depparse 모델 용 2D
         
-        // 🌟 [CRITICAL FIX] Lemma 모델의 필수 입력 텐서(src, src_mask, tgt_in) 매핑 추가
+        // 🌟 [CRITICAL FIX] Tokenizer 예외 방지용 더미 텐서 (tokenize_session이 직접 호출될 경우 에러 우회)
+        let x_tensor = chars_tensor.clone(); 
+        let f_tensor = ndarray::Array3::<f32>::zeros((1, seq_len, 32)).into_dyn();
+        tensor_pool.insert("x", x_tensor);
+        tensor_pool.insert("f", f_tensor);
+        
+        // 🌟 Lemma 모델의 필수 입력 텐서(src, src_mask, tgt_in) 매핑 추가
         tensor_pool.insert("src", chars_tensor.clone());
         tensor_pool.insert("src_mask", chars_mask_tensor.clone());
         tensor_pool.insert("tgt_in", chars_tensor.clone());
@@ -253,7 +276,7 @@ impl StanzaPreprocessor {
         tensor_pool.insert("seq_lengths", slen_tensor.clone());
         tensor_pool.insert("seq", slen_tensor.clone());
         tensor_pool.insert("slen", slen_tensor.clone());
-        tensor_pool.insert("l", slen_tensor.clone()); // 🌟 Tokenizer 입력 'l' 추가
+        tensor_pool.insert("l", slen_tensor.clone()); // Tokenizer 입력 'l' 추가
 
         let mut final_inputs = Vec::new();
 
