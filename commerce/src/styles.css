@@ -410,7 +410,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 #chat-pull-bottom, #list-pull-bottom {
-    margin-bottom: -50px;
+    margin-bottom: 50px;
 }
 
 .chat-pull-loader.visible { opacity: 1; }
