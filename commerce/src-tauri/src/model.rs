@@ -1891,7 +1891,11 @@ impl LogisModel {
                         let seq_len = chars.len();
                         let mut char_ids = Vec::with_capacity(seq_len);
                         for c in &chars {
-                            let id = *stanza.preprocessor.char_vocab.get(c).unwrap_or(&stanza.preprocessor.char_unk_id);
+                            let id = if !stanza.preprocessor.tok_char_vocab.is_empty() {
+                                *stanza.preprocessor.tok_char_vocab.get(c).unwrap_or(&stanza.preprocessor.tok_char_unk_id)
+                            } else {
+                                *stanza.preprocessor.char_vocab.get(c).unwrap_or(&stanza.preprocessor.char_unk_id)
+                            };
                             char_ids.push(id);
                         }
                         
@@ -1918,7 +1922,8 @@ impl LogisModel {
                             tensor_pool.insert("f", char_features.clone().into_dyn());
                             tensor_pool.insert("char_tensor", char_tensor.into_dyn());
                             tensor_pool.insert("char_features", char_features.into_dyn());
-                            tensor_pool.insert("seq_lengths", seq_lengths.into_dyn());
+                            tensor_pool.insert("seq_lengths", seq_lengths.clone().into_dyn());
+                            tensor_pool.insert("l", seq_lengths.into_dyn()); // 🌟 Tokenizer 입력 'l' 추가
                             
                             use onnxruntime::mixed::{DynInput, SessionMixedExt};
 
@@ -2023,13 +2028,14 @@ impl LogisModel {
                             padded_chunk.push("<pad>");
                         }
 
-                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session) {
+                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session, None) {
                             Ok(pos_inputs) => {
                                 match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
                                     Ok(pos_outputs) => {
                                         let output_tensor = &pos_outputs[0];
                                         let shape = output_tensor.shape();
                                         let mut pos_tags = Vec::new();
+                                        let mut pos_ids = Vec::new(); // 🌟 Lemma 전달용 POS ID 수집 배열 추가
 
                                         let num_classes = if shape.len() == 3 { shape[2] as usize } else { shape[1] as usize };
                                         for i in 0..valid_len {
@@ -2041,6 +2047,7 @@ impl LogisModel {
                                             }
                                             let tag = stanza.preprocessor.upos_vocab.get(max_idx as usize).map(|s| s.as_str()).unwrap_or("X");
                                             pos_tags.push(tag);
+                                            pos_ids.push(max_idx as i64); // 🌟 산출된 POS 태그의 Index ID 보존
                                         }
 
                                         // 🌟 [로그 추가] 형태소 분석 결과 전체 로그 출력
@@ -2051,14 +2058,15 @@ impl LogisModel {
 
                                         // 🌟 [수정] 한글 하드코딩 배열을 제거하고 Stanza의 lemma_session을 직접 사용하여 동적으로 커팅합니다.
                                         let mut lemma_words: Vec<String> = vec![String::new(); valid_len];
-                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session) {
+                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session, Some(&pos_ids)) { // 🌟 수집된 pos_ids 전달
                                             if let Ok(lemma_outputs) = stanza.lemma_session.run::<'_, '_, '_, i64, f32, _>(lemma_inputs) {
                                                 let output_tensor = &lemma_outputs[0];
                                                 let shape = output_tensor.shape();
                                                 
-                                                if shape.len() == 4 {
-                                                    let max_char_len = shape[2] as usize;
-                                                    let num_classes = shape[3] as usize;
+                                                if shape.len() == 3 || shape.len() == 4 {
+                                                    let is_4d = shape.len() == 4;
+                                                    let max_char_len = if is_4d { shape[2] as usize } else { shape[1] as usize };
+                                                    let num_classes = if is_4d { shape[3] as usize } else { shape[2] as usize };
                                                     
                                                     for i in 0..valid_len {
                                                         let mut lemma_str = String::new();
@@ -2066,7 +2074,7 @@ impl LogisModel {
                                                             let mut max_val = std::f32::MIN;
                                                             let mut max_idx = 0;
                                                             for c in 0..num_classes {
-                                                                let val = output_tensor[[0, i, j, c]];
+                                                                let val = if is_4d { output_tensor[[0, i, j, c]] } else { output_tensor[[i, j, c]] };
                                                                 if val > max_val { max_val = val; max_idx = c; }
                                                             }
                                                             if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(max_idx as i64)) {

@@ -3,15 +3,18 @@ use std::path::Path;
 use ndarray::Array2;
 use onnxruntime::environment::Environment;
 use onnxruntime::session::Session;
+use onnxruntime::GraphOptimizationLevel;
 
 #[derive(Debug, Clone)]
 pub struct StanzaPreprocessor {
     pub word_vocab: HashMap<String, i64>,
     pub char_vocab: HashMap<char, i64>,
-    pub id_to_char: HashMap<i64, char>,
+    pub tok_char_vocab: HashMap<char, i64>, // 🌟 Tokenizer 전용 독립 Vocab 추가
+    pub id_to_char: HashMap<i64, char>, // 🌟 Lemma 복원용 역방향 맵 추가
     pub upos_vocab: Vec<String>,
     pub word_unk_id: i64,
     pub char_unk_id: i64,
+    pub tok_char_unk_id: i64, // 🌟 Tokenizer 전용 UNK ID
 }
 
 impl StanzaPreprocessor {
@@ -27,7 +30,7 @@ impl StanzaPreprocessor {
         let mut id_to_char: HashMap<i64, char> = HashMap::new();
         let mut upos_vocab = Vec::new();
         
-        // 1. Word Vocab 파싱
+        // 🌟 1. Word Vocab 파싱 (기존 로직 보존 및 통합)
         let word_target = if let Some(pos) = json_val.get("pos") {
             pos.get("word").unwrap_or(&json_val)
         } else if let Some(tokenize) = json_val.get("tokenize") {
@@ -38,7 +41,21 @@ impl StanzaPreprocessor {
 
         Self::extract_vocab_from_node(word_target, &mut word_vocab);
 
-        // 2. Char Vocab 파싱
+        // 🌟 1.5. Tokenizer Char Vocab 파싱 (Tokenizer 전용 독립 사전)
+        let mut tok_char_vocab: HashMap<char, i64> = HashMap::new();
+        let tok_target = json_val.get("tokenize").and_then(|t| t.get("main")).unwrap_or(&serde_json::Value::Null);
+        
+        let mut temp_tok_vocab: HashMap<String, i64> = HashMap::new();
+        Self::extract_vocab_from_node(tok_target, &mut temp_tok_vocab);
+        
+        for (k, v) in temp_tok_vocab {
+            if let Some(c) = k.chars().next() {
+                tok_char_vocab.insert(c, v);
+            }
+        }
+        let tok_char_unk_id = *tok_char_vocab.get(&'<').unwrap_or(&0); // '<unk>' 처리용
+
+        // 🌟 2. Char Vocab 파싱 (Stanza OOV 극복의 핵심 + Lemma 지원)
         let char_target = if let Some(lemma) = json_val.get("lemma") {
             lemma.get("char").unwrap_or(&serde_json::Value::Null)
         } else if let Some(pos) = json_val.get("pos") {
@@ -55,11 +72,11 @@ impl StanzaPreprocessor {
         for (k, v) in temp_char_vocab {
             if let Some(c) = k.chars().next() {
                 char_vocab.insert(c, v);
-                id_to_char.insert(v, c);
+                id_to_char.insert(v, c); // 🌟 원형(Lemma) 문자열 복원용 생성
             }
         }
 
-        // 3. UPOS Vocab 파싱
+        // 🌟 3. UPOS Vocab 동적 파싱 (하드코딩을 파괴하고 파일에서 인덱스 배열 정답을 그대로 수집)
         if let Some(pos_node) = json_val.get("pos") {
             if let Some(upos_arr) = pos_node.get("upos").and_then(|v| v.as_array()) {
                 for v in upos_arr {
@@ -79,11 +96,12 @@ impl StanzaPreprocessor {
             .or_else(|| word_vocab.get("[UNK]"))
             .unwrap_or(&0);
             
-        let char_unk_id = *char_vocab.get(&'<').unwrap_or(&0); 
+        let char_unk_id = *char_vocab.get(&'<').unwrap_or(&0); // '<unk>' 처리용
         
-        Ok(Self { word_vocab, char_vocab, id_to_char, upos_vocab, word_unk_id, char_unk_id })
+        Ok(Self { word_vocab, char_vocab, tok_char_vocab, id_to_char, upos_vocab, word_unk_id, char_unk_id, tok_char_unk_id })
     }
 
+    // 🌟 중복된 JSON 파싱 로직을 공통 헬퍼 함수로 분리
     fn extract_vocab_from_node(target_value: &serde_json::Value, vocab: &mut HashMap<String, i64>) {
         if let Some(arr) = target_value.as_array() {
             for (i, v) in arr.iter().enumerate() {
@@ -143,9 +161,11 @@ impl StanzaPreprocessor {
         }
     }
 
-    pub fn encode_to_tensor(&self, words: &[&str], session: &Session<'static>) -> Result<Vec<ndarray::ArrayD<i64>>, anyhow::Error> {
+    /// 품사 태깅(pos.onnx)을 위해 분할된 단어 배열을 Word 텐서와 Wordchar(길이) 텐서로 변환합니다.
+    pub fn encode_to_tensor(&self, words: &[&str], session: &Session<'static>, pos_ids: Option<&[i64]>) -> Result<Vec<ndarray::ArrayD<i64>>, anyhow::Error> {
         let seq_len = words.len();
         
+        // 🌟 [CRITICAL FIX] 빈 배열(seq_len == 0)이 주어지면 ONNX LSTM Reshape 노드에서 치명적인 에러가 발생하므로 사전에 차단합니다.
         if seq_len == 0 {
             return Err(anyhow::anyhow!("입력된 단어 배열이 비어있어 ONNX 텐서 변환을 수행할 수 없습니다."));
         }
@@ -154,6 +174,8 @@ impl StanzaPreprocessor {
         let mut wlen_vec = Vec::with_capacity(seq_len);
         let mut oidx_vec = Vec::with_capacity(seq_len);
         
+        // 🌟 [CRITICAL FIX] Python Export 시 charmodel의 시퀀스 길이가 32로 고정(Hardcoded)되어 있습니다.
+        // 동적 길이를 사용하면 ONNX Runtime에서 차원 불일치(Shape Mismatch) 에러가 발생하므로 32로 강제 고정합니다.
         let max_word_len = 32; 
         
         let mut chars_raw = ndarray::Array2::<i64>::zeros((seq_len, max_word_len));
@@ -166,6 +188,7 @@ impl StanzaPreprocessor {
             word_ids.push(token_id);
             
             let w_chars: Vec<char> = w.chars().collect();
+            // 🌟 [CRITICAL FIX] 32자를 초과하는 단어 길이는 ONNX Gather 연산 시 Out of Bounds 에러를 유발하므로 32로 제한(Clamp)합니다.
             let safe_wlen = w_chars.len().min(32);
             wlen_vec.push(safe_wlen as i64);
             oidx_vec.push(w_idx as i64);
@@ -173,7 +196,7 @@ impl StanzaPreprocessor {
             for (c_idx, c) in w_chars.iter().take(32).enumerate() {
                 let c_id = *self.char_vocab.get(c).unwrap_or(&self.char_unk_id);
                 chars_raw[[w_idx, c_idx]] = c_id;
-                chars_mask_raw[[w_idx, c_idx]] = 1; 
+                chars_mask_raw[[w_idx, c_idx]] = 1; // ONNX Runtime 0.0.14 대응을 위해 bool을 1/0 i64로 강제 래핑
             }
         }
         
@@ -187,6 +210,7 @@ impl StanzaPreprocessor {
         let slen_tensor = ndarray::Array1::from_vec(vec![seq_len as i64]).into_dyn();
         let wlen_tensor = ndarray::Array1::from_vec(wlen_vec).into_dyn();
         
+        // 🌟 [개선] 휴리스틱(조건부) 탐색을 배제하고 ONNX 파이프라인에서 튀어나올 수 있는 모든 변형 스키마를 1:1 Key-Value 매핑
         let mut tensor_pool = std::collections::HashMap::new();
         tensor_pool.insert("word", word_tensor.clone());
         tensor_pool.insert("word_mask", mask_tensor.clone());
@@ -204,8 +228,20 @@ impl StanzaPreprocessor {
         tensor_pool.insert("pre", pre_tensor.clone());
         
         let pos_tensor = ndarray::Array2::<i64>::zeros((1, seq_len)).into_dyn();
-        tensor_pool.insert("pos", pos_tensor.clone());
+        let pos_1d_tensor = if let Some(ids) = pos_ids {
+            ndarray::Array1::from_vec(ids.to_vec()).into_dyn()
+        } else {
+            ndarray::Array1::<i64>::zeros(seq_len).into_dyn()
+        }; // 🌟 실제 POS 태그 ID 수신 가능하도록 개선
+        
+        tensor_pool.insert("pos", pos_1d_tensor.clone()); // 🌟 1D로 변경
         tensor_pool.insert("upos", pos_tensor.clone());
+        tensor_pool.insert("lemma", pos_tensor.clone()); // 🌟 [CRITICAL FIX] word_tensor 사용 시 Out of Bounds 에러 발생 방지 (0으로 채워진 안전한 pos_tensor 사용)
+        
+        // 🌟 [CRITICAL FIX] Lemma 모델의 필수 입력 텐서(src, src_mask, tgt_in) 매핑 추가
+        tensor_pool.insert("src", chars_tensor.clone());
+        tensor_pool.insert("src_mask", chars_mask_tensor.clone());
+        tensor_pool.insert("tgt_in", chars_tensor.clone());
         
         tensor_pool.insert("word_len", wlen_tensor.clone());
         tensor_pool.insert("wordchar_len", wlen_tensor.clone());
@@ -217,15 +253,18 @@ impl StanzaPreprocessor {
         tensor_pool.insert("seq_lengths", slen_tensor.clone());
         tensor_pool.insert("seq", slen_tensor.clone());
         tensor_pool.insert("slen", slen_tensor.clone());
+        tensor_pool.insert("l", slen_tensor.clone()); // 🌟 Tokenizer 입력 'l' 추가
 
         let mut final_inputs = Vec::new();
 
         for input_meta in &session.inputs {
             let exact_name = input_meta.name.clone();
             
+            // 모델 메타데이터의 정확한 이름(Exact Key)으로만 풀에서 텐서를 꺼내옵니다.
             if let Some(tensor) = tensor_pool.get(exact_name.as_str()) {
                 final_inputs.push(tensor.clone());
             } else {
+                // 모델을 있는 그대로 존중하므로, 사전에 정의되지 않은 입력을 모델이 요구할 경우 유추하지 않고 즉시 에러를 반환합니다.
                 return Err(anyhow::anyhow!("ONNX Schema 불일치: 모델이 알 수 없는 입력({})을 요구합니다.", exact_name));
             }
         }
@@ -234,7 +273,7 @@ impl StanzaPreprocessor {
     }
 }
 
-static STANZA_ENV: once_cell::sync::Lazy<&'static onnxruntime::environment::Environment> = once_cell::sync::Lazy::new(|| {
+pub static STANZA_ENV: once_cell::sync::Lazy<&'static onnxruntime::environment::Environment> = once_cell::sync::Lazy::new(|| {
     Box::leak(Box::new(
         onnxruntime::environment::Environment::builder()
             .with_name("stanza_global_env")
@@ -243,14 +282,20 @@ static STANZA_ENV: once_cell::sync::Lazy<&'static onnxruntime::environment::Envi
     ))
 });
 
+// 🌟 [추가] ONNX Runtime 세션을 초기화하고 보유하는 파이프라인 구조체
 pub struct StanzaPipeline {
     pub preprocessor: StanzaPreprocessor,
     pub tokenize_session: Session<'static>,
     pub pos_session: Session<'static>,
-    pub lemma_session: Session<'static>,
+    pub lemma_session: Session<'static>, // 🌟 Lemma 세션 추가
+    pub depparse_session: Session<'static>, // 🌟 Depparse 세션 추가
 }
 
+// (로cul 라이브러리 onnxruntime crate 자체에 Send/Sync를 구현하였으므로 더 이상 unsafe 래퍼가 필요 없습니다!)
+
 impl StanzaPipeline {
+    /// Stanza 파이프라인에 필요한 필수 모델 파일들의 존재 여부를 체크하고,
+    /// 디렉터리나 파일이 없을 경우 원격 서버에서 자동으로 다운로드합니다.
     pub async fn ensure_models_downloaded<P: AsRef<Path>>(lang_dir: P, lang: &str) -> anyhow::Result<()> {
         let dir = lang_dir.as_ref();
         if !dir.exists() {
@@ -263,8 +308,10 @@ impl StanzaPipeline {
             "tokenizer.onnx",
             "pos.onnx",
             "lemma.onnx",
+            "depparse.onnx", // 🌟 Depparse 파일 추가
         ];
 
+        // Stanza ONNX 모델 파일 저장 원격 Base URL
         let remote_base_url = format!("https://huggingface.co/stanfordnlp/stanza-{}/resolve/main/onnx", lang);
 
         for file_name in required_files.iter() {
@@ -296,22 +343,30 @@ impl StanzaPipeline {
     pub async fn new<P: AsRef<Path>>(base_dir: P, lang: &str) -> anyhow::Result<Self> {
         let lang_dir = base_dir.as_ref().join(lang);
 
+        // 🌟 [자동 다운로드 검사] 세션 생성 전 필요한 모델 파일 존재 여부 검사 및 다운로드 실행
         Self::ensure_models_downloaded(&lang_dir, lang).await?;
 
         let vocab_path = lang_dir.join("vocab.json");
         let tokenize_path = lang_dir.join("tokenizer.onnx");
         let pos_path = lang_dir.join("pos.onnx");
-        let lemma_path = lang_dir.join("lemma.onnx"); 
+        let lemma_path = lang_dir.join("lemma.onnx"); // 🌟 Lemma 경로 추가
+        let depparse_path = lang_dir.join("depparse.onnx"); // 🌟 Depparse 경로 추가
 
         let preprocessor = StanzaPreprocessor::new(&vocab_path)?;
 
         let total_start_time = std::time::Instant::now();
 
+        // onnxruntime 0.0.14 요구사항: Environment 전역 싱글톤 사용 (메모리 릭 방지)
         let env = *STANZA_ENV;
 
+        // 🌟 [onnxruntime 0.0.14 버그 우회] 
+        // 구버전 라이브러리의 설계 결함으로 인해, 파일 경로 문자열의 수명(Lifetime)이 
+        // Session<'static>과 동일하게 'static으로 유지되어야 컴파일이 통과됩니다.
+        // 경로 문자열을 메모리에 영구 고정(Leak)하여 수명 문제를 완벽히 해결합니다.
         let tokenize_path_static: &'static str = Box::leak(tokenize_path.to_string_lossy().into_owned().into_boxed_str());
         let pos_path_static: &'static str = Box::leak(pos_path.to_string_lossy().into_owned().into_boxed_str());
-        let lemma_path_static: &'static str = Box::leak(lemma_path.to_string_lossy().into_owned().into_boxed_str()); 
+        let lemma_path_static: &'static str = Box::leak(lemma_path.to_string_lossy().into_owned().into_boxed_str()); // 🌟 Leak 생성
+        let depparse_path_static: &'static str = Box::leak(depparse_path.to_string_lossy().into_owned().into_boxed_str()); // 🌟 Depparse Leak 추가
 
         let tok_start_time = std::time::Instant::now();
         println!("[STANZA] TOKENIZER 모델 세션을 빌드합니다...");
@@ -343,13 +398,24 @@ impl StanzaPipeline {
             
         println!("[STANZA] ✅ LEMMA 모델 세션 빌드 완료! (소요 시간: {:.2}초)", lemma_start_time.elapsed().as_secs_f32());
 
-        println!("[STANZA] 🚀 모든 세션 로드 완료! (총 소요 시간: {:.2}초)", total_start_time.elapsed().as_secs_f32());
+        let depparse_start_time = std::time::Instant::now();
+        println!("[STANZA] DEPPARSE 모델 세션을 빌드합니다...");
+        
+        let depparse_session = env.new_session_builder()
+            .map_err(|e| anyhow::anyhow!("Depparse Session builder error: {}", e))?
+            .with_model_from_file(depparse_path_static)
+            .map_err(|e| anyhow::anyhow!("depparse.onnx 모델 파일 로드 실패: {}", e))?;
+            
+        println!("[STANZA] ✅ DEPPARSE 모델 세션 빌드 완료! (소요 시간: {:.2}초)", depparse_start_time.elapsed().as_secs_f32());
+
+        println!("[STANZA] 모든 세션 로드 완료! (총 소요 시간: {:.2}초)", total_start_time.elapsed().as_secs_f32());
         
         Ok(Self {
             preprocessor,
             tokenize_session,
             pos_session,
             lemma_session,
+            depparse_session, // 🌟 Depparse 세션 추가 반환
         })
     }
 }
