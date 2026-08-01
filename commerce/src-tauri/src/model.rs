@@ -2028,7 +2028,7 @@ impl LogisModel {
                             padded_chunk.push("<pad>");
                         }
 
-                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session, None) {
+                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session, None, None) {
                             Ok(pos_inputs) => {
                                 match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
                                     Ok(pos_outputs) => {
@@ -2058,7 +2058,7 @@ impl LogisModel {
 
                                         // 🌟 [수정] 한글 하드코딩 배열을 제거하고 Stanza의 lemma_session을 직접 사용하여 동적으로 커팅합니다.
                                         let mut lemma_words: Vec<String> = vec![String::new(); valid_len];
-                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session, Some(&pos_ids)) { // 🌟 수집된 pos_ids 전달
+                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session, Some(&pos_ids), None) { // 🌟 수집된 pos_ids 전달
                                             if let Ok(lemma_outputs) = stanza.lemma_session.run::<'_, '_, '_, i64, f32, _>(lemma_inputs) {
                                                 let output_tensor = &lemma_outputs[0];
                                                 let shape = output_tensor.shape();

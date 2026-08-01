@@ -257,7 +257,7 @@ impl StanzaPreprocessor {
         
         // 🌟 [CRITICAL FIX] Tokenizer 예외 방지용 더미 텐서 (tokenize_session이 직접 호출될 경우 에러 우회)
         let x_tensor = chars_tensor.clone(); 
-        let f_tensor = ndarray::Array3::<f32>::zeros((1, seq_len, 32)).into_dyn();
+        let f_tensor = ndarray::Array3::<i64>::zeros((1, seq_len, 32)).into_dyn();
         tensor_pool.insert("x", x_tensor);
         tensor_pool.insert("f", f_tensor);
         
