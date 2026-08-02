@@ -1749,7 +1749,7 @@ async function handleTeamInvite() {
     btn.innerText = "Wait...";
     btn.disabled = true;
 
-try {
+    try {
         const origin = "https://commerce.logis.center";
         const now = Date.now();
         const createdAt = now - timezoneOffset;
