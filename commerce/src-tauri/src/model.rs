@@ -1089,7 +1089,7 @@ impl LogisModel {
                     .and_then(|s| s.as_str())
                     .unwrap_or("shipping_doc") 
             } else { 
-                "tracking" 
+                "goods" 
             };
             
             let masked_nl = nl.clone(); // 마스킹은 백엔드 push_data 단계에서 동적으로 수행됩니다.

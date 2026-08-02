@@ -4048,7 +4048,7 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         } else if (currentSearchMode === "analytic") {
             baseFilter += " AND type IN ('click', 'hover', 'change', 'report')"; 
         } else {
-            baseFilter += " AND type IN ('sales', 'goods', 'order', 'event', 'coupon', 'review')";
+            baseFilter += " AND type IN ('sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review')";
         }
 
         // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
