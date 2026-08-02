@@ -45,6 +45,19 @@ const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
 const EXPANDED_HEIGHT = 600;
 
+// 🌟 [CRITICAL FIX] chrome.js와 완벽히 동일한 루트 도메인 추출 로직 추가 (필터 엇갈림 원천 차단)
+const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id","com.my","com.sg","com.ph","com.vn"];
+function getRootDomain(hostname: string) {
+    const host = hostname.split('.');
+    const isTwoPart = twoPartDomains.some(domain => hostname.endsWith(domain));
+    if (isTwoPart && host.length >= 3) {
+        return host[host.length - 3] + "." + host[host.length - 2] + "." + host[host.length - 1];
+    } else if (host.length >= 2) {
+        return host[host.length - 2] + "." + host[host.length - 1];
+    }
+    return hostname;
+}
+
 interface ChatSession {
     hash: string;
     token?: string;
@@ -459,6 +472,115 @@ const aiResultsContent = document.getElementById("ai-results-content") as HTMLEl
 const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
 
+// 🌟 채팅폼(submit) 이벤트 (chrome.js 방식 적용)
+if (chatForm) {
+    chatForm.addEventListener("submit", async (e) => {
+        e.preventDefault(); // 폼 기본 동작인 새로고침 방지
+
+        const input = chatForm.querySelector('input[name="talk"]') as HTMLInputElement;
+        if (!input) return;
+
+        const query = input.value.trim();
+        if (!query) return;
+
+        input.value = ""; // 하단 채팅창 비우기
+
+        const now = Date.now();
+
+        let effectiveCc = activeContext.cc;
+        let effectiveBcc = activeContext.bcc;
+        let effectiveRef = activeContext.ref;
+
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+
+        if (!effectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            let targetUrlStr = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetUrlStr.includes("localhost") || targetUrlStr.includes("127.0.0.1") || targetUrlStr === "about:blank") {
+                targetUrlStr = "https://commerce.logis.center/tracking";
+            }
+            try {
+                const urlObj = new URL(targetUrlStr.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                effectiveCc = await hashId(rootDomain);
+                const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                effectiveRef = await hashId((currentSession.team || "") + effectiveCc + link);
+            } catch (err) {}
+        }
+
+        // 1. WebRTC (모바일 기기 등) P2P 연결이 되어있다면 상대방 기기로 전송
+        if (dataChannel && dataChannel.readyState === "open") {
+            dataChannel.send(JSON.stringify({ 
+                type: "chat_message", 
+                content: query 
+            }));
+            console.log("[CHAT] Message sent via WebRTC");
+        }
+
+        // 2. 클라우드플레어 Workers (서버)로 PUT 요청 전송 및 정식 응답 처리 (chrome.js 방식)
+        try {
+            const origin = "https://commerce.logis.center";
+            const tzOffset = new Date().getTimezoneOffset() * 60 * 1000;
+            const createdAt = now - tzOffset;
+            
+            let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+                targetHref = "https://commerce.logis.center/tracking";
+            }
+
+            const params = new URLSearchParams({
+                origin: origin,
+                created_at: createdAt.toString(),
+                hash: currentSession.hash,
+                token: currentSession.token || "",
+                href: targetHref,
+                type: "talk",
+                from: currentSession.address || "",
+                to: effectiveRef || currentSession.team || "",
+                text: encodeURIComponent(query)
+            });
+            
+            const url = `${API_HOST}/?${params.toString()}`;
+            
+            const response = await invoke<any>("proxy_fetch", {
+                url: url,
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                session_params: { hash: currentSession.hash, token: currentSession.token }
+            });
+
+            // 서버 응답 결과(결과 배열)가 온 경우 chrome.js처럼 로컬 DB에 동기화
+            if (response && response.results && response.results.length > 0) {
+                await invoke("upsert_items", { items: response.results });
+                for (const item of response.results) {
+                    if (item.table === "talks" || item.type === "talk") {
+                        await appDb.table("talks").put(item);
+                    }
+                }
+            }
+
+            // 3. 서버 동기화 후 최신 메시지 렌더링
+            await fetchChatHistory(false, true);
+
+            console.log("[CHAT] Message sent to Cloudflare worker and synced");
+        } catch (err) {
+            console.error("[CHAT] Failed to send to Cloudflare worker:", err);
+        }
+
+        // 4. 스크롤을 맨 아래로 부드럽게 이동
+        setTimeout(() => {
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            if (scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                currentY = maxScroll;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
+    });
+}
+
 // --- Settings Toggle Logic ---
 const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
 const settingsPanel = document.getElementById("settings-panel") as HTMLElement;
@@ -775,7 +897,8 @@ async function updateExtractButtonVisibility() {
         } else if (currentDetectedUrl) {
             const urlObj = new URL(currentDetectedUrl.toLowerCase());
             const link = (urlObj.pathname + urlObj.search).toLowerCase();
-            const ccHash = await hashId(urlObj.hostname);
+            const rootDomain = getRootDomain(urlObj.hostname);
+            const ccHash = await hashId(rootDomain);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
             
             const currentRefToCheck = activeContext.ref || hashedRefId;
@@ -854,6 +977,29 @@ const handleSearchInteraction = () => {
 
     const resultH3 = document.querySelector('.nav-section.search h3');
     const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+
+    // 🌟 [추가] 도메인(CC)이 선택되어 있지 않을 경우, 기본 홈 링크(/tracking) 도메인으로 강제 할당합니다.
+    // if (!activeContext.cc && currentSession.team) {
+    //     (async () => {
+    //         const defaultDomain = "logis.center";
+    //         const defaultPath = "/tracking";
+            
+    //         // 해시값 생성
+    //         const ccHash = await hashId(defaultDomain);
+    //         const refHash = await hashId(currentSession.team + ccHash + defaultPath);
+            
+    //         // 컨텍스트에 강제 주입
+    //         activeContext.cc = ccHash;
+    //         activeContext.ref = refHash;
+            
+    //         // UI 태그 추가 (사용자에게 시각적 피드백 제공)
+    //         addSearchTag(`@${defaultDomain}`, 'domain', defaultDomain);
+    //         addSearchTag(`#tracking`, 'type', 'tracking');
+    //         updateTagsUI();
+            
+    //         console.log(`[NAV] No domain selected. Defaulting to: ${defaultDomain} (${defaultPath})`);
+    //     })();
+    // }
 
     // [UI-FIX] If the panel is already expanded, don't refresh the navigation or clear the list.
     // This prevents annoying UI flickering when the user just wants to type in the search bar.
@@ -1182,14 +1328,18 @@ async function renderNavigation() {
 
         // 🌟 [CRITICAL FIX] 크롬 브라우저의 현재 접속 도메인과 일치하는 페이지만 남깁니다.
         let currentDomain = "";
+        console.log(`[DEBUG-NAV] 브라우저 현재 감지된 URL(currentDetectedUrl):`, currentDetectedUrl);
+        
         if (currentDetectedUrl) {
             try {
                 const footprint = new URL(currentDetectedUrl.toLowerCase());
                 currentDomain = footprint.hostname;
+                console.log(`[DEBUG-NAV] 파싱된 현재 도메인(currentDomain):`, currentDomain);
                 
                 // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: 해시 규칙 불일치로 못 찾던 문제를, 
                 // URL 문자열 직접 대조 및 상세/리스트 파라미터 판별을 통해 활성 컨텍스트(activeContext)를 100% 완벽히 복원합니다.
                 if (!activeContext.ref) {
+                    console.log(`[DEBUG-NAV] 활성 컨텍스트(activeContext.ref)가 비어있어 URL 기반 자동 복구를 시도합니다.`);
                     const currentParams = Object.fromEntries(footprint.searchParams.entries());
                     const isDetailMode = Object.values(currentParams).some(val => 
                         val === "form" || val === "view" || val === "detail" || val === "update" || val === "edit" || val === "read"
@@ -1613,12 +1763,17 @@ try {
             });
         }
         
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+
         const params = new URLSearchParams({
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
             token: currentSession.token || "",
-            href: currentDetectedUrl || "https://commerce.logis.center/tracking",
+            href: targetHref,
             from: currentSession.team || "",
             to: currentSession.address || "",
             email: email,
@@ -1730,15 +1885,31 @@ async function syncData() {
         const createdAt = now - timezoneOffset;
         
         // 🌟 [CRITICAL FIX] front.js 패리티: 서버가 나를 정확히 인지하도록 cc, type, 실제 href 파라미터를 추가합니다.
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+
         const queryParams: any = {
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
             token: currentSession.token || "",
-            href: currentDetectedUrl || "https://commerce.logis.center/tracking"
+            href: targetHref
         };
 
-        if (activeContext.cc) queryParams.cc = activeContext.cc;
+        // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버 동기화 시, 강제 지정된 사이드바 메뉴가 없다면 현재 URL의 도메인(CC)을 최우선으로 서버에 전달합니다.
+        let syncEffectiveCc = activeContext.cc;
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+        if (!syncEffectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            try {
+                const urlObj = new URL(targetHref.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                syncEffectiveCc = await hashId(rootDomain);
+            } catch(e) {}
+        }
+
+        if (syncEffectiveCc) queryParams.cc = syncEffectiveCc;
         if (currentSearchMode && currentSearchMode !== "commerce") queryParams.type = currentSearchMode;
 
         const params = new URLSearchParams(queryParams);
@@ -1755,27 +1926,75 @@ async function syncData() {
 
         stepQrSpinner();
 
+        console.log('response',response);
+
         if (response.results && Array.isArray(response.results)) {
+            // 🌟 [추가] 서버에서 압축된 gzip 데이터를 그대로 보낼 경우, chrome.js와 동일하게 pako로 압축 해제
+            try {
+                const pako = (window as any).pako;
+                for (let i = 0; i < response.results.length; i++) {
+                    let item = response.results[i];
+                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
+                        let arrData = item.data.data || item.data;
+                        let arr: Uint8Array | null = null;
+                        
+                        if (Array.isArray(arrData)) {
+                            arr = new Uint8Array(arrData);
+                        } else if (arrData.buffer) {
+                            arr = new Uint8Array(arrData.buffer);
+                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
+                            arr = new Uint8Array(Object.values(arrData) as number[]);
+                        }
+
+                        if (arr) {
+                            try {
+                                if (pako) {
+                                    const decompressed = pako.ungzip(arr, { to: 'string' });
+                                    item.data = JSON.parse(decompressed);
+                                } else {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                }
+                            } catch (e) {
+                                try {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                } catch (err) {}
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.warn("[SYNC] pako decompression failed:", err);
+            }
+
             // 🌟 [버그 수정] DOM에 렌더링된 요소뿐만 아니라, Dexie DB에 있는 백그라운드 통계(team) 객체의 최신 시간도 대조해야 합니다.
-            // 안 그러면 방금 전처리 완료된 로컬 통계를 과거의 서버 통계로 덮어버리게 됩니다!
             const localUsers = await Select["users"]({});
             const localPages = await Select["pages"]({});
+            const localTalks = await appDb.table("talks").toArray(); // 🌟 채팅(talks) 데이터도 로컬 맵에 반드시 포함
             const localMap = new Map();
-            [...localUsers, ...localPages].forEach((item: any) => {
-                localMap.set(item.id, item.updated_at_ts || item.updated_at || 0);
+            [...localUsers, ...localPages, ...localTalks].forEach((item: any) => {
+                // 🌟 updated_at이 0인 레거시 데이터를 대비해 created_at을 백업으로 사용
+                localMap.set(item.id, item.updated_at_ts || item.updated_at || item.created_at_ts || item.created_at || 0);
             });
 
             const filteredResults = response.results.filter((newItem: any) => {
-                let localUpdated = 0;
-                
                 const existingEl = document.getElementById(newItem.id);
+                
+                // 🌟 완전 신규 데이터 (DOM에도 없고 로컬 DB 캐시에도 없는 경우)는 조건 없이 즉시 통과
+                if (!existingEl && !localMap.has(newItem.id)) {
+                    return true;
+                }
+
+                let localUpdated = 0;
                 if (existingEl) {
-                    localUpdated = parseInt(existingEl.dataset.updatedAt || "0");
+                    localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
                 } else if (localMap.has(newItem.id)) {
                     localUpdated = parseInt(localMap.get(newItem.id) || "0");
                 }
 
-                const serverUpdated = newItem.updated_at || 0;
+                // 🌟 서버의 updated_at이 0일 수 있으므로(기존 index.ts 특성), created_at을 백업 비교값으로 활용
+                const serverUpdated = newItem.updated_at || newItem.created_at || 0;
                 return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
             });
 
@@ -1793,10 +2012,14 @@ async function syncData() {
                     return r.type === "pages" || r.type === "page" || d.node !== undefined || d.item !== undefined;
                 });
                 
-                const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r));
+                // chrome.js 형태의 talks(채팅) 메시지 추출
+                const newTalks = filteredResults.filter((r: any) => r.type === "talk" || r.table === "talks");
+
+                const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r) && !newTalks.includes(r));
 
                 if (newUsers.length > 0) await appDb.table("users").bulkPut(newUsers);
                 if (newPages.length > 0) await appDb.table("pages").bulkPut(newPages);
+                if (newTalks.length > 0) await appDb.table("talks").bulkPut(newTalks);
                 if (newItems.length > 0) await appDb.table("items").bulkPut(enrichForIndex(newItems));
 
                 // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
@@ -2282,7 +2505,8 @@ btnExtract?.addEventListener("click", async () => {
                     }
 
                     const urlObj = new URL(validUrl.toLowerCase());
-                    const cc = await hashId(urlObj.hostname);
+                    const rootDomain = getRootDomain(urlObj.hostname);
+                    const cc = await hashId(rootDomain);
                     const rawPath = urlObj.pathname + urlObj.search;
                     const teamId = currentSession.team || "";
                     const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
@@ -3863,6 +4087,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         // 🌟 [CRITICAL FIX] 새로고침/동기화(isSync)가 아닐 경우 currentPage 기반의 offset을 적용합니다.
         const currentOffset = isSync ? 0 : currentPage * pageSize;
         
+        console.log(`[DEBUG-LIST] 🔍 문서 조회 요청 시작`);
+        console.log(`[DEBUG-LIST] 현재 모드: ${currentSearchMode}, IsSync: ${isSync}`);
+        console.log(`[DEBUG-LIST] 적용된 SQL 필터(finalFilter):`, finalFilter);
+        console.log(`[DEBUG-LIST] 활성 컨텍스트(activeContext):`, JSON.stringify(activeContext));
+        
         if (textQuery) {
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
@@ -3896,6 +4125,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 }
                 return doc;
             });
+        }
+        
+        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
+        if (docs.length === 0) {
+            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다! 필터 조건이 너무 엄격하거나 DB에 해당 도메인/타입의 데이터가 존재하지 않습니다.`);
         }
 
         // 🌟 [CRITICAL FIX] N:N 교차 검색(Dexie)을 돌리기 전에, 로컬에서 방금 파싱된 최신 데이터를 Dexie DB에 동기화해줍니다! (Local Cache Warming)
@@ -4312,11 +4546,16 @@ async function checkAuthStatus() {
     try {
         // 🌟 [CRITICAL FIX] Tauri의 window.location.href는 'localhost'이므로 서버가 도메인(cc)을 파악하지 못합니다.
         // 브라우저에서 감지된 URL(currentDetectedUrl)이나 기본 클라우드 주소를 전달해야 완벽히 매칭됩니다!
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+
         const queryParams: Record<string, string> = { 
             origin: origin, 
             created_at: createdAt.toString(), 
             hash: currentSession.hash, 
-            href: currentDetectedUrl || "https://commerce.logis.center/tracking" 
+            href: targetHref 
         };
         if (currentSession.token) queryParams.token = currentSession.token;
         const params = new URLSearchParams(queryParams);
@@ -4975,8 +5214,13 @@ async function syncBrowserStatus() {
 
         // 🌟 [CRITICAL FIX] 새 탭(빈 주소) 이동 시에도 currentDetectedUrl을 정상적으로 덮어씌워 버튼을 비활성화합니다!
         if (res.url !== undefined) {
+            const urlChanged = currentDetectedUrl !== res.url;
             currentDetectedUrl = res.url;
             isCurrentShop = res.is_client || res.is_admin;
+
+            if (urlChanged && !activeContext.cc && currentTab === "settings") {
+                fetchChatHistory(true, true);
+            }
         }
 
         if (s === "running") {
@@ -5508,14 +5752,43 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
 
         if (rawContent && rawContent !== "undefined") {
             try {
-                const contentObj = typeof rawContent === 'string' ? JSON.parse(rawContent) : rawContent;
-                textContent = contentObj.text || contentObj.title || contentObj.summary || textContent || (typeof contentObj === 'string' ? contentObj : JSON.stringify(contentObj));
+                let contentObj: any = rawContent;
+                if (typeof rawContent === 'string') {
+                    try {
+                        contentObj = JSON.parse(rawContent);
+                    } catch (e) {
+                        contentObj = rawContent;
+                    }
+                }
+                
+                // ArrayBuffer 또는 Gzip 배열 형태의 데이터 파싱 보완
+                if (contentObj && typeof contentObj === 'object' && !contentObj.text && !contentObj.title) {
+                    if (Array.isArray(contentObj) || contentObj.buffer) {
+                        try {
+                            const arr = new Uint8Array(contentObj.data || contentObj);
+                            const decompressed = (window as any).pako ? (window as any).pako.ungzip(arr, { to: 'string' }) : new TextDecoder().decode(arr);
+                            contentObj = JSON.parse(decompressed);
+                        } catch (err) {}
+                    }
+                }
+
+                if (typeof contentObj === 'object' && contentObj !== null) {
+                    textContent = contentObj.text || contentObj.title || contentObj.summary || contentObj.markdown || textContent;
+                } else if (typeof contentObj === 'string') {
+                    textContent = contentObj;
+                }
             } catch (e) {
                 if (!textContent) textContent = String(rawContent);
             }
         }
 
-        const displayMsg: ChatMessage = { ...msg, text: textContent };
+        // chrome.js 형태의 from 주소 기반 유저/시스템 role 자동 교정
+        let computedRole = msg.role;
+        if (msg.from && currentSession.address) {
+            computedRole = (msg.from.toLowerCase() === currentSession.address.toLowerCase()) ? "user" : "system";
+        }
+
+        const displayMsg: ChatMessage = { ...msg, role: computedRole, text: textContent };
         const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query") && !displayMsg.task_id.endsWith("_query"));
         const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
         
@@ -5586,13 +5859,38 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             temp.innerHTML = createMessageHTML(displayMsg);
             const newEl = temp.firstElementChild as HTMLElement;
             if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
-            chatTalks.appendChild(newEl);
+            
+            // 🌟 [CRITICAL FIX] chrome.js 패리티: 신규 메시지만 append/prepend 로 처리하여 DOM 중복 생성을 원천 차단합니다.
+            if (mode === 'prepend') {
+                chatTalks.prepend(newEl);
+            } else {
+                chatTalks.appendChild(newEl);
+            }
         }
     }
 
     // 🌟 [CRITICAL FIX] DOM 정렬 로직 강화 (시간 오름차순 및 질문 우선순위 고정)
     const sortedChildren = Array.from(chatTalks.children) as HTMLElement[];
-    sortedChildren.sort((a, b) => {
+    
+    // ".no-msg"나 ".chat-history-end" 같은 안내 문구는 정렬 및 중복 검사 대상에서 제외
+    const messageNodes = sortedChildren.filter(node => !node.classList.contains('no-msg') && !node.classList.contains('chat-history-end'));
+    const infoNodes = sortedChildren.filter(node => node.classList.contains('no-msg') || node.classList.contains('chat-history-end'));
+
+    // 🌟 [중복 노드 제거 헬퍼] 동일한 ID가 여러 개 있을 경우 가장 최신 노드(아래쪽)만 남기고 삭제
+    const uniqueIds = new Set();
+    const uniqueNodes = [];
+    for (let i = messageNodes.length - 1; i >= 0; i--) {
+        const node = messageNodes[i];
+        if (!uniqueIds.has(node.id)) {
+            uniqueIds.add(node.id);
+            uniqueNodes.unshift(node); // 원래 순서를 유지하기 위해 앞으로 넣음
+        } else {
+            // 중복된 노드는 DOM에서 즉시 파기
+            node.remove();
+        }
+    }
+
+    uniqueNodes.sort((a, b) => {
         const timeA = Number(a.dataset.createdAt || 0);
         const timeB = Number(b.dataset.createdAt || 0);
         
@@ -5615,7 +5913,9 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
     });
 
     // 🌟 [핵심 수정] 정렬된 리스트와 현재 DOM 순서를 비교하여 필요한 노드만 재배치
-    sortedChildren.forEach((node, idx) => {
+    // 정보성 노드(안내 문구)는 무조건 가장 위쪽에 배치
+    const finalNodes = [...infoNodes, ...uniqueNodes];
+    finalNodes.forEach((node, idx) => {
         if (chatTalks.children[idx] !== node) {
             chatTalks.insertBefore(node, chatTalks.children[idx] || null);
         }
@@ -5695,10 +5995,31 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
     isChatLoading = true;
 
     try {
+        // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버에는 정상적으로 채팅 내역이 저장되었지만, 로컬 DB에서 꺼내올 때 URL 필터가 누락되어 빈 화면이 노출되는 버그를 해결합니다.
+        let effectiveCc = activeContext.cc;
+        let effectiveBcc = activeContext.bcc;
+        let effectiveRef = activeContext.ref;
+
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+
+        if (!effectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            let targetUrlStr = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetUrlStr.includes("localhost") || targetUrlStr.includes("127.0.0.1") || targetUrlStr === "about:blank") {
+                targetUrlStr = "https://commerce.logis.center/tracking";
+            }
+            try {
+                const urlObj = new URL(targetUrlStr.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                effectiveCc = await hashId(rootDomain);
+                const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                effectiveRef = await hashId((currentSession.team || "") + effectiveCc + link);
+            } catch (err) {}
+        }
+
         let baseFilter = "";
-        if (activeContext.ref) baseFilter = `ref = '${activeContext.ref}'`;
-        else if (activeContext.bcc) baseFilter = `bcc = '${activeContext.bcc}'`;
-        else if (activeContext.cc) baseFilter = `cc = '${activeContext.cc}'`;
+        if (effectiveRef) baseFilter = `ref = '${effectiveRef}'`;
+        else if (effectiveBcc) baseFilter = `bcc = '${effectiveBcc}'`;
+        else if (effectiveCc) baseFilter = `cc = '${effectiveCc}'`;
         
         let finalFilter = baseFilter;
         let oldestTime = 0;

@@ -107,7 +107,9 @@ body {
 
 .pill-nav:active { cursor: grabbing; }
 
-#search-mode-tabs{margin-bottom: 2em; padding: 0.7rem;}
+.nav-section.users{display: none;}
+
+#search-mode-tabs{display: none !important; margin-bottom: 2em; padding: 0.7rem;}
 #search-mode-tabs button:hover{font-style: italic;}
 #search-mode-tabs button[data-mode="shipping"]{width: 55px;}
 #search-mode-tabs button[data-mode="commerce"]{width: 77px;}

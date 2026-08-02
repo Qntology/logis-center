@@ -1455,6 +1455,31 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         "origin": origin_val
                     }));
                 }
+
+                // 🌟 [CRITICAL FIX] 서버에서 받아온 talk/prompt 메시지는 items 테이블(upsert_item)이 아니라 
+                // 반드시 messages 테이블(add_message)로 직접 인서트해야 화면의 get_chat_messages에서 정상 조회됩니다!
+                let from_val = clean_item.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let to_val = clean_item.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                let cc_val = clean_item.get("cc").and_then(|v| v.as_str()).unwrap_or("");
+                let bcc_val = clean_item.get("bcc").and_then(|v| v.as_str()).unwrap_or("");
+                let ref_val = clean_item.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                let status_val = clean_item.get("status").and_then(|v| v.as_i64()).unwrap_or(9) as i32;
+                let created_at_val = clean_item.get("created_at").map(|v| v.to_string()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis().to_string());
+                
+                // Chrome.js처럼 role 구분 (프론트에서 address 비교로 재교정되므로 기본값 user 지정)
+                let role_val = if type_str == "talk" { "user" } else { "system_task" };
+
+                if !id.is_empty() {
+                    let _ = db.add_message(
+                        &id, role_val, &text_val, 
+                        None, Some(status_val), 
+                        Some(cc_val), Some(bcc_val), Some(ref_val), 
+                        Some(from_val), Some(to_val), Some(type_str.as_str()), 
+                        Some(created_at_val.as_str())
+                    ).await;
+                    count += 1;
+                }
+                continue; // messages 테이블에 저장했으므로 하단의 items/talks 테이블 저장 로직은 건너뜀
             }
 
             // Determine table based on cleaned type
