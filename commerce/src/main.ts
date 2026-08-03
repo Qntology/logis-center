@@ -2659,30 +2659,87 @@ listen("extraction-progress", async (event: any) => {
             // 🌟 [추가] 검색어와 카운트 H3에 업데이트
             const resultH3 = document.querySelector('.nav-section.search h3');
             if (resultH3) {
-                let queryText = "";
-                if (response.structured && response.structured.original_text) {
-                    queryText = response.structured.original_text;
+                // 🌟 [TRACKING EQ] structured_query의 context 배열에서 tracking_number 조건을 추출합니다.
+                let trackingNumberForEq = "";
+                if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
+                    for (const ctx of response.structured.context) {
+                        if (ctx.condition && ctx.condition.tracking_number) {
+                            const tnVal = ctx.condition.tracking_number.value || "";
+                            if (tnVal) {
+                                trackingNumberForEq = tnVal;
+                                break;
+                            }
+                        }
+                    }
                 }
-                if (!queryText) {
-                    const queryEl = document.getElementById(`${payload.task_id}_query`);
-                    if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                if (trackingNumberForEq) {
+                    // 🌟 [TRACKING EQ] tracking_number가 감지되면 LanceDB FTS 대신 Dexie DB eq 쿼리로 정확 매칭합니다.
+                    const countStr = response.results ? response.results.length : 0;
+                    resultH3.innerHTML = `tracking_number: ${trackingNumberForEq} <strong class="count">(${countStr})</strong>`;
+                } else {
+                    let queryText = "";
+                    if (response.structured && response.structured.original_text) {
+                        queryText = response.structured.original_text;
+                    }
+                    if (!queryText) {
+                        const queryEl = document.getElementById(`${payload.task_id}_query`);
+                        if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                    }
+                    let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
+                    if (currentSearchMode === "commerce") displayMode = "Goods";
+                    const countStr = response.results ? response.results.length : 0;
+                    resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
                 }
-                
-                let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-                if (currentSearchMode === "commerce") displayMode = "Goods";
-                
-                // 검색 결과 개수를 여기서 직접 카운트 (추가될 개수)
-                const countStr = response.results ? response.results.length : 0;
-                resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
             }
 
             console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 원본 검색 결과 수: ${response.results ? response.results.length : 0}`);
+
+            // 🌟 [TRACKING EQ] tracking_number가 감지되면 Dexie DB eq 쿼리로 정확 매칭 문서를 검색합니다.
+            let trackingEqDocs: any[] = [];
+            if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
+                for (const ctx of response.structured.context) {
+                    if (ctx.condition && ctx.condition.tracking_number) {
+                        const tnVal = ctx.condition.tracking_number.value || "";
+                        if (tnVal && appDb) {
+                            console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 실행: tracking_number = '${tnVal}'`);
+                            try {
+                                const eqResults = await appDb.table("items")
+                                    .where("tracking_number").equals(tnVal)
+                                    .toArray();
+                                console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과: ${eqResults.length}건`);
+                                for (const match of eqResults) {
+                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
+                                    trackingEqDocs.push({
+                                        id: match.id,
+                                        uuid: match.id,
+                                        type: dData.type || match.type || "tracking",
+                                        data: dData,
+                                        text: dData.text || match.text || "",
+                                        created_at: dData.created_at || match.created_at || 0,
+                                        updated_at: dData.updated_at || match.updated_at || 0,
+                                        search_badge: "📦 Tracking EQ Match"
+                                    });
+                                }
+                            } catch (e) {
+                                console.error("[SEARCH-DEBUG] Dexie eq 쿼리 실패:", e);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
             if (response.results && response.results.length > 0) {
                 if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
                 
                 let docs: any[] = [];
+                // 🌟 [TRACKING EQ] Dexie eq 쿼리 결과를 우선 병합합니다.
+                if (trackingEqDocs.length > 0) {
+                    docs.push(...trackingEqDocs);
+                    console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과 ${trackingEqDocs.length}건 병합 완료`);
+                }
+                
                 for (const res of response.results) {
                     try {
                         // 🌟 [CRITICAL FIX] 백엔드가 이미 전체 JSON 데이터를 res.text에 담아 보냈으므로, 
@@ -2704,6 +2761,11 @@ listen("extraction-progress", async (event: any) => {
                         if (fullDoc.data) {
                             fullDoc.data.search_score = res.score;
                             fullDoc.data.search_context = res.context_type;
+                            // 🌟 [TRACKING BADGE] tracking_number 기반 교차 검색 결과임을 명시합니다.
+                            if (res.relation === "cross_tracking" || res.relation === "cross_items") {
+                                fullDoc.data.search_relation = res.relation;
+                                fullDoc.data.search_badge = "📦 Tracking Match";
+                            }
                         }
                         
                         docs.push(fullDoc);
@@ -2743,7 +2805,8 @@ listen("extraction-progress", async (event: any) => {
                         }
 
                         // 2. 역방향: 내부에 포함된 외래키를 통해 부모 문서 검색 (DB 인덱스 활용)
-                        const refKeys = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
+                        // 🌟 [TRACKING ENHANCEMENT] tracking_number를 최우선으로 배치하여 송장 번호 기반 교차 검색을 강화합니다.
+                        const refKeys = ["tracking_number", "no", "code", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
                         for (const key of refKeys) {
                             const rawRef = parsedData[key];
                             if (rawRef !== undefined && rawRef !== null && rawRef !== "") {

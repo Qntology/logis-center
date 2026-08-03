@@ -455,14 +455,16 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
             
             // 🌟 [CRITICAL FIX] LanceDB 스키마(store.rs)에 실제로 물리적으로 존재하는 컬럼만 명시해야 SQL 에러(Fallback)를 방지할 수 있습니다!
             // 가상 컬럼(weight, no, started_at 등)이 SQL에 포함되면 DataFusion 쿼리가 실패하여 모든 필터(5000원 등)가 통째로 초기화되는 치명적 버그 수정.
+            // 🌟 [TRACKING FIX] tracking_number는 text 컬럼에 내장되어 있으므로 FTS 검색으로 처리합니다. SQL 필터에서는 무시합니다.
             let valid_cols = [
                 "amount", "status", "type", "created_at", "updated_at", "mode", "is_masked"
             ];
-            
             let mapped_key = match key.as_str() {
                 "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" | "amount_total" | "total_amount" | "shipping_fee" => "amount",
                 "started_at" | "shipping_date" | "issue_date" | "order_date" | "registration_date" | "release_date" | "manufacture_date" | "payment_date" => "created_at",
                 "expired_at" | "delivery_date" => "updated_at",
+                // 🌟 [TRACKING] tracking_number, no, code는 텍스트 기반 FTS 검색으로 처리하므로 SQL 필터에서는 스킵
+                "tracking_number" | "no" | "code" | "carrier" => "",
                 k if valid_cols.contains(&k) => k,
                 _ => "" 
             };
@@ -859,14 +861,28 @@ async fn ai_search_complex(
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() { continue; }
-                
                 let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                
                 // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
                 if ctx_type == "ignore" {
                     continue;
                 }
-                
+                // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
+                // 백엔드 FTS/LIKE 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
+                let search_text = text.to_string();
+                let detected_tracking_number: Option<String> = {
+                    let mut tn: Option<String> = None;
+                    if let Some(cond_obj) = ctx.get("condition").and_then(|v| v.as_object()) {
+                        if let Some(tn_cond) = cond_obj.get("tracking_number") {
+                            if let Some(tn_val) = tn_cond.get("value").and_then(|v| v.as_str()) {
+                                if !tn_val.is_empty() {
+                                    tn = Some(tn_val.to_string());
+                                    println!("[AI-SEARCH] Tracking number '{}' detected. Delegating to Dexie eq query (frontend).", tn_val);
+                                }
+                            }
+                        }
+                    }
+                    tn
+                };
                 let target_table = match ctx_type {
                     "member" | "team" | "user" => "users",
                     "page" | "pages" => "pages",
@@ -883,18 +899,34 @@ async fn ai_search_complex(
                     Some(f) => Some(format!("({}) AND {}", f, mode_filter)),
                     None => Some(mode_filter.clone()),
                 };
-
-                let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 384]);
-                
-                let use_fts = true; 
-                let search_result = store.search_items(target_table, text, emb.clone(), 5, 0, final_sql_filter.clone(), use_fts).await;
-                
+                // 🌟 [TRACKING EXACT MATCH] tracking_number가 감지되면 FTS를 비활성화하고,
+                // text / json_data 컬럼에 SQL LIKE 필터를 걸어 해당 송장번호가 포함된 행만 정확히 조회합니다.
+                let emb = model.get_embedding(search_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                let has_tracking = detected_tracking_number.is_some();
+                let use_fts = !has_tracking;
+                let tracking_sql = if let Some(ref tn) = detected_tracking_number {
+                    let escaped_tn = tn.replace('\'', "''");
+                    let like_clause = format!("(text LIKE '%{}%' OR json_data LIKE '%{}%')", escaped_tn, escaped_tn);
+                    match final_sql_filter.clone() {
+                        Some(f) => Some(format!("({}) AND {}", f, like_clause)),
+                        None => Some(like_clause),
+                    }
+                } else {
+                    final_sql_filter.clone()
+                };
+                let search_result = store.search_items(target_table, &search_text, emb.clone(), 5, 0, tracking_sql.clone(), use_fts).await;
                 let final_results = match search_result {
                     Ok(res) => res,
                     Err(_) => {
-                        store.search_items(target_table, text, emb.clone(), 5, 0, Some(mode_filter.clone()), use_fts).await.unwrap_or_default()
+                        // LIKE 필터가 DataFusion에서 실패하면 mode_filter만으로 폴백
+                        store.search_items(target_table, &search_text, emb.clone(), 5, 0, Some(mode_filter.clone()), use_fts).await.unwrap_or_default()
                     }
                 };
+                // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
+                // 백엔드 교차 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
+                if let Some(ref tn) = detected_tracking_number {
+                    println!("[AI-SEARCH] Tracking number '{}' cross-search delegated to Dexie eq query (frontend).", tn);
+                }
 
                 for (id, content, score) in final_results {
                     // 결과 배열 내 중복 방어

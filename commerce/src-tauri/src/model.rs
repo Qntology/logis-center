@@ -2163,10 +2163,17 @@ impl LogisModel {
         if ext_words_string.is_empty() {
             ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
         }
-
+        // 🌟 [TRACKING NUMBER DETECTION] 검색어에서 송장 번호 패턴(6자리 이상 순수 숫자 또는 숫자-하이픈 조합)을 감지합니다.
+        let mut detected_tracking_numbers: Vec<String> = Vec::new();
+        for word in &ext_words_string {
+            let digits_only: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits_only.len() >= 6 {
+                detected_tracking_numbers.push(digits_only.clone());
+                emit_term(&format!("  📦 [TRACKING DETECTED] Query contains potential tracking number: '{}'", digits_only));
+            }
+        }
         let words: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
         let mut context_arr = Vec::new();
-
         // 🌟 [1차 패스] 최소 2단어 이상(2-gram)의 교차 윈도우 스팬 및 카테고리별 기본 점수 수집
         struct SpanData {
             start: usize,
@@ -2175,6 +2182,7 @@ impl LogisModel {
             scores: std::collections::HashMap<String, f32>,
         }
         emit_term(&format!("  🔎 [INPUT WORDS] 분할된 단어 목록: {:?}", words));
+
         let mut raw_spans = Vec::new();
 
         for start in 0..words.len() {
@@ -3783,7 +3791,21 @@ impl LogisModel {
                 // 만약 모든 청크가 ignore가 아니었다면 마스터 컨텍스트를 추가합니다.
                 if !master_text.is_empty() || !master_type.is_empty() {
                     if master_type.is_empty() { master_type = "goods".to_string(); }
-
+                    // 🌟 [TRACKING NUMBER INJECTION] 감지된 송장 번호가 있다면 tracking_number 조건을 마스터 컨디션에 강제 주입합니다.
+                    if !detected_tracking_numbers.is_empty() {
+                        for tn in &detected_tracking_numbers {
+                            master_condition.insert("tracking_number".to_string(), json!({
+                                "operator": "contains",
+                                "value": tn
+                            }));
+                            emit_term(&format!("  📦 [TRACKING INJECT] tracking_number = '{}' condition injected into master context.", tn));
+                        }
+                        // tracking_number가 감지되면 마스터 타입을 tracking으로 승급하여 검색 테이블 우선순위를 조정합니다.
+                        if master_type == "goods" {
+                            master_type = "tracking".to_string();
+                            emit_term("  📦 [TRACKING PROMOTION] Master type promoted to 'tracking' for table targeting.");
+                        }
+                    }
                     let master_ctx = json!({
                         "type": master_type,
                         "text": master_text,
@@ -3792,7 +3814,6 @@ impl LogisModel {
                         "find": master_find,
                         "condition": master_condition
                     });
-                    
                     // 단 하나의 완벽하게 병합된 컨텍스트를 맨 앞에 삽입
                     final_contexts.insert(0, master_ctx);
                 }

@@ -4045,20 +4045,113 @@ async fn process_task(
                 }
             }
         }
-
-        
+        // 🌟 [TRACKING RELAY] order 전처리 시 tracking_number가 추출되면 tracking 테이블에서 역방향 쿼리
+        // index.ts Relay(foreign="tracking", primary.type="order") 로직의 Rust 패리티 반영
+        if page_type == "order" {
+            if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
+                if !tn_raw.trim().is_empty() {
+                    let clean_tn = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
+                        .replace("-", "").replace("_", "");
+                    if !clean_tn.is_empty() {
+                        emit_term(&format!("  📦 [TRACKING RELAY] order 전처리에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
+                        match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
+                            Ok(Some((tracking_id, mut tracking_data))) => {
+                                // 기존 tracking 문서 발견 → order.index를 tracking.order에 매핑 + 물류 속성 전파
+                                let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                                let mut needs_update = false;
+                                // order → tracking: width, height, length, weight 전파 (index.ts merge.includes 패리티)
+                                for field in ["width", "height", "length", "weight"] {
+                                    if let Some(val) = extracted_data.get(field).cloned() {
+                                        let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                        if existing == 0.0 {
+                                            tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
+                                            needs_update = true;
+                                        }
+                                    }
+                                }
+                                // order.index → tracking.order 매핑 (index.ts foreign.from="index", foreign.to="order" 패리티)
+                                if let Some(order_index) = extracted_data.get("index") {
+                                    if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
+                                        tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
+                                        needs_update = true;
+                                    }
+                                }
+                                // tracking.index → extracted_data.tracking 역매핑 (index.ts foreign.from="index", foreign.to="tracking" 패리티)
+                                if let Some(tracking_index) = tracking_data.get("index").cloned() {
+                                    if extracted_data.get("tracking").is_none() || extracted_data.get("tracking") == Some(&json!(0)) {
+                                        extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
+                                    }
+                                }
+                                if needs_update {
+                                    if was_foreign_draft {
+                                        let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                        e.0 -= 1; // pages draft--
+                                        e.1 += 1; // pages count++
+                                        e.2 += 1; // global count++
+                                        tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                    }
+                                    let merged_text = parsing::json_to_natural_language(&tracking_data);
+                                    let masked_merged_text = merged_text.clone();
+                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                    tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                    tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
+                                    let _ = store.upsert_item(
+                                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+                                    let _ = store.upsert_item(
+                                        "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+                                    emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
+                                }
+                            },
+                            Ok(None) => {
+                                // tracking 문서 미존재 → draft 생성 (index.ts Relay Ok(None) 분기 패리티)
+                                let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                e.0 += 1; // pages draft++
+                                e.2 += 1; // global count++
+                                let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
+                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                let mut draft_data = json!({});
+                                if let Some(obj) = draft_data.as_object_mut() {
+                                    obj.insert("id".to_string(), json!(draft_id.clone()));
+                                    obj.insert("type".to_string(), json!("tracking"));
+                                    obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                    obj.insert("index".to_string(), json!(tracking_index));
+                                    // order.index → tracking.order 매핑
+                                    if let Some(order_index) = extracted_data.get("index") {
+                                        obj.insert("order".to_string(), order_index.clone());
+                                    }
+                                    obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                }
+                                // tracking.index → extracted_data.tracking 역매핑
+                                extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
+                                let _ = store.upsert_item(
+                                    "tracking", &draft_id, "tracking", draft_data.clone(), None,
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                                let _ = store.upsert_item(
+                                    "items", &draft_id, "tracking", draft_data, None,
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                                emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
-
         let _ = store.upsert_item(
             &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
             Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
         ).await;
-        
         let _ = store.upsert_item(
             "items", &target_id, &page_type, extracted_data.clone(), vector,
             Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
         ).await;
-
         items_to_process.push(extracted_data.clone());
         
     } else {
@@ -4244,18 +4337,113 @@ async fn process_task(
                 }
 
                 
+                // 🌟 [TRACKING RELAY] order 리스트 전처리 시 tracking_number가 추출되면 tracking 테이블에서 역방향 쿼리
+                // index.ts Relay(foreign="tracking", primary.type="order") 로직의 Rust 패리티 반영
+                if page_type == "order" {
+                    if let Some(tn_raw) = single_item.get("tracking_number").and_then(|v| v.as_str()) {
+                        if !tn_raw.trim().is_empty() {
+                            let clean_tn = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
+                                .replace("-", "").replace("_", "");
+                            if !clean_tn.is_empty() {
+                                emit_term(&format!("  📦 [TRACKING RELAY] order 리스트 아이템에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
+                                match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
+                                    Ok(Some((tracking_id, mut tracking_data))) => {
+                                        // 기존 tracking 문서 발견 → order.index를 tracking.order에 매핑 + 물류 속성 전파
+                                        let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                                        let mut needs_update = false;
+                                        // order → tracking: width, height, length, weight 전파 (index.ts merge.includes 패리티)
+                                        for field in ["width", "height", "length", "weight"] {
+                                            if let Some(val) = single_item.get(field).cloned() {
+                                                let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                if existing == 0.0 {
+                                                    tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
+                                                    needs_update = true;
+                                                }
+                                            }
+                                        }
+                                        // order.index → tracking.order 매핑 (index.ts foreign.from="index", foreign.to="order" 패리티)
+                                        if let Some(order_index) = single_item.get("index") {
+                                            if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
+                                                tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
+                                                needs_update = true;
+                                            }
+                                        }
+                                        // tracking.index → single_item.tracking 역매핑 (index.ts foreign.from="index", foreign.to="tracking" 패리티)
+                                        if let Some(tracking_index) = tracking_data.get("index").cloned() {
+                                            if single_item.get("tracking").is_none() || single_item.get("tracking") == Some(&json!(0)) {
+                                                single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
+                                            }
+                                        }
+                                        if needs_update {
+                                            if was_foreign_draft {
+                                                let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                                e.0 -= 1; // pages draft--
+                                                e.1 += 1; // pages count++
+                                                e.2 += 1; // global count++
+                                                tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                            }
+                                            let merged_text = parsing::json_to_natural_language(&tracking_data);
+                                            let masked_merged_text = merged_text.clone();
+                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                            tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                            tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
+                                            let _ = store.upsert_item(
+                                                "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
+                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                            ).await;
+                                            let _ = store.upsert_item(
+                                                "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                            ).await;
+                                            emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        // tracking 문서 미존재 → draft 생성 (index.ts Relay Ok(None) 분기 패리티)
+                                        let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                        e.0 += 1; // pages draft++
+                                        e.2 += 1; // global count++
+                                        let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
+                                        let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                        let mut draft_data = json!({});
+                                        if let Some(obj) = draft_data.as_object_mut() {
+                                            obj.insert("id".to_string(), json!(draft_id.clone()));
+                                            obj.insert("type".to_string(), json!("tracking"));
+                                            obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                            obj.insert("index".to_string(), json!(tracking_index));
+                                            // order.index → tracking.order 매핑
+                                            if let Some(order_index) = single_item.get("index") {
+                                                obj.insert("order".to_string(), order_index.clone());
+                                            }
+                                            obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                        }
+                                        // tracking.index → single_item.tracking 역매핑
+                                        single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
+                                        let _ = store.upsert_item(
+                                            "tracking", &draft_id, "tracking", draft_data.clone(), None,
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                        let _ = store.upsert_item(
+                                            "items", &draft_id, "tracking", draft_data, None,
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                        emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                    },
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
                 // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
-
                 let _ = store.upsert_item(
                     &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
                     Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
                 ).await;
-                
                 let _ = store.upsert_item(
                     "items", &hashed_item_id, &page_type, single_item.clone(), vector,
                     Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
                 ).await;
-
                 items_to_process.push(single_item);
             }
         }

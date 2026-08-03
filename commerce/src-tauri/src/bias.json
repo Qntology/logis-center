@@ -226,12 +226,12 @@
   "ko": {
     "tracking": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 배송을 나열하는 목록, 배송 표, 배송 리스트 페이지",
         "bias": "운송목록, 운송리스트, 운송표, 운송일괄, 배송목록, 송장출력내역, 배송현황, 미배송리스트, 일괄발송",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 배송의 상세 정보를 보여주거나 입력하는 배송 폼 페이지",
         "bias": "운송상세, 운송폼, 운송입력, 운송수정, 송장수정, 단일배송조회, 배송지오류수정, 반품처리, 상세조회",
         "prejudice": "global navigation, menus, footers, aside."
       },
@@ -338,12 +338,12 @@
     },
     "goods": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 상품을 나열하는 목록, 표, 리스트 페이지",
         "bias": "상품목록, 상품리스트, 진열관리, 재고관리",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 상품의 상세 정보를 보여주거나 입력하는 폼 페이지",
         "bias": "상품상세, 상품폼, 상품입력, 상품수정, 상품등록, 상품수정, 옵션추가, 상세설명에디터, 썸네일등록, 연관상품설정, input, select, textarea",
         "prejudice": "global navigation, menus, footers, aside."
       },
@@ -550,12 +550,12 @@
     },
     "order": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 주문을 나열하는 목록, 주문 표, 주문 리스트 페이지",
         "bias": "주문리스트, 주문표, 주문목록, 결제내역, 주문취소/환불목록, 전체주문, 발주관리",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 주문의 상세 정보를 보여주거나 입력하는 주문 폼 페이지",
         "bias": "주문상세, 주문폼, 주문입력, 주문수정, 상세정보, 배송지수정, 부분취소, 결제수정, 수령인변경, 관리자메모",
         "prejudice": "global navigation, menus, footers, aside."
       },
