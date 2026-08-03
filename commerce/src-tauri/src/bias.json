@@ -647,12 +647,12 @@
     },
     "review": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 리뷰을 나열하는 목록, 리뷰 표, 리뷰 리스트 페이지",
         "bias": "리뷰목록, 리뷰리스트, 리뷰표, 리뷰일괄, 리뷰목록, 평점리스트, 일괄승인, 미답변게시글",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 리뷰의 상세 정보를 보여주거나 입력하는 리뷰 폼 페이지",
         "bias": "리뷰상세, 리뷰폼, 리뷰입력, 리뷰수정, 리뷰상세, 답변작성, 블라인드처리",
         "prejudice": "global navigation, menus, footers, aside."
       },
@@ -689,12 +689,12 @@
     },
     "coupon": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 쿠폰을 나열하는 목록, 쿠폰 표, 쿠폰 리스트 페이지",
         "bias": "쿠폰목록, 쿠폰리스트, 쿠폰표, 쿠폰일괄, 쿠폰목록, 발급현황, 사용내역조회",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 쿠폰의 상세 정보를 보여주거나 입력하는 쿠폰 폼 페이지",
         "bias": "쿠폰상세, 쿠폰폼, 쿠폰입력, 쿠폰수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, input, select, textarea",
         "prejudice": "global navigation, menus, footers, aside."
       },
@@ -801,12 +801,12 @@
     },
     "event": {
       "layout_list": {
-        "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
+        "semantic": "다중 이벤트를 나열하는 목록, 이벤트 표, 이벤트 리스트 페이지",
         "bias": "이벤트목록, 이벤트리스트, 이벤트표, 이벤트일괄, 쿠폰목록, 발급현황, 사용내역조회",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
-        "semantic": "단일 항목의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "semantic": "단일 이벤트의 상세 정보를 보여주거나 입력하는 이벤트 폼 페이지",
         "bias": "이벤트상세, 이벤트폼, 이벤트입력, 이벤트수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, input, select, textarea",
         "prejudice": "global navigation, menus, footers, aside."
       },

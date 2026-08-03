@@ -969,7 +969,51 @@ pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
     full_bias.trim().to_string()
 }
 
-pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
+/// 🌟 [PAGE TYPE CLASSIFICATION 전용] layout_list + layout_form + 로컬라이즈된 타입 이름만 사용하여
+/// 필드 레벨 bias 노이즈(예: sender_name의 "테스트", goods 필드의 상품 예시값 등)를 원천 차단합니다.
+pub fn get_page_type_classification_bias(page_type: &str, lang: &str) -> String {
+    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let localized_type = get_localized_page_type(page_type, lang);
+    let mut bias = String::from(page_type);
+    bias.push_str(" ");
+    bias.push_str(&localized_type);
+
+    if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
+        // 오직 layout_list, layout_form만 사용 (필드 레벨 bias는 분류 노이즈의 주범)
+        for key in ["layout_list", "layout_form"] {
+            if let Some(layout_obj) = localized_obj.get(key) {
+                if let Some(b) = layout_obj.get("bias").and_then(|v| v.as_str()) {
+                    bias.push_str(" ");
+                    bias.push_str(&b.replace("{TYPE}", &localized_type));
+                }
+            }
+        }
+        // title bias의 시맨틱 키워드만 포함 (예시값 제외)
+        if let Some(title_obj) = localized_obj.get("title") {
+            if let Some(b) = title_obj.get("bias").and_then(|v| v.as_str()) {
+                // 예시값(긴 문장)은 제거하고 쉼표 앞의 핵심 키워드만 추출
+                let keywords: Vec<&str> = b.split(',').take(3).collect();
+                for kw in keywords {
+                    let kw_trimmed = kw.trim();
+                    if kw_trimmed.len() < 20 {
+                        bias.push_str(" ");
+                        bias.push_str(kw_trimmed);
+                    }
+                }
+            }
+        }
+        // status bias도 포함 (페이지의 상태 필터 텍스트가 타입 판별에 중요)
+        if let Some(status_obj) = localized_obj.get("status") {
+            if let Some(b) = status_obj.get("bias").and_then(|v| v.as_str()) {
+                bias.push_str(" ");
+                bias.push_str(&b.replace("{TYPE}", &localized_type));
+            }
+        }
+    }
+    bias.trim().to_string()
+}
+
+pub fn get_title_bias(page_type:  &str, lang:  &str) -> (String, String) {
     let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
     let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::from("title name product");
