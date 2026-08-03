@@ -801,67 +801,156 @@ async fn process_task(
         // 🌟 [격리 보장] Step A의 노이즈 청소 로직이 원본 PUG를 훼손하여 Step B에 영향을 주지 않도록 독립된 변수로 분리합니다.
         let mut filtered_light_pug = light_pug.clone();
 
-        // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직 고도화 (판정 깨기 로직 포함)]
-        // 단순 빈도수뿐만 아니라 '등장 위치의 분산도(Dispersion)'와 '텍스트의 성격'을 분석하여
-        // 리스트 아이템의 핵심 데이터(상품명 등)가 전역 UI 노이즈로 오인되어 탈락되는 것을 방지합니다.
-        // 🌟 [핵심 개선: 뎁스(Depth) 구조 및 반복 패턴을 결합한 판정 깨기 로직 고도화]
-        // 텍스트가 동일한 DOM 뎁스(리스트 아이템)에서 흐름이 끊기며 나타난다면 전역 UI가 아닌 데이터로 간주하여 보호합니다.
-        let mut global_text_stats: std::collections::HashMap<String, (usize, Vec<(usize, usize)>)> = std::collections::HashMap::new();
-        for (line_idx, line) in pug_lines.iter().enumerate() {
-            if let Some(idx) = line.find('|') {
-                let indent = line.chars().take_while(|c| c.is_whitespace()).count(); // PUG 들여쓰기로 뎁스 측정
-                let text_part = line[idx + 1..].trim();
-                if !text_part.is_empty() && text_part.len() > 2 {
-                    let entry = global_text_stats.entry(text_part.to_string()).or_insert((0, Vec::new()));
-                    entry.0 += 1;
-                    entry.1.push((line_idx, indent));
+                // 🌟 [핵심 개선: 뎁스(Depth) + 테이블 컬럼 위치(colspan/rowspan) 결합 판정 깨기 로직 고도화]
+        // 텍스트가 동일한 DOM 뎁스(리스트 아이템)에서 흐름이 끊기며 나타나더라도,
+        // 테이블 구조 내에서 '동일 컬럼 위치'에 반복되면 UI 버튼으로 판정하여 탈락시킵니다.
+        
+        // Phase 0: 테이블 구조 감지 및 컬럼 인덱스 매핑
+        // PUG에서 tr/td/th 패턴을 추적하여 각 텍스트 라인의 (row_index, col_index)를 산출합니다.
+        let mut line_col_positions: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+        let mut is_table_structure = false;
+        {
+            let mut current_row: usize = 0;
+            let mut current_col: usize = 0;
+            let mut in_row = false;
+            for (line_idx, line) in pug_lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                let tag_part = trimmed.split('|').next().unwrap_or("").trim();
+                let tag_name = tag_part.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+                if tag_name == "tr" {
+                    is_table_structure = true;
+                    if in_row { current_row += 1; }
+                    current_col = 0;
+                    in_row = true;
+                } else if (tag_name == "td" || tag_name == "th") && in_row {
+                    // colspan 파싱: td[colspan="2"] 형태에서 colspan 값 추출
+                    let mut colspan_val = 1;
+                    if let Ok(re_cs) = regex::Regex::new(r#"colspan[=\\"]*(\d+)"#) {
+                        if let Some(cap) = re_cs.captures(tag_part) {
+                            colspan_val = cap[1].parse::<usize>().unwrap_or(1);
+                        }
+                    }
+                    // 현재 td/th에 텍스트가 있는지 확인
+                    if let Some(pipe_idx) = trimmed.find('|') {
+                        let txt = trimmed[pipe_idx + 1..].trim();
+                        if !txt.is_empty() {
+                            line_col_positions.insert(line_idx, (current_row, current_col));
+                        }
+                    }
+                    current_col += colspan_val;
+                } else if tag_name != "td" && tag_name != "th" && tag_name != "tr" && tag_name != "thead" && tag_name != "tbody" && tag_name != "table" {
+                    // 테이블 외부 태그를 만나면 row 추적 리셋
+                    if in_row && !["colgroup", "col", "caption"].contains(&tag_name.as_str()) {
+                        // 테이블 종료는 아니지만 tr 외부이므로 col 리셋하지 않음
+                    }
                 }
             }
         }
+        
+        // Phase 1: 텍스트별 등장 정보 수집 (라인 인덱스 + 뎁스 + 컬럼 위치)
+        let mut global_text_stats: std::collections::HashMap<String, (usize, Vec<(usize, usize, Option<(usize, usize)>)>)> = std::collections::HashMap::new();
+        for (line_idx, line) in pug_lines.iter().enumerate() {
+            if let Some(idx) = line.find('|') {
+                let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+                let text_part = line[idx + 1..].trim();
+                if !text_part.is_empty() && text_part.len() > 2 {
+                    let col_pos = line_col_positions.get(&line_idx).cloned();
+                    let entry = global_text_stats.entry(text_part.to_string()).or_insert((0, Vec::new()));
+                    entry.0 += 1;
+                    entry.1.push((line_idx, indent, col_pos));
+                }
+            }
+        }
+        
+        // Phase 2: 테이블 전체 row 수 계산 (컬럼 반복 판정용)
+        let total_table_rows = if is_table_structure {
+            let mut max_row = 0usize;
+            for (_, &(r, _)) in &line_col_positions {
+                if r > max_row { max_row = r; }
+            }
+            max_row + 1
+        } else { 0 };
+        
         let mut global_boilerplate_texts = std::collections::HashSet::new();
         let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
-        let re_has_digit = regex::Regex::new(r"\d").unwrap(); // 🌟 숫자 포함 여부 확인용 (모델명, 날짜 등 보호)
-
+        let re_has_digit = regex::Regex::new(r"\d").unwrap();
+        
         for (text, (count, occurrences)) in global_text_stats {
             if count >= 4 {
                 // 1. 숫자 데이터 보호 (가격, 수량, 날짜, 모델명 등)
                 let is_numeric_data = re_numeric.is_match(&text) || re_has_digit.is_match(&text);
                 if is_numeric_data { continue; }
-
-                // 2. 🌟 [판정 깨기 로직 고도화] 뎁스(Depth) 구조 및 흐름 단절 패턴 분석
+                
+                // 2. 🌟 [테이블 컬럼 위치 기반 판정] colspan/rowspan 인식
+                // 테이블 구조에서 동일 컬럼에 전체 row의 70% 이상 반복되면 → UI 버튼/레이블
+                if is_table_structure && total_table_rows >= 3 {
+                    let mut col_hits: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                    let mut rows_with_this_text: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                    for (_, _, col_pos) in &occurrences {
+                        if let Some((row_idx, col_idx)) = *col_pos {
+                            *col_hits.entry(col_idx).or_insert(0) += 1;
+                            rows_with_this_text.insert(row_idx);
+                        }
+                    }
+                    // 특정 컬럼에 이 텍스트가 집중되어 있고, 전체 row의 70% 이상에서 등장하면 UI 노이즈
+                    let row_coverage = rows_with_this_text.len() as f64 / total_table_rows as f64;
+                    let max_col_hit = col_hits.values().max().copied().unwrap_or(0);
+                    let is_same_col_repeated = max_col_hit >= (total_table_rows as f64 * 0.7).ceil() as usize;
+                    
+                    if is_same_col_repeated && row_coverage >= 0.7 {
+                        // 짧은 텍스트(버튼, 액션)는 탈락 / 긴 텍스트(공급사명 등 데이터)는 보호
+                        if text.len() < 10 {
+                            global_boilerplate_texts.insert(text.clone());
+                            emit_term(&format!("  🚫 [TABLE-COL DROP] 동일 컬럼({}회/{}rows) 반복 UI 탈락: '{}' ({}회 발견)", max_col_hit, total_table_rows, text, count));
+                            continue;
+                        } else {
+                            emit_term(&format!("  🛡️ [TABLE-COL PROTECT] 동일 컬럼 반복이지만 긴 텍스트(데이터 추정): '{}' ({}회 발견)", text, count));
+                            continue;
+                        }
+                    }
+                }
+                
+                // 3. 🌟 [기존 뎁스 기반 판정 깨기] (테이블이 아니거나 컬럼 판정 미해당 시)
                 let mut is_contiguous = false;
                 let mut is_dispersed = false;
                 let mut is_same_depth = true;
-                
                 if occurrences.len() >= 2 {
                     let mut gaps = Vec::new();
                     let first_indent = occurrences[0].1;
                     for i in 1..occurrences.len() {
                         gaps.push(occurrences[i].0 - occurrences[i-1].0);
                         if occurrences[i].1 != first_indent {
-                            is_same_depth = false; // 하나라도 뎁스가 다르면 false
+                            is_same_depth = false;
                         }
                     }
                     let min_gap = *gaps.iter().min().unwrap_or(&0);
                     let max_gap = *gaps.iter().max().unwrap_or(&0);
-                    
-                    // 🚫 [연속성] 인덱스들이 서로 매우 가까움 (예: 네비게이션 메뉴, 푸터) -> 전역 UI 확신
                     if min_gap <= 3 && max_gap <= 5 {
                         is_contiguous = true;
-                    }
-                    // 🛡️ [분산성] 인덱스들이 문서 전체에 걸쳐 넓게 퍼져 있음
-                    else if max_gap > 10 {
+                    } else if max_gap > 10 {
                         is_dispersed = true;
                     }
-
-                    // 🌟 [추가된 판정 깨기] 동일 뎁스(구조)에서 흐름이 끊기며 나타나는 경우 (리스트 아이템)
-                    // 연이어 나오더라도 이후에 다른 패턴(큰 간격)이 존재한다면 반복 UI가 아닌 복제된 데이터로 판단
+                    // 🌟 동일 뎁스 + 분산: 테이블 컬럼 판정을 통과하지 못한 경우에만 보호
                     if is_same_depth && max_gap > 5 {
+                        // 추가 검증: 테이블 구조에서 서로 다른 컬럼에 등장하면 데이터, 같은 컬럼이면 UI
+                        if is_table_structure {
+                            let mut unique_cols: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                            for (_, _, col_pos) in &occurrences {
+                                if let Some((_, col_idx)) = *col_pos {
+                                    unique_cols.insert(col_idx);
+                                }
+                            }
+                            if unique_cols.len() <= 1 && count >= 6 {
+                                // 같은 컬럼에만 반복 → UI 노이즈 확정
+                                global_boilerplate_texts.insert(text.clone());
+                                emit_term(&format!("  🚫 [TABLE-SAME-COL DROP] 단일 컬럼 반복 탈락: '{}' ({}회, 컬럼 {:?})", text, count, unique_cols));
+                                continue;
+                            }
+                        }
                         emit_term(&format!("  🛡️ [GLOBAL PROTECT] 동일 구조(Depth) 내 분산 패턴 데이터 보호: '{}' ({}회 발견)", text, count));
-                        continue; // 판정 취소 및 강제 보호
+                        continue;
                     } else if !is_same_depth && is_dispersed {
-                        // 아예 구조가 다른 영역(헤더, 푸터, 사이드바 등)에서 흩어져서 발견되는 경우 
-                        // 전역 UI(메뉴, 카테고리 등)일 확률이 매우 높으므로 확실하게 탈락 처리
                         if text.len() < 20 {
                             global_boilerplate_texts.insert(text.clone());
                             emit_term(&format!("  🚫 [GLOBAL DROP] 다중 구조(Depth) 교차 발견 노이즈 탈락: '{}' ({}회 발견)", text, count));
@@ -869,16 +958,13 @@ async fn process_task(
                         }
                     }
                 }
-
-                // 3. 최종 판정 (위에서 보호되지 않은 나머지 텍스트들)
+                // 4. 최종 판정
                 if is_contiguous {
-                    // 뭉쳐있는 경우: 전역 UI(메뉴 등)일 확률이 높으므로 탈락 (단, 너무 긴 문장은 보호)
                     if text.len() < 20 {
                         global_boilerplate_texts.insert(text.clone());
                         emit_term(&format!("  🚫 [GLOBAL DROP] 뭉쳐있는 UI 노이즈 탈락: '{}' ({}회 발견, 연속됨)", text, count));
                     }
                 } else if is_dispersed {
-                    // 🌟 분산되어 있지만 뎁스가 다르거나 불규칙한 경우
                     if text.len() >= 5 {
                         emit_term(&format!("  🛡️ [GLOBAL PROTECT] 분산된 데이터(상품명 추정) 보호: '{}' ({}회 발견, 간격 넓음)", text, count));
                     } else {
@@ -886,7 +972,6 @@ async fn process_task(
                         emit_term(&format!("  🚫 [GLOBAL DROP] 분산된 짧은 UI(버튼) 탈락: '{}' ({}회 발견)", text, count));
                     }
                 } else {
-                    // 기타 경우 (중간 정도 간격): 기존 로직 따르되 보수적으로 접근
                     if text.len() > 3 && !text.contains("선택") && !text.contains("전체") && !text.contains("카테고리") {
                         global_boilerplate_texts.insert(text.clone());
                         emit_term(&format!("  🚫 [GLOBAL DROP] 판정 전 전역 중복 UI 탈락: '{}' ({}회 발견)", text, count));
@@ -1261,30 +1346,66 @@ async fn process_task(
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
-
             let (list_bias, form_bias, layout_prejudice) = crate::parsing::get_combinatorial_layout_bias(&[&page_type], &doc_lang);
-            
             let prej_emb: Vec<f32> = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             
+            // 🌟 [NAVIGATION PRE-FILTER] Track B/C 후보 선정 전, 네비게이션/헤더/푸터/사이드바 라인을 사전 탈락
+            // Track A에서 놓친 개별 네비게이션 라인을 구조 태그 + prejudice 유사도 이중 검증으로 차단합니다.
+            {
+                let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu";
+                let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                let nav_tags = ["nav", "header", "footer", "aside", "menu", "gnb", "lnb", "breadcrumb"];
+                let mut nav_wiped_count = 0usize;
+                for (i, line) in pug_lines.iter().enumerate() {
+                    if wiped_indices[i] { continue; }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    // 구조 태그 기반 감지: nav, header, footer, aside 등
+                    let tag_name = trimmed.split(|c: char| c == '[' || c == ' ' || c == '(' || c == '|').next().unwrap_or("").to_lowercase();
+                    let is_nav_tag = nav_tags.iter().any(|&nt| tag_name.contains(nt));
+                    // id/class 기반 감지: gnb, lnb, menu, nav 등
+                    let has_nav_attr = nav_tags.iter().any(|&nt| trimmed.to_lowercase().contains(nt));
+                    if is_nav_tag || has_nav_attr {
+                        wiped_indices[i] = true;
+                        nav_wiped_count += 1;
+                        continue;
+                    }
+                    // 벡터 유사도 기반 감지: prejudice 임계값 0.45로 Track A(0.55)보다 낮게 설정하여 보강
+                    if !line_embeddings[i].iter().all(|&v| v == 0.0) {
+                        let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
+                        if nav_score > 0.45 {
+                            wiped_indices[i] = true;
+                            nav_wiped_count += 1;
+                        }
+                    }
+                }
+                if nav_wiped_count > 0 {
+                    emit_term(&format!("  🚫 [NAV PRE-FILTER] Step A-2 진입 전 네비게이션/레이아웃 {}개 라인 사전 탈락 완료.", nav_wiped_count));
+                }
+            }
+            
             // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
             let system_content_a2 = format!("[PUG CONTENT]\n{}", filtered_light_pug);
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
-
             emit_term("\n[CLASSIFICATION] Track B & C Vector Matching (Batch DOM Blocks)...");
-            
             let mut list_scores = Vec::new();
             let mut form_scores = Vec::new();
-
             for (i, emb) in line_embeddings.iter().enumerate() {
                 // 🌟 노이즈로 청소된 줄(wiped_indices)과 텍스트가 없는 줄은 평가에서 완벽히 배제합니다.
                 if wiped_indices[i] { continue; }
                 let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
-                
-                list_scores.push((i, cosine_similarity(&list_bias_emb, emb)));
-                form_scores.push((i, cosine_similarity(&form_bias_emb, emb)));
+                // 🌟 [추가 방어] prejudice 유사도가 bias보다 높으면 후보에서 원천 배제
+                let prej_score = cosine_similarity(&prej_emb, emb);
+                let list_s = cosine_similarity(&list_bias_emb, emb);
+                let form_s = cosine_similarity(&form_bias_emb, emb);
+                if prej_score > list_s && prej_score > form_s && prej_score > 0.35 {
+                    continue; // prejudice가 우세한 라인은 Track B/C 후보에서 완전 배제
+                }
+                list_scores.push((i, list_s));
+                form_scores.push((i, form_s));
             }
 
             list_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
