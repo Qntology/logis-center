@@ -801,70 +801,76 @@ async fn process_task(
         // 🌟 [격리 보장] Step A의 노이즈 청소 로직이 원본 PUG를 훼손하여 Step B에 영향을 주지 않도록 독립된 변수로 분리합니다.
         let mut filtered_light_pug = light_pug.clone();
 
-        // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직 사전 적용]
-        // Page Type 및 Detail 판정 전에 전체 문서에서 반복되는 UI(예: 장바구니, 구매하기 등)를 먼저 걷어내어 판정 정확도를 대폭 높입니다.
-        let mut global_text_positions: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-        for (i, line) in pug_lines.iter().enumerate() {
+        // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직 고도화 (판정 깨기 로직 포함)]
+        // 단순 빈도수뿐만 아니라 '등장 위치의 분산도(Dispersion)'와 '텍스트의 성격'을 분석하여
+        // 리스트 아이템의 핵심 데이터(상품명 등)가 전역 UI 노이즈로 오인되어 탈락되는 것을 방지합니다.
+        let mut global_text_stats: std::collections::HashMap<String, (usize, Vec<usize>)> = std::collections::HashMap::new();
+        for (line_idx, line) in pug_lines.iter().enumerate() {
             if let Some(idx) = line.find('|') {
                 let text_part = line[idx + 1..].trim();
                 if !text_part.is_empty() && text_part.len() > 2 {
-                    global_text_positions.entry(text_part.to_string()).or_default().push(i);
+                    let entry = global_text_stats.entry(text_part.to_string()).or_insert((0, Vec::new()));
+                    entry.0 += 1;
+                    entry.1.push(line_idx);
                 }
             }
         }
-        
         let mut global_boilerplate_texts = std::collections::HashSet::new();
         let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
-        
-        for (text, positions) in global_text_positions {
-            let count = positions.len();
-            // 문서 전체에서 4번 이상 동일하게 반복 등장하면 구조적 UI 요소로 간주
+        let re_has_digit = regex::Regex::new(r"\d").unwrap(); // 🌟 숫자 포함 여부 확인용 (모델명, 날짜 등 보호)
+
+        for (text, (count, indices)) in global_text_stats {
             if count >= 4 {
-                let is_numeric_data = re_numeric.is_match(&text);
-                if !is_numeric_data && text.len() > 3 {
-                    
-                    // 🌟 [추가 개선] 판정 취소(Break) 로직
-                    // 단순 빈도뿐만 아니라, 등장 간격(Gap)과 주변 문맥 패턴이 불규칙하면 콘텐츠(예: 상품명)로 간주하여 탈락을 취소합니다.
-                    let mut is_regular = true;
-                    
-                    // 1. 등장 간격(Gap) 불규칙성 검사
-                    if count >= 3 {
-                        let mut gaps = Vec::new();
-                        for w in positions.windows(2) {
-                            gaps.push(w[1] - w[0]);
-                        }
-                        let min_gap = *gaps.iter().min().unwrap();
-                        let max_gap = *gaps.iter().max().unwrap();
-                        // 간격이 심하게 들쭉날쭉하면 흐름이 끊어진 것으로 판단
-                        if max_gap > min_gap * 3 && max_gap > 10 {
-                            is_regular = false;
-                        }
-                    }
+                // 1. 숫자 데이터 보호 (가격, 수량, 날짜, 모델명 등)
+                let is_numeric_data = re_numeric.is_match(&text) || re_has_digit.is_match(&text);
+                if is_numeric_data { continue; }
 
-                    // 2. 이후 등장하는 패턴(Next Line)의 불규칙성 검사
-                    let mut next_line_texts = std::collections::HashSet::new();
-                    for &pos in &positions {
-                        if pos + 1 < pug_lines.len() {
-                            let next_line = &pug_lines[pos + 1];
-                            if let Some(idx) = next_line.find('|') {
-                                let next_text = next_line[idx + 1..].trim();
-                                if !next_text.is_empty() {
-                                    next_line_texts.insert(next_text.to_string());
-                                }
-                            }
-                        }
+                // 2. 🌟 [판정 깨기 로직] 등장 인덱스의 분산도(Dispersion) 분석
+                let mut is_contiguous = false;
+                let mut is_dispersed = false;
+                
+                if indices.len() >= 2 {
+                    let mut gaps = Vec::new();
+                    for i in 1..indices.len() {
+                        gaps.push(indices[i] - indices[i-1]);
                     }
+                    let min_gap = *gaps.iter().min().unwrap_or(&0);
+                    let max_gap = *gaps.iter().max().unwrap_or(&0);
                     
-                    // 이어지는 텍스트 패턴이 다양하게 끊어지는 경우 (절반 이상이 다른 패턴일 때) 흐름 단절로 보아 탈락 취소
-                    if next_line_texts.len() > count / 2 {
-                        is_regular = false;
+                    // 🚫 [연속성] 인덱스들이 서로 매우 가까움 (예: 네비게이션 메뉴, 푸터) -> 전역 UI 확신
+                    if min_gap <= 3 && max_gap <= 5 {
+                        is_contiguous = true;
                     }
+                    // 🛡️ [분산성] 인덱스들이 문서 전체에 걸쳐 넓게 퍼져 있음 (예: 리스트 아이템의 공통 요소)
+                    else if max_gap > 10 {
+                        is_dispersed = true;
+                    }
+                }
 
-                    if is_regular {
+                // 3. 최종 판정
+                if is_contiguous {
+                    // 뭉쳐있는 경우: 전역 UI(메뉴 등)일 확률이 높으므로 탈락 (단, 너무 긴 문장은 보호)
+                    if text.len() < 20 {
+                        global_boilerplate_texts.insert(text.clone());
+                        emit_term(&format!("  🚫 [GLOBAL DROP] 뭉쳐있는 UI 노이즈 탈락: '{}' ({}회 발견, 연속됨)", text, count));
+                    }
+                } else if is_dispersed {
+                    // 🌟 [판정 깨기] 흩어져 있는 경우: 리스트 아이템의 공통 요소.
+                    // 텍스트가 일정 길이 이상(>= 5)이라면 '상품명'이나 '카테고리' 같은 데이터일 가능성이 높으므로 보호!
+                    // (짧은 텍스트는 '구매하기', '상세보기' 같은 버튼일 확률이 높으므로 탈락)
+                    if text.len() >= 5 {
+                        emit_term(&format!("  🛡️ [GLOBAL PROTECT] 분산된 데이터(상품명 추정) 보호: '{}' ({}회 발견, 간격 넓음)", text, count));
+                        // global_boilerplate_texts에 넣지 않음 (탈락 취소)
+                    } else {
+                        global_boilerplate_texts.insert(text.clone());
+                        emit_term(&format!("  🚫 [GLOBAL DROP] 분산된 짧은 UI(버튼) 탈락: '{}' ({}회 발견)", text, count));
+                    }
+                } else {
+                    // 기타 경우 (중간 정도 간격): 기존 로직 따르되 보수적으로 접근
+                    // 🌟 드롭박스 UI 키워드(선택, 전체 등)는 하드코딩으로 방어
+                    if text.len() > 3 && !text.contains("선택") && !text.contains("전체") && !text.contains("카테고리") {
                         global_boilerplate_texts.insert(text.clone());
                         emit_term(&format!("  🚫 [GLOBAL DROP] 판정 전 전역 중복 UI 탈락: '{}' ({}회 발견)", text, count));
-                    } else {
-                        emit_term(&format!("  💡 [GLOBAL DROP 취소] 불규칙한 흐름/패턴 감지되어 보존: '{}' ({}회 발견)", text, count));
                     }
                 }
             }
