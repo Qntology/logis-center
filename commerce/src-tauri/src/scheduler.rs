@@ -800,6 +800,84 @@ async fn process_task(
         
         // 🌟 [격리 보장] Step A의 노이즈 청소 로직이 원본 PUG를 훼손하여 Step B에 영향을 주지 않도록 독립된 변수로 분리합니다.
         let mut filtered_light_pug = light_pug.clone();
+
+        // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직 사전 적용]
+        // Page Type 및 Detail 판정 전에 전체 문서에서 반복되는 UI(예: 장바구니, 구매하기 등)를 먼저 걷어내어 판정 정확도를 대폭 높입니다.
+        let mut global_text_positions: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, line) in pug_lines.iter().enumerate() {
+            if let Some(idx) = line.find('|') {
+                let text_part = line[idx + 1..].trim();
+                if !text_part.is_empty() && text_part.len() > 2 {
+                    global_text_positions.entry(text_part.to_string()).or_default().push(i);
+                }
+            }
+        }
+        
+        let mut global_boilerplate_texts = std::collections::HashSet::new();
+        let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
+        
+        for (text, positions) in global_text_positions {
+            let count = positions.len();
+            // 문서 전체에서 4번 이상 동일하게 반복 등장하면 구조적 UI 요소로 간주
+            if count >= 4 {
+                let is_numeric_data = re_numeric.is_match(&text);
+                if !is_numeric_data && text.len() > 3 {
+                    
+                    // 🌟 [추가 개선] 판정 취소(Break) 로직
+                    // 단순 빈도뿐만 아니라, 등장 간격(Gap)과 주변 문맥 패턴이 불규칙하면 콘텐츠(예: 상품명)로 간주하여 탈락을 취소합니다.
+                    let mut is_regular = true;
+                    
+                    // 1. 등장 간격(Gap) 불규칙성 검사
+                    if count >= 3 {
+                        let mut gaps = Vec::new();
+                        for w in positions.windows(2) {
+                            gaps.push(w[1] - w[0]);
+                        }
+                        let min_gap = *gaps.iter().min().unwrap();
+                        let max_gap = *gaps.iter().max().unwrap();
+                        // 간격이 심하게 들쭉날쭉하면 흐름이 끊어진 것으로 판단
+                        if max_gap > min_gap * 3 && max_gap > 10 {
+                            is_regular = false;
+                        }
+                    }
+
+                    // 2. 이후 등장하는 패턴(Next Line)의 불규칙성 검사
+                    let mut next_line_texts = std::collections::HashSet::new();
+                    for &pos in &positions {
+                        if pos + 1 < pug_lines.len() {
+                            let next_line = &pug_lines[pos + 1];
+                            if let Some(idx) = next_line.find('|') {
+                                let next_text = next_line[idx + 1..].trim();
+                                if !next_text.is_empty() {
+                                    next_line_texts.insert(next_text.to_string());
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 이어지는 텍스트 패턴이 다양하게 끊어지는 경우 (절반 이상이 다른 패턴일 때) 흐름 단절로 보아 탈락 취소
+                    if next_line_texts.len() > count / 2 {
+                        is_regular = false;
+                    }
+
+                    if is_regular {
+                        global_boilerplate_texts.insert(text.clone());
+                        emit_term(&format!("  🚫 [GLOBAL DROP] 판정 전 전역 중복 UI 탈락: '{}' ({}회 발견)", text, count));
+                    } else {
+                        emit_term(&format!("  💡 [GLOBAL DROP 취소] 불규칙한 흐름/패턴 감지되어 보존: '{}' ({}회 발견)", text, count));
+                    }
+                }
+            }
+        }
+
+        for (i, line) in pug_lines.iter().enumerate() {
+            if let Some(idx) = line.find('|') {
+                let text_part = line[idx + 1..].trim();
+                if global_boilerplate_texts.contains(text_part) {
+                    wiped_indices[i] = true; // 판정 및 임베딩 연산에서 완전 배제
+                }
+            }
+        }
         
         // 🌟 [CRITICAL FIX] VRAM(GPU) 사용률 0% 병목 현상 원천 해결!
         // 한 줄씩 CPU가 던지고 기다리던 코드를 대량 일괄(Batch) 처리로 변경하여 GPU 코어를 100% 혹사시킵니다.
@@ -808,6 +886,10 @@ async fn process_task(
         
         for (line_idx, line) in pug_lines.iter().enumerate() {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
+            // 🌟 반복 UI로 판정된 라인은 임베딩 연산 자체에서 제외하여 속도/정확도를 동시 상승시킵니다.
+            if wiped_indices[line_idx] { continue; }
+            
             let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { "" };
             if !text_part.is_empty() {
                 texts_to_embed.push(text_part.to_string());
@@ -1568,7 +1650,7 @@ async fn process_task(
                     }
                 }
             }
-        } // 👈 🌟 [핵심 변경 2 끝] JS 선택자 분석 스킵 괄호 닫기!
+        }
 
         
         let target_selector = selector_info.get("final_target_selector")
@@ -1650,7 +1732,6 @@ async fn process_task(
                     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        // 🌟 [CRITICAL FIX] Qwen 3.5 생성기의 파라미터가 추가되었으므로 마지막 인자로 None(semantic_prejudice)을 추가로 전달합니다.
                         if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             

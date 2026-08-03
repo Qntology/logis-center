@@ -1,6 +1,6 @@
 pub fn page_type_prompt() -> String { 
     r###"[TASK]
-Based on the provided Pug template, identify the primary category of this webpage and its main language.
+Based on the provided Pug template, identify the primary category.
 
 [SCHEMA DEFINITIONS]
 - type: The main category. Must be one of:
@@ -15,8 +15,7 @@ Based on the provided Pug template, identify the primary category of this webpag
 
 [OUTPUT FORMAT]
 {
-    "type": "String",
-    "language": "String"
+    "type": "String"
 }"###.to_string() 
 }
 

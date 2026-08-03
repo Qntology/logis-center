@@ -920,7 +920,6 @@ pub fn get_combinatorial_layout_bias(active_types: &[&str], lang: &str) -> (Stri
                 if let Some(b) = l_form.get("bias").and_then(|v| v.as_str()) {
                     if !combined_form_bias.is_empty() { combined_form_bias.push_str(" "); }
                     combined_form_bias.push_str(&b.replace("{TYPE}", &localized_type));
-                    combined_form_bias.push_str(&format!(" {} input {} select {} textarea", localized_type, localized_type, localized_type));
                 }
                 if let Some(p) = l_form.get("prejudice").and_then(|v| v.as_str()) {
                     combined_prejudice.insert(p.replace("{TYPE}", &localized_type));
