@@ -1,20 +1,5 @@
 # License
 
-## Reference License
-
-This project integrates and extends the following open-source works:
-
-| Component | Project | License |
-|-----------|---------|---------|
-| Game Project | [buxx/opencombat](https://github.com/buxx/opencombat) | AGPL-3.0 |
-| Inference Engine | [ruihe774/bonsai-pot](https://github.com/ruihe774/bonsai-pot) | Unlicense |
-| Inference Model | [prism-ml/Bonsai-4B](https://github.com/prism-ml/Bonsai-4B) | Apache-2.0 |
-| Embedding Model | [kekeappa/kor-static-embedding-512](https://github.com/kekeappa/kor-static-embedding-512) | Apache-2.0 |
-| NLP Engine | [hephaex/mecab-ko](https://github.com/hephaex/mecab-ko) | Apache-2.0, MIT |
-| NLP Model | [eunjeon/mecab-ko-dic](https://github.com/eunjeon/mecab-ko-dic) | Apache-2.0 |
-
----
-
 ## Open Source Licenses
 
 This project uses the following open-source libraries:
