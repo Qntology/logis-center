@@ -1735,12 +1735,17 @@ impl Qwen3_5TextModel {
                 if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                     let mut reg = attn.registry.entries.write().unwrap();
                     let total_blocks = attn.kv_blocks.len();
+                    
                     let mut garbage_bin = Vec::new();
+                    
                     for (idx, block) in attn.kv_blocks.iter_mut().enumerate() {
-                        if idx + 1 >= total_blocks { continue; }
+                        if idx + 1 >= total_blocks { continue; } 
+                        
                         let mut inner = block.inner.write().unwrap();
+
                         // 🌟 [VRAM 즉시 반환 (Early Offloading) - Qwen 3.5]
                         // 과거 블록이 VRAM에 남아 OS에 80%~85% 메모리를 점유하는 현상을 끊어냅니다.
+                        // 브라우저 켤 때 65%로 떨어지던 그 메모리 반환 효과를 디코딩 루프마다 선제적으로 트리거합니다.
                         if inner.location == KVLocation::VRAM {
                             let k = inner.k_cache.take();
                             let v = inner.v_cache.take();
@@ -1752,18 +1757,18 @@ impl Qwen3_5TextModel {
                                 if idx < reg.len() { reg[idx].location[l_idx] = KVLocation::RAM; }
                             }
                         }
-                        // 🌟 [SSD-RELEASE] SSD에 이미 안착된 블록의 RAM 텐서를 즉시 해제합니다.
-                        // 이 처리가 없으면 10GB 이상의 과거 문맥이 RAM에 영구 잔류합니다.
+
                         if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
                             garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
                             inner.location = KVLocation::SSD;
+                            
                             reg[idx].location[l_idx] = KVLocation::SSD;
                             let mut cache = reg[idx].bitkv_cache.write().unwrap();
                             cache[l_idx] = None;
                         }
                     }
+                    
                     if !garbage_bin.is_empty() {
-                        // 🌟 [ASYNC-DROP] 메인 디코딩 스레드를 막지 않고 백그라운드에서 텐서 파괴
                         tokio::task::spawn_blocking(move || {
                             drop(garbage_bin);
                         });
@@ -1852,10 +1857,7 @@ impl Qwen3_5TextModel {
                         }
                     },
                     AttnKind::LinearAttn(_attn) => {
-                        // 🌟 [SSM-DECODE-SKIP] 디코딩 중에는 SSM 상태를 디스크에 쓰지 않습니다.
-                        // SSM 상태는 prefill 완료 시점(force_flush_all_active_blocks)에서만 저장하고,
-                        // 디코딩 중에는 RAM에 상주시켜 매 토큰 I/O를 0으로 만듭니다.
-                        // force_flush_all_active_blocks에서 ssm_dumps 수집 시 is_ssm_dirty 플래그로 제어됩니다.
+                        // 디코딩 중 SSM 디스크 I/O 스팸 방지
                     }
                 }
             }

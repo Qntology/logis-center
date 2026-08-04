@@ -13,21 +13,155 @@ use crate::{
     utils::tensor_utils::prepare_causal_attention_mask,
 };
 
+pub struct Qwen3Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    num_kv_groups: usize,
+    head_dim: usize,
+    scaling: f64,
+    pub kv_cache: Option<(Tensor, Tensor)>,
+}
+
+impl Qwen3Attention {
+    pub fn new(config: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let num_attention_heads = config.num_attention_heads;
+        let head_dim = config.head_dim;
+        let num_key_value_heads = config.num_key_value_heads;
+        let num_kv_groups = num_attention_heads / num_key_value_heads;
+        let scaling = 1f64 / f64::sqrt(head_dim as f64);
+        let q_proj = linear_b(
+            hidden_size,
+            num_attention_heads * head_dim,
+            config.attention_bias,
+            vb.pp("q_proj"),
+        )?;
+        let k_proj = linear_b(
+            hidden_size,
+            num_key_value_heads * head_dim,
+            config.attention_bias,
+            vb.pp("k_proj"),
+        )?;
+        let v_proj = linear_b(
+            hidden_size,
+            num_key_value_heads * head_dim,
+            config.attention_bias,
+            vb.pp("v_proj"),
+        )?;
+        let o_proj = linear_b(
+            num_attention_heads * head_dim,
+            hidden_size,
+            config.attention_bias,
+            vb.pp("o_proj"),
+        )?;
+        let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads,
+            num_key_value_heads,
+            num_kv_groups,
+            head_dim,
+            scaling,
+            kv_cache: None,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let query_states = self.q_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_attention_heads,
+            self.head_dim,
+        ))?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        let key_states = self.k_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        let value_states = self.v_proj.forward(xs)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let (query_states, key_states) =
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        
+        // 🌟 [CRITICAL FIX] 동일하게 소유권(take)을 빼앗아 VRAM 2배 널뛰기 스파이크를 완전히 제거합니다.
+        let (key_states, value_states) = match self.kv_cache.take() {
+            None => (key_states.contiguous()?, value_states.contiguous()?),
+            Some((prev_k, prev_v)) => {
+                let dev = key_states.device();
+                let prev_k = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
+                let prev_v = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
+                let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
+                let v = Tensor::cat(&[&prev_v, &value_states], 2)?.contiguous()?;
+                (k, v)
+            }
+        };
+        
+        // 🌟 [JIT CPU Offload] 동일하게 보관용 캐시를 연산 직후 즉각 RAM으로 대피시켜 VRAM 스파이크를 없앱니다.
+        self.kv_cache = Some((
+            key_states.to_device(&candle_core::Device::Cpu)?, 
+            value_states.to_device(&candle_core::Device::Cpu)?
+        ));
+        let attn_output = eager_attention_forward(
+            &query_states,
+            &key_states,
+            &value_states,
+            Some(self.num_kv_groups),
+            attention_mask,
+            self.scaling,
+        )?;
+        let attn_output =
+            attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        let attn_output = attn_output.apply(&self.o_proj)?;
+        Ok(attn_output)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache = None
+    }
+}
+
+#[derive(Clone)]
+pub struct Fp8VramKVCache {
+    pub k_fp8: Tensor,
+    pub v_fp8: Tensor,
+}
 
 pub struct Qwen3DecoderLayer {
+    // self_attn: Qwen3Attention,
     self_attn: QKNormAttention,
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    // 🌟 [BLOCK-KV] 전체 캐시 왕복(Fp8VramKVCache)을 제거하고, qwen과 동일한 1024토큰 블록 시스템으로 교체합니다.
-    // VRAM에는 활성 블록(≤1024토큰)만 BF16으로 상주, 과거 블록은 FP8로 RAM에 동결됩니다.
-    pub kv_blocks: Vec<crate::models::qwen::quantized_model::KVBlock>,
-    pub registry: crate::models::qwen::quantized_model::KVRegistry,
-    pub layer_idx: usize,
+    pub fp8_cache: Option<Fp8VramKVCache>, // 🌟 [FP8 Compression] RAM으로 내리지 않고 VRAM 내에서 FP8로 압축하여 상주
 }
 
 impl Qwen3DecoderLayer {
-    pub fn new(config: &Qwen3Config, vb: VarBuilder, layer_idx: usize, registry: crate::models::qwen::quantized_model::KVRegistry) -> Result<Self> {
+    pub fn new(config: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+        // let self_attn = Qwen3Attention::new(config, vb.pp("self_attn"))?;
         let self_attn = QKNormAttention::new(
             vb.pp("self_attn"),
             config.hidden_size,
@@ -68,9 +202,7 @@ impl Qwen3DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            kv_blocks: Vec::new(),
-            registry,
-            layer_idx,
+            fp8_cache: None,
         })
     }
 
@@ -81,12 +213,28 @@ impl Qwen3DecoderLayer {
         cos: &Tensor,
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // 🌟 [FP8 Compression] VRAM에 보관 중이던 FP8 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
+        if self.self_attn.kv_cache.is_none() {
+            if let Some(cache) = self.fp8_cache.take() {
+                let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                
+                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F8E4M3) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
+                let k_restored = cache.k_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.k_fp8.clone());
+                let v_restored = cache.v_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.v_fp8.clone());
+                
+                self.self_attn.kv_cache = Some((k_restored, v_restored));
+            }
+        }
+
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(xs)?;
-        // 🌟 [BLOCK-KV] 전체 캐시 압축/해제 없이 블록 단위 어텐션 수행
-        let xs = self.forward_block_attention(&xs, cos, sin, attention_mask, seqlen_offset)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        
+        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 상태로 VRAM에 보존합니다.
+        // RAM-VRAM 스왑 없이 순수 VRAM 내에서 용량을 50% 절약합니다.
+        self.compress_kv_in_vram()?;
+        
         let xs = residual.add(&xs)?;
         let residual = xs.clone();
         let xs = self.post_attention_layernorm.forward(&xs)?;
@@ -95,241 +243,45 @@ impl Qwen3DecoderLayer {
         Ok(xs)
     }
 
-    /// 🌟 [BLOCK-KV] qwen의 quantized_model.rs와 동일한 1024토큰 블록 파이프라인입니다.
-    /// VRAM에는 활성 블록만 BF16으로 존재하고, 과거 블록은 FP8로 RAM에 동결됩니다.
-    /// 토큰당 비용: O(활성블록 1024) + O(과거블록 읽기) — 압축/해제 왕복 없음.
-    fn forward_block_attention(
-        &mut self,
-        xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        use crate::models::qwen::quantized_model::{KVBlock, KVLocation};
-        let (b_sz, q_len, _) = xs.dims3()?;
-        let dev = xs.device();
-        let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
-
-        // 1. Q/K/V 투영 + RoPE
-        let query_states = self.self_attn.q_proj.forward(xs)?
-            .reshape((b_sz, q_len, self.self_attn.num_attention_heads, self.self_attn.head_dim))?;
-        let query_states = self.self_attn.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
-        let key_states = self.self_attn.k_proj.forward(xs)?
-            .reshape((b_sz, q_len, self.self_attn.num_key_value_heads, self.self_attn.head_dim))?;
-        let key_states = self.self_attn.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
-        let value_states = self.self_attn.v_proj.forward(xs)?
-            .reshape((b_sz, q_len, self.self_attn.num_key_value_heads, self.self_attn.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
-        let (query_states, key_states) = apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        let query_states = query_states.to_dtype(target_dtype)?.contiguous()?;
-        let key_states = key_states.to_dtype(target_dtype)?.contiguous()?;
-
-        // 2. [BLOCK-APPEND] 활성 블록에 추가 or 새 블록 생성
-        let mut tokens_to_process = q_len;
-        let mut chunk_offset = 0;
-        while tokens_to_process > 0 {
-            let mut appended = false;
-            if let Some(last_block) = self.kv_blocks.last_mut() {
-                let mut inner = last_block.inner.write().unwrap();
-                let free_space = 1024usize.saturating_sub(inner.len);
-                if inner.location == KVLocation::VRAM && free_space > 0 {
-                    let take = tokens_to_process.min(free_space);
-                    let k_piece = key_states.narrow(2, chunk_offset, take)?;
-                    let v_piece = value_states.narrow(2, chunk_offset, take)?;
-                    if let (Some(pk), Some(pv)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
-                        let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
-                        let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?;
-                        let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?;
-                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
-                        inner.len += take;
-                        tokens_to_process -= take;
-                        chunk_offset += take;
-                        appended = true;
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if inner.index < reg.len() {
-                            reg[inner.index].token_len = inner.len;
-                            if self.layer_idx < reg[inner.index].is_dirty.len() { reg[inner.index].is_dirty[self.layer_idx] = true; }
-                        }
-                    }
-                }
-            }
-            if !appended {
-                let take = tokens_to_process.min(1024);
-                let k_piece = key_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let v_piece = value_states.narrow(2, chunk_offset, take)?.contiguous()?;
-                let index = self.kv_blocks.len();
-                let current_total = seqlen_offset + chunk_offset;
-                let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
-                {
-                    let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
-                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
-                }
-                let mut reg = self.registry.entries.write().unwrap();
-                if index < reg.len() {
-                    reg[index].token_start = current_total;
-                    reg[index].token_len = take;
-                    if self.layer_idx < reg[index].is_dirty.len() { reg[index].is_dirty[self.layer_idx] = true; }
-                    reg[index].location[self.layer_idx] = KVLocation::VRAM;
-                }
-                self.kv_blocks.push(new_block);
-                tokens_to_process -= take;
-                chunk_offset += take;
-            }
-        }
-
-        // 3. [BLOCK-ATTENTION] 온라인 소프트맥스로 블록 순회 (qwen과 동일)
-        let total_tokens_now = seqlen_offset + q_len;
-        let mut out_res: Option<Tensor> = None;
-        let mut m_n: Option<Tensor> = None;
-        let mut l_n: Option<Tensor> = None;
-        let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
-        let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
-        let kv_h = self.self_attn.num_key_value_heads;
-        let q_folded = if self.self_attn.num_kv_groups > 1 {
-            q_aligned.reshape((q_b, kv_h, self.self_attn.num_kv_groups * q_l, q_d))?
-        } else {
-            q_aligned.clone()
-        };
-
-        for block in &self.kv_blocks {
-            let (index, b_off, _b_len) = {
-                let inner = block.inner.read().unwrap();
-                (inner.index, inner.offset, inner.len)
-            };
-            if b_off >= total_tokens_now { continue; }
-            let (k_block, v_block) = {
-                let mut inner = block.inner.write().unwrap();
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    if inner.location == KVLocation::VRAM {
-                        (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()))
-                    } else {
-                        (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?)
-                    }
-                } else {
-                    let fallback_shape = vec![1, kv_h, _b_len, self.self_attn.head_dim];
-                    (Tensor::zeros(fallback_shape.as_slice(), target_dtype, dev)?, Tensor::zeros(fallback_shape.as_slice(), target_dtype, dev)?)
-                }
-            };
-            let k = k_block.contiguous()?;
-            let v = v_block.contiguous()?;
-            let actual_kv_len = k.dim(2)?;
-            let k_t = k.transpose(2, 3)?;
-            let s_folded = (q_folded.matmul(&k_t)? * self.self_attn.scaling)?;
-            let mut s_chunk = if self.self_attn.num_kv_groups > 1 {
-                s_folded.reshape((q_b, q_h, q_l, actual_kv_len))?
-            } else {
-                s_folded
-            };
-            if let Some(mask) = attention_mask {
-                let mask_len = mask.dim(candle_core::D::Minus1)?;
-                if b_off < mask_len {
-                    let take = std::cmp::min(actual_kv_len, mask_len - b_off);
-                    let chunk_mask = mask.narrow(candle_core::D::Minus1, b_off, take)?;
-                    if take < actual_kv_len {
-                        let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?.broadcast_add(&chunk_mask.to_dtype(target_dtype)?)?;
-                        let right_unmasked = s_chunk.narrow(candle_core::D::Minus1, take, actual_kv_len - take)?;
-                        s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?;
-                    } else {
-                        s_chunk = s_chunk.broadcast_add(&chunk_mask.to_dtype(target_dtype)?)?;
-                    }
-                }
-            }
-            let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
-            let m_j = s_chunk_f32.max_keepdim(candle_core::D::Minus1)?;
-            let safe_floor = Tensor::new(-10000.0_f32, m_j.device())?.broadcast_as(m_j.shape())?;
-            let m_j_safe = m_j.maximum(&safe_floor)?;
-            let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
-            let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
-            let p_v = p_j.to_dtype(v.dtype())?.contiguous()?;
-            let p_folded = if self.self_attn.num_kv_groups > 1 {
-                p_v.reshape((q_b, kv_h, self.self_attn.num_kv_groups * q_l, actual_kv_len))?
-            } else {
-                p_v
-            };
-            let out_folded = p_folded.matmul(&v)?;
-            let out_j = if self.self_attn.num_kv_groups > 1 {
-                out_folded.reshape((q_b, q_h, q_l, self.self_attn.head_dim))?
-            } else {
-                out_folded
-            };
-            let out_j_f32 = out_j.to_dtype(DType::F32)?;
-            match out_res {
-                None => { out_res = Some(out_j_f32); m_n = Some(m_j); l_n = Some(l_j); }
-                Some(prev_out_f32) => {
-                    let prev_m = m_n.as_ref().unwrap();
-                    let prev_l = l_n.as_ref().unwrap();
-                    let m_new = prev_m.maximum(&m_j_safe)?;
-                    let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
-                    let diff_new = m_j_safe.broadcast_sub(&m_new)?.exp()?;
-                    let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
-                    out_res = Some(out_new_f32); m_n = Some(m_new); l_n = Some(l_new);
-                }
-            }
-            drop(k);
-            drop(v);
-        }
-
-        let attn_output = if let (Some(out_f32), Some(l_f32)) = (out_res, l_n) {
-            out_f32.broadcast_div(&l_f32)?.to_dtype(target_dtype)?
-        } else {
-            return Err(anyhow::anyhow!("No KV data processed"));
-        };
-        let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.self_attn.num_attention_heads * self.self_attn.head_dim))?;
-        let attn_output = attn_output.apply(&self.self_attn.o_proj)?;
-        Ok(attn_output)
-    }
-
     pub fn clear_kv_cache(&mut self) {
-        self.kv_blocks.clear();
+        self.self_attn.clear_kv_cache();
+        self.fp8_cache = None;
     }
 
-    /// 🌟 [BLOCK-KV] 전체 캐시 왕복 압축/해제 함수를 삭제합니다.
-    /// 블록 시스템에서는 활성 블록만 VRAM에 있고, 과거 블록은 이미 FP8로 RAM에 동결되어 있습니다.
-    /// 더 이상 매 토큰마다 전체를 압축/해제할 필요가 없습니다.
+    pub fn compress_kv_in_vram(&mut self) -> Result<()> {
+        if let Some((k, v)) = self.self_attn.kv_cache.take() {
+            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F8E4M3) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
+            let k_fp8 = k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone());
+            let v_fp8 = v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone());
+            
+            self.fp8_cache = Some(Fp8VramKVCache {
+                k_fp8,
+                v_fp8,
+            });
+        }
+        Ok(())
+    }
 
     pub fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
-        let mut ks = Vec::new();
-        let mut vs = Vec::new();
-        for block in &self.kv_blocks {
-            let inner = block.inner.read().unwrap();
-            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                ks.push(k.to_dtype(DType::F32).unwrap_or_else(|_| k.clone()));
-                vs.push(v.to_dtype(DType::F32).unwrap_or_else(|_| v.clone()));
+        if let Some(cache) = &self.self_attn.kv_cache {
+            Some(cache.clone())
+        } else if let Some(fp8_cache) = &self.fp8_cache {
+            // 스냅샷 저장을 위해 호출될 경우, 원래 타입으로 복원하여 반환
+            let target_dtype = candle_core::DType::F32; // 저장용 기본 타입
+            if let Ok(k) = fp8_cache.k_fp8.to_dtype(target_dtype) {
+                if let Ok(v) = fp8_cache.v_fp8.to_dtype(target_dtype) {
+                    return Some((k, v));
+                }
             }
+            None
+        } else {
+            None
         }
-        if ks.is_empty() { return None; }
-        let k_cat = Tensor::cat(&ks, 2).ok()?;
-        let v_cat = Tensor::cat(&vs, 2).ok()?;
-        Some((k_cat, v_cat))
     }
 
     pub fn set_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
-        use crate::models::qwen::quantized_model::{KVBlock, KVLocation};
-        self.kv_blocks.clear();
-        if let Some((k, v)) = cache {
-            let total_len = k.dim(2).unwrap_or(0);
-            let mut offset = 0;
-            let mut idx = 0;
-            while offset < total_len {
-                let take = (total_len - offset).min(1024);
-                let k_piece = k.narrow(2, offset, take).unwrap();
-                let v_piece = v.narrow(2, offset, take).unwrap();
-                let new_block = KVBlock::new(KVLocation::VRAM, idx, take, offset);
-                {
-                    let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(k_piece);
-                    inner.v_cache = Some(v_piece);
-                }
-                self.kv_blocks.push(new_block);
-                offset += take;
-                idx += 1;
-            }
-        }
+        self.self_attn.kv_cache = cache;
+        self.fp8_cache = None;
     }
 }
 
@@ -339,7 +291,6 @@ pub struct Qwen3Model {
     norm: RmsNorm,
     rotary_emb: RoPE,
     lm_head: Linear,
-    pub registry: crate::models::qwen::quantized_model::KVRegistry,
 }
 
 impl Qwen3Model {
@@ -347,11 +298,10 @@ impl Qwen3Model {
         let vb = vb.pp("model");
         let vocab_size = config.vocab_size;
         let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
-        let registry = crate::models::qwen::quantized_model::KVRegistry::new();
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
         for layer_idx in 0..config.num_hidden_layers {
-            let layer = Qwen3DecoderLayer::new(config, vb_l.pp(layer_idx), layer_idx, registry.clone())?;
+            let layer = Qwen3DecoderLayer::new(config, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
@@ -368,7 +318,6 @@ impl Qwen3Model {
             norm,
             rotary_emb,
             lm_head,
-            registry,
         })
     }
     
@@ -418,35 +367,9 @@ impl Qwen3Model {
         let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin };
 
         let mut hidden_states = inputs_embeds;
-        for (layer_idx, decode_layer) in self.layers.iter_mut().enumerate() {
+        for decode_layer in &mut self.layers {
             hidden_states =
-                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref(), seqlen_offset)?;
-            // 🌟 [VRAM-EVICT] 활성 블록 8개 초과 시 가장 오래된 블록을 FP8로 RAM에 동결
-            // qwen의 evacuate_vram_to_ram_only와 동일한 로직 — VRAM 상한 8블록 유지
-            let vram_limit = 8;
-            let mut vram_indices = Vec::new();
-            for (idx, block) in decode_layer.kv_blocks.iter().enumerate() {
-                let inner = block.inner.read().unwrap();
-                if inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
-                    vram_indices.push((idx, inner.offset));
-                }
-            }
-            if vram_indices.len() > vram_limit {
-                vram_indices.sort_by_key(|k| k.1);
-                let num_to_evict = vram_indices.len().saturating_sub(vram_limit);
-                for i in 0..num_to_evict {
-                    let (idx, _) = vram_indices[i];
-                    let mut inner = decode_layer.kv_blocks[idx].inner.write().unwrap();
-                    if let (Some(k), Some(v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                        let target_dtype = if k.device().is_cuda() || k.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
-                        inner.k_cache = Some(k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()));
-                        inner.v_cache = Some(v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone()));
-                        inner.location = crate::models::qwen::quantized_model::KVLocation::RAM;
-                        let mut reg = self.registry.entries.write().unwrap();
-                        if idx < reg.len() { reg[idx].location[layer_idx] = crate::models::qwen::quantized_model::KVLocation::RAM; }
-                    }
-                }
-            }
+                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
         let hidden_state = hidden_states.narrow(1, seq_len - 1, 1)?;
@@ -467,6 +390,13 @@ impl Qwen3Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    pub fn compress_kv_in_vram(&mut self) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.compress_kv_in_vram()?;
+        }
+        Ok(())
     }
 
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
