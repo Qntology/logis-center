@@ -770,19 +770,21 @@ pub fn eager_attention_forward(
         let kv_seq_len = key_states.dim(2)?;
         let block_size = 4096;
 
-        // GQA 처리를 위한 K, V 복제 (Flash Attention 미사용 시 필수)
-        let key_states_rep = match num_key_value_groups {
-            Some(g) if g > 1 => repeat_kv(key_states.clone(), g)?,
-            _ => key_states.clone(),
-        };
-        let value_states_rep = match num_key_value_groups {
-            Some(g) if g > 1 => repeat_kv(value_states.clone(), g)?,
-            _ => value_states.clone(),
-        };
-        
+        // [GQA-FOLD] repeat_kv는 K/V 전체를 groups배로 물리 복제합니다.
+        // Q의 head 축을 접으면 동일 결과를 복제 없이 얻으므로, VRAM 피크와 대역폭을 함께 절감합니다.
+        let groups = num_key_value_groups.unwrap_or(1).max(1);
+
         let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
-        let k_aligned = key_states_rep.to_dtype(target_dtype)?.contiguous()?;
-        let v_aligned = value_states_rep.to_dtype(target_dtype)?.contiguous()?;
+        let k_aligned = key_states.to_dtype(target_dtype)?.contiguous()?;
+        let v_aligned = value_states.to_dtype(target_dtype)?.contiguous()?;
+
+        let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
+        let kv_h = k_aligned.dim(1)?;
+        let q_work = if groups > 1 {
+            q_aligned.reshape((q_b, kv_h, groups * q_l, q_d))?
+        } else {
+            q_aligned.clone()
+        };
 
         // 짧은 문맥이거나 이미지가 작을 경우 기존 방식 사용
         if kv_seq_len <= block_size {
