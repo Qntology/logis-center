@@ -1528,55 +1528,58 @@ async fn process_task(
                 let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
 
                 let mut total_title_score = 0.0;
-                // 🌟 [CRITICAL FIX] 타이틀 가중치 대폭 상향 (5x→15x, 4x→12x)
+                // 🌟 [CRITICAL FIX] 타이틀 가중치 대폭 상향 (15x→20x, 12x→15x)
                 // 타이틀 "주문내역 수정"은 페이지 정체성의 절대 시그널입니다.
-                // 145개 라인의 분산 점수가 타이틀의 명확한 도메인 시그널을 역전하지 못하도록 차단합니다.
+                // 수많은 라인의 분산 점수가 타이틀의 명확한 도메인 시그널을 역전하지 못하도록 강력히 차단합니다.
                 if title_sim > 0.0 {
-                    total_title_score += title_sim * 15.0;
+                    total_title_score += title_sim * 20.0;
                 }
                 // 🌟 [TITLE-ONLY SEMANTIC MATCH] 레이아웃/폼/상태 바이어스 노이즈 없이
                 // 순수 페이지 타입 이름 + 로컬라이즈된 이름만으로 타이틀과 코사인 매칭합니다.
-                // "주문내역 수정"이 goods 바이어스의 "상품수정"에 오염되는 것을 원천 방지합니다.
                 if title_only_sim > 0.0 {
-                    total_title_score += title_only_sim * 12.0;
+                    total_title_score += title_only_sim * 15.0;
                 }
 
                 // 🌟 [TITLE-DOMINANCE BONUS] 타이틀 전용 임베딩 유사도가 타 카테고리 대비 압도적이면
-                // 최종 정규화 점수에 1.5배 승산 보너스를 적용합니다.
-                // "주문내역 수정" vs "order 주문" title_only_sim이 "coupon 이벤트" 대비 명확히 높으므로
-                // order가 결정적 우위를 확보합니다.
+                // 최종 정규화 점수에 높은 승산 보너스를 적용합니다.
                 let mut title_dominance_bonus = 1.0f32;
-                if title_only_sim > 0.35 {
+                if title_only_sim > 0.30 {
                     let max_other_title_only: f32 = categories.iter()
                         .filter(|c| *c != cat)
                         .map(|c| category_title_scores.get(*c).map(|(_, to)| *to).unwrap_or(0.0))
                         .fold(0.0f32, f32::max);
-                    if title_only_sim > max_other_title_only * 1.2 {
-                        title_dominance_bonus = 1.5;
+                    if title_only_sim > max_other_title_only * 1.15 {
+                        title_dominance_bonus = 2.0;
                     }
                 }
 
                 // 🌟 [SCORE NORMALIZATION v2] 증거 기반 신뢰도 + 타이틀 코사인 일관성 보정
                 // 1. 최소 증거 페널티: 기여 라인이 3개 미만이면 과소 표본으로 간주하여 신뢰도 감쇠
-                //    (2줄만 우연히 매칭된 카테고리가 9줄 일관 매칭을 이기는 구조적 결함 차단)
                 let evidence_factor = if contributing_lines < 3 {
                     (contributing_lines as f32) / 3.0
                 } else {
                     1.0
                 };
+                
+                // 🌟 [CRITICAL FIX: Title Coherence Gate] 타이틀 시그널과 정면 충돌하는 
+                // 범용 UI 라인들이 다수 포착되어 점수를 부풀리는 현상(review 오분류 등)을 원천 차단합니다.
+                let title_coherence_penalty = if title_only_sim < 0.25 {
+                    0.5 // 타이틀 관련성이 현저히 떨어지면 라인 점수를 반토막 냅니다
+                } else {
+                    1.0
+                };
+
                 // 2. 타이틀 코사인 부스트: 타이틀 임베딩과 카테고리 앵커 간 코사인 유사도가
-                //    임계값(0.40) 이상이면, 해당 카테고리의 최종 점수를 코사인 값에 비례하여 증폭합니다.
-                //    (contains가 아닌 순수 코사인 유사도 기반 판정)
-                let title_boost = if title_sim > 0.40 {
-                    1.0 + (title_sim - 0.40) * 2.5
+                //    임계값(0.35) 이상이면, 해당 카테고리의 최종 점수를 코사인 값에 비례하여 강력히 증폭합니다.
+                let title_boost = if title_sim > 0.35 {
+                    1.0 + (title_sim - 0.35) * 3.5
                 } else {
                     1.0
                 };
                 
                 // 🌟 [핵심 개선] 타이틀 점수와 라인 점수를 엄격히 분리하여 정규화합니다.
-                // 기존처럼 합산 후 라인 수로 나누면, 정상적으로 많은 라인을 포착한 order의 타이틀 점수가 부당하게 희석됩니다.
                 let normalized_line_score = if contributing_lines > 0 {
-                    (line_total / (contributing_lines as f32).sqrt()) * evidence_factor
+                    (line_total / (contributing_lines as f32).sqrt()) * evidence_factor * title_coherence_penalty
                 } else {
                     0.0
                 };
