@@ -2,9 +2,22 @@ use std::path::PathBuf;
 use tauri::AppHandle;
 use std::fs;
 
+/// 🌟 [misc_utils.rs에서 이동] 앱 데이터 루트 디렉토리 반환
+pub fn get_app_dir() -> std::path::PathBuf {
+    if let Some(mut path) = dirs::data_local_dir() {
+        path.push("logis-center");
+        let _ = std::fs::create_dir_all(&path);
+        path
+    } else {
+        let path = std::path::PathBuf::from("logis-center-data");
+        let _ = std::fs::create_dir_all(&path);
+        path
+    }
+}
+
 pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
     // [STRICT] All temporary files must be collected in the "tmp" folder in the project root
-    let path = crate::utils::get_app_dir().join("tmp");
+    let path = get_app_dir().join("tmp");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
     }
