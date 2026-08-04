@@ -10,7 +10,10 @@ This project integrates and extends the following open-source works:
 | Language Model | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Apache-2.0 |
 | Language Model | [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Apache-2.0 |
 | Embedding Model | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Apache-2.0 |
-| NLP Engine | [stanfordnlp/stanza](https://github.com/stanfordnlp/stanza) | Apache-2.0 |
+| NLP Model | [stanfordnlp](https://huggingface.co/stanfordnlp) | Apache-2.0 |
+| Qwen Inference Engine | [jhqxxx/aha](https://github.com/jhqxxx/aha) | Apache-2.0 |
+| Granite Inference Engine | [ericlbuehler/mistral.rs](https://github.com/ericlbuehler/mistral.rs) | MIT |
+
 
 ---
 
