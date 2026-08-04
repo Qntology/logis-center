@@ -11,23 +11,6 @@ use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn merge_node(obj1: &Value, obj2: &Value) -> Value {
-    let mut merged = obj1.clone();
-    if let (Some(m_obj), Some(o2_obj)) = (merged.as_object_mut(), obj2.as_object()) {
-        for (k, v) in o2_obj {
-            let is_empty = match v {
-                Value::Null => true,
-                Value::String(s) => s.is_empty(),
-                Value::Number(n) => n.as_f64().unwrap_or(0.0) == 0.0,
-                _ => false,
-            };
-            if !is_empty {
-                m_obj.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    merged
-}
 
 use tokio::sync::Notify;
 use once_cell::sync::Lazy;
@@ -35,25 +18,16 @@ use once_cell::sync::OnceCell;
 
 // 🌟 분리된 stanza 모듈에서 타입 가져오기
 use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
-use crate::pug_utils::*;
+use crate::utils::pug_utils::*;
 use crate::js_templates::*;
+use crate::utils::json_utils::merge_node;
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context};
+use crate::utils::logger::log_task_progress;
+
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
 
-// [UI-SYNC] Instant notification system to wake up the worker
-static UI_READY_SIGNAL: Lazy<Notify> = Lazy::new(|| Notify::new());
-static TASK_QUEUED_SIGNAL: Lazy<Notify> = Lazy::new(|| Notify::new());
-static UI_READY_FLAG: AtomicBool = AtomicBool::new(false);
 
-pub fn mark_ui_ready() {
-    UI_READY_FLAG.store(true, Ordering::SeqCst);
-    UI_READY_SIGNAL.notify_waiters(); // Wake up any sleeping tasks instantly
-    println!("[Scheduler] UI signaled ready. Background worker woke up.");
-}
-
-pub fn notify_new_task() {
-    TASK_QUEUED_SIGNAL.notify_waiters();
-}
 
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
@@ -80,8 +54,8 @@ pub async fn start_background_worker(
     // 여기서 다시 spawn 하여 불필요한 DB 락 경쟁을 일으킬 필요가 없습니다.
     
     tokio::spawn(async move {
-        if !UI_READY_FLAG.load(Ordering::SeqCst) {
-            UI_READY_SIGNAL.notified().await;
+        if !crate::utils::sync_utils::UI_READY_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::utils::sync_utils::UI_READY_SIGNAL.notified().await;
         }
         
         let mut delay_secs = 1;
@@ -114,7 +88,7 @@ pub async fn start_background_worker(
                     _ = sleep(Duration::from_secs(delay_secs)) => {
                         delay_secs = (delay_secs + 1).min(10); 
                     }
-                    _ = TASK_QUEUED_SIGNAL.notified() => {
+                    _ = crate::utils::sync_utils::TASK_QUEUED_SIGNAL.notified() => {
                         delay_secs = 1;
                         println!("[Scheduler] New task signal received. Waking up immediately.");
                     }
@@ -441,54 +415,7 @@ async fn process_task(
         }
     }
 
-    let mut url = task_data.get("href")
-        .or_else(|| task_data.get("link"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let mut origin_candidate = task_data.get("origin")
-        .or_else(|| task_data.get("domain"))
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    
-    // 브라우저 자동화 모듈이 감지한 '진짜 현재 활성화 탭 URL'을 강제로 끌어와서 완벽한 절대 주소로 병합(Join)합니다!
-    {
-        let state = crate::automation::LAST_DETECTED_STATE.lock().await;
-        let active_tab_url = state.url.clone();
-        
-        if !active_tab_url.is_empty() {
-            if let Ok(active_parsed) = url::Url::parse(&active_tab_url) {
-                let active_origin = format!("{}://{}", active_parsed.scheme(), active_parsed.host_str().unwrap_or("localhost"));
-                
-                if origin_candidate.is_empty() || origin_candidate.contains("localhost") {
-                    origin_candidate = active_origin;
-                }
-                
-                if url.is_empty() {
-                    url = active_tab_url;
-                } else if !url.starts_with("http") {
-                    
-                    if let Ok(joined) = active_parsed.join(&url) {
-                        url = joined.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    
-    if !url.starts_with("http") && !origin_candidate.is_empty() && !origin_candidate.contains("localhost") {
-        let scheme = if origin_candidate.starts_with("http") { "" } else { "http://" };
-        let base_str = format!("{}{}", scheme, origin_candidate);
-        if let Ok(base) = url::Url::parse(&base_str) {
-            if let Ok(joined) = base.join(&url) {
-                url = joined.to_string();
-            }
-        }
-    }
+    let (mut url, mut origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
     
     
     let active_task_json = json!({
@@ -1325,92 +1252,7 @@ async fn process_task(
                 }
             }
 
-            let mut is_korean = false;
-            let mut is_japanese = false;
-            let mut is_chinese_char = false;
-            let mut is_russian = false;
-            let mut is_arabic = false;
-            let mut is_thai = false;
-            let mut is_hindi = false;
-            let mut is_bengali = false;
-            let mut is_greek = false;
-            let mut is_hebrew = false;
-            let mut is_vietnamese = false;
-            let mut has_latin = false;
-
-            for c in filtered_light_pug.chars() {
-                let u = c as u32;
-                // 1. 유니코드 블록이 명확한 언어들
-                if (u >= 0xAC00 && u <= 0xD7A3) || (u >= 0x1100 && u <= 0x11FF) || (u >= 0x3130 && u <= 0x318F) { is_korean = true; }
-                else if (u >= 0x3040 && u <= 0x309F) || (u >= 0x30A0 && u <= 0x30FF) { is_japanese = true; }
-                else if u >= 0x4E00 && u <= 0x9FFF { is_chinese_char = true; }
-                else if u >= 0x0400 && u <= 0x04FF { is_russian = true; }
-                else if u >= 0x0600 && u <= 0x06FF { is_arabic = true; }
-                else if u >= 0x0E00 && u <= 0x0E7F { is_thai = true; }
-                else if u >= 0x0900 && u <= 0x097F { is_hindi = true; }
-                else if u >= 0x0980 && u <= 0x09FF { is_bengali = true; }
-                else if u >= 0x0370 && u <= 0x03FF { is_greek = true; }
-                else if u >= 0x0590 && u <= 0x05FF { is_hebrew = true; }
-                else if u >= 0x1EA0 && u <= 0x1EF9 { is_vietnamese = true; }
-                // 2. 라틴 알파벳 영역 (whatlang 세부 판별 필요)
-                else if (u >= 0x0041 && u <= 0x005A) || (u >= 0x0061 && u <= 0x007A) || (u >= 0x00C0 && u <= 0x024F) {
-                    has_latin = true;
-                }
-            }
-
-            // 우선순위 판별: 확실한 유니코드가 있다면 whatlang 호출 없이 즉시 결정
-            let local_language = if is_korean {
-                "ko".to_string()
-            } else if is_japanese {
-                "ja".to_string()
-            } else if is_thai {
-                "th".to_string()
-            } else if is_russian {
-                "ru".to_string()
-            } else if is_arabic {
-                "ar".to_string()
-            } else if is_hindi {
-                "hi".to_string()
-            } else if is_bengali {
-                "bn".to_string()
-            } else if is_greek {
-                "el".to_string()
-            } else if is_hebrew {
-                "he".to_string()
-            } else if is_vietnamese {
-                "vi".to_string()
-            } else if is_chinese_char {
-                "zh-hans".to_string()
-            } else if has_latin {
-                // 유니코드로 구분이 힘든 라틴 알파벳 계열 언어만 whatlang으로 정밀 분류
-                match whatlang::detect(&filtered_light_pug) {
-                    Some(info) => match info.lang() {
-                        whatlang::Lang::Fra => "fr",
-                        whatlang::Lang::Deu => "de",
-                        whatlang::Lang::Spa => "es",
-                        whatlang::Lang::Ita => "it",
-                        whatlang::Lang::Por => "pt",
-                        whatlang::Lang::Nld => "nl",
-                        _ => "en",
-                    }.to_string(),
-                    None => "en".to_string(),
-                }
-            } else {
-                "en".to_string()
-            };
-
-            let mut detected_languages_vec = vec![local_language.clone()];
-            if local_language != "en" {
-                detected_languages_vec.push("en".to_string());
-            }
-
-            // 🌟 [CRITICAL FIX] 다국어 검증(Stage 3) 시 local_language를 무조건 가장 먼저(0번 인덱스) 검증하도록 재배열
-            if let Some(pos) = detected_languages_vec.iter().position(|l| l == &local_language) {
-                let local = detected_languages_vec.remove(pos);
-                detected_languages_vec.insert(0, local);
-            }
-            
-            doc_lang = detected_languages_vec[0].clone();
+            doc_lang = crate::utils::lang_utils::detect_document_language(&filtered_light_pug);
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 
@@ -2628,7 +2470,7 @@ async fn process_task(
     }
     
     // VRAM이 OS에서 완전히 반환될 때까지 잠시 대기합니다.
-    wait_for_resources_settled(1200, 800, Some(&cancellation_token), model.device_config.gpu_id as u32).await?;
+    crate::utils::resources::wait_for_resources_settled(1200, 800, Some(&cancellation_token), model.device_config.gpu_id as u32).await?;
 
     let mut extracted_data = json!({});
 
@@ -4535,7 +4377,7 @@ async fn process_task(
                     emit_term(&format!("  ⚠️ [FALLBACK] Field: '{}' | Best Score ({:.4}) is too low. Using full context.", field_name, best_score));
                     content_pug.clone()
                 } else {
-                    extract_pug_context(&pug_lines_ref, best_idx)
+                    other_extract_pug_context(&pug_lines_ref, best_idx)
                 };
 
                 let mut json_contexts = Vec::new();
@@ -5019,7 +4861,7 @@ async fn process_task(
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
         // 2. Wait for VRAM to settle (Driver latency)
-        wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+        crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
     // [PARITY] ID Generation
@@ -5735,7 +5577,7 @@ async fn process_task(
     }
 
     if !items_to_process.is_empty() {
-        let _ = update_team_base_metrics(&store, &team_id, &task.cc, &items_to_process, stats_diff.clone()).await;
+        let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &items_to_process, stats_diff.clone()).await;
         println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", items_to_process.len(), stats_diff);
     }
 
@@ -5761,304 +5603,6 @@ async fn process_task(
     Ok(())
 }
 
-pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
-    use std::io::Write;
-    use tauri::Emitter;
-
-    
-    let mut final_payload = payload.clone();
-    if let Some(obj) = final_payload.as_object_mut() {
-        obj.insert("task_id".to_string(), serde_json::json!(task_id));
-    }
-
-    let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
-    
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path) 
-    {
-        let line = format!("{}\n", final_payload.to_string());
-        let _ = file.write_all(line.as_bytes());
-    }
-
-    if let Some(cat) = final_payload.get("category").and_then(|v| v.as_str()) {
-        if let Ok(mut w) = crate::CURRENT_UI_CATEGORY.write() {
-            *w = cat.to_string();
-        }
-    }
-    if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
-        *w = Some(final_payload.clone());
-    }
-
-    let _ = app.emit("extraction-progress", &final_payload);
-}
-
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>, target_gpu_id: u32) -> Result<()> {
-    use nvml_wrapper::Nvml;
-    use sysinfo::System;
-    
-    let mut sys = System::new_all();
-    let nvml = Nvml::init().ok();
-    
-    let target_vram_bytes = target_vram_mb * 1024 * 1024;
-    let target_ram_bytes = target_ram_mb * 1024 * 1024;
-
-    let mut last_vram = 0;
-    let mut stable_ticks = 0;
-    let mut last_report = std::time::Instant::now();
-    let start_time = std::time::Instant::now();
-
-    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB) on GPU {}...", target_vram_mb, target_gpu_id);
-
-    loop {
-        if let Some(token) = cancellation_token {
-            if token.load(Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("Task cancelled during resource wait"));
-            }
-        }
-
-        sys.refresh_memory(); 
-        let current_ram = sys.available_memory();
-        let mut current_vram = 0;
-        let mut has_gpu = false;
-
-        if let Some(ref nvml_inst) = nvml {
-            if let Ok(dev) = nvml_inst.device_by_index(target_gpu_id) {
-                if let Ok(mem) = dev.memory_info() {
-                    current_vram = mem.free;
-                    has_gpu = true;
-                }
-            }
-        }
-
-        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
-        let meets_ram = current_ram >= target_ram_bytes;
-        
-        if meets_vram && meets_ram {
-            break; // Perfect state reached
-        }
-
-        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing,
-        // it means we've recovered all we can. Don't wait forever.
-        let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
-        if delta < 10_000_000 { // Change < 10MB (more lenient)
-            stable_ticks += 1;
-        } else {
-            stable_ticks = 0;
-        }
-
-        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.6B)
-        // This prevents being stuck at 0.7GB when target is 1.1GB.
-        if (stable_ticks >= 3 && current_vram > 600_000_000) || current_vram > target_vram_bytes {
-            println!("[RESOURCE-WATCH] Memory sufficient or stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
-            break;
-        }
-
-        if last_report.elapsed().as_secs() >= 2 { // Faster reporting
-            println!("[RESOURCE-DIAG] Waiting... VRAM: {:.2} GB free (Target: {:.2} GB)", 
-                current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
-            last_report = std::time::Instant::now();
-        }
-
-        // Absolute maximum wait 10s (reduced from 20s)
-        if start_time.elapsed().as_secs() > 10 {
-            println!("[RESOURCE-WATCH] Timeout or sufficient VRAM reached. Proceeding.");
-            break;
-        }
-
-        last_vram = current_vram;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    Ok(())
-}
-
-async fn update_team_base_metrics(
-    store: &crate::store::VectorStore,
-    team_id: &str,
-    task_cc: &str,
-    items: &Vec<serde_json::Value>,
-    stats_diff: std::collections::HashMap<String, (i64, i64, i64)>,
-) -> anyhow::Result<()> {
-    let (team_json_str, team_vector, t_from, t_to, t_cc, t_bcc, t_ref, t_digest) = match store.get_item_by_id("users", team_id).await {
-        Ok(Some(doc)) => (doc.json_data, doc.vector, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref, doc.digest),
-        _ => (
-            json!({ "base": { "pages": {} } }).to_string(),
-            vec![0.0; 384],
-            "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()
-        )
-    };
-
-    
-    let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
-    
-    
-    while let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
-        if let Ok(inner_obj) = serde_json::from_str(inner_str) {
-            parsed_val = inner_obj;
-        } else {
-            break;
-        }
-    }
-    let mut team_data = parsed_val;
-    
-    
-    if let Some(obj) = team_data.as_object_mut() {
-        obj.remove("json_data");
-    }
-    
-    // --- [블록 1 & 2: 맵 순회로 모든 타입의 통계 업데이트] ---
-    for (t_name, (pages_draft_diff, pages_count_diff, global_count_diff)) in stats_diff.iter() {
-        // 페이지별 통계 업데이트
-        {
-            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-            let pages = base.entry("pages").or_insert(json!({})).as_object_mut().unwrap();
-            let cc_node = pages.entry(task_cc).or_insert(json!({})).as_object_mut().unwrap();
-            let page_type_node = cc_node.entry(t_name).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-
-            let current_draft = page_type_node.get("draft").and_then(|v| v.as_i64()).unwrap_or(0);
-            let current_count = page_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            
-            page_type_node.insert("draft".to_string(), json!(0.max(current_draft + pages_draft_diff)));
-            page_type_node.insert("count".to_string(), json!(0.max(current_count + pages_count_diff)));
-        } 
-
-        // 글로벌 전체 통계 업데이트 (aa.ts와 동일하게 draft는 건드리지 않고 count만 누적)
-        {
-            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-            let global_type_node = base.entry(t_name).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-            
-            let global_count = global_type_node.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-            
-            // 글로벌 draft는 클라우드 로직 상 사용되지 않으므로 보존하거나 건드리지 않습니다.
-            global_type_node.insert("count".to_string(), json!(0.max(global_count + global_count_diff)));
-        }
-    }
-
-    // Min/Max 업데이트는 items 내의 데이터에 한해서 진행
-    {
-        let properties = [
-            "price", "quantity", "width", "height", "length", "weight", "shipping_fee", 
-            "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", 
-            "discount", "min_order_amount", "max_discount_amount", "usage_limit", 
-            "usage_per", "started_at", "expired_at"
-        ];
-
-        for item in items {
-            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
-            let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
-
-            for prop in properties.iter() {
-                if let Some(val) = item.get(*prop) {
-                    let num_val = if val.is_number() {
-                        val.as_f64().unwrap_or(0.0)
-                    } else if let Some(s) = val.as_str() {
-                        s.parse::<f64>().unwrap_or(0.0)
-                    } else {
-                        continue;
-                    };
-
-                    if num_val == 0.0 && *prop != "started_at" && *prop != "expired_at" { continue; }
-
-                    
-                    let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 0.0, "max": 0.0 })).as_object_mut().unwrap();
-                    
-                    let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-                    
-                    
-                    if current_min == 0.0 || num_val <= current_min { prop_node.insert("min".to_string(), json!(num_val)); }
-                    if current_max == 0.0 || num_val >= current_max { prop_node.insert("max".to_string(), json!(num_val)); }
-                }
-            }
-        }
-    } // 👈 여기서 두 번째 참조가 종료됩니다.
-
-    
-    if let Some(base_json) = team_data.get("base") {
-        println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(base_json).unwrap_or_default());
-    }
-
-    
-    if let Some(obj) = team_data.as_object_mut() {
-        obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-    }
-
-    // 5. Save back to DB (digest 파라미터에 None을 전달하여 강제 쓰기를 유도합니다)
-    let _ = store.upsert_item(
-        "users", 
-        team_id, 
-        "team", 
-        team_data, 
-        Some(team_vector),
-        Some(&t_from),
-        Some(&t_to),
-        Some(&t_cc),
-        Some(&t_bcc),
-        Some(&t_ref),
-        None
-    ).await;
-
-    
-    if let Ok(Some(saved_doc)) = store.get_item_by_id("users", team_id).await {
-        println!("\n==================================================");
-        println!("✅ [DB-VERIFY] DB에 통계(Team) 데이터가 100% 정상 저장되었습니다!");
-        println!("- 타겟 ID: {}", saved_doc.id);
-        println!("- 갱신된 Timestamp: {}", saved_doc.updated_at_ts);
-        
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&saved_doc.json_data) {
-            if let Some(base_stats) = parsed.get("base") {
-                println!("- DB 내 실제 Base 통계:\n{}", serde_json::to_string_pretty(base_stats).unwrap_or_default());
-            }
-        }
-        println!("==================================================\n");
-    } else {
-        println!("\n==================================================");
-        println!("🚨 [DB-VERIFY] 치명적 오류: DB에 Team 데이터가 저장되지 않았습니다!");
-        println!("==================================================\n");
-    }
-
-    Ok(())
-}
 
 
-// [IN-MEMORY VECTOR SEARCH] 코사인 유사도 계산 및 PUG 부모 컨텍스트 추출
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
-}
 
-fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
-    if lines.is_empty() { return String::new(); }
-    let mut parent_idx = target_idx;
-    let target_indent = lines[target_idx].chars().take_while(|c| c.is_whitespace()).count();
-    
-    // 1. 위로 거슬러 올라가며 들여쓰기가 더 적은(부모) 노드를 찾습니다.
-    for i in (0..target_idx).rev() {
-        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
-        if indent < target_indent && !lines[i].trim().is_empty() {
-            parent_idx = i;
-            break;
-        }
-    }
-
-    let parent_indent = lines[parent_idx].chars().take_while(|c| c.is_whitespace()).count();
-    let mut context_lines = vec![lines[parent_idx]];
-    
-    // 2. 부모 노드의 하위(자식) 노드들을 모두 긁어옵니다.
-    for i in (parent_idx + 1)..lines.len() {
-        if lines[i].trim().is_empty() { continue; }
-        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
-        // 다시 부모와 같거나 밖으로 나가는 들여쓰기를 만나면 블록 종료
-        if indent <= parent_indent {
-            break;
-        }
-        context_lines.push(lines[i]);
-    }
-    
-    context_lines.join("\n")
-}

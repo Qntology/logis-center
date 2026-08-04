@@ -6,7 +6,7 @@ use anyhow::Result;
 use tauri::Emitter;
 use crate::store::{Task, VectorStore};
 use crate::model::LogisModel;
-use crate::scheduler::log_task_progress;
+use crate::utils::logger::log_task_progress;
 
 pub async fn process_analytic_task(
     task: Task,

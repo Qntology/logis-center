@@ -6,7 +6,7 @@ mod logic;
 mod scheduler;
 pub mod analytic; 
 pub mod stanza;
-pub mod pug_utils;
+
 pub mod js_templates;
 pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
 pub mod parsers; // 🌟 문서 파서 모듈 선언
@@ -17,6 +17,8 @@ pub mod position_embed;
 pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
+
+use crate::utils::pug_utils::*;
 
 use tauri::{State, Manager, Listener, Emitter}; 
 use tokio::sync::Mutex as TokioMutex;
@@ -818,7 +820,7 @@ async fn ai_search_complex(
         "spinner": "⠋" 
     });
     let _ = app_handle.emit("extraction-progress", &payload_start);
-    crate::scheduler::log_task_progress(&app_handle, &task_id, &payload_start);
+    crate::utils::logger::log_task_progress(&app_handle, &task_id, &payload_start);
 
     
     let search_process = async {
@@ -1565,7 +1567,7 @@ struct InitialSyncData {
 
 #[tauri::command]
 async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, String> {
-    scheduler::mark_ui_ready();
+    crate::utils::sync_utils::mark_ui_ready();
     
     let store_guard = state.store.lock().await;
     let mut tasks = Vec::new();
@@ -2157,7 +2159,7 @@ pub fn run() {
                                 "created_at": task.created_at,
                                 "text": msg_text
                             }));
-                            crate::scheduler::notify_new_task();
+                            crate::utils::sync_utils::notify_new_task();
                         }
                     });
                 }

@@ -1,9 +1,93 @@
 use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use once_cell::sync::Lazy;
 use nvml_wrapper::Nvml;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+use anyhow::Result;
+
+
+
+pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>, target_gpu_id: u32) -> Result<()> {
+    use nvml_wrapper::Nvml;
+    use sysinfo::System;
+    
+    let mut sys = System::new_all();
+    let nvml = Nvml::init().ok();
+    
+    let target_vram_bytes = target_vram_mb * 1024 * 1024;
+    let target_ram_bytes = target_ram_mb * 1024 * 1024;
+
+    let mut last_vram = 0;
+    let mut stable_ticks = 0;
+    let mut last_report = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
+
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB) on GPU {}...", target_vram_mb, target_gpu_id);
+
+    loop {
+        if let Some(token) = cancellation_token {
+            if token.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Task cancelled during resource wait"));
+            }
+        }
+
+        sys.refresh_memory(); 
+        let current_ram = sys.available_memory();
+        let mut current_vram = 0;
+        let mut has_gpu = false;
+
+        if let Some(ref nvml_inst) = nvml {
+            if let Ok(dev) = nvml_inst.device_by_index(target_gpu_id) {
+                if let Ok(mem) = dev.memory_info() {
+                    current_vram = mem.free;
+                    has_gpu = true;
+                }
+            }
+        }
+
+        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let meets_ram = current_ram >= target_ram_bytes;
+        
+        if meets_vram && meets_ram {
+            break; // Perfect state reached
+        }
+
+        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing,
+        // it means we've recovered all we can. Don't wait forever.
+        let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
+        if delta < 10_000_000 { // Change < 10MB (more lenient)
+            stable_ticks += 1;
+        } else {
+            stable_ticks = 0;
+        }
+
+        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.6B)
+        // This prevents being stuck at 0.7GB when target is 1.1GB.
+        if (stable_ticks >= 3 && current_vram > 600_000_000) || current_vram > target_vram_bytes {
+            println!("[RESOURCE-WATCH] Memory sufficient or stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
+            break;
+        }
+
+        if last_report.elapsed().as_secs() >= 2 { // Faster reporting
+            println!("[RESOURCE-DIAG] Waiting... VRAM: {:.2} GB free (Target: {:.2} GB)", 
+                current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
+            last_report = std::time::Instant::now();
+        }
+
+        // Absolute maximum wait 10s (reduced from 20s)
+        if start_time.elapsed().as_secs() > 10 {
+            println!("[RESOURCE-WATCH] Timeout or sufficient VRAM reached. Proceeding.");
+            break;
+        }
+
+        last_vram = current_vram;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
 
 // Global System Monitor Instance
 static SYSTEM_MONITOR: Lazy<Arc<Mutex<System>>> = Lazy::new(|| {

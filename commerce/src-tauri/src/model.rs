@@ -955,7 +955,7 @@ impl LogisModel {
         // 🌟 [CRITICAL FIX 1] 이미지 추출 5단계를 완벽하게 맞추기 위한 로딩 스텝(2단계) UI 추가!
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload_load);
-        crate::scheduler::log_task_progress(app_handle, &task_id, &payload_load);
+        crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_load);
 
         self.ensure_qwen3_5(true).await?; 
 
@@ -1101,7 +1101,7 @@ impl LogisModel {
             // 🌟 [CRITICAL FIX 2] 5단계 마무리를 위한 저장 스텝(4단계) UI 추가!
             let payload_save = json!({ "task_id": task_id.clone(), "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋" });
             let _ = app_handle.emit("extraction-progress", &payload_save);
-            crate::scheduler::log_task_progress(app_handle, &task_id, &payload_save);
+            crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_save);
 
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
@@ -1190,9 +1190,9 @@ impl LogisModel {
             });
             
             // 🌟 [CRITICAL FIX] Done 상태를 파일에도 확실히 기록하여 상세페이지 복구 시 100% 출력되게 합니다!
-            crate::scheduler::log_task_progress(app_handle, &task_id, &payload);
+            crate::utils::logger::log_task_progress(app_handle, &task_id, &payload);
             
-            crate::scheduler::notify_new_task();
+            crate::utils::sync_utils::notify_new_task();
             
             Ok(())
         } else {
@@ -1227,7 +1227,7 @@ impl LogisModel {
 
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload); // 기존 변수명이 app_handle이면 app_handle로 사용
+            crate::utils::logger::log_task_progress(_app_handle, task_id, &base_payload); // 기존 변수명이 app_handle이면 app_handle로 사용
         }
         
         // 🌟 [CRITICAL FIX] 화면에 실시간 진행률(퍼센트)을 쏘아 보내는 코드를 복구합니다!
@@ -1418,7 +1418,7 @@ impl LogisModel {
         
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
+            crate::utils::logger::log_task_progress(app_handle, task_id, &base_payload);
         }
 
         let mut gen_guard = self.generator.lock().await;
@@ -1552,7 +1552,7 @@ impl LogisModel {
 
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(_app_handle, task_id, &base_payload);
+            crate::utils::logger::log_task_progress(_app_handle, task_id, &base_payload);
         }
 
         let max_tok = self.max_tokens_limit;
@@ -1714,7 +1714,7 @@ impl LogisModel {
         emit_term("[STAGE-1] Loading Models (Embedding & Qwen3) for Commerce Pipeline...");
         let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Segmenting semantic intents...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         // 🌟 [최적화] 파이프라인 중간에 모델을 교체하며 발생하는 Ping-Pong 로드를 방지하기 위해, 최초에 Qwen3와 Embedding 모델을 한 번에 모두 로드합니다.
         self.ensure_qwen3().await?;
@@ -2674,7 +2674,7 @@ impl LogisModel {
 
                 let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Mapping attributes...", "spinner": "⠋" });
                 let _ = app_handle.emit("extraction-progress", &payload);
-                crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+                crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
                 let mut current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -3826,7 +3826,7 @@ impl LogisModel {
 
         let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Analysis complete.", "spinner": "✅" });
         let _ = app_handle.emit("extraction-progress", &payload);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
         emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
@@ -3871,7 +3871,7 @@ impl LogisModel {
 
         let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Extracting logistics filters...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
         self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
@@ -3911,7 +3911,7 @@ impl LogisModel {
         
         let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
         let _ = app_handle.emit("extraction-progress", &payload);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         let ctx = json!([{
             "type": "tracking",
@@ -3944,7 +3944,7 @@ impl LogisModel {
         // UI에 스피너 표기
         let payload = json!({ "task_id": task_id, "category": "Analytic", "summary": "Running mock analytics...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         // 🌟 취소 버튼 즉시 반응 대응
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3966,7 +3966,7 @@ impl LogisModel {
 
         let payload_done = json!({ "task_id": task_id, "category": "Done", "summary": "Analytic processing complete (Dummy).", "spinner": "✅" });
         let _ = app_handle.emit("extraction-progress", &payload_done);
-        crate::scheduler::log_task_progress(app_handle, task_id, &payload_done);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload_done);
 
         emit_term("[SUCCESS] Analytic Search Pipeline Completed.");
         Ok(json!({ "context": ctx }))
@@ -3980,7 +3980,7 @@ impl LogisModel {
         // 1. Context Gathering
         status_history.push_str("✅ Context gathered.\n\n");
         // [LOG-ONLY]
-        crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
+        crate::utils::logger::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
         // 2. Multi-step reasoning loop
         let steps = vec![
@@ -3991,7 +3991,7 @@ impl LogisModel {
 
         for step in steps.iter() {
             status_history.push_str(&format!("**⏳ {}**\n", step));
-            crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
+            crate::utils::logger::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
@@ -3999,7 +3999,7 @@ impl LogisModel {
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
-            crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
+            crate::utils::logger::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
             crate::models::qwen::generate::wait_for_global_io().await;
             
@@ -4033,7 +4033,7 @@ impl LogisModel {
         status_history.push_str(&report);
         
         // [LOG-ONLY]
-        crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
+        crate::utils::logger::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
         Ok(report)
     }
