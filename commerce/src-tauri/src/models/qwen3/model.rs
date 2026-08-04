@@ -13,137 +13,6 @@ use crate::{
     utils::tensor_utils::prepare_causal_attention_mask,
 };
 
-pub struct Qwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    scaling: f64,
-    pub kv_cache: Option<(Tensor, Tensor)>,
-}
-
-impl Qwen3Attention {
-    pub fn new(config: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = config.hidden_size;
-        let num_attention_heads = config.num_attention_heads;
-        let head_dim = config.head_dim;
-        let num_key_value_heads = config.num_key_value_heads;
-        let num_kv_groups = num_attention_heads / num_key_value_heads;
-        let scaling = 1f64 / f64::sqrt(head_dim as f64);
-        let q_proj = linear_b(
-            hidden_size,
-            num_attention_heads * head_dim,
-            config.attention_bias,
-            vb.pp("q_proj"),
-        )?;
-        let k_proj = linear_b(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            config.attention_bias,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = linear_b(
-            hidden_size,
-            num_key_value_heads * head_dim,
-            config.attention_bias,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = linear_b(
-            num_attention_heads * head_dim,
-            hidden_size,
-            config.attention_bias,
-            vb.pp("o_proj"),
-        )?;
-        let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            num_attention_heads,
-            num_key_value_heads,
-            num_kv_groups,
-            head_dim,
-            scaling,
-            kv_cache: None,
-        })
-    }
-
-    pub fn forward(
-        &mut self,
-        xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        attention_mask: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-        let query_states = self.q_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_attention_heads,
-            self.head_dim,
-        ))?;
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
-        let key_states = self.k_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
-        let value_states = self.v_proj.forward(xs)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        
-        // 🌟 [CRITICAL FIX] 동일하게 소유권(take)을 빼앗아 VRAM 2배 널뛰기 스파이크를 완전히 제거합니다.
-        let (key_states, value_states) = match self.kv_cache.take() {
-            None => (key_states.contiguous()?, value_states.contiguous()?),
-            Some((prev_k, prev_v)) => {
-                let dev = key_states.device();
-                let prev_k = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
-                let prev_v = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
-                let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
-                let v = Tensor::cat(&[&prev_v, &value_states], 2)?.contiguous()?;
-                (k, v)
-            }
-        };
-        
-        // 🌟 [JIT CPU Offload] 동일하게 보관용 캐시를 연산 직후 즉각 RAM으로 대피시켜 VRAM 스파이크를 없앱니다.
-        self.kv_cache = Some((
-            key_states.to_device(&candle_core::Device::Cpu)?, 
-            value_states.to_device(&candle_core::Device::Cpu)?
-        ));
-        let attn_output = eager_attention_forward(
-            &query_states,
-            &key_states,
-            &value_states,
-            Some(self.num_kv_groups),
-            attention_mask,
-            self.scaling,
-        )?;
-        let attn_output =
-            attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
-        let attn_output = attn_output.apply(&self.o_proj)?;
-        Ok(attn_output)
-    }
-
-    pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
-    }
-}
-
 #[derive(Clone)]
 pub struct Fp8VramKVCache {
     pub k_fp8: Tensor,
@@ -151,7 +20,6 @@ pub struct Fp8VramKVCache {
 }
 
 pub struct Qwen3DecoderLayer {
-    // self_attn: Qwen3Attention,
     self_attn: QKNormAttention,
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
@@ -161,7 +29,6 @@ pub struct Qwen3DecoderLayer {
 
 impl Qwen3DecoderLayer {
     pub fn new(config: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
-        // let self_attn = Qwen3Attention::new(config, vb.pp("self_attn"))?;
         let self_attn = QKNormAttention::new(
             vb.pp("self_attn"),
             config.hidden_size,
