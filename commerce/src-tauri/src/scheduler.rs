@@ -1414,38 +1414,42 @@ async fn process_task(
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 
-            let doc_title = {
+            // 🌟 [TITLE CANDIDATE POOL] <title> 하나만 믿던 구조를 폐기합니다.
+            // 실측: goods_list.html / order_list.html 둘 다 <title>이 '관리자 페이지'로 동일합니다.
+            //       도메인 신호가 0인 이 타이틀에서 '관리' n-gram이 order 앵커의 '발주관리'와
+            //       코사인 0.85로 붙어버려 TitleP=0.961 / Prior=3.38x 가 만들어졌고,
+            //       라인 근거(goods MeanLineContrast 0.1492 > order 0.0757)를 압살했습니다.
+            //       또한 len() < 5 조건 때문에 진짜 제목인 <h1>전체 상품관리</h1>가 통째로 버려졌습니다.
+            // 개선: <title> + h1~h3 + legend/caption을 "후보"로만 모아두고,
+            //       실제 채택은 아래 [TITLE ANCHOR SELECTION]에서 코사인으로 결정합니다.
+            let title_candidates: Vec<String> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut t_val = if let Ok(sel) = scraper::Selector::parse("title") {
-                    doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
-                } else {
-                    String::new()
+                let norm = |s: String| -> String {
+                    s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
                 };
-                
-                if t_val.is_empty() || t_val.len() < 5 {
-                    let mut heading_texts = Vec::new();
-                    if let Ok(sel_h1) = scraper::Selector::parse("h1") {
-                        for el in doc.select(&sel_h1) {
-                            heading_texts.push(el.text().collect::<Vec<_>>().join(" ").trim().to_string());
-                        }
-                    }
-                    if let Ok(sel_h2) = scraper::Selector::parse("h2") {
-                        for el in doc.select(&sel_h2) {
-                            heading_texts.push(el.text().collect::<Vec<_>>().join(" ").trim().to_string());
-                        }
-                    }
-                    if !heading_texts.is_empty() {
-                        t_val = heading_texts.join(" | ");
+                let mut cands: Vec<String> = Vec::new();
+                if let Ok(sel) = scraper::Selector::parse("title") {
+                    if let Some(el) = doc.select(&sel).next() {
+                        let t = norm(el.text().collect::<Vec<_>>().join(" "));
+                        if !t.is_empty() { cands.push(t); }
                     }
                 }
-                t_val
+                for tag in ["h1", "h2", "h3", "legend", "caption"] {
+                    if let Ok(sel_h) = scraper::Selector::parse(tag) {
+                        for el in doc.select(&sel_h) {
+                            let t = norm(el.text().collect::<Vec<_>>().join(" "));
+                            if t.is_empty() || t.chars().count() > 60 { continue; }
+                            if !cands.contains(&t) { cands.push(t); }
+                        }
+                    }
+                }
+                if cands.len() > 24 { cands.truncate(24); }
+                cands
             };
-            
-            let title_emb = if !doc_title.is_empty() {
-                model.get_embedding(doc_title.clone()).await.unwrap_or(vec![0.0; 384])
-            } else {
-                vec![0.0; 384]
-            };
+
+            // 채택 전 임시값입니다. 실제 값은 [TITLE ANCHOR SELECTION]에서 코사인으로 덮어씁니다.
+            let mut doc_title = title_candidates.first().cloned().unwrap_or_default();
+            let mut title_emb = vec![0.0f32; 384];
 
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
@@ -1499,6 +1503,59 @@ async fn process_task(
                 best
             };
 
+            // 🌟 [CHROME PREJUDICE VECTOR] "사이트 껍데기" 전용 배제 벡터
+            //    '관리자 페이지', '관리자 주메뉴', '행복을 주는 쇼핑몰!', '기본검색' 처럼
+            //    어느 도메인에도 속하지 않는 범용 문구를 코사인 한 방으로 걸러내기 위한 기준점입니다.
+            //    하드코딩 문자열 비교가 아니라 벡터 비교이므로 다국어에 그대로 동작합니다.
+            let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
+            let chrome_prej_emb = model.get_embedding(chrome_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+
+            // 🌟 [TITLE ANCHOR SELECTION via COSINE]
+            // 후보(<title>, h1~h3, legend, caption) 중 "도메인 변별력이 가장 큰 문구"를 코사인으로 채택합니다.
+            //   DomainContrast = (6개 카테고리 MAX-POOL 최대값) - (6개 평균)  → 특정 도메인 쏠림 정도
+            //   ChromeSim      = chrome 배제 벡터와의 코사인                  → 껍데기 정도
+            //   TitleScore     = DomainContrast - 0.5 * max(0, ChromeSim - DomainMax * 0.85)
+            // '관리자 페이지'는 ChromeSim이 압도적이고 DomainContrast는 껍데기 조각('관리')으로
+            // 인위 부양된 값이라 감점되고, '전체 상품관리'는 goods 쏠림이 커서 채택됩니다.
+            {
+                if !title_candidates.is_empty() {
+                    let cand_embs = model
+                        .get_embedding_batch(title_candidates.clone())
+                        .await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; title_candidates.len()]);
+
+                    let mut best_idx = 0usize;
+                    let mut best_score = f32::MIN;
+                    for (idx, cand) in title_candidates.iter().enumerate() {
+                        let emb = &cand_embs[idx];
+                        if emb.iter().all(|&v| v == 0.0) { continue; }
+                        let mut sims: Vec<f32> = Vec::with_capacity(categories.len());
+                        for ci in 0..categories.len() {
+                            sims.push(max_pool_sim(emb, &category_phrase_embs[ci].1));
+                        }
+                        let mean_s: f32 = sims.iter().sum::<f32>() / (sims.len() as f32);
+                        let max_s: f32 = sims.iter().cloned().fold(0.0f32, f32::max);
+                        let domain_contrast = max_s - mean_s;
+                        let chrome_sim = cosine_similarity(&chrome_prej_emb, emb);
+                        // 껍데기 유사도가 도메인 최대치의 85%를 넘어서는 초과분만큼만 비례 감점
+                        let chrome_penalty = (chrome_sim - max_s * 0.85).max(0.0);
+                        let cand_score = domain_contrast - chrome_penalty * 0.5;
+                        emit_term(&format!(
+                            "  🏷️ [TITLE CANDIDATE] '{}' | DomainMax: {:.4} | Contrast: {:+.4} | ChromeSim: {:.4} | Score: {:+.4}",
+                            cand, max_s, domain_contrast, chrome_sim, cand_score
+                        ));
+                        if cand_score > best_score {
+                            best_score = cand_score;
+                            best_idx = idx;
+                        }
+                    }
+
+                    doc_title = title_candidates[best_idx].clone();
+                    title_emb = cand_embs[best_idx].clone();
+                    emit_term(&format!("  👑 [TITLE ANCHOR SELECTED] '{}' (Score: {:+.4})", doc_title, best_score));
+                }
+            }
+
             // 🌟 [COMMON-MODE REJECTION] 6개 카테고리 유사도의 평균을 빼서 공통성분을 제거합니다.
             // 기존: TitleSim 6개가 0.3776~0.4926에 전부 몰려 있음 = 0.40 수준은 "한국어 커머스 관리자
             //       페이지"라는 공통 배경 신호일 뿐 도메인 신호가 아님. 그런데 x15.0으로 절대값을
@@ -1536,6 +1593,10 @@ async fn process_task(
                 category_line_scores.insert(cat.to_string(), (0.0, 0));
             }
             let mut ambiguous_lines = 0usize;
+            // 🌟 [BODY CONSENSUS POOL] 임계/마진 게이트에 탈락한 라인까지 전부 담아
+            //    "본문 전체가 어느 도메인에 가까운가"를 타이틀과 무관하게 별도 표결시킵니다.
+            //    이미 계산되는 sims를 재활용하므로 임베딩 추가 호출은 0건입니다.
+            let mut body_sim_pool: Vec<Vec<f32>> = vec![Vec::new(); categories.len()];
 
             for (i, emb) in line_embeddings.iter().enumerate() {
                 // 노이즈로 판정되어 삭제될 줄(wiped_indices)은 철저히 배제합니다.
@@ -1556,6 +1617,10 @@ async fn process_task(
                 let mut sims: Vec<(usize, f32)> = Vec::with_capacity(categories.len());
                 for (ci, (_, phrase_embs)) in category_phrase_embs.iter().enumerate() {
                     sims.push((ci, max_pool_sim(emb, phrase_embs)));
+                }
+                // 🌟 [BODY CONSENSUS 수집] 게이트 통과 여부와 무관하게 원본 코사인을 적재합니다.
+                for (ci, s) in &sims {
+                    body_sim_pool[*ci].push(*s);
                 }
                 let mean_sim: f32 = sims.iter().map(|(_, s)| *s).sum::<f32>() / (sims.len() as f32);
 
@@ -1581,6 +1646,25 @@ async fn process_task(
             if ambiguous_lines > 0 {
                 emit_term(&format!("  ⚖️ [AMBIGUITY GATE] 카테고리 간 마진 부족으로 배제된 범용 라인: {}개", ambiguous_lines));
             }
+
+            // 🌟 [BODY CONSENSUS via TOP-K COSINE] 타이틀에 전혀 의존하지 않는 독립 표결입니다.
+            // 카테고리별 상위 10개 라인 코사인의 평균 → 6개 평균 제거(공통성분 소거).
+            // "그 도메인에 강하게 붙는 라인 덩어리가 실제로 존재하는가"만 봅니다.
+            let body_consensus: Vec<f32> = {
+                let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
+                for ci in 0..categories.len() {
+                    let mut v = body_sim_pool[ci].clone();
+                    v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let k = v.len().min(10);
+                    let avg = if k == 0 { 0.0 } else { v[..k].iter().sum::<f32>() / (k as f32) };
+                    raw.push(avg);
+                }
+                let mean_b: f32 = if raw.is_empty() { 0.0 } else { raw.iter().sum::<f32>() / (raw.len() as f32) };
+                for (ci, cat) in categories.iter().enumerate() {
+                    emit_term(&format!("  🗳️ [BODY CONSENSUS] {} | Top10Mean: {:.4} | Contrast: {:+.4}", cat, raw[ci], raw[ci] - mean_b));
+                }
+                raw.iter().map(|v| v - mean_b).collect()
+            };
 
             // 🌟 [TITLE PRIOR via SOFTMAX] 타이틀 대비값을 6개 카테고리 확률분포로 변환합니다.
             // 기존: title_sim > 0.40 같은 절대 임계 판정 → 6개가 전부 0.37~0.49에 몰려 있으므로 무의미.
@@ -1628,7 +1712,34 @@ async fn process_task(
                 if windows.is_empty() {
                     Vec::new()
                 } else {
-                    model.get_embedding_batch(windows.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; windows.len()])
+                    let raw_embs = model.get_embedding_batch(windows.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; windows.len()]);
+                    // 🌟 [CHROME WINDOW GATE via COSINE]
+                    // n-gram 분해는 '관리자'에서 '관리'라는 껍데기 조각을 만들어냅니다.
+                    // 실측: 이 조각이 order 앵커의 '발주관리'와 붙어 TitleMaxPool을 0.8534까지 끌어올렸습니다.
+                    // → 윈도우 자체가 chrome 배제 벡터에 더 가까우면 MAX-POOL 후보에서 제외합니다.
+                    let mut gated: Vec<Vec<f32>> = Vec::with_capacity(raw_embs.len());
+                    let mut dropped_win = 0usize;
+                    for (wi, we) in raw_embs.into_iter().enumerate() {
+                        if we.iter().all(|&v| v == 0.0) { continue; }
+                        let chrome_s = cosine_similarity(&chrome_prej_emb, &we);
+                        let mut dom_s = 0.0f32;
+                        for ci in 0..categories.len() {
+                            let s = max_pool_sim(&we, &category_phrase_embs[ci].1);
+                            if s > dom_s { dom_s = s; }
+                        }
+                        if chrome_s >= dom_s * 0.85 {
+                            dropped_win += 1;
+                            if dropped_win <= 8 {
+                                emit_term(&format!("  🚫 [CHROME WINDOW DROP] '{}' | ChromeSim: {:.4} >= DomainMax: {:.4} x 0.85", windows[wi], chrome_s, dom_s));
+                            }
+                            continue;
+                        }
+                        gated.push(we);
+                    }
+                    if dropped_win > 0 {
+                        emit_term(&format!("  🚫 [CHROME WINDOW GATE] 껍데기 n-gram 윈도우 {}개 제외 (잔존: {}개)", dropped_win, gated.len()));
+                    }
+                    gated
                 }
             };
 
@@ -1649,14 +1760,43 @@ async fn process_task(
                 raw.iter().map(|v| v - mean_w).collect()
             };
 
-            // 🌟 [FINAL SCORING v3] 대비(contrast) 기반 타이틀 신호 + 평균 라인 신호 × 타이틀 사전확률
+            // 🌟 [TITLE TRUST via COSINE] 타이틀 신호를 얼마나 믿을지 0.0~1.0으로 환산합니다.
+            //   근거 1) 채택 타이틀의 도메인 최대 유사도 vs chrome 유사도
+            //   근거 2) 윈도우 대비값의 1등-2등 마진 (한 도메인만 뾰족하게 튀는가)
+            // 껍데기 타이틀이면 trust가 0에 수렴 → Prior/Boost가 자동으로 1.0x 중립으로 접히고
+            // 판정이 온전히 본문 근거(LineSig + BodySig)로만 넘어갑니다.
+            let title_trust: f32 = {
+                let mut dom_max = 0.0f32;
+                for ci in 0..categories.len() {
+                    let s = max_pool_sim(&title_emb, &category_phrase_embs[ci].1);
+                    if s > dom_max { dom_max = s; }
+                }
+                let chrome_s = cosine_similarity(&chrome_prej_emb, &title_emb);
+                // (1) 껍데기 대비 도메인 우세도: chrome >= domain 이면 0
+                let chrome_trust = ((dom_max - chrome_s) / 0.15).clamp(0.0, 1.0);
+                // (2) 윈도우 대비값 1등-2등 마진: 0.02 이하 → 0, 0.10 이상 → 1
+                let mut wc = title_window_contrast.clone();
+                wc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let peak_margin = (wc.get(0).copied().unwrap_or(0.0) - wc.get(1).copied().unwrap_or(0.0)).max(0.0);
+                let margin_trust = ((peak_margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                let t = chrome_trust.min(margin_trust);
+                emit_term(&format!(
+                    "  🔒 [TITLE TRUST] DomainMax: {:.4} | ChromeSim: {:.4} | ChromeTrust: {:.3} | PeakMargin: {:.4} | MarginTrust: {:.3} → Trust: {:.3}",
+                    dom_max, chrome_s, chrome_trust, peak_margin, margin_trust, t
+                ));
+                t
+            };
+
+            // 🌟 [FINAL SCORING v4] 타이틀 신뢰도(TITLE TRUST)로 타이틀 3중 곱셈을 제어하고,
+            //    타이틀과 독립된 본문 표결(BODY CONSENSUS)을 세 번째 증거로 추가합니다.
             for (ci, cat) in categories.iter().enumerate() {
                 let (title_contrast, title_only_contrast) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
                 let title_raw = category_title_raw.get(*cat).copied().unwrap_or(0.0);
                 let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
 
                 // 1) 타이틀 신호: 공통성분이 제거된 대비값만 증폭합니다. 음수(평균 이하)는 0으로 클리핑.
-                let title_signal = (title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0);
+                //    🌟 title_trust를 곱해 껍데기 타이틀의 신호를 0으로 수렴시킵니다.
+                let title_signal = ((title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0)) * title_trust;
 
                 // 2) 라인 신호: 합계/√n 방식은 라인 개수에 비례해 증가하므로(√n에 비례),
                 //    라인당 품질이 같아도 59줄이 9줄을 2.5배 이기는 구조적 결함이 있었습니다.
@@ -1679,19 +1819,28 @@ async fn process_task(
                 };
                 let line_signal = mean_line_contrast * 10.0 * coverage * evidence_factor;
 
+                // 2-1) 🌟 [BODY SIGNAL] 타이틀에 전혀 의존하지 않는 본문 상위-K 코사인 대비값입니다.
+                //      타이틀이 오염되어도 이 항은 절대 오염되지 않습니다.
+                let body_contrast = body_consensus.get(ci).copied().unwrap_or(0.0);
+                let body_signal = body_contrast.max(0.0) * 12.0;
+
                 // 3) 타이틀 사전확률 승산 배수 (p=1.0 → 3.5x, p=1/6 → 1.0x, p≈0 → 0.5x)
-                let title_prior = 0.5 + 3.0 * title_probs[ci];
+                //    🌟 title_trust로 중립(1.0x)과 선형 보간합니다. trust=0 → 무조건 1.0x.
+                let title_prior_raw = 0.5 + 3.0 * title_probs[ci];
+                let title_prior = 1.0 + (title_prior_raw - 1.0) * title_trust;
 
                 // 🌟 [TITLE SOFT-CONTAINS BOOST via COSINE]
                 // contains 하드매칭을 제거하고, 타이틀 윈도우 MAX-POOL 코사인의 대비값으로 부스트합니다.
                 //   대비값 0.00 → 1.00x (중립, '관리자 페이지'처럼 도메인 신호 없는 타이틀)
                 //   대비값 0.25 이상 → 2.50x (상한, '주문내역 수정'처럼 도메인이 명확한 타이틀)
                 // 문자열 일치가 아니라 의미 근접도를 재므로 발주/오더/order/受注 같은 표기 변형도 포착됩니다.
+                //    🌟 여기도 title_trust로 중립 보간하여 껍데기 부스트를 봉쇄합니다.
                 let win_contrast = title_window_contrast.get(ci).copied().unwrap_or(0.0);
-                let title_keyword_boost = (1.0 + 6.0 * win_contrast.max(0.0)).min(2.5);
-                emit_term(&format!("  🔤 [TITLE SOFT-CONTAINS] {} | WindowContrast: {:+.4} → boost {:.2}x", cat, win_contrast, title_keyword_boost));
+                let boost_raw = (1.0 + 6.0 * win_contrast.max(0.0)).min(2.5);
+                let title_keyword_boost = 1.0 + (boost_raw - 1.0) * title_trust;
+                emit_term(&format!("  🔤 [TITLE SOFT-CONTAINS] {} | WindowContrast: {:+.4} → raw {:.2}x × trust {:.3} → boost {:.2}x", cat, win_contrast, boost_raw, title_trust, title_keyword_boost));
 
-                let normalized_score = (title_signal + line_signal) * title_prior * title_keyword_boost;
+                let normalized_score = (title_signal + line_signal + body_signal) * title_prior * title_keyword_boost;
                 category_scores.push((cat.to_string(), normalized_score, title_raw, contributing_lines));
                 if normalized_score > max_total_score {
                     max_total_score = normalized_score;
@@ -1699,8 +1848,8 @@ async fn process_task(
                 }
 
                 emit_term(&format!(
-                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Lines: {} | Coverage: {:.3} | TitleSig: {:.3} | LineSig: {:.3}",
-                    cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, title_signal, line_signal
+                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Lines: {} | Coverage: {:.3} | BodyContrast: {:+.4} | TitleSig: {:.3} | LineSig: {:.3} | BodySig: {:.3}",
+                    cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, body_contrast, title_signal, line_signal, body_signal
                 ));
             }
             // 🌟 [DETAILED CLASSIFICATION LOG] 판정 근거를 투명하게 출력합니다.
@@ -1730,6 +1879,59 @@ async fn process_task(
             let prej_emb: Vec<f32> = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
+
+            // 🌟 [LAYOUT MULTI-VECTOR ANCHOR] Step A에서 검증된 MAX-POOL 방식을 Step A-2에 이식합니다.
+            // 기존 결함: list_bias / form_bias를 각각 '한 덩어리 문장'으로 임베딩했습니다.
+            //   ko/order 기준 layout_form 어휘(주문상세, 주문폼, 주문입력, 주문수정, 주문내역,
+            //   주문내역수정, 상세정보, 배송지수정, 부분취소)가 layout_list 어휘
+            //   (주문리스트, 주문표, 주문목록, 결제내역, 전체주문, 발주관리)보다 길고 조밀해서
+            //   어떤 한국어 관리자 헤딩을 넣어도 FormSim이 구조적으로 높게 나왔습니다.
+            //   실측 상수 오프셋 (FormSim - ListSim):
+            //     order_detail '주문내역 수정'  List 0.4839 / Form 0.5907 → +0.1068
+            //     goods_list   '전체 상품관리'  List 0.5035 / Form 0.5919 → +0.0884
+            //   → '주문리스트(전체)'를 넣어도 form이 이기는 구조라 order_list가 detail로 확정됐습니다.
+            // 개선: 구 단위로 쪼개 개별 임베딩 후 MAX-POOL.
+            //   '주문리스트(전체)' vs list 구절 '주문리스트' → 0.9대
+            //   '주문리스트(전체)' vs form 구절 '주문내역'   → 0.8대  → 방향이 정상 복구됩니다.
+            let split_bias_phrases = |raw: &str| -> Vec<String> {
+                let mut v: Vec<String> = raw
+                    .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                v.retain(|p| seen.insert(p.clone()));
+                if v.len() > 48 { v.truncate(48); }
+                v
+            };
+            let list_phrases = split_bias_phrases(&list_bias);
+            let form_phrases = split_bias_phrases(&form_bias);
+            let list_phrase_embs: Vec<Vec<f32>> = if list_phrases.is_empty() {
+                vec![list_bias_emb.clone()]
+            } else {
+                model.get_embedding_batch(list_phrases.clone()).await.unwrap_or_else(|_| vec![list_bias_emb.clone(); list_phrases.len()])
+            };
+            let form_phrase_embs: Vec<Vec<f32>> = if form_phrases.is_empty() {
+                vec![form_bias_emb.clone()]
+            } else {
+                model.get_embedding_batch(form_phrases.clone()).await.unwrap_or_else(|_| vec![form_bias_emb.clone(); form_phrases.len()])
+            };
+            emit_term(&format!("  🧩 [LAYOUT ANCHOR SPLIT] ListPhrases: {} | FormPhrases: {}", list_phrase_embs.len(), form_phrase_embs.len()));
+
+            // 🌟 [LAYOUT MAX-POOL 헬퍼] 대상 벡터 vs 레이아웃 구절 집합의 최대 코사인
+            let layout_max_pool = |target: &[f32], phrase_embs: &Vec<Vec<f32>>| -> f32 {
+                let mut best = 0.0f32;
+                for pe in phrase_embs {
+                    let s = cosine_similarity(target, pe);
+                    if s > best { best = s; }
+                }
+                best
+            };
+
+            // 🌟 [LAYOUT CHROME VECTOR] 브랜딩/네비/검색 껍데기 헤딩 배제용 기준 벡터입니다.
+            //    '행복을 주는 쇼핑몰!', '관리자 주메뉴', '기본검색'을 코사인 한 방으로 걸러냅니다.
+            let layout_chrome_text = "global navigation, menus, header, footer, sidebar, breadcrumb, admin main menu, main menu, admin page, administrator page, dashboard, control panel, site name, shopping mall, welcome, home, index, basic search, search form, search filter, login, logout, notice, banner, copyright";
+            let nav_chrome_emb = model.get_embedding(layout_chrome_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
             
             // 🌟 [NAVIGATION PRE-FILTER] Track B/C 후보 선정 전, 네비게이션/헤더/푸터/사이드바 라인을 사전 탈락
             // Track A에서 놓친 개별 네비게이션 라인을 구조 태그 + prejudice 유사도 이중 검증으로 차단합니다.
@@ -2116,49 +2318,62 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [HEADING VECTOR SIGNAL] 페이지의 h1(없으면 h2)은 "이 화면이 리스트인가 상세인가"를
+            // 🌟 [HEADING VECTOR SIGNAL v2] 페이지의 h1(없으면 h2)은 "이 화면이 리스트인가 상세인가"를
             // 가장 직접적으로 선언하는 텍스트입니다. <title>이 '관리자 페이지'처럼 무의미해도
             // 헤딩에는 레이아웃 정체성이 그대로 남습니다.
-            //   order_list.html  → h1 '주문리스트(전체)' : list_bias의 '주문리스트/전체주문'과 직결
-            //   order_detail.html → h1 '주문내역 수정'   : form_bias의 '주문내역 수정'과 직결
-            // 이 한 줄을 list_bias / form_bias와 코사인 비교하는 것만으로 두 페이지가 정반대로 갈립니다.
+            //   order_list.html   → h1 '주문리스트(전체)' : list 구절 '주문리스트'와 직결
+            //   order_detail.html → h1 '주문내역 수정'   : form 구절 '주문내역 수정'과 직결
+            //   goods_list.html   → h1 '전체 상품관리'   : list 구절 '전체상품/상품관리'와 직결
+            // 개선 1: 단일 희석 벡터 → 구 단위 MAX-POOL (form 어휘 밀도 편향 소거)
+            // 개선 2: chrome 벡터로 '행복을 주는 쇼핑몰!' / '관리자 주메뉴' / '기본검색' 사전 탈락
+            // 개선 3: h1 티어를 h2보다 무조건 우선, 동일 티어 내에서만 |gap| 최대값 채택
             let (heading_list_sim, heading_form_sim, heading_text) = {
-                let heads = {
+                let heads: Vec<(usize, String)> = {
                     let doc = scraper::Html::parse_document(&clean_html_content);
-                    let mut temp_heads: Vec<String> = Vec::new();
-                    for tag in ["h1", "h2"] {
+                    let mut temp: Vec<(usize, String)> = Vec::new();
+                    for (tier, tag) in ["h1", "h2"].iter().enumerate() {
                         if let Ok(sel_h) = scraper::Selector::parse(tag) {
                             for el in doc.select(&sel_h) {
                                 let txt = el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-                                if !txt.is_empty() && txt.chars().count() <= 60 { temp_heads.push(txt); }
+                                if !txt.is_empty() && txt.chars().count() <= 60 { temp.push((tier, txt)); }
                             }
                         }
-                        // 페이지 정체성은 h1이 우선이므로 h1을 확보하면 h2는 보지 않습니다.
-                        if !temp_heads.is_empty() { break; }
                     }
-                    if temp_heads.len() > 12 { temp_heads.truncate(12); }
-                    temp_heads
+                    if temp.len() > 16 { temp.truncate(16); }
+                    temp
                 };
 
                 if heads.is_empty() {
                     (0.0f32, 0.0f32, String::new())
                 } else {
-                    let head_embs = model.get_embedding_batch(heads.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; heads.len()]);
-                    // 여러 헤딩 중 list/form 변별력(|gap|)이 가장 큰 헤딩을 페이지 대표로 채택합니다.
-                    // ('행복을 주는 쇼핑몰!' 같은 브랜딩 헤딩은 gap이 0에 가까워 자동 탈락)
+                    let head_texts: Vec<String> = heads.iter().map(|(_, t)| t.clone()).collect();
+                    let head_embs = model.get_embedding_batch(head_texts.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; head_texts.len()]);
+
+                    let mut best_tier = usize::MAX;
                     let mut best_gap = -1.0f32;
                     let mut sel_l = 0.0f32;
                     let mut sel_f = 0.0f32;
                     let mut sel_txt = String::new();
                     for (hi, he) in head_embs.iter().enumerate() {
-                        let l = cosine_similarity(&list_bias_emb, he);
-                        let f = cosine_similarity(&form_bias_emb, he);
+                        if he.iter().all(|&v| v == 0.0) { continue; }
+                        let tier = heads[hi].0;
+                        let txt = &heads[hi].1;
+                        let l = layout_max_pool(he, &list_phrase_embs);
+                        let f = layout_max_pool(he, &form_phrase_embs);
                         let gap = (l - f).abs();
-                        if gap > best_gap {
+                        let chrome_s = cosine_similarity(&nav_chrome_emb, he);
+                        let layout_max = l.max(f);
+                        if chrome_s >= layout_max * 0.90 {
+                            emit_term(&format!("  🚫 [HEADING CHROME DROP] '{}' (h{}) | ChromeSim: {:.4} >= LayoutMax: {:.4} x 0.90", txt, tier + 1, chrome_s, layout_max));
+                            continue;
+                        }
+                        emit_term(&format!("  🧷 [HEADING CANDIDATE] '{}' (h{}) | ListMaxPool: {:.4} | FormMaxPool: {:.4} | Gap: {:+.4} | ChromeSim: {:.4}", txt, tier + 1, l, f, l - f, chrome_s));
+                        if tier < best_tier || (tier == best_tier && gap > best_gap) {
+                            best_tier = tier;
                             best_gap = gap;
                             sel_l = l;
                             sel_f = f;
-                            sel_txt = heads[hi].clone();
+                            sel_txt = txt.clone();
                         }
                     }
                     (sel_l, sel_f, sel_txt)
@@ -2211,7 +2426,126 @@ async fn process_task(
                 }
             };
 
-            // 🌟 [FINAL DECISION v2] Track 점수 + 헤딩 벡터 + 주기성 3개 증거를 합산하여 판정합니다.
+            // 🌟 [ROW REPETITION COSINE] 리스트/상세를 가르는 가장 결정적인 구조 증거입니다.
+            // 업로드된 3개 파일의 실측 DOM:
+            //   order_list.html   table#sodr_list       → tbody 11행, 전 행이 16셀로 동일
+            //   goods_list.html   table#sodr_list.tablef → tbody 26행 (13셀/5셀 교대 반복)
+            //   order_detail.html table#sodr_list       → tbody 1행뿐. 나머지 4개 테이블은 전부 2셀 라벨/값
+            // 기존 [PERIODICITY COSINE]은 라인 단위 스트라이드라 nav/검색폼 라인에 희석되어
+            // 리스트(0.0643)와 상세(0.0490)의 차이가 0.015밖에 나지 않았습니다.
+            // 여기서는 <tr> 하나를 통째로 임베딩해 "행끼리 얼마나 같은 모양인가"를 직접 잽니다.
+            //   자격 조건: 행 3개 이상 AND 최빈 셀 개수 3개 이상 (라벨/값 2셀 폼 테이블 원천 배제)
+            //   baseline : 같은 문서의 서로 다른 테이블 행 간 코사인 = 공통성분 소거
+            // → order_detail은 자격 테이블이 0개라 점수가 정확히 0이 됩니다.
+            let (row_repeat_score, row_uniformity, row_baseline, row_dbg) = {
+                let harvested: Vec<(Vec<String>, usize)> = {
+                    let doc = scraper::Html::parse_document(&clean_html_content);
+                    let mut out: Vec<(Vec<String>, usize)> = Vec::new();
+                    if let (Ok(tbl_sel), Ok(tr_sel), Ok(cell_sel)) = (
+                        scraper::Selector::parse("table"),
+                        scraper::Selector::parse("tr"),
+                        scraper::Selector::parse("td, th"),
+                    ) {
+                        for tbl in doc.select(&tbl_sel) {
+                            let mut rows: Vec<String> = Vec::new();
+                            let mut cell_counts: Vec<usize> = Vec::new();
+                            for tr in tbl.select(&tr_sel) {
+                                let txt = tr.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+                                if txt.chars().count() < 4 { continue; }
+                                rows.push(txt.chars().take(400).collect::<String>());
+                                cell_counts.push(tr.select(&cell_sel).count());
+                            }
+                            if rows.len() < 2 { continue; }
+                            if rows.len() > 30 { rows.truncate(30); cell_counts.truncate(30); }
+                            let mut freq: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                            for c in &cell_counts { *freq.entry(*c).or_insert(0) += 1; }
+                            let modal_cells = freq.iter().max_by_key(|(_, v)| **v).map(|(k, _)| *k).unwrap_or(0);
+                            out.push((rows, modal_cells));
+                        }
+                    }
+                    if out.len() > 10 { out.truncate(10); }
+                    out
+                };
+
+                if harvested.is_empty() {
+                    (0.0f32, 0.0f32, 0.0f32, String::from("no table"))
+                } else {
+                    let mut all_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                    for (rows, _) in &harvested {
+                        let e = model.get_embedding_batch(rows.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; rows.len()]);
+                        all_embs.push(e);
+                    }
+
+                    // (1) 자격 테이블에 한해 stride 1~3 인접 코사인 평균의 최대값 = 행 균일도
+                    let mut best_uni = 0.0f32;
+                    let mut best_ti: i32 = -1;
+                    let mut best_row_stride = 0usize;
+                    for (ti, (rows, modal_cells)) in harvested.iter().enumerate() {
+                        if rows.len() < 3 || *modal_cells < 3 {
+                            emit_term(&format!("  ⏭️ [ROW REPETITION SKIP] table[{}] rows:{} modalCells:{} (리스트 자격 미달)", ti, rows.len(), modal_cells));
+                            continue;
+                        }
+                        let embs = &all_embs[ti];
+                        for stride in 1..=3usize {
+                            if embs.len() <= stride { break; }
+                            let mut s = 0.0f32;
+                            let mut c = 0usize;
+                            for k in stride..embs.len() {
+                                s += cosine_similarity(&embs[k - stride], &embs[k]);
+                                c += 1;
+                            }
+                            if c < 2 { continue; }
+                            let m = s / (c as f32);
+                            if m > best_uni {
+                                best_uni = m;
+                                best_ti = ti as i32;
+                                best_row_stride = stride;
+                            }
+                        }
+                    }
+
+                    if best_ti < 0 {
+                        (0.0f32, 0.0f32, 0.0f32, String::from("no qualifying list table"))
+                    } else {
+                        // (2) baseline: 서로 다른 테이블의 행 간 코사인 평균 = 이 문서의 배경 유사도
+                        let mut base_sum = 0.0f32;
+                        let mut base_cnt = 0usize;
+                        for a in 0..all_embs.len() {
+                            for b in (a + 1)..all_embs.len() {
+                                for ea in all_embs[a].iter().take(6) {
+                                    for eb in all_embs[b].iter().take(6) {
+                                        base_sum += cosine_similarity(ea, eb);
+                                        base_cnt += 1;
+                                    }
+                                }
+                            }
+                        }
+                        // 테이블이 하나뿐이면 같은 테이블 내 최원거리 쌍을 배경으로 대체합니다.
+                        if base_cnt == 0 {
+                            let embs = &all_embs[best_ti as usize];
+                            let far = (embs.len() / 2).max(1);
+                            for k in far..embs.len() {
+                                base_sum += cosine_similarity(&embs[k - far], &embs[k]);
+                                base_cnt += 1;
+                            }
+                        }
+                        let baseline = if base_cnt > 0 { base_sum / (base_cnt as f32) } else { 0.0 };
+
+                        // (3) 양(volume) 보정: 행이 많을수록 리스트 확률이 높지만 상한 처리합니다.
+                        let n_rows = all_embs[best_ti as usize].len() as f32;
+                        let volume = (((n_rows - 2.0).max(0.0)).ln_1p() / 2.0).min(1.2);
+
+                        let contrast = (best_uni - baseline).max(0.0);
+                        let score = contrast * volume;
+                        let dbg = format!("table[{}] rows:{} modalCells:{} rowStride:{} volume:{:.3}",
+                            best_ti, n_rows as usize, harvested[best_ti as usize].1, best_row_stride, volume);
+                        (score, best_uni, baseline, dbg)
+                    }
+                }
+            };
+            emit_term(&format!("  🧱 [ROW REPETITION] {} | Uniformity: {:.4} | Baseline: {:.4} | Contrast: {:+.4} | Score: {:.4}", row_dbg, row_uniformity, row_baseline, row_uniformity - row_baseline, row_repeat_score));
+
+            // 🌟 [FINAL DECISION v3] Track 점수 + 헤딩 벡터 + 주기성 + 행 반복 4개 증거를 합산합니다.
             // 기존: is_detail = total_form_score > total_list_score
             //       한쪽 트랙이 NAV 필터로 0점이 되면 "리스트가 아니다"가 아니라 "측정 실패"인데도
             //       0.0638 > 0.0 으로 detail 확정되는 치명적 비대칭이 있었습니다.
@@ -2219,13 +2553,27 @@ async fn process_task(
             let heading_list_bonus = heading_gap.max(0.0) * 2.0;
             let heading_form_bonus = (-heading_gap).max(0.0) * 2.0;
             let periodicity_bonus = periodicity_contrast * 2.0;
+            let row_repeat_bonus = row_repeat_score * 3.0;
 
-            let list_final = total_list_score + heading_list_bonus + periodicity_bonus;
-            let form_final = total_form_score + heading_form_bonus;
+            // 🌟 [TRACK ASYMMETRY GUARD] 실측: 'table#sodr_list'(NavScore 0.5090)는 매번 NAV DROP되고
+            //    'section#anc_sodr_paymo'(SOFT-CARRY)만 살아남아 LIST 트랙이 늘 0.0000이었습니다.
+            //    한쪽만 0이라는 건 "그쪽이 아니다"가 아니라 "그쪽을 측정하지 못했다"입니다.
+            //    살아남은 반대쪽 트랙을 단독 근거로 쓰면 항상 그쪽으로 확정되므로 양쪽 대칭 감쇠합니다.
+            let list_measured = total_list_score > 0.0001;
+            let form_measured = total_form_score > 0.0001;
+            let track_damp = if list_measured != form_measured { 0.5f32 } else { 1.0f32 };
+            let eff_list_track = total_list_score * track_damp;
+            let eff_form_track = total_form_score * track_damp;
+            if track_damp < 1.0 {
+                emit_term(&format!("  ⚖️ [TRACK ASYMMETRY GUARD] 한쪽 트랙 측정 실패(List: {:.4} / Form: {:.4}). 양쪽 트랙 50% 감쇠 적용.", total_list_score, total_form_score));
+            }
 
-            emit_term(&format!("  🧭 [HEADING VECTOR] '{}' | ListSim: {:.4} | FormSim: {:.4} | Gap: {:+.4}", heading_text, heading_list_sim, heading_form_sim, heading_gap));
+            let list_final = eff_list_track + heading_list_bonus + periodicity_bonus + row_repeat_bonus;
+            let form_final = eff_form_track + heading_form_bonus;
+
+            emit_term(&format!("  🧭 [HEADING VECTOR] '{}' | ListMaxPool: {:.4} | FormMaxPool: {:.4} | Gap: {:+.4}", heading_text, heading_list_sim, heading_form_sim, heading_gap));
             emit_term(&format!("  🔁 [PERIODICITY COSINE] BestStride: {} | PeakContrast: {:+.4} | Baseline: {:.4}", best_stride, periodicity_contrast, periodicity_baseline));
-            emit_term(&format!("  🧮 [EVIDENCE SUM] ListFinal: {:.4} (track {:.4} + heading {:.4} + period {:.4}) | FormFinal: {:.4} (track {:.4} + heading {:.4})", list_final, total_list_score, heading_list_bonus, periodicity_bonus, form_final, total_form_score, heading_form_bonus));
+            emit_term(&format!("  🧮 [EVIDENCE SUM] ListFinal: {:.4} (track {:.4} + heading {:.4} + period {:.4} + rows {:.4}) | FormFinal: {:.4} (track {:.4} + heading {:.4})", list_final, eff_list_track, heading_list_bonus, periodicity_bonus, row_repeat_bonus, form_final, eff_form_track, heading_form_bonus));
 
             // 🌟 [LOW-CONFIDENCE FALLBACK] 폴백 조건을 "둘 다 0"에서 "마진 부족"으로 확장합니다.
             // 한쪽만 0이 되는 비대칭 상황이 기존 폴백의 정확한 사각지대였습니다.
@@ -2233,13 +2581,14 @@ async fn process_task(
             if decision_margin < 0.02 {
                 emit_term(&format!("  ⚠️ [LOW-CONFIDENCE FALLBACK] 판정 마진 {:.4} < 0.02. 전체 PUG 직접 임베딩 폴백 가동.", decision_margin));
                 let fallback_pug_emb = model.get_embedding(filtered_light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                let fallback_form_sim = cosine_similarity(&form_bias_emb, &fallback_pug_emb);
-                let fallback_list_sim = cosine_similarity(&list_bias_emb, &fallback_pug_emb);
+                // 🌟 폴백도 단일 희석 벡터 대신 구 단위 MAX-POOL로 통일합니다.
+                let fallback_form_sim = layout_max_pool(&fallback_pug_emb, &form_phrase_embs);
+                let fallback_list_sim = layout_max_pool(&fallback_pug_emb, &list_phrase_embs);
                 let fallback_prej_sim = cosine_similarity(&prej_emb, &fallback_pug_emb);
                 let fallback_form_final = (fallback_form_sim - fallback_prej_sim).max(0.0) + heading_form_bonus;
-                let fallback_list_final = (fallback_list_sim - fallback_prej_sim).max(0.0) + heading_list_bonus + periodicity_bonus;
+                let fallback_list_final = (fallback_list_sim - fallback_prej_sim).max(0.0) + heading_list_bonus + periodicity_bonus + row_repeat_bonus;
                 is_detail = fallback_form_final > fallback_list_final;
-                emit_term(&format!("  📊 [FALLBACK SCORE] FormSim: {:.4} | ListSim: {:.4} | PrejSim: {:.4} | FormFinal: {:.4} | ListFinal: {:.4} | is_detail: {}", fallback_form_sim, fallback_list_sim, fallback_prej_sim, fallback_form_final, fallback_list_final, is_detail));
+                emit_term(&format!("  📊 [FALLBACK SCORE] FormMaxPool: {:.4} | ListMaxPool: {:.4} | PrejSim: {:.4} | FormFinal: {:.4} | ListFinal: {:.4} | is_detail: {}", fallback_form_sim, fallback_list_sim, fallback_prej_sim, fallback_form_final, fallback_list_final, is_detail));
             } else {
                 is_detail = form_final > list_final;
             }
