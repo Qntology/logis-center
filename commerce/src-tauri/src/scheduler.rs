@@ -16,7 +16,6 @@ use tokio::sync::Notify;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 
-// 🌟 분리된 stanza 모듈에서 타입 가져오기
 use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
@@ -24,11 +23,7 @@ use crate::utils::json_utils::merge_node;
 use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases};
 use crate::utils::logger::log_task_progress;
 
-
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
-
-
-
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
@@ -49,10 +44,7 @@ pub async fn start_background_worker(
             let _ = app_handle_prog.emit("extraction-progress", &payload);
         }
     });
-
-    
-    // 여기서 다시 spawn 하여 불필요한 DB 락 경쟁을 일으킬 필요가 없습니다.
-    
+   
     tokio::spawn(async move {
         if !crate::utils::sync_utils::UI_READY_FLAG.load(std::sync::atomic::Ordering::SeqCst) {
             crate::utils::sync_utils::UI_READY_SIGNAL.notified().await;
@@ -104,13 +96,12 @@ pub async fn start_background_worker(
                     break;
                 }
 
-
                 println!("[Scheduler] Processing task: {}", task.id);
                 
                 {
                     let store_guard = store.lock().await;
                     if let Some(db) = store_guard.as_ref() {
-                        // DB의 상태값만 안전하게 1(Processing)로 동기화합니다.
+
                         let _ = db.update_task_status(&task.id, 1).await;
                         let _ = db.update_message_status(&task.id, 1, Some("Processing...")).await;
                         
@@ -135,8 +126,6 @@ pub async fn start_background_worker(
                             }
                         }
 
-                        // 일정 시간 뒤에 메모리를 비워주거나, 다음 작업 시작 시 덮어씌워지도록 유지합니다.
-
                         {
                             let mut model_lock = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
@@ -153,7 +142,7 @@ pub async fn start_background_worker(
                         }
 
                         current_device_pref = None; 
-                        oom_retry_map.remove(&task.id); // 성공 시 장부 삭제
+                        oom_retry_map.remove(&task.id);
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
@@ -173,7 +162,7 @@ pub async fn start_background_worker(
                         if err_msg.contains("Task cancelled") {
                              println!("[Scheduler] Task cancelled: {}", task.id);
                              
-                             // 여기서 백엔드가 메시지를 다시 생성하거나 이벤트를 쏘면 UI가 좀비처럼 부활하므로 조용히 종료만 합니다.
+
                              current_device_pref = None;
                              continue;
                         } else if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
@@ -223,7 +212,7 @@ pub async fn start_background_worker(
                                     println!("[Scheduler] OOM Detected twice! Activating CPU Mode for text task.");
                                     current_device_pref = Some("cpu".to_string());
 
-                                    // 여기도 더러워진 로그 청소
+
                                     let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
                                     let _ = std::fs::remove_file(&log_path);
 
@@ -297,7 +286,6 @@ async fn process_task(
     emit_term("\n=======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
 
-    
     if task.r#type == "analytic_extraction" {
         return crate::analytic::process_analytic_task(
             task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
@@ -309,7 +297,6 @@ async fn process_task(
         emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
     }
 
-    
     let payload = json!({ 
         "task_id": task.id,
         "task_type": task.r#type, 
@@ -325,14 +312,12 @@ async fn process_task(
     
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
 
-    // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
     let kv_name = if task.r#type == "image_extraction" {
         Some("image".to_string())
     } else {
         Some("text".to_string())
     };
-    
-    // [FIX] Robust device preference parsing (supports both "cpu" string and true/false boolean)
+ 
     let task_device_pref = if let Some(v) = task_data.get("device_preference") {
         if v.as_str() == Some("cpu") || v.as_bool() == Some(true) {
             Some("cpu".to_string())
@@ -345,9 +330,8 @@ async fn process_task(
     let effective_device_pref = task_device_pref.as_deref().or(device_preference.as_deref());
     
     let language = "english"; 
-    let mut doc_lang = "en".to_string(); // 🌟 신규 다국어 감지 변수 추가
+    let mut doc_lang = "en".to_string();
 
-    // [LOCK] Acquire Model Access
     let model = {
         println!("[Scheduler] 🛡️ Attempting to acquire Model Lock...");
         let mut model_lock = model_mutex.lock().await;
@@ -355,7 +339,7 @@ async fn process_task(
         
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
+
         if let Some(m) = model_lock.as_ref() {
             let wants_cpu = effective_device_pref == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
@@ -367,7 +351,7 @@ async fn process_task(
 
         if model_lock.is_none() {
             println!("[Scheduler] Model not initialized. Starting LogisModel::new...");
-            // [LOG-ONLY] No emit here to keep UI clean
+
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
             match LogisModel::new(app_handle.clone(), effective_device_pref).await {
@@ -384,23 +368,17 @@ async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
-    // 🌟 [CRITICAL FIX] 텍스트 추출 시작 단계에서는 임베딩 모델의 "파일 다운로드 여부"만 가볍게 확인합니다.
-    // 실제 텐서 메모리 로딩은 추후 AI가 분석을 끝내고 추출 단계(Stage 3)에 진입하여 모델이 '진짜 쓰일 때' 지연 로딩됩니다!
     if task.r#type != "image_extraction" && task.r#type != "analytic_extraction" {
         model.check_embedding_downloaded().await?;
     }
 
-    // --- Image Extraction Logic (Qwen 3.5 Pipeline) ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         
 
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
-            
-            
-            // log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Analyzing visual context with Qwen 3.5...", "spinner": "⠋" }));
-            
+
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
@@ -416,8 +394,7 @@ async fn process_task(
     }
 
     let (mut url, mut origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
-    
-    
+
     let active_task_json = json!({
         "id": task.id.clone(),
         "type": task.r#type.clone(),
@@ -433,12 +410,10 @@ async fn process_task(
         *w = Some(active_task_json.clone());
     }
 
-    
     if url.is_empty() { 
         return Err(anyhow::anyhow!("Task missing target URL or unsupported type for background extraction.")); 
     }
 
-    // [MEMORY] Fetch and process directly in memory
     let raw_html_content = if task.r#type == "document_extraction" {
         let file_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
         let ext = task_data.get("document_ext").and_then(|s| s.as_str()).unwrap_or("");
@@ -449,13 +424,11 @@ async fn process_task(
             "summary": format!("Parsing {} file format...", ext.to_uppercase()), 
             "spinner": "📄" 
         });
+
         let _ = app_handle.emit("extraction-progress", &payload);
-        
-        // 🌟 [수정] 새로 작성된 extract_document_text 동기 함수 호출 (await 제거)
+
         let extracted_text = crate::parsers::extract_document_text(file_path).unwrap_or_else(|e| format!("Document Parsing Error: {}", e));
-        
-        // 🌟 기존 AI 파이프라인에서 HTML 태그 기반 구조 분석을 하므로, 줄바꿈 단위로 div 태그로 감싼 가짜 HTML 구조를 생성합니다.
-        // 문서 텍스트 내부의 <, > 기호가 HTML 파서를 붕괴시키지 않도록 이스케이프 처리를 병행합니다.
+
         let fake_html = extracted_text.lines()
             .map(|line| {
                 let safe_line = line.replace("<", "&lt;").replace(">", "&gt;");
@@ -471,23 +444,21 @@ async fn process_task(
     } else if !url.is_empty() {
         let response = reqwest::get(&url).await?;
         let bytes = response.bytes().await?;
-        
-        // [ENCODING-FIX] UTF-8 First Strategy
+
         let (decoded_utf8, _, malformed_utf8) = encoding_rs::UTF_8.decode(&bytes);
         let utf8_str = decoded_utf8.as_ref();
-        
-        // Check for explicit EUC-KR/CP949 markers in the UTF-8 decoded string
+
         let needs_euc = utf8_str.to_lowercase().contains("charset=euc-kr") || 
                         utf8_str.to_lowercase().contains("charset=\"euc-kr\"") ||
                         utf8_str.to_lowercase().contains("charset=cp949") ||
                         utf8_str.to_lowercase().contains("charset=ks_c_5601");
 
         if needs_euc && malformed_utf8 {
-            // Only use EUC-KR if it's explicitly requested AND UTF-8 decoding had issues
+
             let (decoded_euc, _, _) = encoding_rs::EUC_KR.decode(&bytes);
             decoded_euc.into_owned()
         } else {
-            // Default to UTF-8 (Lossy fallback if needed)
+
             utf8_str.to_string()
         }
     } else {
@@ -501,24 +472,20 @@ async fn process_task(
     let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
-    // 1. 정확한 토큰 수 측정을 위해 Tokenizer 로드 (파일 경로 탐색)
     let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap_or_default();
     let tokenizer_path = base_path.join("Qwen3-0.6B-Instruct-gguf").to_string_lossy().to_string();
-    
-    // 1. 모델이 실제로 받게 될 전체 서식을 먼저 만듭니다. (scheduler.rs 539라인 참고)
+ 
     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", light_pug);
 
-    // 2. 이 전체 문자열을 인코딩해야 [TEXT-PREFILL]과 100% 일치합니다.
-    let mut token_count = raw_system_prefix.len() / 4; // 폴백용
+    let mut token_count = raw_system_prefix.len() / 4;
 
     if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(&tokenizer_path) {
-        // light_pug가 아니라 서식이 포함된 raw_system_prefix를 넣습니다.
+
         token_count = tokenizer.text_encode_vec(raw_system_prefix.clone(), false)
             .map(|v| v.len())
             .unwrap_or(token_count);
     }
 
-    // // 2. 실제 계산된 토큰 수가 3000 이하일 경우 FullContent 모드로 승급
     if token_count <= 6000 {
         println!("[Scheduler] Document is short enough ({} tokens). Upgrading to FullContent Mode...", token_count);
         raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
@@ -537,7 +504,6 @@ async fn process_task(
         base_model_size,
         light_pug.chars().take(100).collect::<String>().replace("\n", " ")
     );
-
 
     use crate::openai_types::{
         ChatCompletionRequestSystemMessage,
@@ -579,30 +545,23 @@ async fn process_task(
         (url_obj.path().to_string(), url_obj)
     };
 
-    
     let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
     let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path));
 
     {
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
-            
-            
-            // 클라우드(aa.ts)는 원본 대소문자를 유지하여 저장하고, 로컬(main.ts)은 소문자로 변환하여 요청합니다.
-            // 경로 비교 시 반드시 소문자로 통일하여 검색해야 100% 매칭됩니다!
             let link_val = (url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()).to_lowercase();
             let path_only = url_obj.path().to_lowercase(); 
             
             let mut potential_caches = Vec::new();
 
-            // 1. ID 기반 조회 (정확한 매칭 1차 수집)
             if let Ok(Some(page_doc)) = db.get_item_by_id("pages", &page_id).await {
                 potential_caches.push(page_doc);
             } else if let Ok(Some(page_doc)) = db.get_item_by_id("items", &page_id).await {
                 potential_caches.push(page_doc);
             }
 
-            // 2. URL 경로 기반 역추적 조회 (대소문자 무시)
             let tables_to_check = ["pages", "items"];
             for tbl in tables_to_check {
                 if let Ok(docs) = db.get_all_items(tbl, 1000, 0, None).await {
@@ -617,7 +576,6 @@ async fn process_task(
                 }
             }
 
-            // 3. 수집된 캐시 중 현재 DOM 구조와 가장 잘 맞는 캐시 선별
             let mut final_cache = None;
 
             for page_doc in potential_caches {
@@ -630,7 +588,6 @@ async fn process_task(
                         if item_sel.starts_with(node_sel) { item_sel.to_string() } else { format!("{} {}", node_sel, item_sel) }
                     } else if !item_sel.is_empty() { item_sel.to_string() } else { node_sel.to_string() };
 
-                    
                     let target_sel_clean = target_sel_str.replace(">", " ");
 
                     if !cached_detail {
@@ -643,14 +600,12 @@ async fn process_task(
                         }
 
                         if is_dom_matched {
-                            // DOM까지 완벽 일치하는 리스트 캐시 -> 최우선 채택 및 탐색 종료
+
                             final_cache = Some((page_doc, val, false, target_sel_clean));
                             break;
-                        } 
-                        
-                        // (빈 리스트일 가능성보다, 동일한 주소 체계를 가진 상세 페이지일 가능성이 99%이기 때문입니다.)
+                        }
+
                     } else {
-                        // Detail 캐시인 경우
                         if final_cache.is_none() {
                             final_cache = Some((page_doc, val, true, target_sel_clean));
                         }
@@ -658,14 +613,13 @@ async fn process_task(
                 }
             }
 
-            // 4. 최종 결정된 캐시 적용 및 파이프라인 패스
+
             if let Some((_page_doc, val, cached_detail, target_sel_str)) = final_cache {
                 emit_term(&format!("[Scheduler] ⚡ CACHE HIT! Skipping AI Pre-processing for: {}", raw_path));
                 page_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
-                
-                
+
                 is_detail = cached_detail; 
-                
+
                 selector_info = val.clone();
                 selector_info.as_object_mut().unwrap().insert("final_target_selector".to_string(), json!(target_sel_str));
                 skip_ai_analysis = true; 
@@ -677,20 +631,11 @@ async fn process_task(
         }
     }
 
-
-    // ==================================================================================
-    // [ULTRA-OPTIMIZED PIPELINE]
-    // Step 0: 0.6B Base Baking [System: PUG] -> Save task_id_base
-    // Step 1: 0.6B Loads base -> Ask Classification [User: Task] -> Save task_id_step_a
-    // Step 2: 0.6B Loads base -> Ask Selectors [User: Task] -> Save task_id_step_b
-    // ==================================================================================
-
     let base_session_id = format!("{}_base", task.id);
     let system_content = format!("[PUG CONTENT]\n{}", light_pug);
 
-    
     if !skip_ai_analysis {
-        // --- STEP 0: BASE BAKING (공통 컨텍스트 딱 1번만 굽기) ---
+
         if base_model_size == crate::model::ModelSize::Qwen {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
@@ -699,33 +644,25 @@ async fn process_task(
                 println!("[Scheduler] Baking Base PUG Context to SSD...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
                 
-                
                 model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
-                
                 
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    
-                    // 이렇게 해야 f_ids[kv_len..] 슬라이싱 시 토큰이 엇갈려 환각(Hallucination)이 발생하는 것을 원천 차단할 수 있습니다.
                     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", system_content);
-                    
-                    // System 메시지(PUG)만 1만 토큰을 읽어서 base_session_id 로 저장합니다.
+
                     gen.prefill_only(raw_system_prefix, Some(cancellation_token.clone()), Some(base_session_id.clone()), None, kv_name.clone()).await?;
                 }
             }
-            
-            // Qwen 모델을 VRAM에 올리고 사용하지 않을 때 즉시 내림 (임베딩 사용 준비)
+
             model.deep_purge_resources().await;
         }
 
-        // 🌟 [CRITICAL OPTIMIZATION] PUG 라인 벡터화 및 DOM 파싱을 Step A와 A-2가 공유하도록 단 한 번만 실행합니다!
-        // 태그 껍데기를 제외한 '순수 텍스트' 영역만 벡터화하여 연산량을 70% 이상 대폭 단축시킵니다.
         let pug_lines: Vec<String> = light_pug.lines().map(|s| s.to_string()).collect();
         let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
         let mut wiped_indices = vec![false; pug_lines.len()];
-        // 🌟 [조기 타이틀 추출] GLOBAL DROP / NAV PRE-FILTER에서 도메인 시그널 보호용
-        let early_doc_title = { // 내부 doc_title도 동일하게 수정
+
+        let early_doc_title = {
             let doc = scraper::Html::parse_document(&clean_html_content);
             let mut t_val = if let Ok(sel) = scraper::Selector::parse("title") {
                 doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
@@ -745,7 +682,7 @@ async fn process_task(
                     if !txt.is_empty() { heading_texts.push(txt); }
                 }
             }
-            // 🌟 [CRITICAL FIX] 관리자 페이지의 쓰레기 타이틀을 h1/h2로 강제 보정 (다국어 완벽 호환)
+
             if !heading_texts.is_empty() {
                 if t_val.is_empty() || t_val.len() < 5 {
                     t_val = heading_texts.join(" | ");
@@ -761,15 +698,8 @@ async fn process_task(
             vec![0.0; 384]
         };
         
-        // 🌟 [격리 보장] Step A의 노이즈 청소 로직이 원본 PUG를 훼손하여 Step B에 영향을 주지 않도록 독립된 변수로 분리합니다.
-        let mut filtered_light_pug = light_pug.clone();
 
-        // 🌟 [핵심 개선: 뎁스(Depth) + 테이블 컬럼 위치(colspan/rowspan) 결합 판정 깨기 로직 고도화]
-        // 텍스트가 동일한 DOM 뎁스(리스트 아이템)에서 흐름이 끊기며 나타나더라도,
-        // 테이블 구조 내에서 '동일 컬럼 위치'에 반복되면 UI 버튼으로 판정하여 탈락시킵니다.
-        
-        // Phase 0: 테이블 구조 감지 및 컬럼 인덱스 매핑
-        // PUG에서 tr/td/th 패턴을 추적하여 각 텍스트 라인의 (row_index, col_index)를 산출합니다.
+        let mut filtered_light_pug = light_pug.clone();
         let mut line_col_positions: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
         let mut is_table_structure = false;
         {
@@ -787,14 +717,14 @@ async fn process_task(
                     current_col = 0;
                     in_row = true;
                 } else if (tag_name == "td" || tag_name == "th") && in_row {
-                    // colspan 파싱: td[colspan="2"] 형태에서 colspan 값 추출
+
                     let mut colspan_val = 1;
                     if let Ok(re_cs) = regex::Regex::new(r#"colspan[=\\"]*(\d+)"#) {
                         if let Some(cap) = re_cs.captures(tag_part) {
                             colspan_val = cap[1].parse::<usize>().unwrap_or(1);
                         }
                     }
-                    // 현재 td/th에 텍스트가 있는지 확인
+
                     if let Some(pipe_idx) = trimmed.find('|') {
                         let txt = trimmed[pipe_idx + 1..].trim();
                         if !txt.is_empty() {
@@ -803,15 +733,14 @@ async fn process_task(
                     }
                     current_col += colspan_val;
                 } else if tag_name != "td" && tag_name != "th" && tag_name != "tr" && tag_name != "thead" && tag_name != "tbody" && tag_name != "table" {
-                    // 테이블 외부 태그를 만나면 row 추적 리셋
+
                     if in_row && !["colgroup", "col", "caption"].contains(&tag_name.as_str()) {
-                        // 테이블 종료는 아니지만 tr 외부이므로 col 리셋하지 않음
+
                     }
                 }
             }
         }
-        
-        // Phase 1: 텍스트별 등장 정보 수집 (라인 인덱스 + 뎁스 + 컬럼 위치)
+
         let mut global_text_stats: std::collections::HashMap<String, (usize, Vec<(usize, usize, Option<(usize, usize)>)>)> = std::collections::HashMap::new();
         for (line_idx, line) in pug_lines.iter().enumerate() {
             if let Some(idx) = line.find('|') {
@@ -825,8 +754,7 @@ async fn process_task(
                 }
             }
         }
-        
-        // Phase 2: 테이블 전체 row 수 계산 (컬럼 반복 판정용)
+
         let total_table_rows = if is_table_structure {
             let mut max_row = 0usize;
             for (_, &(r, _)) in &line_col_positions {
@@ -834,9 +762,7 @@ async fn process_task(
             }
             max_row + 1
         } else { 0 };
-        
-        // 🌟 [전역 UI 노이즈 판정용 임베딩 사전 생성]
-        // E0425 에러 해결: universal_prej_emb 변수가 먼저 선언되도록 Scope를 상단으로 끌어올립니다.
+
         let universal_prejudice = "global navigation, menus, footer, aside, search form, search filter.";
         let universal_prej_emb = model.get_embedding(universal_prejudice.to_string()).await.unwrap_or(vec![0.0; 384]);
         
@@ -846,12 +772,10 @@ async fn process_task(
         
         for (text, (count, occurrences)) in global_text_stats {
             if count >= 4 {
-                // 1. 숫자 데이터 보호 (가격, 수량, 날짜, 모델명 등)
+
                 let is_numeric_data = re_numeric.is_match(&text) || re_has_digit.is_match(&text);
                 if is_numeric_data { continue; }
-                
-                // 2. 🌟 [테이블 컬럼 위치 기반 판정] colspan/rowspan 인식
-                // 테이블 구조에서 동일 컬럼에 전체 row의 70% 이상 반복되면 → UI 버튼/레이블
+
                 if is_table_structure && total_table_rows >= 3 {
                     let mut col_hits: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
                     let mut rows_with_this_text: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -861,13 +785,13 @@ async fn process_task(
                             rows_with_this_text.insert(row_idx);
                         }
                     }
-                    // 특정 컬럼에 이 텍스트가 집중되어 있고, 전체 row의 70% 이상에서 등장하면 UI 노이즈
+
                     let row_coverage = rows_with_this_text.len() as f64 / total_table_rows as f64;
                     let max_col_hit = col_hits.values().max().copied().unwrap_or(0);
                     let is_same_col_repeated = max_col_hit >= (total_table_rows as f64 * 0.7).ceil() as usize;
                     
                     if is_same_col_repeated && row_coverage >= 0.7 {
-                        // 🌟 [href/event 보호] 해당 텍스트가 포함된 PUG 라인에 href 또는 이벤트 속성이 있으면 링크/액션 데이터로 간주하여 보호
+
                         let has_link_or_event = occurrences.iter().any(|(line_idx, _, _)| {
                             let line = &pug_lines[*line_idx];
                             line.contains("href=") || line.contains("onclick") || line.contains("onsubmit") || line.contains("onchange") || line.contains("data-url")
@@ -876,7 +800,7 @@ async fn process_task(
                             emit_term(&format!("  🛡️ [TABLE-COL LINK PROTECT] 동일 컬럼 반복이지만 href/event 속성 포함 링크 데이터 보호: '{}' ({}회 발견)", text, count));
                             continue;
                         }
-                        // 짧은 텍스트(버튼, 액션)는 탈락 / 긴 텍스트(공급사명 등 데이터)는 보호
+
                         if text.len() < 10 {
                             global_boilerplate_texts.insert(text.clone());
                             emit_term(&format!("  🚫 [TABLE-COL DROP] 동일 컬럼({}회/{}rows) 반복 UI 탈락: '{}' ({}회 발견)", max_col_hit, total_table_rows, text, count));
@@ -887,11 +811,11 @@ async fn process_task(
                         }
                     }
                 }
-                
-                // 3. 🌟 [기존 뎁스 기반 판정 깨기] (테이블이 아니거나 컬럼 판정 미해당 시)
+
                 let mut is_contiguous = false;
                 let mut is_dispersed = false;
                 let mut is_same_depth = true;
+
                 if occurrences.len() >= 2 {
                     let mut gaps = Vec::new();
                     let first_indent = occurrences[0].1;
@@ -908,9 +832,9 @@ async fn process_task(
                     } else if max_gap > 10 {
                         is_dispersed = true;
                     }
-                    // 🌟 동일 뎁스 + 분산: 테이블 컬럼 판정을 통과하지 못한 경우에만 보호
+
                     if is_same_depth && max_gap > 5 {
-                        // 추가 검증: 테이블 구조에서 서로 다른 컬럼에 등장하면 데이터, 같은 컬럼이면 UI
+
                         if is_table_structure {
                             let mut unique_cols: std::collections::HashSet<usize> = std::collections::HashSet::new();
                             for (_, _, col_pos) in &occurrences {
@@ -919,7 +843,7 @@ async fn process_task(
                                 }
                             }
                             if unique_cols.len() <= 1 && count >= 6 {
-                                // 🌟 [href/event 보호] 동일 컬럼 반복이라도 href 또는 이벤트 속성이 포함된 라인이 있으면 링크 데이터로 보호
+
                                 let has_link_or_event = occurrences.iter().any(|(line_idx, _, _)| {
                                     let line = &pug_lines[*line_idx];
                                     line.contains("href=") || line.contains("onclick") || line.contains("onsubmit") || line.contains("onchange") || line.contains("data-url")
@@ -928,7 +852,7 @@ async fn process_task(
                                     emit_term(&format!("  🛡️ [TABLE-SAME-COL LINK PROTECT] 단일 컬럼 반복이지만 href/event 속성 포함 링크 데이터 보호: '{}' ({}회, 컬럼 {:?})", text, count, unique_cols));
                                     continue;
                                 }
-                                // 같은 컬럼에만 반복 → UI 노이즈 확정
+
                                 global_boilerplate_texts.insert(text.clone());
                                 emit_term(&format!("  🚫 [TABLE-SAME-COL DROP] 단일 컬럼 반복 탈락: '{}' ({}회, 컬럼 {:?})", text, count, unique_cols));
                                 continue;
@@ -937,7 +861,7 @@ async fn process_task(
                         continue;
                     } else if !is_same_depth && is_dispersed {
                         if text.len() < 20 {
-                            // 🌟 [href/event 보호] 다중 구조 교차 발견이라도 href/event 속성이 있으면 보호
+
                             let has_link_or_event = occurrences.iter().any(|(line_idx, _, _)| {
                                 let line = &pug_lines[*line_idx];
                                 line.contains("href=") || line.contains("onclick") || line.contains("onsubmit") || line.contains("onchange") || line.contains("data-url")
@@ -946,7 +870,7 @@ async fn process_task(
                                 emit_term(&format!("  🛡️ [GLOBAL LINK PROTECT] 다중 구조 교차지만 href/event 속성 포함 링크 데이터 보호: '{}' ({}회 발견)", text, count));
                                 continue;
                             }
-                            // 🌟 [TITLE VECTOR PROTECT] 타이틀 임베딩과 코사인 유사도가 높으면 도메인 시그널로 보호
+
                             let drop_text_emb = model.get_embedding(text.clone()).await.unwrap_or(vec![0.0f32; 384]);
                             let title_protect_sim = cosine_similarity(&early_title_emb, &drop_text_emb);
                             if title_protect_sim > 0.40 {
@@ -959,10 +883,9 @@ async fn process_task(
                         }
                     }
                 }
-                // 4. 최종 판정
+
                 if is_contiguous {
                     if text.len() < 20 {
-                        // 🌟 [href/event 보호] 연속된 짧은 텍스트라도 href/event 속성이 있으면 보호
                         let has_link_or_event = occurrences.iter().any(|(line_idx, _, _)| {
                             let line = &pug_lines[*line_idx];
                             line.contains("href=") || line.contains("onclick") || line.contains("onsubmit") || line.contains("onchange") || line.contains("data-url")
@@ -982,8 +905,6 @@ async fn process_task(
                         emit_term(&format!("  🚫 [GLOBAL DROP] 분산된 짧은 UI(버튼) 탈락: '{}' ({}회 발견)", text, count));
                     }
                 } else {
-                    // 🌟 [다국어 벡터 판정] 한국어 하드코딩("선택","전체","카테고리")을 제거하고,
-                    // layout prejudice 벡터와의 코사인 유사도로 UI 노이즈 여부를 판정합니다.
                     if text.len() > 3 {
                         let text_emb = model.get_embedding(text.clone()).await.unwrap_or(vec![0.0f32; 384]);
                         let ui_noise_score = cosine_similarity(&universal_prej_emb, &text_emb);
@@ -1000,20 +921,17 @@ async fn process_task(
             if let Some(idx) = line.find('|') {
                 let text_part = line[idx + 1..].trim();
                 if global_boilerplate_texts.contains(text_part) {
-                    wiped_indices[i] = true; // 판정 및 임베딩 연산에서 완전 배제
+                    wiped_indices[i] = true;
                 }
             }
         }
-        
-        // 🌟 [CRITICAL FIX] VRAM(GPU) 사용률 0% 병목 현상 원천 해결!
-        // 한 줄씩 CPU가 던지고 기다리던 코드를 대량 일괄(Batch) 처리로 변경하여 GPU 코어를 100% 혹사시킵니다.
+
         let mut texts_to_embed = Vec::new();
         let mut text_indices = Vec::new();
         
         for (line_idx, line) in pug_lines.iter().enumerate() {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            
-            // 🌟 반복 UI로 판정된 라인은 임베딩 연산 자체에서 제외하여 속도/정확도를 동시 상승시킵니다.
+
             if wiped_indices[line_idx] { continue; }
             
             let text_part = if let Some(idx) = line.find('|') { line[idx + 1..].trim() } else { "" };
@@ -1024,7 +942,7 @@ async fn process_task(
         }
 
         if !texts_to_embed.is_empty() {
-            // VRAM 용량 초과 방지를 위해 100줄 단위로 끊어서 GPU에 병렬 주입합니다.
+
             for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
                 let start_idx = chunk_idx * 100;
                 if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
@@ -1066,19 +984,17 @@ async fn process_task(
             serde_json::to_string(&nodes_json).unwrap_or_default()
         };
 
-        // --- STEP A: CLASSIFICATION (인메모리 초고속 벡터 및 유니코드 분별 가동) ---
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting PURE VECTOR DETERMINISTIC RELAY (Step A)");
             
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Cleaning global noise layouts...", "spinner": "⠋" }));
 
-            // (universal_prej_emb는 상위 Scope에서 선언된 변수를 재사용합니다)
             let js_template = get_boa_block_extractor_template();
 
             let mut pre_processed_blocks = std::collections::HashSet::new();
             let mut track_a_candidates = Vec::new();
-            let mut seen_candidates = std::collections::HashSet::new(); // 🌟 [핵심 최적화 1] 텍스트 중복 수집 차단으로 JS 엔진 폭주 방지
+            let mut seen_candidates = std::collections::HashSet::new();
 
             for line_idx in 0..pug_lines.len() {
                 let text_part = if let Some(idx) = pug_lines[line_idx].find('|') { pug_lines[line_idx][idx + 1..].trim() } else { "" };
@@ -1137,7 +1053,7 @@ async fn process_task(
                                 let chunk_owned = chunk.to_vec();
                                 let html_ref = &html_clone;
                                 
-                                // 🌟 8개의 스레드가 각각 독립적인 DOM 트리를 구축하고 동시에 CSS 선택자를 사냥합니다!
+
                                 handles.push(s.spawn(move || {
                                     let doc = scraper::Html::parse_document(html_ref);
                                     let mut local_res = Vec::with_capacity(chunk_owned.len());
@@ -1159,7 +1075,6 @@ async fn process_task(
                 }).await.unwrap_or_default()
             };
 
-            // 🌟 [핵심 최적화 3] 완성된 PUG 블록들을 한데 모아 Batch 임베딩 타격! (VRAM 0% 대기현상 완전 파괴)
             let mut unique_pugs_to_embed = Vec::new();
             let mut track_a_pugs_clean = Vec::new();
             for (sel, block_pug) in track_a_pugs {
@@ -1205,7 +1120,6 @@ async fn process_task(
                 let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
                 let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
 
-                // 🌟 [CRITICAL FIX] 도메인별 바이어스 임베딩 사전 계산 (다국어 CONTENT VECTOR GATE용)
                 let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
                 let mut category_embs = Vec::new();
                 for cat in &categories {
@@ -1224,8 +1138,7 @@ async fn process_task(
                         let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
                         if nav_score > 0.38 {
                             let title_line_sim = cosine_similarity(&early_title_emb, &line_embeddings[i]);
-                            
-                            // 🌟 [DOMAIN VECTOR GATE] 6개 도메인 중 하나라도 강력히 일치하면 네비게이션 탈락에서 보호
+
                             let mut max_domain_sim = 0.0;
                             for emb in &category_embs {
                                 let sim = cosine_similarity(emb, &line_embeddings[i]);
@@ -1234,7 +1147,7 @@ async fn process_task(
 
                             if (max_domain_sim > 0.30 && max_domain_sim >= nav_score * 0.85) || (title_line_sim > nav_score && title_line_sim > 0.40) {
                                 nav_domain_protected += 1;
-                                continue; // 🛡️ 사이드바에도 있지만 본문 데이터이기도 하므로 보호!
+                                continue;
                             }
                             wiped_indices[i] = true;
                             nav_wiped_count += 1;
@@ -1256,14 +1169,6 @@ async fn process_task(
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 
-            // 🌟 [TITLE CANDIDATE POOL] <title> 하나만 믿던 구조를 폐기합니다.
-            // 실측: goods_list.html / order_list.html 둘 다 <title>이 '관리자 페이지'로 동일합니다.
-            //       도메인 신호가 0인 이 타이틀에서 '관리' n-gram이 order 앵커의 '발주관리'와
-            //       코사인 0.85로 붙어버려 TitleP=0.961 / Prior=3.38x 가 만들어졌고,
-            //       라인 근거(goods MeanLineContrast 0.1492 > order 0.0757)를 압살했습니다.
-            //       또한 len() < 5 조건 때문에 진짜 제목인 <h1>전체 상품관리</h1>가 통째로 버려졌습니다.
-            // 개선: <title> + h1~h3 + legend/caption을 "후보"로만 모아두고,
-            //       실제 채택은 아래 [TITLE ANCHOR SELECTION]에서 코사인으로 결정합니다.
             let title_candidates: Vec<String> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
                 let norm = |s: String| -> String {
@@ -1289,23 +1194,13 @@ async fn process_task(
                 cands
             };
 
-            // 채택 전 임시값입니다. 실제 값은 [TITLE ANCHOR SELECTION]에서 코사인으로 덮어씁니다.
             let mut doc_title = title_candidates.first().cloned().unwrap_or_default();
             let mut title_emb = vec![0.0f32; 384];
 
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
-            let mut category_scores: Vec<(String, f32, f32, usize)> = Vec::new(); // (cat, total, title_sim, line_count)
-
-            // 🌟 [MULTI-VECTOR ANCHOR / MAX-POOLING] 앵커 길이 편향 제거
-            // 기존: 앵커 전체를 한 문장으로 임베딩 → 토큰 평균화로 희석
-            //       review 앵커는 "리뷰"가 15회 반복되는 초고밀도 짧은 앵커라 무조건 유리,
-            //       order 앵커는 layout_list+layout_form+title+status가 붙어 길고 분산되어 불리.
-            //       그 결과 "주문내역 수정" 타이틀이 order(0.4509) < review(0.4926) 로 역전됨.
-            // 개선: 앵커를 구(phrase) 단위로 쪼개 개별 임베딩 후 MAX-POOLING.
-            //       "가장 잘 맞는 한 구절"의 코사인만 취하므로 앵커 길이/토큰수 영향이 완전히 소거됨.
-            //       "주문내역 수정" vs order 구절 "주문내역" → 0.8대, vs review 구절 "리뷰수정" → 0.5대
+            let mut category_scores: Vec<(String, f32, f32, usize)> = Vec::new();
             let mut category_phrase_embs: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
             let mut category_title_only_embs: Vec<(String, Vec<f32>)> = Vec::new();
             for cat in &categories {
@@ -1335,20 +1230,9 @@ async fn process_task(
                 category_title_only_embs.push((cat.to_string(), title_only_emb));
             }
 
-            // 🌟 [CHROME PREJUDICE VECTOR] "사이트 껍데기" 전용 배제 벡터
-            //    '관리자 페이지', '관리자 주메뉴', '행복을 주는 쇼핑몰!', '기본검색' 처럼
-            //    어느 도메인에도 속하지 않는 범용 문구를 코사인 한 방으로 걸러내기 위한 기준점입니다.
-            //    하드코딩 문자열 비교가 아니라 벡터 비교이므로 다국어에 그대로 동작합니다.
             let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
             let chrome_prej_emb = model.get_embedding(chrome_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
 
-            // 🌟 [TITLE ANCHOR SELECTION via COSINE]
-            // 후보(<title>, h1~h3, legend, caption) 중 "도메인 변별력이 가장 큰 문구"를 코사인으로 채택합니다.
-            //   DomainContrast = (6개 카테고리 MAX-POOL 최대값) - (6개 평균)  → 특정 도메인 쏠림 정도
-            //   ChromeSim      = chrome 배제 벡터와의 코사인                  → 껍데기 정도
-            //   TitleScore     = DomainContrast - 0.5 * max(0, ChromeSim - DomainMax * 0.85)
-            // '관리자 페이지'는 ChromeSim이 압도적이고 DomainContrast는 껍데기 조각('관리')으로
-            // 인위 부양된 값이라 감점되고, '전체 상품관리'는 goods 쏠림이 커서 채택됩니다.
             {
                 if !title_candidates.is_empty() {
                     let cand_embs = model
@@ -1369,7 +1253,7 @@ async fn process_task(
                         let max_s: f32 = sims.iter().cloned().fold(0.0f32, f32::max);
                         let domain_contrast = max_s - mean_s;
                         let chrome_sim = cosine_similarity(&chrome_prej_emb, emb);
-                        // 껍데기 유사도가 도메인 최대치의 85%를 넘어서는 초과분만큼만 비례 감점
+
                         let chrome_penalty = (chrome_sim - max_s * 0.85).max(0.0);
                         let cand_score = domain_contrast - chrome_penalty * 0.5;
                         emit_term(&format!(
@@ -1388,11 +1272,6 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [COMMON-MODE REJECTION] 6개 카테고리 유사도의 평균을 빼서 공통성분을 제거합니다.
-            // 기존: TitleSim 6개가 0.3776~0.4926에 전부 몰려 있음 = 0.40 수준은 "한국어 커머스 관리자
-            //       페이지"라는 공통 배경 신호일 뿐 도메인 신호가 아님. 그런데 x15.0으로 절대값을
-            //       증폭하니 신호(0.04 차이)가 아니라 노이즈(0.45 공통값)를 15배 증폭하는 꼴이었음.
-            // 개선: (자기 유사도 - 6개 평균) = 대비(contrast)만 남겨 순수 변별 신호로 스코어링.
             let mut category_title_scores: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
             let mut category_title_raw: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
             {
@@ -1413,25 +1292,15 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [MARGIN-GATED WINNER-TAKES-ALL]
-            // 기존 문제: 1등이 2등을 0.001 차이로 이겨도 100% 독점 → 어느 카테고리에도 안 붙는
-            //            범용 라인("수정", "내역", "닫기", "확인")이 밀도 높은 앵커(review/coupon)에
-            //            전부 흡착됨. 실측 review 54줄 / coupon 59줄 vs order 9줄.
-            // 개선 1: 1등-2등 마진이 임계값 미만이면 "판정 불가"로 보고 아무에게도 주지 않음.
-            // 개선 2: 적립 점수를 절대 코사인(sim)이 아니라 6개 평균 대비 초과분(contrast)으로 변경.
-            //         → 모든 라인에 공통으로 실리는 배경 유사도가 점수로 환산되지 않음.
             let mut category_line_scores: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
             for cat in &categories {
                 category_line_scores.insert(cat.to_string(), (0.0, 0));
             }
             let mut ambiguous_lines = 0usize;
-            // 🌟 [BODY CONSENSUS POOL] 임계/마진 게이트에 탈락한 라인까지 전부 담아
-            //    "본문 전체가 어느 도메인에 가까운가"를 타이틀과 무관하게 별도 표결시킵니다.
-            //    이미 계산되는 sims를 재활용하므로 임베딩 추가 호출은 0건입니다.
             let mut body_sim_pool: Vec<Vec<f32>> = vec![Vec::new(); categories.len()];
 
             for (i, emb) in line_embeddings.iter().enumerate() {
-                // 노이즈로 판정되어 삭제될 줄(wiped_indices)은 철저히 배제합니다.
+
                 if wiped_indices[i] { continue; }
                 let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
@@ -1441,8 +1310,8 @@ async fn process_task(
                 let tag_part = trimmed_line.split('|').next().unwrap_or("").trim().to_lowercase();
                 let is_table_cell = tag_part.starts_with("td") || tag_part.starts_with("th");
                 let weight = if is_table_cell { 1.5 } else { 1.0 };
-                // MAX-POOLING 도입으로 절대 코사인 분포가 전반 상승하므로 임계값을 재보정합니다.
-                // (기존 단일 희석 벡터 기준 0.15/0.25 → 구 단위 최대값 기준 0.30/0.38)
+
+
                 let sim_threshold = if is_table_cell { 0.30 } else { 0.38 };
                 let margin_threshold = if is_table_cell { 0.015 } else { 0.030 };
 
@@ -1450,7 +1319,7 @@ async fn process_task(
                 for (ci, (_, phrase_embs)) in category_phrase_embs.iter().enumerate() {
                     sims.push((ci, max_pool_sim(emb, phrase_embs)));
                 }
-                // 🌟 [BODY CONSENSUS 수집] 게이트 통과 여부와 무관하게 원본 코사인을 적재합니다.
+
                 for (ci, s) in &sims {
                     body_sim_pool[*ci].push(*s);
                 }
@@ -1465,7 +1334,7 @@ async fn process_task(
                 if best_sim < sim_threshold { continue; }
                 if margin < margin_threshold {
                     ambiguous_lines += 1;
-                    continue; // 카테고리 변별력이 없는 범용 라인은 어느 쪽에도 적립하지 않음
+                    continue;
                 }
 
                 let contrast = best_sim - mean_sim;
@@ -1479,9 +1348,6 @@ async fn process_task(
                 emit_term(&format!("  ⚖️ [AMBIGUITY GATE] 카테고리 간 마진 부족으로 배제된 범용 라인: {}개", ambiguous_lines));
             }
 
-            // 🌟 [BODY CONSENSUS via TOP-K COSINE] 타이틀에 전혀 의존하지 않는 독립 표결입니다.
-            // 카테고리별 상위 10개 라인 코사인의 평균 → 6개 평균 제거(공통성분 소거).
-            // "그 도메인에 강하게 붙는 라인 덩어리가 실제로 존재하는가"만 봅니다.
             let body_consensus: Vec<f32> = {
                 let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
@@ -1498,11 +1364,6 @@ async fn process_task(
                 raw.iter().map(|v| v - mean_b).collect()
             };
 
-            // 🌟 [TITLE PRIOR via SOFTMAX] 타이틀 대비값을 6개 카테고리 확률분포로 변환합니다.
-            // 기존: title_sim > 0.40 같은 절대 임계 판정 → 6개가 전부 0.37~0.49에 몰려 있으므로 무의미.
-            // 개선: 대비값에 softmax(T=0.05)를 적용해 "타이틀이 어느 도메인을 가리키는가"의
-            //       상대 확률을 얻고, 이를 승산 배수(0.5x ~ 3.5x)로 환산합니다.
-            //       타이틀이 애매하면 전 카테고리 p≈0.167 → 배수 1.0x로 자동 중립화됩니다.
             let title_probs: Vec<f32> = {
                 let combined: Vec<f32> = categories.iter().map(|c| {
                     let (a, o) = category_title_scores.get(*c).copied().unwrap_or((0.0, 0.0));
@@ -1515,22 +1376,13 @@ async fn process_task(
                 exps.iter().map(|e| e / sum_e).collect()
             };
 
-            // 🌟 [SOFT-CONTAINS via COSINE] 문자열 contains를 코사인 슬라이딩 윈도우로 대체합니다.
-            // 기존 doc_title.contains("주문") 방식의 한계:
-            //   1) 표기 변형을 못 잡음 (주문 / 발주 / 오더 / order / 受注 ...)
-            //   2) '관리자 페이지'처럼 도메인 단어가 없는 타이틀에서 전 카테고리 MISS → 부스트 전멸
-            //   3) 띄어쓰기, 괄호, 특수문자 변형에 그대로 깨짐 ('주문 리스트(전체)' vs '주문리스트')
-            // 개선: 타이틀을 어절 + 문자 n-gram(2~4) 윈도우로 분해해 각각 임베딩한 뒤,
-            //       카테고리 구절 집합과 MAX-POOL 코사인을 계산합니다.
-            //       "부분 문자열이 도메인 단어와 의미적으로 얼마나 가까운가"를 연속값으로 재므로
-            //       contains의 다국어/표기변형 취약점이 사라집니다.
             let title_window_embs: Vec<Vec<f32>> = {
                 let mut windows: Vec<String> = doc_title
                     .split(|c: char| c.is_whitespace() || c == '|' || c == '/' || c == '(' || c == ')' || c == '[' || c == ']' || c == '-' || c == ',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                // 공백이 없는 CJK 타이틀을 위해 문자 n-gram 윈도우를 추가로 생성합니다.
+
                 let title_chars: Vec<char> = doc_title.chars().filter(|c| !c.is_whitespace()).collect();
                 for w in 2..=4usize {
                     if title_chars.len() < w { break; }
@@ -1545,10 +1397,7 @@ async fn process_task(
                     Vec::new()
                 } else {
                     let raw_embs = model.get_embedding_batch(windows.clone()).await.unwrap_or_else(|_| vec![vec![0.0; 384]; windows.len()]);
-                    // 🌟 [CHROME WINDOW GATE via COSINE]
-                    // n-gram 분해는 '관리자'에서 '관리'라는 껍데기 조각을 만들어냅니다.
-                    // 실측: 이 조각이 order 앵커의 '발주관리'와 붙어 TitleMaxPool을 0.8534까지 끌어올렸습니다.
-                    // → 윈도우 자체가 chrome 배제 벡터에 더 가까우면 MAX-POOL 후보에서 제외합니다.
+
                     let mut gated: Vec<Vec<f32>> = Vec::with_capacity(raw_embs.len());
                     let mut dropped_win = 0usize;
                     for (wi, we) in raw_embs.into_iter().enumerate() {
@@ -1575,9 +1424,6 @@ async fn process_task(
                 }
             };
 
-            // 카테고리별 "타이틀 윈도우 최대 유사도"를 구한 뒤 공통성분(6개 평균)을 제거합니다.
-            // '관리자 페이지'처럼 도메인 신호가 없는 타이틀은 6개가 모두 비슷해져 대비값이 0에 수렴하고,
-            // 그 결과 부스트가 자동으로 1.0x(중립)가 됩니다.
             let title_window_contrast: Vec<f32> = {
                 let mut raw: Vec<f32> = Vec::new();
                 for ci in 0..categories.len() {
@@ -1592,11 +1438,6 @@ async fn process_task(
                 raw.iter().map(|v| v - mean_w).collect()
             };
 
-            // 🌟 [TITLE TRUST via COSINE] 타이틀 신호를 얼마나 믿을지 0.0~1.0으로 환산합니다.
-            //   근거 1) 채택 타이틀의 도메인 최대 유사도 vs chrome 유사도
-            //   근거 2) 윈도우 대비값의 1등-2등 마진 (한 도메인만 뾰족하게 튀는가)
-            // 껍데기 타이틀이면 trust가 0에 수렴 → Prior/Boost가 자동으로 1.0x 중립으로 접히고
-            // 판정이 온전히 본문 근거(LineSig + BodySig)로만 넘어갑니다.
             let title_trust: f32 = {
                 let mut dom_max = 0.0f32;
                 for ci in 0..categories.len() {
@@ -1604,9 +1445,9 @@ async fn process_task(
                     if s > dom_max { dom_max = s; }
                 }
                 let chrome_s = cosine_similarity(&chrome_prej_emb, &title_emb);
-                // (1) 껍데기 대비 도메인 우세도: chrome >= domain 이면 0
+
                 let chrome_trust = ((dom_max - chrome_s) / 0.15).clamp(0.0, 1.0);
-                // (2) 윈도우 대비값 1등-2등 마진: 0.02 이하 → 0, 0.10 이상 → 1
+
                 let mut wc = title_window_contrast.clone();
                 wc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 let peak_margin = (wc.get(0).copied().unwrap_or(0.0) - wc.get(1).copied().unwrap_or(0.0)).max(0.0);
@@ -1619,20 +1460,13 @@ async fn process_task(
                 t
             };
 
-            // 🌟 [FINAL SCORING v4] 타이틀 신뢰도(TITLE TRUST)로 타이틀 3중 곱셈을 제어하고,
-            //    타이틀과 독립된 본문 표결(BODY CONSENSUS)을 세 번째 증거로 추가합니다.
             for (ci, cat) in categories.iter().enumerate() {
                 let (title_contrast, title_only_contrast) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
                 let title_raw = category_title_raw.get(*cat).copied().unwrap_or(0.0);
                 let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
 
-                // 1) 타이틀 신호: 공통성분이 제거된 대비값만 증폭합니다. 음수(평균 이하)는 0으로 클리핑.
-                //    🌟 title_trust를 곱해 껍데기 타이틀의 신호를 0으로 수렴시킵니다.
                 let title_signal = ((title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0)) * title_trust;
 
-                // 2) 라인 신호: 합계/√n 방식은 라인 개수에 비례해 증가하므로(√n에 비례),
-                //    라인당 품질이 같아도 59줄이 9줄을 2.5배 이기는 구조적 결함이 있었습니다.
-                //    → 평균 대비값(품질) × 포화형 커버리지(양)로 분리하여 개수 보상을 상한 처리합니다.
                 let mean_line_contrast = if contributing_lines > 0 {
                     line_total / (contributing_lines as f32)
                 } else {
@@ -1643,7 +1477,7 @@ async fn process_task(
                 } else {
                     0.0
                 };
-                // 최소 증거 페널티: 기여 라인이 3개 미만이면 과소 표본으로 간주하여 신뢰도 감쇠
+
                 let evidence_factor = if contributing_lines < 3 {
                     (contributing_lines as f32) / 3.0
                 } else {
@@ -1651,22 +1485,12 @@ async fn process_task(
                 };
                 let line_signal = mean_line_contrast * 10.0 * coverage * evidence_factor;
 
-                // 2-1) 🌟 [BODY SIGNAL] 타이틀에 전혀 의존하지 않는 본문 상위-K 코사인 대비값입니다.
-                //      타이틀이 오염되어도 이 항은 절대 오염되지 않습니다.
                 let body_contrast = body_consensus.get(ci).copied().unwrap_or(0.0);
                 let body_signal = body_contrast.max(0.0) * 12.0;
 
-                // 3) 타이틀 사전확률 승산 배수 (p=1.0 → 3.5x, p=1/6 → 1.0x, p≈0 → 0.5x)
-                //    🌟 title_trust로 중립(1.0x)과 선형 보간합니다. trust=0 → 무조건 1.0x.
                 let title_prior_raw = 0.5 + 3.0 * title_probs[ci];
                 let title_prior = 1.0 + (title_prior_raw - 1.0) * title_trust;
 
-                // 🌟 [TITLE SOFT-CONTAINS BOOST via COSINE]
-                // contains 하드매칭을 제거하고, 타이틀 윈도우 MAX-POOL 코사인의 대비값으로 부스트합니다.
-                //   대비값 0.00 → 1.00x (중립, '관리자 페이지'처럼 도메인 신호 없는 타이틀)
-                //   대비값 0.25 이상 → 2.50x (상한, '주문내역 수정'처럼 도메인이 명확한 타이틀)
-                // 문자열 일치가 아니라 의미 근접도를 재므로 발주/오더/order/受注 같은 표기 변형도 포착됩니다.
-                //    🌟 여기도 title_trust로 중립 보간하여 껍데기 부스트를 봉쇄합니다.
                 let win_contrast = title_window_contrast.get(ci).copied().unwrap_or(0.0);
                 let boost_raw = (1.0 + 6.0 * win_contrast.max(0.0)).min(2.5);
                 let title_keyword_boost = 1.0 + (boost_raw - 1.0) * title_trust;
@@ -1684,7 +1508,7 @@ async fn process_task(
                     cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, body_contrast, title_signal, line_signal, body_signal
                 ));
             }
-            // 🌟 [DETAILED CLASSIFICATION LOG] 판정 근거를 투명하게 출력합니다.
+
             emit_term("\n[PAGE-TYPE CLASSIFICATION] === Per-Category Score Breakdown ===");
             emit_term(&format!("  Document Title: '{}'", doc_title));
             let mut sorted_scores = category_scores.clone();
@@ -1703,7 +1527,6 @@ async fn process_task(
             }
         }
 
-        // --- STEP A-2: DETAIL CLASSIFICATION (디테일 페이지 여부 판별) ---
         {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             println!("[Scheduler] Starting DISK BRIDGE RELAY (Load Base -> Is Detail)");
@@ -1712,19 +1535,6 @@ async fn process_task(
             let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
 
-            // 🌟 [LAYOUT MULTI-VECTOR ANCHOR] Step A에서 검증된 MAX-POOL 방식을 Step A-2에 이식합니다.
-            // 기존 결함: list_bias / form_bias를 각각 '한 덩어리 문장'으로 임베딩했습니다.
-            //   ko/order 기준 layout_form 어휘(주문상세, 주문폼, 주문입력, 주문수정, 주문내역,
-            //   주문내역수정, 상세정보, 배송지수정, 부분취소)가 layout_list 어휘
-            //   (주문리스트, 주문표, 주문목록, 결제내역, 전체주문, 발주관리)보다 길고 조밀해서
-            //   어떤 한국어 관리자 헤딩을 넣어도 FormSim이 구조적으로 높게 나왔습니다.
-            //   실측 상수 오프셋 (FormSim - ListSim):
-            //     order_detail '주문내역 수정'  List 0.4839 / Form 0.5907 → +0.1068
-            //     goods_list   '전체 상품관리'  List 0.5035 / Form 0.5919 → +0.0884
-            //   → '주문리스트(전체)'를 넣어도 form이 이기는 구조라 order_list가 detail로 확정됐습니다.
-            // 개선: 구 단위로 쪼개 개별 임베딩 후 MAX-POOL.
-            //   '주문리스트(전체)' vs list 구절 '주문리스트' → 0.9대
-            //   '주문리스트(전체)' vs form 구절 '주문내역'   → 0.8대  → 방향이 정상 복구됩니다.
             let list_phrases = split_bias_phrases(&list_bias);
             let form_phrases = split_bias_phrases(&form_bias);
             let list_phrase_embs: Vec<Vec<f32>> = if list_phrases.is_empty() {
@@ -1739,25 +1549,13 @@ async fn process_task(
             };
             emit_term(&format!("  🧩 [LAYOUT ANCHOR SPLIT] ListPhrases: {} | FormPhrases: {}", list_phrase_embs.len(), form_phrase_embs.len()));
 
-            // 🌟 [LAYOUT CHROME VECTOR] 브랜딩/네비/검색 껍데기 헤딩 배제용 기준 벡터입니다.
-            //    '행복을 주는 쇼핑몰!', '관리자 주메뉴', '기본검색'을 코사인 한 방으로 걸러냅니다.
             let layout_chrome_text = "global navigation, menus, header, footer, sidebar, breadcrumb, admin main menu, main menu, admin page, administrator page, dashboard, control panel, site name, shopping mall, welcome, home, index, basic search, search form, search filter, login, logout, notice, banner, copyright";
             let nav_chrome_emb = model.get_embedding(layout_chrome_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
-            
-            // 🌟 [NAVIGATION PRE-FILTER] Track B/C 후보 선정 전, 네비게이션/헤더/푸터/사이드바 라인을 사전 탈락
-            // Track A에서 놓친 개별 네비게이션 라인을 구조 태그 + prejudice 유사도 이중 검증으로 차단합니다.
-            // 🌟 [CRITICAL FIX] 기존 단순 문자열 매칭에서 벡터 유사도 기반 판정으로 전면 개편합니다.
-            // 🌟 [DOMAIN VECTOR GATE 복원] Step A의 NAV PRE-FILTER에는 도메인/타이틀 보호가 있는데
-            //    (실측 결과: 0개 탈락 / 284개 보호) Step A-2에는 임계값만 같고 보호 로직이 통째로
-            //    빠져 있어 같은 284개 라인이 282개 몰살당했습니다.
-            //    리스트 본문(table#sodr_list의 행들)이 여기서 전멸하면 Track B가 근거를 잃습니다.
-            //    → Step A와 동일한 3중 보호(도메인 / 레이아웃 / 타이틀)를 벡터로 복원합니다.
+
             {
                 let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, top bar, bottom bar, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
                 let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
 
-                // 🌟 확정된 page_type의 앵커를 구(phrase) 단위로 분해해 MAX-POOL 비교합니다.
-                //    (Step A와 동일하게 앵커 길이 희석을 배제)
                 let domain_phrase_embs: Vec<Vec<f32>> = {
                     let anchor_text = crate::parsing::get_page_type_classification_bias(&page_type, &doc_lang);
                     let localized_type = crate::parsing::get_localized_page_type(&page_type, &doc_lang);
@@ -1785,21 +1583,20 @@ async fn process_task(
                     if wiped_indices[i] { continue; }
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
-                    // 🌟 [다국어 벡터 판정] contains 기반 하드코딩을 완전 제거하고,
-                    // bias/prejudice 코사인 유사도만으로 네비게이션/레이아웃 라인을 판정합니다.
+
                     if !line_embeddings[i].iter().all(|&v| v == 0.0) {
                         let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
                         if nav_score > 0.38 {
-                            // 보호 1: 확정 도메인(page_type) 구절과 강하게 일치하는 본문 데이터
+
                             let mut domain_sim = 0.0f32;
                             for pe in &domain_phrase_embs {
                                 let s = cosine_similarity(pe, &line_embeddings[i]);
                                 if s > domain_sim { domain_sim = s; }
                             }
-                            // 보호 2: 이 단계에서 판정하려는 대상 자체(list/form 레이아웃)와 일치하는 라인
+
                             let layout_sim = cosine_similarity(&list_bias_emb, &line_embeddings[i])
                                 .max(cosine_similarity(&form_bias_emb, &line_embeddings[i]));
-                            // 보호 3: 페이지 타이틀과 일치하는 도메인 시그널
+
                             let title_line_sim = cosine_similarity(&early_title_emb, &line_embeddings[i]);
 
                             if (domain_sim > 0.30 && domain_sim >= nav_score * 0.85)
@@ -1807,7 +1604,7 @@ async fn process_task(
                                 || (title_line_sim > nav_score && title_line_sim > 0.40)
                             {
                                 nav_domain_protected += 1;
-                                continue; // 🛡️ 사이드바에도 있지만 본문 데이터이기도 하므로 보호!
+                                continue;
                             }
                             wiped_indices[i] = true;
                             nav_wiped_count += 1;
@@ -1818,24 +1615,23 @@ async fn process_task(
                     emit_term(&format!("  🚫 [NAV PRE-FILTER] Step A-2 진입 전 네비게이션/레이아웃 {}개 라인 사전 탈락 완료. (도메인/레이아웃/타이틀 벡터 보호: {}개)", nav_wiped_count, nav_domain_protected));
                 }
             }
-            
-            // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
+
             let system_content_a2 = format!("[PUG CONTENT]\n{}", filtered_light_pug);
             log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Scoring DOM blocks to determine page type...", "spinner": "⠋" }));
             emit_term("\n[CLASSIFICATION] Track B & C Vector Matching (Batch DOM Blocks)...");
             let mut list_scores = Vec::new();
             let mut form_scores = Vec::new();
             for (i, emb) in line_embeddings.iter().enumerate() {
-                // 🌟 노이즈로 청소된 줄(wiped_indices)과 텍스트가 없는 줄은 평가에서 완벽히 배제합니다.
+
                 if wiped_indices[i] { continue; }
                 let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
-                // 🌟 [추가 방어] prejudice 유사도가 bias보다 높으면 후보에서 원천 배제
+
                 let prej_score = cosine_similarity(&prej_emb, emb);
                 let list_s = cosine_similarity(&list_bias_emb, emb);
                 let form_s = cosine_similarity(&form_bias_emb, emb);
                 if prej_score > list_s && prej_score > form_s && prej_score > 0.35 {
-                    continue; // prejudice가 우세한 라인은 Track B/C 후보에서 완전 배제
+                    continue;
                 }
                 list_scores.push((i, list_s));
                 form_scores.push((i, form_s));
@@ -1933,7 +1729,7 @@ async fn process_task(
                         });
                     }
                     results.extend(fallback_results);
-                    results.sort_by_key(|k| k.0); // 🌟 인덱스 정렬 보존 (Track B/C 리스트, 폼 구분 유지)
+                    results.sort_by_key(|k| k.0);
                     results
                 }).await.unwrap_or_default()
             };
@@ -1942,10 +1738,10 @@ async fn process_task(
             let mut processed_list_blocks = std::collections::HashSet::new();
             let mut total_form_score = 0.0;
             let mut processed_form_blocks = std::collections::HashSet::new();
-            // 🌟 [NAV BLOCK FILTER] 블록 레벨에서 네비게이션을 벡터 유사도로 판정하기 위한 prejudice 임베딩 사전 생성
+
             let nav_block_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu, snb, gnb, nav, sidebar, side bar, left panel, right panel, quick links";
             let nav_block_prej_emb = model.get_embedding(nav_block_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
-            // 🌟 [핵심 최적화 3] 생성된 BC 블록 일괄 Batch 병렬 타격
+
             let mut unique_bc_pugs_to_embed = Vec::new();
             let mut track_bc_pugs_clean: Vec<(usize, String, String, f32)> = Vec::new();
             for (i, sel, block_pug) in track_bc_pugs {
@@ -1955,10 +1751,7 @@ async fn process_task(
                     emit_term(&format!("  ⚠️ [{}] Anchor Line {} failed to resolve a valid structural parent block via DOM.", track_name, track_bc_indices[i] + 1));
                     continue; 
                 }
-                // 🌟 [셀렉터 자연어화] CSS 셀렉터는 자연어가 아니므로 그대로 임베딩하면 노이즈입니다.
-                //    'table#sodr_list' → 'table sodr list' 처럼 snake_case/camelCase/구분자를 분해해
-                //    실단어 토큰으로 만들어야 list_bias와의 코사인이 정상적으로 잡힙니다.
-                //    (기존: 'sodr_list'가 한 덩어리로 임베딩되어 list 신호가 소실 → LIST 트랙만 전멸)
+
                 let sel_naturalized: String = {
                     let lowered = sel.to_lowercase();
                     let mut out = String::new();
@@ -1977,10 +1770,10 @@ async fn process_task(
                     }
                     out.split_whitespace().collect::<Vec<_>>().join(" ")
                 };
-                // 🌟 [다국어 벡터 판정] 셀렉터 텍스트를 임베딩하여 nav prejudice와 코사인 유사도로 판정
+
                 let sel_emb = model.get_embedding(sel_naturalized.clone()).await.unwrap_or(vec![0.0f32; 384]);
                 let sel_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_emb);
-                // 🌟 [셀렉터 ID/클래스 토큰 분리 임베딩] 셀렉터에서 ID(#)와 클래스(.) 토큰만 추출하여 별도 임베딩
+
                 let sel_id_class_tokens: String = sel.to_lowercase()
                     .split(|c: char| c == ' ' || c == '>')
                     .flat_map(|part| {
@@ -2004,10 +1797,9 @@ async fn process_task(
                     sel_id_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_id_emb);
                     sel_id_emb_opt = Some(sel_id_emb);
                 }
-                // 🌟 [통합 셀렉터 NAV 점수] 전체 셀렉터 임베딩과 ID/클래스 토큰 임베딩 중 높은 값 채택
+
                 let effective_sel_nav_score = sel_nav_score.max(sel_id_nav_score);
-                // 🌟 [CONTENT 점수도 동일하게 MAX 채택] nav만 max를 쓰고 content는 전체 셀렉터만 쓰던
-                //    비대칭을 제거합니다. (이 비대칭이 LIST 트랙만 탈락시킨 직접 원인)
+
                 let sel_content_max = {
                     let mut m = cosine_similarity(&form_bias_emb, &sel_emb)
                         .max(cosine_similarity(&list_bias_emb, &sel_emb));
@@ -2017,12 +1809,7 @@ async fn process_task(
                     }
                     m
                 };
-                // 🌟 [상대 우세 판정] 절대 임계 0.35 단독 판정을 폐기합니다.
-                //    실측: table#sodr_list(nav 0.4319)는 탈락, form#forderlist(nav 0.4722)는 생존 —
-                //    NAV가 더 높은 쪽이 살아남는 모순이 발생했습니다. 절대값이 아니라
-                //    "nav가 content를 얼마나 압도하는가"의 비율만이 유효한 판정 기준입니다.
-                //    또한 하드 드롭은 트랙 전체를 0점으로 만들 수 있으므로,
-                //    NAV가 압도적일 때(1.35배 초과)만 드롭하고 나머지는 블록 단계로 이월합니다.
+
                 let nav_dominance = if sel_content_max > 0.001 {
                     effective_sel_nav_score / sel_content_max
                 } else {
@@ -2060,14 +1847,11 @@ async fn process_task(
             for (i, sel, block_pug, sel_nav_carry) in track_bc_pugs_clean {
                 let is_list_track = i < 5;
                 let block_emb = bc_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
-                // 🌟 [CRITICAL FIX: NAV VECTOR GATE] 블록 임베딩과 네비게이션 prejudice 벡터의 코사인 유사도를 계산하여
-                // 네비게이션 블록이 form/list 점수에 기여하는 것을 원천 차단합니다.
-                // 블록 임베딩은 셀렉터 문자열과 달리 실제 본문 텍스트를 담고 있으므로,
-                // 네비게이션 판정은 여기(블록 단계)를 1차 신뢰선으로 삼습니다.
+
                 let nav_block_score = cosine_similarity(&nav_block_prej_emb, &block_emb);
-                // 🌟 [임계값 하향] 0.35 → 0.25로 낮춰 중간 대역 네비게이션도 포착
+
                 if nav_block_score > 0.25 {
-                    // 🌟 [CONTENT VECTOR GATE 강화] 0.70 → 0.85로 상향
+
                     let block_form_sim = cosine_similarity(&form_bias_emb, &block_emb);
                     let block_list_sim = cosine_similarity(&list_bias_emb, &block_emb);
                     let block_content_max = block_form_sim.max(block_list_sim);
@@ -2081,21 +1865,17 @@ async fn process_task(
                     }
                 }
                 let mut b_prej_score = cosine_similarity(&prej_emb, &block_emb);
-                // 🌟 [비례적 NAV 페널티] nav_block_score가 0.15 이상이면 prejudice에 가산하여 점수를 감쇠시킵니다.
-                // 이는 임계값을 통과한 중간 대역 네비게이션이 form/list 점수에 과도하게 기여하는 것을 방지합니다.
+
+
                 if nav_block_score > 0.15 {
                     b_prej_score += nav_block_score * 0.5;
                 }
-                // 🌟 [셀렉터 NAV 소프트 이월] 셀렉터 단계에서 드롭 대신 이월된 NAV 점수를
-                // 0.35 초과분만큼 prejudice에 가산합니다. 트랙을 통째로 죽이지 않으면서도
-                // 네비게이션 성격의 셀렉터는 최종 점수에서 비례적으로 감쇠됩니다.
+
                 if sel_nav_carry > 0.35 {
                     b_prej_score += (sel_nav_carry - 0.35) * 0.5;
                 }
+
                 if is_list_track {
-                    // 🌟 [다국어 벡터 판정] 리스트 레이아웃 감지를 contains 대신 list_bias 벡터 유사도로 판정합니다.
-                    // 셀렉터 텍스트의 임베딩과 list_bias 간 유사도가 높으면 구조적 리스트 컨테이너로 인정하여
-                    // Prejudice 페널티를 30% 감경합니다.
                     let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
                     let sel_list_sim = cosine_similarity(&list_bias_emb, &sel_emb);
                     if sel_list_sim > 0.30 {
@@ -2110,9 +1890,6 @@ async fn process_task(
                         emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_list_score));
                     }
                 } else {
-                    // 🌟 [다국어 벡터 판정] 상세 폼 레이아웃 감지를 contains 대신 form_bias 벡터 유사도로 판정합니다.
-                    // 셀렉터 텍스트의 임베딩과 form_bias 간 유사도가 높으면 상세 폼 컨테이너로 인정하여
-                    // Prejudice 페널티를 30% 감경합니다.
                     let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
                     let sel_form_sim = cosine_similarity(&form_bias_emb, &sel_emb);
                     if sel_form_sim > 0.30 {
@@ -2129,15 +1906,6 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [HEADING VECTOR SIGNAL v2] 페이지의 h1(없으면 h2)은 "이 화면이 리스트인가 상세인가"를
-            // 가장 직접적으로 선언하는 텍스트입니다. <title>이 '관리자 페이지'처럼 무의미해도
-            // 헤딩에는 레이아웃 정체성이 그대로 남습니다.
-            //   order_list.html   → h1 '주문리스트(전체)' : list 구절 '주문리스트'와 직결
-            //   order_detail.html → h1 '주문내역 수정'   : form 구절 '주문내역 수정'과 직결
-            //   goods_list.html   → h1 '전체 상품관리'   : list 구절 '전체상품/상품관리'와 직결
-            // 개선 1: 단일 희석 벡터 → 구 단위 MAX-POOL (form 어휘 밀도 편향 소거)
-            // 개선 2: chrome 벡터로 '행복을 주는 쇼핑몰!' / '관리자 주메뉴' / '기본검색' 사전 탈락
-            // 개선 3: h1 티어를 h2보다 무조건 우선, 동일 티어 내에서만 |gap| 최대값 채택
             let (heading_list_sim, heading_form_sim, heading_text) = {
                 let heads: Vec<(usize, String)> = {
                     let doc = scraper::Html::parse_document(&clean_html_content);
@@ -2191,11 +1959,6 @@ async fn process_task(
                 }
             };
 
-            // 🌟 [PERIODICITY COSINE] 리스트 페이지는 같은 구조의 행이 N번 반복되므로,
-            // 콘텐츠 라인 시퀀스의 자기상관(autocorrelation)이 특정 stride에서 뾰족한 봉우리를 만듭니다.
-            // (16컬럼 테이블 11행 → stride 16에서 '날짜 vs 날짜', '금액 vs 금액'이 정렬되어 코사인 급등)
-            // 상세 페이지는 섹션마다 성격이 달라 자기상관이 평평합니다.
-            // stride 2~4는 상세 폼의 라벨/값 교대와 구분되지 않으므로 5 이상만 리스트 근거로 인정합니다.
             let (periodicity_contrast, best_stride, periodicity_baseline) = {
                 let mut content_idxs: Vec<usize> = Vec::new();
                 for (i, line) in pug_lines.iter().enumerate() {
@@ -2225,7 +1988,7 @@ async fn process_task(
                     if stride_means.is_empty() {
                         (0.0f32, 0usize, 0.0f32)
                     } else {
-                        // 전체 stride 평균 = 이 페이지의 "배경 자기유사도". 여기서 얼마나 튀는지가 신호입니다.
+
                         let base: f32 = stride_means.iter().map(|(_, m)| *m).sum::<f32>() / (stride_means.len() as f32);
                         let mut bs = 0usize;
                         let mut bm = -1.0f32;
@@ -2237,17 +2000,6 @@ async fn process_task(
                 }
             };
 
-            // 🌟 [ROW REPETITION COSINE] 리스트/상세를 가르는 가장 결정적인 구조 증거입니다.
-            // 업로드된 3개 파일의 실측 DOM:
-            //   order_list.html   table#sodr_list       → tbody 11행, 전 행이 16셀로 동일
-            //   goods_list.html   table#sodr_list.tablef → tbody 26행 (13셀/5셀 교대 반복)
-            //   order_detail.html table#sodr_list       → tbody 1행뿐. 나머지 4개 테이블은 전부 2셀 라벨/값
-            // 기존 [PERIODICITY COSINE]은 라인 단위 스트라이드라 nav/검색폼 라인에 희석되어
-            // 리스트(0.0643)와 상세(0.0490)의 차이가 0.015밖에 나지 않았습니다.
-            // 여기서는 <tr> 하나를 통째로 임베딩해 "행끼리 얼마나 같은 모양인가"를 직접 잽니다.
-            //   자격 조건: 행 3개 이상 AND 최빈 셀 개수 3개 이상 (라벨/값 2셀 폼 테이블 원천 배제)
-            //   baseline : 같은 문서의 서로 다른 테이블 행 간 코사인 = 공통성분 소거
-            // → order_detail은 자격 테이블이 0개라 점수가 정확히 0이 됩니다.
             let (row_repeat_score, row_uniformity, row_baseline, row_dbg) = {
                 let harvested: Vec<(Vec<String>, usize)> = {
                     let doc = scraper::Html::parse_document(&clean_html_content);
@@ -2287,7 +2039,6 @@ async fn process_task(
                         all_embs.push(e);
                     }
 
-                    // (1) 자격 테이블에 한해 stride 1~3 인접 코사인 평균의 최대값 = 행 균일도
                     let mut best_uni = 0.0f32;
                     let mut best_ti: i32 = -1;
                     let mut best_row_stride = 0usize;
@@ -2318,7 +2069,7 @@ async fn process_task(
                     if best_ti < 0 {
                         (0.0f32, 0.0f32, 0.0f32, String::from("no qualifying list table"))
                     } else {
-                        // (2) baseline: 서로 다른 테이블의 행 간 코사인 평균 = 이 문서의 배경 유사도
+
                         let mut base_sum = 0.0f32;
                         let mut base_cnt = 0usize;
                         for a in 0..all_embs.len() {
@@ -2331,7 +2082,7 @@ async fn process_task(
                                 }
                             }
                         }
-                        // 테이블이 하나뿐이면 같은 테이블 내 최원거리 쌍을 배경으로 대체합니다.
+
                         if base_cnt == 0 {
                             let embs = &all_embs[best_ti as usize];
                             let far = (embs.len() / 2).max(1);
@@ -2342,7 +2093,7 @@ async fn process_task(
                         }
                         let baseline = if base_cnt > 0 { base_sum / (base_cnt as f32) } else { 0.0 };
 
-                        // (3) 양(volume) 보정: 행이 많을수록 리스트 확률이 높지만 상한 처리합니다.
+
                         let n_rows = all_embs[best_ti as usize].len() as f32;
                         let volume = (((n_rows - 2.0).max(0.0)).ln_1p() / 2.0).min(1.2);
 
@@ -2354,22 +2105,15 @@ async fn process_task(
                     }
                 }
             };
+
             emit_term(&format!("  🧱 [ROW REPETITION] {} | Uniformity: {:.4} | Baseline: {:.4} | Contrast: {:+.4} | Score: {:.4}", row_dbg, row_uniformity, row_baseline, row_uniformity - row_baseline, row_repeat_score));
 
-            // 🌟 [FINAL DECISION v3] Track 점수 + 헤딩 벡터 + 주기성 + 행 반복 4개 증거를 합산합니다.
-            // 기존: is_detail = total_form_score > total_list_score
-            //       한쪽 트랙이 NAV 필터로 0점이 되면 "리스트가 아니다"가 아니라 "측정 실패"인데도
-            //       0.0638 > 0.0 으로 detail 확정되는 치명적 비대칭이 있었습니다.
             let heading_gap = heading_list_sim - heading_form_sim;
             let heading_list_bonus = heading_gap.max(0.0) * 2.0;
             let heading_form_bonus = (-heading_gap).max(0.0) * 2.0;
             let periodicity_bonus = periodicity_contrast * 2.0;
             let row_repeat_bonus = row_repeat_score * 3.0;
 
-            // 🌟 [TRACK ASYMMETRY GUARD] 실측: 'table#sodr_list'(NavScore 0.5090)는 매번 NAV DROP되고
-            //    'section#anc_sodr_paymo'(SOFT-CARRY)만 살아남아 LIST 트랙이 늘 0.0000이었습니다.
-            //    한쪽만 0이라는 건 "그쪽이 아니다"가 아니라 "그쪽을 측정하지 못했다"입니다.
-            //    살아남은 반대쪽 트랙을 단독 근거로 쓰면 항상 그쪽으로 확정되므로 양쪽 대칭 감쇠합니다.
             let list_measured = total_list_score > 0.0001;
             let form_measured = total_form_score > 0.0001;
             let track_damp = if list_measured != form_measured { 0.5f32 } else { 1.0f32 };
@@ -2386,13 +2130,11 @@ async fn process_task(
             emit_term(&format!("  🔁 [PERIODICITY COSINE] BestStride: {} | PeakContrast: {:+.4} | Baseline: {:.4}", best_stride, periodicity_contrast, periodicity_baseline));
             emit_term(&format!("  🧮 [EVIDENCE SUM] ListFinal: {:.4} (track {:.4} + heading {:.4} + period {:.4} + rows {:.4}) | FormFinal: {:.4} (track {:.4} + heading {:.4})", list_final, eff_list_track, heading_list_bonus, periodicity_bonus, row_repeat_bonus, form_final, eff_form_track, heading_form_bonus));
 
-            // 🌟 [LOW-CONFIDENCE FALLBACK] 폴백 조건을 "둘 다 0"에서 "마진 부족"으로 확장합니다.
-            // 한쪽만 0이 되는 비대칭 상황이 기존 폴백의 정확한 사각지대였습니다.
             let decision_margin = (form_final - list_final).abs();
             if decision_margin < 0.02 {
                 emit_term(&format!("  ⚠️ [LOW-CONFIDENCE FALLBACK] 판정 마진 {:.4} < 0.02. 전체 PUG 직접 임베딩 폴백 가동.", decision_margin));
                 let fallback_pug_emb = model.get_embedding(filtered_light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                // 🌟 폴백도 단일 희석 벡터 대신 구 단위 MAX-POOL로 통일합니다.
+
                 let fallback_form_sim = max_pool_sim(&fallback_pug_emb, &form_phrase_embs);
                 let fallback_list_sim = max_pool_sim(&fallback_pug_emb, &list_phrase_embs);
                 let fallback_prej_sim = cosine_similarity(&prej_emb, &fallback_pug_emb);
@@ -2405,16 +2147,14 @@ async fn process_task(
             }
             println!("[Scheduler] Classified is_detail as: {} (Form: {:.4}, List: {:.4})", is_detail, form_final, list_final);
             emit_term(&format!("  ✅ Determined Detail Page: {}", is_detail));
-        } // 👈 🌟 [핵심 변경 1 끝] 0.6B 분석 블록 종료
-    } // 🌟 [CRITICAL FIX] 누락된 if !skip_ai_analysis 블록 닫기 괄호를 복구합니다!
+        }
+    }
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 임베딩 모델을 VRAM에 올리고 사용하지 않을 때 즉시 내림
     model.deep_purge_resources().await;
-    
-    // 🌟 [KV CACHE CLEAR] 모델 본체는 살려두고, 이전 단계 연산으로 팽창한 KV 캐시만 제거하여 VRAM을 확보합니다.
+ 
     {
         let q3_clear_arc = model.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2437,17 +2177,15 @@ async fn process_task(
             }).await;
         }
     }
-    
-    // VRAM이 OS에서 완전히 반환될 때까지 잠시 대기합니다.
+ 
     crate::utils::resources::wait_for_resources_settled(1200, 800, Some(&cancellation_token), model.device_config.gpu_id as u32).await?;
 
     let mut extracted_data = json!({});
 
-    // --- PHASE 2 Continue: Detail Extraction (If needed) ---
     if !is_detail {
         
         if !skip_ai_analysis {
-            // --- STEP B: SELECTORS (선택자 추출 - JS 기반 신규 로직) ---
+
             {
                 use boa_engine::{Context, Source};
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -2455,12 +2193,12 @@ async fn process_task(
                 
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Analyzing DOM with JS engine...", "spinner": "⠋" }));
 
-                // 1. LLM에게 상품명(titles) 추출 요청
+
                 let title_prompt = parsing::extract_titles_prompt(&page_type);
                 let task_question = format!("{}\n\n[ACTION] RETURN JSON ONLY.", title_prompt);
                 let snapshot_id = format!("{}_step_b_titles", task.id);
 
-                // println!("title_prompt {}", title_prompt);
+
 
                 let mut titles = Vec::new();
                 {
@@ -2485,7 +2223,7 @@ async fn process_task(
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                             
-                            // 🎯 [SEMANTIC STEERING] 상품 제목에 집중하도록 방향타 고정!
+
                             let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                             gen.generate(
                                 params, 
@@ -2515,7 +2253,7 @@ async fn process_task(
                     
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-                    // res.text 가 아닌 res 를 그대로 파싱
+
                     let title_info = parsing::parse_json_from_llm(&res);
                         
                     if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
@@ -2553,7 +2291,6 @@ async fn process_task(
                     println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                 }
 
-                // 다른 LLM 모델(Qwen/Qwen3)을 VRAM에 올리고 사용하지 않을 때 즉시 내림
                 model.deep_purge_resources().await;
 
                 if titles.is_empty() {
@@ -2561,7 +2298,6 @@ async fn process_task(
                     return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
                 }
 
-                // 2. Boa Engine으로 DOM 분석
                 {
                     println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
                     let mut context = Context::default();
@@ -2571,12 +2307,10 @@ async fn process_task(
                     let mut nodes_json = Vec::new();
                     let mut node_to_idx = std::collections::HashMap::new();
 
-                    // 1단계: 모든 노드 ID 매핑 (부모 참조 안정성 확보)
                     for (idx, node) in document.tree.root().descendants().enumerate() {
                         node_to_idx.insert(node.id(), idx);
                     }
 
-                    // 2단계: 노드 정보 수집 (Element 노드 중심) 
                     for (idx, node) in document.tree.root().descendants().enumerate() {
                         if let Some(el) = node.value().as_element() {
                             let parent_idx = node.parent().and_then(|p| node_to_idx.get(&p.id())).map(|&i| i as i32).unwrap_or(-1);
@@ -2656,10 +2390,10 @@ async fn process_task(
         emit_term(&format!("[Scheduler] Target Selector configured as: '{}'", target_selector));
 
         let mut final_thead_selector = String::new();
-        let mut cache_updated = false; // DB 업데이트가 필요한지 추적하는 플래그
+        let mut cache_updated = false;
         let mut thead_pug = String::new();
 
-        // 1. 사용자 요청대로 'head' 키로 캐시된 선택자가 있는지 확인합니다.
+
         if let Some(sel) = selector_info.get("head").and_then(|v| v.as_str()) {
             if !sel.is_empty() && sel != "..." {
                 final_thead_selector = sel.to_string();
@@ -2667,9 +2401,9 @@ async fn process_task(
             }
         } 
         
-        // 2. 캐시가 없거나 비어있는 경우 AI를 통해 테이블 헤더 구조를 분석합니다.
+
         if final_thead_selector.is_empty() {
-            // Document를 다시 생성하여 안전하게 target_selector 기반으로 샘플 첫 행(ref_row)을 뽑아냅니다.
+
             let reference_row_for_thead = {
                 let clean_content = &clean_html_content;
                 let document = scraper::Html::parse_document(clean_content);
@@ -2712,7 +2446,7 @@ async fn process_task(
                         if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
                             
-                            // JSON 응답에서 page_type에 맞는 선택자 추출
+
                             let mut thead_val = thead_json.get(&page_type);
                             if thead_val.is_none() {
                                 if let Some(obj) = thead_json.as_object() {
@@ -2722,14 +2456,14 @@ async fn process_task(
                                 }
                             }
 
-                            // 1. thead 선택자 추출 (Flat 구조에 맞추어 get("table") 제거)
+
                             final_thead_selector = thead_val
                                 .and_then(|v| v.get("thead"))
                                 .and_then(|v| v.get("selector"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("").to_string().replace(">", " "); 
                             
-                            // 2. tbody와 thead를 감싸는 부모 wrapper(table) 선택자 추출
+
                             let final_table_selector = thead_val
                                 .and_then(|v| v.get("table"))
                                 .and_then(|v| v.get("selector"))
@@ -2742,7 +2476,7 @@ async fn process_task(
                                     let combined_sel = format!("{} {}", final_table_selector, final_thead_selector);
                                     let doc = scraper::Html::parse_document(&clean_html_content);
                                     
-                                    // 컴파일 에러 해결: Result의 에러 객체가 참조를 붙잡지 않도록 즉시 boolean으로 변환 후 스코프를 닫습니다.
+
                                     let is_valid = scraper::Selector::parse(&combined_sel)
                                         .map(|parsed_sel| doc.select(&parsed_sel).next().is_some())
                                         .unwrap_or(false);
@@ -2756,7 +2490,7 @@ async fn process_task(
                             if !final_thead_selector.is_empty() && final_thead_selector != "..." {
                                 selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(final_thead_selector.clone()));
                                 println!("[Scheduler] AI determined head selector and cached: {}", final_thead_selector);
-                                cache_updated = true; // 새로운 head를 찾았으므로 DB 업데이트 예약
+                                cache_updated = true;
                             }
 
                             
@@ -2771,10 +2505,9 @@ async fn process_task(
             }
         }
 
-        // 다른 LLM 모델(Qwen 3.5)을 VRAM에 올리고 사용하지 않을 때 즉시 내림
         model.deep_purge_resources().await;
 
-        // 3. 최종 결정된 selector를 사용하여 head PUG를 추출합니다.
+
         if !final_thead_selector.is_empty() && final_thead_selector != "..." {
             let clean_content = &clean_html_content;
             let doc = scraper::Html::parse_document(clean_content);
@@ -2790,7 +2523,7 @@ async fn process_task(
                             if tag == "thead" || tag == "tr" {
                                 if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
                                     target_node = wrapped;
-                                    // thead를 찾으면 가장 완벽한 다중 행 헤더 그룹이므로 즉시 탐색 종료
+
                                     if tag == "thead" { break; } 
                                 }
                             }
@@ -2810,7 +2543,7 @@ async fn process_task(
             }
         }
 
-        // 4. DB 저장을 head 추출 이후로 실행하여 head 정보를 포함한 selector_info를 영구 저장합니다.
+
         if !skip_ai_analysis || cache_updated {
             let store = {
                 let store_guard = store_mutex.lock().await;
@@ -2910,7 +2643,7 @@ async fn process_task(
             }
         }
         
-        // [LIST MODE] 지능형 리스트 추출 (LLM 기반)
+
         let list_log = json!({ "category": "List Processing", "summary": "Extracting list data with LLM...", "spinner": "⠋" });
         log_task_progress(app_handle, &task.id, &list_log);
 
@@ -2929,10 +2662,10 @@ async fn process_task(
             )
         };
 
-        // 2순위: 본문 아이템이 여러 줄(tr)로 구성된 경우 완벽하게 묶어냅니다.
+
         let mut group_size = if !thead_pug.is_empty() {
             let mut max_span = 1;
-            // [CRITICAL FIX] colspan은 가로 병합이므로 세로 행 그룹화에 포함하면 다중 병합 오류가 발생합니다. rowspan만 추출합니다.
+
             if let Ok(re) = regex::Regex::new(r#"rowspan="(\d+)""#) {
                 for cap in re.captures_iter(&thead_pug) {
                     if let Ok(val) = cap[1].parse::<usize>() {
@@ -2956,7 +2689,7 @@ async fn process_task(
         };
 
         if group_size > 1 && !pug_list.is_empty() {
-            // [CRITICAL FIX] 이미 split_doc_to_pug_list_advanced 내부에서 병합되어 반환된 경우 이중 병합을 방지합니다.
+
             let first_item_tr_count = pug_list.first()
                 .map(|p| p.lines().filter(|l| {
                     let indent = l.chars().take_while(|c| c.is_whitespace()).count();
@@ -2964,7 +2697,7 @@ async fn process_task(
                 }).count())
                 .unwrap_or(1);
 
-            // 이미 PUG 문자열 내부에 tr 태그가 group_size 만큼(혹은 그 이상) 존재한다면, 이미 완벽하게 그룹화된 상태입니다.
+
             if first_item_tr_count >= group_size || first_item_tr_count > 1 {
                 println!("[Scheduler] 🌟 Items are already grouped ({} trs per item). Skipping manual chunking.", first_item_tr_count);
                 group_size = 1;
@@ -2980,15 +2713,12 @@ async fn process_task(
 
         if !pug_list.is_empty() {
             let total_items = pug_list.len();
-
-            // 🌟 [핵심 개선: 중복/반복 UI 탈락 로직]
-            // "상품 상세보기", "구매하기" 등 모든 리스트 아이템에 동일하게 반복 등장하는 텍스트는
-            // 상품명이 아닌 버튼/UI 요소이므로 LLM 추출 전에 미리 전역에서 탈락(Drop) 시킵니다.
             let mut text_frequency: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
             for item_pug in &pug_list {
                 let mut seen_in_this_item = std::collections::HashSet::new();
                 for line in item_pug.lines() {
-                    // [해결] HTML 구조 태그(tr 등)가 텍스트로 오인되지 않도록 '|' 기호 이후의 텍스트만 추출합니다.
+
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
                         if !text_part.is_empty() && text_part.len() > 2 {
@@ -3002,17 +2732,15 @@ async fn process_task(
             }
 
             let mut boilerplate_texts = std::collections::HashSet::new();
+
             if total_items >= 2 {
-                // 아이템의 70% 이상에서 동일하게 등장하면 구조적 UI 요소로 간주
                 let threshold = (total_items as f32 * 0.7).ceil() as usize; 
                 
-                // 🌟 특정 문자셋이나 글자 수 제한 없이 순수하게 숫자(1,000 등) 데이터 구조인지를 판별합니다.
-                // 숫자가 아닌 문자(공백, 원, $, 기호 등)가 앞뒤로 몇 글자가 오든 허용하며, "상품 상세보기"처럼 숫자가 아예 없는 문구만 탈락시킵니다.
                 let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
 
                 for (text, count) in text_frequency {
                     if count >= threshold {
-                        // 정규식을 만족하는 숫자 형태의 데이터는 탈락(Drop)에서 완벽히 제외합니다.
+
                         let is_numeric_data = re_numeric.is_match(&text);
                         
                         if !is_numeric_data && text.len() > 3 {
@@ -3023,11 +2751,11 @@ async fn process_task(
                 }
             }
 
-            // 리스트 전용 스키마 정의를 호출하여 핵심 필드만 개별 추출
+
             let fields = parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
 
-            // 환각 검증을 위한 문서 타이틀 추출
+
             let doc_title = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
                 let mut t_val = if let Ok(sel) = scraper::Selector::parse("title") {
@@ -3036,7 +2764,6 @@ async fn process_task(
                     String::new()
                 };
                 
-                // 🌟 [개선] title이 없거나 너무 짧은 경우(SPA, Admin 페이지 등), 본문의 h1, h2 태그를 수집하여 강력한 문맥 타이틀로 활용합니다.
                 if t_val.is_empty() || t_val.len() < 5 {
                     let mut heading_texts = Vec::new();
                     if let Ok(sel_h1) = scraper::Selector::parse("h1") {
@@ -3056,12 +2783,10 @@ async fn process_task(
                 t_val
             };
 
-            // 모델 가중치 변경(스위칭) 없이 가장 가벼운 모델인 Qwen3 하나만으로 전체 파이프라인을 관통하여 속도를 극대화합니다!
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
-            // 🌟 [핵심 반영 1] 필드별 상호 배타적(Competitive) Bias/Prejudice 사전 계산 루프 (List Mode)
-            // 별도의 for 루프에서 타 필드의 bias를 현재 필드의 prejudice로 합산하여 code, id, no 등의 컬럼 식별력을 극대화합니다.
             let mut field_embeddings = Vec::new();
+
             for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
                 let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
                 
@@ -3071,7 +2796,7 @@ async fn process_task(
                 }
                 for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
                     if f_idx != other_idx {
-                        dynamic_prej_texts.push(other_bias.clone()); // 타 필드의 bias를 오답 밀어내기(Prejudice)로 활용
+                        dynamic_prej_texts.push(other_bias.clone());
                     }
                 }
                 let combined_prej = dynamic_prej_texts.join(" , ");
@@ -3080,17 +2805,17 @@ async fn process_task(
                 field_embeddings.push((bias_emb, prej_emb, combined_prej));
             }
 
-            // 🌟 [NOISE FILTER] bias.json의 layout_list.prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
+
             let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
             let layout_prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
 
-            // [최적화] thead는 모든 아이템에 공통으로 적용되므로 루프 바깥에서 단 한 번만 벡터화합니다.
             let mut thead_lines: Vec<String> = thead_pug.lines().map(|s| s.to_string()).collect();
             let mut thead_embeddings = vec![vec![0.0; 384]; thead_lines.len()];
             
-            // 🌟 [GRID ALIGNMENT] thead 파싱 및 컬럼 인덱스별 헤더 텍스트 머지
+
             let thead_cells = parse_pug_grid(&thead_lines);
             let mut header_cols: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+
             for cell in &thead_cells {
                 for c in cell.col..(cell.col + cell.colspan) {
                     let existing = header_cols.entry(c).or_insert(String::new());
@@ -3106,7 +2831,6 @@ async fn process_task(
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
                 
-                // 🌟 배치 임베딩 적용
                 let mut texts_to_embed = Vec::new();
                 let mut text_indices = Vec::new();
                 
@@ -3130,14 +2854,14 @@ async fn process_task(
                                 let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
                                 let is_short = original_text.len() <= 3;
                                 
-                                // th, td, tr, input 등 테이블/폼 구조를 나타내는 태그 문자열 강제 보호
+
                                 let is_structure_tag = original_text.starts_with("th") 
                                     || original_text.starts_with("td") 
                                     || original_text.starts_with("tr") 
                                     || original_text.starts_with("input")
                                     || original_text.starts_with("div");
                                 
-                                // 임계값을 높이고(0.6), 숫자, 짧은 핵심 텍스트, 구조 태그는 노이즈 탈락에서 강제 보호합니다.
+
                                 if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag {
                                     emit_term(&format!("    🚫 [NOISE FILTERED] Header Line {} : {} (Score: {:.4})", original_idx + 1, original_text, noise_score));
                                     thead_lines[original_idx] = String::new(); 
@@ -3150,7 +2874,7 @@ async fn process_task(
                 }
             }
 
-            // --- [핵심 최적화: LLM 기반 Thead Column Pre-Mapping (루프 밖에서 1회만 수행)] ---
+
             let mut unique_headers = Vec::new();
             for (_, h_text) in &header_cols {
                 let clean_h = h_text.trim();
@@ -3209,7 +2933,7 @@ async fn process_task(
                     }
                 }
 
-                // 환각 캐시 비우기
+
                 let q3_clear_arc = model.qwen3_generator.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
@@ -3217,7 +2941,7 @@ async fn process_task(
                     }
                 }).await;
             }
-            // ----------------------------------------------------------------------------------
+
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -3234,26 +2958,26 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("\n[STAGE-3] Processing List Item {}/{} ...", idx + 1, total_items));
 
-                // 헤더(Thead)와 개별 아이템(Item)의 PUG를 결합하여 검증 텍스트 생성 (나중의 본문 텍스트 검증용)
+
                 let full_item_pug = format!("{}\n{}", thead_pug, item_pug);
                 
-                // [수정] 아이템 영역만 분리하여 가볍게 벡터화 진행 및 노이즈 필터링
+
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 
-                // 🌟 [핵심 개선: 1차 탈락 적용] 추출된 반복 UI 요소(Boilerplate)를 PUG 컨텍스트에서 완전히 삭제합니다.
+
                 for i in 0..item_lines.len() {
                     let line = &item_lines[i];
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
                         if boilerplate_texts.contains(text_part) {
                             emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
-                            // [해결] 라인 전체를 삭제하면 td 구조가 날아가 컬럼이 밀립니다. HTML 태그 뼈대(예: 'td | ')만 남겨 구조를 유지합니다!
+
                             item_lines[i] = format!("{} ", &line[..=idx]);
                         }
                     }
                 }
 
-                // 🌟 [GRID ALIGNMENT] tbody 아이템 셀 파싱 및 thead 헤더 텍스트 융합 (rowspan, colspan 구조 매칭 포함)
+
                 let item_cells = parse_pug_grid(&item_lines);
                 let mut line_enriched_texts = vec![String::new(); item_lines.len()];
                 
@@ -3277,7 +3001,7 @@ async fn process_task(
 
                 let mut item_embeddings = vec![vec![0.0; 384]; item_lines.len()];
                 
-                // 🌟 배치 임베딩 적용
+
                 let mut texts_to_embed = Vec::new();
                 let mut text_indices = Vec::new();
                 
@@ -3310,14 +3034,14 @@ async fn process_task(
                                 let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
                                 let is_short = original_text.len() <= 3;
                                 
-                                // th, td, tr, input 등 테이블/폼 구조를 나타내는 태그 문자열 강제 보호
+
                                 let is_structure_tag = original_text.starts_with("th") 
                                     || original_text.starts_with("td") 
                                     || original_text.starts_with("tr") 
                                     || original_text.starts_with("input")
                                     || original_text.starts_with("div");
                                 
-                                // 임계값을 높이고(0.6), 숫자, 짧은 핵심 텍스트, 구조 태그는 노이즈 탈락에서 강제 보호합니다.
+
                                 if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag {
                                     emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
                                     item_lines[original_idx] = String::new(); 
@@ -3330,13 +3054,13 @@ async fn process_task(
                     }
                 }
 
-                // 🌟 [CRITICAL FIX] LLM에게 노이즈가 제거된 [VECTORIZING] 텍스트들만 모아서 전달하여 완벽한 추출 환경 구성
+
                 let mut json_contexts = Vec::new();
                 for (line_idx, line) in item_lines.iter().enumerate() {
                     if !line.trim().is_empty() {
                         let enriched = &line_enriched_texts[line_idx];
                         let target_text = if enriched.is_empty() {
-                            // [수정] '|' 기호가 없다면 PUG의 구조 태그(td, tr 등)이므로 절대로 LLM에 넘기지 않고 빈 문자열 처리합니다.
+
                             if let Some(p) = line.find('|') { line[p + 1..].trim() } else { "" }
                         } else {
                             enriched.as_str()
@@ -3361,11 +3085,11 @@ async fn process_task(
                 let mut item_val = json!({});
                 let mut global_ignore_list: Vec<String> = Vec::new();
                 
-                // 🌟 String 벡터를 &str 배열로 참조 변환하여 이후 컨텍스트 추출기에 완벽 호환되게 연결합니다.
+
                 let thead_lines_ref: Vec<&str> = thead_lines.iter().map(|s| s.as_str()).collect();
                 let item_lines_ref: Vec<&str> = item_lines.iter().map(|s| s.as_str()).collect();
 
-                // 🌟 [핵심 반영 2] 필드별 상호 배타적 Bias/Prejudice 벡터 사전 계산 (별도 루프)
+
                 let mut field_embeddings = Vec::new();
                 for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
                     let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
@@ -3376,7 +3100,7 @@ async fn process_task(
                     }
                     for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
                         if f_idx != other_idx {
-                            dynamic_prej_texts.push(other_bias.clone()); // 타 필드의 bias를 prejudice로 편입
+                            dynamic_prej_texts.push(other_bias.clone());
                         }
                     }
                     let combined_prej = dynamic_prej_texts.join(" , ");
@@ -3385,10 +3109,10 @@ async fn process_task(
                     field_embeddings.push((bias_emb, prej_emb, combined_prej));
                 }
 
-                // 🌟 [핵심 반영 3] Item 라인별 Pre-mapping 수행 (사전 매핑된 Thead 정보 활용하여 LLM 100% 우회)
+
                 let mut pre_mapped_hints = Vec::new();
                 
-                // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
+
                 let mut url_pool = String::new();
                 if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
                     for line in &item_lines_ref {
@@ -3401,7 +3125,7 @@ async fn process_task(
                     }
                 }
 
-                // 사전에 LLM으로 1회만 매핑해둔 Thead 기반 힌트 초고속 적용
+
                 for cell in &item_cells {
                     let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
                     let clean_h = h_text.trim();
@@ -3414,7 +3138,7 @@ async fn process_task(
 
                                 let mut final_field = best_field.clone();
                                 
-                                // URL 풀 검증 로직 적용
+
                                 if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
                                     if url_pool.contains(&clean_text.to_lowercase()) {
                                         final_field = "id".to_string();
@@ -3433,17 +3157,17 @@ async fn process_task(
                     }
                 }
                 
-                // 🌟 JSON 배열 형태로 예쁘게 렌더링하여 프롬프트 컨텍스트에 완벽 주입
+
                 let pre_mapped_context = if !pre_mapped_hints.is_empty() {
                     serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
                 } else {
                     String::new()
                 };
 
-                // 상세 페이지와 완벽히 동일하게 필드별로 순회하며 개별 타격 추출
+
                 for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
                     
-                    // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
+
                     let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                     let mut bypassed_values: Vec<(String, String)> = Vec::new();
                     for k in &keys {
@@ -3494,12 +3218,12 @@ async fn process_task(
                             }
                         }
                         emit_term(&format!("    ⚡ [PRE-MAP BYPASS] Successfully mapped without LLM: {}", extracted_results.join(", ")));
-                        continue; // LLM 호출 로직을 완벽하게 건너뛰고 다음 필드로 넘어갑니다!
+                        continue;
                     }
 
                     let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
                     
-                    // Header 영역 독립 매칭
+
                     let mut best_thead_idx = 0;
                     let mut best_thead_score = -1.0;
                     for (i, emb) in thead_embeddings.iter().enumerate() {
@@ -3516,6 +3240,7 @@ async fn process_task(
                     
                     let mut best_item_idx = 0;
                     let mut best_item_score = -1.0;
+
                     for (i, emb) in item_embeddings.iter().enumerate() {
                         if item_lines_ref[i].trim().is_empty() { continue; }
                         let b_score = cosine_similarity(bias_emb, emb);
@@ -3533,6 +3258,7 @@ async fn process_task(
                     emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' | Header Score: {:.4} | Item Score: {:.4} (Using filtered structure)", field_name, best_thead_score, best_item_score));
                     
                     let mut final_context_str = format!("[JSON CONTEXT]\n{}", targeted_pug);
+
                     if !pre_mapped_context.is_empty() {
                         final_context_str.push_str(&format!("\n\n[PRE-MAPPED COLUMNS]\nThe embedding model explicitly mapped the following values to specific columns. Use this mapping as your absolute primary reference:\n{}", pre_mapped_context));
                     } else if best_item_score > 0.15 {
@@ -3564,6 +3290,7 @@ async fn process_task(
 
                     let mut metadata_str = String::new();
                     let mut target_data_str = String::new();
+
                     for line in targeted_pug.lines() {
                         if let Some(idx) = line.find('|') {
                             metadata_str.push_str(line[..idx].trim());
@@ -3575,6 +3302,7 @@ async fn process_task(
                             target_data_str.push_str("\n");
                         }
                     }
+
                     let metadata_str = metadata_str.trim();
                     let target_data_str = target_data_str.trim();
 
@@ -3595,9 +3323,9 @@ async fn process_task(
                         let sys_msg = system_message.clone();
                         
                         let field_name_clone = field_name.clone();
-                        let bias_target_for_closure = bias_target.clone(); // 🌟 다국어 Bias 할당
+                        let bias_target_for_closure = bias_target.clone();
                         
-                        // 🌟 [CRITICAL FIX] 강력해진 타 필드 오답 페널티를 LLM Logit Bias 제어 변수에도 할당
+
                         let prejudice_target_for_closure = dynamic_prej_str.clone();
                         
                         let task_q = task_question.clone();
@@ -3626,7 +3354,7 @@ async fn process_task(
                             }
                         }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
-                        // 환각 캐시를 즉시 제거하여 다음 재시도 시 방어
+
                         let q3_clear_arc = model.qwen3_generator.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
@@ -3644,7 +3372,7 @@ async fn process_task(
                         match res {
                             Ok(res_text) => {
                                 let mut parsed = parsing::parse_json_from_llm(&res_text);
-                                let parsed_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed }; // 🌟 mut 제거
+                                let parsed_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
 
                                 let mut requires_retry = false;
                                 let mut extracted_values_for_retry = Vec::new();
@@ -3774,8 +3502,8 @@ async fn process_task(
                                     }
                                 }
                                 
-                                // 공통 속성(has_header, language 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
-                                // [CRITICAL FIX] "title"을 제거하여 정상 추출된 상품명이 다른 필드 추출 시 HTML 페이지 기본 타이틀로 덮어씌워지는 환각 버그 방지
+
+
                                 for ck in ["has_header", "has_footer", "language"] {
                                     if let Some(val) = parsed_val.get(ck) {
                                         item_val.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
@@ -3794,14 +3522,14 @@ async fn process_task(
                                 break;
                             }
                         }
-                    } // loop end
-                } // fields for loop end
+                    }
+                }
 
-                // 포스트 프로세싱: id, link 등 병합
+
                 let mut temp_id = item_val.get("id").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
                 let mut temp_code = item_val.get("code").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
                 
-                // 🌟 [CRITICAL FIX] 개발 로직: 추출된 결과(JSON)를 PUG/HTML 텍스트 기반으로 검증 및 스왑
+
                 if !temp_id.is_empty() || !temp_code.is_empty() {
                     let mut url_pool = String::new();
                     if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
@@ -3870,15 +3598,14 @@ async fn process_task(
                     all_extracted_items.push(item_val);
                 }
                 
-                // 🌟 [CRITICAL OPTIMIZATION] 동일 모델(Qwen3)을 연속 재사용하므로, 루프 내부에서 커널 워킹셋 메모리를 탈탈 비우고 대기하던 심각한 병목 가비지 코드를 원천 삭제하여 무지연 고속 순회 체계를 확립합니다.
                 crate::models::qwen::generate::wait_for_global_io().await;
-            } // items for loop end
+            }
         }
 
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });
 
     } else {
-        // [DETAIL MODE] Disk Bridge Relay
+
         println!("[Scheduler] Starting DISK BRIDGE RELAY for Details");
         
         let content_pug = {
@@ -3888,16 +3615,16 @@ async fn process_task(
         };
 
         if !content_pug.trim().is_empty() {
-            // 모델 스위칭 딜레이 없이, 가장 가벼운 모델인 Qwen3 하나만으로 필드별 순차 추출(Loop)을 진행합니다!
+
             model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-            // 🌟 [NOISE FILTER] bias.json의 prejudice 값을 가져와 노이즈 필터링용 벡터를 생성합니다.
+
             let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
             let layout_prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
 
-            // (이전 답변에서 생성된 parsing.rs의 get_detail_schema_fields를 호출합니다)
+
             let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
 
@@ -3905,12 +3632,12 @@ async fn process_task(
             let _ = app_handle.emit("extraction-progress", &payload);
             emit_term(&format!("[STAGE-3] Extracting {} detailed fields individually...", total_fields));
 
-            // 1. PUG 각 개별줄 내용을 임베딩 모델로 384차원 인메모리 벡터 저장 및 노이즈 필터링 적용
+
             let mut pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
-            // 🌟 [CRITICAL FIX] 인덱스 정렬(Alignment)을 위해 미리 크기를 할당합니다.
+
             let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
             
-            // 🌟 배치 임베딩 적용
+
             let mut texts_to_embed = Vec::new();
             let mut text_indices = Vec::new();
             
@@ -3934,7 +3661,7 @@ async fn process_task(
                 }
             }
 
-            // 🎯 Track A: Stage 3 Detail (Boa Engine 기반 부모 뭉치 단위 노이즈 삭제)
+
             let (list_bias, form_bias, _) = crate::parsing::get_combinatorial_layout_bias(&[&page_type], &doc_lang);
             let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
@@ -3942,7 +3669,7 @@ async fn process_task(
             let mut wiped_indices = vec![false; pug_lines.len()];
             let mut processed_blocks = std::collections::HashSet::new();
 
-            // Boa 엔진용 HTML 노드 JSON 생성 (Stage 3 컨텍스트 용)
+
             let nodes_str_detail = {
                 let document_for_boa = scraper::Html::parse_document(&clean_html_content);
                 let mut nodes_json = Vec::new();
@@ -3973,11 +3700,11 @@ async fn process_task(
                 serde_json::to_string(&nodes_json).unwrap_or_default()
             };
             
-            let js_template_detail = get_boa_block_extractor_template(); // 🌟 Batch 처리용 템플릿 사용
+            let js_template_detail = get_boa_block_extractor_template();
 
             let mut track_a_candidates = Vec::new();
             let mut track_a_indices = Vec::new();
-            let mut seen_detail_candidates = std::collections::HashSet::new(); // 🌟 JS 텍스트 중복 파싱 차단
+            let mut seen_detail_candidates = std::collections::HashSet::new();
 
             for line_idx in 0..pug_lines.len() {
                 if wiped_indices[line_idx] { continue; }
@@ -3996,9 +3723,9 @@ async fn process_task(
                 }
             }
 
-            // 🌟 Boa 엔진 1번으로 Stage 3 노이즈 후보군 일괄 처리
+
             let track_a_selectors: Vec<String> = {
-                let target_len = track_a_candidates.len(); // 🌟 [CRITICAL FIX] 클로저 이동 전 길이 미리 추출
+                let target_len = track_a_candidates.len();
                 let target_titles_str = serde_json::to_string(&track_a_candidates).unwrap_or_else(|_| "[]".to_string());
                 let js_code = js_template_detail
                     .replace("NODES_PLACEHOLDER", &nodes_str_detail)
@@ -4017,7 +3744,7 @@ async fn process_task(
                 }).await.unwrap_or_else(|_| vec![String::new(); target_len])
             };
 
-            // 🌟 [CRITICAL OPTIMIZATION] 스레드 8개를 가동하여 거대한 DOM 순회 작업을 병렬 해체, 속도를 800% 부스팅합니다!
+
             let stage3_pugs: Vec<String> = {
                 let html_clone = clean_html_content.clone();
                 let selectors = track_a_selectors.clone();
@@ -4063,7 +3790,7 @@ async fn process_task(
                 }).await.unwrap_or_default()
             };
 
-            // 🌟 [핵심 최적화 3] Detail Noise 블록 일괄 Batch 병렬 타격
+
             let mut unique_stage3_pugs_to_embed = Vec::new();
             for block_pug in &stage3_pugs {
                 if block_pug.is_empty() || processed_blocks.contains(block_pug) { continue; }
@@ -4094,7 +3821,7 @@ async fn process_task(
                     if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
                         emit_term(&format!("  🚫 [NOISE BLOCK DELETED] Boa Matched. Lines {}~{} (Prej: {:.4} > List: {:.4} & Form: {:.4})", start_idx + 1, end_idx + 1, block_prej_score, block_list_score, block_form_score));
                         for j in start_idx..=end_idx {
-                            pug_lines[j] = String::new(); // 인덱스 보존을 위해 줄 내용만 삭제
+                            pug_lines[j] = String::new();
                             wiped_indices[j] = true;
                         }
                     }
@@ -4109,7 +3836,7 @@ async fn process_task(
             
             let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
 
-            // 문서 타이틀 추출 (환각 검증용)
+
             let doc_title = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
                 let mut t_val = if let Ok(sel) = scraper::Selector::parse("title") {
@@ -4118,7 +3845,7 @@ async fn process_task(
                     String::new()
                 };
                 
-                // 🌟 [개선] title이 없거나 너무 짧은 경우(SPA, Admin 페이지 등), 본문의 h1, h2 태그를 수집하여 강력한 문맥 타이틀로 활용합니다.
+
                 if t_val.is_empty() || t_val.len() < 5 {
                     let mut heading_texts = Vec::new();
                     if let Ok(sel_h1) = scraper::Selector::parse("h1") {
@@ -4138,7 +3865,7 @@ async fn process_task(
                 t_val
             };
 
-            // 🌟 [핵심 반영 4] 필드별 상호 배타적 Bias/Prejudice 벡터 사전 계산 (Detail Mode)
+
             let mut field_embeddings = Vec::new();
             for (f_idx, (_, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
                 let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
@@ -4158,10 +3885,10 @@ async fn process_task(
                 field_embeddings.push((bias_emb, prej_emb, combined_prej));
             }
 
-            // 🌟 [핵심 반영 5] Detail 라인별 Pre-mapping 수행 (LLM 기반 구조 분석 - 필드별 독립 호출)
+
             let mut pre_mapped_hints = Vec::new();
             
-            // 🌟 [개발 로직 검증용 URL 풀 생성] a 태그의 href 속성 값만 정확하게 추출하여 풀에 담습니다.
+
             let mut url_pool = String::new();
             if let Ok(href_re) = regex::Regex::new(r#"href=["']([^"']+)["']"#) {
                 for line in &pug_lines_ref {
@@ -4189,7 +3916,7 @@ async fn process_task(
                     items_str.push_str(&format!("{}. {}\n", list_idx + 1, text_candidates[list_idx].1));
                 }
 
-                // 각 필드별로 병렬 LLM 호출을 통해 매핑 수행
+
                 let mut handles = Vec::new();
                 for (fname, fdesc, _, _) in &fields {
                     let mapping_prompt = crate::parsing::column_mapping_prompt(fname, fdesc, &items_str);
@@ -4229,7 +3956,7 @@ async fn process_task(
 
                                 let mut final_field = best_field.clone();
                                 
-                                // URL 풀 검증 로직은 그대로 유지
+
                                 if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
                                     if url_pool.contains(&clean_text.to_lowercase()) {
                                         final_field = "id".to_string();
@@ -4256,21 +3983,21 @@ async fn process_task(
                 }).await;
             }
             
-            // 🌟 JSON 배열 형태로 예쁘게 렌더링하여 프롬프트 컨텍스트에 완벽 주입
+
             let pre_mapped_context = if !pre_mapped_hints.is_empty() {
                 serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
             } else {
                 String::new()
             };
 
-            let mut global_ignore_list: Vec<String> = Vec::new(); // 🌟 전역 무시 리스트 추가
+            let mut global_ignore_list: Vec<String> = Vec::new();
 
-            // 필드 단위로 하나씩 쪼개어 순차 추출 (병렬 처리 시의 VRAM 초과/컨텍스트 환각 방지)
-            // 🌟 [CRITICAL FIX] prejudice_target 매개변수 추가
+
+
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                // 🌟 [CRITICAL FIX] Pre-map 바이패스 로직: 이미 매핑된 값이 있다면 LLM을 완전히 건너뛰고 즉시 주입합니다.
+
                 let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                 let mut bypassed_values: Vec<(String, String)> = Vec::new();
                 for k in &keys {
@@ -4321,7 +4048,7 @@ async fn process_task(
                         }
                     }
                     emit_term(&format!("    ⚡ [PRE-MAP BYPASS] Successfully mapped without LLM: {}", extracted_results.join(", ")));
-                    continue; // LLM 호출 로직을 완벽하게 건너뛰고 다음 필드로 넘어갑니다!
+                    continue;
                 }
 
                 let (bias_emb, prej_emb, dynamic_prej_str) = &field_embeddings[idx];
@@ -4341,7 +4068,7 @@ async fn process_task(
                     }
                 }
                 
-                // 3. 찾은 컨텍스트 블록으로 추론을 위한 시스템 메시지 동적 조립 및 Fallback 처리
+
                 let targeted_pug = if best_score < 0.25 {
                     emit_term(&format!("  ⚠️ [FALLBACK] Field: '{}' | Best Score ({:.4}) is too low. Using full context.", field_name, best_score));
                     content_pug.clone()
@@ -4355,7 +4082,7 @@ async fn process_task(
                     if trimmed.is_empty() { continue; }
                     if let Some(idx) = trimmed.find('|') {
                         let meta = trimmed[..idx].trim();
-                        // 껍데기 HTML 태그명(td, th 등)이 있으면 제거하고 순수 메타데이터 텍스트만 추출
+
                         let clean_meta = meta.split('[').next().unwrap_or(meta).trim();
                         json_contexts.push(json!({
                             "metadata": clean_meta,
@@ -4396,7 +4123,7 @@ async fn process_task(
                 log_task_progress(app_handle, &task.id, &payload);
                 emit_term(&format!("[STAGE-3] {}", summary_msg));
 
-                // 🌟 [CRITICAL FIX] 새롭게 추가된 title 파라미터 규격에 맞춰 &doc_title을 주입합니다.
+
                 let mut metadata_str = String::new();
                 let mut target_data_str = String::new();
                 for line in targeted_pug.lines() {
@@ -4419,8 +4146,8 @@ async fn process_task(
                     parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                 };
                 
-                // 🌟 [BIAS SKIP LOGIC] 본문에 존재하지 않는 잘못된 추출값 기록용 리스트 및 카운터
-                let mut ignore_list: Vec<String> = global_ignore_list.clone(); // 🌟 매 필드마다 전역 리스트를 복사하여 누적 시작
+
+                let mut ignore_list: Vec<String> = global_ignore_list.clone();
                 let mut miss_counter = 0;
                 
                 loop {
@@ -4432,7 +4159,7 @@ async fn process_task(
                     
                     let field_name_clone = field_name.clone();
                     let bias_target_for_closure = bias_target.clone(); 
-                    let prejudice_target_for_closure = dynamic_prej_str.clone(); // 🌟 강력해진 타 필드 오답 페널티를 Logit-bias에 주입
+                    let prejudice_target_for_closure = dynamic_prej_str.clone();
                     
                     let task_q = task_question.clone();
                     let ignore_list_clone = ignore_list.clone();
@@ -4452,9 +4179,9 @@ async fn process_task(
                                 ..Default::default()
                             };
                             
-                            // 🌟 [CRITICAL FIX] Prejudice(오답 밀어내기) 파라미터를 Qwen3 모델에 전달합니다!
+
                             let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-                            // let b_target = if bias_target_for_closure.is_empty() { None } else { Some(bias_target_for_closure.as_str()) };
+
                             
                             gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
                         } else {
@@ -4462,8 +4189,8 @@ async fn process_task(
                         }
                     }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
 
-                    // 🌟 [개선 2] 한 번의 생성이 끝날 때마다 (성공/실패 무관하게) 즉시 KV 캐시를 초기화하여, 
-                    // 다음 재시도 시 모델이 과거의 환각 데이터를 바탕으로 헛소리를 이어가는 것을 원천 차단합니다!
+
+
                     let q3_clear_arc = model.qwen3_generator.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
@@ -4482,17 +4209,17 @@ async fn process_task(
                         Ok(res_text) => {
                             let mut parsed = parsing::parse_json_from_llm(&res_text);
                             
-                            // type 래퍼 제거 로직
-                            let item_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed }; // 🌟 mut 제거
 
-                            // 🌟 [BIAS SKIP LOGIC] 추출된 값이 실제로 PUG 본문이나 제목에 존재하는지 검증
+                            let item_val = if let Some(inner) = parsed.get_mut(&page_type) { inner.take() } else { parsed };
+
+
                             let mut requires_retry = false;
                             let mut extracted_values_for_retry = Vec::new();
                             
                             let keys: Vec<&str> = field_name_clone.split(',').map(|s| s.trim()).collect();
                             let mut found_valid_value = false;
 
-                            // 🎯 [핵심 개선] ENUM 속성이나 영단어로 번역되어 출력될 수 있는 필드들은 본문 텍스트 완벽 매칭 검사에서 제외합니다.
+
                             let skip_pug_match_fields = ["status", "payment_method", "payment_origin", "condition", "currency"];
                             let is_enum_field = skip_pug_match_fields.iter().any(|&f| field_name_clone.contains(f));
 
@@ -4512,7 +4239,7 @@ async fn process_task(
                                         let extracted_str = if val.is_string() {
                                             val.as_str().unwrap_or("").trim().to_string()
                                         } else if val.is_number() {
-                                            val.to_string() // 숫자형 데이터도 검증을 위해 문자열로 변환
+                                            val.to_string()
                                         } else {
                                             String::new()
                                         };
@@ -4560,7 +4287,6 @@ async fn process_task(
                                                         }
                                                     }
 
-                                                    // 010-0356789 같은 환각 전화번호는 2차 검증(숫자 배열)에서도 걸러져서 확실히 재시도됩니다!
                                                     if !is_matched {
                                                         requires_retry = true;
                                                     }
@@ -4571,7 +4297,7 @@ async fn process_task(
                                 }
                             }
 
-                            // 🌟 [CRITICAL FIX] LLM이 요구한 키를 뱉지 않았거나, 빈 값("")을 뱉었을 경우에도 재시도 (최대 3회)
+
                             if !found_valid_value {
                                 requires_retry = true;
                             }
@@ -4588,7 +4314,7 @@ async fn process_task(
                                     ignore_list.push(format!(" {}", ex_str));
                                     ignore_list.push(ex_str.to_lowercase());
                                 }
-                                // 🎯 빈 값을 뱉는 것을 억제하기 위해 JSON 빈 문자열 패턴을 ignore_list에 추가합니다.
+
                                 if !found_valid_value {
                                     for k in &keys {
                                         ignore_list.push(format!("\"{}\": \"\"", k));
@@ -4598,19 +4324,19 @@ async fn process_task(
                                 continue;
                             }
 
-                            // 검증 통과 후 저장 및 결과 로그 출력
+
                             let mut extracted_results = Vec::new();
                             for k in &keys {
                                 if let Some(val) = item_val.get(*k) {
                                     extracted_data.as_object_mut().unwrap().insert(k.to_string(), val.clone());
                                     extracted_results.push(format!("\"{}\": {}", k, val));
                                     
-                                    // 🌟 [전역 무시 리스트 업데이트] 성공적으로 찾은 값을 다른 필드에서 중복 추출하지 않도록 방어합니다.
+
                                     let val_str = if val.is_string() { val.as_str().unwrap().trim().to_string() }
                                                   else if val.is_number() { val.to_string() }
                                                   else { String::new() };
                                     
-                                    // 이름이나 짧은 단어가 실수로 억제되는 것을 방지하기 위해 길이가 5 이상인 고유값만 추가합니다.
+
                                     if val_str.len() >= 5 && val_str != "null" && val_str != "true" && val_str != "false" {
                                         if !global_ignore_list.contains(&val_str) {
                                             global_ignore_list.push(val_str.clone());
@@ -4621,8 +4347,8 @@ async fn process_task(
                                 }
                             }
                             
-                            // 공통 속성(has_header, language 등)도 데이터에 병합하되, 로그에서는 생략하여 깔끔하게 유지합니다.
-                            // [CRITICAL FIX] "title"을 제거하여 정상 추출된 상품명이 다른 필드 추출 시 HTML 페이지 기본 타이틀로 덮어씌워지는 환각 버그 방지
+
+
                             for ck in ["has_header", "has_footer", "language"] {
                                 if let Some(val) = item_val.get(ck) {
                                     extracted_data.as_object_mut().unwrap().insert(ck.to_string(), val.clone());
@@ -4634,7 +4360,7 @@ async fn process_task(
                             } else {
                                 emit_term(&format!("  ✅ Extracted: (null or empty for {})", field_name_clone));
                             }
-                            break; // 정상 추출 시 무한루프 탈출
+                            break;
                         },
                         Err(e) => {
                             println!("[Scheduler] Error extracting detail field {}: {:?}", field_name_clone, e);
@@ -4648,17 +4374,16 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // --- DB OPS & SIDE EFFECTS ---
     
     let search_mode_str = search_mode.clone();
-    let doc_lang_str = doc_lang.clone(); // 🌟 다국어 Currency 매핑을 위한 변수 복제
+    let doc_lang_str = doc_lang.clone();
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
             
             if obj.get("mode").is_none() { obj.insert("mode".to_string(), json!(search_mode_str.clone())); }
             
-            // 🌟 [CRITICAL FIX] 통화 대문자 변환 및 국가 언어 기반 기본 통화 자동 매핑 (Fallback)
+
             let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim();
             if currency_val.is_empty() || currency_val == "null" {
                 let default_currency = match doc_lang_str.as_str() {
@@ -4677,7 +4402,7 @@ async fn process_task(
                 obj.insert("currency".to_string(), json!(currency_val.to_uppercase()));
             }
             
-            // 수량 정수형 캐스팅
+
             if let Some(q) = obj.get("quantity").cloned() {
                 let q_val = if q.is_number() { q.as_i64().unwrap_or(0) }
                             else if let Some(s) = q.as_str() { s.parse::<i64>().unwrap_or(0) }
@@ -4695,7 +4420,7 @@ async fn process_task(
                     if let Some(date_val) = obj.get(*key).and_then(|v| v.as_str()) {
                         let s = date_val.trim();
                         if !s.is_empty() && s != "null" {
-                            // 1. Unix Timestamp 감지 (순수 숫자 10자리 혹은 13자리)
+
                             if s.chars().all(char::is_numeric) && (s.len() == 10 || s.len() == 13) {
                                 if let Ok(ts) = s.parse::<i64>() {
                                     let ts_ms = if s.len() == 10 { ts * 1000 } else { ts };
@@ -4707,26 +4432,26 @@ async fn process_task(
                                 }
                             }
 
-                            // 2. 이미 완벽한 ISO 포맷인 경우 스킵 (T 포함, 글자수 충분)
+
                             if s.contains('T') && s.len() >= 19 {
                                 continue;
                             }
 
-                            // 3. 다양한 형태의 문자열 분해 및 논리적 역추론 (MM/DD/YYYY, YY-MM-DD 등)
+
                             let nums: Vec<u32> = re_date.find_iter(s).filter_map(|m| m.as_str().parse().ok()).collect();
                             if nums.len() >= 3 {
                                 let mut year = nums[0];
                                 let mut month = nums[1];
                                 let mut day = nums[2];
 
-                                // MM/DD/YYYY 또는 DD/MM/YYYY 형태 대응 (마지막 숫자가 31을 초과하면 연도로 간주)
+
                                 if day > 31 && year <= 31 {
                                     year = nums[2];
-                                    day = nums[1]; // 월/일 판별은 모호하므로 순서 유지
+                                    day = nums[1];
                                     month = nums[0];
                                 }
 
-                                // 2자리 연도 보정 (예: 24 -> 2024, 99 -> 1999)
+
                                 if year < 100 {
                                     year += if year > 50 { 1900 } else { 2000 };
                                 }
@@ -4743,7 +4468,7 @@ async fn process_task(
                             }
                         }
                     } else if let Some(date_num) = obj.get(*key).and_then(|v| v.as_i64()) {
-                        // LLM이 문자열이 아닌 정수형(Unix Time)으로 뱉어냈을 경우 방어
+
                         let ts_ms = if date_num < 10_000_000_000 { date_num * 1000 } else { date_num };
                         if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
                             let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -4753,7 +4478,7 @@ async fn process_task(
                 }
             }
 
-            // 날짜 기본값(Fallback) 매핑 (비어있는 경우도 확실히 체크)
+
             if obj.get("started_at").is_none() || obj.get("started_at").unwrap().is_null() || obj.get("started_at").unwrap().as_str() == Some("") {
                 if let Some(m) = obj.get("manufacture_date").cloned() { obj.insert("started_at".to_string(), m); }
             }
@@ -4761,7 +4486,7 @@ async fn process_task(
                 if let Some(e) = obj.get("expiration_date").cloned() { obj.insert("expired_at".to_string(), e); }
             }
             
-            // 상태(Condition) 텍스트의 정수형 플래그 매핑
+
             if let Some(cond) = obj.get("condition").and_then(|v| v.as_str()) {
                 let cond_lower = cond.to_lowercase();
                 if cond_lower.contains("used") { obj.insert("used".to_string(), json!(1)); }
@@ -4788,14 +4513,14 @@ async fn process_task(
     {
         println!("[Scheduler] Generating natural language sentences for FTS/Vector matching and Privacy Masking...");
         
-        // [PRIVACY] goods(상품) 타입은 개인정보가 없으므로 필터를 우회하여 속도를 최적화합니다.
+
         let should_mask = page_type != "goods";
 
         if is_detail {
             let original_lang_text = parsing::json_to_natural_language(&extracted_data);
             
-            // [PRIVACY] AI를 통한 개인정보 마스킹 로직 주입 (조건부)
-            let masked_lang_text = original_lang_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
+
+            let masked_lang_text = original_lang_text.clone();
 
             if let Some(obj) = extracted_data.as_object_mut() {
                 obj.insert("text".to_string(), json!(original_lang_text));
@@ -4806,8 +4531,8 @@ async fn process_task(
                 for item in items.iter_mut() {
                     let original_lang_text = parsing::json_to_natural_language(item);
                     
-                    // [PRIVACY] AI를 통한 개인정보 마스킹 로직 주입 (조건부)
-                    let masked_lang_text = original_lang_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
+
+                    let masked_lang_text = original_lang_text.clone();
 
                     if let Some(obj) = item.as_object_mut() {
                         obj.insert("text".to_string(), json!(original_lang_text));
@@ -4818,22 +4543,20 @@ async fn process_task(
         }
     }
 
-    // --- PHASE 3: HANDOVER (Unload Qwen -> Load Embedding) ---
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
         
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
         
-        // 1. Explicitly Unload to free VRAM for Embedding Model
+
         model.deep_purge_resources().await;
         
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
-        // 2. Wait for VRAM to settle (Driver latency)
+
         crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
-    // [PARITY] ID Generation
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
@@ -4858,7 +4581,6 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
 
-    // Re-acquire Store for final ops
     let store = {
         let store_guard = store_mutex.lock().await;
         store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
@@ -4888,12 +4610,12 @@ async fn process_task(
                         obj.insert("no".to_string(), json!(clean_tracking_no));
                         obj.insert("index".to_string(), json!(tracking_index));
                         obj.insert("goods".to_string(), json!(goods_index));
-                        obj.insert("order".to_string(), json!(index_val)); // 부모 오더 index 매핑
+                        obj.insert("order".to_string(), json!(index_val));
                     }
                     
                     
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
-                    let masked_tracking_text = tracking_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
+                    let masked_tracking_text = tracking_text.clone();
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 384]);
                     
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
@@ -4939,7 +4661,7 @@ async fn process_task(
 
     if is_detail {
         
-        // Phase 2.5에서 주입된 영문 FTS 키워드가 포함된 text 속성을 최우선으로 사용하여 벡터화합니다.
+
         let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
         let mut target_id = generated_id.clone(); 
@@ -5001,27 +4723,22 @@ async fn process_task(
             }
         }
 
-        
-        // 새 항목이면 pages: count++, global: count++
-        // 기존 Draft 항목이었다면 pages: draft--, count++ 승급 (global은 이미 리스트에서 올렸으므로 변동 없음)
         if is_new {
             let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.1 += 1; // pages count++
-            e.2 += 1; // global count++
+            e.1 += 1;
+            e.2 += 1;
         } else if was_draft {
             let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.0 -= 1; // pages draft--
-            e.1 += 1; // pages count++
+            e.0 -= 1;
+            e.1 += 1;
         }
 
-        
         let vector = if let Some(v) = existing_vector {
             Some(v)
         } else {
             Some(model.get_embedding(text_to_embed).await?)
         };
 
-        
         let related_types = crate::logic::related(&page_type);
         for foreign_type in related_types {
             if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
@@ -5031,7 +4748,7 @@ async fn process_task(
                             let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                             let mut needs_update = false;
 
-                            // 2. Update 속성 병합 (Import/Export)
+
                             if let Some(update) = &merge_rule.update {
                                 for field in &update.includes {
                                     if update.from == page_type {
@@ -5059,7 +4776,7 @@ async fn process_task(
                                 }
                             }
 
-                            // 3. Upsert 속성 병합
+
                             if let Some(upsert) = &merge_rule.upsert {
                                 for field in &upsert.includes {
                                     if upsert.from == page_type {
@@ -5075,18 +4792,18 @@ async fn process_task(
                                 }
                             }
 
-                            // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
+
                             if needs_update {
                                 if was_foreign_draft && merge_rule.update.as_ref().map_or(false, |u| u.to == foreign_type) {
                                     let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                    e.0 -= 1; // pages draft--
-                                    e.1 += 1; // pages count++
+                                    e.0 -= 1;
+                                    e.1 += 1;
                                     
-                                    e.2 += 1; // global count++
+                                    e.2 += 1;
                                     foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                 }
                                 let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
+                                let masked_merged_text = merged_text.clone();
                                 let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                 
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
@@ -5106,8 +4823,8 @@ async fn process_task(
                         Ok(None) => {
                             
                             let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                            e.0 += 1; // pages draft++
-                            e.2 += 1; // global count++
+                            e.0 += 1;
+                            e.2 += 1;
 
                             let mut draft_data = json!({});
                             
@@ -5123,7 +4840,7 @@ async fn process_task(
                                 obj.insert("id".to_string(), json!(draft_id.clone()));
                                 obj.insert("type".to_string(), json!(foreign_type));
                                 obj.insert(q.column.clone(), q.value.clone());
-                                obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                obj.insert("updated_at".to_string(), json!(0));
                             }
 
                             let _ = store.upsert_item(
@@ -5141,8 +4858,8 @@ async fn process_task(
                 }
             }
         }
-        // 🌟 [TRACKING RELAY] order 전처리 시 tracking_number가 추출되면 tracking 테이블에서 역방향 쿼리
-        // index.ts Relay(foreign="tracking", primary.type="order") 로직의 Rust 패리티 반영
+
+
         if page_type == "order" {
             if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
                 if !tn_raw.trim().is_empty() {
@@ -5152,10 +4869,10 @@ async fn process_task(
                         emit_term(&format!("  📦 [TRACKING RELAY] order 전처리에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
                         match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
                             Ok(Some((tracking_id, mut tracking_data))) => {
-                                // 기존 tracking 문서 발견 → order.index를 tracking.order에 매핑 + 물류 속성 전파
+
                                 let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                                 let mut needs_update = false;
-                                // order → tracking: width, height, length, weight 전파 (index.ts merge.includes 패리티)
+
                                 for field in ["width", "height", "length", "weight"] {
                                     if let Some(val) = extracted_data.get(field).cloned() {
                                         let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -5165,14 +4882,14 @@ async fn process_task(
                                         }
                                     }
                                 }
-                                // order.index → tracking.order 매핑 (index.ts foreign.from="index", foreign.to="order" 패리티)
+
                                 if let Some(order_index) = extracted_data.get("index") {
                                     if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
                                         tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
                                         needs_update = true;
                                     }
                                 }
-                                // tracking.index → extracted_data.tracking 역매핑 (index.ts foreign.from="index", foreign.to="tracking" 패리티)
+
                                 if let Some(tracking_index) = tracking_data.get("index").cloned() {
                                     if extracted_data.get("tracking").is_none() || extracted_data.get("tracking") == Some(&json!(0)) {
                                         extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -5181,9 +4898,9 @@ async fn process_task(
                                 if needs_update {
                                     if was_foreign_draft {
                                         let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                        e.0 -= 1; // pages draft--
-                                        e.1 += 1; // pages count++
-                                        e.2 += 1; // global count++
+                                        e.0 -= 1;
+                                        e.1 += 1;
+                                        e.2 += 1;
                                         tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                     }
                                     let merged_text = parsing::json_to_natural_language(&tracking_data);
@@ -5203,10 +4920,10 @@ async fn process_task(
                                 }
                             },
                             Ok(None) => {
-                                // tracking 문서 미존재 → draft 생성 (index.ts Relay Ok(None) 분기 패리티)
+
                                 let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                e.0 += 1; // pages draft++
-                                e.2 += 1; // global count++
+                                e.0 += 1;
+                                e.2 += 1;
                                 let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
                                 let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
                                 let mut draft_data = json!({});
@@ -5215,13 +4932,13 @@ async fn process_task(
                                     obj.insert("type".to_string(), json!("tracking"));
                                     obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
                                     obj.insert("index".to_string(), json!(tracking_index));
-                                    // order.index → tracking.order 매핑
+
                                     if let Some(order_index) = extracted_data.get("index") {
                                         obj.insert("order".to_string(), order_index.clone());
                                     }
-                                    obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                    obj.insert("updated_at".to_string(), json!(0));
                                 }
-                                // tracking.index → extracted_data.tracking 역매핑
+
                                 extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
                                 let _ = store.upsert_item(
                                     "tracking", &draft_id, "tracking", draft_data.clone(), None,
@@ -5239,7 +4956,7 @@ async fn process_task(
                 }
             }
         }
-        // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
+
         let _ = store.upsert_item(
             &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
             Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
@@ -5287,31 +5004,26 @@ async fn process_task(
                     obj.insert("updated_at".to_string(), json!(0));
                 }
 
-                // Phase 2.5에서 주입된 영문 FTS 키워드가 포함된 text 속성을 최우선으로 사용하여 벡터화합니다.
+
                 let text_to_embed = single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item));
                 let item_digest = crate::utils::hash::digest(&text_to_embed);
                 
                 let mut existing_vector = None;
                 let mut is_new = true;
-                // let is_fully_processed = false;
+
 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
                     is_new = false;
-                    // 이미 상세 페이지에서 처리되어 updated_at이 0보다 큰지 확인
-                    // if existing_item.updated_at_ts > 0 {
-                    //     is_fully_processed = true;
-                    // }
+
                     if existing_item.digest == item_digest {
                         existing_vector = Some(existing_item.vector);
                     }
                 }
 
-                
-                // 새 항목이면 pages: draft++, global: count++
                 if is_new {
                     let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-                    e.0 += 1; // pages draft++
-                    e.2 += 1; // global count++
+                    e.0 += 1;
+                    e.2 += 1;
                 }
                 
                 let vector = if let Some(v) = existing_vector {
@@ -5329,7 +5041,7 @@ async fn process_task(
                                 Ok(Some((foreign_id, mut foreign_data))) => {
                                     let mut needs_update = false;
 
-                                    // 2. Update 속성 병합
+
                                     if let Some(update) = &merge_rule.update {
                                         for field in &update.includes {
                                             if update.from == page_type {
@@ -5357,7 +5069,7 @@ async fn process_task(
                                         }
                                     }
 
-                                    // 3. Upsert 속성 병합
+
                                     if let Some(upsert) = &merge_rule.upsert {
                                         for field in &upsert.includes {
                                             if upsert.from == page_type {
@@ -5373,10 +5085,10 @@ async fn process_task(
                                         }
                                     }
 
-                                    // 4. 연관 문서에 변경 사항이 있다면 벡터 재생성 후 DB 재저장
+
                                     if needs_update {
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                        let masked_merged_text = merged_text.clone(); // 마스킹은 Push 단계에서 동적 수행됨
+                                        let masked_merged_text = merged_text.clone();
                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                         
                                         foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
@@ -5396,8 +5108,8 @@ async fn process_task(
                                 Ok(None) => {
                                     
                                     let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                    e.0 += 1; // pages draft++
-                                    e.2 += 1; // global count++
+                                    e.0 += 1;
+                                    e.2 += 1;
 
                                     let mut draft_data = json!({});
                                     
@@ -5413,7 +5125,7 @@ async fn process_task(
                                         obj.insert("id".to_string(), json!(draft_id.clone()));
                                         obj.insert("type".to_string(), json!(foreign_type));
                                         obj.insert(q.column.clone(), q.value.clone());
-                                        obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                        obj.insert("updated_at".to_string(), json!(0));
                                     }
 
                                     let _ = store.upsert_item(
@@ -5432,9 +5144,6 @@ async fn process_task(
                     }
                 }
 
-                
-                // 🌟 [TRACKING RELAY] order 리스트 전처리 시 tracking_number가 추출되면 tracking 테이블에서 역방향 쿼리
-                // index.ts Relay(foreign="tracking", primary.type="order") 로직의 Rust 패리티 반영
                 if page_type == "order" {
                     if let Some(tn_raw) = single_item.get("tracking_number").and_then(|v| v.as_str()) {
                         if !tn_raw.trim().is_empty() {
@@ -5444,10 +5153,10 @@ async fn process_task(
                                 emit_term(&format!("  📦 [TRACKING RELAY] order 리스트 아이템에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
                                 match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
                                     Ok(Some((tracking_id, mut tracking_data))) => {
-                                        // 기존 tracking 문서 발견 → order.index를 tracking.order에 매핑 + 물류 속성 전파
+
                                         let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                                         let mut needs_update = false;
-                                        // order → tracking: width, height, length, weight 전파 (index.ts merge.includes 패리티)
+
                                         for field in ["width", "height", "length", "weight"] {
                                             if let Some(val) = single_item.get(field).cloned() {
                                                 let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -5457,14 +5166,14 @@ async fn process_task(
                                                 }
                                             }
                                         }
-                                        // order.index → tracking.order 매핑 (index.ts foreign.from="index", foreign.to="order" 패리티)
+
                                         if let Some(order_index) = single_item.get("index") {
                                             if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
                                                 tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
                                                 needs_update = true;
                                             }
                                         }
-                                        // tracking.index → single_item.tracking 역매핑 (index.ts foreign.from="index", foreign.to="tracking" 패리티)
+
                                         if let Some(tracking_index) = tracking_data.get("index").cloned() {
                                             if single_item.get("tracking").is_none() || single_item.get("tracking") == Some(&json!(0)) {
                                                 single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -5473,9 +5182,9 @@ async fn process_task(
                                         if needs_update {
                                             if was_foreign_draft {
                                                 let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                e.0 -= 1; // pages draft--
-                                                e.1 += 1; // pages count++
-                                                e.2 += 1; // global count++
+                                                e.0 -= 1;
+                                                e.1 += 1;
+                                                e.2 += 1;
                                                 tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                             }
                                             let merged_text = parsing::json_to_natural_language(&tracking_data);
@@ -5495,10 +5204,10 @@ async fn process_task(
                                         }
                                     },
                                     Ok(None) => {
-                                        // tracking 문서 미존재 → draft 생성 (index.ts Relay Ok(None) 분기 패리티)
+
                                         let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                        e.0 += 1; // pages draft++
-                                        e.2 += 1; // global count++
+                                        e.0 += 1;
+                                        e.2 += 1;
                                         let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
                                         let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
                                         let mut draft_data = json!({});
@@ -5507,13 +5216,13 @@ async fn process_task(
                                             obj.insert("type".to_string(), json!("tracking"));
                                             obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
                                             obj.insert("index".to_string(), json!(tracking_index));
-                                            // order.index → tracking.order 매핑
+
                                             if let Some(order_index) = single_item.get("index") {
                                                 obj.insert("order".to_string(), order_index.clone());
                                             }
-                                            obj.insert("updated_at".to_string(), json!(0)); // Draft 플래그
+                                            obj.insert("updated_at".to_string(), json!(0));
                                         }
-                                        // tracking.index → single_item.tracking 역매핑
+
                                         single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
                                         let _ = store.upsert_item(
                                             "tracking", &draft_id, "tracking", draft_data.clone(), None,
@@ -5531,7 +5240,7 @@ async fn process_task(
                         }
                     }
                 }
-                // 여기서 다시 덮어씌우는 과정을 생략하여 보호합니다.
+
                 let _ = store.upsert_item(
                     &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
                     Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
@@ -5550,18 +5259,14 @@ async fn process_task(
         println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", items_to_process.len(), stats_diff);
     }
 
-    // Final Status Update
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
-
-    
-    // 대신 프론트엔드가 이 'Done' 신호를 받고 내부적으로 app.fetch()를 트리거하여
-    // DB에서 완벽하게 세팅된(id, ref, bcc 등) 데이터를 가져가도록 유도해야 합니다.
+ 
     let payload = json!({
         "task_id": task.id, 
         "category": "Done", 
         "summary": "Extraction complete. Updating list...", 
         "spinner": "✅",
-        // data를 null로 보내어 프론트엔드가 기존에 그리던 캐시를 초기화하도록 합니다.
+
         "data": null 
     });
     
@@ -5571,7 +5276,3 @@ async fn process_task(
     println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
     Ok(())
 }
-
-
-
-
