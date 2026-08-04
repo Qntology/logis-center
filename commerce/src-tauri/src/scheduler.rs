@@ -4,7 +4,7 @@ use tokio::time::{sleep, Duration};
 use crate::store::{VectorStore, Task};
 use crate::logic;
 use crate::utils;
-use crate::parsing::{self, PugMode};
+use crate::utils::parsing::{self, PugMode};
 use crate::model::LogisModel;
 use serde_json::{Value, json};
 use anyhow::Result;
@@ -21,7 +21,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases};
 use crate::utils::logger::log_task_progress;
 
 
@@ -1335,16 +1335,6 @@ async fn process_task(
                 category_title_only_embs.push((cat.to_string(), title_only_emb));
             }
 
-            // 🌟 [MAX-POOL COSINE 헬퍼] 대상 벡터 vs 카테고리 구절 벡터 집합의 최대 코사인
-            let max_pool_sim = |target: &[f32], phrase_embs: &Vec<Vec<f32>>| -> f32 {
-                let mut best = 0.0f32;
-                for pe in phrase_embs {
-                    let s = cosine_similarity(target, pe);
-                    if s > best { best = s; }
-                }
-                best
-            };
-
             // 🌟 [CHROME PREJUDICE VECTOR] "사이트 껍데기" 전용 배제 벡터
             //    '관리자 페이지', '관리자 주메뉴', '행복을 주는 쇼핑몰!', '기본검색' 처럼
             //    어느 도메인에도 속하지 않는 범용 문구를 코사인 한 방으로 걸러내기 위한 기준점입니다.
@@ -1735,17 +1725,6 @@ async fn process_task(
             // 개선: 구 단위로 쪼개 개별 임베딩 후 MAX-POOL.
             //   '주문리스트(전체)' vs list 구절 '주문리스트' → 0.9대
             //   '주문리스트(전체)' vs form 구절 '주문내역'   → 0.8대  → 방향이 정상 복구됩니다.
-            let split_bias_phrases = |raw: &str| -> Vec<String> {
-                let mut v: Vec<String> = raw
-                    .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let mut seen = std::collections::HashSet::new();
-                v.retain(|p| seen.insert(p.clone()));
-                if v.len() > 48 { v.truncate(48); }
-                v
-            };
             let list_phrases = split_bias_phrases(&list_bias);
             let form_phrases = split_bias_phrases(&form_bias);
             let list_phrase_embs: Vec<Vec<f32>> = if list_phrases.is_empty() {
@@ -1759,16 +1738,6 @@ async fn process_task(
                 model.get_embedding_batch(form_phrases.clone()).await.unwrap_or_else(|_| vec![form_bias_emb.clone(); form_phrases.len()])
             };
             emit_term(&format!("  🧩 [LAYOUT ANCHOR SPLIT] ListPhrases: {} | FormPhrases: {}", list_phrase_embs.len(), form_phrase_embs.len()));
-
-            // 🌟 [LAYOUT MAX-POOL 헬퍼] 대상 벡터 vs 레이아웃 구절 집합의 최대 코사인
-            let layout_max_pool = |target: &[f32], phrase_embs: &Vec<Vec<f32>>| -> f32 {
-                let mut best = 0.0f32;
-                for pe in phrase_embs {
-                    let s = cosine_similarity(target, pe);
-                    if s > best { best = s; }
-                }
-                best
-            };
 
             // 🌟 [LAYOUT CHROME VECTOR] 브랜딩/네비/검색 껍데기 헤딩 배제용 기준 벡터입니다.
             //    '행복을 주는 쇼핑몰!', '관리자 주메뉴', '기본검색'을 코사인 한 방으로 걸러냅니다.
@@ -2200,8 +2169,8 @@ async fn process_task(
                         if he.iter().all(|&v| v == 0.0) { continue; }
                         let tier = heads[hi].0;
                         let txt = &heads[hi].1;
-                        let l = layout_max_pool(he, &list_phrase_embs);
-                        let f = layout_max_pool(he, &form_phrase_embs);
+                        let l = max_pool_sim(he, &list_phrase_embs);
+                        let f = max_pool_sim(he, &form_phrase_embs);
                         let gap = (l - f).abs();
                         let chrome_s = cosine_similarity(&nav_chrome_emb, he);
                         let layout_max = l.max(f);
@@ -2424,8 +2393,8 @@ async fn process_task(
                 emit_term(&format!("  ⚠️ [LOW-CONFIDENCE FALLBACK] 판정 마진 {:.4} < 0.02. 전체 PUG 직접 임베딩 폴백 가동.", decision_margin));
                 let fallback_pug_emb = model.get_embedding(filtered_light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
                 // 🌟 폴백도 단일 희석 벡터 대신 구 단위 MAX-POOL로 통일합니다.
-                let fallback_form_sim = layout_max_pool(&fallback_pug_emb, &form_phrase_embs);
-                let fallback_list_sim = layout_max_pool(&fallback_pug_emb, &list_phrase_embs);
+                let fallback_form_sim = max_pool_sim(&fallback_pug_emb, &form_phrase_embs);
+                let fallback_list_sim = max_pool_sim(&fallback_pug_emb, &list_phrase_embs);
                 let fallback_prej_sim = cosine_similarity(&prej_emb, &fallback_pug_emb);
                 let fallback_form_final = (fallback_form_sim - fallback_prej_sim).max(0.0) + heading_form_bonus;
                 let fallback_list_final = (fallback_list_sim - fallback_prej_sim).max(0.0) + heading_list_bonus + periodicity_bonus + row_repeat_bonus;

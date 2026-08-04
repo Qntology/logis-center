@@ -5,6 +5,27 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
 }
 
+pub fn max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>) -> f32 {
+    let mut best = 0.0f32;
+    for pe in phrase_embs {
+        let s = cosine_similarity(target, pe);
+        if s > best { best = s; }
+    }
+    best
+}
+
+pub fn split_bias_phrases(raw: &str) -> Vec<String> {
+    let mut v: Vec<String> = raw
+        .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|p| seen.insert(p.clone()));
+    if v.len() > 48 { v.truncate(48); }
+    v
+}
+
 pub fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
     if lines.is_empty() { return String::new(); }
     let mut parent_idx = target_idx;

@@ -1,16 +1,14 @@
 mod model;
 mod store;
 mod automation;
-pub mod parsing;
+pub use utils::parsing;
 mod logic;
 mod scheduler;
-pub mod analytic; 
+pub mod analytic;
 pub mod stanza;
-
 pub mod js_templates;
 pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
 pub mod parsers; // 🌟 문서 파서 모듈 선언
-
 pub mod models;
 pub mod utils;
 pub mod position_embed;

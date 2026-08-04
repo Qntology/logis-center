@@ -19,6 +19,7 @@ pub mod metrics;
 
 pub mod sync_utils;
 pub mod url_utils;
+pub mod parsing;
 
 pub use device_utils::*;
 pub use misc_utils::*;

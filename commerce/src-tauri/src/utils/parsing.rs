@@ -5,6 +5,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 
 pub use crate::prompts::*; // 🌟 분리된 프롬프트 함수들을 외부에서 그대로 사용할 수 있도록 재수출
+use crate::tokenizer;
 
 // 🌟 [다국어 지원] 빌드 시점에 bias.json 파일을 읽어와 메모리에 영구 등재합니다.
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
@@ -195,7 +196,7 @@ fn is_root_layout_element(line: &str) -> bool {
 }
 
 
-pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &crate::tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
+pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &tokenizer::TokenizerModel, bottom_drop_tokens: Option<usize>) -> String {
     let mut lines: Vec<&str> = pug.lines().collect();
     if lines.is_empty() { return String::new(); }
 

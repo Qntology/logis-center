@@ -2281,11 +2281,10 @@ impl LogisModel {
         // 1. 모든 카테고리에 대해 layout_list, layout_form의 bias 값 추출
         let all_cats = ["order", "goods", "tracking", "review", "coupon", "event"];
         let mut cat_core_texts = std::collections::HashMap::new();
-        
         for cat in &all_cats {
-            let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
+            let contexts: Vec<(String, String, String)> = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
             let mut core_text = String::new();
-            for (key, bias, _) in contexts {
+            for (key, bias, _prej) in contexts.into_iter() {
                 if key == "layout_list" || key == "layout_form" {
                     core_text.push_str(&bias);
                     core_text.push_str(", ");
@@ -2293,7 +2292,6 @@ impl LogisModel {
             }
             cat_core_texts.insert(cat.to_string(), core_text);
         }
-
         // 2. review, coupon, event 카테고리에 대해 각각 bias와 (나머지 카테고리의 합인) prejudice를 계산
         let target_cats = ["review", "coupon", "event"];
         for target_cat in &target_cats {
