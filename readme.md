@@ -1,5 +1,19 @@
 # License
 
+## Reference License
+
+This project integrates and extends the following open-source works:
+
+| Component | Project | License |
+|-----------|---------|---------|
+| OCR Model | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | Apache-2.0 |
+| Language Model | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Apache-2.0 |
+| Language Model | [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Apache-2.0 |
+| Embedding Model | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Apache-2.0 |
+| NLP Engine | [stanfordnlp/stanza](https://github.com/stanfordnlp/stanza) | Apache-2.0 |
+
+---
+
 ## Open Source Licenses
 
 This project uses the following open-source libraries:
