@@ -798,27 +798,32 @@ async fn process_task(
         let mut line_embeddings = vec![vec![0.0; 384]; pug_lines.len()];
         let mut wiped_indices = vec![false; pug_lines.len()];
         // 🌟 [조기 타이틀 추출] GLOBAL DROP / NAV PRE-FILTER에서 도메인 시그널 보호용
-        let early_doc_title = {
+        let early_doc_title = { // 내부 doc_title도 동일하게 수정
             let doc = scraper::Html::parse_document(&clean_html_content);
             let mut t_val = if let Ok(sel) = scraper::Selector::parse("title") {
                 doc.select(&sel).next().map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default()
             } else {
                 String::new()
             };
-            if t_val.is_empty() || t_val.len() < 5 {
-                let mut heading_texts = Vec::new();
-                if let Ok(sel_h1) = scraper::Selector::parse("h1") {
-                    for el in doc.select(&sel_h1) {
-                        heading_texts.push(el.text().collect::<Vec<_>>().join(" ").trim().to_string());
-                    }
+            let mut heading_texts = Vec::new();
+            if let Ok(sel_h1) = scraper::Selector::parse("h1") {
+                for el in doc.select(&sel_h1) {
+                    let txt = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                    if !txt.is_empty() { heading_texts.push(txt); }
                 }
-                if let Ok(sel_h2) = scraper::Selector::parse("h2") {
-                    for el in doc.select(&sel_h2) {
-                        heading_texts.push(el.text().collect::<Vec<_>>().join(" ").trim().to_string());
-                    }
+            }
+            if let Ok(sel_h2) = scraper::Selector::parse("h2") {
+                for el in doc.select(&sel_h2) {
+                    let txt = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                    if !txt.is_empty() { heading_texts.push(txt); }
                 }
-                if !heading_texts.is_empty() {
+            }
+            // 🌟 [CRITICAL FIX] 관리자 페이지의 쓰레기 타이틀을 h1/h2로 강제 보정 (다국어 완벽 호환)
+            if !heading_texts.is_empty() {
+                if t_val.is_empty() || t_val.len() < 5 {
                     t_val = heading_texts.join(" | ");
+                } else {
+                    t_val = format!("{} | {}", t_val, heading_texts.join(" | "));
                 }
             }
             t_val
@@ -1270,32 +1275,47 @@ async fn process_task(
             filtered_light_pug = pre_filtered_pug.trim_end().to_string();
 
             {
-                let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu";
+                let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
                 let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+
+                // 🌟 [CRITICAL FIX] 도메인별 바이어스 임베딩 사전 계산 (다국어 CONTENT VECTOR GATE용)
+                let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
+                let mut category_embs = Vec::new();
+                for cat in &categories {
+                    let anchor_text = crate::parsing::get_page_type_classification_bias(cat, &doc_lang);
+                    let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                    category_embs.push(anchor_emb);
+                }
+
                 let mut nav_wiped_count = 0usize;
-                let mut nav_title_protected = 0usize;
+                let mut nav_domain_protected = 0usize;
                 for (i, line) in pug_lines.iter().enumerate() {
                     if wiped_indices[i] { continue; }
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
                     if !line_embeddings[i].iter().all(|&v| v == 0.0) {
                         let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
-                        if nav_score > 0.40 {
-                            // 🌟 [TITLE VECTOR GATE] 타이틀 임베딩과 코사인 유사도가 nav 점수보다 높으면
-                            // 해당 라인은 네비게이션이 아닌 도메인 핵심 콘텐츠로 판정하여 보호합니다.
+                        if nav_score > 0.38 {
                             let title_line_sim = cosine_similarity(&early_title_emb, &line_embeddings[i]);
-                            if title_line_sim > nav_score {
-                                nav_title_protected += 1;
-                                continue;
+                            
+                            // 🌟 [DOMAIN VECTOR GATE] 6개 도메인 중 하나라도 강력히 일치하면 네비게이션 탈락에서 보호
+                            let mut max_domain_sim = 0.0;
+                            for emb in &category_embs {
+                                let sim = cosine_similarity(emb, &line_embeddings[i]);
+                                if sim > max_domain_sim { max_domain_sim = sim; }
+                            }
+
+                            if (max_domain_sim > 0.30 && max_domain_sim >= nav_score * 0.85) || (title_line_sim > nav_score && title_line_sim > 0.40) {
+                                nav_domain_protected += 1;
+                                continue; // 🛡️ 사이드바에도 있지만 본문 데이터이기도 하므로 보호!
                             }
                             wiped_indices[i] = true;
                             nav_wiped_count += 1;
                         }
                     }
                 }
-                if nav_wiped_count > 0 || nav_title_protected > 0 {
-                    emit_term(&format!("  🚫 [STEP-A NAV PRE-FILTER] 페이지 분류 전 네비게이션/레이아웃 {}개 라인 사전 탈락 완료. (타이틀 벡터 보호: {}개)", nav_wiped_count, nav_title_protected));
-                    // filtered_light_pug 재구성
+                if nav_wiped_count > 0 || nav_domain_protected > 0 {
+                    emit_term(&format!("  🚫 [STEP-A NAV PRE-FILTER] 페이지 분류 전 네비게이션/레이아웃 {}개 라인 사전 탈락 완료. (도메인/타이틀 벡터 보호: {}개)", nav_wiped_count, nav_domain_protected));
                     let mut re_filtered = String::new();
                     for (idx, line) in pug_lines.iter().enumerate() {
                         if !wiped_indices[idx] { re_filtered.push_str(line); }
@@ -1430,35 +1450,156 @@ async fn process_task(
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
+            let mut category_scores: Vec<(String, f32, f32, usize)> = Vec::new(); // (cat, total, title_sim, line_count)
+
+            // 🌟 [CRITICAL FIX] 모든 카테고리 앵커 임베딩 + 타이틀 전용 임베딩을 사전 일괄 계산합니다.
+            // 이후 라인별 경쟁 스코어링에서 6개 앵커를 동시에 비교하기 위한 필수 전제 조건입니다.
+            let mut category_anchor_embs: Vec<(String, Vec<f32>)> = Vec::new();
+            let mut category_title_only_embs: Vec<(String, Vec<f32>)> = Vec::new();
             for cat in &categories {
-                // bias.json 내의 해당 카테고리에 속한 '모든 속성의 bias 데이터'를 통째로 긁어옵니다.
-                let anchor_text = crate::parsing::get_page_type_full_bias(cat, &doc_lang);
+                let anchor_text = crate::parsing::get_page_type_classification_bias(cat, &doc_lang);
                 let anchor_emb = model.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
-                let mut total_sim = 0.0;
-                // 1. 타이틀 점수 합산 (타이틀은 페이지 정체성에 매우 중요하므로 5배 가중치 부여)
-                if !doc_title.is_empty() {
-                    let title_sim = cosine_similarity(&title_emb, &anchor_emb);
-                    if title_sim > 0.0 {
-                        total_sim += title_sim * 5.0; 
+                category_anchor_embs.push((cat.to_string(), anchor_emb));
+                let title_only_bias = format!("{} {}", cat, crate::parsing::get_localized_page_type(cat, &doc_lang));
+                let title_only_emb = model.get_embedding(title_only_bias).await.unwrap_or(vec![0.0; 384]);
+                category_title_only_embs.push((cat.to_string(), title_only_emb));
+            }
+
+            // 🌟 [CRITICAL FIX] 타이틀 스코어링 사전 계산: 페이지 정체성의 최강 시그널인 타이틀을
+            // 전체 앵커 + 타이틀 전용 앵커 양쪽으로 매칭하여 카테고리별 (title_sim, title_only_sim) 저장합니다.
+            let mut category_title_scores: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
+            if !doc_title.is_empty() {
+                for cat in &categories {
+                    let anchor_emb = &category_anchor_embs.iter().find(|(c, _)| c == *cat).unwrap().1;
+                    let title_only_emb = &category_title_only_embs.iter().find(|(c, _)| c == *cat).unwrap().1;
+                    let title_sim = cosine_similarity(&title_emb, anchor_emb);
+                    let title_only_sim = cosine_similarity(&title_emb, title_only_emb);
+                    category_title_scores.insert(cat.to_string(), (title_sim, title_only_sim));
+                }
+            }
+
+            // 🌟 [CRITICAL FIX: WINNER-TAKES-ALL COMPETITIVE SCORING]
+            // 각 라인을 6개 카테고리 앵커 전부와 비교하여, 가장 높은 코사인 유사도를 보인
+            // 단일 카테고리에만 독점적으로 점수를 부여합니다.
+            // 기존: "쿠폰할인" 라인이 coupon, order, event 등 임계값 초과 카테고리 전부에 점수 누적
+            // 개선: "쿠폰할인" 라인이 coupon 앵커와 가장 유사하면 coupon에만 점수 부여
+            //        "주문번호", "주문일시", "결제방법" 라인은 order 앵커와 가장 유사하므로 order에만 부여
+            //        → 범용 관리 용어(수정, 내역, 입력, 설정)가 여러 카테고리에 동시 누적되는 현상 원천 차단
+            let mut category_line_scores: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
+            for cat in &categories {
+                category_line_scores.insert(cat.to_string(), (0.0, 0));
+            }
+
+            for (i, emb) in line_embeddings.iter().enumerate() {
+                // 노이즈로 판정되어 삭제될 줄(wiped_indices)은 철저히 배제합니다.
+                if wiped_indices[i] { continue; }
+                let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
+                if text_part.is_empty() { continue; }
+
+                let trimmed_line = pug_lines[i].trim();
+                let tag_part = trimmed_line.split('|').next().unwrap_or("").trim().to_lowercase();
+                let is_table_cell = tag_part.starts_with("td") || tag_part.starts_with("th");
+                // 🌟 [CRITICAL FIX] 테이블 헤더(th) 및 셀(td)은 구조적 핵심이므로 임계값을 0.15로 하향하여 희석된 벡터 포착
+                let sim_threshold = if is_table_cell { 0.15 } else { 0.25 };
+                let weight = if is_table_cell { 1.5 } else { 1.0 };
+
+                // 6개 카테고리 앵커 전부와 코사인 유사도 계산 후 최고점 카테고리 선발
+                let mut best_cat: Option<(&str, f32)> = None;
+                for (cat, anchor_emb) in &category_anchor_embs {
+                    let sim = cosine_similarity(anchor_emb, emb);
+                    if sim > sim_threshold {
+                        if best_cat.is_none() || sim > best_cat.unwrap().1 {
+                            best_cat = Some((cat.as_str(), sim));
+                        }
                     }
                 }
-                // 2. 문서 전체를 끝까지 읽고 판단 (노이즈가 제거된 모든 유효 라인 순회)
-                for (i, emb) in line_embeddings.iter().enumerate() {
-                    // 노이즈로 판정되어 삭제될 줄(wiped_indices)은 철저히 배제합니다.
-                    if wiped_indices[i] { continue; } 
-                    let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
-                    if text_part.is_empty() { continue; }
-                    let sim = cosine_similarity(&anchor_emb, emb);
-                    // 연관성이 뚜렷한 라인(임계치 0.25 초과)의 점수만 누적하여 전체 페이지의 카테고리 밀도를 정밀 측정합니다.
-                    if sim > 0.25 {
-                        total_sim += sim;
+
+                // 최고 유사도 카테고리에만 독점 부여 (Winner-Takes-All)
+                if let Some((winner_cat, sim)) = best_cat {
+                    let entry = category_line_scores.get_mut(winner_cat).unwrap();
+                    entry.0 += sim * weight;
+                    entry.1 += 1;
+                }
+            }
+
+            // 🌟 [FINAL SCORING] 타이틀 점수(초고배율) + 경쟁 라인 점수 + 타이틀 지배 보너스 합산
+            for cat in &categories {
+                let (title_sim, title_only_sim) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
+                let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
+
+                let mut total_title_score = 0.0;
+                // 🌟 [CRITICAL FIX] 타이틀 가중치 대폭 상향 (5x→15x, 4x→12x)
+                // 타이틀 "주문내역 수정"은 페이지 정체성의 절대 시그널입니다.
+                // 145개 라인의 분산 점수가 타이틀의 명확한 도메인 시그널을 역전하지 못하도록 차단합니다.
+                if title_sim > 0.0 {
+                    total_title_score += title_sim * 15.0;
+                }
+                // 🌟 [TITLE-ONLY SEMANTIC MATCH] 레이아웃/폼/상태 바이어스 노이즈 없이
+                // 순수 페이지 타입 이름 + 로컬라이즈된 이름만으로 타이틀과 코사인 매칭합니다.
+                // "주문내역 수정"이 goods 바이어스의 "상품수정"에 오염되는 것을 원천 방지합니다.
+                if title_only_sim > 0.0 {
+                    total_title_score += title_only_sim * 12.0;
+                }
+
+                // 🌟 [TITLE-DOMINANCE BONUS] 타이틀 전용 임베딩 유사도가 타 카테고리 대비 압도적이면
+                // 최종 정규화 점수에 1.5배 승산 보너스를 적용합니다.
+                // "주문내역 수정" vs "order 주문" title_only_sim이 "coupon 이벤트" 대비 명확히 높으므로
+                // order가 결정적 우위를 확보합니다.
+                let mut title_dominance_bonus = 1.0f32;
+                if title_only_sim > 0.35 {
+                    let max_other_title_only: f32 = categories.iter()
+                        .filter(|c| *c != cat)
+                        .map(|c| category_title_scores.get(*c).map(|(_, to)| *to).unwrap_or(0.0))
+                        .fold(0.0f32, f32::max);
+                    if title_only_sim > max_other_title_only * 1.2 {
+                        title_dominance_bonus = 1.5;
                     }
                 }
-                if total_sim > max_total_score {
-                    max_total_score = total_sim;
+
+                // 🌟 [SCORE NORMALIZATION v2] 증거 기반 신뢰도 + 타이틀 코사인 일관성 보정
+                // 1. 최소 증거 페널티: 기여 라인이 3개 미만이면 과소 표본으로 간주하여 신뢰도 감쇠
+                //    (2줄만 우연히 매칭된 카테고리가 9줄 일관 매칭을 이기는 구조적 결함 차단)
+                let evidence_factor = if contributing_lines < 3 {
+                    (contributing_lines as f32) / 3.0
+                } else {
+                    1.0
+                };
+                // 2. 타이틀 코사인 부스트: 타이틀 임베딩과 카테고리 앵커 간 코사인 유사도가
+                //    임계값(0.40) 이상이면, 해당 카테고리의 최종 점수를 코사인 값에 비례하여 증폭합니다.
+                //    (contains가 아닌 순수 코사인 유사도 기반 판정)
+                let title_boost = if title_sim > 0.40 {
+                    1.0 + (title_sim - 0.40) * 2.5
+                } else {
+                    1.0
+                };
+                
+                // 🌟 [핵심 개선] 타이틀 점수와 라인 점수를 엄격히 분리하여 정규화합니다.
+                // 기존처럼 합산 후 라인 수로 나누면, 정상적으로 많은 라인을 포착한 order의 타이틀 점수가 부당하게 희석됩니다.
+                let normalized_line_score = if contributing_lines > 0 {
+                    (line_total / (contributing_lines as f32).sqrt()) * evidence_factor
+                } else {
+                    0.0
+                };
+
+                let normalized_score = (normalized_line_score + (total_title_score * title_dominance_bonus)) * title_boost;
+
+                category_scores.push((cat.to_string(), normalized_score, title_sim, contributing_lines));
+                if normalized_score > max_total_score {
+                    max_total_score = normalized_score;
                     best_type = cat.to_string();
                 }
             }
+            // 🌟 [DETAILED CLASSIFICATION LOG] 판정 근거를 투명하게 출력합니다.
+            emit_term("\n[PAGE-TYPE CLASSIFICATION] === Per-Category Score Breakdown ===");
+            emit_term(&format!("  Document Title: '{}'", doc_title));
+            let mut sorted_scores = category_scores.clone();
+            sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (cat, score, t_sim, line_cnt) in &sorted_scores {
+                let marker = if *cat == best_type { "👑" } else { "  " };
+                emit_term(&format!("  {} [{}] Normalized: {:.4} | TitleSim: {:.4} | ContributingLines: {}", marker, cat, score, t_sim, line_cnt));
+            }
+            emit_term(&format!("  Anchor Bias Sample (winner '{}'): '{}'...", best_type, crate::parsing::get_page_type_classification_bias(&best_type, &doc_lang).chars().take(120).collect::<String>()));
+            emit_term("[PAGE-TYPE CLASSIFICATION] ====================================\n");
             page_type = best_type;
             println!("[Scheduler] Deterministic Classified Page Type: {} (Max Score: {:.4})", page_type, max_total_score);
 
@@ -1476,6 +1617,31 @@ async fn process_task(
             let list_bias_emb: Vec<f32> = model.get_embedding(list_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             let form_bias_emb: Vec<f32> = model.get_embedding(form_bias.clone()).await.unwrap_or(vec![0.0f32; 384]);
             
+            // 🌟 [NAVIGATION PRE-FILTER] Track B/C 후보 선정 전, 네비게이션/헤더/푸터/사이드바 라인을 사전 탈락
+            // Track A에서 놓친 개별 네비게이션 라인을 구조 태그 + prejudice 유사도 이중 검증으로 차단합니다.
+            // 🌟 [CRITICAL FIX] 기존 단순 문자열 매칭에서 벡터 유사도 기반 판정으로 전면 개편합니다.
+            {
+                let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, top bar, bottom bar, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
+                let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                let mut nav_wiped_count = 0usize;
+                for (i, line) in pug_lines.iter().enumerate() {
+                    if wiped_indices[i] { continue; }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    // 🌟 [다국어 벡터 판정] contains 기반 하드코딩을 완전 제거하고,
+                    // bias/prejudice 코사인 유사도만으로 네비게이션/레이아웃 라인을 판정합니다.
+                    if !line_embeddings[i].iter().all(|&v| v == 0.0) {
+                        let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
+                        if nav_score > 0.38 {
+                            wiped_indices[i] = true;
+                            nav_wiped_count += 1;
+                        }
+                    }
+                }
+                if nav_wiped_count > 0 {
+                    emit_term(&format!("  🚫 [NAV PRE-FILTER] Step A-2 진입 전 네비게이션/레이아웃 {}개 라인 사전 탈락 완료.", nav_wiped_count));
+                }
+            }
             
             // 🌟 [CRITICAL OPTIMIZATION] 중복 생성되던 pug_lines, line_embeddings, nodes_str을 전면 삭제하고 Step A의 데이터를 그대로 계승하여 대기시간을 완전히 소멸시킵니다.
             let system_content_a2 = format!("[PUG CONTENT]\n{}", filtered_light_pug);
@@ -1600,7 +1766,9 @@ async fn process_task(
             let mut processed_list_blocks = std::collections::HashSet::new();
             let mut total_form_score = 0.0;
             let mut processed_form_blocks = std::collections::HashSet::new();
-
+            // 🌟 [NAV BLOCK FILTER] 블록 레벨에서 네비게이션을 벡터 유사도로 판정하기 위한 prejudice 임베딩 사전 생성
+            let nav_block_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu, snb, gnb, nav, sidebar, side bar, left panel, right panel, quick links";
+            let nav_block_prej_emb = model.get_embedding(nav_block_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
             // 🌟 [핵심 최적화 3] 생성된 BC 블록 일괄 Batch 병렬 타격
             let mut unique_bc_pugs_to_embed = Vec::new();
             let mut track_bc_pugs_clean = Vec::new();
@@ -1611,7 +1779,48 @@ async fn process_task(
                     emit_term(&format!("  ⚠️ [{}] Anchor Line {} failed to resolve a valid structural parent block via DOM.", track_name, track_bc_indices[i] + 1));
                     continue; 
                 }
-                
+                // 🌟 [다국어 벡터 판정] 셀렉터 텍스트를 임베딩하여 nav prejudice와 코사인 유사도로 판정
+                let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
+                let sel_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_emb);
+                // 🌟 [셀렉터 ID/클래스 토큰 분리 임베딩] 셀렉터에서 ID(#)와 클래스(.) 토큰만 추출하여 별도 임베딩
+                let sel_id_class_tokens: String = sel.to_lowercase()
+                    .split(|c: char| c == ' ' || c == '>')
+                    .flat_map(|part| {
+                        let mut tokens = Vec::new();
+                        if let Some(hash_pos) = part.find('#') {
+                            let id_token: String = part[hash_pos+1..].chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+                            if !id_token.is_empty() { tokens.push(id_token); }
+                        }
+                        for class_part in part.split('.') {
+                            let class_token: String = class_part.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+                            if !class_token.is_empty() && !class_token.contains('#') { tokens.push(class_token); }
+                        }
+                        tokens
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut sel_id_nav_score = 0.0f32;
+                if !sel_id_class_tokens.is_empty() {
+                    let sel_id_emb = model.get_embedding(sel_id_class_tokens.clone()).await.unwrap_or(vec![0.0f32; 384]);
+                    sel_id_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_id_emb);
+                }
+                // 🌟 [통합 셀렉터 NAV 점수] 전체 셀렉터 임베딩과 ID/클래스 토큰 임베딩 중 높은 값 채택
+                let effective_sel_nav_score = sel_nav_score.max(sel_id_nav_score);
+                // 🌟 [임계값 하향] 0.45 → 0.35로 낮춰 사이드바/네비게이션 셀렉터를 더 적극적으로 포착
+                if effective_sel_nav_score > 0.35 {
+                    // 🌟 [CONTENT VECTOR GATE 강화] 0.70 → 0.85로 상향하여 네비게이션이 콘텐츠로 위장하는 것을 차단
+                    let sel_form_sim = cosine_similarity(&form_bias_emb, &sel_emb);
+                    let sel_list_sim = cosine_similarity(&list_bias_emb, &sel_emb);
+                    let sel_content_max = sel_form_sim.max(sel_list_sim);
+                    if sel_content_max > effective_sel_nav_score * 0.85 {
+                        let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
+                        emit_term(&format!("  🛡️ [NAV SELECTOR CONTENT PROTECT] {} Anchor Line {} selector '{}' NavScore: {:.4} (ID/Class: {:.4}) but ContentSim: {:.4} >= 85% of Nav. Protected.", track_name, track_bc_indices[i] + 1, sel, sel_nav_score, sel_id_nav_score, sel_content_max));
+                    } else {
+                        let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
+                        emit_term(&format!("  🚫 [NAV VECTOR SELECTOR DROP] {} Anchor Line {} selector '{}' NavScore: {:.4} (ID/Class: {:.4}) > 0.35. Excluded.", track_name, track_bc_indices[i] + 1, sel, sel_nav_score, sel_id_nav_score));
+                        continue;
+                    }
+                }
                 if is_list_track {
                     if block_pug.is_empty() || processed_list_blocks.contains(&block_pug) { continue; }
                     processed_list_blocks.insert(block_pug.clone());
@@ -1637,22 +1846,61 @@ async fn process_task(
             for (i, sel, block_pug) in track_bc_pugs_clean {
                 let is_list_track = i < 5;
                 let block_emb = bc_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
+                // 🌟 [CRITICAL FIX: NAV VECTOR GATE] 블록 임베딩과 네비게이션 prejudice 벡터의 코사인 유사도를 계산하여
+                // 네비게이션 블록이 form/list 점수에 기여하는 것을 원천 차단합니다.
+                let nav_block_score = cosine_similarity(&nav_block_prej_emb, &block_emb);
+                // 🌟 [임계값 하향] 0.35 → 0.25로 낮춰 중간 대역 네비게이션도 포착
+                if nav_block_score > 0.25 {
+                    // 🌟 [CONTENT VECTOR GATE 강화] 0.70 → 0.85로 상향
+                    let block_form_sim = cosine_similarity(&form_bias_emb, &block_emb);
+                    let block_list_sim = cosine_similarity(&list_bias_emb, &block_emb);
+                    let block_content_max = block_form_sim.max(block_list_sim);
+                    if block_content_max > nav_block_score * 0.85 {
+                        let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
+                        emit_term(&format!("  🛡️ [NAV BLOCK CONTENT PROTECT] {} Anchor: {} | Selector: '{}' | NavScore: {:.4} but ContentSim: {:.4} >= 85% of Nav. Protected.", track_name, track_bc_indices[i] + 1, sel, nav_block_score, block_content_max));
+                    } else {
+                        let track_name = if is_list_track { "TRACK B (LIST)" } else { "TRACK C (FORM)" };
+                        emit_term(&format!("  🚫 [NAV VECTOR DROP] {} Anchor: {} | Selector: '{}' | NavScore: {:.4} > 0.25. Navigation block excluded.", track_name, track_bc_indices[i] + 1, sel, nav_block_score));
+                        continue;
+                    }
+                }
                 let mut b_prej_score = cosine_similarity(&prej_emb, &block_emb);
+                // 🌟 [비례적 NAV 페널티] nav_block_score가 0.15 이상이면 prejudice에 가산하여 점수를 감쇠시킵니다.
+                // 이는 임계값을 통과한 중간 대역 네비게이션이 form/list 점수에 과도하게 기여하는 것을 방지합니다.
+                if nav_block_score > 0.15 {
+                    b_prej_score += nav_block_score * 0.5;
+                }
                 if is_list_track {
+                    // 🌟 [다국어 벡터 판정] 리스트 레이아웃 감지를 contains 대신 list_bias 벡터 유사도로 판정합니다.
+                    // 셀렉터 텍스트의 임베딩과 list_bias 간 유사도가 높으면 구조적 리스트 컨테이너로 인정하여
+                    // Prejudice 페널티를 30% 감경합니다.
+                    let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
+                    let sel_list_sim = cosine_similarity(&list_bias_emb, &sel_emb);
+                    if sel_list_sim > 0.30 {
+                        b_prej_score *= 0.70; 
+                    }
                     let b_list_score = cosine_similarity(&list_bias_emb, &block_emb);
                     let final_score = (b_list_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_list_score += final_score;
-                        emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_list_score, b_prej_score, final_score));
+                        emit_term(&format!("  📊 [TRACK B (LIST)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | NavScore: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_list_score, b_prej_score, nav_block_score, final_score));
                     } else {
                         emit_term(&format!("  ⚠️ [TRACK B (LIST)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_list_score));
                     }
                 } else {
+                    // 🌟 [다국어 벡터 판정] 상세 폼 레이아웃 감지를 contains 대신 form_bias 벡터 유사도로 판정합니다.
+                    // 셀렉터 텍스트의 임베딩과 form_bias 간 유사도가 높으면 상세 폼 컨테이너로 인정하여
+                    // Prejudice 페널티를 30% 감경합니다.
+                    let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
+                    let sel_form_sim = cosine_similarity(&form_bias_emb, &sel_emb);
+                    if sel_form_sim > 0.30 {
+                        b_prej_score *= 0.70;
+                    }
                     let b_form_score = cosine_similarity(&form_bias_emb, &block_emb);
                     let final_score = (b_form_score - b_prej_score).max(0.0);
                     if final_score > 0.0 {
                         total_form_score += final_score;
-                        emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_form_score, b_prej_score, final_score));
+                        emit_term(&format!("  📊 [TRACK C (FORM)] Anchor: {} | Selector: '{}' | Bias: {:.4} | Prej: {:.4} | NavScore: {:.4} | Sum: {:.4}", track_bc_indices[i] + 1, sel, b_form_score, b_prej_score, nav_block_score, final_score));
                     } else {
                         emit_term(&format!("  ⚠️ [TRACK C (FORM)] Anchor: {} Ignored. Selector: '{}' (Prej {:.4} > Bias {:.4})", track_bc_indices[i] + 1, sel, b_prej_score, b_form_score));
                     }
