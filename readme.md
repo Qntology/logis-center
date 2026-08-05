@@ -9,7 +9,7 @@
 ```text
 =============================================================================
                        [ 🌐 URL / HTML DROP ZONE ]
-│                 demofran.com/admin/goods.php?code=list
+│                 testshop.com/admin/goods.php?code=list
 │
 ▼
 =============================================================================
