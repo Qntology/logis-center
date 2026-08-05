@@ -243,7 +243,7 @@
 ### ⚠️ **This board is a probability game.**
 > Vector matching and LLM extraction only place the ball into the "most plausible basket" —
 > they do not guarantee a correct answer. Only the FORMAT GATE physically bounces out wrong balls.
-> Misassignments that slip through (e.g., "진열" → currency) are saved to the DB as-is.
+> Misassignments that slip through (e.g., "Display" → currency) are saved to the DB as-is.
 
 
 ---
