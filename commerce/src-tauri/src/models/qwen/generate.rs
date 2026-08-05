@@ -192,7 +192,23 @@ use tokio::sync::OnceCell;
 
 pub async fn get_worker_channel() -> Result<mpsc::Sender<SlotTask>> { BAKE_TX.get().cloned().ok_or(anyhow!("Bake init error")) }
 pub async fn get_load_worker() -> Result<mpsc::Sender<SlotTask>> { LOAD_TX.get().cloned().ok_or(anyhow!("Load init error")) }
-pub async fn wait_for_global_io() { while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } }
+/// I/O 큐 상한선(백프레셔 워터마크). 이 값을 넘을 때만 대기합니다.
+pub const IO_BACKPRESSURE_WATERMARK: usize = 64;
+
+/// [BACKPRESSURE] 큐를 0까지 비우지 않고 상한선까지만 기다립니다.
+/// 디코딩 루프가 매 토큰 SSD 쓰기 전량 완료를 대기하던 직렬화를 제거합니다.
+pub async fn wait_for_global_io() {
+    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > IO_BACKPRESSURE_WATERMARK {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// [DRAIN] 스냅샷 확정처럼 "전부 디스크에 안착했는지"를 보장해야 하는 지점 전용입니다.
+pub async fn drain_global_io() {
+    while GLOBAL_IO_COUNTER.load(Ordering::SeqCst) > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
 
 pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
@@ -595,7 +611,7 @@ impl QwenVLGenerateModel {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await; 
             
             println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
-            wait_for_global_io().await; 
+            drain_global_io().await; 
             println!("[PREFILL-SAVE] Confirm: Block 0 to 42 are safely on SSD.");
         }
 

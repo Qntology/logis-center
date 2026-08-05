@@ -893,8 +893,17 @@ impl Qwen3_5Attention {
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
-        
-        let q_aligned = (query_states * self.scaling)?;
+
+        let q_aligned = (query_states * self.scaling)?.contiguous()?;
+
+        // [GQA-FOLD] K/V groups배 복제를 제거하기 위해 Q head 축을 접습니다.
+        let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
+        let kv_h = self.num_key_value_heads;
+        let q_folded = if self.num_kv_groups > 1 {
+            q_aligned.reshape((q_b, kv_h, self.num_kv_groups * q_l, q_d))?
+        } else {
+            q_aligned.clone()
+        };
 
         for block in &self.kv_blocks {
             let (index, b_off, b_len) = {
@@ -952,8 +961,11 @@ impl Qwen3_5Attention {
                             let block_file = full_path.join(format!("l{}.st", self.layer_idx));
                             for _retry in 0..3 {
                                 if block_file.exists() {
-                                    if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&block_file) {
-                                        if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                                    if let Ok(raw_content) = crate::utils::direct_loader::load_kv_block(&block_file) {
+                                        // [CRYPTO-COMPAT] 저장측(spawn_slot_worker)은 평문 safetensors로 기록합니다.
+                                        // 복호화가 성공하면 복호문을, 실패하면 원본을 그대로 사용해 폴백(zeros)을 없앱니다.
+                                        let content = crate::utils::crypto::decrypt_data(&raw_content).unwrap_or(raw_content);
+                                        {
                                             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                                 let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
                                                 let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).or_else(|_| st.tensor(s)).ok();
@@ -992,6 +1004,10 @@ impl Qwen3_5Attention {
                                             }
                                         }
                                     }
+                                } else {
+                                    // [NO-BLOCKING-WAIT] 파일 자체가 없으면 재시도해도 생기지 않습니다.
+                                    // 비동기 런타임 워커를 5ms씩 묶어두던 블로킹 sleep을 제거합니다.
+                                    break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(5));
                             }
@@ -1015,22 +1031,20 @@ impl Qwen3_5Attention {
                 }
             };
 
-            let mut k = k_block;
-            let mut v = v_block;
-
-            if self.num_kv_groups > 1 {
-                let (b, h, s, d) = k.dims4()?;
-                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
-            }
-
-            k = k.contiguous()?;
-            v = v.contiguous()?;
+            let k = k_block.contiguous()?;
+            let v = v_block.contiguous()?;
 
             let actual_kv_len = k.dim(2)?;
-            let k_t = k.transpose(2, 3)?.contiguous()?;
-            
-            let mut s_chunk = q_aligned.matmul(&k_t)?;
+
+            // [ZERO-COPY-T] transpose 뷰를 그대로 matmul에 전달합니다.
+            let k_t = k.transpose(2, 3)?;
+
+            let s_folded = q_folded.matmul(&k_t)?;
+            let mut s_chunk = if self.num_kv_groups > 1 {
+                s_folded.reshape((q_b, q_h, q_l, actual_kv_len))?
+            } else {
+                s_folded
+            };
 
             if let Some(mask) = &attention_mask {
                 let mask_len = mask.dim(candle_core::D::Minus1)?;
@@ -1059,9 +1073,20 @@ impl Qwen3_5Attention {
             // m_j 대신 m_j_safe를 사용하여 빼기 연산 수행
             let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
-            
-            // v와 곱할 때는 타겟 타입(BF16)으로 맞추고, 다시 누적기(out_res)에 넣기 위해 F32로 올립니다.
-            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
+
+            // [GQA-FOLD] P @ V 도 접어서 계산 후 원래 head 배열로 복원합니다.
+            let p_v = p_j.to_dtype(v.dtype())?.contiguous()?;
+            let p_folded = if self.num_kv_groups > 1 {
+                p_v.reshape((q_b, kv_h, self.num_kv_groups * q_l, actual_kv_len))?
+            } else {
+                p_v
+            };
+            let out_folded = p_folded.matmul(&v)?;
+            let out_j = if self.num_kv_groups > 1 {
+                out_folded.reshape((q_b, q_h, q_l, self.head_dim))?
+            } else {
+                out_folded
+            };
             let out_j_f32 = out_j.to_dtype(DType::F32)?;
 
             match out_res.as_ref() {
@@ -1608,6 +1633,16 @@ impl Qwen3_5TextModel {
 
         let total_layers = self.layers.len();
 
+        // [DECODE-RESIDENT] 토큰당 1회만 판정합니다. System::new()+refresh_memory()는
+        // new_all()과 달리 프로세스 목록을 스캔하지 않아 비용이 무시할 수준입니다.
+        let keep_resident = if is_decoding {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            sys.available_memory() > 6_000_000_000
+        } else {
+            false
+        };
+
         for l_idx in 0..total_layers {
             // 가중치가 비워져 있을 때만 Mmap 로드! 
             if self.layers[l_idx].is_cleared() {
@@ -1690,7 +1725,10 @@ impl Qwen3_5TextModel {
 
                 layer.set_ssm_dirty(is_dirty_backup); 
             }
-            layer.clear_weights();
+            // [DECODE-RESIDENT] 디코딩 시 매 토큰 mmap→heap 가중치 복사(레이어 수 × 토큰 수)를 제거합니다.
+            if !keep_resident {
+                layer.clear_weights();
+            }
 
             
             if is_decoding {

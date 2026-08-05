@@ -134,7 +134,8 @@ For EVERY extracted field, wrap it in an operator object:
 
 [OUTPUT FORMAT]
 { "<property_name>": { "operator": "...", "value": "..." } }
-JSON ONLY. NO EXPLANATION. /no_think"###;
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
 }
@@ -155,7 +156,9 @@ Current Language: {LANGUAGE}
 3. Extract all visible barcodes into an array.
 
 [OUTPUT FORMAT]
-{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }"###;
+{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
         template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
     } else {
         String::new()
@@ -179,19 +182,7 @@ Locate the main table wrapper, its body container, and its corresponding header 
 4. Provide the final exact CSS selector for the `thead` based on your analysis within that table wrapper.
 
 [OUTPUT FORMAT]
-{
-  "{TYPE}" : {
-    "tbody" : {
-      "selector" : "{ITEM_SELECTOR}"
-    },
-    "table" : {
-        "selector" : String
-    },
-    "thead" : {
-      "selector" : String
-    }
-  }
-}
+{ "{TYPE}" : { "tbody" : { "selector" : "{ITEM_SELECTOR}" }, "table" : { "selector" : "..." }, "thead" : { "selector" : "..." } } }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
