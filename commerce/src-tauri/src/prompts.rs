@@ -779,20 +779,23 @@ Text: "{TEXT}"
             .replace("{CANDIDATES}", &cands_str)
 }
 
+
+
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
-        dynamic_output_keys.push_str(&format!("  \"{}\": \"...\",\n", key.trim()));
+        dynamic_output_keys.push_str(&format!("  \"{}\": <an EXACT literal substring copied from [TARGET DATA], or null>,\n", key.trim()));
     }
     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
+
     let template = r###"[TASK]
-Analyze the provided concentrated context and extract specific properties into a JSON object.
+Extract ONE property set from the given data. You are a strict copier, not a writer.
 
 [CONTEXT]
 Page Type: {TYPE}
-Language: {LANGUAGE}
-Metadata: {METADATA}
+Output Language: {LANGUAGE}
+Column labels present in this block (these are LABELS, never values): {METADATA}
 
 [SCHEMA DEFINITIONS]
 {FIELDS}
@@ -800,12 +803,19 @@ Metadata: {METADATA}
 [TARGET DATA]
 {TARGET_DATA}
 
-[EXTRACTION RULES]
-1. Return ONLY valid JSON containing the requested keys.
-2. If the field is completely missing in the data, use null.
-3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
-4. Extract only numeric values for price, amount, weight, and dimensions.
-5. Do NOT make up data. Only extract what is present in the context.
+[SELECTION RULES]
+1. The value MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, pad, or re-type it.
+2. NEVER return a string that appears in the column labels list above. A label is the question, not the answer.
+3. NEVER return a format placeholder or a schema hint. Strings like "yyyy-MM-ddThh:mm:ss", "YYYY-MM-DD", "string", "number", "boolean", "...", "N/A", "none" are ALWAYS wrong. If no real literal exists, return null.
+4. If [VECTOR MATCH RESULT] is present, the text AFTER the '|' on that line is the primary candidate. Verify it fits the schema; if it does not, return null.
+5. If [ALREADY CLAIMED VALUES] is present, those values belong to OTHER columns. You MUST NOT return any of them.
+6. If [LINK CANDIDATES] or [DATE CANDIDATES] is present, the answer MUST be one of the listed literals or null. Never invent one.
+7. SHAPE RULES. The answer must physically look like what the field is:
+   - A date field REQUIRES a real date literal with separators (e.g. "26-03-15", "2026/05/20"). A bare number such as "9", "10", "615600" is NEVER a date. Return null instead.
+   - A tracking number REQUIRES a code of 8 characters or more. A row index such as "1", "10", "11" is NEVER a tracking number. Return null instead.
+   - A name, title, or product field REQUIRES letters. A bare number such as "1" or "35000" is NEVER a name or a title. Return null instead.
+   - When "id" and "link" are asked together, the link MUST literally contain the id. If no listed link contains the id, return null for the link.
+8. Returning null is always better than guessing. An absent field is correct data; a wrong field is corrupted data.
 
 [OUTPUT FORMAT]
 {
@@ -822,7 +832,54 @@ Metadata: {METADATA}
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
-pub fn column_mapping_prompt(field_name: &str, field_desc: &str, items: &str) -> String {
+// 🌟 [NEW] insight / summary / analysis 계열 합성 필드 전용 프롬프트.
+// 기존 extract_single_field_prompt 는 "리터럴 복사" 지시라, 합성 필드에 쓰면
+// LLM 이 어쩔 수 없이 셀 하나("89000", "본사")를 그대로 뱉게 됩니다.
+// 또한 원문 언어(doc_lang)를 명시적으로 전달하여, 한국어 문서에서도
+// 고유명사/코드/숫자는 원문 그대로 보존하고 문장만 영어로 합성하도록 강제합니다.
+pub fn extract_synthesis_field_prompt(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str) -> String {
+    let mut dynamic_output_keys = String::new();
+    for key in field_name.split(',') {
+        dynamic_output_keys.push_str(&format!("  \"{}\": <one sentence written by you, or null>,\n", key.trim()));
+    }
+    let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
+
+    let template = r###"[TASK]
+Write ONE analytic sentence for the requested field. This field is a SUMMARY you compose, not a value you copy.
+
+[CONTEXT]
+Page Type: {TYPE}
+Source Document Language: {DOC_LANG}
+
+[SCHEMA DEFINITIONS]
+{FIELDS}
+
+[SOURCE DATA]
+{SOURCE_DATA}
+
+[WRITING RULES]
+1. Read ALL of [SOURCE DATA] before writing. NEVER answer with a single cell value such as a bare number, a status word, a person name, a branch name, or a column label.
+2. The sentence MUST combine at least two different facts taken from [SOURCE DATA].
+3. Do NOT invent facts. Only restate and connect what is present in [SOURCE DATA].
+4. Keep every proper noun, product name, code, identifier, and number EXACTLY as written in [SOURCE DATA]. Never translate, transliterate, or reformat them, whatever the source language is.
+5. Write the connecting sentence in English, while keeping the copied literals in their original script.
+6. If [SOURCE DATA] has no usable content for this field, return null. A null summary is correct; a fabricated one is corrupted data.
+
+[OUTPUT FORMAT]
+{
+{DYNAMIC_KEYS}
+}
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{DOC_LANG}", doc_lang)
+            .replace("{FIELDS}", field_desc)
+            .replace("{SOURCE_DATA}", source_data)
+            .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
+}
+
+pub fn column_mapping_prompt(field_name: &str, field_desc: &str, items: &str, competitors: &str) -> String {
     let template = r###"[TASK]
 Identify the most appropriate numbered item for the given schema field based on its context.
 If no item is suitable for this field, return 0.
@@ -830,6 +887,11 @@ If no item is suitable for this field, return 0.
 [SCHEMA FIELD]
 Name: {FIELD_NAME}
 Description: {FIELD_DESC}
+
+[COMPETING FIELDS]
+These other schema fields are extracted separately from the SAME candidate list.
+If a candidate item fits one of these competing fields better than it fits "{FIELD_NAME}", you MUST return 0.
+{COMPETITORS}
 
 [CANDIDATE ITEMS]
 {ITEMS}
@@ -843,6 +905,7 @@ Description: {FIELD_DESC}
 
     template.replace("{FIELD_NAME}", field_name)
             .replace("{FIELD_DESC}", field_desc)
+            .replace("{COMPETITORS}", competitors)
             .replace("{ITEMS}", items)
 }
 
