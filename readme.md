@@ -4,15 +4,15 @@
 
 This project integrates and extends the following open-source works:
 
-| Component | Project | License |
+| Project | Component | License |
 |-----------|---------|---------|
-| Multimodal | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | Apache-2.0 |
-| Language Model | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Apache-2.0 |
-| Language Model | [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Apache-2.0 |
-| Embedding Model | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Apache-2.0 |
-| NLP Model | [stanfordnlp](https://huggingface.co/stanfordnlp) | Apache-2.0 |
-| Qwen Inference Engine | [jhqxxx/aha](https://github.com/jhqxxx/aha) | Apache-2.0 |
-| Granite Inference Engine | [ericlbuehler/mistral.rs](https://github.com/ericlbuehler/mistral.rs) | MIT |
+| [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | Multimodal | Apache-2.0 |
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Language Model | Apache-2.0 |
+| [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Language Model | Apache-2.0 |
+| [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Embedding Model | Apache-2.0 |
+| [stanfordnlp](https://huggingface.co/stanfordnlp) | NLP Model | Apache-2.0 |
+| [jhqxxx/aha](https://github.com/jhqxxx/aha) | Qwen Inference Engine | Apache-2.0 |
+| [ericlbuehler/mistral.rs](https://github.com/ericlbuehler/mistral.rs) | Granite Inference Engine | MIT |
 
 ---
 
