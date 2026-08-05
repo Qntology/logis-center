@@ -14,9 +14,7 @@ Based on the provided Pug template, identify the primary category.
 - language: ISO 639-1 language code.
 
 [OUTPUT FORMAT]
-{
-    "type": "String"
-}"###.to_string() 
+{ "type": "String" }"###.to_string() 
 }
 
 pub fn extract_titles_prompt(page_type: &str) -> String {
@@ -34,12 +32,10 @@ pub fn extract_titles_prompt(page_type: &str) -> String {
 Find all the {TITLES} from the following PUG/HTML content.
 
 [SCHEMA DEFINITIONS]
-{ 
-  {CATEGORY} : ["{TITLE}"]
-}
+{ {CATEGORY}: ["{TITLE}"] }
 
 [OUTPUT FORMAT]
-{ {CATEGORY} : [...] }
+{ {CATEGORY}: [...] }
 
 RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -182,7 +178,7 @@ Locate the main table wrapper, its body container, and its corresponding header 
 4. Provide the final exact CSS selector for the `thead` based on your analysis within that table wrapper.
 
 [OUTPUT FORMAT]
-{ "{TYPE}" : { "tbody" : { "selector" : "{ITEM_SELECTOR}" }, "table" : { "selector" : "..." }, "thead" : { "selector" : "..." } } }
+{ "{TYPE}": { "tbody": { "selector": "{ITEM_SELECTOR}" }, "table": { "selector": "..." }, "thead": { "selector": "..." } } }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -267,16 +263,7 @@ Read the entire document from top to bottom, applying the following strict filte
     - has_form: Boolean. True if the main data payload is heavily composed of data entry fields (text, select, radio, file uploads) dedicated to creating or updating a single entity.
 
 [OUTPUT FORMAT]
-{
-  "{TYPE}": {
-    "has_header": Boolean,
-    "title": String,
-    "has_footer": Boolean,
-    "language": String,
-    "has_list": Boolean,
-    "has_form": Boolean
-  }
-}
+{ "{TYPE}": { "has_header": Boolean, "title": String, "has_footer": Boolean, "language": String, "has_list": Boolean, "has_form": Boolean } }
 
 JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     
@@ -312,11 +299,7 @@ pub fn para2graph(language: &str) -> String {
     * '': If none logically apply.
 
 [OUTPUT FORMAT]
-{
-  "original_text": "String",
-  "segmented_plan": "String",
-  "context": [...]
-}
+{ "original_text": "String", "segmented_plan": "String", "context": [...] }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
     template.replace("{LANG}", language)
@@ -361,9 +344,7 @@ Text: "{TEXT}"
 3. If none of the candidates match, but the text explicitly mentions time, choose the best fit from [AVAILABLE TIME INTENTS]. Otherwise, return "".
 
 [OUTPUT FORMAT]
-{
-  "time_intent": "String"
-}
+{ "time_intent": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -409,9 +390,7 @@ Text: "{TEXT}"
 3. If none of the candidates match, but the text explicitly mentions a season, choose the best fit from [AVAILABLE SEASON INTENTS]. Otherwise, return "".
 
 [OUTPUT FORMAT]
-{
-  "season_intent": "String"
-}
+{ "season_intent": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -471,9 +450,7 @@ condition:
 {CURRENT}
 
 [OUTPUT FORMAT]
-{
-  "condition": condition
-}
+{ "condition": condition }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -574,9 +551,7 @@ Text: "{TEXT}"
 3. Otherwise, return "".
 
 [OUTPUT FORMAT]
-{
-  "status": "String"
-}
+{ "status": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -668,9 +643,7 @@ You MUST strictly choose ONLY from the provided array and use the Vector Matchin
   * '': If none logically apply.
 
 [OUTPUT FORMAT]
-{
-  "status": "String"
-}
+{ "status": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -718,9 +691,7 @@ Text: "{TEXT}"
 3. Otherwise, return "".
 
 [OUTPUT FORMAT]
-{
-  "substantial": "String"
-}
+{ "substantial": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -760,9 +731,7 @@ Text: "{TEXT}"
 3. Otherwise, return "".
 
 [OUTPUT FORMAT]
-{
-  "find": "String"
-}
+{ "find": "String" }
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 
@@ -801,9 +770,7 @@ Column labels (LABELS, never answers): {METADATA}
 4. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
 
 [OUTPUT FORMAT]
-{
-{DYNAMIC_KEYS}
-}
+{ {DYNAMIC_KEYS} }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
@@ -849,9 +816,7 @@ Source Document Language: {DOC_LANG}
 6. If [SOURCE DATA] has no usable content for this field, return null. A null summary is correct; a fabricated one is corrupted data.
 
 [OUTPUT FORMAT]
-{
-{DYNAMIC_KEYS}
-}
+{ {DYNAMIC_KEYS} }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
@@ -899,7 +864,7 @@ Instructions:
 3. If none of the candidates are correct, suggest a completely different property from the schema.
 
 [OUTPUT FORMAT]
-{"suggested_property": "String"}
+{ "suggested_property": "String" }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -927,7 +892,7 @@ If the current operator is already correct, just return it.
 Valid operators: {VALID_OPS}
 
 [OUTPUT FORMAT]
-{"suggested_operator": "String"}
+{ "suggested_operator": "String" }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -962,7 +927,7 @@ Instructions:
 3. Return the best-fitting category as "suggested_category".
 
 [OUTPUT FORMAT]
-{"suggested_category": "String"}
+{ "suggested_category": "String" }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
