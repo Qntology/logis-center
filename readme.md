@@ -240,7 +240,7 @@
 
 > **"PUG Line 25 → [LAYER 3] confirmed as goods → [LAYER 4] confirmed as List → [LAYER 6] passed Format/Centering/LLM Reject gates → [LAYER 7] 4 field values + 2 synthesized sentences landed in baskets"**
 
-⚠️ **This board is a probability game.**
+### ⚠️ **This board is a probability game.**
 > Vector matching and LLM extraction only place the ball into the "most plausible basket" —
 > they do not guarantee a correct answer. Only the FORMAT GATE physically bounces out wrong balls.
 > Misassignments that slip through (e.g., "진열" → currency) are saved to the DB as-is.
