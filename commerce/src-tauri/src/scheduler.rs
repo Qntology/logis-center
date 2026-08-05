@@ -20,7 +20,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, FieldFormat};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, FieldFormat};
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
@@ -2950,116 +2950,76 @@ async fn process_task(
             let mut header_to_field_map = std::collections::HashMap::new();
 
             if !unique_headers.is_empty() {
-                let mut items_str = String::new();
-                for (idx, h_text) in unique_headers.iter().enumerate() {
-                    items_str.push_str(&format!("{}. {}\n", idx + 1, h_text));
-                }
-
-                let header_embs_for_gate: Vec<Vec<f32>> = model
+                // 🌟 [HEADER COSINE MAP] LLM 컬럼 매핑을 전면 폐기하고 코사인 2회로 확정합니다.
+                //    기존 코드는 이미 한 덩어리로 합쳐진 bias_target("order status state")을 통째로
+                //    임베딩해 비교했기 때문에 구가 1개뿐이었고, 그래서 로그의 MaxPoolSim 과
+                //    CentroidSim 이 소수점 4자리까지 동일했으며 18개 헤더가 전부 탈락했습니다.
+                //    여기서는 bias.json 의 {lang}.{type}.{field} 노드를 직접 읽어
+                //    라벨 구 뱅크(semantic + 비수치 bias)와 편견 구 뱅크(prejudice)를 각각 임베딩하고
+                //    score = 라벨MaxPool - 편견MaxPool 로 판정합니다.
+                let header_embs: Vec<Vec<f32>> = model
                     .get_embedding_batch(unique_headers.clone())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_headers.len()]);
 
-                let mut field_bias_embs_for_gate: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
-                for (fname, _, bias_target, _) in &fields {
-                    let e = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                    field_bias_embs_for_gate.insert(fname.clone(), e);
+                let mut hdr_field_names: Vec<String> = Vec::new();
+                let mut hdr_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut hdr_label_weights: Vec<Vec<f32>> = Vec::new();
+                let mut hdr_prej_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+
+                for (fname, _, _, _) in &fields {
+                    let (label_phrases, label_weights) = label_phrase_bank(&doc_lang, &page_type, fname);
+                    if label_phrases.is_empty() { continue; }
+                    let prej_phrases = prejudice_phrase_bank(&doc_lang, &page_type, fname);
+
+                    let l_embs = model.get_embedding_batch(label_phrases.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; label_phrases.len()]);
+                    let p_embs = if prej_phrases.is_empty() {
+                        Vec::new()
+                    } else {
+                        model.get_embedding_batch(prej_phrases.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; prej_phrases.len()])
+                    };
+
+                    emit_term(&format!("  🏷️ [LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개", fname, label_phrases.len(), p_embs.len()));
+                    hdr_field_names.push(fname.clone());
+                    hdr_label_embs.push(l_embs);
+                    hdr_label_weights.push(label_weights);
+                    hdr_prej_embs.push(p_embs);
                 }
 
-                let mut handles = Vec::new();
-                for (fname, fdesc, _, _) in &fields {
-                    let competitors: String = fields.iter()
-                        .filter(|(other_name, _, _, _)| other_name != fname)
-                        .map(|(other_name, other_desc, _, _)| {
-                            let short_desc: String = other_desc.lines().next().unwrap_or("").trim().chars().take(120).collect();
-                            format!("- {} : {}", other_name, short_desc)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                let hdr_abs_floor = 0.62f32;
+                let hdr_score_floor = 0.10f32;
+                let hdr_margin = 0.03f32;
 
-                    let mapping_prompt = crate::parsing::column_mapping_prompt(fname, fdesc, &items_str, &competitors);
-                    let q3_gen = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    let fname_clone = fname.clone();
-                    
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        let mut gen_guard = q3_gen.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            let params = crate::openai_types::ChatCompletionParameters {
-                                messages: vec![
-                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(mapping_prompt),
-                                        name: None,
-                                    })
-                                ],
-                                model: "qwen3".to_string(), max_tokens: Some(64), temperature: Some(0.0), top_p: Some(0.95),
-                                ..Default::default()
-                            };
-                            let res = gen.generate(params, Some(cancel_clone), None, None);
-                            (fname_clone, res)
-                        } else {
-                            (fname_clone, Err(anyhow::anyhow!("LLM Generator not available")))
+                let mut hdr_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_headers.len()]; hdr_field_names.len()];
+                for f in 0..hdr_field_names.len() {
+                    for h in 0..unique_headers.len() {
+                        if header_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                        let own = weighted_max_pool_sim(&header_embs[h], &hdr_label_embs[f], &hdr_label_weights[f]);
+                        if own < hdr_abs_floor { continue; }
+                        let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&header_embs[h], &hdr_prej_embs[f]) };
+                        let score = own - prej;
+                        if score < hdr_score_floor {
+                            emit_term(&format!("    🚫 [HEADER PREJUDICE DROP] '{}' → '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4} < {:.2}", unique_headers[h], hdr_field_names[f], own, prej, score, hdr_score_floor));
+                            continue;
                         }
-                    }));
+                        hdr_matrix[f][h] = score;
+                    }
                 }
 
-                let mut gate_claims: Vec<(String, String, f32)> = Vec::new();
-
-                for h in handles {
-                    if let Ok((fname, Ok(res_text))) = h.await {
-                        let parsed = crate::parsing::parse_json_from_llm(&res_text);
-                        if let Some(result_val) = parsed.get("result").and_then(|v| if v.is_number() { v.as_u64() } else { v.as_str().and_then(|s| s.parse::<u64>().ok()) }) {
-                            let idx = result_val as usize;
-                            if idx > 0 && idx <= unique_headers.len() {
-                                let matched_header = unique_headers[idx - 1].clone();
-
-                                let h_emb = &header_embs_for_gate[idx - 1];
-                                let f_emb = field_bias_embs_for_gate.get(&fname).cloned().unwrap_or(vec![0.0f32; 384]);
-                                let own_sim = cosine_similarity(&f_emb, h_emb);
-
-                                let mut rival_name = String::new();
-                                let mut rival_sim = 0.0f32;
-                                for (other_name, oe) in &field_bias_embs_for_gate {
-                                    if *other_name == fname { continue; }
-                                    let s = cosine_similarity(oe, h_emb);
-                                    if s > rival_sim { rival_sim = s; rival_name = other_name.clone(); }
-                                }
-
-                                if own_sim < 0.20 {
-                                    emit_term(&format!("    🚫 [THEAD-MAP VECTOR REJECT] Header '{}' → '{}' 거절. OwnSim: {:.4} < 0.20 (LLM 단독 오매핑 차단)", matched_header, fname, own_sim));
-                                    continue;
-                                }
-
-                                if rival_sim > own_sim * 1.15 {
-                                    emit_term(&format!("    🚫 [THEAD-MAP RIVAL REJECT] Header '{}' → '{}' 거절. OwnSim: {:.4} < RivalSim: {:.4} ('{}'에 더 적합)", matched_header, fname, own_sim, rival_sim, rival_name));
-                                    continue;
-                                }
-
-                                gate_claims.push((matched_header, fname, own_sim));
-                            }
+                let hdr_assign = exclusive_assign(&hdr_matrix, hdr_score_floor, hdr_margin);
+                for (f, a) in hdr_assign.iter().enumerate() {
+                    match a {
+                        Some((h, score, margin)) => {
+                            header_to_field_map.insert(unique_headers[*h].clone(), hdr_field_names[f].clone());
+                            emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}", unique_headers[*h], hdr_field_names[f], score, margin));
+                        },
+                        None => {
+                            emit_term(&format!("    ⚪ [HEADER UNMAPPED] Field '{}' | 확정 가능한 헤더 없음. 값 라인 벡터 매칭으로 폴백합니다.", hdr_field_names[f]));
                         }
                     }
                 }
-
-                gate_claims.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-                let mut claimed_headers: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for (matched_header, fname, own_sim) in gate_claims {
-                    if claimed_headers.contains(&matched_header) {
-                        emit_term(&format!("    ⚖️ [THEAD-MAP EXCLUSIVE] Header '{}' 는 이미 선점됨. '{}' (Sim: {:.4}) 매핑 포기.", matched_header, fname, own_sim));
-                        continue;
-                    }
-                    claimed_headers.insert(matched_header.clone());
-                    header_to_field_map.insert(matched_header.clone(), fname.clone());
-                    emit_term(&format!("    ✨ [THEAD-MAP] Header '{}' mapped to Schema Field '{}' (Sim: {:.4})", matched_header, fname, own_sim));
-                }
-
-
-                let q3_clear_arc = model.qwen3_generator.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                        gen.clear_kv_cache();
-                    }
-                }).await;
             }
 
             // 🌟 [ID/LINK PATTERN TRACKER] 아이템 루프 중 id/link 확정 성공 시 URL 패턴을 기억하고,
@@ -3111,10 +3071,18 @@ async fn process_task(
 
                 let item_cells = parse_pug_grid(&item_lines);
                 let mut line_enriched_texts = vec![String::new(); item_lines.len()];
+                // 🌟 [LINE OWNER] 헤더 코사인으로 확정된 컬럼이 어떤 라인을 소유하는지 기록합니다.
+                //    이 기록이 있어야 (1) 정답 셀이 노이즈 필터에 삭제되지 않고
+                //    (2) 다른 컬럼이 그 라인을 벡터로 선점하지 못합니다.
+                let mut line_owner_field: Vec<Option<String>> = vec![None; item_lines.len()];
                 
                 for cell in &item_cells {
                     let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
+                    let owner = header_to_field_map.get(h_text.trim()).cloned();
                     for &line_idx in &cell.line_indices {
+                        if let Some(o) = &owner {
+                            line_owner_field[line_idx] = Some(o.clone());
+                        }
                         let original_text = if let Some(p) = item_lines[line_idx].find('|') {
                             item_lines[line_idx][p + 1..].trim()
                         } else {
@@ -3173,11 +3141,17 @@ async fn process_task(
                                     || original_text.starts_with("div");
                                 
 
-                                if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag {
+                                let is_header_owned = line_owner_field[original_idx].is_some();
+
+                                if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag && !is_header_owned {
                                     emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
                                     item_lines[original_idx] = String::new(); 
                                 } else {
-                                    emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), original_text));
+                                    if noise_score > 0.6 && is_header_owned {
+                                        emit_term(&format!("    🛡️ [HEADER OWNED PROTECT] Item Line {}/{} : {} (NoiseScore {:.4} 이지만 '{}' 컬럼으로 코사인 확정됨)", original_idx + 1, item_lines.len(), original_text, noise_score, line_owner_field[original_idx].clone().unwrap_or_default()));
+                                    } else {
+                                        emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), original_text));
+                                    }
                                     item_embeddings[original_idx] = emb;
                                 }
                             }
@@ -3252,36 +3226,64 @@ async fn process_task(
                     }
                 }
 
+                // 🌟 [HEADER OWNED ROUTING] 헤더 코사인으로 확정된 컬럼만 처리합니다.
+                //    - enum 계열(status/payment_method 등)은 셀 값이 "취소"/"무통장" 이라 그대로 저장하면
+                //      parse_status 가 인식하지 못하므로 LLM 우회 대신 "벡터 배정 강제"로 보냅니다.
+                //    - id,link 는 결정론적 href 해석기 + URL 패턴 소급 복구가 이미 완성되어 있으므로
+                //      선점만 걸어두고 값 주입은 하지 않습니다.
+                //    - 나머지는 LLM 없이 셀 값을 그대로 확정합니다.
+                let mut header_forced_assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut header_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                let mut header_id_tokens: Vec<String> = Vec::new();
 
-                for cell in &item_cells {
-                    let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
-                    let clean_h = h_text.trim();
-                    if !clean_h.is_empty() {
-                        if let Some(best_field) = header_to_field_map.get(clean_h) {
-                            for &line_idx in &cell.line_indices {
-                                let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
-                                let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
-                                if clean_text.is_empty() || clean_text.len() < 2 { continue; }
+                for line_idx in 0..item_lines_ref.len() {
+                    let owner_field = match &line_owner_field[line_idx] {
+                        Some(o) => o.clone(),
+                        None => continue,
+                    };
+                    if item_lines_ref[line_idx].trim().is_empty() { continue; }
 
-                                let mut final_field = best_field.clone();
-                                
+                    let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
+                    let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
+                    if clean_text.is_empty() || clean_text.chars().count() < 2 { continue; }
 
-                                if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
-                                    if url_pool.contains(&clean_text.to_lowercase()) {
-                                        final_field = "id".to_string();
-                                    } else {
-                                        final_field = "code".to_string();
-                                    }
-                                }
+                    header_owned_lines.insert(line_idx);
 
-                                pre_mapped_hints.push(json!({
-                                    "target_column": final_field,
-                                    "extracted_value": clean_text
-                                }));
-                                emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' via Header '{}'", line_idx + 1, final_field, clean_h));
-                            }
+                    if is_id_link_field(&owner_field) {
+                        for tok in clean_text.split(|c: char| !c.is_alphanumeric()) {
+                            if tok.chars().count() < 6 { continue; }
+                            if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+                            if !header_id_tokens.iter().any(|t| t == tok) { header_id_tokens.push(tok.to_string()); }
                         }
+                        emit_term(&format!("    🔑 [HEADER OWNED / ID COLUMN] Item Line {} 는 '{}' 컬럼입니다. 결정론적 ID/LINK 해석기에 위임하고 타 컬럼 선점을 차단합니다.", line_idx + 1, owner_field));
+                        continue;
                     }
+
+                    let lower_owner = owner_field.to_lowercase();
+                    let needs_normalization = lower_owner.contains("status")
+                        || lower_owner.contains("payment_method")
+                        || lower_owner.contains("payment_origin")
+                        || lower_owner.contains("condition")
+                        || lower_owner.contains("currency");
+
+                    if needs_normalization {
+                        header_forced_assign.entry(owner_field.clone()).or_insert(line_idx);
+                        emit_term(&format!("    🎯 [HEADER FORCED ASSIGN] '{}' ← Item Line {} (\"{}\") | enum 정규화가 필요해 값 우회 대신 벡터 배정을 확정합니다.", owner_field, line_idx + 1, clean_text));
+                        continue;
+                    }
+
+                    if let Some(existing) = pre_mapped_hints.iter_mut().find(|h: &&mut serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str())) {
+                        let prev = existing.get("extracted_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !prev.is_empty() && prev != clean_text {
+                            existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(format!("{} {}", prev, clean_text)));
+                        }
+                    } else {
+                        pre_mapped_hints.push(json!({
+                            "target_column": owner_field.clone(),
+                            "extracted_value": clean_text
+                        }));
+                    }
+                    emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' via Header cosine", line_idx + 1, owner_field));
                 }
                 
 
@@ -3307,12 +3309,36 @@ async fn process_task(
                     emit_term(&format!("    🔑 [ID/LINK DETERMINISTIC] 식별자 '{}' 가 href '{}' 안에 실제 존재함을 확인. 해당 라인은 다른 컬럼이 선점할 수 없습니다.", det_id, det_link));
                 }
 
+                // 🌟 헤더 코사인으로 주인이 확정된 라인은 다른 컬럼의 벡터 후보에서 제외합니다.
+                for l in &header_owned_lines {
+                    det_consumed_lines.insert(*l);
+                }
+
+                // 🌟 [ID SHADOW LINE] 체크박스 label 처럼 식별자 셀의 값을 그대로 복제한 라인이 존재합니다.
+                //    (로그의 "1 | 주문번호 26031514155635" → recipient_name 오매칭 원인)
+                //    의미 비교가 아니라 "같은 식별자 토큰의 복제본"이라는 구조적 사실로 소비시킵니다.
+                if !header_id_tokens.is_empty() {
+                    let mut shadow_hits = 0usize;
+                    for (l, v) in line_values.iter().enumerate() {
+                        if v.is_empty() || det_consumed_lines.contains(&l) { continue; }
+                        let hit = v.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| header_id_tokens.iter().any(|t| t.eq_ignore_ascii_case(tok)));
+                        if hit {
+                            det_consumed_lines.insert(l);
+                            shadow_hits += 1;
+                        }
+                    }
+                    if shadow_hits > 0 {
+                        emit_term(&format!("    🧹 [ID SHADOW DROP] 식별자 컬럼 값을 복제한 라인 {}개를 다른 컬럼 후보에서 제외했습니다.", shadow_hits));
+                    }
+                }
+
                 // 🌟 [EXCLUSIVE VECTOR ASSIGNMENT + FORMAT GATE + DOUBLE CENTERING]
                 //  1) 형식 게이트 : 유사도를 재기 전에 값의 생김새부터 검증합니다. (핵심)
                 //  2) 이중 센터링 : 라인/필드 고유 베이스라인을 제거해 0.5~0.7 에 뭉친 원시값을 변별 가능하게 만듭니다.
                 //  3) 배타 배정   : 경쟁 마진이 큰 순서로 1:1 선점합니다.
                 //  4) 유일후보 폴백 : 형식 통과 후보가 딱 하나면 마진과 무관하게 확정합니다.
-                let (vector_assignment, vector_raw_matrix): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>) = {
+                let (mut vector_assignment, vector_raw_matrix): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>) = {
                     let line_count = item_lines_ref.len();
                     let field_count = field_phrase_embs.len();
                     let mut raw = vec![vec![-1.0f32; line_count]; field_count];
@@ -3362,6 +3388,17 @@ async fn process_task(
 
                     (assign, raw)
                 };
+
+                // 🌟 [HEADER OVERRIDE] enum 계열은 헤더 코사인이 확정한 컬럼을 벡터 배정보다 우선합니다.
+                //    로그의 'status ← "수량 | 1"', 'payment_method ← "총주문액 | 615600"' 이
+                //    여기서 각각 '주문상태 | 취소', '결제방법 | 무통장' 으로 교체됩니다.
+                for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
+                    if let Some(l) = header_forced_assign.get(fname) {
+                        let raw = vector_raw_matrix.get(f_i).and_then(|r| r.get(*l)).copied().unwrap_or(0.0).max(0.0);
+                        vector_assignment[f_i] = Some((*l, raw, 0.0));
+                        emit_term(&format!("    🧷 [HEADER OVERRIDE] '{}' 의 벡터 배정을 헤더 코사인 확정 컬럼(Line {})으로 교체했습니다.", fname, *l + 1));
+                    }
+                }
 
                 for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
                     match vector_assignment[f_i] {
@@ -4337,86 +4374,104 @@ async fn process_task(
             }
 
             if !text_candidates.is_empty() {
-                let mut items_str = String::new();
-                let max_candidates = text_candidates.len().min(100);
-                for list_idx in 0..max_candidates {
-                    items_str.push_str(&format!("{}. {}\n", list_idx + 1, text_candidates[list_idx].1));
+                // 🌟 [DETAIL LABEL COSINE MAP] LLM 컬럼 매핑을 폐기합니다.
+                //    디테일 문서에는 thead 가 없으므로 각 값 라인의 "직전 라벨 라인"을 헤더로 간주하고
+                //    리스트 경로와 완전히 동일한 라벨/편견 구 뱅크 코사인으로 확정합니다.
+                let mut cand_labels: Vec<String> = vec![String::new(); text_candidates.len()];
+                for ci in 0..text_candidates.len() {
+                    let cur_line = text_candidates[ci].0;
+                    for prev in (0..cur_line).rev() {
+                        let v = match pug_lines_ref[prev].find('|') {
+                            Some(p) => pug_lines_ref[prev][p + 1..].trim(),
+                            None => "",
+                        };
+                        if v.is_empty() { continue; }
+                        let cc = v.chars().filter(|c| !c.is_whitespace()).count();
+                        if cc == 0 || cc > 24 { break; }
+                        if v.chars().any(|c| c.is_ascii_digit()) { break; }
+                        cand_labels[ci] = v.to_string();
+                        break;
+                    }
                 }
 
+                let mut unique_labels: Vec<String> = Vec::new();
+                for l in &cand_labels {
+                    if l.is_empty() { continue; }
+                    if !unique_labels.contains(l) { unique_labels.push(l.clone()); }
+                }
 
-                let mut handles = Vec::new();
-                for (fname, fdesc, _, _) in &fields {
-                    let competitors: String = fields.iter()
-                        .filter(|(other_name, _, _, _)| other_name != fname)
-                        .map(|(other_name, other_desc, _, _)| {
-                            let short_desc: String = other_desc.lines().next().unwrap_or("").trim().chars().take(120).collect();
-                            format!("- {} : {}", other_name, short_desc)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                if !unique_labels.is_empty() {
+                    let label_embs: Vec<Vec<f32>> = model
+                        .get_embedding_batch(unique_labels.clone())
+                        .await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_labels.len()]);
 
-                    let mapping_prompt = crate::parsing::column_mapping_prompt(fname, fdesc, &items_str, &competitors);
-                    let q3_gen = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    let fname_clone = fname.clone();
-                    
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        let mut gen_guard = q3_gen.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            let params = crate::openai_types::ChatCompletionParameters {
-                                messages: vec![
-                                    crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                                        content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(mapping_prompt),
-                                        name: None,
-                                    })
-                                ],
-                                model: "qwen3".to_string(), max_tokens: Some(64), temperature: Some(0.0), top_p: Some(0.95),
-                                ..Default::default()
-                            };
-                            let res = gen.generate(params, Some(cancel_clone), None, None);
-                            (fname_clone, res)
+                    let mut d_field_names: Vec<String> = Vec::new();
+                    let mut d_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                    let mut d_label_weights: Vec<Vec<f32>> = Vec::new();
+                    let mut d_prej_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+
+                    for (fname, _, _, _) in &fields {
+                        let (lp, lw) = label_phrase_bank(&doc_lang, &page_type, fname);
+                        if lp.is_empty() { continue; }
+                        let pp = prejudice_phrase_bank(&doc_lang, &page_type, fname);
+                        let le = model.get_embedding_batch(lp.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; lp.len()]);
+                        let pe = if pp.is_empty() {
+                            Vec::new()
                         } else {
-                            (fname_clone, Err(anyhow::anyhow!("LLM Generator not available")))
+                            model.get_embedding_batch(pp.clone()).await
+                                .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
+                        };
+                        d_field_names.push(fname.clone());
+                        d_label_embs.push(le);
+                        d_label_weights.push(lw);
+                        d_prej_embs.push(pe);
+                    }
+
+                    let mut d_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; d_field_names.len()];
+                    for f in 0..d_field_names.len() {
+                        for h in 0..unique_labels.len() {
+                            if label_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                            let own = weighted_max_pool_sim(&label_embs[h], &d_label_embs[f], &d_label_weights[f]);
+                            if own < 0.62 { continue; }
+                            let prej = if d_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&label_embs[h], &d_prej_embs[f]) };
+                            let score = own - prej;
+                            if score < 0.10 { continue; }
+                            d_matrix[f][h] = score;
                         }
-                    }));
-                }
+                    }
 
-                for h in handles {
-                    if let Ok((best_field, Ok(res_text))) = h.await {
-                        let parsed = crate::parsing::parse_json_from_llm(&res_text);
-                        if let Some(result_val) = parsed.get("result").and_then(|v| if v.is_number() { v.as_u64() } else { v.as_str().and_then(|s| s.parse::<u64>().ok()) }) {
-                            let idx = result_val as usize;
-                            if idx > 0 && idx <= max_candidates {
-                                let clean_text = &text_candidates[idx - 1].1;
-                                let original_line_idx = text_candidates[idx - 1].0;
+                    let d_assign = exclusive_assign(&d_matrix, 0.10, 0.03);
+                    for (f, a) in d_assign.iter().enumerate() {
+                        if let Some((h, score, margin)) = a {
+                            let owner = d_field_names[f].clone();
+                            if is_id_link_field(&owner) { continue; }
 
-                                let mut final_field = best_field.clone();
-                                
+                            let lower_owner = owner.to_lowercase();
+                            let needs_normalization = lower_owner.contains("status")
+                                || lower_owner.contains("payment_method")
+                                || lower_owner.contains("payment_origin")
+                                || lower_owner.contains("condition")
+                                || lower_owner.contains("currency");
+                            if needs_normalization {
+                                emit_term(&format!("    🎯 [DETAIL LABEL COSINE MAP] Label '{}' → '{}' 확정이나 enum 정규화가 필요해 값 우회를 생략합니다. (Score: {:+.4})", unique_labels[*h], owner, score));
+                                continue;
+                            }
 
-                                if final_field == "id" || final_field == "code" || final_field == "stock_keeping_unit" {
-                                    if url_pool.contains(&clean_text.to_lowercase()) {
-                                        final_field = "id".to_string();
-                                    } else {
-                                        final_field = "code".to_string();
-                                    }
-                                }
-
+                            for ci in 0..text_candidates.len() {
+                                if cand_labels[ci] != unique_labels[*h] { continue; }
+                                let clean_text = text_candidates[ci].1.clone();
+                                if clean_text.trim().is_empty() { continue; }
                                 pre_mapped_hints.push(json!({
-                                    "target_column": final_field,
+                                    "target_column": owner.clone(),
                                     "extracted_value": clean_text
                                 }));
-                                emit_term(&format!("    🔍 [LLM-PRE-MAP] Detail Line {} mapped to '{}'", original_line_idx + 1, final_field));
+                                emit_term(&format!("    ✨ [DETAIL LABEL COSINE MAP] Label '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4} | Detail Line {}", unique_labels[*h], owner, score, margin, text_candidates[ci].0 + 1));
                             }
                         }
                     }
                 }
-
-                let q3_clear_arc = model.qwen3_generator.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                        gen.clear_kv_cache();
-                    }
-                }).await;
             }
             
 

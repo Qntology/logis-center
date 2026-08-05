@@ -784,18 +784,18 @@ Text: "{TEXT}"
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
-        dynamic_output_keys.push_str(&format!("  \"{}\": <an EXACT literal substring copied from [TARGET DATA], or null>,\n", key.trim()));
+        dynamic_output_keys.push_str(&format!("  \"{}\": <literal substring of [TARGET DATA], or null>,\n", key.trim()));
     }
     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
-
+    // 🌟 기존 7번 SHAPE RULES 전체는 detect_field_format / value_matches_format 의
+    //    사전 형식 게이트와 사후 [FORMAT REJECT] 검증이 코드로 강제하므로 프롬프트에서 제거했습니다.
     let template = r###"[TASK]
-Extract ONE property set from the given data. You are a strict copier, not a writer.
+Copy ONE property set from [TARGET DATA]. You are a copier, not a writer.
 
 [CONTEXT]
-Page Type: {TYPE}
-Output Language: {LANGUAGE}
-Column labels present in this block (these are LABELS, never values): {METADATA}
+Page Type: {TYPE} / Output Language: {LANGUAGE}
+Column labels (LABELS, never answers): {METADATA}
 
 [SCHEMA DEFINITIONS]
 {FIELDS}
@@ -803,19 +803,11 @@ Column labels present in this block (these are LABELS, never values): {METADATA}
 [TARGET DATA]
 {TARGET_DATA}
 
-[SELECTION RULES]
-1. The value MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, pad, or re-type it.
-2. NEVER return a string that appears in the column labels list above. A label is the question, not the answer.
-3. NEVER return a format placeholder or a schema hint. Strings like "yyyy-MM-ddThh:mm:ss", "YYYY-MM-DD", "string", "number", "boolean", "...", "N/A", "none" are ALWAYS wrong. If no real literal exists, return null.
-4. If [VECTOR MATCH RESULT] is present, the text AFTER the '|' on that line is the primary candidate. Verify it fits the schema; if it does not, return null.
-5. If [ALREADY CLAIMED VALUES] is present, those values belong to OTHER columns. You MUST NOT return any of them.
-6. If [LINK CANDIDATES] or [DATE CANDIDATES] is present, the answer MUST be one of the listed literals or null. Never invent one.
-7. SHAPE RULES. The answer must physically look like what the field is:
-   - A date field REQUIRES a real date literal with separators (e.g. "26-03-15", "2026/05/20"). A bare number such as "9", "10", "615600" is NEVER a date. Return null instead.
-   - A tracking number REQUIRES a code of 8 characters or more. A row index such as "1", "10", "11" is NEVER a tracking number. Return null instead.
-   - A name, title, or product field REQUIRES letters. A bare number such as "1" or "35000" is NEVER a name or a title. Return null instead.
-   - When "id" and "link" are asked together, the link MUST literally contain the id. If no listed link contains the id, return null for the link.
-8. Returning null is always better than guessing. An absent field is correct data; a wrong field is corrupted data.
+[RULES]
+1. The answer MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, or re-type it.
+2. Never answer with a column label, a format placeholder ("yyyy-MM-ddThh:mm:ss", "string", "...", "N/A"), or a value listed under [ALREADY CLAIMED VALUES].
+3. If [VECTOR MATCH RESULT], [LINK CANDIDATES] or [DATE CANDIDATES] is given, the answer MUST come from it.
+4. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
 
 [OUTPUT FORMAT]
 {
@@ -877,36 +869,6 @@ Source Document Language: {DOC_LANG}
             .replace("{FIELDS}", field_desc)
             .replace("{SOURCE_DATA}", source_data)
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
-}
-
-pub fn column_mapping_prompt(field_name: &str, field_desc: &str, items: &str, competitors: &str) -> String {
-    let template = r###"[TASK]
-Identify the most appropriate numbered item for the given schema field based on its context.
-If no item is suitable for this field, return 0.
-
-[SCHEMA FIELD]
-Name: {FIELD_NAME}
-Description: {FIELD_DESC}
-
-[COMPETING FIELDS]
-These other schema fields are extracted separately from the SAME candidate list.
-If a candidate item fits one of these competing fields better than it fits "{FIELD_NAME}", you MUST return 0.
-{COMPETITORS}
-
-[CANDIDATE ITEMS]
-{ITEMS}
-
-[OUTPUT FORMAT]
-{
-  "result": Number
-}
-
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
-
-    template.replace("{FIELD_NAME}", field_name)
-            .replace("{FIELD_DESC}", field_desc)
-            .replace("{COMPETITORS}", competitors)
-            .replace("{ITEMS}", items)
 }
 
 pub fn verify_property_mapping_prompt(text: &str, property: &str) -> String {
