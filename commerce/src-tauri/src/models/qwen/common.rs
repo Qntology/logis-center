@@ -508,46 +508,22 @@ pub fn decoding_attention_parallel(
 
     // [CRITICAL FIX] 루프 내부에서 매번 발생하던 query_states의 형변환을 루프 밖으로 빼내 GPU 스톨을 제거합니다!
     let q_aligned = query_states.to_dtype(key_states.dtype())?;
-    // [GQA-FOLD] 디코딩(q_len=1)에서도 Q 헤드 축을 접어 KV 헤드 수 불일치를 해소합니다.
-    let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
-    let kv_h = key_states.dim(1)?;
-    let groups = q_h / kv_h.max(1);
-    let q_work = if groups > 1 {
-        q_aligned.reshape((q_b, kv_h, groups * q_l, q_d))?
-    } else {
-        q_aligned.clone()
-    };
+
     for i in 0..num_chunks {
         let start = i * chunk_size;
         let end = (start + chunk_size).min(kv_seq_len);
-        let chunk_len = end - start;
-        let k_chunk = key_states.narrow(2, start, chunk_len)?;
-        let v_chunk = value_states.narrow(2, start, chunk_len)?;
-        // [GQA-FOLD] q_work로 matmul → [b, kv_h, groups*q_l, chunk_len]
-        let attn_folded = (q_work.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
-        let mut attn_weights = if groups > 1 {
-            attn_folded.reshape((q_b, q_h, q_l, chunk_len))?
-        } else {
-            attn_folded
-        };
+        let k_chunk = key_states.narrow(2, start, end - start)?;
+        let v_chunk = value_states.narrow(2, start, end - start)?;
+
+        let attn_weights = (q_aligned.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
         let max_logits = attn_weights.max_keepdim(D::Minus1)?;
         let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-        // [GQA-FOLD] P @ V
-        let p_v = exp_weights.to_dtype(v_chunk.dtype())?.contiguous()?;
-        let p_folded = if groups > 1 {
-            p_v.reshape((q_b, kv_h, groups * q_l, chunk_len))?
-        } else {
-            p_v
-        };
-        let out_folded = p_folded.matmul(&v_chunk)?;
-        let out_chunk = if groups > 1 {
-            out_folded.reshape((q_b, q_h, q_l, q_d))?
-        } else {
-            out_folded
-        };
+        
+        let out_chunk = exp_weights.to_dtype(v_chunk.dtype())?.matmul(&v_chunk)?;
         // [OPTIMIZATION] log()를 취하지 않고 가중치 합(sum_exp)과 max_logits만 보관
-        let exp_sum_val = sum_exp;
+        let exp_sum_val = sum_exp; 
+
         chunk_outputs.push(out_chunk);
         chunk_logsumexp.push((exp_sum_val, max_logits)); // 튜플 형태로 저장
     }
@@ -595,61 +571,45 @@ pub fn block_wise_attention(
         query_states.clone()
     };
 
-    // [GQA-FOLD-PREP] 루프 진입 전 Q를 한 번만 접습니다.
-    let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
-    let kv_h = if !k_blocks.is_empty() { k_blocks[0].dim(1)? } else { q_h };
-    let q_folded = if num_kv_groups > 1 {
-        q_aligned.reshape((q_b, kv_h, num_kv_groups * q_l, q_d))?
-    } else {
-        q_aligned.clone()
-    };
     for (k_block, v_block) in k_blocks.iter().zip(v_blocks.iter()) {
         let block_len = k_block.dim(2)?;
-        // [GQA-FOLD] K/V 물리 복제 제거. q_folded가 이미 접혀 있으므로 그대로 matmul.
-        let k = k_block.contiguous()?;
-        let v = v_block.contiguous()?;
-        // Attn Scores: Q_folded @ K^T → [b, kv_h, groups*q_l, block_len]
-        let attn_folded = (q_folded.matmul(&k.transpose(2, 3)?)? * scaling)?;
-        // [UNFOLD] 마스크 적용을 위해 원래 헤드 배열로 복원
-        let mut attn_weights = if num_kv_groups > 1 {
-            attn_folded.reshape((q_b, q_h, q_l, block_len))?
-        } else {
-            attn_folded
-        };
+        // GQA support: repeat KV heads if needed
+        let (mut k, mut v) = (k_block.clone(), v_block.clone());
+        if num_kv_groups > 1 {
+            let (b, h, s, d) = k.dims4()?;
+            k = k.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
+            v = v.unsqueeze(2)?.expand((b, h, num_kv_groups, s, d))?.reshape((b, h * num_kv_groups, s, d))?;
+        }
+
+        // Attn Scores: Q @ K^T
+        let mut attn_weights = (q_aligned.matmul(&k.transpose(2, 3)?)? * scaling)?;
+
         // Apply Mask if present
         if let Some(mask) = attention_mask {
             let m_len = mask.dim(D::Minus1)?;
             if current_kv_offset < m_len {
                 let take = (m_len - current_kv_offset).min(block_len);
                 let m_sub = mask.narrow(D::Minus1, current_kv_offset, take)?;
+                
                 if take < block_len {
                     let left_masked = attn_weights.narrow(D::Minus1, 0, take)?
                         .broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
                     let right_unmasked = attn_weights.narrow(D::Minus1, take, block_len - take)?;
+                    
                     attn_weights = Tensor::cat(&[&left_masked, &right_unmasked], D::Minus1)?;
                 } else {
                     attn_weights = attn_weights.broadcast_add(&m_sub.to_dtype(attn_weights.dtype())?)?;
                 }
             }
         }
+
         // Online Softmax Logic (Safe Softmax)
         let attn_weights_f32 = attn_weights.to_dtype(DType::F32)?;
         let max_logits = attn_weights_f32.max_keepdim(D::Minus1)?;
         let exp_weights = attn_weights_f32.broadcast_sub(&max_logits)?.exp()?;
         let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
-        // [GQA-FOLD] P @ V: 접어서 곱한 뒤 복원
-        let p_v = exp_weights.to_dtype(v.dtype())?.contiguous()?;
-        let p_folded = if num_kv_groups > 1 {
-            p_v.reshape((q_b, kv_h, num_kv_groups * q_l, block_len))?
-        } else {
-            p_v
-        };
-        let out_folded = p_folded.matmul(&v)?;
-        let out_block = if num_kv_groups > 1 {
-            out_folded.reshape((q_b, q_h, q_l, q_d))?
-        } else {
-            out_folded
-        };
+        
+        let out_block = exp_weights.to_dtype(v.dtype())?.matmul(&v)?;
 
         if let (Some(prev_out), Some(prev_max), Some(prev_sum)) = (final_out, max_logits_acc, sum_exp_acc) {
             let new_max = prev_max.broadcast_maximum(&max_logits)?;
