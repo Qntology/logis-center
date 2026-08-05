@@ -779,20 +779,23 @@ Text: "{TEXT}"
             .replace("{CANDIDATES}", &cands_str)
 }
 
+
+
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
-        dynamic_output_keys.push_str(&format!("  \"{}\": \"...\",\n", key.trim()));
+        dynamic_output_keys.push_str(&format!("  \"{}\": <literal substring of [TARGET DATA], or null>,\n", key.trim()));
     }
     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
+    // 🌟 기존 7번 SHAPE RULES 전체는 detect_field_format / value_matches_format 의
+    //    사전 형식 게이트와 사후 [FORMAT REJECT] 검증이 코드로 강제하므로 프롬프트에서 제거했습니다.
     let template = r###"[TASK]
-Analyze the provided concentrated context and extract specific properties into a JSON object.
+Copy ONE property set from [TARGET DATA]. You are a copier, not a writer.
 
 [CONTEXT]
-Page Type: {TYPE}
-Language: {LANGUAGE}
-Metadata: {METADATA}
+Page Type: {TYPE} / Output Language: {LANGUAGE}
+Column labels (LABELS, never answers): {METADATA}
 
 [SCHEMA DEFINITIONS]
 {FIELDS}
@@ -800,12 +803,11 @@ Metadata: {METADATA}
 [TARGET DATA]
 {TARGET_DATA}
 
-[EXTRACTION RULES]
-1. Return ONLY valid JSON containing the requested keys.
-2. If the field is completely missing in the data, use null.
-3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
-4. Extract only numeric values for price, amount, weight, and dimensions.
-5. Do NOT make up data. Only extract what is present in the context.
+[RULES]
+1. The answer MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, or re-type it.
+2. Never answer with a column label, a format placeholder ("yyyy-MM-ddThh:mm:ss", "string", "...", "N/A"), or a value listed under [ALREADY CLAIMED VALUES].
+3. If [VECTOR MATCH RESULT], [LINK CANDIDATES] or [DATE CANDIDATES] is given, the answer MUST come from it.
+4. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
 
 [OUTPUT FORMAT]
 {
@@ -822,28 +824,51 @@ Metadata: {METADATA}
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
-pub fn column_mapping_prompt(field_name: &str, field_desc: &str, items: &str) -> String {
+// 🌟 [NEW] insight / summary / analysis 계열 합성 필드 전용 프롬프트.
+// 기존 extract_single_field_prompt 는 "리터럴 복사" 지시라, 합성 필드에 쓰면
+// LLM 이 어쩔 수 없이 셀 하나("89000", "본사")를 그대로 뱉게 됩니다.
+// 또한 원문 언어(doc_lang)를 명시적으로 전달하여, 한국어 문서에서도
+// 고유명사/코드/숫자는 원문 그대로 보존하고 문장만 영어로 합성하도록 강제합니다.
+pub fn extract_synthesis_field_prompt(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str) -> String {
+    let mut dynamic_output_keys = String::new();
+    for key in field_name.split(',') {
+        dynamic_output_keys.push_str(&format!("  \"{}\": <one sentence written by you, or null>,\n", key.trim()));
+    }
+    let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
+
     let template = r###"[TASK]
-Identify the most appropriate numbered item for the given schema field based on its context.
-If no item is suitable for this field, return 0.
+Write ONE analytic sentence for the requested field. This field is a SUMMARY you compose, not a value you copy.
 
-[SCHEMA FIELD]
-Name: {FIELD_NAME}
-Description: {FIELD_DESC}
+[CONTEXT]
+Page Type: {TYPE}
+Source Document Language: {DOC_LANG}
 
-[CANDIDATE ITEMS]
-{ITEMS}
+[SCHEMA DEFINITIONS]
+{FIELDS}
+
+[SOURCE DATA]
+{SOURCE_DATA}
+
+[WRITING RULES]
+1. Read ALL of [SOURCE DATA] before writing. NEVER answer with a single cell value such as a bare number, a status word, a person name, a branch name, or a column label.
+2. The sentence MUST combine at least two different facts taken from [SOURCE DATA].
+3. Do NOT invent facts. Only restate and connect what is present in [SOURCE DATA].
+4. Keep every proper noun, product name, code, identifier, and number EXACTLY as written in [SOURCE DATA]. Never translate, transliterate, or reformat them, whatever the source language is.
+5. Write the connecting sentence in English, while keeping the copied literals in their original script.
+6. If [SOURCE DATA] has no usable content for this field, return null. A null summary is correct; a fabricated one is corrupted data.
 
 [OUTPUT FORMAT]
 {
-  "result": Number
+{DYNAMIC_KEYS}
 }
 
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
-    template.replace("{FIELD_NAME}", field_name)
-            .replace("{FIELD_DESC}", field_desc)
-            .replace("{ITEMS}", items)
+    template.replace("{TYPE}", page_type)
+            .replace("{DOC_LANG}", doc_lang)
+            .replace("{FIELDS}", field_desc)
+            .replace("{SOURCE_DATA}", source_data)
+            .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
 pub fn verify_property_mapping_prompt(text: &str, property: &str) -> String {
