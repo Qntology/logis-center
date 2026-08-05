@@ -178,17 +178,17 @@ Locate the main table wrapper, its body container, and its corresponding header 
 3. The `tbody` selector is exactly "{ITEM_SELECTOR}". Return it as provided.
 4. Provide the final exact CSS selector for the `thead` based on your analysis within that table wrapper.
 
-[Expected Output Format]
+[OUTPUT FORMAT]
 {
   "{TYPE}" : {
     "tbody" : {
       "selector" : "{ITEM_SELECTOR}"
     },
     "table" : {
-        "selector" : "..."
+        "selector" : String
     },
     "thead" : {
-      "selector" : "..."
+      "selector" : String
     }
   }
 }

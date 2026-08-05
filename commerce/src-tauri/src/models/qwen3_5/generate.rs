@@ -1046,7 +1046,7 @@ impl Qwen3_5GenerateModel {
             
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             println!("[PREFILL-WAIT] Waiting for SSD write to complete...");
-            crate::models::qwen::generate::drain_global_io().await;
+            crate::models::qwen::generate::wait_for_global_io().await;
             println!("[PREFILL-SAVE] Confirm: Qwen 3.5 Base Context prefilled and safely flushed to disk. ({} tokens)", safe_toks);
         }
 

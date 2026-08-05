@@ -711,19 +711,9 @@ impl QuantizedQwenVLTextAttention {
         let mut out_res: Option<Tensor> = None;
         let mut m_n: Option<Tensor> = None;
         let mut l_n: Option<Tensor> = None;
-
+        
+        
         let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
-
-        // [GQA-FOLD] K/V를 groups배로 물리 복제하는 대신 Q의 head 축을 접습니다.
-        // 메모리 레이아웃 [b][H][q_len][d] == [b][kv_h][groups][q_len][d] 이므로
-        // reshape은 복사 없는 메타데이터 조작으로 끝납니다.
-        let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
-        let kv_h = self.num_key_value_heads;
-        let q_folded = if self.num_kv_groups > 1 {
-            q_aligned.reshape((q_b, kv_h, self.num_kv_groups * q_l, q_d))?
-        } else {
-            q_aligned.clone()
-        };
 
         for block in &self.kv_blocks {
             let (index, b_off, _b_len) = {
@@ -801,9 +791,6 @@ impl QuantizedQwenVLTextAttention {
                                             break;
                                         }
                                     }
-                                } else {
-                                    // [NO-BLOCKING-WAIT] 존재하지 않는 경로 후보에 대한 5ms×3 대기를 제거합니다.
-                                    break;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(5));
                             }
@@ -812,13 +799,7 @@ impl QuantizedQwenVLTextAttention {
                     }
                     
                     let fallback_shape = vec![1, self.num_key_value_heads, _b_len, self.head_dim];
-
-                    // [DIAG] zeros 폴백은 곧 "문맥 소실"입니다. 무음 처리하지 말고 반드시 노출시킵니다.
-                    if k_cpu.is_none() {
-                        println!("[KV-MISS] layer {} block off={} 재로딩 실패 → zeros 폴백 (문맥 손실 발생)",
-                            self.layer_idx, b_off);
-                    }
-
+                    
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     
@@ -835,21 +816,23 @@ impl QuantizedQwenVLTextAttention {
             };
 
             // [STEP B] Online Softmax for this Chunk
-            let k = k_block.contiguous()?;
-            let v = v_block.contiguous()?;
+            let mut k = k_block;
+            let mut v = v_block;
+
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+
+            k = k.contiguous()?;
+            v = v.contiguous()?;
 
             let actual_kv_len = k.dim(2)?;
-
-            // [ZERO-COPY-T] candle의 CUDA matmul은 transpose 뷰를 cuBLAS OP_T로 직접 처리합니다.
-            // .contiguous()를 붙이면 K 전체를 한 번 더 복사하므로 제거합니다.
-            let k_t = k.transpose(2, 3)?;
-
-            let s_folded = (q_folded.matmul(&k_t)? * self.scaling)?;
-            let mut s_chunk = if self.num_kv_groups > 1 {
-                s_folded.reshape((q_b, q_h, q_l, actual_kv_len))?
-            } else {
-                s_folded
-            };
+            
+            let k_t = k.transpose(2, 3)?.contiguous()?; 
+            
+            let mut s_chunk = (q_aligned.matmul(&k_t)? * self.scaling)?;
 
             
             if has_dynamic_mask {
@@ -881,20 +864,8 @@ impl QuantizedQwenVLTextAttention {
             let m_j = s_chunk_f32.max_keepdim(candle_core::D::Minus1)?;
             let p_j = s_chunk_f32.broadcast_sub(&m_j)?.exp()?;
             let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
-
-            // [GQA-FOLD] P @ V 도 동일하게 접어서 계산 후 원래 head 배열로 복원합니다.
-            let p_v = p_j.to_dtype(v.dtype())?.contiguous()?;
-            let p_folded = if self.num_kv_groups > 1 {
-                p_v.reshape((q_b, kv_h, self.num_kv_groups * q_l, actual_kv_len))?
-            } else {
-                p_v
-            };
-            let out_folded = p_folded.matmul(&v)?;
-            let out_j = if self.num_kv_groups > 1 {
-                out_folded.reshape((q_b, q_h, q_l, self.head_dim))?
-            } else {
-                out_folded
-            };
+            
+            let out_j = p_j.to_dtype(v.dtype())?.matmul(&v)?;
             let out_j_f32 = out_j.to_dtype(DType::F32)?;
 
             match out_res {
@@ -2116,14 +2087,12 @@ impl QuantizedQwenVLTextModel {
                 tokio::task::yield_now().await;
             } else {
                 let _ = self.evacuate_vram_to_ram_only(layer_idx).await;
-
-                // 프리필 청크 경계에서만 동기화하여 과거 블록 VRAM을 회수합니다.
-                // 디코딩(1토큰)에서는 회수할 과거 블록이 없는데도 스톨만 발생하므로 건너뜁니다.
-                if !is_decoding {
-                    let dev = self.layers[layer_idx].device();
-                    if dev.is_cuda() {
-                        let _ = dev.synchronize();
-                    }
+                
+                
+                // 매 청크(256 토큰)마다 GPU 연산 완료를 대기하여, 과거 블록의 VRAM을 즉시 회수합니다.
+                let dev = self.layers[layer_idx].device();
+                if dev.is_cuda() {
+                    let _ = dev.synchronize();
                 }
             }
         } 
@@ -2281,24 +2250,12 @@ impl QuantizedQwenVLTextModel {
         }
 
         // 가중치 비우기 (프리필 중 메모리 안정성 확보)
+        self.layers[layer_idx].clear(); 
+        if target_device.is_cuda() { let _ = target_device.synchronize(); }
         let is_decoding = current_seq_len <= 1;
-
-        // [DECODE-RESIDENT] 디코딩 구간에서는 레이어당 연산이 O(1)이라 가중치 재적재가 전체를 지배합니다.
-        // 여유 RAM이 임계치 이상일 때만 가중치를 상주시키고, 부족하면 기존과 동일하게 즉시 비웁니다.
-        let keep_resident = if is_decoding {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            sys.available_memory() > 6_000_000_000
-        } else {
-            false
-        };
-        if !keep_resident {
-            self.layers[layer_idx].clear();
+        if !is_decoding {
+            // println!("[MEMORY-OPT] Layer {} Weights and Gradients cleared from RAM/VRAM.", layer_idx);
         }
-
-        // [NO-PER-LAYER-STALL] 레이어마다 GPU 하드 동기화를 걸면 토큰당 28회 파이프라인이 멈춥니다.
-        // 프리필에서만 유지하고 디코딩에서는 제거합니다.
-        if target_device.is_cuda() && !is_decoding { let _ = target_device.synchronize(); }
 
         if let Some(sid) = session_id {
             
@@ -2341,21 +2298,16 @@ impl QuantizedQwenVLTextModel {
             }
         }
         
-        // [TRIM-ONCE] 워킹셋 트림/malloc_trim은 OS 커널 호출입니다.
-        // 레이어마다(= 토큰당 28회) 호출하면 다음 접근에서 페이지 폴트가 다시 발생해
-        // 메모리는 안 줄고 속도만 떨어집니다. 프리필 경계에서만 수행합니다.
-        if !is_decoding {
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
         Ok(next_xs)
     }
@@ -2877,9 +2829,9 @@ impl QuantizedQwenVLTextModel {
 
         let mut last_chunk_len = 1024;
         let (_, last_st_path) = fragments.last().unwrap();
-        if let Ok(raw_content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
-            {
-                if let Ok(st) = safetensors::SafeTensors::deserialize(&raw_content) {
+        if let Ok(encrypted_content) = crate::utils::direct_loader::load_kv_block(&last_st_path.join("l0.st")) {
+            if let Ok(content) = crate::utils::crypto::decrypt_data(&encrypted_content) {
+                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                     if let Some(name) = st.names().iter().find(|n| n.contains("k_shape")) {
                         if let Ok(view) = st.tensor(name) {
                             let data = view.data();
