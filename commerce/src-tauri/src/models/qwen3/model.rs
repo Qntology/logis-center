@@ -183,9 +183,9 @@ impl Qwen3DecoderLayer {
                     location: crate::utils::resources::KvResidency::Vram,
                 },
                 _ => {
-                    let k_cpu = k_fp8.to_device(&Device::Cpu)
+                    let k_cpu = k_fp8.to_device(&candle_core::Device::Cpu)
                                      .unwrap_or_else(|_| k_fp8.clone());
-                    let v_cpu = v_fp8.to_device(&Device::Cpu)
+                    let v_cpu = v_fp8.to_device(&candle_core::Device::Cpu)
                                      .unwrap_or_else(|_| v_fp8.clone());
                     Fp8VramKVCache {
                         k_fp8: k_cpu, v_fp8: v_cpu,
