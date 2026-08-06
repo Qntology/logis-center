@@ -782,6 +782,46 @@ pub fn find_identifier_token_in_lines(lines: &[String]) -> Option<String> {
     None
 }
 
+// 🌟 [DEAD HREF] href 가 실제 페이지 이동이 아니라 자바스크립트 훅/레이어 토글인지 판정합니다.
+//    '#', '#none', '#layerSnsShare', 'javascript:...' 는 전부 UI 액션이며 실데이터 링크가 아닙니다.
+//    이 구분이 없으면 "a[href=\"#none\"] | SMS발송" 이 '링크 데이터'로 보호되어 컬럼을 오염시킵니다.
+pub fn is_dead_href(href: &str) -> bool {
+    let h = href.trim().to_ascii_lowercase();
+    if h.is_empty() { return true; }
+    if h.starts_with('#') { return true; }
+    if h.starts_with("javascript:") { return true; }
+    if h.starts_with("mailto:") || h.starts_with("tel:") { return true; }
+    false
+}
+
+// 🌟 [REAL HREF] PUG 라인이 실제 상세 페이지로 이동하는 href 를 갖고 있으면 그 값을 돌려줍니다.
+//    "a[href=\"/disp/.../ProductRegister?product_no=18\"] | 테스트상품" → Some(...)  ← 실데이터
+//    "a[href=\"#none\"] | SMS발송"                                    → None        ← UI 액션
+//    "li | 상품 상세보기"                                              → None        ← UI 액션(속성 유실)
+pub fn line_real_href(line: &str) -> Option<String> {
+    let re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for cap in re.captures_iter(line) {
+        if let Some(m) = cap.get(1) {
+            let v = m.as_str().trim();
+            if !is_dead_href(v) { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
+// 🌟 [MULTI VALUE FIELD] 값이 여러 개 이어붙어야 정상인 배열 성격의 필드인지 판정합니다.
+//    옵션/태그/구성상품만 공백 병합을 허용하고, title/name 같은 단일 값 필드는
+//    반드시 대표값 1개만 채택해야 합니다. (기존 무조건 Join 이 title 오염의 직접 원인)
+pub fn is_multi_value_field(field_name: &str) -> bool {
+    let lower = field_name.to_lowercase();
+    ["options", "tags", "goods", "additional_goods", "additional_image", "region_restrictions"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
 pub fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
     if lines.is_empty() { return String::new(); }
     let mut parent_idx = target_idx;

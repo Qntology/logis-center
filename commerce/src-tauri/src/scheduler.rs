@@ -20,7 +20,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_labeled_token_candidates, id_shape_signature, id_shape_allowed, same_host, FieldFormat};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_labeled_token_candidates, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
@@ -2714,6 +2714,14 @@ async fn process_task(
         if !pug_list.is_empty() {
             let total_items = pug_list.len();
             let mut text_frequency: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            // 🌟 [P0-1 SUBORDINATE] 같은 셀(td) 안에 "실제 상세페이지로 가는 href" 형제가 존재하는데
+            //    자신은 링크가 없는 라인 = 그 컬럼의 대표값이 아닌 종속 라인(액션 버튼 / 옵션 나열).
+            //    'li | 상품 상세보기' 와 'a[href=".../ProductRegister?product_no=18"] | 테스트상품' 이
+            //    같은 td 에 있으므로 전자는 여기서 구조적으로 확정 탈락됩니다.
+            let mut subordinate_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            // 🌟 [P0-2 DEAD ACTION] href 속성은 있으나 전부 '#', '#none', 'javascript:' 인 순수 UI 액션 버튼.
+            //    'SMS발송', 'SNS공유', '주소복사' 가 여기에 해당합니다.
+            let mut dead_action_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
             for item_pug in &pug_list {
                 let mut seen_in_this_item = std::collections::HashSet::new();
@@ -2729,6 +2737,35 @@ async fn process_task(
                 for text in seen_in_this_item {
                     *text_frequency.entry(text).or_insert(0) += 1;
                 }
+
+                let cell_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
+                let mut seen_sub = std::collections::HashSet::new();
+                let mut seen_dead = std::collections::HashSet::new();
+
+                for cell in parse_pug_grid(&cell_lines) {
+                    let has_real_link = cell.line_indices.iter()
+                        .any(|&li| line_real_href(&cell_lines[li]).is_some());
+                    if !has_real_link { continue; }
+                    for &li in &cell.line_indices {
+                        if line_real_href(&cell_lines[li]).is_some() { continue; }
+                        if let Some(p) = cell_lines[li].find('|') {
+                            let t = cell_lines[li][p + 1..].trim();
+                            if t.len() > 2 { seen_sub.insert(t.to_string()); }
+                        }
+                    }
+                }
+
+                for line in &cell_lines {
+                    if !line.contains("href=") { continue; }
+                    if line_real_href(line).is_some() { continue; }
+                    if let Some(p) = line.find('|') {
+                        let t = line[p + 1..].trim();
+                        if t.len() > 2 { seen_dead.insert(t.to_string()); }
+                    }
+                }
+
+                for t in seen_sub { *subordinate_texts.entry(t).or_insert(0) += 1; }
+                for t in seen_dead { *dead_action_texts.entry(t).or_insert(0) += 1; }
             }
 
             let mut boilerplate_texts = std::collections::HashSet::new();
@@ -2763,6 +2800,20 @@ async fn process_task(
                         let is_numeric_data = re_numeric.is_match(&text);
                         
                         if !is_numeric_data && text.len() > 3 {
+
+                            // 🌟 [P0 ACTION GATE] 벡터 유사도를 재기 '전에' 구조적 사실부터 확정합니다.
+                            //    (1) 같은 셀에 실제 이동 링크 형제가 있는데 자신은 링크가 없다 → 컬럼 대표값이 아님
+                            //    (2) href 가 '#', '#none', 'javascript:' 뿐이다 → 순수 UI 액션 버튼
+                            //    이 두 경우는 enum 유사도가 아무리 높아도 실데이터가 될 수 없습니다.
+                            //    기존에는 '상품 상세보기'(0.5135) '쇼핑몰화면 진열보기'(0.5090) 가
+                            //    ENUM VECTOR PROTECT 로 살아남아 title 을 오염시켰습니다.
+                            let sub_hits = subordinate_texts.get(&text).copied().unwrap_or(0);
+                            let dead_hits = dead_action_texts.get(&text).copied().unwrap_or(0);
+                            if sub_hits >= threshold || dead_hits >= threshold {
+                                boilerplate_texts.insert(text.clone());
+                                emit_term(&format!("[Scheduler] 🚫 [ACTION LINE DROP] 구조적으로 UI 액션/종속 라인 확정 탈락: '{}' ({} / {} 아이템 | Subordinate: {} | DeadHref: {})", text, count, total_items, sub_hits, dead_hits));
+                                continue;
+                            }
 
                             let mut enum_sim = 0.0f32;
                             if !enum_guard_embs.is_empty() {
@@ -3088,9 +3139,12 @@ async fn process_task(
                         let text_part = line[idx + 1..].trim();
                         if boilerplate_texts.contains(text_part) {
 
-                            let has_link_or_event = line.contains("href=") || line.contains("onclick") || line.contains("data-url");
+                            // 🌟 [P0] '#none' / '#' / '#layerSnsShare' / 'javascript:' 같은 죽은 href 는
+                            //    데이터 링크가 아니라 UI 액션 훅이므로 보호 대상에서 제외합니다.
+                            //    (기존 line.contains("href=") 는 'a[href="#none"] | SMS발송' 까지 보호했습니다)
+                            let has_link_or_event = line_real_href(line).is_some() || line.contains("onclick") || line.contains("data-url");
                             if has_link_or_event {
-                                emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
+                                emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (실제 이동 href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
                                 continue;
                             }
 
@@ -3305,23 +3359,58 @@ async fn process_task(
                         continue;
                     }
 
+                    // 🌟 [P1 REPRESENTATIVE VALUE] 같은 컬럼(td) 안에 액션 버튼·옵션 나열이 섞여 있어도
+                    //    실제 상세페이지로 이어지는 링크를 가진 라인 하나만 대표값으로 채택합니다.
+                    //    Rank 2 = 실제 이동 href 보유(진짜 상품명) / Rank 1 = 링크 없는 일반 셀
+                    //    Rank 0 = 죽은 href(UI 액션). 동일 랭크면 더 긴 텍스트가 승리합니다.
+                    //    기존의 무조건 공백 Join 이 'UI 버튼 + 옵션 + 상품명' 뭉침의 직접 원인이었습니다.
+                    let raw_line = item_lines_ref[line_idx];
+                    let line_rank: i32 = if line_real_href(raw_line).is_some() {
+                        2
+                    } else if raw_line.contains("href=") {
+                        0
+                    } else {
+                        1
+                    };
+
                     if let Some(existing) = pre_mapped_hints.iter_mut().find(|h: &&mut serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str())) {
                         let prev = existing.get("extracted_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        if !prev.is_empty() && prev != clean_text {
-                            existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(format!("{} {}", prev, clean_text)));
+                        let prev_rank = existing.get("line_rank").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+
+                        if is_multi_value_field(&owner_field) {
+                            if !prev.is_empty() && prev != clean_text {
+                                existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(format!("{} {}", prev, clean_text)));
+                            }
+                        } else if prev.is_empty()
+                            || line_rank > prev_rank
+                            || (line_rank == prev_rank && clean_text.chars().count() > prev.chars().count())
+                        {
+                            existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(clean_text));
+                            existing.as_object_mut().unwrap().insert("line_rank".to_string(), json!(line_rank));
+                            emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_rank, clean_text, line_rank));
+                        } else {
+                            emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 는 이미 상위 랭크 대표값(\"{}\")을 확보하여 \"{}\" (Rank {}) 는 병합하지 않습니다.", owner_field, prev, clean_text, line_rank));
                         }
                     } else {
                         pre_mapped_hints.push(json!({
                             "target_column": owner_field.clone(),
-                            "extracted_value": clean_text
+                            "extracted_value": clean_text,
+                            "line_rank": line_rank
                         }));
                     }
-                    emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' via Header cosine", line_idx + 1, owner_field));
+                    emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' (Rank {}) via Header cosine", line_idx + 1, owner_field, line_rank));
                 }
                 
 
                 let pre_mapped_context = if !pre_mapped_hints.is_empty() {
-                    serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
+                    // 🌟 line_rank 는 대표값 판정을 위한 내부 메타데이터이므로
+                    //    LLM 에게 전달되는 [ALREADY CLAIMED VALUES] 컨텍스트에서는 제거합니다.
+                    let clean_hints: Vec<serde_json::Value> = pre_mapped_hints.iter().map(|h| {
+                        let mut c = h.clone();
+                        if let Some(o) = c.as_object_mut() { o.remove("line_rank"); }
+                        c
+                    }).collect();
+                    serde_json::to_string_pretty(&clean_hints).unwrap_or_default()
                 } else {
                     String::new()
                 };
