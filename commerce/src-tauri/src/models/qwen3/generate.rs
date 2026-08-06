@@ -387,6 +387,27 @@ impl Qwen3GenerateModel {
             }
         }
 
+        // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전에 단 1회만 VRAM/RAM 여유를 계산합니다.
+        //    KV Cache 는 단조 증가하므로 "마지막 토큰까지 자랐을 때의 최대 크기"로 판정해야
+        //    디코딩 도중 OOM 이 발생하지 않습니다. 매 토큰 재확인은 불필요합니다.
+        {
+            let (kv_layers, kv_heads, head_dim) = self.qwen3.kv_geometry();
+            let plan = crate::utils::resources::plan_kv_residency(
+                &crate::utils::resources::KvPlanInput {
+                    gpu_id: crate::utils::resources::primary_gpu_id(),
+                    is_cpu_mode: self.device.is_cpu(),
+                    num_kv_layers: kv_layers,
+                    num_kv_heads: kv_heads,
+                    head_dim,
+                    // VRAM 상주 시 Fp8VramKVCache 가 FP8(1바이트)로 압축 보관합니다.
+                    bytes_per_elem: 1,
+                    planned_tokens: seqlen_offset + sample_len as usize,
+                    label: "Qwen3(0.6B) generate_part",
+                },
+            );
+            self.qwen3.set_kv_residency(plan);
+        }
+
         // 🌟 [Phase 2: Decoding] 첫 토큰을 얻은 후 1글자씩 이어서 생성합니다.
         for i in 1..sample_len {
             if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
@@ -696,6 +717,26 @@ impl Qwen3GenerateModel {
                 generate.push(next_token);
                 if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) { gen_text.push_str(&piece); }
             }
+        }
+
+        // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전에 단 1회만 VRAM/RAM 여유를 계산합니다.
+        //    VRAM 이 충분하면 FP8 캐시를 VRAM 에 그대로 두고(왕복 0회),
+        //    부족하면 RAM 으로 대피시켜 OOM 을 원천 차단합니다.
+        {
+            let (kv_layers, kv_heads, head_dim) = self.qwen3.kv_geometry();
+            let plan = crate::utils::resources::plan_kv_residency(
+                &crate::utils::resources::KvPlanInput {
+                    gpu_id: crate::utils::resources::primary_gpu_id(),
+                    is_cpu_mode: self.device.is_cpu(),
+                    num_kv_layers: kv_layers,
+                    num_kv_heads: kv_heads,
+                    head_dim,
+                    bytes_per_elem: 1,
+                    planned_tokens: seqlen_offset + sample_len as usize,
+                    label: "Qwen3(0.6B) generate",
+                },
+            );
+            self.qwen3.set_kv_residency(plan);
         }
 
         // 🌟 [Phase 2: Decoding] 첫 번째 토큰을 얻은 후 1글자씩 이어서 생성합니다.

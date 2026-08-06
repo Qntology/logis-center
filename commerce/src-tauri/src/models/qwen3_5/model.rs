@@ -706,6 +706,9 @@ pub struct Qwen3_5Attention {
     layer_idx: usize,
     pub active_session_id: Option<String>,
     pub active_kv_name: Option<String>,
+    // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 KV 블록 배치 위치.
+    //    기본값 Ssd 는 기존 동작(VRAM→RAM→SSD 연속 강등)과 100% 동일합니다.
+    pub kv_residency: crate::utils::resources::KvResidency,
     
     
     pub vram_merged_k: Option<Tensor>,
@@ -739,6 +742,7 @@ impl Qwen3_5Attention {
             layer_idx,
             active_session_id: None,
             active_kv_name: None,
+            kv_residency: crate::utils::resources::KvResidency::Ssd,
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -771,6 +775,7 @@ impl Qwen3_5Attention {
             layer_idx,
             active_session_id: None,
             active_kv_name: None,
+            kv_residency: crate::utils::resources::KvResidency::Ssd,
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -1264,6 +1269,14 @@ impl AttnKind {
             attn.is_state_dirty = dirty;
         }
     }
+
+    // 🌟 [KV RESIDENCY] full_attention 레이어에만 배치 위치를 전파합니다.
+    //    linear_attention(SSM) 레이어는 고정 크기 state 라 블록 오프로딩 대상이 아닙니다.
+    pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
+        if let AttnKind::SelfAttn(attn) = self {
+            attn.kv_residency = residency;
+        }
+    }
 }
 
 pub struct Qwen3_5DecoderLayer {
@@ -1357,6 +1370,7 @@ impl Qwen3_5DecoderLayer {
                 q_norm: dummy_norm.clone(), k_norm: dummy_norm.clone(),
                 num_attention_heads, num_key_value_heads, num_kv_groups, head_dim, scaling,
                 kv_blocks: Vec::new(), registry, layer_idx, active_session_id: None, active_kv_name: None,
+                kv_residency: crate::utils::resources::KvResidency::Ssd,
                 vram_merged_k: None, vram_merged_v: None, merged_vram_block_count: 0,
             })
         };
@@ -1440,6 +1454,11 @@ impl Qwen3_5DecoderLayer {
         self.attn.set_ssm_dirty(dirty);
     }
 
+    // 🌟 [KV RESIDENCY] 레이어 단위 배치 위치 전파 위임
+    pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
+        self.attn.set_kv_residency(residency);
+    }
+
     pub fn clear_cache(&mut self) {
         match &mut self.attn {
             AttnKind::LinearAttn(attn) => { attn.clear_cache(); }
@@ -1491,6 +1510,12 @@ impl Qwen3_5DecoderLayer {
 // ----------------------------------------------------------------------------------
 // [Qwen3_5TextModel] SSD 캐싱 관리자 연결
 // ----------------------------------------------------------------------------------
+
+/// 🌟 [KV RESIDENCY] 디코딩 진입 시 앞으로 생성할 토큰 수를 알 수 없으므로,
+/// 보수적으로 이만큼 더 자란다고 가정하고 VRAM 상주 가능 여부를 판정합니다.
+/// (scheduler.rs 의 max_tokens 는 128~512, qwen3_5 generate 기본값은 1024)
+pub const QWEN35_DECODE_HEADROOM_TOKENS: usize = 2048;
+
 pub struct Qwen3_5TextModel {
     embed_tokens: Embedding,
     pub layers: Vec<Qwen3_5DecoderLayer>,
@@ -1502,6 +1527,12 @@ pub struct Qwen3_5TextModel {
     pub current_kv_len: usize,
     pub active_session_id: Option<String>,
     pub active_kv_name: Option<String>,
+    // 🌟 [KV RESIDENCY] 디코딩 루프 진입 시 1회만 계산되는 배치 계획.
+    //    프리필 구간에서는 None 으로 무효화되어 기존 SSD 오프로딩이 그대로 유지됩니다.
+    pub kv_plan: Option<crate::utils::resources::KvResidency>,
+    // 🌟 [DECODE-RESIDENT] 가중치 상주 여부도 같은 시점에 1회만 판정하여
+    //    토큰마다 반복되던 sysinfo 호출을 제거합니다.
+    pub keep_weights_resident: bool,
     
     // Mmap 핑퐁을 위한 메타데이터 필드
     pub mmap: Option<std::sync::Arc<memmap2::Mmap>>,
@@ -1526,6 +1557,7 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section: config.rope_parameters.mrope_section.clone(), dtype: vb.dtype(),
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
+            kv_plan: None, keep_weights_resident: false,
             mmap: None, ct: None, base_name: "model".to_string(), 
         })
     }
@@ -1593,6 +1625,7 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section, dtype,
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
+            kv_plan: None, keep_weights_resident: false,
             mmap: mmap_handle, ct: ct_handle, base_name: "model".to_string(),
         })
     }
@@ -1633,15 +1666,53 @@ impl Qwen3_5TextModel {
 
         let total_layers = self.layers.len();
 
-        // [DECODE-RESIDENT] 토큰당 1회만 판정합니다. System::new()+refresh_memory()는
-        // new_all()과 달리 프로세스 목록을 스캔하지 않아 비용이 무시할 수준입니다.
-        let keep_resident = if is_decoding {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            sys.available_memory() > 6_000_000_000
+        // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전(= 첫 디코딩 토큰)에 단 1회만 판정합니다.
+        //    KV Cache 는 단조 증가하므로 "앞으로 자랄 최대치"를 기준으로 판정해야
+        //    디코딩 도중 OOM 이 터지지 않습니다. 이후 토큰에서는 캐시된 계획을 그대로 씁니다.
+        //    프리필 구간에서는 계획을 무효화하여 기존 SSD 오프로딩 경로를 100% 유지합니다.
+        let kv_residency = if is_decoding {
+            if self.kv_plan.is_none() {
+                // full_attention 레이어만 KV 블록을 보유합니다. (linear_attention 은 고정 크기 SSM state)
+                let (full_attn_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
+                let planned = seqlen_offset + seq_len + QWEN35_DECODE_HEADROOM_TOKENS;
+
+                let plan = crate::utils::resources::plan_kv_residency(
+                    &crate::utils::resources::KvPlanInput {
+                        gpu_id: crate::utils::resources::primary_gpu_id(),
+                        is_cpu_mode: xs.device().is_cpu(),
+                        num_kv_layers: full_attn_layers,
+                        num_kv_heads: kv_heads,
+                        head_dim: kv_head_dim,
+                        // Qwen3.5 는 KV 블록을 F8E4M3(1바이트)로 압축 보관합니다.
+                        bytes_per_elem: 1,
+                        planned_tokens: planned,
+                        label: "Qwen3.5(2B)",
+                    },
+                );
+
+                // 가중치 상주 여부도 같은 시점에 1회만 결정합니다.
+                self.keep_weights_resident =
+                    crate::utils::resources::free_ram_bytes() > 6_000_000_000;
+
+                self.kv_plan = Some(plan);
+
+                // 전 레이어에 배치 계획을 전파합니다.
+                for layer in self.layers.iter_mut() {
+                    layer.set_kv_residency(plan);
+                }
+            }
+            self.kv_plan.unwrap_or(crate::utils::resources::KvResidency::Ssd)
         } else {
-            false
+            self.kv_plan = None;
+            self.keep_weights_resident = false;
+            for layer in self.layers.iter_mut() {
+                layer.set_kv_residency(crate::utils::resources::KvResidency::Ssd);
+            }
+            crate::utils::resources::KvResidency::Ssd
         };
+
+        // [DECODE-RESIDENT] 디코딩 시 매 토큰 mmap→heap 가중치 복사를 제거하기 위한 상주 플래그
+        let keep_resident = self.keep_weights_resident;
 
         for l_idx in 0..total_layers {
             // 가중치가 비워져 있을 때만 Mmap 로드! 
@@ -1713,7 +1784,13 @@ impl Qwen3_5TextModel {
             xs = layer.forward(&xs, Some(&cos), Some(&sin), layer_mask.as_ref(), seqlen_offset)?;
 
             
-            if layer.layer_type == "linear_attention" {
+            // 🌟 [KV RESIDENCY - SSM] SSM state 는 토큰 수와 무관한 고정 크기(레이어 합계 약 50~100MB)입니다.
+            //    VRAM 상주가 확정된 디코딩 구간에서는 CPU 대피를 건너뛰어
+            //    매 토큰 27개 레이어 × CPU↔GPU 왕복을 통째로 제거합니다.
+            let ssm_keep_in_vram =
+                is_decoding && kv_residency == crate::utils::resources::KvResidency::Vram;
+
+            if layer.layer_type == "linear_attention" && !ssm_keep_in_vram {
                 let is_dirty_backup = layer.is_ssm_dirty(); 
                 
                 let (conv_opt, rec_opt) = layer.get_ssm_states();
@@ -1731,7 +1808,15 @@ impl Qwen3_5TextModel {
             }
 
             
-            if is_decoding {
+            // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 배치 위치에 따라 과거 블록을 처리합니다.
+            //   - Vram : 아무것도 하지 않고 과거 블록을 VRAM 에 그대로 상주시킵니다. (SSD/RAM 왕복 0회)
+            //   - Ram  : VRAM → RAM 대피까지만 수행하고 SSD 강등은 하지 않습니다.
+            //            Qwen3_5Attention::forward 가 KVLocation::RAM 블록을 to_device(dev) 로
+            //            잠깐 올려 쓰는 경로를 이미 갖고 있으므로 추가 구현 없이 동작합니다.
+            //   - Ssd  : 기존과 100% 동일하게 VRAM → RAM → SSD 로 연속 강등합니다.
+            if is_decoding && kv_residency != crate::utils::resources::KvResidency::Vram {
+                let demote_to_ssd = kv_residency == crate::utils::resources::KvResidency::Ssd;
+
                 if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                     let mut reg = attn.registry.entries.write().unwrap();
                     let total_blocks = attn.kv_blocks.len();
@@ -1758,7 +1843,14 @@ impl Qwen3_5TextModel {
                             }
                         }
 
-                        if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
+                        // 🌟 [RAM 상주 유지] RAM 여유가 확인된 경우에는 여기서 멈춥니다.
+                        //    기존 코드는 RAM 을 경유지로만 쓰고 즉시 SSD 로 버렸기 때문에
+                        //    다음 토큰마다 SSD 재읽기 경로를 반드시 다시 타야 했습니다.
+                        if demote_to_ssd
+                            && inner.location == KVLocation::RAM
+                            && idx < reg.len()
+                            && reg[idx].ssd_path.is_some()
+                        {
                             garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
                             inner.location = KVLocation::SSD;
                             
@@ -1869,11 +1961,31 @@ impl Qwen3_5TextModel {
         Ok(xs)
     }
 
+    /// 🌟 [KV RESIDENCY] KV 블록을 실제로 보유하는 full_attention 레이어의
+    /// (레이어 수, KV 헤드 수, head_dim) 을 반환합니다.
+    /// linear_attention(SSM) 레이어는 토큰 수와 무관한 고정 크기이므로 집계에서 제외합니다.
+    fn kv_plan_geometry(&self) -> (usize, usize, usize) {
+        let mut layers = 0usize;
+        let mut heads = 0usize;
+        let mut dim = 0usize;
+        for layer in self.layers.iter() {
+            if let AttnKind::SelfAttn(attn) = &layer.attn {
+                layers += 1;
+                heads = attn.num_key_value_heads;
+                dim = attn.head_dim;
+            }
+        }
+        (layers, heads, dim)
+    }
+
     pub fn clear_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_cache();
         }
         self.current_kv_len = 0;
+        // 🌟 [KV RESIDENCY] 세션이 바뀌면 배치 계획도 폐기하여 다음 디코딩에서 재판정합니다.
+        self.kv_plan = None;
+        self.keep_weights_resident = false;
     }
 
     
