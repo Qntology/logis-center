@@ -766,8 +766,9 @@ Column labels (LABELS, never answers): {METADATA}
 [RULES]
 1. The answer MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, or re-type it.
 2. Never answer with a column label, a format placeholder ("yyyy-MM-ddThh:mm:ss", "string", "...", "N/A"), or a value listed under [ALREADY CLAIMED VALUES].
-3. If [VECTOR MATCH RESULT], [LINK CANDIDATES] or [DATE CANDIDATES] is given, the answer MUST come from it.
-4. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
+3. NEVER answer with an HTML/PUG tag name.
+4. If [VECTOR MATCH RESULT], [LINK CANDIDATES] or [DATE CANDIDATES] is given, the answer MUST come from it.
+5. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
 
 [OUTPUT FORMAT]
 { {DYNAMIC_KEYS} }
