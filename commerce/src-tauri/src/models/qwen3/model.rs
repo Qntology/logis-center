@@ -165,33 +165,34 @@ impl Qwen3DecoderLayer {
 
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
-            // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F8E4M3) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
-            let k_fp8 = k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone());
-            let v_fp8 = v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone());
+            let dev = k.device();
+            let k_fp8 = if dev.is_cuda() {
+                k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone())
+            } else {
+                k.clone()
+            };
+            let v_fp8 = if dev.is_cuda() {
+                v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone())
+            } else {
+                v.clone()
+            };
 
-            // 🌟 [KV RESIDENCY] VRAM 여유가 없다고 판정된 경우 압축 직후 곧바로 RAM 으로 대피시킵니다.
-            //    FP8 변환 자체는 GPU 코어로 끝낸 뒤 옮기므로 CPU 연산 병목이 발생하지 않습니다.
             let stored = match self.kv_residency {
                 crate::utils::resources::KvResidency::Vram => Fp8VramKVCache {
-                    k_fp8,
-                    v_fp8,
+                    k_fp8, v_fp8,
                     location: crate::utils::resources::KvResidency::Vram,
                 },
                 _ => {
-                    let k_cpu = k_fp8
-                        .to_device(&candle_core::Device::Cpu)
-                        .unwrap_or_else(|_| k_fp8.clone());
-                    let v_cpu = v_fp8
-                        .to_device(&candle_core::Device::Cpu)
-                        .unwrap_or_else(|_| v_fp8.clone());
+                    let k_cpu = k_fp8.to_device(&candle_core::Device::Cpu)
+                                     .unwrap_or_else(|_| k_fp8.clone());
+                    let v_cpu = v_fp8.to_device(&candle_core::Device::Cpu)
+                                     .unwrap_or_else(|_| v_fp8.clone());
                     Fp8VramKVCache {
-                        k_fp8: k_cpu,
-                        v_fp8: v_cpu,
+                        k_fp8: k_cpu, v_fp8: v_cpu,
                         location: crate::utils::resources::KvResidency::Ram,
                     }
                 }
             };
-
             self.fp8_cache = Some(stored);
         }
         Ok(())

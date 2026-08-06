@@ -20,7 +20,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, FieldFormat};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_labeled_token_candidates, id_shape_signature, id_shape_allowed, same_host, FieldFormat};
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
@@ -3022,10 +3022,43 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [ID/LINK PATTERN TRACKER] 아이템 루프 중 id/link 확정 성공 시 URL 패턴을 기억하고,
-            //    실패한 아이템의 원시 라인을 보관합니다. 루프 종료 후 소급 복구에 사용합니다.
+            // 🌟 [ID/LINK COSINE BANK] href 후보의 "URL 상 역할 문구"와 소급 복구 후보의 "컬럼 라벨"을
+            //    코사인으로 채점하기 위한 라벨/편견 뱅크입니다.
+            //    문자열 포함(contains) 검사로는 도메인 조각 'cafe24' 와 쿼리값 '18' 을 절대 구분할 수 없습니다.
+            let (idlink_label_phrases, idlink_label_weights) = label_phrase_bank(&doc_lang, &page_type, "id,link");
+            let idlink_label_embs: Vec<Vec<f32>> = if idlink_label_phrases.is_empty() {
+                Vec::new()
+            } else {
+                model.get_embedding_batch(idlink_label_phrases.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; idlink_label_phrases.len()])
+            };
+
+            let mut idlink_prej_phrases = prejudice_phrase_bank(&doc_lang, &page_type, "id,link");
+            for extra in [
+                "host name", "domain name", "website address", "server address",
+                "cdn", "static asset", "image server", "protocol", "www",
+                "file extension", "stylesheet", "script", "anchor", "javascript",
+                "navigation menu", "layer popup",
+            ] {
+                let e = extra.to_string();
+                if !idlink_prej_phrases.contains(&e) { idlink_prej_phrases.push(e); }
+            }
+            let idlink_prej_embs: Vec<Vec<f32>> = if idlink_prej_phrases.is_empty() {
+                Vec::new()
+            } else {
+                model.get_embedding_batch(idlink_prej_phrases.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; idlink_prej_phrases.len()])
+            };
+            emit_term(&format!("  🔑 [ID/LINK COSINE BANK] 라벨 구 {}개 | 편견 구 {}개 준비 완료.", idlink_label_embs.len(), idlink_prej_embs.len()));
+
+            // 🌟 [ID/LINK PATTERN TRACKER] 아이템 루프 중 id/link 확정 성공 시 URL 패턴과
+            //    식별자 '생김새'(자릿수/숫자전용 여부), 기준 링크(호스트 검증용)를 함께 기억합니다.
+            //    실패한 아이템의 원시 라인과 라벨 라인을 보관해 루프 종료 후 소급 복구에 사용합니다.
             let mut discovered_url_pattern: Option<(String, String)> = None; // (prefix, suffix)
+            let mut pattern_reference_link: Option<String> = None;
+            let mut confirmed_id_shapes: Vec<(usize, bool)> = Vec::new();
             let mut all_item_raw_lines: Vec<Vec<String>> = Vec::new();
+            let mut all_item_labeled_lines: Vec<Vec<String>> = Vec::new();
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -3293,18 +3326,62 @@ async fn process_task(
                     String::new()
                 };
 
-                // 🌟 [DETERMINISTIC ID/LINK RESOLVER]
-                //  href 문자열 안에 실제로 박혀 있는 식별자 토큰만 id 로 채택하고, 그 href 를 link 로 확정합니다.
-                //  LLM 이 "id: 26031514155635 / link: /shop/view.php?index_no=7" 처럼
-                //  서로 무관한 값을 짝지어 반환하던 문제가 구조적으로 사라집니다.
-                let det_id_link = resolve_id_link_from_lines(&item_lines_ref);
+                // 🌟 [COSINE ID/LINK RESOLVER]
+                //  href 를 (host / path / query) 로 구조 분해해 식별자 후보를 뽑고,
+                //  각 후보가 URL 상에서 맡은 '역할 문구'(예: "product register product no", "host name domain name")를
+                //  id,link 라벨 뱅크와 코사인 비교해 승자를 고릅니다.
+                //  이 방식이라야 도메인 조각 'cafe24'(6자+숫자) 가 식별자로 승격되는 사고가 원천 차단됩니다.
+                let idlink_cands = collect_id_link_candidates(&item_lines_ref);
+                let mut det_id_link: Option<(String, String)> = None;
+
+                if !idlink_cands.is_empty() && !idlink_label_embs.is_empty() {
+                    let role_texts: Vec<String> = idlink_cands.iter().map(|c| c.role_phrase.clone()).collect();
+                    let role_embs = model.get_embedding_batch(role_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; role_texts.len()]);
+
+                    let mut best_score = f32::MIN;
+                    let mut best_idx: Option<usize> = None;
+
+                    for (ci, cand) in idlink_cands.iter().enumerate() {
+                        let emb = &role_embs[ci];
+                        if emb.iter().all(|&v| v == 0.0) { continue; }
+
+                        let own = weighted_max_pool_sim(emb, &idlink_label_embs, &idlink_label_weights);
+                        let prej = if idlink_prej_embs.is_empty() { 0.0 } else { max_pool_sim(emb, &idlink_prej_embs) };
+                        let score = (own - prej) + 0.15 * (cand.prior - 1.0);
+
+                        emit_term(&format!("      🧭 [ID/LINK CANDIDATE] '{}' ← 역할 '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Prior: {:.2}{} | Score: {:+.4}",
+                            cand.token, cand.role_phrase, own, prej, cand.prior,
+                            if cand.is_host_part { " (host)" } else { "" }, score));
+
+                        if own < 0.30 { continue; }
+                        if score <= 0.0 { continue; }
+                        if score > best_score { best_score = score; best_idx = Some(ci); }
+                    }
+
+                    if let Some(bi) = best_idx {
+                        let c = &idlink_cands[bi];
+                        det_id_link = Some((c.token.clone(), c.href.clone()));
+                        emit_term(&format!("    🔑 [ID/LINK COSINE] 식별자 '{}' 확정 (역할 '{}', Score {:+.4}) → link '{}'", c.token, c.role_phrase, best_score, c.href));
+                    }
+                }
+
+                if det_id_link.is_none() {
+                    det_id_link = resolve_id_link_from_lines(&item_lines_ref);
+                    if let Some((fid, flink)) = &det_id_link {
+                        emit_term(&format!("    🔑 [ID/LINK FALLBACK] 코사인 게이트를 통과한 후보가 없어 레거시 해석기로 확정: '{}' → '{}'", fid, flink));
+                    }
+                }
+
                 let mut det_consumed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 if let Some((det_id, det_link)) = &det_id_link {
-                    let lower_id = det_id.to_lowercase();
+                    // 부분 문자열 포함이 아니라 '토큰 완전일치'로 선점합니다.
+                    // id 가 '18' 처럼 짧아졌을 때 '1800' 같은 무관한 셀까지 삼키는 것을 막습니다.
                     for (l, v) in line_values.iter().enumerate() {
-                        if !v.is_empty() && v.to_lowercase().contains(&lower_id) {
-                            det_consumed_lines.insert(l);
-                        }
+                        if v.is_empty() { continue; }
+                        let matched = v.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(det_id.as_str()));
+                        if matched { det_consumed_lines.insert(l); }
                     }
                     emit_term(&format!("    🔑 [ID/LINK DETERMINISTIC] 식별자 '{}' 가 href '{}' 안에 실제 존재함을 확인. 해당 라인은 다른 컬럼이 선점할 수 없습니다.", det_id, det_link));
                 }
@@ -3492,11 +3569,19 @@ async fn process_task(
                                 global_ignore_list.push(format!(" {}", det_id));
                                 global_ignore_list.push(det_id.to_lowercase());
                             }
-                            // 🌟 [URL PATTERN DISCOVERY] 첫 성공 시 URL 구조 패턴을 추출하여 이후 실패 아이템에 소급 적용합니다.
+                            // 🌟 [URL PATTERN DISCOVERY] 성공한 id/link 쌍에서 URL 구조 패턴과 식별자 '생김새'를 함께 학습합니다.
+                            //    extract_url_pattern 은 호스트(도메인) 구간 매칭을 거부하므로
+                            //    prefix='https://breakbot.' / suffix='.com/...' 같은 도메인 변조 패턴이 만들어질 수 없습니다.
+                            let id_shape = id_shape_signature(&det_id);
+                            if !confirmed_id_shapes.contains(&id_shape) { confirmed_id_shapes.push(id_shape); }
+
                             if discovered_url_pattern.is_none() {
                                 if let Some((prefix, suffix)) = extract_url_pattern(&det_id, &det_link) {
                                     discovered_url_pattern = Some((prefix.clone(), suffix.clone()));
-                                    emit_term(&format!("    📐 [URL PATTERN DISCOVERED] prefix: '{}' | suffix: '{}' → 이후 실패 아이템에 소급 적용 가능", prefix, suffix));
+                                    pattern_reference_link = Some(det_link.clone());
+                                    emit_term(&format!("    📐 [URL PATTERN DISCOVERED] prefix: '{}' | suffix: '{}' | IdShape: (길이 {}, 숫자전용 {}) → 이후 실패 아이템에 소급 적용 가능", prefix, suffix, id_shape.0, id_shape.1));
+                                } else {
+                                    emit_term(&format!("    🚫 [URL PATTERN REJECTED] 식별자 '{}' 가 path/query 구간에서 발견되지 않아 패턴화를 거부했습니다. (link: {})", det_id, det_link));
                                 }
                             }
                             emit_term(&format!("    ⚡ [ID/LINK BYPASS] LLM 없이 확정: \"id\": \"{}\", \"link\": \"{}\"", det_id, det_link));
@@ -3981,57 +4066,165 @@ async fn process_task(
                     
                     emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&item_val).unwrap_or_default()));
                     all_extracted_items.push(item_val);
-                    // 🌟 [RAW LINE ARCHIVE] 소급 복구 시 원시 라인에서 식별자를 재탐색하기 위해 보관합니다.
+                    // 🌟 [RAW LINE ARCHIVE] 소급 복구 시 원시 라인에서 href 를 재탐색하기 위해 보관합니다.
                     all_item_raw_lines.push(item_lines.clone());
+                    // 🌟 [LABELED LINE ARCHIVE] 소급 복구의 코사인 채점 대상은 '값'이 아니라 '그 값이 달린 컬럼 라벨'입니다.
+                    //    (예: "상품코드 | P000000P" → 라벨 '상품코드' 를 id,link 라벨 뱅크와 코사인 비교)
+                    let labeled_snapshot: Vec<String> = (0..item_lines.len()).map(|li| {
+                        if !line_enriched_texts[li].is_empty() {
+                            line_enriched_texts[li].clone()
+                        } else {
+                            item_lines[li].clone()
+                        }
+                    }).collect();
+                    all_item_labeled_lines.push(labeled_snapshot);
                 }
                 
                 crate::models::qwen::generate::wait_for_global_io().await;
             }
 
-            // 🌟 [ID/LINK RETRY PASS] 루프 종료 후, id/link가 누락된 아이템에 대해
-            //    성공 아이템에서 발견된 URL 패턴 + 원시 라인 내 식별자 토큰으로 소급 복구를 시도합니다.
-            //    Item 1에서 href가 없어 실패했지만 Item 2에서 패턴이 발견된 경우,
-            //    Item 1의 "주문번호 | 26031514155635"에서 토큰을 추출하여 link를 역산합니다.
-            if let Some((ref pat_prefix, ref pat_suffix)) = discovered_url_pattern {
-                let mut retry_count = 0usize;
+            // 🌟 [ID/LINK RETRY PASS - COSINE]
+            //    1단계: 실패 아이템의 원시 라인에 href 가 남아 있으면, 그 href 후보를 다시 코사인으로 채점해 직접 복구합니다.
+            //           (로그의 아이템 4·5·6·8·9·10 은 '바로구매 URL' 셀만 비어 있을 뿐
+            //            상품명 셀의 a[href=".../ProductRegister?product_no=15"] 가 그대로 살아 있습니다.)
+            //    2단계: href 자체가 없을 때만, '값'이 아니라 '그 값이 달린 컬럼 라벨'을
+            //           id,link 라벨 뱅크와 코사인 비교해 가장 식별자다운 컬럼의 값만 채택하고 URL 패턴에 대입합니다.
+            //    3단계: 학습된 식별자 생김새(자릿수/숫자전용 여부)와 다른 토큰, 그리고 호스트가 달라지는 재구성 링크는
+            //           대입 자체를 거부합니다. 잘못된 링크를 만드는 것보다 빈 값이 안전합니다.
+            {
                 let total_extracted_items = all_extracted_items.len();
-                for (item_idx, item_val) in all_extracted_items.iter_mut().enumerate() {
-                    let has_id = item_val.get("id").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
-                    let has_link = item_val.get("link").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
+                let mut retry_count = 0usize;
+                let mut reject_count = 0usize;
+
+                for item_idx in 0..total_extracted_items {
+                    let (has_id, has_link) = {
+                        let iv = &all_extracted_items[item_idx];
+                        (
+                            iv.get("id").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty()),
+                            iv.get("link").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty()),
+                        )
+                    };
                     if has_id && has_link { continue; }
 
-                    // 1단계: 이미 추출된 필드에서 식별자 후보 탐색
-                    let mut candidate_id: Option<String> = None;
-                    for key in ["tracking_number", "code", "no"] {
-                        if let Some(val_str) = item_val.get(key).and_then(|v| v.as_str()) {
-                            let trimmed = val_str.trim();
-                            if trimmed.chars().count() >= 8 && trimmed.chars().any(|c| c.is_ascii_digit()) {
-                                candidate_id = Some(trimmed.to_string());
-                                break;
+                    let mut recovered: Option<(String, String, String)> = None; // (id, link, 사유)
+
+                    // --- 1단계 : 원시 라인에 남아 있는 href 를 코사인으로 재채점 ---
+                    if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
+                        let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
+                        let cands = collect_id_link_candidates(&raw_refs);
+
+                        if !cands.is_empty() && !idlink_label_embs.is_empty() {
+                            let role_texts: Vec<String> = cands.iter().map(|c| c.role_phrase.clone()).collect();
+                            let role_embs = model.get_embedding_batch(role_texts.clone()).await
+                                .unwrap_or_else(|_| vec![vec![0.0; 384]; role_texts.len()]);
+
+                            let mut best = f32::MIN;
+                            let mut best_i: Option<usize> = None;
+                            for (ci, c) in cands.iter().enumerate() {
+                                let emb = &role_embs[ci];
+                                if emb.iter().all(|&v| v == 0.0) { continue; }
+                                let own = weighted_max_pool_sim(emb, &idlink_label_embs, &idlink_label_weights);
+                                let prej = if idlink_prej_embs.is_empty() { 0.0 } else { max_pool_sim(emb, &idlink_prej_embs) };
+                                let score = (own - prej) + 0.15 * (c.prior - 1.0);
+                                emit_term(&format!("      🧭 [RETRY HREF CANDIDATE] Item {}/{}: '{}' ← 역할 '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4}",
+                                    item_idx + 1, total_extracted_items, c.token, c.role_phrase, own, prej, score));
+                                if own < 0.30 { continue; }
+                                if score <= 0.0 { continue; }
+                                if score > best { best = score; best_i = Some(ci); }
+                            }
+
+                            if let Some(bi) = best_i {
+                                let c = &cands[bi];
+                                recovered = Some((
+                                    c.token.clone(),
+                                    c.href.clone(),
+                                    format!("href 코사인 재채점 (역할 '{}', Score {:+.4})", c.role_phrase, best),
+                                ));
                             }
                         }
                     }
 
-                    // 2단계: 추출된 필드에 없으면 원시 PUG 라인에서 직접 탐색
-                    if candidate_id.is_none() {
-                        if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
-                            candidate_id = find_identifier_token_in_lines(raw_lines);
+                    // --- 2단계 : href 가 아예 없을 때만 컬럼 라벨 코사인 + URL 패턴 대입 ---
+                    if recovered.is_none() {
+                        if let Some((ref pat_prefix, ref pat_suffix)) = discovered_url_pattern {
+                            let labeled = all_item_labeled_lines.get(item_idx).cloned().unwrap_or_default();
+                            let cands = collect_labeled_token_candidates(&labeled);
+
+                            let mut chosen: Option<(String, String, f32)> = None; // (token, label, score)
+
+                            if !cands.is_empty() && !idlink_label_embs.is_empty() {
+                                let label_texts: Vec<String> = cands.iter().map(|c| c.label_phrase.clone()).collect();
+                                let label_embs = model.get_embedding_batch(label_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; label_texts.len()]);
+
+                                for (ci, c) in cands.iter().enumerate() {
+                                    if !id_shape_allowed(&c.token, &confirmed_id_shapes) {
+                                        reject_count += 1;
+                                        emit_term(&format!("      🚫 [SHAPE REJECT] Item {}/{}: 후보 '{}' 는 학습된 식별자 생김새와 달라 URL 대입을 거부했습니다.", item_idx + 1, total_extracted_items, c.token));
+                                        continue;
+                                    }
+
+                                    let emb = &label_embs[ci];
+                                    if emb.iter().all(|&v| v == 0.0) { continue; }
+                                    let own = weighted_max_pool_sim(emb, &idlink_label_embs, &idlink_label_weights);
+                                    let prej = if idlink_prej_embs.is_empty() { 0.0 } else { max_pool_sim(emb, &idlink_prej_embs) };
+                                    let score = own - prej;
+
+                                    emit_term(&format!("      🧭 [RECOVERY CANDIDATE] Item {}/{}: '{}' ← 라벨 '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4}",
+                                        item_idx + 1, total_extracted_items, c.token, c.label_phrase, own, prej, score));
+
+                                    if own < 0.40 { continue; }
+                                    if score <= 0.05 { continue; }
+                                    let better = chosen.as_ref().map(|(_, _, s)| score > *s).unwrap_or(true);
+                                    if better { chosen = Some((c.token.clone(), c.label_phrase.clone(), score)); }
+                                }
+                            }
+
+                            // 코사인 게이트를 전부 통과하지 못했을 때만 레거시 토큰 탐색을 시도하되,
+                            // 생김새 게이트는 그대로 강제해 'P000000P' 같은 이형 토큰의 대입을 막습니다.
+                            if chosen.is_none() {
+                                if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
+                                    if let Some(tok) = find_identifier_token_in_lines(raw_lines) {
+                                        if id_shape_allowed(&tok, &confirmed_id_shapes) {
+                                            chosen = Some((tok, "legacy token scan".to_string(), 0.0));
+                                        } else {
+                                            reject_count += 1;
+                                            emit_term(&format!("      🚫 [SHAPE REJECT] Item {}/{}: 레거시 토큰 '{}' 도 학습된 식별자 생김새와 달라 폐기했습니다.", item_idx + 1, total_extracted_items, tok));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some((tok, label, score)) = chosen {
+                                let link = apply_url_pattern(pat_prefix, pat_suffix, &tok);
+                                let host_ok = pattern_reference_link.as_ref()
+                                    .map(|r| same_host(r, &link))
+                                    .unwrap_or(true);
+                                if host_ok {
+                                    recovered = Some((tok, link, format!("라벨 코사인 (라벨 '{}', Score {:+.4})", label, score)));
+                                } else {
+                                    reject_count += 1;
+                                    emit_term(&format!("      🚫 [HOST REJECT] Item {}/{}: 재구성 링크 '{}' 의 호스트가 기준 링크와 달라 폐기했습니다.", item_idx + 1, total_extracted_items, link));
+                                }
+                            }
                         }
                     }
 
-                    // 3단계: 후보가 있으면 패턴 적용
-                    if let Some(ref found_id) = candidate_id {
-                        let constructed_link = apply_url_pattern(pat_prefix, pat_suffix, found_id);
-                        if let Some(obj) = item_val.as_object_mut() {
+                    // --- 3단계 : 모든 게이트를 통과한 값만 주입 ---
+                    if let Some((found_id, constructed_link, reason)) = recovered {
+                        if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
                             obj.insert("id".to_string(), json!(found_id.clone()));
                             obj.insert("link".to_string(), json!(constructed_link.clone()));
                         }
                         retry_count += 1;
-                        emit_term(&format!("  🔄 [ID/LINK RETRY] Item {}/{}: 패턴 기반 소급 복구 → \"id\": \"{}\", \"link\": \"{}\"", item_idx + 1, total_extracted_items, found_id, constructed_link));
+                        emit_term(&format!("  🔄 [ID/LINK RETRY] Item {}/{}: {} → \"id\": \"{}\", \"link\": \"{}\"", item_idx + 1, total_extracted_items, reason, found_id, constructed_link));
+                    } else {
+                        emit_term(&format!("  ⚪ [ID/LINK RETRY SKIP] Item {}/{}: 코사인 게이트를 통과한 식별자 후보가 없어 id/link 를 비워 둡니다. (잘못된 링크보다 빈 값이 안전합니다)", item_idx + 1, total_extracted_items));
                     }
                 }
-                if retry_count > 0 {
-                    emit_term(&format!("  🔄 [ID/LINK RETRY SUMMARY] {}개 아이템이 URL 패턴 기반으로 소급 복구되었습니다.", retry_count));
+
+                if retry_count > 0 || reject_count > 0 {
+                    emit_term(&format!("  🔄 [ID/LINK RETRY SUMMARY] 복구 {}개 | 생김새·호스트 게이트 거부 {}개.", retry_count, reject_count));
                 }
             }
         }
