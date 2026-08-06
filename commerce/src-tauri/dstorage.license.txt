@@ -1,0 +1,8 @@
+Microsoft DirectStorage Redistributable Package (dstorage.dll)
+========================================================================
+This software includes DirectStorage, provided by Microsoft Corporation.
+
+* Copyright: (c) Microsoft Corporation. All rights reserved.
+* Source / Info: https://www.nuget.org/packages/Microsoft.DirectStorage
+* License Type: Microsoft Software License Terms (Proprietary)
+* License Terms: https://www.nuget.org/packages/Microsoft.DirectStorage/License

@@ -1,0 +1,8 @@
+NVIDIA CUDA Toolkit / CUDA Runtime
+========================================================================
+This software includes components from the NVIDIA CUDA Toolkit.
+
+* Copyright: (c) NVIDIA Corporation. All rights reserved.
+* Source / Info: https://developer.nvidia.com/cuda-toolkit
+* License Type: NVIDIA CUDA Toolkit End User License Agreement (EULA)
+* License Terms: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/part_license.html

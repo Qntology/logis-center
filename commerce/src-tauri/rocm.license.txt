@@ -1,0 +1,8 @@
+AMD ROCm (Radeon Open Compute)
+========================================================================
+This software includes components from the AMD ROCm platform.
+
+* Copyright: (c) Advanced Micro Devices, Inc. All rights reserved.
+* Source Code: https://github.com/ROCm/ROCm
+* License Type: MIT License (Core Open Source Components)
+* License Terms: https://github.com/ROCm/ROCm/blob/develop/LICENSE
