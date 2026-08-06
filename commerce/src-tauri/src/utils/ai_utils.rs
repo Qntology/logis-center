@@ -387,9 +387,287 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     out
 }
 
-// 🌟 [DETERMINISTIC ID/LINK] LLM 에게 id 와 link 를 동시에 물어보면
-// "id 는 주문번호, link 는 아무 상세페이지 href" 처럼 서로 무관한 값이 짝지어져 나옵니다.
-// href 문자열 안에 실제로 포함된 식별자 토큰만 채택하면 id 와 link 가 구조적으로 100% 일치합니다.
+// 🌟 [URL SPLIT] href 를 (host, path, query) 로 분해합니다.
+//    상대경로/프로토콜생략(//) 형태까지 그대로 받아냅니다.
+//    이 분해가 있어야 "도메인 조각(cafe24)" 과 "쿼리값(18)" 을 구조적으로 구분할 수 있습니다.
+pub fn split_href_parts(href: &str) -> (String, String, String) {
+    let mut rest: &str = href.trim();
+    let mut host = String::new();
+
+    if let Some(pos) = rest.find("://") {
+        rest = &rest[pos + 3..];
+        let end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+        host = rest[..end].to_string();
+        rest = &rest[end..];
+    } else if rest.starts_with("//") {
+        let tmp = &rest[2..];
+        let end = tmp.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(tmp.len());
+        host = tmp[..end].to_string();
+        rest = &tmp[end..];
+    }
+
+    let no_frag = match rest.find('#') { Some(p) => &rest[..p], None => rest };
+    match no_frag.find('?') {
+        Some(p) => (host, no_frag[..p].to_string(), no_frag[p + 1..].to_string()),
+        None => (host, no_frag.to_string(), String::new()),
+    }
+}
+
+// 🌟 [HOST REGION] link 문자열에서 호스트 구간이 끝나는 바이트 인덱스를 돌려줍니다.
+//    이 인덱스 이전에서 매칭된 조각으로는 절대 URL 패턴을 만들지 않습니다.
+pub fn host_region_end(link: &str) -> usize {
+    let total = link.len();
+    if let Some(p) = link.find("://") {
+        let after = p + 3;
+        let rest = &link[after..];
+        return rest.find(|c: char| c == '/' || c == '?' || c == '#').map(|e| after + e).unwrap_or(total);
+    }
+    if link.starts_with("//") {
+        let rest = &link[2..];
+        return rest.find(|c: char| c == '/' || c == '?' || c == '#').map(|e| 2 + e).unwrap_or(total);
+    }
+    0
+}
+
+// 🌟 [URL TOKEN HUMANIZE] "product_no" → "product no", "ProductRegister" → "product register".
+//    임베딩 모델이 이해할 수 있는 자연어 구로 바꿔야 코사인 비교가 의미를 갖습니다.
+pub fn humanize_url_token(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    for (i, ch) in chars.iter().enumerate() {
+        if ch.is_alphanumeric() {
+            let need_space = if i == 0 {
+                false
+            } else {
+                let p = chars[i - 1];
+                if p.is_alphanumeric() {
+                    (p.is_lowercase() && ch.is_uppercase()) || (p.is_ascii_digit() != ch.is_ascii_digit())
+                } else {
+                    true
+                }
+            };
+            if need_space && !out.is_empty() && !out.ends_with(' ') { out.push(' '); }
+            for lc in ch.to_lowercase() { out.push(lc); }
+        } else if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// 🌟 [ID/LINK CANDIDATE] href 안에서 식별자로 쓸 수 있는 토큰을,
+//    "그 토큰이 URL 상에서 맡은 역할 문구" 와 함께 수집합니다.
+//    role_phrase 가 코사인 채점 대상이며, token 은 문자열 포함검사가 아니라 구조 파싱으로 뽑힙니다.
+#[derive(Debug, Clone)]
+pub struct IdLinkCandidate {
+    pub token: String,
+    pub href: String,
+    pub role_phrase: String,
+    pub is_host_part: bool,
+    pub prior: f32,
+}
+
+pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
+    let href_re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hrefs: Vec<String> = Vec::new();
+    for line in lines {
+        for cap in href_re.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let v = m.as_str().trim().to_string();
+                if v.is_empty() { continue; }
+                let lower = v.to_ascii_lowercase();
+                if lower.starts_with("javascript:") || lower.starts_with("mailto:") || lower.starts_with("tel:") { continue; }
+                if lower == "#" || lower == "#none" { continue; }
+                if !hrefs.contains(&v) { hrefs.push(v); }
+            }
+        }
+    }
+    if hrefs.is_empty() { return Vec::new(); }
+
+    let mut out: Vec<IdLinkCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for href in &hrefs {
+        let (host, path, query) = split_href_parts(href);
+        let segs: Vec<String> = path.split('/')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let res_role = segs.last()
+            .map(|s| humanize_url_token(s.split('.').next().unwrap_or(s.as_str())))
+            .unwrap_or_default();
+
+        // 1) 쿼리 파라미터 값 : 파라미터 키가 그대로 역할 문구가 됩니다. (product_no=18 → "product register product no")
+        if !query.is_empty() {
+            for pair in query.split('&') {
+                let (k, v) = match pair.find('=') {
+                    Some(p) => (&pair[..p], &pair[p + 1..]),
+                    None => continue,
+                };
+                let val = v.trim();
+                if val.is_empty() { continue; }
+                if !val.chars().any(|c| c.is_ascii_digit()) { continue; }
+                if val.chars().count() > 32 { continue; }
+
+                let key_role = humanize_url_token(k);
+                if key_role.is_empty() { continue; }
+                let role = if key_role.split_whitespace().count() >= 2 || res_role.is_empty() {
+                    key_role
+                } else {
+                    format!("{} {}", res_role, key_role).trim().to_string()
+                };
+
+                let dedup = format!("Q::{}::{}", val, role);
+                if !seen.insert(dedup) { continue; }
+                out.push(IdLinkCandidate {
+                    token: val.to_string(),
+                    href: href.clone(),
+                    role_phrase: role,
+                    is_host_part: false,
+                    prior: 1.00,
+                });
+            }
+        }
+
+        // 2) 경로 세그먼트 : 직전 세그먼트들이 역할 문구가 됩니다. (/product/view/18 → "product view")
+        for (i, seg) in segs.iter().enumerate() {
+            let clean = seg.split('.').next().unwrap_or(seg.as_str());
+            if clean.is_empty() { continue; }
+            if !clean.chars().any(|c| c.is_ascii_digit()) { continue; }
+            if clean.chars().count() > 32 { continue; }
+
+            let mut ctx: Vec<String> = Vec::new();
+            if i >= 2 { ctx.push(humanize_url_token(&segs[i - 2])); }
+            if i >= 1 { ctx.push(humanize_url_token(&segs[i - 1])); }
+            let joined = ctx.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+            let role = if joined.is_empty() { "url path segment".to_string() } else { joined };
+
+            let prior = if i + 1 == segs.len() { 0.92 } else { 0.80 };
+            let dedup = format!("P::{}::{}", clean, role);
+            if !seen.insert(dedup) { continue; }
+            out.push(IdLinkCandidate {
+                token: clean.to_string(),
+                href: href.clone(),
+                role_phrase: role,
+                is_host_part: false,
+                prior,
+            });
+        }
+
+        // 3) 호스트 조각 : 'cafe24' 같은 도메인 파편도 후보로 담되,
+        //    도메인 역할 문구를 붙여 코사인이 스스로 떨어뜨리도록 만듭니다.
+        for part in host.split('.') {
+            if part.is_empty() { continue; }
+            if !part.chars().any(|c| c.is_ascii_digit()) { continue; }
+            let dedup = format!("H::{}", part);
+            if !seen.insert(dedup) { continue; }
+            out.push(IdLinkCandidate {
+                token: part.to_string(),
+                href: href.clone(),
+                role_phrase: "host name domain name website address server address".to_string(),
+                is_host_part: true,
+                prior: 0.05,
+            });
+        }
+    }
+
+    if out.len() > 24 { out.truncate(24); }
+    out
+}
+
+// 🌟 [LABELED TOKEN CANDIDATE] href 가 아예 없는 아이템의 소급 복구용 후보입니다.
+//    핵심은 "값" 이 아니라 "그 값이 달린 컬럼 라벨" 을 코사인 채점 대상으로 삼는다는 점입니다.
+//    ("상품코드 | P000000P" → 라벨 '상품코드' 를 id,link 라벨 뱅크와 비교)
+#[derive(Debug, Clone)]
+pub struct LabeledTokenCandidate {
+    pub token: String,
+    pub label_phrase: String,
+}
+
+fn is_structural_tag_label(label: &str) -> bool {
+    let l = label.trim().to_lowercase();
+    let tag = l.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("");
+    ["td", "th", "tr", "div", "span", "p", "a", "li", "ul", "ol", "input", "table", "tbody", "thead", "label", "button", "textarea"]
+        .contains(&tag)
+}
+
+pub fn collect_labeled_token_candidates(labeled_lines: &[String]) -> Vec<LabeledTokenCandidate> {
+    let mut out: Vec<LabeledTokenCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in labeled_lines {
+        let (label_raw, value) = match line.find('|') {
+            Some(p) => (line[..p].trim(), line[p + 1..].trim()),
+            None => continue,
+        };
+        if value.is_empty() { continue; }
+
+        let label = if label_raw.is_empty() || is_structural_tag_label(label_raw) {
+            "identifier code number".to_string()
+        } else {
+            label_raw.to_string()
+        };
+
+        for tok in value.split(|c: char| !c.is_alphanumeric()) {
+            let n = tok.chars().count();
+            if n < 2 || n > 32 { continue; }
+            if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+            let dedup = format!("{}::{}", label, tok);
+            if !seen.insert(dedup) { continue; }
+            out.push(LabeledTokenCandidate { token: tok.to_string(), label_phrase: label.clone() });
+        }
+    }
+
+    if out.len() > 48 { out.truncate(48); }
+    out
+}
+
+// 🌟 [ID SHAPE] 확정된 식별자의 '생김새'(자릿수, 숫자전용 여부)를 학습해 둡니다.
+//    goods 목록의 id 가 전부 '18','17','16' 처럼 2자리 숫자였다면
+//    'P000000P' 를 URL 패턴에 대입하는 순간 링크가 깨지므로 아예 거부해야 합니다.
+pub fn id_shape_signature(token: &str) -> (usize, bool) {
+    let n = token.chars().count();
+    let digits_only = !token.is_empty() && token.chars().all(|c| c.is_ascii_digit());
+    (n, digits_only)
+}
+
+pub fn id_shape_allowed(token: &str, learned: &[(usize, bool)]) -> bool {
+    if learned.is_empty() { return true; }
+    let (n, digits_only) = id_shape_signature(token);
+
+    let mut min_len = usize::MAX;
+    let mut max_len = 0usize;
+    let mut any_digits_only = false;
+    let mut any_mixed = false;
+    for (l, d) in learned {
+        if *l < min_len { min_len = *l; }
+        if *l > max_len { max_len = *l; }
+        if *d { any_digits_only = true; } else { any_mixed = true; }
+    }
+
+    if digits_only && !any_digits_only { return false; }
+    if !digits_only && !any_mixed { return false; }
+
+    let lo = min_len.saturating_sub(2);
+    let hi = max_len + 2;
+    n >= lo && n <= hi
+}
+
+// 🌟 [HOST GUARD] 재구성된 링크가 기준 링크와 같은 호스트인지 검증합니다.
+//    'https://breakbot.P000000P.com/...' 같은 도메인 변조를 여기서 최종 차단합니다.
+pub fn same_host(a: &str, b: &str) -> bool {
+    let (ha, _, _) = split_href_parts(a);
+    let (hb, _, _) = split_href_parts(b);
+    if ha.is_empty() || hb.is_empty() { return true; }
+    ha.eq_ignore_ascii_case(&hb)
+}
+
+// 🌟 [DETERMINISTIC ID/LINK - LEGACY FALLBACK] 코사인 후보가 전부 탈락했을 때만 쓰이는 최후 보루입니다.
+//    기존과 달리 '호스트 구간' 매칭은 무조건 무시하므로, 도메인 조각(cafe24)이 id 로 승격되는 경로가 사라집니다.
 pub fn resolve_id_link_from_lines(lines: &[&str]) -> Option<(String, String)> {
     let href_re = regex::Regex::new(r#"href=["']([^"']+)["']"#).ok()?;
 
@@ -421,37 +699,60 @@ pub fn resolve_id_link_from_lines(lines: &[&str]) -> Option<(String, String)> {
 
     let mut best: Option<(String, String)> = None;
     for tok in &tokens {
-        let lower_tok = tok.to_lowercase();
+        let lower_tok = tok.to_ascii_lowercase();
         for h in &hrefs {
-            if h.to_lowercase().contains(&lower_tok) {
-                let is_better = match &best {
-                    None => true,
-                    Some((bt, _)) => tok.chars().count() > bt.chars().count(),
-                };
-                if is_better { best = Some((tok.clone(), h.clone())); }
-            }
+            let lower_h = h.to_ascii_lowercase();
+            let start = host_region_end(h);
+            if start >= lower_h.len() { continue; }
+            if !lower_h[start..].contains(&lower_tok) { continue; }
+
+            let is_better = match &best {
+                None => true,
+                Some((bt, _)) => tok.chars().count() > bt.chars().count(),
+            };
+            if is_better { best = Some((tok.clone(), h.clone())); }
         }
     }
     best
 }
 
 // 🌟 [URL PATTERN EXTRACT] 성공적으로 확정된 id/link 쌍에서 URL 구조 패턴을 추출합니다.
-// 예: id="26020315071105", link="/admin/pop_orderform.php?od_id=26031514155635"
-//   → prefix="/admin/pop_orderform.php?od_id=", suffix=""
-// 이 패턴을 사용하면 href가 없는 아이템에서도 식별자만 있으면 link를 역산할 수 있습니다.
+// 예: id="18", link="https://host/disp/admin/shop1/product/ProductRegister?product_no=18"
+//   → prefix="https://host/disp/admin/shop1/product/ProductRegister?product_no=", suffix=""
+// [CRITICAL] 호스트(도메인) 구간에서 매칭된 조각으로는 절대 패턴을 만들지 않습니다.
+//            이 가드가 없으면 prefix="https://breakbot." / suffix=".com/..." 같은 도메인 변조 패턴이 만들어집니다.
 pub fn extract_url_pattern(id: &str, link: &str) -> Option<(String, String)> {
     if id.is_empty() || link.is_empty() { return None; }
-    let lower_link = link.to_lowercase();
-    let lower_id = id.to_lowercase();
-    if let Some(pos) = lower_link.find(&lower_id) {
-        let prefix = &link[..pos];
-        let suffix = &link[pos + id.len()..];
-        // prefix가 비어있으면 패턴으로서 의미가 없음 (link 자체가 id인 경우)
-        if prefix.is_empty() && suffix.is_empty() { return None; }
-        Some((prefix.to_string(), suffix.to_string()))
-    } else {
-        None
+    if !id.is_ascii() { return None; }
+
+    let lower_link = link.to_ascii_lowercase();
+    let lower_id = id.to_ascii_lowercase();
+
+    let host_end = host_region_end(link);
+    if host_end >= lower_link.len() { return None; }
+
+    // 식별자는 URL 뒤쪽에 오는 것이 일반적이므로 path/query 구간의 '가장 오른쪽' 매칭을 채택합니다.
+    let mut pos_opt: Option<usize> = None;
+    let mut cursor = host_end;
+    while cursor <= lower_link.len() {
+        match lower_link[cursor..].find(&lower_id) {
+            Some(rel) => {
+                let abs = cursor + rel;
+                pos_opt = Some(abs);
+                cursor = abs + lower_id.len().max(1);
+            },
+            None => break,
+        }
     }
+
+    let pos = pos_opt?;
+    let end = pos + id.len();
+    if !link.is_char_boundary(pos) || !link.is_char_boundary(end) { return None; }
+
+    let prefix = &link[..pos];
+    let suffix = &link[end..];
+    if prefix.is_empty() && suffix.is_empty() { return None; }
+    Some((prefix.to_string(), suffix.to_string()))
 }
 
 // 🌟 [URL PATTERN APPLY] 추출된 패턴에 새 식별자를 대입하여 link를 생성합니다.
@@ -461,7 +762,8 @@ pub fn apply_url_pattern(prefix: &str, suffix: &str, new_id: &str) -> String {
 
 // 🌟 [IDENTIFIER TOKEN SEARCH] PUG 라인 배열에서 식별자 후보 토큰을 탐색합니다.
 // 조건: 파이프 뒤(value)에 위치, 8자 이상, 숫자 포함, 영숫자 토큰.
-// "주문번호 | 26031514155635" → "26031514155635" 추출.
+// 이제는 코사인 게이트가 모두 실패했을 때의 최후 폴백으로만 호출되며,
+// 호출부에서 id_shape_allowed() 생김새 게이트를 반드시 통과해야 실제로 사용됩니다.
 pub fn find_identifier_token_in_lines(lines: &[String]) -> Option<String> {
     for line in lines {
         let value = match line.find('|') {
