@@ -89,6 +89,146 @@ pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64,
     Ok(())
 }
 
+// ============================================================================
+// [KV RESIDENCY PLANNER]
+// 디코딩 단계에서 KV Cache 를 어디에 둘지(VRAM / RAM / SSD) 단 1회 판정합니다.
+// KV Cache 는 토큰이 진행될수록 단조 증가하므로, "지금 크기"가 아니라
+// "마지막 토큰까지 자랐을 때의 최대 크기"를 기준으로 판정해야
+// 디코딩 도중 OOM 이 터지는 사고를 원천 차단할 수 있습니다.
+// ============================================================================
+
+/// VRAM 상주 판정 시 남겨둘 안전 마진.
+/// Attention score 행렬, logits(vocab 15만), cuBLAS 워크스페이스, 드라이버 예약분을 포괄합니다.
+pub const KV_VRAM_SAFETY_MARGIN_BYTES: u64 = 640 * 1024 * 1024;
+
+/// RAM 오프로딩 판정 시 남겨둘 안전 마진. OS/브라우저 동시 사용을 고려합니다.
+pub const KV_RAM_SAFETY_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvResidency {
+    /// VRAM 상주. 디코딩 중 SSD/RAM 왕복이 전혀 발생하지 않습니다.
+    Vram,
+    /// RAM 오프로딩. 매 토큰 필요한 레이어만 PCIe 로 올렸다 내립니다.
+    Ram,
+    /// SSD 오프로딩. 기존 경로 그대로 유지합니다.
+    Ssd,
+}
+
+pub struct KvPlanInput<'a> {
+    pub gpu_id: u32,
+    pub is_cpu_mode: bool,
+    /// KV 를 실제로 보관하는 레이어 수 (Qwen3.5 는 full_attention 레이어 수만 셉니다)
+    pub num_kv_layers: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    /// 보관 시 원소 1개당 바이트 수 (FP8=1, BF16/F16=2, F32=4)
+    pub bytes_per_elem: usize,
+    /// 현재 문맥 길이 + 앞으로 생성할 최대 토큰 수
+    pub planned_tokens: usize,
+    pub label: &'a str,
+}
+
+/// NVML 장치 목록을 1회만 훑어 여유 VRAM 이 가장 큰 GPU 인덱스를 캐싱합니다.
+/// device_utils::get_best_device_info 와 동일한 정책이지만 Device 객체를 생성하지 않아
+/// 디코딩 경로에서 호출해도 CUDA 컨텍스트를 건드리지 않습니다.
+static PRIMARY_GPU_ID: Lazy<u32> = Lazy::new(|| {
+    if let Ok(nvml) = Nvml::init() {
+        if let Ok(count) = nvml.device_count() {
+            let mut best_id = 0u32;
+            let mut max_free = 0u64;
+            for i in 0..count {
+                if let Ok(dev) = nvml.device_by_index(i) {
+                    if let Ok(mem) = dev.memory_info() {
+                        if mem.free > max_free {
+                            max_free = mem.free;
+                            best_id = i;
+                        }
+                    }
+                }
+            }
+            return best_id;
+        }
+    }
+    0
+});
+
+pub fn primary_gpu_id() -> u32 {
+    *PRIMARY_GPU_ID
+}
+
+/// 토큰 1개가 전 레이어에 걸쳐 차지하는 KV 바이트 수
+pub fn kv_bytes_per_token(input: &KvPlanInput) -> u64 {
+    (2u64)
+        * (input.num_kv_heads as u64)
+        * (input.head_dim as u64)
+        * (input.bytes_per_elem as u64)
+        * (input.num_kv_layers as u64)
+}
+
+/// 현재 여유 VRAM(bytes). GPU 가 없거나 NVML 실패 시 0 을 반환합니다.
+pub fn free_vram_bytes(gpu_id: u32) -> u64 {
+    if let Ok(nvml) = Nvml::init() {
+        if let Ok(dev) = nvml.device_by_index(gpu_id) {
+            if let Ok(mem) = dev.memory_info() {
+                return mem.free;
+            }
+        }
+    }
+    0
+}
+
+/// 현재 여유 RAM(bytes).
+pub fn free_ram_bytes() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.available_memory()
+}
+
+/// 디코딩 단계 KV Cache 배치 위치를 결정합니다.
+pub fn plan_kv_residency(input: &KvPlanInput) -> KvResidency {
+    let per_token = kv_bytes_per_token(input);
+    let need = per_token.saturating_mul(input.planned_tokens as u64);
+
+    // CPU 모드에서는 애초에 VRAM 이 없으므로 RAM 상주가 유일한 정답입니다.
+    if input.is_cpu_mode {
+        println!(
+            "[KV-PLAN] {} | CPU Mode → RAM 상주 (Need: {:.2} MB)",
+            input.label,
+            need as f64 / 1e6
+        );
+        return KvResidency::Ram;
+    }
+
+    let vram_free = free_vram_bytes(input.gpu_id);
+    let ram_free = free_ram_bytes();
+
+    let vram_ok = vram_free > 0 && vram_free >= need.saturating_add(KV_VRAM_SAFETY_MARGIN_BYTES);
+    let ram_ok = ram_free >= need.saturating_add(KV_RAM_SAFETY_MARGIN_BYTES);
+
+    let decision = if vram_ok {
+        KvResidency::Vram
+    } else if ram_ok {
+        KvResidency::Ram
+    } else {
+        KvResidency::Ssd
+    };
+
+    println!(
+        "[KV-PLAN] {} | Tokens: {} | PerToken: {} B | Need: {:.2} MB | VRAM free: {:.2} MB (margin {:.0} MB) | RAM free: {:.2} MB (margin {:.0} MB) → {:?}",
+        input.label,
+        input.planned_tokens,
+        per_token,
+        need as f64 / 1e6,
+        vram_free as f64 / 1e6,
+        KV_VRAM_SAFETY_MARGIN_BYTES as f64 / 1e6,
+        ram_free as f64 / 1e6,
+        KV_RAM_SAFETY_MARGIN_BYTES as f64 / 1e6,
+        decision
+    );
+
+    decision
+}
+
 // Global System Monitor Instance
 static SYSTEM_MONITOR: Lazy<Arc<Mutex<System>>> = Lazy::new(|| {
     let mut sys = System::new_with_specifics(

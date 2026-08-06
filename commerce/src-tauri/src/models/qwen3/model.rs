@@ -17,6 +17,9 @@ use crate::{
 pub struct Fp8VramKVCache {
     pub k_fp8: Tensor,
     pub v_fp8: Tensor,
+    // 🌟 [KV RESIDENCY] 이 캐시가 물리적으로 어디에 놓여 있는지 기록합니다.
+    //    VRAM 이면 그대로 두고, RAM 이면 연산 직전에만 GPU 로 올렸다 즉시 내립니다.
+    pub location: crate::utils::resources::KvResidency,
 }
 
 pub struct Qwen3DecoderLayer {
@@ -25,6 +28,9 @@ pub struct Qwen3DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     pub fp8_cache: Option<Fp8VramKVCache>, // 🌟 [FP8 Compression] RAM으로 내리지 않고 VRAM 내에서 FP8로 압축하여 상주
+    // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 목표 배치 위치.
+    //    기본값은 기존 동작과 100% 동일한 Vram 입니다.
+    pub kv_residency: crate::utils::resources::KvResidency,
 }
 
 impl Qwen3DecoderLayer {
@@ -70,6 +76,7 @@ impl Qwen3DecoderLayer {
             input_layernorm,
             post_attention_layernorm,
             fp8_cache: None,
+            kv_residency: crate::utils::resources::KvResidency::Vram,
         })
     }
 
@@ -84,12 +91,26 @@ impl Qwen3DecoderLayer {
         // 🌟 [FP8 Compression] VRAM에 보관 중이던 FP8 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
         if self.self_attn.kv_cache.is_none() {
             if let Some(cache) = self.fp8_cache.take() {
-                let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
-                
+                let dev = xs.device();
+                let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+
+                // 🌟 [KV RESIDENCY] RAM 에 대피해 있던 캐시라면 연산 직전에만 GPU 로 올립니다.
+                //    PCIe 4.0 x16 기준 28레이어 × 28KB/token ≈ 784KB → 0.03ms 로 무시 가능한 비용입니다.
+                let k_src = if cache.location == crate::utils::resources::KvResidency::Vram {
+                    cache.k_fp8.clone()
+                } else {
+                    cache.k_fp8.to_device(dev).unwrap_or_else(|_| cache.k_fp8.clone())
+                };
+                let v_src = if cache.location == crate::utils::resources::KvResidency::Vram {
+                    cache.v_fp8.clone()
+                } else {
+                    cache.v_fp8.to_device(dev).unwrap_or_else(|_| cache.v_fp8.clone())
+                };
+
                 // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F8E4M3) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
-                let k_restored = cache.k_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.k_fp8.clone());
-                let v_restored = cache.v_fp8.to_dtype(target_dtype).unwrap_or_else(|_| cache.v_fp8.clone());
-                
+                let k_restored = k_src.to_dtype(target_dtype).unwrap_or_else(|_| k_src.clone());
+                let v_restored = v_src.to_dtype(target_dtype).unwrap_or_else(|_| v_src.clone());
+
                 self.self_attn.kv_cache = Some((k_restored, v_restored));
             }
         }
@@ -115,16 +136,63 @@ impl Qwen3DecoderLayer {
         self.fp8_cache = None;
     }
 
+    /// 🌟 [KV RESIDENCY] 디코딩 진입 시 계산된 목표 배치 위치를 주입합니다.
+    pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
+        self.kv_residency = residency;
+        // 이미 보관 중인 캐시가 있다면 즉시 목표 위치로 이주시킵니다.
+        if let Some(cache) = self.fp8_cache.take() {
+            let moved = match residency {
+                crate::utils::resources::KvResidency::Vram => cache,
+                _ => {
+                    let k_cpu = cache
+                        .k_fp8
+                        .to_device(&candle_core::Device::Cpu)
+                        .unwrap_or_else(|_| cache.k_fp8.clone());
+                    let v_cpu = cache
+                        .v_fp8
+                        .to_device(&candle_core::Device::Cpu)
+                        .unwrap_or_else(|_| cache.v_fp8.clone());
+                    Fp8VramKVCache {
+                        k_fp8: k_cpu,
+                        v_fp8: v_cpu,
+                        location: crate::utils::resources::KvResidency::Ram,
+                    }
+                }
+            };
+            self.fp8_cache = Some(moved);
+        }
+    }
+
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
             // 🌟 [CRITICAL FIX] VRAM 내부에서 FP8(F8E4M3) 압축 시도 시, 해당 드라이버 심볼이 없으면(CUDA_ERROR_NOT_FOUND) 원본(BF16/F32)을 그대로 보존하여 에러를 원천 차단합니다.
             let k_fp8 = k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone());
             let v_fp8 = v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone());
-            
-            self.fp8_cache = Some(Fp8VramKVCache {
-                k_fp8,
-                v_fp8,
-            });
+
+            // 🌟 [KV RESIDENCY] VRAM 여유가 없다고 판정된 경우 압축 직후 곧바로 RAM 으로 대피시킵니다.
+            //    FP8 변환 자체는 GPU 코어로 끝낸 뒤 옮기므로 CPU 연산 병목이 발생하지 않습니다.
+            let stored = match self.kv_residency {
+                crate::utils::resources::KvResidency::Vram => Fp8VramKVCache {
+                    k_fp8,
+                    v_fp8,
+                    location: crate::utils::resources::KvResidency::Vram,
+                },
+                _ => {
+                    let k_cpu = k_fp8
+                        .to_device(&candle_core::Device::Cpu)
+                        .unwrap_or_else(|_| k_fp8.clone());
+                    let v_cpu = v_fp8
+                        .to_device(&candle_core::Device::Cpu)
+                        .unwrap_or_else(|_| v_fp8.clone());
+                    Fp8VramKVCache {
+                        k_fp8: k_cpu,
+                        v_fp8: v_cpu,
+                        location: crate::utils::resources::KvResidency::Ram,
+                    }
+                }
+            };
+
+            self.fp8_cache = Some(stored);
         }
         Ok(())
     }
@@ -135,6 +203,8 @@ impl Qwen3DecoderLayer {
         } else if let Some(fp8_cache) = &self.fp8_cache {
             // 스냅샷 저장을 위해 호출될 경우, 원래 타입으로 복원하여 반환
             let target_dtype = candle_core::DType::F32; // 저장용 기본 타입
+            // 🌟 [KV RESIDENCY] RAM 대피본이라도 스냅샷 저장 경로는 그대로 동작해야 하므로
+            //    device 를 따지지 않고 dtype 만 복원합니다. (safetensors 저장은 CPU 텐서를 요구)
             if let Ok(k) = fp8_cache.k_fp8.to_dtype(target_dtype) {
                 if let Ok(v) = fp8_cache.v_fp8.to_dtype(target_dtype) {
                     return Some((k, v));
@@ -158,6 +228,10 @@ pub struct Qwen3Model {
     norm: RmsNorm,
     rotary_emb: RoPE,
     lm_head: Linear,
+    // 🌟 [KV RESIDENCY] KV 크기 계산에 필요한 형상 정보를 보관합니다.
+    kv_num_layers: usize,
+    kv_num_heads: usize,
+    kv_head_dim: usize,
 }
 
 impl Qwen3Model {
@@ -185,6 +259,9 @@ impl Qwen3Model {
             norm,
             rotary_emb,
             lm_head,
+            kv_num_layers: config.num_hidden_layers,
+            kv_num_heads: config.num_key_value_heads,
+            kv_head_dim: config.head_dim,
         })
     }
     
@@ -256,6 +333,26 @@ impl Qwen3Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
+        }
+    }
+
+    /// 🌟 [KV RESIDENCY] (레이어 수, KV 헤드 수, head_dim) 을 반환합니다.
+    pub fn kv_geometry(&self) -> (usize, usize, usize) {
+        (self.kv_num_layers, self.kv_num_heads, self.kv_head_dim)
+    }
+
+    /// 🌟 [KV RESIDENCY] 디코딩 진입 시 계산된 배치 위치를 전 레이어에 전파합니다.
+    /// Qwen3(0.6B) 경로에는 SSD 오프로딩 인프라가 없으므로 Ssd 판정은 RAM 으로 강등 처리합니다.
+    pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
+        let effective = match residency {
+            crate::utils::resources::KvResidency::Ssd => {
+                println!("[KV-PLAN] Qwen3(0.6B) 경로는 디코딩 SSD 오프로딩을 지원하지 않습니다. RAM 오프로딩으로 강등합니다.");
+                crate::utils::resources::KvResidency::Ram
+            }
+            other => other,
+        };
+        for layer in self.layers.iter_mut() {
+            layer.set_kv_residency(effective);
         }
     }
 

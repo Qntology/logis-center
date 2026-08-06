@@ -411,6 +411,9 @@ pub struct QuantizedQwenVLTextAttention {
     pub layer_idx: usize,
     pub active_kv_name: Option<String>, // [NEW] JIT-LOAD 경로 동기화용
     pub active_session_id: Option<String>, // [추가] 에러 해결을 위한 필드
+    // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 KV 블록 배치 위치.
+    //    기본값 Ssd 는 기존 동작(매 토큰 SSD 재읽기)과 100% 동일합니다.
+    pub kv_residency: crate::utils::resources::KvResidency,
     // [ACCUMULATOR] VRAM 내 병합 캐시: 매번 수십개의 블록을 cat하는 오버헤드 제거
     pub vram_merged_k: Option<Tensor>,
     pub vram_merged_v: Option<Tensor>,
@@ -556,6 +559,7 @@ impl QuantizedQwenVLTextAttention {
             layer_idx,
             active_kv_name: None,
             active_session_id: None, // [추가]
+            kv_residency: crate::utils::resources::KvResidency::Ssd,
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -826,9 +830,30 @@ impl QuantizedQwenVLTextAttention {
                     let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
 
                     
-                    inner.k_cache = Some(k_safe); 
-                    inner.v_cache = Some(v_safe); 
-                    inner.location = KVLocation::RAM;
+                    // 🌟 [KV RESIDENCY] VRAM 상주가 확정된 경우, 읽어온 블록을 FP8 로 VRAM 에 눌러앉힙니다.
+                    //    이후 토큰에서는 이 블록이 KVLocation::VRAM 으로 잡혀
+                    //    SafeTensors 역직렬화 + PCIe 업로드가 통째로 사라집니다.
+                    if self.kv_residency == crate::utils::resources::KvResidency::Vram && dev.is_cuda() {
+                        let k_res = k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_gpu.clone());
+                        let v_res = v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_gpu.clone());
+                        inner.k_cache = Some(k_res);
+                        inner.v_cache = Some(v_res);
+                        inner.location = KVLocation::VRAM;
+
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                            reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                        }
+                    } else {
+                        inner.k_cache = Some(k_safe); 
+                        inner.v_cache = Some(v_safe); 
+                        inner.location = KVLocation::RAM;
+
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                            reg[index].location[self.layer_idx] = KVLocation::RAM;
+                        }
+                    }
                     
                     (k_gpu, v_gpu, true)
                 }
@@ -1533,6 +1558,7 @@ impl QuantizedQwenVLTextDecoderLayer {
             layer_idx,
             active_kv_name: None,
             active_session_id: None,
+            kv_residency: crate::utils::resources::KvResidency::Ssd,
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
@@ -1691,6 +1717,11 @@ impl QuantizedQwenVLTextDecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
+    // 🌟 [KV RESIDENCY] 레이어 단위 배치 위치 전파 위임
+    pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
+        self.self_attn.kv_residency = residency;
+    }
+
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
         self.self_attn.evacuate_vram_to_cache()
     }
@@ -1728,6 +1759,10 @@ impl QuantizedQwenVLTextDecoderLayer {
     }
 }
 
+/// 🌟 [KV RESIDENCY] 디코딩 진입 시 앞으로 생성할 토큰 수를 알 수 없으므로,
+/// 보수적으로 이만큼 더 자란다고 가정하고 VRAM 상주 가능 여부를 판정합니다.
+pub const QWEN06B_DECODE_HEADROOM_TOKENS: usize = 2048;
+
 #[derive(Clone)]
 pub struct QuantizedQwenVLTextModel {
     pub embed_tokens: Embedding, 
@@ -1744,6 +1779,12 @@ pub struct QuantizedQwenVLTextModel {
     pub active_kv_name: Option<String>,
     pub pinned_layer_count: usize,
     pub current_kv_len: usize,
+    // 🌟 [KV RESIDENCY] 디코딩 루프 진입 시 1회만 계산되는 배치 계획.
+    //    프리필 구간에서는 None 으로 무효화되어 기존 SSD 오프로딩이 그대로 유지됩니다.
+    pub kv_plan: Option<crate::utils::resources::KvResidency>,
+    // 🌟 [DECODE-RESIDENT] 가중치 상주 여부도 같은 시점에 1회만 판정하여
+    //    레이어마다(= 토큰당 28회) 반복되던 sysinfo 호출을 제거합니다.
+    pub keep_weights_resident: bool,
     // [NEW] 재로딩을 위한 메타데이터
     pub config: QwenVLTextConfig,
     pub ct: Option<Arc<gguf_file::Content>>,
@@ -1853,6 +1894,8 @@ impl QuantizedQwenVLTextModel {
             active_kv_name: None, 
             pinned_layer_count: if current_device.is_cuda() { num_layers_to_load } else { 0 }, 
             current_kv_len: 0,
+            kv_plan: None,
+            keep_weights_resident: false,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -1939,6 +1982,8 @@ impl QuantizedQwenVLTextModel {
             active_kv_name: None, 
             pinned_layer_count, 
             current_kv_len: 0,
+            kv_plan: None,
+            keep_weights_resident: false,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -2149,6 +2194,13 @@ impl QuantizedQwenVLTextModel {
     }
 
     async fn evacuate_vram_to_ram_only(&mut self, layer_idx: usize) -> Result<()> {
+        // 🌟 [KV RESIDENCY] VRAM 상주가 확정된 구간에서는 강제 퇴거를 수행하지 않습니다.
+        //    기존 vram_limit = 8 고정값은 VRAM 여유와 무관하게 9번째 블록부터 무조건
+        //    RAM 으로 쫓아내어, 다음 토큰에서 다시 올려야 하는 낭비를 만들었습니다.
+        if self.kv_plan == Some(crate::utils::resources::KvResidency::Vram) {
+            return Ok(());
+        }
+
         let current_kv_len = self.layers[layer_idx].get_kv_len();
         let is_small_model = self.layers.len() <= 36;
         if is_small_model && current_kv_len < 1024 { return Ok(()); }
@@ -2284,14 +2336,9 @@ impl QuantizedQwenVLTextModel {
         let is_decoding = current_seq_len <= 1;
 
         // [DECODE-RESIDENT] 디코딩 구간에서는 레이어당 연산이 O(1)이라 가중치 재적재가 전체를 지배합니다.
-        // 여유 RAM이 임계치 이상일 때만 가중치를 상주시키고, 부족하면 기존과 동일하게 즉시 비웁니다.
-        let keep_resident = if is_decoding {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_memory();
-            sys.available_memory() > 6_000_000_000
-        } else {
-            false
-        };
+        // 🌟 [KV RESIDENCY] 판정은 forward() 진입 시 1회만 수행되며, 여기서는 그 결과만 읽습니다.
+        //    (기존에는 레이어마다 = 토큰당 28회 sysinfo 를 호출했습니다.)
+        let keep_resident = is_decoding && self.keep_weights_resident;
         if !keep_resident {
             self.layers[layer_idx].clear();
         }
@@ -2307,36 +2354,76 @@ impl QuantizedQwenVLTextModel {
             if current_seq_len > 1 {
                 let _ = self.evacuate_layer_kv_to_cpu(layer_idx, &sid, seqlen_offset, current_seq_len).await;
             } else {
-                
-                // 다음 글자까지 기다릴 필요 없이, RAM 해제 작업을 백그라운드 스레드에 던져버려서 메인 디코딩 렉(Stutter)을 0으로 만듭니다.
-                let mut reg = self.registry.entries.write().unwrap();
-                let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
-                let total_blocks = kv_blocks.len();
-                
-                let mut garbage_bin = Vec::new(); // 백그라운드로 보낼 쓰레기통
-                
-                for (idx, block) in kv_blocks.iter_mut().enumerate() {
-                    if idx + 1 >= total_blocks { continue; } // 현재 활성 블록은 제외
+                // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 배치 위치에 따라 과거 블록을 처리합니다.
+                //   - Vram : 아무것도 하지 않고 과거 블록을 VRAM 에 그대로 상주시킵니다. (SSD 재읽기 0회)
+                //   - Ram  : RAM 에 그대로 눌러앉힙니다. STEP A 가 to_device(dev) 로 잠깐 올려 씁니다.
+                //   - Ssd  : 기존과 100% 동일하게 RAM → SSD 로 강등하고 bitkv_cache 를 비웁니다.
+                let residency = self.kv_plan.unwrap_or(crate::utils::resources::KvResidency::Ssd);
+
+                if residency == crate::utils::resources::KvResidency::Ssd {
+                    // 다음 글자까지 기다릴 필요 없이, RAM 해제 작업을 백그라운드 스레드에 던져버려서 메인 디코딩 렉(Stutter)을 0으로 만듭니다.
+                    let mut reg = self.registry.entries.write().unwrap();
+                    let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+                    let total_blocks = kv_blocks.len();
                     
-                    let mut inner = block.inner.write().unwrap();
-                    if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
-                        // Tensor를 파괴하는 대신 take()로 소유권을 뺏어서 쓰레기통에 담습니다.
-                        let old_k = inner.k_cache.take();
-                        let old_v = inner.v_cache.take();
-                        garbage_bin.push((old_k, old_v));
+                    let mut garbage_bin = Vec::new(); // 백그라운드로 보낼 쓰레기통
+                    
+                    for (idx, block) in kv_blocks.iter_mut().enumerate() {
+                        if idx + 1 >= total_blocks { continue; } // 현재 활성 블록은 제외
                         
-                        inner.location = KVLocation::SSD;
-                        reg[idx].location[layer_idx] = KVLocation::SSD;
-                        let mut cache = reg[idx].bitkv_cache.write().unwrap();
-                        cache[layer_idx] = None;
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::RAM && idx < reg.len() && reg[idx].ssd_path.is_some() {
+                            // Tensor를 파괴하는 대신 take()로 소유권을 뺏어서 쓰레기통에 담습니다.
+                            let old_k = inner.k_cache.take();
+                            let old_v = inner.v_cache.take();
+                            garbage_bin.push((old_k, old_v));
+                            
+                            inner.location = KVLocation::SSD;
+                            reg[idx].location[layer_idx] = KVLocation::SSD;
+                            let mut cache = reg[idx].bitkv_cache.write().unwrap();
+                            cache[layer_idx] = None;
+                        }
                     }
-                }
-                
-                // 수집된 쓰레기들을 메인 스레드가 아닌 비동기 런타임에서 조용히 파괴합니다.
-                if !garbage_bin.is_empty() {
-                    tauri::async_runtime::spawn(async move {
-                        drop(garbage_bin);
-                    });
+                    
+                    // 수집된 쓰레기들을 메인 스레드가 아닌 비동기 런타임에서 조용히 파괴합니다.
+                    if !garbage_bin.is_empty() {
+                        tauri::async_runtime::spawn(async move {
+                            drop(garbage_bin);
+                        });
+                    }
+                } else if residency == crate::utils::resources::KvResidency::Ram {
+                    // 🌟 VRAM 은 부족하지만 RAM 은 충분한 경우:
+                    //    과거 블록을 VRAM 에서만 걷어내고 RAM 에는 그대로 남깁니다.
+                    let mut reg = self.registry.entries.write().unwrap();
+                    let kv_blocks = &mut self.layers[layer_idx].self_attn.kv_blocks;
+                    let total_blocks = kv_blocks.len();
+
+                    for (idx, block) in kv_blocks.iter_mut().enumerate() {
+                        if idx + 1 >= total_blocks { continue; } // 현재 활성 블록은 제외
+
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::VRAM {
+                            let k = inner.k_cache.take();
+                            let v = inner.v_cache.take();
+                            if let (Some(k_t), Some(v_t)) = (k, v) {
+                                let target_dtype = if k_t.device().is_cuda() || k_t.dtype() == candle_core::DType::F8E4M3 {
+                                    candle_core::DType::F8E4M3
+                                } else {
+                                    candle_core::DType::F32
+                                };
+                                inner.k_cache = Some(
+                                    k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone())
+                                        .to_device(&Device::Cpu).unwrap_or_else(|_| k_t.clone())
+                                );
+                                inner.v_cache = Some(
+                                    v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone())
+                                        .to_device(&Device::Cpu).unwrap_or_else(|_| v_t.clone())
+                                );
+                                inner.location = KVLocation::RAM;
+                                if idx < reg.len() { reg[idx].location[layer_idx] = KVLocation::RAM; }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2669,6 +2756,45 @@ impl QuantizedQwenVLTextModel {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let is_decoding = seq_len <= 1;
 
+        // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전(= 첫 디코딩 토큰)에 단 1회만 판정합니다.
+        //    KV Cache 는 단조 증가하므로 "앞으로 자랄 최대치"를 기준으로 판정해야
+        //    디코딩 도중 OOM 이 터지지 않습니다. 이후 토큰에서는 캐시된 계획을 그대로 씁니다.
+        //    프리필 구간에서는 계획을 무효화하여 기존 SSD 오프로딩 경로를 100% 유지합니다.
+        if is_decoding {
+            if self.kv_plan.is_none() {
+                let (kv_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
+                let planned = seqlen_offset + seq_len + QWEN06B_DECODE_HEADROOM_TOKENS;
+
+                let plan = crate::utils::resources::plan_kv_residency(
+                    &crate::utils::resources::KvPlanInput {
+                        gpu_id: self.device_id as u32,
+                        is_cpu_mode: self.is_forced_cpu,
+                        num_kv_layers: kv_layers,
+                        num_kv_heads: kv_heads,
+                        head_dim: kv_head_dim,
+                        // KV 블록은 VRAM 에서 F8E4M3(1바이트)로 압축 보관됩니다.
+                        bytes_per_elem: 1,
+                        planned_tokens: planned,
+                        label: "Qwen(0.6B)",
+                    },
+                );
+
+                self.keep_weights_resident =
+                    crate::utils::resources::free_ram_bytes() > 6_000_000_000;
+                self.kv_plan = Some(plan);
+
+                for layer in self.layers.iter_mut() {
+                    layer.set_kv_residency(plan);
+                }
+            }
+        } else {
+            self.kv_plan = None;
+            self.keep_weights_resident = false;
+            for layer in self.layers.iter_mut() {
+                layer.set_kv_residency(crate::utils::resources::KvResidency::Ssd);
+            }
+        }
+
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?;
@@ -2769,11 +2895,27 @@ impl QuantizedQwenVLTextModel {
         Ok(final_output)
     }
 
+    /// 🌟 [KV RESIDENCY] (레이어 수, KV 헤드 수, head_dim) 을 반환합니다.
+    /// GGUF 텐서 형상으로 헤드 수가 오버라이드된 경우까지 반영하기 위해
+    /// config 가 아니라 실제 레이어 0 의 어텐션 필드를 우선 참조합니다.
+    fn kv_plan_geometry(&self) -> (usize, usize, usize) {
+        let layers = self.layers.len();
+        let (heads, dim) = self
+            .layers
+            .first()
+            .map(|l| (l.self_attn.num_key_value_heads, l.self_attn.head_dim))
+            .unwrap_or((self.config.num_key_value_heads, self.config.head_dim));
+        (layers, heads, dim)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
         self.current_kv_len = 0;
+        // 🌟 [KV RESIDENCY] 세션이 바뀌면 배치 계획도 폐기하여 다음 디코딩에서 재판정합니다.
+        self.kv_plan = None;
+        self.keep_weights_resident = false;
     }
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {
