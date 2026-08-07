@@ -5083,12 +5083,37 @@ document.getElementById("btn-logout")?.addEventListener("click", async () => {
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
-            await appDb.delete(); // Dexie DB 완전 삭제
-            sessionStorage.clear(); // 세션 스토리지 초기화
-            window.location.reload(); // 앱 상태를 완전히 비우기 위해 강제 새로고침
+            // 1. 프론트엔드 전역 상태 초기화
+            await GlobalTaskManager.forceReset();
+            isExtracting = false;
+            isSearching = false;
+            stopSpinner();
+            cachedDocs = [];
+            currentPage = 0;
+            hasMore = true;
+            selectedUuids.clear();
+            activeTags = [];
+            activeContext = { cc: "", bcc: "", ref: "" };
+            if (docListContainer) docListContainer.innerHTML = "";
+            if (chatTalks) chatTalks.innerHTML = "";
+            
+            // 2. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
+            await invoke("reset_lancedb");
+            console.log("[RESET] LanceDB backend reset complete.");
+            
+            // 3. 프론트엔드 Dexie DB 완전 삭제 후 재생성
+            await appDb.delete();
+            await appDb.open();
+            console.log("[RESET] Dexie DB deleted and reopened.");
+            
+            // 4. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
+            sessionStorage.clear();
+            
+            // 5. 앱 강제 새로고침
+            window.location.reload();
         } catch (e) {
             console.error("DB Initialization failed:", e);
-            alert("DB 초기화 중 오류가 발생했습니다.");
+            alert("DB 초기화 중 오류가 발생했습니다: " + e);
         }
     }
 });

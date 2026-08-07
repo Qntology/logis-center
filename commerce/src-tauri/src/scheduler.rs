@@ -6278,12 +6278,19 @@ async fn process_task(
         
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
-            was_draft = if existing_item.updated_at_ts == 0 {
-                true
-            } else if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                !json_val.get("detail").and_then(|v| v.as_bool()).unwrap_or(true)
+            // 🌟 [CRITICAL FIX] index.ts와 동일하게 "items" 테이블의 updated_at을 기준으로 draft 판정.
+            // target_table(sales)의 updated_at_ts가 0이더라도, items 테이블에서 이미
+            // updated_at이 설정되어 있으면(이전에 상세 스캔된 적 있음) draft가 아님.
+            // 또한 update_team_base_metrics가 items_to_process를 스캔하여 draft/count를
+            // 자동 계산하므로, 여기서 수동으로 stats_diff를 적용하면 이중 카운트 발생.
+            let mut items_doc_updated_at: i64 = -1; // -1 = items 테이블에서 못 찾음
+            if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
+                items_doc_updated_at = items_doc.updated_at_ts;
+            }
+            was_draft = if items_doc_updated_at == 0 {
+                true // items 테이블의 updated_at이 0 → 아직 상세 스캔 안됨 (draft 상태)
             } else {
-                false
+                false // items 테이블의 updated_at > 0 또는 항목 없음 → 이미 상세 스캔됨
             };
             
             if existing_item.digest == item_digest {
@@ -6307,10 +6314,12 @@ async fn process_task(
                 is_new = false;
                 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    was_draft = if existing_item.updated_at_ts == 0 {
+                    let mut items_doc_updated_at: i64 = -1;
+                    if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
+                        items_doc_updated_at = items_doc.updated_at_ts;
+                    }
+                    was_draft = if items_doc_updated_at == 0 {
                         true
-                    } else if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                        !json_val.get("detail").and_then(|v| v.as_bool()).unwrap_or(true)
                     } else {
                         false
                     };
@@ -6333,9 +6342,15 @@ async fn process_task(
             e.1 += 1;
             e.2 += 1;
         } else if was_draft {
-            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.0 -= 1;
-            e.1 += 1;
+            // 🌟 [CRITICAL FIX] update_team_base_metrics가 items_to_process를 스캔하여
+            // updated_at > 0인 항목을 자동으로 count로 분류합니다.
+            // 여기서 수동으로 draft--, count++를 적용하면 update_team_base_metrics의
+            // 자동 분류와 겹쳐 이중 카운트가 발생합니다.
+            // extracted_data의 updated_at을 now로 설정하는 것만으로 충분합니다.
+            // (was_draft 판정은 updated_at 업데이트 트리거로만 사용)
+            if let Some(obj) = extracted_data.as_object_mut() {
+                obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+            }
         }
 
         let vector = if let Some(v) = existing_vector {
@@ -6343,6 +6358,25 @@ async fn process_task(
         } else {
             Some(model.get_embedding(text_to_embed).await?)
         };
+
+        // 🌟 [INDEX.TS PARITY] 릴레이 실행 전에 tracking_number로부터 tracking index를 사전 계산합니다.
+        // index.ts에서는 item.tracking = crc32(hashId('tracking'+team.id+tracking_number))를
+        // 릴레이 전에 설정하여 릴레이가 기존 항목을 정확히 찾을 수 있도록 합니다.
+        if page_type == "order" {
+            if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
+                if !tn_raw.trim().is_empty() {
+                    let clean_tn_pre = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
+                        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                    if !clean_tn_pre.is_empty() {
+                        let tracking_index_pre = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn_pre)));
+                        if let Some(obj) = extracted_data.as_object_mut() {
+                            obj.insert("tracking".to_string(), json!(tracking_index_pre));
+                        }
+                        emit_term(&format!("  🔑 [TRACKING INDEX PRE-COMPUTE] tracking_number '{}' → tracking index {} 사전 설정 완료.", clean_tn_pre, tracking_index_pre));
+                    }
+                }
+            }
+        }
 
         let related_types = crate::logic::related(&page_type);
         for foreign_type in related_types {
@@ -6426,37 +6460,72 @@ async fn process_task(
                             }
                         },
                         Ok(None) => {
-                            
-                            let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                            e.0 += 1;
-                            e.2 += 1;
-
-                            let mut draft_data = json!({});
-                            
-                            
-                            let val_str = match &q.value {
+                            // 🌟 [DEDUP FIX] 상세 페이지 relay에서 기존 목록 전처리에서 이미 생성된
+                            // goods/tracking이 있는지 "items" 테이블에서 교차 검색합니다.
+                            let mut found_existing = false;
+                            let val_str_for_search = match &q.value {
                                 serde_json::Value::String(s) => s.clone(),
                                 serde_json::Value::Number(n) => n.to_string(),
                                 _ => q.value.to_string(),
                             };
-                            let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
-                            
-                            if let Some(obj) = draft_data.as_object_mut() {
-                                obj.insert("id".to_string(), json!(draft_id.clone()));
-                                obj.insert("type".to_string(), json!(foreign_type));
-                                obj.insert(q.column.clone(), q.value.clone());
-                                obj.insert("updated_at".to_string(), json!(0));
+                            if !val_str_for_search.is_empty() {
+                                let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
+                                    if !cross_results.is_empty() {
+                                        found_existing = true;
+                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                    }
+                                }
                             }
 
-                            let _ = store.upsert_item(
-                                &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                            ).await;
+                            // 🌟 [ORDER INDEX FALLBACK] goods/tracking relay가 tracking 컬럼으로 못 찾았을 때,
+                            // order index로도 검색합니다. 목록 스캔에서 생성된 항목에는 tracking 값이 없지만
+                            // order index는 있으므로 이 폴백으로 기존 항목을 찾을 수 있습니다.
+                            // index.ts의 relay가 column: primary.type, value: primary.index로 쿼리하는 동작과 동일합니다.
+                            if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
+                                if let Some(order_idx) = extracted_data.get("index") {
+                                    let order_idx_str = match order_idx {
+                                        serde_json::Value::Number(n) => n.to_string(),
+                                        serde_json::Value::String(s) => s.clone(),
+                                        _ => order_idx.to_string(),
+                                    };
+                                    let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                    if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
+                                        if !fallback_results.is_empty() {
+                                            found_existing = true;
+                                            emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] order index {}로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", order_idx_str, foreign_type));
+                                        }
+                                    }
+                                }
+                            }
 
-                            let _ = store.upsert_item(
-                                "items", &draft_id, foreign_type, draft_data, None,
-                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                            ).await;
+                            if !found_existing {
+                                let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
+                                e.0 += 1;
+                                e.2 += 1;
+
+                                let mut draft_data = json!({});
+                                let val_str = match &q.value {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    _ => q.value.to_string(),
+                                };
+                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                                if let Some(obj) = draft_data.as_object_mut() {
+                                    obj.insert("id".to_string(), json!(draft_id.clone()));
+                                    obj.insert("type".to_string(), json!(foreign_type));
+                                    obj.insert(q.column.clone(), q.value.clone());
+                                    obj.insert("updated_at".to_string(), json!(0));
+                                }
+                                let _ = store.upsert_item(
+                                    &q.table, &draft_id, foreign_type, draft_data.clone(), None,
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                                let _ = store.upsert_item(
+                                    "items", &draft_id, foreign_type, draft_data, None,
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                ).await;
+                            }
                         },
                         _ => {}
                     }
@@ -6525,35 +6594,119 @@ async fn process_task(
                                 }
                             },
                             Ok(None) => {
-
-                                let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                e.0 += 1;
-                                e.2 += 1;
-                                let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
-                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
-                                let mut draft_data = json!({});
-                                if let Some(obj) = draft_data.as_object_mut() {
-                                    obj.insert("id".to_string(), json!(draft_id.clone()));
-                                    obj.insert("type".to_string(), json!("tracking"));
-                                    obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                    obj.insert("index".to_string(), json!(tracking_index));
-
-                                    if let Some(order_index) = extracted_data.get("index") {
-                                        obj.insert("order".to_string(), order_index.clone());
+                                // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                let mut found_existing_tracking = false;
+                                let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
+                                    if !tracking_cross.is_empty() {
+                                        found_existing_tracking = true;
+                                        let existing_tracking_id = &tracking_cross[0].id;
+                                        // 기존 tracking 문서에 order index만 매핑
+                                        if let Ok(Some(mut existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
+                                            if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
+                                                if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
+                                                    if let Some(order_index) = extracted_data.get("index") {
+                                                        ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
+                                                    }
+                                                    if let Some(tn_val) = extracted_data.get("tracking") {
+                                                        ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
+                                                    }
+                                                    ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                                    ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                                    let merged_text = crate::parsing::json_to_natural_language(&ej);
+                                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                                    ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                                    ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                                    let _ = store.upsert_item(
+                                                        "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
+                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                    ).await;
+                                                    let _ = store.upsert_item(
+                                                        "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                    ).await;
+                                                }
+                                                if let Some(tracking_index) = ej.get("index").cloned() {
+                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
+                                                }
+                                            }
+                                        }
+                                        emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
                                     }
-                                    obj.insert("updated_at".to_string(), json!(0));
                                 }
 
-                                extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                let _ = store.upsert_item(
-                                    "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                let _ = store.upsert_item(
-                                    "items", &draft_id, "tracking", draft_data, None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                // 🌟 [ORDER INDEX FALLBACK] tracking_number로 못 찾았으면 order index로도 검색합니다.
+                                // 목록 스캔에서 생성된 tracking 항목에는 tracking_number가 없지만 order index는 있습니다.
+                                // index.ts의 relay("tracking", "order")가 column: primary.type, value: primary.index로
+                                // 쿼리하는 것과 동일한 로직입니다.
+                                if !found_existing_tracking {
+                                    if let Some(order_index_val) = extracted_data.get("index") {
+                                        match store.find_item_by_property("tracking", "order", order_index_val).await {
+                                            Ok(Some((fallback_tid, mut fallback_tdata))) => {
+                                                found_existing_tracking = true;
+                                                let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                                                if let Some(obj) = fallback_tdata.as_object_mut() {
+                                                    obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                                    if let Some(tn_idx) = extracted_data.get("tracking") {
+                                                        obj.insert("tracking".to_string(), tn_idx.clone());
+                                                    }
+                                                    obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                                }
+                                                if was_fb_draft {
+                                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                                    e.0 -= 1;
+                                                    e.1 += 1;
+                                                }
+                                                let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
+                                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                                fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                                fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                                let _ = store.upsert_item(
+                                                    "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
+                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                ).await;
+                                                let _ = store.upsert_item(
+                                                    "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                ).await;
+                                                if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
+                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
+                                                }
+                                                emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
+                                            },
+                                            _ => {}
+                                        }
+                                    }
+                                }
+
+                                if !found_existing_tracking {
+                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                    e.0 += 1;
+                                    e.2 += 1;
+                                    let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
+                                    let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                    let mut draft_data = json!({});
+                                    if let Some(obj) = draft_data.as_object_mut() {
+                                        obj.insert("id".to_string(), json!(draft_id.clone()));
+                                        obj.insert("type".to_string(), json!("tracking"));
+                                        obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                        obj.insert("index".to_string(), json!(tracking_index));
+                                        if let Some(order_index) = extracted_data.get("index") {
+                                            obj.insert("order".to_string(), order_index.clone());
+                                        }
+                                        obj.insert("updated_at".to_string(), json!(0));
+                                    }
+                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
+                                    let _ = store.upsert_item(
+                                        "tracking", &draft_id, "tracking", draft_data.clone(), None,
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+                                    let _ = store.upsert_item(
+                                        "items", &draft_id, "tracking", draft_data, None,
+                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                    ).await;
+                                    emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                }
                             },
                             _ => {}
                         }
@@ -6711,37 +6864,69 @@ async fn process_task(
                                     }
                                 },
                                 Ok(None) => {
-                                    
-                                    let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                    e.0 += 1;
-                                    e.2 += 1;
-
-                                    let mut draft_data = json!({});
-                                    
-                                    
-                                    let val_str = match &q.value {
+                                    // 🌟 [DEDUP FIX] relay draft 생성 전, 동일한 foreign_type + 값이
+                                    // 이미 items 테이블에 존재하는지 확인하여 중복 생성을 방지합니다.
+                                    let mut found_existing = false;
+                                    let val_str_for_search = match &q.value {
                                         serde_json::Value::String(s) => s.clone(),
                                         serde_json::Value::Number(n) => n.to_string(),
                                         _ => q.value.to_string(),
                                     };
-                                    let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
-                                    
-                                    if let Some(obj) = draft_data.as_object_mut() {
-                                        obj.insert("id".to_string(), json!(draft_id.clone()));
-                                        obj.insert("type".to_string(), json!(foreign_type));
-                                        obj.insert(q.column.clone(), q.value.clone());
-                                        obj.insert("updated_at".to_string(), json!(0));
+                                    if !val_str_for_search.is_empty() {
+                                        let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                        if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
+                                            if !cross_results.is_empty() {
+                                                found_existing = true;
+                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                            }
+                                        }
                                     }
 
-                                    let _ = store.upsert_item(
-                                        &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    // 🌟 [ORDER INDEX FALLBACK] goods/tracking relay가 못 찾았을 때 order index로도 검색
+                                    if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
+                                        if let Some(order_idx) = single_item.get("index") {
+                                            let order_idx_str = match order_idx {
+                                                serde_json::Value::Number(n) => n.to_string(),
+                                                serde_json::Value::String(s) => s.clone(),
+                                                _ => order_idx.to_string(),
+                                            };
+                                            let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                            if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
+                                                if !fallback_results.is_empty() {
+                                                    found_existing = true;
+                                                    emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] order index {}로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", order_idx_str, foreign_type));
+                                                }
+                                            }
+                                        }
+                                    }
 
-                                    let _ = store.upsert_item(
-                                        "items", &draft_id, foreign_type, draft_data, None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    if !found_existing {
+                                        let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
+                                        e.0 += 1;
+                                        e.2 += 1;
+
+                                        let mut draft_data = json!({});
+                                        let val_str = match &q.value {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            serde_json::Value::Number(n) => n.to_string(),
+                                            _ => q.value.to_string(),
+                                        };
+                                        let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                                        if let Some(obj) = draft_data.as_object_mut() {
+                                            obj.insert("id".to_string(), json!(draft_id.clone()));
+                                            obj.insert("type".to_string(), json!(foreign_type));
+                                            obj.insert(q.column.clone(), q.value.clone());
+                                            obj.insert("updated_at".to_string(), json!(0));
+                                        }
+                                        let _ = store.upsert_item(
+                                            &q.table, &draft_id, foreign_type, draft_data.clone(), None,
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                        let _ = store.upsert_item(
+                                            "items", &draft_id, foreign_type, draft_data, None,
+                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                        ).await;
+                                    }
                                 },
                                 _ => {}
                             }
@@ -6809,35 +6994,115 @@ async fn process_task(
                                         }
                                     },
                                     Ok(None) => {
-
-                                        let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                        e.0 += 1;
-                                        e.2 += 1;
-                                        let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
-                                        let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
-                                        let mut draft_data = json!({});
-                                        if let Some(obj) = draft_data.as_object_mut() {
-                                            obj.insert("id".to_string(), json!(draft_id.clone()));
-                                            obj.insert("type".to_string(), json!("tracking"));
-                                            obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                            obj.insert("index".to_string(), json!(tracking_index));
-
-                                            if let Some(order_index) = single_item.get("index") {
-                                                obj.insert("order".to_string(), order_index.clone());
+                                        // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                        let mut found_existing_tracking = false;
+                                        let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                        if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
+                                            if !tracking_cross.is_empty() {
+                                                found_existing_tracking = true;
+                                                let existing_tracking_id = &tracking_cross[0].id;
+                                                if let Ok(Some(mut existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
+                                                    if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
+                                                        if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
+                                                            if let Some(order_index) = single_item.get("index") {
+                                                                ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
+                                                            }
+                                                            if let Some(tn_val) = single_item.get("tracking") {
+                                                                ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
+                                                            }
+                                                            ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                                            let merged_text = crate::parsing::json_to_natural_language(&ej);
+                                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                                            ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                                            ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                                            let _ = store.upsert_item(
+                                                                "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
+                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                            ).await;
+                                                            let _ = store.upsert_item(
+                                                                "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                            ).await;
+                                                        }
+                                                        if let Some(tracking_index) = ej.get("index").cloned() {
+                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
+                                                        }
+                                                    }
+                                                }
+                                                emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
                                             }
-                                            obj.insert("updated_at".to_string(), json!(0));
                                         }
 
-                                        single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                        let _ = store.upsert_item(
-                                            "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        let _ = store.upsert_item(
-                                            "items", &draft_id, "tracking", draft_data, None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                        // 🌟 [ORDER INDEX FALLBACK] tracking_number로 못 찾았으면 order index로도 검색합니다.
+                                        if !found_existing_tracking {
+                                            if let Some(order_index_val) = single_item.get("index") {
+                                                match store.find_item_by_property("tracking", "order", order_index_val).await {
+                                                    Ok(Some((fallback_tid, mut fallback_tdata))) => {
+                                                        found_existing_tracking = true;
+                                                        let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                                                        if let Some(obj) = fallback_tdata.as_object_mut() {
+                                                            obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                                            if let Some(tn_idx) = single_item.get("tracking") {
+                                                                obj.insert("tracking".to_string(), tn_idx.clone());
+                                                            }
+                                                            obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                                        }
+                                                        if was_fb_draft {
+                                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                                            e.0 -= 1;
+                                                            e.1 += 1;
+                                                        }
+                                                        let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
+                                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                                                        fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                                        fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                                        let _ = store.upsert_item(
+                                                            "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
+                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                        ).await;
+                                                        let _ = store.upsert_item(
+                                                            "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                                        ).await;
+                                                        if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
+                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
+                                                        }
+                                                        emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
+                                                    },
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+
+                                        if !found_existing_tracking {
+                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
+                                            e.0 += 1;
+                                            e.2 += 1;
+                                            let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
+                                            let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                            let mut draft_data = json!({});
+                                            if let Some(obj) = draft_data.as_object_mut() {
+                                                obj.insert("id".to_string(), json!(draft_id.clone()));
+                                                obj.insert("type".to_string(), json!("tracking"));
+                                                obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
+                                                obj.insert("index".to_string(), json!(tracking_index));
+                                                if let Some(order_index) = single_item.get("index") {
+                                                    obj.insert("order".to_string(), order_index.clone());
+                                                }
+                                                obj.insert("updated_at".to_string(), json!(0));
+                                            }
+                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
+                                            let _ = store.upsert_item(
+                                                "tracking", &draft_id, "tracking", draft_data.clone(), None,
+                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                            ).await;
+                                            let _ = store.upsert_item(
+                                                "items", &draft_id, "tracking", draft_data, None,
+                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
+                                            ).await;
+                                            emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                        }
                                     },
                                     _ => {}
                                 }
