@@ -200,15 +200,36 @@ impl QwenVLVisionAttention {
         let q_splits = split_tensor(&query_states, chunks, 2)?;
         let k_splits = split_tensor(&key_states, chunks, 2)?;
         let v_splits = split_tensor(&value_states, chunks, 2)?;
-        
+
+        // 🌟 [VISION-TILE] qwen/common.rs 의 eager_attention_forward 도 KV 축만 4096 으로 자릅니다.
+        //    쿼리 축을 타일링해 (q_tile × 4096 × heads) 로 전이 버퍼를 가둡니다. 결과는 완전 동일합니다.
+        let max_kv = chunks.iter().copied().max().unwrap_or(seq_length);
+        let dtype_bytes = query_states.dtype().size_in_bytes();
+        let q_tile = crate::models::common::vision_query_tile_size(self.num_heads, max_kv, dtype_bytes);
+
         let mut attn_outputs = Vec::new();
         for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
-            let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
-            attn_outputs.push(output);
+            let q_len = q.dim(2)?;
+
+            if q_tile == 0 || q_len <= q_tile {
+                let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
+                attn_outputs.push(output);
+            } else {
+                let mut off = 0usize;
+                while off < q_len {
+                    let take = (q_len - off).min(q_tile);
+                    let q_tile_t = q.narrow(2, off, take)?.contiguous()?;
+                    let out = eager_attention_forward(&q_tile_t, k, v, None, None, self.scaling)?;
+                    drop(q_tile_t);
+                    attn_outputs.push(out);
+                    off += take;
+                }
+            }
         }
         
         // [CRITICAL FIX] 취합 후에도 reshape 시 metadata만 조작하므로 contiguous() 불필요!
         let attn_output = Tensor::cat(&attn_outputs, 1)?.reshape((seq_length, ()))?;
+        drop(attn_outputs);
         Ok(attn_output.apply(&self.proj)?)
     }
 }

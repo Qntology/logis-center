@@ -2565,13 +2565,13 @@ impl Qwen3_5Model {
                 if image_embeds.is_none() {
                     // 🌟 [VISION-JIT] 캐시 MISS 가 확정된 이 순간에만 mmproj 를 mmap 에서 붙입니다.
                     //    캐시 히트 경로에서는 600MB 를 아예 올리지 않습니다.
+                    // 🌟 [VISION-STREAM] forward 가 블록을 하나씩 읽고 버리므로 &mut 借用 이 필요합니다.
+                    //    reload 와 forward 를 하나의 as_mut() 借用 으로 묶습니다.
                     if let Some(visual) = self.visual.as_mut() {
                         if !visual.is_weights_loaded && visual.is_jit_capable() {
                             visual.reload_weights()?;
                         }
-                    }
 
-                    if let Some(visual) = self.visual.as_ref() {
                         let (computed, deepstacks): (Tensor, Vec<Tensor>) =
                             visual.forward(pixel_values, image_grid_thw)?;
 
@@ -2594,9 +2594,16 @@ impl Qwen3_5Model {
         }
         if let Some(pixel_values_video) = pixel_values_video {
             if let Some(video_grid_thw) = video_grid_thw {
-                if let Some(visual) = self.visual.as_ref() {
+                // 🌟 [VISION-STREAM] forward 가 &mut self 로 바뀌었으므로 as_mut() 로 받습니다.
+                //    (embeds 를 먼저 확보한 뒤 inputs_embeds 를 만지면 借用 충돌이 없습니다)
+                let video_embeds_opt: Option<Tensor> = if let Some(visual) = self.visual.as_mut() {
                     let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
-                    
+                    Some(video_embeds)
+                } else {
+                    None
+                };
+
+                if let Some(video_embeds) = video_embeds_opt {
                     let vid_token_t = Tensor::new(vec![self.video_token_id as f32], &Device::Cpu)?;
                     let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&vid_token_t)?.to_dtype(DType::U8)?;
                     let vision_mask = mask_cpu.to_device(input_ids.device())?;

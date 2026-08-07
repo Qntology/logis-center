@@ -94,7 +94,9 @@ impl QwenVLProcessor {
     ///   mem(N) = A·N + B·N²  →  B·N² + A·N - usable = 0 의 양근이 안전 패치 수입니다.
     fn compute_adaptive_max_pixels(&self, config_max: u32) -> u32 {
         const A: f64 = 24_000.0;
-        const B: f64 = 32.0;
+        // 🌟 [VISION-TILE 반영] 쿼리축 타일링으로 어텐션 전이 버퍼에 상한이 걸렸으므로
+        //   N² 계수를 32 → 4 로 낮춥니다. (qwen3vl/processor.rs 와 동일 근거)
+        const B: f64 = 4.0;
         const RESERVE: u64 = 800_000_000;
 
         let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;

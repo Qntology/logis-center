@@ -70,7 +70,13 @@ pub struct Qwen3VLProcessor {
 ///   ① 6GB 초과 구간이 무방비였고 ② JIT 으로 확보한 VRAM 을 반영하지 못했으며
 ///   ③ 계단 경계에서 30% 불연속이 발생했습니다. 이를 연속 함수로 대체합니다.
 const VISION_MEM_LINEAR_COEF: f64 = 24_000.0;
-const VISION_MEM_QUADRATIC_COEF: f64 = 32.0;
+/// 🌟 [VISION-TILE 반영] 쿼리축 타일링 도입 전에는 어텐션 전이 버퍼가
+///   (N × min(N,4096) × heads) 로 N² 에 가깝게 자라 B = 32 가 필요했습니다.
+///   타일링 이후에는 전이 버퍼가 (q_tile × 4096 × heads) 로 상한이 걸려
+///   N 에 대해 사실상 상수가 됩니다. 남는 N² 성분은 block_outputs 누적분뿐이므로
+///   계수를 32 → 4 로 낮춰 확보한 VRAM 을 해상도로 환원합니다.
+///   (OOM 이 재발하면 4 → 8 → 16 순으로 되돌리십시오)
+const VISION_MEM_QUADRATIC_COEF: f64 = 4.0;
 /// ViT 가중치(mmproj) + CUDA 컨텍스트 + 파편화 여유분
 const VISION_VRAM_RESERVE: u64 = 800_000_000;
 

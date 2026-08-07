@@ -428,6 +428,13 @@ impl TwoLinearMLPGguf {
         self.linear2 = dummy;
     }
 
+    /// 🌟 [VISION-STREAM] 레이어 스트리밍이 Gguf 래퍼를 거치지 않고
+    ///   &Content 로 직접 읽은 프로젝션을 밀어 넣을 수 있도록 노출합니다.
+    pub fn set_projs(&mut self, linear1: ProjKind, linear2: ProjKind) {
+        self.linear1 = linear1;
+        self.linear2 = linear2;
+    }
+
     /// 🌟 [VISION-JIT] 비전 입력이 감지되면 mmproj GGUF에서 in-place로 재로드합니다.
     pub fn load_weights_inplace<R: Read + Seek>(
         &mut self,
