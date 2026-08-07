@@ -232,13 +232,18 @@ pub fn exclusive_assign_by_score(
             let own = get(f, l);
             if own < abs_threshold { continue; }
 
+            // 🌟 [RIVAL FIX] 후보 자격이 없는 칸(-1.0 같은 무효 표식)을 경쟁자로 세면
+            //    margin = own - (-1.0) = own + 1.0 이 되어, 경쟁자가 아예 없는 쓰레기 후보가
+            //    가장 강한 주장처럼 정렬됩니다. (로그의 '상품금액'→'bank' Margin +1.0407)
+            //    abs_threshold 를 통과한 '실제 후보'만 경쟁자로 인정합니다.
             let mut rival = f32::MIN;
             for other in 0..field_count {
                 if other == f { continue; }
                 let s = get(other, l);
+                if s < abs_threshold { continue; }
                 if s > rival { rival = s; }
             }
-            if rival == f32::MIN { rival = 0.0; }
+            let rival = if rival == f32::MIN { abs_threshold } else { rival };
 
             let margin = own - rival;
             if margin < margin_threshold { continue; }
@@ -568,6 +573,18 @@ pub fn strip_markup_prefix(value: &str) -> String {
 pub fn extract_date_literal(s: &str) -> Option<String> {
     let re = regex::Regex::new(r"\d{2,4}[-/\.]\d{1,2}[-/\.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?").ok()?;
     re.find(s).map(|m| m.as_str().trim().to_string())
+}
+
+// 🌟 [PURE NUMERIC] 열거형(Enum)은 '상태/수단/기관명' 이므로 순수 금액·수량이 될 수 없습니다.
+//    '615600원', '(-) 0원', '0' 처럼 숫자와 단위 한 글자로만 이루어진 값을 구조적으로 판별합니다.
+//    (특정 통화 문자를 하드코딩하지 않고 '알파벳류 글자 수 <= 1' 로 일반화합니다)
+pub fn is_pure_numeric_value(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() { return false; }
+    let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits == 0 { return false; }
+    let letters = v.chars().filter(|c| c.is_alphabetic()).count();
+    letters <= 1
 }
 
 pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
@@ -1419,6 +1436,15 @@ pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
     }
 
     // (c) placeholder 기반 보조 페어 : "개별 운송장번호" 처럼 th 가 없는 값의 유일한 라벨입니다.
+    //     🌟 [PLACEHOLDER DEDUPE] 단, 그 라인을 이미 th 기반 라벨이 소유하고 있다면
+    //     placeholder 는 '보조 안내문'일 뿐 라벨이 아닙니다.
+    //     Line 165 는 th '가맹점 ID' 가 있는데 placeholder '없음' 이 중복 생성되어
+    //     payment_origin ← '없음' → 값 'test1' 오염을 만들었고,
+    //     Line 178 도 th '입금자명' 위에 '실 입금자명' 이 겹쳤습니다.
+    //     반대로 Line 75 는 th 페어가 없으므로 placeholder 가 유일한 라벨이라 반드시 보존됩니다.
+    let structural_lines: std::collections::HashSet<usize> =
+        pairs.iter().map(|p| p.primary_line).collect();
+
     for i in 0..n {
         if lines[i].trim().is_empty() { continue; }
         if parts[i].1 != "input" && parts[i].1 != "textarea" { continue; }
@@ -1426,6 +1452,7 @@ pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
         if ph.trim().is_empty() { continue; }
         let v = parts[i].3.trim().to_string();
         if v.is_empty() { continue; }
+        if structural_lines.contains(&i) { continue; }
         pairs.push(DetailPair {
             label: ph.trim().to_string(),
             section: sections[i].clone(),

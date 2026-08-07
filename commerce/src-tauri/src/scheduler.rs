@@ -20,7 +20,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, exclusive_assign_by_score, self_poisoned_prejudice_mask, collect_select_groups, enum_status_keys, status_key_phrases, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, exclusive_assign_by_score, self_poisoned_prejudice_mask, collect_select_groups, enum_status_keys, status_key_phrases, double_center_matrix, detect_field_format, value_matches_format, is_pure_numeric_value, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
@@ -4942,6 +4942,32 @@ async fn process_task(
                     d_prej_embs.push(kept);
                 }
 
+                // 🌟 ②-0 [PAIR VALUE PRE-BUILD] 각 유일 라벨이 실제로 들고 있는 값을 미리 합성합니다.
+                //    행렬을 만들기 '전에' 값 형식을 검증해야, 형식이 맞지 않는 라벨이 필드를 선점한 뒤
+                //    [DETAIL PAIR FORMAT REJECT] 로 버려지면서 그 필드가 통째로 빈값이 되는 사고를 막습니다.
+                //    (로그: registration_date←'주문채널', sender_address←'주문하신 분 IP Address',
+                //           payment_date←'전달 메세지' 가 전부 이 경로로 소멸했습니다)
+                let mut phrase_single_value: Vec<String> = vec![String::new(); unique_phrases.len()];
+                let mut phrase_multi_value: Vec<String> = vec![String::new(); unique_phrases.len()];
+                for (pi, ph) in pair_phrases.iter().enumerate() {
+                    let h = match unique_phrases.iter().position(|u| u == ph) { Some(v) => v, None => continue };
+                    let p = &detail_pairs[pi];
+                    if p.primary_line >= pug_lines_ref.len() { continue; }
+                    if pug_lines_ref[p.primary_line].trim().is_empty() { continue; }
+                    if phrase_single_value[h].is_empty() && !p.value.trim().is_empty() {
+                        phrase_single_value[h] = p.value.clone();
+                    }
+                    let av = p.value_all.trim();
+                    if !av.is_empty() && !phrase_multi_value[h].contains(av) {
+                        if phrase_multi_value[h].is_empty() {
+                            phrase_multi_value[h] = av.to_string();
+                        } else {
+                            phrase_multi_value[h].push(' ');
+                            phrase_multi_value[h].push_str(av);
+                        }
+                    }
+                }
+
                 // 🌟 ② 리프 행렬 / 섹션 행렬을 각각 원시 코사인으로 채웁니다.
                 //    편견은 '점수에서 빼는' 방식이 아니라 '경쟁 개념이 우세하면 후보 탈락'이라는
                 //    상대 게이트로만 사용합니다. (절대 감점은 임계치 지옥을 다시 만듭니다)
@@ -4950,6 +4976,15 @@ async fn process_task(
                 let mut sec_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
 
                 for f in 0..d_field_names.len() {
+                    let f_fmt = detect_field_format(&d_field_names[f]);
+                    let f_multi = is_multi_value_field(&d_field_names[f]);
+                    // 생김새가 확정적인 형식은 행렬 진입 전에 값까지 검증합니다.
+                    let f_strict = matches!(
+                        f_fmt,
+                        FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric
+                            | FieldFormat::Phone | FieldFormat::Address | FieldFormat::Text
+                    );
+
                     for h in 0..unique_phrases.len() {
                         if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
                         let own = weighted_max_pool_sim(&leaf_embs[h], &d_label_embs[f], &d_label_weights[f]);
@@ -4960,6 +4995,26 @@ async fn process_task(
                                 unique_phrases[h], d_field_names[f], own, prej));
                             continue;
                         }
+
+                        // 🌟 ②-1 [PAIR VALUE FORMAT GATE] 라벨이 아무리 잘 맞아도
+                        //    그 라벨이 들고 있는 값이 필드 형식과 다르면 후보가 될 수 없습니다.
+                        let pair_val = if f_multi { &phrase_multi_value[h] } else { &phrase_single_value[h] };
+                        if f_strict {
+                            if pair_val.trim().is_empty() || !value_matches_format(f_fmt, pair_val) {
+                                emit_term(&format!("    🚫 [PAIR VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 이 형식과 불일치하여 후보 제외.",
+                                    unique_phrases[h], d_field_names[f], f_fmt, pair_val));
+                                continue;
+                            }
+                        }
+                        // 🌟 ②-2 [ENUM NUMERIC GATE] 열거형은 '상태/수단/기관명' 이므로
+                        //    순수 금액·수량이 될 수 없습니다.
+                        //    (로그: bank←'상품금액' 615600, payment_method←'무통장 입금액' 615600원)
+                        if f_fmt == FieldFormat::Enum && is_pure_numeric_value(pair_val) {
+                            emit_term(&format!("    🚫 [ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치이므로 열거형 후보가 될 수 없습니다.",
+                                unique_phrases[h], d_field_names[f], pair_val));
+                            continue;
+                        }
+
                         leaf_raw[f][h] = own;
 
                         if unique_section[h].is_empty() { continue; }
@@ -4968,24 +5023,44 @@ async fn process_task(
                     }
                 }
 
-                // 🌟 ③ 이중 센터링 : 라벨 고유 베이스라인과 필드 고유 베이스라인을 동시에 제거해
-                //    0.55~0.90 에 뭉친 원시값을 '상대 우위' 값으로 변환합니다.
-                let leaf_centered = double_center_matrix(&leaf_raw);
-                let sec_centered = double_center_matrix(&sec_raw);
-                const SECTION_WEIGHT: f32 = 1.0f32;
-
+                // 🌟 ③ [이중 센터링 폐기 + 섹션 라인 대비]
+                //    이중 센터링은 밀집 행렬 전용 도구입니다. 편견/형식 게이트를 통과한 페어 행렬은
+                //    밀도가 ~5% 라 '유효 후보가 1개뿐인 라벨'이 대부분이고, 그 경우
+                //      centered = own - own - field_mean + global = global - field_mean
+                //    으로 own 이 식에서 완전히 소거됩니다.
+                //    → '계좌번호'(0.8817) 와 '상품금액'(0.7073) 의 점수가 비트 단위로 같아졌습니다.
+                //    라벨 간 경쟁은 exclusive_assign_by_score 의 margin 이 이미 담당하므로
+                //    센터링은 '동률을 깨는 섹션 항'에만 라인 단위로 제한 적용합니다.
+                //    (sender_*/recipient_* 는 리프 라벨이 '이름/핸드폰/주소'로 완전 동률이라
+                //     이 항이 유일한 판별 신호입니다)
+                const SECTION_WEIGHT: f32 = 0.5f32;
                 let mut d_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
-                for f in 0..d_field_names.len() {
-                    for h in 0..unique_phrases.len() {
+                for h in 0..unique_phrases.len() {
+                    let mut sec_sum = 0.0f32;
+                    let mut sec_cnt = 0usize;
+                    for f in 0..d_field_names.len() {
                         if leaf_raw[f][h] < 0.0 { continue; }
-                        let sec_term = if sec_raw[f][h] >= 0.0 { sec_centered[f][h] } else { 0.0 };
-                        d_matrix[f][h] = leaf_centered[f][h] + SECTION_WEIGHT * sec_term;
+                        if sec_raw[f][h] < 0.0 { continue; }
+                        sec_sum += sec_raw[f][h];
+                        sec_cnt += 1;
+                    }
+                    let sec_mean = if sec_cnt > 0 { sec_sum / (sec_cnt as f32) } else { 0.0 };
+                    for f in 0..d_field_names.len() {
+                        if leaf_raw[f][h] < 0.0 { continue; }
+                        // 경쟁 필드가 2개 이상일 때만 섹션 대비가 의미를 갖습니다.
+                        let sec_term = if sec_cnt > 1 && sec_raw[f][h] >= 0.0 {
+                            sec_raw[f][h] - sec_mean
+                        } else {
+                            0.0
+                        };
+                        d_matrix[f][h] = leaf_raw[f][h] + SECTION_WEIGHT * sec_term;
                     }
                 }
 
                 // 🌟 ④ 절대 점수(증거 강도) 우선 배타 배정.
-                //    '주문하신 분 이름'(own 1.0) 이 '판매자'(own 0.80) 보다 먼저 sender_name 을 잠급니다.
-                let d_assign = exclusive_assign_by_score(&d_matrix, 0.0, 0.005);
+                //    '계좌번호'(0.8817) 가 '상품금액'(0.7073) 보다, '주문하신 분 이름'(1.0) 이
+                //    '판매자'(0.76) 보다 먼저 필드를 잠급니다.
+                let d_assign = exclusive_assign_by_score(&d_matrix, 0.0, 0.0);
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -5245,6 +5320,10 @@ async fn process_task(
 
                 for f in 0..field_count {
                     if field_is_analytic[f] { continue; }
+                    // 🌟 [ID/LINK VECTOR SKIP] id,link 는 '추출 주소 우선' 결정론 해석기가 이미 확정했습니다.
+                    //    벡터 배정을 남겨두면 운송장 input(Line 75) 같은 Identifier 형식 라인을 선점해
+                    //    tracking_number 를 ⛔ FORMAT SKIP 으로 몰아냅니다.
+                    if is_id_link_field(&fields[f].0) && det_id_link.is_some() { continue; }
                     let fmt = field_formats[f];
                     for l in 0..line_count {
                         if pug_lines_ref[l].trim().is_empty() { continue; }
@@ -5497,6 +5576,37 @@ async fn process_task(
                         }
                         emit_term(&format!("  ⚡ [DATE REGEX BYPASS] LLM 없이 확정: {}", done.join(", ")));
                         continue;
+                    }
+                }
+
+                // 🌟 [VALUE COPY BYPASS] 형식 게이트가 이미 '이 값은 이 형식이 맞다'고 판정한 라인을
+                //    배타적으로 지목했다면, 0.6B 에게 '한 글자도 틀리지 말고 복사하라'고 부탁할 이유가 없습니다.
+                //    로그 근거: recipient_phone 은 컨텍스트가 [td, "010-3333-3333"] 로 정답이었는데
+                //    모델이 'td' → '10-3278' 을 반환해 3회 만에 폐기되었습니다.
+                //    복사는 코드가 하고, LLM 은 Text/Enum/합성 필드에만 남깁니다.
+                if !field_is_analytic[idx] && has_vector_match {
+                    let copyable = matches!(
+                        field_format,
+                        FieldFormat::Phone | FieldFormat::Address | FieldFormat::TrackingCode | FieldFormat::Numeric
+                    );
+                    if copyable {
+                        let raw_val = line_values[best_idx].trim().to_string();
+                        if !raw_val.is_empty() && value_matches_format(field_format, &raw_val) {
+                            let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
+                            let mut done = Vec::new();
+                            for k in &keys {
+                                extracted_data.as_object_mut().unwrap().insert(k.to_string(), json!(raw_val.clone()));
+                                done.push(format!("\"{}\": \"{}\"", k, raw_val));
+                            }
+                            if !global_ignore_list.contains(&raw_val) {
+                                global_ignore_list.push(raw_val.clone());
+                                global_ignore_list.push(format!(" {}", raw_val));
+                                global_ignore_list.push(raw_val.to_lowercase());
+                            }
+                            emit_term(&format!("  ⚡ [VALUE COPY BYPASS] ({:?}) LLM 없이 Line {} 값 그대로 확정: {}",
+                                field_format, best_idx + 1, done.join(", ")));
+                            continue;
+                        }
                     }
                 }
 
