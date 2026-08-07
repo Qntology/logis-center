@@ -407,6 +407,33 @@ pub struct TableContext {
     pub base_url: Option<String>, 
 }
 
+// 🌟 [STRUCTURE GUARD] el_ref.text() 는 '텍스트 노드'만 수집하므로
+//    <tr><th>이름</th><td><input value="세글만"></td></tr> 같은 폼 행은
+//    trim() 이후 "이름" 한 덩어리가 되어 인라인 병합 조건을 통과해 버립니다.
+//    그 순간 td 와 input[value] 는 출력조차 되지 않고 문서에서 영구 소멸합니다.
+//    (로그의 'tr | 이름', 'tr | 핸드폰', 'tr | E-mail' 이 전부 이 경로입니다)
+//    따라서 "텍스트로 환원되지 않는 데이터"를 자손으로 가진 노드는
+//    절대 한 줄로 압축하지 않고 반드시 자식까지 펼쳐서 출력합니다.
+fn has_data_bearing_descendant(node: NodeRef<scraper::Node>) -> bool {
+    for desc in node.descendants() {
+        if desc.id() == node.id() { continue; }
+        if let Some(el) = desc.value().as_element() {
+            let t = el.name().to_lowercase();
+            // 셀/폼컨트롤/미디어는 그 자체가 독립된 데이터 단위입니다.
+            if ["tr", "td", "th", "input", "select", "option", "textarea", "button", "img"]
+                .contains(&t.as_str())
+            {
+                return true;
+            }
+            // 텍스트가 아닌 속성에 값이 실려 있는 노드(링크/리소스/폼값)
+            if el.attr("href").map_or(false, |v| !v.trim().is_empty()) { return true; }
+            if el.attr("src").map_or(false, |v| !v.trim().is_empty()) { return true; }
+            if el.attr("value").map_or(false, |v| !v.trim().is_empty()) { return true; }
+        }
+    }
+    false
+}
+
 pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode, ctx: &mut Option<TableContext>) {
     if indent_level > 50 { return; }
     let indent = "    ".repeat(indent_level);
@@ -600,7 +627,9 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
             let mut is_inline_text = false;
             let mut inline_content = String::new();
 
-            // 🌟 [CRITICAL FIX] 텍스트만 포함하는 태그(td, th, label, span, input 등)를 한 줄로 병합하여 PUG 컨텍스트 밀도를 비약적으로 높입니다.
+            // 🌟 [CRITICAL FIX] 텍스트만 포함하는 태그(td, th, label, span 등)를 한 줄로 병합하여 PUG 컨텍스트 밀도를 높입니다.
+            //    단, 자손에 '텍스트로 환원되지 않는 데이터'(input[value], option, a[href], img[src], td/th)가 존재하면
+            //    병합 시 해당 데이터가 출력조차 되지 않고 소멸하므로 반드시 펼쳐서 출력합니다.
             if should_output_text {
                 if tag_name == "input" {
                     if let Some(val) = element.attr("value") {
@@ -620,7 +649,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         inline_content = clean.to_string();
                         is_inline_text = true;
                     }
-                } else {
+                } else if !has_data_bearing_descendant(node) {
                     if let Some(el_ref) = scraper::ElementRef::wrap(node) {
                         // 🌟 [요구사항 완벽 반영] 하드코딩된 태그 리스트 검사를 완전히 삭제했습니다!
                         // 어떤 태그이든 상관없이 모든 하위 텍스트를 긁어와 병합 검사를 무조건 실행합니다.

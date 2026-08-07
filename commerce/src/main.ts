@@ -900,17 +900,22 @@ async function updateExtractButtonVisibility() {
             const rootDomain = getRootDomain(urlObj.hostname);
             const ccHash = await hashId(rootDomain);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
-            
-            const currentRefToCheck = activeContext.ref || hashedRefId;
-            
-            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
+            // 🌟 [CRITICAL FIX v2] 현재 URL 기반 해시를 1순위로 검사합니다.
+            const currentRefToCheck = hashedRefId;
+            let isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
+            // 🌟 [CRITICAL FIX v2] hashedRefId로 매칭되지 않았을 때 activeContext.ref도 추가 확인합니다.
+            //    네비게이션 클릭 후 추출 시 task.ref = activeContext.ref로 저장되므로
+            //    URL 기반 해시만으로는 매칭이 안 되는 케이스를 커버합니다.
+            //    (URL 변경 시 browser-match-found에서 activeContext.ref가 ""로 초기화되므로
+            //     다른 페이지에서는 이 분기가 실행되지 않아 원래 버그가 재발하지 않습니다.)
+            if (!isActive && activeContext.ref && activeContext.ref !== currentRefToCheck) {
+                isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: activeContext.ref } });
+            }
             // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
             const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link)) ||
-                             GlobalTaskManager.backendQueued.some(p => p.ref === currentRefToCheck || p.link === link);
-            
-            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload && 
+                GlobalTaskManager.backendQueued.some(p => p.ref === currentRefToCheck || p.link === link);
+            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload &&
                 (GlobalTaskManager.currentTaskPayload.ref === currentRefToCheck || GlobalTaskManager.currentTaskPayload.link === link);
-            
             if (isActive || isQueued || isCurrentExecuting) shouldHide = true;
         }
     } catch (e) {
@@ -929,19 +934,18 @@ async function updateExtractButtonVisibility() {
 
 listen("browser-match-found", async (event: any) => {
     const payload = event.payload;
-    
-    // 신호가 오면 즉시 브라우저 실행 상태를 확정 짓습니다.
     if (payload.status === "running" || (payload.url && payload.url !== "")) {
         isBrowserRunning = true;
     } else if (payload.status === "stopped") {
         isBrowserRunning = false;
         isAutoLaunchLocked = false;
     }
-
     currentDetectedUrl = payload.url || "";
     isCurrentShop = payload.is_client || payload.is_admin || false;
-
-    // 통합 가시성 로직 호출
+    // 🌟 [CRITICAL FIX] URL 변경 시 이전 페이지의 activeContext.ref를 초기화합니다.
+    //    이어서 호출되는 renderNavigation()이 새 페이지의 ref를 재설정하므로,
+    //    이전 페이지의 stale ref가 버튼 가시성 판정을 오염시키는 것을 원천 차단합니다.
+    activeContext.ref = "";
     await updateExtractButtonVisibility();
     await renderNavigation();
 });
