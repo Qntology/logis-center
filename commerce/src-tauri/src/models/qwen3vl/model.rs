@@ -91,6 +91,30 @@ impl Qwen3VLVisionPatchEmbed {
         self.conv3d_bias = self.conv3d_bias.to_device(device)?;
         Ok(())
     }
+
+    /// 🌟 [VISION-JIT] patch_embed 가중치 해제 (conv3d 전개 행렬은 단독으로도 수십 MB)
+    pub fn clear_weights(&mut self) {
+        let dummy = Tensor::zeros((1, 1), DType::F16, &Device::Cpu).unwrap();
+        self.conv3d_weight = dummy.clone();
+        self.conv3d_bias = dummy;
+    }
+
+    /// 🌟 [VISION-JIT] new_from_gguf와 100% 동일한 전개 순서로 in-place 재로드합니다.
+    pub fn load_weights_inplace<R: Read + Seek>(&mut self, gguf: &mut Gguf<R>) -> Result<()> {
+        let w0 = gguf
+            .get_dequantized_f16("v.patch_embd.weight")?
+            .to_dtype(candle_core::DType::F16)?
+            .unsqueeze(2)?;
+        let w1 = gguf
+            .get_dequantized_f16("v.patch_embd.weight.1")?
+            .to_dtype(candle_core::DType::F16)?
+            .unsqueeze(2)?;
+        self.conv3d_weight = Tensor::cat(&[w0, w1], 2)?.flatten(1, 4)?.t()?;
+        self.conv3d_bias = gguf
+            .get_dequantized_f16("v.patch_embd.bias")?
+            .to_dtype(candle_core::DType::F16)?;
+        Ok(())
+    }
 }
 
 pub struct Qwen3VLVisionPatchMerger {
@@ -160,6 +184,30 @@ impl Qwen3VLVisionPatchMerger {
         let n_w = self.norm.weight().to_device(device)?;
         let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
         self.norm = LayerNorm::new(n_w, n_b, 1e-6);
+        Ok(())
+    }
+
+    /// 🌟 [VISION-JIT] merger(norm + fc1 + fc2) 가중치 전체 해제
+    pub fn clear_weights(&mut self) {
+        let dummy_t = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        self.norm = LayerNorm::new(dummy_t.clone(), dummy_t, 1e-6);
+        let dummy_p = crate::models::common::gguf::dummy_proj(&Device::Cpu);
+        self.linear_fc1 = dummy_p.clone();
+        self.linear_fc2 = dummy_p;
+    }
+
+    /// 🌟 [VISION-JIT] new_from_gguf와 동일한 prefix 규약으로 in-place 재로드합니다.
+    pub fn load_weights_inplace<R: Read + Seek>(
+        &mut self,
+        gguf: &mut Gguf<R>,
+        rms_norm_eps: f64,
+        norm_prefix: &str,
+        linear1_prefix: &str,
+        linear2_prefix: &str,
+    ) -> Result<()> {
+        self.norm = gguf.layer_norm(norm_prefix, rms_norm_eps)?;
+        self.linear_fc1 = ProjKind::QuantizedProj(gguf.quantize_linear(linear1_prefix, true)?);
+        self.linear_fc2 = ProjKind::QuantizedProj(gguf.quantize_linear(linear2_prefix, true)?);
         Ok(())
     }
 
@@ -265,6 +313,24 @@ impl Qwen3VLVisionAttention {
         // GGUF 양자화된 텐서(ProjKind)는 자체 장치를 사용하므로 이동 생략
         Ok(())
     }
+
+    /// 🌟 [VISION-JIT] qkv/proj 양자화 가중치 해제
+    pub fn clear_weights(&mut self) {
+        let dummy = crate::models::common::gguf::dummy_proj(&Device::Cpu);
+        self.qkv = dummy.clone();
+        self.proj = dummy;
+    }
+
+    /// 🌟 [VISION-JIT] mmproj GGUF에서 qkv/proj를 in-place 재로드합니다.
+    pub fn load_weights_inplace<R: Read + Seek>(
+        &mut self,
+        gguf: &mut Gguf<R>,
+        prefix: &str,
+    ) -> Result<()> {
+        self.qkv = ProjKind::QuantizedProj(gguf.quantize_linear(&format!("{prefix}.attn_qkv"), true)?);
+        self.proj = ProjKind::QuantizedProj(gguf.quantize_linear(&format!("{prefix}.attn_out"), true)?);
+        Ok(())
+    }
 }
 
 pub struct Qwen3VLVisionBlock {
@@ -362,6 +428,30 @@ impl Qwen3VLVisionBlock {
         self.attn.to_device(device)?;
         Ok(())
     }
+
+    /// 🌟 [VISION-JIT] 블록 단위 전체 해제 (norm1/norm2/attn/mlp)
+    pub fn clear_weights(&mut self) {
+        let dummy_t = Tensor::zeros((1,), DType::F32, &Device::Cpu).unwrap();
+        self.norm1 = LayerNorm::new(dummy_t.clone(), dummy_t.clone(), 1e-6);
+        self.norm2 = LayerNorm::new(dummy_t.clone(), dummy_t, 1e-6);
+        self.attn.clear_weights();
+        self.mlp.clear_weights();
+    }
+
+    /// 🌟 [VISION-JIT] new_from_gguf와 동일한 텐서 이름으로 블록 전체를 in-place 재로드합니다.
+    pub fn load_weights_inplace<R: Read + Seek>(
+        &mut self,
+        gguf: &mut Gguf<R>,
+        prefix: &str,
+        rms_norm_eps: f64,
+    ) -> Result<()> {
+        self.norm1 = gguf.layer_norm(&format!("{prefix}.ln1"), rms_norm_eps)?;
+        self.norm2 = gguf.layer_norm(&format!("{prefix}.ln2"), rms_norm_eps)?;
+        self.attn.load_weights_inplace(gguf, prefix)?;
+        self.mlp
+            .load_weights_inplace(gguf, prefix, true, Some("ffn_up"), Some("ffn_down"))?;
+        Ok(())
+    }
 }
 
 pub struct Qwen3VLVisionModel {
@@ -372,9 +462,16 @@ pub struct Qwen3VLVisionModel {
     rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
     blocks: Vec<Qwen3VLVisionBlock>,
     merger: Qwen3VLVisionPatchMerger,
-    deepstack_visual_indexes: Vec<usize>,
+    // 🌟 [VISION-CACHE] 캐시본의 deepstack 개수 검증을 위해 외부 노출이 필요합니다.
+    pub deepstack_visual_indexes: Vec<usize>,
     deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>,
     dtype: DType,
+    // 🌟 [VISION-JIT] 가중치 상주 여부. mmproj_path가 None이면 재로드 소스가 없으므로 항상 상주로 고정됩니다.
+    pub is_weights_loaded: bool,
+    mmproj_path: Option<String>,
+    rms_norm_eps: f64,
+    hidden_size: usize,
+    device: Device,
 }
 
 impl Qwen3VLVisionModel {
@@ -414,6 +511,12 @@ impl Qwen3VLVisionModel {
             deepstack_visual_indexes,
             deepstack_merger_list,
             dtype: vb.dtype(),
+            // 🌟 [VISION-JIT] safetensors(VarBuilder) 경로는 mmap 재로드 소스가 없으므로 JIT 비활성
+            is_weights_loaded: true,
+            mmproj_path: None,
+            rms_norm_eps: 1e-6,
+            hidden_size: config.hidden_size,
+            device: vb.device().clone(),
         })
     }
 
@@ -501,6 +604,12 @@ impl Qwen3VLVisionModel {
             deepstack_visual_indexes,
             deepstack_merger_list,
             dtype: DType::F32,
+            // 🌟 [VISION-JIT] 생성 직후에는 상주 상태. set_mmproj_path() 등록 후에만 unload가 허용됩니다.
+            is_weights_loaded: true,
+            mmproj_path: None,
+            rms_norm_eps,
+            hidden_size,
+            device: mmproj_gguf.device().clone(),
         })
     }
 
@@ -512,6 +621,105 @@ impl Qwen3VLVisionModel {
         self.merger.to_device(device)?;
         for merger in self.deepstack_merger_list.iter_mut() { merger.to_device(device)?; }
         Ok(())
+    }
+
+    /// 🌟 [VISION-JIT] mmproj GGUF 경로를 등록해야 unload/reload가 활성화됩니다.
+    /// 등록하지 않으면 unload_weights()는 no-op으로 동작하여 기존 거동을 100% 보존합니다.
+    pub fn set_mmproj_path(&mut self, path: Option<String>) {
+        self.mmproj_path = path;
+    }
+
+    pub fn is_jit_capable(&self) -> bool {
+        self.mmproj_path.is_some()
+    }
+
+    /// 🌟 [VISION-JIT] ViT는 상태 없는 1회성 feed-forward이므로,
+    /// 임베딩 주입이 끝나면 가중치를 1바이트 껍데기로 교체해 VRAM/RAM을 즉시 반환합니다.
+    pub fn unload_weights(&mut self) {
+        if !self.is_weights_loaded || self.mmproj_path.is_none() {
+            return;
+        }
+        self.patch_embed.clear_weights();
+        let dummy = Tensor::zeros((1, 1), DType::F32, &Device::Cpu).unwrap();
+        self.pos_embed = Embedding::new(dummy, 1);
+        for block in self.blocks.iter_mut() {
+            block.clear_weights();
+        }
+        self.merger.clear_weights();
+        for merger in self.deepstack_merger_list.iter_mut() {
+            merger.clear_weights();
+        }
+        self.is_weights_loaded = false;
+
+        if self.device.is_cuda() {
+            let _ = self.device.synchronize();
+        }
+        Self::force_memory_release();
+        println!("[VISION-JIT] mmproj weights unloaded. VRAM/RAM returned to OS.");
+    }
+
+    /// 🌟 [VISION-JIT] 비전 입력이 감지되면 mmproj GGUF에서 즉시 재로드합니다.
+    pub fn reload_weights(&mut self) -> Result<()> {
+        if self.is_weights_loaded {
+            return Ok(());
+        }
+        let path = match self.mmproj_path.clone() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let mut file = std::fs::File::open(&path)?;
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        let mut gguf = Gguf::new(content, file, self.device.clone());
+
+        self.patch_embed.load_weights_inplace(&mut gguf)?;
+
+        let pos_w = gguf
+            .get_dequantized_f16("v.position_embd.weight")?
+            .to_dtype(candle_core::DType::F16)?;
+        self.pos_embed = Embedding::new(pos_w, self.hidden_size);
+
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            block.load_weights_inplace(&mut gguf, &format!("v.blk.{i}"), self.rms_norm_eps)?;
+        }
+
+        self.merger.load_weights_inplace(
+            &mut gguf,
+            self.rms_norm_eps,
+            "v.post_ln",
+            "mm.0",
+            "mm.2",
+        )?;
+
+        let ds_indexes = self.deepstack_visual_indexes.clone();
+        for (k, i) in ds_indexes.iter().enumerate() {
+            let prefix = format!("v.deepstack.{i}");
+            self.deepstack_merger_list[k].load_weights_inplace(
+                &mut gguf,
+                self.rms_norm_eps,
+                &format!("{prefix}.norm"),
+                &format!("{prefix}.fc1"),
+                &format!("{prefix}.fc2"),
+            )?;
+        }
+
+        self.is_weights_loaded = true;
+        println!("[VISION-JIT] mmproj weights reloaded from {}", path);
+        Ok(())
+    }
+
+    /// 🌟 [VISION-JIT] 기존 텍스트 모델과 동일한 OS 레벨 강제 메모리 반환 루틴
+    fn force_memory_release() {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
     }
 
     pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
@@ -1135,11 +1343,54 @@ impl Qwen3VLModel {
         let mut deepstack_video_embeds = None;
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
-                let (image_embeds, deepstack_img_embed) =
-                    self.get_vision_features(pixel_values, image_grid_thw)?;
-                let image_embeds = Tensor::cat(&image_embeds, 0)?;
                 let vision_mask = self.get_placeholder_mask(input_ids, true)?;
                 let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+
+                // 🌟 [VISION-CACHE] Qwen3VL 은 deepstack 을 실제로 사용하므로
+                //    캐시본도 deepstack 까지 완전히 복원되어야 합니다.
+                //    복원 개수가 deepstack_visual_indexes 와 다르면 캐시를 폐기합니다.
+                let cache_key = crate::models::vision_cache::VisionEmbedCache::compute_key(
+                    pixel_values, image_grid_thw
+                ).ok();
+                let expected_ds = self.visual.deepstack_visual_indexes.len();
+
+                let mut resolved: Option<(Tensor, Vec<Tensor>)> = None;
+
+                if let Some(key) = cache_key {
+                    if let Some((cached, cached_ds)) = crate::models::vision_cache::VISION_CACHE
+                        .try_load(key, inputs_embeds.device(), inputs_embeds.dtype())
+                    {
+                        let shape_ok = crate::models::vision_cache::validate_embed_shape(
+                            &cached, n_image_tokens as usize
+                        ).is_ok();
+                        if shape_ok && cached_ds.len() == expected_ds {
+                            resolved = Some((cached, cached_ds));
+                        } else {
+                            println!(
+                                "[VISION-CACHE] Discarding stale entry (tokens ok: {}, deepstack {} vs expected {}). Falling back to ViT.",
+                                shape_ok, cached_ds.len(), expected_ds
+                            );
+                        }
+                    }
+                }
+
+                let (image_embeds, deepstack_img_embed) = match resolved {
+                    Some(v) => v,
+                    None => {
+                        let (split_embeds, ds) =
+                            self.get_vision_features(pixel_values, image_grid_thw)?;
+                        let merged = Tensor::cat(&split_embeds, 0)?;
+                        if let Some(key) = cache_key {
+                            if let Err(e) = crate::models::vision_cache::VISION_CACHE
+                                .save(key, &merged, &ds)
+                            {
+                                println!("[VISION-CACHE] Save failed (non-fatal): {}", e);
+                            }
+                        }
+                        (merged, ds)
+                    }
+                };
+
                 if n_image_tokens as usize != image_embeds.dim(0)? {
                     return Err(anyhow!(format!(
                         "n_image_token num: {} not equal to image_embed len: {}",

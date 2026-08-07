@@ -267,6 +267,13 @@ pub struct RegistryEntry {
     pub last_accessed: std::time::Instant, // LRU 순위 결정을 위한 접근 시각
     #[serde(skip, default = "default_bitkv_cache")]
     pub bitkv_cache: Arc<std::sync::RwLock<Vec<Option<BitKVMetadata>>>>,
+    /// 🌟 [VISION TAG] 이 블록에서 image_pad / video_pad 토큰이 차지하는 비율 (0.0 ~ 1.0).
+    ///   손실 압축(공간 풀링)은 적용하지 않습니다.
+    ///   K 에는 이미 RoPE 회전이 적용되어 있어 인접 토큰 평균은
+    ///   유효한 회전 상태가 아니게 되고, 이미지 내 공간 위치 정보가 소실됩니다.
+    ///   이 필드는 오프로딩 우선순위 판단과 [KV-MISS] 진단 가시성 확보에만 사용합니다.
+    #[serde(default)]
+    pub vision_token_ratio: f32,
 }
 
 impl RegistryEntry {
@@ -281,6 +288,8 @@ impl RegistryEntry {
             is_dirty: vec![true; num_layers],
             last_accessed: std::time::Instant::now(),
             bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; num_layers])),
+            // 🌟 [VISION TAG] 기본값 0.0 = 순수 텍스트 블록
+            vision_token_ratio: 0.0,
         }
     }
 }
@@ -302,6 +311,60 @@ impl KVRegistry {
         }
         Self {
             entries: Arc::new(std::sync::RwLock::new(entries)),
+        }
+    }
+
+    /// 🌟 [VISION TAG] 프리필 시점에 input_ids 를 스캔해 블록별 비전 토큰 비율을 기록합니다.
+    ///   무손실 메타데이터이며, KV 텐서 자체는 어떤 변형도 가하지 않습니다.
+    ///   (기획서의 Spatial2x2 공간 풀링은 K 에 이미 적용된 RoPE 회전을 파괴하므로 채택하지 않습니다)
+    pub fn tag_vision_blocks(&self, input_ids_cpu: &[u32], vision_token_ids: &[u32]) {
+        if vision_token_ids.is_empty() { return; }
+
+        let total = input_ids_cpu.len();
+        if total == 0 { return; }
+
+        let mut reg = match self.entries.write() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut tagged_blocks = 0usize;
+        let mut total_vision_tokens = 0usize;
+
+        for (block_idx, entry) in reg.iter_mut().enumerate() {
+            let start = block_idx * 1024;
+            if start >= total { break; }
+            let end = (start + 1024).min(total);
+            let span = end - start;
+            if span == 0 { continue; }
+
+            let vision_count = input_ids_cpu[start..end]
+                .iter()
+                .filter(|id| vision_token_ids.contains(id))
+                .count();
+
+            entry.vision_token_ratio = vision_count as f32 / span as f32;
+
+            if vision_count > 0 {
+                tagged_blocks += 1;
+                total_vision_tokens += vision_count;
+            }
+        }
+
+        if tagged_blocks > 0 {
+            println!(
+                "[VISION-TAG] {} KV blocks contain vision tokens (total {} tokens). Metadata only — no lossy compression applied.",
+                tagged_blocks, total_vision_tokens
+            );
+        }
+    }
+
+    /// 🌟 [VISION TAG] 특정 블록이 비전 우세 블록인지 조회합니다.
+    /// 오프로딩 우선순위 판단 및 [KV-MISS] 진단 로그에 사용합니다.
+    pub fn is_vision_dominant(&self, block_idx: usize, threshold: f32) -> bool {
+        match self.entries.read() {
+            Ok(reg) => reg.get(block_idx).map(|e| e.vision_token_ratio > threshold).unwrap_or(false),
+            Err(_) => false,
         }
     }
 
@@ -819,8 +882,19 @@ impl QuantizedQwenVLTextAttention {
 
                     // [DIAG] zeros 폴백은 곧 "문맥 소실"입니다. 무음 처리하지 말고 반드시 노출시킵니다.
                     if k_cpu.is_none() {
-                        println!("[KV-MISS] layer {} block off={} 재로딩 실패 → zeros 폴백 (문맥 손실 발생)",
-                            self.layer_idx, b_off);
+                        // 🌟 [VISION TAG] 손실된 블록이 비전 우세 블록이면 이미지 인식 자체가 무너집니다.
+                        //    텍스트 블록 손실과 증상이 완전히 다르므로 구분해서 노출합니다.
+                        let v_ratio = {
+                            let reg = self.registry.entries.read().unwrap();
+                            reg.get(index).map(|e| e.vision_token_ratio).unwrap_or(0.0)
+                        };
+                        if v_ratio > 0.0 {
+                            println!("[KV-MISS] layer {} block off={} 재로딩 실패 → zeros 폴백 (VISION 블록, 비전 토큰 비율 {:.1}% — 이미지 인식 붕괴 위험)",
+                                self.layer_idx, b_off, v_ratio * 100.0);
+                        } else {
+                            println!("[KV-MISS] layer {} block off={} 재로딩 실패 → zeros 폴백 (문맥 손실 발생)",
+                                self.layer_idx, b_off);
+                        }
                     }
 
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
@@ -1472,6 +1546,9 @@ impl QuantizedQwenVLTextAttention {
                     is_dirty: vec![false; 28], 
                     last_accessed: std::time::Instant::now(),
                     bitkv_cache: Arc::new(std::sync::RwLock::new(vec![None; 28])),
+                    // 🌟 [VISION TAG] 스냅샷 복원 시점에는 원본 input_ids 가 없으므로
+                    //    비율을 알 수 없습니다. 0.0(텍스트로 간주)으로 안전 초기화합니다.
+                    vision_token_ratio: 0.0,
                 });
             }
             
@@ -3102,6 +3179,12 @@ pub struct QuantizedQwenVLModel {
     pub vision_device: Device,
     pub mmap: Option<Arc<Mmap>>,
     pub mmproj_mmap: Option<Arc<Mmap>>,
+    // 🌟 [VISION-JIT] mmproj 메타데이터와 dtype 을 보관해야 visual 을 통째로 버렸다가
+    //    동일한 조건으로 재구성할 수 있습니다. (mmproj_mmap 만으로는 텐서 인덱스를 알 수 없습니다)
+    pub vision_ct: Option<Arc<gguf_file::Content>>,
+    pub vision_dtype: DType,
+    // 🌟 [VISION-JIT] baking_only 로 뜬 인스턴스는 애초에 비전 자격이 없으므로 JIT 대상에서 제외합니다.
+    pub vision_baking_only: bool,
 }
 
 impl QuantizedQwenVLModel {
@@ -3160,7 +3243,11 @@ impl QuantizedQwenVLModel {
             text_device: text_device.clone(), 
             vision_device: vision_device.clone(), 
             mmap: main_mmap_handle, 
-            mmproj_mmap: mmproj_mmap_handle 
+            mmproj_mmap: mmproj_mmap_handle,
+            // 🌟 [VISION-JIT] 재구성 재료 보관
+            vision_ct: Some(ct_vision),
+            vision_dtype,
+            vision_baking_only: baking_only,
         })
     }
 
@@ -3213,8 +3300,89 @@ impl QuantizedQwenVLModel {
             text_device: text_device.clone(), 
             vision_device: vision_device.clone(), 
             mmap: None, 
-            mmproj_mmap: None 
+            mmproj_mmap: None,
+            // 🌟 [VISION-JIT] 이 경로는 호출자 소유 reader 를 쓰므로 재구성 소스를 보관할 수 없습니다.
+            //    vision_ct 를 None 으로 두어 JIT 을 비활성화하고 기존 거동을 100% 유지합니다.
+            vision_ct: None,
+            vision_dtype,
+            vision_baking_only: baking_only,
         })
+    }
+
+    /// 🌟 [VISION-JIT] mmproj 를 mmap 에서 다시 구성할 수 있는 상태인지 확인합니다.
+    pub fn is_vision_jit_capable(&self) -> bool {
+        !self.vision_baking_only
+            && self.vision_ct.is_some()
+            && self.mmproj_mmap.is_some()
+            && self.config.vision_config.is_some()
+    }
+
+    /// 🌟 [VISION-JIT] 현재 비전 가중치가 실제로 메모리에 올라와 있는지 확인합니다.
+    pub fn is_vision_resident(&self) -> bool {
+        self.visual.is_some()
+    }
+
+    /// 🌟 [VISION-JIT] 비전 모델 전체를 폐기하여 VRAM/RAM 을 즉시 반환합니다.
+    /// 0.6B 의 from_gguf_content 는 전체 역양자화를 수행하므로 재구성이 비쌉니다.
+    /// 따라서 forward 내부 자동 해제는 하지 않고, 텍스트 전용 경로에서만 명시적으로 호출합니다.
+    pub fn unload_vision_weights(&mut self) {
+        if self.visual.is_none() { return; }
+        if !self.is_vision_jit_capable() {
+            // 재구성 소스가 없으면 한 번 버리면 복구 불가이므로 해제를 거부합니다.
+            return;
+        }
+        self.visual = None;
+
+        if self.vision_device.is_cuda() {
+            let _ = self.vision_device.synchronize();
+        }
+        Self::force_memory_release();
+        println!("[VISION-JIT] Qwen(0.6B) mmproj vision model unloaded. Memory returned to OS.");
+    }
+
+    /// 🌟 [VISION-JIT] 비전 입력이 감지되면 mmap 에서 즉시 재구성합니다.
+    pub fn reload_vision_weights(&mut self) -> Result<()> {
+        if self.visual.is_some() { return Ok(()); }
+        if !self.is_vision_jit_capable() { return Ok(()); }
+
+        // 借用 충돌을 피하기 위해 재료를 먼저 소유권으로 복사합니다.
+        let cfg = self.config.clone();
+        let v_cfg = cfg.vision_config.clone().ok_or(anyhow!("Missing vision_config"))?;
+        let ct = self.vision_ct.clone().ok_or(anyhow!("Missing mmproj content"))?;
+        let mmap = self.mmproj_mmap.clone().ok_or(anyhow!("Missing mmproj mmap"))?;
+        let dev = self.vision_device.clone();
+        let dtype = self.vision_dtype;
+
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+        let vb = from_gguf_content(&cfg, &ct, &mut reader, &dev, dtype)?;
+        self.visual = Some(QwenVLVisionModel::new(v_cfg, vb.pp("visual"))?);
+
+        println!("[VISION-JIT] Qwen(0.6B) mmproj vision model reloaded from mmap.");
+        Ok(())
+    }
+
+    /// 🌟 [VISION-JIT] 외부에서 상태를 한 번에 지정하는 진입점입니다.
+    pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
+        if active {
+            self.reload_vision_weights()
+        } else {
+            self.unload_vision_weights();
+            Ok(())
+        }
+    }
+
+    /// 🌟 [VISION-JIT] 텍스트 모델과 동일한 OS 레벨 강제 메모리 반환 루틴
+    fn force_memory_release() {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
     }
     
     fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
@@ -3336,6 +3504,12 @@ impl QuantizedQwenVLModel {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let (b_sz, seq_len) = input_ids.dims2()?;
 
+        // 🌟 [VISION-JIT] 텍스트 경로에서 떼어낸 상태로 이미지가 들어오면 ViT 가 없어 패닉합니다.
+        //    실제 비전 텐서가 도착한 이 순간에만 mmap 에서 되살립니다.
+        //    (0.6B 는 재구성이 비싸므로 여기서 자동 해제는 하지 않습니다)
+        if pixel_values.is_some() && self.visual.is_none() && self.is_vision_jit_capable() {
+            self.reload_vision_weights()?;
+        }
         
         let mut inputs_embeds = self.language_model.embed_tokens.forward(&input_ids)?;
         let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
