@@ -900,16 +900,33 @@ async function updateExtractButtonVisibility() {
             const rootDomain = getRootDomain(urlObj.hostname);
             const ccHash = await hashId(rootDomain);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
-            // 🌟 [CRITICAL FIX v2] 현재 URL 기반 해시를 1순위로 검사합니다.
+            // 🌟 [CRITICAL FIX v3] 현재 URL 기반 해시를 1순위로 검사합니다.
             const currentRefToCheck = hashedRefId;
             let isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
-            // 🌟 [CRITICAL FIX v2] hashedRefId로 매칭되지 않았을 때 activeContext.ref도 추가 확인합니다.
+            // 🌟 [CRITICAL FIX v3] hashedRefId로 매칭되지 않았을 때 activeContext.ref도 추가 확인합니다.
             //    네비게이션 클릭 후 추출 시 task.ref = activeContext.ref로 저장되므로
             //    URL 기반 해시만으로는 매칭이 안 되는 케이스를 커버합니다.
             //    (URL 변경 시 browser-match-found에서 activeContext.ref가 ""로 초기화되므로
             //     다른 페이지에서는 이 분기가 실행되지 않아 원래 버그가 재발하지 않습니다.)
             if (!isActive && activeContext.ref && activeContext.ref !== currentRefToCheck) {
                 isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: activeContext.ref } });
+            }
+            // 🌟 [CRITICAL FIX v3] 네비게이션 렌더링이 아직 activeContext.ref를 설정하지 못한
+            //    레이스 컨디션 상태에서, 백엔드 ACTIVE_TASK_MEM에 같은 페이지의 진행 중 태스크가
+            //    있는지 get_active_task_context로 추가 교차 검증합니다.
+            //    🌟 [FIX v4] 단, 활성 태스크의 link가 현재 URL의 path와 일치할 때만 숨김 처리합니다.
+            //    아직 동기화하지 않은 새 팝업 페이지로 포커싱했을 때, 다른 페이지의 태스크 때문에
+            //    버튼이 잘못 숨겨지는 것을 방지합니다.
+            if (!isActive && !activeContext.ref) {
+                try {
+                    const activeCtx = await invoke<any>("get_active_task_context");
+                    if (activeCtx && activeCtx.id && (activeCtx.status === 1 || activeCtx.status === 10)) {
+                        const activeLink = (activeCtx.link || "").toLowerCase();
+                        if (activeLink && activeLink === link) {
+                            isActive = true;
+                        }
+                    }
+                } catch (_e2) { /* 무시 */ }
             }
             // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
             const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link)) ||
@@ -946,8 +963,11 @@ listen("browser-match-found", async (event: any) => {
     //    이어서 호출되는 renderNavigation()이 새 페이지의 ref를 재설정하므로,
     //    이전 페이지의 stale ref가 버튼 가시성 판정을 오염시키는 것을 원천 차단합니다.
     activeContext.ref = "";
-    await updateExtractButtonVisibility();
+    // 🌟 [CRITICAL FIX v3] renderNavigation()이 activeContext.ref를 재설정하기 전에
+    //    updateExtractButtonVisibility()를 호출하면 ref="" 상태에서 매칭 실패 → 버튼 오노출됩니다.
+    //    따라서 renderNavigation()을 먼저 완료시킨 뒤, 설정된 ref 기반으로 최종 판정을 내립니다.
     await renderNavigation();
+    await updateExtractButtonVisibility();
 });
 
 listen("browser-status", async (event: any) => {
@@ -955,8 +975,14 @@ listen("browser-status", async (event: any) => {
     const statusStr = typeof payload === "object" ? payload.status : payload;
     
     if (typeof payload === "object" && payload.url !== undefined) {
+        const prevUrl = currentDetectedUrl;
         currentDetectedUrl = payload.url || "";
         isCurrentShop = payload.is_client || payload.is_admin || false;
+        // 🌟 [CRITICAL FIX v3] URL이 실제로 변경되었을 때만 버튼 가시성 재평가를 수행합니다.
+        //    800ms 주기 하트비트에서 매번 재평가하면 비동기 레이스로 버튼이 깜빡입니다.
+        if (prevUrl !== currentDetectedUrl) {
+            await updateExtractButtonVisibility();
+        }
     }
 
     if (statusStr === "running") {
@@ -966,9 +992,19 @@ listen("browser-status", async (event: any) => {
         isBrowserRunning = false;
         isAutoLaunchLocked = false;
         currentDetectedUrl = "";
+        // 🌟 [CRITICAL FIX] 브라우저 종료 시 btnAutoLaunch를 직접 노출시킵니다.
+        //    updateExtractButtonVisibility() 내부의 extractClickLock 조기 리턴이나
+        //    isExtracting 상태에 의해 btnAutoLaunch 노출이 누락되는 것을 원천 차단합니다.
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
+        }
+        if (btnExtract) {
+            btnExtract.style.display = "none";
+            btnExtract.classList.add("hidden");
+        }
+        await updateExtractButtonVisibility();
     }
-    
-    await updateExtractButtonVisibility();
 });
 
 const handleSearchInteraction = () => {
@@ -1723,8 +1759,12 @@ async function renderNavigation() {
             isFirstNavRender = false;
             stopSpinner();
         }
-        // 🌟 [CRITICAL FIX] 네비게이션 렌더링 완료 후 DOM을 참조하는 버튼 가시성 로직을 강제 재평가하여 버튼을 복구합니다.
-        await updateExtractButtonVisibility();
+        // 🌟 [CRITICAL FIX v3] 네비게이션 렌더링 완료 후 DOM을 참조하는 버튼 가시성 로직을 강제 재평가하여 버튼을 복구합니다.
+        //    단, activeContext.ref가 아직 비어있다면(매칭 실패 또는 레이스 컨디션),
+        //    caller(browser-match-found 리스너)가 renderNavigation() 직후 별도로 호출하므로 여기서는 스킵합니다.
+        if (activeContext.ref) {
+            await updateExtractButtonVisibility();
+        }
     }
 }
 
@@ -3051,6 +3091,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                 if (searchInput) searchInput.disabled = false; 
                 if (btnSubmit) btnSubmit.style.display = "flex"; 
             }
+            // 🌟 [CRITICAL FIX] 작업 완료 시점에 브라우저가 이미 종료된 상태라면
+            //    isAutoLaunchLocked를 강제로 false로 리셋하여 btnAutoLaunch 노출을 보장합니다.
+            //    작업 진행 중 브라우저가 종료되면 isAutoLaunchLocked가 true로 남아있어
+            //    updateExtractButtonVisibility()의 2번 단계에서 btnAutoLaunch가 노출되지 않는 버그를 수정합니다.
+            if (!isBrowserRunning) {
+                isAutoLaunchLocked = false;
+            }
             updateExtractButtonVisibility(); 
         }
 
@@ -3308,15 +3355,19 @@ listen("browser-status", async (event: any) => {
             btnAutoLaunch.classList.add("hidden");
         }
     } else {
-        if (!isAutoLaunchLocked) {
-            console.log("[WIDGET] Browser stopped. Resetting UI.");
-            isBrowserRunning = false;
-            if (btnAutoLaunch) {
-                btnAutoLaunch.style.display = "flex";
-                btnAutoLaunch.classList.remove("hidden");
-            }
-            currentDetectedUrl = "";
+        // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+        //    작업 진행 중(extractClickLock=true, isAutoLaunchLocked=true) 브라우저가 종료되면
+        //    이 조건 때문에 btnAutoLaunch 노출 로직이 실행되지 않는 버그를 수정합니다.
+        //    첫 번째 browser-status 리스너에서 이미 isAutoLaunchLocked=false로 설정하지만,
+        //    이벤트 리스너 실행 순서 보장이 없으므로 여기서도 무조건 리셋합니다.
+        console.log("[WIDGET] Browser stopped. Resetting UI.");
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
         }
+        currentDetectedUrl = "";
     }
     await updateExtractButtonVisibility();
 });
@@ -4989,16 +5040,20 @@ async function initSession() {
         if (btnAutoLaunch) {
             if (data.browser_status === "running") {
                 isBrowserRunning = true;
-                // 🌟 [CRITICAL FIX] 새로고침 시에도 앱이 이미 실행 중이면 락을 강제로 잠가 버튼 노출을 완벽 차단합니다.
-                if (!isAutoLaunchLocked) isAutoLaunchLocked = true; 
+                // 🌟 [CRITICAL FIX] isAutoLaunchLocked를 여기서 설정하지 않습니다.
+                //    try_reconnect_existing_browser가 IS_BROWSER_LAUNCHING을 일시적으로 true로 설정하면
+                //    mark_ui_ready가 "running"을 반환하고, isAutoLaunchLocked=true가 고정되어
+                //    브라우저가 실제로 없음에도 btnAutoLaunch가 영원히 숨겨지는 버그를 수정합니다.
+                //    isAutoLaunchLocked는 btnAutoLaunch 클릭 시에만 true로 설정되어야 합니다.
                 btnAutoLaunch.style.display = "none";
                 btnAutoLaunch.classList.add("hidden");
             } else {
-                if (!isAutoLaunchLocked) {
-                    isBrowserRunning = false;
-                    btnAutoLaunch.style.display = "flex";
-                    btnAutoLaunch.classList.remove("hidden");
-                }
+                // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+                //    브라우저가 stopped이면 무조건 btnAutoLaunch를 노출합니다.
+                isBrowserRunning = false;
+                isAutoLaunchLocked = false;
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
             }
             console.log(`[WIDGET] 🔵 [${new Date().toISOString().split('T')[1].slice(0, -1)}] UI Ready Browser Status: ${data.browser_status}`);
         }
@@ -5054,12 +5109,37 @@ document.getElementById("btn-logout")?.addEventListener("click", async () => {
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
-            await appDb.delete(); // Dexie DB 완전 삭제
-            sessionStorage.clear(); // 세션 스토리지 초기화
-            window.location.reload(); // 앱 상태를 완전히 비우기 위해 강제 새로고침
+            // 1. 프론트엔드 전역 상태 초기화
+            await GlobalTaskManager.forceReset();
+            isExtracting = false;
+            isSearching = false;
+            stopSpinner();
+            cachedDocs = [];
+            currentPage = 0;
+            hasMore = true;
+            selectedUuids.clear();
+            activeTags = [];
+            activeContext = { cc: "", bcc: "", ref: "" };
+            if (docListContainer) docListContainer.innerHTML = "";
+            if (chatTalks) chatTalks.innerHTML = "";
+            
+            // 2. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
+            await invoke("reset_lancedb");
+            console.log("[RESET] LanceDB backend reset complete.");
+            
+            // 3. 프론트엔드 Dexie DB 완전 삭제 후 재생성
+            await appDb.delete();
+            await appDb.open();
+            console.log("[RESET] Dexie DB deleted and reopened.");
+            
+            // 4. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
+            sessionStorage.clear();
+            
+            // 5. 앱 강제 새로고침
+            window.location.reload();
         } catch (e) {
             console.error("DB Initialization failed:", e);
-            alert("DB 초기화 중 오류가 발생했습니다.");
+            alert("DB 초기화 중 오류가 발생했습니다: " + e);
         }
     }
 });
@@ -5298,15 +5378,18 @@ async function syncBrowserStatus() {
                 btnAutoLaunch.classList.add("hidden");
             }
         } else {
-            if (!isAutoLaunchLocked) {
-                console.log("[WIDGET] Browser stopped. Resetting UI.");
-                isBrowserRunning = false;
-                if (btnAutoLaunch) {
-                    btnAutoLaunch.style.display = "flex";
-                    btnAutoLaunch.classList.remove("hidden");
-                }
-                currentDetectedUrl = ""; 
+            // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+            //    window focus 시 syncBrowserStatus()가 호출되는데, 작업 진행 중 브라우저가 종료된 후
+            //    포커스가 돌아오면 isAutoLaunchLocked=true 상태로 이 분기에 진입하여
+            //    btnAutoLaunch가 영원히 노출되지 않는 버그를 수정합니다.
+            console.log("[WIDGET] Browser stopped. Resetting UI.");
+            isBrowserRunning = false;
+            isAutoLaunchLocked = false;
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
             }
+            currentDetectedUrl = ""; 
         }
         await updateExtractButtonVisibility();
     } catch (e) {
