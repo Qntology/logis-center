@@ -774,3 +774,109 @@ pub fn get_available_browsers() -> Vec<BrowserStatus> {
     }
     browsers
 }
+
+pub async fn shutdown_browser() {
+    // 1. monitor task에 종료 신호 전송
+    //    monitor 루프 내부의 crate::utils::is_extraction_stopped() 체크가 true를 반환하면
+    //    루프를 빠져나와 Arc<Browser>를 drop합니다.
+    crate::utils::set_extraction_stop_signal(true);
+    println!("[APP] Stop signal sent to monitor task. Waiting for Arc release...");
+
+    // 2. monitor task가 Arc를 drop할 때까지 strong_count 폴링 (최대 5초)
+    //    monitor 루프 간격이 800ms이므로 5초면 충분합니다.
+    let mut arc_released = false;
+    for attempt in 0..50 {
+        let count = {
+            let guard = GLOBAL_BROWSER.lock().await;
+            match guard.as_ref() {
+                Some(arc) => Arc::strong_count(arc),
+                None => {
+                    println!("[APP] GLOBAL_BROWSER is already None. Nothing to close.");
+                    return;
+                }
+            }
+        };
+        if count <= 1 {
+            arc_released = true;
+            println!("[APP] Arc strong_count dropped to {}. Monitor task released.", count);
+            break;
+        }
+        if attempt % 10 == 0 {
+            println!("[APP] Waiting for monitor task to release Arc... (strong_count={}, attempt={})", count, attempt);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    if !arc_released {
+        println!("[APP] WARNING: Arc still referenced after 5s. Proceeding with take + fallback.");
+    }
+
+    // 3. GLOBAL_BROWSER에서 Arc를 꺼내 close 시도
+    let mut guard = GLOBAL_BROWSER.lock().await;
+    match guard.take() {
+        Some(browser_arc) => {
+            match Arc::try_unwrap(browser_arc) {
+                Ok(mut browser) => {
+                    println!("[APP] Arc unwrapped successfully. Calling browser.close()...");
+                    if let Err(e) = browser.close().await {
+                        println!("[APP] browser.close() returned error (non-fatal): {:?}", e);
+                    } else {
+                        println!("[APP] browser.close() succeeded. Child process terminated.");
+                    }
+                },
+                Err(_still_referenced) => {
+                    // 4. 최후 폴백: OS 레벨에서 브라우저 프로세스 강제 종료
+                    println!("[APP] Arc::try_unwrap still failed. Killing browser process via OS...");
+                    kill_browser_processes();
+                }
+            }
+        },
+        None => {
+            println!("[APP] GLOBAL_BROWSER is already None after wait. Nothing to close.");
+        }
+    }
+    println!("[APP] shutdown_browser() finished.");
+}
+
+#[cfg(target_os = "windows")]
+fn kill_browser_processes() {
+    // debug port 9222로 시작된 Chrome/Edge만 선별 kill
+    // wmic로 CommandLine에 remote-debugging-port=9222가 포함된 프로세스만 종료
+    let output = std::process::Command::new("wmic")
+        .args([
+            "process", "where",
+            "CommandLine like '%--remote-debugging-port=9222%'",
+            "get", "ProcessId", "/format:csv",
+        ])
+        .output();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let pid_str = line.trim().trim_end_matches(',');
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                if pid > 0 {
+                    println!("[APP] Killing browser PID: {}", pid);
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .output();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kill_browser_processes() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "--remote-debugging-port=9222"])
+        .output();
+    println!("[APP] pkill sent for debug-port browser processes.");
+}
+
+#[cfg(target_os = "linux")]
+fn kill_browser_processes() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "--remote-debugging-port=9222"])
+        .output();
+    println!("[APP] pkill sent for debug-port browser processes.");
+}

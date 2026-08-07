@@ -992,6 +992,17 @@ listen("browser-status", async (event: any) => {
         isBrowserRunning = false;
         isAutoLaunchLocked = false;
         currentDetectedUrl = "";
+        // 🌟 [CRITICAL FIX] 브라우저 종료 시 btnAutoLaunch를 직접 노출시킵니다.
+        //    updateExtractButtonVisibility() 내부의 extractClickLock 조기 리턴이나
+        //    isExtracting 상태에 의해 btnAutoLaunch 노출이 누락되는 것을 원천 차단합니다.
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
+        }
+        if (btnExtract) {
+            btnExtract.style.display = "none";
+            btnExtract.classList.add("hidden");
+        }
         await updateExtractButtonVisibility();
     }
 });
@@ -3080,6 +3091,13 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                 if (searchInput) searchInput.disabled = false; 
                 if (btnSubmit) btnSubmit.style.display = "flex"; 
             }
+            // 🌟 [CRITICAL FIX] 작업 완료 시점에 브라우저가 이미 종료된 상태라면
+            //    isAutoLaunchLocked를 강제로 false로 리셋하여 btnAutoLaunch 노출을 보장합니다.
+            //    작업 진행 중 브라우저가 종료되면 isAutoLaunchLocked가 true로 남아있어
+            //    updateExtractButtonVisibility()의 2번 단계에서 btnAutoLaunch가 노출되지 않는 버그를 수정합니다.
+            if (!isBrowserRunning) {
+                isAutoLaunchLocked = false;
+            }
             updateExtractButtonVisibility(); 
         }
 
@@ -3337,15 +3355,19 @@ listen("browser-status", async (event: any) => {
             btnAutoLaunch.classList.add("hidden");
         }
     } else {
-        if (!isAutoLaunchLocked) {
-            console.log("[WIDGET] Browser stopped. Resetting UI.");
-            isBrowserRunning = false;
-            if (btnAutoLaunch) {
-                btnAutoLaunch.style.display = "flex";
-                btnAutoLaunch.classList.remove("hidden");
-            }
-            currentDetectedUrl = "";
+        // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+        //    작업 진행 중(extractClickLock=true, isAutoLaunchLocked=true) 브라우저가 종료되면
+        //    이 조건 때문에 btnAutoLaunch 노출 로직이 실행되지 않는 버그를 수정합니다.
+        //    첫 번째 browser-status 리스너에서 이미 isAutoLaunchLocked=false로 설정하지만,
+        //    이벤트 리스너 실행 순서 보장이 없으므로 여기서도 무조건 리셋합니다.
+        console.log("[WIDGET] Browser stopped. Resetting UI.");
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
         }
+        currentDetectedUrl = "";
     }
     await updateExtractButtonVisibility();
 });
@@ -5018,16 +5040,20 @@ async function initSession() {
         if (btnAutoLaunch) {
             if (data.browser_status === "running") {
                 isBrowserRunning = true;
-                // 🌟 [CRITICAL FIX] 새로고침 시에도 앱이 이미 실행 중이면 락을 강제로 잠가 버튼 노출을 완벽 차단합니다.
-                if (!isAutoLaunchLocked) isAutoLaunchLocked = true; 
+                // 🌟 [CRITICAL FIX] isAutoLaunchLocked를 여기서 설정하지 않습니다.
+                //    try_reconnect_existing_browser가 IS_BROWSER_LAUNCHING을 일시적으로 true로 설정하면
+                //    mark_ui_ready가 "running"을 반환하고, isAutoLaunchLocked=true가 고정되어
+                //    브라우저가 실제로 없음에도 btnAutoLaunch가 영원히 숨겨지는 버그를 수정합니다.
+                //    isAutoLaunchLocked는 btnAutoLaunch 클릭 시에만 true로 설정되어야 합니다.
                 btnAutoLaunch.style.display = "none";
                 btnAutoLaunch.classList.add("hidden");
             } else {
-                if (!isAutoLaunchLocked) {
-                    isBrowserRunning = false;
-                    btnAutoLaunch.style.display = "flex";
-                    btnAutoLaunch.classList.remove("hidden");
-                }
+                // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+                //    브라우저가 stopped이면 무조건 btnAutoLaunch를 노출합니다.
+                isBrowserRunning = false;
+                isAutoLaunchLocked = false;
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
             }
             console.log(`[WIDGET] 🔵 [${new Date().toISOString().split('T')[1].slice(0, -1)}] UI Ready Browser Status: ${data.browser_status}`);
         }
@@ -5352,15 +5378,18 @@ async function syncBrowserStatus() {
                 btnAutoLaunch.classList.add("hidden");
             }
         } else {
-            if (!isAutoLaunchLocked) {
-                console.log("[WIDGET] Browser stopped. Resetting UI.");
-                isBrowserRunning = false;
-                if (btnAutoLaunch) {
-                    btnAutoLaunch.style.display = "flex";
-                    btnAutoLaunch.classList.remove("hidden");
-                }
-                currentDetectedUrl = ""; 
+            // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
+            //    window focus 시 syncBrowserStatus()가 호출되는데, 작업 진행 중 브라우저가 종료된 후
+            //    포커스가 돌아오면 isAutoLaunchLocked=true 상태로 이 분기에 진입하여
+            //    btnAutoLaunch가 영원히 노출되지 않는 버그를 수정합니다.
+            console.log("[WIDGET] Browser stopped. Resetting UI.");
+            isBrowserRunning = false;
+            isAutoLaunchLocked = false;
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
             }
+            currentDetectedUrl = ""; 
         }
         await updateExtractButtonVisibility();
     } catch (e) {

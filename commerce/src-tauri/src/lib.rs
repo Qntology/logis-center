@@ -2200,6 +2200,27 @@ pub fn run() {
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                println!("[APP] Application exiting. Shutting down browser...");
+
+                // 1. 전역 브라우저 상태를 즉시 stopped으로 고정
+                if let Ok(mut state) = crate::CURRENT_BROWSER_STATE.write() {
+                    *state = "stopped".to_string();
+                }
+                crate::IS_BROWSER_LAUNCHING.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                // 2. automation::shutdown_browser()로 명시적 close() 호출 후 인스턴스 제거
+                let rt = tokio::runtime::Runtime::new();
+                if let Ok(rt) = rt {
+                    rt.block_on(async {
+                        automation::shutdown_browser().await;
+                    });
+                }
+
+                println!("[APP] Browser shutdown complete.");
+            }
+        });
 }
