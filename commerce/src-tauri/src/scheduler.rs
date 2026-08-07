@@ -4855,6 +4855,8 @@ async fn process_task(
             //    '주문하신 분 이름→sender_name -0.0015' 처럼 정답이 절대 임계치에 전멸했습니다.
             let mut header_forced_assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut pair_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            // 🌟 [SCOPE FIX] FORMAT FAMILY SHARE 블록에서도 접근할 수 있도록 if 블록 바깥에 선언합니다.
+            let mut pair_line_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
             if !detail_pairs.is_empty() {
                 // 동일 라벨("이름", "핸드폰", "주소")이 여러 번 등장하면 섹션 제목을 접두어로 붙여 구분합니다.
@@ -5061,6 +5063,8 @@ async fn process_task(
                 //    '계좌번호'(0.8817) 가 '상품금액'(0.7073) 보다, '주문하신 분 이름'(1.0) 이
                 //    '판매자'(0.76) 보다 먼저 필드를 잠급니다.
                 let d_assign = exclusive_assign_by_score(&d_matrix, 0.0, 0.0);
+                // 🌟 [PAIR LINE MAP] FORMAT FAMILY SHARE가 PRE-MAP'd 필드의 실제 라인을
+                //    소스로 사용할 수 있도록 field_name → primary_line 기록을 구축합니다.
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -5120,6 +5124,7 @@ async fn process_task(
                         continue;
                     }
 
+                    pair_line_map.insert(owner.clone(), primary);
                     pre_mapped_hints.push(json!({
                         "target_column": owner.clone(),
                         "extracted_value": merged.clone()
@@ -5406,15 +5411,29 @@ async fn process_task(
                     if is_id_link_field(&fields[f].0) { continue; }
                     let fmt = field_formats[f];
                     if !matches!(fmt, FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric) { continue; }
-
                     let mut best_line: Option<usize> = None;
                     let mut best_raw = f32::MIN;
                     for other in 0..vector_assignment.len() {
                         if other == f { continue; }
                         if field_formats[other] != fmt { continue; }
-                        if let Some((l, _, _)) = vector_assignment[other] {
-                            let raw = vector_raw_matrix[f].get(l).copied().unwrap_or(-1.0);
-                            if raw < 0.0 { continue; }
+                        // 🌟 [SOURCE RESOLUTION] PRE-MAP'd 필드는 DETAIL PAIR 라인을,
+                        //    그 외에는 벡터 배정 라인을 소스로 사용합니다.
+                        //    PRE-MAP이 있으면 벡터 배정은 무의미하므로(필드 루프에서 BYPASS됨)
+                        //    벡터 배정 라인을 소스로 쓰면 오염됩니다.
+                        let source_line: Option<usize> = if let Some(&pl) = pair_line_map.get(&fields[other].0) {
+                            Some(pl)
+                        } else if let Some((l, _, _)) = vector_assignment[other] {
+                            Some(l)
+                        } else {
+                            None
+                        };
+                        if let Some(l) = source_line {
+                            // 🌟 [VALUE FORMAT GATE] 공유 전 대상 필드 형식과 값의 생김새를 검증합니다.
+                            //    "010-3333-3333"을 Date로 공유하는 사고를 여기서 최종 차단합니다.
+                            if l < line_values.len() && !value_matches_format(fmt, &line_values[l]) {
+                                continue;
+                            }
+                            let raw = vector_raw_matrix[f].get(l).copied().unwrap_or(0.0);
                             if raw > best_raw { best_raw = raw; best_line = Some(l); }
                         }
                     }

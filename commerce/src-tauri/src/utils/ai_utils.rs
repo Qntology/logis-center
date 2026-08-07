@@ -495,7 +495,9 @@ pub fn has_date_literal(s: &str) -> bool {
                     let start3 = m;
                     while m < n && chars[m].is_ascii_digit() { m += 1; }
                     let g3 = m - start3;
-                    if g3 >= 1 && g1 >= 2 && g1 <= 4 { return true; }
+                    // 🌟 [DATE SHAPE GATE] 월(g2)·일(g3)은 물리적으로 최대 2자리.
+                    //    "010-3333-3333"(g2=4, g3=4) 같은 전화번호를 날짜로 오인하는 것을 원천 차단.
+                    if g3 >= 1 && g1 >= 2 && g1 <= 4 && g2 <= 2 && g3 <= 2 { return true; }
                 }
             }
             i = j;
