@@ -20,7 +20,7 @@ use crate::stanza::{StanzaPreprocessor, StanzaPipeline};
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
-use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
+use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, exclusive_assign_by_score, self_poisoned_prejudice_mask, collect_select_groups, enum_status_keys, status_key_phrases, double_center_matrix, detect_field_format, value_matches_format, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
@@ -4847,8 +4847,12 @@ async fn process_task(
                 }
             }
 
-            // 🌟 [DETAIL PAIR COSINE MAP] 구조적으로 결합된 (라벨 → 값) 페어를
-            //    리스트 경로와 동일한 라벨/편견 구 뱅크 코사인으로 필드에 확정합니다.
+            // 🌟 [DETAIL PAIR COSINE MAP v2] 구조적으로 결합된 (라벨 → 값) 페어를
+            //    ① 편견 자기오염 제거 ② 리프라벨/섹션 이중 행렬 ③ 이중 센터링 ④ 점수순 배타 배정
+            //    네 단계로 확정합니다. 고정 임계치(0.55 / 0.10 / 0.03)는 전부 폐기합니다.
+            //    폐기 근거: 다국어 임베딩의 한국어 짧은 라벨 코사인은 0.55~0.90 대역에 뭉쳐 있어
+            //    '계좌번호→bank +0.0701', '개별 전자결제(PG)→payment_origin +0.0471',
+            //    '주문하신 분 이름→sender_name -0.0015' 처럼 정답이 절대 임계치에 전멸했습니다.
             let mut header_forced_assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut pair_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
@@ -4867,18 +4871,33 @@ async fn process_task(
                     }
                 }
 
+                // 🌟 유일 키를 만들면서 '리프 라벨'과 '섹션'을 분리 보관합니다.
+                //    Max-Pool 은 "주문하신 분 이름" 에서 공통 구 '이름' 만 뽑아
+                //    sender_name 과 recipient_name 을 완전 동률로 만들어 버립니다.
+                //    유일한 판별 신호인 섹션을 별도 행렬로 살려야 합니다.
                 let mut unique_phrases: Vec<String> = Vec::new();
-                for ph in &pair_phrases {
-                    if !unique_phrases.iter().any(|e| e == ph) { unique_phrases.push(ph.clone()); }
+                let mut unique_leaf: Vec<String> = Vec::new();
+                let mut unique_section: Vec<String> = Vec::new();
+                for (pi, ph) in pair_phrases.iter().enumerate() {
+                    if unique_phrases.iter().any(|e| e == ph) { continue; }
+                    unique_phrases.push(ph.clone());
+                    unique_leaf.push(detail_pairs[pi].label.clone());
+                    unique_section.push(detail_pairs[pi].section.trim().to_string());
                 }
 
-                let phrase_embs: Vec<Vec<f32>> = model.get_embedding_batch(unique_phrases.clone()).await
-                    .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_phrases.len()]);
+                let leaf_embs: Vec<Vec<f32>> = model.get_embedding_batch(unique_leaf.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_leaf.len()]);
+                let section_texts: Vec<String> = unique_section.iter()
+                    .map(|s| if s.is_empty() { " ".to_string() } else { s.clone() })
+                    .collect();
+                let section_embs: Vec<Vec<f32>> = model.get_embedding_batch(section_texts.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; section_texts.len()]);
 
                 let mut d_field_names: Vec<String> = Vec::new();
                 let mut d_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
                 let mut d_label_weights: Vec<Vec<f32>> = Vec::new();
-                let mut d_prej_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut d_prej_raw: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut d_prej_texts: Vec<Vec<String>> = Vec::new();
 
                 for (fname, _, _, _) in &fields {
                     let (lp, lw) = label_phrase_bank(&doc_lang, &page_type, fname);
@@ -4892,34 +4911,81 @@ async fn process_task(
                         model.get_embedding_batch(pp.clone()).await
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
                     };
-                    emit_term(&format!("  🏷️ [LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개", fname, lp.len(), pe.len()));
                     d_field_names.push(fname.clone());
                     d_label_embs.push(le);
                     d_label_weights.push(lw);
-                    d_prej_embs.push(pe);
+                    d_prej_raw.push(pe);
+                    d_prej_texts.push(pp);
                 }
 
-                let pair_abs_floor = 0.55f32;
-                let pair_score_floor = 0.10f32;
+                // 🌟 ① [SELF-POISON GUARD] recipient_address.prejudice 의 '받는사람',
+                //    sender_phone.prejudice 의 '주문자' 처럼 자기 자신을 가장 잘 설명하는
+                //    편견 구를 코사인으로 색출해 제거합니다.
+                let mut d_prej_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(d_field_names.len());
+                for f in 0..d_field_names.len() {
+                    let mask = self_poisoned_prejudice_mask(&d_label_embs[f], &d_prej_raw[f], &d_label_embs, f);
+                    let mut kept: Vec<Vec<f32>> = Vec::new();
+                    let mut dropped = 0usize;
+                    for (pi, poisoned) in mask.iter().enumerate() {
+                        if *poisoned {
+                            dropped += 1;
+                            if dropped <= 6 {
+                                emit_term(&format!("    🧪 [SELF-POISON DROP] '{}' 의 편견 구 '{}' 는 경쟁 필드보다 자기 자신을 더 잘 설명하므로 편견 자격을 박탈합니다.",
+                                    d_field_names[f], d_prej_texts[f].get(pi).cloned().unwrap_or_default()));
+                            }
+                        } else {
+                            kept.push(d_prej_raw[f][pi].clone());
+                        }
+                    }
+                    emit_term(&format!("  🏷️ [LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개 (자기오염 {}개 제거)",
+                        d_field_names[f], d_label_embs[f].len(), kept.len(), dropped));
+                    d_prej_embs.push(kept);
+                }
+
+                // 🌟 ② 리프 행렬 / 섹션 행렬을 각각 원시 코사인으로 채웁니다.
+                //    편견은 '점수에서 빼는' 방식이 아니라 '경쟁 개념이 우세하면 후보 탈락'이라는
+                //    상대 게이트로만 사용합니다. (절대 감점은 임계치 지옥을 다시 만듭니다)
+                let pair_abs_floor = 0.50f32;
+                let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
+                let mut sec_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
+
+                for f in 0..d_field_names.len() {
+                    for h in 0..unique_phrases.len() {
+                        if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                        let own = weighted_max_pool_sim(&leaf_embs[h], &d_label_embs[f], &d_label_weights[f]);
+                        if own < pair_abs_floor { continue; }
+                        let prej = if d_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&leaf_embs[h], &d_prej_embs[f]) };
+                        if prej >= own {
+                            emit_term(&format!("    🚫 [PAIR PREJUDICE GATE] '{}' → '{}' | LabelMaxPool: {:.4} <= PrejMaxPool: {:.4}. 경쟁 개념이 우세하여 후보 제외.",
+                                unique_phrases[h], d_field_names[f], own, prej));
+                            continue;
+                        }
+                        leaf_raw[f][h] = own;
+
+                        if unique_section[h].is_empty() { continue; }
+                        if section_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                        sec_raw[f][h] = weighted_max_pool_sim(&section_embs[h], &d_label_embs[f], &d_label_weights[f]);
+                    }
+                }
+
+                // 🌟 ③ 이중 센터링 : 라벨 고유 베이스라인과 필드 고유 베이스라인을 동시에 제거해
+                //    0.55~0.90 에 뭉친 원시값을 '상대 우위' 값으로 변환합니다.
+                let leaf_centered = double_center_matrix(&leaf_raw);
+                let sec_centered = double_center_matrix(&sec_raw);
+                const SECTION_WEIGHT: f32 = 1.0f32;
 
                 let mut d_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
                 for f in 0..d_field_names.len() {
                     for h in 0..unique_phrases.len() {
-                        if phrase_embs[h].iter().all(|&v| v == 0.0) { continue; }
-                        let own = weighted_max_pool_sim(&phrase_embs[h], &d_label_embs[f], &d_label_weights[f]);
-                        if own < pair_abs_floor { continue; }
-                        let prej = if d_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&phrase_embs[h], &d_prej_embs[f]) };
-                        let score = own - prej;
-                        if score < pair_score_floor {
-                            emit_term(&format!("    🚫 [DETAIL PAIR PREJUDICE DROP] '{}' → '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4} < {:.2}",
-                                unique_phrases[h], d_field_names[f], own, prej, score, pair_score_floor));
-                            continue;
-                        }
-                        d_matrix[f][h] = score;
+                        if leaf_raw[f][h] < 0.0 { continue; }
+                        let sec_term = if sec_raw[f][h] >= 0.0 { sec_centered[f][h] } else { 0.0 };
+                        d_matrix[f][h] = leaf_centered[f][h] + SECTION_WEIGHT * sec_term;
                     }
                 }
 
-                let d_assign = exclusive_assign(&d_matrix, pair_score_floor, 0.03);
+                // 🌟 ④ 절대 점수(증거 강도) 우선 배타 배정.
+                //    '주문하신 분 이름'(own 1.0) 이 '판매자'(own 0.80) 보다 먼저 sender_name 을 잠급니다.
+                let d_assign = exclusive_assign_by_score(&d_matrix, 0.0, 0.005);
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -4983,14 +5049,184 @@ async fn process_task(
                         "target_column": owner.clone(),
                         "extracted_value": merged.clone()
                     }));
-                    emit_term(&format!("    ✨ [DETAIL PAIR COSINE MAP] Label '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
-                        unique_phrases[h], owner, score, margin, primary + 1, merged));
+                    emit_term(&format!("    ✨ [DETAIL PAIR COSINE MAP] Label '{}' → Field '{}' | LeafRaw: {:.4} | SecRaw: {:.4} | Centered: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
+                        unique_phrases[h], owner,
+                        leaf_raw[f][h].max(0.0),
+                        sec_raw[f][h].max(0.0),
+                        score, margin, primary + 1, merged));
                 }
             }
 
             // 구조적으로 주인이 확정된 라인은 다른 필드가 벡터로 선점할 수 없습니다.
             for l in &pair_owned_lines { det_consumed_lines.insert(*l); }
-            
+
+            // 🌟 [ENUM SELECT RESOLVER]
+            //  상태는 '취소' 라는 한국어 리터럴 매칭이 아니라 아래 4단계로 확정합니다.
+            //  ① 원본 HTML 에서 모든 <select> 를 수집합니다.
+            //     (PUG 는 selected 아닌 option 을 버리므로 '반품/교환' 후보 집합이 소멸합니다)
+            //  ② 각 select 의 "옵션 집합"을 bias.json status_filters(영어 캐노니컬) 뱅크와
+            //     코사인 대조하고, 택배사/은행/카드 같은 '상태가 아닌 열거형' 뱅크와의 대비를 뺍니다.
+            //  ③ 마진이 충분하면 selected 옵션 텍스트를 다시 캐노니컬 키로 환산합니다.
+            //  ④ 마진이 부족해 애매할 때만 LLM(Qwen3.5)에게 CSS selector 를 묻고,
+            //     값 자체는 우리가 그 selector 의 selected 옵션에서 결정론적으로 읽습니다.
+            let mut enum_resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            {
+                let select_groups = collect_select_groups(&clean_html_content);
+                if select_groups.is_empty() {
+                    emit_term("  ⚪ [ENUM SELECT] 문서에 <select> 컨트롤이 없어 상태 선택자 해석을 건너뜁니다.");
+                } else {
+                    let status_keys = enum_status_keys(&page_type);
+                    let mut key_banks: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
+                    for k in &status_keys {
+                        let phrases = status_key_phrases(k);
+                        let e = model.get_embedding_batch(phrases.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()]);
+                        key_banks.push((k.to_string(), e));
+                    }
+
+                    // '상태가 아닌 열거형' 경쟁 뱅크 : 택배사 / 은행 / 카드 / PG / 안내문구
+                    let rival_phrases: Vec<String> = {
+                        let mut v: Vec<String> = vec![
+                            "delivery company".to_string(), "courier company".to_string(),
+                            "shipping carrier".to_string(), "postal service".to_string(),
+                            "bank name".to_string(), "bank account number".to_string(),
+                            "credit card company".to_string(), "payment gateway".to_string(),
+                            "please select".to_string(), "choose an option".to_string(),
+                            "category".to_string(), "brand".to_string(), "country".to_string(),
+                        ];
+                        for fname in ["carrier", "bank", "card", "payment_origin", "payment_method"] {
+                            let (lp, _) = label_phrase_bank(&doc_lang, &page_type, fname);
+                            for p in lp { if !v.iter().any(|e| e == &p) { v.push(p); } }
+                        }
+                        if v.len() > 64 { v.truncate(64); }
+                        v
+                    };
+                    let rival_bank = model.get_embedding_batch(rival_phrases.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; rival_phrases.len()]);
+
+                    let mut scored: Vec<(usize, f32)> = Vec::new();
+                    for (gi, g) in select_groups.iter().enumerate() {
+                        let opt_embs = model.get_embedding_batch(g.options.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; g.options.len()]);
+                        let mut s_sum = 0.0f32;
+                        let mut r_sum = 0.0f32;
+                        let mut cnt = 0usize;
+                        for oe in &opt_embs {
+                            if oe.iter().all(|&v| v == 0.0) { continue; }
+                            let mut best_k = 0.0f32;
+                            for (_, kb) in &key_banks {
+                                let s = max_pool_sim(oe, kb);
+                                if s > best_k { best_k = s; }
+                            }
+                            s_sum += best_k;
+                            r_sum += max_pool_sim(oe, &rival_bank);
+                            cnt += 1;
+                        }
+                        if cnt == 0 { continue; }
+                        let s_mean = s_sum / (cnt as f32);
+                        let r_mean = r_sum / (cnt as f32);
+
+                        let role_emb = model.get_embedding(g.role_phrase.clone()).await.unwrap_or(vec![0.0; 384]);
+                        let mut role_status = 0.0f32;
+                        for (_, kb) in &key_banks {
+                            let s = max_pool_sim(&role_emb, kb);
+                            if s > role_status { role_status = s; }
+                        }
+                        let role_rival = max_pool_sim(&role_emb, &rival_bank);
+                        let contrast = (s_mean - r_mean) + 0.5 * (role_status - role_rival);
+
+                        emit_term(&format!("      🎛️ [SELECT CANDIDATE] '{}' | Role: '{}' | Options: {} | StatusMean: {:.4} | RivalMean: {:.4} | RoleΔ: {:+.4} | Contrast: {:+.4}",
+                            g.selector, g.role_phrase, g.options.len(), s_mean, r_mean, role_status - role_rival, contrast));
+                        scored.push((gi, contrast));
+                    }
+
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                    let mut chosen: Option<usize> = None;
+                    if let Some((gi, c1)) = scored.first().copied() {
+                        let c2 = scored.get(1).map(|x| x.1).unwrap_or(f32::MIN);
+                        let margin = if c2 == f32::MIN { c1 } else { c1 - c2 };
+                        if c1 > 0.02 && margin > 0.02 {
+                            chosen = Some(gi);
+                            emit_term(&format!("  🎛️ [ENUM SELECT COSINE] 상태 컨트롤 확정: '{}' | Contrast: {:+.4} | Margin: {:+.4}",
+                                select_groups[gi].selector, c1, margin));
+                        } else {
+                            emit_term(&format!("  ⚠️ [ENUM SELECT AMBIGUOUS] 최고 Contrast {:+.4} / Margin {:+.4} 로 코사인 확정 실패. LLM CSS selector 탐색으로 넘어갑니다.", c1, margin));
+                        }
+                    }
+
+                    // ④ 코사인이 애매할 때만 LLM 에게 selector 를 묻습니다. (문서당 최대 1회)
+                    if chosen.is_none() {
+                        let catalogue: Vec<serde_json::Value> = select_groups.iter().map(|g| json!({
+                            "selector": g.selector,
+                            "role": g.role_phrase,
+                            "options": g.options
+                        })).collect();
+                        let cat_str = serde_json::to_string_pretty(&catalogue).unwrap_or_default();
+                        let sel_prompt = crate::parsing::extract_status_selector_prompt(&page_type, &doc_lang, &cat_str);
+
+                        let params = ChatCompletionParameters {
+                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(sel_prompt),
+                                name: None,
+                            })],
+                            model: "qwen3.5".to_string(),
+                            max_tokens: Some(128),
+                            temperature: Some(0.0),
+                            top_p: Some(0.95),
+                            ..Default::default()
+                        };
+
+                        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                        let mut picked = String::new();
+                        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                            if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_status_selector", task.id)), kv_name.clone(), None, None).await {
+                                let parsed = crate::parsing::parse_json_from_llm(&res);
+                                picked = parsed.get("status_selector").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                            }
+                        }
+                        model.deep_purge_resources().await;
+                        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+
+                        if !picked.is_empty() && picked != "null" {
+                            if let Some(pos) = select_groups.iter().position(|g| g.selector == picked) {
+                                chosen = Some(pos);
+                                emit_term(&format!("  🤖 [ENUM SELECT LLM] LLM 이 상태 컨트롤로 '{}' 를 지목했습니다.", picked));
+                            } else {
+                                emit_term(&format!("  🚫 [ENUM SELECT LLM REJECT] LLM 이 반환한 '{}' 는 실제 후보 목록에 없어 폐기합니다.", picked));
+                            }
+                        }
+                    }
+
+                    // ③ selected 옵션 텍스트 → 캐노니컬 키 환산
+                    if let Some(gi) = chosen {
+                        let g = &select_groups[gi];
+                        let sel_emb = model.get_embedding(g.selected.clone()).await.unwrap_or(vec![0.0; 384]);
+                        let mut best_key = String::new();
+                        let mut best = f32::MIN;
+                        let mut second = f32::MIN;
+                        for (k, kb) in &key_banks {
+                            let s = max_pool_sim(&sel_emb, kb);
+                            emit_term(&format!("      🧭 [STATUS KEY] '{}' ← selected \"{}\" | MaxPool: {:.4}", k, g.selected, s));
+                            if s > best { second = best; best = s; best_key = k.clone(); }
+                            else if s > second { second = s; }
+                        }
+                        if !best_key.is_empty() && best > 0.35 && (best - second) > 0.01 {
+                            enum_resolved.insert("status".to_string(), best_key.clone());
+                            emit_term(&format!("  ✅ [ENUM SELECT RESOLVED] '{}' (selected: \"{}\") → status = '{}' | Top: {:.4} | Margin: {:+.4}",
+                                g.selector, g.selected, best_key, best, best - second));
+                        } else {
+                            emit_term(&format!("  ⚠️ [ENUM SELECT UNRESOLVED] selected \"{}\" 의 캐노니컬 마진 부족 (Top {:.4} / 2nd {:.4}). 기존 경로로 위임합니다.",
+                                g.selected, best, second));
+                        }
+                    }
+                }
+            }
+
+            // 🌟 상태가 결정론적으로 확정되면 구조적 페어의 enum 강제 배정은 폐기합니다.
+            if enum_resolved.contains_key("status") {
+                header_forced_assign.remove("status");
+            }
 
             let pre_mapped_context = if !pre_mapped_hints.is_empty() {
                 serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
@@ -5079,6 +5315,42 @@ async fn process_task(
                 }
             }
 
+            // 🌟 [FORMAT FAMILY SHARE] 같은 형식(FieldFormat)의 필드는 물리적으로 같은 셀을 가리킬 수 있습니다.
+            //    order_date 와 registration_date 는 둘 다 '주문일시' 셀이 정답인데,
+            //    1:1 배타 배정 때문에 한쪽이 반드시 빈값이 되고 ⛔ FORMAT SKIP 으로 폐기되었습니다.
+            //    배정에서 밀려난 필드는 '같은 형식으로 이미 확정된 라인'을 공유하도록 허용합니다.
+            {
+                let mut shared = 0usize;
+                for f in 0..vector_assignment.len() {
+                    if vector_assignment[f].is_some() { continue; }
+                    if field_is_analytic[f] { continue; }
+                    if is_id_link_field(&fields[f].0) { continue; }
+                    let fmt = field_formats[f];
+                    if !matches!(fmt, FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric) { continue; }
+
+                    let mut best_line: Option<usize> = None;
+                    let mut best_raw = f32::MIN;
+                    for other in 0..vector_assignment.len() {
+                        if other == f { continue; }
+                        if field_formats[other] != fmt { continue; }
+                        if let Some((l, _, _)) = vector_assignment[other] {
+                            let raw = vector_raw_matrix[f].get(l).copied().unwrap_or(-1.0);
+                            if raw < 0.0 { continue; }
+                            if raw > best_raw { best_raw = raw; best_line = Some(l); }
+                        }
+                    }
+                    if let Some(l) = best_line {
+                        vector_assignment[f] = Some((l, best_raw, 0.0));
+                        shared += 1;
+                        emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 같은 형식 필드가 확정한 라인을 공유합니다.",
+                            fields[f].0, fmt, l + 1, best_raw));
+                    }
+                }
+                if shared > 0 {
+                    emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] 총 {}개 필드가 동일 형식 라인을 공유했습니다.", shared));
+                }
+            }
+
             for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
                 match vector_assignment[f_i] {
                     Some((l, contrast, margin)) => {
@@ -5096,7 +5368,20 @@ async fn process_task(
 
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                
+
+                // 🌟 [ENUM DETERMINISTIC BYPASS] select 옵션 집합 코사인(필요시 LLM selector)으로
+                //    이미 캐노니컬 키가 확정된 열거형은 LLM 을 호출하지 않고 그대로 확정합니다.
+                //    '취소' 라는 단어를 문자열로 찾는 로직은 여기서 완전히 사라집니다.
+                if let Some(canon) = enum_resolved.get(&field_name).cloned() {
+                    extracted_data.as_object_mut().unwrap().insert(field_name.clone(), json!(canon.clone()));
+                    if !global_ignore_list.contains(&canon) {
+                        global_ignore_list.push(canon.clone());
+                        global_ignore_list.push(format!(" {}", canon));
+                        global_ignore_list.push(canon.to_lowercase());
+                    }
+                    emit_term(&format!("  ⚡ [ENUM BYPASS] LLM 없이 확정: \"{}\": \"{}\"", field_name, canon));
+                    continue;
+                }
 
                 let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                 let mut bypassed_values: Vec<(String, String)> = Vec::new();
@@ -5180,10 +5465,15 @@ async fn process_task(
                 // 🌟 [STRICT FORMAT SKIP] 형식이 확정적인 필드는 후보 셀이 없으면 LLM 호출 없이 비워둡니다.
                 //    🌟 Enum 도 포함합니다. 구조적 페어도, option[selected] 폴백도 없으면
                 //    쓰레기를 넣느니 비워 두는 것이 안전합니다. (card = "2323" 사고 차단)
+                // 🌟 Phone 추가: 전화번호는 생김새가 100% 확정적이므로, 후보가 없으면
+                //    이메일/네비링크를 억지로 물려 3회 환각시키느니 빈 값이 안전합니다.
+                //    Address 는 다국어 단일토큰 주소가 존재할 수 있어 strict 에서 제외하고
+                //    전체 컨텍스트 LLM 폴백을 남겨둡니다.
                 let strict_format_field = matches!(
                     field_format,
                     FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric
                         | FieldFormat::Identifier | FieldFormat::Link | FieldFormat::Enum
+                        | FieldFormat::Phone
                 );
                 if !field_is_analytic[idx] && strict_format_field && !has_vector_match {
                     emit_term(&format!("  ⛔ [FORMAT SKIP] Field: '{}' ({:?}) | 형식에 맞는 후보 셀이 문서에 존재하지 않습니다. LLM 호출 없이 빈 값으로 확정.", field_name, field_format));
@@ -5419,6 +5709,7 @@ async fn process_task(
                                             key_fmt,
                                             FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Text
                                                 | FieldFormat::Numeric | FieldFormat::Enum | FieldFormat::Identifier
+                                                | FieldFormat::Phone | FieldFormat::Address
                                         );
                                         if strict_post && !extracted_str.is_empty() && !value_matches_format(key_fmt, &extracted_str) {
                                             emit_term(&format!("  🚫 [FORMAT REJECT] '{}' ({:?}) 에 형식 불일치 값 '{}' 반환. 폐기 후 재시도합니다.", k, key_fmt, extracted_str));

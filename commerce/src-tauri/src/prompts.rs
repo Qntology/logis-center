@@ -828,6 +828,47 @@ Source Document Language: {DOC_LANG}
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
 }
 
+// 🌟 [NEW] 상태(status) 컨트롤의 CSS selector 를 찾는 전용 프롬프트.
+// 코사인으로 '옵션 집합이 생애주기 상태인지'를 판정했는데 마진이 부족해 애매할 때만 호출됩니다.
+// 값을 뱉게 하지 않고 '선택자'만 뱉게 하여, 실제 값은 우리가 selected 옵션에서 결정론적으로 읽습니다.
+pub fn extract_status_selector_prompt(page_type: &str, lang: &str, candidates_json: &str) -> String {
+    let template = r###"[TASK]
+Pick the ONE form control that holds the CURRENT LIFECYCLE STATE of this single {TYPE} record.
+
+[CONTEXT]
+Page Type: {TYPE}
+Document Language: {LANG}
+
+[CANDIDATES]
+Every entry below is a real <select> element found in this document.
+- "selector": its exact CSS selector
+- "role"    : the words attached to the control (its name / id / row header)
+- "options" : every option label inside it
+{CANDIDATES}
+
+[RULES]
+1. The correct control lists MUTUALLY EXCLUSIVE LIFECYCLE STATES of ONE record.
+   Examples of lifecycle states: pending, preparing, in transit, delivered, completed,
+   cancelled, returned, exchanged, refunded, expired, on hold.
+2. It is NOT a control that lists organizations or catalogue values:
+   couriers, delivery companies, banks, account numbers, card issuers, payment gateways,
+   categories, brands, countries, quantities, dates, or addresses.
+3. Judge by the OPTION SET, not by the control name. A control whose options are company
+   names is never the state control, however its name reads.
+4. "selector" MUST be copied character for character from [CANDIDATES]. Never invent one.
+5. If no candidate lists lifecycle states, return null. null is correct data; a wrong
+   selector silently corrupts every record.
+
+[OUTPUT FORMAT]
+{ "status_selector": <one selector copied verbatim from [CANDIDATES], or null> }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{LANG}", lang)
+            .replace("{CANDIDATES}", candidates_json)
+}
+
 pub fn verify_property_mapping_prompt(text: &str, property: &str) -> String {
     let template = r###"[TASK]
 Given the text '{TEXT}' and the current property '{PROPERTY}', suggest the most accurate property name(s) from the schema.
