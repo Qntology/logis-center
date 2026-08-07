@@ -5,3 +5,4 @@ pub mod qwen3vl;
 pub mod granite;
 pub mod common;
 pub mod embedding;
+pub mod vision_cache;

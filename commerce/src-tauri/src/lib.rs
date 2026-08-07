@@ -1779,6 +1779,11 @@ async fn delete_all_models() -> Result<String, String> {
     if models_dir.exists() {
         std::fs::remove_dir_all(&models_dir).map_err(|e| e.to_string())?;
     }
+
+    // 🌟 [VISION-CACHE] 모델이 사라지면 ViT 출력의 재현성도 보장할 수 없으므로
+    //    캐시된 비전 임베딩을 함께 폐기합니다.
+    crate::models::vision_cache::VISION_CACHE.clear_all();
+
     Ok("Deleted".to_string())
 }
 

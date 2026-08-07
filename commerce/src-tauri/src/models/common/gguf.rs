@@ -27,6 +27,11 @@ impl<R: Read + Seek> Gguf<R> {
         Self { ct, reader, device }
     }
 
+    /// 🌟 [VISION-JIT] 비전 모델이 재로드용 device를 보관할 수 있도록 노출합니다.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     pub fn get_matedata(&self, name: &str) -> Result<Value> {
         match self.ct.metadata.get(name) {
             None => Err(anyhow!("cannot find {name} in metadata")),
@@ -416,6 +421,40 @@ impl TwoLinearMLPGguf {
             act,
         })
     }
+    /// 🌟 [VISION-JIT] mmproj MLP 가중치를 1바이트 껍데기로 교체하여 메모리를 즉시 반환합니다.
+    pub fn clear_weights(&mut self) {
+        let dummy = dummy_proj(&Device::Cpu);
+        self.linear1 = dummy.clone();
+        self.linear2 = dummy;
+    }
+
+    /// 🌟 [VISION-STREAM] 레이어 스트리밍이 Gguf 래퍼를 거치지 않고
+    ///   &Content 로 직접 읽은 프로젝션을 밀어 넣을 수 있도록 노출합니다.
+    pub fn set_projs(&mut self, linear1: ProjKind, linear2: ProjKind) {
+        self.linear1 = linear1;
+        self.linear2 = linear2;
+    }
+
+    /// 🌟 [VISION-JIT] 비전 입력이 감지되면 mmproj GGUF에서 in-place로 재로드합니다.
+    pub fn load_weights_inplace<R: Read + Seek>(
+        &mut self,
+        gguf: &mut Gguf<R>,
+        prefix: &str,
+        bias: bool,
+        linear1_name: Option<&str>,
+        linear2_name: Option<&str>,
+    ) -> Result<()> {
+        let linear1_name = linear1_name.unwrap_or("ffn_up");
+        let linear2_name = linear2_name.unwrap_or("ffn_down");
+        self.linear1 = ProjKind::QuantizedProj(
+            gguf.quantize_linear(&format!("{prefix}.{linear1_name}"), bias)?,
+        );
+        self.linear2 = ProjKind::QuantizedProj(
+            gguf.quantize_linear(&format!("{prefix}.{linear2_name}"), bias)?,
+        );
+        Ok(())
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = xs
             .apply(&self.linear1)?

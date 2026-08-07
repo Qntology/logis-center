@@ -61,7 +61,92 @@ pub struct Qwen3VLProcessor {
     max_frames: u32,
 }
 
+/// 🌟 [VRAM 역산] 비전 인코더가 소비하는 VRAM 을 패치 수 N 의 이차식으로 모델링합니다.
+///   mem(N) = A·N + B·N²
+///     A : pixel_values / hidden_states / MLP intermediate / deepstack 등 N 에 선형인 항
+///     B : eager_attention_forward 가 block_outputs·block_lse 를 전 블록 동시 보관하며
+///         생기는 N² 근사 항 (block_size = 4096 기준)
+///   기존 계단식 캡(589_824 / 802_816 / 1_048_576 / 1_327_104)은
+///   ① 6GB 초과 구간이 무방비였고 ② JIT 으로 확보한 VRAM 을 반영하지 못했으며
+///   ③ 계단 경계에서 30% 불연속이 발생했습니다. 이를 연속 함수로 대체합니다.
+const VISION_MEM_LINEAR_COEF: f64 = 24_000.0;
+/// 🌟 [VISION-TILE 반영] 쿼리축 타일링 도입 전에는 어텐션 전이 버퍼가
+///   (N × min(N,4096) × heads) 로 N² 에 가깝게 자라 B = 32 가 필요했습니다.
+///   타일링 이후에는 전이 버퍼가 (q_tile × 4096 × heads) 로 상한이 걸려
+///   N 에 대해 사실상 상수가 됩니다. 남는 N² 성분은 block_outputs 누적분뿐이므로
+///   계수를 32 → 4 로 낮춰 확보한 VRAM 을 해상도로 환원합니다.
+///   (OOM 이 재발하면 4 → 8 → 16 순으로 되돌리십시오)
+const VISION_MEM_QUADRATIC_COEF: f64 = 4.0;
+/// ViT 가중치(mmproj) + CUDA 컨텍스트 + 파편화 여유분
+const VISION_VRAM_RESERVE: u64 = 800_000_000;
+
+/// 사용 가능한 VRAM 바이트로부터 안전한 최대 패치 수를 역산합니다.
+/// B·N² + A·N - usable = 0 의 양근을 구합니다.
+pub fn vision_max_patches_from_vram(usable_bytes: u64) -> usize {
+    if usable_bytes == 0 {
+        return 0;
+    }
+    let a = VISION_MEM_LINEAR_COEF;
+    let b = VISION_MEM_QUADRATIC_COEF;
+    let u = usable_bytes as f64;
+    let disc = (a * a + 4.0 * b * u).sqrt();
+    let n = (disc - a) / (2.0 * b);
+    if n <= 0.0 { 0 } else { n as usize }
+}
+
 impl Qwen3VLProcessor {
+    /// 🌟 [VRAM 역산] NVML 로 현재 가용 VRAM 을 읽어 안전한 max_pixels 를 계산합니다.
+    /// NVML 이 없거나(CPU 모드) 조회에 실패하면 설정값을 그대로 존중합니다.
+    fn compute_adaptive_max_pixels(&self, config_max: u32) -> u32 {
+        let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
+        if patch_area == 0 { return config_max; }
+
+        let nvml = match nvml_wrapper::Nvml::init() {
+            Ok(n) => n,
+            Err(_) => return config_max,
+        };
+        let dev = match nvml.device_by_index(0) {
+            Ok(d) => d,
+            Err(_) => return config_max,
+        };
+        let mem = match dev.memory_info() {
+            Ok(m) => m,
+            Err(_) => return config_max,
+        };
+
+        let free_vram = mem.free;
+        let usable = free_vram.saturating_sub(VISION_VRAM_RESERVE);
+        let max_patches = vision_max_patches_from_vram(usable);
+        if max_patches == 0 {
+            // VRAM 이 예약분조차 못 채우는 극한 상황. 최소 해상도로 강제합니다.
+            let floor_px = 262_144u32; // 512x512
+            println!(
+                "[VISION-ADAPTIVE] Free VRAM {:.0}MB is below reserve. Forcing minimum {}px².",
+                free_vram as f64 / 1e6, floor_px
+            );
+            return config_max.min(floor_px);
+        }
+
+        let adaptive_px = (max_patches as u64).saturating_mul(patch_area);
+        let adaptive_px = if adaptive_px > u32::MAX as u64 { u32::MAX } else { adaptive_px as u32 };
+
+        if adaptive_px < config_max {
+            let side = (adaptive_px as f64).sqrt() as u32;
+            println!(
+                "[VISION-ADAPTIVE] Free VRAM {:.0}MB (usable {:.0}MB) → max {} patches → max_pixels {} (~{}x{}). Config was {}.",
+                free_vram as f64 / 1e6,
+                usable as f64 / 1e6,
+                max_patches,
+                adaptive_px,
+                side, side,
+                config_max
+            );
+            adaptive_px
+        } else {
+            config_max
+        }
+    }
+
     pub fn new(path: &str, device: &Device, dtype: DType) -> Result<Self> {
         let path = path.to_string();
         assert!(
@@ -178,45 +263,54 @@ impl Qwen3VLProcessor {
         img_mean: &Tensor,
         img_std: &Tensor,
     ) -> Result<Tensor> {
+        // 🌟 [VRAM 역산] 단일 이미지 기준. 다중 이미지는 process_images 가 budget_divisor 로 나눠 호출합니다.
+        self.process_img_with_budget(img, img_mean, img_std, 1)
+    }
+
+    /// 🌟 [VRAM 역산] budget_divisor 는 "이 배치에서 동시에 살아 있어야 하는 이미지 수" 입니다.
+    /// process_images 가 5장을 Tensor::cat 으로 합치면 VRAM 도 5배가 필요하므로,
+    /// 이미지 한 장당 예산을 1/5 로 나눠야 실제로 안전합니다.
+    /// (기존 계단식 캡은 항상 1장 기준이라 다중 이미지에서 무방비였습니다)
+    pub fn process_img_with_budget(
+        &self,
+        img: &DynamicImage,
+        img_mean: &Tensor,
+        img_std: &Tensor,
+        budget_divisor: usize,
+    ) -> Result<Tensor> {
         let img_h = img.height();
         let img_w = img.width();
-        
-        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32; 
-        let min_pixels = self.img_process_cfg.size.shortest_edge as u32; 
+
+        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32;
+        let min_pixels = self.img_process_cfg.size.shortest_edge as u32;
 
         // 상식적인 면적 범위 방어
         if max_pixels > 16_777_216 { max_pixels = 16_777_216; }
 
-        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    
-                    // 비전 모델은 이미지 패치(Patch) 개수의 제곱(N^2)에 비례하여 VRAM을 폭식합니다.
-                    // 1344x1344 (1.8M 픽셀) = 7056 토큰 = 3.2GB의 행렬 연산 메모리가 일시적으로 필요하므로 4GB 환경에서는 무조건 터집니다.
-                    // 따라서 VRAM 용량별로 안전한 "최대 픽셀 수"를 철저하게 보수적으로 재조정합니다.
-                    
-                    let free_vram = mem.free;
-                    
-                    if free_vram < 2_000_000_000 {
-                        // 2GB 이하: 768x768 (589,824) -> 2304 토큰 -> Attention ~340MB 스파이크
-                        let cap = 589_824; 
-                        if max_pixels > cap { max_pixels = cap; }
-                    } else if free_vram < 3_000_000_000 {
-                        // 3GB 이하: 896x896 (802,816) -> 3136 토큰 -> Attention ~620MB 스파이크
-                        let cap = 802_816; 
-                        if max_pixels > cap { max_pixels = cap; }
-                    } else if free_vram < 4_500_000_000 {
-                        // 4.5GB 이하: 1024x1024 (1,048,576) -> 4096 토큰 -> Attention ~1.07GB 스파이크 (안전)
-                        let cap = 1_048_576; 
-                        if max_pixels > cap { max_pixels = cap; }
-                    } else if free_vram < 6_000_000_000 {
-                        // 6GB 이하: 1152x1152 (1,327,104) -> 5184 토큰 -> Attention ~1.7GB 스파이크
-                        let cap = 1_327_104; 
-                        if max_pixels > cap { max_pixels = cap; }
-                    }
-                }
+        // 🌟 [VRAM 역산] 계단식 캡(589_824 / 802_816 / 1_048_576 / 1_327_104)을
+        //    가용 VRAM 기반 연속 역산으로 대체합니다.
+        //    ① 6GB 초과 구간 무방비 문제 해소 ② JIT 으로 확보한 VRAM 즉시 반영
+        //    ③ 계단 경계 30% 불연속 제거
+        let adaptive = self.compute_adaptive_max_pixels(max_pixels);
+        if adaptive < max_pixels { max_pixels = adaptive; }
+
+        // 다중 이미지 배치 보정: 동시 상주 장수만큼 장당 예산을 축소합니다.
+        let divisor = budget_divisor.max(1);
+        if divisor > 1 {
+            let shared = max_pixels / divisor as u32;
+            let floor_px = 262_144u32; // 512x512 미만으로는 내려가지 않습니다.
+            let shared = shared.max(floor_px.min(max_pixels));
+            if shared < max_pixels {
+                println!(
+                    "[VISION-ADAPTIVE] Batch of {} images → per-image max_pixels {} (was {}).",
+                    divisor, shared, max_pixels
+                );
+                max_pixels = shared;
             }
         }
+
+        // min_pixels 가 max_pixels 를 역전하면 img_smart_resize 가 붕괴하므로 방어합니다.
+        let min_pixels = if min_pixels > max_pixels { max_pixels } else { min_pixels };
 
         // 이제 계산된 픽셀 한계에 맞춰 이미지를 지능적으로 축소합니다.
         let (resize_h, resize_w) = img_smart_resize(
@@ -226,11 +320,11 @@ impl Qwen3VLProcessor {
             min_pixels,
             max_pixels,
         )?;
-        
+
         let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
         let img_tensor = img_tensor.unsqueeze(0)?;
-        
+
         Ok(img_tensor)
     }
 
@@ -298,15 +392,45 @@ impl Qwen3VLProcessor {
         let mut pixel_values_vec = Vec::new();
         let mut vision_grid_thws_vec = Vec::new();
 
-        for img in imgs {
-            let img_tensor = self.process_img(&img, img_mean, img_std)?;
-            let img_tensor = Tensor::cat(&[&img_tensor, &img_tensor], 0)?.contiguous()?;
-            let (img_tensor, grid_thw) = self.process_vision_tensor(&img_tensor)?;
-            pixel_values_vec.push(img_tensor);
-            vision_grid_thws_vec.push(grid_thw);
+        // 🌟 [VRAM 역산] 결과 텐서들이 최종적으로 Tensor::cat 으로 전부 합쳐지므로,
+        //    이미지 장수를 예산 분모로 전달해야 실제 피크를 통제할 수 있습니다.
+        let total = imgs.len().max(1);
+        if total > 1 {
+            println!("[VISION-ADAPTIVE] process_images: {} images will co-reside. Splitting VRAM budget.", total);
         }
+
+        for img in imgs {
+            let img_tensor = self.process_img_with_budget(&img, img_mean, img_std, total)?;
+            let doubled = Tensor::cat(&[&img_tensor, &img_tensor], 0)?.contiguous()?;
+
+            // 🌟 [VRAM] 원본 img_tensor 는 doubled 로 복사가 끝났으므로 즉시 폐기합니다.
+            drop(img_tensor);
+
+            let (patched, grid_thw) = self.process_vision_tensor(&doubled)?;
+
+            // 🌟 [VRAM] reshape/permute 소스인 doubled 도 patched 확보 직후 폐기합니다.
+            //    고해상도 다중 이미지에서 이 두 drop 이 루프마다 수백 MB 를 회수합니다.
+            drop(doubled);
+
+            pixel_values_vec.push(patched);
+            vision_grid_thws_vec.push(grid_thw);
+
+            // 이미지 1장 처리가 끝날 때마다 GPU 큐를 비워 중간 버퍼가 실제로 반환되게 합니다.
+            if self.device.is_cuda() {
+                let _ = self.device.synchronize();
+            }
+        }
+
         let pixel_values = Tensor::cat(&pixel_values_vec, 0)?;
         let vision_grid_thws = Tensor::cat(&vision_grid_thws_vec, 0)?;
+
+        // 🌟 [VRAM] 개별 조각들은 합쳐진 이후 불필요합니다.
+        drop(pixel_values_vec);
+        drop(vision_grid_thws_vec);
+        if self.device.is_cuda() {
+            let _ = self.device.synchronize();
+        }
+
         Ok(VisionInput {
             data: pixel_values,
             grid_thw: vision_grid_thws,

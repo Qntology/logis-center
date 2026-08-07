@@ -90,53 +90,126 @@ impl QwenVLProcessor {
         Ok(vision_map)
     }
 
+    /// 🌟 [VRAM 역산] Qwen3VL 프로세서와 동일한 이차식 모델을 사용합니다.
+    ///   mem(N) = A·N + B·N²  →  B·N² + A·N - usable = 0 의 양근이 안전 패치 수입니다.
+    fn compute_adaptive_max_pixels(&self, config_max: u32) -> u32 {
+        const A: f64 = 24_000.0;
+        // 🌟 [VISION-TILE 반영] 쿼리축 타일링으로 어텐션 전이 버퍼에 상한이 걸렸으므로
+        //   N² 계수를 32 → 4 로 낮춥니다. (qwen3vl/processor.rs 와 동일 근거)
+        const B: f64 = 4.0;
+        const RESERVE: u64 = 800_000_000;
+
+        let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
+        if patch_area == 0 { return config_max; }
+
+        let nvml = match nvml_wrapper::Nvml::init() {
+            Ok(n) => n,
+            Err(_) => return config_max,
+        };
+        let dev = match nvml.device_by_index(0) {
+            Ok(d) => d,
+            Err(_) => return config_max,
+        };
+        let mem = match dev.memory_info() {
+            Ok(m) => m,
+            Err(_) => return config_max,
+        };
+
+        let free_vram = mem.free;
+        let usable = free_vram.saturating_sub(RESERVE);
+        if usable == 0 {
+            let floor_px = 262_144u32;
+            println!(
+                "[PROCESSOR] Free VRAM {:.0}MB is below reserve. Forcing minimum {}px².",
+                free_vram as f64 / 1e6, floor_px
+            );
+            return config_max.min(floor_px);
+        }
+
+        let disc = (A * A + 4.0 * B * usable as f64).sqrt();
+        let n = ((disc - A) / (2.0 * B)) as u64;
+        if n == 0 { return config_max.min(262_144); }
+
+        let adaptive = n.saturating_mul(patch_area);
+        let adaptive = if adaptive > u32::MAX as u64 { u32::MAX } else { adaptive as u32 };
+
+        if adaptive < config_max {
+            let side = (adaptive as f64).sqrt() as u32;
+            println!(
+                "[PROCESSOR] Free VRAM {:.0}MB (usable {:.0}MB) → max {} patches → max_pixels {} (~{}x{}).",
+                free_vram as f64 / 1e6, usable as f64 / 1e6, n, adaptive, side, side
+            );
+            adaptive
+        } else {
+            config_max
+        }
+    }
+
     pub fn process_img(
         &self,
         img: &DynamicImage,
         img_mean: &Tensor,
         img_std: &Tensor,
     ) -> Result<Tensor> {
+        self.process_img_with_budget(img, img_mean, img_std, 1)
+    }
+
+    /// 🌟 [VRAM 역산] budget_divisor 는 이 배치에서 동시 상주할 이미지 수입니다.
+    pub fn process_img_with_budget(
+        &self,
+        img: &DynamicImage,
+        img_mean: &Tensor,
+        img_std: &Tensor,
+        budget_divisor: usize,
+    ) -> Result<Tensor> {
         let img_h = img.height();
         let img_w = img.width();
-        
-        // --- Dynamic Resolution Capping (RAM & VRAM) ---
+
+        // 🌟 [BUGFIX] 기존 코드는 img_smart_resize 의 max_pixels(면적) 인자에
+        //    1024 / 896 / 768 이라는 '변 길이' 를 넣고 있었습니다.
+        //    768px² = 0.75 패치라 사실상 모든 이미지가 최소 크기로 뭉개졌습니다.
+        //    면적 단위로 통일하고 이차식 역산으로 교체합니다.
+        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32;
+        let shortest_edge = self.img_process_cfg.size.shortest_edge as u32;
+
+        if max_pixels > 16_777_216 { max_pixels = 16_777_216; }
+
+        // 1. System RAM Check (면적 기준으로 환산)
         let mut sys = System::new_all();
         sys.refresh_memory();
         let free_ram = sys.available_memory();
-        
-        let mut longest_edge = self.img_process_cfg.size.longest_edge as u32;
-        let shortest_edge = self.img_process_cfg.size.shortest_edge as u32;
-        
-        // 1. System RAM Check
         if free_ram < 2_000_000_000 {
-            if longest_edge > 1024 {
-                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to 1024px.", free_ram as f64 / 1e9);
-                longest_edge = 1024;
+            let cap = 1_048_576u32; // 1024x1024 의 '면적'
+            if max_pixels > cap {
+                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to {}px² (1024x1024).", free_ram as f64 / 1e9, cap);
+                max_pixels = cap;
             }
         }
 
-        // 2. VRAM Check (New)
-        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    if mem.free < 1_500_000_000 {
-                        let cap = if mem.free < 800_000_000 { 768 } else { 896 };
-                        if longest_edge > cap {
-                            println!("[PROCESSOR] Low VRAM ({:.2} MB). Capping Image to {}px to save Attention memory.", 
-                                mem.free as f64 / 1e6, cap);
-                            longest_edge = cap;
-                        }
-                    }
-                }
+        // 2. VRAM 이차식 역산
+        let adaptive = self.compute_adaptive_max_pixels(max_pixels);
+        if adaptive < max_pixels { max_pixels = adaptive; }
+
+        // 3. 다중 이미지 배치 보정
+        let divisor = budget_divisor.max(1);
+        if divisor > 1 {
+            let shared = max_pixels / divisor as u32;
+            let floor_px = 262_144u32;
+            let shared = shared.max(floor_px.min(max_pixels));
+            if shared < max_pixels {
+                println!("[PROCESSOR] Batch of {} images → per-image max_pixels {} (was {}).", divisor, shared, max_pixels);
+                max_pixels = shared;
             }
         }
-        
+
+        let shortest_edge = if shortest_edge > max_pixels { max_pixels } else { shortest_edge };
+
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
             (self.img_process_cfg.patch_size * self.img_process_cfg.merge_size) as u32,
             shortest_edge,
-            longest_edge,
+            max_pixels,
         )?;
         // ----------------------------------
 
@@ -201,14 +274,36 @@ impl QwenVLProcessor {
         let mut pixel_values_vec = Vec::new();
         let mut vision_grid_thws_vec = Vec::new();
 
-        for img in imgs {
-            let img_tensor = self.process_img(&img, img_mean, img_std)?;
-            let (img_tensor, grid_thw) = self.process_vision_tensor(&img_tensor)?;
-            pixel_values_vec.push(img_tensor);
-            vision_grid_thws_vec.push(grid_thw);
+        // 🌟 [VRAM 역산] 결과가 최종적으로 Tensor::cat 으로 합쳐지므로 장수를 예산 분모로 넘깁니다.
+        let total = imgs.len().max(1);
+        if total > 1 {
+            println!("[PROCESSOR] process_images: {} images will co-reside. Splitting VRAM budget.", total);
         }
+
+        for img in imgs {
+            let raw = self.process_img_with_budget(&img, img_mean, img_std, total)?;
+            let (patched, grid_thw) = self.process_vision_tensor(&raw)?;
+
+            // 🌟 [VRAM] reshape/permute 소스는 patched 확보 직후 폐기합니다.
+            drop(raw);
+
+            pixel_values_vec.push(patched);
+            vision_grid_thws_vec.push(grid_thw);
+
+            if self.device.is_cuda() {
+                let _ = self.device.synchronize();
+            }
+        }
+
         let pixel_values = Tensor::cat(&pixel_values_vec, 0)?;
         let vision_grid_thws = Tensor::cat(&vision_grid_thws_vec, 0)?;
+
+        drop(pixel_values_vec);
+        drop(vision_grid_thws_vec);
+        if self.device.is_cuda() {
+            let _ = self.device.synchronize();
+        }
+
         Ok(VisionInput {
             data: pixel_values,
             grid_thw: vision_grid_thws,

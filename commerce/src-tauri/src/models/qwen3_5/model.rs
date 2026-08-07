@@ -2316,6 +2316,37 @@ impl Qwen3_5Model {
     }
 
     
+    /// 🌟 [VISION-JIT] mmproj GGUF 실제 파일 경로를 비전 모델에 등록합니다.
+    /// 이 호출이 없으면 unload/reload 가 전부 no-op 이 되어 기존 거동이 100% 보존됩니다.
+    pub fn set_mmproj_path(&mut self, path: Option<String>) {
+        if let Some(v) = self.visual.as_mut() {
+            v.set_mmproj_path(path);
+        }
+    }
+
+    /// 🌟 [VISION-JIT] mmproj 재로드 소스가 등록되어 JIT 이 가능한 상태인지 확인합니다.
+    pub fn is_vision_jit_capable(&self) -> bool {
+        self.visual.as_ref().map(|v| v.is_jit_capable()).unwrap_or(false)
+    }
+
+    /// 🌟 [VISION-JIT] 현재 비전 가중치가 메모리에 상주 중인지 확인합니다.
+    pub fn is_vision_resident(&self) -> bool {
+        self.visual.as_ref().map(|v| v.is_weights_loaded).unwrap_or(false)
+    }
+
+    /// 🌟 [VISION-JIT] 비전 가중치만 붙였다 뗍니다. 텍스트 모델은 그대로 상주합니다.
+    /// active=false 는 텍스트 전용 추론 진입 시, true 는 이미지/비디오 입력 감지 시 호출합니다.
+    pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
+        if let Some(v) = self.visual.as_mut() {
+            if active {
+                v.reload_weights()?;
+            } else {
+                v.unload_weights();
+            }
+        }
+        Ok(())
+    }
+
     pub fn compute_and_set_rope_deltas(
         &mut self,
         full_input_ids: &Tensor,
@@ -2477,6 +2508,18 @@ impl Qwen3_5Model {
         kv_name: Option<String>,
     ) -> Result<Tensor> {
         let input_ids_cpu = input_ids.to_device(&Device::Cpu)?;
+
+        // 🌟 [VISION-JIT + CACHE] 여기서 무조건 mmproj 를 붙이면
+        //    캐시 히트로 ViT 를 건너뛸 때도 600MB 를 헛되이 올리게 됩니다.
+        //    reload 는 실제로 ViT 를 호출하기 직전(캐시 MISS 확정 후)으로 미룹니다.
+        //    비디오는 캐시 대상이 아니므로 여기서 즉시 붙입니다.
+        if pixel_values_video.is_some() {
+            if let Some(visual) = self.visual.as_mut() {
+                if !visual.is_weights_loaded && visual.is_jit_capable() {
+                    visual.reload_weights()?;
+                }
+            }
+        }
         
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
         let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
@@ -2484,14 +2527,66 @@ impl Qwen3_5Model {
         
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
-                if let Some(visual) = self.visual.as_ref() {
-                    let (image_embeds, _): (Tensor, _) = visual.forward(pixel_values, image_grid_thw)?;
-                    
-                    // 외부 유틸리티 대신 CPU에서 직접 마스크를 만들어 CUDA U32/U8 충돌 원천 차단
-                    let img_token_t = Tensor::new(vec![self.image_token_id as f32], &Device::Cpu)?;
-                    let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&img_token_t)?.to_dtype(DType::U8)?;
-                    let vision_mask = mask_cpu.to_device(input_ids.device())?;
-                    
+                // 외부 유틸리티 대신 CPU에서 직접 마스크를 만들어 CUDA U32/U8 충돌 원천 차단
+                let img_token_t = Tensor::new(vec![self.image_token_id as f32], &Device::Cpu)?;
+                let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&img_token_t)?.to_dtype(DType::U8)?;
+                let vision_mask = mask_cpu.to_device(input_ids.device())?;
+
+                // 🌟 [VISION-CACHE] 프롬프트가 요구하는 이미지 토큰 수를 먼저 확정합니다.
+                //    캐시본이 이 수와 다르면 masked_scatter_dim0 이 붕괴하므로 반드시 검증합니다.
+                let expected_tokens = vision_mask
+                    .to_dtype(candle_core::DType::F32)?
+                    .sum_all()?
+                    .to_scalar::<f32>()? as usize;
+
+                // 🌟 [VISION-CACHE] ViT 는 결정론적 feed-forward 이므로
+                //    동일 (pixel_values, grid_thw) 조합의 결과를 디스크에서 그대로 재사용합니다.
+                //    pixel_values 는 이미 리사이즈/정규화가 끝난 상태라
+                //    Part 6 의 적응형 해상도 변화가 해시에 자동 반영됩니다.
+                let cache_key = crate::models::vision_cache::VisionEmbedCache::compute_key(
+                    pixel_values, image_grid_thw
+                ).ok();
+
+                let mut image_embeds: Option<Tensor> = None;
+
+                if let Some(key) = cache_key {
+                    if let Some((cached, _cached_ds)) = crate::models::vision_cache::VISION_CACHE
+                        .try_load(key, inputs_embeds.device(), inputs_embeds.dtype())
+                    {
+                        match crate::models::vision_cache::validate_embed_shape(&cached, expected_tokens) {
+                            Ok(_) => { image_embeds = Some(cached); }
+                            Err(e) => {
+                                println!("[VISION-CACHE] Discarding stale cache entry: {}. Falling back to ViT.", e);
+                            }
+                        }
+                    }
+                }
+
+                if image_embeds.is_none() {
+                    // 🌟 [VISION-JIT] 캐시 MISS 가 확정된 이 순간에만 mmproj 를 mmap 에서 붙입니다.
+                    //    캐시 히트 경로에서는 600MB 를 아예 올리지 않습니다.
+                    // 🌟 [VISION-STREAM] forward 가 블록을 하나씩 읽고 버리므로 &mut 借用 이 필요합니다.
+                    //    reload 와 forward 를 하나의 as_mut() 借用 으로 묶습니다.
+                    if let Some(visual) = self.visual.as_mut() {
+                        if !visual.is_weights_loaded && visual.is_jit_capable() {
+                            visual.reload_weights()?;
+                        }
+
+                        let (computed, deepstacks): (Tensor, Vec<Tensor>) =
+                            visual.forward(pixel_values, image_grid_thw)?;
+
+                        if let Some(key) = cache_key {
+                            if let Err(e) = crate::models::vision_cache::VISION_CACHE
+                                .save(key, &computed, &deepstacks)
+                            {
+                                println!("[VISION-CACHE] Save failed (non-fatal): {}", e);
+                            }
+                        }
+                        image_embeds = Some(computed);
+                    }
+                }
+
+                if let Some(image_embeds) = image_embeds {
                     let image_embeds = image_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
                 }
@@ -2499,9 +2594,16 @@ impl Qwen3_5Model {
         }
         if let Some(pixel_values_video) = pixel_values_video {
             if let Some(video_grid_thw) = video_grid_thw {
-                if let Some(visual) = self.visual.as_ref() {
+                // 🌟 [VISION-STREAM] forward 가 &mut self 로 바뀌었으므로 as_mut() 로 받습니다.
+                //    (embeds 를 먼저 확보한 뒤 inputs_embeds 를 만지면 借用 충돌이 없습니다)
+                let video_embeds_opt: Option<Tensor> = if let Some(visual) = self.visual.as_mut() {
                     let (video_embeds, _): (Tensor, _) = visual.forward(pixel_values_video, video_grid_thw)?;
-                    
+                    Some(video_embeds)
+                } else {
+                    None
+                };
+
+                if let Some(video_embeds) = video_embeds_opt {
                     let vid_token_t = Tensor::new(vec![self.video_token_id as f32], &Device::Cpu)?;
                     let mask_cpu = input_ids_cpu.to_dtype(DType::F32)?.broadcast_eq(&vid_token_t)?.to_dtype(DType::U8)?;
                     let vision_mask = mask_cpu.to_device(input_ids.device())?;
@@ -2509,6 +2611,15 @@ impl Qwen3_5Model {
                     let video_embeds = video_embeds.to_dtype(inputs_embeds.dtype())?;
                     inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
                 }
+            }
+        }
+
+        // 🌟 [VISION-JIT] ViT 는 상태 없는 1회성 feed-forward 이고, 그 출력은 이미 inputs_embeds 에
+        //    병합이 끝났습니다. 프리필(chunk_size 2048)이 시작되기 전에 mmproj 를 반환해야
+        //    그 VRAM 을 어텐션/KV 가 그대로 쓸 수 있습니다.
+        if pixel_values.is_some() || pixel_values_video.is_some() {
+            if let Some(visual) = self.visual.as_mut() {
+                visual.unload_weights();
             }
         }
 
@@ -2538,6 +2649,20 @@ impl Qwen3_5Model {
         
         let chunk_size = 2048; 
         let mut final_hidden_state = None;
+
+        // 🌟 [VISION TAG] 프리필 진입 직전, KV 블록별 비전 토큰 비율을 장부에 기록합니다.
+        //    KV 텐서에는 어떤 손실 변형도 가하지 않는 순수 메타데이터입니다.
+        //    (인접 토큰 평균 풀링은 K 의 RoPE 회전 위상을 파괴하므로 채택하지 않았습니다)
+        if total_len > 1 && seqlen_offset == 0 {
+            if let Ok(ids_2d) = input_ids_cpu.to_vec2::<u32>() {
+                if let Some(row) = ids_2d.first() {
+                    self.language_model.registry.tag_vision_blocks(
+                        row,
+                        &[self.image_token_id, self.video_token_id],
+                    );
+                }
+            }
+        }
 
         if total_len > 1 {
             let mut processed = 0;

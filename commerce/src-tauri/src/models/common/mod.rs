@@ -735,6 +735,69 @@ impl NaiveAttnGateUpDownMLPBlock {
     }
 }
 
+/// 🌟 [VISION-TILE] eager_attention_forward 의 블록 분할은 KV 축만 자릅니다.
+/// 쿼리 축은 seq 전체로 남아 있어 전이 버퍼가 (q_len × min(kv_len, 4096) × heads) 로 커집니다.
+/// ViT 는 이미지 1장이 곧 chunk 1개라 q_len == kv_len == N 이 되어
+/// N=5720 기준 attn_folded 750MB + broadcast_sub 750MB + exp 750MB = 약 2.2GB 가
+/// 동시에 살아 있게 됩니다.
+///
+/// 소프트맥스는 KV 축에 대해 정규화되므로 쿼리 행은 서로 완전히 독립입니다.
+/// 따라서 쿼리를 타일로 잘라 계산한 뒤 이어 붙여도 결과가 완전히 동일합니다.
+/// (근사·손실이 전혀 없는 정확한 분해입니다)
+///
+/// 이 함수는 가용 VRAM 예산 안에 전이 버퍼를 가두는 쿼리 타일 크기를 계산합니다.
+/// 0 을 반환하면 타일링을 하지 않는다는 뜻입니다.
+pub fn vision_query_tile_size(num_heads: usize, kv_len: usize, dtype_bytes: usize) -> usize {
+    // eager_attention_forward 내부 블록 상한
+    const ATTN_BLOCK: usize = 4096;
+    // attn_folded / broadcast_sub 임시 / exp 결과가 동시에 존재하는 최악 계수
+    const LIVE_COPIES: usize = 3;
+    // ViT 가중치 + CUDA 컨텍스트 + 파편화 여유
+    const RESERVE: u64 = 400_000_000;
+    // 어텐션 이외의 전이 텐서(pos_embed 보간, MLP intermediate 등)를 위해 절반만 씁니다.
+    const BUDGET_SHARE: u64 = 2;
+
+    const TILE_MIN: usize = 256;
+    const TILE_MAX: usize = 4096;
+
+    if num_heads == 0 || kv_len == 0 || dtype_bytes == 0 {
+        return 0;
+    }
+
+    let span = kv_len.min(ATTN_BLOCK);
+    let bytes_per_q_row = LIVE_COPIES
+        .saturating_mul(span)
+        .saturating_mul(num_heads)
+        .saturating_mul(dtype_bytes);
+    if bytes_per_q_row == 0 {
+        return 0;
+    }
+
+    let nvml = match nvml_wrapper::Nvml::init() {
+        Ok(n) => n,
+        // NVML 이 없으면(CPU 모드 등) 보수적으로 고정 타일을 씁니다.
+        Err(_) => return TILE_MAX.min(kv_len),
+    };
+    let dev = match nvml.device_by_index(0) {
+        Ok(d) => d,
+        Err(_) => return TILE_MAX.min(kv_len),
+    };
+    let mem = match dev.memory_info() {
+        Ok(m) => m,
+        Err(_) => return TILE_MAX.min(kv_len),
+    };
+
+    let usable = mem.free.saturating_sub(RESERVE);
+    let budget = usable / BUDGET_SHARE;
+    if budget == 0 {
+        return TILE_MIN;
+    }
+
+    let tile = (budget / bytes_per_q_row as u64) as usize;
+    let tile = tile.clamp(TILE_MIN, TILE_MAX);
+    tile
+}
+
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,

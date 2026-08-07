@@ -45,6 +45,43 @@ impl Qwen3_5GenerateModel {
         self.max_position_embeddings
     }
 
+    /// 🌟 [VISION-JIT] 이 인스턴스가 비전 입력을 처리할 자격(전처리기 + mmproj)을 갖췄는지 확인합니다.
+    /// 가중치의 물리적 상주 여부와는 무관합니다.
+    pub fn vision_capable(&self) -> bool {
+        self.pre_processor.is_some()
+    }
+
+    /// 🌟 [VISION-JIT] mmproj 를 mmap 에서 다시 읽어올 수 있는 상태인지 확인합니다.
+    pub fn is_vision_jit_capable(&self) -> bool {
+        self.qwen3_5.is_vision_jit_capable()
+    }
+
+    /// 🌟 [VISION-JIT] 현재 비전 가중치가 실제로 메모리에 올라와 있는지 확인합니다.
+    pub fn vision_resident(&self) -> bool {
+        self.qwen3_5.is_vision_resident()
+    }
+
+    /// 🌟 [VISION-JIT] 2B 텍스트 모델 전체를 파기하지 않고 비전 가중치만 붙였다 뗍니다.
+    pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
+        self.qwen3_5.set_vision_active(active)?;
+
+        // 비전을 뗀 직후 OS 레벨 메모리 반환을 즉시 트리거합니다.
+        if !active {
+            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        }
+        Ok(())
+    }
+
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let model_name = std::path::Path::new(path)
             .file_name()
@@ -122,7 +159,8 @@ impl Qwen3_5GenerateModel {
         // 외부에서 명시적으로 비전 가중치 경로를 지정했을 때만 로드하도록 제한하여 텍스트 전용 모드 최적화
         let target_mmproj = mmproj_file.map(|f| f.to_string());
 
-        let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = target_mmproj {
+        // 🌟 [VISION-JIT] 경로 문자열은 이후 set_mmproj_path 등록에 재사용해야 하므로 clone 으로 소유권을 보존합니다.
+        let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = target_mmproj.clone() {
             let mut reader = std::fs::File::open(&mmproj_f)?;
             let content = gguf_file::Content::read(&mut reader)?;
             let mmproj_gguf = Gguf::new(content, reader, device.clone());
@@ -137,13 +175,17 @@ impl Qwen3_5GenerateModel {
             .to_u32()?;
             
         // 밥줄(Mmap, Ct)을 쥐여준 채로 모델 생성
-        let qwen3_5 = Qwen3_5Model::new_from_gguf(
+        let mut qwen3_5 = Qwen3_5Model::new_from_gguf(
             &mut model_gguf, 
             mmproj_gguf.as_mut(), 
             &device,
             Some(mmap_arc.clone()), 
             Some(ct_arc)
         )?;
+
+        // 🌟 [VISION-JIT] mmproj 재로드 소스를 등록합니다.
+        //    등록되지 않으면(순수 텍스트 모드) unload/reload 는 전부 no-op 으로 동작합니다.
+        qwen3_5.set_mmproj_path(target_mmproj);
         
         let stem = std::path::Path::new(model_file)
             .file_stem()

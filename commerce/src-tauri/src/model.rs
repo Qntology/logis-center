@@ -267,6 +267,16 @@ impl LogisModel {
         #[cfg(target_os = "macos")]
         unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 
+        // 🌟 [VISION-CACHE] 디스크 캐시는 모델 파기와 무관하게 유지됩니다.
+        //    (ViT 는 결정론적이므로 모델 인스턴스가 바뀌어도 결과가 동일합니다)
+        {
+            let (hits, misses) = crate::models::vision_cache::VISION_CACHE.stats();
+            if hits + misses > 0 {
+                let rate = (hits as f64 / (hits + misses) as f64) * 100.0;
+                println!("[VISION-CACHE] Session stats — hits: {} | misses: {} | hit rate: {:.1}%", hits, misses, rate);
+            }
+        }
+
         println!("[DIAG-PURGE] Aggressive Purge Complete.");
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -480,7 +490,16 @@ impl LogisModel {
             if *current == Some(target_size) {
                 let is_loaded = match target_size {
                     ModelSize::Qwen => {
-                        if let Some(gen) = self.generator.lock().await.as_ref() {
+                        // 🌟 [VISION-JIT] secure_vram_relay(Qwen) 의 호출자는 Base PUG 베이킹 /
+                        //    타이틀 추출 / ingest_pug_to_ssd 세 곳뿐이며 전부 순수 텍스트 경로입니다.
+                        //    기존에는 is_baking=false 인 타이틀 추출에서도 mmproj 가 통째로 상주했습니다.
+                        let mut gen_guard = self.generator.lock().await;
+                        if let Some(gen) = gen_guard.as_mut() {
+                            if gen.is_vision_jit_capable() && gen.vision_resident() {
+                                let _ = gen.set_vision_active(false);
+                                println!("[RELAY] Text-only path detected. Detached Qwen(0.6B) vision weights to free VRAM.");
+                            }
+
                             let is_baking_loaded = match &gen.qwen {
                                 crate::models::qwen::generate::ModelVariant::QuantizedVL(m) => m.language_model.baking_only,
                                 crate::models::qwen::generate::ModelVariant::QuantizedText(m) => m.language_model.baking_only,
@@ -497,7 +516,22 @@ impl LogisModel {
                         }
                     },
                     ModelSize::Qwen3 => self.qwen3_generator.lock().await.is_some(),
-                    ModelSize::Qwen3_5 => self.qwen3_5_generator.lock().await.is_some(),
+                    ModelSize::Qwen3_5 => {
+                        // 🌟 [VISION-JIT] secure_vram_relay 로 들어오는 Qwen3_5 요청은
+                        //    thead 구조 추출 / status selector 추출 등 전부 순수 텍스트 경로입니다.
+                        //    기존에는 여기서 그냥 Skipping 으로 빠져나가면서
+                        //    직전 이미지 추출이 올려둔 mmproj 600MB 가 프리필 내내 VRAM 을 점유했습니다.
+                        let mut guard = self.qwen3_5_generator.lock().await;
+                        if let Some(gen) = guard.as_mut() {
+                            if gen.vision_capable() && gen.is_vision_jit_capable() && gen.vision_resident() {
+                                let _ = gen.set_vision_active(false);
+                                println!("[RELAY] Text-only path detected. Detached Qwen 3.5 vision weights to free VRAM.");
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 };
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
@@ -533,6 +567,20 @@ impl LogisModel {
         match target_size {
             ModelSize::Qwen => {
                 self.ensure_generator_ext(ModelSize::Qwen, false, is_baking).await?;
+
+                // 🌟 [VISION-JIT] 신규 로드 직후에도 비전을 떼어냅니다.
+                //    secure_vram_relay(Qwen) 는 전부 텍스트 전용 경로이며,
+                //    실제 이미지가 들어오면 QuantizedQwenVLModel::forward 가 mmap 에서 자동 복원합니다.
+                {
+                    let mut gen_guard = self.generator.lock().await;
+                    if let Some(gen) = gen_guard.as_mut() {
+                        if gen.is_vision_jit_capable() && gen.vision_resident() {
+                            let _ = gen.set_vision_active(false);
+                            println!("[RELAY] Freshly loaded Qwen(0.6B): vision weights detached for text-only workload.");
+                        }
+                    }
+                }
+
                 if let Some(tid) = task_id {
                     self.load_kv_snapshot(tid, kv_name).await?;
                 }
@@ -745,10 +793,30 @@ impl LogisModel {
     }
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
+        // 🌟 [VISION-JIT] 이미 2B 가 상주 중이고 mmproj 재로드 소스가 등록되어 있다면,
+        //    2GB 텍스트 모델을 통째로 파기/재로딩하지 않고 비전 가중치(약 600MB)만 붙였다 뗍니다.
+        //    기존에는 '이미지 추출 → thead 추출' 처럼 비전/텍스트가 번갈아 올 때마다
+        //    GGUF 를 처음부터 다시 읽어야 했습니다.
+        {
+            let mut guard = self.qwen3_5_generator.lock().await;
+            if let Some(gen) = guard.as_mut() {
+                if gen.vision_capable() && gen.is_vision_jit_capable() {
+                    if gen.vision_resident() != needs_vision {
+                        gen.set_vision_active(needs_vision)?;
+                        println!(
+                            "[MODEL] Qwen 3.5 vision weights {} WITHOUT full reload (2B text model stays resident).",
+                            if needs_vision { "ATTACHED" } else { "DETACHED" }
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         let needs_load = {
             let guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_ref() {
-                let is_large = gen.pre_processor.is_some();
+                let is_large = gen.vision_capable();
                 is_large != needs_vision // 🌟 wants_large 대신 needs_vision 직접 사용
             } else {
                 true
@@ -1096,6 +1164,19 @@ impl LogisModel {
 
             let item_digest = crate::utils::hash::digest(&nl);
 
+            // 🌟 [VISION-JIT] 비전 추론이 모두 끝났습니다. 이어지는 임베딩/DB 동기화 단계가
+            //    VRAM 을 쓸 수 있도록 mmproj 가중치를 여기서 즉시 반환합니다.
+            //    (2B 텍스트 모델 본체는 그대로 상주하므로 재로딩 비용은 0 입니다)
+            {
+                let mut q35_guard = self.qwen3_5_generator.lock().await;
+                if let Some(gen) = q35_guard.as_mut() {
+                    if gen.vision_capable() && gen.is_vision_jit_capable() && gen.vision_resident() {
+                        let _ = gen.set_vision_active(false);
+                        emit_term("[VISION-JIT] Vision pipeline complete. mmproj weights released before embedding stage.");
+                    }
+                }
+            }
+
             emit_term("[STAGE-3] Syncing extracted data to LanceDB...");
 
             // 🌟 [CRITICAL FIX 2] 5단계 마무리를 위한 저장 스텝(4단계) UI 추가!
@@ -1299,6 +1380,17 @@ impl LogisModel {
             if gen_guard.is_none() {
                 drop(gen_guard);
                 self.ensure_generator(ModelSize::Qwen).await?; // 🌟 Small -> Qwen
+            }
+        }
+
+        // 🌟 [VISION-JIT] chat 은 ChatCompletionRequestMessageContentPart::Text 만 조립하는
+        //    순수 텍스트 경로입니다. 비전 가중치가 붙어 있다면 여기서 반환합니다.
+        {
+            let mut gen_guard = self.generator.lock().await;
+            if let Some(gen) = gen_guard.as_mut() {
+                if gen.is_vision_jit_capable() && gen.vision_resident() {
+                    let _ = gen.set_vision_active(false);
+                }
             }
         }
         

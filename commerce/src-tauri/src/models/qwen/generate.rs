@@ -518,6 +518,31 @@ impl ModelVariant {
         }
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { match self { Self::Standard(_) => Ok(()), Self::QuantizedVL(m) => m.rebalance_layers(device_id, offset, total_len), Self::QuantizedText(m) => m.rebalance_layers(device_id, offset, total_len) } }
+
+    /// 🌟 [VISION-JIT] mmproj 재구성 소스가 등록되어 JIT 이 가능한 변형인지 확인합니다.
+    /// QuantizedText / Standard 는 애초에 mmproj 개념이 없으므로 항상 false 입니다.
+    pub fn is_vision_jit_capable(&self) -> bool {
+        match self {
+            Self::QuantizedVL(m) => m.is_vision_jit_capable(),
+            _ => false,
+        }
+    }
+
+    /// 🌟 [VISION-JIT] 현재 비전 가중치가 메모리에 상주 중인지 확인합니다.
+    pub fn is_vision_resident(&self) -> bool {
+        match self {
+            Self::QuantizedVL(m) => m.is_vision_resident(),
+            _ => false,
+        }
+    }
+
+    /// 🌟 [VISION-JIT] 텍스트 모델은 그대로 둔 채 비전 가중치만 붙였다 뗍니다.
+    pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.set_vision_active(active),
+            _ => Ok(()),
+        }
+    }
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) { match self { Self::QuantizedVL(m) => m.language_model.get_current_kv(), Self::QuantizedText(m) => m.language_model.get_current_kv(), _ => (vec![], vec![]) } }
     pub fn inject_kv_bitkv(&mut self, kd: &[Tensor], vd: &[Tensor], os: &[usize]) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(kd, vd, os), _ => Ok(()) } }
     pub async fn drop_kv_storage(&mut self) -> Result<()> { match self { Self::QuantizedVL(m) => m.language_model.drop_kv_storage(), Self::QuantizedText(m) => m.language_model.drop_kv_storage(), _ => Ok(()) } }
@@ -547,6 +572,36 @@ impl QwenVLGenerateModel {
             ModelVariant::QuantizedText(m) => m.language_model.config.max_position_embeddings,
             ModelVariant::Standard(m) => m.config.text_config.as_ref().map(|tc| tc.max_position_embeddings).unwrap_or(32768),
         }
+    }
+
+    /// 🌟 [VISION-JIT] mmproj 를 mmap 에서 다시 구성할 수 있는 상태인지 확인합니다.
+    pub fn is_vision_jit_capable(&self) -> bool {
+        self.qwen.is_vision_jit_capable()
+    }
+
+    /// 🌟 [VISION-JIT] 현재 비전 가중치가 메모리에 상주 중인지 확인합니다.
+    pub fn vision_resident(&self) -> bool {
+        self.qwen.is_vision_resident()
+    }
+
+    /// 🌟 [VISION-JIT] 0.6B 텍스트 모델은 유지한 채 비전 가중치만 탈부착합니다.
+    pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
+        self.qwen.set_vision_active(active)?;
+
+        if !active {
+            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            #[cfg(target_os = "linux")]
+            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+            #[cfg(target_os = "macos")]
+            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        }
+        Ok(())
     }
 
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _is_disk_swap: bool, kv_root: std::path::PathBuf) -> Result<Self> {
