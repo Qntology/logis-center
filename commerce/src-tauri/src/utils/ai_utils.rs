@@ -5,6 +5,304 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
 }
 
+// =====================================================================
+// 🌟 [STANZA IMPROVEMENT] 언어 중립(Language-Agnostic) 형태·구문 판별 엔진
+// ---------------------------------------------------------------------
+// 판별 근거는 아래 4가지뿐이며, 전부 언어에 무관한 보편 자원입니다.
+//   ① UD UPOS 태그셋      (vocab.json 의 pos.upos 배열 — 전 언어 공통 규격)
+//   ② UD DEPREL 태그셋    (vocab.json 의 depparse.deprel 배열 — 전 언어 공통 규격)
+//   ③ Stanza Lemma 출력   (표면형-원형 차이로 굴절/교착 여부를 모델이 직접 알려줌)
+//   ④ 문자열 구조 규칙    (숫자 밀도 / 구분자 — 문자 체계와 무관)
+// 특정 언어의 어휘·조사·어미 사전은 일절 사용하지 않습니다.
+// =====================================================================
+
+/// [PHASE 1] UD UPOS 중 개체명(PII)이 될 수 없는 태그 — 전 언어 공통
+const UPOS_HARD_REJECT: &[&str] = &[
+    "VERB", "AUX", "ADV", "ADP", "PART", "SCONJ", "CCONJ", "CONJ",
+    "DET", "PRON", "INTJ", "PUNCT", "SYM",
+];
+
+/// [PHASE 1] 개체명 후보로 인정되는 핵심 체언 태그 — 전 언어 공통
+const UPOS_STRONG_ENTITY: &[&str] = &["NOUN", "PROPN"];
+
+/// [PHASE 1] 단독으로는 개체명 근거가 되지 못하고 보조 근거(구문/복합어)가 필요한 태그
+const UPOS_WEAK_ENTITY: &[&str] = &["ADJ", "NUM", "X"];
+
+/// UPOS 서브타입(`NOUN:xxx` 형태) 제거 후 상위 태그만 반환
+fn upos_base(tag: &str) -> &str {
+    match tag.find(':') {
+        Some(i) => &tag[..i],
+        None => tag,
+    }
+}
+
+/// UD DEPREL 서브타입(`nsubj:pass`, `flat:name` 등) 제거 후 소문자 상위 레이블 반환
+fn deprel_base(label: &str) -> String {
+    let l = label.to_lowercase();
+    match l.find(':') {
+        Some(i) => l[..i].to_string(),
+        None => l,
+    }
+}
+
+/// [PHASE 2] UD 수식어·기능어 의존관계 → 개체명 기각 근거 (전 언어 공통)
+fn is_modifier_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "acl" | "advcl" | "advmod" | "amod" | "aux" | "cop" | "case" | "mark"
+            | "cc" | "det" | "discourse" | "expl" | "punct" | "dep"
+    )
+}
+
+/// [PHASE 2] UD 체언 논항·복합어 의존관계 → 개체명 후보 근거 (전 언어 공통)
+fn is_nominal_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "nsubj" | "obj" | "iobj" | "obl" | "nmod" | "flat" | "compound"
+            | "appos" | "conj" | "root" | "vocative" | "list" | "nummod"
+    )
+}
+
+/// [PHASE 4] 구분자 포함 여부 (전화·주민번호 등 식별번호의 보편적 구조 신호)
+fn has_identifier_separator(word: &str) -> bool {
+    word.chars().any(|c| matches!(c, '-' | '.' | '/' | '+' | '(' | ')' | ' ' | '_'))
+}
+
+/// [PHASE 4] 식별번호 후보가 실제 식별번호 '구조'인지 검증.
+/// 언어별 단위 사전(도/명/원 등) 없이, 숫자 개수와 구분자 유무만으로 판정하므로
+/// 어떤 문자 체계에서도 동일하게 동작합니다. ('38도','119에','24절기','12일' → 전부 기각)
+fn is_valid_identifier_shape(word: &str, base_target: &str) -> bool {
+    let digits = word.chars().filter(|c| c.is_ascii_digit()).count();
+    let sep = has_identifier_separator(word);
+
+    match base_target {
+        // 이메일: 로컬파트@도메인 구조와 도메인 내 점(.) 존재를 요구
+        "email" => {
+            if let Some(at) = word.find('@') {
+                let domain = &word[at + 1..];
+                !word[..at].is_empty() && domain.contains('.') && domain.len() >= 4
+            } else {
+                false
+            }
+        }
+        // 주민등록/사회보장번호류: 최소 8자리 이상 숫자. 구분자가 없으면 10자리 이상 요구
+        "national_id" => (digits >= 8 && sep) || digits >= 10,
+        // 연락처: 구분자 없는 순수 숫자열 9자리 이상, 또는 구분자 포함 7자리 이상
+        "contact_number" => (digits >= 9) || (digits >= 7 && sep),
+        _ => false,
+    }
+}
+
+/// [PHASE 3] Stanza Lemma 출력과 표면형을 비교하여 '굴절/교착이 일어난 토큰'인지 판정.
+/// 접두 일치(prefix) / 접미 일치(suffix) 양쪽을 모두 검사하므로
+/// 교착어(한국어·일본어·터키어), 굴절어(러시아어·독일어), 고립어(중국어)를 함께 커버합니다.
+fn is_inflected_surface(surface: &str, lemma: &str) -> bool {
+    if lemma.trim().is_empty() { return false; }
+    let s: String = surface.chars().filter(|c| c.is_alphanumeric()).collect();
+    let l: String = lemma.chars().filter(|c| c.is_alphanumeric()).collect();
+    if l.is_empty() || s.is_empty() { return false; }
+    if s == l { return false; }
+    let sc = s.chars().count();
+    let lc = l.chars().count();
+    // 원형이 표면형의 앞/뒤에 포함되며 길이가 더 짧다면 굴절이 발생한 것으로 간주
+    (sc > lc) && (s.starts_with(&l) || s.ends_with(&l) || s.contains(&l))
+}
+
+/// [PHASE 3] Lemma 를 이용한 언어 중립 접미 절단.
+/// 언어별 조사/어미 목록 대신 모델이 산출한 원형을 그대로 신뢰하여 잘라냅니다.
+fn trim_surface_by_lemma(surface: &str, lemma: &str) -> Option<String> {
+    if !is_inflected_surface(surface, lemma) { return None; }
+    let l: String = lemma.chars().filter(|c| c.is_alphanumeric()).collect();
+    if l.chars().count() < 2 { return None; }
+    if surface.starts_with(&l) && surface.chars().count() > l.chars().count() {
+        return Some(l);
+    }
+    if let Some(idx) = surface.rfind(&l) {
+        // 원형이 표면형 뒤쪽에 붙은 형태(접두 굴절)는 원형만 남깁니다.
+        if idx > 0 { return Some(l); }
+    }
+    None
+}
+
+/// 형태·구문 판별 결과
+#[derive(Debug, Clone)]
+pub struct MorphVerdict {
+    pub accept: bool,
+    pub reason: String,
+}
+
+impl MorphVerdict {
+    fn ok(reason: &str) -> Self { Self { accept: true, reason: reason.to_string() } }
+    fn no(reason: &str) -> Self { Self { accept: false, reason: reason.to_string() } }
+}
+
+/// [PHASE 1 + 2 + 4] 개체명 후보 최종 판정 (언어 중립).
+/// - identifier 계열은 구조 검증으로 대체
+/// - PROPN 단독 통과 금지: UD DEPREL 체언 관계 또는 복합 체언 구성일 때만 인정
+/// - 전 토큰이 UD 수식어 관계이면 강제 기각
+pub fn evaluate_entity_candidacy(
+    surface: &str,
+    words: &[String],
+    tags: &[&str],
+    deprels: Option<&[String]>,
+    lemmas: Option<&[String]>,
+    base_target: &str,
+    is_sub_language: bool,
+) -> MorphVerdict {
+    // ── 0) 식별번호 계열: 형태소가 아니라 '구조'로 판정 (언어 무관) ──
+    if matches!(base_target, "email" | "contact_number" | "national_id") {
+        return if is_valid_identifier_shape(surface, base_target) {
+            MorphVerdict::ok("IDENTIFIER-SHAPE 검증 통과")
+        } else {
+            MorphVerdict::no("식별번호 구조(숫자 밀도/구분자) 미충족")
+        };
+    }
+
+    // ── 1) 유효 토큰 수집 (구두점·기호 제외) ──
+    let mut core: Vec<usize> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if i >= tags.len() { break; }
+        if w.chars().any(|c| c.is_alphanumeric()) {
+            let t = upos_base(tags[i]);
+            if t != "PUNCT" && t != "SYM" { core.push(i); }
+        }
+    }
+
+    if core.is_empty() {
+        // 메인 언어와 다른 표기(로마자 약어 등)는 태거 신뢰도가 낮으므로 최소 조건으로 구제
+        let alnum = surface.chars().filter(|c| c.is_alphanumeric()).count();
+        if is_sub_language && alnum >= 2 {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (태거 신뢰도 낮음)");
+        }
+        return MorphVerdict::no("유효 토큰 없음 (전부 구두점/기호)");
+    }
+
+    // ── 2) UPOS 1차 게이트 ──
+    let mut has_strong = false;
+    let mut has_weak = false;
+    let mut all_hard_reject = true;
+    for &i in &core {
+        let t = upos_base(tags[i]);
+        if UPOS_STRONG_ENTITY.contains(&t) { has_strong = true; }
+        if UPOS_WEAK_ENTITY.contains(&t) { has_weak = true; }
+        if !UPOS_HARD_REJECT.contains(&t) { all_hard_reject = false; }
+    }
+
+    if all_hard_reject {
+        if is_sub_language {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (UPOS 기각 면제)");
+        }
+        return MorphVerdict::no("UD UPOS 전량 비체언(용언/부사/조사/접속사 등)");
+    }
+
+    // ── 3) UD DEPREL 교차 검증 (Phase 2 핵심) ──
+    if let Some(rels) = deprels {
+        let mut nominal_support = false;
+        let mut modifier_hits = 0usize;
+        let mut checked = 0usize;
+        for &i in &core {
+            if i >= rels.len() { continue; }
+            checked += 1;
+            if is_nominal_deprel(&rels[i]) { nominal_support = true; }
+            else if is_modifier_deprel(&rels[i]) { modifier_hits += 1; }
+        }
+        if checked > 0 && !nominal_support && modifier_hits == checked {
+            return MorphVerdict::no("UD DEPREL 전량 수식어 관계(acl/amod/advmod 등)");
+        }
+        // PROPN 단독 토큰은 구문상 체언 논항일 때만 인정 (PROPN 남발 차단)
+        if core.len() == 1 && !has_weak {
+            let i = core[0];
+            let t = upos_base(tags[i]);
+            if t == "PROPN" && i < rels.len() && !is_nominal_deprel(&rels[i]) {
+                return MorphVerdict::no("단일 PROPN 이나 UD DEPREL 체언 근거 부재");
+            }
+        }
+        if nominal_support {
+            return MorphVerdict::ok("UD DEPREL 체언 논항 근거 확보");
+        }
+    }
+
+    // ── 4) DEPREL 미확보 시 폴백: 체언 태그 + 비굴절 여부로 판단 ──
+    if !has_strong {
+        // 약체언(ADJ/NUM/X) 단독은 개체명 근거로 불충분
+        if core.len() >= 2 {
+            return MorphVerdict::ok("복합 구성 내 약체언 (보조 근거 인정)");
+        }
+        if is_sub_language {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (약체언 단독)");
+        }
+        return MorphVerdict::no("체언(NOUN/PROPN) 부재 — 약체언 단독은 개체명 불가");
+    }
+
+    // 단일 토큰이 굴절형이면(모델 원형 ≠ 표면형) 개체명보다 활용형일 가능성이 높음
+    if core.len() == 1 {
+        if let Some(lm) = lemmas {
+            let i = core[0];
+            if i < lm.len() && is_inflected_surface(&words[i], &lm[i]) {
+                let t = upos_base(tags[i]);
+                if t != "PROPN" {
+                    return MorphVerdict::no("단일 굴절형 토큰 (Lemma 상이) — 활용형으로 판단");
+                }
+            }
+        }
+    }
+
+    MorphVerdict::ok("UD UPOS 체언 근거 확보")
+}
+
+/// [PHASE 2] Depparse ONNX 세션을 실행하여 토큰별 UD DEPREL 레이블을 추출합니다.
+/// preprocessor 와 session 을 분리 수신하여 StanzaPipeline 의 필드 단위 대여 충돌을 방지합니다.
+pub fn run_depparse_deprels(
+    preprocessor: &crate::stanza::StanzaPreprocessor,
+    session: &mut onnxruntime::session::Session<'static>,
+    words: &[&str],
+    pos_ids: &[i64],
+) -> Option<Vec<String>> {
+    if preprocessor.deprel_vocab.is_empty() || words.is_empty() { return None; }
+    if pos_ids.len() < words.len() { return None; }
+
+    // 세션 가변 대여 이전에 사전을 복제하여 라이프타임 충돌을 원천 차단
+    let deprel_vocab: Vec<String> = preprocessor.deprel_vocab.clone();
+
+    let inputs = preprocessor
+        .encode_to_tensor(words, session, Some(&pos_ids[..words.len()]), None)
+        .ok()?;
+
+    let outputs = session.run::<'_, '_, '_, i64, f32, _>(inputs).ok()?;
+    if outputs.len() < 2 { return None; }
+
+    let arc = &outputs[0];
+    let rel = &outputs[1];
+    let arc_shape = arc.shape();
+    let rel_shape = rel.shape();
+    if arc_shape.len() < 3 || rel_shape.len() < 4 { return None; }
+
+    let seq = words.len().min(arc_shape[1] as usize).min(rel_shape[1] as usize);
+    let head_dim = (arc_shape[2] as usize).min(rel_shape[2] as usize);
+    let num_rel = rel_shape[3] as usize;
+    if seq == 0 || head_dim == 0 || num_rel == 0 { return None; }
+
+    let mut result = Vec::with_capacity(seq);
+    for i in 0..seq {
+        // 1) 최고 점수 head(지배소) 탐색
+        let mut best_head = 0usize;
+        let mut best_arc = std::f32::MIN;
+        for h in 0..head_dim {
+            let v = arc[[0, i, h]];
+            if v > best_arc { best_arc = v; best_head = h; }
+        }
+        // 2) 해당 head 에 대한 최적 DEPREL 레이블 탐색
+        let mut best_rel = 0usize;
+        let mut best_rel_score = std::f32::MIN;
+        for r in 0..num_rel {
+            let v = rel[[0, i, best_head, r]];
+            if v > best_rel_score { best_rel_score = v; best_rel = r; }
+        }
+        result.push(deprel_vocab.get(best_rel).cloned().unwrap_or_else(|| "dep".to_string()));
+    }
+    Some(result)
+}
+
 pub fn max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>) -> f32 {
     let mut best = 0.0f32;
     for pe in phrase_embs {
