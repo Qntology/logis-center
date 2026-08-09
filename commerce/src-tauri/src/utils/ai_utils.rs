@@ -364,6 +364,248 @@ pub fn weighted_max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>, weight
     best
 }
 
+// 🌟 [UNCAPPED PHRASE SPLIT] split_bias_phrases 는 48개에서 잘라냅니다.
+//    bias.json 의 color 뱅크는 50개 언어의 색상명이 수백 개 나열되어 있어
+//    48개로 자르면 한국어/영어 이후의 언어(ベージュ, بيج, бежевый ...)가 통째로 소멸합니다.
+//    다국어 검색이 목적이므로 속성 뱅크에는 절대 상한을 두지 않습니다.
+pub fn split_bias_phrases_full(raw: &str) -> Vec<String> {
+    let mut v: Vec<String> = raw
+        .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|p| seen.insert(p.clone()));
+    v
+}
+
+// 🌟 [UNCAPPED WEIGHTED SPLIT] split_bias_phrases_weighted 의 상한 제거판.
+//    숫자 비중이 높은 순수 예시 리터럴("15000", "2026-03-15")은 형식 힌트일 뿐이므로
+//    동일한 규칙으로 가중치만 낮춥니다. (새 상수 도입 아님 — 기존 규칙 재사용)
+pub fn split_bias_phrases_weighted_full(raw: &str) -> (Vec<String>, Vec<f32>) {
+    let phrases = split_bias_phrases_full(raw);
+    let mut weights = Vec::with_capacity(phrases.len());
+    for p in &phrases {
+        let compact: Vec<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
+        let total = compact.len().max(1);
+        let digits = compact.iter().filter(|c| c.is_ascii_digit()).count();
+        let ratio = digits as f32 / total as f32;
+
+        if ratio >= 0.25 {
+            weights.push(0.80);
+        } else if digits > 0 {
+            weights.push(0.95);
+        } else {
+            weights.push(1.0);
+        }
+    }
+    (phrases, weights)
+}
+
+// 🌟 [SEMANTIC ANCHOR] 필드의 '정체성 문구'(semantic)를 bias.json 에서 언어 중립으로 꺼냅니다.
+//    ko.goods.title.semantic = "상품명, 의류명, 제품명, 품목명, 이름" 처럼
+//    정답 변별 구가 bias 가 아니라 semantic 에만 존재하는 경우가 많은데
+//    (로그의 '가디건' → title 이 정답인 근거는 '의류명' 단 하나입니다)
+//    기존 파이프라인은 semantic 을 프롬프트 설명문으로만 쓰고 벡터 공간에는 올리지 않았습니다.
+//    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
+pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+
+    for lk in [doc_lang, "en", "ko"] {
+        let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
+        if let Some(s) = lang_node
+            .get(page_type)
+            .and_then(|p| p.get(field_name))
+            .and_then(|n| n.get("semantic"))
+            .and_then(|v| v.as_str())
+        {
+            if !s.trim().is_empty() { return s.to_string(); }
+        }
+        if let Some(s) = lang_node
+            .get("default")
+            .and_then(|p| p.get(field_name))
+            .and_then(|n| n.get("semantic"))
+            .and_then(|v| v.as_str())
+        {
+            if !s.trim().is_empty() { return s.to_string(); }
+        }
+    }
+
+    let mut stack: Vec<&serde_json::Value> = vec![dict];
+    let mut hops = 0usize;
+    while let Some(node) = stack.pop() {
+        hops += 1;
+        if hops > 8192 { break; }
+        if let Some(obj) = node.as_object() {
+            if let Some(child) = obj.get(field_name) {
+                if let Some(s) = child.get("semantic").and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() { return s.to_string(); }
+                }
+            }
+            for (_, v) in obj {
+                if v.is_object() { stack.push(v); }
+            }
+        }
+    }
+
+    humanize_url_token(field_name)
+}
+
+// 🌟 [CROSS-FIELD AMBIGUITY MASK] bias.json 을 수정하지 않고 런타임에서 무변별 구를 구조적으로 제거합니다.
+//    ① 두 개 이상 필드의 bias 뱅크에 '문자 그대로 동일한 구'가 들어 있으면
+//       그 구는 어떤 필드도 지목하지 못합니다.
+//       (ko.goods 의 title / model_name / brand_name 이 "goods 상품명, goods 상품제목, goods 상품이름" 을
+//        완전히 공유 → 로그의 '가디건 → brand_name' 오배정의 직접 원인)
+//    ② 자기 필드의 prejudice 에 동일한 구가 존재하면 자기모순입니다.
+//       (ko.goods.brand_name 은 bias 와 prejudice 양쪽에 "상품명" 을 갖고 있어 스스로 점수를 깎습니다)
+//    문자열 집합 비교이므로 의미 판정(contains)이 아니라 순수 구조 판정이며 상수를 쓰지 않습니다.
+pub fn cross_field_ambiguous_phrase_mask(
+    bias_banks: &Vec<Vec<String>>,
+    prejudice_banks: &Vec<Vec<String>>,
+) -> Vec<Vec<bool>> {
+    let mut counter: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for bank in bias_banks.iter() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in bank.iter() {
+            if seen.insert(p.as_str()) {
+                *counter.entry(p.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut out: Vec<Vec<bool>> = Vec::with_capacity(bias_banks.len());
+    for (i, bank) in bias_banks.iter().enumerate() {
+        let empty: Vec<String> = Vec::new();
+        let own_prej: &Vec<String> = prejudice_banks.get(i).unwrap_or(&empty);
+        let mut keep: Vec<bool> = bank
+            .iter()
+            .map(|p| {
+                let shared = counter.get(p).copied().unwrap_or(0) > 1;
+                let self_contradiction = own_prej.iter().any(|q| q == p);
+                !shared && !self_contradiction
+            })
+            .collect();
+        // 전량 탈락 시 뱅크 소멸을 막기 위해 원본을 그대로 유지합니다.
+        if keep.iter().all(|k| !*k) { keep = vec![true; bank.len()]; }
+        out.push(keep);
+    }
+    out
+}
+
+// 🌟 [DETERMINISTIC CONDITION VALUE] 조건 값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
+//    0.6B 모델에게 값 복사를 맡기면 value 키를 통째로 누락시켜 조건이 증발합니다.
+//    (로그: color 조건에 value 키가 없어 색상 필터 없이 FTS 가 실행됨)
+//    형식이 확정적인 필드는 LLM 없이 코드가 직접 복사합니다.
+pub fn deterministic_condition_value(chunks: &Vec<String>, numeric_only: bool) -> String {
+    let joined = chunks
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if numeric_only {
+        return joined.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    }
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// 🌟 [QUERY FORMAT GATE] 자연어 질의 청크가 '이 속성의 값이 될 생김새'인지 배정 전에 검증합니다.
+//    detect_field_format 이 이미 필드명에서 물리적 형식을 결정론적으로 판정하므로
+//    다국어 어휘 리터럴을 단 하나도 쓰지 않고, 숫자 밀도 / 알파벳 존재 / 토큰 길이만 봅니다.
+//    (로그: '가디건' 이 supply_price(Number) 2순위로 살아남아 LLM 후보 목록을 오염시켰습니다)
+//    - Synthesis(insight/summary) : 합성 문장이라 DB 필터 조건이 될 수 없음
+//    - Link                        : 조건 대상이 아님 (호출부에서 이미 제외하지만 방어적으로 차단)
+pub fn query_chunk_matches_property(field_name: &str, chunk: &str) -> bool {
+    let v = chunk.trim();
+    if v.is_empty() { return false; }
+
+    match detect_field_format(field_name) {
+        FieldFormat::Synthesis => false,
+        FieldFormat::Link => false,
+        FieldFormat::Enum => true,
+        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
+        FieldFormat::Date => v.chars().any(|c| c.is_ascii_digit()),
+        FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
+        FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
+        FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
+    }
+}
+
+// 🌟 [MAX-COVERAGE GREEDY ASSIGN] 청크가 굶어 죽지 않는 1:1 배타 배정.
+//    exclusive_assign_by_score 의 rival 은 '같은 라인에 대한 다른 필드의 최고 점수'입니다.
+//    따라서 margin_threshold = 0.0 으로 호출하면
+//        margin = own - max_{f'≠f} matrix[f'][l] >= 0  ⟺  own 이 그 라인의 argmax
+//    가 되어, 각 라인은 자기 argmax 필드 하나에만 주장을 낼 수 있습니다.
+//    그 필드를 더 높은 점수의 다른 라인이 가져가면 차선책으로 이동할 기회 없이 소멸합니다.
+//    (로그: '가디건'/'무거운'/'제품중에서'/'제품으로'/'중에서'/'메세지도'/'보여줘' 가 전부 이 경로로 전멸.
+//     특히 color 뱅크는 50개 언어 색상명 ~700구라 Max-Pool 이 구조적으로 부풀려져
+//     무관한 청크의 argmax 를 독식하는 '흡수 싱크' 로 작동했습니다)
+//    여기서는 margin 을 '정렬 기준'이 아니라 '보고용 지표'로만 쓰고,
+//    유효한 모든 (필드 × 라인) 주장을 절대 점수 순으로 그리디 배정하여 커버리지를 최대화합니다.
+//    matrix[field][line], 음수는 무효 칸. 반환값 = field_idx -> Option<(line_idx, own, margin)>
+pub fn greedy_exclusive_assign(matrix: &Vec<Vec<f32>>) -> Vec<Option<(usize, f32, f32)>> {
+    let field_count = matrix.len();
+    let mut result: Vec<Option<(usize, f32, f32)>> = vec![None; field_count];
+    if field_count == 0 { return result; }
+
+    let mut line_count = 0usize;
+    for row in matrix.iter() { if row.len() > line_count { line_count = row.len(); } }
+    if line_count == 0 { return result; }
+
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+
+    // 라인별 2순위 점수 (margin 보고용). 무효 칸(-1.0)은 절대 포함되지 않습니다.
+    let mut runner_up = vec![-1.0f32; line_count];
+    for l in 0..line_count {
+        let mut best = -1.0f32;
+        let mut second = -1.0f32;
+        for f in 0..field_count {
+            let v = get(f, l);
+            if v < 0.0 { continue; }
+            if v > best { second = best; best = v; }
+            else if v > second { second = v; }
+        }
+        runner_up[l] = second;
+    }
+
+    let mut claims: Vec<(usize, usize, f32)> = Vec::new();
+    for f in 0..field_count {
+        for l in 0..line_count {
+            let own = get(f, l);
+            if own < 0.0 { continue; }
+            claims.push((f, l, own));
+        }
+    }
+    claims.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut claimed_lines = vec![false; line_count];
+    for (f, l, own) in claims {
+        if result[f].is_some() { continue; }
+        if claimed_lines[l] { continue; }
+        let margin = if runner_up[l] < 0.0 { own } else { own - runner_up[l] };
+        result[f] = Some((l, own, margin));
+        claimed_lines[l] = true;
+    }
+
+    result
+}
+
+// 🌟 [SQL-EFFECTIVE FORMAT] 이 속성이 실제 SQL 필터를 바꾸는 '형식 확정' 필드인지 판정합니다.
+//    lib.rs 의 convert_conditions_to_sql 이 물리 컬럼으로 매핑하는 것은
+//    금액(amount) / 날짜(created_at, updated_at) / 송장(tracking_number LIKE) 계열뿐입니다.
+//    문자열 속성(color/title/tags)은 SQL 을 전혀 바꾸지 않으므로
+//    N:N 조합에서 별도 쿼리를 발행할 가치가 없고, 조건 완화 티어의 기준이 됩니다.
+pub fn is_sql_effective_field(field_name: &str) -> bool {
+    matches!(
+        detect_field_format(field_name),
+        FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode
+    )
+}
+
 // 🌟 [LOCALIZED BIAS NODE] bias.json 의 {lang}.{page_type}.{field} 노드를 원본 그대로 꺼냅니다.
 //    스케줄러가 쥐고 있던 bias_target 은 이미 한 덩어리로 합쳐진 짧은 문자열이라
 //    콤마가 없어 구 분할이 1개로 끝났고, 그래서 로그의 MaxPoolSim 이 CentroidSim 과
