@@ -863,11 +863,25 @@ async fn ai_search_complex(
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() { continue; }
-                let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let raw_ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
-                if ctx_type == "ignore" {
+                if raw_ctx_type == "ignore" {
                     continue;
                 }
+
+                // 🌟 [TABLE FALLBACK] STAGE-3 이 발행한 "{domain}_items" 폴백 컨텍스트는
+                //    target_table match 에서 어떤 분기에도 걸리지 않아 items(전 타입 미러)로 조회됩니다.
+                //    SQL 필터의 type 컬럼에는 원래 도메인 이름을 넣어야 하므로 접미사만 벗겨냅니다.
+                //    이 경로가 있어야 scheduler 의 저장 테이블과 lib 의 조회 테이블이 어긋나도
+                //    데이터가 존재하는 한 반드시 결과에 포함됩니다.
+                let ctx_type: &str = match raw_ctx_type.strip_suffix("_items") {
+                    Some(base) => {
+                        println!("[AI-SEARCH] Table fallback context detected. Querying 'items' mirror with type = '{}'.", base);
+                        base
+                    },
+                    None => raw_ctx_type,
+                };
+                let is_table_fallback = raw_ctx_type.ends_with("_items");
                 // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
                 // 백엔드 FTS/LIKE 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
                 let search_text = text.to_string();
@@ -885,17 +899,41 @@ async fn ai_search_complex(
                     }
                     tn
                 };
-                let target_table = match ctx_type {
-                    "member" | "team" | "user" => "users",
-                    "page" | "pages" => "pages",
-                    "talk" => "talks",
-                    "sales" | "goods" | "order" => "sales",
-                    "tracking" | "shipping" | "receiving" => "tracking",
-                    "event" | "coupon" | "review" => "event",
-                    _ => "items",
+                let target_table = if is_table_fallback {
+                    // 🌟 items 는 scheduler 가 모든 타입을 이중 upsert 하는 미러 테이블입니다.
+                    "items"
+                } else {
+                    match ctx_type {
+                        "member" | "team" | "user" => "users",
+                        "page" | "pages" => "pages",
+                        "talk" => "talks",
+                        "sales" | "goods" | "order" => "sales",
+                        "tracking" | "shipping" | "receiving" => "tracking",
+                        "event" | "coupon" => "event",
+                        // 🌟 [TABLE MAPPING FIX] scheduler 의 저장 매핑은
+                        //      "event" | "coupon" => "event",  나머지(review 포함) => "items"
+                        //    입니다. 즉 review 는 items 에 저장되는데 여기서 event 를 조회하고 있어
+                        //    데이터가 존재해도 물리적으로 항상 0건이 됩니다.
+                        //    (로그: review A/FULL·B/NARROWED 두 티어 모두 Table: event / total_found: 0)
+                        //    지금까지는 E/TABLE-FALLBACK 티어가 items 를 훑어 리콜을 겨우 보증했습니다.
+                        "review" => "items",
+                        _ => "items",
+                    }
                 };
 
-                let sql_filter = convert_conditions_to_sql(ctx);
+                // 🌟 [FALLBACK SQL FIX] convert_conditions_to_sql 은 ctx["type"] 을 그대로 SQL 에 넣습니다.
+                //    폴백 컨텍스트의 type 은 "review_items" 같은 라우팅 전용 이름이라
+                //    DB 에 존재하지 않는 값이 되어 `type = 'review_items'` 로 나가고 항상 0건이 됩니다.
+                //    (로그: [AI-SEARCH] Table fallback ... 직후 filter 가 "(type = 'review_items')" 로 출력됨)
+                //    SQL 생성 시에는 접미사를 벗긴 원래 도메인 이름을 사용합니다.
+                let sql_ctx = if is_table_fallback {
+                    let mut c = ctx.clone();
+                    if let Some(o) = c.as_object_mut() { o.insert("type".to_string(), json!(ctx_type)); }
+                    c
+                } else {
+                    ctx.clone()
+                };
+                let sql_filter = convert_conditions_to_sql(&sql_ctx);
                 let mode_filter = format!("mode = '{}'", search_mode);
                 let final_sql_filter = match sql_filter {
                     Some(f) => Some(format!("({}) AND {}", f, mode_filter)),
