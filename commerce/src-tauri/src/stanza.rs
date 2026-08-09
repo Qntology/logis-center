@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use ndarray::Array2;
-use onnxruntime::environment::Environment;
 use onnxruntime::session::Session;
-use onnxruntime::GraphOptimizationLevel;
 
 #[derive(Debug, Clone)]
 pub struct StanzaPreprocessor {
@@ -12,6 +9,9 @@ pub struct StanzaPreprocessor {
     pub tok_char_vocab: HashMap<char, i64>, // 🌟 Tokenizer 전용 독립 Vocab 추가
     pub id_to_char: HashMap<i64, char>, // 🌟 Lemma 복원용 역방향 맵 추가
     pub upos_vocab: Vec<String>,
+    // 🌟 [PHASE 2] Depparse 의존관계(UD DEPREL) 레이블 사전.
+    // 값 자체를 vocab.json 에서 동적으로 읽으므로 언어별 하드코딩이 전혀 없습니다.
+    pub deprel_vocab: Vec<String>,
     pub word_unk_id: i64,
     pub char_unk_id: i64,
     pub tok_char_unk_id: i64, // 🌟 Tokenizer 전용 UNK ID
@@ -29,6 +29,8 @@ impl StanzaPreprocessor {
         let mut char_vocab: HashMap<char, i64> = HashMap::new();
         let mut id_to_char: HashMap<i64, char> = HashMap::new();
         let mut upos_vocab = Vec::new();
+        // 🌟 [PHASE 2] UD DEPREL 레이블 사전 컨테이너 (언어별 vocab.json 에서 동적 수집)
+        let mut deprel_vocab: Vec<String> = Vec::new();
         
         // 🌟 1. Word Vocab 파싱 (기존 로직 보존 및 통합)
         let word_target = if let Some(pos) = json_val.get("pos") {
@@ -87,6 +89,31 @@ impl StanzaPreprocessor {
             }
         }
 
+        // 🌟 [PHASE 2] 3-1. Depparse DEPREL Vocab 동적 파싱
+        // final_definitive_conversion.py 의 MultiVocab 덤프 구조상 depparse.deprel 로 저장되며,
+        // 변환본에 따라 rel / dep / main 키로 떨어지는 경우까지 폴백 탐색합니다.
+        if let Some(dep_node) = json_val.get("depparse") {
+            if let Some(dep_arr) = dep_node.get("deprel").and_then(|v| v.as_array()) {
+                for v in dep_arr {
+                    if let Some(s) = v.as_str() {
+                        deprel_vocab.push(s.to_string());
+                    }
+                }
+            }
+            if deprel_vocab.is_empty() {
+                for alt_key in ["rel", "dep", "main"] {
+                    if let Some(alt_arr) = dep_node.get(alt_key).and_then(|v| v.as_array()) {
+                        for v in alt_arr {
+                            if let Some(s) = v.as_str() {
+                                deprel_vocab.push(s.to_string());
+                            }
+                        }
+                        if !deprel_vocab.is_empty() { break; }
+                    }
+                }
+            }
+        }
+
         if word_vocab.is_empty() {
             return Err(anyhow::anyhow!("vocab.json 내부에서 단어 매핑(Vocab) 구조를 찾을 수 없습니다."));
         }
@@ -98,7 +125,7 @@ impl StanzaPreprocessor {
             
         let char_unk_id = *char_vocab.get(&'<').unwrap_or(&0); // '<unk>' 처리용
         
-        Ok(Self { word_vocab, char_vocab, tok_char_vocab, id_to_char, upos_vocab, word_unk_id, char_unk_id, tok_char_unk_id })
+        Ok(Self { word_vocab, char_vocab, tok_char_vocab, id_to_char, upos_vocab, deprel_vocab, word_unk_id, char_unk_id, tok_char_unk_id })
     }
 
     // 🌟 중복된 JSON 파싱 로직을 공통 헬퍼 함수로 분리

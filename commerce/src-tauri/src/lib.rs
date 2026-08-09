@@ -20,8 +20,6 @@ pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
 
-use crate::utils::pug_utils::*;
-
 use tauri::{State, Manager, Listener, Emitter}; 
 use tokio::sync::Mutex as TokioMutex;
 use std::sync::RwLock; 
