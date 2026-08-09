@@ -118,7 +118,7 @@ impl QwenVLProcessor {
         let free_vram = mem.free;
         let usable = free_vram.saturating_sub(RESERVE);
         if usable == 0 {
-            let floor_px = 262_144u32;
+            let floor_px = 1_048_576u32;
             println!(
                 "[PROCESSOR] Free VRAM {:.0}MB is below reserve. Forcing minimum {}px².",
                 free_vram as f64 / 1e6, floor_px
@@ -128,7 +128,7 @@ impl QwenVLProcessor {
 
         let disc = (A * A + 4.0 * B * usable as f64).sqrt();
         let n = ((disc - A) / (2.0 * B)) as u64;
-        if n == 0 { return config_max.min(262_144); }
+        if n == 0 { return config_max.min(1_048_576); }
 
         let adaptive = n.saturating_mul(patch_area);
         let adaptive = if adaptive > u32::MAX as u64 { u32::MAX } else { adaptive as u32 };
@@ -179,9 +179,9 @@ impl QwenVLProcessor {
         sys.refresh_memory();
         let free_ram = sys.available_memory();
         if free_ram < 2_000_000_000 {
-            let cap = 1_048_576u32; // 1024x1024 의 '면적'
+            let cap = 3_145_728u32; // 약 1772x1772 의 '면적' (OCR 품질 보존을 위해 상향)
             if max_pixels > cap {
-                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to {}px² (1024x1024).", free_ram as f64 / 1e9, cap);
+                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to {}px².", free_ram as f64 / 1e9, cap);
                 max_pixels = cap;
             }
         }
@@ -194,7 +194,7 @@ impl QwenVLProcessor {
         let divisor = budget_divisor.max(1);
         if divisor > 1 {
             let shared = max_pixels / divisor as u32;
-            let floor_px = 262_144u32;
+            let floor_px = 1_048_576u32;
             let shared = shared.max(floor_px.min(max_pixels));
             if shared < max_pixels {
                 println!("[PROCESSOR] Batch of {} images → per-image max_pixels {} (was {}).", divisor, shared, max_pixels);
@@ -213,7 +213,7 @@ impl QwenVLProcessor {
         )?;
         // ----------------------------------
 
-        let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
+        let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
         let img_tensor = img_tensor.unsqueeze(0)?;
         Ok(img_tensor)

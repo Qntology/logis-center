@@ -119,7 +119,7 @@ impl Qwen3VLProcessor {
         let max_patches = vision_max_patches_from_vram(usable);
         if max_patches == 0 {
             // VRAM 이 예약분조차 못 채우는 극한 상황. 최소 해상도로 강제합니다.
-            let floor_px = 262_144u32; // 512x512
+            let floor_px = 1_048_576u32; // 1024x1024 (OCR 품질 보장)
             println!(
                 "[VISION-ADAPTIVE] Free VRAM {:.0}MB is below reserve. Forcing minimum {}px².",
                 free_vram as f64 / 1e6, floor_px
@@ -298,7 +298,7 @@ impl Qwen3VLProcessor {
         let divisor = budget_divisor.max(1);
         if divisor > 1 {
             let shared = max_pixels / divisor as u32;
-            let floor_px = 262_144u32; // 512x512 미만으로는 내려가지 않습니다.
+            let floor_px = 1_048_576u32; // 1024x1024 미만으로는 내려가지 않습니다.
             let shared = shared.max(floor_px.min(max_pixels));
             if shared < max_pixels {
                 println!(
@@ -321,7 +321,7 @@ impl Qwen3VLProcessor {
             max_pixels,
         )?;
 
-        let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
+        let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
         let img_tensor = img_tensor.unsqueeze(0)?;
 
