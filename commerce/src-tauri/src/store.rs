@@ -409,6 +409,10 @@ impl VectorStore {
         };
         let table = self.conn.open_table(target).execute().await?;
         table.delete(&format!("id = '{}'", id)).await?;
+
+        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        let _ = self.delete_chunks_by_item(id).await;
+
         Ok(())
     }
 
@@ -428,6 +432,12 @@ impl VectorStore {
         let table = self.conn.open_table(target).execute().await?;
         let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
         table.delete(&format!("id IN ({})", id_list)).await?;
+
+        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        for id in &ids {
+            let _ = self.delete_chunks_by_item(id).await;
+        }
+
         Ok(())
     }
     
@@ -524,6 +534,10 @@ impl VectorStore {
                 }
             }
         }
+
+        // 🌟 [PHASE D] item_chunks 테이블 초기화
+        self.init_chunks_table().await?;
+
         Ok(())
     }
     
@@ -919,7 +933,7 @@ impl VectorStore {
     }
 
     pub async fn reset_database(&self) -> Result<()> {
-        let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages"];
+        let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages", "item_chunks"];
         for name in tables {
             let _ = self.conn.drop_table(name, &[]).await;
             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, name));
@@ -931,6 +945,286 @@ impl VectorStore {
         self.init_all_tables().await?;
         
         Ok(())
+    }
+
+    // =====================================================================
+    // 🌟 [PHASE D] item_chunks 테이블 — 청크 단위 코사인 유사도 검색용
+    // =====================================================================
+
+    /// [PHASE D-1] item_chunks 테이블 스키마를 생성합니다.
+    /// 앱 시작 시 init_all_tables() 이후에 호출됩니다.
+    /// 기존 테이블이 존재하면 스키마 호환성 검사 후 그대로 사용합니다.
+    pub async fn init_chunks_table(&self) -> Result<()> {
+        let uri = self.base_path.clone();
+        let existing = self.conn.table_names().execute().await?;
+
+        if existing.contains(&"item_chunks".to_string()) {
+            match self.conn.open_table("item_chunks").execute().await {
+                Ok(table) => {
+                    let current_schema = table.schema().await.unwrap_or_else(|_| {
+                        Arc::new(Schema::new(Vec::<Field>::new()))
+                    });
+                    let has_chunk_id = current_schema.field_with_name("chunk_id").is_ok();
+                    let has_vector = current_schema.field_with_name("vector").is_ok();
+                    let has_property = current_schema.field_with_name("property").is_ok();
+                    if !has_chunk_id || !has_vector || !has_property {
+                        println!("[Store] item_chunks schema mismatch. Dropping for recreation.");
+                        let _ = self.conn.drop_table("item_chunks", &[]).await;
+                        let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                    } else {
+                        return Ok(());
+                    }
+                },
+                Err(_) => {
+                    println!("[Store] Corrupted item_chunks table detected. Force dropping.");
+                    let _ = self.conn.drop_table("item_chunks", &[]).await;
+                    let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                }
+            }
+        }
+
+        let existing_after = self.conn.table_names().execute().await?;
+        if !existing_after.contains(&"item_chunks".to_string()) {
+            let chunk_schema = Arc::new(Schema::new(vec![
+                // 청크 식별
+                Field::new("chunk_id", DataType::Utf8, false),
+                Field::new("item_id", DataType::Utf8, false),
+                Field::new("item_type", DataType::Utf8, false),
+
+                // 청크 내용
+                Field::new("chunk_text", DataType::Utf8, false),
+                Field::new("property", DataType::Utf8, false),
+                Field::new("property_format", DataType::Utf8, false),
+                Field::new("value_part", DataType::Utf8, true),
+
+                // 임베딩 (granite-embedding-97m-multilingual-r2 = 384차원)
+                Field::new("vector", DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)), 384
+                ), true),
+
+                // 메타데이터
+                Field::new("cc", DataType::Utf8, true),
+                Field::new("bcc", DataType::Utf8, true),
+                Field::new("ref", DataType::Utf8, true),
+                Field::new("mode", DataType::Utf8, true),
+
+                // 타임스탬프
+                Field::new("created_at", DataType::Int64, false),
+                Field::new("updated_at", DataType::Int64, false),
+            ]));
+
+            if let Err(_) = self.conn.create_empty_table("item_chunks", chunk_schema.clone()).execute().await {
+                let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                let _ = self.conn.create_empty_table("item_chunks", chunk_schema).execute().await;
+            }
+            println!("[Store] item_chunks table created successfully.");
+        }
+
+        Ok(())
+    }
+
+    /// [PHASE D-2] 청크 1건을 item_chunks 테이블에 삽입합니다.
+    /// 동일 chunk_id 가 이미 존재하면 삭제 후 재삽입합니다 (upsert 시맨틱).
+    ///
+    /// # 인자
+    ///   - chunk_id:       UUID 기반 청크 고유 식별자
+    ///   - item_id:        원본 item 의 해시 ID (FK)
+    ///   - item_type:      도메인 타입 ("goods", "order", "tracking" 등)
+    ///   - chunk_text:     자연어 청크 원문
+    ///   - property:       PLINKO 확정 속성명 (snake_case)
+    ///   - property_format: 형식 문자열 ("Numeric", "Text", "Enum" 등)
+    ///   - value_part:     청크에서 추출한 실제 값 부분
+    ///   - vector:         384차원 임베딩 벡터
+    ///   - cc, bcc, ref_val, mode: 메타데이터
+    pub async fn upsert_chunk(
+        &self,
+        chunk_id: &str,
+        item_id: &str,
+        item_type: &str,
+        chunk_text: &str,
+        property: &str,
+        property_format: &str,
+        value_part: &str,
+        vector: Option<Vec<f32>>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+        ref_val: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+
+        // 기존 동일 chunk_id 삭제 (upsert)
+        let _ = table.delete(&format!("chunk_id = '{}'", chunk_id)).await;
+
+        let safe_vector = match vector {
+            Some(v) if v.len() == 384 => v,
+            _ => vec![0.0; 384],
+        };
+
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let values_builder = Float32Array::from(safe_vector);
+        let list_field = Field::new("item", DataType::Float32, true);
+        let list_array = FixedSizeListArray::try_new(
+            Arc::new(list_field), 384, Arc::new(values_builder), None
+        )?;
+
+        let schema = table.schema().await?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec![chunk_id.to_string()])),
+            Arc::new(StringArray::from(vec![item_id.to_string()])),
+            Arc::new(StringArray::from(vec![item_type.to_string()])),
+            Arc::new(StringArray::from(vec![chunk_text.to_string()])),
+            Arc::new(StringArray::from(vec![property.to_string()])),
+            Arc::new(StringArray::from(vec![property_format.to_string()])),
+            Arc::new(StringArray::from(vec![value_part.to_string()])),
+            Arc::new(list_array),
+            Arc::new(StringArray::from(vec![cc.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![bcc.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![ref_val.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![mode.unwrap_or("commerce").to_string()])),
+            Arc::new(Int64Array::from(vec![now])),
+            Arc::new(Int64Array::from(vec![now])),
+        ])?;
+
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    /// [PHASE D-3] item_chunks 테이블에서 코사인 유사도 벡터 검색을 수행합니다.
+    /// STAGE-4 (검색 시) 에서 호출됩니다.
+    ///
+    /// # 인자
+    ///   - query_vec:  검색 질의의 임베딩 벡터 (384차원)
+    ///   - limit:      반환할 최대 청크 수
+    ///   - filter:     SQL 필터 (예: "item_type = 'goods' AND mode = 'commerce'")
+    ///
+    /// # 반환
+    ///   Vec<(chunk_id, item_id, chunk_text, property, score)>
+    ///   score 는 코사인 유사도 (높을수록 유사)
+    pub async fn search_chunks(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Vec<(String, String, String, String, f32)>> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+
+        // 벡터가 전부 0 이면 검색 불가
+        if query_vec.iter().all(|&v| v == 0.0) {
+            return Ok(Vec::new());
+        }
+
+        let mut q = table.query();
+        if let Some(f) = filter {
+            if !f.trim().is_empty() {
+                q = q.only_if(f.to_string());
+            }
+        }
+
+        // 오버페치 후 item_id 기준 그룹핑을 위해 limit * 3 으로 조회
+        let overfetch = limit * 3;
+        let results = q
+            .limit(overfetch)
+            .nearest_to(query_vec.to_vec())?
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut chunks: Vec<(String, String, String, String, f32)> = Vec::new();
+
+        for batch in results {
+            let num_rows = batch.num_rows();
+            if num_rows == 0 { continue; }
+
+            // 컬럼 인덱스: 0=chunk_id, 1=item_id, 2=item_type, 3=chunk_text,
+            //              4=property, 5=property_format, 6=value_part, 7=vector, ...
+            let chunk_ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let item_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let chunk_texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let properties = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+
+            // LanceDB nearest_to 는 _distance 컬럼을 마지막에 추가합니다
+            let dist_idx = batch.num_columns() - 1;
+            let distances = batch.column(dist_idx).as_any().downcast_ref::<Float32Array>();
+
+            for i in 0..num_rows {
+                let score = distances
+                    .map(|d| 1.0 - d.value(i))  // LanceDB 는 L2 거리 반환 → 코사인 유사도로 변환
+                    .unwrap_or(0.0);
+
+                chunks.push((
+                    chunk_ids.value(i).to_string(),
+                    item_ids.value(i).to_string(),
+                    chunk_texts.value(i).to_string(),
+                    properties.value(i).to_string(),
+                    score,
+                ));
+            }
+        }
+
+        // 점수 내림차순 정렬
+        chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+
+        // item_id 기준 그룹핑: 동일 item 의 여러 청크 점수를 합산하여
+        // 최종 상위 limit 개 item 을 반환합니다.
+        let mut item_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut item_best_chunk: std::collections::HashMap<String, (String, String, String, f32)> = std::collections::HashMap::new();
+
+        for (chunk_id, item_id, chunk_text, property, score) in &chunks {
+            let entry = item_scores.entry(item_id.clone()).or_insert(0.0);
+            *entry += score;
+
+            let best = item_best_chunk.entry(item_id.clone()).or_insert_with(|| {
+                (chunk_id.clone(), chunk_text.clone(), property.clone(), *score)
+            });
+            if *score > best.3 {
+                *best = (chunk_id.clone(), chunk_text.clone(), property.clone(), *score);
+            }
+        }
+
+        // 합산 점수 기준 내림차순 정렬 후 상위 limit 개 반환
+        let mut final_results: Vec<(String, String, String, String, f32)> = Vec::new();
+        let mut sorted_items: Vec<(String, f32)> = item_scores.into_iter().collect();
+        sorted_items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (item_id, total_score) in sorted_items.into_iter().take(limit) {
+            if let Some((chunk_id, chunk_text, property, best_score)) = item_best_chunk.remove(&item_id) {
+                // total_score 를 대표 점수로 사용하되, best_score 가 더 높으면 best_score 사용
+                let representative_score = total_score.max(best_score);
+                final_results.push((chunk_id, item_id, chunk_text, property, representative_score));
+            }
+        }
+
+        Ok(final_results)
+    }
+
+    /// [PHASE D-4] 특정 item_id 에 연관된 모든 청크를 삭제합니다.
+    /// item 삭제 또는 재추출 시 호출됩니다.
+    pub async fn delete_chunks_by_item(&self, item_id: &str) -> Result<()> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+        table.delete(&format!("item_id = '{}'", item_id)).await?;
+        Ok(())
+    }
+
+    /// [PHASE D-5] 특정 item_id 의 청크 개수를 반환합니다.
+    /// 재인덱싱 여부 판정에 사용됩니다.
+    pub async fn count_chunks_by_item(&self, item_id: &str) -> Result<usize> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+        let results = table.query()
+            .only_if(format!("item_id = '{}'", item_id))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut count = 0usize;
+        for batch in results {
+            count += batch.num_rows();
+        }
+        Ok(count)
     }
 }
 

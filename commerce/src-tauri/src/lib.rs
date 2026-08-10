@@ -978,8 +978,279 @@ async fn ai_search_complex(
                     // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
                     // 프론트엔드(Dexie DB)로 역할을 위임합니다.
                 }
+
+                // =====================================================================
+                // 🌟 [STAGE-4] item_chunks 청크 레벨 코사인 유사도 매칭
+                // ---------------------------------------------------------------------
+                // 기존 search_items() 는 전체 문서 벡터 1개와 질의 벡터를 비교하므로
+                // "무거운" ↔ "Its weight is 1.5" 같은 필드 레벨 매칭이 희석되어 0건이 됩니다.
+                // STAGE-4 는 scheduler 가 사전 저장한 item_chunks 테이블의
+                // 속성별 청크 임베딩과 코사인 유사도를 계산하여
+                // 필드 레벨 매칭을 복원합니다.
+                //
+                // 매칭 전략:
+                //   4-A: 질의 텍스트 임베딩으로 item_chunks 전체 코사인 검색
+                //   4-B: PLINKO 조건(condition)에 확정된 속성이 있으면
+                //        해당 속성 청크에 보너스 가중치 부여
+                //   4-C: item_id 기준 그룹핑 후 기존 all_results 와 dedup 병합
+                // =====================================================================
+                {
+                    // 4-A: item_chunks 테이블 코사인 검색
+                    //      item_type 필터로 도메인을 좁히고, mode 필터로 검색 모드 일치 보장
+                    let chunk_type_filter = if is_table_fallback {
+                        // 폴백 컨텍스트는 타입 접미사가 벗겨진 ctx_type 사용
+                        format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode)
+                    } else {
+                        format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode)
+                    };
+
+                    let chunk_results = store.search_chunks(
+                        &emb,
+                        10, // 상위 10개 청크 (item_id 그룹핑 전 오버페치)
+                        Some(&chunk_type_filter),
+                    ).await.unwrap_or_default();
+
+                    if !chunk_results.is_empty() {
+                        println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
+                    }
+
+                    // 4-B: PLINKO 조건 기반 청크 필터링 및 보너스 점수
+                    //      STAGE-2 의 PLINKO GAME 이 확정한 속성명(condition 키)과
+                    //      청크의 property 가 일치하면 보너스 점수를 부여합니다.
+                    //      이 보너스는 매직 상수가 아니라 '속성 확정 여부' 라는
+                    //      결정론적 사실에 기반합니다.
+                    let condition_props: Vec<String> = ctx.get("condition")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| obj.keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    for (chunk_id, item_id, chunk_text, property, mut score) in chunk_results {
+                        // 4-B: 속성 매칭 보너스
+                        //      PLINKO 가 확정한 속성과 청크 속성이 일치하면
+                        //      코사인 점수에 속성 확정 보너스를 가산합니다.
+                        //      보너스 크기는 '조건에 확정된 속성 개수' 에 반비례하여
+                        //      여러 속성이 확정된 경우 보너스가 분산되도록 합니다.
+                        if !condition_props.is_empty() && condition_props.contains(&property) {
+                            let bonus = 1.0 / (condition_props.len() as f32);
+                            score += bonus;
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 보너스 +{:.4} → 최종 {:.4}", property, bonus, score);
+                        }
+
+                        // 4-C: item_id 기준 기존 결과와 dedup
+                        //      이미 all_results 에 동일 item_id 가 있으면
+                        //      점수만 갱신하고 중복 삽입하지 않습니다.
+                        let existing = all_results.iter_mut().find(|item| {
+                            item.get("id").and_then(|v| v.as_str()) == Some(&item_id)
+                        });
+
+                        if let Some(existing_item) = existing {
+                            // 기존 점수보다 높으면 갱신
+                            let old_score = existing_item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            if score > old_score {
+                                existing_item.as_object_mut().unwrap().insert("score".to_string(), json!(score));
+                                existing_item.as_object_mut().unwrap().insert("chunk_match".to_string(), json!(true));
+                                existing_item.as_object_mut().unwrap().insert("matched_property".to_string(), json!(property));
+                                existing_item.as_object_mut().unwrap().insert("matched_chunk".to_string(), json!(chunk_text));
+                            }
+                        } else {
+                            // 신규 결과 삽입
+                            // chunk_id 가 아닌 item_id 를 기준으로 삽입하여
+                            // 동일 item 의 여러 청크가 중복 결과로 나타나지 않도록 합니다.
+                            let is_item_dup = all_results.iter().any(|item| {
+                                item.get("id").and_then(|v| v.as_str()) == Some(&item_id)
+                            });
+                            if !is_item_dup {
+                                all_results.push(json!({
+                                    "id": item_id,
+                                    "text": chunk_text,
+                                    "score": score,
+                                    "context_type": ctx_type,
+                                    "relation": "chunk_match",
+                                    "chunk_id": chunk_id,
+                                    "matched_property": property,
+                                    "chunk_match": true
+                                }));
+                            }
+                        }
+                    }
+                }
+                // =====================================================================
+                // 🌟 [STAGE-4 종료]
+                // =====================================================================
             }
         }
+
+        // =====================================================================
+        // 🌟 [STAGE-5] 결과 병합 & 스코어 랭킹 & 프론트엔드 응답 포맷 조립
+        // ---------------------------------------------------------------------
+        // STAGE-4 까지 수집된 all_results 에는 다음 두 종류의 결과가 혼재합니다.
+        //   (A) search_items()  → 전체 문서 벡터 + FTS 매칭  (relation: "primary")
+        //   (B) search_chunks() → 청크 레벨 코사인 매칭       (relation: "chunk_match")
+        //
+        // STAGE-5 의 역할:
+        //   5-A: item_id 기준 dedup (동일 item 의 여러 청크가 중복 결과로 나타나지 않도록)
+        //   5-B: 점수 정규화 (문서 점수와 청크 점수를 동일한 스케일로 병합)
+        //   5-C: 매칭 속성(property) 메타데이터 주입 (프론트엔드 하이라이트용)
+        //   5-D: 최종 랭킹 (내림차순) 후 limit 적용
+        //   5-E: 프론트엔드 응답 JSON 포맷 확정
+        // =====================================================================
+        {
+            // ── 5-A: item_id 기준 dedup ──
+            // 동일 item_id 가 여러 번 등장하면 점수를 합산하고,
+            // 가장 높은 청크 매칭 정보(property, chunk_text)를 대표로 남깁니다.
+            let mut merged_map: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            let mut merge_order: Vec<String> = Vec::new();
+
+            for item in all_results.iter() {
+                let item_id = item.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if item_id.is_empty() { continue; }
+
+                let score = item.get("score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let is_chunk_match = item.get("chunk_match")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let matched_property = item.get("matched_property")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let matched_chunk = item.get("matched_chunk")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if let Some(existing) = merged_map.get_mut(&item_id) {
+                    // 기존 항목의 점수에 새 점수를 가산
+                    let old_score = existing.get("score")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let combined = old_score + score;
+                    existing.as_object_mut().unwrap()
+                        .insert("score".to_string(), json!(combined));
+
+                    // 청크 매칭 정보가 더 구체적이면 대표 메타데이터로 교체
+                    if is_chunk_match && !matched_property.is_empty() {
+                        let old_prop = existing.get("matched_property")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if old_prop.is_empty() || score > old_score {
+                            existing.as_object_mut().unwrap()
+                                .insert("matched_property".to_string(), json!(matched_property));
+                            existing.as_object_mut().unwrap()
+                                .insert("matched_chunk".to_string(), json!(matched_chunk));
+                            existing.as_object_mut().unwrap()
+                                .insert("chunk_match".to_string(), json!(true));
+                        }
+                    }
+
+                    // 매칭된 속성 목록 누적 (프론트엔드에서 다중 하이라이트 가능)
+                    if is_chunk_match && !matched_property.is_empty() {
+                        let props = existing.get("matched_properties")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut props_vec: Vec<Value> = props;
+                        if !props_vec.iter().any(|p| p.as_str() == Some(&matched_property)) {
+                            props_vec.push(json!(matched_property));
+                        }
+                        existing.as_object_mut().unwrap()
+                            .insert("matched_properties".to_string(), json!(props_vec));
+                    }
+                } else {
+                    // 신규 항목 삽입
+                    let mut entry = item.clone();
+                    if is_chunk_match && !matched_property.is_empty() {
+                        entry.as_object_mut().unwrap()
+                            .insert("matched_properties".to_string(), json!(vec![matched_property.clone()]));
+                    }
+                    merge_order.push(item_id.clone());
+                    merged_map.insert(item_id, entry);
+                }
+            }
+
+            // ── 5-B: 점수 정규화 ──
+            // 문서 매칭(primary)과 청크 매칭(chunk_match)의 점수 스케일이 다를 수 있으므로
+            // 최대 점수 기준으로 0.0~1.0 에 정규화합니다.
+            // 단, 점수가 전부 0 이면 정규화를 건너뜁니다.
+            let mut max_score: f32 = 0.0;
+            for item in merged_map.values() {
+                let s = item.get("score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                if s > max_score { max_score = s; }
+            }
+
+            let mut ranked_results: Vec<serde_json::Value> = Vec::new();
+            for item_id in &merge_order {
+                if let Some(mut item) = merged_map.remove(item_id) {
+                    if max_score > 0.0 {
+                        let raw = item.get("score")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        let normalized = raw / max_score;
+                        item.as_object_mut().unwrap()
+                            .insert("score".to_string(), json!(normalized));
+                        item.as_object_mut().unwrap()
+                            .insert("raw_score".to_string(), json!(raw));
+                    }
+                    ranked_results.push(item);
+                }
+            }
+
+            // ── 5-D: 최종 랭킹 (점수 내림차순) ──
+            ranked_results.sort_by(|a, b| {
+                let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // ── 5-E: 프론트엔드 응답 포맷 확정 ──
+            // 프론트엔드(main.ts)가 소비하는 필드:
+            //   id, text, score, context_type, relation,
+            //   chunk_match(bool), matched_property, matched_chunk, matched_properties
+            //
+            // chunk_match = true 인 항목은 프론트엔드에서
+            // "어떤 속성이 매칭되었는지" 를 배지로 표시할 수 있습니다.
+            //
+            // limit: 프론트엔드 렌더링 부하 방지를 위해 최대 20개 반환
+            let final_limit = 20usize;
+            if ranked_results.len() > final_limit {
+                ranked_results.truncate(final_limit);
+            }
+
+            // ── 검색 통계 로그 출력 ──
+            let chunk_match_count = ranked_results.iter()
+                .filter(|r| r.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false))
+                .count();
+            let primary_count = ranked_results.len() - chunk_match_count;
+
+            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건)",
+                ranked_results.len(), primary_count, chunk_match_count);
+
+            for (rank, item) in ranked_results.iter().enumerate() {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let prop = item.get("matched_property").and_then(|v| v.as_str()).unwrap_or("-");
+                let is_chunk = item.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ctx = item.get("context_type").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={}",
+                    rank + 1, id, score, ctx,
+                    if is_chunk { "chunk" } else { "doc" },
+                    prop);
+            }
+
+            all_results = ranked_results;
+        }
+        // =====================================================================
+        // 🌟 [STAGE-5 종료]
+        // =====================================================================
+
         Ok(json!({ "structured": structured_query, "results": all_results }))
     }.await; 
 
