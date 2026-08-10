@@ -6733,21 +6733,111 @@ async fn process_task(
         {
             let natural_text = crate::nl_convert::json_to_natural_language(&extracted_data);
 
-            // PHASE A: 문장 단위 분할
+            // PHASE A: 문장 단위 분할 + 로그 출력
             let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
-            crate::nl_convert::log_chunk_split_result(&raw_chunks);
+            emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
+            for (ci, (ct, cp)) in raw_chunks.iter().enumerate() {
+                emit_term(&format!("    [{}] property='{}' | text='{}'", ci, cp, ct));
+            }
 
             if !raw_chunks.is_empty() {
-                // PHASE B: 속성 태깅 + NMS 중복 제거 + FORMAT GATE
+                // ── 필드 뱅크 구축 (PLINKO GAME 입력) ──
+                // bias.json 에서 필드명 + bias 구 임베딩 + 형식을 추출합니다.
+                let fields = crate::parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
+                let mut idx_field_names: Vec<String> = Vec::new();
+                let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+                let mut idx_field_formats: Vec<String> = Vec::new();
+
+                for (fname, _, bias_target, _) in &fields {
+                    // insight/summary/analysis 계열은 PLINKO 슬롯에서 제외합니다.
+                    let lower_fname = fname.to_lowercase();
+                    if lower_fname.contains("insight")
+                        || lower_fname.contains("summary")
+                        || lower_fname.contains("analysis")
+                    {
+                        continue;
+                    }
+
+                    let (phrases, weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+                    let phrase_embs = if phrases.is_empty() {
+                        vec![vec![0.0f32; 384]]
+                    } else {
+                        model.get_embedding_batch(phrases.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                    };
+
+                    let fmt_str = {
+                        let lower = fname.to_lowercase();
+                        let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+                        let has = |k: &str| keys.iter().any(|x| x == k);
+
+                        if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                            "Synthesis".to_string()
+                        } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                            "TrackingCode".to_string()
+                        } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                            "Identifier".to_string()
+                        } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                            "Link".to_string()
+                        } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                            "Date".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                                || k == "cellphone" || k == "contact" || k == "number"
+                        }) {
+                            "Phone".to_string()
+                        } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                            "Address".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                                || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+                        }) {
+                            "Enum".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                                || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                                || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                                || k.contains("duration")
+                        }) {
+                            "Numeric".to_string()
+                        } else {
+                            "Text".to_string()
+                        }
+                    };
+
+                    idx_field_names.push(fname.clone());
+                    idx_field_phrase_embs.push(phrase_embs);
+                    idx_field_phrase_weights.push(weights);
+                    idx_field_formats.push(fmt_str);
+                }
+
+                emit_term(&format!(
+                    "  📐 [PHASE B+C] 필드 뱅크 구축 완료: {}개 필드 (PLINKO GAME 입력)",
+                    idx_field_names.len()
+                ));
+
+                // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                let model_for_embed = model.clone();
                 let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
                     &raw_chunks,
                     &doc_lang,
                     &page_type,
-                );
+                    &idx_field_names,
+                    &idx_field_phrase_embs,
+                    &idx_field_phrase_weights,
+                    &idx_field_formats,
+                    move |text: String| {
+                        let m = model_for_embed.clone();
+                        async move {
+                            m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
+                        }
+                    },
+                ).await;
                 crate::nl_convert::log_enriched_chunks(&enriched_chunks);
 
                 if !enriched_chunks.is_empty() {
-                    // PHASE C: 임베딩 생성 (청크 텍스트 + 속성 앵커 구별 임베딩)
+                    // PHASE D: 임베딩 생성 (청크 텍스트 + 속성 앵커 구별 임베딩)
                     let chunk_texts: Vec<String> = enriched_chunks.iter()
                         .map(|c| c.chunk_text.clone())
                         .collect();
@@ -6755,7 +6845,7 @@ async fn process_task(
                     let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
 
-                    // PHASE D: LanceDB item_chunks 테이블 저장
+                    // PHASE E: LanceDB item_chunks 테이블 저장
                     // 기존 item_id 를 기준으로 이전 청크를 먼저 삭제합니다.
                     let _ = store.delete_chunks_by_item(&target_id).await;
 
@@ -6797,7 +6887,7 @@ async fn process_task(
                     }
 
                     emit_term(&format!(
-                        "  🧩 [PHASE A~D] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 | table='item_chunks'",
+                        "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 | table='item_chunks'",
                         target_id, enriched_chunks.len()
                     ));
                 }
@@ -7209,19 +7299,103 @@ async fn process_task(
                 {
                     let natural_text = crate::nl_convert::json_to_natural_language(&single_item);
 
-                    // PHASE A: 문장 단위 분할
+                    // PHASE A: 문장 단위 분할 + 로그 출력
                     let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
+                    emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
+                    for (ci, (ct, cp)) in raw_chunks.iter().enumerate() {
+                        emit_term(&format!("    [{}] property='{}' | text='{}'", ci, cp, ct));
+                    }
 
                     if !raw_chunks.is_empty() {
-                        // PHASE B: 속성 태깅 + NMS 중복 제거 + FORMAT GATE
+                        // ── 필드 뱅크 구축 (PLINKO GAME 입력) ──
+                        let fields = crate::parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
+                        let mut idx_field_names: Vec<String> = Vec::new();
+                        let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                        let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+                        let mut idx_field_formats: Vec<String> = Vec::new();
+
+                        for (fname, _, bias_target, _) in &fields {
+                            let lower_fname = fname.to_lowercase();
+                            if lower_fname.contains("insight")
+                                || lower_fname.contains("summary")
+                                || lower_fname.contains("analysis")
+                            {
+                                continue;
+                            }
+
+                            let (phrases, weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+                            let phrase_embs = if phrases.is_empty() {
+                                vec![vec![0.0f32; 384]]
+                            } else {
+                                model.get_embedding_batch(phrases.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                            };
+
+                            let fmt_str = {
+                                let lower = fname.to_lowercase();
+                                let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+                                let has = |k: &str| keys.iter().any(|x| x == k);
+
+                                if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                                    "Synthesis".to_string()
+                                } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                                    "TrackingCode".to_string()
+                                } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                                    "Identifier".to_string()
+                                } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                                    "Link".to_string()
+                                } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                                    "Date".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                                        || k == "cellphone" || k == "contact" || k == "number"
+                                }) {
+                                    "Phone".to_string()
+                                } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                                    "Address".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                                        || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+                                }) {
+                                    "Enum".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                                        || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                                        || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                                        || k.contains("duration")
+                                }) {
+                                    "Numeric".to_string()
+                                } else {
+                                    "Text".to_string()
+                                }
+                            };
+
+                            idx_field_names.push(fname.clone());
+                            idx_field_phrase_embs.push(phrase_embs);
+                            idx_field_phrase_weights.push(weights);
+                            idx_field_formats.push(fmt_str);
+                        }
+
+                        // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                        let model_for_embed = model.clone();
                         let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
                             &raw_chunks,
                             &doc_lang,
                             &page_type,
-                        );
+                            &idx_field_names,
+                            &idx_field_phrase_embs,
+                            &idx_field_phrase_weights,
+                            &idx_field_formats,
+                            move |text: String| {
+                                let m = model_for_embed.clone();
+                                async move {
+                                    m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
+                                }
+                            },
+                        ).await;
 
                         if !enriched_chunks.is_empty() {
-                            // PHASE C: 임베딩 생성
+                            // PHASE D: 임베딩 생성
                             let chunk_texts: Vec<String> = enriched_chunks.iter()
                                 .map(|c| c.chunk_text.clone())
                                 .collect();
@@ -7229,7 +7403,7 @@ async fn process_task(
                             let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
                                 .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
 
-                            // PHASE D: LanceDB item_chunks 테이블 저장
+                            // PHASE E: LanceDB item_chunks 테이블 저장
                             let _ = store.delete_chunks_by_item(&hashed_item_id).await;
 
                             for (ci, chunk_meta) in enriched_chunks.iter().enumerate() {
@@ -7268,7 +7442,7 @@ async fn process_task(
                             }
 
                             emit_term(&format!(
-                                "  🧩 [PHASE A~D] 청크 인덱싱 완료: item_id='{}' | 청크 {}개",
+                                "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개",
                                 hashed_item_id, enriched_chunks.len()
                             ));
                         }

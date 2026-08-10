@@ -299,7 +299,7 @@ pub struct ChunkMetadata {
 /// [PHASE B] detect_field_format() 결과를 문자열로 변환합니다.
 /// ai_utils.rs 의 FieldFormat enum 을 직접 참조하지 않고
 /// 문자열로 변환하여 nl_convert.rs 의 독립성을 유지합니다.
-fn field_format_to_string(field_name: &str) -> String {
+pub fn field_format_to_string(field_name: &str) -> String {
     let lower = field_name.to_lowercase();
     let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
     let has = |k: &str| keys.iter().any(|x| x == k);
@@ -755,33 +755,408 @@ pub fn log_enriched_chunks(chunks: &[ChunkMetadata]) {
     }
 }
 
-/// [PHASE B - 통합 진입점] PHASE A 출력을 받아 PHASE B 전체 파이프라인을 순차 실행합니다.
+// =====================================================================
+// 🌟 [PHASE C] 인덱싱 전용 PLINKO GAME — Sliding Window Cliff Detection
+// =====================================================================
+// 검색 경로(model.rs)의 PLINKO GAME 과 동일한 구조로 동작하되,
+// 입력이 "사용자 질의" 대신 "json_to_natural_language() 출력 청크"입니다.
+//
+// 차이점:
+//   - 검색 경로: 질의 단어를 하나씩 확장하며 필드 뱅크와 코사인 비교
+//   - 인덱싱 경로: 청크 텍스트를 단어 단위로 확장하며 필드 뱅크와 코사인 비교
+//   - FORMAT GATE 를 배정 '전' 에 적용 (설계 원칙 준수)
+//   - 임베딩은 외부 클로저(embed_fn)로 주입받아 nl_convert.rs 의 독립성 유지
+// =====================================================================
+
+/// [PHASE C] PLINKO GAME 확정 결과 구조체입니다.
+///
+/// 필드 설명:
+///   - chunk_text:    확정된 청크 텍스트 (Sliding Window 로 잘린 부분)
+///   - property:      확정된 속성명 (snake_case)
+///   - score:         확정 시점의 코사인 점수
+///   - alternatives:  차순위 후보 (속성명, 점수) 최대 5개
+///   - all_scores:    전 필드 코사인 점수 (배타 배정 행렬 구축용)
+#[derive(Debug, Clone)]
+pub struct PlinkoResult {
+    pub chunk_text: String,
+    pub property: String,
+    pub score: f32,
+    pub alternatives: Vec<(String, f32)>,
+    pub all_scores: Vec<(String, f32)>,
+}
+
+/// [PHASE C] 인덱싱 전용 PLINKO GAME — Sliding Window Cliff Detection.
+///
+/// 검색 경로(model.rs)의 PLINKO GAME 과 **동일 알고리즘**으로 동작합니다.
+/// 각 청크의 단어를 하나씩 확장하면서 필드 뱅크와 Max-Pool 코사인을 계산하고,
+/// 점수가 하락(Cliff)하면 이전 청크를 해당 속성으로 확정합니다.
+///
+/// FORMAT GATE 는 배정 '전' 에 적용합니다:
+///   - Numeric 필드: 숫자 포함 필수
+///   - Date 필드: 숫자 포함 필수
+///   - Phone 필드: 숫자 7자리 이상 필수
+///   - Link 필드: '/' 또는 'http' 포함 필수
+///   - 형식 불일치 시 해당 필드를 후보에서 제외
+///
+/// # 인자
+///   - chunks:              nms_battle_for_indexing() 통과 청크 배열
+///   - field_names:         필드명 배열 (예: ["id", "title", "sale_price", ...])
+///   - field_phrase_embs:   필드별 bias 구 임베딩 뱅크
+///   - field_phrase_weights: 필드별 구 가중치
+///   - field_formats:       필드별 형식 문자열 ("Numeric", "Text", "Enum" 등)
+///   - embed_fn:            텍스트 → 임베딩 벡터 변환 클로저 (비동기)
+///
+/// # 반환
+///   Vec<PlinkoResult> — 각 청크의 확정 속성 + 점수 + 대안
+pub async fn plinko_game_for_indexing<F, Fut>(
+    chunks: &[ChunkMetadata],
+    field_names: &[String],
+    field_phrase_embs: &[Vec<Vec<f32>>],
+    field_phrase_weights: &[Vec<f32>],
+    field_formats: &[String],
+    embed_fn: F,
+) -> Vec<PlinkoResult>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<f32>>,
+{
+    let mut results: Vec<PlinkoResult> = Vec::with_capacity(chunks.len());
+
+    for chunk_meta in chunks {
+        let words: Vec<&str> = chunk_meta.chunk_text.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
+
+        // ── Sliding Window 상태 ──
+        let mut current_window: Vec<&str> = Vec::new();
+        let mut prev_max_score: f32 = -1.0;
+        let mut best_prop: String = String::new();
+        let mut prev_alternatives: Vec<(String, f32)> = Vec::new();
+        let mut prev_all_scores: Vec<(String, f32)> = Vec::new();
+
+        for word in &words {
+            current_window.push(word);
+            let test_text = current_window.join(" ");
+
+            // 임베딩 계산 (외부 클로저)
+            let test_emb = embed_fn(test_text.clone()).await;
+            if test_emb.iter().all(|&v| v == 0.0) {
+                continue;
+            }
+
+            // ── FORMAT GATE (배정 전) + Max-Pool 코사인 ──
+            let mut candidates: Vec<(String, f32)> = Vec::with_capacity(field_names.len());
+            for fi in 0..field_names.len() {
+                let fmt = field_formats.get(fi).map(|s| s.as_str()).unwrap_or("Text");
+
+                // FORMAT GATE: 값 형식 검증 (배정 전)
+                let value_part = &chunk_meta.value_part;
+                let passes = match fmt {
+                    "Numeric" => value_part.chars().any(|c| c.is_ascii_digit()),
+                    "Date" => value_part.chars().any(|c| c.is_ascii_digit()),
+                    "Phone" => value_part.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+                    "TrackingCode" => {
+                        value_part.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| tok.chars().count() >= 8 && tok.chars().any(|c| c.is_ascii_digit()))
+                    },
+                    "Identifier" => {
+                        value_part.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| tok.chars().count() >= 4 && tok.chars().any(|c| c.is_ascii_digit()))
+                    },
+                    "Link" => value_part.contains('/') || value_part.to_lowercase().starts_with("http"),
+                    "Enum" => true,
+                    "Text" => value_part.chars().any(|c| c.is_alphabetic()),
+                    "Address" => value_part.chars().any(|c| c.is_alphabetic()) && value_part.split_whitespace().count() >= 2,
+                    "Synthesis" => true,
+                    _ => true,
+                };
+                if !passes {
+                    continue;
+                }
+
+                // Max-Pool 코사인
+                let own = crate::utils::ai_utils::weighted_max_pool_sim(
+                    &test_emb,
+                    &field_phrase_embs[fi],
+                    &field_phrase_weights[fi],
+                );
+                candidates.push((field_names[fi].clone(), own));
+            }
+
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // 점수 내림차순 정렬
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let current_max = candidates[0].1;
+            let current_best = candidates[0].0.clone();
+            let current_alternatives: Vec<(String, f32)> = candidates.iter().skip(1).take(5).cloned().collect();
+
+            // ── Cliff Detection: 점수 하락 시 이전 청크 확정 ──
+            if current_max < prev_max_score && current_window.len() > 1 {
+                // 이전 청크를 best_prop 으로 확정
+                let confirmed_text = current_window[..current_window.len() - 1].join(" ");
+                if !confirmed_text.trim().is_empty() && prev_max_score > 0.0 && !best_prop.is_empty() {
+                    results.push(PlinkoResult {
+                        chunk_text: confirmed_text,
+                        property: best_prop.clone(),
+                        score: prev_max_score,
+                        alternatives: prev_alternatives.clone(),
+                        all_scores: prev_all_scores.clone(),
+                    });
+                }
+
+                // 새 창 시작: 현재 단어로 리셋
+                current_window = vec![word];
+                let reset_text = word.to_string();
+                let reset_emb = embed_fn(reset_text.clone()).await;
+                if !reset_emb.iter().all(|&v| v == 0.0) {
+                    let mut reset_candidates: Vec<(String, f32)> = Vec::new();
+                    for fi in 0..field_names.len() {
+                        let fmt = field_formats.get(fi).map(|s| s.as_str()).unwrap_or("Text");
+                        let value_part = &chunk_meta.value_part;
+                        let passes = match fmt {
+                            "Numeric" => value_part.chars().any(|c| c.is_ascii_digit()),
+                            "Date" => value_part.chars().any(|c| c.is_ascii_digit()),
+                            "Phone" => value_part.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+                            "Link" => value_part.contains('/') || value_part.to_lowercase().starts_with("http"),
+                            "Enum" => true,
+                            "Text" => value_part.chars().any(|c| c.is_alphabetic()),
+                            _ => true,
+                        };
+                        if !passes { continue; }
+                        let own = crate::utils::ai_utils::weighted_max_pool_sim(
+                            &reset_emb,
+                            &field_phrase_embs[fi],
+                            &field_phrase_weights[fi],
+                        );
+                        reset_candidates.push((field_names[fi].clone(), own));
+                    }
+                    reset_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    if !reset_candidates.is_empty() {
+                        prev_max_score = reset_candidates[0].1;
+                        best_prop = reset_candidates[0].0.clone();
+                        prev_alternatives = reset_candidates.iter().skip(1).take(5).cloned().collect();
+                        prev_all_scores = reset_candidates;
+                    }
+                }
+            } else {
+                prev_max_score = current_max;
+                best_prop = current_best;
+                prev_alternatives = current_alternatives;
+                prev_all_scores = candidates;
+            }
+        }
+
+        // ── 잔여 청크 처리 (Sweep) ──
+        if !current_window.is_empty() && prev_max_score > 0.0 && !best_prop.is_empty() {
+            let remaining_text = current_window.join(" ");
+            if !remaining_text.trim().is_empty() {
+                results.push(PlinkoResult {
+                    chunk_text: remaining_text,
+                    property: best_prop.clone(),
+                    score: prev_max_score,
+                    alternatives: prev_alternatives.clone(),
+                    all_scores: prev_all_scores.clone(),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+// =====================================================================
+// 🌟 [PHASE C-2] 인덱싱 전용 EXCLUSIVE ASSIGN — 배타 배정
+// =====================================================================
+// 검색 경로의 exclusive_assign_by_score() 와 동일한 그리디 배타 배정입니다.
+// 한 청크는 하나의 속성만, 한 속성은 하나의 청크만 가질 수 있습니다.
+//
+// PLINKO 결과의 all_scores 로 행렬을 구축하고,
+// double_center_matrix → exclusive_assign_by_score 순서로 처리합니다.
+// =====================================================================
+
+/// [PHASE C-2] PLINKO 결과를 받아 배타 배정을 수행합니다.
+///
+/// # 인자
+///   - plinko_results: plinko_game_for_indexing() 반환값
+///   - field_names:    필드명 배열 (PLINKO 에 전달한 것과 동일)
+///
+/// # 반환
+///   Vec<PlinkoResult> — 배타 배정 후 최종 확정된 결과
+///     (한 속성에 여러 청크가 배정된 경우, 점수가 높은 청크만 생존)
+pub fn exclusive_assign_for_indexing(
+    plinko_results: Vec<PlinkoResult>,
+    field_names: &[String],
+) -> Vec<PlinkoResult> {
+    if plinko_results.is_empty() {
+        return plinko_results;
+    }
+
+    let chunk_count = plinko_results.len();
+    let field_count = field_names.len();
+
+    // ── 행렬 구축: [field][chunk] ──
+    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; chunk_count]; field_count];
+    for (ci, pr) in plinko_results.iter().enumerate() {
+        for (fname, score) in &pr.all_scores {
+            if let Some(fi) = field_names.iter().position(|f| f == fname) {
+                matrix[fi][ci] = *score;
+            }
+        }
+    }
+
+    // ── 이중 센터링 ──
+    let centered = crate::utils::ai_utils::double_center_matrix(&matrix);
+
+    // ── 배타 배정 (점수 우선 그리디) ──
+    let assign = crate::utils::ai_utils::exclusive_assign_by_score(&centered, 0.0, 0.0);
+
+    // ── 배정 결과 → 최종 PlinkoResult 필터링 ──
+    let mut final_results: Vec<PlinkoResult> = Vec::new();
+    let mut assigned_chunks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for (fi, a) in assign.iter().enumerate() {
+        if let Some((ci, own, margin)) = a {
+            if assigned_chunks.contains(ci) {
+                continue;
+            }
+            assigned_chunks.insert(*ci);
+            let mut pr = plinko_results[*ci].clone();
+            pr.property = field_names[fi].clone();
+            pr.score = *own;
+            let _ = margin; // 로그용으로만 사용
+            final_results.push(pr);
+        }
+    }
+
+    // 배정되지 않은 청크는 "unclassified" 로 보존
+    for (ci, pr) in plinko_results.iter().enumerate() {
+        if !assigned_chunks.contains(&ci) {
+            let mut unclassified = pr.clone();
+            unclassified.property = "unclassified".to_string();
+            final_results.push(unclassified);
+        }
+    }
+
+    final_results
+}
+
+// =====================================================================
+// 🌟 [PHASE C - 로그 헬퍼]
+// =====================================================================
+
+/// [PHASE C] PLINKO GAME + EXCLUSIVE ASSIGN 결과를 터미널에 출력합니다.
+pub fn log_plinko_results(results: &[PlinkoResult]) {
+    println!("  🎯 [PLINKO GAME / INDEXING] 확정 결과: {}개 청크", results.len());
+    for (i, r) in results.iter().enumerate() {
+        let alt_str = if r.alternatives.is_empty() {
+            String::from("-")
+        } else {
+            r.alternatives.iter()
+                .map(|(name, score)| format!("{}({:.4})", name, score))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "    [{}] property='{}' | score={:.4} | text='{}' | alts=[{}]",
+            i, r.property, r.score, r.chunk_text, alt_str
+        );
+    }
+}
+
+/// [PHASE B+C - 통합 진입점] PHASE A 출력을 받아 PHASE B + PHASE C 전체 파이프라인을 순차 실행합니다.
 ///
 /// 호출 순서:
-///   1. enrich_chunks_with_metadata()  — 형식 + bias/prejudice + 값 추출
-///   2. nms_battle_for_indexing()      — 텍스트 레벨 중복 제거
-///   3. format_gate_for_indexing()     — 형식 검증 게이트
+///   1. enrich_chunks_with_metadata()       — 형식 + bias/prejudice + 값 추출
+///   2. nms_battle_for_indexing()           — 텍스트 레벨 중복 제거
+///   3. format_gate_for_indexing()          — 형식 검증 게이트 (배정 전)
+///   4. plinko_game_for_indexing()          — Sliding Window Cliff Detection 속성 확정
+///   5. exclusive_assign_for_indexing()     — 배타 배정 (한 청크 = 한 속성)
+///   6. log_plinko_results()                — 결과 로그 출력
 ///
 /// # 인자
 ///   - raw_chunks: split_natural_language_to_chunks() 반환값
 ///   - doc_lang:   문서 언어 코드
 ///   - page_type:  도메인 타입
+///   - field_names: 필드명 배열 (bias.json 에서 추출)
+///   - field_phrase_embs: 필드별 bias 구 임베딩 뱅크
+///   - field_phrase_weights: 필드별 구 가중치
+///   - field_formats: 필드별 형식 문자열 배열
+///   - embed_fn: 텍스트 → 임베딩 벡터 변환 클로저 (비동기)
 ///
 /// # 반환
-///   Vec<ChunkMetadata> — PHASE C(임베딩) + PHASE D(LanceDB 저장) 에 전달할 최종 배열
-pub fn run_phase_b_pipeline(
+///   Vec<ChunkMetadata> — PHASE D(임베딩) + PHASE E(LanceDB 저장) 에 전달할 최종 배열
+pub async fn run_phase_b_pipeline<F, Fut>(
     raw_chunks: &[(String, String)],
     doc_lang: &str,
     page_type: &str,
-) -> Vec<ChunkMetadata> {
+    field_names: &[String],
+    field_phrase_embs: &[Vec<Vec<f32>>],
+    field_phrase_weights: &[Vec<f32>],
+    field_formats: &[String],
+    embed_fn: F,
+) -> Vec<ChunkMetadata>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<f32>>,
+{
+    // ── PHASE B ──
+
     // Step 1: 메타데이터 부여
     let enriched = enrich_chunks_with_metadata(raw_chunks, doc_lang, page_type);
 
     // Step 2: NMS 중복 제거
     let deduplicated = nms_battle_for_indexing(enriched);
 
-    // Step 3: 형식 검증 게이트
+    // Step 3: 형식 검증 게이트 (배정 전)
     let gated = format_gate_for_indexing(deduplicated);
 
-    gated
+    // ── PHASE C: PLINKO GAME ──
+
+    // Step 4: Sliding Window Cliff Detection
+    let plinko_results = plinko_game_for_indexing(
+        &gated,
+        field_names,
+        field_phrase_embs,
+        field_phrase_weights,
+        field_formats,
+        embed_fn,
+    ).await;
+
+    // Step 5: 배타 배정
+    let assigned = exclusive_assign_for_indexing(plinko_results, field_names);
+
+    // Step 6: 로그 출력
+    log_plinko_results(&assigned);
+
+    // ── PHASE C → PHASE D 브릿지 ──
+    // PLINKO 확정 결과를 ChunkMetadata 에 반영합니다.
+    // PLINKO 로 확정된 property 가 기존 패턴 매칭 결과보다 우선합니다.
+    // 단, PLINKO 가 "unclassified" 로 판정한 청크는 기존 패턴 매칭 결과를 유지합니다.
+
+    let mut final_chunks = gated;
+    for pr in &assigned {
+        // 청크 텍스트로 매칭되는 ChunkMetadata 를 찾습니다.
+        if let Some(chunk_meta) = final_chunks.iter_mut().find(|c| {
+            c.chunk_text == pr.chunk_text
+        }) {
+            // PLINKO 가 확정한 속성이 unclassified 가 아니면 덮어씁니다.
+            if pr.property != "unclassified" {
+                if chunk_meta.property != pr.property {
+                    println!(
+                        "  🔄 [PLINKO OVERRIDE] '{}' | '{}' → '{}' (score: {:.4})",
+                        pr.chunk_text, chunk_meta.property, pr.property, pr.score
+                    );
+                }
+                chunk_meta.property = pr.property.clone();
+                chunk_meta.property_format = field_format_to_string(&pr.property);
+            }
+        }
+    }
+
+    final_chunks
 }
