@@ -6736,8 +6736,9 @@ async fn process_task(
             // PHASE A: 문장 단위 분할 + 로그 출력
             let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
             emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
-            for (ci, (ct, cp)) in raw_chunks.iter().enumerate() {
-                emit_term(&format!("    [{}] property='{}' | text='{}'", ci, cp, ct));
+            for (ci, (ct, cp, confirmed)) in raw_chunks.iter().enumerate() {
+                let flag = if *confirmed { "✓" } else { "?" };
+                emit_term(&format!("    [{}] {} property='{}' | text='{}'", ci, flag, cp, ct));
             }
 
             if !raw_chunks.is_empty() {
@@ -6818,6 +6819,8 @@ async fn process_task(
                 ));
 
                 // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                // raw_chunks 는 Vec<(String, String, bool)> 타입으로,
+                // confirmed 플래그가 PLINKO 확인 모드 / NMS 보호 / 배타 배정 우선순위에 사용됩니다.
                 let model_for_embed = model.clone();
                 let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
                     &raw_chunks,
@@ -6837,59 +6840,75 @@ async fn process_task(
                 crate::nl_convert::log_enriched_chunks(&enriched_chunks);
 
                 if !enriched_chunks.is_empty() {
-                    // PHASE D: 임베딩 생성 (청크 텍스트 + 속성 앵커 구별 임베딩)
-                    let chunk_texts: Vec<String> = enriched_chunks.iter()
-                        .map(|c| c.chunk_text.clone())
+                    // ── PHASE D: 임베딩 생성 ──
+                    let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.property != "unclassified")
                         .collect();
 
-                    let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
-                        .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
-
-                    // PHASE E: LanceDB item_chunks 테이블 저장
-                    // 기존 item_id 를 기준으로 이전 청크를 먼저 삭제합니다.
-                    let _ = store.delete_chunks_by_item(&target_id).await;
-
-                    for (ci, chunk_meta) in enriched_chunks.iter().enumerate() {
-                        let chunk_id = format!("{}_{}", target_id, ci);
-
-                        // 구별 임베딩: 청크 벡터 0.7 + 속성 앵커 벡터 0.3
-                        let chunk_vec = &chunk_embs[ci];
-                        let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
-                            &doc_lang, &page_type, &chunk_meta.property,
-                        );
-                        let anchor_emb = model.get_embedding(anchor_text).await
-                            .unwrap_or(vec![0.0; 384]);
-
-                        let mut final_vec = vec![0.0f32; 384];
-                        for d in 0..384 {
-                            final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
-                        }
-                        // L2 정규화
-                        let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-                        if norm > 0.0 {
-                            for d in 0..384 { final_vec[d] /= norm; }
-                        }
-
-                        let _ = store.upsert_chunk(
-                            &chunk_id,
-                            &target_id,
-                            &page_type,
-                            &chunk_meta.chunk_text,
-                            &chunk_meta.property,
-                            &chunk_meta.property_format,
-                            &chunk_meta.value_part,
-                            Some(final_vec),
-                            Some(&task.cc),
-                            Some(&bcc),
-                            Some(&ref_val),
-                            Some(&search_mode),
-                        ).await;
+                    let skipped_count = enriched_chunks.len() - indexable_chunks.len();
+                    if skipped_count > 0 {
+                        emit_term(&format!(
+                            "  🚫 [PHASE D FILTER] unclassified 청크 {}개 인덱싱 제외",
+                            skipped_count
+                        ));
                     }
 
-                    emit_term(&format!(
-                        "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 | table='item_chunks'",
-                        target_id, enriched_chunks.len()
-                    ));
+                    if indexable_chunks.is_empty() {
+                        emit_term("  ⚠️ [PHASE D] 인덱싱 대상 청크가 없습니다. 건너뜁니다.");
+                    } else {
+                        let chunk_texts: Vec<String> = indexable_chunks.iter()
+                            .map(|(_, c)| c.chunk_text.clone())
+                            .collect();
+
+                        let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+                        // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
+                        let _ = store.delete_chunks_by_item(&target_id).await;
+
+                        for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+                            let chunk_id = format!("{}_{}", target_id, ci);
+
+                            // 구별 임베딩: 청크 벡터 0.7 + 속성 앵커 벡터 0.3
+                            let chunk_vec = &chunk_embs[ei];
+                            let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
+                                &doc_lang, &page_type, &chunk_meta.property,
+                            );
+                            let anchor_emb = model.get_embedding(anchor_text).await
+                                .unwrap_or(vec![0.0; 384]);
+
+                            let mut final_vec = vec![0.0f32; 384];
+                            for d in 0..384 {
+                                final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
+                            }
+                            // L2 정규화
+                            let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > 0.0 {
+                                for d in 0..384 { final_vec[d] /= norm; }
+                            }
+
+                            let _ = store.upsert_chunk(
+                                &chunk_id,
+                                &target_id,
+                                &page_type,
+                                &chunk_meta.chunk_text,
+                                &chunk_meta.property,
+                                &chunk_meta.property_format,
+                                &chunk_meta.value_part,
+                                Some(final_vec),
+                                Some(&task.cc),
+                                Some(&bcc),
+                                Some(&ref_val),
+                                Some(&search_mode),
+                            ).await;
+                        }
+
+                        emit_term(&format!(
+                            "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | table='item_chunks'",
+                            target_id, indexable_chunks.len(), enriched_chunks.len()
+                        ));
+                    }
                 }
             }
         }
@@ -7302,8 +7321,9 @@ async fn process_task(
                     // PHASE A: 문장 단위 분할 + 로그 출력
                     let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
                     emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
-                    for (ci, (ct, cp)) in raw_chunks.iter().enumerate() {
-                        emit_term(&format!("    [{}] property='{}' | text='{}'", ci, cp, ct));
+                    for (ci, (ct, cp, confirmed)) in raw_chunks.iter().enumerate() {
+                        let flag = if *confirmed { "✓" } else { "?" };
+                        emit_term(&format!("    [{}] {} property='{}' | text='{}'", ci, flag, cp, ct));
                     }
 
                     if !raw_chunks.is_empty() {
@@ -7377,6 +7397,9 @@ async fn process_task(
                         }
 
                         // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                        // raw_chunks: Vec<(String, String, bool)> — confirmed 플래그 포함
+                        // 전처리 경로에서는 JSON 구조 패턴 매칭으로 확정된 청크가
+                        // PLINKO 확인 모드에서 슬라이딩 윈도우를 건너뛰고 기존 property 를 유지합니다.
                         let model_for_embed = model.clone();
                         let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
                             &raw_chunks,
@@ -7395,56 +7418,73 @@ async fn process_task(
                         ).await;
 
                         if !enriched_chunks.is_empty() {
-                            // PHASE D: 임베딩 생성
-                            let chunk_texts: Vec<String> = enriched_chunks.iter()
-                                .map(|c| c.chunk_text.clone())
+                            // ── PHASE D: 임베딩 생성 ──
+                            let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.property != "unclassified")
                                 .collect();
 
-                            let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
-                                .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
-
-                            // PHASE E: LanceDB item_chunks 테이블 저장
-                            let _ = store.delete_chunks_by_item(&hashed_item_id).await;
-
-                            for (ci, chunk_meta) in enriched_chunks.iter().enumerate() {
-                                let chunk_id = format!("{}_{}", hashed_item_id, ci);
-
-                                let chunk_vec = &chunk_embs[ci];
-                                let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
-                                    &doc_lang, &page_type, &chunk_meta.property,
-                                );
-                                let anchor_emb = model.get_embedding(anchor_text).await
-                                    .unwrap_or(vec![0.0; 384]);
-
-                                let mut final_vec = vec![0.0f32; 384];
-                                for d in 0..384 {
-                                    final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
-                                }
-                                let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                if norm > 0.0 {
-                                    for d in 0..384 { final_vec[d] /= norm; }
-                                }
-
-                                let _ = store.upsert_chunk(
-                                    &chunk_id,
-                                    &hashed_item_id,
-                                    &page_type,
-                                    &chunk_meta.chunk_text,
-                                    &chunk_meta.property,
-                                    &chunk_meta.property_format,
-                                    &chunk_meta.value_part,
-                                    Some(final_vec),
-                                    Some(&task.cc),
-                                    Some(&bcc),
-                                    Some(&ref_val),
-                                    Some(&search_mode),
-                                ).await;
+                            let skipped_count = enriched_chunks.len() - indexable_chunks.len();
+                            if skipped_count > 0 {
+                                emit_term(&format!(
+                                    "  🚫 [PHASE D FILTER] unclassified 청크 {}개 인덱싱 제외",
+                                    skipped_count
+                                ));
                             }
 
-                            emit_term(&format!(
-                                "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개",
-                                hashed_item_id, enriched_chunks.len()
-                            ));
+                            if indexable_chunks.is_empty() {
+                                emit_term("  ⚠️ [PHASE D] 인덱싱 대상 청크가 없습니다. 건너뜁니다.");
+                            } else {
+                                let chunk_texts: Vec<String> = indexable_chunks.iter()
+                                    .map(|(_, c)| c.chunk_text.clone())
+                                    .collect();
+
+                                let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+                                // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
+                                let _ = store.delete_chunks_by_item(&hashed_item_id).await;
+
+                                for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+                                    let chunk_id = format!("{}_{}", hashed_item_id, ci);
+
+                                    let chunk_vec = &chunk_embs[ei];
+                                    let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
+                                        &doc_lang, &page_type, &chunk_meta.property,
+                                    );
+                                    let anchor_emb = model.get_embedding(anchor_text).await
+                                        .unwrap_or(vec![0.0; 384]);
+
+                                    let mut final_vec = vec![0.0f32; 384];
+                                    for d in 0..384 {
+                                        final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
+                                    }
+                                    let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                    if norm > 0.0 {
+                                        for d in 0..384 { final_vec[d] /= norm; }
+                                    }
+
+                                    let _ = store.upsert_chunk(
+                                        &chunk_id,
+                                        &hashed_item_id,
+                                        &page_type,
+                                        &chunk_meta.chunk_text,
+                                        &chunk_meta.property,
+                                        &chunk_meta.property_format,
+                                        &chunk_meta.value_part,
+                                        Some(final_vec),
+                                        Some(&task.cc),
+                                        Some(&bcc),
+                                        Some(&ref_val),
+                                        Some(&search_mode),
+                                    ).await;
+                                }
+
+                                emit_term(&format!(
+                                    "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중)",
+                                    hashed_item_id, indexable_chunks.len(), enriched_chunks.len()
+                                ));
+                            }
                         }
                     }
                 }
