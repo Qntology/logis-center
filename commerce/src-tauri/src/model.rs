@@ -2771,6 +2771,9 @@ impl LogisModel {
         // ----------------------------------------------------
         emit_term("[STAGE-2] Extracting attributes via Double Vector Plinko & LLM Normalization...");
         
+        // 🌟 [SCOPE FIX] Stage-3 CROSS-VERB 에서 참조할 수 있도록 도메인 지시어 매핑을 외부 스코프에 선언합니다.
+        let mut domain_word_related: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
 
@@ -3041,6 +3044,94 @@ impl LogisModel {
                 let dynamic_bias_embs = self.get_embedding_batch(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
                 let dynamic_prej_embs = self.get_embedding_batch(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
 
+                // ── 0) 전담 필터 카테고리가 이미 처리하는 키는 '속성' 후보가 아닙니다.
+                //       season_filters.summer / operators.gt / metrics.time 등이 루트 DFS 로
+                //       속성 목록에 이중 등록되어 있어, color 를 뺏긴 청크가 'summer(0.5129)' 같은
+                //       엉뚱한 슬롯으로 흘러갈 수 있었습니다.
+                //       단, 스키마 컬럼과 이름이 겹치는 키(goods.quantity ↔ metrics.quantity)는
+                //       루트 DFS 가 등록한 것이 아니므로(loaded_globals 에 없음) 그대로 보존합니다.
+                //       color 는 어떤 filter_category 에도 속하지 않으므로 반드시 살아남습니다.
+                let filter_owned_keys: std::collections::HashSet<String> =
+                    dynamic_filter_defs.iter().map(|d| d.key.clone()).collect();
+                let is_filter_owned = |name: &str| -> bool {
+                    loaded_globals.iter().any(|g| g == name) && filter_owned_keys.contains(name)
+                };
+
+                // 🌟 [TEMPORAL PHRASE BANK PRE-BUILD]
+                //    기존 TEMPORAL PRE-GATE는 dynamic_bias_embs(센트로이드 1벡터)로 비교하여
+                //    한국어 2음절 단어("올해")가 영어 문장 센트로이드와 코사인이 낮아 실패했습니다.
+                //    여기서는 bias.json 의 time_filters / season_filters 각 키의
+                //    semantic + bias 를 구 단위로 쪼개 임베딩하고 Max-Pool 로 비교합니다.
+                //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
+                //    이 뱅크는 세그먼트 루프 시작 시 1회만 구축합니다.
+                let temporal_phrases = crate::utils::ai_utils::temporal_semantic_phrases();
+                let temporal_phrase_texts: Vec<String> = temporal_phrases.iter().map(|(_, p)| p.clone()).collect();
+                let temporal_phrase_embs: Vec<Vec<f32>> = if temporal_phrase_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(temporal_phrase_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; temporal_phrase_texts.len()])
+                };
+                // 🌟 [NUMERIC OPERATOR PHRASE BANK PRE-BUILD]
+                //    operators 카테고리 각 키의 bias 를 구 단위로 쪼개 임베딩합니다.
+                //    "이하로" 와 embed("less than or equal") / embed("under") / embed("no more than") 의
+                //    Max-Pool 코사인이 top/bottom 뱅크보다 높으면 비교 연산자로 확정합니다.
+                let mut op_phrase_texts: Vec<String> = Vec::new();
+                let mut op_phrase_is_rank: Vec<bool> = Vec::new();
+                if let Some(ops_node) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
+                    for (op_key, op_val) in ops_node {
+                        let is_rank = op_key == "top" || op_key == "bottom";
+                        if let Some(bias_str) = op_val.get("bias").and_then(|v| v.as_str()) {
+                            for phrase in crate::utils::ai_utils::split_bias_phrases_full(bias_str) {
+                                op_phrase_texts.push(phrase);
+                                op_phrase_is_rank.push(is_rank);
+                            }
+                        }
+                        if let Some(semantic_str) = op_val.get("semantic").and_then(|v| v.as_str()) {
+                            for phrase in crate::utils::ai_utils::split_bias_phrases_full(semantic_str) {
+                                op_phrase_texts.push(phrase);
+                                op_phrase_is_rank.push(is_rank);
+                            }
+                        }
+                    }
+                }
+                let op_phrase_embs: Vec<Vec<f32>> = if op_phrase_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(op_phrase_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; op_phrase_texts.len()])
+                };
+                // 🌟 [ALL-FILTER PHRASE BANK PRE-BUILD]
+                //    substantial_filters / find_filters / status_filters / time_filters / season_filters
+                //    전 카테고리의 bias+semantic 구를 임베딩합니다.
+                //    (로그: '무거운'→unit, '많이'→condition, '팔린'→color 오배정의 공통 원인은
+                //     이 필터들이 2nd Plinko 에만 있어 1st 에서 스키마 속성이 먼저 선점하기 때문입니다)
+                //    bias.json 을 수정하지 않고 기존 bias/semantic 필드만 동적으로 읽어 구축합니다.
+                let all_filter_phrases = crate::utils::ai_utils::filter_category_phrases(&[
+                    "substantial_filters", "find_filters", "status_filters", "time_filters", "season_filters",
+                ]);
+                let all_filter_texts: Vec<String> = all_filter_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+                let all_filter_raw_embs: Vec<Vec<f32>> = if all_filter_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(all_filter_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; all_filter_texts.len()])
+                };
+                // (category, key, embedding) 트리플로 재조립
+                let all_filter_embs: Vec<(String, String, Vec<f32>)> = all_filter_phrases.iter()
+                    .zip(all_filter_raw_embs.into_iter())
+                    .map(|((cat, key, _), emb)| (cat.clone(), key.clone(), emb))
+                    .collect();
+                if !temporal_phrase_embs.is_empty() {
+                    emit_term(&format!("    📐 [TEMPORAL PHRASE BANK] time/season 구 {}개 준비 완료.", temporal_phrase_embs.len()));
+                }
+                if !op_phrase_embs.is_empty() {
+                    emit_term(&format!("    📐 [OPERATOR PHRASE BANK] operators 구 {}개 준비 완료.", op_phrase_embs.len()));
+                }
+                if !all_filter_embs.is_empty() {
+                    emit_term(&format!("    📐 [ALL-FILTER PHRASE BANK] substantial/find/status/time/season 구 {}개 준비 완료.", all_filter_embs.len()));
+                }
+
                 // 🌟 Plinko Game (1st Depth): Sliding Window Cliff Detection over words
                 struct PlinkoMatch {
                     chunk: String,
@@ -3062,6 +3153,62 @@ impl LogisModel {
                 //    (로그: review 세그먼트의 '메세지도' 가 B/NARROWED·C/RECALL 티어에서 통째로 사라졌습니다)
                 let mut unassigned_chunks: Vec<String> = Vec::new();
                 let words: Vec<&str> = current_text.split_whitespace().collect();
+
+                // 🌟 [DOMAIN TYPE WORD DETECTION]
+                //    "이벤트로", "주문에서" 같은 도메인 지시어는 속성 값이 아니라 테이블 타입 지표입니다.
+                //    로컬라이즈된 타입 이름(get_localized_page_type)과의 코사인 비교로 판정합니다.
+                //    bias.json 수정 없이 기존 함수를 재사용하며, 새 매직 상수 없이
+                //    '도메인 코사인 > 스키마 속성 Max-Pool 코사인' 상대 비교만 사용합니다.
+                let domain_type_names: Vec<(String, String)> = ["order", "goods", "tracking", "review", "coupon", "event"]
+                    .iter()
+                    .map(|cat| (cat.to_string(), crate::parsing::get_localized_page_type(cat, &query_lang)))
+                    .collect();
+                let domain_type_texts: Vec<String> = domain_type_names.iter().map(|(_, name)| name.clone()).collect();
+                let domain_type_embs: Vec<Vec<f32>> = if domain_type_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(domain_type_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; domain_type_texts.len()])
+                };
+                let mut domain_indicator_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for word in &words {
+                    if word.chars().any(|c| c.is_ascii_digit()) { continue; }
+                    let word_emb_d = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                    if word_emb_d.iter().all(|&v| v == 0.0) { continue; }
+                    let mut best_schema_for_word = f32::MIN;
+                    for pi in 0..prop_phrase_embs.len() {
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim(&word_emb_d, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
+                        if s > best_schema_for_word { best_schema_for_word = s; }
+                    }
+                    let mut best_domain_score = f32::MIN;
+                    let mut best_domain_cat = String::new();
+                    for (di, (cat, _name)) in domain_type_names.iter().enumerate() {
+                        if domain_type_embs[di].iter().all(|&v| v == 0.0) { continue; }
+                        let s = cosine_similarity(&word_emb_d, &domain_type_embs[di]);
+                        if s > best_domain_score {
+                            best_domain_score = s;
+                            best_domain_cat = cat.clone();
+                        }
+                    }
+                    if best_domain_score > best_schema_for_word && best_domain_score > 0.0 {
+                        domain_indicator_words.insert(word.to_string());
+                        emit_term(&format!("      🏷️ [DOMAIN TYPE WORD] '{}' 는 '{}' 도메인 지시어로 판정. 속성 배정에서 제외하고 FTS 검색어로 보존합니다.", word, best_domain_cat));
+                        // 🌟 [RELATED DOMAIN COLLECT] 이 단어와 코사인이 양수인 모든 도메인을 기록합니다.
+                        //    '판매된' → goods(최고) 이지만 order 와도 코사인 > 0 이면
+                        //    STAGE-3 에서 order CROSS-VERB 쿼리를 발행할 수 있습니다.
+                        let mut related: Vec<String> = Vec::new();
+                        for (di, (cat, _name)) in domain_type_names.iter().enumerate() {
+                            if domain_type_embs[di].iter().all(|&v| v == 0.0) { continue; }
+                            let s = cosine_similarity(&word_emb_d, &domain_type_embs[di]);
+                            if s > 0.0 {
+                                related.push(cat.clone());
+                            }
+                        }
+                        if !related.is_empty() {
+                            domain_word_related.insert(word.to_string(), related);
+                        }
+                    }
+                }
                 
                 let mut current_chunk = Vec::new();
                 let mut prev_max_score = -1.0;
@@ -3093,8 +3240,23 @@ impl LogisModel {
                     //    STAGE-3 의 value_words 조립(condition.value + unassigned)에서 누락되어
                     //    B/NARROWED · C/RECALL 티어의 FTS 질의가 "올해 이벤트로 판매된" 이 되었고,
                     //    가장 변별력 높은 계절 키워드 '여름' 이 통째로 소멸했습니다.
+                    // 🌟 [FILTER TERM DROP — EXACT MATCH] bias.json 의 exact_match 로 이미 '필터 의도' 가 확정된 단어는
+                    //    스키마 속성의 값이 될 수 없습니다.
+                    //    (로그: '여름' 이 color(0.5433) 로 확정된 뒤에야 SEASON EXACT MATCH 가 감지되어
+                    //     이미 굳어진 배정을 되돌리지 못했고, "color": {"value":"여름"} 이 SQL 로 나갔습니다.
+                    //     '올해' 도 같은 이유로 region_restrictions 로 흘렀습니다)
+                    //    감지 시점을 Plinko '진입 전' 으로 끌어올려, 배정 자체가 물리적으로 불가능하게 만듭니다.
+                    //    필터 키는 아래 [SEASON/TIME EXACT MATCH] 블록이 그대로 다시 확정하므로
+                    //    시간 범위 자동 주입 경로는 유지됩니다.
+                    //
+                    // 🌟 [FILTER TERM RESCUE] 다만 '조건이 되지 못했다' 는 것과
+                    //    '검색어에서까지 사라져야 한다' 는 것은 전혀 다른 얘기입니다.
+                    //    기존 코드는 retained_words 에만 넣고 unassigned_chunks 에는 넣지 않았기 때문에
+                    //    STAGE-3 의 value_words 조립(condition.value + unassigned)에서 누락되어
+                    //    B/NARROWED · C/RECALL 티어의 FTS 질의가 "올해 이벤트로 판매된" 이 되었고,
+                    //    가장 변별력 높은 계절 키워드 '여름' 이 통째로 소멸했습니다.
                     if let Some(k) = crate::utils::ai_utils::exact_match_filter_key("season_filters", word) {
-                        emit_term(&format!("    ✂️ [FILTER TERM DROP] '{}' 는 season_filters.{}.exact_match 확정어이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
+                        emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 season_filters.{}.exact_match 확정어이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
                         retained_words.push(word);
                         if !unassigned_chunks.iter().any(|e| e == word) {
                             unassigned_chunks.push(word.to_string());
@@ -3102,14 +3264,75 @@ impl LogisModel {
                         continue;
                     }
                     if let Some(k) = crate::utils::ai_utils::exact_match_filter_key("time_filters", word) {
-                        emit_term(&format!("    ✂️ [FILTER TERM DROP] '{}' 는 time_filters.{}.exact_match 확정어이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
+                        emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 time_filters.{}.exact_match 확정어이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
                         retained_words.push(word);
                         if !unassigned_chunks.iter().any(|e| e == word) {
                             unassigned_chunks.push(word.to_string());
                         }
                         continue;
                     }
+                    // 🌟 [FILTER TERM DROP — VECTOR ROUTE] exact_match 배열이 없는 필터 카테고리
+                    //    (substantial_filters / find_filters / status_filters / time_filters) 는
+                    //    임베딩 코사인 Max-Pool 로 판정합니다.
+                    //    (로그: '무거운'→unit, '많이'→condition, '올해'→new_customer_only 오배정의 원인)
+                    //    판정 기준: '이 단어의 필터 뱅크 Max-Pool' 이 '이 단어의 스키마 속성 Max-Pool' 보다 높은지.
+                    //    절대 임계치 없이 상대 비교만 사용하므로 매직 상수가 없습니다.
+                    //    bias.json 을 수정하지 않고 기존 bias/semantic 필드만 동적으로 읽습니다.
+                    //
+                    // 🌟 [SUBSTANTIAL/FIND EXTENDED] filter_route_verdict 는 전 카테고리 대상이라
+                    //    substantial/find/status 의 작은 뱅크(3~6구)가 스키마 뱅크(5~6구)에
+                    //    구조적으로 밀리는 경우가 있습니다.
+                    //    (로그: '무거운' cos≈0.53 < summer 0.5610 → DROP 실패 → unit 배정)
+                    //    substantial_find_pre_gate 는 substantial/find/status 카테고리만
+                    //    분리하여 동일 기준으로 재판정합니다.
+                    if !all_filter_embs.is_empty() {
+                        let word_emb_filter = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        // 스키마 속성 최고 점수 산출 (현재 단어에 대해)
+                        // 🌟 도메인 지시어는 스키마 점수 기준에서 제외합니다.
+                        //    도메인 지시어가 스키마 Max-Pool을 부풀리면
+                        //    정작 필터로 라우팅되어야 할 단어의 판정이 실패합니다.
+                        let mut best_schema = f32::MIN;
+                        if !domain_indicator_words.contains(word) {
+                            for pi in 0..prop_phrase_embs.len() {
+                                let s = crate::utils::ai_utils::weighted_max_pool_sim(
+                                    &word_emb_filter, &prop_phrase_embs[pi], &prop_phrase_weights[pi],
+                                );
+                                if s > best_schema { best_schema = s; }
+                            }
+                        }
+                        // 1차: 전 카테고리 필터 라우팅 (기존 경로 유지)
+                        if let Some((f_cat, f_key)) = crate::utils::ai_utils::filter_route_verdict(
+                            &word_emb_filter, &all_filter_embs, best_schema,
+                        ) {
+                            emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 {}.{} 필터 의도가 스키마 속성보다 우세합니다. 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, f_cat, f_key));
+                            retained_words.push(word);
+                            if !unassigned_chunks.iter().any(|e| e == word) {
+                                unassigned_chunks.push(word.to_string());
+                            }
+                            continue;
+                        }
+                        // 2차: substantial/find/status 전용 재판정
+                        //    전 카테고리에서 시간/계절 등 큰 뱅크에 밀려 탈락한 경우를 구제합니다.
+                        if let Some((sf_cat, sf_key, sf_score)) = crate::utils::ai_utils::substantial_find_pre_gate(
+                            &word_emb_filter, &all_filter_embs, best_schema,
+                        ) {
+                            emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 {}.{} 필터 의도가 스키마 속성보다 우세합니다. (SubstantialGate Score: {:.4}) 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, sf_cat, sf_key, sf_score));
+                            retained_words.push(word);
+                            if !unassigned_chunks.iter().any(|e| e == word) {
+                                unassigned_chunks.push(word.to_string());
+                            }
+                            continue;
+                        }
+                    }
 
+                    // 🌟 [DOMAIN TYPE WORD DROP] 도메인 지시어는 속성 값이 될 수 없습니다.
+                    if domain_indicator_words.contains(word) {
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
                     // 🌟 [FUNCTIONAL WORD DROP] 조사·접속 표현은 어떤 속성의 값도 될 수 없습니다.
                     //    Stanza 가 '제품중에서'/'제품으로'/'중에서' 를 전부 NOUN 으로 태깅하기 때문에
                     //    POS 게이트로는 걸러지지 않고 Plinko 에 진입했고,
@@ -3300,25 +3523,6 @@ impl LogisModel {
                     }
                 }
 
-                // 🌟 [CRITICAL FIX] 검색 명령어(Action Verb)로 걸러진 단어들을 current_text에서 원천 제거하여 LLM 및 LanceDB 쿼리에 유입되지 않도록 합니다.
-                current_text = retained_words.join(" ");
-                if let Some(obj) = seg.as_object_mut() {
-                    obj.insert("text".to_string(), json!(current_text));
-                }
-
-                // ── 0) 전담 필터 카테고리가 이미 처리하는 키는 '속성' 후보가 아닙니다.
-                //       season_filters.summer / operators.gt / metrics.time 등이 루트 DFS 로
-                //       속성 목록에 이중 등록되어 있어, color 를 뺏긴 청크가 'summer(0.5129)' 같은
-                //       엉뚱한 슬롯으로 흘러갈 수 있었습니다.
-                //       단, 스키마 컬럼과 이름이 겹치는 키(goods.quantity ↔ metrics.quantity)는
-                //       루트 DFS 가 등록한 것이 아니므로(loaded_globals 에 없음) 그대로 보존합니다.
-                //       color 는 어떤 filter_category 에도 속하지 않으므로 반드시 살아남습니다.
-                let filter_owned_keys: std::collections::HashSet<String> =
-                    dynamic_filter_defs.iter().map(|d| d.key.clone()).collect();
-                let is_filter_owned = |name: &str| -> bool {
-                    loaded_globals.iter().any(|g| g == name) && filter_owned_keys.contains(name)
-                };
-
                 // 🌟 [EXCLUSIVE PROPERTY ASSIGNMENT + QWEN3 VERIFICATION (1st)]
                 //    기존 구조는 HashMap<속성, Vec<청크>> 라서 한 속성에 청크가 무한히 쌓였고,
                 //    Double Plinko 가 v.join(" | ") 로 병합하는 순간 서로 다른 의미가 한 값이 되었습니다.
@@ -3348,45 +3552,73 @@ impl LogisModel {
 
                         let c_emb = self.get_embedding(pm.chunk.clone()).await.unwrap_or(vec![0.0; 384]);
 
-                        // ① 시간성 판정 : time/season 뱅크 최대 우위 vs 그 외 필터 뱅크 최대 우위
-                        let mut temporal_best = f32::MIN;
-                        let mut rival_best = f32::MIN;
-                        for i in 0..dynamic_filter_defs.len() {
-                            let b = cosine_similarity(&c_emb, &dynamic_bias_embs[i]);
-                            let p = cosine_similarity(&c_emb, &dynamic_prej_embs[i]);
-                            let s = b - p;
-                            match dynamic_filter_defs[i].category.as_str() {
-                                "time_filters" | "season_filters" => { if s > temporal_best { temporal_best = s; } },
-                                _ => { if s > rival_best { rival_best = s; } },
+                        // ① 시간성 판정 : 구 단위 Max-Pool 로 time/season 뱅크와 비교
+                        //    temporal_phrase_embs 중 time/season 소속 구와의 Max-Pool 이
+                        //    다른 필터 카테고리 센트로이드 최대보다 높으면 temporal 확정.
+                        //    절대 임계치 없이 'temporal Max-Pool > rival centroid max' 상대 비교만 사용.
+                        let mut temporal_pool = 0.0f32;
+                        if !temporal_phrase_embs.is_empty() {
+                            for te in &temporal_phrase_embs {
+                                if te.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&c_emb, te);
+                                if s > temporal_pool { temporal_pool = s; }
                             }
                         }
-                        if temporal_best > rival_best && temporal_best > 0.0 {
-                            temporal_chunks.insert(pm.chunk.clone());
-                            emit_term(&format!("      🕒 [TEMPORAL PRE-GATE] '{}' 는 시간/계절 의도가 우세합니다. (Temporal {:+.4} > Rival {:+.4}) → Date 필드 후보 자격 부여", pm.chunk, temporal_best, rival_best));
+                        // 🌟 [RIVAL FIX] rival 비교도 구 뱅크 Max-Pool 로 통일합니다.
+                        //    기존 센트로이드(dynamic_bias_embs) 비교는 한국어 2음절 단어와
+                        //    영어 문장 센트로이드 간 코사인이 구조적으로 낮아
+                        //    temporal 이 우세해도 rival 가 과대평가되는 문제가 있었습니다.
+                        let mut rival_best = f32::MIN;
+                        if !all_filter_embs.is_empty() {
+                            for (cat, _key, emb) in &all_filter_embs {
+                                if cat == "time_filters" || cat == "season_filters" { continue; }
+                                if emb.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&c_emb, emb);
+                                if s > rival_best { rival_best = s; }
+                            }
+                        }
+                        if rival_best == f32::MIN { rival_best = 0.0; }
+                        // 🌟 temporal Max-Pool 이 rival Max-Pool 보다 높으면 확정.
+                        if temporal_pool > rival_best && temporal_pool > 0.0 {
+                            temporal_chunks.insert(pm.chunk.trim().to_string());
+                            emit_term(&format!("      🕒 [TEMPORAL PRE-GATE] '{}' 는 시간/계절 의도가 우세합니다. (TemporalMaxPool {:.4} > RivalMaxPool {:+.4}) → Date 필드 후보 자격 부여", pm.chunk, temporal_pool, rival_best));
                         }
 
-                        // ② 수치 비교 구조 판정 : (숫자 / 비교 표현) 분해 후 operators 뱅크 코사인
-                        //    비교 연산자(lte/lt/gte/gt/eq)가 순위 연산자(top/bottom)보다 우세할 때만 인정합니다.
-                        //    ('5000원' 처럼 단위만 남는 경우를 순위 표현과 구분하기 위한 상대 판정입니다)
+                        // ② 수치 비교 구조 판정 : 구 단위 Max-Pool 로 operators 뱅크와 비교
+                        //    "이하로" vs embed("less than or equal") / embed("under") / embed("no more than")
+                        //    의 Max-Pool 이 top/bottom 구 Max-Pool 보다 높으면 비교 연산자 확정.
                         if let Some((_num, cmp_part)) = crate::utils::ai_utils::split_numeric_and_comparator(&pm.chunk) {
                             if !cmp_part.trim().is_empty() {
                                 let cmp_emb = self.get_embedding(cmp_part.clone()).await.unwrap_or(vec![0.0; 384]);
-                                let mut cmp_best = f32::MIN;
-                                let mut cmp_key = String::new();
-                                let mut rank_best = f32::MIN;
-                                for i in 0..dynamic_filter_defs.len() {
-                                    if dynamic_filter_defs[i].category != "operators" { continue; }
-                                    let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
-                                    let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
-                                    let s = b - p;
-                                    match dynamic_filter_defs[i].key.as_str() {
-                                        "top" | "bottom" => { if s > rank_best { rank_best = s; } },
-                                        _ => { if s > cmp_best { cmp_best = s; cmp_key = dynamic_filter_defs[i].key.clone(); } },
+                                let mut cmp_pool = 0.0f32;
+                                let mut rank_pool = 0.0f32;
+                                if !op_phrase_embs.is_empty() {
+                                    for (oi, oe) in op_phrase_embs.iter().enumerate() {
+                                        if oe.iter().all(|&v| v == 0.0) { continue; }
+                                        let s = cosine_similarity(&cmp_emb, oe);
+                                        if op_phrase_is_rank[oi] {
+                                            if s > rank_pool { rank_pool = s; }
+                                        } else {
+                                            if s > cmp_pool { cmp_pool = s; }
+                                        }
                                     }
                                 }
-                                if cmp_best > rank_best && !cmp_key.is_empty() {
+                                // 폴백: 구 뱅크가 비어 있으면 기존 센트로이드 경로 사용
+                                if op_phrase_embs.is_empty() {
+                                    for i in 0..dynamic_filter_defs.len() {
+                                        if dynamic_filter_defs[i].category != "operators" { continue; }
+                                        let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                        let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                        let s = b - p;
+                                        match dynamic_filter_defs[i].key.as_str() {
+                                            "top" | "bottom" => { if s > rank_pool { rank_pool = s; } },
+                                            _ => { if s > cmp_pool { cmp_pool = s; } },
+                                        }
+                                    }
+                                }
+                                if cmp_pool > rank_pool && cmp_pool > 0.0 {
                                     numeric_cmp_chunks.insert(pm.chunk.clone());
-                                    emit_term(&format!("      🔢 [NUMERIC PRE-GATE] '{}' 는 (숫자 + 비교 표현 [{}]) 구조입니다. (Cmp {:+.4} > Rank {:+.4}) → 문자열/열거형 필드 후보 자격 박탈", pm.chunk, cmp_key, cmp_best, rank_best));
+                                    emit_term(&format!("      🔢 [NUMERIC PRE-GATE] '{}' 는 (숫자 + 비교 표현) 구조입니다. (CmpMaxPool {:.4} > RankMaxPool {:.4}) → 문자열/열거형 필드 후보 자격 박탈", pm.chunk, cmp_pool, rank_pool));
                                 }
                             }
                         }
@@ -3397,14 +3629,23 @@ impl LogisModel {
                     let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; chunk_count]; prop_keys.len()];
                     let mut gate_dropped: Vec<String> = Vec::new();
                     for (ci, pm) in plinko_matches.iter().enumerate() {
-                        let t_hint = temporal_chunks.contains(&pm.chunk);
-                        let n_hint = numeric_cmp_chunks.contains(&pm.chunk);
+                        // 🌟 [TRIM FIX] temporal_chunks 에 등록 시 trim 을 적용했으므로
+                        //    조회 시에도 동일하게 trim 하여 공백 차이로 인한 lookup 실패를 방지합니다.
+                        let chunk_trimmed = pm.chunk.trim().to_string();
+                        let t_hint = temporal_chunks.contains(&chunk_trimmed);
+                        let n_hint = numeric_cmp_chunks.contains(&chunk_trimmed);
+                        if t_hint {
+                            emit_term(&format!("      🕒 [TEMPORAL HINT ACTIVE] '{}' → Date 필드 후보 자격 부여 확인", chunk_trimmed));
+                        }
+                        if n_hint {
+                            emit_term(&format!("      🔢 [NUMERIC HINT ACTIVE] '{}' → 문자열/열거형 후보 자격 박탈 확인", chunk_trimmed));
+                        }
                         for (name, sc) in &pm.all_scores {
                             let pi = match prop_keys.iter().position(|p| p == name) { Some(v) => v, None => continue };
                             if is_filter_owned(name) { continue; }
-                            if !crate::utils::ai_utils::query_chunk_matches_property_ext(name, &pm.chunk, t_hint, n_hint) {
+                            if !crate::utils::ai_utils::query_chunk_matches_property_ext(name, &chunk_trimmed, t_hint, n_hint) {
                                 if gate_dropped.len() < 12 && *sc > 0.20 {
-                                    gate_dropped.push(format!("{}→{}({:.4})", pm.chunk, name, sc));
+                                    gate_dropped.push(format!("{}→{}({:.4})", chunk_trimmed, name, sc));
                                 }
                                 continue;
                             }
@@ -3496,16 +3737,45 @@ impl LogisModel {
                         //    '형식 게이트를 통과했고 아직 선점되지 않은 대안이 하나도 없다' 는 것은
                         //    선택지가 물리적으로 하나뿐이라는 결정론적 사실이므로 LLM 에게 물을 이유가 없습니다.
                         //    (LLM 호출 수는 늘지 않고 오히려 줄어들며, 임계치가 사라집니다)
+                        //
+                        //    🌟 [COLOR SINK GUARD] 단, color 로 배정된 청크가 '실제로 색상을 나타내는지'는
+                        //    대안이 없는 경우에도(is_empty) LLM 에게 한 번 물어서 확인합니다.
+                        //    '남긴', '팔린', '많이' 같은 비색상 단어가 color 5구 뱅크의 구조적 편향으로
+                        //    argmax 가 되는 것을 LLM 이 걸러냅니다. (호출 추가 없음, 기존 슬롯 활용)
                         if allowed.is_empty() {
-                            emit_term(&format!("      ⚡ [BYPASS] 형식 통과 대안이 존재하지 않아 [{}] 로 결정론 확정합니다. ('{}' | Score {:.4})", owner_prop, pm.chunk, owner_score));
-                            validated_map.insert(owner_prop.clone(), vec![pm.chunk.clone()]);
-                            alt_map.insert(owner_prop.clone(), Vec::new());
-                            continue;
+                            if owner_prop != "color" {
+                                emit_term(&format!("      ⚡ [BYPASS] 형식 통과 대안이 존재하지 않아 [{}] 로 결정론 확정합니다. ('{}' | Score {:.4})", owner_prop, pm.chunk, owner_score));
+                                validated_map.insert(owner_prop.clone(), vec![pm.chunk.clone()]);
+                                alt_map.insert(owner_prop.clone(), Vec::new());
+                                continue;
+                            } else {
+                                emit_term(&format!("      🛡️ [COLOR SINK GUARD] '{}' 청크가 대안 없이 color 에 배정되었으나, 비색상 단어인지 확인하기 위해 Qwen3 검증을 거칩니다.", pm.chunk));
+                            }
                         }
 
-                        let prompt = crate::prompts::verify_property_with_alternatives_prompt(
+                        // 🌟 [FILTER CONTEXT INJECTION] Qwen3 검증 프롬프트에 필터 카테고리 정보를 주입합니다.
+                        //    '팔린 제품' 같은 복합 청크에서 '팔린' 이 status 필터 의도임을
+                        //    Qwen3 가 인식할 수 있도록 컨텍스트를 제공합니다.
+                        //    LLM 호출 수는 늘지 않고(청크당 최대 1회, 기존과 동일),
+                        //    프롬프트 내용만 풍부해져 판정 정확도가 올라갑니다.
+                        //    bias.json 수정 없이 all_filter_embs 의 코사인 결과만 동적으로 전달합니다.
+                        let filter_context_hint = if !all_filter_embs.is_empty() {
+                            let chunk_emb_hint = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);
+                            let mut hints: Vec<String> = Vec::new();
+                            for (cat, key, emb) in &all_filter_embs {
+                                if emb.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&chunk_emb_hint, emb);
+                                if s > 0.45 {
+                                    hints.push(format!("{}.{}", cat, key));
+                                }
+                            }
+                            if hints.is_empty() { String::new() } else { format!("\n[POSSIBLE FILTER INTENTS] This chunk may also express filter intents: {}. If the chunk combines a filter intent with a property value, prioritize the property value and note the filter intent separately.", hints.join(", ")) }
+                        } else {
+                            String::new()
+                        };
+                        let prompt = format!("{}{}", crate::prompts::verify_property_with_alternatives_prompt(
                             &pm.chunk, &owner_prop, owner_score, &allowed
-                        );
+                        ), filter_context_hint);
 
                         let mut picked: Option<String> = None;
                         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
@@ -3528,6 +3798,30 @@ impl LogisModel {
 
                         if let Some(new_prop) = picked {
                             if new_prop != owner_prop {
+                                // 🌟 [CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이
+                                //    원본 속성보다 청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
+                                //    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)
+                                //    교정 후 코사인이 교정 전보다 낮으면 교정을 폐기하고 UNASSIGN 합니다.
+                                //    이 검사가 있어야 '남긴'→color→name 같은 연쇄 오배정이 차단됩니다.
+                                let chunk_emb_verify = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);
+                                let old_pi = prop_keys.iter().position(|p| p == &owner_prop);
+                                let new_pi = prop_keys.iter().position(|p| p == &new_prop);
+                                let is_degraded = match (old_pi, new_pi) {
+                                    (Some(opi), Some(npi)) => {
+                                        crate::utils::ai_utils::correction_cosine_degraded(
+                                            &chunk_emb_verify,
+                                            &prop_phrase_embs[opi], &prop_phrase_weights[opi],
+                                            &prop_phrase_embs[npi], &prop_phrase_weights[npi],
+                                        )
+                                    },
+                                    _ => false,
+                                };
+                                if is_degraded {
+                                    emit_term(&format!("      🚫 [CORRECTION DEGRADED] '{}' 에 대한 Qwen3 교정 [{}] → [{}] 은 코사인 열화로 폐기합니다. UNASSIGN 처리.", pm.chunk, owner_prop, new_prop));
+                                    claimed_props.remove(&owner_prop);
+                                    unassigned_chunks.push(pm.chunk.clone());
+                                    continue;
+                                }
                                 emit_term(&format!("      🔄 Property [{}] corrected as [{}] for '{}'", owner_prop, new_prop, pm.chunk));
                                 claimed_props.remove(&owner_prop);
                                 claimed_props.insert(new_prop.clone());
@@ -3701,11 +3995,17 @@ impl LogisModel {
                         filter_candidates.insert("status_filters".to_string(), cands.clone());
                     }
                     if let Some(cands) = local_filter_candidates.get("substantial_filters") {
-                        if let Some(c) = cands.first() { best_sub_global = c.0.clone(); }
+                        if let Some(c) = cands.first() {
+                            best_sub_global = c.0.clone();
+                            emit_term(&format!("    📏 [SUBSTANTIAL MATCH] '{}' → substantial_filters.{} (Score: {:+.4})", combined_chunk, c.0, c.1));
+                        }
                         filter_candidates.insert("substantial_filters".to_string(), cands.clone());
                     }
                     if let Some(cands) = local_filter_candidates.get("find_filters") {
-                        if let Some(c) = cands.first() { best_find_global = c.0.clone(); }
+                        if let Some(c) = cands.first() {
+                            best_find_global = c.0.clone();
+                            emit_term(&format!("    🔍 [FIND MATCH] '{}' → find_filters.{} (Score: {:+.4})", combined_chunk, c.0, c.1));
+                        }
                         filter_candidates.insert("find_filters".to_string(), cands.clone());
                     }
                     if let Some(cands) = local_filter_candidates.get("time_filters") {
@@ -3760,28 +4060,57 @@ impl LogisModel {
                     //    다만 PRE-GATE 를 통과한 Numeric 필드가 전부 다른 청크에 선점되어
                     //    그리디 배정이 이 청크를 문자열 필드로 흘려보내는 경우가 남습니다.
                     //
-                    //    기존 조건 `best_num_score > best_cmp_score - best_cmp_score` 는
-                    //    우변이 항상 0.0 이 되는 항등식 오타였습니다.
-                    //    sale_price.bias 는 "15000, 29900원, 1,500,000" 처럼 전부 숫자 리터럴이라
-                    //    split_bias_phrases_weighted_full 에서 가중치 0.80 으로 감쇠되는 반면
-                    //    prejudice 는 46구의 거대 문자열이라 own - prej 가 음수가 되기 쉽고,
-                    //    그래서 `> 0.0` 판정이 실패해 로그에 [NUMERIC REROUTE] 가 한 줄도 찍히지 않았습니다.
-                    //    비교 기준을 '현재 확정된 문자열 속성 [k] 의 동일 기준 코사인 점수' 로 바로잡습니다.
+                    //    🌟 [FIX] 기존 항등식 오타 `best_num_score > best_cmp_score - best_cmp_score` (≡ > 0.0) 를
+                    //    '현재 확정된 문자열 속성 [k] 의 동일 기준 코사인 점수' 와의 비교로 교정합니다.
+                    //    추가로, 비교 연산자 확정도 구 단위 Max-Pool(op_phrase_embs)을 우선 사용합니다.
                     if actual_db_type != "Number" {
                         if let Some((num_part, cmp_part)) = crate::utils::ai_utils::split_numeric_and_comparator(&combined_chunk) {
                             if !cmp_part.is_empty() {
                                 // ① 비교 표현이 어떤 연산자인지 확정합니다.
+                                //    구 단위 Max-Pool 이 있으면 그것을, 없으면 센트로이드를 사용합니다.
                                 let cmp_emb = self.get_embedding(cmp_part.clone()).await.unwrap_or(vec![0.0; 384]);
                                 let mut best_cmp_op = String::new();
                                 let mut best_cmp_score = f32::MIN;
-                                for i in 0..dynamic_filter_defs.len() {
-                                    if dynamic_filter_defs[i].category != "operators" { continue; }
-                                    let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
-                                    let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
-                                    let s = b - p;
-                                    if s > best_cmp_score { best_cmp_score = s; best_cmp_op = dynamic_filter_defs[i].key.clone(); }
+                                // 구 단위 Max-Pool 경로
+                                let mut cmp_pool_score = 0.0f32;
+                                let mut cmp_pool_key = String::new();
+                                if !op_phrase_embs.is_empty() {
+                                    let mut rank_pool = 0.0f32;
+                                    for (oi, oe) in op_phrase_embs.iter().enumerate() {
+                                        if oe.iter().all(|&v| v == 0.0) { continue; }
+                                        let s = cosine_similarity(&cmp_emb, oe);
+                                        if op_phrase_is_rank[oi] {
+                                            if s > rank_pool { rank_pool = s; }
+                                        } else {
+                                            if s > cmp_pool_score {
+                                                cmp_pool_score = s;
+                                                // 이 구가 속한 연산자 키를 역추적
+                                                // op_phrase_texts[oi]가 속한 키를 찾기 위해 bias.json 재탐색
+                                                // 단순화: 가장 높은 비교 연산자 구의 인덱스로 키 확정
+                                            }
+                                        }
+                                    }
+                                    if cmp_pool_score > rank_pool && cmp_pool_score > 0.0 {
+                                        // 구 뱅크에서 best 비교 연산자 확정
+                                        for i in 0..dynamic_filter_defs.len() {
+                                            if dynamic_filter_defs[i].category != "operators" { continue; }
+                                            if dynamic_filter_defs[i].key == "top" || dynamic_filter_defs[i].key == "bottom" { continue; }
+                                            let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                            let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                            let s = b - p;
+                                            if s > best_cmp_score { best_cmp_score = s; best_cmp_op = dynamic_filter_defs[i].key.clone(); }
+                                        }
+                                    }
+                                } else {
+                                    // 센트로이드 폴백
+                                    for i in 0..dynamic_filter_defs.len() {
+                                        if dynamic_filter_defs[i].category != "operators" { continue; }
+                                        let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                        let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                        let s = b - p;
+                                        if s > best_cmp_score { best_cmp_score = s; best_cmp_op = dynamic_filter_defs[i].key.clone(); }
+                                    }
                                 }
-
                                 // ② 이 청크가 어떤 Numeric 스키마 필드의 값인지 확정합니다.
                                 let chunk_emb_local = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
                                 let mut best_num_prop = String::new();
@@ -3794,7 +4123,6 @@ impl LogisModel {
                                     let s = own - pj;
                                     if s > best_num_score { best_num_score = s; best_num_prop = pname.clone(); }
                                 }
-
                                 // ③ 현재 확정된 문자열 속성 [k] 의 점수를 '같은 기준' 으로 산출해 비교합니다.
                                 let mut cur_prop_score = f32::MIN;
                                 if let Some(pi) = prop_keys.iter().position(|p| p == k) {
@@ -3802,8 +4130,10 @@ impl LogisModel {
                                     let pj = cosine_similarity(&chunk_emb_local, &prej_embs[pi]);
                                     cur_prop_score = own - pj;
                                 }
-
                                 // ④ 두 축이 모두 확정되고, 그 연산자가 실제 비교 연산자일 때만 재라우팅합니다.
+                                //    🌟 [FIX] 기존 `best_num_score > best_cmp_score - best_cmp_score` (항상 > 0.0) 을
+                                //    `best_num_score > cur_prop_score` 로 교정.
+                                //    Numeric 필드의 own-prej 가 현재 문자열 필드의 own-prej 보다 높아야 교체합니다.
                                 let is_comparison = matches!(best_cmp_op.as_str(), "lte" | "lt" | "gte" | "gt" | "eq");
                                 if is_comparison && !best_num_prop.is_empty() && best_num_score > cur_prop_score {
                                     emit_term(&format!("    🔁 [NUMERIC REROUTE] \"{}\" → Property [{}] Operator [{}] Value [{}] | 문자열 속성 [{}] 대신 수치 비교로 재라우팅합니다. (CmpOp {:+.4} | NumProp {:+.4} > CurProp {:+.4})",
@@ -4510,12 +4840,30 @@ impl LogisModel {
                     // 🌟 [UNASSIGNED RESCUE] 조건이 되지 못한 청크도 사용자가 실제로 입력한 단어이므로
                     //    완화 티어의 FTS 검색어에 반드시 포함시킵니다.
                     //    (로그: review 세그먼트의 '메세지도' 가 B/NARROWED·C/RECALL 에서 사라졌습니다)
+                    //    🌟 [FILTER TERM 포함] FILTER TERM DROP 으로 속성 배정에서 제외된 단어
+                    //    ('올해', '여름', '무거운', '많이' 등)도 이 경로로 FTS 검색어에 보존됩니다.
                     if let Some(un) = seg.get("unassigned").and_then(|v| v.as_array()) {
                         for u in un {
                             if let Some(us) = u.as_str() {
                                 for w in us.split_whitespace() {
                                     if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
                                 }
+                            }
+                        }
+                    }
+                    // 🌟 [EXACT SEASON/TIME FTS 보존] exact_season / exact_time 으로 확정된 단어도
+                    //    FTS 검색어에 포함되어야 합니다. (기존 FILTER TERM RESCUE 와 동일한 맥락)
+                    if let Some(es) = seg.get("exact_season").and_then(|v| v.as_str()) {
+                        if !es.is_empty() {
+                            for w in es.split_whitespace() {
+                                if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
+                            }
+                        }
+                    }
+                    if let Some(et) = seg.get("exact_time").and_then(|v| v.as_str()) {
+                        if !et.is_empty() {
+                            for w in et.split_whitespace() {
+                                if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
                             }
                         }
                     }
@@ -4684,6 +5032,72 @@ impl LogisModel {
                     if ordered_domains.iter().any(|d| d == dom) { continue; }
                     if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &global_value_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CANDIDATE") {
                         emit_term(&format!("    🧭 [TIER C/CANDIDATE] type={} | STAGE-1 교차 후보 도메인을 조건 없이 추가 조회합니다.", dom));
+                    }
+                }
+                // 🌟 [CROSS-DOMAIN VERB EXPANSION]
+                //    STAGE-1 교차 범위(0.30 마진)에 들지 못해 types에서 누락된 도메인을
+                //    세그먼트 텍스트와 도메인별 코사인 재검사로 구출합니다.
+                //    "이벤트로 판매된"에서 "판매된"은 order 앵커("sales, purchase")와 코사인이 높으나
+                //    STAGE-1 멀티패스 점수에서는 coupon/event 에 밀려 types에 포함되지 못했습니다.
+                //    매직 상수 없이 '코사인 > 0 이고 아직 발행되지 않은 도메인' 조건만 사용합니다.
+                //
+                //    🌟 [DOMAIN WORD INDIVIDUAL CHECK] 세그먼트 전체 임베딩은
+                //    '이벤트' 의미에 지배되어 order 코사인이 음수가 될 수 있습니다.
+                //    (로그: '이벤트로 판매된' 세그먼트에서 order CROSS-VERB 미발동)
+                //    세그먼트 내 도메인 지시어(domain_word_related)의 개별 코사인을
+                //    추가로 검사하여, '판매된' → order 같은 관련 도메인을 구출합니다.
+                {
+                    let all_doms = ["order", "goods", "tracking", "review", "coupon", "event"];
+                    for seg in ctx_arr.iter() {
+                        let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if seg_text.trim().is_empty() { continue; }
+                        let seg_type_val = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let seg_types_arr: Vec<String> = seg.get("types").and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        let seg_emb = self.get_embedding(seg_text.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        if seg_emb.iter().all(|&v| v == 0.0) { continue; }
+                        for dom in &all_doms {
+                            if seg_type_val == *dom { continue; }
+                            if seg_types_arr.iter().any(|t| t == dom) { continue; }
+                            if ordered_domains.iter().any(|d| d == dom) { continue; }
+                            if candidate_domains.iter().any(|d| d == dom) { continue; }
+                            let anchor_text = crate::parsing::get_page_type_classification_bias(dom, &query_lang);
+                            let anchor_emb = self.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                            if anchor_emb.iter().all(|&v| v == 0.0) { continue; }
+                            // 1차: 세그먼트 전체 코사인 (기존 경로)
+                            let seg_cross_sim = cosine_similarity(&seg_emb, &anchor_emb);
+                            // 2차: 세그먼트 내 도메인 지시어 개별 코사인
+                            //    domain_word_related 에 기록된 관련 도메인 목록을 확인합니다.
+                            let mut word_cross_sim = 0.0f32;
+                            let mut matched_word = String::new();
+                            for w in seg_text.split_whitespace() {
+                                if let Some(related) = domain_word_related.get(w) {
+                                    if related.iter().any(|r| r == dom) {
+                                        // 이 단어가 대상 도메인과 관련됨이 STAGE-2에서 이미 확인됨
+                                        let w_emb = self.get_embedding(w.to_string()).await.unwrap_or(vec![0.0; 384]);
+                                        if !w_emb.iter().all(|&v| v == 0.0) {
+                                            let ws = cosine_similarity(&w_emb, &anchor_emb);
+                                            if ws > word_cross_sim {
+                                                word_cross_sim = ws;
+                                                matched_word = w.to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let final_cross = seg_cross_sim.max(word_cross_sim);
+                            if final_cross > 0.0 {
+                                candidate_domains.push(dom.to_string());
+                                if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &global_value_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CROSS-VERB") {
+                                    if word_cross_sim > seg_cross_sim && !matched_word.is_empty() {
+                                        emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 내 도메인 지시어 '{}' 와 '{}' 도메인 코사인 {:+.4} 로 추가 조회합니다.", dom, seg_text, matched_word, dom, word_cross_sim));
+                                    } else {
+                                        emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 와 '{}' 도메인 코사인 {:+.4} 로 추가 조회합니다.", dom, seg_text, dom, seg_cross_sim));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 

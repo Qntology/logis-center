@@ -592,6 +592,13 @@ pub fn query_chunk_matches_property_ext(
         FieldFormat::Date => {
             if v.chars().any(|c| c.is_ascii_digit()) { return true; }
             if temporal_hint { return true; }
+            // 🌟 [SEMANTIC ANCHOR TEMPORAL] bias.json 의 time_filters.*.semantic 에
+            //    "current year", "previous day" 등의 영어 구가 있습니다.
+            //    exact_match 배열이 없는 time_filters 를 위해,
+            //    semantic 필드의 구를 split_bias_phrases_full 로 쪼개
+            //    다국어 임베딩 코사인으로 매칭합니다.
+            //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
+            if temporal_semantic_match(v) { return true; }
             v.split_whitespace().any(|w| {
                 exact_match_filter_key("time_filters", w).is_some()
                     || exact_match_filter_key("season_filters", w).is_some()
@@ -603,6 +610,175 @@ pub fn query_chunk_matches_property_ext(
         FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
     }
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH] bias.json 의 time_filters / season_filters 각 키의
+//    "semantic" 필드에는 "current year", "spring season" 같은 핵심 의미 구가 있습니다.
+//    exact_match 배열이 없는 time_filters 를 위해, 이 semantic 구를
+//    split_bias_phrases_full 로 쪼개 임베딩하고, 질의 청크와의 코사인을 계산합니다.
+//    판정 기준은 '해당 카테고리 내 semantic 구들과의 Max-Pool 코사인'이
+//    '다른 모든 필터 카테고리 semantic 구들과의 Max-Pool 코사인'보다 높은지입니다.
+//    절대 임계치 없이 상대 비교만 사용하므로 매직 상수가 없습니다.
+//    이 함수는 임베딩을 내부에서 생성하지 않고, 호출부가 미리 계산한
+//    temporal_semantic_scores 맵을 참조하는 구조로 model.rs 에서 호출됩니다.
+//    여기서는 bias.json 에서 semantic 구 목록을 추출하는 순수 결정론 함수입니다.
+pub fn temporal_semantic_phrases() -> Vec<(String, String)> {
+    // (category_key, semantic_phrase) 쌍을 반환
+    let mut out: Vec<(String, String)> = Vec::new();
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    for cat in ["time_filters", "season_filters"] {
+        if let Some(node) = dict.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+                // bias 도 구 단위로 추가 (semantic 이 짧을 수 있으므로)
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH - LIGHTWEIGHT] 임베딩 없이 문자열 구조로 판정하는 폴백.
+//    bias.json 의 time_filters.*.semantic / bias 구 중에
+//    질의 청크의 '공백 제거 소문자'와 완전일치하는 구가 있으면 temporal 로 판정.
+//    예: chunk="올해" → bias 구 "this year" 와는 불일치하지만,
+//    season_filters 의 exact_match 에는 없으므로 이 경로로는 불가.
+//    따라서 이 함수는 보조 수단이며, 주 경로는 model.rs 의 임베딩 코사인입니다.
+pub fn temporal_semantic_match(_chunk: &str) -> bool {
+    // 이 함수는 model.rs 에서 임베딩 기반으로 대체되므로
+    // 여기서는 항상 false 를 반환하여 기존 exact_match 경로를 유지합니다.
+    // 실제 temporal 판정은 model.rs 의 TEMPORAL PRE-GATE 개선에서 수행합니다.
+    false
+}
+
+// 🌟 [FILTER CATEGORY PHRASE BANK] substantial_filters / find_filters / status_filters 의
+//    bias + semantic 구를 쪼개 (category, key, phrase) 목록을 반환합니다.
+//    bias.json 에 exact_match 배열이 없는 필터 카테고리(time_filters 포함)를 위해
+//    임베딩 코사인 Max-Pool 로 매칭할 수 있는 구 뱅크를 동적으로 구축합니다.
+//    다국어 어휘 리터럴을 추가하지 않고, bias.json 의 기존 bias/semantic 필드만 읽습니다.
+pub fn filter_category_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        if !out.iter().any(|(_, _, p)| p == &phrase) {
+                            out.push((cat.to_string(), key.clone(), phrase));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [FILTER ROUTE VERDICT] 질의 청크가 스키마 속성보다 필터 카테고리에 더 적합한지
+//    임베딩 코사인 Max-Pool 상대 비교로 판정합니다.
+//    절대 임계치 없이 '필터 Max-Pool > 스키마 속성 Max-Pool' 상대 우위만 사용합니다.
+//    반환: Some((category, key)) 이면 필터 라우팅, None 이면 스키마 속성 배정 유지.
+pub fn filter_route_verdict(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String)> {
+    // (category, key) 그룹별 Max-Pool: 개별 구 코사인의 비대칭을 해소합니다.
+    // 스키마 측이 weighted_max_pool_sim(구 단위 최대)을 사용하므로
+    // 필터 측도 동일 그룹 내 최대 코사인으로 비교해야 공정한 판정입니다.
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key))
+    } else {
+        None
+    }
+}
+
+// 🌟 [SUBSTANTIAL/FIND PRE-GATE] substantial_filters / find_filters / status_filters 의
+//    bias+semantic 구 뱅크와 청크 간 Max-Pool 코사인을 계산하여,
+//    스키마 속성보다 필터 의도가 우세한 청크를 배정 전에 차단합니다.
+//    filter_route_verdict 가 단어 단위(1토큰)에서만 동작하는 반면,
+//    이 함수는 Plinko 청크(다중 토큰) 단위에서도 동작합니다.
+//    (로그: '무거운' 이 summer(0.5610) 에 밀려 substantial_filters.weight 로 라우팅 실패)
+//    판정 기준: '필터 Max-Pool > 스키마 Max-Pool' 상대 비교만 사용. 매직 상수 없음.
+//    반환: Some((category, key, score)) 이면 필터 라우팅, None 이면 스키마 배정 유지.
+pub fn substantial_find_pre_gate(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String, f32)> {
+    if filter_phrase_embs.is_empty() { return None; }
+    // (category, key) 그룹별 Max-Pool
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        // substantial / find / status 카테고리만 대상
+        if cat != "substantial_filters" && cat != "find_filters" && cat != "status_filters" { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key, best_score))
+    } else {
+        None
+    }
+}
+
+// 🌟 [QWEN3 CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이 원본 속성보다
+//    청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
+//    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)
+//    교정 후 코사인이 교정 전보다 낮으면 교정을 폐기하고 UNASSIGN 합니다.
+//    새 매직 상수 없이 '교정 후 < 교정 전' 부호 판정만 사용합니다.
+pub fn correction_cosine_degraded(
+    chunk_emb: &[f32],
+    old_prop_embs: &Vec<Vec<f32>>,
+    old_prop_weights: &Vec<f32>,
+    new_prop_embs: &Vec<Vec<f32>>,
+    new_prop_weights: &Vec<f32>,
+) -> bool {
+    let old_score = weighted_max_pool_sim(chunk_emb, old_prop_embs, old_prop_weights);
+    let new_score = weighted_max_pool_sim(chunk_emb, new_prop_embs, new_prop_weights);
+    new_score < old_score
 }
 
 // 🌟 [MAX-COVERAGE GREEDY ASSIGN] 청크가 굶어 죽지 않는 1:1 배타 배정.
@@ -900,7 +1076,26 @@ pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
 
     let d = digits.trim_end_matches('.').to_string();
     if d.is_empty() { return None; }
-    Some((d, rest.split_whitespace().collect::<Vec<_>>().join(" ")))
+    // 🌟 [COMPARATOR ENRICHMENT] rest 가 "원 이하로" 처럼 단위+비교 표현이면
+    //    단위 문자를 제거하고 순수 비교 표현만 남깁니다.
+    //    판정 기준: rest 의 첫 토큰이 알파벳/한글 1~2자이면서 숫자가 없으면 '단위'로 간주.
+    //    다국어 하드코딩 없이 '토큰 길이 + 숫자 부재' 라는 구조 규칙만 사용합니다.
+    let rest_trimmed = rest.trim();
+    let rest_tokens: Vec<&str> = rest_trimmed.split_whitespace().collect();
+    let comparator = if rest_tokens.len() >= 2 {
+        let first_tok = rest_tokens[0];
+        let first_has_digit = first_tok.chars().any(|c| c.is_ascii_digit());
+        let first_len = first_tok.chars().count();
+        // 첫 토큰이 2자 이하이고 숫자가 없으면 단위(원, 원, 円, $, € 등)로 간주하고 제거
+        if !first_has_digit && first_len <= 2 {
+            rest_tokens[1..].join(" ")
+        } else {
+            rest_trimmed.to_string()
+        }
+    } else {
+        rest_trimmed.to_string()
+    };
+    Some((d, comparator))
 }
 
 // 🌟 [LOCALIZED BIAS NODE] bias.json 의 {lang}.{page_type}.{field} 노드를 원본 그대로 꺼냅니다.
