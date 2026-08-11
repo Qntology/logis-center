@@ -764,6 +764,214 @@ pub fn substantial_find_pre_gate(
     }
 }
 
+// =====================================================================
+// 🌟 [GLOBAL-BASELINE SURPRISAL] 뱅크 크기 편향 제거 + 절대 신호 보존
+// ---------------------------------------------------------------------
+// 직전 구현은 각 뱅크를 '자기 자신의' 평균/표준편차로 표준화했습니다.
+// 극값이론이 E[z of max] ≈ √(2 ln N) 을 예측하므로, 그 값으로 다시 나누면
+// 무관한 질의에 대해 결과가 정의상 1.0 으로 수렴합니다.
+// (로그 실측: 6개 단어 전부 0.9475 ~ 1.1919 — 판별력 0)
+//
+// 여기서는 '모든 뱅크를 합친 전역 코사인 분포'를 공통 기준선으로 삼고,
+// 뱅크 크기가 만드는 기대 최댓값 √(2 ln N) 만큼만 차감합니다.
+//     surprisal = (max - μ_global) / σ_global - √(2 ln N)
+// 반환값 0 = 무작위로 N개 뽑은 기대치와 동일(= 근거 없음)
+//         > 0 = 그 기대치를 넘는 실제 의미적 근거 존재
+// 0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
+// =====================================================================
+
+#[derive(Debug, Clone)]
+pub struct SurprisalScore {
+    pub category: String,
+    pub key: String,
+    pub max_cos: f32,
+    pub n: usize,
+    pub surprisal: f32,
+}
+
+fn gumbel_expected_z(n: usize) -> f32 {
+    if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
+}
+
+fn group_sims(
+    query: &[f32],
+    src: &[(String, String, Vec<f32>)],
+    pool: &mut Vec<f32>,
+) -> (Vec<(String, String)>, Vec<Vec<f32>>) {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut sims: Vec<Vec<f32>> = Vec::new();
+    for (c, k, e) in src {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(query, e);
+        pool.push(s);
+        match order.iter().position(|(a, b)| a == c && b == k) {
+            Some(i) => sims[i].push(s),
+            None => { order.push((c.clone(), k.clone())); sims.push(vec![s]); }
+        }
+    }
+    (order, sims)
+}
+
+/// 필터 뱅크와 스키마 뱅크를 **하나의 공통 기준선**으로 동시에 채점합니다.
+/// 두 결과가 같은 척도이므로 그대로 대소 비교할 수 있습니다.
+/// 각 필터 키의 prejudice 구가 자기 기대치를 넘으면 그만큼 상쇄합니다.
+/// (bias.json 이 이미 갖고 있는 편견 사전을 필터 경로에서 처음으로 활용)
+pub fn surprisal_dual_scores(
+    query: &[f32],
+    filter_bias: &[(String, String, Vec<f32>)],
+    filter_prej: &[(String, String, Vec<f32>)],
+    schema_names: &[String],
+    schema_banks: &[Vec<Vec<f32>>],
+    schema_skip: &[bool],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    let mut pool: Vec<f32> = Vec::new();
+
+    let (f_order, f_sims) = group_sims(query, filter_bias, &mut pool);
+    let (p_order, p_sims) = group_sims(query, filter_prej, &mut pool);
+
+    let mut s_sims: Vec<Vec<f32>> = Vec::with_capacity(schema_banks.len());
+    for (i, bank) in schema_banks.iter().enumerate() {
+        let mut v: Vec<f32> = Vec::new();
+        if !schema_skip.get(i).copied().unwrap_or(false) {
+            for e in bank {
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(query, e);
+                pool.push(s);
+                v.push(s);
+            }
+        }
+        s_sims.push(v);
+    }
+
+    if pool.len() < 2 { return (Vec::new(), Vec::new()); }
+    let mean: f32 = pool.iter().sum::<f32>() / (pool.len() as f32);
+    let var: f32 = pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (pool.len() as f32);
+    let std = var.sqrt().max(1e-6);
+
+    let raw = |sims: &Vec<f32>| -> Option<(f32, usize, f32)> {
+        if sims.is_empty() { return None; }
+        let m = sims.iter().cloned().fold(f32::MIN, f32::max);
+        let n = sims.len();
+        Some((m, n, (m - mean) / std - gumbel_expected_z(n)))
+    };
+
+    let mut fout: Vec<SurprisalScore> = Vec::new();
+    for (i, (c, k)) in f_order.iter().enumerate() {
+        let (m, n, mut sc) = match raw(&f_sims[i]) { Some(v) => v, None => continue };
+        if let Some(pi) = p_order.iter().position(|(a, b)| a == c && b == k) {
+            if let Some((_, _, ps)) = raw(&p_sims[pi]) {
+                if ps > 0.0 { sc -= ps; }
+            }
+        }
+        fout.push(SurprisalScore { category: c.clone(), key: k.clone(), max_cos: m, n, surprisal: sc });
+    }
+    fout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut sout: Vec<SurprisalScore> = Vec::new();
+    for (i, name) in schema_names.iter().enumerate() {
+        let (m, n, sc) = match raw(&s_sims[i]) { Some(v) => v, None => continue };
+        sout.push(SurprisalScore { category: "schema".to_string(), key: name.clone(), max_cos: m, n, surprisal: sc });
+    }
+    sout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+
+    (fout, sout)
+}
+
+/// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
+/// filter_category_phrases 의 prejudice 판입니다.
+pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(p) {
+                        if out.iter().any(|(c, k, e)| c == cat && k == key && e == &phrase) { continue; }
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [ABSTRACT BRIDGE PREJUDICE] search_bridge.abstract_bridge 의 prejudice 구.
+pub fn abstract_bridge_prejudice_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+        if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+            for phrase in split_bias_phrases_full(p) {
+                if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &phrase) { continue; }
+                out.push((cat.clone(), key.clone(), phrase));
+            }
+        }
+    }
+    out
+}
+
+/// [STEM CANDIDATES] 같은 질의의 다른 토큰들과 공유하는 접두 어간 후보를 뽑습니다.
+/// 언어별 조사/어미 사전을 쓰지 않고 '문자 접두 공유'라는 구조적 사실만 사용합니다.
+/// 반환값은 길이 내림차순 어간 목록입니다.
+pub fn shared_prefix_stems(word: &str, others: &[String]) -> Vec<String> {
+    let w: Vec<char> = word.chars().collect();
+    let mut stems: Vec<String> = Vec::new();
+    for o in others {
+        if o == word { continue; }
+        let oc: Vec<char> = o.chars().collect();
+        let mut n = 0usize;
+        while n < w.len() && n < oc.len() && w[n] == oc[n] { n += 1; }
+        if n < 2 { continue; }
+        if n >= w.len() { continue; }
+        let stem: String = w[..n].iter().collect();
+        if !stems.iter().any(|s| s == &stem) { stems.push(stem); }
+    }
+    stems.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    stems
+}
+
+/// [ABSTRACT BRIDGE] bias.json 의 search_bridge.abstract_bridge 에서
+/// (category, key, phrase) 트리플을 수집합니다.
+/// 키는 "substantial_filters.weight" 처럼 "카테고리.키" 형태입니다.
+/// 언어별 어휘를 코드에 두지 않고 bias.json 의 영어 브릿지 구만 사용하며,
+/// 다국어 임베딩 모델이 교차언어 매칭을 담당합니다.
+pub fn abstract_bridge_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    {
+        Some(n) => n,
+        None => return out,
+    };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &p) { continue; }
+                    out.push((cat.clone(), key.clone(), p));
+                }
+            }
+        }
+    }
+    out
+}
+
 // 🌟 [QWEN3 CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이 원본 속성보다
 //    청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
 //    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)

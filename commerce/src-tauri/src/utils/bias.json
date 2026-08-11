@@ -1,4 +1,91 @@
 {
+  "search_bridge": {
+    "sales_to_order": {
+      "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",
+      "target_domain": "order",
+      "semantic": "sales performance, revenue, transaction volume, sold items",
+      "bias": "sales, sold, selling, revenue, turnover, transaction, purchase volume, sales volume, sales performance",
+      "prejudice": "product registration, product list, display, exposure, traffic, page views, impressions"
+    },
+    "domain_affinity": {
+      "coupon": ["event"],
+      "event": ["coupon"],
+      "order": ["tracking"],
+      "tracking": ["order"]
+    },
+    "abstract_bridge": {
+      "substantial_filters.weight": {
+        "semantic": "how heavy or how light the item physically is",
+        "bias": "heavy, light, lightweight, heavyweight, heaviness, lightness, weighs a lot, weighs little, hard to lift, easy to carry, physical mass of the product, gross weight, net weight, kilogram, gram, pound, ton",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, count of items, price, discount"
+      },
+      "substantial_filters.size": {
+        "semantic": "how big or how small the item physically is",
+        "bias": "big, large, small, tiny, huge, oversized, compact, bulky, roomy, spacious, wide, narrow, tall, short, thick, thin, physical dimensions, volume of the product, takes up space",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, weight, price, discount"
+      },
+      "substantial_filters.sale_price": {
+        "semantic": "how expensive or how cheap the selling price is",
+        "bias": "expensive, cheap, pricey, affordable, costly, budget priced, low priced, high priced, bargain, premium priced, sells for a lot, sells for little, overpriced, underpriced",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, weight, size, wholesale cost, shipping charge"
+      },
+      "substantial_filters.supply_price": {
+        "semantic": "how high or how low the wholesale sourcing cost is",
+        "bias": "high cost, low cost, expensive to source, cheap to source, wholesale cost, purchase cost, cost price, procurement cost, margin thin, margin wide",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, selling price, weight, size"
+      },
+      "substantial_filters.shipping_fee": {
+        "semantic": "how expensive or how cheap the delivery charge is",
+        "bias": "free shipping, expensive shipping, cheap shipping, high delivery charge, low delivery charge, costly freight, no shipping cost",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, selling price, weight, size, delivery speed"
+      },
+      "substantial_filters.shipping_duration": {
+        "semantic": "how fast or how slow the delivery takes",
+        "bias": "fast delivery, slow delivery, quick shipping, delayed shipping, arrives quickly, takes long to arrive, same day arrival, next day arrival, long lead time, short lead time",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, address, among these, from these, show me, tell me, shipping charge, weight, size"
+      },
+      "substantial_filters.discount": {
+        "semantic": "how large or how small the price reduction is",
+        "bias": "heavily discounted, deeply discounted, small discount, big discount, steep markdown, slight markdown, price cut, on sale, half off",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, selling price, weight, size"
+      },
+      "substantial_filters.low_stock_threshold": {
+        "semantic": "how close the inventory is to running out",
+        "bias": "almost out of stock, running low, nearly sold out, low inventory, needs restock, stock is short, stock is plentiful",
+        "prejudice": "product name, item title, customer message, review comment, person name, buyer, customer, color, brand, date, address, among these, from these, show me, tell me, price, weight"
+      },
+      "find_filters.many": {
+        "semantic": "a large count or a high number of occurrences",
+        "bias": "many, a lot of, lots of, numerous, plenty, frequently, often, popular, best selling, sells well, high volume, most, top ranked, widely purchased",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, heavy, expensive"
+      },
+      "find_filters.few": {
+        "semantic": "a small count or a low number of occurrences",
+        "bias": "few, a little, hardly any, rarely, seldom, unpopular, sells poorly, low volume, scarce, least, bottom ranked, barely purchased",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, light, cheap"
+      },
+      "find_filters.much": {
+        "semantic": "a large monetary value or amount",
+        "bias": "costs a lot, high value, big amount, large sum, expensive total, high revenue, spends a lot",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, heavy, count of items"
+      },
+      "find_filters.little": {
+        "semantic": "a small monetary value or amount",
+        "bias": "costs little, low value, small amount, tiny sum, cheap total, low revenue, spends little",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, light, count of items"
+      },
+      "find_filters.heavy": {
+        "semantic": "physically heavy object",
+        "bias": "heavy, weighs a lot, heavyweight, hard to lift, dense and heavy, massive, weighty",
+        "prejudice": "product name, item title, customer message, review comment, person name, color, brand, date, address, among these, from these, show me, tell me, expensive, count of items"
+      },
+      "find_filters.light": {
+        "semantic": "physically light object",
+        "bias": "light, weighs little, lightweight, easy to carry, feather weight, barely weighs anything",
+        "prejudice": "product name, item title, customer message, review comment, person name, buyer, customer, color, brand, date, address, among these, from these, show me, tell me, cheap, count of items"
+      }
+    }
+  },
   "insight": {
     "conversion_insight": {
       "target_domain": ["order"],
