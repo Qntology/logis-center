@@ -451,6 +451,121 @@ pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
     humanize_url_token(field_name)
 }
 
+// 🌟 [ABSTRACT BRIDGE — FIELD SCOPE] search_bridge.abstract_bridge 에서
+//    이 필드를 목표로 하는 브릿지 구만 뽑아냅니다.
+//    키는 "substantial_filters.weight" 형태이므로 '.' 뒤 조각이 필드명과 같으면 채택합니다.
+//    정방향은 이 구들로 '무거운' → weight 를 라우팅하는데, 역방향(저장)에는 이 축이
+//    통째로 빠져 있어서 "정방향이 잡은 의도를 받아줄 벡터가 DB에 없는" 상태였습니다.
+pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    if out.len() > 48 { out.truncate(48); }
+    out
+}
+
+// 🌟 [INDEXING ANCHOR] 저장(역방향) 시점에 청크 벡터 위에 얹을 '다국어 라벨 앵커'입니다.
+//    json_to_natural_language() 는 무조건 영어 문장을 만들지만 질의는 문서 언어이므로,
+//    저장 벡터에 문서 언어 라벨을 반드시 섞어야 코사인이 성립합니다.
+//    구성: ① semantic 앵커(문서 언어) ② label_phrase_bank(문서 언어 bias 비수치 구)
+//          ③ abstract_bridge(추상 수식어 — heavy/expensive/fast ...)
+//    bias.json 은 한 글자도 수정하지 않고 기존 노드만 재조합합니다.
+pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let mut phrases: Vec<String> = Vec::new();
+
+    for p in split_bias_phrases_full(&semantic_anchor_text(doc_lang, page_type, field_name)) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    let (label_phrases, _w) = label_phrase_bank(doc_lang, page_type, field_name);
+    for p in label_phrases {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    for p in abstract_bridge_field_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    if phrases.is_empty() {
+        return humanize_url_token(field_name);
+    }
+    if phrases.len() > 32 { phrases.truncate(32); }
+    phrases.join(", ")
+}
+
+// 🌟 [METRICS FAMILY] bias.json 의 metrics.* 노드를 (family_key, phrase) 목록으로 펼칩니다.
+//    metrics.price.bias 에는 이미 "won" 이 들어 있어서, 다국어 임베딩이
+//    '원' ↔ 'won' 을 연결해 줍니다. 따라서 "5000원 이하로" 의 수치 대상이
+//    quantity 가 아니라 price 계열이라는 사실을 어휘 하드코딩 없이 판정할 수 있습니다.
+pub fn metrics_family_phrases() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(node) = crate::parsing::BIAS_DICT.get("metrics").and_then(|v| v.as_object()) {
+        for (key, val) in node {
+            for field in ["semantic", "bias"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                    for p in split_bias_phrases_full(s) {
+                        if out.iter().any(|(k, e)| k == key && e == &p) { continue; }
+                        out.push((key.clone(), p));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [METRICS FAMILY — 단일 벡터 argmax] 임베딩 하나가 어떤 metrics 계열에 가장 가까운지
+//    (family_key, score) 로 반환합니다. 그룹별 Max-Pool 이라 뱅크 크기 편향이 없습니다.
+pub fn metrics_family_argmax(target: &[f32], bank: &[(String, Vec<f32>)]) -> (String, f32) {
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(target, e);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    (best_key, if best == f32::MIN { 0.0 } else { best })
+}
+
+// 🌟 [METRICS FAMILY — 필드 뱅크 argmax] 그 필드의 구 뱅크 전체가 어떤 metrics 계열인지 판정합니다.
+//    sale_price 뱅크는 metrics.price 와, quantity 뱅크는 metrics.quantity 와 붙습니다.
+pub fn metrics_family_of_bank(field_bank: &Vec<Vec<f32>>, bank: &[(String, Vec<f32>)]) -> String {
+    if field_bank.is_empty() { return String::new(); }
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = max_pool_sim(e, field_bank);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    best_key
+}
+
 // 🌟 [CROSS-FIELD AMBIGUITY MASK] bias.json 을 수정하지 않고 런타임에서 무변별 구를 구조적으로 제거합니다.
 //    ① 두 개 이상 필드의 bias 뱅크에 '문자 그대로 동일한 구'가 들어 있으면
 //       그 구는 어떤 필드도 지목하지 못합니다.

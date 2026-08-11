@@ -3127,6 +3127,25 @@ impl LogisModel {
                     self.get_embedding_batch(op_phrase_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; op_phrase_texts.len()])
                 };
+                // 🌟 [METRICS FAMILY BANK] bias.json 의 metrics.* 를 (계열, 구) 로 펼쳐 임베딩합니다.
+                //    metrics.price.bias 에 "won" 이 이미 존재하므로 다국어 임베딩이 '원' ↔ 'won' 을
+                //    연결해 줍니다. 이 축이 있어야 "5000원 이하로" 의 수치 대상이
+                //    quantity 가 아니라 price 계열이라는 사실을 어휘 하드코딩 없이 확정할 수 있습니다.
+                let metric_family_defs = crate::utils::ai_utils::metrics_family_phrases();
+                let metric_family_texts: Vec<String> = metric_family_defs.iter().map(|(_, p)| p.clone()).collect();
+                let metric_family_raw: Vec<Vec<f32>> = if metric_family_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(metric_family_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; metric_family_texts.len()])
+                };
+                let metric_family_bank: Vec<(String, Vec<f32>)> = metric_family_defs.iter()
+                    .zip(metric_family_raw.into_iter())
+                    .map(|((k, _), e)| (k.clone(), e))
+                    .collect();
+                if !metric_family_bank.is_empty() {
+                    emit_term(&format!("    📐 [METRICS FAMILY BANK] metrics 계열 구 {}개 준비 완료.", metric_family_bank.len()));
+                }
                 // 🌟 [ALL-FILTER PHRASE BANK PRE-BUILD]
                 //    substantial_filters / find_filters / status_filters / time_filters / season_filters
                 //    전 카테고리의 bias+semantic 구를 임베딩합니다.
@@ -4266,15 +4285,45 @@ impl LogisModel {
                                 }
                                 // ② 이 청크가 어떤 Numeric 스키마 필드의 값인지 확정합니다.
                                 let chunk_emb_local = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                                // 🌟 [METRICS FAMILY GATE] 먼저 "이 청크가 어떤 계량 계열인가" 를 판정합니다.
+                                //    "5000원 이하로" → metrics.price ("won" 구와 공명)
+                                //    그런 다음 후보 Numeric 필드도 자기 구 뱅크로 계열을 판정하여
+                                //    계열이 일치하는 필드만 경쟁시킵니다.
+                                //    이 게이트가 없으면 quantity 가 미세한 점수 차로 sale_price 를 이깁니다.
+                                let (chunk_metric_family, chunk_metric_score) = if metric_family_bank.is_empty() {
+                                    (String::new(), 0.0f32)
+                                } else {
+                                    crate::utils::ai_utils::metrics_family_argmax(&chunk_emb_local, &metric_family_bank)
+                                };
+                                if !chunk_metric_family.is_empty() {
+                                    emit_term(&format!("      📐 [METRICS FAMILY] \"{}\" → metrics.{} (MaxPool {:.4})", combined_chunk, chunk_metric_family, chunk_metric_score));
+                                }
+
                                 let mut best_num_prop = String::new();
                                 let mut best_num_score = f32::MIN;
+                                let mut family_filtered = 0usize;
                                 for (pi, pname) in prop_keys.iter().enumerate() {
                                     if prop_types.get(pname).copied().unwrap_or("String") != "Number" { continue; }
                                     if is_filter_owned(pname) { continue; }
+
+                                    if !chunk_metric_family.is_empty() && !metric_family_bank.is_empty() {
+                                        let field_family = crate::utils::ai_utils::metrics_family_of_bank(
+                                            &prop_phrase_embs[pi], &metric_family_bank,
+                                        );
+                                        if !field_family.is_empty() && field_family != chunk_metric_family {
+                                            family_filtered += 1;
+                                            continue;
+                                        }
+                                    }
+
                                     let own = crate::utils::ai_utils::weighted_max_pool_sim(&chunk_emb_local, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
                                     let pj = cosine_similarity(&chunk_emb_local, &prej_embs[pi]);
                                     let s = own - pj;
                                     if s > best_num_score { best_num_score = s; best_num_prop = pname.clone(); }
+                                }
+                                if family_filtered > 0 {
+                                    emit_term(&format!("      🚧 [METRICS FAMILY GATE] 계열 불일치 Numeric 필드 {}개를 재라우팅 후보에서 제외했습니다.", family_filtered));
                                 }
                                 // ③ 현재 확정된 문자열 속성 [k] 의 점수를 '같은 기준' 으로 산출해 비교합니다.
                                 let mut cur_prop_score = f32::MIN;
@@ -4759,6 +4808,28 @@ impl LogisModel {
                             }
                         }
 
+                        // 🌟 [PERCENT RESIDUE SWEEP] 0.6B 모델은 값이 없을 때 percent_total 을 창작합니다.
+                        //    (로그: { "operator":"lt", "percent_total":"0.38", "value":"" })
+                        //    percent_total 은 top/bottom 연산자에서만 의미를 갖는 필드이므로,
+                        //    그 외 연산자이거나 is_percent 가 거짓이면 잔재를 완전히 제거합니다.
+                        //    프론트엔드 Dexie 재질의가 이 키를 읽고 오동작하는 경로를 원천 차단합니다.
+                        {
+                            let mut swept: Vec<String> = Vec::new();
+                            for (k, v) in structured_cond.iter_mut() {
+                                let obj = match v.as_object_mut() { Some(o) => o, None => continue };
+                                let op = obj.get("operator").and_then(|o| o.as_str()).unwrap_or("").to_string();
+                                let is_rank = op == "top" || op == "bottom";
+                                let is_percent = obj.get("is_percent").and_then(|b| b.as_bool()).unwrap_or(false);
+                                if is_rank && is_percent { continue; }
+                                let had_percent = obj.remove("percent_total").is_some();
+                                let had_flag = obj.remove("is_percent").is_some();
+                                if had_percent || had_flag { swept.push(k.clone()); }
+                            }
+                            if !swept.is_empty() {
+                                emit_term(&format!("      🧽 [PERCENT RESIDUE SWEEP] top/bottom 이 아닌 조건 {:?} 에서 percent_total/is_percent 환각 잔재를 제거했습니다.", swept));
+                            }
+                        }
+
                         // 🌟 [ABSTRACT QUALIFIER MATERIALIZE]
                         //    substantial_filters 키(weight / sale_price / shipping_fee ...)는
                         //    실제 스키마 필드명과 동일하므로, find_filters 방향을 연산자로 환산해
@@ -4996,6 +5067,8 @@ impl LogisModel {
                 let mut groups: std::collections::HashMap<String, DomainGroup> = std::collections::HashMap::new();
                 let mut group_order: Vec<String> = Vec::new();
                 let mut candidate_domains: Vec<String> = Vec::new();
+                // 🌟 [CROSS-DOMAIN REQUEST] (host 도메인, substantial 필드, find 방향, 세그먼트 텍스트)
+                let mut sub_host_requests: Vec<(String, String, String, String)> = Vec::new();
 
                 // ── 1) 도메인 축 : 세그먼트를 '확정 타입'별로 그룹핑합니다. 절대 서로 섞지 않습니다.
                 for seg in ctx_arr.iter() {
@@ -5024,6 +5097,18 @@ impl LogisModel {
                             && !candidate_domains.iter().any(|d| d == host)
                         {
                             candidate_domains.push(host.to_string());
+                        }
+                        // 🌟 [CROSS-DOMAIN REQUEST] 지금까지는 host 를 candidate_domains 에만 넣어
+                        //    '조건 없는' C/CANDIDATE 쿼리만 나갔습니다.
+                        //    weight/many 같은 실제 조건을 담은 host 도메인 쿼리를 발행하기 위해
+                        //    (host, substantial, find, 세그먼트 텍스트) 를 요청 목록으로 보관합니다.
+                        if !host.is_empty() {
+                            let sub_key = seg.get("substantial").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let find_key = seg.get("find").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let seg_text_for_host = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            if !sub_key.is_empty() {
+                                sub_host_requests.push((host.to_string(), sub_key, find_key, seg_text_for_host));
+                            }
                         }
                     }
 
@@ -5304,6 +5389,53 @@ impl LogisModel {
                 };
                 let empty_alts = serde_json::Map::new();
                 let empty_val = json!("");
+
+                // 🌟 [TIER D/CROSS-DOMAIN] substantial 필드를 실제로 보유한 도메인에
+                //    '조건이 실린' 쿼리를 발행합니다.
+                //    (로그: weight 는 goods 스키마에 없고 tracking 에 존재 → 그러나 조건 있는 tracking 쿼리는 0건이었음)
+                //    find 방향이 확정되어 있으면 top/bottom 조건으로 물질화하고,
+                //    방향이 없으면 조건 없이 도메인 리콜만 보증합니다.
+                for (host, sub_field, find_key, seg_text_for_host) in &sub_host_requests {
+                    let dir_op = match find_key.as_str() {
+                        "heavy" | "many" | "much"   => "top",
+                        "light" | "few"  | "little" => "bottom",
+                        _ => "",
+                    };
+                    let host_text = {
+                        let mut w: Vec<String> = Vec::new();
+                        for x in seg_text_for_host.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        for x in global_value_text.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        w.join(" ")
+                    };
+
+                    let mut host_cond = serde_json::Map::new();
+                    if !dir_op.is_empty() {
+                        host_cond.insert(sub_field.clone(), json!({
+                            "operator": dir_op,
+                            "percent_total": "20.0",
+                            "is_percent": true
+                        }));
+                    }
+
+                    if push_ctx(&mut final_contexts, &mut seen_ctx, host, &host_text, host_cond.clone(), &empty_alts, &empty_val, &json!(sub_field), &json!(find_key), "D/CROSS-DOMAIN") {
+                        emit_term(&format!(
+                            "    🔀 [TIER D/CROSS-DOMAIN] type={} | '{}' 를 보유한 도메인에 조건({}) 쿼리를 발행합니다. | text=\"{}\"",
+                            host, sub_field,
+                            if dir_op.is_empty() { "없음".to_string() } else { format!("{} {} 20%", sub_field, dir_op) },
+                            host_text
+                        ));
+                    }
+
+                    // items 미러 폴백도 함께 발행하여 target_table 매핑 오류에 대비합니다.
+                    let host_fallback = format!("{}_items", host);
+                    if push_ctx(&mut final_contexts, &mut seen_ctx, &host_fallback, &host_text, serde_json::Map::new(), &empty_alts, &empty_val, &json!(sub_field), &json!(find_key), "E/CROSS-DOMAIN-FALLBACK") {
+                        emit_term(&format!("    🅴 [TIER E/CROSS-DOMAIN-FALLBACK] type={} | items 미러 테이블로 교차 도메인 리콜을 보증합니다.", host_fallback));
+                    }
+                }
                 for dom in &candidate_domains {
                     if ordered_domains.iter().any(|d| d == dom) { continue; }
                     if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &global_value_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CANDIDATE") {
@@ -5379,7 +5511,25 @@ impl LogisModel {
                             // 🌟 [SALES BRIDGE FORCE] bridge_forced 가 true 면 코사인 > 0 조건을 우회합니다.
                             if final_cross > 0.0 || bridge_forced {
                                 candidate_domains.push(dom.to_string());
-                                if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &global_value_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CROSS-VERB") {
+
+                                // 🌟 [DEDUP FIX] 기존에는 global_value_text + 빈 조건으로 push 하여
+                                //    이미 발행된 C/CANDIDATE 와 시그니처(도메인+텍스트+조건)가 완전히 같아
+                                //    seen_ctx 에 의해 조용히 삭제되었습니다.
+                                //    (로그에 '이벤트로 판매된' 의 order CROSS-VERB 가 한 줄도 안 찍힌 원인)
+                                //    발동 근거가 된 세그먼트 텍스트를 앞에 붙여 시그니처를 분리하고,
+                                //    동시에 FTS 정밀도도 함께 올립니다.
+                                let cross_text = {
+                                    let mut w: Vec<String> = Vec::new();
+                                    for x in seg_text.split_whitespace() {
+                                        if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                                    }
+                                    for x in global_value_text.split_whitespace() {
+                                        if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                                    }
+                                    w.join(" ")
+                                };
+
+                                if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &cross_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CROSS-VERB") {
                                     if bridge_forced && word_cross_sim <= seg_cross_sim {
                                         emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 내 도메인 지시어 '{}' 가 SALES BRIDGE 로 '{}' 도메인 관련 확정. 코사인 무관 추가 조회.", dom, seg_text, matched_word, dom));
                                     } else if word_cross_sim > seg_cross_sim && !matched_word.is_empty() {
@@ -5387,6 +5537,8 @@ impl LogisModel {
                                     } else {
                                         emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 와 '{}' 도메인 코사인 {:+.4} 로 추가 조회합니다.", dom, seg_text, dom, seg_cross_sim));
                                     }
+                                } else {
+                                    emit_term(&format!("    ⚪ [CROSS-VERB DEDUP] type={} | 동일 시그니처 컨텍스트가 이미 발행되어 중복 발행을 건너뜁니다.", dom));
                                 }
                             }
                         }

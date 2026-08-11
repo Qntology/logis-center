@@ -6760,7 +6760,22 @@ async fn process_task(
                         continue;
                     }
 
-                    let (phrases, weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+                    let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+                    // 🌟 [ABSTRACT BRIDGE MERGE] 정방향은 '무거운' 을 search_bridge.abstract_bridge 로
+                    //    substantial_filters.weight 에 라우팅합니다. 그런데 역방향 필드 뱅크에는
+                    //    heavy / weighs a lot 계열 구가 하나도 없어서 그 의도를 받아줄 벡터가
+                    //    DB 에 존재하지 않았습니다. 동일 bias.json 노드를 그대로 편입합니다.
+                    let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+                    if !bridge_ph.is_empty() {
+                        emit_term(&format!("  🌉 [ABSTRACT BRIDGE MERGE] '{}' 뱅크에 추상 수식어 브릿지 구 {}개 편입", fname, bridge_ph.len()));
+                    }
+                    for p in bridge_ph {
+                        if phrases.iter().any(|e| e == &p) { continue; }
+                        phrases.push(p);
+                        weights.push(1.0);
+                    }
+
                     let phrase_embs = if phrases.is_empty() {
                         vec![vec![0.0f32; 384]]
                     } else {
@@ -6867,20 +6882,41 @@ async fn process_task(
                         // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                         let _ = store.delete_chunks_by_item(&target_id).await;
 
+                        // 🌟 [MULTILINGUAL ANCHOR BLEND] 저장 벡터를 3중 합성으로 만듭니다.
+                        //   ① chunk_text : "The sale price is 29900 KRW." (json_to_natural_language 영어 자연문)
+                        //   ② anchor     : indexing_anchor_text() — 문서 언어 semantic + label + abstract_bridge
+                        //   ③ localized  : "{anchor} {value_part}" — 라벨과 실제 값을 문서 언어로 결합
+                        //   질의는 문서 언어인데 저장문이 영어라 코사인이 구조적으로 낮았습니다.
+                        //   (로그: 청크 매칭 0.2694 vs FTS 0.9995)
+                        //   앵커/로컬라이즈 텍스트를 배치 임베딩하여 청크당 개별 호출도 제거합니다.
+                        let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                        let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                        for (_, cm) in indexable_chunks.iter() {
+                            let a = crate::utils::ai_utils::indexing_anchor_text(
+                                &doc_lang, &page_type, &cm.property,
+                            );
+                            let v = cm.value_part.trim();
+                            let l = if v.is_empty() { a.clone() } else { format!("{} {}", a, v) };
+                            anchor_texts.push(a);
+                            localized_texts.push(l);
+                        }
+                        let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+                        let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
                         for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
                             let chunk_id = format!("{}_{}", target_id, ci);
 
-                            // 구별 임베딩: 청크 벡터 0.7 + 속성 앵커 벡터 0.3
                             let chunk_vec = &chunk_embs[ei];
-                            let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
-                                &doc_lang, &page_type, &chunk_meta.property,
-                            );
-                            let anchor_emb = model.get_embedding(anchor_text).await
-                                .unwrap_or(vec![0.0; 384]);
+                            let anchor_emb = &anchor_embs[ei];
+                            let localized_emb = &localized_embs[ei];
 
                             let mut final_vec = vec![0.0f32; 384];
                             for d in 0..384 {
-                                final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
+                                final_vec[d] = chunk_vec[d] * 0.5
+                                    + anchor_emb[d] * 0.2
+                                    + localized_emb[d] * 0.3;
                             }
                             // L2 정규화
                             let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -7343,7 +7379,16 @@ async fn process_task(
                                 continue;
                             }
 
-                            let (phrases, weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+                            let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+                            // 🌟 [ABSTRACT BRIDGE MERGE] 리스트 경로도 동일하게 추상 수식어 브릿지를 편입합니다.
+                            let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+                            for p in bridge_ph {
+                                if phrases.iter().any(|e| e == &p) { continue; }
+                                phrases.push(p);
+                                weights.push(1.0);
+                            }
+
                             let phrase_embs = if phrases.is_empty() {
                                 vec![vec![0.0f32; 384]]
                             } else {
@@ -7445,19 +7490,35 @@ async fn process_task(
                                 // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                                 let _ = store.delete_chunks_by_item(&hashed_item_id).await;
 
+                                // 🌟 [MULTILINGUAL ANCHOR BLEND] 상세 경로와 동일한 3중 합성.
+                                let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                                let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                                for (_, cm) in indexable_chunks.iter() {
+                                    let a = crate::utils::ai_utils::indexing_anchor_text(
+                                        &doc_lang, &page_type, &cm.property,
+                                    );
+                                    let v = cm.value_part.trim();
+                                    let l = if v.is_empty() { a.clone() } else { format!("{} {}", a, v) };
+                                    anchor_texts.push(a);
+                                    localized_texts.push(l);
+                                }
+                                let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+                                let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
                                 for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
                                     let chunk_id = format!("{}_{}", hashed_item_id, ci);
 
                                     let chunk_vec = &chunk_embs[ei];
-                                    let anchor_text = crate::utils::ai_utils::semantic_anchor_text(
-                                        &doc_lang, &page_type, &chunk_meta.property,
-                                    );
-                                    let anchor_emb = model.get_embedding(anchor_text).await
-                                        .unwrap_or(vec![0.0; 384]);
+                                    let anchor_emb = &anchor_embs[ei];
+                                    let localized_emb = &localized_embs[ei];
 
                                     let mut final_vec = vec![0.0f32; 384];
                                     for d in 0..384 {
-                                        final_vec[d] = chunk_vec[d] * 0.7 + anchor_emb[d] * 0.3;
+                                        final_vec[d] = chunk_vec[d] * 0.5
+                                            + anchor_emb[d] * 0.2
+                                            + localized_emb[d] * 0.3;
                                     }
                                     let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
                                     if norm > 0.0 {

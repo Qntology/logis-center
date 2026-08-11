@@ -186,11 +186,12 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
         }
 
         // 패턴 6: "Regarding {context},"
-        // → 중첩 객체 컨텍스트 도입부, property = context, confirmed = true
-        if let Some(rest) = s.strip_prefix("Regarding ") {
-            let context = rest.trim_end_matches(',').trim();
-            let property = context.to_lowercase().replace(' ', "_");
-            chunks.push((s.to_string(), property, true));
+        // → 중첩 객체 컨텍스트 '도입부'일 뿐, 값이 존재하지 않습니다.
+        //   기존에는 property = context 로 확정되어 실제 값 청크가 들어와야 할
+        //   슬롯을 선점하고(예: "Regarding options,") 값 없는 쓰레기 벡터가 저장되었습니다.
+        //   전용 property 로 격리하여 run_phase_b_pipeline Step 0 에서 폐기합니다.
+        if s.strip_prefix("Regarding ").is_some() {
+            chunks.push((s.to_string(), "context_intro".to_string(), false));
             continue;
         }
 
@@ -1340,6 +1341,14 @@ pub fn exclusive_assign_for_indexing(
     let mut claimed_fields: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // ── 1단계: confirmed 청크 우선 배정 ──
+    // 🌟 [MULTI-VALUE PRESERVE] 검색 경로의 배타 배정은 "한 질의 조각 = 한 컬럼" 이라는
+    //    '판정' 이지만, 인덱싱은 '저장' 입니다.
+    //    goods 배열 안 여러 상품의 title, tags 다중 값, additional_image_url 처럼
+    //    같은 property 가 여러 값을 갖는 것이 정상입니다.
+    //    기존에는 2번째부터 unclassified 로 강등되어 PHASE D 필터에서 통째로 사라졌습니다.
+    //    NMS 의 D1(동일 텍스트) / D2(동일 property+value) 가 이미 진짜 중복을 제거했으므로,
+    //    여기서는 confirmed 청크를 절대 폐기하지 않고 그대로 보존합니다.
+    let mut multi_value_kept = 0usize;
     for (ci, pr) in plinko_results.iter().enumerate() {
         if !pr.all_scores.is_empty() {
             continue; // 비confirmed 청크는 2단계에서 처리
@@ -1356,16 +1365,22 @@ pub fn exclusive_assign_for_indexing(
         };
 
         if claimed_fields.contains(&fi) {
-            let mut dup = pr.clone();
-            dup.property = "unclassified".to_string();
+            multi_value_kept += 1;
             assigned_chunks.insert(ci);
-            final_results.push(dup);
+            final_results.push(pr.clone());
             continue;
         }
 
         claimed_fields.insert(fi);
         assigned_chunks.insert(ci);
         final_results.push(pr.clone());
+    }
+
+    if multi_value_kept > 0 {
+        println!(
+            "  🧬 [MULTI-VALUE PRESERVE] 동일 property 의 추가 확정 청크 {}개를 강등 없이 보존했습니다.",
+            multi_value_kept
+        );
     }
 
     // ── 2단계: 비confirmed 청크 그리디 경쟁 ──
@@ -1510,18 +1525,26 @@ where
     Fut: std::future::Future<Output = Vec<f32>>,
 {
     // ── Step 0: 인덱싱 불가 청크 필터링 ──
+    //   masked_text / text : json_to_natural_language 출력 자체를 재수록한 자기참조 청크
+    //   unclassified       : 패턴 매칭 실패
+    //   context_intro      : "Regarding {context}," — 값이 없는 도입부
+    //   json_data          : 직렬화 원문 덩어리
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
         .filter(|(_, property, _)| {
             let p = property.as_str();
-            p != "masked_text" && p != "text" && p != "unclassified"
+            p != "masked_text"
+                && p != "text"
+                && p != "unclassified"
+                && p != "context_intro"
+                && p != "json_data"
         })
         .collect();
 
     let removed_count = raw_chunks.len() - filtered_chunks.len();
     if removed_count > 0 {
         println!(
-            "  🚫 [PHASE A FILTER] masked_text/text/unclassified 청크 {}개 인덱싱 대상에서 제외",
+            "  🚫 [PHASE A FILTER] masked_text/text/unclassified/context_intro/json_data 청크 {}개 인덱싱 대상에서 제외",
             removed_count
         );
     }

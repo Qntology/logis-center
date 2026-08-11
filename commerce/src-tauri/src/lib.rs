@@ -997,43 +997,69 @@ async fn ai_search_complex(
                 {
                     // 4-A: item_chunks 테이블 코사인 검색
                     //      item_type 필터로 도메인을 좁히고, mode 필터로 검색 모드 일치 보장
-                    let chunk_type_filter = if is_table_fallback {
-                        // 폴백 컨텍스트는 타입 접미사가 벗겨진 ctx_type 사용
-                        format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode)
-                    } else {
-                        format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode)
-                    };
+                    let chunk_type_filter = format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode);
+                    if is_table_fallback {
+                        println!("[AI-SEARCH] 🧩 [STAGE-4] 폴백 컨텍스트 감지. item_type='{}' 로 청크 검색을 수행합니다.", ctx_type);
+                    }
 
-                    let chunk_results = store.search_chunks(
+                    // 4-B: PLINKO 조건 기반 타겟 속성 목록 구축
+                    //      ① condition 키 (PLINKO 가 확정한 속성)
+                    //      ② substantial (추상 수식어가 지목한 물리 속성 — weight / sale_price ...)
+                    //      substantial 은 LanceDB 물리 컬럼이 아니라 SQL 로는 절대 반영되지 않지만,
+                    //      item_chunks 의 property 컬럼에는 그대로 존재하므로
+                    //      '무거운 → weight' 의도를 여기서 실제 검색으로 회수합니다.
+                    let mut condition_props: Vec<String> = ctx.get("condition")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| obj.keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    let substantial_prop = ctx.get("substantial")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !substantial_prop.is_empty() && !condition_props.iter().any(|p| p == &substantial_prop) {
+                        condition_props.push(substantial_prop.clone());
+                    }
+
+                    let mut chunk_results = store.search_chunks(
                         &emb,
                         10, // 상위 10개 청크 (item_id 그룹핑 전 오버페치)
                         Some(&chunk_type_filter),
                     ).await.unwrap_or_default();
 
+                    // 4-C: 속성 타겟 청크 검색 (property 필터 고정)
+                    //      전체 코사인 검색은 긴 질의 문장과 짧은 저장 청크 사이의 구조적 격차 때문에
+                    //      정답 속성 청크가 상위 10개 밖으로 밀려날 수 있습니다.
+                    //      확정된 속성마다 property 를 고정한 별도 쿼리를 던져 리콜을 보증합니다.
+                    for target_prop in condition_props.iter() {
+                        if target_prop.trim().is_empty() { continue; }
+                        let escaped_prop = target_prop.replace('\'', "''");
+                        let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
+                        let targeted = store.search_chunks(&emb, 5, Some(&prop_filter)).await.unwrap_or_default();
+                        if targeted.is_empty() { continue; }
+                        println!("[AI-SEARCH]   🎯 [STAGE-4C] property='{}' 타겟 청크 검색: {}건 추가 확보", target_prop, targeted.len());
+                        for t in targeted {
+                            if chunk_results.iter().any(|(cid, _, _, _, _)| cid == &t.0) { continue; }
+                            chunk_results.push(t);
+                        }
+                    }
+
                     if !chunk_results.is_empty() {
                         println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
                     }
 
-                    // 4-B: PLINKO 조건 기반 청크 필터링 및 보너스 점수
-                    //      STAGE-2 의 PLINKO GAME 이 확정한 속성명(condition 키)과
-                    //      청크의 property 가 일치하면 보너스 점수를 부여합니다.
-                    //      이 보너스는 매직 상수가 아니라 '속성 확정 여부' 라는
-                    //      결정론적 사실에 기반합니다.
-                    let condition_props: Vec<String> = ctx.get("condition")
-                        .and_then(|v| v.as_object())
-                        .map(|obj| obj.keys().cloned().collect())
-                        .unwrap_or_default();
-
-                    for (chunk_id, item_id, chunk_text, property, mut score) in chunk_results {
-                        // 4-B: 속성 매칭 보너스
-                        //      PLINKO 가 확정한 속성과 청크 속성이 일치하면
-                        //      코사인 점수에 속성 확정 보너스를 가산합니다.
-                        //      보너스 크기는 '조건에 확정된 속성 개수' 에 반비례하여
-                        //      여러 속성이 확정된 경우 보너스가 분산되도록 합니다.
+                    for (chunk_id, item_id, chunk_text, property, raw_cosine) in chunk_results {
+                        // 4-D: 3-Track 스케일 정합
+                        //      store.rs 의 하이브리드 검색은 Column=3.0 / FTS=2.0 / Vector=1.0 가산 스케일입니다.
+                        //      기존 청크 점수는 코사인(0~1) 그대로라 최종 랭킹에서 영향력이 사실상 0 이었습니다.
+                        //      (로그: FTS 0.9995 vs 청크 0.2694)
+                        //      청크 매칭은 '본문 매칭' 이므로 FTS 트랙(2.0)과 동일 스케일로 환산하고,
+                        //      PLINKO 가 확정한 속성과 일치하면 Column 트랙(3.0)을 추가로 얹습니다.
+                        let mut score = raw_cosine * 2.0;
                         if !condition_props.is_empty() && condition_props.contains(&property) {
-                            let bonus = 1.0 / (condition_props.len() as f32);
-                            score += bonus;
-                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 보너스 +{:.4} → 최종 {:.4}", property, bonus, score);
+                            let column_track = raw_cosine * 3.0;
+                            score += column_track;
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
                         }
 
                         // 4-C: item_id 기준 기존 결과와 dedup

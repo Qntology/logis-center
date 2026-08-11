@@ -967,7 +967,12 @@ impl VectorStore {
                     let has_chunk_id = current_schema.field_with_name("chunk_id").is_ok();
                     let has_vector = current_schema.field_with_name("vector").is_ok();
                     let has_property = current_schema.field_with_name("property").is_ok();
-                    if !has_chunk_id || !has_vector || !has_property {
+                    // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식이 바뀌면 기존 청크는
+                    //    새 질의 벡터와 정합하지 않습니다. 스키마가 같아도 강제 재구축이 필요하므로
+                    //    레시피 버전을 컬럼으로 각인하고, 버전이 다르면 테이블을 드롭합니다.
+                    //    (v2 = chunk 0.5 + anchor 0.2 + localized 0.3, 다국어 앵커 편입)
+                    let has_recipe_v2 = current_schema.field_with_name("embed_recipe_v2").is_ok();
+                    if !has_chunk_id || !has_vector || !has_property || !has_recipe_v2 {
                         println!("[Store] item_chunks schema mismatch. Dropping for recreation.");
                         let _ = self.conn.drop_table("item_chunks", &[]).await;
                         let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
@@ -1011,6 +1016,9 @@ impl VectorStore {
                 // 타임스탬프
                 Field::new("created_at", DataType::Int64, false),
                 Field::new("updated_at", DataType::Int64, false),
+
+                // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식 버전 각인 (v2)
+                Field::new("embed_recipe_v2", DataType::Utf8, true),
             ]));
 
             if let Err(_) = self.conn.create_empty_table("item_chunks", chunk_schema.clone()).execute().await {
@@ -1085,6 +1093,7 @@ impl VectorStore {
             Arc::new(StringArray::from(vec![mode.unwrap_or("commerce").to_string()])),
             Arc::new(Int64Array::from(vec![now])),
             Arc::new(Int64Array::from(vec![now])),
+            Arc::new(StringArray::from(vec!["chunk0.5+anchor0.2+localized0.3".to_string()])),
         ])?;
 
         table.add(vec![batch]).execute().await?;
