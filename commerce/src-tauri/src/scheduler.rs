@@ -21,6 +21,201 @@ use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_ext
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
+
+// =====================================================================
+// 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
+// ---------------------------------------------------------------------
+// 흐름:
+//   원문 "Cable Knit Cardigan"
+//     → 1차: 문서 언어 표기로 음차   "케이블 니트 카디건"   (transliteration_native)
+//     → 2차: 원문 표기로 역음차      "keibeul nit kadigeon" (transliteration_roman)
+//   두 별칭을 동일 item_id / 동일 property 로 item_chunks 에 추가 저장합니다.
+//   store.rs 의 search_chunks() 가 item_id 기준으로 점수를 합산하므로,
+//   별칭 하나만 매칭돼도 원본 item 이 그대로 상위 랭크됩니다.
+//
+// 언어 하드코딩이 없는 이유:
+//   1차 목표 표기 = native_script_sample()  → detect_document_language 결과 + bias.json
+//   2차 목표 표기 = 원문 값 그 자체          → 언어 테이블 자체가 불필요
+// =====================================================================
+
+/// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
+/// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
+///
+/// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
+async fn generate_transliteration_aliases(
+    model: &LogisModel,
+    chunks: &[&crate::nl_convert::ChunkMetadata],
+    doc_lang: &str,
+    page_type: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> Vec<(String, String)> {
+    let emit = |msg: &str| {
+        println!("{}", msg);
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+    };
+
+    let mut out: Vec<(String, String)> = vec![(String::new(), String::new()); chunks.len()];
+    let mut cache: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let mut made = 0usize;
+    let mut reused = 0usize;
+    let mut skipped = 0usize;
+
+    for (i, cm) in chunks.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) { break; }
+
+        if !crate::nl_convert::needs_transliteration(cm) { skipped += 1; continue; }
+
+        let src = cm.value_part.trim().to_string();
+        if src.is_empty() { skipped += 1; continue; }
+
+        if let Some(hit) = cache.get(&src) {
+            out[i] = hit.clone();
+            reused += 1;
+            continue;
+        }
+
+        // 1차 목표 표기 체계 확보. 원문과 같은 표기 체계면 음차가 성립하지 않으므로
+        // LLM 을 아예 호출하지 않습니다. (영어 문서 + 영어 값 → 호출 0회)
+        let target1 = match crate::nl_convert::transliteration_target_sample(&src, doc_lang, page_type, &cm.property) {
+            Some(t) => t,
+            None => {
+                cache.insert(src.clone(), (String::new(), String::new()));
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let p1 = crate::nl_convert::build_transliteration_prompt(&src, &target1);
+        let raw1 = model.call_qwen3_transliteration(&p1, Some(cancel.clone())).await.unwrap_or_default();
+        let s1 = crate::nl_convert::sanitize_transliteration(&raw1, &src);
+
+        // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
+        //      목표 표기 샘플이 원문 값 그 자체이므로 언어 이름을 코드에 둘 필요가 없습니다.
+        let mut s2 = String::new();
+        if !s1.is_empty() {
+            let p2 = crate::nl_convert::build_transliteration_prompt(&s1, &src);
+            let raw2 = model.call_qwen3_transliteration(&p2, Some(cancel.clone())).await.unwrap_or_default();
+            s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
+        }
+
+        let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
+
+        if pair.0.is_empty() && pair.1.is_empty() {
+            emit(&format!("      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')", src, cm.property));
+        } else {
+            made += 1;
+            emit(&format!(
+                "      🔤 [SYNONYM EXPANSION] '{}' → native='{}' | roman='{}' (property='{}')",
+                src, pair.0, pair.1, cm.property
+            ));
+        }
+
+        cache.insert(src.clone(), pair.clone());
+        out[i] = pair;
+    }
+
+    if made > 0 || reused > 0 {
+        emit(&format!(
+            "  🔤 [SYNONYM EXPANSION] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
+            made, reused, skipped
+        ));
+    }
+
+    out
+}
+
+/// [SYNONYM EXPANSION] 생성된 별칭을 item_chunks 에 추가 행으로 저장합니다.
+///
+/// 저장 벡터는 원본 청크와 **동일한 v3 형식 인지 3중 합성**을 사용합니다.
+///   ① chunk  = 별칭 그 자체
+///   ② anchor = indexing_anchor_text() (원본과 동일한 라벨 개념 축)
+///   ③ local  = "{leaf_label} {별칭}"
+/// Text/Address 는 (0.25 / 0.10 / 0.65) 이므로 별칭이 벡터를 지배합니다.
+///
+/// property / property_format 을 원본과 동일하게 두는 이유:
+///   lib.rs 의 STAGE-4B(조건 매칭 Column 트랙)와 STAGE-4C(property 타겟 검색)가
+///   property 문자열로 동작하기 때문입니다. 별칭에 다른 property 를 주면
+///   그 두 경로에서 별칭이 통째로 배제됩니다.
+async fn upsert_alias_chunks(
+    store: &VectorStore,
+    model: &LogisModel,
+    item_id: &str,
+    base_chunk_id: &str,
+    page_type: &str,
+    doc_lang: &str,
+    chunk_meta: &crate::nl_convert::ChunkMetadata,
+    aliases: &(String, String),
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    search_mode: &str,
+) -> usize {
+    let mut saved = 0usize;
+
+    if aliases.0.trim().is_empty() && aliases.1.trim().is_empty() {
+        return 0;
+    }
+
+    let anchor_text = crate::utils::ai_utils::indexing_anchor_text(doc_lang, page_type, &chunk_meta.property);
+    let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, &chunk_meta.property);
+
+    let variants: [(&str, &String); 2] = [("tn", &aliases.0), ("tr", &aliases.1)];
+
+    for (suffix, alias) in variants.iter() {
+        let a = alias.trim();
+        if a.is_empty() { continue; }
+
+        let localized = if leaf.trim().is_empty() {
+            a.to_string()
+        } else {
+            format!("{} {}", leaf.trim(), a)
+        };
+
+        let embs = model
+            .get_embedding_batch(vec![a.to_string(), anchor_text.clone(), localized.clone()])
+            .await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; 3]);
+        if embs.len() < 3 { continue; }
+
+        let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+            "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+            _ => (0.40f32, 0.30f32, 0.30f32),
+        };
+
+        let mut final_vec = vec![0.0f32; 384];
+        for d in 0..384 {
+            final_vec[d] = embs[0][d] * w_chunk
+                + embs[1][d] * w_anchor
+                + embs[2][d] * w_local;
+        }
+        let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for d in 0..384 { final_vec[d] /= norm; }
+        }
+
+        let alias_chunk_id = format!("{}_{}", base_chunk_id, suffix);
+        let _ = store.upsert_chunk(
+            &alias_chunk_id,
+            item_id,
+            page_type,
+            a,
+            &chunk_meta.property,
+            &chunk_meta.property_format,
+            a,
+            Some(final_vec),
+            Some(cc),
+            Some(bcc),
+            Some(ref_val),
+            Some(search_mode),
+        ).await;
+        saved += 1;
+    }
+
+    saved
+}
+
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
@@ -6159,6 +6354,27 @@ async fn process_task(
         crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
+    // 🌟 [SYNONYM ENGINE PRELOAD] 음차 별칭 생성기(Qwen3 0.6B)와 임베딩 모델을 '함께' 상주시킵니다.
+    //
+    //    로딩 순서가 핵심입니다.
+    //      ensure_qwen3()      : 내부에서 deep_purge_resources() 를 호출합니다 (지금은 빈 상태라 무해).
+    //      ensure_embedding()  : 아무것도 파기하지 않고 임베딩만 추가 로드합니다.
+    //    따라서 Qwen3 → Embedding 순서로 올리면 둘이 공존하고,
+    //    이후 아이템 루프에서 ensure_qwen3() 는 is_some() 을 보고 즉시 반환하므로
+    //    아이템마다 2GB 모델을 갈아끼우는 핑퐁이 물리적으로 발생하지 않습니다.
+    //
+    //    비용: VRAM 상주량 증가(0.6B Q8 + 97m 임베딩), 태스크 소요 시간 증가.
+    //    이 비용은 크로스링구얼 리콜을 얻기 위해 의도적으로 감수하는 것입니다.
+    {
+        emit_term("[Scheduler] 🔤 Loading Qwen3(0.6B) + Embedding together for synonym expansion...");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading transliteration engine...", "spinner": "🔤" }));
+
+        model.ensure_qwen3().await?;
+        model.ensure_embedding().await?;
+
+        emit_term("[Scheduler] ✅ Transliteration engine + Embedding model are resident together (no model ping-pong).");
+    }
+
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
@@ -6881,6 +7097,22 @@ async fn process_task(
                         let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
 
+                        // 🌟 [SYNONYM EXPANSION] 2-pass 음차 별칭 생성.
+                        //    detect_document_language 결과(doc_lang)로 목표 표기 체계를 정하고,
+                        //    Qwen3 0.6B 로 원문 → 문서 언어 표기 → 로마자 표기 순서로 뒤집습니다.
+                        //    Text/Address 형식 청크만 대상이며, 표기 체계가 같으면 호출 자체를 생략합니다.
+                        let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+                            indexable_chunks.iter().map(|(_, c)| *c).collect();
+                        let alias_pairs = generate_transliteration_aliases(
+                            &model,
+                            &metas,
+                            &doc_lang,
+                            &page_type,
+                            cancellation_token,
+                            app_handle,
+                            &task.id,
+                        ).await;
+
                         // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                         let _ = store.delete_chunks_by_item(&target_id).await;
 
@@ -6919,6 +7151,8 @@ async fn process_task(
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
                         let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+                        let mut alias_saved = 0usize;
 
                         for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
                             let chunk_id = format!("{}_{}", target_id, ci);
@@ -6959,11 +7193,27 @@ async fn process_task(
                                 Some(&ref_val),
                                 Some(&search_mode),
                             ).await;
+
+                            // 🌟 [SYNONYM EXPANSION] 별칭 벡터를 같은 item_id / 같은 property 로 추가 저장합니다.
+                            alias_saved += upsert_alias_chunks(
+                                &store,
+                                &model,
+                                &target_id,
+                                &chunk_id,
+                                &page_type,
+                                &doc_lang,
+                                chunk_meta,
+                                &alias_pairs[ei],
+                                &task.cc,
+                                &bcc,
+                                &ref_val,
+                                &search_mode,
+                            ).await;
                         }
 
                         emit_term(&format!(
-                            "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | table='item_chunks'",
-                            target_id, indexable_chunks.len(), enriched_chunks.len()
+                            "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | 음차 별칭 {}개 | table='item_chunks'",
+                            target_id, indexable_chunks.len(), enriched_chunks.len(), alias_saved
                         ));
                     }
                 }
@@ -7506,6 +7756,21 @@ async fn process_task(
                                 let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
 
+                                // 🌟 [SYNONYM EXPANSION] 상세 경로와 동일한 2-pass 음차 별칭 생성.
+                                //    Qwen3 와 임베딩이 이미 함께 상주하므로 아이템마다 모델을 갈아끼우지 않습니다.
+                                //    동일 값은 캐시로 재사용되어 LLM 호출이 값의 종류 수만큼만 발생합니다.
+                                let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+                                    indexable_chunks.iter().map(|(_, c)| *c).collect();
+                                let alias_pairs = generate_transliteration_aliases(
+                                    &model,
+                                    &metas,
+                                    &doc_lang,
+                                    &page_type,
+                                    cancellation_token,
+                                    app_handle,
+                                    &task.id,
+                                ).await;
+
                                 // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                                 let _ = store.delete_chunks_by_item(&hashed_item_id).await;
 
@@ -7530,6 +7795,8 @@ async fn process_task(
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
                                 let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+                                let mut alias_saved = 0usize;
 
                                 for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
                                     let chunk_id = format!("{}_{}", hashed_item_id, ci);
@@ -7568,11 +7835,27 @@ async fn process_task(
                                         Some(&ref_val),
                                         Some(&search_mode),
                                     ).await;
+
+                                    // 🌟 [SYNONYM EXPANSION] 별칭 벡터를 같은 item_id / 같은 property 로 추가 저장합니다.
+                                    alias_saved += upsert_alias_chunks(
+                                        &store,
+                                        &model,
+                                        &hashed_item_id,
+                                        &chunk_id,
+                                        &page_type,
+                                        &doc_lang,
+                                        chunk_meta,
+                                        &alias_pairs[ei],
+                                        &task.cc,
+                                        &bcc,
+                                        &ref_val,
+                                        &search_mode,
+                                    ).await;
                                 }
 
                                 emit_term(&format!(
-                                    "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중)",
-                                    hashed_item_id, indexable_chunks.len(), enriched_chunks.len()
+                                    "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | 음차 별칭 {}개",
+                                    hashed_item_id, indexable_chunks.len(), enriched_chunks.len(), alias_saved
                                 ));
                             }
                         }

@@ -943,6 +943,247 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
     chunks
 }
 
+// =====================================================================
+// 🌟 [SYNONYM EXPANSION] 음차(Transliteration) 별칭 생성 지원 함수
+// ---------------------------------------------------------------------
+// 목적:
+//   다국어 임베딩은 'Knit' ↔ '니트' 를 의미 공간에서 연결하지만,
+//   자유서술 값(상품명)은 bias.json 에 리터럴로 등재할 수 없어 표기 유사도가 0 입니다.
+//   (log 실측: 'Cable Knit Cardigan' 저장 벡터 vs '니트 가디건' 질의 = 0.5631,
+//    반면 '베이지'는 color 뱅크에 리터럴 등재되어 0.8582)
+//   따라서 값 자체를 별칭 벡터로 물질화합니다.
+//
+// 설계 원칙 준수:
+//   - 언어 이름/예시 문자열 하드코딩 없음.
+//     1차 목표 표기 체계 = bias.json 에서 뽑은 '그 언어의 실제 문자 샘플'
+//     2차 목표 표기 체계 = 원문 값 그 자체
+//   - contains() 의미 판정 없음. 표기 체계 판정은 char::is_ascii_alphabetic 카운트뿐.
+//   - 새 매직 상수 없음. 길이 상한은 split_natural_language_to_chunks 의 R2(150자) 재사용.
+//   - LLM 은 '판정'이 아니라 '문자열 → 문자열 변환기'로만 사용.
+// =====================================================================
+
+/// [SYNONYM EXPANSION] 값의 주 표기 체계가 라틴(ASCII 알파벳)인지 판정합니다.
+/// 문자 클래스 카운트만 사용하므로 언어 사전이 전혀 필요 없습니다.
+pub fn is_latin_dominant(value: &str) -> bool {
+    let mut latin = 0usize;
+    let mut other = 0usize;
+    for c in value.chars() {
+        if !c.is_alphabetic() { continue; }
+        if c.is_ascii_alphabetic() { latin += 1; } else { other += 1; }
+    }
+    latin >= other
+}
+
+/// [SYNONYM EXPANSION] 이 청크가 음차 별칭 생성 대상인지 판정합니다.
+///
+/// 판정 규칙 (전부 결정론, 어휘 하드코딩 없음):
+///   T1: property_format 이 '자유 서술 값'을 담는 형식이어야 합니다. (Text / Address)
+///       Numeric / Date / Identifier / Link / Phone / TrackingCode / Enum 은
+///       값이 숫자·코드·캐노니컬 키라 음차가 물리적으로 무의미합니다.
+///       Synthesis 는 합성 문장이라 별칭 벡터가 노이즈만 늘리므로 제외합니다.
+///   T2: 값에 '문자'가 하나라도 있어야 소리를 옮길 수 있습니다.
+///   T3: 숫자 비율이 절반 이상이면 코드성 값이므로 제외합니다.
+///   T4: 길이 상한은 R2 의 150자를 그대로 재사용합니다. (새 상수 도입 아님)
+pub fn needs_transliteration(chunk: &ChunkMetadata) -> bool {
+    match chunk.property_format.as_str() {
+        "Text" | "Address" => {},
+        _ => return false,
+    }
+
+    let v = chunk.value_part.trim();
+    if v.is_empty() { return false; }
+
+    let n = v.chars().count();
+    if n < 2 { return false; }
+    if n > 150 { return false; }
+
+    if !v.chars().any(|c| c.is_alphabetic()) { return false; }
+
+    let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits * 2 >= n { return false; }
+
+    true
+}
+
+/// [SYNONYM EXPANSION] 문서 언어의 '실제 문자 샘플'을 bias.json 에서 동적으로 확보합니다.
+/// detect_document_language() 결과(doc_lang)를 그대로 받아
+///   get_localized_page_type()  → 그 언어로 쓰인 도메인 명사
+///   indexing_leaf_label()      → 그 언어로 쓰인 이 속성의 라벨
+/// 두 조각을 이어붙입니다. 코드에는 어떤 언어 이름도 등장하지 않습니다.
+pub fn native_script_sample(doc_lang: &str, page_type: &str, property: &str) -> String {
+    let localized_type = crate::parsing::get_localized_page_type(page_type, doc_lang);
+    let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, property);
+
+    let mut s = String::new();
+    let lt = localized_type.trim();
+    if !lt.is_empty() { s.push_str(lt); }
+
+    let lf = leaf.trim();
+    if !lf.is_empty() && lf != lt {
+        if !s.is_empty() { s.push(' '); }
+        s.push_str(lf);
+    }
+    s
+}
+
+/// [SYNONYM EXPANSION] 로마자 표기 샘플입니다.
+/// 스키마 속성명을 자연어화한 결과이므로 항상 ASCII 이며,
+/// 특정 언어가 아니라 '문자 체계'만 지시합니다.
+pub fn latin_script_sample(property: &str) -> String {
+    let h = crate::utils::ai_utils::humanize_url_token(property);
+    if h.trim().is_empty() { property.to_string() } else { h }
+}
+
+/// [SYNONYM EXPANSION] 1차 음차의 목표 표기 샘플을 결정합니다.
+///   - 값이 라틴 우세  → 목표는 문서 언어 표기 (Beige → 베이지)
+///   - 값이 비라틴 우세 → 목표는 로마자 표기   (베이지 → beiji)
+/// 목표 샘플이 원문과 같은 표기 체계면 음차가 성립하지 않으므로 None 을 돌려
+/// LLM 호출 자체를 생략합니다. (영어 문서에서 영어 값 → 호출 0회)
+pub fn transliteration_target_sample(
+    value: &str,
+    doc_lang: &str,
+    page_type: &str,
+    property: &str,
+) -> Option<String> {
+    let src_latin = is_latin_dominant(value);
+
+    if src_latin {
+        let sample = native_script_sample(doc_lang, page_type, property);
+        if sample.trim().is_empty() { return None; }
+        if is_latin_dominant(&sample) { return None; }
+        Some(sample)
+    } else {
+        let sample = latin_script_sample(property);
+        if sample.trim().is_empty() { return None; }
+        if !is_latin_dominant(&sample) { return None; }
+        Some(sample)
+    }
+}
+
+/// [SYNONYM EXPANSION] 음차 프롬프트를 만듭니다.
+/// 목표 표기 체계를 '언어 이름'이 아니라 '실제 문자 샘플'로 지시하므로
+/// 어떤 언어가 들어와도 동일한 프롬프트 한 벌로 동작합니다.
+pub fn build_transliteration_prompt(source_value: &str, target_script_sample: &str) -> String {
+    format!(
+"[TASK]
+Respell the SOURCE text so that it is written with the same kind of characters as the SCRIPT SAMPLE.
+This is a sound-based respelling (transliteration). It is NOT a translation.
+
+[SOURCE]
+{}
+
+[SCRIPT SAMPLE]
+{}
+
+[RULES]
+1. Write how the SOURCE sounds, using only the kind of characters that appear in the SCRIPT SAMPLE.
+2. Never translate the meaning. Never explain. Never add or remove words.
+3. Keep the original word order and the original word count.
+4. Copy every digit and symbol from the SOURCE exactly as it is.
+5. Answer with one single line that contains the respelled text and nothing else.
+
+[OUTPUT]",
+        source_value,
+        target_script_sample
+    )
+}
+
+/// [SYNONYM EXPANSION] LLM 응답에서 음차 결과만 남기는 결정론 정화기입니다.
+///
+/// 0.6B 모델이 붙이는 잔재(코드펜스 / 접두 라벨 / 감싸는 따옴표 / 설명 줄)를
+/// 구조 파싱으로만 벗겨냅니다. 어휘 판정이 없으므로 다국어에서 동일하게 동작합니다.
+///
+/// 최종 게이트:
+///   G1: 결과가 원문과 동일하면 폐기 (모델이 그대로 반복한 경우)
+///   G2: 표기 체계가 뒤집히지 않았으면 폐기 (음차가 일어나지 않았다는 구조적 증거)
+///   G3: 길이가 R2(150자)를 넘으면 폐기 (음차가 아니라 설명문)
+pub fn sanitize_transliteration(raw: &str, source_value: &str) -> String {
+    let mut s = raw.trim().to_string();
+
+    // 코드펜스 제거
+    if s.starts_with("```") {
+        s = s.trim_start_matches('`').to_string();
+        if let Some(p) = s.find("```") { s = s[..p].to_string(); }
+        if let Some(nl) = s.find('\n') {
+            let head = s[..nl].trim().to_string();
+            if !head.is_empty()
+                && head.chars().all(|c| c.is_ascii_alphanumeric())
+                && head.chars().count() <= 12
+            {
+                s = s[nl + 1..].to_string();
+            }
+        }
+    }
+
+    // 첫 유효 줄만 사용
+    s = s.lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+
+    // 접두 라벨 제거 (콜론 앞이 순수 ASCII 라벨일 때만)
+    if let Some(p) = s.find(':') {
+        if p <= 24 {
+            let head = s[..p].trim();
+            let is_label = !head.is_empty()
+                && head.chars().all(|c| c.is_ascii_alphabetic() || c.is_whitespace() || c == '[' || c == ']');
+            if is_label { s = s[p + 1..].trim().to_string(); }
+        }
+    }
+
+    // 감싸는 따옴표/강조 기호 제거
+    let trims: [char; 8] = ['"', '\'', '`', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '*'];
+    loop {
+        let before = s.clone();
+        s = s.trim().to_string();
+        for t in trims.iter() {
+            s = s.trim_start_matches(*t).trim_end_matches(*t).to_string();
+        }
+        s = s.trim().to_string();
+        if s == before { break; }
+    }
+
+    // 문장 종결 부호 제거 (음차 결과는 문장이 아닙니다)
+    s = s.trim_end_matches(|c: char| c == '.' || c == ',' || c == ';').trim().to_string();
+
+    // 공백 정규화
+    s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if s.is_empty() { return String::new(); }
+
+    let src = source_value.trim();
+    if s.eq_ignore_ascii_case(src) { return String::new(); }                 // G1
+    if is_latin_dominant(&s) == is_latin_dominant(src) { return String::new(); } // G2
+    if s.chars().count() > 150 { return String::new(); }                     // G3
+
+    s
+}
+
+/// [SYNONYM EXPANSION] 1차/2차 결과를 표기 체계 기준으로 슬롯에 배정합니다.
+///   transliteration_native : 비라틴(문서 언어) 표기 별칭
+///   transliteration_roman  : 라틴(로마자) 표기 별칭
+/// 원문과 완전히 같은 후보는 검색 가치가 없으므로 배정하지 않습니다.
+pub fn assign_transliterations(source_value: &str, stage1: &str, stage2: &str) -> (String, String) {
+    let mut native = String::new();
+    let mut roman = String::new();
+    let src = source_value.trim();
+
+    for cand in [stage1, stage2] {
+        let c = cand.trim();
+        if c.is_empty() { continue; }
+        if c.eq_ignore_ascii_case(src) { continue; }
+
+        if is_latin_dominant(c) {
+            if roman.is_empty() { roman = c.to_string(); }
+        } else if native.is_empty() {
+            native = c.to_string();
+        }
+    }
+
+    (native, roman)
+}
+
 /// [PHASE B - 로그 헬퍼] 메타데이터 부여 + NMS + FORMAT GATE 전체 결과를 출력합니다.
 /// confirmed(✓) / 비confirmed(?) 카운트 요약을 포함합니다.
 pub fn log_enriched_chunks(chunks: &[ChunkMetadata]) {
