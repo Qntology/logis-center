@@ -87,12 +87,20 @@ async fn generate_transliteration_aliases(
             }
         };
 
+        println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
+        println!("    SOURCE       = '{}'", src);
+        println!("    SCRIPT_SAMPLE = '{}'", target1);
+
         let p1 = crate::nl_convert::build_transliteration_prompt(&src, &target1);
         let raw1 = model.call_qwen3_transliteration(&p1, Some(cancel.clone())).await.unwrap_or_default();
         // JSON 응답에서 "transliteration" 키를 추출합니다.
         // sanitize_transliteration 내부에서 parse_json_from_llm 으로 1차 파싱하고,
         // 파싱 실패 시 폴백 구조 파싱을 수행한 뒤 G1/G2/G3 게이트를 적용합니다.
         let s1 = crate::nl_convert::sanitize_transliteration(&raw1, &src);
+
+
+        println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\\n"));
+        println!("    PASS-1 RESULT= '{}'", s1);
 
         // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
         //      원문 자체를 SCRIPT SAMPLE 로 넣으면 LLM 이 원문을 그대로 복사하므로,
@@ -111,8 +119,15 @@ async fn generate_transliteration_aliases(
                 let raw2 = model.call_qwen3_transliteration(&p2, Some(cancel.clone())).await.unwrap_or_default();
                 s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
             }
+
+            println!("    PASS-2 SOURCE       = '{}'", s1);
+            println!("    PASS-2 SCRIPT_SAMPLE = '{}'", src);
+            println!("    PASS-2 RAW          = '{}'", raw2.replace('\n', "\\n"));
+            println!("    PASS-2 RESULT       = '{}'", s2);
+        } else {
+            println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
         }
-        
+
         let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
 
         if pair.0.is_empty() && pair.1.is_empty() {
