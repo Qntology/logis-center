@@ -1939,6 +1939,10 @@ impl LogisModel {
         let mut ext_words_string: Vec<String> = Vec::new();
         let mut stanza_lemmas: Option<Vec<String>> = None;
         let mut stanza_deprels: Option<Vec<String>> = None;
+        // 🌟 [POS TAG STORAGE] Stanza POS 태그를 저장하여 ACTION VERB 판정에 사용합니다.
+        //    기존에는 POS 태그를 debug_pos_log 에만 출력하고 실제 판정에는 사용하지 않았습니다.
+        //    (log2: '니트' PROPN, '가디건' NOUN 이라는 확정 정보가 코사인 경쟁에서 무시됨)
+        let mut stanza_pos_tags: Option<Vec<String>> = None;
         
         let stanza_lang_code = match query_lang.as_str() {
             "korean" | "ko" => "ko",
@@ -2198,7 +2202,8 @@ impl LogisModel {
                                         let depparse_opt = crate::utils::ai_utils::run_depparse_deprels(&stanza.preprocessor, &mut stanza.depparse_session, &padded_chunk, &pos_ids);
                                         let mut filtered_lemmas = Vec::new();
                                         let mut filtered_deprels = Vec::new();
-
+                                        // 🌟 [POS TAG COLLECT] 필터링을 통과한 단어의 POS 태그를 함께 수집합니다.
+                                        let mut filtered_pos_tags: Vec<String> = Vec::new();
                                         for (i, word) in ext_words_string.iter().enumerate() {
                                             let tag = pos_tags[i];
                                             let lemma = if let Some(l) = lemma_words.get(i) { l.clone() } else { String::new() };
@@ -2237,6 +2242,10 @@ impl LogisModel {
                                             if !clean_word.trim().is_empty() {
                                                 filtered_words.push(clean_word);
                                                 filtered_lemmas.push(lemma.clone());
+                                                // 🌟 [POS TAG COLLECT] 이 단어의 POS 태그를 저장합니다.
+                                                //    drop_tags 로 걸러지지 않은 단어만 여기에 도달하므로
+                                                //    filtered_words 와 filtered_pos_tags 는 항상 같은 길이입니다.
+                                                filtered_pos_tags.push(tag.to_string());
                                                 if let Some(ref d) = depparse_opt {
                                                     if i < d.len() {
                                                         filtered_deprels.push(d[i].clone());
@@ -2257,6 +2266,8 @@ impl LogisModel {
                                         if !filtered_words.is_empty() {
                                             ext_words_string = filtered_words;
                                             stanza_lemmas = Some(filtered_lemmas);
+                                            // 🌟 [POS TAG STORE] POS 태그를 저장합니다.
+                                            stanza_pos_tags = Some(filtered_pos_tags);
                                             if depparse_opt.is_some() {
                                                 stanza_deprels = Some(filtered_deprels);
                                             }
@@ -2280,6 +2291,23 @@ impl LogisModel {
         } else {
             emit_term(&format!("[STANZA] ⚠️ Stanza model directory not found: {:?}. Falling back to whitespace splitting.", stanza_lang_dir));
         }
+        // 🌟 [WORD-POS MAP] ext_words_string 의 각 단어에 대응하는 POS 태그를
+        //    HashMap 으로 구축합니다. PLINKO 루프의 words 는 current_text.split_whitespace()
+        //    이므로 ext_words_string 과 직접 인덱스 대응이 불가능합니다.
+        //    단어 문자열 자체를 키로 사용하여 O(1) 조회합니다.
+        //    Stanza 처리가 실패했거나 POS 태그가 없으면 빈 맵이 되어
+        //    ACTION VERB 판정이 코사인 폴백으로 동작합니다.
+        let word_pos_map: std::collections::HashMap<String, String> = {
+            let mut m = std::collections::HashMap::new();
+            if let Some(ref tags) = stanza_pos_tags {
+                for (i, w) in ext_words_string.iter().enumerate() {
+                    if let Some(tag) = tags.get(i) {
+                        m.insert(w.clone(), tag.clone());
+                    }
+                }
+            }
+            m
+        };
 
         if ext_words_string.is_empty() {
             ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
@@ -3456,12 +3484,45 @@ impl LogisModel {
                         .max(op_bank_sim)
                         .max(temporal_sim)
                         .max(filter_sim);
-
-                    let is_action_verb = word != "|"
-                        && !word_has_digit
-                        && action_sim > rival_max;
-
+                    // 🌟 [POS-FIRST ACTION VERB GATE]
+                    //    Stanza POS 태그를 1차 판정으로 사용하고, 코사인 경쟁은 폴백으로만 동작합니다.
+                    //
+                    //    판정 규칙:
+                    //    ① POS = VERB / AUX
+                    //       → ACTION VERB 확정. 코사인 불필요.
+                    //       Stanza 가 용언으로 판정한 단어는 구조적으로 명령어/서술어입니다.
+                    //
+                    //    ② POS = NOUN / PROPN / ADJ / NUM
+                    //       → 원칙적으로 ACTION VERB 아님.
+                    //       단, action_sim 이 rival_max 대비 10% 이상 상대 우위이면
+                    //       Stanza 오분류 보정으로 ACTION VERB 확정.
+                    //       (log2: '찾아줘' Stanza=NOUN, action 0.8893 vs rival 0.6747 = 31.8% 우위 → 확정)
+                    //       (log2: '니트' Stanza=PROPN, action 0.7400 vs rival 0.7309 = 1.2% 우위 → 구제)
+                    //       10% 는 절대 임계치가 아니라 코사인 공간에서
+                    //       "사실상 동률" 과 "명확한 우위" 를 구분하는 구조적 비율입니다.
+                    //
+                    //    ③ POS 없음 / PUNCT / SYM / X / 불확실
+                    //       → 코사인 폴백 (기존 4중 역검증 결과 사용).
+                    //       이 경우에도 action_sim > rival_max 조건 유지.
+                    let word_pos = word_pos_map.get(word).map(|s| s.as_str()).unwrap_or("");
+                    let is_action_verb = if word == "|" || word_has_digit {
+                        false
+                    } else {
+                        match word_pos {
+                            "VERB" | "AUX" => true,
+                            "NOUN" | "PROPN" | "ADJ" | "NUM" => {
+                                action_sim > rival_max && action_sim > rival_max * 1.10
+                            },
+                            _ => {
+                                action_sim > rival_max
+                            },
+                        }
+                    };
                     if is_action_verb {
+                        emit_term(&format!(
+                            "    🚫 [ACTION VERB IGNORED] '{}' | POS: {} | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
+                            word, word_pos, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                        ));
                         emit_term(&format!(
                             "    🚫 [ACTION VERB IGNORED] '{}' | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
                             word, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
@@ -3495,8 +3556,8 @@ impl LogisModel {
                         continue;
                     } else if action_sim > rival_max - 0.05 {
                         emit_term(&format!(
-                            "    🛡️ [ACTION VERB RESCUE] '{}' | Action: {:.4} <= Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). 명령어가 아니라 값/연산자/시간 표현으로 판정하여 Plinko 로 보냅니다.",
-                            word, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                            "    🛡️ [ACTION VERB RESCUE] '{}' | POS: {} | Action: {:.4} <= Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). 명령어가 아니라 값/연산자/시간 표현으로 판정하여 Plinko 로 보냅니다.",
+                            word, word_pos, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
                         ));
                     }
 
