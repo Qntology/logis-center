@@ -63,12 +63,20 @@ async fn generate_transliteration_aliases(
     let mut skipped = 0usize;
 
     for (i, cm) in chunks.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) { break; }
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
 
-        if !crate::nl_convert::needs_transliteration(cm) { skipped += 1; continue; }
+        if !crate::nl_convert::needs_transliteration(cm) {
+            skipped += 1;
+            continue;
+        }
 
         let src = cm.value_part.trim().to_string();
-        if src.is_empty() { skipped += 1; continue; }
+        if src.is_empty() {
+            skipped += 1;
+            continue;
+        }
 
         if let Some(hit) = cache.get(&src) {
             out[i] = hit.clone();
@@ -76,54 +84,59 @@ async fn generate_transliteration_aliases(
             continue;
         }
 
-        // 1차 목표 표기 체계 확보. 원문과 같은 표기 체계면 음차가 성립하지 않으므로
-        // LLM 을 아예 호출하지 않습니다. (영어 문서 + 영어 값 → 호출 0회)
-        let target1 = match crate::nl_convert::transliteration_target_sample(&src, doc_lang, page_type, &cm.property) {
-            Some(t) => t,
-            None => {
-                cache.insert(src.clone(), (String::new(), String::new()));
-                skipped += 1;
-                continue;
-            }
-        };
+        // 1차 음차 가능 여부 판정.
+        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
+        if !crate::nl_convert::can_transliterate(&src, doc_lang) {
+            cache.insert(src.clone(), (String::new(), String::new()));
+            skipped += 1;
+            continue;
+        }
 
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
-        println!("    SOURCE       = '{}'", src);
-        println!("    SCRIPT_SAMPLE = '{}'", target1);
+        println!("    SOURCE = '{}'", src);
 
-        let p1 = crate::nl_convert::build_transliteration_prompt(&src, &target1);
-        let raw1 = model.call_qwen3_transliteration(&p1, Some(cancel.clone())).await.unwrap_or_default();
+        let p1 = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
+        let raw1 = model
+            .call_qwen3_5_transliteration(&p1, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+
         // JSON 응답에서 "transliteration" 키를 추출합니다.
         // sanitize_transliteration 내부에서 parse_json_from_llm 으로 1차 파싱하고,
         // 파싱 실패 시 폴백 구조 파싱을 수행한 뒤 G1/G2/G3 게이트를 적용합니다.
         let s1 = crate::nl_convert::sanitize_transliteration(&raw1, &src);
 
-
         println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\\n"));
         println!("    PASS-1 RESULT= '{}'", s1);
 
         // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
-        //      원문 자체를 SCRIPT SAMPLE 로 넣으면 LLM 이 원문을 그대로 복사하므로,
-        //      원문의 표기 체계에 해당하는 일반 샘플을 사용하여 복사 경로를 원천 차단합니다.
+        //      SCRIPT SAMPLE 없이 "다른 표기 체계로 음차" 지시만 전달하므로
+        //      샘플 복사 환각이 원천 차단됩니다.
         let mut s2 = String::new();
         if !s1.is_empty() {
-            let target2_sample = if crate::nl_convert::is_latin_dominant(&src) {
-                // 원문이 라틴 → 2차 목표도 라틴 (로마자 역음차)
-                crate::nl_convert::latin_script_sample(&cm.property)
-            } else {
-                // 원문이 비라틴 → 2차 목표도 비라틴 (원문 언어 복원)
-                crate::nl_convert::native_script_sample(doc_lang, page_type, &cm.property)
-            };
-            if !target2_sample.is_empty() && crate::nl_convert::is_latin_dominant(&target2_sample) != crate::nl_convert::is_latin_dominant(&s1) {
-                let p2 = crate::nl_convert::build_transliteration_prompt(&s1, &target2_sample);
-                let raw2 = model.call_qwen3_transliteration(&p2, Some(cancel.clone())).await.unwrap_or_default();
+            // 1차 결과와 원문의 표기 체계가 달라야 2차 역음차가 성립합니다.
+            if crate::nl_convert::is_latin_dominant(&s1) != crate::nl_convert::is_latin_dominant(&src) {
+                // 🌟 [REVERSE TARGET] 2차는 1차 결과를 '원문의 표기 체계'로 되돌립니다.
+                //    원문이 라틴이면 → 1차 결과가 비라틴(문서 언어) → 2차 타겟은 "english"
+                //    원문이 비라틴이면 → 1차 결과가 라틴(로마자) → 2차 타겟은 doc_lang
+                let second_target = if crate::nl_convert::is_latin_dominant(&src) {
+                    "english"
+                } else {
+                    doc_lang
+                };
+                let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
+                let raw2 = model
+                    .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
                 s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
+                println!("    PASS-2 SOURCE = '{}'", s1);
+                println!("    PASS-2 TARGET = '{}'", second_target);
+                println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\\n"));
+                println!("    PASS-2 RESULT = '{}'", s2);
+            } else {
+                println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있거나 표기 체계 미반전)");
             }
-
-            println!("    PASS-2 SOURCE       = '{}'", s1);
-            println!("    PASS-2 SCRIPT_SAMPLE = '{}'", src);
-            println!("    PASS-2 RAW          = '{}'", raw2.replace('\n', "\\n"));
-            println!("    PASS-2 RESULT       = '{}'", s2);
         } else {
             println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
         }
@@ -131,7 +144,10 @@ async fn generate_transliteration_aliases(
         let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
 
         if pair.0.is_empty() && pair.1.is_empty() {
-            emit(&format!("      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')", src, cm.property));
+            emit(&format!(
+                "      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')",
+                src, cm.property
+            ));
         } else {
             made += 1;
             emit(&format!(
@@ -146,7 +162,7 @@ async fn generate_transliteration_aliases(
 
     if made > 0 || reused > 0 {
         emit(&format!(
-            "  🔤 [SYNONYM EXPANSION] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
+            "  🔤 [SYNONYM EXPANSION / Qwen3.5-2B] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
             made, reused, skipped
         ));
     }
@@ -6382,27 +6398,28 @@ async fn process_task(
         crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
-    // 🌟 [SYNONYM ENGINE PRELOAD] 음차 별칭 생성기(Qwen3 0.6B)와 임베딩 모델을 '함께' 상주시킵니다.
+    // 🌟 [SYNONYM ENGINE PRELOAD - QWEN3.5] 음차 별칭 생성기를 Qwen3.5 2B로 분리 동작시킵니다.
     //
-    //    로딩 순서가 핵심입니다.
-    //      ensure_qwen3()      : 내부에서 deep_purge_resources() 를 호출합니다 (지금은 빈 상태라 무해).
-    //      ensure_embedding()  : 아무것도 파기하지 않고 임베딩만 추가 로드합니다.
-    //    따라서 Qwen3 → Embedding 순서로 올리면 둘이 공존하고,
-    //    이후 아이템 루프에서 ensure_qwen3() 는 is_some() 을 보고 즉시 반환하므로
-    //    아이템마다 2GB 모델을 갈아끼우는 핑퐁이 물리적으로 발생하지 않습니다.
+    //    Qwen3 0.6B는 음차(transliteration) 능력이 부족하여 원문을 그대로 반복하는 문제가 있습니다.
+    //    (로그 실측: 'Cable Knit Cardigan' → 그대로 반복 → G1 게이트 폐기 → 별칭 0건)
     //
-    //    비용: VRAM 상주량 증가(0.6B Q8 + 97m 임베딩), 태스크 소요 시간 증가.
+    //    분리 동작 순서:
+    //      1. Qwen3 0.6B의 메인 추출 작업이 이미 완료된 상태 (PHASE 3 Handover에서 purge 완료)
+    //      2. Qwen3.5 2B 를 로드 (ensure_qwen3_5)
+    //      3. Embedding 모델을 함께 로드 (ensure_embedding)
+    //      4. Qwen3.5 + Embedding 이 공존하면서 음차 별칭 생성 수행
+    //
+    //    비용: VRAM 상주량 증가(2B Q8 + 97m 임베딩), 태스크 소요 시간 증가.
     //    이 비용은 크로스링구얼 리콜을 얻기 위해 의도적으로 감수하는 것입니다.
+    //    0.6B 대비 2B 모델은 음차 정확도가 현저히 높습니다.
     {
-        emit_term("[Scheduler] 🔤 Loading Qwen3(0.6B) + Embedding together for synonym expansion...");
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading transliteration engine...", "spinner": "🔤" }));
-
-        model.ensure_qwen3().await?;
+        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding together for synonym expansion...");
+        emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading Qwen3.5 transliteration engine...", "spinner": "🔤" }));
+        model.ensure_qwen3_5(false).await?;
         model.ensure_embedding().await?;
-
-        emit_term("[Scheduler] ✅ Transliteration engine + Embedding model are resident together (no model ping-pong).");
+        emit_term("[Scheduler] ✅ Qwen3.5(2B) Transliteration engine + Embedding model are resident together (no model ping-pong).");
     }
-
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))

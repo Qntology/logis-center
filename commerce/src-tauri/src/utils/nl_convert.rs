@@ -1034,29 +1034,26 @@ pub fn latin_script_sample(property: &str) -> String {
     if h.trim().is_empty() { property.to_string() } else { h }
 }
 
-/// [SYNONYM EXPANSION] 1차 음차의 목표 표기 샘플을 결정합니다.
-///   - 값이 라틴 우세  → 목표는 문서 언어 표기 (Beige → 베이지)
-///   - 값이 비라틴 우세 → 목표는 로마자 표기   (베이지 → beiji)
-/// 목표 샘플이 원문과 같은 표기 체계면 음차가 성립하지 않으므로 None 을 돌려
-/// LLM 호출 자체를 생략합니다. (영어 문서에서 영어 값 → 호출 0회)
-pub fn transliteration_target_sample(
-    value: &str,
-    doc_lang: &str,
-    page_type: &str,
-    property: &str,
-) -> Option<String> {
+/// [SYNONYM EXPANSION] 1차 음차가 가능한지 판정합니다.
+///   - 값이 라틴 우세  → 문서 언어가 비라틴이어야 음차 성립
+///   - 값이 비라틴 우세 → 로마자는 항상 라틴이므로 항상 성립
+/// 반환값은 더 이상 샘플 문자열이 아니라 bool 입니다.
+/// LLM 호출 여부를 결정하는 데만 사용하며, 프롬프트에는 전달하지 않습니다.
+pub fn can_transliterate(
+value: &str,
+doc_lang: &str,
+) -> bool {
     let src_latin = is_latin_dominant(value);
-
+    
     if src_latin {
-        let sample = native_script_sample(doc_lang, page_type, property);
-        if sample.trim().is_empty() { return None; }
-        if is_latin_dominant(&sample) { return None; }
-        Some(sample)
+    // 라틴 원문 → 비라틴 문서 언어에서만 음차 가능
+        let sample = native_script_sample(doc_lang, "", "");
+
+        if sample.trim().is_empty() { return false; }
+        !is_latin_dominant(&sample)
     } else {
-        let sample = latin_script_sample(property);
-        if sample.trim().is_empty() { return None; }
-        if !is_latin_dominant(&sample) { return None; }
-        Some(sample)
+        // 비라틴 원문 → 로마자(라틴)는 항상 성립
+        true
     }
 }
 
@@ -1065,8 +1062,8 @@ pub fn transliteration_target_sample(
 /// 어떤 언어가 들어와도 동일한 프롬프트 한 벌로 동작합니다.
 /// 프롬프트 본문은 prompts.rs 의 transliteration_prompt() 에 위임하며,
 /// 출력 형식은 JSON ({ "transliteration": "..." }) 입니다.
-pub fn build_transliteration_prompt(source_value: &str, target_script_sample: &str) -> String {
-    crate::prompts::transliteration_prompt(source_value, target_script_sample)
+pub fn build_transliteration_prompt(source_value: &str, target_language: &str) -> String {
+    crate::prompts::transliteration_prompt(source_value, target_language)
 }
 
 /// [SYNONYM EXPANSION] LLM 응답에서 음차 결과를 추출하는 결정론 정화기입니다.

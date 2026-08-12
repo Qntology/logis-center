@@ -803,11 +803,9 @@ impl LogisModel {
     //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
     pub async fn call_qwen3_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         self.ensure_qwen3().await?;
-
         let gen_arc = self.qwen3_generator.clone();
         let cancel_clone = cancel_token.clone();
         let prompt_string = prompt.to_string();
-
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
@@ -830,7 +828,6 @@ impl LogisModel {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }
         }).await??;
-
         // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
         let q3_clear_arc = self.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -838,10 +835,49 @@ impl LogisModel {
                 gen.clear_kv_cache();
             }
         }).await;
-
         Ok(res)
     }
 
+    // 🌟 [SYNONYM EXPANSION - QWEN3.5] 음차(Transliteration) 전용 Qwen3.5 2B 호출.
+    //    0.6B 모델은 음차 능력이 부족하여 원문을 그대로 반복하는 문제가 있습니다.
+    //    Qwen3.5 2B 모델은 별도의 VRAM 슬롯(qwen3_5_generator)을 사용하며,
+    //    호출 전 Qwen3 0.6B를 내리고 Qwen3.5를 올리는 분리 동작을 전제로 합니다.
+    //
+    //    시스템 프롬프트에도 언어 이름이 전혀 없습니다.
+    //    목표 표기 체계는 user 프롬프트의 [SCRIPT SAMPLE] 로만 전달되며,
+    //    그 샘플은 detect_document_language + bias.json 에서 런타임에 생성됩니다.
+    //
+    //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
+    pub async fn call_qwen3_5_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        self.ensure_qwen3_5(false).await?;
+        let mut gen_guard = self.qwen3_5_generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
+
+        let params = crate::openai_types::ChatCompletionParameters {
+            messages: vec![
+                crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                    content: "You respell text into another writing system by sound only. You never translate meaning. Return strictly the requested JSON format.".to_string(),
+                    name: None,
+                }),
+                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
+                    name: None,
+                })
+            ],
+            model: "qwen3.5".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+            ..Default::default()
+        };
+
+        let res = gen.generate(params, cancel_token.clone(), None, None, None, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Qwen3.5 transliteration failed: {}", e))?;
+
+        // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
+        let _ = gen.clear_kv_cache();
+
+        drop(gen_guard);
+        Ok(res)
+    }
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
         // 🌟 [VISION-JIT] 이미 2B 가 상주 중이고 mmproj 재로드 소스가 등록되어 있다면,
         //    2GB 텍스트 모델을 통째로 파기/재로딩하지 않고 비전 가중치(약 600MB)만 붙였다 뗍니다.
