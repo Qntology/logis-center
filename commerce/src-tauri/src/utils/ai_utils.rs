@@ -484,7 +484,13 @@ pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
 //    저장 벡터에 문서 언어 라벨을 반드시 섞어야 코사인이 성립합니다.
 //    구성: ① semantic 앵커(문서 언어) ② label_phrase_bank(문서 언어 bias 비수치 구)
 //          ③ abstract_bridge(추상 수식어 — heavy/expensive/fast ...)
-//    bias.json 은 한 글자도 수정하지 않고 기존 노드만 재조합합니다.
+//          ④ search_bridge.multilingual_value_anchor(값 도메인 다국어 구)
+//    bias.json 의 기존 노드 + 신설 multilingual_value_anchor 노드만 재조합합니다.
+//
+//    🌟 [LABEL-ONLY] 이 함수의 출력은 '라벨 개념' 전용입니다.
+//    로컬라이즈(값 결합) 텍스트에 이 블롭을 그대로 쓰면 값이 30여 토큰 중 3토큰으로
+//    희석되어, 값 질의("니트 가디건")가 어떤 청크와도 구분되지 않습니다.
+//    값 결합용으로는 반드시 indexing_leaf_label() 을 사용하십시오.
 pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let mut phrases: Vec<String> = Vec::new();
 
@@ -501,11 +507,68 @@ pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
         if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
     }
 
+    // 🌟 [MULTILINGUAL VALUE ANCHOR] 역방향 인덱싱 전용 다국어 값 도메인 축.
+    //    정방향 필터 뱅크(filter_category_phrases / abstract_bridge_phrases)는
+    //    이 노드를 읽지 않으므로 구조적으로 분리되어 있습니다.
+    for p in multilingual_value_anchor_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
     if phrases.is_empty() {
         return humanize_url_token(field_name);
     }
     if phrases.len() > 32 { phrases.truncate(32); }
     phrases.join(", ")
+}
+
+// 🌟 [INDEXING LEAF LABEL] 값과 결합할 '단 하나의 짧은 문서 언어 라벨'입니다.
+//    indexing_anchor_text() 는 라벨 10~32구를 join 한 블롭이라
+//    "상품명, 의류명, 제품명, 품목명, 이름, ... Cable Knit Cardigan" 처럼
+//    값이 통째로 희석됩니다.
+//    (new_log2.txt: title 청크가 후보 진입조차 못 하고 status 가 상위 9건 독점)
+//    여기서는 semantic 의 '첫 구' 하나만 뽑아 "상품명 Cable Knit Cardigan" 형태로
+//    값이 지배하는 로컬라이즈 텍스트를 만듭니다.
+pub fn indexing_leaf_label(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let sem = semantic_anchor_text(doc_lang, page_type, field_name);
+    for p in split_bias_phrases_full(&sem) {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        // 예시값(숫자 리터럴/장문)은 라벨이 아닙니다.
+        if is_value_example_phrase(t) { continue; }
+        return t.to_string();
+    }
+    humanize_url_token(field_name)
+}
+
+// 🌟 [MULTILINGUAL VALUE ANCHOR] bias.json 의 search_bridge.multilingual_value_anchor 에서
+//    이 필드의 '값이 속한 의미 도메인'을 다국어로 기술한 구를 읽습니다.
+//
+//    🌟 [역방향 전용] abstract_bridge 와 달리 filter 카테고리를 만들지 않습니다.
+//    filter_category_phrases() 는 substantial/find/status/time/season 만 읽고,
+//    abstract_bridge_phrases() 는 search_bridge.abstract_bridge 만 읽습니다.
+//    따라서 이 노드는 정방향 필터 뱅크·SURPRISAL 게이트·연산자 뱅크 어디에도
+//    편입되지 않으며, 오직 indexing_anchor_text() 를 통해 역방향 저장 벡터에만 들어갑니다.
+pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("multilingual_value_anchor"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    if out.len() > 48 { out.truncate(48); }
+    out
 }
 
 // 🌟 [METRICS FAMILY] bias.json 의 metrics.* 노드를 (family_key, phrase) 목록으로 펼칩니다.

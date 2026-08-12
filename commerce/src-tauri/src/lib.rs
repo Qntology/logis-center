@@ -1044,6 +1044,40 @@ async fn ai_search_complex(
                         }
                     }
 
+                    // 4-D: 조건이 하나도 없을 때의 값 청크 진입 보증
+                    //      PLINKO 가 ACTION VERB 게이트 등으로 조건을 못 만들면 STAGE-4C 가 아예 돌지 않고,
+                    //      전역 코사인 검색만 남습니다. 그런데 그 창을 저변별 청크(status/sale_price)가
+                    //      독점하면 값이 담긴 title 청크가 후보에 진입조차 못 합니다.
+                    //      (new_log2.txt: 조건 0개 → 상위 10건 전부 status/traffic_insight, title 0건)
+                    //      스키마에서 '자유 서술 값을 담는 형식(Text)' 필드만 골라 타겟 검색을 겁니다.
+                    //      필드 선정은 detect_field_format 의 결정론 판정만 사용하므로
+                    //      다국어 어휘도, 필드명 하드코딩도 없습니다.
+                    if condition_props.is_empty() {
+                        use crate::utils::ai_utils::FieldFormat;
+                        let schema_fields = crate::parsing::get_detail_schema_fields(ctx_type, "", "en");
+                        let mut probed = 0usize;
+                        for (fname, _, _, _) in schema_fields.iter() {
+                            if crate::utils::ai_utils::detect_field_format(fname) != FieldFormat::Text {
+                                continue;
+                            }
+                            let escaped_prop = fname.replace('\'', "''");
+                            let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
+                            let targeted = store.search_chunks(&emb, 3, Some(&prop_filter)).await.unwrap_or_default();
+                            if targeted.is_empty() { continue; }
+                            probed += targeted.len();
+                            for t in targeted {
+                                if chunk_results.iter().any(|(cid, _, _, _, _)| cid == &t.0) { continue; }
+                                chunk_results.push(t);
+                            }
+                        }
+                        if probed > 0 {
+                            println!(
+                                "[AI-SEARCH]   🧭 [STAGE-4D] 조건 부재 → Text 형식 필드 타겟 청크 검색: {}건 추가 확보 (값 청크 진입 보증)",
+                                probed
+                            );
+                        }
+                    }
+
                     if !chunk_results.is_empty() {
                         println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
                     }
@@ -1060,6 +1094,38 @@ async fn ai_search_complex(
                             let column_track = raw_cosine * 3.0;
                             score += column_track;
                             println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                        }
+
+                        // 🌟 [STAGE-4X CROSS-LINGUAL VALUE BONUS]
+                        //    "니트 가디건" ↔ "Cable Knit Cardigan" 처럼 값이 서로 다른 문자 체계일 때
+                        //    FTS(ngram 문자열 포함)는 물리적으로 0건입니다.
+                        //    (log2.txt: use_fts=true 인데 FTS 가산점 +2.0 이 한 건도 붙지 않음)
+                        //    이 경우 크로스링구얼 매칭이 가능한 트랙은 값 청크 코사인뿐이므로,
+                        //    '값이 의미를 나르는 속성'에 FTS 결손분을 보전합니다.
+                        //    형식 판정은 detect_field_format 이 이미 결정론으로 수행하므로
+                        //    다국어 어휘 하드코딩이 필요 없습니다.
+                        {
+                            use crate::utils::ai_utils::FieldFormat;
+                            // 🌟 [ENUM EXCLUDE] Enum 값은 'complete' / 'show' / 'hide' 같은
+                            //    저카디널리티 캐노니컬 키이며, 전 아이템에서 동일 문자열입니다.
+                            //    크로스링구얼 값 매칭의 대상이 아닌데도 1.5배 보너스를 받아
+                            //    랭킹을 독주했습니다.
+                            //    (new_log2.txt: property='status' 에 +3.5915 가 붙어 상위 10건 중 9건 점유)
+                            //    자유 서술 값을 담는 Text / Address 만 크로스링구얼 보전 대상입니다.
+                            //    형식 판정은 detect_field_format 이 필드명만으로 결정론 수행하므로
+                            //    다국어 어휘 하드코딩이 전혀 필요 없습니다.
+                            let value_bearing = matches!(
+                                crate::utils::ai_utils::detect_field_format(&property),
+                                FieldFormat::Text | FieldFormat::Address
+                            );
+                            if value_bearing {
+                                let cross_lingual_track = raw_cosine * 1.5;
+                                score += cross_lingual_track;
+                                println!(
+                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (score {:.4}) → 최종 {:.4}",
+                                    property, cross_lingual_track, raw_cosine, score
+                                );
+                            }
                         }
 
                         // 4-C: item_id 기준 기존 결과와 dedup

@@ -33,7 +33,21 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
 
                 for (key, v) in map {
                     // 이미 처리된 핵심 속성 및 시스템 변수는 스킵
-                    if ["title", "name", "type", "currency", "text", "json_data", "data", "id", "index", "no", "link", "path", "origin", "mode", "detail"].contains(&key.as_str()) { continue; }
+                    // 🌟 [SELF-REFERENCE GUARD] scheduler.rs 는 json_to_natural_language() 호출 '직전'에
+                    //    text / masked_text 를 extracted_data 에 삽입합니다.
+                    //    masked_text 가 스킵 목록에 없어서 자연어 원문이 통째로 다시 자연어화되고,
+                    //    ". " 분할 시 link/title/code/sale_price/traffic_insight 청크가 전부 복제되었습니다.
+                    //    (log.txt 실측: 21개 청크 중 14개가 masked_text 블롭의 잔재)
+                    //    또한 updated_at / created_at / digest 등 시스템 타임스탬프는
+                    //    "Its updated at is 0" 이라는 전 아이템 공통 쓰레기 청크를 만들므로 함께 배제합니다.
+                    if [
+                        "title", "name", "type", "currency", "text", "masked_text",
+                        "json_data", "data", "id", "index", "no", "link", "path",
+                        "origin", "mode", "detail",
+                        "updated_at", "created_at", "updated_at_ts", "created_at_ts",
+                        "digest", "vector", "from", "to", "cc", "bcc", "ref",
+                        "is_masked", "tier", "score",
+                    ].contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
 
                     let clean_key = key.replace("_", " ");
@@ -1529,6 +1543,7 @@ where
     //   unclassified       : 패턴 매칭 실패
     //   context_intro      : "Regarding {context}," — 값이 없는 도입부
     //   json_data          : 직렬화 원문 덩어리
+    //   updated_at 계열    : "Its updated at is 0" — 전 아이템 공통 시스템 타임스탬프
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
         .filter(|(_, property, _)| {
@@ -1538,21 +1553,58 @@ where
                 && p != "unclassified"
                 && p != "context_intro"
                 && p != "json_data"
+                && p != "updated_at"
+                && p != "created_at"
+                && p != "digest"
+                && p != "index"
         })
         .collect();
 
     let removed_count = raw_chunks.len() - filtered_chunks.len();
     if removed_count > 0 {
         println!(
-            "  🚫 [PHASE A FILTER] masked_text/text/unclassified/context_intro/json_data 청크 {}개 인덱싱 대상에서 제외",
+            "  🚫 [PHASE A FILTER] 자기참조/시스템 청크 {}개 인덱싱 대상에서 제외",
             removed_count
         );
     }
 
+    // 🌟 [SCHEMA PROPERTY CANONICALIZE]
+    //    Phase A 는 패턴에서 'id' / 'link' 를 따로 뽑지만, bias_schema 의 필드명은 콤마 결합 키
+    //    'id,link' 입니다. 이 불일치 때문에 확인 모드의 origin_score 가 항상 0.0000 이 되고
+    //    (log.txt: origin='id'(0.0000), origin='link'(0.0000)),
+    //    정방향 STAGE-4C 의 `property = 'id,link'` 타겟 검색이 저장된 'id' 청크를 못 찾습니다.
+    //    field_names 를 진실의 원천으로 삼아 구조적으로 정규화합니다.
+    let canonicalize = |p: &str| -> String {
+        if field_names.iter().any(|f| f == p) {
+            return p.to_string();
+        }
+        // 콤마 결합 키('id,link')의 구성 요소와 완전일치하면 그 결합 키로 승격
+        for f in field_names.iter() {
+            if f.split(',').any(|part| part.trim() == p) {
+                return f.clone();
+            }
+        }
+        p.to_string()
+    };
+
+    let mut canon_log: Vec<String> = Vec::new();
     let filtered_owned: Vec<(String, String, bool)> = filtered_chunks
         .into_iter()
-        .cloned()
+        .map(|(t, p, c)| {
+            let cp = canonicalize(p.as_str());
+            if &cp != p && canon_log.len() < 8 {
+                canon_log.push(format!("{}→{}", p, cp));
+            }
+            (t.clone(), cp, *c)
+        })
         .collect();
+
+    if !canon_log.is_empty() {
+        println!(
+            "  🔧 [SCHEMA CANONICALIZE] Phase A 속성명을 스키마 필드명으로 정규화: {:?}",
+            canon_log
+        );
+    }
 
     // ── PHASE B ──
     // Step 1: 메타데이터 부여 (confirmed 플래그 전파)

@@ -6751,14 +6751,16 @@ async fn process_task(
                 let mut idx_field_formats: Vec<String> = Vec::new();
 
                 for (fname, _, bias_target, _) in &fields {
-                    // insight/summary/analysis 계열은 PLINKO 슬롯에서 제외합니다.
+                    // 🌟 [SYNTHESIS BANK INCLUDE] 역방향 PLINKO 는 확인 모드(경쟁 없음)이므로
+                    //    insight 계열을 뱅크에서 빼도 배정이 달라지지 않습니다.
+                    //    반대로 빼면 field_names 에 없어져 origin_score 가 항상 0.0000 이 되고
+                    //    (log.txt: origin='general_insight'(0.0000), origin='traffic_insight'(0.0000))
+                    //    CONFIRM FLAG 진단이 전량 오탐으로 오염됩니다.
+                    //    format_gate 는 "Synthesis" 를 무조건 통과시키므로 부작용이 없습니다.
                     let lower_fname = fname.to_lowercase();
-                    if lower_fname.contains("insight")
+                    let _is_synthesis = lower_fname.contains("insight")
                         || lower_fname.contains("summary")
-                        || lower_fname.contains("analysis")
-                    {
-                        continue;
-                    }
+                        || lower_fname.contains("analysis");
 
                     let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
 
@@ -6882,21 +6884,34 @@ async fn process_task(
                         // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                         let _ = store.delete_chunks_by_item(&target_id).await;
 
-                        // 🌟 [MULTILINGUAL ANCHOR BLEND] 저장 벡터를 3중 합성으로 만듭니다.
-                        //   ① chunk_text : "The sale price is 29900 KRW." (json_to_natural_language 영어 자연문)
-                        //   ② anchor     : indexing_anchor_text() — 문서 언어 semantic + label + abstract_bridge
-                        //   ③ localized  : "{anchor} {value_part}" — 라벨과 실제 값을 문서 언어로 결합
-                        //   질의는 문서 언어인데 저장문이 영어라 코사인이 구조적으로 낮았습니다.
-                        //   (로그: 청크 매칭 0.2694 vs FTS 0.9995)
-                        //   앵커/로컬라이즈 텍스트를 배치 임베딩하여 청크당 개별 호출도 제거합니다.
+                        // 🌟 [MULTILINGUAL VALUE BLEND v3] 저장 벡터를 형식 인지 3중 합성으로 만듭니다.
+                        //   ① chunk_text : "This goods is titled 'Cable Knit Cardigan'." (영어 자연문 원본)
+                        //   ② anchor     : indexing_anchor_text() — 라벨 개념 센트로이드 + 다국어 값 도메인 축
+                        //   ③ localized  : "{leaf_label} {value_part}" — 짧은 문서 언어 라벨 1개 + 실제 값
+                        //
+                        //   🌟 [v2 → v3 변경 이유]
+                        //   v2 는 localized 를 "{anchor} {value}" 로 만들었는데, anchor 가
+                        //   "상품명, 의류명, 제품명, 품목명, 이름, 상품제목, 상품이름, ..." 10~32구 블롭이라
+                        //   값 'Cable Knit Cardigan' 이 30여 토큰 중 3토큰으로 희석되었습니다.
+                        //
+                        //   🌟 [Enum 그룹 교정] Enum 값은 'complete'/'show'/'hide' 같은
+                        //   저카디널리티 캐노니컬 키이고 전 아이템에서 동일 문자열입니다.
+                        //   값 지배 그룹에 넣으면 변별력 0인 청크가 한국어 라벨 축으로 상위를 독점합니다.
+                        //   (new_log2.txt: property='status' 가 상위 10건 중 9건 점유)
+                        //   따라서 Enum 은 라벨 지배 그룹으로 보냅니다.
+                        //     Text/Address/Synthesis → 값이 자유 서술이라 의미를 나른다 → localized 지배
+                        //     Enum/Numeric/Date/Identifier/Link/Phone/TrackingCode → 값은 리터럴 → 라벨 지배
                         let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
                         let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
                         for (_, cm) in indexable_chunks.iter() {
                             let a = crate::utils::ai_utils::indexing_anchor_text(
                                 &doc_lang, &page_type, &cm.property,
                             );
+                            let leaf = crate::utils::ai_utils::indexing_leaf_label(
+                                &doc_lang, &page_type, &cm.property,
+                            );
                             let v = cm.value_part.trim();
-                            let l = if v.is_empty() { a.clone() } else { format!("{} {}", a, v) };
+                            let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
                             anchor_texts.push(a);
                             localized_texts.push(l);
                         }
@@ -6912,11 +6927,17 @@ async fn process_task(
                             let anchor_emb = &anchor_embs[ei];
                             let localized_emb = &localized_embs[ei];
 
+                            // 🌟 [FORMAT-AWARE WEIGHT] 형식이 값의 의미 밀도를 결정합니다.
+                            let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+                                "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+                                _ => (0.40f32, 0.30f32, 0.30f32),
+                            };
+
                             let mut final_vec = vec![0.0f32; 384];
                             for d in 0..384 {
-                                final_vec[d] = chunk_vec[d] * 0.5
-                                    + anchor_emb[d] * 0.2
-                                    + localized_emb[d] * 0.3;
+                                final_vec[d] = chunk_vec[d] * w_chunk
+                                    + anchor_emb[d] * w_anchor
+                                    + localized_emb[d] * w_local;
                             }
                             // L2 정규화
                             let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -7371,13 +7392,11 @@ async fn process_task(
                         let mut idx_field_formats: Vec<String> = Vec::new();
 
                         for (fname, _, bias_target, _) in &fields {
+                            // 🌟 [SYNTHESIS BANK INCLUDE] 상세 경로와 동일. 확인 모드이므로 배정 영향 없음.
                             let lower_fname = fname.to_lowercase();
-                            if lower_fname.contains("insight")
+                            let _is_synthesis = lower_fname.contains("insight")
                                 || lower_fname.contains("summary")
-                                || lower_fname.contains("analysis")
-                            {
-                                continue;
-                            }
+                                || lower_fname.contains("analysis");
 
                             let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
 
@@ -7490,15 +7509,20 @@ async fn process_task(
                                 // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
                                 let _ = store.delete_chunks_by_item(&hashed_item_id).await;
 
-                                // 🌟 [MULTILINGUAL ANCHOR BLEND] 상세 경로와 동일한 3중 합성.
+                                // 🌟 [MULTILINGUAL VALUE BLEND v3] 상세 경로와 동일한 형식 인지 3중 합성.
+                                //    localized 를 "{leaf_label} {value}" 로 축약하여 값이 지배하게 하고,
+                                //    Enum 은 라벨 지배 그룹으로 보내 저변별 청크의 상위 독점을 차단합니다.
                                 let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
                                 let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
                                 for (_, cm) in indexable_chunks.iter() {
                                     let a = crate::utils::ai_utils::indexing_anchor_text(
                                         &doc_lang, &page_type, &cm.property,
                                     );
+                                    let leaf = crate::utils::ai_utils::indexing_leaf_label(
+                                        &doc_lang, &page_type, &cm.property,
+                                    );
                                     let v = cm.value_part.trim();
-                                    let l = if v.is_empty() { a.clone() } else { format!("{} {}", a, v) };
+                                    let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
                                     anchor_texts.push(a);
                                     localized_texts.push(l);
                                 }
@@ -7514,11 +7538,16 @@ async fn process_task(
                                     let anchor_emb = &anchor_embs[ei];
                                     let localized_emb = &localized_embs[ei];
 
+                                    let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+                                        "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+                                        _ => (0.40f32, 0.30f32, 0.30f32),
+                                    };
+
                                     let mut final_vec = vec![0.0f32; 384];
                                     for d in 0..384 {
-                                        final_vec[d] = chunk_vec[d] * 0.5
-                                            + anchor_emb[d] * 0.2
-                                            + localized_emb[d] * 0.3;
+                                        final_vec[d] = chunk_vec[d] * w_chunk
+                                            + anchor_emb[d] * w_anchor
+                                            + localized_emb[d] * w_local;
                                     }
                                     let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
                                     if norm > 0.0 {

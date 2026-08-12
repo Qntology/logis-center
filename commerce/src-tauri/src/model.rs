@@ -2784,6 +2784,10 @@ impl LogisModel {
         
         // 🌟 [SCOPE FIX] Stage-3 CROSS-VERB 에서 참조할 수 있도록 도메인 지시어 매핑을 외부 스코프에 선언합니다.
         let mut domain_word_related: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        // 🌟 [ACTION WORD SET] 벡터 역검증을 통과해 '순수 검색 명령어'로 확정된 단어입니다.
+        //    STAGE-3 이 A/FULL 티어의 FTS 검색어에서 이 단어들만 제거합니다.
+        //    다국어 어휘 리터럴을 코드에 두지 않기 위해 런타임 확정 집합만 사용합니다.
+        let mut global_action_words: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             let total_segments = ctx_arr.len();
@@ -3370,7 +3374,20 @@ impl LogisModel {
                 let mut retained_words = Vec::new();
 
                 for word in words {
-                    // 1. FILTER TERM DROP
+                    // 🌟 [ORDER FIX] 1. DOMAIN TYPE WORD DROP 을 최우선으로 올립니다.
+                    //    사전 패스가 이미 '이벤트로'/'판매된'/'고객의' 를 도메인 지시어로 확정했는데
+                    //    본 루프의 ACTION VERB 가 그 판정을 덮어써 왔습니다.
+                    //    (log1.txt: DOMAIN TYPE WORD 로그 직후 동일 단어가 ACTION VERB IGNORED)
+                    //    ACTION VERB 로 소비되면 retained_words 에도 안 들어가 B/NARROWED 텍스트에서도 증발합니다.
+                    if domain_indicator_words.contains(word) {
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+
+                    // 2. FILTER TERM DROP
                     if let Some(k) = crate::utils::ai_utils::exact_match_filter_key("season_filters", word) {
                         emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 season_filters.{}.exact_match 확정어이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
                         retained_words.push(word);
@@ -3388,15 +3405,74 @@ impl LogisModel {
                         continue;
                     }
 
-                    // 2. ACTION VERB IGNORED
+                    // 3. ACTION VERB IGNORED — 4중 역검증
                     let word_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
                     let action_sim = crate::utils::ai_utils::max_pool_sim(&word_emb, &action_verb_embs);
                     let op_sim = crate::utils::ai_utils::max_pool_sim(&word_emb, &operator_embs);
                     let word_has_digit = word.chars().any(|c| c.is_ascii_digit());
 
-                    if word != "|" && !word_has_digit && action_sim > 0.55 && action_sim > op_sim {
-                        emit_term(&format!("    🚫 [ACTION VERB IGNORED] '{}' acts as a search verb (Sim: {:.4}, OpSim: {:.4}). Skipping Plinko mapping.", word, action_sim, op_sim));
-                        
+                    // 🌟 [REVERSE VERIFICATION] action_verbs 는 ~500구 다국어 뱅크이고
+                    //    Max-Pool 은 그 중 최댓값을 취하므로, 한국어 2~3음절 단어는
+                    //    구조적으로 0.65~0.80 대역의 우연 공명이 반드시 발생합니다.
+                    //    (log2: '니트' 0.7400 / '가디건' 0.7429 — 둘 다 상품명)
+                    //    (log1: '제품' 0.6741 vs OpSim 0.6715 — 마진 0.0026)
+                    //    절대 임계치로는 이 잡음을 구분할 수 없으므로,
+                    //    '이 단어가 다른 어떤 뱅크보다 명령어 뱅크에 더 가까운가' 라는
+                    //    상대 우위로 판정합니다. 새 매직 상수를 도입하지 않습니다.
+                    //
+                    //    ① 속성 뱅크  : '니트'/'가디건'/'제품' 같은 값 명사를 구제
+                    //    ② 연산자 뱅크 : '이하로' 같은 비교 표현을 구제 (P0 — 가격 조건 복원)
+                    //    ③ 시간 뱅크  : '올해' 같은 시간 표현을 구제
+                    //    ④ 필터 뱅크  : '팔린'/'남긴' 같은 상태·수식 표현을 구제
+                    let mut max_prop_sim = 0.0f32;
+                    for pi in 0..prop_phrase_embs.len() {
+                        if prop_is_filter_owned[pi] { continue; }
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim(
+                            &word_emb, &prop_phrase_embs[pi], &prop_phrase_weights[pi],
+                        );
+                        if s > max_prop_sim { max_prop_sim = s; }
+                    }
+                    let op_bank_sim = if op_phrase_embs.is_empty() {
+                        op_sim
+                    } else {
+                        crate::utils::ai_utils::max_pool_sim(&word_emb, &op_phrase_embs).max(op_sim)
+                    };
+                    let temporal_sim = if temporal_phrase_embs.is_empty() {
+                        0.0f32
+                    } else {
+                        crate::utils::ai_utils::max_pool_sim(&word_emb, &temporal_phrase_embs)
+                    };
+                    let filter_sim = {
+                        let mut m = 0.0f32;
+                        for (_, _, e) in all_filter_embs.iter() {
+                            if e.iter().all(|&v| v == 0.0) { continue; }
+                            let s = cosine_similarity(&word_emb, e);
+                            if s > m { m = s; }
+                        }
+                        m
+                    };
+
+                    let rival_max = max_prop_sim
+                        .max(op_bank_sim)
+                        .max(temporal_sim)
+                        .max(filter_sim);
+
+                    let is_action_verb = word != "|"
+                        && !word_has_digit
+                        && action_sim > rival_max;
+
+                    if is_action_verb {
+                        emit_term(&format!(
+                            "    🚫 [ACTION VERB IGNORED] '{}' | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
+                            word, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                        ));
+
+                        // 🌟 [FTS 정화용 기록] 벡터로 확정된 순수 명령어만 STAGE-3 검색 텍스트에서 제거합니다.
+                        //    다국어 어휘 하드코딩 없이 이 목록만 소비합니다.
+                        if !global_action_words.contains(word) {
+                            global_action_words.insert(word.to_string());
+                        }
+
                         // 이전에 쌓인 청크가 유효하다면 즉시 강제 Cliff(저장) 처리하여 슬롯에 안전하게 넣습니다.
                         if !current_chunk.is_empty() && prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
                             emit_term(&format!("    📉 [FORCED CLIFF] Action verb intercepted. End of semantic chunk."));
@@ -3409,7 +3485,7 @@ impl LogisModel {
                                 all_scores: prev_all_scores.clone(),
                             });
                         }
-                        
+
                         // 윈도우 완전 초기화 (명령어 단어는 버림)
                         current_chunk = Vec::new();
                         prev_max_score = -1.0;
@@ -3417,15 +3493,11 @@ impl LogisModel {
                         prev_alternatives = Vec::new();
                         prev_all_scores = Vec::new();
                         continue;
-                    }
-
-                    // 3. DOMAIN TYPE WORD DROP
-                    if domain_indicator_words.contains(word) {
-                        retained_words.push(word);
-                        if !unassigned_chunks.iter().any(|e| e == word) {
-                            unassigned_chunks.push(word.to_string());
-                        }
-                        continue;
+                    } else if action_sim > rival_max - 0.05 {
+                        emit_term(&format!(
+                            "    🛡️ [ACTION VERB RESCUE] '{}' | Action: {:.4} <= Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). 명령어가 아니라 값/연산자/시간 표현으로 판정하여 Plinko 로 보냅니다.",
+                            word, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                        ));
                     }
 
                     // 4. FUNCTIONAL WORD DROP
@@ -4235,7 +4307,16 @@ impl LogisModel {
                     //    🌟 [FIX] 기존 항등식 오타 `best_num_score > best_cmp_score - best_cmp_score` (≡ > 0.0) 를
                     //    '현재 확정된 문자열 속성 [k] 의 동일 기준 코사인 점수' 와의 비교로 교정합니다.
                     //    추가로, 비교 연산자 확정도 구 단위 Max-Pool(op_phrase_embs)을 우선 사용합니다.
-                    if actual_db_type != "Number" {
+                    //
+                    //    🌟 [NUMBER→NUMBER 허용] 기존 `actual_db_type != "Number"` 가드는
+                    //    '5000원 이하로' 가 quantity(Number)로 굳었을 때 METRICS FAMILY GATE 를
+                    //    아예 실행하지 않았습니다. quantity 는 convert_conditions_to_sql 의
+                    //    valid_cols 에 없어 SQL 에서 통째로 폐기되므로 가격 조건이 소멸합니다.
+                    //    (log1.txt: '5000원' → quantity(0.5464) → Qwen3 교정 열화 → UNASSIGN)
+                    //    metrics.price.bias 에 "won" 이 있어 '원' ↔ 'won' 다국어 공명이 성립하므로,
+                    //    Numeric 필드끼리도 계열 판정으로 재라우팅합니다.
+                    //    자기 자신으로의 재라우팅은 best_num_score == cur_prop_score 가 되어 자연 차단됩니다.
+                    {
                         if let Some((num_part, cmp_part)) = crate::utils::ai_utils::split_numeric_and_comparator(&combined_chunk) {
                             if !cmp_part.is_empty() {
                                 // ① 비교 표현이 어떤 연산자인지 확정합니다.
@@ -4838,8 +4919,14 @@ impl LogisModel {
                         //      light / few / little → bottom (하위 구간)
                         //    방향은 문자열 판정이 아니라 위에서 코사인으로 확정한 캐노니컬 키를 그대로 씁니다.
                         //    percent_total 은 기존 퍼지(Fuzzy) 변환이 쓰는 값과 동일하게 유지합니다.
+                        // 🌟 [DEAD BRANCH FIX] 기존 구조는 CROSS-DOMAIN 분기를
+                        //    `prop_keys.iter().any(|p| p == &best_sub_global)` 안에 중첩시켰습니다.
+                        //    그런데 CROSS-DOMAIN 은 정확히 '이 필드가 현재 스키마에 없을 때'를 위한 것이라
+                        //    논리적으로 절대 도달할 수 없는 죽은 코드였습니다.
+                        //    (log1.txt: '무거운' → substantial_filters.weight 확정에도 MATERIALIZE 로그 0건.
+                        //     goods 스키마에 weight 가 없고 tracking 에만 있기 때문)
+                        //    현재 스키마 보유 여부로 분기를 완전히 분리합니다.
                         if !best_sub_global.is_empty()
-                            && prop_keys.iter().any(|p| p == &best_sub_global)
                             && !structured_cond.contains_key(&best_sub_global)
                         {
                             let dir_op = match best_find_global.as_str() {
@@ -4847,7 +4934,9 @@ impl LogisModel {
                                 "light" | "few"  | "little" => "bottom",
                                 _ => "",
                             };
-                            if !dir_op.is_empty() {
+                            let owned_here = prop_keys.iter().any(|p| p == &best_sub_global);
+
+                            if owned_here && !dir_op.is_empty() {
                                 structured_cond.insert(best_sub_global.clone(), json!({
                                     "operator": dir_op,
                                     "percent_total": "20.0",
@@ -4861,7 +4950,7 @@ impl LogisModel {
                                 // 🌟 [CROSS-DOMAIN MATERIALIZE] 현재 도메인 스키마에 그 필드가 없으면
                                 //    다른 도메인 스키마를 뒤져 보유 도메인을 찾아 메타데이터로 남깁니다.
                                 //    STAGE-3 이 이 값을 읽어 해당 도메인 컨텍스트를 추가 발행합니다.
-                                //    (예: goods 질의의 '무거운' → weight 는 tracking 테이블에 있음)
+                                //    (예: goods 질의의 '무거운' → weight 는 tracking 스키마에 있음)
                                 let mut host_domain = String::new();
                                 for cand in ["tracking", "goods", "order", "event", "coupon", "review"] {
                                     if cand == seg_type { continue; }
@@ -4873,14 +4962,14 @@ impl LogisModel {
                                 }
                                 if !host_domain.is_empty() {
                                     emit_term(&format!(
-                                        "      🔀 [CROSS-DOMAIN MATERIALIZE] '{}' 는 '{}' 스키마에 없고 '{}' 스키마에 존재합니다. 교차 도메인 컨텍스트를 발행합니다.",
-                                        best_sub_global, seg_type, host_domain
+                                        "      🔀 [CROSS-DOMAIN MATERIALIZE] '{}' 는 '{}' 스키마에 없고 '{}' 스키마에 존재합니다. 교차 도메인 컨텍스트를 발행합니다. (find='{}')",
+                                        best_sub_global, seg_type, host_domain, best_find_global
                                     ));
                                     obj.insert("substantial_host".to_string(), json!(host_domain));
                                 } else {
                                     emit_term(&format!(
-                                        "      ⚪ [ABSTRACT MATERIALIZE SKIP] substantial='{}' 을 보유한 도메인 스키마가 없어 메타데이터로만 전달합니다.",
-                                        best_sub_global
+                                        "      ⚪ [ABSTRACT MATERIALIZE SKIP] substantial='{}' 을 보유한 도메인 스키마가 없어 메타데이터로만 전달합니다. (find='{}')",
+                                        best_sub_global, best_find_global
                                     ));
                                 }
                             }
@@ -5004,7 +5093,15 @@ impl LogisModel {
                 emit_term("[STAGE-3] Generating domain-split N:N combinatorial contexts...");
 
                 struct DomainGroup {
+                    // 🌟 [PURGED] ACTION WORD 를 제거한 정화 텍스트 — A/FULL, B/NARROWED 전용
                     text_words: Vec<String>,
+                    // 🌟 [RAW] 정화 이전 세그먼트 원문 — C/RECALL, C/CANDIDATE, E/FALLBACK 전용
+                    //    ACTION VERB 게이트가 오탐하면 text_words 가 통째로 비어
+                    //    push_ctx 의 `body.is_empty() && condition.is_empty()` 에 걸려
+                    //    모든 티어가 소멸합니다.
+                    //    (new_log2.txt: '니트'/'가디건'/'찾아줘' 3단어 전부 오탐 → 발행 쿼리 7건 → 1건)
+                    //    원문 축을 별도로 보존하여 리콜 티어는 게이트 오탐과 무관하게 항상 발행되도록 합니다.
+                    raw_words: Vec<String>,
                     value_words: Vec<String>,
                     condition: serde_json::Map<String, Value>,
                     alternates: serde_json::Map<String, Value>,
@@ -5115,6 +5212,7 @@ impl LogisModel {
                     if !group_order.iter().any(|g| g == &seg_type) { group_order.push(seg_type.clone()); }
                     let g = groups.entry(seg_type.clone()).or_insert_with(|| DomainGroup {
                         text_words: Vec::new(),
+                        raw_words: Vec::new(),
                         value_words: Vec::new(),
                         condition: serde_json::Map::new(),
                         alternates: serde_json::Map::new(),
@@ -5126,6 +5224,14 @@ impl LogisModel {
                     if let Some(text) = seg.get("text").and_then(|v| v.as_str()) {
                         for w in text.split_whitespace() {
                             if w == "|" { continue; }
+                            // 🌟 [RAW AXIS] 정화 여부와 무관하게 원문은 항상 보존합니다.
+                            //    ACTION VERB 게이트가 전 단어를 오탐해도 리콜 티어가 살아남습니다.
+                            if !g.raw_words.iter().any(|e| e == w) { g.raw_words.push(w.to_string()); }
+
+                            // 🌟 [ACTION WORD PURGE] 벡터로 확정된 순수 명령어는 FTS 노이즈입니다.
+                            //    '찾아줘'/'보여줘' 가 ngram 검색어에 남으면 무관한 문서를 끌어옵니다.
+                            //    역검증을 통과한 값/연산자/시간 표현은 이 집합에 없으므로 그대로 보존됩니다.
+                            if global_action_words.contains(w) { continue; }
                             if !g.text_words.iter().any(|e| e == w) { g.text_words.push(w.to_string()); }
                         }
                     }
@@ -5235,6 +5341,7 @@ impl LogisModel {
                     if !group_order.iter().any(|g| g == "tracking") { group_order.push("tracking".to_string()); }
                     let g = groups.entry("tracking".to_string()).or_insert_with(|| DomainGroup {
                         text_words: Vec::new(),
+                        raw_words: Vec::new(),
                         value_words: Vec::new(),
                         condition: serde_json::Map::new(),
                         alternates: serde_json::Map::new(),
@@ -5249,6 +5356,7 @@ impl LogisModel {
                         }));
                         if !g.value_words.iter().any(|e| e == tn) { g.value_words.push(tn.clone()); }
                         if !g.text_words.iter().any(|e| e == tn) { g.text_words.push(tn.clone()); }
+                        if !g.raw_words.iter().any(|e| e == tn) { g.raw_words.push(tn.clone()); }
                         emit_term(&format!("  📦 [TRACKING INJECT] tracking_number = '{}' 를 독립 tracking 도메인 컨텍스트로 발행합니다.", tn));
                     }
                 }
@@ -5302,22 +5410,39 @@ impl LogisModel {
                 //       C/RECALL   : 조건 없음 + 값 텍스트                     (리콜 보증)
                 let ordered_domains = group_order.clone();
                 for dom in &ordered_domains {
-                    let (full_text, value_text, cond, alts, st, sb, fd) = match groups.get(dom) {
-                        Some(g) => (
-                            g.text_words.join(" "),
-                            // 🌟 [WORD ORDER PRESERVE] condition 맵 순회로 뒤섞인 value_words 를
-                            //    세그먼트 원문(text_words) 순서로 복원한 뒤 조립합니다.
-                            if g.value_words.is_empty() {
-                                g.text_words.join(" ")
+                    let (full_text, value_text, raw_text, cond, alts, st, sb, fd) = match groups.get(dom) {
+                        Some(g) => {
+                            let raw = g.raw_words.join(" ");
+                            // 🌟 [PURGE COLLAPSE GUARD] ACTION VERB 게이트가 세그먼트의 모든 단어를
+                            //    오탐하면 text_words 가 비고, push_ctx 가 A/FULL·B/NARROWED·C/RECALL·
+                            //    E/FALLBACK 을 전부 거부하여 티어 구조가 통째로 무너집니다.
+                            //    (new_log2.txt 실측: 발행 쿼리 7건 → 1건, 결과 20건 → 10건)
+                            //    정화본이 비면 즉시 원문으로 복구합니다.
+                            let purged = if g.text_words.is_empty() { raw.clone() } else { g.text_words.join(" ") };
+                            let vt = if g.value_words.is_empty() {
+                                purged.clone()
                             } else {
-                                reorder_by_source(&g.value_words, &g.text_words).join(" ")
-                            },
-                            g.condition.clone(),
-                            g.alternates.clone(),
-                            g.status.clone(),
-                            g.substantial.clone(),
-                            g.find.clone(),
-                        ),
+                                // 🌟 [WORD ORDER PRESERVE] condition 맵 순회로 뒤섞인 value_words 를
+                                //    세그먼트 원문(raw_words) 순서로 복원한 뒤 조립합니다.
+                                reorder_by_source(&g.value_words, &g.raw_words).join(" ")
+                            };
+                            if g.text_words.is_empty() && !raw.trim().is_empty() {
+                                emit_term(&format!(
+                                    "    🛟 [PURGE COLLAPSE GUARD] type={} | ACTION WORD 정화로 텍스트가 비어 원문으로 복구합니다. text=\"{}\"",
+                                    dom, raw
+                                ));
+                            }
+                            (
+                                purged,
+                                vt,
+                                raw,
+                                g.condition.clone(),
+                                g.alternates.clone(),
+                                g.status.clone(),
+                                g.substantial.clone(),
+                                g.find.clone(),
+                            )
+                        },
                         None => continue,
                     };
 
@@ -5335,8 +5460,10 @@ impl LogisModel {
                         emit_term(&format!("    🅱️ [TIER B/NARROWED] type={} | conditions={} | text=\"{}\"", dom, narrowed.len(), value_text));
                     }
 
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &value_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "C/RECALL") {
-                        emit_term(&format!("    🅲 [TIER C/RECALL] type={} | 조건 없이 순수 FTS 로 재조회 | text=\"{}\"", dom, value_text));
+                    // 🌟 [RAW RECALL] 최후 리콜 티어는 정화 이전 원문으로 조회합니다.
+                    //    게이트 오탐으로 제거된 실질 명사('메세지도' 등)가 여기서 반드시 되살아납니다.
+                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &raw_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "C/RECALL") {
+                        emit_term(&format!("    🅲 [TIER C/RECALL] type={} | 조건 없이 원문 FTS 로 재조회 | text=\"{}\"", dom, raw_text));
                     }
 
                     // 🌟 [TIER E/TABLE-FALLBACK] lib.rs 의 target_table 매핑과 scheduler.rs 의 저장 테이블이 어긋나면
@@ -5350,8 +5477,8 @@ impl LogisModel {
                     //    lib.rs 의 target_table match 는 알 수 없는 타입을 items 로 보내므로
                     //    도메인 이름을 그대로 두고 tier 만 분기하면 별도 코드 변경 없이 동작합니다.
                     let fallback_domain = format!("{}_items", dom);
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, &fallback_domain, &value_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "E/TABLE-FALLBACK") {
-                        emit_term(&format!("    🅴 [TIER E/TABLE-FALLBACK] type={} | items 미러 테이블을 조건 없이 추가 조회합니다. (target_table 매핑 오류 보험)", fallback_domain));
+                    if push_ctx(&mut final_contexts, &mut seen_ctx, &fallback_domain, &raw_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "E/TABLE-FALLBACK") {
+                        emit_term(&format!("    🅴 [TIER E/TABLE-FALLBACK] type={} | items 미러 테이블을 원문으로 추가 조회합니다. (target_table 매핑 오류 보험)", fallback_domain));
                     }
 
                     // ── 4) 속성 대안 축 : 1순위 확정이 틀렸을 때를 대비한 대안 조합.
@@ -5381,7 +5508,16 @@ impl LogisModel {
                     let mut w: Vec<String> = Vec::new();
                     for dom in &ordered_domains {
                         if let Some(g) = groups.get(dom) {
-                            let src = if g.value_words.is_empty() { &g.text_words } else { &g.value_words };
+                            // 🌟 [RAW FALLBACK] value_words → text_words → raw_words 순으로 내려갑니다.
+                            //    C/CANDIDATE 는 '교차 후보 도메인 리콜 보증' 티어이므로
+                            //    ACTION WORD 정화로 인해 비는 일이 절대 없어야 합니다.
+                            let src = if !g.value_words.is_empty() {
+                                &g.value_words
+                            } else if !g.text_words.is_empty() {
+                                &g.text_words
+                            } else {
+                                &g.raw_words
+                            };
                             for x in src { if !w.iter().any(|e| e == x) { w.push(x.clone()); } }
                         }
                     }
@@ -5401,13 +5537,21 @@ impl LogisModel {
                         "light" | "few"  | "little" => "bottom",
                         _ => "",
                     };
+                    // 🌟 [SEGMENT SCOPED] 교차 도메인 쿼리의 FTS 텍스트는
+                    //    그 추상 수식어가 나온 '그 세그먼트' 로 한정합니다.
+                    //    기존에는 global_value_text 를 통째로 이어붙여
+                    //    tracking 쿼리에 '이벤트로', '리뷰를', '고객의' 까지 들어갔습니다.
+                    //    (new_log1.txt 921행: text 가 4개 세그먼트 전 단어 융합)
+                    //    세그먼트 텍스트가 비어 있을 때만 전역 텍스트로 폴백합니다.
                     let host_text = {
                         let mut w: Vec<String> = Vec::new();
                         for x in seg_text_for_host.split_whitespace() {
                             if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
                         }
-                        for x in global_value_text.split_whitespace() {
-                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        if w.is_empty() {
+                            for x in global_value_text.split_whitespace() {
+                                if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                            }
                         }
                         w.join(" ")
                     };

@@ -757,9 +757,35 @@ impl VectorStore {
          // =======================================================
          // 🌟 [Track 1] Column Matching (SQL Filter)
          // =======================================================
-         // LLM이 뽑아낸 속성 조건(예: brand_name = '가디건') 및 보안 스코프를 독립 실행. 가장 높은 가중치(+3.0) 부여.
-         if let Some(ref f) = filter {
-             if !f.trim().is_empty() {
+         // LLM이 뽑아낸 속성 조건(예: amount <= 5000) 만 가장 높은 가중치(+3.0) 를 받습니다.
+         //
+         // 🌟 [SCOPE-ONLY GUARD] convert_conditions_to_sql 은 조건이 하나도 없어도
+         //    항상 `type = '...'` 를 넣고, 호출부가 `mode = '...'` 를 붙입니다.
+         //    따라서 filter 가 None 이 되는 경우가 없어, 기존 코드는 그 타입의
+         //    '모든 행' 에 +3.0 을 상납했습니다.
+         //    (log2.txt 실측: 조건 0개인데 결과가 4.0 / 3.999 / 3.998 / 3.997 / 3.0
+         //     = 3.0 blanket + 벡터 랭크. FTS 는 한 건도 매칭되지 않았음)
+         //    이 상태에서는 의미 신호(FTS·벡터·청크)가 전부 무력화됩니다.
+         //    type / mode 는 '스코프' 이지 '조건' 이 아니므로 가산점 대상에서 제외합니다.
+         let has_real_condition = match filter.as_ref() {
+             None => false,
+             Some(f) => {
+                 // type / mode 술어와 괄호·AND 를 구조적으로 제거한 뒤 잔여 술어가 있는지 확인합니다.
+                 let mut residue = String::new();
+                 for clause in f.split(" AND ") {
+                     let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                     if c.is_empty() { continue; }
+                     let lower = c.to_lowercase();
+                     if lower.starts_with("type ") || lower.starts_with("type=") { continue; }
+                     if lower.starts_with("mode ") || lower.starts_with("mode=") { continue; }
+                     residue.push_str(c);
+                 }
+                 !residue.trim().is_empty()
+             }
+         };
+
+         if has_real_condition {
+             if let Some(ref f) = filter {
                  let q = table.query().only_if(f);
                  if let Ok(res) = q.limit(fetch_limit).execute().await {
                      if let Ok(batches) = res.try_collect::<Vec<_>>().await {
@@ -773,6 +799,10 @@ impl VectorStore {
                      }
                  }
              }
+         } else if let Some(ref f) = filter {
+             // 실질 조건이 없으면 스코프 필터로만 사용하고 가산점은 주지 않습니다.
+             // (Track 2 / Track 3 이 동일 필터를 체이닝하므로 보안 스코프는 그대로 유지됩니다)
+             let _ = f;
          }
 
          // =======================================================
@@ -970,9 +1000,10 @@ impl VectorStore {
                     // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식이 바뀌면 기존 청크는
                     //    새 질의 벡터와 정합하지 않습니다. 스키마가 같아도 강제 재구축이 필요하므로
                     //    레시피 버전을 컬럼으로 각인하고, 버전이 다르면 테이블을 드롭합니다.
-                    //    (v2 = chunk 0.5 + anchor 0.2 + localized 0.3, 다국어 앵커 편입)
-                    let has_recipe_v2 = current_schema.field_with_name("embed_recipe_v2").is_ok();
-                    if !has_chunk_id || !has_vector || !has_property || !has_recipe_v2 {
+                    // 🌟 (v2 = chunk 0.5 + anchor 0.2 + localized 0.3 — 라벨 블롭이 값을 희석)
+                    // 🌟 (v3 = 형식 인지 가중치 + localized 를 "{leaf_label} {value}" 로 축약 + Enum 라벨 지배)
+                    let has_recipe_v3 = current_schema.field_with_name("embed_recipe_v3").is_ok();
+                    if !has_chunk_id || !has_vector || !has_property || !has_recipe_v3 {
                         println!("[Store] item_chunks schema mismatch. Dropping for recreation.");
                         let _ = self.conn.drop_table("item_chunks", &[]).await;
                         let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
@@ -1017,8 +1048,8 @@ impl VectorStore {
                 Field::new("created_at", DataType::Int64, false),
                 Field::new("updated_at", DataType::Int64, false),
 
-                // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식 버전 각인 (v2)
-                Field::new("embed_recipe_v2", DataType::Utf8, true),
+                // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식 버전 각인 (v3)
+                Field::new("embed_recipe_v3", DataType::Utf8, true),
             ]));
 
             if let Err(_) = self.conn.create_empty_table("item_chunks", chunk_schema.clone()).execute().await {
@@ -1093,7 +1124,7 @@ impl VectorStore {
             Arc::new(StringArray::from(vec![mode.unwrap_or("commerce").to_string()])),
             Arc::new(Int64Array::from(vec![now])),
             Arc::new(Int64Array::from(vec![now])),
-            Arc::new(StringArray::from(vec!["chunk0.5+anchor0.2+localized0.3".to_string()])),
+            Arc::new(StringArray::from(vec!["v3:format-aware(chunk+anchor+leafvalue)".to_string()])),
         ])?;
 
         table.add(vec![batch]).execute().await?;
@@ -1131,11 +1162,24 @@ impl VectorStore {
             }
         }
 
-        // 오버페치 후 item_id 기준 그룹핑을 위해 limit * 3 으로 조회
-        let overfetch = limit * 3;
+        // 🌟 [QUERY VECTOR NORMALIZE] 저장 벡터는 upsert_chunk 직전에 L2 정규화되어 있습니다.
+        //    질의 벡터는 정규화되지 않은 채 들어와 L2 거리 스케일이 어긋났습니다.
+        //    양쪽을 정규화해야 L2² = 2 - 2cos 관계가 성립합니다.
+        let normalized_query: Vec<f32> = {
+            let norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                query_vec.iter().map(|x| x / norm).collect()
+            } else {
+                query_vec.to_vec()
+            }
+        };
+
+        // 🌟 [OVERFETCH 확대] property 다양성 캡을 적용하려면 후보 창이 충분히 커야 합니다.
+        //    저변별 청크가 상한에 걸려 버려지는 만큼을 미리 확보합니다.
+        let overfetch = limit * 6;
         let results = q
             .limit(overfetch)
-            .nearest_to(query_vec.to_vec())?
+            .nearest_to(normalized_query)?
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -1159,8 +1203,16 @@ impl VectorStore {
             let distances = batch.column(dist_idx).as_any().downcast_ref::<Float32Array>();
 
             for i in 0..num_rows {
+                // 🌟 [DISTANCE → SIMILARITY FIX]
+                //    distance_type 을 지정하지 않았으므로 LanceDB 기본값인 L2(제곱거리)가 옵니다.
+                //    정규화 벡터에서 L2² = 2 - 2cos 이므로 올바른 변환은 cos = 1 - d/2 입니다.
+                //    기존 `1.0 - d` 는 2·cos - 1 이 되어 코사인 0.5 미만이 음수가 되고,
+                //    item 별 그룹 합산이 2·Σcos - n 으로 왜곡되어
+                //    매칭 청크가 많은 아이템이 구조적으로 불리해졌습니다.
+                //    설령 백엔드가 코사인 거리(1-cos)를 돌려주더라도 이 식은 (1+cos)/2 로
+                //    단조 증가를 유지하므로 순위가 깨지지 않고 음수도 발생하지 않습니다.
                 let score = distances
-                    .map(|d| 1.0 - d.value(i))  // LanceDB 는 L2 거리 반환 → 코사인 유사도로 변환
+                    .map(|d| (1.0f32 - d.value(i) / 2.0f32).clamp(0.0f32, 1.0f32))
                     .unwrap_or(0.0);
 
                 chunks.push((
@@ -1175,6 +1227,42 @@ impl VectorStore {
 
         // 점수 내림차순 정렬
         chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 🌟 [PROPERTY DIVERSIFICATION] 저변별 청크가 후보 윈도우를 독점하는 것을 차단합니다.
+        //    status 청크는 "It is currently in 'complete' status" 로 전 아이템에서
+        //    바이트 단위로 동일하여 변별력이 0인데도, 오버페치 창(limit*3)을 전부 채워
+        //    정작 값이 담긴 title 청크가 후보에 진입조차 못 했습니다.
+        //    (new_log2.txt 실측: 상위 10건 중 9건이 property='status')
+        //    (new_log1.txt 실측: 상위 10건 중 8건이 property='sale_price')
+        //    한 property 가 차지할 수 있는 행 수를 상한으로 묶어 MMR 형태의 다양성을 확보합니다.
+        //    상한값은 '반환 개수의 절반' 이라는 구조적 비율이며 매직 상수가 아닙니다.
+        {
+            let per_property_cap = std::cmp::max(2usize, limit / 2);
+            let mut prop_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut kept: Vec<(String, String, String, String, f32)> = Vec::with_capacity(chunks.len());
+            let mut suppressed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for c in chunks.into_iter() {
+                let n = prop_count.entry(c.3.clone()).or_insert(0);
+                if *n >= per_property_cap {
+                    *suppressed.entry(c.3.clone()).or_insert(0) += 1;
+                    continue;
+                }
+                *n += 1;
+                kept.push(c);
+            }
+            if !suppressed.is_empty() {
+                let mut brief: Vec<String> = suppressed
+                    .iter()
+                    .map(|(p, n)| format!("{}({}행)", p, n))
+                    .collect();
+                brief.sort();
+                println!(
+                    "  🎛️ [PROPERTY DIVERSIFICATION] property 당 상한 {}행 적용. 초과 억제: {:?}",
+                    per_property_cap, brief
+                );
+            }
+            chunks = kept;
+        }
 
         // item_id 기준 그룹핑: 동일 item 의 여러 청크 점수를 합산하여
         // 최종 상위 limit 개 item 을 반환합니다.

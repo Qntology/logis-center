@@ -8,10 +8,44 @@
       "prejudice": "product registration, product list, display, exposure, traffic, page views, impressions"
     },
     "domain_affinity": {
-      "coupon": ["event"],
-      "event": ["coupon"],
-      "order": ["tracking"],
-      "tracking": ["order"]
+      "coupon": ["event", "goods"],
+      "event": ["coupon", "goods"],
+      "order": ["tracking", "goods", "review"],
+      "tracking": ["order", "goods"],
+      "goods": ["order", "review", "tracking"],
+      "review": ["goods", "order"]
+    },
+    "multilingual_value_anchor": {
+      "goods.title": {
+        "semantic": "the concrete name of a physical product a shopper searches for",
+        "bias": "product name, item name, goods name, clothing, apparel, garment, knitwear, knit, cardigan, sweater, coat, jacket, shirt, pants, dress, shoes, bag, accessory, electronics, gadget, appliance, furniture, cosmetics, food, 상품명, 제품명, 품목명, 의류, 옷, 니트, 가디건, 스웨터, 코트, 자켓, 셔츠, 바지, 원피스, 신발, 가방, 액세서리, 가전, 가구, 화장품, 식품, 商品名, 製品名, 衣類, ニット, カーディガン, セーター, コート, 商品名称, 服装, 针织, 开衫, 毛衣, 外套, nombre del producto, ropa, prenda, punto, cárdigan, suéter, abrigo, nom du produit, vêtement, tricot, cardigan, pull, manteau, produktname, kleidung, strick, strickjacke, pullover, mantel, nome do produto, roupa, malha, casaco, nome del prodotto, abbigliamento, maglia, maglione, cappotto, название товара, одежда, трикотаж, кардиган, свитер, пальто, اسم المنتج, ملابس, تريكو, كارديجان, سترة, معطف, उत्पाद का नाम, कपड़े, बुना हुआ, कार्डिगन, स्वेटर, कोट, ชื่อสินค้า, เสื้อผ้า, ถักนิตติ้ง, คาร์ดิแกน, เสื้อกันหนาว, เสื้อโค้ท, tên sản phẩm, quần áo, áo len, áo cardigan, áo khoác, nama produk, pakaian, rajut, kardigan, sweter, mantel",
+        "prejudice": "identifier, code, url, link, date, price, quantity, status, address, phone number"
+      },
+      "goods.tags": {
+        "semantic": "category keywords a shopper uses to narrow a catalog",
+        "bias": "category, keyword, tag, genre, collection, season, style, material, fabric, 카테고리, 키워드, 태그, 분류, 컬렉션, 시즌, 스타일, 소재, 원단, カテゴリ, キーワード, タグ, 素材, 分类, 关键词, 标签, 材质, categoría, palabra clave, etiqueta, material, catégorie, mot clé, étiquette, matière, kategorie, schlagwort, categoria, parola chiave, tessuto, категория, ключевое слово, материал, فئة, كلمة مفتاحية, مادة, श्रेणी, कीवर्ड, सामग्री, หมวดหมู่, คำสำคัญ, วัสดุ, danh mục, từ khóa, chất liệu, kategori, kata kunci, bahan",
+        "prejudice": "identifier, code, url, link, date, price, quantity, status"
+      },
+      "goods.description": {
+        "semantic": "long form explanation of what the product is and how it is used",
+        "bias": "description, detail, explanation, specification, feature, usage, 상세설명, 설명, 사양, 특징, 사용법, 詳細説明, 説明, 仕様, 特徴, 详细说明, 规格, 特点, descripción, detalle, especificación, característica, description, détail, spécification, caractéristique, beschreibung, spezifikation, merkmal, descrição, detalhe, especificação, descrizione, dettaglio, specifica, описание, детали, характеристика, وصف, تفاصيل, مواصفات, विवरण, विशेषता, รายละเอียด, คุณสมบัติ, mô tả, đặc điểm, deskripsi, spesifikasi",
+        "prejudice": "identifier, code, url, link, date, price, quantity, status, person name"
+      },
+      "order.goods": {
+        "semantic": "the concrete product a customer actually ordered",
+        "bias": "ordered product, purchased item, line item, 주문상품, 구매상품, 품목, 注文商品, 購入品, 订购商品, 购买商品, producto pedido, artículo comprado, produit commandé, article acheté, bestelltes produkt, gekaufter artikel, produto pedido, prodotto ordinato, заказанный товар, купленный товар, المنتج المطلوب, ऑर्डर किया गया उत्पाद, สินค้าที่สั่งซื้อ, sản phẩm đã đặt, produk yang dipesan",
+        "prejudice": "identifier, order number, tracking number, date, price, status, address, phone number"
+      },
+      "review.title": {
+        "semantic": "the message a customer wrote about a product",
+        "bias": "review, feedback, comment, message, opinion, rating text, 리뷰, 후기, 평가, 코멘트, 메시지, 메세지, 의견, レビュー, 感想, コメント, メッセージ, 评价, 评论, 留言, reseña, comentario, mensaje, opinión, avis, commentaire, message, bewertung, kommentar, nachricht, avaliação, comentário, mensagem, recensione, commento, messaggio, отзыв, комментарий, сообщение, مراجعة, تعليق, رسالة, समीक्षा, टिप्पणी, संदेश, รีวิว, ความคิดเห็น, ข้อความ, đánh giá, bình luận, tin nhắn, ulasan, komentar, pesan",
+        "prejudice": "identifier, code, url, link, date, price, quantity, status"
+      },
+      "tracking.title": {
+        "semantic": "the concrete product being shipped in this parcel",
+        "bias": "shipped product, parcel content, item in transit, 배송상품, 운송품목, 소포내용물, 配送商品, 荷物の中身, 包裹内容, producto enviado, contenido del paquete, produit expédié, contenu du colis, versandtes produkt, paketinhalt, produto enviado, prodotto spedito, отправленный товар, содержимое посылки, المنتج المشحون, भेजा गया उत्पाद, สินค้าที่จัดส่ง, sản phẩm được giao, produk yang dikirim",
+        "prejudice": "tracking number, identifier, carrier, date, address, phone number, weight, dimension"
+      }
     },
     "abstract_bridge": {
       "substantial_filters.weight": {
