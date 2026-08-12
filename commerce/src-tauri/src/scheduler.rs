@@ -95,12 +95,22 @@ async fn generate_transliteration_aliases(
         let s1 = crate::nl_convert::sanitize_transliteration(&raw1, &src);
 
         // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
-        //      목표 표기 샘플이 원문 값 그 자체이므로 언어 이름을 코드에 둘 필요가 없습니다.
+        //      원문 자체를 SCRIPT SAMPLE 로 넣으면 LLM 이 원문을 그대로 복사하므로,
+        //      원문의 표기 체계에 해당하는 일반 샘플을 사용하여 복사 경로를 원천 차단합니다.
         let mut s2 = String::new();
         if !s1.is_empty() {
-            let p2 = crate::nl_convert::build_transliteration_prompt(&s1, &src);
-            let raw2 = model.call_qwen3_transliteration(&p2, Some(cancel.clone())).await.unwrap_or_default();
-            s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
+            let target2_sample = if crate::nl_convert::is_latin_dominant(&src) {
+                // 원문이 라틴 → 2차 목표도 라틴 (로마자 역음차)
+                crate::nl_convert::latin_script_sample(&cm.property)
+            } else {
+                // 원문이 비라틴 → 2차 목표도 비라틴 (원문 언어 복원)
+                crate::nl_convert::native_script_sample(doc_lang, page_type, &cm.property)
+            };
+            if !target2_sample.is_empty() && crate::nl_convert::is_latin_dominant(&target2_sample) != crate::nl_convert::is_latin_dominant(&s1) {
+                let p2 = crate::nl_convert::build_transliteration_prompt(&s1, &target2_sample);
+                let raw2 = model.call_qwen3_transliteration(&p2, Some(cancel.clone())).await.unwrap_or_default();
+                s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
+            }
         }
         
         let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
