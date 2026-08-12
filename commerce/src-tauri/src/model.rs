@@ -814,7 +814,7 @@ impl LogisModel {
                 let params = crate::openai_types::ChatCompletionParameters {
                     messages: vec![
                         crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: "You respell text into another writing system by sound only. You never translate meaning. You answer with one single line and nothing else.".to_string(),
+                            content: "You respell text into another writing system by sound only. You never translate meaning. Return strictly the requested JSON format.".to_string(),
                             name: None,
                         }),
                         crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {

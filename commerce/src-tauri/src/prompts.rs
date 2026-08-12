@@ -976,3 +976,30 @@ Instructions:
     template.replace("{TEXT}", text)
             .replace("{CANDIDATES}", &cands_str)
 }
+
+pub fn transliteration_prompt(source_value: &str, target_script_sample: &str) -> String {
+    let template = r###"[TASK]
+Respell the SOURCE text so that it is written with the same kind of characters as the SCRIPT SAMPLE.
+This is a sound-based respelling (transliteration). It is NOT a translation.
+
+[SOURCE]
+{SOURCE}
+
+[SCRIPT SAMPLE]
+{SCRIPT_SAMPLE}
+
+[RULES]
+1. Write how the SOURCE sounds, using only the kind of characters that appear in the SCRIPT SAMPLE.
+2. Never translate the meaning. Never explain. Never add or remove words.
+3. Keep the original word order and the original word count.
+4. Copy every digit and symbol from the SOURCE exactly as it is.
+5. The "transliteration" value must be a single line containing only the respelled text.
+
+[OUTPUT FORMAT]
+{ "transliteration": String }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template.replace("{SOURCE}", source_value)
+        .replace("{SCRIPT_SAMPLE}", target_script_sample)
+}

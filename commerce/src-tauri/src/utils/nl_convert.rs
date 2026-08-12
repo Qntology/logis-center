@@ -1063,89 +1063,84 @@ pub fn transliteration_target_sample(
 /// [SYNONYM EXPANSION] 음차 프롬프트를 만듭니다.
 /// 목표 표기 체계를 '언어 이름'이 아니라 '실제 문자 샘플'로 지시하므로
 /// 어떤 언어가 들어와도 동일한 프롬프트 한 벌로 동작합니다.
+/// 프롬프트 본문은 prompts.rs 의 transliteration_prompt() 에 위임하며,
+/// 출력 형식은 JSON ({ "transliteration": "..." }) 입니다.
 pub fn build_transliteration_prompt(source_value: &str, target_script_sample: &str) -> String {
-    format!(
-"[TASK]
-Respell the SOURCE text so that it is written with the same kind of characters as the SCRIPT SAMPLE.
-This is a sound-based respelling (transliteration). It is NOT a translation.
-
-[SOURCE]
-{}
-
-[SCRIPT SAMPLE]
-{}
-
-[RULES]
-1. Write how the SOURCE sounds, using only the kind of characters that appear in the SCRIPT SAMPLE.
-2. Never translate the meaning. Never explain. Never add or remove words.
-3. Keep the original word order and the original word count.
-4. Copy every digit and symbol from the SOURCE exactly as it is.
-5. Answer with one single line that contains the respelled text and nothing else.
-
-[OUTPUT]",
-        source_value,
-        target_script_sample
-    )
+    crate::prompts::transliteration_prompt(source_value, target_script_sample)
 }
 
-/// [SYNONYM EXPANSION] LLM 응답에서 음차 결과만 남기는 결정론 정화기입니다.
+/// [SYNONYM EXPANSION] LLM 응답에서 음차 결과를 추출하는 결정론 정화기입니다.
 ///
-/// 0.6B 모델이 붙이는 잔재(코드펜스 / 접두 라벨 / 감싸는 따옴표 / 설명 줄)를
-/// 구조 파싱으로만 벗겨냅니다. 어휘 판정이 없으므로 다국어에서 동일하게 동작합니다.
+/// 응답은 JSON 형식 ({ "transliteration": "..." }) 으로 수신합니다.
+/// parse_json_from_llm 패턴으로 JSON 을 파싱하고,
+/// 파싱 실패 시 폴백으로 원시 텍스트에서 구조 파싱을 시도합니다.
 ///
 /// 최종 게이트:
 ///   G1: 결과가 원문과 동일하면 폐기 (모델이 그대로 반복한 경우)
 ///   G2: 표기 체계가 뒤집히지 않았으면 폐기 (음차가 일어나지 않았다는 구조적 증거)
 ///   G3: 길이가 R2(150자)를 넘으면 폐기 (음차가 아니라 설명문)
 pub fn sanitize_transliteration(raw: &str, source_value: &str) -> String {
-    let mut s = raw.trim().to_string();
+    let mut s = String::new();
 
-    // 코드펜스 제거
-    if s.starts_with("```") {
-        s = s.trim_start_matches('`').to_string();
-        if let Some(p) = s.find("```") { s = s[..p].to_string(); }
-        if let Some(nl) = s.find('\n') {
-            let head = s[..nl].trim().to_string();
-            if !head.is_empty()
-                && head.chars().all(|c| c.is_ascii_alphanumeric())
-                && head.chars().count() <= 12
-            {
-                s = s[nl + 1..].to_string();
+    // ── 1차: JSON 파싱 (parse_json_from_llm 패턴) ──
+    let parsed = crate::parsing::parse_json_from_llm(raw);
+    if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
+        s = val.trim().to_string();
+    }
+
+    // ── 2차 폴백: JSON 파싱 실패 시 원시 텍스트 구조 파싱 ──
+    if s.is_empty() {
+        let mut fallback = raw.trim().to_string();
+
+        // 코드펜스 제거
+        if fallback.starts_with("```") {
+            fallback = fallback.trim_start_matches('`').to_string();
+            if let Some(p) = fallback.find("```") { fallback = fallback[..p].to_string(); }
+            if let Some(nl) = fallback.find('\n') {
+                let head = fallback[..nl].trim().to_string();
+                if !head.is_empty()
+                    && head.chars().all(|c| c.is_ascii_alphanumeric())
+                    && head.chars().count() <= 12
+                {
+                    fallback = fallback[nl + 1..].to_string();
+                }
             }
         }
-    }
 
-    // 첫 유효 줄만 사용
-    s = s.lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty())
-        .unwrap_or("")
-        .to_string();
+        // 첫 유효 줄만 사용
+        fallback = fallback.lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
 
-    // 접두 라벨 제거 (콜론 앞이 순수 ASCII 라벨일 때만)
-    if let Some(p) = s.find(':') {
-        if p <= 24 {
-            let head = s[..p].trim();
-            let is_label = !head.is_empty()
-                && head.chars().all(|c| c.is_ascii_alphabetic() || c.is_whitespace() || c == '[' || c == ']');
-            if is_label { s = s[p + 1..].trim().to_string(); }
+        // 접두 라벨 제거 (콜론 앞이 순수 ASCII 라벨일 때만)
+        if let Some(p) = fallback.find(':') {
+            if p <= 24 {
+                let head = fallback[..p].trim();
+                let is_label = !head.is_empty()
+                    && head.chars().all(|c| c.is_ascii_alphabetic() || c.is_whitespace() || c == '[' || c == ']');
+                if is_label { fallback = fallback[p + 1..].trim().to_string(); }
+            }
         }
-    }
 
-    // 감싸는 따옴표/강조 기호 제거
-    let trims: [char; 8] = ['"', '\'', '`', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '*'];
-    loop {
-        let before = s.clone();
-        s = s.trim().to_string();
-        for t in trims.iter() {
-            s = s.trim_start_matches(*t).trim_end_matches(*t).to_string();
+        // 감싸는 따옴표/강조 기호 제거
+        let trims: [char; 8] = ['"', '\'', '`', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '*'];
+        loop {
+            let before = fallback.clone();
+            fallback = fallback.trim().to_string();
+            for t in trims.iter() {
+                fallback = fallback.trim_start_matches(*t).trim_end_matches(*t).to_string();
+            }
+            fallback = fallback.trim().to_string();
+            if fallback == before { break; }
         }
-        s = s.trim().to_string();
-        if s == before { break; }
-    }
 
-    // 문장 종결 부호 제거 (음차 결과는 문장이 아닙니다)
-    s = s.trim_end_matches(|c: char| c == '.' || c == ',' || c == ';').trim().to_string();
+        // 문장 종결 부호 제거
+        fallback = fallback.trim_end_matches(|c: char| c == '.' || c == ',' || c == ';').trim().to_string();
+
+        s = fallback;
+    }
 
     // 공백 정규화
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
