@@ -101,17 +101,27 @@ async fn generate_transliteration_aliases(
             .await
             .unwrap_or_default();
 
-        // JSON 응답에서 "transliteration" 키를 추출합니다.
-        // sanitize_transliteration 내부에서 parse_json_from_llm 으로 1차 파싱하고,
-        // 파싱 실패 시 폴백 구조 파싱을 수행한 뒤 G1/G2/G3 게이트를 적용합니다.
-        let s1 = crate::nl_convert::sanitize_transliteration(&raw1, &src);
+        // JSON 응답에서 단어별 "transcription" 과 "transliteration" 을 모두 추출합니다.
+        // sanitize_transliteration_dual 내부에서 parse_json_from_llm 으로 파싱하고,
+        // 단어별 객체를 원문 단어 순서로 조립한 뒤 G1/G2/G3 게이트를 적용합니다.
+        let (s1_transcription, s1_transliteration) = crate::nl_convert::sanitize_transliteration_dual(&raw1, &src);
+
+        // transcription 과 transliteration 중 유효한 것을 s1 으로 선택합니다.
+        // 둘 다 유효하고 다르면 transcription 을 우선으로 사용합니다.
+        let s1 = if !s1_transcription.is_empty() {
+            s1_transcription.clone()
+        } else {
+            s1_transliteration.clone()
+        };
 
         println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\\n"));
+        println!("    PASS-1 TRANSCRIPTION    = '{}'", s1_transcription);
+        println!("    PASS-1 TRANSLITERATION  = '{}'", s1_transliteration);
         println!("    PASS-1 RESULT= '{}'", s1);
 
         // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
-        //      SCRIPT SAMPLE 없이 "다른 표기 체계로 음차" 지시만 전달하므로
-        //      샘플 복사 환각이 원천 차단됩니다.
+        //      🌟 [ANY_ASCII FAST PATH] 비라틴 → 라틴 방향이면 any_ascii 를 먼저 시도합니다.
+        //      any_ascii 가 성공하면 LLM 호출 없이 즉시 확정합니다.
         let mut s2 = String::new();
         if !s1.is_empty() {
             // 1차 결과와 원문의 표기 체계가 달라야 2차 역음차가 성립합니다.
@@ -124,16 +134,31 @@ async fn generate_transliteration_aliases(
                 } else {
                     doc_lang
                 };
-                let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
-                let raw2 = model
-                    .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
-                    .await
-                    .unwrap_or_default();
-                s2 = crate::nl_convert::sanitize_transliteration(&raw2, &s1);
-                println!("    PASS-2 SOURCE = '{}'", s1);
-                println!("    PASS-2 TARGET = '{}'", second_target);
-                println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\\n"));
-                println!("    PASS-2 RESULT = '{}'", s2);
+
+                // 🌟 [ANY_ASCII GATE] 비라틴 → 라틴 방향이면 any_ascii 우선 시도
+                if crate::nl_convert::is_latin_dominant(&src) && !crate::nl_convert::is_latin_dominant(&s1) {
+                    if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&s1) {
+                        s2 = ascii_result;
+                        println!("    PASS-2 SOURCE = '{}'", s1);
+                        println!("    PASS-2 METHOD = any_ascii (LLM skipped)");
+                        println!("    PASS-2 RESULT = '{}'", s2);
+                    }
+                }
+
+                // any_ascii 가 실패하거나 해당 방향이 아니면 LLM 폴백
+                if s2.is_empty() {
+                    let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
+                    let raw2 = model
+                        .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    let (s2_t, s2_tr) = crate::nl_convert::sanitize_transliteration_dual(&raw2, &s1);
+                    s2 = if !s2_t.is_empty() { s2_t } else { s2_tr };
+                    println!("    PASS-2 SOURCE = '{}'", s1);
+                    println!("    PASS-2 TARGET = '{}'", second_target);
+                    println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\\n"));
+                    println!("    PASS-2 RESULT = '{}'", s2);
+                }
             } else {
                 println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있거나 표기 체계 미반전)");
             }
@@ -141,9 +166,35 @@ async fn generate_transliteration_aliases(
             println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
         }
 
+        // 🌟 [DUAL SAVE] transcription 과 transliteration 이 다르면 둘 다 별칭 후보로 사용합니다.
+        //    assign_transliterations 가 native/roman 슬롯에 배정합니다.
+        let mut extra_alias = String::new();
+        if !s1_transcription.is_empty() && !s1_transliteration.is_empty()
+            && s1_transcription != s1_transliteration
+        {
+            // transliteration 이 transcription 과 다르면 추가 별칭으로 보존
+            extra_alias = s1_transliteration.clone();
+            println!("    DUAL SAVE: transcription='{}' != transliteration='{}' → both saved", s1_transcription, s1_transliteration);
+        }
+
         let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
 
-        if pair.0.is_empty() && pair.1.is_empty() {
+        // 🌟 [DUAL SAVE APPLY] 추가 별칭이 있으면 pair 에 병합합니다.
+        //    native 가 비어있고 extra 가 비라틴이 아니면 native 에,
+        //    roman 이 비어있고 extra 가 라틴이면 roman 에 배정합니다.
+        let final_pair = if !extra_alias.is_empty() {
+            let mut p = pair.clone();
+            if crate::nl_convert::is_latin_dominant(&extra_alias) {
+                if p.1.is_empty() { p.1 = extra_alias.clone(); }
+            } else {
+                if p.0.is_empty() { p.0 = extra_alias.clone(); }
+            }
+            p
+        } else {
+            pair
+        };
+
+        if final_pair.0.is_empty() && final_pair.1.is_empty() {
             emit(&format!(
                 "      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')",
                 src, cm.property
@@ -152,12 +203,11 @@ async fn generate_transliteration_aliases(
             made += 1;
             emit(&format!(
                 "      🔤 [SYNONYM EXPANSION] '{}' → native='{}' | roman='{}' (property='{}')",
-                src, pair.0, pair.1, cm.property
+                src, final_pair.0, final_pair.1, cm.property
             ));
         }
-
-        cache.insert(src.clone(), pair.clone());
-        out[i] = pair;
+        cache.insert(src.clone(), final_pair.clone());
+        out[i] = final_pair;
     }
 
     if made > 0 || reused > 0 {

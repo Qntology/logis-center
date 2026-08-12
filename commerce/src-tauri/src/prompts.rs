@@ -978,28 +978,48 @@ Instructions:
 }
 
 pub fn transliteration_prompt(source_value: &str, target_language: &str) -> String {
-let template = r###"[TASK]
-Respell the SOURCE text into the {TARGET_LANGUAGE} writing system by sound only.
-This is a sound-based respelling (transliteration). It is NOT a translation.
+    // 🌟 [SPECIAL CHAR PRE-STRIPPED] 호출부(build_transliteration_prompt)에서
+    //    이미 특수문자가 공백으로 치환된 source_value 가 전달됩니다.
+    //    여기서도 방어적으로 한 번 더 공백 정규화를 수행합니다.
+    let cleaned = source_value
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    // 🌟 [WORD-KEY JSON] 각 단어를 독립 키로 갖는 객체 구조를 생성합니다.
+    //    LLM 이 단어 단위로 독립 음차하므로 중간 맥락 끊김이 발생하지 않습니다.
+    let word_keys: Vec<String> = words.iter().map(|w| format!("\"{}\": String", w)).collect();
+    let transcription_obj = format!("{{ {} }}", word_keys.join(", "));
+    let transliteration_obj = format!("{{ {} }}", word_keys.join(", "));
 
+    let template = r###"[TASK]
+You are a sound-based respelling engine.
+For every word in [SOURCE], write how that word sounds in the [TARGET LANGUAGE] writing system.
+This is NOT a translation. You must never change the meaning.
+Process each word independently. Never merge words. Never split words. Never skip words.
+The number of keys in each output object MUST equal the number of words in [SOURCE].
 [SOURCE]
 {SOURCE}
-
 [TARGET LANGUAGE]
 {TARGET_LANGUAGE}
-
 [RULES]
-1. Write how the SOURCE sounds in the {TARGET_LANGUAGE} writing system.
-2. Never translate the meaning. Never explain. Never add or remove words.
-3. Keep the original word order and the original word count.
-4. Copy every digit and symbol from the SOURCE exactly as it is.
-5. The "transliteration" value must be a single line containing only the respelled text.
-6. Do NOT repeat or echo any example. Output ONLY the respelled text.
-
+1. Fill every key in both output objects. Do not leave any key empty or omit any key.
+2. The value for each key is the sound-based respelling of that single word only.
+3. Never translate meaning. Never add words. Never remove words. Never explain.
+4. Keys must be copied character-for-character from [SOURCE] words.
+5. Digits inside a word must be copied exactly as they appear.
+6. Output ONLY the JSON object. No markdown. No comment. No extra text.
 [OUTPUT FORMAT]
-{ "language": "{TARGET_LANGUAGE}", "transliteration": String }
-
+{
+    "language": "{TARGET_LANGUAGE}",
+    "transliteration": {TRANSLITERATION_OBJ},
+    "transcription": {TRANSCRIPTION_OBJ}
+}
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
-template.replace("{SOURCE}", source_value)
-    .replace("{TARGET_LANGUAGE}", target_language)
+
+    template.replace("{SOURCE}", &cleaned)
+        .replace("{TARGET_LANGUAGE}", target_language)
+        .replace("{TRANSCRIPTION_OBJ}", &transcription_obj)
+        .replace("{TRANSLITERATION_OBJ}", &transliteration_obj)
 }

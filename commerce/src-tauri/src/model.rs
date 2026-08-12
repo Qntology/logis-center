@@ -794,11 +794,11 @@ impl LogisModel {
 
     // 🌟 [SYNONYM EXPANSION] 음차(Transliteration) 전용 Qwen3 호출.
     //    call_qwen3_verification_model 은 시스템 프롬프트가 "JSON 으로 답하라"라서
-    //    음차 결과가 JSON 껍데기에 갇힙니다. 여기서는 '한 줄 평문'만 받도록 분리합니다.
+    //    음차 결과가 JSON 껍데기에 갇힙니다. 여기서는 단어별 JSON만 받도록 분리합니다.
     //
     //    시스템 프롬프트에도 언어 이름이 전혀 없습니다.
-    //    목표 표기 체계는 user 프롬프트의 [SCRIPT SAMPLE] 로만 전달되며,
-    //    그 샘플은 detect_document_language + bias.json 에서 런타임에 생성됩니다.
+    //    목표 표기 체계는 user 프롬프트의 [TARGET LANGUAGE] 로만 전달되며,
+    //    그 값은 lang_code_to_full_name() 으로 런타임에 생성됩니다.
     //
     //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
     pub async fn call_qwen3_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
@@ -812,7 +812,7 @@ impl LogisModel {
                 let params = crate::openai_types::ChatCompletionParameters {
                     messages: vec![
                         crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: "You respell text into another writing system by sound only. You never translate meaning. Return strictly the requested JSON format.".to_string(),
+                            content: "You respell each word of the source text into the target writing system by sound only. You never translate meaning. You process every word independently. Return strictly the requested JSON format.".to_string(),
                             name: None,
                         }),
                         crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
@@ -820,7 +820,7 @@ impl LogisModel {
                             name: None,
                         })
                     ],
-                    model: "qwen3".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
                     ..Default::default()
                 };
                 gen.generate(params, cancel_clone, None, None).map_err(|e| anyhow::anyhow!("Qwen3 transliteration failed: {}", e))
@@ -828,6 +828,7 @@ impl LogisModel {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }
         }).await??;
+
         // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
         let q3_clear_arc = self.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -835,6 +836,7 @@ impl LogisModel {
                 gen.clear_kv_cache();
             }
         }).await;
+
         Ok(res)
     }
 
@@ -844,19 +846,21 @@ impl LogisModel {
     //    호출 전 Qwen3 0.6B를 내리고 Qwen3.5를 올리는 분리 동작을 전제로 합니다.
     //
     //    시스템 프롬프트에도 언어 이름이 전혀 없습니다.
-    //    목표 표기 체계는 user 프롬프트의 [SCRIPT SAMPLE] 로만 전달되며,
-    //    그 샘플은 detect_document_language + bias.json 에서 런타임에 생성됩니다.
+    //    목표 표기 체계는 user 프롬프트의 [TARGET LANGUAGE] 로만 전달되며,
+    //    그 값은 lang_code_to_full_name() 으로 런타임에 생성됩니다.
     //
     //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
+    //    max_tokens 256 : 단어별 JSON 구조는 기존 단일 문자열보다 토큰 수가 많으므로 상향합니다.
     pub async fn call_qwen3_5_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         self.ensure_qwen3_5(false).await?;
+
         let mut gen_guard = self.qwen3_5_generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
 
         let params = crate::openai_types::ChatCompletionParameters {
             messages: vec![
                 crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                    content: "You respell text into another writing system by sound only. You never translate meaning. Return strictly the requested JSON format.".to_string(),
+                    content: "You respell each word of the source text into the target writing system by sound only. You never translate meaning. You process every word independently. Return strictly the requested JSON format.".to_string(),
                     name: None,
                 }),
                 crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
@@ -864,7 +868,7 @@ impl LogisModel {
                     name: None,
                 })
             ],
-            model: "qwen3.5".to_string(), max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(1.0), top_p: Some(0.95),
             ..Default::default()
         };
 
@@ -874,10 +878,11 @@ impl LogisModel {
 
         // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
         let _ = gen.clear_kv_cache();
-
         drop(gen_guard);
+
         Ok(res)
     }
+
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
         // 🌟 [VISION-JIT] 이미 2B 가 상주 중이고 mmproj 재로드 소스가 등록되어 있다면,
         //    2GB 텍스트 모델을 통째로 파기/재로딩하지 않고 비전 가중치(약 600MB)만 붙였다 뗍니다.

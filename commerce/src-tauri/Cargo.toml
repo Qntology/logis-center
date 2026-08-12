@@ -77,6 +77,7 @@ boa_engine = { path = "../crates/boa-engine/core/engine" }
 onnxruntime = { path = "../crates/onnxruntime" }
 ndarray = "0.15.1"
 whatlang = "0.18.0"
+any_ascii = "0.3.3"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "../crates/direct-storage" }
