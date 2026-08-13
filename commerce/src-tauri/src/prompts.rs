@@ -906,7 +906,7 @@ Instructions:
 3. If none of the candidates are correct, suggest a completely different property from the schema.
 
 [OUTPUT FORMAT]
-{ "suggested_property": "String" }
+{ "suggested_property": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -934,7 +934,7 @@ If the current operator is already correct, just return it.
 Valid operators: {VALID_OPS}
 
 [OUTPUT FORMAT]
-{ "suggested_operator": "String" }
+{ "suggested_operator": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -969,10 +969,49 @@ Instructions:
 3. Return the best-fitting category as "suggested_category".
 
 [OUTPUT FORMAT]
-{ "suggested_category": "String" }
+{ "suggested_category": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
     template.replace("{TEXT}", text)
             .replace("{CANDIDATES}", &cands_str)
+}
+
+pub fn transliteration_prompt(source_value: &str, target_language: &str) -> String {
+    // 🌟 [SPECIAL CHAR PRE-STRIPPED] 호출부(build_transliteration_prompt)에서
+    //    이미 특수문자가 공백으로 치환된 source_value 가 전달됩니다.
+    //    여기서도 방어적으로 한 번 더 공백 정규화를 수행합니다.
+    let cleaned = source_value
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    // 🌟 [WORD-KEY JSON] 각 단어를 독립 키로 갖는 객체 구조를 생성합니다.
+    //    LLM 이 단어 단위로 독립 음차하므로 중간 맥락 끊김이 발생하지 않습니다.
+    // 🌟 [FULL SOURCE FIRST] 최초 첫 번째 키로 특수문자 제거된 전체 SOURCE 를 배치하여
+    //    LLM 이 전체 문맥을 먼저 파악한 뒤 단어별 음차를 수행하도록 합니다.
+    let mut word_keys: Vec<String> = Vec::with_capacity(words.len() + 1);
+    word_keys.push(format!("\"{}\": String", cleaned));
+    for w in &words {
+        word_keys.push(format!("\"{}\": String", w));
+    }
+    let transliteration_obj = format!("{{ {} }}", word_keys.join(", "));
+    let template = r###"[TASK]
+You are a sound-based respelling engine.
+write how that word sounds in the [TARGET LANGUAGE] writing system.
+
+[TARGET LANGUAGE]
+{TARGET_LANGUAGE}
+
+[RULES]
+- Digits inside a word must be copied exactly as they appear.
+
+[OUTPUT FORMAT]
+{ "language": "{TARGET_LANGUAGE}", "transliteration": {TRANSLITERATION_OBJ} }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
+    template.replace("{SOURCE}", &cleaned)
+        .replace("{TARGET_LANGUAGE}", target_language)
+        .replace("{TRANSLITERATION_OBJ}", &transliteration_obj)
 }

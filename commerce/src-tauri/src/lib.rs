@@ -863,11 +863,25 @@ async fn ai_search_complex(
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() { continue; }
-                let ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let raw_ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
-                if ctx_type == "ignore" {
+                if raw_ctx_type == "ignore" {
                     continue;
                 }
+
+                // 🌟 [TABLE FALLBACK] STAGE-3 이 발행한 "{domain}_items" 폴백 컨텍스트는
+                //    target_table match 에서 어떤 분기에도 걸리지 않아 items(전 타입 미러)로 조회됩니다.
+                //    SQL 필터의 type 컬럼에는 원래 도메인 이름을 넣어야 하므로 접미사만 벗겨냅니다.
+                //    이 경로가 있어야 scheduler 의 저장 테이블과 lib 의 조회 테이블이 어긋나도
+                //    데이터가 존재하는 한 반드시 결과에 포함됩니다.
+                let ctx_type: &str = match raw_ctx_type.strip_suffix("_items") {
+                    Some(base) => {
+                        println!("[AI-SEARCH] Table fallback context detected. Querying 'items' mirror with type = '{}'.", base);
+                        base
+                    },
+                    None => raw_ctx_type,
+                };
+                let is_table_fallback = raw_ctx_type.ends_with("_items");
                 // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
                 // 백엔드 FTS/LIKE 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
                 let search_text = text.to_string();
@@ -885,17 +899,41 @@ async fn ai_search_complex(
                     }
                     tn
                 };
-                let target_table = match ctx_type {
-                    "member" | "team" | "user" => "users",
-                    "page" | "pages" => "pages",
-                    "talk" => "talks",
-                    "sales" | "goods" | "order" => "sales",
-                    "tracking" | "shipping" | "receiving" => "tracking",
-                    "event" | "coupon" | "review" => "event",
-                    _ => "items",
+                let target_table = if is_table_fallback {
+                    // 🌟 items 는 scheduler 가 모든 타입을 이중 upsert 하는 미러 테이블입니다.
+                    "items"
+                } else {
+                    match ctx_type {
+                        "member" | "team" | "user" => "users",
+                        "page" | "pages" => "pages",
+                        "talk" => "talks",
+                        "sales" | "goods" | "order" => "sales",
+                        "tracking" | "shipping" | "receiving" => "tracking",
+                        "event" | "coupon" => "event",
+                        // 🌟 [TABLE MAPPING FIX] scheduler 의 저장 매핑은
+                        //      "event" | "coupon" => "event",  나머지(review 포함) => "items"
+                        //    입니다. 즉 review 는 items 에 저장되는데 여기서 event 를 조회하고 있어
+                        //    데이터가 존재해도 물리적으로 항상 0건이 됩니다.
+                        //    (로그: review A/FULL·B/NARROWED 두 티어 모두 Table: event / total_found: 0)
+                        //    지금까지는 E/TABLE-FALLBACK 티어가 items 를 훑어 리콜을 겨우 보증했습니다.
+                        "review" => "items",
+                        _ => "items",
+                    }
                 };
 
-                let sql_filter = convert_conditions_to_sql(ctx);
+                // 🌟 [FALLBACK SQL FIX] convert_conditions_to_sql 은 ctx["type"] 을 그대로 SQL 에 넣습니다.
+                //    폴백 컨텍스트의 type 은 "review_items" 같은 라우팅 전용 이름이라
+                //    DB 에 존재하지 않는 값이 되어 `type = 'review_items'` 로 나가고 항상 0건이 됩니다.
+                //    (로그: [AI-SEARCH] Table fallback ... 직후 filter 가 "(type = 'review_items')" 로 출력됨)
+                //    SQL 생성 시에는 접미사를 벗긴 원래 도메인 이름을 사용합니다.
+                let sql_ctx = if is_table_fallback {
+                    let mut c = ctx.clone();
+                    if let Some(o) = c.as_object_mut() { o.insert("type".to_string(), json!(ctx_type)); }
+                    c
+                } else {
+                    ctx.clone()
+                };
+                let sql_filter = convert_conditions_to_sql(&sql_ctx);
                 let mode_filter = format!("mode = '{}'", search_mode);
                 let final_sql_filter = match sql_filter {
                     Some(f) => Some(format!("({}) AND {}", f, mode_filter)),
@@ -940,8 +978,415 @@ async fn ai_search_complex(
                     // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
                     // 프론트엔드(Dexie DB)로 역할을 위임합니다.
                 }
+
+                // =====================================================================
+                // 🌟 [STAGE-4] item_chunks 청크 레벨 코사인 유사도 매칭
+                // ---------------------------------------------------------------------
+                // 기존 search_items() 는 전체 문서 벡터 1개와 질의 벡터를 비교하므로
+                // "무거운" ↔ "Its weight is 1.5" 같은 필드 레벨 매칭이 희석되어 0건이 됩니다.
+                // STAGE-4 는 scheduler 가 사전 저장한 item_chunks 테이블의
+                // 속성별 청크 임베딩과 코사인 유사도를 계산하여
+                // 필드 레벨 매칭을 복원합니다.
+                //
+                // 매칭 전략:
+                //   4-A: 질의 텍스트 임베딩으로 item_chunks 전체 코사인 검색
+                //   4-B: PLINKO 조건(condition)에 확정된 속성이 있으면
+                //        해당 속성 청크에 보너스 가중치 부여
+                //   4-C: item_id 기준 그룹핑 후 기존 all_results 와 dedup 병합
+                // =====================================================================
+                {
+                    // 4-A: item_chunks 테이블 코사인 검색
+                    //      item_type 필터로 도메인을 좁히고, mode 필터로 검색 모드 일치 보장
+                    let chunk_type_filter = format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode);
+                    if is_table_fallback {
+                        println!("[AI-SEARCH] 🧩 [STAGE-4] 폴백 컨텍스트 감지. item_type='{}' 로 청크 검색을 수행합니다.", ctx_type);
+                    }
+
+                    // 4-B: PLINKO 조건 기반 타겟 속성 목록 구축
+                    //      ① condition 키 (PLINKO 가 확정한 속성)
+                    //      ② substantial (추상 수식어가 지목한 물리 속성 — weight / sale_price ...)
+                    //      substantial 은 LanceDB 물리 컬럼이 아니라 SQL 로는 절대 반영되지 않지만,
+                    //      item_chunks 의 property 컬럼에는 그대로 존재하므로
+                    //      '무거운 → weight' 의도를 여기서 실제 검색으로 회수합니다.
+                    let mut condition_props: Vec<String> = ctx.get("condition")
+                        .and_then(|v| v.as_object())
+                        .map(|obj| obj.keys().cloned().collect())
+                        .unwrap_or_default();
+
+                    let substantial_prop = ctx.get("substantial")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !substantial_prop.is_empty() && !condition_props.iter().any(|p| p == &substantial_prop) {
+                        condition_props.push(substantial_prop.clone());
+                    }
+
+                    let mut chunk_results = store.search_chunks(
+                        &emb,
+                        10, // 상위 10개 청크 (item_id 그룹핑 전 오버페치)
+                        Some(&chunk_type_filter),
+                    ).await.unwrap_or_default();
+
+                    // 4-C: 속성 타겟 청크 검색 (property 필터 고정)
+                    //      전체 코사인 검색은 긴 질의 문장과 짧은 저장 청크 사이의 구조적 격차 때문에
+                    //      정답 속성 청크가 상위 10개 밖으로 밀려날 수 있습니다.
+                    //      확정된 속성마다 property 를 고정한 별도 쿼리를 던져 리콜을 보증합니다.
+                    //
+                    //      🌟 [ALIAS RECALL] 이 경로는 음차 별칭(_tn/_tr)이 살아 돌아오는 유일한 통로입니다.
+                    //      별칭은 원본과 동일한 property 를 갖도록 저장되므로(STAGE-4B/4C 호환 목적),
+                    //      limit 이 작으면 원본 청크만으로 창이 가득 차 별칭이 전멸합니다.
+                    //      10개 상품 × (원본 + native + roman) = 30 행이 존재할 수 있으므로 창을 넓힙니다.
+                    for target_prop in condition_props.iter() {
+                        if target_prop.trim().is_empty() { continue; }
+                        let escaped_prop = target_prop.replace('\'', "''");
+                        let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
+                        let targeted = store.search_chunks(&emb, 12, Some(&prop_filter)).await.unwrap_or_default();
+                        if targeted.is_empty() { continue; }
+                        println!("[AI-SEARCH]   🎯 [STAGE-4C] property='{}' 타겟 청크 검색: {}건 추가 확보", target_prop, targeted.len());
+                        for t in targeted {
+                            if chunk_results.iter().any(|(cid, _, _, _, _, _)| cid == &t.0) { continue; }
+                            chunk_results.push(t);
+                        }
+                    }
+
+                    // 4-D: 조건이 하나도 없을 때의 값 청크 진입 보증
+                    //      PLINKO 가 ACTION VERB 게이트 등으로 조건을 못 만들면 STAGE-4C 가 아예 돌지 않고,
+                    //      전역 코사인 검색만 남습니다. 그런데 그 창을 저변별 청크(status/sale_price)가
+                    //      독점하면 값이 담긴 title 청크가 후보에 진입조차 못 합니다.
+                    //      (new_log2.txt: 조건 0개 → 상위 10건 전부 status/traffic_insight, title 0건)
+                    //      스키마에서 '자유 서술 값을 담는 형식(Text)' 필드만 골라 타겟 검색을 겁니다.
+                    //      필드 선정은 detect_field_format 의 결정론 판정만 사용하므로
+                    //      다국어 어휘도, 필드명 하드코딩도 없습니다.
+                    //
+                    //      🌟 [ALIAS RECALL] 여기도 limit 3 은 치명적이었습니다.
+                    //      store.rs 의 per_property_cap = max(2, 3/2) = 2 가 걸려
+                    //      "title(16행)" 이 통째로 억제되었고(log 실측), 음차 별칭이 100% 소멸했습니다.
+                    //      store.rs 가 property 고정 검색에서 캡을 해제했으므로,
+                    //      여기서는 창 크기만 별칭 포함 규모로 넓혀 주면 됩니다.
+                    if condition_props.is_empty() {
+                        use crate::utils::ai_utils::FieldFormat;
+                        let schema_fields = crate::parsing::get_detail_schema_fields(ctx_type, "", "en");
+                        let mut probed = 0usize;
+                        for (fname, _, _, _) in schema_fields.iter() {
+                            if crate::utils::ai_utils::detect_field_format(fname) != FieldFormat::Text {
+                                continue;
+                            }
+                            let escaped_prop = fname.replace('\'', "''");
+                            let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
+                            let targeted = store.search_chunks(&emb, 12, Some(&prop_filter)).await.unwrap_or_default();
+                            if targeted.is_empty() { continue; }
+                            probed += targeted.len();
+                            for t in targeted {
+                                if chunk_results.iter().any(|(cid, _, _, _, _, _)| cid == &t.0) { continue; }
+                                chunk_results.push(t);
+                            }
+                        }
+                        if probed > 0 {
+                            println!(
+                                "[AI-SEARCH]   🧭 [STAGE-4D] 조건 부재 → Text 형식 필드 타겟 청크 검색: {}건 추가 확보 (값 청크 진입 보증)",
+                                probed
+                            );
+                        }
+                    }
+
+                    if !chunk_results.is_empty() {
+                        println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
+                    }
+
+                    for (chunk_id, item_id, chunk_text, property, group_score, best_cos) in chunk_results {
+                        // 🌟 [SCALE FIX] 트랙 가중치는 반드시 '코사인(0~1)' 에만 곱합니다.
+                        //    기존에는 search_chunks 가 돌려준 '그룹 합산 점수' 를 코사인이라 가정하고 곱해
+                        //    (log 실측: score 3.0146 → 최종 10.5510) 상한 1.0 전제가 무너졌고,
+                        //    질의와 무관해도 청크가 많이 살아남은 item 이 상위를 독점했습니다.
+                        //    합산(group_score)은 '증거의 양' 이므로 별도의 완만한 보너스로만 반영합니다.
+                        let raw_cosine = best_cos.clamp(0.0f32, 1.0f32);
+
+                        // 🌟 [ALIAS FLAG] 이 매칭이 음차 별칭 청크에서 나왔는지 판정합니다.
+                        //    scheduler 의 upsert_alias_chunks 가 chunk_id 에 _tn / _tr 접미어를 붙이므로
+                        //    의미 판정이 아니라 '우리가 만든 접미어' 라는 구조적 사실입니다.
+                        let is_alias = chunk_id.ends_with("_tn") || chunk_id.ends_with("_tr");
+
+                        // 4-D: 3-Track 스케일 정합
+                        //      store.rs 의 하이브리드 검색은 Column=3.0 / FTS=2.0 / Vector=1.0 가산 스케일입니다.
+                        //      청크 매칭은 '본문 매칭' 이므로 FTS 트랙(2.0)과 동일 스케일로 환산하고,
+                        //      PLINKO 가 확정한 속성과 일치하면 Column 트랙(3.0)을 추가로 얹습니다.
+                        let mut score = raw_cosine * 2.0;
+                        if !condition_props.is_empty() && condition_props.contains(&property) {
+                            let column_track = raw_cosine * 3.0;
+                            score += column_track;
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                        }
+
+                        // 🌟 [STAGE-4X CROSS-LINGUAL VALUE BONUS]
+                        //    "니트 가디건" ↔ "Cable Knit Cardigan" 처럼 값이 서로 다른 문자 체계일 때
+                        //    FTS(ngram 문자열 포함)는 물리적으로 0건입니다.
+                        //    이 경우 크로스링구얼 매칭이 가능한 트랙은 값 청크 코사인뿐이므로,
+                        //    '값이 의미를 나르는 속성'에 FTS 결손분을 보전합니다.
+                        {
+                            use crate::utils::ai_utils::FieldFormat;
+                            // 🌟 [ENUM EXCLUDE] Enum 값은 'complete' / 'show' / 'hide' 같은
+                            //    저카디널리티 캐노니컬 키이며, 전 아이템에서 동일 문자열입니다.
+                            //    자유 서술 값을 담는 Text / Address 만 크로스링구얼 보전 대상입니다.
+                            let value_bearing = matches!(
+                                crate::utils::ai_utils::detect_field_format(&property),
+                                FieldFormat::Text | FieldFormat::Address
+                            );
+                            if value_bearing {
+                                let cross_lingual_track = raw_cosine * 1.5;
+                                score += cross_lingual_track;
+                                println!(
+                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
+                                    property, cross_lingual_track, raw_cosine, score
+                                );
+                            }
+                        }
+
+                        // 🌟 [STAGE-4Y ALIAS TRACK] 음차 별칭이 매칭됐다는 것은
+                        //    '문자 체계가 달라 FTS 가 물리적으로 0건인 상황에서, 발음 축으로 값이 일치했다'
+                        //    는 뜻입니다. 이것이 바로 별칭을 저장한 목적이므로 전용 트랙을 부여합니다.
+                        //    (원본 청크가 이미 확보한 점수를 대체하지 않고 가산만 하므로
+                        //     별칭이 없는 item 이 손해를 보지 않습니다)
+                        if is_alias {
+                            let alias_track = raw_cosine * 1.5;
+                            score += alias_track;
+                            println!(
+                                "[AI-SEARCH]   🔤 [STAGE-4Y] 음차 별칭 매칭 ({}) property='{}' | chunk='{}' → 별칭 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
+                                if chunk_id.ends_with("_tn") { "native" } else { "roman" },
+                                property, chunk_text, alias_track, raw_cosine, score
+                            );
+                        }
+
+                        // 🌟 [EVIDENCE VOLUME] 합산 점수는 '몇 개의 청크가 함께 반응했는가' 라는
+                        //    보조 신호입니다. 로그 스케일로 완만하게만 반영하여
+                        //    청크 수가 많은 item 이 코사인 우위를 뒤집지 못하게 합니다.
+                        if group_score > raw_cosine {
+                            let volume_bonus = ((group_score - raw_cosine).max(0.0) + 1.0).ln() * 0.25;
+                            score += volume_bonus;
+                        }
+
+                        // 4-C: item_id 기준 기존 결과와 dedup
+                        //      이미 all_results 에 동일 item_id 가 있으면
+                        //      점수만 갱신하고 중복 삽입하지 않습니다.
+                        let existing = all_results.iter_mut().find(|item| {
+                            item.get("id").and_then(|v| v.as_str()) == Some(&item_id)
+                        });
+
+                        if let Some(existing_item) = existing {
+                            // 기존 점수보다 높으면 갱신
+                            let old_score = existing_item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                            if score > old_score {
+                                existing_item.as_object_mut().unwrap().insert("score".to_string(), json!(score));
+                                existing_item.as_object_mut().unwrap().insert("chunk_match".to_string(), json!(true));
+                                existing_item.as_object_mut().unwrap().insert("matched_property".to_string(), json!(property));
+                                existing_item.as_object_mut().unwrap().insert("matched_chunk".to_string(), json!(chunk_text));
+                                existing_item.as_object_mut().unwrap().insert("alias_match".to_string(), json!(is_alias));
+                            }
+                        } else {
+                            // 신규 결과 삽입
+                            // chunk_id 가 아닌 item_id 를 기준으로 삽입하여
+                            // 동일 item 의 여러 청크가 중복 결과로 나타나지 않도록 합니다.
+                            let is_item_dup = all_results.iter().any(|item| {
+                                item.get("id").and_then(|v| v.as_str()) == Some(&item_id)
+                            });
+                            if !is_item_dup {
+                                all_results.push(json!({
+                                    "id": item_id,
+                                    "text": chunk_text,
+                                    "score": score,
+                                    "context_type": ctx_type,
+                                    "relation": "chunk_match",
+                                    "chunk_id": chunk_id,
+                                    "matched_property": property,
+                                    "chunk_match": true,
+                                    "alias_match": is_alias
+                                }));
+                            }
+                        }
+                    }
+                }
+                // =====================================================================
+                // 🌟 [STAGE-4 종료]
+                // =====================================================================
             }
         }
+
+        // =====================================================================
+        // 🌟 [STAGE-5] 결과 병합 & 스코어 랭킹 & 프론트엔드 응답 포맷 조립
+        // ---------------------------------------------------------------------
+        // STAGE-4 까지 수집된 all_results 에는 다음 두 종류의 결과가 혼재합니다.
+        //   (A) search_items()  → 전체 문서 벡터 + FTS 매칭  (relation: "primary")
+        //   (B) search_chunks() → 청크 레벨 코사인 매칭       (relation: "chunk_match")
+        //
+        // STAGE-5 의 역할:
+        //   5-A: item_id 기준 dedup (동일 item 의 여러 청크가 중복 결과로 나타나지 않도록)
+        //   5-B: 점수 정규화 (문서 점수와 청크 점수를 동일한 스케일로 병합)
+        //   5-C: 매칭 속성(property) 메타데이터 주입 (프론트엔드 하이라이트용)
+        //   5-D: 최종 랭킹 (내림차순) 후 limit 적용
+        //   5-E: 프론트엔드 응답 JSON 포맷 확정
+        // =====================================================================
+        {
+            // ── 5-A: item_id 기준 dedup ──
+            // 동일 item_id 가 여러 번 등장하면 점수를 합산하고,
+            // 가장 높은 청크 매칭 정보(property, chunk_text)를 대표로 남깁니다.
+            let mut merged_map: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            let mut merge_order: Vec<String> = Vec::new();
+
+            for item in all_results.iter() {
+                let item_id = item.get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if item_id.is_empty() { continue; }
+
+                let score = item.get("score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let is_chunk_match = item.get("chunk_match")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let matched_property = item.get("matched_property")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let matched_chunk = item.get("matched_chunk")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if let Some(existing) = merged_map.get_mut(&item_id) {
+                    // 기존 항목의 점수에 새 점수를 가산
+                    let old_score = existing.get("score")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let combined = old_score + score;
+                    existing.as_object_mut().unwrap()
+                        .insert("score".to_string(), json!(combined));
+
+                    // 청크 매칭 정보가 더 구체적이면 대표 메타데이터로 교체
+                    if is_chunk_match && !matched_property.is_empty() {
+                        let old_prop = existing.get("matched_property")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if old_prop.is_empty() || score > old_score {
+                            existing.as_object_mut().unwrap()
+                                .insert("matched_property".to_string(), json!(matched_property));
+                            existing.as_object_mut().unwrap()
+                                .insert("matched_chunk".to_string(), json!(matched_chunk));
+                            existing.as_object_mut().unwrap()
+                                .insert("chunk_match".to_string(), json!(true));
+                        }
+                    }
+
+                    // 매칭된 속성 목록 누적 (프론트엔드에서 다중 하이라이트 가능)
+                    if is_chunk_match && !matched_property.is_empty() {
+                        let props = existing.get("matched_properties")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut props_vec: Vec<Value> = props;
+                        if !props_vec.iter().any(|p| p.as_str() == Some(&matched_property)) {
+                            props_vec.push(json!(matched_property));
+                        }
+                        existing.as_object_mut().unwrap()
+                            .insert("matched_properties".to_string(), json!(props_vec));
+                    }
+                } else {
+                    // 신규 항목 삽입
+                    let mut entry = item.clone();
+                    if is_chunk_match && !matched_property.is_empty() {
+                        entry.as_object_mut().unwrap()
+                            .insert("matched_properties".to_string(), json!(vec![matched_property.clone()]));
+                    }
+                    merge_order.push(item_id.clone());
+                    merged_map.insert(item_id, entry);
+                }
+            }
+
+            // ── 5-B: 점수 정규화 ──
+            // 문서 매칭(primary)과 청크 매칭(chunk_match)의 점수 스케일이 다를 수 있으므로
+            // 최대 점수 기준으로 0.0~1.0 에 정규화합니다.
+            // 단, 점수가 전부 0 이면 정규화를 건너뜁니다.
+            let mut max_score: f32 = 0.0;
+            for item in merged_map.values() {
+                let s = item.get("score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                if s > max_score { max_score = s; }
+            }
+
+            let mut ranked_results: Vec<serde_json::Value> = Vec::new();
+            for item_id in &merge_order {
+                if let Some(mut item) = merged_map.remove(item_id) {
+                    if max_score > 0.0 {
+                        let raw = item.get("score")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0) as f32;
+                        let normalized = raw / max_score;
+                        item.as_object_mut().unwrap()
+                            .insert("score".to_string(), json!(normalized));
+                        item.as_object_mut().unwrap()
+                            .insert("raw_score".to_string(), json!(raw));
+                    }
+                    ranked_results.push(item);
+                }
+            }
+
+            // ── 5-D: 최종 랭킹 (점수 내림차순) ──
+            ranked_results.sort_by(|a, b| {
+                let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // ── 5-E: 프론트엔드 응답 포맷 확정 ──
+            // 프론트엔드(main.ts)가 소비하는 필드:
+            //   id, text, score, context_type, relation,
+            //   chunk_match(bool), matched_property, matched_chunk, matched_properties
+            //
+            // chunk_match = true 인 항목은 프론트엔드에서
+            // "어떤 속성이 매칭되었는지" 를 배지로 표시할 수 있습니다.
+            //
+            // limit: 프론트엔드 렌더링 부하 방지를 위해 최대 20개 반환
+            let final_limit = 20usize;
+            if ranked_results.len() > final_limit {
+                ranked_results.truncate(final_limit);
+            }
+
+            // ── 검색 통계 로그 출력 ──
+            let chunk_match_count = ranked_results.iter()
+                .filter(|r| r.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false))
+                .count();
+            let primary_count = ranked_results.len() - chunk_match_count;
+
+            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건)",
+                ranked_results.len(), primary_count, chunk_match_count);
+
+            for (rank, item) in ranked_results.iter().enumerate() {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let prop = item.get("matched_property").and_then(|v| v.as_str()).unwrap_or("-");
+                let is_chunk = item.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_alias = item.get("alias_match").and_then(|v| v.as_bool()).unwrap_or(false);
+                let ctx = item.get("context_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let matched_text = item.get("matched_chunk")
+                    .or_else(|| item.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let brief: String = matched_text.chars().take(48).collect();
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'",
+                    rank + 1, id, score, ctx,
+                    if is_chunk { if is_alias { "alias" } else { "chunk" } } else { "doc" },
+                    prop, brief);
+            }
+
+            all_results = ranked_results;
+        }
+        // =====================================================================
+        // 🌟 [STAGE-5 종료]
+        // =====================================================================
+
         Ok(json!({ "structured": structured_query, "results": all_results }))
     }.await; 
 

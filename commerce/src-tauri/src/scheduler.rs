@@ -21,6 +21,395 @@ use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_ext
 use crate::utils::logger::log_task_progress;
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
+
+// =====================================================================
+// 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
+// ---------------------------------------------------------------------
+// 흐름:
+//   원문 "Cable Knit Cardigan"
+//     → 1차: 문서 언어 표기로 음차   "케이블 니트 카디건"   (transliteration_native)
+//     → 2차: 원문 표기로 역음차      "keibeul nit kadigeon" (transliteration_roman)
+//   두 별칭을 동일 item_id / 동일 property 로 item_chunks 에 추가 저장합니다.
+//   store.rs 의 search_chunks() 가 item_id 기준으로 점수를 합산하므로,
+//   별칭 하나만 매칭돼도 원본 item 이 그대로 상위 랭크됩니다.
+//
+// 언어 하드코딩이 없는 이유:
+//   1차 목표 표기 = native_script_sample()  → detect_document_language 결과 + bias.json
+//   2차 목표 표기 = 원문 값 그 자체          → 언어 테이블 자체가 불필요
+// =====================================================================
+
+/// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
+/// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
+///
+/// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
+async fn generate_transliteration_aliases(
+    model: &LogisModel,
+    chunks: &[&crate::nl_convert::ChunkMetadata],
+    doc_lang: &str,
+    page_type: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> Vec<(String, String)> {
+    let emit = |msg: &str| {
+        println!("{}", msg);
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+    };
+
+    let mut out: Vec<(String, String)> = vec![(String::new(), String::new()); chunks.len()];
+    let mut cache: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let mut made = 0usize;
+    let mut reused = 0usize;
+    let mut skipped = 0usize;
+
+    for (i, cm) in chunks.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if !crate::nl_convert::needs_transliteration(cm) {
+            skipped += 1;
+            continue;
+        }
+
+        let src = cm.value_part.trim().to_string();
+        if src.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        if let Some(hit) = cache.get(&src) {
+            out[i] = hit.clone();
+            reused += 1;
+            continue;
+        }
+
+        // 1차 음차 가능 여부 판정.
+        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
+        if !crate::nl_convert::can_transliterate(&src, doc_lang) {
+            cache.insert(src.clone(), (String::new(), String::new()));
+            skipped += 1;
+            continue;
+        }
+
+        println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
+        println!("    SOURCE = '{}'", src);
+
+        // 🌟 [LANGUAGE TRACK SPLIT] 표기 체계별로 단어를 분리하여 트랙별 처리합니다.
+        // 비라틴 단어(한글 등) → target "english" (로마자 전사)
+        // 라틴 단어(영어 등)   → target doc_lang (문서 언어 스크립트 전사)
+        let (non_latin_words, latin_words) = crate::nl_convert::split_words_by_script(&src);
+        let is_mixed = !non_latin_words.is_empty() && !latin_words.is_empty();
+
+        let s1_transliteration = if is_mixed {
+            println!("    [TRACK SPLIT] 비라틴: {:?} | 라틴: {:?}", non_latin_words, latin_words);
+
+            // Track A: 비라틴 단어 → 로마자 전사 (target: english)
+            let mut track_a_transliteration = String::new();
+            if !non_latin_words.is_empty() {
+                let p_a = crate::nl_convert::build_transliteration_prompt_for_words(&non_latin_words, "english");
+                let raw_a = model
+                    .call_qwen3_5_transliteration(&p_a, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
+                println!("    TRACK-A RAW (non-latin→latin) = '{}'", raw_a.replace('\n', "\n"));
+                let (_t_a, tr_a) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_a, &non_latin_words);
+                track_a_transliteration = tr_a;
+            }
+
+            // Track B: 라틴 단어 → 문서 언어 스크립트 전사 (target: doc_lang)
+            let mut track_b_transliteration = String::new();
+            if !latin_words.is_empty() {
+                let p_b = crate::nl_convert::build_transliteration_prompt_for_words(&latin_words, doc_lang);
+                let raw_b = model
+                    .call_qwen3_5_transliteration(&p_b, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
+                println!("    TRACK-B RAW (latin→{}) = '{}'", doc_lang, raw_b.replace('\n', "\n"));
+                let (_t_b, tr_b) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_b, &latin_words);
+                track_b_transliteration = tr_b;
+            }
+
+            // 트랙 결과를 원본 단어 순서로 병합
+            let merged_transliteration = crate::nl_convert::merge_track_results(
+                &src,
+                &non_latin_words, &track_a_transliteration,
+                &latin_words, &track_b_transliteration,
+            );
+
+            println!("    TRACK-A TRANSLITERATION= '{}'", track_a_transliteration);
+            println!("    TRACK-B TRANSLITERATION= '{}'", track_b_transliteration);
+
+            merged_transliteration
+        } else {
+            // 단일 스크립트: 기존 로직 그대로
+            let p1 = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
+            let raw1 = model
+                .call_qwen3_5_transliteration(&p1, Some(cancel.clone()))
+                .await
+                .unwrap_or_default();
+            println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\n"));
+            let (_t, tr) = crate::nl_convert::sanitize_transliteration_dual(&raw1, &src);
+            tr
+        };
+
+        // 🌟 [MIXED SCRIPT RE-TRANSLITERATION]
+        //    PASS-1 결과에서 한글+라틴 혼용 단어(예: "시IELD")가 발견되면
+        //    해당 단어만 재음차하여 순수 목표 스크립트로 교정합니다.
+        //    (Qwen3.5 가 간헐적으로 일부 문자만 변환하고 나머지를 원문 그대로 남기는 문제 대응)
+        let mut s1 = s1_transliteration.clone();
+        {
+            let mixed_words = crate::nl_convert::find_mixed_script_words(&s1);
+            if !mixed_words.is_empty() {
+                println!("    🔧 [MIXED SCRIPT DETECTED] 혼용 단어 {:?} 발견 → 재음차 수행", mixed_words);
+                // 혼용 단어의 '원문 형태'를 역추적합니다.
+                // 혼용 단어는 PASS-1 프롬프트에 넣었던 원문 단어에서 파생되었으므로,
+                // 원문 단어 목록에서 해당 혼용 단어를 만든 원문을 찾습니다.
+                // 판정: 혼용 단어의 라틴 부분과 원문 단어가 포함 관계이면 매칭.
+                let mut retranslate_pairs: Vec<(String, String)> = Vec::new(); // (원문단어, 혼용단어)
+                let src_words: Vec<&str> = src.split_whitespace().collect();
+                for mw in &mixed_words {
+                    // 혼용 단어에서 라틴 부분만 추출하여 원문과 매칭
+                    let latin_part: String = mw.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+                    let mut matched_src = mw.clone(); // 폴백: 혼용 단어 자체
+                    for sw in &src_words {
+                        let sw_lower = sw.to_lowercase();
+                        let latin_lower = latin_part.to_lowercase();
+                        if !latin_lower.is_empty() && sw_lower.contains(&latin_lower) {
+                            matched_src = sw.to_string();
+                            break;
+                        }
+                    }
+                    retranslate_pairs.push((matched_src, mw.clone()));
+                }
+                if !retranslate_pairs.is_empty() {
+                    let retranslate_words: Vec<String> = retranslate_pairs.iter().map(|(s, _)| s.clone()).collect();
+                    println!("    🔧 [MIXED RE-TRANSLATE] 원문 단어 {:?} 재음차 요청", retranslate_words);
+                    let p_re = crate::nl_convert::build_transliteration_prompt_for_words(&retranslate_words, doc_lang);
+                    let raw_re = model
+                        .call_qwen3_5_transliteration(&p_re, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    println!("    🔧 [MIXED RE-TRANSLATE RAW] = '{}'", raw_re.replace('\n', "\n"));
+                    let (_t_re, tr_re) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_re, &retranslate_words);
+                    if !tr_re.is_empty() {
+                        // 재음차 결과를 단어별로 매핑하여 혼용 단어 교체
+                        let re_results: Vec<&str> = tr_re.split_whitespace().collect();
+                        let mut replacements: Vec<(String, String)> = Vec::new();
+                        for (i, (_src_w, mixed_w)) in retranslate_pairs.iter().enumerate() {
+                            if let Some(new_w) = re_results.get(i) {
+                                let new_word = new_w.to_string();
+                                // 재음차 결과도 여전히 혼용이면 폐기
+                                let still_mixed = crate::nl_convert::find_mixed_script_words(&new_word);
+                                if still_mixed.is_empty() && !new_word.is_empty() {
+                                    replacements.push((mixed_w.clone(), new_word));
+                                } else {
+                                    println!("    ⚠️ [MIXED RE-TRANSLATE SKIP] '{}' 재음차 결과 '{}' 도 혼용이라 폐기", mixed_w, new_word);
+                                }
+                            }
+                        }
+                        if !replacements.is_empty() {
+                            println!("    🔧 [MIXED SCRIPT FIXED] 교체: {:?}", replacements);
+                            s1 = crate::nl_convert::replace_mixed_words(&s1, &replacements);
+                        }
+                    }
+                }
+            }
+        }
+        println!("    PASS-1 TRANSLITERATION  = '{}'", s1_transliteration);
+        println!("    PASS-1 RESULT= '{}'", s1);
+
+        // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
+        //      🌟 [ANY_ASCII FAST PATH] 비라틴 → 라틴 방향이면 any_ascii 를 먼저 시도합니다.
+        //      any_ascii 가 성공하면 LLM 호출 없이 즉시 확정합니다.
+        let mut s2 = String::new();
+        if !s1.is_empty() {
+            // 1차 결과와 원문의 표기 체계가 달라야 2차 역음차가 성립합니다.
+            if crate::nl_convert::is_latin_dominant(&s1) != crate::nl_convert::is_latin_dominant(&src) {
+                // 🌟 [REVERSE TARGET] 2차는 1차 결과를 '원문의 표기 체계'로 되돌립니다.
+                //    원문이 라틴이면 → 1차 결과가 비라틴(문서 언어) → 2차 타겟은 "english"
+                //    원문이 비라틴이면 → 1차 결과가 라틴(로마자) → 2차 타겟은 doc_lang
+                let second_target = if crate::nl_convert::is_latin_dominant(&src) {
+                    "english"
+                } else {
+                    doc_lang
+                };
+
+                // 🌟 [ANY_ASCII GATE] 비라틴 → 라틴 방향이면 any_ascii 우선 시도
+                if crate::nl_convert::is_latin_dominant(&src) && !crate::nl_convert::is_latin_dominant(&s1) {
+                    if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&s1) {
+                        s2 = ascii_result;
+                        println!("    PASS-2 SOURCE = '{}'", s1);
+                        println!("    PASS-2 METHOD = any_ascii (LLM skipped)");
+                        println!("    PASS-2 RESULT = '{}'", s2);
+                    }
+                }
+
+                // any_ascii 가 실패하거나 해당 방향이 아니면 LLM 폴백
+                if s2.is_empty() {
+                    let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
+                    let raw2 = model
+                        .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    let (s2_t, s2_tr) = crate::nl_convert::sanitize_transliteration_dual(&raw2, &s1);
+                    s2 = if !s2_t.is_empty() { s2_t } else { s2_tr };
+                    println!("    PASS-2 SOURCE = '{}'", s1);
+                    println!("    PASS-2 TARGET = '{}'", second_target);
+                    println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\\n"));
+                    println!("    PASS-2 RESULT = '{}'", s2);
+                }
+            } else {
+                println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있거나 표기 체계 미반전)");
+            }
+        } else {
+            println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
+        }
+
+        let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
+
+        let final_pair = pair;
+
+        if final_pair.0.is_empty() && final_pair.1.is_empty() {
+            emit(&format!(
+                "      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')",
+                src, cm.property
+            ));
+        } else {
+            made += 1;
+            emit(&format!(
+                "      🔤 [SYNONYM EXPANSION] '{}' → native='{}' | roman='{}' (property='{}')",
+                src, final_pair.0, final_pair.1, cm.property
+            ));
+        }
+        cache.insert(src.clone(), final_pair.clone());
+        out[i] = final_pair;
+    }
+
+    if made > 0 || reused > 0 {
+        emit(&format!(
+            "  🔤 [SYNONYM EXPANSION / Qwen3.5-2B] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
+            made, reused, skipped
+        ));
+    }
+
+    out
+}
+
+/// [SYNONYM EXPANSION] 생성된 별칭을 item_chunks 에 추가 행으로 저장합니다.
+///
+/// 저장 벡터는 원본 청크와 **동일한 v3 형식 인지 3중 합성**을 사용합니다.
+///   ① chunk  = 별칭 그 자체
+///   ② anchor = indexing_anchor_text() (원본과 동일한 라벨 개념 축)
+///   ③ local  = "{leaf_label} {별칭}"
+/// Text/Address 는 (0.25 / 0.10 / 0.65) 이므로 별칭이 벡터를 지배합니다.
+///
+/// property / property_format 을 원본과 동일하게 두는 이유:
+///   lib.rs 의 STAGE-4B(조건 매칭 Column 트랙)와 STAGE-4C(property 타겟 검색)가
+///   property 문자열로 동작하기 때문입니다. 별칭에 다른 property 를 주면
+///   그 두 경로에서 별칭이 통째로 배제됩니다.
+async fn upsert_alias_chunks(
+    store: &VectorStore,
+    model: &LogisModel,
+    item_id: &str,
+    base_chunk_id: &str,
+    page_type: &str,
+    doc_lang: &str,
+    chunk_meta: &crate::nl_convert::ChunkMetadata,
+    aliases: &(String, String),
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    search_mode: &str,
+) -> usize {
+    let mut saved = 0usize;
+
+    if aliases.0.trim().is_empty() && aliases.1.trim().is_empty() {
+        return 0;
+    }
+
+    let anchor_text = crate::utils::ai_utils::indexing_anchor_text(doc_lang, page_type, &chunk_meta.property);
+    let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, &chunk_meta.property);
+
+    let variants: [(&str, &String); 2] = [("tn", &aliases.0), ("tr", &aliases.1)];
+
+    // 🌟 [ORIGIN VALUE FALLBACK] 음차 품질은 LLM 편차가 큽니다.
+    //    (log 실측: 'Cable' → '불랙드' 처럼 명백한 오음차가 섞임)
+    //    별칭 벡터가 통째로 빗나가면 그 행은 영구적으로 죽은 벡터가 되어
+    //    저장 비용만 쓰고 검색에는 한 번도 기여하지 못합니다.
+    //    원본 값을 낮은 비중으로 섞어, 음차가 빗나가도 최소한 원본 표기 축으로는
+    //    반응하도록 만들어 별칭 행이 리콜 보험 역할을 하게 합니다.
+    let origin_value = chunk_meta.value_part.trim().to_string();
+
+    for (suffix, alias) in variants.iter() {
+        let a = alias.trim();
+        if a.is_empty() { continue; }
+
+        // 🌟 [VALUE-DOMINANT LOCALIZED] "{짧은 문서언어 라벨} {별칭} {원본값}"
+        //    leaf 는 indexing_leaf_label() 이 뽑은 단일 라벨(예: '상품명')이므로
+        //    값이 희석되지 않습니다. 원본값을 뒤에 붙여 두 표기 체계를 한 벡터에 담습니다.
+        let localized = {
+            let mut s = String::new();
+            if !leaf.trim().is_empty() { s.push_str(leaf.trim()); s.push(' '); }
+            s.push_str(a);
+            if !origin_value.is_empty() && !a.eq_ignore_ascii_case(&origin_value) {
+                s.push(' ');
+                s.push_str(&origin_value);
+            }
+            s
+        };
+
+        let embs = model
+            .get_embedding_batch(vec![a.to_string(), anchor_text.clone(), localized.clone()])
+            .await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; 3]);
+        if embs.len() < 3 { continue; }
+
+        let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+            "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+            _ => (0.40f32, 0.30f32, 0.30f32),
+        };
+
+        let mut final_vec = vec![0.0f32; 384];
+        for d in 0..384 {
+            final_vec[d] = embs[0][d] * w_chunk
+                + embs[1][d] * w_anchor
+                + embs[2][d] * w_local;
+        }
+        let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for d in 0..384 { final_vec[d] /= norm; }
+        }
+
+        let alias_chunk_id = format!("{}_{}", base_chunk_id, suffix);
+        let _ = store.upsert_chunk(
+            &alias_chunk_id,
+            item_id,
+            page_type,
+            a,
+            &chunk_meta.property,
+            &chunk_meta.property_format,
+            a,
+            Some(final_vec),
+            Some(cc),
+            Some(bcc),
+            Some(ref_val),
+            Some(search_mode),
+        ).await;
+        saved += 1;
+
+        // 🌟 [ALIAS INDEX LOG] 정방향 로그의 [ALIAS CHUNK HIT] 와 chunk_id 로 대조하기 위해
+        //    어떤 id 로 무엇이 저장됐는지 남깁니다.
+        //    지금까지는 "저장은 됐는데 검색에 안 잡힌다" 를 로그만으로 증명할 수 없었습니다.
+        println!(
+            "      💾 [ALIAS INDEXED] chunk_id='{}' | property='{}' | alias='{}' | localized='{}'",
+            alias_chunk_id, chunk_meta.property, a, localized
+        );
+    }
+
+    saved
+}
+
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
@@ -6159,6 +6548,28 @@ async fn process_task(
         crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
     }
 
+    // 🌟 [SYNONYM ENGINE PRELOAD - QWEN3.5] 음차 별칭 생성기를 Qwen3.5 2B로 분리 동작시킵니다.
+    //
+    //    Qwen3 0.6B는 음차(transliteration) 능력이 부족하여 원문을 그대로 반복하는 문제가 있습니다.
+    //    (로그 실측: 'Cable Knit Cardigan' → 그대로 반복 → G1 게이트 폐기 → 별칭 0건)
+    //
+    //    분리 동작 순서:
+    //      1. Qwen3 0.6B의 메인 추출 작업이 이미 완료된 상태 (PHASE 3 Handover에서 purge 완료)
+    //      2. Qwen3.5 2B 를 로드 (ensure_qwen3_5)
+    //      3. Embedding 모델을 함께 로드 (ensure_embedding)
+    //      4. Qwen3.5 + Embedding 이 공존하면서 음차 별칭 생성 수행
+    //
+    //    비용: VRAM 상주량 증가(2B Q8 + 97m 임베딩), 태스크 소요 시간 증가.
+    //    이 비용은 크로스링구얼 리콜을 얻기 위해 의도적으로 감수하는 것입니다.
+    //    0.6B 대비 2B 모델은 음차 정확도가 현저히 높습니다.
+    {
+        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding together for synonym expansion...");
+        emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading Qwen3.5 transliteration engine...", "spinner": "🔤" }));
+        model.ensure_qwen3_5(false).await?;
+        model.ensure_embedding().await?;
+        emit_term("[Scheduler] ✅ Qwen3.5(2B) Transliteration engine + Embedding model are resident together (no model ping-pong).");
+    }
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
@@ -6721,6 +7132,291 @@ async fn process_task(
             Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
         ).await;
         items_to_process.push(extracted_data.clone());
+
+        // =====================================================================
+        // 🌟 [PHASE A~D] 청크 단위 인덱싱 파이프라인 (상세 페이지)
+        // ---------------------------------------------------------------------
+        // 기존: json_to_natural_language() → 단일 긴 문장 → items.text 컬럼 1개
+        // 변경: json_to_natural_language() → 문장 분할 → 속성 태깅 → 임베딩 → item_chunks 저장
+        //
+        // 이 블록이 있어야 검색 시 "무거운" ↔ "weight is 1.5" 코사인 매칭이 가능해집니다.
+        // =====================================================================
+        {
+            let natural_text = crate::nl_convert::json_to_natural_language(&extracted_data);
+
+            // PHASE A: 문장 단위 분할 + 로그 출력
+            let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
+            emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
+            for (ci, (ct, cp, confirmed)) in raw_chunks.iter().enumerate() {
+                let flag = if *confirmed { "✓" } else { "?" };
+                emit_term(&format!("    [{}] {} property='{}' | text='{}'", ci, flag, cp, ct));
+            }
+
+            if !raw_chunks.is_empty() {
+                // ── 필드 뱅크 구축 (PLINKO GAME 입력) ──
+                // bias.json 에서 필드명 + bias 구 임베딩 + 형식을 추출합니다.
+                let fields = crate::parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
+                let mut idx_field_names: Vec<String> = Vec::new();
+                let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+                let mut idx_field_formats: Vec<String> = Vec::new();
+
+                for (fname, _, bias_target, _) in &fields {
+                    // 🌟 [SYNTHESIS BANK INCLUDE] 역방향 PLINKO 는 확인 모드(경쟁 없음)이므로
+                    //    insight 계열을 뱅크에서 빼도 배정이 달라지지 않습니다.
+                    //    반대로 빼면 field_names 에 없어져 origin_score 가 항상 0.0000 이 되고
+                    //    (log.txt: origin='general_insight'(0.0000), origin='traffic_insight'(0.0000))
+                    //    CONFIRM FLAG 진단이 전량 오탐으로 오염됩니다.
+                    //    format_gate 는 "Synthesis" 를 무조건 통과시키므로 부작용이 없습니다.
+                    let lower_fname = fname.to_lowercase();
+                    let _is_synthesis = lower_fname.contains("insight")
+                        || lower_fname.contains("summary")
+                        || lower_fname.contains("analysis");
+
+                    let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+                    // 🌟 [ABSTRACT BRIDGE MERGE] 정방향은 '무거운' 을 search_bridge.abstract_bridge 로
+                    //    substantial_filters.weight 에 라우팅합니다. 그런데 역방향 필드 뱅크에는
+                    //    heavy / weighs a lot 계열 구가 하나도 없어서 그 의도를 받아줄 벡터가
+                    //    DB 에 존재하지 않았습니다. 동일 bias.json 노드를 그대로 편입합니다.
+                    let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+                    if !bridge_ph.is_empty() {
+                        emit_term(&format!("  🌉 [ABSTRACT BRIDGE MERGE] '{}' 뱅크에 추상 수식어 브릿지 구 {}개 편입", fname, bridge_ph.len()));
+                    }
+                    for p in bridge_ph {
+                        if phrases.iter().any(|e| e == &p) { continue; }
+                        phrases.push(p);
+                        weights.push(1.0);
+                    }
+
+                    let phrase_embs = if phrases.is_empty() {
+                        vec![vec![0.0f32; 384]]
+                    } else {
+                        model.get_embedding_batch(phrases.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                    };
+
+                    let fmt_str = {
+                        let lower = fname.to_lowercase();
+                        let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+                        let has = |k: &str| keys.iter().any(|x| x == k);
+
+                        if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                            "Synthesis".to_string()
+                        } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                            "TrackingCode".to_string()
+                        } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                            "Identifier".to_string()
+                        } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                            "Link".to_string()
+                        } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                            "Date".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                                || k == "cellphone" || k == "contact" || k == "number"
+                        }) {
+                            "Phone".to_string()
+                        } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                            "Address".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                                || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+                        }) {
+                            "Enum".to_string()
+                        } else if keys.iter().any(|k| {
+                            k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                                || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                                || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                                || k.contains("duration")
+                        }) {
+                            "Numeric".to_string()
+                        } else {
+                            "Text".to_string()
+                        }
+                    };
+
+                    idx_field_names.push(fname.clone());
+                    idx_field_phrase_embs.push(phrase_embs);
+                    idx_field_phrase_weights.push(weights);
+                    idx_field_formats.push(fmt_str);
+                }
+
+                emit_term(&format!(
+                    "  📐 [PHASE B+C] 필드 뱅크 구축 완료: {}개 필드 (PLINKO GAME 입력)",
+                    idx_field_names.len()
+                ));
+
+                // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                // raw_chunks 는 Vec<(String, String, bool)> 타입으로,
+                // confirmed 플래그가 PLINKO 확인 모드 / NMS 보호 / 배타 배정 우선순위에 사용됩니다.
+                let model_for_embed = model.clone();
+                let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+                    &raw_chunks,
+                    &doc_lang,
+                    &page_type,
+                    &idx_field_names,
+                    &idx_field_phrase_embs,
+                    &idx_field_phrase_weights,
+                    &idx_field_formats,
+                    move |text: String| {
+                        let m = model_for_embed.clone();
+                        async move {
+                            m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
+                        }
+                    },
+                ).await;
+                crate::nl_convert::log_enriched_chunks(&enriched_chunks);
+
+                if !enriched_chunks.is_empty() {
+                    // ── PHASE D: 임베딩 생성 ──
+                    let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.property != "unclassified")
+                        .collect();
+
+                    let skipped_count = enriched_chunks.len() - indexable_chunks.len();
+                    if skipped_count > 0 {
+                        emit_term(&format!(
+                            "  🚫 [PHASE D FILTER] unclassified 청크 {}개 인덱싱 제외",
+                            skipped_count
+                        ));
+                    }
+
+                    if indexable_chunks.is_empty() {
+                        emit_term("  ⚠️ [PHASE D] 인덱싱 대상 청크가 없습니다. 건너뜁니다.");
+                    } else {
+                        let chunk_texts: Vec<String> = indexable_chunks.iter()
+                            .map(|(_, c)| c.chunk_text.clone())
+                            .collect();
+
+                        let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+                        // 🌟 [SYNONYM EXPANSION] 2-pass 음차 별칭 생성.
+                        //    detect_document_language 결과(doc_lang)로 목표 표기 체계를 정하고,
+                        //    Qwen3 0.6B 로 원문 → 문서 언어 표기 → 로마자 표기 순서로 뒤집습니다.
+                        //    Text/Address 형식 청크만 대상이며, 표기 체계가 같으면 호출 자체를 생략합니다.
+                        let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+                            indexable_chunks.iter().map(|(_, c)| *c).collect();
+                        let alias_pairs = generate_transliteration_aliases(
+                            &model,
+                            &metas,
+                            &doc_lang,
+                            &page_type,
+                            cancellation_token,
+                            app_handle,
+                            &task.id,
+                        ).await;
+
+                        // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
+                        let _ = store.delete_chunks_by_item(&target_id).await;
+
+                        // 🌟 [MULTILINGUAL VALUE BLEND v3] 저장 벡터를 형식 인지 3중 합성으로 만듭니다.
+                        //   ① chunk_text : "This goods is titled 'Cable Knit Cardigan'." (영어 자연문 원본)
+                        //   ② anchor     : indexing_anchor_text() — 라벨 개념 센트로이드 + 다국어 값 도메인 축
+                        //   ③ localized  : "{leaf_label} {value_part}" — 짧은 문서 언어 라벨 1개 + 실제 값
+                        //
+                        //   🌟 [v2 → v3 변경 이유]
+                        //   v2 는 localized 를 "{anchor} {value}" 로 만들었는데, anchor 가
+                        //   "상품명, 의류명, 제품명, 품목명, 이름, 상품제목, 상품이름, ..." 10~32구 블롭이라
+                        //   값 'Cable Knit Cardigan' 이 30여 토큰 중 3토큰으로 희석되었습니다.
+                        //
+                        //   🌟 [Enum 그룹 교정] Enum 값은 'complete'/'show'/'hide' 같은
+                        //   저카디널리티 캐노니컬 키이고 전 아이템에서 동일 문자열입니다.
+                        //   값 지배 그룹에 넣으면 변별력 0인 청크가 한국어 라벨 축으로 상위를 독점합니다.
+                        //   (new_log2.txt: property='status' 가 상위 10건 중 9건 점유)
+                        //   따라서 Enum 은 라벨 지배 그룹으로 보냅니다.
+                        //     Text/Address/Synthesis → 값이 자유 서술이라 의미를 나른다 → localized 지배
+                        //     Enum/Numeric/Date/Identifier/Link/Phone/TrackingCode → 값은 리터럴 → 라벨 지배
+                        let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                        let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                        for (_, cm) in indexable_chunks.iter() {
+                            let a = crate::utils::ai_utils::indexing_anchor_text(
+                                &doc_lang, &page_type, &cm.property,
+                            );
+                            let leaf = crate::utils::ai_utils::indexing_leaf_label(
+                                &doc_lang, &page_type, &cm.property,
+                            );
+                            let v = cm.value_part.trim();
+                            let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
+                            anchor_texts.push(a);
+                            localized_texts.push(l);
+                        }
+                        let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+                        let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+                        let mut alias_saved = 0usize;
+
+                        for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+                            let chunk_id = format!("{}_{}", target_id, ci);
+
+                            let chunk_vec = &chunk_embs[ei];
+                            let anchor_emb = &anchor_embs[ei];
+                            let localized_emb = &localized_embs[ei];
+
+                            // 🌟 [FORMAT-AWARE WEIGHT] 형식이 값의 의미 밀도를 결정합니다.
+                            let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+                                "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+                                _ => (0.40f32, 0.30f32, 0.30f32),
+                            };
+
+                            let mut final_vec = vec![0.0f32; 384];
+                            for d in 0..384 {
+                                final_vec[d] = chunk_vec[d] * w_chunk
+                                    + anchor_emb[d] * w_anchor
+                                    + localized_emb[d] * w_local;
+                            }
+                            // L2 정규화
+                            let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            if norm > 0.0 {
+                                for d in 0..384 { final_vec[d] /= norm; }
+                            }
+
+                            let _ = store.upsert_chunk(
+                                &chunk_id,
+                                &target_id,
+                                &page_type,
+                                &chunk_meta.chunk_text,
+                                &chunk_meta.property,
+                                &chunk_meta.property_format,
+                                &chunk_meta.value_part,
+                                Some(final_vec),
+                                Some(&task.cc),
+                                Some(&bcc),
+                                Some(&ref_val),
+                                Some(&search_mode),
+                            ).await;
+
+                            // 🌟 [SYNONYM EXPANSION] 별칭 벡터를 같은 item_id / 같은 property 로 추가 저장합니다.
+                            alias_saved += upsert_alias_chunks(
+                                &store,
+                                &model,
+                                &target_id,
+                                &chunk_id,
+                                &page_type,
+                                &doc_lang,
+                                chunk_meta,
+                                &alias_pairs[ei],
+                                &task.cc,
+                                &bcc,
+                                &ref_val,
+                                &search_mode,
+                            ).await;
+                        }
+
+                        emit_term(&format!(
+                            "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | 음차 별칭 {}개 | table='item_chunks'",
+                            target_id, indexable_chunks.len(), enriched_chunks.len(), alias_saved
+                        ));
+                    }
+                }
+            }
+        }
+        // =====================================================================
+        // 🌟 [PHASE A~D 종료]
+        // =====================================================================
         
     } else {
         
@@ -7116,7 +7812,253 @@ async fn process_task(
                     "items", &hashed_item_id, &page_type, single_item.clone(), vector,
                     Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
                 ).await;
-                items_to_process.push(single_item);
+                items_to_process.push(single_item.clone());
+
+                // =====================================================================
+                // 🌟 [PHASE A~D] 청크 단위 인덱싱 파이프라인 (리스트 페이지 개별 아이템)
+                // =====================================================================
+                {
+                    let natural_text = crate::nl_convert::json_to_natural_language(&single_item);
+
+                    // PHASE A: 문장 단위 분할 + 로그 출력
+                    let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
+                    emit_term(&format!("  📝 [PHASE A] RAW-CHUNK 분할 결과: {}개 청크", raw_chunks.len()));
+                    for (ci, (ct, cp, confirmed)) in raw_chunks.iter().enumerate() {
+                        let flag = if *confirmed { "✓" } else { "?" };
+                        emit_term(&format!("    [{}] {} property='{}' | text='{}'", ci, flag, cp, ct));
+                    }
+
+                    if !raw_chunks.is_empty() {
+                        // ── 필드 뱅크 구축 (PLINKO GAME 입력) ──
+                        let fields = crate::parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
+                        let mut idx_field_names: Vec<String> = Vec::new();
+                        let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+                        let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+                        let mut idx_field_formats: Vec<String> = Vec::new();
+
+                        for (fname, _, bias_target, _) in &fields {
+                            // 🌟 [SYNTHESIS BANK INCLUDE] 상세 경로와 동일. 확인 모드이므로 배정 영향 없음.
+                            let lower_fname = fname.to_lowercase();
+                            let _is_synthesis = lower_fname.contains("insight")
+                                || lower_fname.contains("summary")
+                                || lower_fname.contains("analysis");
+
+                            let (mut phrases, mut weights) = crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+                            // 🌟 [ABSTRACT BRIDGE MERGE] 리스트 경로도 동일하게 추상 수식어 브릿지를 편입합니다.
+                            let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+                            for p in bridge_ph {
+                                if phrases.iter().any(|e| e == &p) { continue; }
+                                phrases.push(p);
+                                weights.push(1.0);
+                            }
+
+                            let phrase_embs = if phrases.is_empty() {
+                                vec![vec![0.0f32; 384]]
+                            } else {
+                                model.get_embedding_batch(phrases.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                            };
+
+                            let fmt_str = {
+                                let lower = fname.to_lowercase();
+                                let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+                                let has = |k: &str| keys.iter().any(|x| x == k);
+
+                                if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                                    "Synthesis".to_string()
+                                } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                                    "TrackingCode".to_string()
+                                } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                                    "Identifier".to_string()
+                                } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                                    "Link".to_string()
+                                } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                                    "Date".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                                        || k == "cellphone" || k == "contact" || k == "number"
+                                }) {
+                                    "Phone".to_string()
+                                } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                                    "Address".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                                        || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+                                }) {
+                                    "Enum".to_string()
+                                } else if keys.iter().any(|k| {
+                                    k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                                        || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                                        || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                                        || k.contains("duration")
+                                }) {
+                                    "Numeric".to_string()
+                                } else {
+                                    "Text".to_string()
+                                }
+                            };
+
+                            idx_field_names.push(fname.clone());
+                            idx_field_phrase_embs.push(phrase_embs);
+                            idx_field_phrase_weights.push(weights);
+                            idx_field_formats.push(fmt_str);
+                        }
+
+                        // ── PHASE B+C 통합 파이프라인 (비동기) ──
+                        // raw_chunks: Vec<(String, String, bool)> — confirmed 플래그 포함
+                        // 전처리 경로에서는 JSON 구조 패턴 매칭으로 확정된 청크가
+                        // PLINKO 확인 모드에서 슬라이딩 윈도우를 건너뛰고 기존 property 를 유지합니다.
+                        let model_for_embed = model.clone();
+                        let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+                            &raw_chunks,
+                            &doc_lang,
+                            &page_type,
+                            &idx_field_names,
+                            &idx_field_phrase_embs,
+                            &idx_field_phrase_weights,
+                            &idx_field_formats,
+                            move |text: String| {
+                                let m = model_for_embed.clone();
+                                async move {
+                                    m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
+                                }
+                            },
+                        ).await;
+
+                        if !enriched_chunks.is_empty() {
+                            // ── PHASE D: 임베딩 생성 ──
+                            let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.property != "unclassified")
+                                .collect();
+
+                            let skipped_count = enriched_chunks.len() - indexable_chunks.len();
+                            if skipped_count > 0 {
+                                emit_term(&format!(
+                                    "  🚫 [PHASE D FILTER] unclassified 청크 {}개 인덱싱 제외",
+                                    skipped_count
+                                ));
+                            }
+
+                            if indexable_chunks.is_empty() {
+                                emit_term("  ⚠️ [PHASE D] 인덱싱 대상 청크가 없습니다. 건너뜁니다.");
+                            } else {
+                                let chunk_texts: Vec<String> = indexable_chunks.iter()
+                                    .map(|(_, c)| c.chunk_text.clone())
+                                    .collect();
+
+                                let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+                                // 🌟 [SYNONYM EXPANSION] 상세 경로와 동일한 2-pass 음차 별칭 생성.
+                                //    Qwen3 와 임베딩이 이미 함께 상주하므로 아이템마다 모델을 갈아끼우지 않습니다.
+                                //    동일 값은 캐시로 재사용되어 LLM 호출이 값의 종류 수만큼만 발생합니다.
+                                let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+                                    indexable_chunks.iter().map(|(_, c)| *c).collect();
+                                let alias_pairs = generate_transliteration_aliases(
+                                    &model,
+                                    &metas,
+                                    &doc_lang,
+                                    &page_type,
+                                    cancellation_token,
+                                    app_handle,
+                                    &task.id,
+                                ).await;
+
+                                // ── PHASE E: LanceDB item_chunks 테이블 저장 ──
+                                let _ = store.delete_chunks_by_item(&hashed_item_id).await;
+
+                                // 🌟 [MULTILINGUAL VALUE BLEND v3] 상세 경로와 동일한 형식 인지 3중 합성.
+                                //    localized 를 "{leaf_label} {value}" 로 축약하여 값이 지배하게 하고,
+                                //    Enum 은 라벨 지배 그룹으로 보내 저변별 청크의 상위 독점을 차단합니다.
+                                let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                                let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+                                for (_, cm) in indexable_chunks.iter() {
+                                    let a = crate::utils::ai_utils::indexing_anchor_text(
+                                        &doc_lang, &page_type, &cm.property,
+                                    );
+                                    let leaf = crate::utils::ai_utils::indexing_leaf_label(
+                                        &doc_lang, &page_type, &cm.property,
+                                    );
+                                    let v = cm.value_part.trim();
+                                    let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
+                                    anchor_texts.push(a);
+                                    localized_texts.push(l);
+                                }
+                                let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+                                let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+                                let mut alias_saved = 0usize;
+
+                                for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+                                    let chunk_id = format!("{}_{}", hashed_item_id, ci);
+
+                                    let chunk_vec = &chunk_embs[ei];
+                                    let anchor_emb = &anchor_embs[ei];
+                                    let localized_emb = &localized_embs[ei];
+
+                                    let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+                                        "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+                                        _ => (0.40f32, 0.30f32, 0.30f32),
+                                    };
+
+                                    let mut final_vec = vec![0.0f32; 384];
+                                    for d in 0..384 {
+                                        final_vec[d] = chunk_vec[d] * w_chunk
+                                            + anchor_emb[d] * w_anchor
+                                            + localized_emb[d] * w_local;
+                                    }
+                                    let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                    if norm > 0.0 {
+                                        for d in 0..384 { final_vec[d] /= norm; }
+                                    }
+
+                                    let _ = store.upsert_chunk(
+                                        &chunk_id,
+                                        &hashed_item_id,
+                                        &page_type,
+                                        &chunk_meta.chunk_text,
+                                        &chunk_meta.property,
+                                        &chunk_meta.property_format,
+                                        &chunk_meta.value_part,
+                                        Some(final_vec),
+                                        Some(&task.cc),
+                                        Some(&bcc),
+                                        Some(&ref_val),
+                                        Some(&search_mode),
+                                    ).await;
+
+                                    // 🌟 [SYNONYM EXPANSION] 별칭 벡터를 같은 item_id / 같은 property 로 추가 저장합니다.
+                                    alias_saved += upsert_alias_chunks(
+                                        &store,
+                                        &model,
+                                        &hashed_item_id,
+                                        &chunk_id,
+                                        &page_type,
+                                        &doc_lang,
+                                        chunk_meta,
+                                        &alias_pairs[ei],
+                                        &task.cc,
+                                        &bcc,
+                                        &ref_val,
+                                        &search_mode,
+                                    ).await;
+                                }
+
+                                emit_term(&format!(
+                                    "  🧩 [PHASE A~E] 청크 인덱싱 완료: item_id='{}' | 청크 {}개 (전체 {}개 중) | 음차 별칭 {}개",
+                                    hashed_item_id, indexable_chunks.len(), enriched_chunks.len(), alias_saved
+                                ));
+                            }
+                        }
+                    }
+                }
+                // =====================================================================
+                // 🌟 [PHASE A~D 종료]
+                // =====================================================================
             }
         }
     }

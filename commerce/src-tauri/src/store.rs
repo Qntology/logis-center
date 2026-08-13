@@ -409,6 +409,10 @@ impl VectorStore {
         };
         let table = self.conn.open_table(target).execute().await?;
         table.delete(&format!("id = '{}'", id)).await?;
+
+        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        let _ = self.delete_chunks_by_item(id).await;
+
         Ok(())
     }
 
@@ -428,6 +432,12 @@ impl VectorStore {
         let table = self.conn.open_table(target).execute().await?;
         let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
         table.delete(&format!("id IN ({})", id_list)).await?;
+
+        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        for id in &ids {
+            let _ = self.delete_chunks_by_item(id).await;
+        }
+
         Ok(())
     }
     
@@ -524,6 +534,10 @@ impl VectorStore {
                 }
             }
         }
+
+        // 🌟 [PHASE D] item_chunks 테이블 초기화
+        self.init_chunks_table().await?;
+
         Ok(())
     }
     
@@ -743,9 +757,35 @@ impl VectorStore {
          // =======================================================
          // 🌟 [Track 1] Column Matching (SQL Filter)
          // =======================================================
-         // LLM이 뽑아낸 속성 조건(예: brand_name = '가디건') 및 보안 스코프를 독립 실행. 가장 높은 가중치(+3.0) 부여.
-         if let Some(ref f) = filter {
-             if !f.trim().is_empty() {
+         // LLM이 뽑아낸 속성 조건(예: amount <= 5000) 만 가장 높은 가중치(+3.0) 를 받습니다.
+         //
+         // 🌟 [SCOPE-ONLY GUARD] convert_conditions_to_sql 은 조건이 하나도 없어도
+         //    항상 `type = '...'` 를 넣고, 호출부가 `mode = '...'` 를 붙입니다.
+         //    따라서 filter 가 None 이 되는 경우가 없어, 기존 코드는 그 타입의
+         //    '모든 행' 에 +3.0 을 상납했습니다.
+         //    (log2.txt 실측: 조건 0개인데 결과가 4.0 / 3.999 / 3.998 / 3.997 / 3.0
+         //     = 3.0 blanket + 벡터 랭크. FTS 는 한 건도 매칭되지 않았음)
+         //    이 상태에서는 의미 신호(FTS·벡터·청크)가 전부 무력화됩니다.
+         //    type / mode 는 '스코프' 이지 '조건' 이 아니므로 가산점 대상에서 제외합니다.
+         let has_real_condition = match filter.as_ref() {
+             None => false,
+             Some(f) => {
+                 // type / mode 술어와 괄호·AND 를 구조적으로 제거한 뒤 잔여 술어가 있는지 확인합니다.
+                 let mut residue = String::new();
+                 for clause in f.split(" AND ") {
+                     let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
+                     if c.is_empty() { continue; }
+                     let lower = c.to_lowercase();
+                     if lower.starts_with("type ") || lower.starts_with("type=") { continue; }
+                     if lower.starts_with("mode ") || lower.starts_with("mode=") { continue; }
+                     residue.push_str(c);
+                 }
+                 !residue.trim().is_empty()
+             }
+         };
+
+         if has_real_condition {
+             if let Some(ref f) = filter {
                  let q = table.query().only_if(f);
                  if let Ok(res) = q.limit(fetch_limit).execute().await {
                      if let Ok(batches) = res.try_collect::<Vec<_>>().await {
@@ -759,6 +799,10 @@ impl VectorStore {
                      }
                  }
              }
+         } else if let Some(ref f) = filter {
+             // 실질 조건이 없으면 스코프 필터로만 사용하고 가산점은 주지 않습니다.
+             // (Track 2 / Track 3 이 동일 필터를 체이닝하므로 보안 스코프는 그대로 유지됩니다)
+             let _ = f;
          }
 
          // =======================================================
@@ -919,7 +963,7 @@ impl VectorStore {
     }
 
     pub async fn reset_database(&self) -> Result<()> {
-        let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages"];
+        let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages", "item_chunks"];
         for name in tables {
             let _ = self.conn.drop_table(name, &[]).await;
             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, name));
@@ -931,6 +975,421 @@ impl VectorStore {
         self.init_all_tables().await?;
         
         Ok(())
+    }
+
+    // =====================================================================
+    // 🌟 [PHASE D] item_chunks 테이블 — 청크 단위 코사인 유사도 검색용
+    // =====================================================================
+
+    /// [PHASE D-1] item_chunks 테이블 스키마를 생성합니다.
+    /// 앱 시작 시 init_all_tables() 이후에 호출됩니다.
+    /// 기존 테이블이 존재하면 스키마 호환성 검사 후 그대로 사용합니다.
+    pub async fn init_chunks_table(&self) -> Result<()> {
+        let uri = self.base_path.clone();
+        let existing = self.conn.table_names().execute().await?;
+
+        if existing.contains(&"item_chunks".to_string()) {
+            match self.conn.open_table("item_chunks").execute().await {
+                Ok(table) => {
+                    let current_schema = table.schema().await.unwrap_or_else(|_| {
+                        Arc::new(Schema::new(Vec::<Field>::new()))
+                    });
+                    let has_chunk_id = current_schema.field_with_name("chunk_id").is_ok();
+                    let has_vector = current_schema.field_with_name("vector").is_ok();
+                    let has_property = current_schema.field_with_name("property").is_ok();
+                    // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식이 바뀌면 기존 청크는
+                    //    새 질의 벡터와 정합하지 않습니다. 스키마가 같아도 강제 재구축이 필요하므로
+                    //    레시피 버전을 컬럼으로 각인하고, 버전이 다르면 테이블을 드롭합니다.
+                    // 🌟 (v2 = chunk 0.5 + anchor 0.2 + localized 0.3 — 라벨 블롭이 값을 희석)
+                    // 🌟 (v3 = 형식 인지 가중치 + localized 를 "{leaf_label} {value}" 로 축약 + Enum 라벨 지배)
+                    let has_recipe_v3 = current_schema.field_with_name("embed_recipe_v3").is_ok();
+                    if !has_chunk_id || !has_vector || !has_property || !has_recipe_v3 {
+                        println!("[Store] item_chunks schema mismatch. Dropping for recreation.");
+                        let _ = self.conn.drop_table("item_chunks", &[]).await;
+                        let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                    } else {
+                        return Ok(());
+                    }
+                },
+                Err(_) => {
+                    println!("[Store] Corrupted item_chunks table detected. Force dropping.");
+                    let _ = self.conn.drop_table("item_chunks", &[]).await;
+                    let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                }
+            }
+        }
+
+        let existing_after = self.conn.table_names().execute().await?;
+        if !existing_after.contains(&"item_chunks".to_string()) {
+            let chunk_schema = Arc::new(Schema::new(vec![
+                // 청크 식별
+                Field::new("chunk_id", DataType::Utf8, false),
+                Field::new("item_id", DataType::Utf8, false),
+                Field::new("item_type", DataType::Utf8, false),
+
+                // 청크 내용
+                Field::new("chunk_text", DataType::Utf8, false),
+                Field::new("property", DataType::Utf8, false),
+                Field::new("property_format", DataType::Utf8, false),
+                Field::new("value_part", DataType::Utf8, true),
+
+                // 임베딩 (granite-embedding-97m-multilingual-r2 = 384차원)
+                Field::new("vector", DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)), 384
+                ), true),
+
+                // 메타데이터
+                Field::new("cc", DataType::Utf8, true),
+                Field::new("bcc", DataType::Utf8, true),
+                Field::new("ref", DataType::Utf8, true),
+                Field::new("mode", DataType::Utf8, true),
+
+                // 타임스탬프
+                Field::new("created_at", DataType::Int64, false),
+                Field::new("updated_at", DataType::Int64, false),
+
+                // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식 버전 각인 (v3)
+                Field::new("embed_recipe_v3", DataType::Utf8, true),
+            ]));
+
+            if let Err(_) = self.conn.create_empty_table("item_chunks", chunk_schema.clone()).execute().await {
+                let _ = std::fs::remove_dir_all(format!("{}/item_chunks.lance", uri));
+                let _ = self.conn.create_empty_table("item_chunks", chunk_schema).execute().await;
+            }
+            println!("[Store] item_chunks table created successfully.");
+        }
+
+        Ok(())
+    }
+
+    /// [PHASE D-2] 청크 1건을 item_chunks 테이블에 삽입합니다.
+    /// 동일 chunk_id 가 이미 존재하면 삭제 후 재삽입합니다 (upsert 시맨틱).
+    ///
+    /// # 인자
+    ///   - chunk_id:       UUID 기반 청크 고유 식별자
+    ///   - item_id:        원본 item 의 해시 ID (FK)
+    ///   - item_type:      도메인 타입 ("goods", "order", "tracking" 등)
+    ///   - chunk_text:     자연어 청크 원문
+    ///   - property:       PLINKO 확정 속성명 (snake_case)
+    ///   - property_format: 형식 문자열 ("Numeric", "Text", "Enum" 등)
+    ///   - value_part:     청크에서 추출한 실제 값 부분
+    ///   - vector:         384차원 임베딩 벡터
+    ///   - cc, bcc, ref_val, mode: 메타데이터
+    pub async fn upsert_chunk(
+        &self,
+        chunk_id: &str,
+        item_id: &str,
+        item_type: &str,
+        chunk_text: &str,
+        property: &str,
+        property_format: &str,
+        value_part: &str,
+        vector: Option<Vec<f32>>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+        ref_val: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<()> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+
+        // 기존 동일 chunk_id 삭제 (upsert)
+        let _ = table.delete(&format!("chunk_id = '{}'", chunk_id)).await;
+
+        let safe_vector = match vector {
+            Some(v) if v.len() == 384 => v,
+            _ => vec![0.0; 384],
+        };
+
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let values_builder = Float32Array::from(safe_vector);
+        let list_field = Field::new("item", DataType::Float32, true);
+        let list_array = FixedSizeListArray::try_new(
+            Arc::new(list_field), 384, Arc::new(values_builder), None
+        )?;
+
+        let schema = table.schema().await?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec![chunk_id.to_string()])),
+            Arc::new(StringArray::from(vec![item_id.to_string()])),
+            Arc::new(StringArray::from(vec![item_type.to_string()])),
+            Arc::new(StringArray::from(vec![chunk_text.to_string()])),
+            Arc::new(StringArray::from(vec![property.to_string()])),
+            Arc::new(StringArray::from(vec![property_format.to_string()])),
+            Arc::new(StringArray::from(vec![value_part.to_string()])),
+            Arc::new(list_array),
+            Arc::new(StringArray::from(vec![cc.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![bcc.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![ref_val.unwrap_or("").to_string()])),
+            Arc::new(StringArray::from(vec![mode.unwrap_or("commerce").to_string()])),
+            Arc::new(Int64Array::from(vec![now])),
+            Arc::new(Int64Array::from(vec![now])),
+            Arc::new(StringArray::from(vec!["v3:format-aware(chunk+anchor+leafvalue)".to_string()])),
+        ])?;
+
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    /// [PHASE D-3] item_chunks 테이블에서 코사인 유사도 벡터 검색을 수행합니다.
+    /// STAGE-4 (검색 시) 에서 호출됩니다.
+    ///
+    /// # 인자
+    ///   - query_vec:  검색 질의의 임베딩 벡터 (384차원)
+    ///   - limit:      반환할 최대 청크 수
+    ///   - filter:     SQL 필터 (예: "item_type = 'goods' AND mode = 'commerce'")
+    ///
+    /// # 반환
+    ///   Vec<(chunk_id, item_id, chunk_text, property, group_score, best_cos)>
+    ///     - group_score : 그 item 이 확보한 청크 점수의 합산 (증거의 '양')
+    ///     - best_cos    : 그 item 의 최고 코사인 (0.0~1.0, 증거의 '질')
+    ///
+    /// 🌟 [반환값 분리 이유] 기존에는 합산 점수 하나만 돌려주었고, lib.rs 가 그것을
+    ///    코사인이라 가정하여 트랙 가중치(Column 3.0 / FTS 2.0 / CrossLingual 1.5)를 곱했습니다.
+    ///    (log 실측: score 3.0146 × 2.0 + × 1.5 = 10.5510)
+    ///    코사인 상한 1.0 을 전제로 설계된 가중치 체계가 무너져,
+    ///    '청크가 많이 살아남은 item' 이 '질의와 실제로 가까운 item' 을 압도했습니다.
+    ///    (Beige Wool Coat 가 '니트 가디건' 질의에서 RANK 2, Cable Knit Sweater 는 RANK 7)
+    ///    이제 두 값을 분리해 돌려주고, 가중치는 best_cos 에만 곱하도록 합니다.
+    pub async fn search_chunks(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        filter: Option<&str>,
+    ) -> Result<Vec<(String, String, String, String, f32, f32)>> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+
+        // 벡터가 전부 0 이면 검색 불가
+        if query_vec.iter().all(|&v| v == 0.0) {
+            return Ok(Vec::new());
+        }
+
+        // 🌟 [PROPERTY-PINNED DETECTION] 호출부가 `property = '...'` 로 property 를
+        //    이미 하나로 고정한 타겟 검색인지 판정합니다.
+        //    이 SQL 문자열은 전부 우리 코드(lib.rs STAGE-4C / 4D)가 생성하므로
+        //    '의미 판정' 이 아니라 '우리가 만든 술어의 존재 여부' 라는 구조적 사실입니다.
+        //    고정 검색에서 property 다양성 캡을 적용하면 정확히 정반대로 작동합니다.
+        //    (log 실측: property='title' 고정 검색인데 "title(16행)" 억제 → 별칭 전멸)
+        let property_pinned = filter
+            .map(|f| f.contains("property = '"))
+            .unwrap_or(false);
+
+        let mut q = table.query();
+        if let Some(f) = filter {
+            if !f.trim().is_empty() {
+                q = q.only_if(f.to_string());
+            }
+        }
+
+        // 🌟 [QUERY VECTOR NORMALIZE] 저장 벡터는 upsert_chunk 직전에 L2 정규화되어 있습니다.
+        //    질의 벡터는 정규화되지 않은 채 들어와 L2 거리 스케일이 어긋났습니다.
+        //    양쪽을 정규화해야 L2² = 2 - 2cos 관계가 성립합니다.
+        let normalized_query: Vec<f32> = {
+            let norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                query_vec.iter().map(|x| x / norm).collect()
+            } else {
+                query_vec.to_vec()
+            }
+        };
+
+        // 🌟 [OVERFETCH 확대] property 다양성 캡을 적용하려면 후보 창이 충분히 커야 합니다.
+        //    저변별 청크가 상한에 걸려 버려지는 만큼을 미리 확보합니다.
+        //    🌟 property 고정 검색은 캡이 없으므로 오버페치를 더 크게 잡아
+        //    원본 청크와 음차 별칭(_tn/_tr)이 함께 창에 들어오도록 보장합니다.
+        let overfetch = if property_pinned { limit * 12 } else { limit * 6 };
+        let results = q
+            .limit(overfetch)
+            .nearest_to(normalized_query)?
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut chunks: Vec<(String, String, String, String, f32)> = Vec::new();
+
+        for batch in results {
+            let num_rows = batch.num_rows();
+            if num_rows == 0 { continue; }
+
+            // 컬럼 인덱스: 0=chunk_id, 1=item_id, 2=item_type, 3=chunk_text,
+            //              4=property, 5=property_format, 6=value_part, 7=vector, ...
+            let chunk_ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let item_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let chunk_texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let properties = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+
+            // LanceDB nearest_to 는 _distance 컬럼을 마지막에 추가합니다
+            let dist_idx = batch.num_columns() - 1;
+            let distances = batch.column(dist_idx).as_any().downcast_ref::<Float32Array>();
+
+            for i in 0..num_rows {
+                // 🌟 [DISTANCE → SIMILARITY FIX]
+                //    distance_type 을 지정하지 않았으므로 LanceDB 기본값인 L2(제곱거리)가 옵니다.
+                //    정규화 벡터에서 L2² = 2 - 2cos 이므로 올바른 변환은 cos = 1 - d/2 입니다.
+                //    기존 `1.0 - d` 는 2·cos - 1 이 되어 코사인 0.5 미만이 음수가 되고,
+                //    item 별 그룹 합산이 2·Σcos - n 으로 왜곡되어
+                //    매칭 청크가 많은 아이템이 구조적으로 불리해졌습니다.
+                //    설령 백엔드가 코사인 거리(1-cos)를 돌려주더라도 이 식은 (1+cos)/2 로
+                //    단조 증가를 유지하므로 순위가 깨지지 않고 음수도 발생하지 않습니다.
+                let score = distances
+                    .map(|d| (1.0f32 - d.value(i) / 2.0f32).clamp(0.0f32, 1.0f32))
+                    .unwrap_or(0.0);
+
+                chunks.push((
+                    chunk_ids.value(i).to_string(),
+                    item_ids.value(i).to_string(),
+                    chunk_texts.value(i).to_string(),
+                    properties.value(i).to_string(),
+                    score,
+                ));
+            }
+        }
+
+        // 점수 내림차순 정렬
+        chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 🌟 [PROPERTY DIVERSIFICATION] 저변별 청크가 후보 윈도우를 독점하는 것을 차단합니다.
+        //    status 청크는 "It is currently in 'complete' status" 로 전 아이템에서
+        //    바이트 단위로 동일하여 변별력이 0인데도, 오버페치 창을 전부 채워
+        //    정작 값이 담긴 title 청크가 후보에 진입조차 못 했습니다.
+        //
+        //    🌟 [PINNED BYPASS] 단, 호출부가 property 를 이미 하나로 고정했다면
+        //    이 캡은 존재 이유가 사라지고 오히려 정답 청크를 학살합니다.
+        //    (log 실측: property='title' 고정 검색에서 "title(16행)" 억제)
+        //    별칭(_tn/_tr)은 원본과 같은 property 를 쓰므로 캡의 1순위 희생양이었습니다.
+        //
+        //    🌟 [ALIAS GROUP SPLIT] 캡을 적용하는 전역 검색에서도, 음차 별칭은
+        //    원본 청크와 '다른 표기 체계' 를 담은 별개 증거이므로 같은 슬롯을 두고
+        //    경쟁시키면 안 됩니다. chunk_id 접미어(_tn/_tr)라는 구조적 사실만으로
+        //    별도 그룹키를 부여하여 원본과 별칭이 나란히 생존하도록 합니다.
+        if property_pinned {
+            println!(
+                "  🎯 [PROPERTY PINNED] property 고정 검색 감지. 다양성 캡을 적용하지 않습니다. (후보 {}행 전량 보존)",
+                chunks.len()
+            );
+        } else {
+            let per_property_cap = std::cmp::max(2usize, limit / 2);
+            let group_key = |chunk_id: &str, property: &str| -> String {
+                if chunk_id.ends_with("_tn") || chunk_id.ends_with("_tr") {
+                    format!("{}#alias", property)
+                } else {
+                    property.to_string()
+                }
+            };
+            let mut prop_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut kept: Vec<(String, String, String, String, f32)> = Vec::with_capacity(chunks.len());
+            let mut suppressed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for c in chunks.into_iter() {
+                let k = group_key(&c.0, &c.3);
+                let n = prop_count.entry(k.clone()).or_insert(0);
+                if *n >= per_property_cap {
+                    *suppressed.entry(k).or_insert(0) += 1;
+                    continue;
+                }
+                *n += 1;
+                kept.push(c);
+            }
+            if !suppressed.is_empty() {
+                let mut brief: Vec<String> = suppressed
+                    .iter()
+                    .map(|(p, n)| format!("{}({}행)", p, n))
+                    .collect();
+                brief.sort();
+                println!(
+                    "  🎛️ [PROPERTY DIVERSIFICATION] property 당 상한 {}행 적용 (별칭은 별도 그룹). 초과 억제: {:?}",
+                    per_property_cap, brief
+                );
+            }
+            chunks = kept;
+        }
+
+        // 🌟 [ALIAS HIT LOG] 어떤 별칭 청크가 실제로 창에 들어왔는지 남깁니다.
+        //    지금까지 정방향 로그에 별칭이 한 줄도 찍히지 않아
+        //    "저장이 안 된 것인지 검색이 안 된 것인지" 구분이 불가능했습니다.
+        {
+            let mut alias_hits: Vec<String> = Vec::new();
+            for (cid, _iid, ctext, prop, s) in chunks.iter() {
+                if cid.ends_with("_tn") || cid.ends_with("_tr") {
+                    if alias_hits.len() < 8 {
+                        alias_hits.push(format!("{}[{}] '{}' ({:.4})", prop, if cid.ends_with("_tn") { "native" } else { "roman" }, ctext, s));
+                    }
+                }
+            }
+            if !alias_hits.is_empty() {
+                println!("  🔤 [ALIAS CHUNK HIT] 음차 별칭 청크가 후보 창에 진입했습니다: {:?}", alias_hits);
+            }
+        }
+
+        // item_id 기준 그룹핑: 동일 item 의 여러 청크 점수를 합산하여
+        // 최종 상위 limit 개 item 을 반환합니다.
+        let mut item_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut item_best_chunk: std::collections::HashMap<String, (String, String, String, f32)> = std::collections::HashMap::new();
+
+        for (chunk_id, item_id, chunk_text, property, score) in &chunks {
+            let entry = item_scores.entry(item_id.clone()).or_insert(0.0);
+            *entry += score;
+
+            let best = item_best_chunk.entry(item_id.clone()).or_insert_with(|| {
+                (chunk_id.clone(), chunk_text.clone(), property.clone(), *score)
+            });
+            if *score > best.3 {
+                *best = (chunk_id.clone(), chunk_text.clone(), property.clone(), *score);
+            }
+        }
+
+        // 🌟 [RANKING BASIS] 대표 정렬 기준을 '최고 코사인' 으로 바꿉니다.
+        //    합산(total)은 '증거의 양' 이지 '질의와의 가까움' 이 아닙니다.
+        //    합산으로 정렬하면 무관한 값이라도 청크 수가 많은 item 이 이깁니다.
+        //    합산은 동률을 깨는 보조 기준으로만 사용합니다.
+        let mut final_results: Vec<(String, String, String, String, f32, f32)> = Vec::new();
+        let mut sorted_items: Vec<(String, f32, f32)> = item_scores
+            .into_iter()
+            .map(|(id, total)| {
+                let best = item_best_chunk.get(&id).map(|b| b.3).unwrap_or(0.0);
+                (id, total, best)
+            })
+            .collect();
+        sorted_items.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        for (item_id, total_score, _best) in sorted_items.into_iter().take(limit) {
+            if let Some((chunk_id, chunk_text, property, best_score)) = item_best_chunk.remove(&item_id) {
+                final_results.push((chunk_id, item_id, chunk_text, property, total_score, best_score));
+            }
+        }
+
+        Ok(final_results)
+    }
+
+    /// [PHASE D-4] 특정 item_id 에 연관된 모든 청크를 삭제합니다.
+    /// item 삭제 또는 재추출 시 호출됩니다.
+    pub async fn delete_chunks_by_item(&self, item_id: &str) -> Result<()> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+        table.delete(&format!("item_id = '{}'", item_id)).await?;
+        Ok(())
+    }
+
+    /// [PHASE D-5] 특정 item_id 의 청크 개수를 반환합니다.
+    /// 재인덱싱 여부 판정에 사용됩니다.
+    pub async fn count_chunks_by_item(&self, item_id: &str) -> Result<usize> {
+        let table = self.conn.open_table("item_chunks").execute().await?;
+        let results = table.query()
+            .only_if(format!("item_id = '{}'", item_id))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut count = 0usize;
+        for batch in results {
+            count += batch.num_rows();
+        }
+        Ok(count)
     }
 }
 

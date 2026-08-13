@@ -451,6 +451,195 @@ pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
     humanize_url_token(field_name)
 }
 
+// 🌟 [ABSTRACT BRIDGE — FIELD SCOPE] search_bridge.abstract_bridge 에서
+//    이 필드를 목표로 하는 브릿지 구만 뽑아냅니다.
+//    키는 "substantial_filters.weight" 형태이므로 '.' 뒤 조각이 필드명과 같으면 채택합니다.
+//    정방향은 이 구들로 '무거운' → weight 를 라우팅하는데, 역방향(저장)에는 이 축이
+//    통째로 빠져 있어서 "정방향이 잡은 의도를 받아줄 벡터가 DB에 없는" 상태였습니다.
+pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    if out.len() > 48 { out.truncate(48); }
+    out
+}
+
+// 🌟 [INDEXING ANCHOR] 저장(역방향) 시점에 청크 벡터 위에 얹을 '다국어 라벨 앵커'입니다.
+//    json_to_natural_language() 는 무조건 영어 문장을 만들지만 질의는 문서 언어이므로,
+//    저장 벡터에 문서 언어 라벨을 반드시 섞어야 코사인이 성립합니다.
+//
+//    🌟 [편입 순서 역전] 기존 순서는
+//        ① semantic ② label_phrase_bank ③ abstract_bridge ④ multilingual_value_anchor
+//    였고 마지막에 truncate(32) 를 걸었습니다.
+//    그 결과 앞 세 축이 창을 다 먹고 나면 ④ 는 영어 앞부분만 들어가,
+//    정작 크로스링구얼 매칭의 핵심인 '니트 / 가디건 / ニット / カーディガン' 이
+//    저장 벡터에 단 한 번도 실리지 못했습니다.
+//    다국어 값 축을 최우선으로 편입하고 상한을 제거합니다.
+//    (앵커 가중치는 Text 0.10 / 그 외 0.30 이므로 구 수가 늘어도 값 벡터를 침범하지 않습니다)
+//
+//    🌟 [LABEL-ONLY] 이 함수의 출력은 '라벨 개념' 전용입니다.
+//    로컬라이즈(값 결합) 텍스트에 이 블롭을 그대로 쓰면 값이 수십 토큰 중 3토큰으로
+//    희석되어, 값 질의("니트 가디건")가 어떤 청크와도 구분되지 않습니다.
+//    값 결합용으로는 반드시 indexing_leaf_label() 을 사용하십시오.
+pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let mut phrases: Vec<String> = Vec::new();
+
+    // ① [최우선] 다국어 값 도메인 축 — 크로스링구얼 매칭의 유일한 근거
+    for p in multilingual_value_anchor_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ② 문서 언어 semantic 앵커
+    for p in split_bias_phrases_full(&semantic_anchor_text(doc_lang, page_type, field_name)) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ③ 문서 언어 라벨 뱅크
+    let (label_phrases, _w) = label_phrase_bank(doc_lang, page_type, field_name);
+    for p in label_phrases {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ④ 추상 수식어 브릿지 (heavy / expensive / fast ...)
+    for p in abstract_bridge_field_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    if phrases.is_empty() {
+        return humanize_url_token(field_name);
+    }
+    phrases.join(", ")
+}
+
+// 🌟 [INDEXING LEAF LABEL] 값과 결합할 '단 하나의 짧은 문서 언어 라벨'입니다.
+//    indexing_anchor_text() 는 라벨 10~32구를 join 한 블롭이라
+//    "상품명, 의류명, 제품명, 품목명, 이름, ... Cable Knit Cardigan" 처럼
+//    값이 통째로 희석됩니다.
+//    (new_log2.txt: title 청크가 후보 진입조차 못 하고 status 가 상위 9건 독점)
+//    여기서는 semantic 의 '첫 구' 하나만 뽑아 "상품명 Cable Knit Cardigan" 형태로
+//    값이 지배하는 로컬라이즈 텍스트를 만듭니다.
+pub fn indexing_leaf_label(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let sem = semantic_anchor_text(doc_lang, page_type, field_name);
+    for p in split_bias_phrases_full(&sem) {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        // 예시값(숫자 리터럴/장문)은 라벨이 아닙니다.
+        if is_value_example_phrase(t) { continue; }
+        return t.to_string();
+    }
+    humanize_url_token(field_name)
+}
+
+// 🌟 [MULTILINGUAL VALUE ANCHOR] bias.json 의 search_bridge.multilingual_value_anchor 에서
+//    이 필드의 '값이 속한 의미 도메인'을 다국어로 기술한 구를 읽습니다.
+//
+//    🌟 [양방향 공용] 이 노드는 '스키마 속성 뱅크' 에만 편입됩니다.
+//    filter_category_phrases() 는 substantial/find/status/time/season 만 읽고,
+//    abstract_bridge_phrases() 는 search_bridge.abstract_bridge 만 읽으므로
+//    정방향 필터 뱅크·SURPRISAL 게이트·연산자 뱅크는 전혀 오염되지 않습니다.
+//    역방향은 indexing_anchor_text() 로, 정방향은 속성 뱅크 구축부로 편입되어
+//    질의 벡터와 저장 벡터가 같은 다국어 값 축을 공유하게 됩니다.
+//
+//    🌟 [상한 제거 이유] 이 노드의 구 순서는 (semantic → 영어 → 한국어 → 일본어 → 중국어 → …)
+//    이므로 48구 상한은 일본어 3구째에서 잘려, 그 뒤 40여 개 언어의 값 어휘가 통째로 소멸합니다.
+//    다국어 크로스링구얼 매칭이 이 노드의 유일한 존재 이유이므로 상한을 두지 않습니다.
+//    (Max-Pool 은 구 개수가 늘어도 최댓값만 취하고, 뱅크 크기 편향은
+//     bank_size_equalized_mask() 가 질의 시점에 상대 통계로 별도 정규화합니다)
+pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("multilingual_value_anchor"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [METRICS FAMILY] bias.json 의 metrics.* 노드를 (family_key, phrase) 목록으로 펼칩니다.
+//    metrics.price.bias 에는 이미 "won" 이 들어 있어서, 다국어 임베딩이
+//    '원' ↔ 'won' 을 연결해 줍니다. 따라서 "5000원 이하로" 의 수치 대상이
+//    quantity 가 아니라 price 계열이라는 사실을 어휘 하드코딩 없이 판정할 수 있습니다.
+pub fn metrics_family_phrases() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(node) = crate::parsing::BIAS_DICT.get("metrics").and_then(|v| v.as_object()) {
+        for (key, val) in node {
+            for field in ["semantic", "bias"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                    for p in split_bias_phrases_full(s) {
+                        if out.iter().any(|(k, e)| k == key && e == &p) { continue; }
+                        out.push((key.clone(), p));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [METRICS FAMILY — 단일 벡터 argmax] 임베딩 하나가 어떤 metrics 계열에 가장 가까운지
+//    (family_key, score) 로 반환합니다. 그룹별 Max-Pool 이라 뱅크 크기 편향이 없습니다.
+pub fn metrics_family_argmax(target: &[f32], bank: &[(String, Vec<f32>)]) -> (String, f32) {
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(target, e);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    (best_key, if best == f32::MIN { 0.0 } else { best })
+}
+
+// 🌟 [METRICS FAMILY — 필드 뱅크 argmax] 그 필드의 구 뱅크 전체가 어떤 metrics 계열인지 판정합니다.
+//    sale_price 뱅크는 metrics.price 와, quantity 뱅크는 metrics.quantity 와 붙습니다.
+pub fn metrics_family_of_bank(field_bank: &Vec<Vec<f32>>, bank: &[(String, Vec<f32>)]) -> String {
+    if field_bank.is_empty() { return String::new(); }
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = max_pool_sim(e, field_bank);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    best_key
+}
+
 // 🌟 [CROSS-FIELD AMBIGUITY MASK] bias.json 을 수정하지 않고 런타임에서 무변별 구를 구조적으로 제거합니다.
 //    ① 두 개 이상 필드의 bias 뱅크에 '문자 그대로 동일한 구'가 들어 있으면
 //       그 구는 어떤 필드도 지목하지 못합니다.
@@ -524,13 +713,469 @@ pub fn query_chunk_matches_property(field_name: &str, chunk: &str) -> bool {
         FieldFormat::Link => false,
         FieldFormat::Enum => true,
         FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
-        FieldFormat::Date => v.chars().any(|c| c.is_ascii_digit()),
+        // 🌟 [NATURAL LANGUAGE TIME] 날짜 필드는 리터럴(2026-03-15)뿐 아니라
+        //    자연어 시간 표현('올해', '여름', 'last year')도 값이 될 수 있습니다.
+        //    기존 숫자 존재 판정만으로는 '올해' 가 ASCII 숫자 0개라 차단되어
+        //    started_at / expired_at / registration_date 후보 12개가 통째로 학살되었습니다.
+        //    (로그: [FORMAT GATE] "올해→started_at(0.5521)", "올해→expired_at(0.5342)" ...)
+        //    bias.json 의 time_filters / season_filters exact_match 배열은
+        //    50개 언어의 시간·계절 표현을 문자열 그대로 담은 확정 사전이므로
+        //    다국어 하드코딩 없이 완전일치(==)로 되살릴 수 있습니다.
+        FieldFormat::Date => {
+            if v.chars().any(|c| c.is_ascii_digit()) { return true; }
+            v.split_whitespace().any(|w| {
+                exact_match_filter_key("time_filters", w).is_some()
+                    || exact_match_filter_key("season_filters", w).is_some()
+            })
+        },
         FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
         FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
         FieldFormat::Identifier => longest_code_token_len(v) >= 4,
         FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
     }
+}
+
+// 🌟 [QUERY FORMAT GATE — VECTOR EXTENDED]
+//    query_chunk_matches_property 의 Date 분기는 bias.json 의 exact_match 배열에 전적으로 의존합니다.
+//    그런데 time_filters 노드에는 exact_match 가 아예 존재하지 않습니다(season_filters 에만 있음).
+//      "this_year": { "semantic": ..., "bias": ..., "prejudice": ... }   ← exact_match 없음
+//    그래서 '올해' 는 (ASCII 숫자 0개) AND (exact_match 미등록) 이 되어 통째로 차단되고,
+//    로그처럼 started_at(0.5521) / expired_at(0.5342) / registration_date(0.5202) 라는
+//    1순위보다 높은 정답 후보 12개가 배정 이전에 전멸합니다.
+//    그 상태에서 Qwen3 는 남은 쓰레기(title/color/address/status/first_purchase_only) 중에서만
+//    고를 수 있어 '올해 → new_customer_only' 오배정이 확정됩니다.
+//
+//    여기서는 bias.json 을 수정하지 않고, 호출부가 임베딩 코사인/문자열 구조 파싱으로 확정한
+//      ① temporal_hint         : 이 청크가 시간·계절 의도인가 (time/season 뱅크 우위)
+//      ② numeric_comparison_hint : 이 청크가 (숫자 + 비교 표현) 구조인가
+//    두 힌트를 받아 게이트를 확장합니다. 어휘 리터럴과 contains 판정은 일절 사용하지 않습니다.
+pub fn query_chunk_matches_property_ext(
+    field_name: &str,
+    chunk: &str,
+    temporal_hint: bool,
+    numeric_comparison_hint: bool,
+) -> bool {
+    let v = chunk.trim();
+    if v.is_empty() { return false; }
+
+    let fmt = detect_field_format(field_name);
+
+    // 🌟 [NUMERIC COMPARISON EXCLUSIVE] '5000원 이하로' 처럼 숫자와 비교 표현이 결합된 청크는
+    //    물리적으로 수치 비교 조건입니다.
+    //    currency.bias 의 '원' 이 '5000원' 과 공명해 String 필드가 이 청크를 선점하면
+    //        currency contains "5000원 이하로"   (convert_conditions_to_sql 에서 통째로 스킵)
+    //    라는 SQL 무효 조건만 남고, 정답인 sale_price lte 5000 은 영원히 발행되지 않습니다.
+    //    cross_field_ambiguous_phrase_mask 는 '문자 그대로 동일한 구'만 제거하므로
+    //    '원'(currency.bias) vs '29900원'(sale_price.bias) 은 잡을 수 없습니다.
+    //    따라서 배정 '전' 에 문자열/열거형 필드의 후보 자격 자체를 박탈합니다.
+    if numeric_comparison_hint {
+        return matches!(fmt, FieldFormat::Numeric | FieldFormat::Date);
+    }
+
+    match fmt {
+        FieldFormat::Synthesis => false,
+        FieldFormat::Link => false,
+        FieldFormat::Enum => true,
+        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
+        FieldFormat::Date => {
+            if v.chars().any(|c| c.is_ascii_digit()) { return true; }
+            if temporal_hint { return true; }
+            // 🌟 [SEMANTIC ANCHOR TEMPORAL] bias.json 의 time_filters.*.semantic 에
+            //    "current year", "previous day" 등의 영어 구가 있습니다.
+            //    exact_match 배열이 없는 time_filters 를 위해,
+            //    semantic 필드의 구를 split_bias_phrases_full 로 쪼개
+            //    다국어 임베딩 코사인으로 매칭합니다.
+            //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
+            if temporal_semantic_match(v) { return true; }
+            v.split_whitespace().any(|w| {
+                exact_match_filter_key("time_filters", w).is_some()
+                    || exact_match_filter_key("season_filters", w).is_some()
+            })
+        },
+        FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
+        FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
+        FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
+    }
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH] bias.json 의 time_filters / season_filters 각 키의
+//    "semantic" 필드에는 "current year", "spring season" 같은 핵심 의미 구가 있습니다.
+//    exact_match 배열이 없는 time_filters 를 위해, 이 semantic 구를
+//    split_bias_phrases_full 로 쪼개 임베딩하고, 질의 청크와의 코사인을 계산합니다.
+//    판정 기준은 '해당 카테고리 내 semantic 구들과의 Max-Pool 코사인'이
+//    '다른 모든 필터 카테고리 semantic 구들과의 Max-Pool 코사인'보다 높은지입니다.
+//    절대 임계치 없이 상대 비교만 사용하므로 매직 상수가 없습니다.
+//    이 함수는 임베딩을 내부에서 생성하지 않고, 호출부가 미리 계산한
+//    temporal_semantic_scores 맵을 참조하는 구조로 model.rs 에서 호출됩니다.
+//    여기서는 bias.json 에서 semantic 구 목록을 추출하는 순수 결정론 함수입니다.
+pub fn temporal_semantic_phrases() -> Vec<(String, String)> {
+    // (category_key, semantic_phrase) 쌍을 반환
+    let mut out: Vec<(String, String)> = Vec::new();
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    for cat in ["time_filters", "season_filters"] {
+        if let Some(node) = dict.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+                // bias 도 구 단위로 추가 (semantic 이 짧을 수 있으므로)
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH - LIGHTWEIGHT] 임베딩 없이 문자열 구조로 판정하는 폴백.
+//    bias.json 의 time_filters.*.semantic / bias 구 중에
+//    질의 청크의 '공백 제거 소문자'와 완전일치하는 구가 있으면 temporal 로 판정.
+//    예: chunk="올해" → bias 구 "this year" 와는 불일치하지만,
+//    season_filters 의 exact_match 에는 없으므로 이 경로로는 불가.
+//    따라서 이 함수는 보조 수단이며, 주 경로는 model.rs 의 임베딩 코사인입니다.
+pub fn temporal_semantic_match(_chunk: &str) -> bool {
+    // 이 함수는 model.rs 에서 임베딩 기반으로 대체되므로
+    // 여기서는 항상 false 를 반환하여 기존 exact_match 경로를 유지합니다.
+    // 실제 temporal 판정은 model.rs 의 TEMPORAL PRE-GATE 개선에서 수행합니다.
+    false
+}
+
+// 🌟 [FILTER CATEGORY PHRASE BANK] substantial_filters / find_filters / status_filters 의
+//    bias + semantic 구를 쪼개 (category, key, phrase) 목록을 반환합니다.
+//    bias.json 에 exact_match 배열이 없는 필터 카테고리(time_filters 포함)를 위해
+//    임베딩 코사인 Max-Pool 로 매칭할 수 있는 구 뱅크를 동적으로 구축합니다.
+//    다국어 어휘 리터럴을 추가하지 않고, bias.json 의 기존 bias/semantic 필드만 읽습니다.
+pub fn filter_category_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        if !out.iter().any(|(_, _, p)| p == &phrase) {
+                            out.push((cat.to_string(), key.clone(), phrase));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [FILTER ROUTE VERDICT] 질의 청크가 스키마 속성보다 필터 카테고리에 더 적합한지
+//    임베딩 코사인 Max-Pool 상대 비교로 판정합니다.
+//    절대 임계치 없이 '필터 Max-Pool > 스키마 속성 Max-Pool' 상대 우위만 사용합니다.
+//    반환: Some((category, key)) 이면 필터 라우팅, None 이면 스키마 속성 배정 유지.
+pub fn filter_route_verdict(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String)> {
+    // (category, key) 그룹별 Max-Pool: 개별 구 코사인의 비대칭을 해소합니다.
+    // 스키마 측이 weighted_max_pool_sim(구 단위 최대)을 사용하므로
+    // 필터 측도 동일 그룹 내 최대 코사인으로 비교해야 공정한 판정입니다.
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key))
+    } else {
+        None
+    }
+}
+
+// 🌟 [SUBSTANTIAL/FIND PRE-GATE] substantial_filters / find_filters / status_filters 의
+//    bias+semantic 구 뱅크와 청크 간 Max-Pool 코사인을 계산하여,
+//    스키마 속성보다 필터 의도가 우세한 청크를 배정 전에 차단합니다.
+//    filter_route_verdict 가 단어 단위(1토큰)에서만 동작하는 반면,
+//    이 함수는 Plinko 청크(다중 토큰) 단위에서도 동작합니다.
+//    (로그: '무거운' 이 summer(0.5610) 에 밀려 substantial_filters.weight 로 라우팅 실패)
+//    판정 기준: '필터 Max-Pool > 스키마 Max-Pool' 상대 비교만 사용. 매직 상수 없음.
+//    반환: Some((category, key, score)) 이면 필터 라우팅, None 이면 스키마 배정 유지.
+pub fn substantial_find_pre_gate(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String, f32)> {
+    if filter_phrase_embs.is_empty() { return None; }
+    // (category, key) 그룹별 Max-Pool
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        // substantial / find / status 카테고리만 대상
+        if cat != "substantial_filters" && cat != "find_filters" && cat != "status_filters" { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key, best_score))
+    } else {
+        None
+    }
+}
+
+// =====================================================================
+// 🌟 [GLOBAL-BASELINE SURPRISAL] 뱅크 크기 편향 제거 + 절대 신호 보존
+// ---------------------------------------------------------------------
+// 직전 구현은 각 뱅크를 '자기 자신의' 평균/표준편차로 표준화했습니다.
+// 극값이론이 E[z of max] ≈ √(2 ln N) 을 예측하므로, 그 값으로 다시 나누면
+// 무관한 질의에 대해 결과가 정의상 1.0 으로 수렴합니다.
+// (로그 실측: 6개 단어 전부 0.9475 ~ 1.1919 — 판별력 0)
+//
+// 여기서는 '모든 뱅크를 합친 전역 코사인 분포'를 공통 기준선으로 삼고,
+// 뱅크 크기가 만드는 기대 최댓값 √(2 ln N) 만큼만 차감합니다.
+//     surprisal = (max - μ_global) / σ_global - √(2 ln N)
+// 반환값 0 = 무작위로 N개 뽑은 기대치와 동일(= 근거 없음)
+//         > 0 = 그 기대치를 넘는 실제 의미적 근거 존재
+// 0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
+// =====================================================================
+
+#[derive(Debug, Clone)]
+pub struct SurprisalScore {
+    pub category: String,
+    pub key: String,
+    pub max_cos: f32,
+    pub n: usize,
+    pub surprisal: f32,
+}
+
+fn gumbel_expected_z(n: usize) -> f32 {
+    if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
+}
+
+fn group_sims(
+    query: &[f32],
+    src: &[(String, String, Vec<f32>)],
+    pool: &mut Vec<f32>,
+) -> (Vec<(String, String)>, Vec<Vec<f32>>) {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut sims: Vec<Vec<f32>> = Vec::new();
+    for (c, k, e) in src {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(query, e);
+        pool.push(s);
+        match order.iter().position(|(a, b)| a == c && b == k) {
+            Some(i) => sims[i].push(s),
+            None => { order.push((c.clone(), k.clone())); sims.push(vec![s]); }
+        }
+    }
+    (order, sims)
+}
+
+/// 필터 뱅크와 스키마 뱅크를 **하나의 공통 기준선**으로 동시에 채점합니다.
+/// 두 결과가 같은 척도이므로 그대로 대소 비교할 수 있습니다.
+/// 각 필터 키의 prejudice 구가 자기 기대치를 넘으면 그만큼 상쇄합니다.
+/// (bias.json 이 이미 갖고 있는 편견 사전을 필터 경로에서 처음으로 활용)
+pub fn surprisal_dual_scores(
+    query: &[f32],
+    filter_bias: &[(String, String, Vec<f32>)],
+    filter_prej: &[(String, String, Vec<f32>)],
+    schema_names: &[String],
+    schema_banks: &[Vec<Vec<f32>>],
+    schema_skip: &[bool],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    let mut pool: Vec<f32> = Vec::new();
+
+    let (f_order, f_sims) = group_sims(query, filter_bias, &mut pool);
+    let (p_order, p_sims) = group_sims(query, filter_prej, &mut pool);
+
+    let mut s_sims: Vec<Vec<f32>> = Vec::with_capacity(schema_banks.len());
+    for (i, bank) in schema_banks.iter().enumerate() {
+        let mut v: Vec<f32> = Vec::new();
+        if !schema_skip.get(i).copied().unwrap_or(false) {
+            for e in bank {
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(query, e);
+                pool.push(s);
+                v.push(s);
+            }
+        }
+        s_sims.push(v);
+    }
+
+    if pool.len() < 2 { return (Vec::new(), Vec::new()); }
+    let mean: f32 = pool.iter().sum::<f32>() / (pool.len() as f32);
+    let var: f32 = pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (pool.len() as f32);
+    let std = var.sqrt().max(1e-6);
+
+    let raw = |sims: &Vec<f32>| -> Option<(f32, usize, f32)> {
+        if sims.is_empty() { return None; }
+        let m = sims.iter().cloned().fold(f32::MIN, f32::max);
+        let n = sims.len();
+        Some((m, n, (m - mean) / std - gumbel_expected_z(n)))
+    };
+
+    let mut fout: Vec<SurprisalScore> = Vec::new();
+    for (i, (c, k)) in f_order.iter().enumerate() {
+        let (m, n, mut sc) = match raw(&f_sims[i]) { Some(v) => v, None => continue };
+        if let Some(pi) = p_order.iter().position(|(a, b)| a == c && b == k) {
+            if let Some((_, _, ps)) = raw(&p_sims[pi]) {
+                if ps > 0.0 { sc -= ps; }
+            }
+        }
+        fout.push(SurprisalScore { category: c.clone(), key: k.clone(), max_cos: m, n, surprisal: sc });
+    }
+    fout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut sout: Vec<SurprisalScore> = Vec::new();
+    for (i, name) in schema_names.iter().enumerate() {
+        let (m, n, sc) = match raw(&s_sims[i]) { Some(v) => v, None => continue };
+        sout.push(SurprisalScore { category: "schema".to_string(), key: name.clone(), max_cos: m, n, surprisal: sc });
+    }
+    sout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+
+    (fout, sout)
+}
+
+/// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
+/// filter_category_phrases 의 prejudice 판입니다.
+pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(p) {
+                        if out.iter().any(|(c, k, e)| c == cat && k == key && e == &phrase) { continue; }
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [ABSTRACT BRIDGE PREJUDICE] search_bridge.abstract_bridge 의 prejudice 구.
+pub fn abstract_bridge_prejudice_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+        if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+            for phrase in split_bias_phrases_full(p) {
+                if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &phrase) { continue; }
+                out.push((cat.clone(), key.clone(), phrase));
+            }
+        }
+    }
+    out
+}
+
+/// [STEM CANDIDATES] 같은 질의의 다른 토큰들과 공유하는 접두 어간 후보를 뽑습니다.
+/// 언어별 조사/어미 사전을 쓰지 않고 '문자 접두 공유'라는 구조적 사실만 사용합니다.
+/// 반환값은 길이 내림차순 어간 목록입니다.
+pub fn shared_prefix_stems(word: &str, others: &[String]) -> Vec<String> {
+    let w: Vec<char> = word.chars().collect();
+    let mut stems: Vec<String> = Vec::new();
+    for o in others {
+        if o == word { continue; }
+        let oc: Vec<char> = o.chars().collect();
+        let mut n = 0usize;
+        while n < w.len() && n < oc.len() && w[n] == oc[n] { n += 1; }
+        if n < 2 { continue; }
+        if n >= w.len() { continue; }
+        let stem: String = w[..n].iter().collect();
+        if !stems.iter().any(|s| s == &stem) { stems.push(stem); }
+    }
+    stems.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    stems
+}
+
+/// [ABSTRACT BRIDGE] bias.json 의 search_bridge.abstract_bridge 에서
+/// (category, key, phrase) 트리플을 수집합니다.
+/// 키는 "substantial_filters.weight" 처럼 "카테고리.키" 형태입니다.
+/// 언어별 어휘를 코드에 두지 않고 bias.json 의 영어 브릿지 구만 사용하며,
+/// 다국어 임베딩 모델이 교차언어 매칭을 담당합니다.
+pub fn abstract_bridge_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    {
+        Some(n) => n,
+        None => return out,
+    };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &p) { continue; }
+                    out.push((cat.clone(), key.clone(), p));
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [QWEN3 CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이 원본 속성보다
+//    청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
+//    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)
+//    교정 후 코사인이 교정 전보다 낮으면 교정을 폐기하고 UNASSIGN 합니다.
+//    새 매직 상수 없이 '교정 후 < 교정 전' 부호 판정만 사용합니다.
+pub fn correction_cosine_degraded(
+    chunk_emb: &[f32],
+    old_prop_embs: &Vec<Vec<f32>>,
+    old_prop_weights: &Vec<f32>,
+    new_prop_embs: &Vec<Vec<f32>>,
+    new_prop_weights: &Vec<f32>,
+) -> bool {
+    let old_score = weighted_max_pool_sim(chunk_emb, old_prop_embs, old_prop_weights);
+    let new_score = weighted_max_pool_sim(chunk_emb, new_prop_embs, new_prop_weights);
+    new_score < old_score
 }
 
 // 🌟 [MAX-COVERAGE GREEDY ASSIGN] 청크가 굶어 죽지 않는 1:1 배타 배정.
@@ -604,6 +1249,250 @@ pub fn is_sql_effective_field(field_name: &str) -> bool {
         detect_field_format(field_name),
         FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode
     )
+}
+
+// 🌟 [BANK SIZE BIAS NORMALIZATION] Max-Pool 은 뱅크가 클수록 점수가 구조적으로 부풀려집니다.
+//        E[max of N draws] ≈ μ + σ·√(2 ln N)
+//    bias.json 루트 color.bias 는 50개 언어 색상명 ~700구라
+//        color(N≈700) √(2 ln 700)=3.62  vs  title(N≈11) √(2 ln 11)=2.19  → 1.65배 유리
+//    그 결과 '팔린'(0.6228) '남긴'(0.6365) '여름'(0.5433) 처럼 색상과 무관한 청크의
+//    argmax 가 전부 color 로 몰리는 '흡수 싱크' 가 됩니다.
+//    질의와 무관한 언어권 구(아랍어/힌디어/조지아어 색상명 등)를 런타임에 비활성화합니다.
+//    판정 기준은 '이 뱅크 안에서의 코사인 중앙값' 이라는 상대 통계이므로 새 상수가 아닙니다.
+//    뱅크가 작으면(중앙값 통계가 무의미) 전량 유지하여 정보 손실을 막습니다.
+pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>) -> Vec<bool> {
+    let n = phrase_embs.len();
+    let mut keep = vec![true; n];
+    if n == 0 { return keep; }
+
+    // 유효 구가 다른 스키마 뱅크(수 개~수십 개)와 같은 규모면 정규화가 불필요합니다.
+    let valid: Vec<usize> = (0..n).filter(|&i| !phrase_embs[i].iter().all(|&v| v == 0.0)).collect();
+    if valid.len() < 64 { return keep; }
+
+    let mut sims: Vec<f32> = Vec::with_capacity(valid.len());
+    for &i in &valid { sims.push(cosine_similarity(query_emb, &phrase_embs[i])); }
+
+    let mut sorted = sims.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    for (vi, &i) in valid.iter().enumerate() {
+        if sims[vi] < median { keep[i] = false; }
+    }
+    keep
+}
+
+// 🌟 [BANK SIZE EQUALIZATION] bank_size_normalized_mask 는 중앙값 컷을 '단 한 번'만 수행합니다.
+//    그래서 로그에서 color 뱅크가 603구 → 302구 로 절반만 줄었고,
+//    Max-Pool 의 구조적 이득 E[max of N] ≈ μ + σ·√(2 ln N) 은
+//        √(2 ln 603)=3.58 → √(2 ln 302)=3.38  (겨우 5.6% 감소)
+//    에 그쳐, title(11구, √(2 ln 11)=2.19) 대비 여전히 1.54배 유리한 상태였습니다.
+//    그 결과 색상과 무관한 '팔린'(0.5780) '남긴'(0.6365) 의 argmax 를 color 가 계속 독식했습니다.
+//    여기서는 '이 스키마에서 정상 규모의 뱅크가 실제로 몇 구인가'(호출부 실측 중앙값)를
+//    목표로 삼아 중앙값 컷을 반복 적용하여 유효 크기를 같은 규모로 수렴시킵니다.
+//    각 반복은 '살아남은 구 집합 안에서의 상대 통계'만 사용하므로 절대 임계치가 없고,
+//    target_size 도 호출부의 실측값이므로 새 매직 상수가 아닙니다.
+pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, target_size: usize) -> Vec<bool> {
+    let n = phrase_embs.len();
+    let mut keep = vec![true; n];
+    if n == 0 || target_size == 0 { return keep; }
+
+    let mut valid: Vec<usize> = (0..n).filter(|&i| !phrase_embs[i].iter().all(|&v| v == 0.0)).collect();
+    if valid.len() <= target_size { return keep; }
+
+    let mut guard = 0usize;
+    while valid.len() > target_size && guard < 64 {
+        guard += 1;
+
+        let mut sims: Vec<f32> = Vec::with_capacity(valid.len());
+        for &i in &valid { sims.push(cosine_similarity(query_emb, &phrase_embs[i])); }
+
+        let mut sorted = sims.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+
+        let mut next: Vec<usize> = Vec::with_capacity(valid.len() / 2 + 1);
+        for (vi, &i) in valid.iter().enumerate() {
+            if sims[vi] < median { keep[i] = false; } else { next.push(i); }
+        }
+
+        // 코사인이 전부 동률이면 한 구도 줄지 않아 무한 루프가 되므로 즉시 중단합니다.
+        if next.len() == valid.len() { break; }
+        valid = next;
+    }
+
+    keep
+}
+
+// 🌟 [FUNCTIONAL WORD] 조사·접속 표현은 어떤 속성의 값도 될 수 없습니다.
+//    Stanza 는 '제품중에서'/'제품으로'/'중에서' 를 전부 NOUN 으로 태깅하므로 POS 로는 못 거릅니다.
+//    (로그: 세 청크가 각각 condition / bundle_shipping / status 에 Margin -0.0091, -0.0020, +0.0000 로 억지 배정)
+//
+//    🌟 [LEMMA-FREE FALLBACK] 직전 구현은 lemma 잔여 판정과 deprel 에만 의존했는데,
+//    로그의 Stanza 출력은 전 토큰이 'lemma:' 로 비어 있고 deprel 도 전달되지 않아
+//    항상 false 를 반환했습니다. ([FUNCTIONAL WORD DROP] 이 한 번도 출력되지 않은 이유)
+//    lemma/deprel 이 비어 있어도 동작하도록, 같은 질의 안의 '다른 토큰'을 원형 사전처럼 사용합니다.
+//    어떤 언어든 조사·접속 표현은 '실질 형태소 + 기능 형태소' 구조를 갖고,
+//    그 실질 형태소는 대개 같은 문장에 단독으로도 등장합니다.
+//      '제품중에서' = '제품'(같은 질의에 단독 존재) + '중에서'
+//      '제품으로'   = '제품'(같은 질의에 단독 존재) + '으로'
+//      '중에서'     = 위에서 추출된 잔여와 완전일치
+//    다국어 어휘 리터럴을 단 하나도 쓰지 않고, 문자열 구조 비교만으로 판정합니다.
+pub fn is_functional_word_chunk(
+    chunk: &str,
+    words: &[String],
+    lemmas: Option<&[String]>,
+    deprels: Option<&[String]>,
+) -> bool {
+    let c = chunk.trim();
+    if c.is_empty() { return true; }
+
+    let idx_opt = words.iter().position(|w| w == c);
+
+    // ① 이 토큰 자체가 UD 수식어/기능어 관계인가 (deprel 이 있을 때만)
+    if let (Some(rels), Some(idx)) = (deprels, idx_opt) {
+        if let Some(r) = rels.get(idx) {
+            if is_modifier_deprel(r) { return true; }
+        }
+    }
+
+    // ② Stanza lemma 가 유효할 때의 잔여 판정 (기존 경로 유지)
+    if let (Some(lm), Some(idx)) = (lemmas, idx_opt) {
+        if let Some(l) = lm.get(idx) {
+            let lt = l.trim();
+            if !lt.is_empty() && c != lt {
+                let core: String = lt.chars().filter(|ch| ch.is_alphanumeric()).collect();
+                let surf: String = c.chars().filter(|ch| ch.is_alphanumeric()).collect();
+                if !core.is_empty() && surf.chars().count() > core.chars().count() && surf.starts_with(&core) {
+                    let residue_len = surf.chars().count() - core.chars().count();
+                    if core.chars().count() < residue_len { return true; }
+                }
+            }
+        }
+    }
+
+    // ③ [LEMMA-FREE] 같은 질의의 다른 토큰을 원형으로 삼아 잔여를 구합니다.
+    //    '제품' 이 단독 토큰으로 존재하므로 '제품중에서' 의 잔여 '중에서' 를 얻습니다.
+    let surf: String = c.chars().filter(|ch| ch.is_alphanumeric()).collect();
+    if surf.is_empty() { return true; }
+
+    let mut residues: Vec<String> = Vec::new();
+    for w in words.iter() {
+        if w == c { continue; }
+        let core: String = w.chars().filter(|ch| ch.is_alphanumeric()).collect();
+        if core.is_empty() { continue; }
+        if core.chars().count() >= surf.chars().count() { continue; }
+        if !surf.starts_with(&core) { continue; }
+        let residue: String = surf.chars().skip(core.chars().count()).collect();
+        if residue.is_empty() { continue; }
+        // 실질 형태소보다 잔여가 더 길면 그 토큰은 실질이 아니라 기능 표현입니다.
+        if core.chars().count() < residue.chars().count() { return true; }
+        if !residues.iter().any(|r| r == &residue) { residues.push(residue); }
+    }
+
+    // ④ 이 청크 자체가 다른 토큰에서 떨어져 나온 '잔여' 와 완전히 같으면 기능어입니다.
+    //    ('중에서' 는 '제품중에서' 의 잔여와 완전일치)
+    for other in words.iter() {
+        if other == c { continue; }
+        let o_surf: String = other.chars().filter(|ch| ch.is_alphanumeric()).collect();
+        if o_surf.chars().count() <= surf.chars().count() { continue; }
+        for base in words.iter() {
+            if base == other || base == c { continue; }
+            let b_core: String = base.chars().filter(|ch| ch.is_alphanumeric()).collect();
+            if b_core.is_empty() { continue; }
+            if b_core.chars().count() >= o_surf.chars().count() { continue; }
+            if !o_surf.starts_with(&b_core) { continue; }
+            let residue: String = o_surf.chars().skip(b_core.chars().count()).collect();
+            if residue == surf { return true; }
+        }
+    }
+
+    let _ = residues;
+    false
+}
+
+// 🌟 [EXACT MATCH FILTER] bias.json 의 season_filters.*.exact_match 는
+//    각 언어의 계절명을 '문자열 그대로' 담고 있는 확정 사전입니다. ("여름", "summer", "夏" ...)
+//    로그에서 '여름' 은 summer(0.5591) 가 top(0.5596) 에 0.0005 차이로 밀려 2순위가 되었고,
+//    그 결과 계절 감지 LLM 이 오염된 컨텍스트를 받아 'autumn' 을 환각했습니다.
+//    코사인 경쟁 이전에 완전일치(==)로 확정하면 이 경로가 물리적으로 사라집니다.
+//    부분문자열 포함(contains)이 아니라 배열 원소 완전일치이므로 의미 판정이 아닙니다.
+pub fn exact_match_filter_key(category: &str, chunk: &str) -> Option<String> {
+    let c = chunk.trim();
+    if c.is_empty() { return None; }
+    let lower = c.to_lowercase();
+
+    let node = crate::parsing::BIAS_DICT.get(category)?.as_object()?;
+    for (key, val) in node {
+        let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if s == c || s.to_lowercase() == lower {
+                    return Some(key.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+// 🌟 [NUMERIC COMPARISON SPLIT] '5000원 이하로' 처럼 숫자와 비교 표현이 붙은 청크를
+//    (숫자 / 나머지) 로 구조 분해합니다.
+//    로그에서 이 청크는 currency(0.5943) 로 배정되었는데, currency.bias 의 '원' 이
+//    '5000원' 과 공명한 결과이며 정답은 sale_price lte 5000 입니다.
+//    분해된 나머지("원 이하로")를 operators 뱅크와 코사인 비교하면
+//    다국어 어휘 리터럴 없이 lte 를 확정할 수 있습니다.
+//    반환: (숫자 문자열, 비교 표현 문자열). 숫자가 없으면 None.
+pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
+    let c = chunk.trim();
+    if c.is_empty() { return None; }
+
+    let mut digits = String::new();
+    let mut rest = String::new();
+    let mut prev_digit = false;
+    for ch in c.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && prev_digit) {
+            digits.push(ch);
+            prev_digit = ch.is_ascii_digit();
+        } else if ch == ',' && prev_digit {
+            // 천 단위 구분자는 숫자의 일부이므로 버립니다.
+            prev_digit = true;
+        } else {
+            if !ch.is_whitespace() || !rest.ends_with(' ') { rest.push(ch); }
+            prev_digit = false;
+        }
+    }
+
+    let d = digits.trim_end_matches('.').to_string();
+    if d.is_empty() { return None; }
+    // 🌟 [COMPARATOR ENRICHMENT] rest 가 "원 이하로" 처럼 단위+비교 표현이면
+    //    단위 문자를 제거하고 순수 비교 표현만 남깁니다.
+    //    판정 기준: rest 의 첫 토큰이 알파벳/한글 1~2자이면서 숫자가 없으면 '단위'로 간주.
+    //    다국어 하드코딩 없이 '토큰 길이 + 숫자 부재' 라는 구조 규칙만 사용합니다.
+    let rest_trimmed = rest.trim();
+    let rest_tokens: Vec<&str> = rest_trimmed.split_whitespace().collect();
+    let comparator = if rest_tokens.len() >= 2 {
+        let first_tok = rest_tokens[0];
+        let first_has_digit = first_tok.chars().any(|c| c.is_ascii_digit());
+        let first_len = first_tok.chars().count();
+        // 첫 토큰이 2자 이하이고 숫자가 없으면 단위(원, 원, 円, $, € 등)로 간주하고 제거
+        if !first_has_digit && first_len <= 2 {
+            rest_tokens[1..].join(" ")
+        } else {
+            rest_trimmed.to_string()
+        }
+    } else {
+        rest_trimmed.to_string()
+    };
+    Some((d, comparator))
 }
 
 // 🌟 [LOCALIZED BIAS NODE] bias.json 의 {lang}.{page_type}.{field} 노드를 원본 그대로 꺼냅니다.
@@ -711,12 +1600,22 @@ pub fn exclusive_assign(
             let own = get(f, l);
             if own < abs_threshold { continue; }
 
-            let mut rival = 0.0f32;
+            // 🌟 [RIVAL FIX] rival 초기값 0.0 은 두 가지를 동시에 배제합니다.
+            //    ① 무효 칸(-1.0)  → 의도된 배제
+            //    ② double_center_matrix 를 거쳐 '유효하지만 음수'가 된 경쟁 필드 → 의도치 않은 배제
+            //    ②가 발생하면 rival 이 0.0 으로 고정되어 margin = own 이 되고,
+            //    경쟁이 치열한 라인일수록 오히려 margin 이 과대평가되어
+            //    '경쟁자가 없는 약한 후보'가 먼저 선점하는 역전이 일어납니다.
+            //    exclusive_assign_by_score 는 이미 abs_threshold 기반으로 교정되어 있으므로
+            //    두 함수의 판정 규칙을 동일하게 통일합니다.
+            let mut rival = f32::MIN;
             for other in 0..field_count {
                 if other == f { continue; }
                 let s = get(other, l);
+                if s < abs_threshold { continue; }
                 if s > rival { rival = s; }
             }
+            let rival = if rival == f32::MIN { abs_threshold } else { rival };
 
             let margin = own - rival;
             if margin < margin_threshold { continue; }
@@ -1213,7 +2112,16 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
         for l in 0..raw[f].len() {
             let v = raw[f][l];
             if v < 0.0 { continue; }
-            out[f][l] = v - line_mean[l] - field_mean[f] + global_mean;
+            // 🌟 [SPARSE GUARD] 형식 게이트 통과 후 행렬 밀도는 실측 약 5% 입니다.
+            //    이 라인의 유효 후보가 하나뿐이면 line_mean[l] == v 이므로
+            //        centered = v - v - field_mean[f] + global_mean = global_mean - field_mean[f]
+            //    가 되어 own(v) 이 식에서 완전히 소거됩니다.
+            //    즉 '증거가 압도적인 라인'과 '겨우 통과한 라인'의 점수가 비트 단위로 같아지고,
+            //    이후 배타 배정은 사실상 필드 인덱스 순서로 결정됩니다.
+            //    라인 경쟁이 실제로 존재할 때만 라인 베이스라인을 제거합니다.
+            //    (경쟁이 없으면 라인 베이스라인은 전역 평균과 같다고 보는 것이 정의상 자연스럽습니다)
+            let lm = if line_cnt[l] > 1 { line_mean[l] } else { global_mean };
+            out[f][l] = v - lm - field_mean[f] + global_mean;
         }
     }
     out
