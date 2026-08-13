@@ -103,20 +103,32 @@ async fn generate_transliteration_aliases(
 
         let s1_transliteration = if is_mixed {
             println!("    [TRACK SPLIT] 비라틴: {:?} | 라틴: {:?}", non_latin_words, latin_words);
-
             // Track A: 비라틴 단어 → 로마자 전사 (target: english)
+            // 🌟 [ANY_ASCII FIRST] 비라틴→라틴 방향은 any_ascii로 처리 가능하면 LLM 생략
             let mut track_a_transliteration = String::new();
             if !non_latin_words.is_empty() {
-                let p_a = crate::nl_convert::build_transliteration_prompt_for_words(&non_latin_words, "english");
-                let raw_a = model
-                    .call_qwen3_5_transliteration(&p_a, Some(cancel.clone()))
-                    .await
-                    .unwrap_or_default();
-                println!("    TRACK-A RAW (non-latin→latin) = '{}'", raw_a.replace('\n', "\n"));
-                let (_t_a, tr_a) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_a, &non_latin_words);
-                track_a_transliteration = tr_a;
+                // 🌟 [ANY_ASCII FIRST] 단어 단위로 any_ascii 시도.
+                //    전체 조인이 실패해도 단어별 시도가 성공할 수 있으므로 양쪽 모두 시도합니다.
+                let joined_non_latin = non_latin_words.join(" ");
+                if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&joined_non_latin) {
+                    track_a_transliteration = ascii_result;
+                    println!("    TRACK-A METHOD = any_ascii full (LLM skipped)");
+                    println!("    TRACK-A RESULT = '{}'", track_a_transliteration);
+                } else if let Some(ascii_words_result) = crate::nl_convert::try_any_ascii_transliteration_words(&non_latin_words) {
+                    track_a_transliteration = ascii_words_result;
+                    println!("    TRACK-A METHOD = any_ascii per-word (LLM skipped)");
+                    println!("    TRACK-A RESULT = '{}'", track_a_transliteration);
+                } else {
+                    let p_a = crate::nl_convert::build_transliteration_prompt_for_words(&non_latin_words, "english");
+                    let raw_a = model
+                        .call_qwen3_5_transliteration(&p_a, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    println!("    TRACK-A RAW (non-latin→latin) = '{}'", raw_a.replace('\n', "\n"));
+                    let (_t_a, tr_a) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_a, &non_latin_words);
+                    track_a_transliteration = tr_a;
+                }
             }
-
             // Track B: 라틴 단어 → 문서 언어 스크립트 전사 (target: doc_lang)
             let mut track_b_transliteration = String::new();
             if !latin_words.is_empty() {
@@ -129,18 +141,93 @@ async fn generate_transliteration_aliases(
                 let (_t_b, tr_b) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_b, &latin_words);
                 track_b_transliteration = tr_b;
             }
-
-            // 트랙 결과를 원본 단어 순서로 병합
-            let merged_transliteration = crate::nl_convert::merge_track_results(
-                &src,
-                &non_latin_words, &track_a_transliteration,
-                &latin_words, &track_b_transliteration,
-            );
-
             println!("    TRACK-A TRANSLITERATION= '{}'", track_a_transliteration);
             println!("    TRACK-B TRANSLITERATION= '{}'", track_b_transliteration);
+            // 🌟 [TRACK-B LATIN RESIDUE RETRY]
+            //    Track B 는 라틴 → 문서 언어(비라틴) 음차입니다.
+            //    결과가 여전히 라틴 문자를 포함하면 음차 실패입니다.
+            //    (로그 실측: "RITMO" → " ritmo" → trim 후 "ritmo" = 라틴 잔존)
+            //    실패 단어만 추출하여 Qwen3.5 2B 로 1회 재음차합니다.
+            //    재음차도 라틴이면 원본 라틴 단어를 그대로 유지합니다.
+            if !track_b_transliteration.is_empty() && !latin_words.is_empty() {
+                let track_b_words: Vec<String> = track_b_transliteration
+                    .split_whitespace()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut failed_indices: Vec<usize> = Vec::new();
+                let mut failed_originals: Vec<String> = Vec::new();
+                for (i, w) in track_b_words.iter().enumerate() {
+                    if crate::nl_convert::is_latin_dominant(w) {
+                        // 비라틴이어야 할 단어가 라틴 → 음차 실패
+                        if i < latin_words.len() {
+                            failed_indices.push(i);
+                            failed_originals.push(latin_words[i].clone());
+                        }
+                    }
+                }
+                if !failed_originals.is_empty() {
+                    println!("    🔧 [TRACK-B LATIN RESIDUE] 음차 실패(라틴 잔존) 단어 {:?} 발견 → 재음차 수행", failed_originals);
+                    let p_retry = crate::nl_convert::build_transliteration_prompt_for_words(&failed_originals, doc_lang);
+                    let raw_retry = model
+                        .call_qwen3_5_transliteration(&p_retry, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    println!("    TRACK-B RETRY RAW = '{}'", raw_retry.replace('\n', "\n"));
+                    let (_t_retry, tr_retry) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_retry, &failed_originals);
+                    let retry_words: Vec<String> = tr_retry
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let mut track_b_parts: Vec<String> = track_b_words.clone();
+                    for (fi, &orig_idx) in failed_indices.iter().enumerate() {
+                        if let Some(new_w) = retry_words.get(fi) {
+                            if !new_w.is_empty() && !crate::nl_convert::is_latin_dominant(new_w) {
+                                println!("    🔧 [TRACK-B RETRY FIX] '{}' → '{}'", latin_words[orig_idx], new_w);
+                                track_b_parts[orig_idx] = new_w.clone();
+                            } else {
+                                println!("    ⚠️ [TRACK-B RETRY SKIP] '{}' 재음차 결과 '{}' 도 라틴이라 원본 유지", latin_words[orig_idx], new_w);
+                                track_b_parts[orig_idx] = latin_words[orig_idx].clone();
+                            }
+                        } else {
+                            println!("    ⚠️ [TRACK-B RETRY MISS] '{}' 재음차 결과 매핑 실패. 원본 유지", latin_words[orig_idx]);
+                            track_b_parts[orig_idx] = latin_words[orig_idx].clone();
+                        }
+                    }
+                    track_b_transliteration = track_b_parts.join(" ");
+                    println!("    TRACK-B TRANSLITERATION (after retry)= '{}'", track_b_transliteration);
+                }
+            }
+            // 🌟 [LANGUAGE-CONSISTENT MERGE] 원본 단어 순서 병합(혼용) 대신
+            //    언어별 통일 문자열을 생성합니다.
+            //    native(비라틴 통일) = 원본 비라틴 단어 + 라틴 단어의 문서 언어 음차
+            //    roman(라틴 통일)   = 비라틴 단어의 로마자 음차 + 원본 라틴 단어
+            //    Qwen3.5 가 일부 단어를 잘못 음차해도 언어 그룹 자체는 유지됩니다.
+            let mut korean_unified_parts: Vec<String> = Vec::new();
+            for w in &non_latin_words {
+                korean_unified_parts.push(w.clone());
+            }
+            if !track_b_transliteration.is_empty() {
+                korean_unified_parts.push(track_b_transliteration.clone());
+            }
+            let korean_unified = korean_unified_parts.join(" ");
 
-            merged_transliteration
+            let mut english_unified_parts: Vec<String> = Vec::new();
+            if !track_a_transliteration.is_empty() {
+                english_unified_parts.push(track_a_transliteration.clone());
+            }
+            for w in &latin_words {
+                english_unified_parts.push(w.clone());
+            }
+            let english_unified = english_unified_parts.join(" ");
+
+            println!("    [LANG-UNIFIED] native(ko) = '{}'", korean_unified);
+            println!("    [LANG-UNIFIED] roman(en) = '{}'", english_unified);
+
+            // 🌟 혼용 모드에서는 언어 통일 문자열 2개를 직접 반환합니다.
+            //    이후 PASS-2 를 건너뛰고 assign_transliterations 에 바로 전달합니다.
+            //    반환 형식: "native|||roman" 구분자로 임시 인코딩
+            format!("{}|||{}", korean_unified, english_unified)
         } else {
             // 단일 스크립트: 기존 로직 그대로
             let p1 = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
@@ -157,8 +244,10 @@ async fn generate_transliteration_aliases(
         //    PASS-1 결과에서 한글+라틴 혼용 단어(예: "시IELD")가 발견되면
         //    해당 단어만 재음차하여 순수 목표 스크립트로 교정합니다.
         //    (Qwen3.5 가 간헐적으로 일부 문자만 변환하고 나머지를 원문 그대로 남기는 문제 대응)
+        //    🌟 [MIXED MODE GUARD] 혼용 모드에서는 "|||" 구분자가 포함된 언어 통일 문자열이므로
+        //    mixed-script 감지 및 재음차 로직을 건너뜁니다.
         let mut s1 = s1_transliteration.clone();
-        {
+        if !s1_transliteration.contains("|||") {
             let mixed_words = crate::nl_convert::find_mixed_script_words(&s1);
             if !mixed_words.is_empty() {
                 println!("    🔧 [MIXED SCRIPT DETECTED] 혼용 단어 {:?} 발견 → 재음차 수행", mixed_words);
@@ -214,62 +303,96 @@ async fn generate_transliteration_aliases(
                         }
                     }
                 }
+            } else {
+                // 혼용 모드: "|||" 구분자 포함 문자열은 mixed-script 교정 대상 아님
+                println!("    [MIXED MODE] 언어 통일 문자열이므로 mixed-script 교정 생략");
             }
         }
-        println!("    PASS-1 TRANSLITERATION  = '{}'", s1_transliteration);
-        println!("    PASS-1 RESULT= '{}'", s1);
 
-        // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
-        //      🌟 [ANY_ASCII FAST PATH] 비라틴 → 라틴 방향이면 any_ascii 를 먼저 시도합니다.
-        //      any_ascii 가 성공하면 LLM 호출 없이 즉시 확정합니다.
-        let mut s2 = String::new();
-        if !s1.is_empty() {
-            // 1차 결과와 원문의 표기 체계가 달라야 2차 역음차가 성립합니다.
-            if crate::nl_convert::is_latin_dominant(&s1) != crate::nl_convert::is_latin_dominant(&src) {
-                // 🌟 [REVERSE TARGET] 2차는 1차 결과를 '원문의 표기 체계'로 되돌립니다.
-                //    원문이 라틴이면 → 1차 결과가 비라틴(문서 언어) → 2차 타겟은 "english"
-                //    원문이 비라틴이면 → 1차 결과가 라틴(로마자) → 2차 타겟은 doc_lang
-                let second_target = if crate::nl_convert::is_latin_dominant(&src) {
-                    "english"
-                } else {
-                    doc_lang
-                };
-
-                // 🌟 [ANY_ASCII GATE] 비라틴 → 라틴 방향이면 any_ascii 우선 시도
-                if crate::nl_convert::is_latin_dominant(&src) && !crate::nl_convert::is_latin_dominant(&s1) {
-                    if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&s1) {
-                        s2 = ascii_result;
+        // 🌟 [MIXED MODE FAST PATH] 혼용 모드에서는 언어 통일 문자열이 이미 생성되어 있으므로
+        //    PASS-2 를 건너뛰고 직접 pair 를 조립합니다.
+        let pair: (String, String) = if s1_transliteration.contains("|||") {
+            let mut parts = s1_transliteration.splitn(2, "|||");
+            let native_candidate = parts.next().unwrap_or("").trim().to_string();
+            let roman_candidate = parts.next().unwrap_or("").trim().to_string();
+            println!("    PASS-1 RESULT (mixed native) = '{}'", native_candidate);
+            println!("    PASS-1 RESULT (mixed roman)  = '{}'", roman_candidate);
+            println!("    PASS-2 SKIPPED (혼용 모드: 언어 통일 별칭이 이미 양방향으로 생성됨)");
+            // 🌟 [ANY_ASCII FAST PATH for roman] roman 후보가 비어있고 native 가 비라틴이면
+            //    any_ascii 로 로마자 변환을 시도합니다.
+            let mut final_roman = roman_candidate.clone();
+            if final_roman.is_empty() && !native_candidate.is_empty() && !crate::nl_convert::is_latin_dominant(&native_candidate) {
+                if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&native_candidate) {
+                    final_roman = ascii_result;
+                    println!("    PASS-2 METHOD = any_ascii (LLM skipped)");
+                    println!("    PASS-2 RESULT = '{}'", final_roman);
+                }
+            }
+            // 원문과 완전히 동일하면 폐기
+            let native_final = if !native_candidate.is_empty() && !native_candidate.eq_ignore_ascii_case(&src) {
+                native_candidate
+            } else {
+                String::new()
+            };
+            let roman_final = if !final_roman.is_empty() && !final_roman.eq_ignore_ascii_case(&src) {
+                final_roman
+            } else {
+                String::new()
+            };
+            (native_final, roman_final)
+        } else {
+            // ── 단일 스크립트 경로 (기존 로직 유지) ──
+            println!("    PASS-1 TRANSLITERATION  = '{}'", s1_transliteration);
+            println!("    PASS-1 RESULT= '{}'", s1);
+            // 2차: 1차 결과를 '원문 표기 체계'로 되돌립니다.
+            //      🌟 [ANY_ASCII FAST PATH] 비라틴 → 라틴 방향이면 any_ascii 를 먼저 시도합니다.
+            //      any_ascii 가 성공하면 LLM 호출 없이 즉시 확정합니다.
+            let mut s2 = String::new();
+            if !s1.is_empty() {
+                // 1차 결과와 원문의 표기 체계가 달라야 2차 역음차가 성립합니다.
+                if crate::nl_convert::is_latin_dominant(&s1) != crate::nl_convert::is_latin_dominant(&src) {
+                    // 🌟 [REVERSE TARGET] 2차는 1차 결과를 '원문의 표기 체계'로 되돌립니다.
+                    //    원문이 라틴이면 → 1차 결과가 비라틴(문서 언어) → 2차 타겟은 "english"
+                    //    원문이 비라틴이면 → 1차 결과가 라틴(로마자) → 2차 타겟은 doc_lang
+                    let second_target = if crate::nl_convert::is_latin_dominant(&src) {
+                        "english"
+                    } else {
+                        doc_lang
+                    };
+                    // 🌟 [ANY_ASCII GATE] 비라틴 → 라틴 방향이면 any_ascii 우선 시도
+                    if crate::nl_convert::is_latin_dominant(&src) && !crate::nl_convert::is_latin_dominant(&s1) {
+                        if let Some(ascii_result) = crate::nl_convert::try_any_ascii_transliteration(&s1) {
+                            s2 = ascii_result;
+                            println!("    PASS-2 SOURCE = '{}'", s1);
+                            println!("    PASS-2 METHOD = any_ascii (LLM skipped)");
+                            println!("    PASS-2 RESULT = '{}'", s2);
+                        }
+                    }
+                    // any_ascii 가 실패하거나 해당 방향이 아니면 LLM 폴백
+                    if s2.is_empty() {
+                        let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
+                        let raw2 = model
+                            .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
+                            .await
+                            .unwrap_or_default();
+                        let (s2_t, s2_tr) = crate::nl_convert::sanitize_transliteration_dual(&raw2, &s1);
+                        s2 = if !s2_t.is_empty() { s2_t } else { s2_tr };
                         println!("    PASS-2 SOURCE = '{}'", s1);
-                        println!("    PASS-2 METHOD = any_ascii (LLM skipped)");
+                        println!("    PASS-2 TARGET = '{}'", second_target);
+                        println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\n"));
                         println!("    PASS-2 RESULT = '{}'", s2);
                     }
-                }
-
-                // any_ascii 가 실패하거나 해당 방향이 아니면 LLM 폴백
-                if s2.is_empty() {
-                    let p2 = crate::nl_convert::build_transliteration_prompt(&s1, second_target);
-                    let raw2 = model
-                        .call_qwen3_5_transliteration(&p2, Some(cancel.clone()))
-                        .await
-                        .unwrap_or_default();
-                    let (s2_t, s2_tr) = crate::nl_convert::sanitize_transliteration_dual(&raw2, &s1);
-                    s2 = if !s2_t.is_empty() { s2_t } else { s2_tr };
-                    println!("    PASS-2 SOURCE = '{}'", s1);
-                    println!("    PASS-2 TARGET = '{}'", second_target);
-                    println!("    PASS-2 RAW    = '{}'", raw2.replace('\n', "\\n"));
-                    println!("    PASS-2 RESULT = '{}'", s2);
+                } else {
+                    println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있거나 표기 체계 미반전)");
                 }
             } else {
-                println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있거나 표기 체계 미반전)");
+                println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
             }
-        } else {
-            println!("    PASS-2 SKIPPED (PASS-1 결과가 비어있음)");
-        }
-
-        let pair = crate::nl_convert::assign_transliterations(&src, &s1, &s2);
+            crate::nl_convert::assign_transliterations(&src, &s1, &s2)
+        };
 
         let final_pair = pair;
-
+        
         if final_pair.0.is_empty() && final_pair.1.is_empty() {
             emit(&format!(
                 "      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')",
@@ -281,6 +404,13 @@ async fn generate_transliteration_aliases(
                 "      🔤 [SYNONYM EXPANSION] '{}' → native='{}' | roman='{}' (property='{}')",
                 src, final_pair.0, final_pair.1, cm.property
             ));
+            // 🌟 [LANG-CONSISTENCY LOG] 혼용 소스에서 언어 통일 별칭이 생성된 경우 추가 로그
+            if is_mixed && (!final_pair.0.is_empty() || !final_pair.1.is_empty()) {
+                emit(&format!(
+                    "      🔤 [LANG-UNIFIED] 원본 혼용 → ko='{}' / en='{}' 로 언어별 분리 저장",
+                    final_pair.0, final_pair.1
+                ));
+            }
         }
         cache.insert(src.clone(), final_pair.clone());
         out[i] = final_pair;

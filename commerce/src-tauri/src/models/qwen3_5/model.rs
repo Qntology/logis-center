@@ -2347,6 +2347,16 @@ impl Qwen3_5Model {
         Ok(())
     }
 
+    /// 🌟 [VISION-STREAM] 비전 27블록을 mmap에서 하나씩 읽고 즉시 폐기하는 스트리밍을 켭니다.
+    ///   상주 가중치 337MB → 약 12MB 로 감소. 이미지당 PCIe 전송 27회 추가(~135ms).
+    ///   OCR은 이미지 1장당 1회이므로 체감 영향 미미합니다.
+    ///   mmproj source 미등록 시 내부에서 안전하게 무시됩니다.
+    pub fn set_block_streaming(&mut self, enabled: bool) {
+        if let Some(v) = self.visual.as_mut() {
+            v.set_block_streaming(enabled);
+        }
+    }
+
     pub fn compute_and_set_rope_deltas(
         &mut self,
         full_input_ids: &Tensor,

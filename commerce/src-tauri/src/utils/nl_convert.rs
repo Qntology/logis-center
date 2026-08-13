@@ -1007,6 +1007,34 @@ pub fn try_any_ascii_transliteration(value: &str) -> Option<String> {
     Some(result)
 }
 
+/// [SYNONYM EXPANSION] 단어 목록에 대해 any_ascii 를 개별 시도합니다.
+/// 모든 단어가 any_ascii 로 변환 가능하면 Some(전체 결과),
+/// 하나라도 실패하면 None 을 반환하여 LLM 폴백을 유도합니다.
+pub fn try_any_ascii_transliteration_words(words: &[String]) -> Option<String> {
+    if words.is_empty() { return None; }
+    let mut results: Vec<String> = Vec::with_capacity(words.len());
+    for w in words {
+        let src = w.trim();
+        if src.is_empty() { continue; }
+        if is_latin_dominant(src) {
+            // 이미 라틴이면 그대로 유지
+            results.push(src.to_string());
+            continue;
+        }
+        let converted = any_ascii::any_ascii(src);
+        let converted = converted.trim().to_string();
+        if converted.is_empty() || converted.eq_ignore_ascii_case(src) {
+            return None; // 변환 실패 → LLM 폴백
+        }
+        if !is_latin_dominant(&converted) {
+            return None; // 표기 체계 반전 실패 → LLM 폴백
+        }
+        results.push(converted);
+    }
+    if results.is_empty() { return None; }
+    Some(results.join(" "))
+}
+
 /// [SYNONYM EXPANSION] 값의 주 표기 체계가 라틴(ASCII 알파벳)인지 판정합니다.
 /// 문자 클래스 카운트만 사용하므로 언어 사전이 전혀 필요 없습니다.
 pub fn is_latin_dominant(value: &str) -> bool {
