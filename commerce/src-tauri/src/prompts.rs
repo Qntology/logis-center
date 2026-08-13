@@ -992,7 +992,7 @@ pub fn transliteration_prompt(source_value: &str, target_language: &str) -> Stri
     // 🌟 [FULL SOURCE FIRST] 최초 첫 번째 키로 특수문자 제거된 전체 SOURCE 를 배치하여
     //    LLM 이 전체 문맥을 먼저 파악한 뒤 단어별 음차를 수행하도록 합니다.
     let mut word_keys: Vec<String> = Vec::with_capacity(words.len() + 1);
-    word_keys.push(format!("\"{}\": String", cleaned));
+    // word_keys.push(format!("\"{}\": String", cleaned));
     for w in &words {
         word_keys.push(format!("\"{}\": String", w));
     }
@@ -1008,7 +1008,7 @@ write how that word sounds in the [TARGET LANGUAGE] writing system.
 - Digits inside a word must be copied exactly as they appear.
 
 [OUTPUT FORMAT]
-{ "language": "{TARGET_LANGUAGE}", "transliteration": {TRANSLITERATION_OBJ} }
+{ "language": "{TARGET_LANGUAGE}", "transcription": { "{SOURCE}" : String }, "transliteration": {TRANSLITERATION_OBJ} }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
     template.replace("{SOURCE}", &cleaned)
