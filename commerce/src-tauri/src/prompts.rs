@@ -1014,6 +1014,7 @@ The number of keys in each output object MUST equal the number of words in [SOUR
 {
     "language": "{TARGET_LANGUAGE}",
     "transliteration": {TRANSLITERATION_OBJ},
+    "source":"{SOURCE}",
     "transcription": {TRANSCRIPTION_OBJ}
 }
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;

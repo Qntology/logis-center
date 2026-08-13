@@ -1140,20 +1140,39 @@ impl VectorStore {
     ///   - filter:     SQL 필터 (예: "item_type = 'goods' AND mode = 'commerce'")
     ///
     /// # 반환
-    ///   Vec<(chunk_id, item_id, chunk_text, property, score)>
-    ///   score 는 코사인 유사도 (높을수록 유사)
+    ///   Vec<(chunk_id, item_id, chunk_text, property, group_score, best_cos)>
+    ///     - group_score : 그 item 이 확보한 청크 점수의 합산 (증거의 '양')
+    ///     - best_cos    : 그 item 의 최고 코사인 (0.0~1.0, 증거의 '질')
+    ///
+    /// 🌟 [반환값 분리 이유] 기존에는 합산 점수 하나만 돌려주었고, lib.rs 가 그것을
+    ///    코사인이라 가정하여 트랙 가중치(Column 3.0 / FTS 2.0 / CrossLingual 1.5)를 곱했습니다.
+    ///    (log 실측: score 3.0146 × 2.0 + × 1.5 = 10.5510)
+    ///    코사인 상한 1.0 을 전제로 설계된 가중치 체계가 무너져,
+    ///    '청크가 많이 살아남은 item' 이 '질의와 실제로 가까운 item' 을 압도했습니다.
+    ///    (Beige Wool Coat 가 '니트 가디건' 질의에서 RANK 2, Cable Knit Sweater 는 RANK 7)
+    ///    이제 두 값을 분리해 돌려주고, 가중치는 best_cos 에만 곱하도록 합니다.
     pub async fn search_chunks(
         &self,
         query_vec: &[f32],
         limit: usize,
         filter: Option<&str>,
-    ) -> Result<Vec<(String, String, String, String, f32)>> {
+    ) -> Result<Vec<(String, String, String, String, f32, f32)>> {
         let table = self.conn.open_table("item_chunks").execute().await?;
 
         // 벡터가 전부 0 이면 검색 불가
         if query_vec.iter().all(|&v| v == 0.0) {
             return Ok(Vec::new());
         }
+
+        // 🌟 [PROPERTY-PINNED DETECTION] 호출부가 `property = '...'` 로 property 를
+        //    이미 하나로 고정한 타겟 검색인지 판정합니다.
+        //    이 SQL 문자열은 전부 우리 코드(lib.rs STAGE-4C / 4D)가 생성하므로
+        //    '의미 판정' 이 아니라 '우리가 만든 술어의 존재 여부' 라는 구조적 사실입니다.
+        //    고정 검색에서 property 다양성 캡을 적용하면 정확히 정반대로 작동합니다.
+        //    (log 실측: property='title' 고정 검색인데 "title(16행)" 억제 → 별칭 전멸)
+        let property_pinned = filter
+            .map(|f| f.contains("property = '"))
+            .unwrap_or(false);
 
         let mut q = table.query();
         if let Some(f) = filter {
@@ -1176,7 +1195,9 @@ impl VectorStore {
 
         // 🌟 [OVERFETCH 확대] property 다양성 캡을 적용하려면 후보 창이 충분히 커야 합니다.
         //    저변별 청크가 상한에 걸려 버려지는 만큼을 미리 확보합니다.
-        let overfetch = limit * 6;
+        //    🌟 property 고정 검색은 캡이 없으므로 오버페치를 더 크게 잡아
+        //    원본 청크와 음차 별칭(_tn/_tr)이 함께 창에 들어오도록 보장합니다.
+        let overfetch = if property_pinned { limit * 12 } else { limit * 6 };
         let results = q
             .limit(overfetch)
             .nearest_to(normalized_query)?
@@ -1230,21 +1251,40 @@ impl VectorStore {
 
         // 🌟 [PROPERTY DIVERSIFICATION] 저변별 청크가 후보 윈도우를 독점하는 것을 차단합니다.
         //    status 청크는 "It is currently in 'complete' status" 로 전 아이템에서
-        //    바이트 단위로 동일하여 변별력이 0인데도, 오버페치 창(limit*3)을 전부 채워
+        //    바이트 단위로 동일하여 변별력이 0인데도, 오버페치 창을 전부 채워
         //    정작 값이 담긴 title 청크가 후보에 진입조차 못 했습니다.
-        //    (new_log2.txt 실측: 상위 10건 중 9건이 property='status')
-        //    (new_log1.txt 실측: 상위 10건 중 8건이 property='sale_price')
-        //    한 property 가 차지할 수 있는 행 수를 상한으로 묶어 MMR 형태의 다양성을 확보합니다.
-        //    상한값은 '반환 개수의 절반' 이라는 구조적 비율이며 매직 상수가 아닙니다.
-        {
+        //
+        //    🌟 [PINNED BYPASS] 단, 호출부가 property 를 이미 하나로 고정했다면
+        //    이 캡은 존재 이유가 사라지고 오히려 정답 청크를 학살합니다.
+        //    (log 실측: property='title' 고정 검색에서 "title(16행)" 억제)
+        //    별칭(_tn/_tr)은 원본과 같은 property 를 쓰므로 캡의 1순위 희생양이었습니다.
+        //
+        //    🌟 [ALIAS GROUP SPLIT] 캡을 적용하는 전역 검색에서도, 음차 별칭은
+        //    원본 청크와 '다른 표기 체계' 를 담은 별개 증거이므로 같은 슬롯을 두고
+        //    경쟁시키면 안 됩니다. chunk_id 접미어(_tn/_tr)라는 구조적 사실만으로
+        //    별도 그룹키를 부여하여 원본과 별칭이 나란히 생존하도록 합니다.
+        if property_pinned {
+            println!(
+                "  🎯 [PROPERTY PINNED] property 고정 검색 감지. 다양성 캡을 적용하지 않습니다. (후보 {}행 전량 보존)",
+                chunks.len()
+            );
+        } else {
             let per_property_cap = std::cmp::max(2usize, limit / 2);
+            let group_key = |chunk_id: &str, property: &str| -> String {
+                if chunk_id.ends_with("_tn") || chunk_id.ends_with("_tr") {
+                    format!("{}#alias", property)
+                } else {
+                    property.to_string()
+                }
+            };
             let mut prop_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut kept: Vec<(String, String, String, String, f32)> = Vec::with_capacity(chunks.len());
             let mut suppressed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             for c in chunks.into_iter() {
-                let n = prop_count.entry(c.3.clone()).or_insert(0);
+                let k = group_key(&c.0, &c.3);
+                let n = prop_count.entry(k.clone()).or_insert(0);
                 if *n >= per_property_cap {
-                    *suppressed.entry(c.3.clone()).or_insert(0) += 1;
+                    *suppressed.entry(k).or_insert(0) += 1;
                     continue;
                 }
                 *n += 1;
@@ -1257,11 +1297,28 @@ impl VectorStore {
                     .collect();
                 brief.sort();
                 println!(
-                    "  🎛️ [PROPERTY DIVERSIFICATION] property 당 상한 {}행 적용. 초과 억제: {:?}",
+                    "  🎛️ [PROPERTY DIVERSIFICATION] property 당 상한 {}행 적용 (별칭은 별도 그룹). 초과 억제: {:?}",
                     per_property_cap, brief
                 );
             }
             chunks = kept;
+        }
+
+        // 🌟 [ALIAS HIT LOG] 어떤 별칭 청크가 실제로 창에 들어왔는지 남깁니다.
+        //    지금까지 정방향 로그에 별칭이 한 줄도 찍히지 않아
+        //    "저장이 안 된 것인지 검색이 안 된 것인지" 구분이 불가능했습니다.
+        {
+            let mut alias_hits: Vec<String> = Vec::new();
+            for (cid, _iid, ctext, prop, s) in chunks.iter() {
+                if cid.ends_with("_tn") || cid.ends_with("_tr") {
+                    if alias_hits.len() < 8 {
+                        alias_hits.push(format!("{}[{}] '{}' ({:.4})", prop, if cid.ends_with("_tn") { "native" } else { "roman" }, ctext, s));
+                    }
+                }
+            }
+            if !alias_hits.is_empty() {
+                println!("  🔤 [ALIAS CHUNK HIT] 음차 별칭 청크가 후보 창에 진입했습니다: {:?}", alias_hits);
+            }
         }
 
         // item_id 기준 그룹핑: 동일 item 의 여러 청크 점수를 합산하여
@@ -1281,16 +1338,27 @@ impl VectorStore {
             }
         }
 
-        // 합산 점수 기준 내림차순 정렬 후 상위 limit 개 반환
-        let mut final_results: Vec<(String, String, String, String, f32)> = Vec::new();
-        let mut sorted_items: Vec<(String, f32)> = item_scores.into_iter().collect();
-        sorted_items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 🌟 [RANKING BASIS] 대표 정렬 기준을 '최고 코사인' 으로 바꿉니다.
+        //    합산(total)은 '증거의 양' 이지 '질의와의 가까움' 이 아닙니다.
+        //    합산으로 정렬하면 무관한 값이라도 청크 수가 많은 item 이 이깁니다.
+        //    합산은 동률을 깨는 보조 기준으로만 사용합니다.
+        let mut final_results: Vec<(String, String, String, String, f32, f32)> = Vec::new();
+        let mut sorted_items: Vec<(String, f32, f32)> = item_scores
+            .into_iter()
+            .map(|(id, total)| {
+                let best = item_best_chunk.get(&id).map(|b| b.3).unwrap_or(0.0);
+                (id, total, best)
+            })
+            .collect();
+        sorted_items.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
 
-        for (item_id, total_score) in sorted_items.into_iter().take(limit) {
+        for (item_id, total_score, _best) in sorted_items.into_iter().take(limit) {
             if let Some((chunk_id, chunk_text, property, best_score)) = item_best_chunk.remove(&item_id) {
-                // total_score 를 대표 점수로 사용하되, best_score 가 더 높으면 best_score 사용
-                let representative_score = total_score.max(best_score);
-                final_results.push((chunk_id, item_id, chunk_text, property, representative_score));
+                final_results.push((chunk_id, item_id, chunk_text, property, total_score, best_score));
             }
         }
 

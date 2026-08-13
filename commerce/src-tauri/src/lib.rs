@@ -1031,15 +1031,20 @@ async fn ai_search_complex(
                     //      전체 코사인 검색은 긴 질의 문장과 짧은 저장 청크 사이의 구조적 격차 때문에
                     //      정답 속성 청크가 상위 10개 밖으로 밀려날 수 있습니다.
                     //      확정된 속성마다 property 를 고정한 별도 쿼리를 던져 리콜을 보증합니다.
+                    //
+                    //      🌟 [ALIAS RECALL] 이 경로는 음차 별칭(_tn/_tr)이 살아 돌아오는 유일한 통로입니다.
+                    //      별칭은 원본과 동일한 property 를 갖도록 저장되므로(STAGE-4B/4C 호환 목적),
+                    //      limit 이 작으면 원본 청크만으로 창이 가득 차 별칭이 전멸합니다.
+                    //      10개 상품 × (원본 + native + roman) = 30 행이 존재할 수 있으므로 창을 넓힙니다.
                     for target_prop in condition_props.iter() {
                         if target_prop.trim().is_empty() { continue; }
                         let escaped_prop = target_prop.replace('\'', "''");
                         let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
-                        let targeted = store.search_chunks(&emb, 5, Some(&prop_filter)).await.unwrap_or_default();
+                        let targeted = store.search_chunks(&emb, 12, Some(&prop_filter)).await.unwrap_or_default();
                         if targeted.is_empty() { continue; }
                         println!("[AI-SEARCH]   🎯 [STAGE-4C] property='{}' 타겟 청크 검색: {}건 추가 확보", target_prop, targeted.len());
                         for t in targeted {
-                            if chunk_results.iter().any(|(cid, _, _, _, _)| cid == &t.0) { continue; }
+                            if chunk_results.iter().any(|(cid, _, _, _, _, _)| cid == &t.0) { continue; }
                             chunk_results.push(t);
                         }
                     }
@@ -1052,6 +1057,12 @@ async fn ai_search_complex(
                     //      스키마에서 '자유 서술 값을 담는 형식(Text)' 필드만 골라 타겟 검색을 겁니다.
                     //      필드 선정은 detect_field_format 의 결정론 판정만 사용하므로
                     //      다국어 어휘도, 필드명 하드코딩도 없습니다.
+                    //
+                    //      🌟 [ALIAS RECALL] 여기도 limit 3 은 치명적이었습니다.
+                    //      store.rs 의 per_property_cap = max(2, 3/2) = 2 가 걸려
+                    //      "title(16행)" 이 통째로 억제되었고(log 실측), 음차 별칭이 100% 소멸했습니다.
+                    //      store.rs 가 property 고정 검색에서 캡을 해제했으므로,
+                    //      여기서는 창 크기만 별칭 포함 규모로 넓혀 주면 됩니다.
                     if condition_props.is_empty() {
                         use crate::utils::ai_utils::FieldFormat;
                         let schema_fields = crate::parsing::get_detail_schema_fields(ctx_type, "", "en");
@@ -1062,11 +1073,11 @@ async fn ai_search_complex(
                             }
                             let escaped_prop = fname.replace('\'', "''");
                             let prop_filter = format!("{} AND property = '{}'", chunk_type_filter, escaped_prop);
-                            let targeted = store.search_chunks(&emb, 3, Some(&prop_filter)).await.unwrap_or_default();
+                            let targeted = store.search_chunks(&emb, 12, Some(&prop_filter)).await.unwrap_or_default();
                             if targeted.is_empty() { continue; }
                             probed += targeted.len();
                             for t in targeted {
-                                if chunk_results.iter().any(|(cid, _, _, _, _)| cid == &t.0) { continue; }
+                                if chunk_results.iter().any(|(cid, _, _, _, _, _)| cid == &t.0) { continue; }
                                 chunk_results.push(t);
                             }
                         }
@@ -1082,11 +1093,21 @@ async fn ai_search_complex(
                         println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
                     }
 
-                    for (chunk_id, item_id, chunk_text, property, raw_cosine) in chunk_results {
+                    for (chunk_id, item_id, chunk_text, property, group_score, best_cos) in chunk_results {
+                        // 🌟 [SCALE FIX] 트랙 가중치는 반드시 '코사인(0~1)' 에만 곱합니다.
+                        //    기존에는 search_chunks 가 돌려준 '그룹 합산 점수' 를 코사인이라 가정하고 곱해
+                        //    (log 실측: score 3.0146 → 최종 10.5510) 상한 1.0 전제가 무너졌고,
+                        //    질의와 무관해도 청크가 많이 살아남은 item 이 상위를 독점했습니다.
+                        //    합산(group_score)은 '증거의 양' 이므로 별도의 완만한 보너스로만 반영합니다.
+                        let raw_cosine = best_cos.clamp(0.0f32, 1.0f32);
+
+                        // 🌟 [ALIAS FLAG] 이 매칭이 음차 별칭 청크에서 나왔는지 판정합니다.
+                        //    scheduler 의 upsert_alias_chunks 가 chunk_id 에 _tn / _tr 접미어를 붙이므로
+                        //    의미 판정이 아니라 '우리가 만든 접미어' 라는 구조적 사실입니다.
+                        let is_alias = chunk_id.ends_with("_tn") || chunk_id.ends_with("_tr");
+
                         // 4-D: 3-Track 스케일 정합
                         //      store.rs 의 하이브리드 검색은 Column=3.0 / FTS=2.0 / Vector=1.0 가산 스케일입니다.
-                        //      기존 청크 점수는 코사인(0~1) 그대로라 최종 랭킹에서 영향력이 사실상 0 이었습니다.
-                        //      (로그: FTS 0.9995 vs 청크 0.2694)
                         //      청크 매칭은 '본문 매칭' 이므로 FTS 트랙(2.0)과 동일 스케일로 환산하고,
                         //      PLINKO 가 확정한 속성과 일치하면 Column 트랙(3.0)을 추가로 얹습니다.
                         let mut score = raw_cosine * 2.0;
@@ -1099,21 +1120,13 @@ async fn ai_search_complex(
                         // 🌟 [STAGE-4X CROSS-LINGUAL VALUE BONUS]
                         //    "니트 가디건" ↔ "Cable Knit Cardigan" 처럼 값이 서로 다른 문자 체계일 때
                         //    FTS(ngram 문자열 포함)는 물리적으로 0건입니다.
-                        //    (log2.txt: use_fts=true 인데 FTS 가산점 +2.0 이 한 건도 붙지 않음)
                         //    이 경우 크로스링구얼 매칭이 가능한 트랙은 값 청크 코사인뿐이므로,
                         //    '값이 의미를 나르는 속성'에 FTS 결손분을 보전합니다.
-                        //    형식 판정은 detect_field_format 이 이미 결정론으로 수행하므로
-                        //    다국어 어휘 하드코딩이 필요 없습니다.
                         {
                             use crate::utils::ai_utils::FieldFormat;
                             // 🌟 [ENUM EXCLUDE] Enum 값은 'complete' / 'show' / 'hide' 같은
                             //    저카디널리티 캐노니컬 키이며, 전 아이템에서 동일 문자열입니다.
-                            //    크로스링구얼 값 매칭의 대상이 아닌데도 1.5배 보너스를 받아
-                            //    랭킹을 독주했습니다.
-                            //    (new_log2.txt: property='status' 에 +3.5915 가 붙어 상위 10건 중 9건 점유)
                             //    자유 서술 값을 담는 Text / Address 만 크로스링구얼 보전 대상입니다.
-                            //    형식 판정은 detect_field_format 이 필드명만으로 결정론 수행하므로
-                            //    다국어 어휘 하드코딩이 전혀 필요 없습니다.
                             let value_bearing = matches!(
                                 crate::utils::ai_utils::detect_field_format(&property),
                                 FieldFormat::Text | FieldFormat::Address
@@ -1122,10 +1135,33 @@ async fn ai_search_complex(
                                 let cross_lingual_track = raw_cosine * 1.5;
                                 score += cross_lingual_track;
                                 println!(
-                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (score {:.4}) → 최종 {:.4}",
+                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
                                     property, cross_lingual_track, raw_cosine, score
                                 );
                             }
+                        }
+
+                        // 🌟 [STAGE-4Y ALIAS TRACK] 음차 별칭이 매칭됐다는 것은
+                        //    '문자 체계가 달라 FTS 가 물리적으로 0건인 상황에서, 발음 축으로 값이 일치했다'
+                        //    는 뜻입니다. 이것이 바로 별칭을 저장한 목적이므로 전용 트랙을 부여합니다.
+                        //    (원본 청크가 이미 확보한 점수를 대체하지 않고 가산만 하므로
+                        //     별칭이 없는 item 이 손해를 보지 않습니다)
+                        if is_alias {
+                            let alias_track = raw_cosine * 1.5;
+                            score += alias_track;
+                            println!(
+                                "[AI-SEARCH]   🔤 [STAGE-4Y] 음차 별칭 매칭 ({}) property='{}' | chunk='{}' → 별칭 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
+                                if chunk_id.ends_with("_tn") { "native" } else { "roman" },
+                                property, chunk_text, alias_track, raw_cosine, score
+                            );
+                        }
+
+                        // 🌟 [EVIDENCE VOLUME] 합산 점수는 '몇 개의 청크가 함께 반응했는가' 라는
+                        //    보조 신호입니다. 로그 스케일로 완만하게만 반영하여
+                        //    청크 수가 많은 item 이 코사인 우위를 뒤집지 못하게 합니다.
+                        if group_score > raw_cosine {
+                            let volume_bonus = ((group_score - raw_cosine).max(0.0) + 1.0).ln() * 0.25;
+                            score += volume_bonus;
                         }
 
                         // 4-C: item_id 기준 기존 결과와 dedup
@@ -1143,6 +1179,7 @@ async fn ai_search_complex(
                                 existing_item.as_object_mut().unwrap().insert("chunk_match".to_string(), json!(true));
                                 existing_item.as_object_mut().unwrap().insert("matched_property".to_string(), json!(property));
                                 existing_item.as_object_mut().unwrap().insert("matched_chunk".to_string(), json!(chunk_text));
+                                existing_item.as_object_mut().unwrap().insert("alias_match".to_string(), json!(is_alias));
                             }
                         } else {
                             // 신규 결과 삽입
@@ -1160,7 +1197,8 @@ async fn ai_search_complex(
                                     "relation": "chunk_match",
                                     "chunk_id": chunk_id,
                                     "matched_property": property,
-                                    "chunk_match": true
+                                    "chunk_match": true,
+                                    "alias_match": is_alias
                                 }));
                             }
                         }
@@ -1330,11 +1368,17 @@ async fn ai_search_complex(
                 let score = item.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let prop = item.get("matched_property").and_then(|v| v.as_str()).unwrap_or("-");
                 let is_chunk = item.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false);
+                let is_alias = item.get("alias_match").and_then(|v| v.as_bool()).unwrap_or(false);
                 let ctx = item.get("context_type").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={}",
+                let matched_text = item.get("matched_chunk")
+                    .or_else(|| item.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let brief: String = matched_text.chars().take(48).collect();
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'",
                     rank + 1, id, score, ctx,
-                    if is_chunk { "chunk" } else { "doc" },
-                    prop);
+                    if is_chunk { if is_alias { "alias" } else { "chunk" } } else { "doc" },
+                    prop, brief);
             }
 
             all_results = ranked_results;

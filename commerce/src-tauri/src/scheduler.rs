@@ -95,16 +95,73 @@ async fn generate_transliteration_aliases(
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
         println!("    SOURCE = '{}'", src);
 
-        let p1 = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
-        let raw1 = model
-            .call_qwen3_5_transliteration(&p1, Some(cancel.clone()))
-            .await
-            .unwrap_or_default();
+        // 🌟 [LANGUAGE TRACK SPLIT] 표기 체계별로 단어를 분리하여 트랙별 처리합니다.
+        // 비라틴 단어(한글 등) → target "english" (로마자 전사)
+        // 라틴 단어(영어 등)   → target doc_lang (문서 언어 스크립트 전사)
+        let (non_latin_words, latin_words) = crate::nl_convert::split_words_by_script(&src);
+        let is_mixed = !non_latin_words.is_empty() && !latin_words.is_empty();
 
-        // JSON 응답에서 단어별 "transcription" 과 "transliteration" 을 모두 추출합니다.
-        // sanitize_transliteration_dual 내부에서 parse_json_from_llm 으로 파싱하고,
-        // 단어별 객체를 원문 단어 순서로 조립한 뒤 G1/G2/G3 게이트를 적용합니다.
-        let (s1_transcription, s1_transliteration) = crate::nl_convert::sanitize_transliteration_dual(&raw1, &src);
+        let (s1_transcription, s1_transliteration) = if is_mixed {
+            println!("    [TRACK SPLIT] 비라틴: {:?} | 라틴: {:?}", non_latin_words, latin_words);
+
+            // Track A: 비라틴 단어 → 로마자 전사 (target: english)
+            let mut track_a_transcription = String::new();
+            let mut track_a_transliteration = String::new();
+            if !non_latin_words.is_empty() {
+                let p_a = crate::nl_convert::build_transliteration_prompt_for_words(&non_latin_words, "english");
+                let raw_a = model
+                    .call_qwen3_5_transliteration(&p_a, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
+                println!("    TRACK-A RAW (non-latin→latin) = '{}'", raw_a.replace('\n', "\n"));
+                let (t_a, tr_a) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_a, &non_latin_words);
+                track_a_transcription = t_a;
+                track_a_transliteration = tr_a;
+            }
+
+            // Track B: 라틴 단어 → 문서 언어 스크립트 전사 (target: doc_lang)
+            let mut track_b_transcription = String::new();
+            let mut track_b_transliteration = String::new();
+            if !latin_words.is_empty() {
+                let p_b = crate::nl_convert::build_transliteration_prompt_for_words(&latin_words, doc_lang);
+                let raw_b = model
+                    .call_qwen3_5_transliteration(&p_b, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
+                println!("    TRACK-B RAW (latin→{}) = '{}'", doc_lang, raw_b.replace('\n', "\n"));
+                let (t_b, tr_b) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_b, &latin_words);
+                track_b_transcription = t_b;
+                track_b_transliteration = tr_b;
+            }
+
+            // 트랙 결과를 원본 단어 순서로 병합
+            let merged_transcription = crate::nl_convert::merge_track_results(
+                &src,
+                &non_latin_words, &track_a_transcription,
+                &latin_words, &track_b_transcription,
+            );
+            let merged_transliteration = crate::nl_convert::merge_track_results(
+                &src,
+                &non_latin_words, &track_a_transliteration,
+                &latin_words, &track_b_transliteration,
+            );
+
+            println!("    TRACK-A TRANSCRIPTION  = '{}'", track_a_transcription);
+            println!("    TRACK-A TRANSLITERATION= '{}'", track_a_transliteration);
+            println!("    TRACK-B TRANSCRIPTION  = '{}'", track_b_transcription);
+            println!("    TRACK-B TRANSLITERATION= '{}'", track_b_transliteration);
+
+            (merged_transcription, merged_transliteration)
+        } else {
+            // 단일 스크립트: 기존 로직 그대로
+            let p1 = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
+            let raw1 = model
+                .call_qwen3_5_transliteration(&p1, Some(cancel.clone()))
+                .await
+                .unwrap_or_default();
+            println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\n"));
+            crate::nl_convert::sanitize_transliteration_dual(&raw1, &src)
+        };
 
         // transcription 과 transliteration 중 유효한 것을 s1 으로 선택합니다.
         // 둘 다 유효하고 다르면 transcription 을 우선으로 사용합니다.
@@ -114,7 +171,6 @@ async fn generate_transliteration_aliases(
             s1_transliteration.clone()
         };
 
-        println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\\n"));
         println!("    PASS-1 TRANSCRIPTION    = '{}'", s1_transcription);
         println!("    PASS-1 TRANSLITERATION  = '{}'", s1_transliteration);
         println!("    PASS-1 RESULT= '{}'", s1);
@@ -257,14 +313,30 @@ async fn upsert_alias_chunks(
 
     let variants: [(&str, &String); 2] = [("tn", &aliases.0), ("tr", &aliases.1)];
 
+    // 🌟 [ORIGIN VALUE FALLBACK] 음차 품질은 LLM 편차가 큽니다.
+    //    (log 실측: 'Cable' → '불랙드' 처럼 명백한 오음차가 섞임)
+    //    별칭 벡터가 통째로 빗나가면 그 행은 영구적으로 죽은 벡터가 되어
+    //    저장 비용만 쓰고 검색에는 한 번도 기여하지 못합니다.
+    //    원본 값을 낮은 비중으로 섞어, 음차가 빗나가도 최소한 원본 표기 축으로는
+    //    반응하도록 만들어 별칭 행이 리콜 보험 역할을 하게 합니다.
+    let origin_value = chunk_meta.value_part.trim().to_string();
+
     for (suffix, alias) in variants.iter() {
         let a = alias.trim();
         if a.is_empty() { continue; }
 
-        let localized = if leaf.trim().is_empty() {
-            a.to_string()
-        } else {
-            format!("{} {}", leaf.trim(), a)
+        // 🌟 [VALUE-DOMINANT LOCALIZED] "{짧은 문서언어 라벨} {별칭} {원본값}"
+        //    leaf 는 indexing_leaf_label() 이 뽑은 단일 라벨(예: '상품명')이므로
+        //    값이 희석되지 않습니다. 원본값을 뒤에 붙여 두 표기 체계를 한 벡터에 담습니다.
+        let localized = {
+            let mut s = String::new();
+            if !leaf.trim().is_empty() { s.push_str(leaf.trim()); s.push(' '); }
+            s.push_str(a);
+            if !origin_value.is_empty() && !a.eq_ignore_ascii_case(&origin_value) {
+                s.push(' ');
+                s.push_str(&origin_value);
+            }
+            s
         };
 
         let embs = model
@@ -305,6 +377,14 @@ async fn upsert_alias_chunks(
             Some(search_mode),
         ).await;
         saved += 1;
+
+        // 🌟 [ALIAS INDEX LOG] 정방향 로그의 [ALIAS CHUNK HIT] 와 chunk_id 로 대조하기 위해
+        //    어떤 id 로 무엇이 저장됐는지 남깁니다.
+        //    지금까지는 "저장은 됐는데 검색에 안 잡힌다" 를 로그만으로 증명할 수 없었습니다.
+        println!(
+            "      💾 [ALIAS INDEXED] chunk_id='{}' | property='{}' | alias='{}' | localized='{}'",
+            alias_chunk_id, chunk_meta.property, a, localized
+        );
     }
 
     saved

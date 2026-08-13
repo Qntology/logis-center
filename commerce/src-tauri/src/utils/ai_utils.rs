@@ -482,42 +482,47 @@ pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
 // 🌟 [INDEXING ANCHOR] 저장(역방향) 시점에 청크 벡터 위에 얹을 '다국어 라벨 앵커'입니다.
 //    json_to_natural_language() 는 무조건 영어 문장을 만들지만 질의는 문서 언어이므로,
 //    저장 벡터에 문서 언어 라벨을 반드시 섞어야 코사인이 성립합니다.
-//    구성: ① semantic 앵커(문서 언어) ② label_phrase_bank(문서 언어 bias 비수치 구)
-//          ③ abstract_bridge(추상 수식어 — heavy/expensive/fast ...)
-//          ④ search_bridge.multilingual_value_anchor(값 도메인 다국어 구)
-//    bias.json 의 기존 노드 + 신설 multilingual_value_anchor 노드만 재조합합니다.
+//
+//    🌟 [편입 순서 역전] 기존 순서는
+//        ① semantic ② label_phrase_bank ③ abstract_bridge ④ multilingual_value_anchor
+//    였고 마지막에 truncate(32) 를 걸었습니다.
+//    그 결과 앞 세 축이 창을 다 먹고 나면 ④ 는 영어 앞부분만 들어가,
+//    정작 크로스링구얼 매칭의 핵심인 '니트 / 가디건 / ニット / カーディガン' 이
+//    저장 벡터에 단 한 번도 실리지 못했습니다.
+//    다국어 값 축을 최우선으로 편입하고 상한을 제거합니다.
+//    (앵커 가중치는 Text 0.10 / 그 외 0.30 이므로 구 수가 늘어도 값 벡터를 침범하지 않습니다)
 //
 //    🌟 [LABEL-ONLY] 이 함수의 출력은 '라벨 개념' 전용입니다.
-//    로컬라이즈(값 결합) 텍스트에 이 블롭을 그대로 쓰면 값이 30여 토큰 중 3토큰으로
+//    로컬라이즈(값 결합) 텍스트에 이 블롭을 그대로 쓰면 값이 수십 토큰 중 3토큰으로
 //    희석되어, 값 질의("니트 가디건")가 어떤 청크와도 구분되지 않습니다.
 //    값 결합용으로는 반드시 indexing_leaf_label() 을 사용하십시오.
 pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let mut phrases: Vec<String> = Vec::new();
 
+    // ① [최우선] 다국어 값 도메인 축 — 크로스링구얼 매칭의 유일한 근거
+    for p in multilingual_value_anchor_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ② 문서 언어 semantic 앵커
     for p in split_bias_phrases_full(&semantic_anchor_text(doc_lang, page_type, field_name)) {
         if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
     }
 
+    // ③ 문서 언어 라벨 뱅크
     let (label_phrases, _w) = label_phrase_bank(doc_lang, page_type, field_name);
     for p in label_phrases {
         if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
     }
 
+    // ④ 추상 수식어 브릿지 (heavy / expensive / fast ...)
     for p in abstract_bridge_field_phrases(field_name) {
-        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
-    }
-
-    // 🌟 [MULTILINGUAL VALUE ANCHOR] 역방향 인덱싱 전용 다국어 값 도메인 축.
-    //    정방향 필터 뱅크(filter_category_phrases / abstract_bridge_phrases)는
-    //    이 노드를 읽지 않으므로 구조적으로 분리되어 있습니다.
-    for p in multilingual_value_anchor_phrases(field_name) {
         if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
     }
 
     if phrases.is_empty() {
         return humanize_url_token(field_name);
     }
-    if phrases.len() > 32 { phrases.truncate(32); }
     phrases.join(", ")
 }
 
@@ -543,11 +548,18 @@ pub fn indexing_leaf_label(doc_lang: &str, page_type: &str, field_name: &str) ->
 // 🌟 [MULTILINGUAL VALUE ANCHOR] bias.json 의 search_bridge.multilingual_value_anchor 에서
 //    이 필드의 '값이 속한 의미 도메인'을 다국어로 기술한 구를 읽습니다.
 //
-//    🌟 [역방향 전용] abstract_bridge 와 달리 filter 카테고리를 만들지 않습니다.
+//    🌟 [양방향 공용] 이 노드는 '스키마 속성 뱅크' 에만 편입됩니다.
 //    filter_category_phrases() 는 substantial/find/status/time/season 만 읽고,
-//    abstract_bridge_phrases() 는 search_bridge.abstract_bridge 만 읽습니다.
-//    따라서 이 노드는 정방향 필터 뱅크·SURPRISAL 게이트·연산자 뱅크 어디에도
-//    편입되지 않으며, 오직 indexing_anchor_text() 를 통해 역방향 저장 벡터에만 들어갑니다.
+//    abstract_bridge_phrases() 는 search_bridge.abstract_bridge 만 읽으므로
+//    정방향 필터 뱅크·SURPRISAL 게이트·연산자 뱅크는 전혀 오염되지 않습니다.
+//    역방향은 indexing_anchor_text() 로, 정방향은 속성 뱅크 구축부로 편입되어
+//    질의 벡터와 저장 벡터가 같은 다국어 값 축을 공유하게 됩니다.
+//
+//    🌟 [상한 제거 이유] 이 노드의 구 순서는 (semantic → 영어 → 한국어 → 일본어 → 중국어 → …)
+//    이므로 48구 상한은 일본어 3구째에서 잘려, 그 뒤 40여 개 언어의 값 어휘가 통째로 소멸합니다.
+//    다국어 크로스링구얼 매칭이 이 노드의 유일한 존재 이유이므로 상한을 두지 않습니다.
+//    (Max-Pool 은 구 개수가 늘어도 최댓값만 취하고, 뱅크 크기 편향은
+//     bank_size_equalized_mask() 가 질의 시점에 상대 통계로 별도 정규화합니다)
 pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let node = match crate::parsing::BIAS_DICT
@@ -567,7 +579,6 @@ pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
             }
         }
     }
-    if out.len() > 48 { out.truncate(48); }
     out
 }
 

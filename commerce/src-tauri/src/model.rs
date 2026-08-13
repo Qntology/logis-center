@@ -868,7 +868,7 @@ impl LogisModel {
                     name: None,
                 })
             ],
-            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(1.0), top_p: Some(0.95),
+            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
             ..Default::default()
         };
 
@@ -3065,9 +3065,25 @@ impl LogisModel {
                 //    변경: 구 단위로 쪼개 Max-Pool 로 비교하면 원문과 동일한 구는 코사인 1.0 이 되어
                 //          보너스 없이도 압도적으로 승리합니다. (베이지 → color 뱅크의 "베이지" 구와 정확히 일치)
                 //    추가: semantic 앵커(예: title 의 "의류명")를 뱅크에 편입하여 정답 구를 벡터 공간에 올립니다.
+                //
+                // 🌟 [MULTILINGUAL VALUE ANCHOR — 정방향 편입]
+                //    bias.json 의 search_bridge.multilingual_value_anchor 에는
+                //    goods.title = "knit, cardigan, sweater, ..., 니트, 가디건, 스웨터, 코트, ニット, カーディガン, ..."
+                //    처럼 '그 속성의 값이 실제로 어떤 어휘로 등장하는가' 가 50개 언어로 등재되어 있습니다.
+                //    그런데 정방향은 이 축을 전혀 읽지 않아, 저장 벡터(역방향)에는 있는 축이
+                //    질의 벡터(정방향)에는 없는 비대칭이 발생했습니다.
+                //    (log 실측: '니트 가디건' -> 1st: [color] (0.5906), title 은 상위 2위에도 없음)
+                //    이 축을 편입하면 '니트'/'가디건' 이 title 뱅크의 동일 구와 코사인 1.0 이 되어
+                //    color 뱅크(603구 → BANK EQUALIZE 5구)의 우연 공명을 압도합니다.
+                //
+                //    구조 안전성: multilingual_value_anchor 는 filter_category_phrases() 도,
+                //    abstract_bridge_phrases() 도 읽지 않는 별도 노드이므로
+                //    SURPRISAL 게이트·필터 라우팅·연산자 뱅크를 전혀 오염시키지 않습니다.
+                //    오직 '스키마 속성 뱅크' 에만 들어갑니다.
                 let mut prop_phrase_texts: Vec<Vec<String>> = Vec::with_capacity(prop_keys.len());
                 let mut prop_raw_weights: Vec<Vec<f32>> = Vec::with_capacity(prop_keys.len());
                 let mut prop_prej_texts: Vec<Vec<String>> = Vec::with_capacity(prop_keys.len());
+                let mut mv_anchor_log: Vec<String> = Vec::new();
                 for (i, raw) in bias_texts.iter().enumerate() {
                     let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(raw);
                     let anchor = crate::utils::ai_utils::semantic_anchor_text(&query_lang, &seg_type, &prop_keys[i]);
@@ -3077,11 +3093,30 @@ impl LogisModel {
                             wt.push(1.0);
                         }
                     }
+
+                    // 🌟 다국어 값 어휘 축 편입 (역방향 indexing_anchor_text 와 동일 노드)
+                    let mv = crate::utils::ai_utils::multilingual_value_anchor_phrases(&prop_keys[i]);
+                    if !mv.is_empty() {
+                        mv_anchor_log.push(format!("{}({}구)", prop_keys[i], mv.len()));
+                    }
+                    for p in mv {
+                        if !ph.iter().any(|e| e == &p) {
+                            ph.push(p);
+                            wt.push(1.0);
+                        }
+                    }
+
                     prop_phrase_texts.push(ph);
                     prop_raw_weights.push(wt);
 
                     let prej_raw = prej_texts.get(i).cloned().unwrap_or_default();
                     prop_prej_texts.push(crate::utils::ai_utils::split_bias_phrases_full(&prej_raw));
+                }
+                if !mv_anchor_log.is_empty() {
+                    emit_term(&format!(
+                        "    🌐 [MULTILINGUAL VALUE ANCHOR] 정방향 속성 뱅크에 다국어 값 어휘 축 편입: {:?}",
+                        mv_anchor_log
+                    ));
                 }
 
                 // 🌟 [AMBIGUITY MASK] bias.json 을 손대지 않고 무변별 구를 구조적으로 제거합니다.
