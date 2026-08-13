@@ -906,7 +906,7 @@ Instructions:
 3. If none of the candidates are correct, suggest a completely different property from the schema.
 
 [OUTPUT FORMAT]
-{ "suggested_property": "String" }
+{ "suggested_property": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -934,7 +934,7 @@ If the current operator is already correct, just return it.
 Valid operators: {VALID_OPS}
 
 [OUTPUT FORMAT]
-{ "suggested_operator": "String" }
+{ "suggested_operator": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -969,7 +969,7 @@ Instructions:
 3. Return the best-fitting category as "suggested_category".
 
 [OUTPUT FORMAT]
-{ "suggested_category": "String" }
+{ "suggested_category": String }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
@@ -989,38 +989,29 @@ pub fn transliteration_prompt(source_value: &str, target_language: &str) -> Stri
     let words: Vec<&str> = cleaned.split_whitespace().collect();
     // 🌟 [WORD-KEY JSON] 각 단어를 독립 키로 갖는 객체 구조를 생성합니다.
     //    LLM 이 단어 단위로 독립 음차하므로 중간 맥락 끊김이 발생하지 않습니다.
-    let word_keys: Vec<String> = words.iter().map(|w| format!("\"{}\": String", w)).collect();
-    let transcription_obj = format!("{{ {} }}", word_keys.join(", "));
+    // 🌟 [FULL SOURCE FIRST] 최초 첫 번째 키로 특수문자 제거된 전체 SOURCE 를 배치하여
+    //    LLM 이 전체 문맥을 먼저 파악한 뒤 단어별 음차를 수행하도록 합니다.
+    let mut word_keys: Vec<String> = Vec::with_capacity(words.len() + 1);
+    word_keys.push(format!("\"{}\": String", cleaned));
+    for w in &words {
+        word_keys.push(format!("\"{}\": String", w));
+    }
     let transliteration_obj = format!("{{ {} }}", word_keys.join(", "));
-
     let template = r###"[TASK]
 You are a sound-based respelling engine.
-For every word in [SOURCE], write how that word sounds in the [TARGET LANGUAGE] writing system.
-This is NOT a translation. You must never change the meaning.
-Process each word independently. Never merge words. Never split words. Never skip words.
-The number of keys in each output object MUST equal the number of words in [SOURCE].
-[SOURCE]
-{SOURCE}
+write how that word sounds in the [TARGET LANGUAGE] writing system.
+
 [TARGET LANGUAGE]
 {TARGET_LANGUAGE}
-[RULES]
-1. Fill every key in both output objects. Do not leave any key empty or omit any key.
-2. The value for each key is the sound-based respelling of that single word only.
-3. Never translate meaning. Never add words. Never remove words. Never explain.
-4. Keys must be copied character-for-character from [SOURCE] words.
-5. Digits inside a word must be copied exactly as they appear.
-6. Output ONLY the JSON object. No markdown. No comment. No extra text.
-[OUTPUT FORMAT]
-{
-    "language": "{TARGET_LANGUAGE}",
-    "transliteration": {TRANSLITERATION_OBJ},
-    "source":"{SOURCE}",
-    "transcription": {TRANSCRIPTION_OBJ}
-}
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
 
+[RULES]
+- Digits inside a word must be copied exactly as they appear.
+
+[OUTPUT FORMAT]
+{ "language": "{TARGET_LANGUAGE}", "transliteration": {TRANSLITERATION_OBJ} }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###;
     template.replace("{SOURCE}", &cleaned)
         .replace("{TARGET_LANGUAGE}", target_language)
-        .replace("{TRANSCRIPTION_OBJ}", &transcription_obj)
         .replace("{TRANSLITERATION_OBJ}", &transliteration_obj)
 }

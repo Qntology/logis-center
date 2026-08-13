@@ -1156,9 +1156,7 @@ pub fn build_transliteration_prompt_for_words(words: &[String], target_language:
 /// source_value 대신 명시적 words 목록을 사용하여 응답 매핑을 수행합니다.
 pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
-
     let src_words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
-
     let extract_word_map = |obj: &serde_json::Value| -> String {
         let map = match obj.as_object() { Some(m) => m, None => return String::new() };
         let mut parts: Vec<String> = Vec::new();
@@ -1201,59 +1199,26 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
         }
         parts.join(" ")
     };
-
-    let mut transcription = String::new();
+    // 🌟 [TRANSCRIPTION REMOVED] transcription 파싱을 완전히 제거합니다.
     let mut transliteration = String::new();
-
-    if let Some(t_obj) = parsed.get("transcription") {
-        transcription = extract_word_map(t_obj);
-    }
     if let Some(tr_obj) = parsed.get("transliteration") {
         transliteration = extract_word_map(tr_obj);
-    }
-
-    if transcription.is_empty() {
-        if let Some(val) = parsed.get("transcription").and_then(|v| v.as_str()) {
-            transcription = val.trim().to_string();
-        }
     }
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
-
-    transcription = transcription.split_whitespace().collect::<Vec<_>>().join(" ");
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
-
     // G1: 원문과 동일하면 폐기
     let src_joined = words.join(" ");
-    if !transcription.is_empty() && transcription.eq_ignore_ascii_case(&src_joined) {
-        transcription = String::new();
-    }
     if !transliteration.is_empty() && transliteration.eq_ignore_ascii_case(&src_joined) {
         transliteration = String::new();
     }
-
     // G2: 표기 체계 반전 확인
     let src_non_latin_count: usize = words.iter()
         .filter(|w| !is_latin_dominant(w))
         .count();
-
-    if !transcription.is_empty() {
-        let result_non_latin = transcription.chars()
-            .filter(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
-            .count();
-        let script_flipped =
-            (src_non_latin_count > 0 && result_non_latin < src_non_latin_count)
-            || (src_non_latin_count == 0 && result_non_latin > 0);
-        if !script_flipped && is_latin_dominant(&transcription) == is_latin_dominant(&src_joined) {
-            transcription = String::new();
-        } else if transcription.chars().count() > 150 {
-            transcription = String::new();
-        }
-    }
-
     if !transliteration.is_empty() {
         let result_non_latin = transliteration.chars()
             .filter(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
@@ -1267,12 +1232,8 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
             transliteration = String::new();
         }
     }
-
-    if !transcription.is_empty() && !transliteration.is_empty() && transcription == transliteration {
-        transliteration = String::new();
-    }
-
-    (transcription, transliteration)
+    // 🌟 transcription 은 더 이상 존재하지 않으므로 빈 문자열 반환
+    (String::new(), transliteration)
 }
 
 /// [LANGUAGE TRACK MERGE] 트랙별 결과를 원본 단어 순서로 병합합니다.
@@ -1340,8 +1301,8 @@ pub fn build_transliteration_prompt(source_value: &str, target_language: &str) -
 ///   G2: 표기 체계가 뒤집히지 않았으면 폐기 (음차가 일어나지 않았다는 구조적 증거)
 ///   G3: 길이가 R2(150자)를 넘으면 폐기 (음차가 아니라 설명문)
 pub fn sanitize_transliteration(raw: &str, source_value: &str) -> String {
-    let (t, _) = sanitize_transliteration_dual(raw, source_value);
-    t
+    let (_, tr) = sanitize_transliteration_dual(raw, source_value);
+    tr
 }
 
 /// [SYNONYM EXPANSION] LLM 응답에서 transcription 과 transliteration 을 모두 추출합니다.
@@ -1353,17 +1314,12 @@ pub fn sanitize_transliteration(raw: &str, source_value: &str) -> String {
 pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
     // 🌟 [SPECIAL CHAR STRIP] 프롬프트 키와 동일한 형태로 특수문자를 제거합니다.
-    //    build_transliteration_prompt 가 strip_special_chars_for_transliteration 으로
-    //    키를 만들었으므로, 여기서도 같은 함수로 매칭해야 키 불일치가 사라집니다.
-    //    기존에는 "Side(Full" / "Album)" 같은 키가 원본 split 과 어긋나
-    //    extract_word_map 이 빈 문자열을 반환 → PASS-2 SKIPPED 경로로 빠졌습니다.
     let src_clean = strip_special_chars_for_transliteration(source_value);
     let src_clean_ref = src_clean.as_str();
     let src_words: Vec<&str> = src_clean_ref.split_whitespace().collect();
-
     // ── 단어별 객체에서 값을 순서대로 조립 ──
-    //    키 매칭 실패 시 소문자/대문자 무시 매칭을 2차로 시도하여
-    //    LLM 이 키의 대소문자를 미세하게 바꾼 경우에도 복원합니다.
+    //    🌟 [FULL SOURCE KEY SKIP] transliteration 객체의 첫 번째 키는 전체 SOURCE 입니다.
+    //    단어 단위 추출 시 전체 SOURCE 키는 건너뛰고 개별 단어만 매칭합니다.
     let extract_word_map = |obj: &serde_json::Value| -> String {
         let map = match obj.as_object() { Some(m) => m, None => return String::new() };
         let mut parts: Vec<String> = Vec::new();
@@ -1372,11 +1328,6 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
             if let Some(v) = map.get(*w).and_then(|v| v.as_str()) {
                 let val = v.trim();
                 if !val.is_empty() {
-                    // 🌟 [HYPHEN STRIP] LLM 응답에 하이픈/언더스코어가 포함되면 제거합니다.
-                    //    "test-sang-um" → "testsangum"
-                    //    "no_so" → "noso"
-                    //    입력 소스의 특수문자는 strip_special_chars_for_transliteration 이
-                    //    이미 공백으로 처리하므로, 여기서는 LLM 출력 잔재만 제거합니다.
                     let cleaned: String = val.chars()
                         .filter(|c| !matches!(c, '-' | '_'))
                         .collect();
@@ -1394,7 +1345,6 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
                     if let Some(s) = v.as_str() {
                         let val = s.trim();
                         if !val.is_empty() {
-                            // 🌟 [HYPHEN STRIP] 동일하게 하이픈/언더스코어 제거
                             let cleaned: String = val.chars()
                                 .filter(|c| !matches!(c, '-' | '_'))
                                 .collect();
@@ -1408,71 +1358,30 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
                 }
             }
             if !found {
-                // 3차: LLM 이 키를 누락한 경우 빈 토큰으로 자리 보존
-                //    (조립 시 공백이 연속되어도 최종 정규화에서 압축됨)
+                // LLM 이 키를 누락한 경우 자리 보존 생략
             }
         }
         parts.join(" ")
     };
-
-    let mut transcription = String::new();
+    // 🌟 [TRANSCRIPTION REMOVED] transcription 파싱을 완전히 제거합니다.
+    //    transliteration 만 추출합니다.
     let mut transliteration = String::new();
-
-    if let Some(t_obj) = parsed.get("transcription") {
-        transcription = extract_word_map(t_obj);
-    }
     if let Some(tr_obj) = parsed.get("transliteration") {
         transliteration = extract_word_map(tr_obj);
     }
-
-    // ── 폴백: 기존 문자열 형식 호환 ──
-    if transcription.is_empty() {
-        if let Some(val) = parsed.get("transcription").and_then(|v| v.as_str()) {
-            transcription = val.trim().to_string();
-        }
-    }
+    // ── 폴백: 문자열 형식 호환 ──
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
-
     // 공백 정규화
-    transcription = transcription.split_whitespace().collect::<Vec<_>>().join(" ");
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    // ── G1/G2/G3 게이트: transcription 기준 ──
-    //    🌟 원문 비교도 특수문자 제거된 형태로 통일합니다.
-    //    🌟 [G2 FIX] 원본이 라틴 우세여도 비라틴 토큰이 라틴으로 전사된 경우를
-    //    '표기 체계 반전'으로 인정합니다.
-    //    기존 is_latin_dominant 전체 비교는 "테스트상품 / Yuksek" 처럼
-    //    라틴 비중이 이미 높은 원본에서 한글 부분만 전사해도
-    //    "양쪽 다 라틴 우세"로 판정하여 정당한 전사를 폐기했습니다.
-    //    비라틴 문자 수의 감소(또는 라틴 원본 → 비라틴 증가)로 판정합니다.
+    // ── G1/G2/G3 게이트: transliteration 기준 ──
     let src_non_latin = src_clean_ref
         .chars()
         .filter(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
         .count();
-
-    let mut result_t = transcription.clone();
-    if result_t.is_empty() || result_t.eq_ignore_ascii_case(src_clean_ref) {
-        result_t = String::new();
-    } else {
-        let result_t_non_latin = result_t
-            .chars()
-            .filter(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
-            .count();
-        let script_flipped =
-            (src_non_latin > 0 && result_t_non_latin < src_non_latin)
-            || (src_non_latin == 0 && result_t_non_latin > 0);
-        if !script_flipped && is_latin_dominant(&result_t) == is_latin_dominant(src_clean_ref) {
-            result_t = String::new();
-        } else if result_t.chars().count() > 150 {
-            result_t = String::new();
-        }
-    }
-
-    // ── G1/G2/G3 게이트: transliteration 기준 ──
     let mut result_tr = transliteration.clone();
     if result_tr.is_empty() || result_tr.eq_ignore_ascii_case(src_clean_ref) {
         result_tr = String::new();
@@ -1490,13 +1399,52 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
             result_tr = String::new();
         }
     }
+    // 🌟 transcription 은 더 이상 존재하지 않으므로 빈 문자열 반환
+    (String::new(), result_tr)
+}
 
-    // ── transcription 과 transliteration 이 같으면 하나만 반환 ──
-    if !result_t.is_empty() && !result_tr.is_empty() && result_t == result_tr {
-        result_tr = String::new();
+/// [SYNONYM EXPANSION - MIXED SCRIPT DETECTION]
+/// 음차 결과에서 하나의 단어 안에 비라틴 문자(한글 등)와 라틴 문자가
+/// 혼용된 단어를 감지합니다.
+/// 예: "시IELD" → 한글 '시' + 라틴 'IELD' 혼용 → 감지 대상
+///
+/// 판정 규칙:
+///   M1: 단어 내 알파벳 문자 중 라틴과 비라틴이 '모두' 존재해야 혼용입니다.
+///   M2: 순수 라틴("Pokemon") 또는 순수 비라틴("포켓몬")은 혼용이 아닙니다.
+///   M3: 숫자/특수문자만 있는 단어는 판정에서 제외합니다.
+pub fn find_mixed_script_words(text: &str) -> Vec<String> {
+    let mut mixed: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let has_latin = word.chars().any(|c| c.is_alphabetic() && c.is_ascii_alphabetic());
+        let has_non_latin = word.chars().any(|c| c.is_alphabetic() && !c.is_ascii_alphabetic());
+        if has_latin && has_non_latin {
+            if !mixed.iter().any(|m| m == word) {
+                mixed.push(word.to_string());
+            }
+        }
     }
+    mixed
+}
 
-    (result_t, result_tr)
+/// [SYNONYM EXPANSION - MIXED SCRIPT REPLACEMENT]
+/// 혼용 단어를 재음차 결과로 교체합니다.
+/// text 내 각 단어를 확인하여 replacements 에 포함된 혼용 단어만 교체합니다.
+pub fn replace_mixed_words(text: &str, replacements: &[(String, String)]) -> String {
+    let mut result: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let mut replaced = false;
+        for (old, new) in replacements {
+            if word == old && !new.is_empty() {
+                result.push(new.clone());
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            result.push(word.to_string());
+        }
+    }
+    result.join(" ")
 }
 
 /// [SYNONYM EXPANSION] 1차/2차 결과를 표기 체계 기준으로 슬롯에 배정합니다.
