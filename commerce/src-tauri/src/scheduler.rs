@@ -143,6 +143,61 @@ async fn generate_transliteration_aliases(
             }
             println!("    TRACK-A TRANSLITERATION= '{}'", track_a_transliteration);
             println!("    TRACK-B TRANSLITERATION= '{}'", track_b_transliteration);
+            // 🌟 [TRACK-B LATIN RESIDUE RETRY]
+            //    Track B 는 라틴 → 문서 언어(비라틴) 음차입니다.
+            //    결과가 여전히 라틴 문자를 포함하면 음차 실패입니다.
+            //    (로그 실측: "RITMO" → " ritmo" → trim 후 "ritmo" = 라틴 잔존)
+            //    실패 단어만 추출하여 Qwen3.5 2B 로 1회 재음차합니다.
+            //    재음차도 라틴이면 원본 라틴 단어를 그대로 유지합니다.
+            if !track_b_transliteration.is_empty() && !latin_words.is_empty() {
+                let track_b_words: Vec<String> = track_b_transliteration
+                    .split_whitespace()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut failed_indices: Vec<usize> = Vec::new();
+                let mut failed_originals: Vec<String> = Vec::new();
+                for (i, w) in track_b_words.iter().enumerate() {
+                    if crate::nl_convert::is_latin_dominant(w) {
+                        // 비라틴이어야 할 단어가 라틴 → 음차 실패
+                        if i < latin_words.len() {
+                            failed_indices.push(i);
+                            failed_originals.push(latin_words[i].clone());
+                        }
+                    }
+                }
+                if !failed_originals.is_empty() {
+                    println!("    🔧 [TRACK-B LATIN RESIDUE] 음차 실패(라틴 잔존) 단어 {:?} 발견 → 재음차 수행", failed_originals);
+                    let p_retry = crate::nl_convert::build_transliteration_prompt_for_words(&failed_originals, doc_lang);
+                    let raw_retry = model
+                        .call_qwen3_5_transliteration(&p_retry, Some(cancel.clone()))
+                        .await
+                        .unwrap_or_default();
+                    println!("    TRACK-B RETRY RAW = '{}'", raw_retry.replace('\n', "\n"));
+                    let (_t_retry, tr_retry) = crate::nl_convert::sanitize_transliteration_dual_for_words(&raw_retry, &failed_originals);
+                    let retry_words: Vec<String> = tr_retry
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let mut track_b_parts: Vec<String> = track_b_words.clone();
+                    for (fi, &orig_idx) in failed_indices.iter().enumerate() {
+                        if let Some(new_w) = retry_words.get(fi) {
+                            if !new_w.is_empty() && !crate::nl_convert::is_latin_dominant(new_w) {
+                                println!("    🔧 [TRACK-B RETRY FIX] '{}' → '{}'", latin_words[orig_idx], new_w);
+                                track_b_parts[orig_idx] = new_w.clone();
+                            } else {
+                                println!("    ⚠️ [TRACK-B RETRY SKIP] '{}' 재음차 결과 '{}' 도 라틴이라 원본 유지", latin_words[orig_idx], new_w);
+                                track_b_parts[orig_idx] = latin_words[orig_idx].clone();
+                            }
+                        } else {
+                            println!("    ⚠️ [TRACK-B RETRY MISS] '{}' 재음차 결과 매핑 실패. 원본 유지", latin_words[orig_idx]);
+                            track_b_parts[orig_idx] = latin_words[orig_idx].clone();
+                        }
+                    }
+                    track_b_transliteration = track_b_parts.join(" ");
+                    println!("    TRACK-B TRANSLITERATION (after retry)= '{}'", track_b_transliteration);
+                }
+            }
             // 🌟 [LANGUAGE-CONSISTENT MERGE] 원본 단어 순서 병합(혼용) 대신
             //    언어별 통일 문자열을 생성합니다.
             //    native(비라틴 통일) = 원본 비라틴 단어 + 라틴 단어의 문서 언어 음차

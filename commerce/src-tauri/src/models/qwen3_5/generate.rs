@@ -186,7 +186,12 @@ impl Qwen3_5GenerateModel {
         // 🌟 [VISION-JIT] mmproj 재로드 소스를 등록합니다.
         //    등록되지 않으면(순수 텍스트 모드) unload/reload 는 전부 no-op 으로 동작합니다.
         qwen3_5.set_mmproj_path(target_mmproj);
-        
+
+        // 🌟 [VISION-STREAM] 비전 27블록 스트리밍 활성화.
+        //    337MB 전체 상주 → 1블록(약 12MB)만 상주. 피크 VRAM 약 325MB 절감.
+        //    mmproj 미등록(텍스트 전용) 시 내부에서 안전하게 무시됩니다.
+        qwen3_5.set_block_streaming(true);
+
         let stem = std::path::Path::new(model_file)
             .file_stem()
             .and_then(|s| s.to_str())
