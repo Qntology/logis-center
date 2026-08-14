@@ -101,8 +101,12 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
 
     let itemType = item.type || "unknown";
     const tradeDocs = ['BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'shipping_doc', 'shipping'];
+    // 🌟 [ANALYTICS ADMIN] 사용자 행동 로그 / 리포트 타입
+    const analyticDocs = ['click', 'hover', 'change', 'report'];
 
-    if (item.type === "sales" || item.type === "goods" || item.type === "order") {
+    if (analyticDocs.includes(item.type)) {
+        itemType = "analytic";
+    } else if (item.type === "sales" || item.type === "goods" || item.type === "order") {
         itemType = "sales";
         // 🌟 [CRITICAL FIX] 화면 표시용 타입을 무조건 'order'로 덮어씌우던 원흉(하드코딩) 제거!
         // 이제 DB에 저장된 실제 타입(goods 등)이 UI에 그대로 노출됩니다.
@@ -186,8 +190,27 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
     }
 
     // --- 타입별 HTML 조립 (front.js 패리티) ---
+    // 🌟 [ANALYTICS ADMIN] 사용자 행동 로그 / 리포트 전용 UI
+    //    (기존 Client Front SDK(content.js)의 ._item / ._item._user 렌더링을 이관)
+    if (itemType === "analytic") {
+        body += `
+            ${Tpl(item, "action")}
+            ${Tpl(item, "summary")}
+            ${Tpl(item, "cross_action_flow")}
+        `;
+        body += `<div class="${selector.more}">`;
+        if (more) {
+            body += `
+                ${Tpl(item, "intent_evolution")}
+                ${Tpl(item, "consistent_preferences")}
+                ${Tpl(item, "relate")}
+                ${Tpl(item, "href")}
+            `.trim();
+        }
+        body += `</div>${Tpl(item, "created_at")}`;
+
     // 🌟 Shipping 전용 UI 추가
-    if (itemType === "shipping") {
+    } else if (itemType === "shipping") {
         if(item.status) item.status = parseStatus(item.status);
         body += `
             ${Tpl(item, "status")}

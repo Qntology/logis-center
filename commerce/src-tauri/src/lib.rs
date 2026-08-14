@@ -172,6 +172,228 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     Ok("Memory cleared.".to_string())
 }
 
+// =====================================================================
+// 🌟 [CLIENT-SIDE EMBEDDING] Cloud AI 모드에서도 임베딩은 무조건 로컬에서 수행합니다.
+//    ① get_query_embedding      : 클라우드 검색용 질의 벡터를 로컬 모델로 생성
+//    ② reindex_pending_embeddings : 클라우드가 내려준 아이템을 로컬에서 벡터화 + 청크 인덱싱
+// =====================================================================
+#[tauri::command]
+async fn get_query_embedding(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    text: String,
+    device_preference: Option<String>,
+) -> Result<Vec<f32>, String> {
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+
+    let vec = model.get_embedding(text).await.map_err(|e| e.to_string())?;
+
+    println!("[EMBED-LOCAL] Query embedding generated locally. dim = {}", vec.len());
+
+    Ok(vec)
+}
+
+#[tauri::command]
+async fn reindex_pending_embeddings(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    limit: Option<usize>,
+    device_preference: Option<String>,
+    // 🌟 [MODE ROUTING] commerce / shipping / analytic 트랙을 구분합니다.
+    //    analytic 은 console.logis.center, 나머지는 commerce.logis.center 로 벡터가 전송됩니다.
+    mode: Option<String>,
+) -> Result<Value, String> {
+    // 진행 중인 로컬 작업이 있으면 VRAM 충돌 방지를 위해 즉시 반환합니다.
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        return Ok(json!({ "processed": 0, "vectors": [], "skipped": "searching" }));
+    }
+    if crate::ACTIVE_TASK_MEM.read().unwrap().is_some() {
+        return Ok(json!({ "processed": 0, "vectors": [], "skipped": "busy" }));
+    }
+
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            let _ = std::fs::create_dir_all(&db_path);
+            if let Ok(s) = VectorStore::new(&db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
+        }
+        store_guard.as_ref().cloned()
+    };
+
+    let store = match store_opt {
+        Some(s) => s,
+        None => return Err("DB not initialized".to_string()),
+    };
+
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+
+    let scan_limit = limit.unwrap_or(20);
+
+    // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
+    //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
+    let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
+    let mode_filter = format!("mode = '{}'", target_mode);
+
+    let docs = store.get_all_items("items", 500, 0, Some(mode_filter)).await.map_err(|e| e.to_string())?;
+
+    let mut vectors: Vec<Value> = Vec::new();
+    let mut processed = 0usize;
+
+    for doc in docs {
+        if processed >= scan_limit { break; }
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+
+        if doc.id.is_empty() { continue; }
+        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search" {
+            continue;
+        }
+
+        // 청크가 하나도 없다 = 로컬 임베딩이 아직 수행되지 않은 클라우드 동기화 아이템입니다.
+        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
+        if chunk_count > 0 { continue; }
+
+        let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+
+        // 🌟 [ANALYTICS] Cron Worker 가 구조화한 'action'(사용자 의도 문장)이 벡터의 본체입니다.
+        //    action 이 없으면 summary → cross_action_flow 순으로 폴백합니다.
+        let analytic_text = data.get("action").and_then(|v| v.as_str()).unwrap_or("")
+            .trim().to_string();
+        let analytic_fallback = data.get("summary").and_then(|v| v.as_str())
+            .or_else(|| data.get("cross_action_flow").and_then(|v| v.as_str()))
+            .unwrap_or("").trim().to_string();
+
+        let text = if !analytic_text.is_empty() {
+            analytic_text
+        } else if !doc.text.trim().is_empty() {
+            doc.text.clone()
+        } else if !analytic_fallback.is_empty() {
+            analytic_fallback
+        } else {
+            crate::parsing::json_to_natural_language(&data)
+        };
+
+        if text.trim().is_empty() { continue; }
+
+        let emb = model.get_embedding(text.clone()).await.map_err(|e| e.to_string())?;
+
+        if let Some(o) = data.as_object_mut() {
+            o.insert("text".to_string(), json!(text.clone()));
+            if !o.contains_key("masked_text") {
+                o.insert("masked_text".to_string(), json!(text.clone()));
+            }
+            o.insert("embed".to_string(), json!(1));
+        }
+
+        let target_table = match doc.r#type.as_str() {
+            "sales" | "goods" | "order" => "sales",
+            "tracking" | "receiving" | "shipping" => "tracking",
+            "event" | "coupon" => "event",
+            "member" | "team" | "user" => "users",
+            // 🌟 [ANALYTICS] 사용자 행동 로그 / 리포트는 items 미러 테이블에만 존재합니다.
+            "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
+            _ => "items",
+        };
+
+        let digest = crate::utils::hash::digest(&text);
+
+        let _ = store.upsert_item(
+            target_table, &doc.id, &doc.r#type, data.clone(), Some(emb.clone()),
+            Some(&doc.from), Some(&doc.to), Some(&doc.cc), Some(&doc.bcc), Some(&doc.r#ref), Some(&digest)
+        ).await;
+
+        let _ = store.upsert_item(
+            "items", &doc.id, &doc.r#type, data.clone(), Some(emb.clone()),
+            Some(&doc.from), Some(&doc.to), Some(&doc.cc), Some(&doc.bcc), Some(&doc.r#ref), Some(&digest)
+        ).await;
+
+        let link = data.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let doc_lang = crate::utils::lang_utils::detect_document_language(&text);
+        let mode = if doc.mode.trim().is_empty() { "commerce".to_string() } else { doc.mode.clone() };
+
+        let cancel = state.cancellation_token.clone();
+        let _ = crate::scheduler::index_item_chunks(
+            &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
+            &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync"
+        ).await;
+
+        vectors.push(json!({
+            "id": doc.id,
+            "table": target_table,
+            "type": doc.r#type,
+            "mode": target_mode,
+            "no": data.get("no").and_then(|v| v.as_str()).unwrap_or(""),
+            "from": doc.from,
+            "to": doc.to,
+            "cc": doc.cc,
+            "bcc": doc.bcc,
+            "ref": doc.r#ref,
+            // 🌟 [ANALYTICS METADATA] console.logis.center Vectorize 메타데이터로 그대로 넘어갑니다.
+            "summary": data.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+            "action": data.get("action").and_then(|v| v.as_str()).unwrap_or(""),
+            "relate": data.get("relate").cloned().unwrap_or(json!([])),
+            "values": emb
+        }));
+
+        processed += 1;
+    }
+
+    if processed > 0 {
+        println!("[EMBED-LOCAL] Cloud-synced items embedded locally: {} item(s). (mode: {})", processed, target_mode);
+    }
+
+    model.unload_embedding().await;
+
+    Ok(json!({ "processed": processed, "vectors": vectors, "mode": target_mode }))
+}
+
 #[tauri::command]
 async fn resize_window(app_handle: tauri::AppHandle, width: f64, height: f64) {
     if let Some(window) = app_handle.get_webview_window("main") {
@@ -2646,7 +2868,8 @@ pub fn run() {
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
-            get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb
+            get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
+            get_query_embedding, reindex_pending_embeddings
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

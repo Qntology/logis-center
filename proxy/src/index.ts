@@ -1201,6 +1201,25 @@ const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id
 
 const CenterRegion = "commerce_logis_center"
 
+/*
+	🌟 [CLIENT-SIDE EMBEDDING DELEGATION]
+	- Cloud 트랙(GPU 없는 사용자)은 구조화(LLM 추출)만 서버에서 수행합니다.
+	- 임베딩 벡터 생성은 GPU 유무와 무관하게 "항상" Client App(Tauri) 로컬 모델이 담당합니다.
+	- 따라서 서버는 벡터를 만들지 않고, data 페이로드에 embed:0(대기) 마킹만 남깁니다.
+	- Client App 이 sync 후 로컬 임베딩 → PUT(type=vector) 로 Vectorize 에 반영합니다.
+*/
+const CLIENT_EMBEDDING = true
+
+const markEmbedPending = function(obj){
+	if(!obj || typeof obj != "object"){
+		return obj
+	}
+
+	obj.embed = 0
+
+	return obj
+}
+
 const LogisRegion = {
 	// Western North America
 	'us-w': 'commerce_logis_wnam',
@@ -2822,48 +2841,54 @@ export default {
 											ref:pageId
 										}
 
+										// 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않습니다.
+										if(CLIENT_EMBEDDING){
+											markEmbedPending(item)
 
-										var embeddings
+											console.log('[EMBED-PENDING] tracking item delegated to Client App:', item.id)
+										}else{
+											var embeddings
 
-										if(models['cloudflare']){
-											var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-												text: [item.text]
-											})
+											if(models['cloudflare']){
+												var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+													text: [item.text]
+												})
 
-											var $VectorizeVector = [
-												{
-													id: item.id,
-													values: embeddings[0],
-													metadata: metadata
-												}
-											]
+												var $VectorizeVector = [
+													{
+														id: item.id,
+														values: embeddings[0],
+														metadata: metadata
+													}
+												]
 
-											models['cloudflare'] -= 1
+												models['cloudflare'] -= 1
 
+											}
+
+											if(!embeddings && models['deepinfra']){
+												var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.text)
+
+												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+													return {
+														id: item.id,
+														values: values,
+														metadata: metadata
+													}
+												})
+
+												models['deepinfra'] -= 1
+
+											}
+
+											if(!embeddings){
+												fallback = 'overflow'
+
+												continue
+											}
+
+											await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 										}
-
-										if(!embeddings && models['deepinfra']){
-											var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.text)
-
-											var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-												return {
-													id: item.id,
-													values: values,
-													metadata: metadata
-												}
-											})
-
-											models['deepinfra'] -= 1
-
-										}
-
-										if(!embeddings){
-											fallback = 'overflow'
-
-											continue
-										}
-
-										await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
 										statements[`commerce_logis_${zoneRegion}_items`].push(
 											env[`commerce_logis_${zoneRegion}_items`].prepare(`
@@ -3972,51 +3997,61 @@ export default {
 																	ref:pageId
 																}
 
-																var embeddings
+																// 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않습니다.
+																if(CLIENT_EMBEDDING){
+																	markEmbedPending(tracking)
 
-																if(models['cloudflare']){
-																	var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-																		text: [semantic]
-																	})
+																	team.data.base.pages[task.cc][tracking.type].draft++
+																	team.data.base[item.type].count++
 
-																	var $VectorizeVector = [
-																		{
-																			id: item.id,
-																			values: embeddings[0],
-																			metadata: metadata
-																		}
-																	]
+																	console.log('[EMBED-PENDING] tracking relay delegated to Client App:', tracking.id)
+																}else{
+																	var embeddings
 
-																	models['cloudflare'] -= 1
+																	if(models['cloudflare']){
+																		var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+																			text: [semantic]
+																		})
 
+																		var $VectorizeVector = [
+																			{
+																				id: item.id,
+																				values: embeddings[0],
+																				metadata: metadata
+																			}
+																		]
+
+																		models['cloudflare'] -= 1
+
+																	}
+
+																	if(!embeddings && models['deepinfra']){
+																		var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
+
+																		var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																			return {
+																				id: item.id,
+																				values: values,
+																				metadata: metadata
+																			}
+																		})
+
+																		models['deepinfra'] -= 1
+																	}
+
+																	if(!embeddings){
+																		fallback = 'embeddings overflow'
+
+																		continue
+																	}
+
+
+																	team.data.base.pages[task.cc][tracking.type].draft++
+																	// team.data.base.pages[task.cc][tracking.type].count--
+																	team.data.base[item.type].count++
+
+																	await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 																}
-
-																if(!embeddings && models['deepinfra']){
-																	var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
-
-																	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-																		return {
-																			id: item.id,
-																			values: values,
-																			metadata: metadata
-																		}
-																	})
-
-																	models['deepinfra'] -= 1
-																}
-
-																if(!embeddings){
-																	fallback = 'embeddings overflow'
-
-																	continue
-																}
-
-
-																team.data.base.pages[task.cc][tracking.type].draft++
-																// team.data.base.pages[task.cc][tracking.type].count--
-																team.data.base[item.type].count++
-
-																await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 															}
 
 															var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
@@ -4684,49 +4719,56 @@ export default {
 																				metadata.bcc = edge.bcc
 																				metadata.ref = edge.ref
 
-																				var embeddings
+																				// 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않습니다.
+																				if(CLIENT_EMBEDDING){
+																					markEmbedPending(edge)
 
-																				var $VectorizeVector
+																					console.log('[EMBED-PENDING] relay edge delegated to Client App:', edge.id)
+																				}else{
+																					var embeddings
 
-																				if(models['cloudflare']){
-																					var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-																						text: [semantic],
-																					})
+																					var $VectorizeVector
 
-																					var $VectorizeVector = [
-																						{
-																							id: edge.id,
-																							values: embeddings[0],
-																							metadata: metadata
-																						}
-																					]
+																					if(models['cloudflare']){
+																						var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+																							text: [semantic],
+																						})
 
-																					models['cloudflare'] -= 1
+																						var $VectorizeVector = [
+																							{
+																								id: edge.id,
+																								values: embeddings[0],
+																								metadata: metadata
+																							}
+																						]
 
+																						models['cloudflare'] -= 1
+
+																					}
+
+																					if(!embeddings && models['deepinfra']){
+																						var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
+
+																						var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																							return {
+																								id: edge.id,
+																								values: values,
+																								metadata: metadata
+																							}
+																						})
+
+																						models['deepinfra'] -= 1
+
+																					}
+
+																					if(embeddings){
+																						fallback = 'embeddings overflow'
+
+																						continue
+																					}
+
+																					await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 																				}
-
-																				if(!embeddings && models['deepinfra']){
-																					var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
-
-																					var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-																						return {
-																							id: edge.id,
-																							values: values,
-																							metadata: metadata
-																						}
-																					})
-
-																					models['deepinfra'] -= 1
-
-																				}
-
-																				if(embeddings){
-																					fallback = 'embeddings overflow'
-
-																					continue
-																				}
-
-																				await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
 																			}
 																		}else{
@@ -5117,50 +5159,61 @@ export default {
 													ref:pageId
 												}
 
-												var embeddings
+												// 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않습니다.
+												if(CLIENT_EMBEDDING){
+													markEmbedPending(item)
 
-												if(models['cloudflare']){
-													var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-														text: [item.semantic]
-													})
+													if(item.data && typeof item.data == "object"){
+														markEmbedPending(item.data)
+													}
 
-													var $VectorizeVector = [
-														{
-															id: item.id,
-															values: embeddings[0],
-															metadata: metadata
-														}
-													]
+													console.log('[EMBED-PENDING] item delegated to Client App:', item.id)
+												}else{
+													var embeddings
 
-													models['cloudflare'] -= 1
+													if(models['cloudflare']){
+														var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+															text: [item.semantic]
+														})
 
+														var $VectorizeVector = [
+															{
+																id: item.id,
+																values: embeddings[0],
+																metadata: metadata
+															}
+														]
+
+														models['cloudflare'] -= 1
+
+													}
+
+													if(!embeddings && models['deepinfra']){
+														var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic.tirm())
+
+														var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+															return {
+																id: item.id,
+																values: values,
+																metadata: metadata
+															}
+														})
+
+														models['deepinfra'] -= 1
+													}
+
+													console.log('typeof embeddings',typeof embeddings);
+
+													if(!embeddings){
+														fallback = 'embeddings overflow'
+
+														continue
+													}
+
+													
+
+													await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 												}
-
-												if(!embeddings && models['deepinfra']){
-													var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic.tirm())
-
-													var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-														return {
-															id: item.id,
-															values: values,
-															metadata: metadata
-														}
-													})
-
-													models['deepinfra'] -= 1
-												}
-
-												console.log('typeof embeddings',typeof embeddings);
-
-												if(!embeddings){
-													fallback = 'embeddings overflow'
-
-													continue
-												}
-
-												
-
-												await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 
 											}
 
@@ -5881,7 +5934,16 @@ export default {
 
 											console.log('context.text',context.text);
 
-											if(models['cloudflare']){
+											// 🌟 [CLIENT-SIDE EMBEDDING] Client App 이 로컬 임베딩 모델로 만들어 보낸 질의 벡터를 최우선 사용합니다.
+											if(task.queryVector){
+												if(Array.isArray(task.queryVector) && task.queryVector.length){
+													queryVector = task.queryVector
+
+													console.log('[EMBED-CLIENT] Using client-side query vector. dim =', queryVector.length)
+												}
+											}
+
+											if(!queryVector && models['cloudflare']){
 												var embeddings = await env.AI.run('@cf/google/embeddinggemma-300m', {
 													text: [context.text],
 												})

@@ -540,6 +540,220 @@ async fn upsert_alias_chunks(
     saved
 }
 
+// =====================================================================
+// 🌟 [CLOUD-SYNC LOCAL EMBEDDING] 클라우드(Cloudflare)가 "구조화만" 수행하고 내려보낸 아이템을
+//    로컬 임베딩 모델로 벡터화 + item_chunks 인덱싱하는 재사용 파이프라인입니다.
+//    - GPU 유무와 무관하게 임베딩은 항상 Client App 트랙에서만 수행됩니다.
+//    - scheduler 의 PHASE A~E 와 동일한 v3 형식 인지 3중 합성 벡터를 생성합니다.
+// =====================================================================
+pub async fn index_item_chunks(
+    store: &VectorStore,
+    model: &LogisModel,
+    item_id: &str,
+    page_type: &str,
+    doc_lang: &str,
+    item_json: &Value,
+    is_detail: bool,
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    search_mode: &str,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> Result<usize> {
+    let emit = |msg: &str| {
+        println!("{}", msg);
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+    };
+
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+
+    let natural_text = crate::nl_convert::json_to_natural_language(item_json);
+    let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
+    if raw_chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let fields = if is_detail {
+        crate::parsing::get_detail_schema_fields(page_type, url, doc_lang)
+    } else {
+        crate::parsing::get_list_schema_fields(page_type, url, doc_lang)
+    };
+
+    let mut idx_field_names: Vec<String> = Vec::new();
+    let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+    let mut idx_field_formats: Vec<String> = Vec::new();
+
+    for (fname, _, bias_target, _) in &fields {
+        let (mut phrases, mut weights) =
+            crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+        let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+        for p in bridge_ph {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+            weights.push(1.0);
+        }
+
+        let phrase_embs = if phrases.is_empty() {
+            vec![vec![0.0f32; 384]]
+        } else {
+            model.get_embedding_batch(phrases.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+        };
+
+        let fmt_str = {
+            let lower = fname.to_lowercase();
+            let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+            let has = |k: &str| keys.iter().any(|x| x == k);
+
+            if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                "Synthesis".to_string()
+            } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                "TrackingCode".to_string()
+            } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                "Identifier".to_string()
+            } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                "Link".to_string()
+            } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                "Date".to_string()
+            } else if keys.iter().any(|k| {
+                k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                    || k == "cellphone" || k == "contact" || k == "number"
+            }) {
+                "Phone".to_string()
+            } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                "Address".to_string()
+            } else if keys.iter().any(|k| {
+                k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                    || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+            }) {
+                "Enum".to_string()
+            } else if keys.iter().any(|k| {
+                k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                    || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                    || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                    || k.contains("duration")
+            }) {
+                "Numeric".to_string()
+            } else {
+                "Text".to_string()
+            }
+        };
+
+        idx_field_names.push(fname.clone());
+        idx_field_phrase_embs.push(phrase_embs);
+        idx_field_phrase_weights.push(weights);
+        idx_field_formats.push(fmt_str);
+    }
+
+    let model_for_embed = model.clone();
+    let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+        &raw_chunks,
+        doc_lang,
+        page_type,
+        &idx_field_names,
+        &idx_field_phrase_embs,
+        &idx_field_phrase_weights,
+        &idx_field_formats,
+        move |text: String| {
+            let m = model_for_embed.clone();
+            async move { m.get_embedding(text).await.unwrap_or(vec![0.0; 384]) }
+        },
+    ).await;
+
+    let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+        .enumerate()
+        .filter(|(_, c)| c.property != "unclassified")
+        .collect();
+
+    if indexable_chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let chunk_texts: Vec<String> = indexable_chunks.iter().map(|(_, c)| c.chunk_text.clone()).collect();
+    let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+    let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+        indexable_chunks.iter().map(|(_, c)| *c).collect();
+    let alias_pairs = generate_transliteration_aliases(
+        model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
+    ).await;
+
+    let _ = store.delete_chunks_by_item(item_id).await;
+
+    let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+    let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+    for (_, cm) in indexable_chunks.iter() {
+        let a = crate::utils::ai_utils::indexing_anchor_text(doc_lang, page_type, &cm.property);
+        let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, &cm.property);
+        let v = cm.value_part.trim();
+        let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
+        anchor_texts.push(a);
+        localized_texts.push(l);
+    }
+    let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+    let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+    let mut saved = 0usize;
+
+    for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+        let chunk_id = format!("{}_{}", item_id, ci);
+
+        let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+            "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+            _ => (0.40f32, 0.30f32, 0.30f32),
+        };
+
+        let mut final_vec = vec![0.0f32; 384];
+        for d in 0..384 {
+            final_vec[d] = chunk_embs[ei][d] * w_chunk
+                + anchor_embs[ei][d] * w_anchor
+                + localized_embs[ei][d] * w_local;
+        }
+        let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for d in 0..384 { final_vec[d] /= norm; }
+        }
+
+        let _ = store.upsert_chunk(
+            &chunk_id,
+            item_id,
+            page_type,
+            &chunk_meta.chunk_text,
+            &chunk_meta.property,
+            &chunk_meta.property_format,
+            &chunk_meta.value_part,
+            Some(final_vec),
+            Some(cc),
+            Some(bcc),
+            Some(ref_val),
+            Some(search_mode),
+        ).await;
+        saved += 1;
+
+        saved += upsert_alias_chunks(
+            store, model, item_id, &chunk_id, page_type, doc_lang,
+            chunk_meta, &alias_pairs[ei], cc, bcc, ref_val, search_mode,
+        ).await;
+    }
+
+    emit(&format!(
+        "  🧩 [CLOUD-SYNC INDEX] item_id='{}' | 청크 {}건 로컬 인덱싱 완료 (type='{}')",
+        item_id, saved, page_type
+    ));
+
+    Ok(saved)
+}
+
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,

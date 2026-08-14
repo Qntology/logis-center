@@ -41,6 +41,8 @@ const blockies = (window as any).blockies;
 
 // --- Config ---
 const API_HOST = "https://commerce.logis.center"; 
+// 🌟 [ANALYTICS TRACK] 관리자(Console) 기능 및 사용자 행동 로그 동기화 전용 Client Worker
+const ANALYTICS_API_HOST = "https://console.logis.center";
 const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
 const EXPANDED_HEIGHT = 600;
@@ -97,6 +99,334 @@ export let lastSearchedQuery = "";
 // 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
 let isBrowserRunning = false;
 let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
+
+/*
+    🌟 [CLOUD AI TRACK]
+    - Cloud 모드로 보낸 작업은 로컬 GPU 큐를 점유하지 않습니다. (락 미사용)
+    - 서버 tasks 테이블에서 해당 task 가 사라지면 = 처리 완료로 간주하여 말풍선을 Done 처리합니다.
+    - 임베딩은 GPU 유무와 무관하게 항상 로컬(Client App)에서 수행합니다.
+*/
+interface CloudPendingMeta {
+    serverId: string;
+    kind: "extract" | "search";
+    createdAt: number;
+}
+let cloudPendingTasks = new Map<string, CloudPendingMeta>();
+let isReindexing = false;
+
+// 🌟 로컬에서 계산한 벡터를 Cloudflare(Vectorize)로 밀어 넣습니다.
+// 🌟 [MODE ROUTING] commerce / shipping → commerce.logis.center, analytic → console.logis.center
+async function pushLocalVectorsToCloud(vectors: any[], mode: string = "commerce") {
+    if (!vectors || vectors.length === 0) return;
+    if (!currentSession.hash) return;
+
+    const isAnalytic = mode === "analytic";
+
+    // commerce 트랙은 이메일 인증(팀 소속)이 있어야 서버 스코프가 잡힙니다.
+    // analytic 트랙은 hash 기준의 단말 스코프이므로 이메일이 없어도 동작합니다.
+    if (!isAnalytic && !currentSession.email) return;
+
+    try {
+        const origin = isAnalytic ? "https://console.logis.center" : "https://commerce.logis.center";
+        const apiHost = isAnalytic ? ANALYTICS_API_HOST : API_HOST;
+        const fallbackHref = isAnalytic ? "https://console.logis.center/" : "https://commerce.logis.center/tracking";
+
+        const now = Date.now();
+        const createdAt = now - timezoneOffset;
+
+        let targetHref = currentDetectedUrl || fallbackHref;
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = fallbackHref;
+        }
+
+        const params = new URLSearchParams({
+            origin: origin,
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: targetHref,
+            type: "vector",
+            from: currentSession.address || "",
+            to: currentSession.team || ""
+        });
+
+        await invoke<any>("proxy_fetch", {
+            url: `${apiHost}/?${params.toString()}`,
+            method: "PUT",
+            headers: {
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip"
+            },
+            body: { items: vectors },
+            session_params: { hash: currentSession.hash, token: currentSession.token }
+        });
+
+        console.log(`[EMBED] Pushed ${vectors.length} locally-computed vectors to ${isAnalytic ? "console" : "commerce"}.logis.center Vectorize.`);
+    } catch (e) {
+        console.warn("[EMBED] Failed to push local vectors to cloud:", e);
+    }
+}
+
+// 🌟 클라우드에서 내려온(벡터 없는) 아이템을 로컬 임베딩 모델로 벡터화 + 청크 인덱싱합니다.
+async function runLocalEmbeddingSync() {
+    if (isReindexing) return;
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+
+    isReindexing = true;
+    try {
+        const res = await invoke<any>("reindex_pending_embeddings", {
+            limit: 20,
+            devicePreference: getDevicePref(),
+            // 🌟 [MODE ROUTING] 현재 트랙(commerce / shipping / analytic)을 그대로 백엔드에 전달
+            mode: currentSearchMode
+        });
+
+        if (res && res.processed && res.processed > 0) {
+            console.log(`[EMBED] Locally embedded ${res.processed} cloud-synced item(s). (mode: ${res.mode || currentSearchMode})`);
+
+            if (res.vectors && res.vectors.length > 0) {
+                await pushLocalVectorsToCloud(res.vectors, res.mode || currentSearchMode);
+            }
+
+            await renderNavigation();
+            if (currentTab === "list") {
+                await loadMoreDocs(false, true);
+            }
+        }
+    } catch (e) {
+        console.warn("[EMBED] reindex_pending_embeddings failed:", e);
+    } finally {
+        isReindexing = false;
+    }
+}
+
+// 🌟 [ANALYTICS TRACK] console.logis.center(analytics Client Worker)에서 구조화 결과를 내려받아
+//    LanceDB / Dexie 에 mode='analytic' 으로 태깅 저장한 뒤, 로컬 임베딩을 트리거합니다.
+//    (서버는 임베딩을 하지 않으므로 벡터화는 전적으로 이 앱이 담당합니다)
+async function syncAnalyticsData() {
+    if (!currentSession.hash) return;
+
+    try {
+        const now = Date.now();
+        const createdAt = now - timezoneOffset;
+
+        let targetHref = currentDetectedUrl || "https://console.logis.center/";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://console.logis.center/";
+        }
+
+        const params = new URLSearchParams({
+            origin: "https://console.logis.center",
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: targetHref
+        });
+
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token }
+        });
+
+        stepQrSpinner();
+
+        if (!response || !response.results || !Array.isArray(response.results)) return;
+
+        const pako = (window as any).pako;
+        const items: any[] = [];
+
+        for (let i = 0; i < response.results.length; i++) {
+            const row = response.results[i];
+            if (!row || !row.id) continue;
+
+            // question / answer 는 채팅 말풍선 전용이므로 리스트 동기화 대상에서 제외합니다.
+            if (row.type === "question" || row.type === "answer") continue;
+
+            let parsed: any = {};
+            try {
+                const rawData = row.data;
+                if (rawData && typeof rawData === "object") {
+                    const raw = rawData.data || rawData;
+                    let arr: Uint8Array | null = null;
+
+                    if (Array.isArray(raw)) {
+                        arr = new Uint8Array(raw);
+                    } else if (raw.buffer) {
+                        arr = new Uint8Array(raw.buffer);
+                    } else if (Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
+                        arr = new Uint8Array(Object.values(raw) as number[]);
+                    }
+
+                    if (arr) {
+                        try {
+                            parsed = JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
+                        } catch (e) {
+                            parsed = JSON.parse(new TextDecoder('utf-8').decode(arr));
+                        }
+                    } else {
+                        parsed = raw;
+                    }
+                } else if (typeof rawData === "string") {
+                    parsed = JSON.parse(rawData);
+                }
+            } catch (e) {
+                parsed = {};
+            }
+
+            const textVal = parsed.action || parsed.summary || parsed.cross_action_flow || "";
+
+            items.push({
+                id: row.id,
+                type: row.type || "click",
+                from: row.from || "",
+                to: row.to || "",
+                cc: row.cc || "",
+                bcc: row.bcc || "",
+                ref: row.ref || "",
+                status: 9,
+                // 🌟 mode 태깅이 있어야 reindex_pending_embeddings / loadMoreDocs 가 analytic 트랙으로 격리합니다.
+                mode: "analytic",
+                created_at: row.created_at || now,
+                updated_at: row.updated_at || now,
+                text: textVal,
+                masked_text: textVal,
+                data: {
+                    ...parsed,
+                    id: row.id,
+                    type: row.type || "click",
+                    mode: "analytic",
+                    text: textVal,
+                    masked_text: textVal
+                }
+            });
+        }
+
+        if (items.length > 0) {
+            await invoke("upsert_items", { items });
+            if (appDb) {
+                await appDb.table("items").bulkPut(enrichForIndex(items)).catch(() => null);
+            }
+            console.log(`[SYNC-ANALYTIC] Synced ${items.length} analytics item(s) from console.logis.center.`);
+        }
+
+        if (currentTab === "list") {
+            await loadMoreDocs(false, true);
+        }
+
+        // 🌟 [CLIENT-SIDE EMBEDDING] 서버가 벡터를 만들지 않으므로 여기서 즉시 로컬 임베딩을 수행합니다.
+        runLocalEmbeddingSync();
+
+    } catch (e) {
+        console.warn("[SYNC-ANALYTIC] Failed:", e);
+    } finally {
+        if (!isExtracting && !isSearching) stopSpinner();
+    }
+}
+
+// 🌟 [ANALYTICS ADMIN] 기존 Client Front SDK(content.js)의 관리자 프롬프트 기능을 Client App 으로 이관한 함수입니다.
+//    질의 벡터는 반드시 로컬 임베딩 모델로 만들어 함께 전송하며, 서버는 그 벡터로 Vectorize 를 조회만 합니다.
+async function askAnalyticsAdmin(query: string) {
+    if (!currentSession.hash) return;
+
+    const taskId = `analytic_${Date.now()}`;
+    const now = Date.now();
+
+    try {
+        renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
+
+        let queryVector: number[] = [];
+        try {
+            queryVector = await invoke<number[]>("get_query_embedding", {
+                text: query,
+                devicePreference: getDevicePref()
+            });
+            console.log(`[ANALYTIC] Local query vector generated. dim = ${queryVector.length}`);
+        } catch (err) {
+            console.warn("[ANALYTIC] Local embedding failed:", err);
+        }
+
+        const createdAt = now - timezoneOffset;
+
+        let targetHref = currentDetectedUrl || "https://console.logis.center/";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://console.logis.center/";
+        }
+
+        const params = new URLSearchParams({
+            origin: "https://console.logis.center",
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: targetHref,
+            text: encodeURIComponent(query)
+        });
+
+        renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Querying analytics console...", spinner: "☁️" });
+
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip"
+            },
+            body: { query: query, vector: queryVector },
+            session_params: { hash: currentSession.hash, token: currentSession.token }
+        });
+
+        renderProgressToUI({ task_id: taskId, category: "Done", summary: "Analytics answer received.", spinner: "✅" });
+
+        if (response && response.results && Array.isArray(response.results)) {
+            const pako = (window as any).pako;
+
+            for (const row of response.results) {
+                if (!row) continue;
+                if (row.type !== "question" && row.type !== "answer") continue;
+
+                let parsed: any = {};
+                try {
+                    const rawData = row.data;
+                    const raw = rawData && (rawData.data || rawData);
+                    let arr: Uint8Array | null = null;
+
+                    if (Array.isArray(raw)) {
+                        arr = new Uint8Array(raw);
+                    } else if (raw && raw.buffer) {
+                        arr = new Uint8Array(raw.buffer);
+                    } else if (raw && typeof raw === "object" && Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
+                        arr = new Uint8Array(Object.values(raw) as number[]);
+                    }
+
+                    if (arr) {
+                        try {
+                            parsed = JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
+                        } catch (e) {
+                            parsed = JSON.parse(new TextDecoder('utf-8').decode(arr));
+                        }
+                    } else if (raw && typeof raw === "object") {
+                        parsed = raw;
+                    }
+                } catch (e) {
+                    parsed = {};
+                }
+
+                await renderMessage({
+                    id: row.id,
+                    role: row.type === "question" ? "user" : "system",
+                    text: parsed.text || "",
+                    status: 9,
+                    created_at: Number(row.created_at) || now,
+                    updated_at: Number(row.updated_at) || now
+                });
+            }
+        }
+    } catch (e) {
+        console.error("[ANALYTIC] Admin prompt failed:", e);
+        renderProgressToUI({ task_id: taskId, category: "Error", summary: "Analytics request failed.", spinner: "❌" });
+    }
+}
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
 if (!(window as any).Dexie) {
@@ -514,6 +844,46 @@ if (chatForm) {
                 content: query 
             }));
             console.log("[CHAT] Message sent via WebRTC");
+        }
+
+        // 🌟 [ANALYTICS ADMIN] analytic 모드에서는 console.logis.center 관리자 프롬프트로 라우팅합니다.
+        //    (기존 Client Front SDK(content.js)의 form[name="prompt"] 기능을 이관한 경로)
+        if (currentSearchMode === "analytic") {
+            await askAnalyticsAdmin(query);
+
+            setTimeout(() => {
+                const scrollEl = document.getElementById("chat-scroll");
+                const container = document.querySelector(".chat-container") as HTMLElement;
+                if (scrollEl && container) {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    currentY = maxScroll;
+                    scrollEl.style.transition = "transform 0.3s ease-out";
+                    updateTransform();
+                    setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+                }
+            }, 100);
+
+            return;
+        }
+
+        // 🌟 [ANALYTICS ADMIN] analytic 모드에서는 console.logis.center 관리자 프롬프트로 라우팅합니다.
+        //    (기존 Client Front SDK(content.js)의 form[name="prompt"] 기능을 이관한 경로)
+        if (currentSearchMode === "analytic") {
+            await askAnalyticsAdmin(query);
+
+            setTimeout(() => {
+                const scrollEl = document.getElementById("chat-scroll");
+                const container = document.querySelector(".chat-container") as HTMLElement;
+                if (scrollEl && container) {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    currentY = maxScroll;
+                    scrollEl.style.transition = "transform 0.3s ease-out";
+                    updateTransform();
+                    setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+                }
+            }, 100);
+
+            return;
         }
 
         // 2. 클라우드플레어 Workers (서버)로 PUT 요청 전송 및 정식 응답 처리 (chrome.js 방식)
@@ -1920,6 +2290,12 @@ function showInviteQr(hook: string, email: string) {
 // --- Sync Logic ---
 // main.ts 내부
 async function syncData() {
+    // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
+    if (currentSearchMode === "analytic") {
+        await syncAnalyticsData();
+        return;
+    }
+
     if (!currentSession.hash || !currentSession.email) return;
     
     console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
@@ -2096,6 +2472,47 @@ async function syncData() {
                 }
             }
             
+            // 🌟 [CLOUD TASK LIFECYCLE] 서버 tasks 목록과 대조하여 클라우드 작업 완료 여부를 판정합니다.
+            if (cloudPendingTasks.size > 0) {
+                const serverTaskIds = new Set<string>();
+                for (const r of response.results) {
+                    if (!r) continue;
+                    if (r.table === "tasks" && r.id) {
+                        serverTaskIds.add(r.id);
+                    }
+                }
+
+                for (const [localTid, meta] of Array.from(cloudPendingTasks.entries())) {
+                    const stillRunning = meta.serverId ? serverTaskIds.has(meta.serverId) : false;
+
+                    if (stillRunning) {
+                        await renderProgressToUI({
+                            task_id: localTid,
+                            category: "Cloud Queue",
+                            summary: "Processing on Logis Center...",
+                            spinner: "☁️"
+                        });
+                        continue;
+                    }
+
+                    // 서버 등록 직후의 레이스 컨디션 방어(최소 5초 유예)
+                    if (Date.now() - meta.createdAt < 5000) continue;
+
+                    cloudPendingTasks.delete(localTid);
+
+                    await renderProgressToUI({
+                        task_id: localTid,
+                        category: "Done",
+                        summary: meta.kind === "search"
+                            ? "Cloud AI search complete."
+                            : "Cloud AI extraction complete.",
+                        spinner: "✅"
+                    });
+
+                    console.log(`[CLOUD] Task ${localTid} (server: ${meta.serverId}) finished on Logis Center.`);
+                }
+            }
+
             console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
             // 3. LanceDB 불러오기
             await renderNavigation();
@@ -2106,6 +2523,9 @@ async function syncData() {
             } else if (currentTab === "settings") {
                 await fetchChatHistory(false, true);
             }
+
+            // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
+            runLocalEmbeddingSync();
         }
         
     } catch (e) { 
@@ -2350,17 +2770,78 @@ btnSubmit?.addEventListener("click", async () => {
 
     try {
         const devicePref = getDevicePref();
-        // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
-        await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
-            taskId: taskId, 
-            query: query, 
-            language: "korean",
-            devicePreference: devicePref,
-            searchMode: currentSearchMode,
-            cc: activeContext.cc || "",
-            bcc: activeContext.bcc || "",
-            refId: activeContext.ref || ""
-        });
+        const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+        if (isCloudMode && currentSession.hash && currentSession.email) {
+            // ☁️ [CLOUD SEARCH] LLM 은 서버에서 돌지만, 질의 임베딩은 반드시 로컬 모델로 만듭니다.
+            renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
+
+            let queryVector: number[] = [];
+            try {
+                queryVector = await invoke<number[]>("get_query_embedding", {
+                    text: query,
+                    devicePreference: devicePref
+                });
+                console.log(`[CLOUD SEARCH] Local query vector generated. dim = ${queryVector.length}`);
+            } catch (err) {
+                console.warn("[CLOUD SEARCH] Local embedding failed. Server will fall back.", err);
+            }
+
+            const origin = "https://commerce.logis.center";
+            let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+                targetHref = "https://commerce.logis.center/tracking";
+            }
+
+            const urlObj = new URL(API_HOST);
+            urlObj.searchParams.append("origin", origin);
+            urlObj.searchParams.append("created_at", (Date.now() - timezoneOffset).toString());
+            urlObj.searchParams.append("hash", currentSession.hash);
+            urlObj.searchParams.append("token", currentSession.token || "");
+            urlObj.searchParams.append("href", targetHref);
+            urlObj.searchParams.append("from", currentSession.address || "");
+            urlObj.searchParams.append("to", currentSession.team || "");
+
+            const response = await invoke<any>("proxy_fetch", {
+                url: urlObj.toString(),
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip"
+                },
+                body: { query: query, vector: queryVector },
+                session_params: { hash: currentSession.hash, token: currentSession.token }
+            });
+
+            let serverTaskId = "";
+            if (response && response.results && response.results.length > 0) {
+                serverTaskId = response.results[0].id || "";
+            }
+
+            cloudPendingTasks.set(taskId, {
+                serverId: serverTaskId,
+                kind: "search",
+                createdAt: Date.now()
+            });
+
+            renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Query queued on Logis Center. Processing remotely.", spinner: "☁️" });
+
+            isSearching = false;
+            stopSpinner();
+            if (btnSubmit) btnSubmit.style.display = "flex";
+        } else {
+            // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
+            await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
+                taskId: taskId, 
+                query: query, 
+                language: "korean",
+                devicePreference: devicePref,
+                searchMode: currentSearchMode,
+                cc: activeContext.cc || "",
+                bcc: activeContext.bcc || "",
+                refId: activeContext.ref || ""
+            });
+        }
         
         // 🌟 [CRITICAL FIX] 검색을 대기열에 추가한 직후, 현재 주소가 전처리 중인지 여부를 재검사하여 번개 버튼을 확실히 숨깁니다.
         updateExtractButtonVisibility();
@@ -2507,7 +2988,26 @@ btnExtract?.addEventListener("click", async () => {
                 });
 
                 console.log("[SERVER MODE] Task accepted by server:", response);
+
+                // 🌟 [CLOUD TASK LIFECYCLE] 서버가 만든 task.id 를 기억해 두고 syncData 에서 완료를 판정합니다.
+                let serverTaskId = "";
+                if (response && response.results && response.results.length > 0) {
+                    serverTaskId = response.results[0].id || "";
+                }
+
+                cloudPendingTasks.set(taskId, {
+                    serverId: serverTaskId,
+                    kind: "extract",
+                    createdAt: Date.now()
+                });
+
                 renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
+
+                // 클라우드 작업은 로컬 GPU 큐를 점유하지 않으므로 즉시 락을 해제합니다.
+                isExtracting = false;
+                stopSpinner();
+                await GlobalTaskManager.release(taskId, taskId);
+                await updateExtractButtonVisibility();
                 
             } else {
                 // ==========================================
@@ -5080,6 +5580,9 @@ async function initSession() {
             console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 백그라운드에서 동기화합니다...");
             syncData(); // await를 제거하여 UI 블로킹 방지
         }
+
+        // 🌟 [CLIENT-SIDE EMBEDDING] 이전 세션에서 클라우드로 받아왔지만 로컬 임베딩이 안 된 아이템을 복구합니다.
+        setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
 
     } catch (e) { 
         console.error("[WIDGET] Handshake failed:", e); 
