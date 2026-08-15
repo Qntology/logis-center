@@ -572,6 +572,16 @@ pub async fn index_item_chunks(
         return Ok(0);
     }
 
+    // 🌟 [MODE GUARD] mode 가 비면 item_chunks 의 mode 컬럼이 빈 문자열이 되고,
+    //    STAGE-4 의 `mode = 'commerce'` 필터에서 전량 탈락합니다.
+    //    (analytic 트랙에서 청크 검색이 0건이던 원인)
+    //    호출부가 빈 값을 넘겨도 안전하도록 여기서 방어합니다.
+    let search_mode = if search_mode.trim().is_empty() {
+        item_json.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce")
+    } else {
+        search_mode
+    };
+
     let natural_text = crate::nl_convert::json_to_natural_language(item_json);
     let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
     if raw_chunks.is_empty() {
@@ -752,6 +762,48 @@ pub async fn index_item_chunks(
     ));
 
     Ok(saved)
+}
+
+// =====================================================================
+// 🌟 [SINGLE UPSERT v4]
+// ---------------------------------------------------------------------
+//  v3 까지는 도메인 테이블(sales/tracking/event)과 items 미러 테이블에
+//  같은 문서를 두 번 저장했습니다. 그런데 store.rs 의 resolve_table 이
+//  v4 부터 두 호출을 모두 items 로 접기 때문에,
+//  그대로 두면 '같은 행에 delete → add' 를 두 번 수행하는 낭비가 됩니다.
+//
+//  또한 두 번째 호출의 digest 가 첫 번째와 다르면
+//  upsert_item 의 스킵 가드가 매번 통과되어 무한 재쓰기가 발생할 수 있습니다.
+//
+//  → 저장 지점을 이 헬퍼 하나로 모읍니다.
+//    호출부는 target_table 을 계속 넘겨도 되지만(가독성 유지),
+//    실제 물리 저장은 정확히 1회만 일어납니다.
+async fn save_item(
+    store: &VectorStore,
+    _legacy_table_hint: &str,
+    id: &str,
+    type_: &str,
+    data: Value,
+    vector: Option<Vec<f32>>,
+    from: &str,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    digest: Option<&str>,
+) {
+    // 🌟 users / pages 만 물리 분리되어 있습니다. 나머지는 전부 items 입니다.
+    //    (resolve_table 과 동일한 규칙 — 두 곳이 어긋나면 저장/조회가 갈립니다)
+    let table = match type_ {
+        "member" | "team" | "user" => "users",
+        "pages" | "page" => "pages",
+        _ => "items",
+    };
+
+    let _ = store.upsert_item(
+        table, id, type_, data, vector,
+        Some(from), Some(to), Some(cc), Some(bcc), Some(ref_val), digest
+    ).await;
 }
 
 pub async fn start_background_worker(
@@ -3338,24 +3390,27 @@ async fn process_task(
                 }
 
                 
-                let _ = store.upsert_item("pages", &page_id, &page_type, page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-                
+                // 🌟 v4 : pages 테이블 1회 저장. items 미러 저장을 제거합니다.
+                //    (Select["pages"] 가 pages 테이블만 읽도록 Part 4 에서 정리했습니다)
+                save_item(&store, "pages", &page_id, "pages", page_data, None,
+                    &task.from, &team_id, &task.cc, &bcc, ref_for_page, None).await;
+
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
 
-                
+
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
                 let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
                     "type": page_type.clone(),
-                    "detail": true,
-                    "node": true,
+                    // 🌟 canonicalize 가 0|1 로 내리지만, 의미를 명확히 하기 위해 정수로 씁니다.
+                    "detail": 1,
+                    "node": 1,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                save_item(&store, "pages", &detail_page_id, "pages", detail_page_data, None,
+                    &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
 
             } else {
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
@@ -3364,12 +3419,12 @@ async fn process_task(
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
                     "type": page_type.clone(),
-                    "detail": true,
-                    "node": true,
+                    "detail": 1,
+                    "node": 1,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                save_item(&store, "pages", &detail_page_id, "pages", detail_page_data, None,
+                    &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
             }
         }
         
@@ -6978,22 +7033,12 @@ async fn process_task(
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
                     
-                    let _ = store.upsert_item(
-                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(tracking_vector.clone()),
-                        Some(&task.from), Some(&team_id), Some(&task.cc),
-                        Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
-                        Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
-                        None
-                    ).await;
+                    // 🌟 v4 : items 단일 저장. 이중 upsert 제거.
+                    let tracking_bcc = crate::utils::hash::hash_id(&format!("tracking{}", cc_val));
+                    let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
 
-                    
-                    let _ = store.upsert_item(
-                        "items", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
-                        Some(&task.from), Some(&team_id), Some(&task.cc),
-                        Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
-                        Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
-                        None
-                    ).await;
+                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
+                        &task.from, &team_id, &task.cc, &tracking_bcc, &tracking_ref, None).await;
                 }
             }
         }
@@ -7030,27 +7075,18 @@ async fn process_task(
         
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
-            // 🌟 [CRITICAL FIX] index.ts와 동일하게 "items" 테이블의 updated_at을 기준으로 draft 판정.
-            // target_table(sales)의 updated_at_ts가 0이더라도, items 테이블에서 이미
-            // updated_at이 설정되어 있으면(이전에 상세 스캔된 적 있음) draft가 아님.
-            // 또한 update_team_base_metrics가 items_to_process를 스캔하여 draft/count를
-            // 자동 계산하므로, 여기서 수동으로 stats_diff를 적용하면 이중 카운트 발생.
-            let mut items_doc_updated_at: i64 = -1; // -1 = items 테이블에서 못 찾음
-            if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
-                items_doc_updated_at = items_doc.updated_at_ts;
-            }
-            was_draft = if items_doc_updated_at == 0 {
-                true // items 테이블의 updated_at이 0 → 아직 상세 스캔 안됨 (draft 상태)
-            } else {
-                false // items 테이블의 updated_at > 0 또는 항목 없음 → 이미 상세 스캔됨
-            };
-            
-            if existing_item.digest == item_digest {
-                existing_vector = Some(existing_item.vector);
-            }
+            // 🌟 [v4] target_table 과 "items" 가 이제 같은 물리 테이블이므로
+            //    두 번 조회할 필요가 없습니다. existing_item 하나로 판정합니다.
+            //    (기존에는 sales / items 두 테이블의 updated_at 이 어긋날 수 있어
+            //     이중 조회로 방어했는데, 단일 테이블이 되면서 어긋날 여지가 사라졌습니다)
+            was_draft = existing_item.updated_at_ts == 0;
 
-            
+            // 🌟 [v4] digest 는 물리 컬럼이 아니라 data.digest 입니다.
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                let old_digest = existing_json.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                if old_digest == item_digest {
+                    existing_vector = Some(existing_item.vector);
+                }
                 extracted_data = merge_node(&existing_json, &extracted_data);
             }
         } 
@@ -7064,24 +7100,19 @@ async fn process_task(
             if let Ok(Some((found_id, json_val))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
                 is_new = false;
-                
+
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    let mut items_doc_updated_at: i64 = -1;
-                    if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
-                        items_doc_updated_at = items_doc.updated_at_ts;
-                    }
-                    was_draft = if items_doc_updated_at == 0 {
-                        true
-                    } else {
-                        false
-                    };
-                    
-                    if existing_item.digest == item_digest {
-                        existing_vector = Some(existing_item.vector);
+                    // 🌟 [v4] 단일 테이블이므로 items 재조회 제거.
+                    was_draft = existing_item.updated_at_ts == 0;
+
+                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                        if old_digest == item_digest {
+                            existing_vector = Some(existing_item.vector);
+                        }
                     }
                 }
-                
-                
+
                 extracted_data = merge_node(&json_val, &extracted_data);
                 if let Some(obj) = extracted_data.as_object_mut() {
                     obj.insert("id".to_string(), json!(target_id.clone()));
@@ -7200,20 +7231,17 @@ async fn process_task(
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                 foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
 
-                                let _ = store.upsert_item(
-                                    &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                
-                                let _ = store.upsert_item(
-                                    "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
+                                // 🌟 v4 : items 단일 저장.
+                                save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                             }
                         },
                         Ok(None) => {
-                            // 🌟 [DEDUP FIX] 상세 페이지 relay에서 기존 목록 전처리에서 이미 생성된
-                            // goods/tracking이 있는지 "items" 테이블에서 교차 검색합니다.
+                            // 🌟 [DEDUP FIX v4] 기존 코드는 `json_data LIKE` 를 썼는데,
+                            //    LanceDB 물리 컬럼명은 `data` 입니다. 존재하지 않는 컬럼이라
+                            //    DataFusion 이 매번 실패해 DEDUP 이 사실상 동작하지 않았고,
+                            //    그 결과 중복 draft 가 계속 생성되었습니다.
+                            //    올바른 컬럼명으로 교정합니다.
                             let mut found_existing = false;
                             let val_str_for_search = match &q.value {
                                 serde_json::Value::String(s) => s.clone(),
@@ -7221,7 +7249,7 @@ async fn process_task(
                                 _ => q.value.to_string(),
                             };
                             if !val_str_for_search.is_empty() {
-                                let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
                                 if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                     if !cross_results.is_empty() {
                                         found_existing = true;
@@ -7241,7 +7269,9 @@ async fn process_task(
                                         serde_json::Value::String(s) => s.clone(),
                                         _ => order_idx.to_string(),
                                     };
-                                    let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                    // 🌟 v4 : canonicalize 가 order 를 String 으로 확정했으므로
+                                    //    JSON 표현이 "order":"123" 형태입니다. 따옴표까지 포함해 매칭합니다.
+                                    let fallback_filter = format!("type = '{}' AND data LIKE '%\"order\":\"{}\"%'", foreign_type, order_idx_str);
                                     if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                         if !fallback_results.is_empty() {
                                             found_existing = true;
@@ -7268,15 +7298,14 @@ async fn process_task(
                                     obj.insert("type".to_string(), json!(foreign_type));
                                     obj.insert(q.column.clone(), q.value.clone());
                                     obj.insert("updated_at".to_string(), json!(0));
+                                    // 🌟 v4 : mode 는 봉투 컬럼이므로 draft 에도 반드시 넣어야
+                                    //    프론트엔드 목록 필터(mode 인덱스)에서 누락되지 않습니다.
+                                    obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                    // 🌟 text 가 비면 LanceDB FTS 대상에서 빠지므로 최소 식별 문구를 넣습니다.
+                                    obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                 }
-                                let _ = store.upsert_item(
-                                    &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                let _ = store.upsert_item(
-                                    "items", &draft_id, foreign_type, draft_data, None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
+                                save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
+                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                             }
                         },
                         _ => {}
@@ -7334,21 +7363,19 @@ async fn process_task(
                                     let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                    let _ = store.upsert_item(
-                                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
-                                    let _ = store.upsert_item(
-                                        "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    if tracking_data.get("mode").is_none() {
+                                        tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                    }
+                                    // 🌟 v4 : items 단일 저장.
+                                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
                                 }
                             },
                             Ok(None) => {
                                 // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
                                 let mut found_existing_tracking = false;
-                                let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", clean_tn.replace("'", "''"));
                                 if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                     if !tracking_cross.is_empty() {
                                         found_existing_tracking = true;
@@ -7369,14 +7396,12 @@ async fn process_task(
                                                     let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                     ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                     ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                    let _ = store.upsert_item(
-                                                        "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
-                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                    ).await;
-                                                    let _ = store.upsert_item(
-                                                        "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                    ).await;
+                                                    if ej.get("mode").is_none() {
+                                                        ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                    }
+                                                    // 🌟 v4 : items 단일 저장.
+                                                    save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                 }
                                                 if let Some(tracking_index) = ej.get("index").cloned() {
                                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -7413,14 +7438,12 @@ async fn process_task(
                                                 let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                 fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                 fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                let _ = store.upsert_item(
-                                                    "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
-                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                ).await;
-                                                let _ = store.upsert_item(
-                                                    "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                ).await;
+                                                if fallback_tdata.get("mode").is_none() {
+                                                    fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                }
+                                                // 🌟 v4 : items 단일 저장.
+                                                save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                 if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
                                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
                                                 }
@@ -7447,16 +7470,13 @@ async fn process_task(
                                             obj.insert("order".to_string(), order_index.clone());
                                         }
                                         obj.insert("updated_at".to_string(), json!(0));
+                                        // 🌟 v4 : mode / text 보존
+                                        obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                        obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
                                     }
                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                    let _ = store.upsert_item(
-                                        "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
-                                    let _ = store.upsert_item(
-                                        "items", &draft_id, "tracking", draft_data, None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
+                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
                                 }
                             },
@@ -7467,14 +7487,9 @@ async fn process_task(
             }
         }
 
-        let _ = store.upsert_item(
-            &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
-            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-        ).await;
-        let _ = store.upsert_item(
-            "items", &target_id, &page_type, extracted_data.clone(), vector,
-            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-        ).await;
+        // 🌟 v4 : items 단일 저장. 이중 upsert 로 인한 delete→add 2회 낭비 제거.
+        save_item(&store, &target_table, &target_id, &page_type, extracted_data.clone(), vector,
+            &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
         items_to_process.push(extracted_data.clone());
 
         // =====================================================================
@@ -7810,8 +7825,12 @@ async fn process_task(
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
                     is_new = false;
 
-                    if existing_item.digest == item_digest {
-                        existing_vector = Some(existing_item.vector);
+                    // 🌟 [v4] digest 는 data.digest 입니다.
+                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                        if old_digest == item_digest {
+                            existing_vector = Some(existing_item.vector);
+                        }
                     }
                 }
 
@@ -7885,19 +7904,16 @@ async fn process_task(
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
                                         let masked_merged_text = merged_text.clone();
                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                        
+
                                         foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                         foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
+                                        if foreign_data.get("mode").is_none() {
+                                            foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                        }
 
-                                        let _ = store.upsert_item(
-                                            &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        
-                                        let _ = store.upsert_item(
-                                            "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
+                                        // 🌟 v4 : items 단일 저장.
+                                        save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     }
                                 },
                                 Ok(None) => {
@@ -7910,7 +7926,7 @@ async fn process_task(
                                         _ => q.value.to_string(),
                                     };
                                     if !val_str_for_search.is_empty() {
-                                        let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
                                         if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                             if !cross_results.is_empty() {
                                                 found_existing = true;
@@ -7927,7 +7943,7 @@ async fn process_task(
                                                 serde_json::Value::String(s) => s.clone(),
                                                 _ => order_idx.to_string(),
                                             };
-                                            let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                            let fallback_filter = format!("type = '{}' AND data LIKE '%\"order\":\"{}\"%'", foreign_type, order_idx_str);
                                             if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                                 if !fallback_results.is_empty() {
                                                     found_existing = true;
@@ -7954,15 +7970,11 @@ async fn process_task(
                                             obj.insert("type".to_string(), json!(foreign_type));
                                             obj.insert(q.column.clone(), q.value.clone());
                                             obj.insert("updated_at".to_string(), json!(0));
+                                            obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                            obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                         }
-                                        let _ = store.upsert_item(
-                                            &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        let _ = store.upsert_item(
-                                            "items", &draft_id, foreign_type, draft_data, None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
+                                        save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
+                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     }
                                 },
                                 _ => {}
@@ -8019,21 +8031,19 @@ async fn process_task(
                                             let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                             tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                             tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                            let _ = store.upsert_item(
-                                                "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
-                                            let _ = store.upsert_item(
-                                                "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
+                                            // 🌟 v4 : mode 보존. 없으면 목록 필터에서 사라집니다.
+                                            if tracking_data.get("mode").is_none() {
+                                                tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                            }
+                                            save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                             emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
                                         }
                                     },
                                     Ok(None) => {
                                         // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
                                         let mut found_existing_tracking = false;
-                                        let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", clean_tn.replace("'", "''"));
                                         if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                             if !tracking_cross.is_empty() {
                                                 found_existing_tracking = true;
@@ -8053,14 +8063,12 @@ async fn process_task(
                                                             let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                             ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                             ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                            let _ = store.upsert_item(
-                                                                "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
-                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                            ).await;
-                                                            let _ = store.upsert_item(
-                                                                "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                            ).await;
+                                                            if ej.get("mode").is_none() {
+                                                                ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                            }
+                                                            // 🌟 v4 : items 단일 저장.
+                                                            save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                         }
                                                         if let Some(tracking_index) = ej.get("index").cloned() {
                                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -8094,14 +8102,12 @@ async fn process_task(
                                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                         fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                         fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                        let _ = store.upsert_item(
-                                                            "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
-                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                        ).await;
-                                                        let _ = store.upsert_item(
-                                                            "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                        ).await;
+                                                        if fallback_tdata.get("mode").is_none() {
+                                                            fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                        }
+                                                        // 🌟 v4 : items 단일 저장.
+                                                        save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                         if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
                                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
                                                         }
@@ -8128,16 +8134,12 @@ async fn process_task(
                                                     obj.insert("order".to_string(), order_index.clone());
                                                 }
                                                 obj.insert("updated_at".to_string(), json!(0));
+                                                obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                                obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
                                             }
                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                            let _ = store.upsert_item(
-                                                "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
-                                            let _ = store.upsert_item(
-                                                "items", &draft_id, "tracking", draft_data, None,
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
+                                            save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
+                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                             emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
                                         }
                                     },
@@ -8148,14 +8150,9 @@ async fn process_task(
                     }
                 }
 
-                let _ = store.upsert_item(
-                    &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
-                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-                ).await;
-                let _ = store.upsert_item(
-                    "items", &hashed_item_id, &page_type, single_item.clone(), vector,
-                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-                ).await;
+                // 🌟 v4 : items 단일 저장.
+                save_item(&store, &target_table, &hashed_item_id, &page_type, single_item.clone(), vector,
+                    &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
                 items_to_process.push(single_item.clone());
 
                 // =====================================================================
@@ -8408,8 +8405,26 @@ async fn process_task(
     }
 
     if !items_to_process.is_empty() {
-        let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &items_to_process, stats_diff.clone()).await;
-        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", items_to_process.len(), stats_diff);
+        // 🌟 [METRICS GUARD v4] update_team_base_metrics 는 items_to_process 를 스캔해
+        //    updated_at / type / 수치 필드로 draft·count 및 min/max 를 집계합니다.
+        //    canonicalize 가 수치를 정수/실수로 확정했으므로 집계가 안정화되지만,
+        //    mode / type / updated_at 이 누락된 항목이 섞이면 통계가 어긋납니다.
+        //    집계 직전에 최소 계약을 강제합니다.
+        let metrics_input: Vec<Value> = items_to_process.iter().map(|it| {
+            let mut v = it.clone();
+            if let Some(o) = v.as_object_mut() {
+                if o.get("type").is_none() { o.insert("type".to_string(), json!(page_type.clone())); }
+                if o.get("mode").is_none() { o.insert("mode".to_string(), json!(search_mode.clone())); }
+                if o.get("updated_at").is_none() { o.insert("updated_at".to_string(), json!(0)); }
+                if o.get("created_at").is_none() {
+                    o.insert("created_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                }
+            }
+            v
+        }).collect();
+
+        let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &metrics_input, stats_diff.clone()).await;
+        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", metrics_input.len(), stats_diff);
     }
 
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;

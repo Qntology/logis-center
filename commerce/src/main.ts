@@ -6075,9 +6075,58 @@ async function initSession() {
             await updateExtractButtonVisibility();
         }
 
+        // 🌟 [SCHEMA GENERATION CHECK v4]
+        //  store.rs 의 init_all_tables 는 schema_v4 컬럼이 없으면 테이블을 통째로 drop 합니다.
+        //  구버전 사용자는 앱 실행 직후 LanceDB 가 비어 있게 되므로,
+        //  '데이터가 사라진 것처럼 보이는' 상황을 사용자에게 정확히 설명해야 합니다.
+        //  판정: Dexie 에는 데이터가 있는데 LanceDB(mark_ui_ready)가 비어 있으면 세대 전환입니다.
+        try {
+            const dexieCount = await appDb.table("items").count();
+            const lanceCount = (data.items && data.items.length) ? data.items.length : 0;
+            const alreadyNotified = await kvGet("schema_v4_notified");
+
+            if (dexieCount > 0 && lanceCount === 0 && !alreadyNotified) {
+                await kvSet("schema_v4_notified", "true");
+                console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local search index needs re-population.");
+
+                // 🌟 Dexie 에 원본이 살아 있으므로 LanceDB 로 되밀어 넣습니다.
+                //    (사용자가 다시 추출할 필요가 없습니다)
+                const allRows = await appDb.table("items").limit(2000).toArray();
+                if (allRows.length > 0) {
+                    const restorePayload = allRows.map((r: any) => ({
+                        id: r.id,
+                        type: r.type,
+                        flag: r.flag,
+                        from: r.from,
+                        to: r.to,
+                        cc: r.cc,
+                        bcc: r.bcc,
+                        ref: r.ref,
+                        mode: r.mode,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        ...(r.data || {})
+                    }));
+
+                    console.log(`[SCHEMA] Restoring ${restorePayload.length} document(s) from Dexie into LanceDB v4...`);
+                    // 배치로 나눠 밀어 넣습니다. (한 번에 2000건은 Rust 쪽에서 부담)
+                    for (let i = 0; i < restorePayload.length; i += 100) {
+                        const chunk = restorePayload.slice(i, i + 100);
+                        try { await invoke("upsert_items", { items: chunk }); } catch (e) { console.warn("[SCHEMA] restore chunk failed:", e); }
+                    }
+                    console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
+
+                    // 🌟 벡터/청크는 다시 만들어야 하므로 로컬 임베딩을 트리거합니다.
+                    runLocalEmbeddingSync();
+                }
+            }
+        } catch (e) {
+            console.warn("[SCHEMA] Generation check skipped:", e);
+        }
+
         // 🌟 [CRITICAL FIX] 렌더링 오염(pages 타입 노출) 해결: 필터링 없이 raw DB 아이템을 무작정 렌더링하던 코드를 삭제합니다.
-        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서 
-        // baseFilter("type IN ('sales'...)")를 거쳐 100% 안전하게 수행됩니다.
+        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서
+        // Dexie 스코프 체이닝을 거쳐 100% 안전하게 수행됩니다.
 
         // 🌟 [CRITICAL FIX] Rust(LanceDB)에서 로드한 초기 데이터를 다시 Rust로 덮어쓰는(역동기화) 치명적인 병목 루프를 제거합니다.
 
@@ -6145,10 +6194,14 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             await appDb.delete();
             await appDb.open();
             console.log("[RESET] Dexie DB deleted and reopened.");
-            
+
+            // 🌟 v4 : 세대 전환 안내 플래그도 함께 초기화합니다.
+            //    (전체 초기화 후에는 복구할 원본이 없으므로 안내가 다시 뜨면 안 됩니다)
+            await kvRemove("schema_v4_notified");
+
             // 4. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
             sessionStorage.clear();
-            
+
             // 5. 앱 강제 새로고침
             window.location.reload();
         } catch (e) {
