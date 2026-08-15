@@ -96,8 +96,13 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
 
     const docId = item.id || item.uuid || (item.data && item.data.id) || item.index || Math.random().toString(36).substr(2, 9);
     
+    // 🌟 v4 : 봉투 루트를 우선 읽되, 구버전 데이터를 위해 data.* 폴백을 둡니다.
+    const createdTs = item.created_at ?? item.data?.created_at ?? 0;
+    const updatedTs = item.updated_at ?? item.data?.updated_at ?? 0;
+    const modeStr = item.mode ?? item.data?.mode ?? 'commerce';
+
     let body = `<input type="checkbox" id="more-${docId}" class="toggle-more" ${checked ? 'disabled checked' : ''} style="display:none;" />`;
-    body += `<div id="${docId}" class="${selector.result}" data-type="${item.type || ''}" data-created-at="${item.created_at || 0}" data-updated-at="${item.updated_at || 0}">`;
+    body += `<div id="${docId}" class="${selector.result}" data-type="${item.type || ''}" data-mode="${modeStr}" data-created-at="${createdTs}" data-updated-at="${updatedTs}">`;
 
     let itemType = item.type || "unknown";
     const tradeDocs = ['BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'shipping_doc', 'shipping'];
@@ -211,7 +216,11 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
 
     // 🌟 Shipping 전용 UI 추가
     } else if (itemType === "shipping") {
-        if(item.status) item.status = parseStatus(item.status);
+        // 🌟 v4 : status 는 봉투가 아니라 data.status 입니다.
+        //    canonicalize 가 정수 코드로 확정했으므로 parseStatus 로 문자열화합니다.
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "no")}
@@ -261,7 +270,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "tracking") {
-        if(item.status) item.status = parseStatus(item.status);
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "text")}
@@ -281,7 +292,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "event") {
-        if(item.status) item.status = parseStatus(item.status);
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "title")}
@@ -311,11 +324,20 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         `;
     }
 
-    body += `<input type="hidden" readonly name="${selector.created_at}" value="${item.created_at || 'undefined'}" />`;
-    
-    // Relay 연동을 위한 메타데이터 앵커 태그
-    body += `<div class="${selector.relate}" index="${item.index}" event="${item.event}" views="${item.views}" goods="${item.goods}" tracking="${item.tracking}"></div>`;
-    
+    body += `<input type="hidden" readonly name="${selector.created_at}" value="${createdTs || 'undefined'}" />`;
+
+    // 🌟 [SEARCH BADGE] Dexie 플랜이 어떤 조건으로 이 문서를 통과시켰는지 표시합니다.
+    if (item.data && item.data.search_badge) {
+        body += `<div class="${selector.info} search-badge" style="opacity:0.7;">
+            <strong>match</strong>
+            <span><span class="value">${item.data.search_badge}</span></span>
+        </div>`;
+    }
+
+    // 🌟 [RELAY ANCHOR] v4 : 연관 키가 data.* 로 이동했습니다.
+    const d = item.data || {};
+    body += `<div class="${selector.relate}" index="${d.index ?? ''}" event="${d.event ?? ''}" views="${d.views ?? ''}" goods="${d.goods ?? ''}" tracking="${d.tracking ?? ''}"></div>`;
+
     body += `</div>`; // Close .logis-result
 
     return body;

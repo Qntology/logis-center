@@ -394,19 +394,30 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
-        
-        let target = match table_name {
-            "sales" | "goods" | "order" => "sales",
-            "tracking" | "receiving" | "shipping" => "tracking",
-            "event" | "coupon" => "event",
-            "member" | "team" | "user" => "users",
-            "talk" | "prompt" | "ai_search" => "talks",
-            "pages" => "pages",
-            "items" => "items",
-            t if t.starts_with("commerce_") => &t[9..],
-            _ => "items"
+    // 🌟 [SINGLE ROUTER] 테이블 라우팅을 단 하나의 함수로 통일합니다.
+    //    기존에는 delete_item / delete_items / find_item_by_property / search_items /
+    //    upsert_item 이 각자 다른 match 문을 복붙해 놓아 서로 어긋났고,
+    //    그 결과가 'review 는 items 에 저장되는데 event 에서 조회' 버그였습니다.
+    //    v4 부터 도메인 타입은 전부 items 로 접히고, 구분은 type 컬럼이 담당합니다.
+    fn resolve_table(table_or_type: &str) -> &'static str {
+        let t = if table_or_type.starts_with("commerce_") {
+            &table_or_type[9..]
+        } else {
+            table_or_type
         };
+
+        match t {
+            // 사용자/팀 : 라이프사이클이 달라 물리 분리 유지
+            "users" | "member" | "team" | "user" => "users",
+            // 페이지 셀렉터 캐시 : 검색 대상이 아니라 물리 분리 유지
+            "pages" | "page" => "pages",
+            // 그 외 전부 items (sales/tracking/event/goods/order/coupon/review/talk/...)
+            _ => "items",
+        }
+    }
+
+    pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
+        let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
         table.delete(&format!("id = '{}'", id)).await?;
 
@@ -417,18 +428,9 @@ impl VectorStore {
     }
 
     pub async fn delete_items(&self, table_name: &str, ids: Vec<String>) -> Result<()> {
-        
-        let target = match table_name {
-            "sales" | "goods" | "order" => "sales",
-            "tracking" | "receiving" | "shipping" => "tracking",
-            "event" | "coupon" => "event",
-            "member" | "team" | "user" => "users",
-            "talk" | "prompt" | "ai_search" => "talks",
-            "pages" => "pages",
-            "items" => "items",
-            t if t.starts_with("commerce_") => &t[9..],
-            _ => "items"
-        };
+        if ids.is_empty() { return Ok(()); }
+
+        let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
         let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
         table.delete(&format!("id IN ({})", id_list)).await?;
@@ -441,69 +443,101 @@ impl VectorStore {
         Ok(())
     }
     
+    // 🌟 [SCHEMA v4 / UNIFIED ENVELOPE]
+    //  물리 컬럼을 '봉투(Envelope) 12개 + 검색 부품 3개' 로 확정합니다.
+    //    봉투 : id, type, flag, from, to, cc, bcc, ref, mode, data, created_at, updated_at
+    //    검색 : vector(ANN), text(FTS), masked_text(FTS)
+    //  status / amount / is_masked / digest 는 전부 data JSON 으로 하강합니다.
+    //  → LanceDB 는 '벡터 + FTS + 스코프 프리필터' 만 담당하고,
+    //    도메인 조건(가격/수량/송장번호/상태...)은 Dexie 가 data.* 인덱스로 처리합니다.
+    //  → 도메인 필드가 늘어나도 이 스키마는 영원히 그대로입니다. (Rust 재빌드 불필요)
+    pub const SCHEMA_VERSION: &'static str = "v4:unified-envelope";
+
     pub async fn init_all_tables(&self) -> Result<()> {
-        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
+        // 🌟 [TABLE COLLAPSE] sales / tracking / event 물리 테이블을 폐기합니다.
+        //    scheduler 가 어차피 items 에 이중 upsert 하고 있었고,
+        //    lib.rs 의 target_table match 와 어긋나 'review 는 items 에 저장되는데
+        //    event 에서 조회' 같은 구조적 0건 버그를 만들던 원인입니다.
+        //    items 단일 테이블 + type 컬럼 파티셔닝으로 대체합니다.
+        let tables = vec!["items", "users", "pages"];
+
+        // 🌟 [LEGACY DROP] 이전 버전이 만든 '도메인 분할' 테이블만 정리합니다.
+        //    talks 는 도메인 분할이 아니라 별도 스키마(role/task_id/status)를 가진
+        //    메시지 테이블이므로 절대 포함시키면 안 됩니다.
+        //    (init_task_table 이 별도로 관리합니다)
+        for legacy in ["sales", "tracking", "event"] {
+            let existing_legacy = self.conn.table_names().execute().await.unwrap_or_default();
+            if existing_legacy.contains(&legacy.to_string()) {
+                println!("[Store] Dropping legacy partition table: {}", legacy);
+                let _ = self.conn.drop_table(legacy, &[]).await;
+                let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, legacy));
+            }
+        }
+
         let item_field = Field::new("item", DataType::Float32, true);
         let schema = Arc::new(Schema::new(vec![
+            // ── 봉투(Envelope) : 3개 저장소(D1 / LanceDB / Dexie) 공통 계약 ──
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
+            Field::new("flag", DataType::Utf8, true),
             Field::new("from", DataType::Utf8, true),
             Field::new("to", DataType::Utf8, true),
             Field::new("cc", DataType::Utf8, true),
             Field::new("bcc", DataType::Utf8, true),
             Field::new("ref", DataType::Utf8, true),
-            Field::new("digest", DataType::Utf8, true),
-            Field::new("status", DataType::Int32, true), 
-            Field::new("amount", DataType::Float32, true),
+            Field::new("mode", DataType::Utf8, true),
+            Field::new("data", DataType::Utf8, false),
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("updated_at", DataType::Int64, false),
+            // ── 검색 부품 : LanceDB 전용. 도메인 컬럼이 아님 ──
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 384), true),
             Field::new("text", DataType::Utf8, false),
             Field::new("masked_text", DataType::Utf8, true),
-            Field::new("data", DataType::Utf8, false),
-            Field::new("created_at", DataType::Int64, false), 
-            Field::new("updated_at", DataType::Int64, false),
-            Field::new("mode", DataType::Utf8, true), 
-            Field::new("is_masked", DataType::Boolean, true),
+            // ── 스키마 세대 각인 : 세대가 바뀌면 전량 재생성 ──
+            Field::new("schema_v4", DataType::Utf8, true),
         ]));
-        
+
         let uri = self.base_path.clone();
         let existing = self.conn.table_names().execute().await?;
-        
+
         for name in tables {
             if existing.contains(&name.to_string()) {
                 match self.conn.open_table(name).execute().await {
                     Ok(table) => {
                         let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
-                        let has_ref = current_schema.field_with_name("ref").is_ok();
-                        let has_mode = current_schema.field_with_name("mode").is_ok(); 
-                        let has_masked_text = current_schema.field_with_name("masked_text").is_ok();
-                        let has_is_masked = current_schema.field_with_name("is_masked").is_ok();
-                        let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
-                            field.data_type() == &DataType::Int32
-                        } else { false };
+                        // 🌟 세대 각인 컬럼 하나만 확인하면 됩니다.
+                        //    (기존처럼 컬럼을 하나하나 확인하는 방식은 스키마가 바뀔 때마다
+                        //     검사 코드를 같이 고쳐야 해서 누락이 반복되었습니다)
+                        let is_v4 = current_schema.field_with_name("schema_v4").is_ok();
+                        // 🌟 도메인 컬럼 잔재가 있으면 구세대입니다.
+                        let has_legacy_domain = current_schema.field_with_name("status").is_ok()
+                            || current_schema.field_with_name("amount").is_ok()
+                            || current_schema.field_with_name("is_masked").is_ok();
 
-                        if !has_ref || !status_is_int || !has_mode || !has_masked_text || !has_is_masked { 
-                            println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
+                        if !is_v4 || has_legacy_domain {
+                            println!("[Store] Schema generation mismatch for {} (v4: {}, legacy_domain: {}). Recreating...", name, is_v4, has_legacy_domain);
                             let _ = self.conn.drop_table(name, &[]).await;
+                            let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
                         } else {
                             continue;
                         }
                     },
                     Err(_) => {
-                        
                         println!("[Store] Corrupted table {} detected. Force dropping.", name);
                         let _ = self.conn.drop_table(name, &[]).await;
                         let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
                     }
                 }
             }
-            
+
             if let Err(_) = self.conn.create_empty_table(name, schema.clone()).execute().await {
                 let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
                 let _ = self.conn.create_empty_table(name, schema.clone()).execute().await;
             }
 
-            
-            // 오직 원본 데이터를 모두 참조하고 있는 마스터 테이블인 "items"에만 전용 FTS 인덱스를 구축합니다.
+            // 🌟 [FTS] items 만 마스터 검색 대상입니다.
+            //    data 컬럼 FTS 는 그대로 유지합니다. 도메인 값이 전부 data 로 내려오므로
+            //    오히려 이 인덱스의 가치가 올라갑니다. (송장번호/코드 substring 매칭)
             if let Ok(table) = self.conn.open_table(name).execute().await {
                 if name == "items" {
                     let _ = table.create_index(&["text"], lancedb::index::Index::FTS(
@@ -513,7 +547,7 @@ impl VectorStore {
                             .ngram_min_length(2)
                             .ngram_max_length(3)
                     )).execute().await;
-                    
+
                     let _ = table.create_index(&["masked_text"], lancedb::index::Index::FTS(
                         lancedb::index::scalar::FtsIndexBuilder::default()
                             .with_position(true)
@@ -521,7 +555,7 @@ impl VectorStore {
                             .ngram_min_length(2)
                             .ngram_max_length(3)
                     )).execute().await;
-                    
+
                     let _ = table.create_index(&["data"], lancedb::index::Index::FTS(
                         lancedb::index::scalar::FtsIndexBuilder::default()
                             .with_position(true)
@@ -529,47 +563,151 @@ impl VectorStore {
                             .ngram_min_length(2)
                             .ngram_max_length(3)
                     )).execute().await;
-                    
+
                     println!("[Store] FTS Master Index verified/created exclusively for table: {}", name);
                 }
             }
         }
 
-        // 🌟 [PHASE D] item_chunks 테이블 초기화
+        // 🌟 [PHASE D] item_chunks 테이블 초기화 (변경 없음 — 순수 벡터 테이블)
         self.init_chunks_table().await?;
 
         Ok(())
     }
     
+    // 🌟 [CANONICALIZE / RUST SIDE]
+    //  Dexie 의 canonicalizeData(main.ts) 와 '완전히 동일한 규칙'으로 data 를 정규화합니다.
+    //  두 곳의 규칙이 어긋나면 같은 값이 LanceDB 에는 "123", Dexie 에는 123 으로 들어가
+    //  where('data.no').equals("123") 이 절반을 놓칩니다.
+    //
+    //  규칙:
+    //    ① 식별자류 → String (없으면 "")
+    //    ② 수치류   → Number (없거나 파싱 실패 시 0)
+    //    ③ 불리언류 → 0|1 정수 (IndexedDB 는 boolean 을 키로 인정하지 않음)
+    //    ④ tags     → 배열 (멀티엔트리 인덱스 대상)
+    fn canonicalize_data(mut v: Value) -> Value {
+        const ID_KEYS: [&str; 13] = [
+            "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
+            "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
+        ];
+        const NUM_KEYS: [&str; 24] = [
+            "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
+            "discount", "quantity", "width", "height", "length", "weight",
+            "shipping_fee", "shipping_duration", "low_stock_threshold",
+            "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
+            "started_at", "expired_at", "created_at", "updated_at", "views",
+        ];
+        const BOOL_KEYS: [&str; 11] = [
+            "detail", "is_masked", "is_device", "embed", "node",
+            "new_customer_only", "first_purchase_only", "region_restrictions",
+            "bundle_shipping", "tax_included", "recipient_match",
+        ];
+
+        let obj = match v.as_object_mut() {
+            Some(o) => o,
+            None => return json!({}),
+        };
+
+        for k in ID_KEYS.iter() {
+            let s = match obj.get(*k) {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                Some(other) => other.to_string().trim_matches('"').to_string(),
+            };
+            obj.insert(k.to_string(), json!(s));
+        }
+
+        for k in NUM_KEYS.iter() {
+            let n: f64 = match obj.get(*k) {
+                None | Some(Value::Null) => 0.0,
+                Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
+                Some(Value::String(s)) => {
+                    // 🌟 status 는 문자열 상태값("complete")이 들어올 수 있으므로 먼저 코드로 환산합니다.
+                    if *k == "status" {
+                        crate::logic::parse_status(s) as f64
+                    } else {
+                        let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                        cleaned.parse::<f64>().unwrap_or(0.0)
+                    }
+                },
+                Some(Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
+                _ => 0.0,
+            };
+            // 정수로 떨어지면 정수로 저장해 Dexie 인덱스 타입과 일치시킵니다.
+            if n.fract() == 0.0 && n.abs() < 9e15 {
+                obj.insert(k.to_string(), json!(n as i64));
+            } else {
+                obj.insert(k.to_string(), json!(n));
+            }
+        }
+
+        for k in BOOL_KEYS.iter() {
+            let b = match obj.get(*k) {
+                Some(Value::Bool(x)) => *x,
+                Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+                Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+                _ => false,
+            };
+            obj.insert(k.to_string(), json!(if b { 1 } else { 0 }));
+        }
+
+        // tags : 멀티엔트리 인덱스 대상이므로 반드시 문자열 배열
+        let tags: Vec<Value> = match obj.get("tags") {
+            Some(Value::Array(arr)) => arr.iter().map(|t| {
+                if let Some(o) = t.as_object() {
+                    json!(o.get("tag").and_then(|x| x.as_str()).unwrap_or(""))
+                } else if let Some(s) = t.as_str() {
+                    json!(s)
+                } else {
+                    json!(t.to_string().trim_matches('"'))
+                }
+            }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
+            Some(Value::String(s)) if !s.is_empty() => vec![json!(s)],
+            _ => Vec::new(),
+        };
+        obj.insert("tags".to_string(), json!(tags));
+
+        v
+    }
+
     pub async fn upsert_item(
         &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
         from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
-         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
          let table = self.conn.open_table(target).execute().await?;
 
-         let final_id = if id.is_empty() { 
-             data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string() 
+         let final_id = if id.is_empty() {
+             data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
          } else { id.to_string() };
 
          if final_id.is_empty() { return Ok(()); }
 
-         
-         let existing = self.get_item_by_id(target, &final_id).await?;
-         if let Some(doc) = existing {
-             let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
-             let new_digest = digest.unwrap_or("");
+         // 🌟 [SKIP GUARD] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
+         //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
+         let new_digest = digest.unwrap_or("").to_string();
+         let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
 
-             // 업데이트 시간이 같고 다이제스트가 같으면 불필요한 쓰기 스킵
-             if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() && doc.digest == new_digest {
-                 return Ok(());
+         if let Some(doc) = self.get_item_by_id(target, &final_id).await? {
+             if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() {
+                 let old_digest = serde_json::from_str::<Value>(&doc.json_data)
+                     .ok()
+                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
+                     .unwrap_or_default();
+                 if old_digest == new_digest {
+                     return Ok(());
+                 }
              }
          }
 
-         println!("[DEBUG] store.upsert_item (Updated) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
-         
+         println!("[DEBUG] store.upsert_item (v4) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
+
          let _ = table.delete(&format!("id = '{}'", final_id)).await;
+
          let mut final_data = data_val.clone();
+
+         // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
          if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
              if blob_base64.len() > 50 {
                  use base64::prelude::BASE64_STANDARD;
@@ -581,53 +719,70 @@ impl VectorStore {
                  }
              }
          }
+
+         // 🌟 봉투 값들을 data 안에도 동봉합니다.
+         //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
+         let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
+         let now_ts = if new_updated_at > 0 { new_updated_at } else { chrono::Utc::now().timestamp_millis() };
+         let created_at = data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts);
+
          if let Some(obj) = final_data.as_object_mut() {
+             // 별칭 보정 (기존 동작 유지)
              if let Some(tn) = obj.get("tracking_number").cloned() {
                  if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
              }
              if let Some(p) = obj.get("price").cloned() {
                  if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
              }
+
+             obj.insert("id".to_string(), json!(final_id.clone()));
+             obj.insert("type".to_string(), json!(type_));
+             obj.insert("mode".to_string(), json!(mode_str.clone()));
+             obj.insert("created_at".to_string(), json!(created_at));
+             obj.insert("updated_at".to_string(), json!(now_ts));
+             if !new_digest.is_empty() {
+                 obj.insert("digest".to_string(), json!(new_digest.clone()));
+             }
          }
+
+         // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
+         let final_data = Self::canonicalize_data(final_data);
+
          let json_str = final_data.to_string();
          let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
-         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or("").to_string();
-         let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
-         let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
-         let doc_date_str = data_val.get("order_date").or_else(|| data_val.get("registration_date")).or_else(|| data_val.get("release_date")).or_else(|| data_val.get("manufacture_date")).or_else(|| data_val.get("shipping_date")).or_else(|| data_val.get("started_at")).or_else(|| data_val.get("expired_at")).or_else(|| data_val.get("payment_date")).and_then(|v| v.as_str()).unwrap_or("");
-         
-         
-         let now_ts = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-         let created_at = if !doc_date_str.is_empty() {
-             chrono::DateTime::parse_from_rfc3339(doc_date_str).map(|dt| dt.timestamp_millis()).unwrap_or_else(|_| chrono::NaiveDateTime::parse_from_str(doc_date_str, "%Y-%m-%dT%H:%M:%S").map(|dt| dt.and_utc().timestamp_millis()).unwrap_or(now_ts))
-         } else { 
-             data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts) 
-         };
-         
-         
-         let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
-         let is_masked_val = data_val.get("is_masked").and_then(|v| v.as_bool()).unwrap_or(false);
-         
+         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or(&text_content).to_string();
+         let flag_str = final_data.get("flag").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
          let schema = table.schema().await?;
-         
-         
+
          let safe_vector = match vector {
              Some(v) if v.len() == 384 => v,
              _ => vec![0.0; 384],
          };
          let values_builder = Float32Array::from(safe_vector);
-         
          let list_field = Field::new("item", DataType::Float32, true);
          let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 384, Arc::new(values_builder), None)?;
+
+         // 🌟 컬럼 순서는 init_all_tables 의 schema 정의와 1:1 로 일치해야 합니다.
+         //    0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
+         //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 text / 14 masked_text / 15 schema_v4
          let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(StringArray::from(vec![final_id])), Arc::new(StringArray::from(vec![type_])),
-                Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
-                Arc::new(Int32Array::from(vec![status])), Arc::new(Float32Array::from(vec![amount])),
-                Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![masked_text_content])), Arc::new(StringArray::from(vec![json_str])),
-                Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
-                Arc::new(StringArray::from(vec![mode_str])), Arc::new(BooleanArray::from(vec![Some(is_masked_val)])),
+                Arc::new(StringArray::from(vec![final_id])),
+                Arc::new(StringArray::from(vec![type_])),
+                Arc::new(StringArray::from(vec![flag_str])),
+                Arc::new(StringArray::from(vec![from.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![to.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![mode_str])),
+                Arc::new(StringArray::from(vec![json_str])),
+                Arc::new(Int64Array::from(vec![created_at])),
+                Arc::new(Int64Array::from(vec![now_ts])),
+                Arc::new(list_array),
+                Arc::new(StringArray::from(vec![text_content])),
+                Arc::new(StringArray::from(vec![masked_text_content])),
+                Arc::new(StringArray::from(vec![Self::SCHEMA_VERSION])),
          ])?;
          table.add(vec![batch]).execute().await?;
          Ok(())
@@ -647,209 +802,182 @@ impl VectorStore {
                 }
             }
         }
-        let team_data = json!({"flag": flag, "name": format!("{}'s team", user_name), "title": "", "region": null, "page_count": 0, "favicon": null, "base": base});
-        let user_data = json!({"flag": flag, "name": user_name, "title": "", "region": null, "page_count": 0, "favicon": null});
+
+        // 🌟 [ENVELOPE] flag / mode / text 를 data 안에 명시적으로 넣습니다.
+        //    canonicalize_data 가 ID/NUM/BOOL 키만 건드리므로 base 통계 트리는 그대로 보존됩니다.
+        //    text 가 비면 LanceDB text 컬럼이 빈 문자열이 되어 FTS 대상에서 제외되므로
+        //    최소한의 식별 문구를 넣어 둡니다.
+        let team_data = json!({
+            "flag": flag,
+            "mode": "commerce",
+            "name": format!("{}'s team", user_name),
+            "title": "",
+            "region": null,
+            "page_count": 0,
+            "favicon": null,
+            "text": format!("{}'s team", user_name),
+            "base": base
+        });
+        let user_data = json!({
+            "flag": flag,
+            "mode": "commerce",
+            "name": user_name,
+            "title": "",
+            "region": null,
+            "page_count": 0,
+            "favicon": null,
+            "text": user_name
+        });
+
         self.upsert_item("users", &team_id, "team", team_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         self.upsert_item("users", user_address, "user", user_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         Ok(())
     }
 
+    // 🌟 [ROW READER] RecordBatch → TradeDocument 변환을 한 곳으로 모읍니다.
+    //  기존에는 get_all_items / get_item_by_id 가 컬럼 인덱스를 각자 하드코딩해서
+    //  스키마가 바뀔 때마다 두 곳을 동시에 고쳐야 했고, 실제로 어긋난 적이 있습니다.
+    fn batch_to_docs(batch: &RecordBatch) -> Vec<TradeDocument> {
+        let ids         = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let types       = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let flags       = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let froms       = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        let tos         = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+        let ccs         = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+        let bccs        = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+        let refs        = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+        let modes       = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
+        let jsons       = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+        let createds    = batch.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
+        let updateds    = batch.column(11).as_any().downcast_ref::<Int64Array>().unwrap();
+        let texts       = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+        let masked      = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+
+        let mut out = Vec::with_capacity(batch.num_rows());
+        for i in 0..batch.num_rows() {
+            out.push(TradeDocument {
+                id: ids.value(i).to_string(),
+                r#type: types.value(i).to_string(),
+                flag: flags.value(i).to_string(),
+                from: froms.value(i).to_string(),
+                to: tos.value(i).to_string(),
+                cc: ccs.value(i).to_string(),
+                bcc: bccs.value(i).to_string(),
+                r#ref: refs.value(i).to_string(),
+                mode: modes.value(i).to_string(),
+                json_data: jsons.value(i).to_string(),
+                created_at_ts: createds.value(i),
+                updated_at_ts: updateds.value(i),
+                text: texts.value(i).to_string(),
+                masked_text: masked.value(i).to_string(),
+                vector: Vec::new(),
+            });
+        }
+        out
+    }
+
     pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<TradeDocument>> {
-        let table = self.conn.open_table(table_name).execute().await?;
+        let target = Self::resolve_table(table_name);
+        let table = self.conn.open_table(target).execute().await?;
         let mut q = table.query();
-        if let Some(f) = filter { q = q.only_if(f); }
-        
-        // 데이터를 모두 메모리에 올려 정렬한 뒤 안전하게 Slice하여 반환하도록 limit/offset을 제거합니다.
+        if let Some(f) = filter {
+            if !f.trim().is_empty() { q = q.only_if(f); }
+        }
+
+        // 정렬을 위해 전량을 메모리에 올린 뒤 슬라이스합니다. (기존 동작 유지)
         let results = q.execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
-            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-            let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-            let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
-            let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
-            let statuses = batch.column(8).as_any().downcast_ref::<Int32Array>().unwrap();
-            let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
-            let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-            let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-            let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-            let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
-            let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
-            let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
-            let maskeds = batch.column(17).as_any().downcast_ref::<BooleanArray>().unwrap();
-            
-            for i in 0..batch.num_rows() {
-                docs.push(TradeDocument { 
-                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), 
-                    from: froms.value(i).to_string(), to: tos.value(i).to_string(),
-                    cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(),
-                    r#ref: refs.value(i).to_string(),
-                    text: texts.value(i).to_string(), masked_text: masked_texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
-                    digest: digests.value(i).to_string(), total_amount: amounts.value(i),
-                    status: statuses.value(i).to_string(), 
-                    created_at_ts: createds.value(i), 
-                    updated_at_ts: updateds.value(i),
-                    mode: modes.value(i).to_string(), 
-                    is_masked: maskeds.is_valid(i) && maskeds.value(i),
-                    ..Default::default() 
-                });
-            }
+            docs.extend(Self::batch_to_docs(&batch));
         }
         docs.sort_by_key(|d| std::cmp::Reverse(d.created_at_ts));
-        
-        
+
         let start = offset.min(docs.len());
         let end = (start + limit).min(docs.len());
         Ok(docs[start..end].to_vec())
     }
 
     pub async fn get_item_by_id(&self, table_name: &str, id: &str) -> Result<Option<TradeDocument>> {
-        let table = self.conn.open_table(table_name).execute().await?;
+        let target = Self::resolve_table(table_name);
+        let table = self.conn.open_table(target).execute().await?;
         let results = table.query().only_if(format!("id = '{}'", id)).limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         if results.is_empty() || results[0].num_rows() == 0 { return Ok(None); }
-        let batch = &results[0];
-        let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-        let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
-        let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
-        let statuses = batch.column(8).as_any().downcast_ref::<Int32Array>().unwrap();
-        let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
-        let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
-        let masked_texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
-        let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-        let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-        let createds = batch.column(14).as_any().downcast_ref::<Int64Array>().unwrap();
-        let updateds = batch.column(15).as_any().downcast_ref::<Int64Array>().unwrap();
-        let modes = batch.column(16).as_any().downcast_ref::<StringArray>().unwrap(); 
-        let maskeds = batch.column(17).as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        Ok(Some(TradeDocument { 
-            id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
-            from: froms.value(0).to_string(), to: tos.value(0).to_string(),
-            cc: ccs.value(0).to_string(), bcc: bccs.value(0).to_string(),
-            r#ref: refs.value(0).to_string(),
-            text: texts.value(0).to_string(), masked_text: masked_texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
-            digest: digests.value(0).to_string(), total_amount: amounts.value(0),
-            status: statuses.value(0).to_string(), 
-            created_at_ts: createds.value(0), 
-            updated_at_ts: updateds.value(0),
-            mode: modes.value(0).to_string(), 
-            is_masked: maskeds.is_valid(0) && maskeds.value(0),
-            ..Default::default() 
-        }))
+        let docs = Self::batch_to_docs(&results[0]);
+        Ok(docs.into_iter().next())
     }
     
+    // 🌟 [2-TRACK RECALL SEARCH / v4]
+    //  Track 1(Column Matching) 을 완전히 제거합니다.
+    //
+    //  ── 왜 제거하는가 ──
+    //   v4 부터 filter 인자는 '스코프' 전용입니다. (type / mode / cc / bcc / ref / 시간)
+    //   도메인 조건(가격/수량/송장번호/상태)은 SQL 로 내려오지 않고 Dexie 가 처리합니다.
+    //   따라서 '조건 매칭 +3.0' 이라는 트랙이 성립할 수 없습니다.
+    //   기존 has_real_condition 가드는 이 상황을 이미 부분적으로 방어하고 있었는데,
+    //   v4 에서는 그 분기가 항상 false 가 되므로 코드째로 걷어냅니다.
+    //
+    //  ── 역할 재정의 ──
+    //   LanceDB = 리콜(넓게 긁기). 점수는 '의미 근접도' 만 표현합니다.
+    //   Dexie   = 정밀도(정확히 자르기). 조건/정렬/페이징 담당.
+    //   → 그래서 fetch_limit 을 넉넉히(요청의 4배, 최소 200) 잡습니다.
+    //     Dexie 가 뒤에서 조건으로 잘라내므로 여기서 좁히면 정답이 사라집니다.
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
-         // 🌟 [CRITICAL FIX] "items"로 하드코딩된 라우팅을 해제하고, 요청된 실제 테이블(sales, event 등)을 100% 반영합니다.
-         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
          let table = self.conn.open_table(target).execute().await?;
-         
-         // 🌟 3개의 트랙에서 찾은 문서 ID를 Key로 하여, 점수를 누적(Stacking)할 HashMap
-         let mut combined = std::collections::HashMap::new();
-         let fetch_limit = limit + offset;
+
+         let mut combined: std::collections::HashMap<String, (String, f32)> = std::collections::HashMap::new();
+
+         // 🌟 [OVERFETCH] Dexie 정밀 필터가 뒤에 붙으므로 후보를 넓게 확보합니다.
+         let fetch_limit = std::cmp::max(200, (limit + offset) * 4);
+
+         // 스코프 필터를 정리합니다. 비어 있으면 아예 걸지 않습니다.
+         let scope: Option<String> = filter.as_ref().and_then(|f| {
+             let t = f.trim();
+             if t.is_empty() { None } else { Some(t.to_string()) }
+         });
 
          // =======================================================
-         // 🌟 [Track 1] Column Matching (SQL Filter)
+         // 🌟 [Track A] Native Full Text Search (Tantivy ngram 역인덱스)
+         //     가중치 2.0. 어휘 일치 신호.
          // =======================================================
-         // LLM이 뽑아낸 속성 조건(예: amount <= 5000) 만 가장 높은 가중치(+3.0) 를 받습니다.
-         //
-         // 🌟 [SCOPE-ONLY GUARD] convert_conditions_to_sql 은 조건이 하나도 없어도
-         //    항상 `type = '...'` 를 넣고, 호출부가 `mode = '...'` 를 붙입니다.
-         //    따라서 filter 가 None 이 되는 경우가 없어, 기존 코드는 그 타입의
-         //    '모든 행' 에 +3.0 을 상납했습니다.
-         //    (log2.txt 실측: 조건 0개인데 결과가 4.0 / 3.999 / 3.998 / 3.997 / 3.0
-         //     = 3.0 blanket + 벡터 랭크. FTS 는 한 건도 매칭되지 않았음)
-         //    이 상태에서는 의미 신호(FTS·벡터·청크)가 전부 무력화됩니다.
-         //    type / mode 는 '스코프' 이지 '조건' 이 아니므로 가산점 대상에서 제외합니다.
-         let has_real_condition = match filter.as_ref() {
-             None => false,
-             Some(f) => {
-                 // type / mode 술어와 괄호·AND 를 구조적으로 제거한 뒤 잔여 술어가 있는지 확인합니다.
-                 let mut residue = String::new();
-                 for clause in f.split(" AND ") {
-                     let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
-                     if c.is_empty() { continue; }
-                     let lower = c.to_lowercase();
-                     if lower.starts_with("type ") || lower.starts_with("type=") { continue; }
-                     if lower.starts_with("mode ") || lower.starts_with("mode=") { continue; }
-                     residue.push_str(c);
-                 }
-                 !residue.trim().is_empty()
-             }
-         };
-
-         if has_real_condition {
-             if let Some(ref f) = filter {
-                 let q = table.query().only_if(f);
-                 if let Ok(res) = q.limit(fetch_limit).execute().await {
-                     if let Ok(batches) = res.try_collect::<Vec<_>>().await {
-                         for b in batches {
-                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                             let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-                             for i in 0..b.num_rows() {
-                                 combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), 3.0));
-                             }
-                         }
-                     }
-                 }
-             }
-         } else if let Some(ref f) = filter {
-             // 실질 조건이 없으면 스코프 필터로만 사용하고 가산점은 주지 않습니다.
-             // (Track 2 / Track 3 이 동일 필터를 체이닝하므로 보안 스코프는 그대로 유지됩니다)
-             let _ = f;
-         }
-
-         // =======================================================
-         // 🌟 [Track 2] Native Full Text Search (Tantivy 역인덱스)
-         // =======================================================
-         // 전체 본문(text, data)에서 단어를 찾는 진짜 FTS 엔진을 단독 실행. (가중치 +2.0)
-         if !query_text.is_empty() {
+         if !query_text.trim().is_empty() {
              let mut q = table.query();
-             let has_fts_index = target == "items"; // 🌟 [CRITICAL FIX] FTS 인덱스는 items 테이블에만 생성되어 있으므로 교차 검색 시 에러 방지
-             
+             let has_fts_index = target == "items"; // FTS 인덱스는 items 에만 존재
+
              if use_fts && has_fts_index {
-                 // LanceDB Native FTS 구문 (Tantivy 엔진)
                  let fts_query_str = query_text
                      .split_whitespace()
                      .map(|w| format!("\"{}\"", w.replace("\"", "\\\"")))
                      .collect::<Vec<_>>()
                      .join(" ");
                  q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));
-                 
-                 // [보안 필수] 타 부서/팀 데이터를 긁어오지 못하도록 기본 필터 체이닝
-                 if let Some(ref f) = filter { q = q.only_if(f); } 
+                 if let Some(ref f) = scope { q = q.only_if(f.clone()); }
              } else {
-                 // 타이핑 중(Live Search)일 때 미완성 단어를 잡기 위한 ILIKE Fallback (또는 타 도메인 검색 시)
+                 // 타이핑 중(Live Search) 미완성 단어 대응 ILIKE 폴백
                  let sql_clean = query_text.replace("'", "''");
-                 let words: Vec<&str> = sql_clean.split_whitespace().collect();
                  let mut ilike_conditions = Vec::new();
-                 for w in words {
-                     // 🌟 숫자나 코드가 다른 필드(예: 날짜 2015-03-14)에 매칭되는 것을 줄이기 위한 안전망 적용
+                 for w in sql_clean.split_whitespace() {
                      ilike_conditions.push(format!("(masked_text ILIKE '%{}%' OR text ILIKE '%{}%' OR data ILIKE '%{}%')", w, w, w));
                  }
                  let text_filter = ilike_conditions.join(" AND ");
-                 
-                 let final_filter = if let Some(ref f) = filter {
-                     if text_filter.is_empty() { f.to_string() } else { format!("({}) AND ({})", f, text_filter) }
-                 } else { text_filter };
-                 
+                 let final_filter = match (&scope, text_filter.is_empty()) {
+                     (Some(f), false) => format!("({}) AND ({})", f, text_filter),
+                     (Some(f), true)  => f.clone(),
+                     (None, false)    => text_filter,
+                     (None, true)     => String::new(),
+                 };
                  if !final_filter.is_empty() { q = q.only_if(final_filter); }
              }
-             
+
              if let Ok(res) = q.limit(fetch_limit).execute().await {
                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
                     for b in batches {
                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                        let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+                        // 🌟 data 컬럼 인덱스가 13 → 9 로 이동했습니다.
+                        let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
                         for i in 0..b.num_rows() {
                             let id = ids.value(i).to_string();
-                            // 기존에 [Track 1]에서 찾은 문서라면 점수를 누적(+2.0), 아니면 새로 삽입
                             if let Some((_, s)) = combined.get_mut(&id) { *s += 2.0; }
                             else { combined.insert(id, (txs.value(i).to_string(), 2.0)); }
                         }
@@ -857,29 +985,28 @@ impl VectorStore {
                 }
              }
          }
-         
+
          // =======================================================
-         // 🌟 [Track 3] Vector Search (시맨틱 의미 기반 검색)
+         // 🌟 [Track B] Vector Search (ANN)
+         //     가중치 1.0 시작, 랭크당 -0.001. 의미 근접 신호.
          // =======================================================
-         // 단어가 달라도 문맥적 의미가 통하는 문서를 찾아 타이브레이커 점수를 가산합니다. (가중치 +1.0 미만)
          let is_empty_vec = query_vec.iter().all(|&x| x == 0.0);
-         
+
          if !is_empty_vec {
              let mut vq = table.query();
-             if let Some(ref f) = filter { vq = vq.only_if(f); } // 보안 스코프 유지
-             
+             if let Some(ref f) = scope { vq = vq.only_if(f.clone()); }
+
              if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
                  if let Ok(vres) = vq_with_vector.execute().await {
                      if let Ok(batches) = vres.try_collect::<Vec<_>>().await {
                          let mut rank = 0;
                          for b in batches {
-                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
-                             let txs = b.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                             let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
                              for i in 0..b.num_rows() {
                                  let id = ids.value(i).to_string();
-                                 // 벡터 거리(Rank)에 따라 미세하게 점수를 차등 지급하여 완벽한 정렬 유도
                                  let vec_score = 1.0 - (rank as f32 * 0.001);
-                                 if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; } 
+                                 if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; }
                                  else { combined.insert(id, (txs.value(i).to_string(), vec_score)); }
                                  rank += 1;
                              }
@@ -888,38 +1015,55 @@ impl VectorStore {
                  }
              }
          }
-         
+
          // =======================================================
-         // 🌟 최종 결과 도출 (합산 점수 내림차순 정렬)
+         // 🌟 [Track C] Scope-Only Recall
+         //  질의 텍스트도 없고 벡터도 0 이면(= 순수 목록 조회) 스코프 결과를 그대로 돌려줍니다.
+         //  기존에는 이 경우 Track 1 이 blanket +3.0 을 뿌려 목록처럼 동작했는데,
+         //  Track 1 을 없앴으므로 명시적 경로로 분리합니다.
          // =======================================================
+         if combined.is_empty() {
+             let mut q = table.query();
+             if let Some(ref f) = scope { q = q.only_if(f.clone()); }
+             if let Ok(res) = q.limit(fetch_limit).execute().await {
+                 if let Ok(batches) = res.try_collect::<Vec<_>>().await {
+                     for b in batches {
+                         let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                         let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+                         let createds = b.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
+                         for i in 0..b.num_rows() {
+                             // 최신순 타이브레이커만 부여합니다. (의미 신호 없음)
+                             let recency = (createds.value(i) as f64 / 1.0e13) as f32;
+                             combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), recency));
+                         }
+                     }
+                 }
+             }
+         }
+
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-         
+
          let start = offset.min(final_list.len());
          let end = (start + limit).min(final_list.len());
          let result_slice = final_list[start..end].to_vec();
 
-         // 🌟 [CRITICAL FIX] 내부 N:N 연관 검색(Cross Reference) 시 0.0 벡터가 들어오므로, 이를 감지하여 터미널 스팸(도배) 출력을 원천 차단합니다!
-         // (컴파일 에러 해결: query_vec이 이미 이동(Moved)되었으므로 상단에서 미리 계산해둔 is_empty_vec을 재사용합니다)
          if !is_empty_vec {
              let json_log = serde_json::json!({
                  "target_table": target,
                  "query_text": query_text,
-                 "filter": filter,
+                 "scope_filter": scope,
                  "use_fts": use_fts,
+                 "fetch_limit": fetch_limit,
                  "total_found": final_list.len(),
                  "returned": result_slice.len(),
                  "results": result_slice.iter().map(|(id, text, score)| {
                      let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
-                     serde_json::json!({
-                         "id": id,
-                         "text": parsed_text,
-                         "score": score
-                     })
+                     serde_json::json!({ "id": id, "text": parsed_text, "score": score })
                  }).collect::<Vec<_>>()
              });
              println!("\n=======================================");
-             println!("[STORE] 🔎 3-Track Hybrid Search Results (Table: {}):", target);
+             println!("[STORE] 🔎 2-Track Recall Search (FTS + Vector) — precision filtering delegated to Dexie:");
              println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
              println!("=======================================\n");
          }
@@ -927,34 +1071,54 @@ impl VectorStore {
          Ok(result_slice)
     }
 
+    // 🌟 [PROPERTY LOOKUP v4]
+    //  기존 구현은 테이블 전량을 메모리에 올린 뒤 JSON 을 한 건씩 파싱해서 비교했습니다.
+    //  scheduler 의 relay 로직이 아이템마다 이 함수를 여러 번 호출하므로
+    //  '아이템 수 × 관계 수 × 전체 행 수' 의 3중 비용이 발생하고 있었습니다.
+    //
+    //  v4 에서는 data 컬럼에 FTS(ngram) 인덱스가 걸려 있으므로,
+    //  먼저 data ILIKE 로 후보를 좁힌 뒤에만 JSON 파싱을 합니다.
+    //  값은 canonicalize_data 로 타입이 확정되어 있어 문자열 비교가 안전합니다.
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
-        
-        let target = match table_name {
-            "sales" | "goods" | "order" => "sales",
-            "tracking" | "receiving" | "shipping" => "tracking",
-            "event" | "coupon" => "event",
-            "member" | "team" | "user" => "users",
-            "talk" | "prompt" | "ai_search" => "talks",
-            "pages" => "pages",
-            "items" => "items",
-            t if t.starts_with("commerce_") => &t[9..],
-            _ => "items"
-        };
-        
+        let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
-        
-        
-        let results = table.query().execute().await?.try_collect::<Vec<_>>().await?;
-        let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
-        for batch in results {
+
+        let target_str = match value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+            _ => value.to_string().trim_matches('"').to_string(),
+        };
+        if target_str.is_empty() { return Ok(None); }
+
+        // 🌟 [PREFILTER] data 안에 그 값 문자열이 들어 있는 행만 긁어옵니다.
+        //    substring 이라 오탐이 있을 수 있으므로 아래에서 정확 비교를 다시 합니다.
+        let escaped = target_str.replace('\'', "''");
+        let prefilter = format!("data ILIKE '%{}%'", escaped);
+
+        let batches = match table.query().only_if(prefilter).limit(500).execute().await {
+            Ok(res) => res.try_collect::<Vec<_>>().await.unwrap_or_default(),
+            Err(_) => {
+                // ILIKE 가 실패하면 전량 스캔으로 폴백합니다. (기존 동작 보존)
+                table.query().execute().await?.try_collect::<Vec<_>>().await?
+            }
+        };
+
+        for batch in batches {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let datas = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+            let datas = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
-                let json_str = datas.value(i);
-                if let Ok(data) = serde_json::from_str::<Value>(json_str) {
+                if let Ok(data) = serde_json::from_str::<Value>(datas.value(i)) {
                     if let Some(f_val) = data.get(property) {
-                        let f_val_str = match f_val { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => f_val.to_string() };
-                        if f_val_str == target_str { return Ok(Some((ids.value(i).to_string(), data))); }
+                        let f_val_str = match f_val {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+                            _ => f_val.to_string().trim_matches('"').to_string(),
+                        };
+                        if f_val_str == target_str {
+                            return Ok(Some((ids.value(i).to_string(), data)));
+                        }
                     }
                 }
             }
@@ -963,17 +1127,19 @@ impl VectorStore {
     }
 
     pub async fn reset_database(&self) -> Result<()> {
+        // 🌟 [v4] sales / tracking / event 는 이미 폐기되었지만,
+        //    구버전에서 넘어온 사용자를 위해 drop 대상에는 남겨 둡니다.
         let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages", "item_chunks"];
         for name in tables {
             let _ = self.conn.drop_table(name, &[]).await;
             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, name));
         }
         println!("[Store] LanceDB all tables dropped for factory reset.");
-        
+
         // 테이블 초기화 함수 재호출하여 빈 껍데기로 복구
         self.init_task_table().await?;
         self.init_all_tables().await?;
-        
+
         Ok(())
     }
 
@@ -1393,79 +1559,37 @@ impl VectorStore {
     }
 }
 
+// 🌟 [ENVELOPE v4] 도메인 필드 55개를 전부 제거합니다.
+//  기존 구조체는 무역 문서 전용 컬럼(vessel/pol/pod/incoterms/...)을 Rust 타입에 못 박아 두어
+//  새 도메인이 추가될 때마다 구조체 → LanceDB 스키마 → 프론트엔드 3곳을 동시에 고쳐야 했습니다.
+//  실제로는 대부분 채워지지도 않은 채(Default::default()) 직렬화 비용만 발생하고 있었습니다.
+//
+//  v4 부터 도메인 값은 전부 json_data(= data 컬럼) 안에 있고,
+//  프론트엔드는 Dexie 의 data.* 중첩 인덱스로 쿼리합니다.
+//  → 이 구조체는 앞으로 영원히 변경되지 않습니다.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TradeDocument {
+    // ── 봉투(Envelope) ──
     pub id: String,
     #[serde(rename = "type")]
     pub r#type: String,
+    pub flag: String,
     pub from: String,
     pub to: String,
     pub cc: String,
     pub bcc: String,
     #[serde(rename = "ref")]
     pub r#ref: String,
-    pub text: String,
-    pub masked_text: String,
+    pub mode: String,
+    /// 확장 영역. 모든 도메인 값이 여기에 들어 있습니다. (JSON 문자열)
     pub json_data: String,
-    pub digest: String,
-    pub vector: Vec<f32>,
     #[serde(rename = "created_at")]
-    pub created_at_ts: i64, 
+    pub created_at_ts: i64,
     #[serde(rename = "updated_at")]
     pub updated_at_ts: i64,
-    pub mode: String, 
-    pub is_masked: bool,
-    pub item_descriptions: Vec<String>,
-    pub item_hs_codes: Vec<String>,
-    pub item_sku_numbers: Vec<String>,
-    pub container_numbers: Vec<String>,
-    pub seal_numbers: Vec<String>,
-    pub related_refs: Vec<String>,
-    pub transaction_group: Option<String>,
-    pub link_reason: Option<String>,
-    pub doc_number: String,
-    pub status: String, 
-    pub issue_date: String,
-    pub reference_export: String,
-    pub reference_buyer: String,
-    pub reference_carrier: String, 
-    pub expiry_date: String, 
-    pub bl_type: String,
-    pub name: String,
-    pub supplier_name: String,
-    pub supplier_address: String,
-    pub supplier_tax_id: String,
-    pub buyer_name: String,
-    pub buyer_address: String,
-    pub buyer_tax_id: String,
-    pub notify_party_name: String,
-    pub issuer_name: String,
-    pub vessel: String,
-    pub voyage_number: String,
-    pub pol: String,
-    pub pod: String,
-    pub place_receipt: String,
-    pub place_delivery: String,
-    pub transport_mode: String,
-    pub departure_date: String,
-    pub arrival_date: String,
-    pub incoterms: String,
-    pub incoterms_place: String,
-    pub payment_terms: String,
-    pub freight_payment_term: String,
-    pub lc_tenor: String,
-    pub origin_criterion: String,
-    pub currency: String,
-    pub total_amount: f32,
-    pub subtotal_amount: f32,
-    pub tax_amount: f32,
-    pub freight_amount: f32,
-    pub insurance_amount: f32,
-    pub local_charges: f32,
-    pub package_count: f32,
-    pub package_unit: String,
-    pub weight_gross: f32,
-    pub weight_net: f32,
-    pub volume: f32,
-    pub marks_numbers: String,
+
+    // ── 검색 부품 (LanceDB 전용) ──
+    pub text: String,
+    pub masked_text: String,
+    pub vector: Vec<f32>,
 }

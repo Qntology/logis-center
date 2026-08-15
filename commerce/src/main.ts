@@ -9,31 +9,105 @@ import { item2html, selector } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
-// 🌟 [추가] 어디서든 데이터를 Dexie에 동기화할 수 있도록 전역 헬퍼로 승격
-const enrichForIndex = (docs: any[]) => docs.map(d => {
-    const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
-    return { 
-        ...d, 
-        no: parsed.no?.toString(), 
-        code: parsed.code?.toString(), 
-        tracking_number: parsed.tracking_number?.toString(), 
-        goods: parsed.goods?.toString(), 
-        order: parsed.order?.toString(), 
-        tracking: parsed.tracking?.toString(), 
-        stock_keeping_unit: parsed.stock_keeping_unit?.toString(), 
-        barcode: parsed.barcode?.toString(), 
-        index: parsed.index?.toString(),
-        status: d.status ?? parsed.status ?? 0,
-        amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
-        mode: d.mode ?? parsed.mode ?? 'commerce',
-        is_masked: d.is_masked ?? parsed.is_masked ?? false,
-        text: d.text ?? parsed.text ?? "",
-        masked_text: d.masked_text ?? parsed.masked_text ?? "",
-        created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
-        updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
-        data: parsed
+// 🌟 [CANONICALIZE] data 안의 값 타입을 확정합니다.
+//  IndexedDB 인덱스는 타입이 혼재하면(123 vs "123") equals 가 절반을 놓치고,
+//  boolean / undefined 는 아예 인덱스에서 조용히 빠집니다.
+//  따라서 '쓰기 시점'에 딱 한 번 정규화해서 저장합니다.
+//  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
+const ID_KEYS = [
+    'id', 'no', 'code', 'index', 'tracking_number', 'goods', 'order', 'tracking',
+    'stock_keeping_unit', 'barcode', 'digest', 'gtin', 'mpn'
+];
+const NUM_KEYS = [
+    'status', 'amount', 'total_amount', 'sale_price', 'supply_price', 'compare_at_price',
+    'discount', 'quantity', 'width', 'height', 'length', 'weight',
+    'shipping_fee', 'shipping_duration', 'low_stock_threshold',
+    'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per',
+    'started_at', 'expired_at', 'created_at', 'updated_at', 'views'
+];
+const BOOL_KEYS = [
+    'detail', 'is_masked', 'is_device', 'embed', 'node',
+    'new_customer_only', 'first_purchase_only', 'region_restrictions',
+    'bundle_shipping', 'tax_included', 'recipient_match'
+];
+
+function canonicalizeData(parsed: any): any {
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: any = { ...parsed };
+
+    for (const k of ID_KEYS) {
+        const v = out[k];
+        // 인덱스 대상은 '항상 존재'해야 합니다. 없으면 빈 문자열로 채웁니다.
+        out[k] = (v === undefined || v === null) ? "" : String(v);
+    }
+    for (const k of NUM_KEYS) {
+        const v = out[k];
+        if (v === undefined || v === null || v === "") { out[k] = 0; continue; }
+        const n = typeof v === 'number' ? v : Number(String(v).replace(/[^\d.\-]/g, ''));
+        out[k] = isNaN(n) ? 0 : n;
+    }
+    for (const k of BOOL_KEYS) {
+        const v = out[k];
+        if (v === undefined || v === null) { out[k] = 0; continue; }
+        // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
+        out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
+    }
+    // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
+    if (out.tags === undefined || out.tags === null) out.tags = [];
+    else if (!Array.isArray(out.tags)) out.tags = [String(out.tags)];
+    else out.tags = out.tags.map((t: any) => (typeof t === 'object' ? (t.tag ?? "") : String(t))).filter(Boolean);
+
+    return out;
+}
+
+// 🌟 [NORMALIZE ENVELOPE] Rust(TradeDocument) / Cloudflare(D1 row) / 로컬 생성 객체를
+//  하나의 봉투 형태로 통일합니다. 루트에는 봉투 12개만 남기고, 나머지는 전부 data 로 내립니다.
+//  → 값이 2벌 저장되던 문제(enrichForIndex 호이스팅)가 사라집니다.
+//  → 새 도메인 필드가 생겨도 이 함수는 영원히 그대로입니다.
+const normalizeEnvelope = (docs: any[]) => docs.map(d => {
+    let parsed: any = {};
+    if (typeof d.json_data === 'string') {
+        try { parsed = JSON.parse(d.json_data) || {}; } catch (e) { parsed = {}; }
+    } else if (d.data && typeof d.data === 'object') {
+        parsed = d.data;
+    } else if (typeof d.data === 'string') {
+        try { parsed = JSON.parse(d.data) || {}; } catch (e) { parsed = {}; }
+    } else {
+        parsed = {};
+    }
+
+    // 검색/표시용 텍스트도 data 안으로 통일합니다.
+    if (parsed.text === undefined) parsed.text = d.text ?? "";
+    if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
+    if (parsed.mode === undefined) parsed.mode = d.mode ?? 'commerce';
+    if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
+
+    const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
+    const updated = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0;
+    parsed.created_at = Number(created) || 0;
+    parsed.updated_at = Number(updated) || 0;
+
+    return {
+        // ── 봉투 12개. 이 목록은 앞으로 절대 늘어나지 않습니다 ──
+        id: String(d.id ?? d.uuid ?? parsed.id ?? ""),
+        type: String(d.type ?? d.doc_type ?? parsed.type ?? "unknown"),
+        flag: String(d.flag ?? parsed.flag ?? ""),
+        from: String(d.from ?? parsed.from ?? ""),
+        to: String(d.to ?? parsed.to ?? ""),
+        cc: String(d.cc ?? parsed.cc ?? ""),
+        bcc: String(d.bcc ?? parsed.bcc ?? ""),
+        ref: String(d.ref ?? d.ref_val ?? parsed.ref ?? ""),
+        mode: String(d.mode ?? parsed.mode ?? 'commerce'),
+        created_at: Number(created) || 0,
+        updated_at: Number(updated) || 0,
+        // ── 확장 영역. 여기에 뭘 넣든 스키마 변경 없음 ──
+        data: canonicalizeData(parsed)
     };
 });
+
+// 🌟 [BACK-COMPAT] 기존 호출부(enrichForIndex(...))를 그대로 살려 둡니다.
+//  호출부 치환은 Part 3 에서 일괄 정리합니다.
+const enrichForIndex = normalizeEnvelope;
 
 // Access global libs
 const ethers = (window as any).ethers;
@@ -167,37 +241,47 @@ async function pushLocalVectorsToCloud(vectors: any[], mode: string = "commerce"
     }
 }
 
+// 🌟 [EMBED DEBOUNCE] runLocalEmbeddingSync 중복 호출 방지를 위한 스케줄링 변수
+let reindexScheduled = false;
+let reindexDebounceTimer: number | null = null;
+
 // 🌟 클라우드에서 내려온(벡터 없는) 아이템을 로컬 임베딩 모델로 벡터화 + 청크 인덱싱합니다.
+//    디바운스(2초)를 적용하여 initSession + syncData에서 연속 호출되어도 1회만 실행됩니다.
 async function runLocalEmbeddingSync() {
-    if (isReindexing) return;
+    if (isReindexing || reindexScheduled) return;
     if (isSearching || isExtracting || GlobalTaskManager.isBusy) return;
-
-    isReindexing = true;
-    try {
-        const res = await invoke<any>("reindex_pending_embeddings", {
-            limit: 20,
-            devicePreference: getDevicePref(),
-            // 🌟 [MODE ROUTING] 현재 트랙(commerce / shipping / analytic)을 그대로 백엔드에 전달
-            mode: currentSearchMode
-        });
-
-        if (res && res.processed && res.processed > 0) {
-            console.log(`[EMBED] Locally embedded ${res.processed} cloud-synced item(s). (mode: ${res.mode || currentSearchMode})`);
-
-            if (res.vectors && res.vectors.length > 0) {
-                await pushLocalVectorsToCloud(res.vectors, res.mode || currentSearchMode);
+    // 🌟 [DEBOUNCE] 2초 내 재호출 시 타이머를 리셋하여 마지막 호출만 실행
+    reindexScheduled = true;
+    if (reindexDebounceTimer) clearTimeout(reindexDebounceTimer);
+    reindexDebounceTimer = window.setTimeout(async () => {
+        reindexScheduled = false;
+        reindexDebounceTimer = null;
+        // 디바운스 후에도 여전히 바쁘면 스킵
+        if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+        isReindexing = true;
+        try {
+            const res = await invoke<any>("reindex_pending_embeddings", {
+                limit: 20,
+                devicePreference: getDevicePref(),
+                // 🌟 [MODE ROUTING] 현재 트랙(commerce / shipping / analytic)을 그대로 백엔드에 전달
+                mode: currentSearchMode
+            });
+            if (res && res.processed && res.processed > 0) {
+                console.log(`[EMBED] Locally embedded ${res.processed} cloud-synced item(s). (mode: ${res.mode || currentSearchMode})`);
+                if (res.vectors && res.vectors.length > 0) {
+                    await pushLocalVectorsToCloud(res.vectors, res.mode || currentSearchMode);
+                }
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
             }
-
-            await renderNavigation();
-            if (currentTab === "list") {
-                await loadMoreDocs(false, true);
-            }
+        } catch (e) {
+            console.warn("[EMBED] reindex_pending_embeddings failed:", e);
+        } finally {
+            isReindexing = false;
         }
-    } catch (e) {
-        console.warn("[EMBED] reindex_pending_embeddings failed:", e);
-    } finally {
-        isReindexing = false;
-    }
+    }, 2000);
 }
 
 // 🌟 [ANALYTICS TRACK] console.logis.center(analytics Client Worker)에서 구조화 결과를 내려받아
@@ -306,7 +390,7 @@ async function syncAnalyticsData() {
         if (items.length > 0) {
             await invoke("upsert_items", { items });
             if (appDb) {
-                await appDb.table("items").bulkPut(enrichForIndex(items)).catch(() => null);
+                await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
             }
             console.log(`[SYNC-ANALYTIC] Synced ${items.length} analytics item(s) from console.logis.center.`);
         }
@@ -436,27 +520,367 @@ const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
 
-appDb.version(3).stores({
+// 🌟 [SCHEMA v4 / NESTED INDEX]
+//  루트 호이스팅(enrichForIndex) 을 폐기하고 data.* 중첩 keyPath 를 직접 인덱싱합니다.
+//
+//  ── 왜 이게 가능한가 ──
+//   IndexedDB 의 keyPath 는 점 표기('data.status')를 지원하고,
+//   IDBObjectStore.createIndex() 는 기존 레코드를 자동 백필합니다.
+//   → 새 필드를 인덱스하고 싶으면 아래 문자열에 'data.pol' 한 개만 추가하고
+//     version(6) 으로 올리면 끝입니다. 저장 코드도, Rust 도 건드릴 필요가 없습니다.
+//
+//  ── 반드시 지켜야 하는 제약 ──
+//   1) boolean 은 유효한 IDB 키가 아닙니다. 에러 없이 그 행이 인덱스에서 빠집니다.
+//      → detail / is_masked / is_device / embed 는 전부 0|1 정수로 정규화합니다.
+//   2) undefined / 키 없음도 인덱스에서 제외됩니다.
+//      → 인덱스 대상 경로는 항상 기본값을 써 넣습니다.
+//   3) 타입 혼재(123 vs "123") 시 equals 가 절반을 놓칩니다.
+//      → 식별자류는 String, 수치류는 Number 로 쓰기 시점에 확정합니다.
+//   4) 여기 선언하지 않은 경로는 .filter() 풀스캔으로 처리합니다. (수천~수만 건 = 수 ms)
+appDb.version(5).stores({
     ts_queue: 'taskId, type',
     kv_store: 'key',
-    // 교차 검색에 사용되는 refKeys 및 index를 인덱스로 등록하여 풀스캔 병목을 방지합니다.
-    items: 'id, type, ref, cc, bcc, domain, origin, no, code, tracking_number, goods, order, tracking, stock_keeping_unit, barcode, index',
-    pages: 'id, type, ref, cc, bcc, domain, origin',
-    users: 'id, type, ref, cc, bcc, domain, origin',
-    talks: 'id, task_id'
-});
-(window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
 
-// 기존 localStorage를 대체할 Dexie 헬퍼 함수
-async function kvGet(key: string): Promise<any> {
-    const record = await appDb.table("kv_store").get(key);
-    return record ? record.value : null;
+    items: [
+        // ── 봉투 ──
+        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+        'created_at', 'updated_at',
+        // ── 복합 (스코프 + 타입 동시 좁히기) ──
+        '[cc+type]', '[mode+type]', '[ref+created_at]',
+        // ── data.* 식별자 (N:N 교차 검색 축) ──
+        'data.index', 'data.no', 'data.code', 'data.tracking_number',
+        'data.goods', 'data.order', 'data.tracking',
+        'data.stock_keeping_unit', 'data.barcode',
+        // ── data.* 수치/상태 (조건 필터 축) ──
+        'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+        'data.quantity', 'data.weight', 'data.discount',
+        // ── data.* 문자/시간 ──
+        'data.carrier', 'data.shipping_method',
+        'data.started_at', 'data.expired_at',
+        'data.link', 'data.origin',
+        // ── 동기화 제어 ──
+        'data.embed', 'data.digest',
+        // ── 배열 (멀티엔트리) ──
+        '*data.tags'
+    ].join(', '),
+
+    pages: [
+        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+        'created_at', 'updated_at',
+        'data.origin', 'data.link', 'data.detail'
+    ].join(', '),
+
+    users: [
+        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref',
+        'created_at', 'updated_at',
+        'data.origin', 'data.is_device', 'data.email'
+    ].join(', '),
+
+    talks: [
+        'id', 'task_id', 'role', 'status',
+        'from', 'to', 'cc', 'bcc', 'ref',
+        'created_at', 'updated_at'
+    ].join(', ')
+}).upgrade(async (tx: any) => {
+    // 🌟 [v4 → v5 MIGRATION]
+    //  ① items : enrichForIndex 가 루트로 복제해 둔 25개 필드를 제거합니다.
+    //            (data 안에 원본이 그대로 있으므로 데이터 손실 없음)
+    //  ② users / pages : 기존에 data 객체 없이 json_data 문자열만 들어가 있던
+    //            행들을 정규화합니다. 이게 없으면 nested 인덱스가 전부 빈 값이 됩니다.
+    //            (initSession 의 bulkPut(data.users) 경로가 enrichForIndex 를
+    //             거치지 않아 발생한 기존 결함입니다)
+    const HOISTED = [
+        'no', 'code', 'tracking_number', 'goods', 'order', 'tracking',
+        'stock_keeping_unit', 'barcode', 'index', 'status', 'amount',
+        'is_masked', 'sale_price', 'supply_price', 'carrier', 'shipping_method',
+        'width', 'height', 'length', 'weight', 'started_at', 'expired_at',
+        'domain', 'origin', 'json_data', 'text', 'masked_text'
+    ];
+
+    for (const storeName of ['items', 'pages', 'users']) {
+        try {
+            await tx.table(storeName).toCollection().modify((row: any) => {
+                // data 확보 (json_data 문자열 → 객체)
+                let parsed = row.data;
+                if (typeof parsed === 'string') {
+                    try { parsed = JSON.parse(parsed); } catch (e) { parsed = {}; }
+                }
+                if (!parsed || typeof parsed !== 'object') {
+                    if (typeof row.json_data === 'string') {
+                        try { parsed = JSON.parse(row.json_data); } catch (e) { parsed = {}; }
+                    } else {
+                        parsed = {};
+                    }
+                }
+
+                // 루트에만 있던 값을 data 로 회수 (덮어쓰지 않고 결손만 보충)
+                for (const k of HOISTED) {
+                    if (k === 'json_data') continue;
+                    if (parsed[k] === undefined && row[k] !== undefined) {
+                        parsed[k] = row[k];
+                    }
+                }
+
+                row.data = canonicalizeData(parsed);
+
+                // 루트 복제본 제거
+                for (const k of HOISTED) {
+                    delete row[k];
+                }
+            });
+        } catch (e) {
+            console.warn(`[Dexie v5] migration skipped for ${storeName}:`, e);
+        }
+    }
+    console.log('[Dexie v5] Migrated to unified envelope + nested data.* indexes.');
+});
+
+(window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
+// 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
+//  (db.ts 가 자체 enrich 복사본을 갖고 있으면 두 규칙이 어긋나 인덱스가 조용히 깨집니다)
+(window as any).normalizeEnvelope = normalizeEnvelope;
+(window as any).canonicalizeData = canonicalizeData;
+
+// =====================================================================
+// 🌟 [DEXIE PLAN ENGINE v4]
+// ---------------------------------------------------------------------
+//  Rust(build_dexie_plan)가 내려준 정밀 필터 플랜을 실제 Dexie 쿼리로 실행합니다.
+//
+//  ── 왜 이 엔진이 필요한가 ──
+//   기존에는 convert_conditions_to_sql 이 valid_cols 7개 밖의 조건을 전부 버렸고,
+//   그 손실을 메우려고 STAGE-3 이 A/FULL ~ E/TABLE-FALLBACK 5티어를 발행했습니다.
+//   v4 는 조건을 하나도 버리지 않고 여기로 넘기므로, 티어 보험이 필요 없어집니다.
+//
+//  ── 실행 전략 ──
+//   ① 인덱스가 선언된 경로  → where().equals()/.between()/.above() (O(log n))
+//   ② 인덱스가 없는 경로    → .filter() 풀스캔 (로컬 수천~수만 건 = 수 ms)
+//   ③ top / bottom          → 정렬 후 백분위 슬라이스
+//   ④ contains/not_contains → .filter() (IndexedDB 는 substring 인덱스가 없음)
+// =====================================================================
+
+// 🌟 Dexie 스키마에 실제로 선언한 인덱스 경로 목록입니다.
+//  이 집합에 없는 경로는 자동으로 .filter() 로 떨어집니다.
+//  → 새 경로를 인덱스하면 여기에 한 줄 추가하고 version 을 올리면 끝입니다.
+const DEXIE_INDEXED_PATHS = new Set<string>([
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.link', 'data.origin',
+    'data.embed', 'data.digest'
+]);
+
+interface DexieCondition {
+    path: string;
+    op: string;              // eq | neq | gt | gte | lt | lte | contains | not_contains | top | bottom
+    value?: any;
+    percent?: number;
+    kind?: string;           // number | string | rank
 }
-async function kvSet(key: string, value: any) {
-    await appDb.table("kv_store").put({ key, value });
+
+interface DexiePlan {
+    type?: string;
+    mode?: string;
+    conditions?: DexieCondition[];
+    keywords?: string[];
+    alternates?: Record<string, string[]>;
+    substantial?: string;
+    find?: string;
 }
-async function kvRemove(key: string) {
-    await appDb.table("kv_store").delete(key);
+
+// 🌟 중첩 경로('data.sale_price')를 안전하게 읽습니다.
+function readPath(row: any, path: string): any {
+    if (!row) return undefined;
+    if (path.indexOf('.') === -1) return row[path];
+    let cur: any = row;
+    for (const seg of path.split('.')) {
+        if (cur === null || cur === undefined) return undefined;
+        cur = cur[seg];
+    }
+    return cur;
+}
+
+// 🌟 조건 하나를 '메모리상의 행'에 적용합니다.
+//  인덱스 경로든 아니든 최종 검증은 전부 이 함수를 통과시켜
+//  인덱스 쿼리의 오탐(타입 혼재 등)을 이중으로 막습니다.
+function matchCondition(row: any, cond: DexieCondition): boolean {
+    // top / bottom 은 개별 행으로 판정 불가. 정렬 단계에서 처리합니다.
+    if (cond.op === 'top' || cond.op === 'bottom') return true;
+
+    const raw = readPath(row, cond.path);
+
+    if (cond.kind === 'number') {
+        const target = typeof cond.value === 'number' ? cond.value : Number(cond.value);
+        if (isNaN(target)) return true; // 비교 불가 → 조건 무시(리콜 우선)
+        const actual = typeof raw === 'number'
+            ? raw
+            : Number(String(raw ?? '').replace(/[^\d.\-]/g, ''));
+        if (isNaN(actual)) return false;
+
+        switch (cond.op) {
+            case 'gt':  return actual >  target;
+            case 'gte': return actual >= target;
+            case 'lt':  return actual <  target;
+            case 'lte': return actual <= target;
+            case 'neq': return actual !== target;
+            default:    return actual === target;
+        }
+    }
+
+    // 문자열 계열
+    const actualStr = (raw === null || raw === undefined) ? '' : String(raw);
+    const targetStr = (cond.value === null || cond.value === undefined) ? '' : String(cond.value);
+    if (!targetStr) return true; // 빈 조건은 무시
+
+    const a = actualStr.toLowerCase();
+    const t = targetStr.toLowerCase();
+
+    switch (cond.op) {
+        case 'contains':     return a.includes(t);
+        case 'not_contains': return !a.includes(t);
+        case 'neq':          return a !== t;
+        case 'gt':           return a >  t;
+        case 'gte':          return a >= t;
+        case 'lt':           return a <  t;
+        case 'lte':          return a <= t;
+        default:             return a === t;
+    }
+}
+
+// 🌟 조건 배열 중 '인덱스 쿼리로 후보를 좁히기에 가장 유리한 것' 하나를 고릅니다.
+//  eq 가 범위보다 선택도가 높고, 식별자 경로가 상태/수치보다 선택도가 높습니다.
+function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
+    const HIGH_SELECTIVITY = [
+        'data.tracking_number', 'data.no', 'data.code', 'data.index',
+        'data.barcode', 'data.stock_keeping_unit', 'data.digest'
+    ];
+
+    let best: DexieCondition | null = null;
+    let bestScore = -1;
+
+    for (const c of conds) {
+        if (!DEXIE_INDEXED_PATHS.has(c.path)) continue;
+        if (c.op === 'top' || c.op === 'bottom') continue;
+        if (c.op === 'contains' || c.op === 'not_contains' || c.op === 'neq') continue;
+
+        let score = 0;
+        if (c.op === 'eq') score += 10;
+        else score += 4; // 범위 연산자
+        if (HIGH_SELECTIVITY.includes(c.path)) score += 20;
+
+        if (score > bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+}
+
+// 🌟 [MAIN] 플랜을 실행해 최종 문서 배열을 돌려줍니다.
+//  candidateIds 가 있으면 LanceDB 리콜 후보 안에서만 필터링하고,
+//  없으면 Dexie 전체를 대상으로 합니다(목록 조회 경로).
+async function executeDexiePlan(
+    plan: DexiePlan,
+    opts: { candidateIds?: string[]; limit?: number; offset?: number } = {}
+): Promise<any[]> {
+    if (!appDb) return [];
+
+    const conds: DexieCondition[] = Array.isArray(plan.conditions) ? plan.conditions : [];
+    const limit = opts.limit ?? 200;
+    const offset = opts.offset ?? 0;
+
+    let rows: any[] = [];
+
+    // ── 후보 집합이 주어진 경우 : LanceDB 리콜 결과 안에서만 정밀 필터 ──
+    if (opts.candidateIds && opts.candidateIds.length > 0) {
+        rows = await appDb.table('items').where('id').anyOf(opts.candidateIds).toArray();
+        console.log(`[DEXIE-PLAN] 후보 ${opts.candidateIds.length}건 → Dexie 적재 ${rows.length}건`);
+    } else {
+        // ── 후보가 없는 경우 : 인덱스로 최대한 좁혀서 적재 ──
+        const driver = pickDriverCondition(conds);
+
+        if (driver) {
+            const coll = appDb.table('items').where(driver.path);
+            if (driver.op === 'eq') {
+                rows = await coll.equals(driver.value).toArray();
+            } else if (driver.op === 'gt') {
+                rows = await coll.above(driver.value).toArray();
+            } else if (driver.op === 'gte') {
+                rows = await coll.aboveOrEqual(driver.value).toArray();
+            } else if (driver.op === 'lt') {
+                rows = await coll.below(driver.value).toArray();
+            } else if (driver.op === 'lte') {
+                rows = await coll.belowOrEqual(driver.value).toArray();
+            } else {
+                rows = await appDb.table('items').toArray();
+            }
+            console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
+        } else if (plan.mode) {
+            // 드라이버가 없으면 mode 인덱스로라도 좁힙니다.
+            rows = await appDb.table('items').where('mode').equals(plan.mode).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. mode='${plan.mode}' 로 ${rows.length}건 적재`);
+        } else {
+            rows = await appDb.table('items').toArray();
+            console.log(`[DEXIE-PLAN] 전체 적재 ${rows.length}건`);
+        }
+    }
+
+    // ── 스코프 검증 (type / mode) ──
+    if (plan.type) {
+        rows = rows.filter(r => (r.type || '') === plan.type);
+    }
+    if (plan.mode) {
+        rows = rows.filter(r => (r.mode || 'commerce') === plan.mode);
+    }
+
+    // ── 정밀 조건 전량 적용 ──
+    const rankConds = conds.filter(c => c.op === 'top' || c.op === 'bottom');
+    const plainConds = conds.filter(c => c.op !== 'top' && c.op !== 'bottom');
+
+    if (plainConds.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => plainConds.every(c => matchCondition(r, c)));
+        console.log(`[DEXIE-PLAN] 정밀 조건 ${plainConds.length}개 적용: ${before} → ${rows.length}건`);
+        for (const c of plainConds) {
+            const viaIndex = DEXIE_INDEXED_PATHS.has(c.path) ? 'index' : 'scan';
+            console.log(`  ↳ ${c.path} ${c.op} ${JSON.stringify(c.value)} (${c.kind}, ${viaIndex})`);
+        }
+    }
+
+    // ── top / bottom 백분위 : 정렬 후 슬라이스 ──
+    for (const rc of rankConds) {
+        if (rows.length === 0) break;
+        const pct = Math.max(1, Math.min(100, rc.percent ?? 20));
+        const take = Math.max(1, Math.ceil(rows.length * (pct / 100)));
+
+        const sorted = [...rows].sort((a, b) => {
+            const av = Number(readPath(a, rc.path)) || 0;
+            const bv = Number(readPath(b, rc.path)) || 0;
+            return rc.op === 'top' ? bv - av : av - bv;
+        });
+        rows = sorted.slice(0, take);
+        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건`);
+    }
+
+    // ── keywords : 조건이 되지 못한 청크로 보조 스코어링 ──
+    //  버리지 않고 '가산점' 으로만 씁니다. 여기서 잘라내면 리콜이 무너집니다.
+    if (plan.keywords && plan.keywords.length > 0) {
+        for (const r of rows) {
+            const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.masked_text ?? ''}`.toLowerCase();
+            let hit = 0;
+            for (const k of plan.keywords) {
+                if (k && hay.includes(k.toLowerCase())) hit++;
+            }
+            r.__kw_score = hit;
+        }
+        rows.sort((a, b) => (b.__kw_score || 0) - (a.__kw_score || 0));
+    }
+
+    const start = Math.min(offset, rows.length);
+    const end = Math.min(start + limit, rows.length);
+    return rows.slice(start, end);
 }
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
@@ -2437,10 +2861,12 @@ async function syncData() {
 
                 const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r) && !newTalks.includes(r));
 
-                if (newUsers.length > 0) await appDb.table("users").bulkPut(newUsers);
-                if (newPages.length > 0) await appDb.table("pages").bulkPut(newPages);
+                // 🌟 v4 : users / pages 도 봉투 정규화를 거칩니다.
+                //  talks 는 스키마가 다르므로(role/task_id/status) 그대로 넣습니다.
+                if (newUsers.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(newUsers));
+                if (newPages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(newPages));
                 if (newTalks.length > 0) await appDb.table("talks").bulkPut(newTalks);
-                if (newItems.length > 0) await appDb.table("items").bulkPut(enrichForIndex(newItems));
+                if (newItems.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(newItems));
 
                 // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
                 // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
@@ -2524,8 +2950,10 @@ async function syncData() {
                 await fetchChatHistory(false, true);
             }
 
-            // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
-            runLocalEmbeddingSync();
+             // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
+             //    runLocalEmbeddingSync 내부의 2초 디바운스가 initSession의 4초 타이머와
+             //    겹치는 중복 호출을 자동으로 병합하여 1회만 실행합니다.
+             runLocalEmbeddingSync();
         }
         
     } catch (e) { 
@@ -3203,211 +3631,248 @@ listen("extraction-progress", async (event: any) => {
             // 🌟 [추가] 검색어와 카운트 H3에 업데이트
             const resultH3 = document.querySelector('.nav-section.search h3');
             if (resultH3) {
-                // 🌟 [TRACKING EQ] structured_query의 context 배열에서 tracking_number 조건을 추출합니다.
-                let trackingNumberForEq = "";
-                if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
-                    for (const ctx of response.structured.context) {
-                        if (ctx.condition && ctx.condition.tracking_number) {
-                            const tnVal = ctx.condition.tracking_number.value || "";
-                            if (tnVal) {
-                                trackingNumberForEq = tnVal;
-                                break;
+                // 🌟 [CONDITION SUMMARY] dexie_plans 에서 실제 적용된 조건을 요약해 보여줍니다.
+                //  기존에는 tracking_number 만 특별 취급했지만,
+                //  v4 는 모든 조건이 동등하게 플랜에 들어 있으므로 일반화합니다.
+                const applied: string[] = [];
+                if (response.dexie_plans && Array.isArray(response.dexie_plans)) {
+                    for (const plan of response.dexie_plans) {
+                        if (!plan.conditions) continue;
+                        for (const c of plan.conditions) {
+                            const label = c.path.replace('data.', '');
+                            if (c.op === 'top' || c.op === 'bottom') {
+                                applied.push(`${label} ${c.op} ${c.percent ?? 20}%`);
+                            } else {
+                                const opSym: Record<string, string> = {
+                                    eq: '=', neq: '≠', gt: '>', gte: '≥', lt: '<', lte: '≤',
+                                    contains: '⊇', not_contains: '⊉'
+                                };
+                                applied.push(`${label} ${opSym[c.op] || c.op} ${c.value}`);
                             }
                         }
                     }
                 }
-                if (trackingNumberForEq) {
-                    // 🌟 [TRACKING EQ] tracking_number가 감지되면 LanceDB FTS 대신 Dexie DB eq 쿼리로 정확 매칭합니다.
-                    const countStr = response.results ? response.results.length : 0;
-                    resultH3.innerHTML = `tracking_number: ${trackingNumberForEq} <strong class="count">(${countStr})</strong>`;
-                } else {
-                    let queryText = "";
-                    if (response.structured && response.structured.original_text) {
-                        queryText = response.structured.original_text;
-                    }
-                    if (!queryText) {
-                        const queryEl = document.getElementById(`${payload.task_id}_query`);
-                        if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
-                    }
-                    let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-                    if (currentSearchMode === "commerce") displayMode = "Goods";
-                    const countStr = response.results ? response.results.length : 0;
-                    resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
+
+                let queryText = "";
+                if (response.structured && response.structured.original_text) {
+                    queryText = response.structured.original_text;
                 }
+                if (!queryText) {
+                    const queryEl = document.getElementById(`${payload.task_id}_query`);
+                    if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                }
+
+                let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
+                if (currentSearchMode === "commerce") displayMode = "Goods";
+
+                // 🌟 카운트는 '렌더링될 문서 수' 로 확정해야 하므로 아래 updateResultCount 가 다시 갱신합니다.
+                //    여기서는 조건 요약만 먼저 노출합니다.
+                const condStr = applied.length > 0
+                    ? ` <span style="font-size:0.85em; opacity:0.7;">[${applied.slice(0, 3).join(' · ')}${applied.length > 3 ? ` +${applied.length - 3}` : ''}]</span>`
+                    : "";
+
+                resultH3.innerHTML = `Search ${displayMode}: "${queryText}"${condStr} <strong class="count"></strong>`;
             }
 
-            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 원본 검색 결과 수: ${response.results ? response.results.length : 0}`);
+            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 리콜 후보 수: ${response.results ? response.results.length : 0}`);
+            console.log(`[SEARCH-DEBUG] 수신한 Dexie 플랜 수: ${response.dexie_plans ? response.dexie_plans.length : 0}`);
 
-            // 🌟 [TRACKING EQ] tracking_number가 감지되면 Dexie DB eq 쿼리로 정확 매칭 문서를 검색합니다.
-            let trackingEqDocs: any[] = [];
-            if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
-                for (const ctx of response.structured.context) {
-                    if (ctx.condition && ctx.condition.tracking_number) {
-                        const tnVal = ctx.condition.tracking_number.value || "";
-                        if (tnVal && appDb) {
-                            console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 실행: tracking_number = '${tnVal}'`);
-                            try {
-                                const eqResults = await appDb.table("items")
-                                    .where("tracking_number").equals(tnVal)
-                                    .toArray();
-                                console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과: ${eqResults.length}건`);
-                                for (const match of eqResults) {
-                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                    trackingEqDocs.push({
-                                        id: match.id,
-                                        uuid: match.id,
-                                        type: dData.type || match.type || "tracking",
-                                        data: dData,
-                                        text: dData.text || match.text || "",
-                                        created_at: dData.created_at || match.created_at || 0,
-                                        updated_at: dData.updated_at || match.updated_at || 0,
-                                        search_badge: "📦 Tracking EQ Match"
-                                    });
-                                }
-                            } catch (e) {
-                                console.error("[SEARCH-DEBUG] Dexie eq 쿼리 실패:", e);
+            // 🌟 [DEXIE PLAN EXECUTION]
+            //  LanceDB 는 조건을 적용하지 않은 '리콜 후보' 만 돌려줍니다.
+            //  실제 조건 필터링(가격/수량/송장번호/상태/기간/top·bottom)은 여기서 수행합니다.
+            //  → 기존의 trackingEqDocs 특수 분기는 plan.conditions 의
+            //    data.tracking_number eq 조건으로 일반화되어 사라집니다.
+            let planFilteredIds: Set<string> | null = null;
+            const planBadges = new Map<string, string>();
+
+            if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
+                const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
+                const accepted = new Set<string>();
+
+                for (const plan of response.dexie_plans) {
+                    const condCount = plan.conditions ? plan.conditions.length : 0;
+
+                    // 조건이 하나도 없는 플랜은 후보를 그대로 통과시킵니다. (리콜 우선)
+                    if (condCount === 0) {
+                        for (const id of candidateIds) accepted.add(id);
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 0개 → 후보 전량 통과`);
+                        continue;
+                    }
+
+                    try {
+                        const passed = await executeDexiePlan(plan, { candidateIds, limit: 500 });
+                        for (const p of passed) {
+                            accepted.add(p.id);
+                            // 어떤 조건으로 통과했는지 배지로 남깁니다.
+                            const first = plan.conditions[0];
+                            if (first) {
+                                planBadges.set(p.id, `🎯 ${first.path.replace('data.', '')} ${first.op}`);
                             }
-                            break;
                         }
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
+
+                        // 🌟 [PLAN RECALL] 후보 안에서 0건이면 Dexie 전체에서 다시 찾습니다.
+                        //  LanceDB 리콜이 놓친 문서를 조건만으로 건져 올리는 경로입니다.
+                        //  (기존 C/RECALL, E/TABLE-FALLBACK 티어가 하던 일을 여기서 흡수)
+                        if (passed.length === 0) {
+                            const rescued = await executeDexiePlan(plan, { limit: 200 });
+                            for (const p of rescued) {
+                                accepted.add(p.id);
+                                planBadges.set(p.id, `🛟 recall`);
+                            }
+                            if (rescued.length > 0) {
+                                console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${rescued.length}건 구출 (LanceDB 리콜 누락 보정)`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[DEXIE-PLAN] 실행 실패 (type='${plan.type}'):`, e);
+                        // 실패 시 조건을 포기하고 후보를 통과시킵니다. 0건보다 낫습니다.
+                        for (const id of candidateIds) accepted.add(id);
                     }
                 }
+
+                planFilteredIds = accepted;
+                console.log(`[DEXIE-PLAN] 최종 통과 문서 ${accepted.size}건`);
             }
 
             // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
             if (response.results && response.results.length > 0) {
                 if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
-                
+
                 let docs: any[] = [];
-                // 🌟 [TRACKING EQ] Dexie eq 쿼리 결과를 우선 병합합니다.
-                if (trackingEqDocs.length > 0) {
-                    docs.push(...trackingEqDocs);
-                    console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과 ${trackingEqDocs.length}건 병합 완료`);
-                }
-                
+                const seenIds = new Set<string>();
+
                 for (const res of response.results) {
                     try {
-                        // 🌟 [CRITICAL FIX] 백엔드가 이미 전체 JSON 데이터를 res.text에 담아 보냈으므로, 
-                        // 프론트엔드에서 get_document를 건건이 재호출(N+1 쿼리)하여 렌더링 병목(두 번 쿼리)이 발생하는 현상을 원천 차단합니다!
+                        // 🌟 [PLAN GATE] 플랜이 존재하면 통과한 문서만 렌더링합니다.
+                        if (planFilteredIds && !planFilteredIds.has(res.id)) continue;
+
+                        // 🌟 백엔드가 data 컬럼(JSON 문자열)을 res.text 로 보냅니다.
+                        //    get_document 를 건건이 재호출하는 N+1 쿼리를 원천 차단합니다.
                         let parsedData: any = {};
                         try { parsedData = JSON.parse(res.text); } catch(e) {}
-                        
-                        let fullDoc: any = { 
-                            id: res.id, 
+
+                        let fullDoc: any = {
+                            id: res.id,
                             uuid: res.id,
                             type: parsedData.type || res.context_type || "unknown",
+                            mode: parsedData.mode || currentSearchMode,
                             data: parsedData,
-                            text: res.text,
+                            text: parsedData.text || "",
                             created_at: parsedData.created_at || 0,
                             updated_at: parsedData.updated_at || 0
                         };
-                        
-                        // 검색 점수 및 컨텍스트 병합
+
                         if (fullDoc.data) {
                             fullDoc.data.search_score = res.score;
                             fullDoc.data.search_context = res.context_type;
-                            // 🌟 [TRACKING BADGE] tracking_number 기반 교차 검색 결과임을 명시합니다.
-                            if (res.relation === "cross_tracking" || res.relation === "cross_items") {
-                                fullDoc.data.search_relation = res.relation;
-                                fullDoc.data.search_badge = "📦 Tracking Match";
-                            }
+                            const badge = planBadges.get(res.id);
+                            if (badge) fullDoc.data.search_badge = badge;
                         }
-                        
+
+                        seenIds.add(res.id);
                         docs.push(fullDoc);
                     } catch (e) {
                         console.error("Failed to process search result:", e);
                     }
                 }
-                
+
+                // 🌟 [RESCUED MERGE] LanceDB 후보에는 없었지만 플랜이 건져 올린 문서를 합칩니다.
+                if (planFilteredIds) {
+                    const rescuedIds = Array.from(planFilteredIds).filter(id => !seenIds.has(id));
+                    if (rescuedIds.length > 0 && appDb) {
+                        const rescuedRows = await appDb.table('items').where('id').anyOf(rescuedIds).toArray();
+                        for (const row of rescuedRows) {
+                            docs.push({
+                                id: row.id,
+                                uuid: row.id,
+                                type: row.type || "unknown",
+                                mode: row.mode || currentSearchMode,
+                                data: { ...(row.data || {}), search_badge: planBadges.get(row.id) || "🛟 recall" },
+                                text: row.data?.text || "",
+                                created_at: row.created_at || 0,
+                                updated_at: row.updated_at || 0
+                            });
+                            seenIds.add(row.id);
+                        }
+                        console.log(`[SEARCH-DEBUG] 플랜 구출 문서 ${rescuedRows.length}건 병합 완료`);
+                    }
+                }
+
                 console.log(`[SEARCH-DEBUG] 1차 파싱 완료. 기본 문서 수: ${docs.length}`);
 
-                // 🌟 [Dexie DB 기반 초고속 N:N 양방향 교차 검색 위임]
+                // 🌟 [N:N RELAY v4] 루트 호이스팅 컬럼(index/goods/order/...) 대신
+                //  data.* 중첩 인덱스를 직접 사용합니다.
+                //  canonicalize 가 식별자를 전부 String 으로 확정했으므로
+                //  기존의 '숫자/문자 두 갈래로 쏘던 타입 방어 쿼리' 가 불필요해집니다.
+                //  (쿼리 수가 절반으로 줄고, 타입 혼재로 절반을 놓치던 문제도 사라집니다)
                 if (appDb && docs.length > 0) {
-                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay) 시작...`);
-                    const relayDocs = new Map();
+                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay v4) 시작...`);
+                    const relayDocs = new Map<string, any>();
+                    const existingIds = new Set(docs.map(d => d.id));
+
+                    // 연관 축으로 사용할 data.* 경로 (전부 인덱스 선언되어 있음)
+                    const LINK_PATHS = [
+                        'data.index', 'data.no', 'data.code', 'data.tracking_number',
+                        'data.goods', 'data.order', 'data.tracking',
+                        'data.stock_keeping_unit', 'data.barcode'
+                    ];
+
+                    // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼
+                    const findLinked = async (value: string): Promise<any[]> => {
+                        if (!value) return [];
+                        let coll = appDb.table("items").where(LINK_PATHS[0]).equals(value);
+                        for (let i = 1; i < LINK_PATHS.length; i++) {
+                            coll = coll.or(LINK_PATHS[i]).equals(value);
+                        }
+                        return await coll.toArray();
+                    };
+
+                    const absorb = (match: any, relation: string) => {
+                        if (!match || !match.id) return false;
+                        if (existingIds.has(match.id) || relayDocs.has(match.id)) return false;
+                        const dData = { ...(match.data || {}) };
+                        dData.search_context = match.type;
+                        dData.relation = relation;
+                        relayDocs.set(match.id, { ...match, data: dData });
+                        return true;
+                    };
 
                     for (const doc of docs) {
                         const parsedData = doc.data || {};
-                        const selfIndex = parsedData.index?.toString();
 
-                        // 1. 정방향: 내 index를 포함하는 연관 문서 검색 (DB 인덱스 활용)
+                        // 1) 정방향 : 내 index 를 참조하는 문서들
+                        const selfIndex = parsedData.index ? String(parsedData.index) : "";
                         if (selfIndex) {
-                            const forwardMatches = await appDb.table("items")
-                                .where("index").equals(selfIndex)
-                                .or("order").equals(selfIndex)
-                                .or("goods").equals(selfIndex)
-                                .or("tracking").equals(selfIndex)
-                                .toArray();
-
-                            for (const match of forwardMatches) {
-                                if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id)) {
-                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                    dData.search_context = match.type;
-                                    match.data = dData;
-                                    relayDocs.set(match.id, match);
-                                }
+                            for (const match of await findLinked(selfIndex)) {
+                                if (match.id === doc.id) continue;
+                                absorb(match, "forward");
                             }
                         }
 
-                        // 2. 역방향: 내부에 포함된 외래키를 통해 부모 문서 검색 (DB 인덱스 활용)
-                        // 🌟 [TRACKING ENHANCEMENT] tracking_number를 최우선으로 배치하여 송장 번호 기반 교차 검색을 강화합니다.
+                        // 2) 역방향 : 내가 참조하는 외래키로 부모 찾기
                         const refKeys = ["tracking_number", "no", "code", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
                         for (const key of refKeys) {
                             const rawRef = parsedData[key];
-                            if (rawRef !== undefined && rawRef !== null && rawRef !== "") {
-                                const refStr = rawRef.toString();
-                                const refNum = !isNaN(Number(rawRef)) ? Number(rawRef) : null;
+                            if (rawRef === undefined || rawRef === null || rawRef === "") continue;
+                            const refStr = String(rawRef);
 
-                                // 🌟 [타입 방어 쿼리] 숫자형과 문자열 형식을 모두 인덱스 검색 대상에 포함
-                                let queryCollection = appDb.table("items").where("index").equals(refStr);
-                                if (refNum !== null) {
-                                    queryCollection = queryCollection.or("index").equals(refNum);
-                                }
+                            for (const match of await findLinked(refStr)) {
+                                if (match.id === doc.id) continue;
+                                if (!absorb(match, "backward")) continue;
 
-                                const targetCols = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
-                                for (const col of targetCols) {
-                                    queryCollection = queryCollection.or(col).equals(refStr);
-                                    if (refNum !== null) {
-                                        queryCollection = queryCollection.or(col).equals(refNum);
-                                    }
-                                }
-
-                                const backwardMatches = await queryCollection.toArray();
-
-                                for (const match of backwardMatches) {
-                                    if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id) && match.id !== doc.id) {
-                                        const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                        dData.search_context = match.type;
-                                        dData.relation = "backward"; // Rust 패리티 연관 관계 명시
-                                        match.data = dData;
-                                        relayDocs.set(match.id, match);
-
-                                        // 3. 역방향으로 획득한 상위 데이터에서 한번 더 정방향 하위 연관 시도 (2 Depth 체이닝)
-                                        const bIndex = dData.index?.toString();
-                                        if (bIndex) {
-                                            const d2Matches = await appDb.table("items")
-                                                .where("goods").equals(bIndex)
-                                                .or("order").equals(bIndex)
-                                                .or("tracking").equals(bIndex)
-                                                .toArray();
-
-                                            for (const d2Match of d2Matches) {
-                                                if (!docs.some(d => d.id === d2Match.id) && !relayDocs.has(d2Match.id) && d2Match.id !== match.id && d2Match.id !== doc.id) {
-                                                    const d2Data = typeof d2Match.json_data === 'string' ? JSON.parse(d2Match.json_data) : (d2Match.data || d2Match);
-                                                    d2Data.search_context = d2Match.type;
-                                                    d2Data.relation = "backward_chained"; // Rust 패리티 연관 관계 명시
-                                                    d2Match.data = d2Data;
-                                                    relayDocs.set(d2Match.id, d2Match);
-                                                }
-                                            }
-                                        }
-                                    }
+                                // 3) 2-Depth 체이닝 : 부모의 index 로 다시 자식 찾기
+                                const bIndex = match.data?.index ? String(match.data.index) : "";
+                                if (!bIndex) continue;
+                                for (const d2 of await findLinked(bIndex)) {
+                                    if (d2.id === match.id || d2.id === doc.id) continue;
+                                    absorb(d2, "backward_chained");
                                 }
                             }
                         }
                     }
-                    
+
                     console.log(`[SEARCH-DEBUG] 연관 교차 검색으로 추가된 문서 수: ${relayDocs.size}`);
-                    // 연관 문서들을 최종 화면 렌더링 배열에 병합
                     docs.push(...Array.from(relayDocs.values()));
                 }
                 
@@ -4658,102 +5123,130 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
     
     try {
-        // 🌟 [CRITICAL FIX] 새로 추가된 DB의 'mode' 컬럼을 이용하여 완벽하게 격리된 데이터를 불러옵니다.
-        let baseFilter = `mode = '${currentSearchMode}'`;
-        
-        if (currentSearchMode === "shipping") {
-            baseFilter += " AND type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
-        } else if (currentSearchMode === "analytic") {
-            baseFilter += " AND type IN ('click', 'hover', 'change', 'report')"; 
-        } else {
-            baseFilter += " AND type IN ('sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review')";
-        }
+        // 🌟 [LIST QUERY v4] 목록 조회는 LanceDB 를 거치지 않고 Dexie 에서 직접 처리합니다.
+        //  목록에는 벡터/FTS 가 필요 없고, 필요한 건 스코프 + 타입 + 정렬 + 페이징뿐입니다.
+        //  → SQL 문자열 조립이 사라지므로 DataFusion 문법 에러 클래스가 통째로 소멸합니다.
+        //  → 텍스트 검색이 있을 때만 LanceDB(search_documents)를 후보 소스로 사용합니다.
 
-        // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
-        if (activeContext.ref) baseFilter = `(${baseFilter}) AND ref = '${activeContext.ref}'`;
-        else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
-        else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
+        const TYPE_SETS: Record<string, string[]> = {
+            shipping: ['tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown'],
+            analytic: ['click', 'hover', 'change', 'report'],
+            commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review']
+        };
+        const allowedTypes = TYPE_SETS[currentSearchMode] || TYPE_SETS.commerce;
 
-        // 🌟 [CRITICAL FIX 4] 사이드바 태그(domain, type)는 위의 activeContext를 통해 SQL 필터로 100% 적용되었습니다.
-        // 이 태그들을 텍스트로 엮어서 억지로 AI 검색에 던지면 검색 결과가 0건이 되고 VRAM이 폭발합니다. 삭제합니다!
         const textQuery = searchInput?.value.trim() || "";
-
-        let finalFilter = baseFilter;
-        let latestUpdateTime = 0;
-        let oldestCreatedAt = 0;
+        const currentOffset = isSync ? 0 : currentPage * pageSize;
 
         // [TIMESTAMPS] Scan UI for current range
+        let latestUpdateTime = 0;
         const allCards = docListContainer.querySelectorAll('.logis-result');
         allCards.forEach(el => {
             const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
-            const cr = parseInt((el as HTMLElement).dataset.createdAt || "0");
             if (up > latestUpdateTime) latestUpdateTime = up;
-            if (oldestCreatedAt === 0 || cr < oldestCreatedAt) oldestCreatedAt = cr;
         });
 
-        if (isSync) {
-            // [Top Pull] Newer than latest update
-            const syncFilter = `updated_at > ${latestUpdateTime}`;
-            finalFilter = baseFilter ? `${baseFilter} AND (${syncFilter})` : syncFilter;
-        } else {
-            // 🌟 [CRITICAL FIX] 무한 스크롤(Bottom Pull) 시 시간 기반 필터가 벡터/텍스트 검색의 score 정렬과 충돌하므로, 안전하게 offset 페이징으로 대체합니다.
-            finalFilter = baseFilter;
-        }
+        console.log(`[DEBUG-LIST] 🔍 문서 조회 시작 | mode=${currentSearchMode} | isSync=${isSync} | offset=${currentOffset}`);
+        console.log(`[DEBUG-LIST] 활성 컨텍스트:`, JSON.stringify(activeContext));
 
         let docs: any[] = [];
-        
-        // 🌟 [CRITICAL FIX] 새로고침/동기화(isSync)가 아닐 경우 currentPage 기반의 offset을 적용합니다.
-        const currentOffset = isSync ? 0 : currentPage * pageSize;
-        
-        console.log(`[DEBUG-LIST] 🔍 문서 조회 요청 시작`);
-        console.log(`[DEBUG-LIST] 현재 모드: ${currentSearchMode}, IsSync: ${isSync}`);
-        console.log(`[DEBUG-LIST] 적용된 SQL 필터(finalFilter):`, finalFilter);
-        console.log(`[DEBUG-LIST] 활성 컨텍스트(activeContext):`, JSON.stringify(activeContext));
-        
+
         if (textQuery) {
+            // ── 텍스트 검색 : LanceDB 로 후보를 긁고 Dexie 로 스코프 검증 ──
+            //   스코프는 봉투 컬럼만 담습니다. (sanitize_scope_filter 가 어차피 걸러냄)
+            let scopeSql = `mode = '${currentSearchMode}'`;
+            if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+            else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+            else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
-                limit: pageSize,
-                offset: currentOffset,
-                filter: finalFilter || null 
+                limit: pageSize * 4,
+                offset: 0,
+                filter: scopeSql
             });
-            
-            for (const res of searchResults) {
-                const docId = res[0];
-                const fullDoc = await invoke<any>("get_document", { uuid: docId });
-                if (fullDoc) {
-                    // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
-                    if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
-                        try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
-                    }
-                    docs.push(fullDoc);
+
+            const ids = searchResults.map((r: any) => r[0]).filter(Boolean);
+            if (ids.length > 0 && appDb) {
+                const rows = await appDb.table('items').where('id').anyOf(ids).toArray();
+                // LanceDB 점수 순서를 보존합니다.
+                const orderMap = new Map<string, number>();
+                ids.forEach((id: string, i: number) => orderMap.set(id, i));
+                rows.sort((a: any, b: any) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999));
+                docs = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
+
+            // Dexie 에 아직 없는 문서는 Rust 에서 직접 가져옵니다. (최초 진입 대비)
+            if (docs.length === 0 && ids.length > 0) {
+                for (const id of ids.slice(0, pageSize)) {
+                    const fullDoc = await invoke<any>("get_document", { uuid: id });
+                    if (fullDoc) docs.push(fullDoc);
                 }
             }
-        } else {
-            docs = await invoke<any[]>("get_all_documents", {
-                limit: pageSize,
-                offset: currentOffset,
-                filter: finalFilter || null
-            });
-            
-            // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
-            docs = docs.map(doc => {
-                if (!doc.data && doc.json_data && typeof doc.json_data === "string") {
-                    try { doc.data = JSON.parse(doc.json_data); } catch(e) {}
+            docs = docs.slice(currentOffset, currentOffset + pageSize);
+
+        } else if (appDb) {
+            // ── 일반 목록 : Dexie 컬렉션 체이닝 ──
+            let coll: any;
+
+            // 가장 좁은 스코프 인덱스를 드라이버로 선택합니다.
+            if (activeContext.ref) {
+                coll = appDb.table('items').where('ref').equals(activeContext.ref);
+            } else if (activeContext.bcc) {
+                coll = appDb.table('items').where('bcc').equals(activeContext.bcc);
+            } else if (activeContext.cc) {
+                coll = appDb.table('items').where('cc').equals(activeContext.cc);
+            } else {
+                coll = appDb.table('items').where('mode').equals(currentSearchMode);
+            }
+
+            let rows: any[] = await coll.toArray();
+
+            // 스코프 드라이버가 mode 가 아니었다면 mode 를 추가 검증합니다.
+            rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
+            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+
+            if (isSync && latestUpdateTime > 0) {
+                rows = rows.filter((r: any) => (r.updated_at || 0) > latestUpdateTime);
+            }
+
+            rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+
+            console.log(`[DEBUG-LIST] Dexie 스코프 조회: ${rows.length}건 (allowedTypes=${allowedTypes.length}종)`);
+            docs = isSync ? rows.slice(0, pageSize) : rows.slice(currentOffset, currentOffset + pageSize);
+
+            // 🌟 [COLD START] Dexie 가 비어 있으면 Rust 에서 끌어와 캐시를 채웁니다.
+            //  (앱 최초 실행 / DB 초기화 직후 경로)
+            if (rows.length === 0 && currentPage === 0) {
+                let scopeSql = `mode = '${currentSearchMode}'`;
+                if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+                else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+                else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
+                const fromRust = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize * 5,
+                    offset: 0,
+                    filter: scopeSql
+                });
+                if (fromRust.length > 0) {
+                    console.log(`[DEBUG-LIST] ❄️ Cold start: Rust 에서 ${fromRust.length}건 적재 후 Dexie 캐시 채움`);
+                    await appDb.table("items").bulkPut(normalizeEnvelope(fromRust)).catch(() => null);
+                    docs = normalizeEnvelope(fromRust)
+                        .filter((r: any) => allowedTypes.includes(r.type))
+                        .slice(0, pageSize);
                 }
-                return doc;
-            });
-        }
-        
-        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
-        if (docs.length === 0) {
-            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다! 필터 조건이 너무 엄격하거나 DB에 해당 도메인/타입의 데이터가 존재하지 않습니다.`);
+            }
         }
 
-        // 🌟 [CRITICAL FIX] N:N 교차 검색(Dexie)을 돌리기 전에, 로컬에서 방금 파싱된 최신 데이터를 Dexie DB에 동기화해줍니다! (Local Cache Warming)
+        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
+        if (docs.length === 0) {
+            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다. 스코프가 좁거나 해당 타입 데이터가 없습니다.`);
+        }
+
+        // 🌟 [CACHE WARM] Rust 경유로 들어온 문서를 Dexie 봉투 형태로 정규화해 저장합니다.
         if (appDb && docs.length > 0) {
             try {
-                await appDb.table("items").bulkPut(enrichForIndex(docs));
+                await appDb.table("items").bulkPut(normalizeEnvelope(docs));
             } catch (e) {
                 console.error("[Dexie] Local cache update failed:", e);
             }
@@ -4940,24 +5433,36 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
     try {
         const docId = doc.id || doc.uuid;
         const docRef = doc.ref;
-        
-        // 1. 나를 부모로 가지는 자식들 (ref = 내 ID)
-        let filterStr = `ref = '${docId}'`; 
-        
-        // 2. 나와 같은 출신(링크)을 가진 형제들 (ref = 내 출처)
-        if (docRef && docRef !== "") {
-            filterStr += ` OR ref = '${docRef}'`; 
-        }
-        
-        // 백엔드(LanceDB)에 쿼리 전송
-        const relatedDocs = await invoke<any[]>("get_all_documents", {
-            limit: 10,
-            offset: 0,
-            filter: filterStr
-        });
 
-        // 본인 제외 및 중복 제거
-        const uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+        // 🌟 v4 : 연관 조회도 Dexie 인덱스로 처리합니다.
+        //  기존에는 LanceDB 에 `ref = A OR ref = B` SQL 을 보냈는데,
+        //  OR 절이 DataFusion 에서 전량 스캔으로 떨어져 느렸습니다.
+        //  Dexie 의 ref 인덱스 anyOf 는 O(log n + k) 입니다.
+        let uniqueDocs: any[] = [];
+
+        if (appDb) {
+            const refTargets = [docId];
+            if (docRef && docRef !== "") refTargets.push(docRef);
+
+            const rows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
+            uniqueDocs = rows
+                .filter((r: any) => r.id !== docId)
+                .slice(0, 10);
+        }
+
+        // Dexie 가 비어 있으면 Rust 로 폴백합니다.
+        if (uniqueDocs.length === 0) {
+            let filterStr = `\`ref\` = '${docId}'`;
+            if (docRef && docRef !== "") {
+                filterStr += ` OR \`ref\` = '${docRef}'`;
+            }
+            const relatedDocs = await invoke<any[]>("get_all_documents", {
+                limit: 10,
+                offset: 0,
+                filter: filterStr
+            });
+            uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+        }
 
         if (uniqueDocs.length > 0) {
             const relatedHtml = uniqueDocs.map(d => {
@@ -5396,11 +5901,15 @@ async function initSession() {
         
         const data = await invoke<any>("mark_ui_ready");
 
-        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드의 데이터를 로컬 Dexie DB로 즉시 밀어넣어 고속 쿼리(eq) 준비
+        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드 데이터를 봉투 형태로 정규화해 적재합니다.
+        //  ⚠️ 기존 코드의 결함: users / pages 가 normalizeEnvelope 를 거치지 않아
+        //     data 객체 없이 json_data 문자열만 들어갔고, 그래서 db.ts 의 Select 가
+        //     매번 parseItemData 로 다시 파싱해야 했습니다.
+        //     v4 부터 세 테이블 모두 동일하게 정규화합니다.
         try {
-            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(data.users);
-            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(data.pages);
-            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(enrichForIndex(data.items));
+            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(data.users));
+            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(data.pages));
+            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(data.items));
         } catch(dbErr) {
             console.error("[Dexie] Initial sync failed:", dbErr);
         }
@@ -5581,8 +6090,10 @@ async function initSession() {
             syncData(); // await를 제거하여 UI 블로킹 방지
         }
 
-        // 🌟 [CLIENT-SIDE EMBEDDING] 이전 세션에서 클라우드로 받아왔지만 로컬 임베딩이 안 된 아이템을 복구합니다.
-        setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
+         // 🌟 [CLIENT-SIDE EMBEDDING] 이전 세션에서 클라우드로 받아왔지만 로컬 임베딩이 안 된 아이템을 복구합니다.
+         //    runLocalEmbeddingSync 내부에 2초 디바운스가 있으므로 syncData 완료 후 호출과
+         //    이 4초 타이머 호출이 겹쳐도 1회만 실행됩니다.
+         setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
 
     } catch (e) { 
         console.error("[WIDGET] Handshake failed:", e); 
