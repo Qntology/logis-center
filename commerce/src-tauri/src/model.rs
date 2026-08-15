@@ -5262,45 +5262,51 @@ impl LogisModel {
             }
         }
 
-        // 🌟 [DOMAIN-SPLIT N:N CONTEXT GENERATION]
-        //  기존 STAGE-3 은 서로 다른 도메인의 세그먼트를 '마스터 컨텍스트 1개'로 강제 병합했습니다.
-        //  그 결과(로그의 2번 질의)는 다음과 같이 무너졌습니다.
-        //   ① event 세그먼트('올해 여름')가 만든 started_at / expired_at 이 goods 컨텍스트에 실려
-        //      SQL 이 `created_at >= 1788188400000` 이 되면서 goods 상품 전체가 잘려 0건이 되었습니다.
-        //   ② review 세그먼트의 title="고객의" 가 goods 세그먼트의 title="제품" 을 덮어썼습니다.
-        //      (master_condition.insert 가 무조건 덮어쓰기)
-        //   ③ 도메인이 goods 하나로 접히면서 target_table 도 sales 하나만 조회되어
-        //      event / review 테이블은 아예 검색조차 되지 않았습니다.
-        //  '지연이나 일부 오답보다 정답이 결과에 포함되는 것이 최우선' 이라는 요구에 맞춰
-        //  (도메인 축) × (조건 완화 축) × (질의 텍스트 축) × (속성 대안 축) 의 N:N 조합으로 분할 발행합니다.
-        //  lib.rs 의 검색 루프는 컨텍스트마다 독립 쿼리를 돌리고 id 기준으로 dedup 하므로
-        //  컨텍스트가 늘어날수록 리콜만 올라가고 중복 결과는 생기지 않습니다.
+        // =====================================================================
+        // 🌟 [STAGE-3 v4 / SINGLE CONTEXT PER DOMAIN]
+        // ---------------------------------------------------------------------
+        //  v3 는 도메인마다 A/FULL · B/NARROWED · C/RECALL · D/ALTERNATE ·
+        //  E/TABLE-FALLBACK 5개 티어를 발행했습니다. 그 이유는 전부 '보험' 이었습니다.
+        //
+        //    A vs B : convert_conditions_to_sql 이 조건을 버릴까 봐 완화본을 하나 더
+        //    C      : SQL 문법 에러로 0건이 날까 봐 조건 없는 본을 하나 더
+        //    D      : 속성 확정이 틀렸을까 봐 교체본을 하나 더
+        //    E      : 저장 테이블과 조회 테이블이 어긋날까 봐 items 미러본을 하나 더
+        //
+        //  v4 에서 이 네 가지 위험이 전부 구조적으로 사라졌습니다.
+        //    - build_dexie_plan 이 조건을 하나도 버리지 않음        → A/B 통합
+        //    - build_scope_filter 가 봉투 컬럼만 씀 (문법 에러 불가) → C 불필요
+        //    - alternates 를 dexie_plan 에 실어 프론트가 재질의      → D 불필요
+        //    - 물리 테이블이 items 하나                              → E 불필요
+        //
+        //  → 도메인당 컨텍스트 1개 + 후보 도메인 목록(types) 으로 접습니다.
+        //    LanceDB 왕복이 24회 → 3~4회로 줄고, 임베딩 호출도 같은 비율로 감소합니다.
+        //    리콜은 lib.rs 의 RECALL_LIMIT(50) + Dexie 의 후보 밖 구출 경로가 보증합니다.
+        // =====================================================================
         if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
             if !ctx_arr.is_empty() {
-                emit_term("[STAGE-3] Generating domain-split N:N combinatorial contexts...");
+                emit_term("[STAGE-3] Generating single context per domain (v4)...");
 
                 struct DomainGroup {
-                    // 🌟 [PURGED] ACTION WORD 를 제거한 정화 텍스트 — A/FULL, B/NARROWED 전용
+                    /// ACTION WORD 를 제거한 정화 텍스트 (FTS 정밀도용)
                     text_words: Vec<String>,
-                    // 🌟 [RAW] 정화 이전 세그먼트 원문 — C/RECALL, C/CANDIDATE, E/FALLBACK 전용
-                    //    ACTION VERB 게이트가 오탐하면 text_words 가 통째로 비어
-                    //    push_ctx 의 `body.is_empty() && condition.is_empty()` 에 걸려
-                    //    모든 티어가 소멸합니다.
-                    //    (new_log2.txt: '니트'/'가디건'/'찾아줘' 3단어 전부 오탐 → 발행 쿼리 7건 → 1건)
-                    //    원문 축을 별도로 보존하여 리콜 티어는 게이트 오탐과 무관하게 항상 발행되도록 합니다.
+                    /// 정화 이전 세그먼트 원문 (게이트 오탐 시 복구용)
                     raw_words: Vec<String>,
+                    /// 조건 값 + 미배정 청크 (FTS 리콜용)
                     value_words: Vec<String>,
                     condition: serde_json::Map<String, Value>,
                     alternates: serde_json::Map<String, Value>,
+                    /// 이 도메인과 교차 가능한 후보 도메인 (STAGE-1 types + 브릿지)
+                    candidates: Vec<String>,
                     status: Value,
                     substantial: Value,
                     find: Value,
+                    /// substantial 필드를 보유한 타 도메인 (교차 조회 대상)
+                    substantial_host: String,
                 }
 
                 // 🌟 [WORD ORDER PRESERVE] value_words 는 condition 맵(키 알파벳순) 순회로 수집되어
-                //    원문 어순이 완전히 파괴됩니다.
-                //    (로그: "팔린 많이 5000원 이하로 제품으로 제품중에서 제품 무거운" — 원문과 순서가 전혀 다름)
-                //    FTS 는 어순에 민감하므로 원문 순서로 재정렬해야 매칭률이 유지됩니다.
+                //    원문 어순이 파괴됩니다. FTS 는 어순에 민감하므로 원문 순서로 복원합니다.
                 fn reorder_by_source(words: &Vec<String>, source: &Vec<String>) -> Vec<String> {
                     let mut out: Vec<String> = Vec::with_capacity(words.len());
                     for s in source {
@@ -5314,45 +5320,10 @@ impl LogisModel {
                     out
                 }
 
-                fn push_ctx(
-                    out: &mut Vec<Value>,
-                    seen: &mut std::collections::HashSet<String>,
-                    domain: &str,
-                    text: &str,
-                    condition: serde_json::Map<String, Value>,
-                    alternates: &serde_json::Map<String, Value>,
-                    status: &Value,
-                    substantial: &Value,
-                    find: &Value,
-                    tier: &str,
-                ) -> bool {
-                    if domain.is_empty() { return false; }
-                    let body = text.trim();
-                    if body.is_empty() && condition.is_empty() { return false; }
-                    let sig = format!("{}\u{1}{}\u{1}{}", domain, body, serde_json::to_string(&condition).unwrap_or_default());
-                    if !seen.insert(sig) { return false; }
-
-                    let mut ctx = serde_json::Map::new();
-                    ctx.insert("type".to_string(), json!(domain));
-                    ctx.insert("text".to_string(), json!(body));
-                    ctx.insert("status".to_string(), status.clone());
-                    ctx.insert("substantial".to_string(), substantial.clone());
-                    ctx.insert("find".to_string(), find.clone());
-                    ctx.insert("condition".to_string(), Value::Object(condition));
-                    ctx.insert("alternates".to_string(), Value::Object(alternates.clone()));
-                    ctx.insert("tier".to_string(), json!(tier));
-                    out.push(Value::Object(ctx));
-                    true
-                }
-
                 let mut final_contexts: Vec<Value> = Vec::new();
-                let mut seen_ctx: std::collections::HashSet<String> = std::collections::HashSet::new();
-
                 let mut groups: std::collections::HashMap<String, DomainGroup> = std::collections::HashMap::new();
                 let mut group_order: Vec<String> = Vec::new();
-                let mut candidate_domains: Vec<String> = Vec::new();
-                // 🌟 [CROSS-DOMAIN REQUEST] (host 도메인, substantial 필드, find 방향, 세그먼트 텍스트)
-                let mut sub_host_requests: Vec<(String, String, String, String)> = Vec::new();
+                let mut global_candidates: Vec<String> = Vec::new();
 
                 // ── 1) 도메인 축 : 세그먼트를 '확정 타입'별로 그룹핑합니다. 절대 서로 섞지 않습니다.
                 for seg in ctx_arr.iter() {
@@ -5365,37 +5336,6 @@ impl LogisModel {
                     }
                     if seg_type.is_empty() { continue; }
 
-                    // STAGE-1 이 남긴 교차 후보 도메인(types)은 리콜 보증 티어에서 사용합니다.
-                    if let Some(types) = seg.get("types").and_then(|v| v.as_array()) {
-                        for t in types {
-                            if let Some(ts) = t.as_str() {
-                                if ts.is_empty() || ts == "ignore" { continue; }
-                                if !candidate_domains.iter().any(|d| d == ts) { candidate_domains.push(ts.to_string()); }
-                            }
-                        }
-                    }
-
-                    if let Some(host) = seg.get("substantial_host").and_then(|v| v.as_str()) {
-                        if !host.is_empty()
-                            && !group_order.iter().any(|d| d == host)
-                            && !candidate_domains.iter().any(|d| d == host)
-                        {
-                            candidate_domains.push(host.to_string());
-                        }
-                        // 🌟 [CROSS-DOMAIN REQUEST] 지금까지는 host 를 candidate_domains 에만 넣어
-                        //    '조건 없는' C/CANDIDATE 쿼리만 나갔습니다.
-                        //    weight/many 같은 실제 조건을 담은 host 도메인 쿼리를 발행하기 위해
-                        //    (host, substantial, find, 세그먼트 텍스트) 를 요청 목록으로 보관합니다.
-                        if !host.is_empty() {
-                            let sub_key = seg.get("substantial").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let find_key = seg.get("find").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let seg_text_for_host = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if !sub_key.is_empty() {
-                                sub_host_requests.push((host.to_string(), sub_key, find_key, seg_text_for_host));
-                            }
-                        }
-                    }
-
                     if !group_order.iter().any(|g| g == &seg_type) { group_order.push(seg_type.clone()); }
                     let g = groups.entry(seg_type.clone()).or_insert_with(|| DomainGroup {
                         text_words: Vec::new(),
@@ -5403,16 +5343,45 @@ impl LogisModel {
                         value_words: Vec::new(),
                         condition: serde_json::Map::new(),
                         alternates: serde_json::Map::new(),
+                        candidates: Vec::new(),
                         status: json!(""),
                         substantial: json!(""),
                         find: json!(""),
+                        substantial_host: String::new(),
                     });
+
+                    // 🌟 [CANDIDATES] STAGE-1 이 남긴 교차 후보를 '컨텍스트를 늘리는 대신'
+                    //    types 배열로 컨텍스트 안에 담습니다.
+                    //    lib.rs 는 이 배열을 보고 스코프 SQL 의 type 조건을 IN 절로 넓힙니다.
+                    //    → C/CANDIDATE, C/CROSS-VERB 티어가 통째로 불필요해집니다.
+                    if let Some(types) = seg.get("types").and_then(|v| v.as_array()) {
+                        for t in types {
+                            if let Some(ts) = t.as_str() {
+                                if ts.is_empty() || ts == "ignore" { continue; }
+                                if !g.candidates.iter().any(|d| d == ts) { g.candidates.push(ts.to_string()); }
+                                if !global_candidates.iter().any(|d| d == ts) { global_candidates.push(ts.to_string()); }
+                            }
+                        }
+                    }
+
+                    // 🌟 [CROSS-DOMAIN] substantial 필드를 보유한 타 도메인도 후보에 넣습니다.
+                    //    v3 는 D/CROSS-DOMAIN + E/CROSS-DOMAIN-FALLBACK 2개 컨텍스트를 더 만들었지만,
+                    //    v4 는 types 에 host 를 추가하는 것으로 동일한 리콜을 얻습니다.
+                    if let Some(host) = seg.get("substantial_host").and_then(|v| v.as_str()) {
+                        if !host.is_empty() {
+                            if !g.candidates.iter().any(|d| d == host) { g.candidates.push(host.to_string()); }
+                            if !global_candidates.iter().any(|d| d == host) { global_candidates.push(host.to_string()); }
+                            if g.substantial_host.is_empty() {
+                                g.substantial_host = host.to_string();
+                            }
+                        }
+                    }
 
                     if let Some(text) = seg.get("text").and_then(|v| v.as_str()) {
                         for w in text.split_whitespace() {
                             if w == "|" { continue; }
                             // 🌟 [RAW AXIS] 정화 여부와 무관하게 원문은 항상 보존합니다.
-                            //    ACTION VERB 게이트가 전 단어를 오탐해도 리콜 티어가 살아남습니다.
+                            //    ACTION VERB 게이트가 전 단어를 오탐해도 복구할 수 있습니다.
                             if !g.raw_words.iter().any(|e| e == w) { g.raw_words.push(w.to_string()); }
 
                             // 🌟 [ACTION WORD PURGE] 벡터로 확정된 순수 명령어는 FTS 노이즈입니다.
@@ -5532,26 +5501,36 @@ impl LogisModel {
                         value_words: Vec::new(),
                         condition: serde_json::Map::new(),
                         alternates: serde_json::Map::new(),
+                        candidates: Vec::new(),
                         status: json!(""),
                         substantial: json!(""),
                         find: json!(""),
+                        substantial_host: String::new(),
                     });
                     for tn in &detected_tracking_numbers {
+                        // 🌟 v4 : contains 대신 eq 를 씁니다.
+                        //    canonicalize 가 tracking_number 를 String 으로 확정했고,
+                        //    Dexie 의 data.tracking_number 인덱스가 eq 를 O(log n) 으로 처리합니다.
+                        //    contains 는 풀스캔이라 같은 결과를 훨씬 느리게 얻습니다.
                         g.condition.insert("tracking_number".to_string(), json!({
-                            "operator": "contains",
+                            "operator": "eq",
                             "value": tn
                         }));
                         if !g.value_words.iter().any(|e| e == tn) { g.value_words.push(tn.clone()); }
                         if !g.text_words.iter().any(|e| e == tn) { g.text_words.push(tn.clone()); }
                         if !g.raw_words.iter().any(|e| e == tn) { g.raw_words.push(tn.clone()); }
-                        emit_term(&format!("  📦 [TRACKING INJECT] tracking_number = '{}' 를 독립 tracking 도메인 컨텍스트로 발행합니다.", tn));
+                        // 🌟 order 도 송장번호를 갖고 있을 수 있으므로 후보에 넣습니다.
+                        for cand in ["order", "goods"] {
+                            if !g.candidates.iter().any(|d| d == cand) { g.candidates.push(cand.to_string()); }
+                        }
+                        emit_term(&format!("  📦 [TRACKING INJECT] tracking_number eq '{}' → tracking 도메인 컨텍스트 (candidates: order, goods)", tn));
                     }
                 }
 
-                // 🌟 [DOMAIN AFFINITY] bias.json 의 search_bridge.domain_affinity 를 읽어
-                //    확정 도메인의 친화 도메인을 candidate_domains 에 자동 주입합니다.
-                //    (예: coupon 확정 → event 자동 추가, event 확정 → coupon 자동 추가)
-                //    코사인 없이 bias.json 의 명시적 매핑만 따르므로 매직 상수가 없습니다.
+                // 🌟 [DOMAIN AFFINITY v4] bias.json 의 search_bridge.domain_affinity 를 읽어
+                //    확정 도메인의 친화 도메인을 '해당 그룹의 candidates 배열' 에 주입합니다.
+                //    v3 는 여기서 별도 C/CANDIDATE 컨텍스트를 만들어 쿼리를 늘렸지만,
+                //    v4 는 기존 컨텍스트의 types 를 넓히는 것으로 동일한 리콜을 얻습니다.
                 {
                     let domain_affinity: std::collections::HashMap<String, Vec<String>> = {
                         let dict = &crate::parsing::BIAS_DICT;
@@ -5574,16 +5553,18 @@ impl LogisModel {
                         map
                     };
 
-                    for dom in &group_order {
-                        if let Some(affiliated) = domain_affinity.get(dom) {
+                    let doms: Vec<String> = group_order.clone();
+                    for dom in &doms {
+                        let affiliated = match domain_affinity.get(dom) {
+                            Some(a) => a.clone(),
+                            None => continue,
+                        };
+                        if let Some(g) = groups.get_mut(dom) {
                             for aff in affiliated {
-                                // 이미 확정 도메인이거나 후보에 있으면 skip
-                                if group_order.iter().any(|d| d == aff) { continue; }
-                                if candidate_domains.iter().any(|d| d == aff) { continue; }
-
-                                candidate_domains.push(aff.clone());
+                                if g.candidates.iter().any(|d| d == &aff) { continue; }
+                                g.candidates.push(aff.clone());
                                 emit_term(&format!(
-                                    "  🔗 [DOMAIN AFFINITY] '{}' 확정 → 친화 도메인 '{}' 를 C/CANDIDATE 에 자동 포함",
+                                    "  🔗 [DOMAIN AFFINITY] '{}' 확정 → 친화 도메인 '{}' 를 candidates 에 추가",
                                     dom, aff
                                 ));
                             }
@@ -5591,303 +5572,272 @@ impl LogisModel {
                     }
                 }
 
-                // ── 3) 확정 도메인마다 3단 티어 발행
-                //       A/FULL     : 전체 조건 + 세그먼트 원문 텍스트          (정밀)
-                //       B/NARROWED : SQL 을 실제로 바꾸는 조건만 + 값 텍스트   (완화)
-                //       C/RECALL   : 조건 없음 + 값 텍스트                     (리콜 보증)
+                // ── 3) 도메인마다 컨텍스트를 정확히 1개씩 발행합니다.
+                //
+                //    v3 의 A/FULL · B/NARROWED · C/RECALL · D/ALTERNATE · E/TABLE-FALLBACK 을
+                //    다음과 같이 흡수합니다.
+                //
+                //      A/B  → conditions 전량을 그대로 실어 보냄 (build_dexie_plan 이 안 버림)
+                //      C    → text 는 '정화본 + 원문' 합집합. 게이트 오탐이 있어도 원문이 남음
+                //      D    → alternates 를 컨텍스트에 동봉 (Dexie 가 재질의)
+                //      E    → 물리 테이블이 items 하나라 불필요
+                //      후보 → types 배열로 동봉 (lib.rs 가 type IN (...) 으로 확장)
                 let ordered_domains = group_order.clone();
                 for dom in &ordered_domains {
-                    let (full_text, value_text, raw_text, cond, alts, st, sb, fd) = match groups.get(dom) {
-                        Some(g) => {
-                            let raw = g.raw_words.join(" ");
-                            // 🌟 [PURGE COLLAPSE GUARD] ACTION VERB 게이트가 세그먼트의 모든 단어를
-                            //    오탐하면 text_words 가 비고, push_ctx 가 A/FULL·B/NARROWED·C/RECALL·
-                            //    E/FALLBACK 을 전부 거부하여 티어 구조가 통째로 무너집니다.
-                            //    (new_log2.txt 실측: 발행 쿼리 7건 → 1건, 결과 20건 → 10건)
-                            //    정화본이 비면 즉시 원문으로 복구합니다.
-                            let purged = if g.text_words.is_empty() { raw.clone() } else { g.text_words.join(" ") };
-                            let vt = if g.value_words.is_empty() {
-                                purged.clone()
-                            } else {
-                                // 🌟 [WORD ORDER PRESERVE] condition 맵 순회로 뒤섞인 value_words 를
-                                //    세그먼트 원문(raw_words) 순서로 복원한 뒤 조립합니다.
-                                reorder_by_source(&g.value_words, &g.raw_words).join(" ")
-                            };
-                            if g.text_words.is_empty() && !raw.trim().is_empty() {
-                                emit_term(&format!(
-                                    "    🛟 [PURGE COLLAPSE GUARD] type={} | ACTION WORD 정화로 텍스트가 비어 원문으로 복구합니다. text=\"{}\"",
-                                    dom, raw
-                                ));
-                            }
-                            (
-                                purged,
-                                vt,
-                                raw,
-                                g.condition.clone(),
-                                g.alternates.clone(),
-                                g.status.clone(),
-                                g.substantial.clone(),
-                                g.find.clone(),
-                            )
-                        },
-                        None => continue,
+                    let g = match groups.get(dom) { Some(v) => v, None => continue };
+
+                    let raw = g.raw_words.join(" ");
+                    let purged = if g.text_words.is_empty() { raw.clone() } else { g.text_words.join(" ") };
+
+                    if g.text_words.is_empty() && !raw.trim().is_empty() {
+                        emit_term(&format!(
+                            "  🛟 [PURGE COLLAPSE GUARD] type={} | ACTION WORD 정화로 텍스트가 비어 원문으로 복구합니다.",
+                            dom
+                        ));
+                    }
+
+                    // 🌟 [UNION TEXT] 정화본 · 값 · 원문을 원문 어순으로 합칩니다.
+                    //    v3 는 세 축을 각각 다른 티어로 나눠 3번 쿼리했는데,
+                    //    FTS 는 어차피 ngram 부분 일치라 합쳐서 한 번에 던져도 리콜이 같습니다.
+                    //    오히려 어순이 보존되어 매칭 품질이 올라갑니다.
+                    let union_text = {
+                        let mut w: Vec<String> = Vec::new();
+                        for x in purged.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        for x in g.value_words.iter() {
+                            if !w.iter().any(|e| e == x) { w.push(x.clone()); }
+                        }
+                        for x in raw.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        reorder_by_source(&w, &g.raw_words).join(" ")
                     };
 
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &full_text, cond.clone(), &alts, &st, &sb, &fd, "A/FULL") {
-                        emit_term(&format!("    🅰️ [TIER A/FULL] type={} | conditions={} | text=\"{}\"", dom, cond.len(), full_text));
+                    if union_text.trim().is_empty() && g.condition.is_empty() { continue; }
+
+                    // 🌟 [TYPES] 확정 도메인 + 후보 도메인. lib.rs 가 IN 절로 펼칩니다.
+                    let mut types: Vec<String> = vec![dom.clone()];
+                    for c in &g.candidates {
+                        if c.is_empty() || c == "ignore" { continue; }
+                        if !types.iter().any(|t| t == c) { types.push(c.clone()); }
                     }
 
-                    let mut narrowed = serde_json::Map::new();
-                    for (k, v) in cond.iter() {
-                        if crate::utils::ai_utils::is_sql_effective_field(k) {
-                            narrowed.insert(k.clone(), v.clone());
-                        }
+                    let mut ctx = serde_json::Map::new();
+                    ctx.insert("type".to_string(), json!(dom.clone()));
+                    ctx.insert("types".to_string(), json!(types.clone()));
+                    ctx.insert("text".to_string(), json!(union_text.clone()));
+                    ctx.insert("status".to_string(), g.status.clone());
+                    ctx.insert("substantial".to_string(), g.substantial.clone());
+                    ctx.insert("find".to_string(), g.find.clone());
+                    ctx.insert("condition".to_string(), Value::Object(g.condition.clone()));
+                    ctx.insert("alternates".to_string(), Value::Object(g.alternates.clone()));
+                    ctx.insert("unassigned".to_string(), json!(g.value_words.clone()));
+                    if !g.substantial_host.is_empty() {
+                        ctx.insert("substantial_host".to_string(), json!(g.substantial_host.clone()));
                     }
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &value_text, narrowed.clone(), &alts, &st, &sb, &fd, "B/NARROWED") {
-                        emit_term(&format!("    🅱️ [TIER B/NARROWED] type={} | conditions={} | text=\"{}\"", dom, narrowed.len(), value_text));
-                    }
+                    ctx.insert("tier".to_string(), json!("UNIFIED"));
 
-                    // 🌟 [RAW RECALL] 최후 리콜 티어는 정화 이전 원문으로 조회합니다.
-                    //    게이트 오탐으로 제거된 실질 명사('메세지도' 등)가 여기서 반드시 되살아납니다.
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &raw_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "C/RECALL") {
-                        emit_term(&format!("    🅲 [TIER C/RECALL] type={} | 조건 없이 원문 FTS 로 재조회 | text=\"{}\"", dom, raw_text));
-                    }
+                    emit_term(&format!(
+                        "  📦 [CONTEXT] type={} | types={:?} | conditions={} | alternates={} | text=\"{}\"",
+                        dom, types, g.condition.len(), g.alternates.len(), union_text
+                    ));
 
-                    // 🌟 [TIER E/TABLE-FALLBACK] lib.rs 의 target_table 매핑과 scheduler.rs 의 저장 테이블이 어긋나면
-                    //    데이터가 존재해도 영원히 0건이 됩니다.
-                    //      lib.rs   : "event" | "coupon" | "review" => "event"
-                    //      scheduler: "event" | "coupon" => "event",  나머지(review 등) => "items"
-                    //    즉 review 는 items 에 저장되는데 event 에서 조회되어 구조적으로 절대 못 찾습니다.
-                    //    (로그: review 두 티어 모두 Table: event / total_found: 0)
-                    //    items 는 scheduler 가 모든 타입을 이중 upsert 하는 미러 테이블이므로,
-                    //    매핑 오류와 무관하게 리콜을 보장하는 최후 경로가 됩니다.
-                    //    lib.rs 의 target_table match 는 알 수 없는 타입을 items 로 보내므로
-                    //    도메인 이름을 그대로 두고 tier 만 분기하면 별도 코드 변경 없이 동작합니다.
-                    let fallback_domain = format!("{}_items", dom);
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, &fallback_domain, &raw_text, serde_json::Map::new(), &alts, &st, &sb, &fd, "E/TABLE-FALLBACK") {
-                        emit_term(&format!("    🅴 [TIER E/TABLE-FALLBACK] type={} | items 미러 테이블을 원문으로 추가 조회합니다. (target_table 매핑 오류 보험)", fallback_domain));
-                    }
-
-                    // ── 4) 속성 대안 축 : 1순위 확정이 틀렸을 때를 대비한 대안 조합.
-                    //       단, 문자열 속성은 lib.rs 의 convert_conditions_to_sql 에서 물리 컬럼으로 매핑되지 않아
-                    //       쿼리가 완전히 동일해집니다. SQL 을 실제로 바꾸는 조합만 별도 발행하고,
-                    //       나머지 대안은 alternates 메타데이터로 프론트엔드에 전달합니다. (쿼리 낭비 방지)
-                    for (prop, alt_val) in alts.iter() {
-                        let alt_list = match alt_val.as_array() { Some(a) => a, None => continue };
-                        let alt_name = match alt_list.first().and_then(|v| v.as_str()) { Some(s) => s.to_string(), None => continue };
-                        if !cond.contains_key(prop) { continue; }
-                        if !crate::utils::ai_utils::is_sql_effective_field(&alt_name)
-                            && !crate::utils::ai_utils::is_sql_effective_field(prop) { continue; }
-
-                        let mut swapped = cond.clone();
-                        if let Some(moved) = swapped.remove(prop) {
-                            swapped.insert(alt_name.clone(), moved);
-                        }
-                        if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &full_text, swapped, &alts, &st, &sb, &fd, "D/ALTERNATE") {
-                            emit_term(&format!("    🔀 [TIER D/ALTERNATE] type={} | '{}' → '{}' 로 교체한 대안 조합 발행", dom, prop, alt_name));
-                        }
-                    }
+                    final_contexts.push(Value::Object(ctx));
                 }
 
-                // ── 5) 교차 후보 도메인(types) 리콜 보증 : 조건 없이 순수 FTS 로만 조회합니다.
-                //       STAGE-1 의 도메인 확정이 틀렸을 때 정답 테이블이 아예 조회조차 되지 않는 사고를 막습니다.
-                let global_value_text = {
-                    let mut w: Vec<String> = Vec::new();
-                    for dom in &ordered_domains {
-                        if let Some(g) = groups.get(dom) {
-                            // 🌟 [RAW FALLBACK] value_words → text_words → raw_words 순으로 내려갑니다.
-                            //    C/CANDIDATE 는 '교차 후보 도메인 리콜 보증' 티어이므로
-                            //    ACTION WORD 정화로 인해 비는 일이 절대 없어야 합니다.
-                            let src = if !g.value_words.is_empty() {
-                                &g.value_words
-                            } else if !g.text_words.is_empty() {
-                                &g.text_words
-                            } else {
-                                &g.raw_words
-                            };
-                            for x in src { if !w.iter().any(|e| e == x) { w.push(x.clone()); } }
-                        }
-                    }
-                    w.join(" ")
-                };
-                let empty_alts = serde_json::Map::new();
-                let empty_val = json!("");
+                // ── 4) [SUBSTANTIAL HOST] 추상 수식어가 지목한 필드를 보유한 타 도메인.
+                //       v3 는 D/CROSS-DOMAIN + E/CROSS-DOMAIN-FALLBACK 2개 컨텍스트를 더 만들었지만,
+                //       v4 는 이미 candidates(types) 에 host 가 들어가 있으므로
+                //       '조건만' 해당 그룹에 물질화하면 됩니다.
+                //
+                //       (예: goods 질의의 '무거운' → weight 는 tracking 스키마에 존재
+                //            → goods 컨텍스트의 types 에 tracking 이 이미 포함되어 있고,
+                //              conditions 에 weight top 20% 를 넣으면 Dexie 가 두 타입 모두에서 필터링)
+                for dom in &ordered_domains {
+                    let (host, sub_field, find_key) = match groups.get(dom) {
+                        Some(g) => (
+                            g.substantial_host.clone(),
+                            g.substantial.as_str().unwrap_or("").to_string(),
+                            g.find.as_str().unwrap_or("").to_string(),
+                        ),
+                        None => continue,
+                    };
+                    if host.is_empty() || sub_field.is_empty() { continue; }
 
-                // 🌟 [TIER D/CROSS-DOMAIN] substantial 필드를 실제로 보유한 도메인에
-                //    '조건이 실린' 쿼리를 발행합니다.
-                //    (로그: weight 는 goods 스키마에 없고 tracking 에 존재 → 그러나 조건 있는 tracking 쿼리는 0건이었음)
-                //    find 방향이 확정되어 있으면 top/bottom 조건으로 물질화하고,
-                //    방향이 없으면 조건 없이 도메인 리콜만 보증합니다.
-                for (host, sub_field, find_key, seg_text_for_host) in &sub_host_requests {
                     let dir_op = match find_key.as_str() {
                         "heavy" | "many" | "much"   => "top",
                         "light" | "few"  | "little" => "bottom",
                         _ => "",
                     };
-                    // 🌟 [SEGMENT SCOPED] 교차 도메인 쿼리의 FTS 텍스트는
-                    //    그 추상 수식어가 나온 '그 세그먼트' 로 한정합니다.
-                    //    기존에는 global_value_text 를 통째로 이어붙여
-                    //    tracking 쿼리에 '이벤트로', '리뷰를', '고객의' 까지 들어갔습니다.
-                    //    (new_log1.txt 921행: text 가 4개 세그먼트 전 단어 융합)
-                    //    세그먼트 텍스트가 비어 있을 때만 전역 텍스트로 폴백합니다.
-                    let host_text = {
-                        let mut w: Vec<String> = Vec::new();
-                        for x in seg_text_for_host.split_whitespace() {
-                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                    if dir_op.is_empty() { continue; }
+
+                    // 🌟 이미 발행한 컨텍스트의 condition 에 직접 주입합니다.
+                    for c in final_contexts.iter_mut() {
+                        if c.get("type").and_then(|v| v.as_str()) != Some(dom.as_str()) { continue; }
+                        if let Some(cond_obj) = c.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                            if cond_obj.contains_key(&sub_field) { break; }
+                            cond_obj.insert(sub_field.clone(), json!({
+                                "operator": dir_op,
+                                "percent_total": "20.0",
+                                "is_percent": true
+                            }));
+                            emit_term(&format!(
+                                "  🧲 [SUBSTANTIAL MATERIALIZE] type={} | '{} {} 20%' 조건을 주입했습니다. (host 도메인 '{}' 은 이미 types 에 포함)",
+                                dom, sub_field, dir_op, host
+                            ));
                         }
-                        if w.is_empty() {
-                            for x in global_value_text.split_whitespace() {
-                                if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
-                            }
-                        }
-                        w.join(" ")
+                        break;
+                    }
+                }
+
+                // ── 5) [FALLBACK] 확정 도메인이 하나도 없으면 goods 순수 FTS 라도 발행합니다.
+                let has_real_ctx = final_contexts.iter()
+                    .any(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") != "ignore");
+
+                if !has_real_ctx {
+                    let fallback_text = if global_candidates.is_empty() {
+                        query.clone()
+                    } else {
+                        query.clone()
                     };
 
-                    let mut host_cond = serde_json::Map::new();
-                    if !dir_op.is_empty() {
-                        host_cond.insert(sub_field.clone(), json!({
-                            "operator": dir_op,
-                            "percent_total": "20.0",
-                            "is_percent": true
-                        }));
+                    let mut types: Vec<String> = vec!["goods".to_string()];
+                    for c in &global_candidates {
+                        if c.is_empty() || c == "ignore" { continue; }
+                        if !types.iter().any(|t| t == c) { types.push(c.clone()); }
                     }
 
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, host, &host_text, host_cond.clone(), &empty_alts, &empty_val, &json!(sub_field), &json!(find_key), "D/CROSS-DOMAIN") {
-                        emit_term(&format!(
-                            "    🔀 [TIER D/CROSS-DOMAIN] type={} | '{}' 를 보유한 도메인에 조건({}) 쿼리를 발행합니다. | text=\"{}\"",
-                            host, sub_field,
-                            if dir_op.is_empty() { "없음".to_string() } else { format!("{} {} 20%", sub_field, dir_op) },
-                            host_text
-                        ));
-                    }
+                    let mut ctx = serde_json::Map::new();
+                    ctx.insert("type".to_string(), json!("goods"));
+                    ctx.insert("types".to_string(), json!(types.clone()));
+                    ctx.insert("text".to_string(), json!(fallback_text.clone()));
+                    ctx.insert("status".to_string(), json!(""));
+                    ctx.insert("substantial".to_string(), json!(""));
+                    ctx.insert("find".to_string(), json!(""));
+                    ctx.insert("condition".to_string(), json!({}));
+                    ctx.insert("alternates".to_string(), json!({}));
+                    ctx.insert("unassigned".to_string(), json!([]));
+                    ctx.insert("tier".to_string(), json!("FALLBACK"));
 
-                    // items 미러 폴백도 함께 발행하여 target_table 매핑 오류에 대비합니다.
-                    let host_fallback = format!("{}_items", host);
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, &host_fallback, &host_text, serde_json::Map::new(), &empty_alts, &empty_val, &json!(sub_field), &json!(find_key), "E/CROSS-DOMAIN-FALLBACK") {
-                        emit_term(&format!("    🅴 [TIER E/CROSS-DOMAIN-FALLBACK] type={} | items 미러 테이블로 교차 도메인 리콜을 보증합니다.", host_fallback));
-                    }
+                    final_contexts.push(Value::Object(ctx));
+                    emit_term(&format!("  🛟 [FALLBACK] 확정 도메인이 없어 goods 순수 FTS 컨텍스트를 발행합니다. types={:?}", types));
                 }
-                for dom in &candidate_domains {
-                    if ordered_domains.iter().any(|d| d == dom) { continue; }
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &global_value_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CANDIDATE") {
-                        emit_term(&format!("    🧭 [TIER C/CANDIDATE] type={} | STAGE-1 교차 후보 도메인을 조건 없이 추가 조회합니다.", dom));
-                    }
-                }
-                // 🌟 [CROSS-DOMAIN VERB EXPANSION]
-                //    STAGE-1 교차 범위(0.30 마진)에 들지 못해 types에서 누락된 도메인을
-                //    세그먼트 텍스트와 도메인별 코사인 재검사로 구출합니다.
-                //    "이벤트로 판매된"에서 "판매된"은 order 앵커("sales, purchase")와 코사인이 높으나
-                //    STAGE-1 멀티패스 점수에서는 coupon/event 에 밀려 types에 포함되지 못했습니다.
-                //    매직 상수 없이 '코사인 > 0 이고 아직 발행되지 않은 도메인' 조건만 사용합니다.
+                // 🌟 [CROSS-VERB v4] STAGE-1 교차 범위에 들지 못한 도메인을 코사인으로 구출합니다.
+                //    v3 는 구출된 도메인마다 별도 컨텍스트를 만들어 쿼리를 늘렸습니다.
+                //    v4 는 '그 세그먼트가 속한 도메인 그룹의 candidates' 에 추가만 합니다.
+                //    → lib.rs 가 type IN (...) 으로 한 번에 조회하므로 왕복이 늘지 않습니다.
                 //
-                //    🌟 [DOMAIN WORD INDIVIDUAL CHECK] 세그먼트 전체 임베딩은
-                //    '이벤트' 의미에 지배되어 order 코사인이 음수가 될 수 있습니다.
-                //    (로그: '이벤트로 판매된' 세그먼트에서 order CROSS-VERB 미발동)
-                //    세그먼트 내 도메인 지시어(domain_word_related)의 개별 코사인을
-                //    추가로 검사하여, '판매된' → order 같은 관련 도메인을 구출합니다.
+                //    또한 v3 는 도메인 6개 × 세그먼트 N개 만큼 앵커 임베딩을 매번 계산했습니다.
+                //    앵커는 질의와 무관하므로 루프 밖에서 1회만 계산합니다. (임베딩 호출 대폭 감소)
                 {
                     let all_doms = ["order", "goods", "tracking", "review", "coupon", "event"];
+
+                    // 🌟 [ANCHOR CACHE] 도메인 앵커 임베딩을 1회만 계산합니다.
+                    let mut anchor_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+                    for dom in &all_doms {
+                        let anchor_text = crate::parsing::get_page_type_classification_bias(dom, &query_lang);
+                        let e = self.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                        anchor_cache.insert(dom.to_string(), e);
+                    }
+
+                    // 🌟 [WORD EMB CACHE] 같은 단어를 여러 도메인에 대해 반복 임베딩하지 않습니다.
+                    let mut word_emb_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+
                     for seg in ctx_arr.iter() {
                         let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
                         if seg_text.trim().is_empty() { continue; }
-                        let seg_type_val = seg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        let seg_types_arr: Vec<String> = seg.get("types").and_then(|v| v.as_array())
-                            .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect())
-                            .unwrap_or_default();
+                        let seg_type_val = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if seg_type_val.is_empty() || seg_type_val == "ignore" { continue; }
+
                         let seg_emb = self.get_embedding(seg_text.to_string()).await.unwrap_or(vec![0.0; 384]);
                         if seg_emb.iter().all(|&v| v == 0.0) { continue; }
+
+                        let mut rescued: Vec<(String, f32, String, bool)> = Vec::new();
+
                         for dom in &all_doms {
                             if seg_type_val == *dom { continue; }
-                            if seg_types_arr.iter().any(|t| t == dom) { continue; }
-                            if ordered_domains.iter().any(|d| d == dom) { continue; }
-                            if candidate_domains.iter().any(|d| d == dom) { continue; }
-                            let anchor_text = crate::parsing::get_page_type_classification_bias(dom, &query_lang);
-                            let anchor_emb = self.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
-                            if anchor_emb.iter().all(|&v| v == 0.0) { continue; }
-                            // 1차: 세그먼트 전체 코사인 (기존 경로)
-                            let seg_cross_sim = cosine_similarity(&seg_emb, &anchor_emb);
-                            // 2차: 세그먼트 내 도메인 지시어 개별 코사인
-                            //    domain_word_related 에 기록된 관련 도메인 목록을 확인합니다.
-                            //    🌟 SALES BRIDGE 에 의해 order 가 추가된 경우,
-                            //    코사인이 음수여도 related 에 포함되어 있으면 발동합니다.
+
+                            let anchor_emb = match anchor_cache.get(*dom) {
+                                Some(e) if !e.iter().all(|&v| v == 0.0) => e,
+                                _ => continue,
+                            };
+
+                            let seg_cross_sim = cosine_similarity(&seg_emb, anchor_emb);
+
                             let mut word_cross_sim = 0.0f32;
                             let mut matched_word = String::new();
                             let mut bridge_forced = false;
+
                             for w in seg_text.split_whitespace() {
-                                if let Some(related) = domain_word_related.get(w) {
-                                    if related.iter().any(|r| r == dom) {
-                                        // 이 단어가 대상 도메인과 관련됨이 STAGE-2에서 이미 확인됨
-                                        let w_emb = self.get_embedding(w.to_string()).await.unwrap_or(vec![0.0; 384]);
-                                        if !w_emb.iter().all(|&v| v == 0.0) {
-                                            let ws = cosine_similarity(&w_emb, &anchor_emb);
-                                            if ws > word_cross_sim {
-                                                word_cross_sim = ws;
-                                                matched_word = w.to_string();
-                                            }
-                                            // 🌟 [SALES BRIDGE FORCE] related 에 포함된 도메인은
-                                            //    코사인 부호와 무관하게 CROSS-VERB 를 발동시킵니다.
-                                            //    (브릿지가 이미 STAGE-2 에서 코사인 검증을 통과했으므로)
-                                            if ws <= 0.0 {
-                                                bridge_forced = true;
-                                                if matched_word.is_empty() {
-                                                    matched_word = w.to_string();
-                                                    word_cross_sim = 0.01; // 최소 양수 부여
-                                                }
-                                            }
-                                        }
+                                let related = match domain_word_related.get(w) {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                if !related.iter().any(|r| r == dom) { continue; }
+
+                                let w_emb = match word_emb_cache.get(w) {
+                                    Some(e) => e.clone(),
+                                    None => {
+                                        let e = self.get_embedding(w.to_string()).await.unwrap_or(vec![0.0; 384]);
+                                        word_emb_cache.insert(w.to_string(), e.clone());
+                                        e
+                                    }
+                                };
+                                if w_emb.iter().all(|&v| v == 0.0) { continue; }
+
+                                let ws = cosine_similarity(&w_emb, anchor_emb);
+                                if ws > word_cross_sim {
+                                    word_cross_sim = ws;
+                                    matched_word = w.to_string();
+                                }
+                                // 🌟 [SALES BRIDGE FORCE] STAGE-2 가 이미 코사인 검증을 통과시킨
+                                //    관계이므로, 앵커 코사인이 음수여도 후보로 인정합니다.
+                                if ws <= 0.0 {
+                                    bridge_forced = true;
+                                    if matched_word.is_empty() {
+                                        matched_word = w.to_string();
+                                        word_cross_sim = 0.01;
                                     }
                                 }
                             }
+
                             let final_cross = seg_cross_sim.max(word_cross_sim);
-                            // 🌟 [SALES BRIDGE FORCE] bridge_forced 가 true 면 코사인 > 0 조건을 우회합니다.
                             if final_cross > 0.0 || bridge_forced {
-                                candidate_domains.push(dom.to_string());
+                                rescued.push((dom.to_string(), final_cross, matched_word, bridge_forced));
+                            }
+                        }
 
-                                // 🌟 [DEDUP FIX] 기존에는 global_value_text + 빈 조건으로 push 하여
-                                //    이미 발행된 C/CANDIDATE 와 시그니처(도메인+텍스트+조건)가 완전히 같아
-                                //    seen_ctx 에 의해 조용히 삭제되었습니다.
-                                //    (로그에 '이벤트로 판매된' 의 order CROSS-VERB 가 한 줄도 안 찍힌 원인)
-                                //    발동 근거가 된 세그먼트 텍스트를 앞에 붙여 시그니처를 분리하고,
-                                //    동시에 FTS 정밀도도 함께 올립니다.
-                                let cross_text = {
-                                    let mut w: Vec<String> = Vec::new();
-                                    for x in seg_text.split_whitespace() {
-                                        if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
-                                    }
-                                    for x in global_value_text.split_whitespace() {
-                                        if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
-                                    }
-                                    w.join(" ")
-                                };
+                        if rescued.is_empty() { continue; }
 
-                                if push_ctx(&mut final_contexts, &mut seen_ctx, dom, &cross_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/CROSS-VERB") {
-                                    if bridge_forced && word_cross_sim <= seg_cross_sim {
-                                        emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 내 도메인 지시어 '{}' 가 SALES BRIDGE 로 '{}' 도메인 관련 확정. 코사인 무관 추가 조회.", dom, seg_text, matched_word, dom));
-                                    } else if word_cross_sim > seg_cross_sim && !matched_word.is_empty() {
-                                        emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 내 도메인 지시어 '{}' 와 '{}' 도메인 코사인 {:+.4} 로 추가 조회합니다.", dom, seg_text, matched_word, dom, word_cross_sim));
-                                    } else {
-                                        emit_term(&format!("    🔀 [TIER C/CROSS-VERB] type={} | 세그먼트 '{}' 와 '{}' 도메인 코사인 {:+.4} 로 추가 조회합니다.", dom, seg_text, dom, seg_cross_sim));
-                                    }
+                        if let Some(g) = groups.get_mut(&seg_type_val) {
+                            for (dom, sim, word, forced) in rescued {
+                                if g.candidates.iter().any(|d| d == &dom) { continue; }
+                                g.candidates.push(dom.clone());
+                                if forced {
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (SALES BRIDGE, 지시어 '{}')", seg_type_val, dom, word));
+                                } else if !word.is_empty() {
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (지시어 '{}' 코사인 {:+.4})", seg_type_val, dom, word, sim));
                                 } else {
-                                    emit_term(&format!("    ⚪ [CROSS-VERB DEDUP] type={} | 동일 시그니처 컨텍스트가 이미 발행되어 중복 발행을 건너뜁니다.", dom));
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (세그먼트 코사인 {:+.4})", seg_type_val, dom, sim));
                                 }
                             }
                         }
-                    }
-                }
-
-                // ── 6) 최후 보루 : 확정 도메인이 하나도 없으면 goods 순수 FTS 라도 반드시 발행합니다.
-                if final_contexts.iter().all(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") == "ignore") {
-                    let fallback_text = if global_value_text.trim().is_empty() { query.clone() } else { global_value_text.clone() };
-                    if push_ctx(&mut final_contexts, &mut seen_ctx, "goods", &fallback_text, serde_json::Map::new(), &empty_alts, &empty_val, &empty_val, &empty_val, "C/FALLBACK") {
-                        emit_term("    🛟 [TIER C/FALLBACK] 확정 도메인이 없어 goods 순수 FTS 컨텍스트를 최후 보루로 발행합니다.");
                     }
                 }
 
                 *ctx_arr = final_contexts;
 
                 let query_count = ctx_arr.iter().filter(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") != "ignore").count();
-                emit_term(&format!("  ✅ [N:N COMBINATORIAL CONTEXTS] 발행 쿼리 {}건\n{}", query_count, serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()));
+                let total_types: usize = ctx_arr.iter()
+                    .filter_map(|c| c.get("types").and_then(|v| v.as_array()).map(|a| a.len()))
+                    .sum();
+
+                emit_term(&format!(
+                    "  ✅ [UNIFIED CONTEXTS v4] 발행 쿼리 {}건 (커버 타입 {}종)\n{}",
+                    query_count, total_types,
+                    serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()
+                ));
             }
         }
 

@@ -731,11 +731,40 @@ fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
     let mut filters: Vec<String> = Vec::new();
 
     // ── type : 도메인 파티션 ──
-    if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
-        let clean = t.trim();
-        if !clean.is_empty() && clean != "ignore" {
-            filters.push(format!("type = '{}'", clean.replace('\'', "''")));
+    //  🌟 v4 : STAGE-3 이 types 배열(확정 도메인 + 교차 후보)을 실어 보냅니다.
+    //     v3 는 후보 도메인마다 별도 컨텍스트를 만들어 쿼리를 늘렸는데,
+    //     IN 절 하나로 같은 리콜을 1회 왕복에 얻습니다.
+    let mut type_list: Vec<String> = Vec::new();
+
+    if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(s) = t.as_str() {
+                let clean = s.trim();
+                if clean.is_empty() || clean == "ignore" { continue; }
+                // 구버전 STAGE-3 의 "{domain}_items" 접미사 호환
+                let base = clean.strip_suffix("_items").unwrap_or(clean);
+                if !type_list.iter().any(|x| x == base) { type_list.push(base.to_string()); }
+            }
         }
+    }
+
+    if type_list.is_empty() {
+        if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
+            let clean = t.trim();
+            let base = clean.strip_suffix("_items").unwrap_or(clean);
+            if !base.is_empty() && base != "ignore" {
+                type_list.push(base.to_string());
+            }
+        }
+    }
+
+    if type_list.len() == 1 {
+        filters.push(format!("type = '{}'", type_list[0].replace('\'', "''")));
+    } else if type_list.len() > 1 {
+        let quoted: Vec<String> = type_list.iter()
+            .map(|t| format!("'{}'", t.replace('\'', "''")))
+            .collect();
+        filters.push(format!("type IN ({})", quoted.join(", ")));
     }
 
     // ── mode : commerce / shipping / analytic 트랙 격리 ──
@@ -937,8 +966,29 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         }
     }
 
+    // 🌟 [TYPES] Dexie 도 IN 절과 동일하게 여러 타입을 통과시켜야 합니다.
+    //    plan.type 하나만 보면 교차 후보 도메인 결과가 전부 잘려 나갑니다.
+    let mut types: Vec<String> = Vec::new();
+    if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(s) = t.as_str() {
+                let clean = s.trim();
+                if clean.is_empty() || clean == "ignore" { continue; }
+                let base = clean.strip_suffix("_items").unwrap_or(clean);
+                if !types.iter().any(|x| x == base) { types.push(base.to_string()); }
+            }
+        }
+    }
+    if types.is_empty() {
+        if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
+            let base = t.strip_suffix("_items").unwrap_or(t);
+            if !base.is_empty() && base != "ignore" { types.push(base.to_string()); }
+        }
+    }
+
     json!({
         "type": ctx.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+        "types": types,
         "mode": search_mode,
         "conditions": conditions,
         "keywords": keywords,
@@ -1404,9 +1454,28 @@ async fn ai_search_complex(
                 // =====================================================================
                 {
                     // 4-A: item_chunks 테이블 코사인 검색
-                    //      item_type 필터로 도메인을 좁히고, mode 필터로 검색 모드 일치 보장
-                    //      🌟 v4 : 폴백 접미사가 사라졌으므로 ctx_type 을 그대로 사용합니다.
-                    let chunk_type_filter = format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode);
+                    //      🌟 v4 : STAGE-3 의 types 배열을 IN 절로 펼칩니다.
+                    //      교차 후보 도메인의 청크도 함께 훑어야 리콜이 유지됩니다.
+                    let chunk_type_filter = {
+                        let mut list: Vec<String> = Vec::new();
+                        if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+                            for t in arr {
+                                if let Some(s) = t.as_str() {
+                                    let base = s.strip_suffix("_items").unwrap_or(s).trim();
+                                    if base.is_empty() || base == "ignore" { continue; }
+                                    if !list.iter().any(|x| x == base) { list.push(base.to_string()); }
+                                }
+                            }
+                        }
+                        if list.is_empty() { list.push(ctx_type.to_string()); }
+
+                        if list.len() == 1 {
+                            format!("item_type = '{}' AND mode = '{}'", list[0], search_mode)
+                        } else {
+                            let quoted: Vec<String> = list.iter().map(|t| format!("'{}'", t)).collect();
+                            format!("item_type IN ({}) AND mode = '{}'", quoted.join(", "), search_mode)
+                        }
+                    };
 
                     // 4-B: PLINKO 조건 기반 타겟 속성 목록 구축
                     //      ① condition 키 (PLINKO 가 확정한 속성)

@@ -31,31 +31,51 @@ const BOOL_KEYS = [
     'bundle_shipping', 'tax_included', 'recipient_match'
 ];
 
-function canonicalizeData(parsed: any): any {
+// 🌟 기본값 시딩을 하지 않는 타입. store.rs 의 `matches!(target, "users" | "pages")` 와 대응합니다.
+const NON_SEED_TYPES = new Set(['team', 'user', 'member', 'users', 'pages', 'page']);
+
+// 🌟 seedDefaults = false 면 '있는 키의 타입 정규화' 만 하고 없는 키는 만들지 않습니다.
+//  users / pages 는 도메인 필드 인덱스가 없으므로 시딩이 불필요하고,
+//  시딩하면 팀 통계 문서에 sale_price: 0 같은 키가 48개 붙습니다.
+//  (store.rs 의 canonicalize_data 와 동일한 규칙 — 두 곳이 어긋나면 인덱스가 깨집니다)
+function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     if (!parsed || typeof parsed !== 'object') return {};
     const out: any = { ...parsed };
 
     for (const k of ID_KEYS) {
         const v = out[k];
-        // 인덱스 대상은 '항상 존재'해야 합니다. 없으면 빈 문자열로 채웁니다.
-        out[k] = (v === undefined || v === null) ? "" : String(v);
+        if (v === undefined || v === null) {
+            if (seedDefaults) out[k] = "";
+            continue;
+        }
+        out[k] = String(v);
     }
     for (const k of NUM_KEYS) {
         const v = out[k];
-        if (v === undefined || v === null || v === "") { out[k] = 0; continue; }
+        if (v === undefined || v === null || v === "") {
+            if (seedDefaults) out[k] = 0;
+            continue;
+        }
         const n = typeof v === 'number' ? v : Number(String(v).replace(/[^\d.\-]/g, ''));
         out[k] = isNaN(n) ? 0 : n;
     }
     for (const k of BOOL_KEYS) {
         const v = out[k];
-        if (v === undefined || v === null) { out[k] = 0; continue; }
+        if (v === undefined || v === null) {
+            if (seedDefaults) out[k] = 0;
+            continue;
+        }
         // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
         out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
     }
     // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
-    if (out.tags === undefined || out.tags === null) out.tags = [];
-    else if (!Array.isArray(out.tags)) out.tags = [String(out.tags)];
-    else out.tags = out.tags.map((t: any) => (typeof t === 'object' ? (t.tag ?? "") : String(t))).filter(Boolean);
+    if (out.tags === undefined || out.tags === null) {
+        if (seedDefaults) out.tags = [];
+    } else if (!Array.isArray(out.tags)) {
+        out.tags = [String(out.tags)];
+    } else {
+        out.tags = out.tags.map((t: any) => (typeof t === 'object' ? (t.tag ?? "") : String(t))).filter(Boolean);
+    }
 
     return out;
 }
@@ -101,7 +121,8 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         created_at: Number(created) || 0,
         updated_at: Number(updated) || 0,
         // ── 확장 영역. 여기에 뭘 넣든 스키마 변경 없음 ──
-        data: canonicalizeData(parsed)
+        //    users / team / pages 는 시딩을 끕니다. (통계 문서 오염 방지)
+        data: canonicalizeData(parsed, !NON_SEED_TYPES.has(String(d.type ?? parsed.type ?? "")))
     };
 });
 
@@ -685,6 +706,8 @@ interface DexieCondition {
 
 interface DexiePlan {
     type?: string;
+    /** 🌟 v4 : 확정 도메인 + 교차 후보 도메인. LanceDB 의 IN 절과 동일한 집합입니다. */
+    types?: string[];
     mode?: string;
     conditions?: DexieCondition[];
     keywords?: string[];
@@ -817,8 +840,11 @@ async function executeDexiePlan(
                 rows = await appDb.table('items').toArray();
             }
             console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
+        } else if (plan.types && plan.types.length > 0) {
+            // 🌟 types 인덱스(anyOf)로 좁힙니다. mode 보다 선택도가 높습니다.
+            rows = await appDb.table('items').where('type').anyOf(plan.types).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. type anyOf [${plan.types.join(', ')}] 로 ${rows.length}건 적재`);
         } else if (plan.mode) {
-            // 드라이버가 없으면 mode 인덱스로라도 좁힙니다.
             rows = await appDb.table('items').where('mode').equals(plan.mode).toArray();
             console.log(`[DEXIE-PLAN] 드라이버 없음. mode='${plan.mode}' 로 ${rows.length}건 적재`);
         } else {
@@ -827,9 +853,19 @@ async function executeDexiePlan(
         }
     }
 
-    // ── 스코프 검증 (type / mode) ──
-    if (plan.type) {
-        rows = rows.filter(r => (r.type || '') === plan.type);
+    // ── 스코프 검증 (types / mode) ──
+    //  🌟 v4 : plan.type 하나만 보면 교차 후보 도메인 결과가 전부 잘립니다.
+    //     LanceDB 가 IN 절로 넓힌 만큼 Dexie 도 같은 집합을 통과시켜야 합니다.
+    const allowedTypes: string[] = (plan.types && plan.types.length > 0)
+        ? plan.types
+        : (plan.type ? [plan.type] : []);
+
+    if (allowedTypes.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => allowedTypes.includes(r.type || ''));
+        if (before !== rows.length) {
+            console.log(`[DEXIE-PLAN] types 필터 [${allowedTypes.join(', ')}]: ${before} → ${rows.length}건`);
+        }
     }
     if (plan.mode) {
         rows = rows.filter(r => (r.mode || 'commerce') === plan.mode);
@@ -3635,8 +3671,14 @@ listen("extraction-progress", async (event: any) => {
                 //  기존에는 tracking_number 만 특별 취급했지만,
                 //  v4 는 모든 조건이 동등하게 플랜에 들어 있으므로 일반화합니다.
                 const applied: string[] = [];
+                const coveredTypes = new Set<string>();
+
                 if (response.dexie_plans && Array.isArray(response.dexie_plans)) {
                     for (const plan of response.dexie_plans) {
+                        // 🌟 v4 : 어떤 도메인을 훑었는지도 함께 보여줍니다.
+                        const t = (plan.types && plan.types.length > 0) ? plan.types : (plan.type ? [plan.type] : []);
+                        for (const x of t) coveredTypes.add(x);
+
                         if (!plan.conditions) continue;
                         for (const c of plan.conditions) {
                             const label = c.path.replace('data.', '');
@@ -3652,6 +3694,8 @@ listen("extraction-progress", async (event: any) => {
                         }
                     }
                 }
+
+                console.log(`[SEARCH-DEBUG] 커버 도메인: [${Array.from(coveredTypes).join(', ')}]`);
 
                 let queryText = "";
                 if (response.structured && response.structured.original_text) {

@@ -585,7 +585,13 @@ impl VectorStore {
     //    ② 수치류   → Number (없거나 파싱 실패 시 0)
     //    ③ 불리언류 → 0|1 정수 (IndexedDB 는 boolean 을 키로 인정하지 않음)
     //    ④ tags     → 배열 (멀티엔트리 인덱스 대상)
-    fn canonicalize_data(mut v: Value) -> Value {
+    // 🌟 [SEED GUARD] seed_defaults = true 일 때만 '없는 키에 기본값을 삽입' 합니다.
+    //    Dexie 의 data.* 인덱스는 undefined 값을 조용히 제외하므로 items 에는 기본값이 필요하지만,
+    //    users / pages 문서에 48개 도메인 키를 붙이면 통계 트리 옆에 의미 없는
+    //    sale_price: 0 / tracking_number: "" 가 잔뜩 생깁니다.
+    //    (users 는 data.origin / data.is_device / data.email 만 인덱싱하므로 시딩이 불필요합니다)
+    //    seed_defaults = false 여도 '이미 있는 키의 타입 정규화' 는 그대로 수행합니다.
+    fn canonicalize_data(mut v: Value, seed_defaults: bool) -> Value {
         const ID_KEYS: [&str; 13] = [
             "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
             "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
@@ -609,16 +615,25 @@ impl VectorStore {
         };
 
         for k in ID_KEYS.iter() {
+            if obj.get(*k).is_none() {
+                if seed_defaults { obj.insert(k.to_string(), json!("")); }
+                continue;
+            }
             let s = match obj.get(*k) {
-                None | Some(Value::Null) => String::new(),
+                Some(Value::Null) => String::new(),
                 Some(Value::String(s)) => s.clone(),
                 Some(Value::Number(n)) => n.to_string(),
                 Some(other) => other.to_string().trim_matches('"').to_string(),
+                None => String::new(),
             };
             obj.insert(k.to_string(), json!(s));
         }
 
         for k in NUM_KEYS.iter() {
+            if obj.get(*k).is_none() {
+                if seed_defaults { obj.insert(k.to_string(), json!(0)); }
+                continue;
+            }
             let n: f64 = match obj.get(*k) {
                 None | Some(Value::Null) => 0.0,
                 Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
@@ -643,6 +658,10 @@ impl VectorStore {
         }
 
         for k in BOOL_KEYS.iter() {
+            if obj.get(*k).is_none() {
+                if seed_defaults { obj.insert(k.to_string(), json!(0)); }
+                continue;
+            }
             let b = match obj.get(*k) {
                 Some(Value::Bool(x)) => *x,
                 Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
@@ -652,7 +671,10 @@ impl VectorStore {
             obj.insert(k.to_string(), json!(if b { 1 } else { 0 }));
         }
 
-        // tags : 멀티엔트리 인덱스 대상이므로 반드시 문자열 배열
+        // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
+        if obj.get("tags").is_none() && !seed_defaults {
+            return v;
+        }
         let tags: Vec<Value> = match obj.get("tags") {
             Some(Value::Array(arr)) => arr.iter().map(|t| {
                 if let Some(o) = t.as_object() {
@@ -746,7 +768,10 @@ impl VectorStore {
          }
 
          // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
-         let final_data = Self::canonicalize_data(final_data);
+         //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
+         //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
+         let seed_defaults = !matches!(target, "users" | "pages");
+         let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
          let json_str = final_data.to_string();
          let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
