@@ -655,8 +655,20 @@ appDb.version(5).stores({
     }
     console.log('[Dexie v5] Migrated to unified envelope + nested data.* indexes.');
 });
-
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
+
+// --- kv 헬퍼 (반드시 appDb 선언 바로 아래, 모든 호출부보다 위에 위치) ---
+async function kvGet(key: string): Promise<any> {
+    const record = await appDb.table("kv_store").get(key);
+    return record ? record.value : null;
+}
+async function kvSet(key: string, value: any) {
+    await appDb.table("kv_store").put({ key, value });
+}
+async function kvRemove(key: string) {
+    await appDb.table("kv_store").delete(key);
+}
+
 // 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
 //  (db.ts 가 자체 enrich 복사본을 갖고 있으면 두 규칙이 어긋나 인덱스가 조용히 깨집니다)
 (window as any).normalizeEnvelope = normalizeEnvelope;
