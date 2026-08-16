@@ -251,6 +251,54 @@ async fn reindex_pending_embeddings(
         None => return Err("DB not initialized".to_string()),
     };
 
+    let scan_limit = limit.unwrap_or(20);
+
+    // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
+    //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
+    let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
+    let mode_filter = format!("mode = '{}'", target_mode);
+
+    let docs = store.get_all_items("items", 500, 0, Some(mode_filter)).await.map_err(|e| e.to_string())?;
+
+    // 🌟 [LAZY MODEL LOAD] 대상 선별을 '모델 로드 이전' 으로 끌어올립니다.
+    //    기존 구조는 LogisModel::new → ensure_embedding 을 먼저 수행한 뒤 스캔했기 때문에,
+    //    처리할 문서가 0건이어도 CUDA 컨텍스트와 97M 임베딩 가중치를 매번 올렸다 내렸습니다.
+    //    (로그 실측: [EMBED-LOCAL] 처리 로그가 없는데도 Loading Embedding Model 발생)
+    //    이 스캔 구간은 LanceDB 조회만 사용하므로 모델이 전혀 필요 없습니다.
+    let mut pending: Vec<TradeDocument> = Vec::new();
+    for doc in docs {
+        if pending.len() >= scan_limit { break; }
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        if doc.id.is_empty() { continue; }
+        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search" {
+            continue;
+        }
+        // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
+        //    가장 먼저 탈락시킵니다. chunk_count는 물리적 사실이라
+        //    embed 플래그(소프트 마커)보다 신뢰도가 높습니다.
+        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
+        if chunk_count > 0 { continue; }
+        // 🌟 [EMBED FLAG CHECK] data 내부의 embed 플래그를 보조 확인합니다.
+        //    chunk_count가 0이지만 embed가 1인 경우(청크 삭제 후 재인덱싱 대기 등)
+        //    불필요한 재처리를 방지합니다.
+        if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
+            let already = data_val.get("embed")
+                .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            if already {
+                continue; // 이미 임베딩 완료된 아이템
+            }
+        }
+        pending.push(doc);
+    }
+
+    // 🌟 [VRAM GUARD] 처리 대상이 없으면 모델을 만들지 않고 즉시 반환합니다.
+    if pending.is_empty() {
+        return Ok(json!({ "processed": 0, "vectors": [], "mode": target_mode, "skipped": "no_pending" }));
+    }
+
+    println!("[EMBED-LOCAL] {} pending item(s) detected. Loading embedding model...", pending.len());
+
     let model = {
         let mut model_guard = state.model.lock().await;
 
@@ -275,45 +323,11 @@ async fn reindex_pending_embeddings(
     model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
     model.ensure_embedding().await.map_err(|e| e.to_string())?;
 
-    let scan_limit = limit.unwrap_or(20);
-
-    // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
-    //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
-    let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
-    let mode_filter = format!("mode = '{}'", target_mode);
-
-    let docs = store.get_all_items("items", 500, 0, Some(mode_filter)).await.map_err(|e| e.to_string())?;
-
     let mut vectors: Vec<Value> = Vec::new();
     let mut processed = 0usize;
 
-    for doc in docs {
-        if processed >= scan_limit { break; }
+    for doc in pending {
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
-        if doc.id.is_empty() { continue; }
-        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search" {
-            continue;
-        }
-        // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
-        //    가장 먼저 탈락시킵니다. chunk_count는 물리적 사실이라
-        //    embed 플래그(소프트 마커)보다 신뢰도가 높습니다.
-        //    이 체크가 먼저 오면 embed 플래그가 유실된 엣지 케이스에서도
-        //    재인덱싱이 발생하지 않습니다.
-        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
-        if chunk_count > 0 { continue; }
-        // 🌟 [EMBED FLAG CHECK] data 내부의 embed 플래그를 보조 확인합니다.
-        //    chunk_count가 0이지만 embed가 1인 경우(청크 삭제 후 재인덱싱 대기 등)
-        //    불필요한 재처리를 방지합니다.
-        //    🌟 v4 : canonicalize_data 가 0|1 정수로 확정하지만,
-        //    구버전에서 넘어온 true/"1" 값도 함께 인정합니다.
-        if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
-            let already = data_val.get("embed")
-                .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
-                .unwrap_or(false);
-            if already {
-                continue; // 이미 임베딩 완료된 아이템
-            }
-        }
 
         let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
 

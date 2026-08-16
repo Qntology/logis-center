@@ -2086,17 +2086,40 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     }
                 }
                 var total = { draft: 0, count: 0 };
-                const pagesStats = (currentSession as any).pages;
                 const cc = node.cc || data.cc;
-                
-                // 🌟 [TRACKING LOG] Accordion 그릴 때 각 노드의 매칭 상태 확인
-                if (nodeType !== 'team' && nodeType !== 'user' && nodeType !== 'member') {
-                    console.log(`[TRACKING-4] 렌더링 노드 타입: ${nodeType}, 대상 CC: ${cc}`);
-                    if (pagesStats && cc && pagesStats[cc] && pagesStats[cc][nodeType]) {
-                        total = pagesStats[cc][nodeType];
-                        console.log(`[TRACKING-5] 매칭 성공! 적용될 카운트:`, total);
-                    } else {
-                        console.log(`[TRACKING-FAIL] 매칭 실패. pagesStats 존재여부: ${!!pagesStats}, CC 존재여부: ${!!cc}`);
+
+                // 🌟 [DEXIE COUNT] team.data.base.pages 증감 통계 대신 Dexie 인덱스로 직접 셉니다.
+                //    ① 증감 방식은 서버(proxy/index.ts)와 로컬(metrics.rs)이 같은 트리를 각자 갱신하므로
+                //       한쪽이 실패하면 영구히 어긋납니다.
+                //    ② relay draft / DEDUP 스킵 / ORDER-INDEX FALLBACK 처럼 분기가 늘 때마다
+                //       증감 지점을 같이 늘려야 합니다.
+                //    ③ '[cc+type]' 복합 인덱스가 이미 선언돼 있어 range 조회 1회면 끝납니다.
+                //
+                //    🌟 [DRAFT 판정 계약] proxy/index.ts 와 완전히 동일합니다.
+                //       updated_at == 0  → draft (리스트 스캔으로 껍데기만 존재)
+                //       updated_at >  0  → count (상세 추출까지 완료)
+                //    cc+type 단위 단일 통계이므로 리스트 노드와 상세 노드가 같은 total 을 공유하고,
+                //    리스트 노드는 total.draft 를, 상세 노드는 total.count 를 표시합니다.
+                //    (이 구조 자체가 base.pages[cc][type] 와 동일합니다)
+                if (nodeType !== 'team' && nodeType !== 'user' && nodeType !== 'member'
+                    && nodeType !== 'pages' && nodeType !== 'page' && cc && appDb) {
+                    try {
+                        const rows = await appDb.table('items')
+                            .where('[cc+type]').equals([cc, nodeType])
+                            .toArray();
+                        for (const r of rows) {
+                            // 🌟 updated_at 이 0 / undefined / null 이면 draft.
+                            //    (store.rs 가 0 을 보존하도록 수정된 이후에만 정상 동작합니다)
+                            const up = Number(r.updated_at || 0);
+                            if (up > 0) total.count++;
+                            else total.draft++;
+                        }
+                        console.log(`[NAV-COUNT] cc=${cc} type=${nodeType} | 총 ${rows.length}건 → draft ${total.draft} / count ${total.count}`);
+                        if (rows.length > 0 && total.draft === 0 && total.count === rows.length) {
+                            console.warn(`[NAV-COUNT] ⚠️ 전 건이 count 로 분류되었습니다. store.rs 의 updated_at=0 보존 수정이 반영되었는지 확인하세요.`);
+                        }
+                    } catch (e) {
+                        console.warn(`[NAV-COUNT] Dexie count failed for ${nodeType}:`, e);
                     }
                 }
 
@@ -3653,7 +3676,30 @@ listen("extraction-progress", async (event: any) => {
             stopSpinner();
             updateExtractButtonVisibility();
         }
-        
+        // 🌟 [NEW] 추출 태스크 완료 시 네비게이션 카운트 및 리스트 최신화
+        if ((payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) && payload.category === "Done") {
+            try {
+                const freshDocs = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize,
+                    offset: 0,
+                    filter: `mode = '${currentSearchMode}'`
+                });
+                if (freshDocs.length > 0 && appDb) {
+                    const normalized = normalizeEnvelope(freshDocs);
+                    await appDb.table("items").bulkPut(normalized).catch(() => null);
+                    await renderNavigation();
+                    if (currentTab === "list") {
+                        upsertListItems(normalized, 'prepend');
+                    }
+                }
+            } catch (e) {
+                console.warn("[SYNC] Post-extraction refresh failed:", e);
+                // 폴백: 위 방식 실패 시 완전 새로고침
+                if (currentTab === "list") {
+                    await loadMoreDocs(true);
+                }
+            }
+        }
         // 🌟 [추가] 에러이거나 취소된 경우 H3 복원
         if (payload.task_id.startsWith("search_") && payload.category !== "Done") {
              const resultH3 = document.querySelector('.nav-section.search h3');
@@ -3934,6 +3980,9 @@ listen("extraction-progress", async (event: any) => {
                 
                 console.log(`[SEARCH-DEBUG] 화면에 렌더링될 최종 문서 수(docs.length): ${docs.length}`);
 
+                // 🌟 [TOTAL COUNT] AI 검색은 단발성 고정 셋이므로 docs.length 가 곧 전체 건수입니다.
+                totalResultCount = docs.length;
+
                 if (docs.length > 0) {
                     upsertListItems(docs, 'append');
                     hasMore = false; // 🌟 [CRITICAL FIX] AI 검색 결과는 단발성 고정 셋이므로 스크롤을 통한 전체 리스트 더 불러오기를 원천 차단합니다!
@@ -3943,6 +3992,7 @@ listen("extraction-progress", async (event: any) => {
                 }
             } else {
                 if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
+                totalResultCount = 0;
                 hasMore = false; // 🌟 결과가 없을 때도 추가 불러오기 방지
             }
             
@@ -5161,6 +5211,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (docListContainer) docListContainer.innerHTML = "";
         cachedDocs = [];
         listCurrentY = 0;
+        // 🌟 [TOTAL COUNT] 스코프가 바뀌었으므로 총계를 초기화합니다.
+        totalResultCount = -1;
         updateListTransform();
         // 🌟 [CRITICAL FIX] 검색어가 지워지는 등 새로운 초기화 요청이 들어오면, 기존에 대기 중이던 로딩 락(isLoading)을 강제로 해제하여 먹통 현상을 방지합니다.
         isLoading = false; 
@@ -5239,6 +5291,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                     if (fullDoc) docs.push(fullDoc);
                 }
             }
+            // 🌟 [TOTAL COUNT] slice 이전의 전체 매칭 건수를 기록합니다.
+            if (!isSync) totalResultCount = docs.length;
             docs = docs.slice(currentOffset, currentOffset + pageSize);
 
         } else if (appDb) {
@@ -5268,6 +5322,10 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
 
             rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
 
+            // 🌟 [TOTAL COUNT] slice 이전의 '스코프 전체 건수' 를 기록합니다.
+            //    isSync(상단 당김 갱신)는 최신 델타만 가져오므로 총계를 갱신하지 않습니다.
+            if (!isSync) totalResultCount = rows.length;
+
             console.log(`[DEBUG-LIST] Dexie 스코프 조회: ${rows.length}건 (allowedTypes=${allowedTypes.length}종)`);
             docs = isSync ? rows.slice(0, pageSize) : rows.slice(currentOffset, currentOffset + pageSize);
 
@@ -5287,9 +5345,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 if (fromRust.length > 0) {
                     console.log(`[DEBUG-LIST] ❄️ Cold start: Rust 에서 ${fromRust.length}건 적재 후 Dexie 캐시 채움`);
                     await appDb.table("items").bulkPut(normalizeEnvelope(fromRust)).catch(() => null);
-                    docs = normalizeEnvelope(fromRust)
-                        .filter((r: any) => allowedTypes.includes(r.type))
-                        .slice(0, pageSize);
+                    const coldRows = normalizeEnvelope(fromRust)
+                        .filter((r: any) => allowedTypes.includes(r.type));
+                    // 🌟 [TOTAL COUNT] Cold start 경로도 slice 이전 값을 총계로 씁니다.
+                    if (!isSync) totalResultCount = coldRows.length;
+                    docs = coldRows.slice(0, pageSize);
                 }
             }
         }
@@ -5360,6 +5420,10 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
 }
 
+// 🌟 [TOTAL COUNT] 화면에 렌더링된 카드 수가 아니라 '스코프/검색 전체 건수' 를 보관합니다.
+//    -1 = 아직 집계되지 않음(→ DOM 카운트로 폴백)
+let totalResultCount = -1;
+
 // 🌟 [추가] 리스트 결과 개수 카운트 업데이트 헬퍼 함수
 function updateResultCount() {
     const h3El = document.querySelector('.nav-section.search h3');
@@ -5368,9 +5432,11 @@ function updateResultCount() {
     }
     const countEl = document.querySelector('.nav-section.search h3 strong.count');
     if (countEl) {
-        const count = document.querySelectorAll('#doc-list .logis-result').length;
-        console.log(`[SEARCH-DEBUG] DOM 업데이트 감지: 현재 화면에 표시된 카드 개수 = ${count}`);
-        countEl.textContent = count > 0 ? `(${count})` : "";
+        const rendered = document.querySelectorAll('#doc-list .logis-result').length;
+        // 🌟 페이징으로 몇 장을 그렸든 상관없이 전체 건수를 표기합니다.
+        const total = totalResultCount >= 0 ? totalResultCount : rendered;
+        console.log(`[COUNT] 전체 ${total}건 / 현재 렌더링 ${rendered}건`);
+        countEl.textContent = total > 0 ? `(${total})` : "";
     } else {
         console.log(`[SEARCH-DEBUG] DOM 업데이트 실패: H3 카운트 요소(strong.count)를 찾을 수 없습니다.`);
     }

@@ -745,8 +745,28 @@ impl VectorStore {
          // 🌟 봉투 값들을 data 안에도 동봉합니다.
          //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
          let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
-         let now_ts = if new_updated_at > 0 { new_updated_at } else { chrono::Utc::now().timestamp_millis() };
-         let created_at = data_val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(now_ts);
+
+         // 🌟 [DRAFT MARKER PRESERVE] updated_at = 0 은 '값 없음' 이 아니라
+         //    '리스트 스캔으로 껍데기만 만들어진 draft' 라는 3개 저장소 공통 계약입니다.
+         //    (proxy/src/index.ts 의 `if(updated_at){ count++ } else { draft++ }` 와 동일 규칙)
+         //
+         //    기존 코드는 `if new_updated_at > 0 { .. } else { now() }` 로 0 을 현재 시각으로
+         //    덮어써 버렸고, 그 결과 scheduler 가 넣은 draft(0) / relay draft(0) /
+         //    서버가 내려준 draft(0) 이 전부 count 로 승격되어
+         //    Pages 트리의 Draft 표기가 항상 0 이 되었습니다.
+         //
+         //    판정 기준은 '값이 0인가' 가 아니라 '키가 존재하는가' 입니다.
+         //    키가 아예 없는 경우(pages 캐시 등)에만 현재 시각을 부여합니다.
+         let has_updated_key = data_val.get("updated_at").is_some();
+         let wall_now = chrono::Utc::now().timestamp_millis();
+         let updated_ts = if has_updated_key { new_updated_at } else { wall_now };
+
+         // 🌟 created_at 은 draft 여부와 무관하게 항상 실제 시각이어야 합니다.
+         //    (기존에는 now_ts 를 폴백으로 써서 updated_at 과 결합돼 있었습니다)
+         let created_at = data_val.get("created_at")
+             .and_then(|v| v.as_i64())
+             .filter(|v| *v > 0)
+             .unwrap_or(wall_now);
 
          if let Some(obj) = final_data.as_object_mut() {
              // 별칭 보정 (기존 동작 유지)
@@ -761,7 +781,7 @@ impl VectorStore {
              obj.insert("type".to_string(), json!(type_));
              obj.insert("mode".to_string(), json!(mode_str.clone()));
              obj.insert("created_at".to_string(), json!(created_at));
-             obj.insert("updated_at".to_string(), json!(now_ts));
+             obj.insert("updated_at".to_string(), json!(updated_ts));
              if !new_digest.is_empty() {
                  obj.insert("digest".to_string(), json!(new_digest.clone()));
              }
@@ -791,6 +811,8 @@ impl VectorStore {
          // 🌟 컬럼 순서는 init_all_tables 의 schema 정의와 1:1 로 일치해야 합니다.
          //    0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
          //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 text / 14 masked_text / 15 schema_v4
+         //    🌟 updated_ts 가 0 이면 draft 입니다. 물리 컬럼에도 0 을 그대로 남겨야
+         //       프론트엔드(Dexie)와 서버(proxy)의 draft 판정이 일치합니다.
          let batch = RecordBatch::try_new(schema.clone(), vec![
                 Arc::new(StringArray::from(vec![final_id])),
                 Arc::new(StringArray::from(vec![type_])),
@@ -803,7 +825,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![mode_str])),
                 Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])),
-                Arc::new(Int64Array::from(vec![now_ts])),
+                Arc::new(Int64Array::from(vec![updated_ts])),
                 Arc::new(list_array),
                 Arc::new(StringArray::from(vec![text_content])),
                 Arc::new(StringArray::from(vec![masked_text_content])),

@@ -780,7 +780,7 @@ pub async fn index_item_chunks(
 //    실제 물리 저장은 정확히 1회만 일어납니다.
 async fn save_item(
     store: &VectorStore,
-    _legacy_table_hint: &str,
+    table_hint: &str,
     id: &str,
     type_: &str,
     data: Value,
@@ -792,12 +792,19 @@ async fn save_item(
     ref_val: &str,
     digest: Option<&str>,
 ) {
-    // 🌟 users / pages 만 물리 분리되어 있습니다. 나머지는 전부 items 입니다.
-    //    (resolve_table 과 동일한 규칙 — 두 곳이 어긋나면 저장/조회가 갈립니다)
-    let table = match type_ {
-        "member" | "team" | "user" => "users",
+    // 🌟 [TABLE HINT PRIORITY] hint 가 물리 테이블을 명시하면 그것을 우선합니다.
+    //    기존에는 hint 를 버리고 type_ 로만 라우팅했기 때문에,
+    //    pages 를 저장하려면 type_ 에 "pages" 를 넣어야 했고
+    //    그 값이 upsert_item 안에서 data.type 을 덮어써 도메인 타입(goods/order)을 파괴했습니다.
+    //    hint 로 테이블을 정하면 type_ 에 실제 도메인 타입을 그대로 넘길 수 있습니다.
+    let table = match table_hint {
         "pages" | "page" => "pages",
-        _ => "items",
+        "users" | "member" | "team" | "user" => "users",
+        _ => match type_ {
+            "member" | "team" | "user" => "users",
+            "pages" | "page" => "pages",
+            _ => "items",
+        },
     };
 
     let _ = store.upsert_item(
@@ -3391,8 +3398,10 @@ async fn process_task(
 
                 
                 // 🌟 v4 : pages 테이블 1회 저장. items 미러 저장을 제거합니다.
-                //    (Select["pages"] 가 pages 테이블만 읽도록 Part 4 에서 정리했습니다)
-                save_item(&store, "pages", &page_id, "pages", page_data, None,
+                //    🌟 type_ 에 "pages" 가 아니라 실제 도메인 타입을 넘깁니다.
+                //       upsert_item 이 data.type 을 type_ 로 덮어쓰기 때문에,
+                //       "pages" 를 넘기면 네비게이션이 카운트 키를 찾지 못합니다.
+                save_item(&store, "pages", &page_id, &page_type, page_data, None,
                     &task.from, &team_id, &task.cc, &bcc, ref_for_page, None).await;
 
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
@@ -3409,7 +3418,7 @@ async fn process_task(
                     "node": 1,
                     "item": ""
                 });
-                save_item(&store, "pages", &detail_page_id, "pages", detail_page_data, None,
+                save_item(&store, "pages", &detail_page_id, &page_type, detail_page_data, None,
                     &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
 
             } else {
@@ -3423,7 +3432,7 @@ async fn process_task(
                     "node": 1,
                     "item": ""
                 });
-                save_item(&store, "pages", &detail_page_id, "pages", detail_page_data, None,
+                save_item(&store, "pages", &detail_page_id, &page_type, detail_page_data, None,
                     &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
             }
         }
