@@ -1143,14 +1143,19 @@ impl VectorStore {
          Ok(result_slice)
     }
 
-    // 🌟 [PROPERTY LOOKUP v4]
-    //  기존 구현은 테이블 전량을 메모리에 올린 뒤 JSON 을 한 건씩 파싱해서 비교했습니다.
-    //  scheduler 의 relay 로직이 아이템마다 이 함수를 여러 번 호출하므로
-    //  '아이템 수 × 관계 수 × 전체 행 수' 의 3중 비용이 발생하고 있었습니다.
+    // 🌟 [PROPERTY LOOKUP v5 / KEY-SCOPED PREFILTER]
+    //  v4 는 `data ILIKE '%값%'` 로만 좁혔습니다. 그런데 값이 짧으면(예: index "18")
+    //  전혀 무관한 문서의 다른 키(`"quantity":118`)까지 후보로 끌려와
+    //  500건 상한 안에서 정답이 밀려나는 사고가 발생했습니다.
     //
-    //  v4 에서는 data 컬럼에 FTS(ngram) 인덱스가 걸려 있으므로,
-    //  먼저 data ILIKE 로 후보를 좁힌 뒤에만 JSON 파싱을 합니다.
-    //  값은 canonicalize_data 로 타입이 확정되어 있어 문자열 비교가 안전합니다.
+    //  v5 는 canonicalize_data 가 확정한 '직렬화 형태' 를 그대로 프리필터에 씁니다.
+    //    · 식별자류(String 확정) → `"property":"값"`
+    //    · 수치류(Number 확정)   → `"property":값`
+    //  키까지 포함시키므로 오탐이 구조적으로 사라지고, 상한 500건이 실효를 갖습니다.
+    //
+    //  ⚠️ 이 함수는 scheduler 의 RELAY 경로 전용입니다.
+    //     사용자 검색/목록 조회의 도메인 조건은 전부 Dexie(executeDexiePlan)가 담당하며,
+    //     LanceDB 는 벡터/FTS/봉투 스코프만 책임집니다.
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
         let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
@@ -1163,16 +1168,43 @@ impl VectorStore {
         };
         if target_str.is_empty() { return Ok(None); }
 
-        // 🌟 [PREFILTER] data 안에 그 값 문자열이 들어 있는 행만 긁어옵니다.
-        //    substring 이라 오탐이 있을 수 있으므로 아래에서 정확 비교를 다시 합니다.
-        let escaped = target_str.replace('\'', "''");
-        let prefilter = format!("data ILIKE '%{}%'", escaped);
+        // 🌟 canonicalize_data 와 동일한 분류 규칙입니다. 두 곳이 어긋나면 프리필터가 0건이 됩니다.
+        const ID_KEYS: [&str; 13] = [
+            "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
+            "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
+        ];
+        const NUM_KEYS: [&str; 24] = [
+            "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
+            "discount", "quantity", "width", "height", "length", "weight",
+            "shipping_fee", "shipping_duration", "low_stock_threshold",
+            "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
+            "started_at", "expired_at", "created_at", "updated_at", "views",
+        ];
 
-        let batches = match table.query().only_if(prefilter).limit(500).execute().await {
+        let escaped_prop = property.replace('\'', "''");
+        let escaped_val = target_str.replace('\'', "''");
+
+        // 🌟 [KEY-SCOPED NEEDLE] serde_json 은 공백 없이 `"key":value` 로 직렬화합니다.
+        let needle = if ID_KEYS.iter().any(|k| *k == property) {
+            format!("\"{}\":\"{}\"", escaped_prop, escaped_val)
+        } else if NUM_KEYS.iter().any(|k| *k == property) {
+            format!("\"{}\":{}", escaped_prop, escaped_val)
+        } else {
+            // 분류 밖의 키는 형태를 확신할 수 없으므로 값만으로 좁히고 아래에서 정확 비교합니다.
+            escaped_val.clone()
+        };
+
+        let prefilter = format!("data LIKE '%{}%'", needle);
+
+        let batches = match table.query().only_if(prefilter.clone()).limit(500).execute().await {
             Ok(res) => res.try_collect::<Vec<_>>().await.unwrap_or_default(),
             Err(_) => {
-                // ILIKE 가 실패하면 전량 스캔으로 폴백합니다. (기존 동작 보존)
-                table.query().execute().await?.try_collect::<Vec<_>>().await?
+                println!("[STORE] ⚠️ key-scoped prefilter failed ({}). Falling back to value-only ILIKE.", prefilter);
+                let loose = format!("data ILIKE '%{}%'", escaped_val);
+                match table.query().only_if(loose).limit(500).execute().await {
+                    Ok(res) => res.try_collect::<Vec<_>>().await.unwrap_or_default(),
+                    Err(_) => table.query().limit(2000).execute().await?.try_collect::<Vec<_>>().await?,
+                }
             }
         };
 

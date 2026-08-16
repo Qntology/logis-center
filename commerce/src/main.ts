@@ -16,19 +16,36 @@ import { hashId, time2text } from "./lib/utils";
 //  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
 const ID_KEYS = [
     'id', 'no', 'code', 'index', 'tracking_number', 'goods', 'order', 'tracking',
-    'stock_keeping_unit', 'barcode', 'digest', 'gtin', 'mpn'
+    'stock_keeping_unit', 'barcode', 'digest', 'gtin', 'mpn',
+    // 🌟 [TRADING] 무역 서식의 식별자 계열.
+    //  전부 String 으로 확정해야 Dexie 인덱스 equals 가 절반을 놓치지 않습니다.
+    //  (B/L No 는 'ABCD1234567', 컨테이너는 'MSCU1234567' 처럼 영숫자 혼합입니다)
+    'doc_number', 'container_number', 'seal_number',
+    'reference_invoice', 'reference_lc', 'reference_booking',
+    'reference_buyer', 'reference_seller', 'reference_carrier', 'hs_code'
 ];
 const NUM_KEYS = [
     'status', 'amount', 'total_amount', 'sale_price', 'supply_price', 'compare_at_price',
     'discount', 'quantity', 'width', 'height', 'length', 'weight',
     'shipping_fee', 'shipping_duration', 'low_stock_threshold',
     'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per',
-    'started_at', 'expired_at', 'created_at', 'updated_at', 'views'
+    'started_at', 'expired_at', 'created_at', 'updated_at', 'views',
+    // 🌟 [TRADING] 무역 서식의 수치 계열.
+    //  package_count / weight_gross 는 '5,000 KGS' 같은 표기로 들어오므로
+    //  canonicalize 가 숫자만 추출해 Number 로 확정해야 range 조회가 성립합니다.
+    'package_count', 'weight_gross', 'weight_net', 'volume',
+    'subtotal_amount', 'tax_amount', 'freight_amount', 'insurance_amount',
+    'local_charges', 'exchange_rate', 'number_of_originals'
 ];
 const BOOL_KEYS = [
     'detail', 'is_masked', 'is_device', 'embed', 'node',
     'new_customer_only', 'first_purchase_only', 'region_restrictions',
-    'bundle_shipping', 'tax_included', 'recipient_match'
+    'bundle_shipping', 'tax_included', 'recipient_match',
+    // 🌟 [TRADING] 무역 서식의 불리언 계열.
+    //  IDB 는 boolean 을 키로 인정하지 않으므로 반드시 0|1 정수로 내려야
+    //  '부분선적 허용' 같은 조건이 인덱스에서 조용히 빠지지 않습니다.
+    'partial_shipment_allowed', 'transshipment_allowed',
+    'freight_prepaid', 'marine_pollutant', 'is_original'
 ];
 
 // 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
@@ -575,192 +592,55 @@ const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
 
-// 🌟 [SCHEMA v4 / NESTED INDEX]
-//  루트 호이스팅(enrichForIndex) 을 폐기하고 data.* 중첩 keyPath 를 직접 인덱싱합니다.
+// 🌟 [v8 / TRADING INDEXES]
+//  무역(shipping/trading) 트랙 전용 조회 축을 추가합니다.
+//  스토어 구조는 v7 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
+//  → upgrade 콜백이 필요 없습니다.
 //
-//  ── 왜 이게 가능한가 ──
-//   IndexedDB 의 keyPath 는 점 표기('data.status')를 지원하고,
-//   IDBObjectStore.createIndex() 는 기존 레코드를 자동 백필합니다.
-//   → 새 필드를 인덱스하고 싶으면 아래 문자열에 'data.pol' 한 개만 추가하고
-//     version(6) 으로 올리면 끝입니다. 저장 코드도, Rust 도 건드릴 필요가 없습니다.
+//  ── 왜 봉투를 안 늘리는가 ──
+//   app-logis-center 의 TradeDocument 는 vessel/pol/pod/incoterms 등 55개를
+//   Rust 구조체에 못 박아 두어, 새 무역 서식이 추가될 때마다
+//   구조체 → LanceDB 스키마 → 프론트엔드 3곳을 동시에 고쳐야 했습니다.
+//   v4 봉투 구조에서는 값이 전부 data 안에 있으므로,
+//   '자주 eq/range 로 조회하는 경로' 만 여기에 한 줄씩 추가하면 끝입니다.
 //
-//  ── 반드시 지켜야 하는 제약 ──
-//   1) boolean 은 유효한 IDB 키가 아닙니다. 에러 없이 그 행이 인덱스에서 빠집니다.
-//      → detail / is_masked / is_device / embed 는 전부 0|1 정수로 정규화합니다.
-//   2) undefined / 키 없음도 인덱스에서 제외됩니다.
-//      → 인덱스 대상 경로는 항상 기본값을 써 넣습니다.
-//   3) 타입 혼재(123 vs "123") 시 equals 가 절반을 놓칩니다.
-//      → 식별자류는 String, 수치류는 Number 로 쓰기 시점에 확정합니다.
-//   4) 여기 선언하지 않은 경로는 .filter() 풀스캔으로 처리합니다. (수천~수만 건 = 수 ms)
-// appDb.version(5).stores({
-//     ts_queue: 'taskId, type',
-//     kv_store: 'key',
-
-//     items: [
-//         // ── 봉투 ──
-//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
-//         'created_at', 'updated_at',
-//         // ── 복합 (스코프 + 타입 동시 좁히기) ──
-//         '[cc+type]', '[mode+type]', '[ref+created_at]',
-//         // ── data.* 식별자 (N:N 교차 검색 축) ──
-//         'data.index', 'data.no', 'data.code', 'data.tracking_number',
-//         'data.goods', 'data.order', 'data.tracking',
-//         'data.stock_keeping_unit', 'data.barcode',
-//         // ── data.* 수치/상태 (조건 필터 축) ──
-//         'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
-//         'data.quantity', 'data.weight', 'data.discount',
-//         // ── data.* 문자/시간 ──
-//         'data.carrier', 'data.shipping_method',
-//         'data.started_at', 'data.expired_at',
-//         'data.link', 'data.origin',
-//         // ── 동기화 제어 ──
-//         'data.embed', 'data.digest',
-//         // ── 배열 (멀티엔트리) ──
-//         '*data.tags'
-//     ].join(', '),
-
-//     pages: [
-//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
-//         'created_at', 'updated_at',
-//         'data.origin', 'data.link', 'data.detail'
-//     ].join(', '),
-
-//     users: [
-//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref',
-//         'created_at', 'updated_at',
-//         'data.origin', 'data.is_device', 'data.email'
-//     ].join(', '),
-
-//     talks: [
-//         'id', 'task_id', 'role', 'status',
-//         'from', 'to', 'cc', 'bcc', 'ref',
-//         'created_at', 'updated_at'
-//     ].join(', ')
-// }).upgrade(async (tx: any) => {
-//     // 🌟 [v4 → v5 MIGRATION]
-//     //  ① items : enrichForIndex 가 루트로 복제해 둔 25개 필드를 제거합니다.
-//     //            (data 안에 원본이 그대로 있으므로 데이터 손실 없음)
-//     //  ② users / pages : 기존에 data 객체 없이 json_data 문자열만 들어가 있던
-//     //            행들을 정규화합니다. 이게 없으면 nested 인덱스가 전부 빈 값이 됩니다.
-//     //            (initSession 의 bulkPut(data.users) 경로가 enrichForIndex 를
-//     //             거치지 않아 발생한 기존 결함입니다)
-//     const HOISTED = [
-//         'no', 'code', 'tracking_number', 'goods', 'order', 'tracking',
-//         'stock_keeping_unit', 'barcode', 'index', 'status', 'amount',
-//         'is_masked', 'sale_price', 'supply_price', 'carrier', 'shipping_method',
-//         'width', 'height', 'length', 'weight', 'started_at', 'expired_at',
-//         'domain', 'origin', 'json_data', 'text', 'masked_text'
-//     ];
-
-//     for (const storeName of ['items', 'pages', 'users']) {
-//         try {
-//             await tx.table(storeName).toCollection().modify((row: any) => {
-//                 // data 확보 (json_data 문자열 → 객체)
-//                 let parsed = row.data;
-//                 if (typeof parsed === 'string') {
-//                     try { parsed = JSON.parse(parsed); } catch (e) { parsed = {}; }
-//                 }
-//                 if (!parsed || typeof parsed !== 'object') {
-//                     if (typeof row.json_data === 'string') {
-//                         try { parsed = JSON.parse(row.json_data); } catch (e) { parsed = {}; }
-//                     } else {
-//                         parsed = {};
-//                     }
-//                 }
-
-//                 // 루트에만 있던 값을 data 로 회수 (덮어쓰지 않고 결손만 보충)
-//                 for (const k of HOISTED) {
-//                     if (k === 'json_data') continue;
-//                     if (parsed[k] === undefined && row[k] !== undefined) {
-//                         parsed[k] = row[k];
-//                     }
-//                 }
-
-//                 row.data = canonicalizeData(parsed);
-
-//                 // 루트 복제본 제거
-//                 for (const k of HOISTED) {
-//                     delete row[k];
-//                 }
-//             });
-//         } catch (e) {
-//             console.warn(`[Dexie v5] migration skipped for ${storeName}:`, e);
-//         }
-//     }
-//     console.log('[Dexie v5] Migrated to unified envelope + nested data.* indexes.');
-// });
-
-// 🌟 [v6] 인덱스 보강 전용 세대입니다. 스토어 구조는 v5 와 동일하고 인덱스만 추가하므로
-//  Dexie 가 기존 레코드를 자동 백필합니다. upgrade 콜백이 필요 없습니다.
-//    · pages.data.type  : renderNavigation 이 도메인 타입으로 그룹핑할 때 전량 스캔을 없앱니다.
-//    · talks.type/mode  : analytic / commerce 채팅을 스코프로 분리할 수 있게 합니다.
-//  ⚠️ 새 도메인 필드는 여기에 추가할 필요가 없습니다. 선언되지 않은 data.* 경로는
-//     executeDexiePlan 이 .filter() 풀스캔으로 처리하며, 로컬 수천~수만 건 기준 수 ms 입니다.
-// 🌟 [v7] 인덱스 정합성 정리 세대입니다. 스토어 구조는 v6 과 동일하고 인덱스만 조정하므로
-//  Dexie 가 기존 레코드를 자동 백필합니다. upgrade 콜백이 필요 없습니다.
-//
-//  ── 변경 근거 ──
-//   ① items.data.link / items.data.origin 제거
-//      : 이 두 경로는 executeDexiePlan 에서 항상 contains 로만 조회됩니다.
-//        IndexedDB 에는 substring 인덱스가 없어 어차피 .filter() 풀스캔으로 떨어지므로,
-//        인덱스를 유지하면 쓰기 비용만 늘고 조회 이득이 0입니다.
-//        (pages.data.link 는 loadMoreDocs 의 정확 일치 매칭에 쓰이므로 유지합니다)
-//   ② items.data.title / data.name / data.sender_name / data.recipient_name 추가
-//      : N:N RELAY 와 Dexie 플랜의 eq 조회에 실제로 사용되는 값 경로입니다.
-//   ③ [mode+updated_at] 복합 추가
-//      : renderNavigation 의 draft/count 집계와 loadMoreDocs 의 최신 델타 동기화가
-//        mode 로 좁힌 뒤 updated_at 으로 정렬/필터하므로 range 조회 1회로 끝납니다.
-//   ④ talks.[ref+created_at] 추가
-//      : loadMoreChat 이 ref 스코프 + 시간 커서로 페이징하는 정확한 형태입니다.
-//
-//  ⚠️ 새 도메인 필드는 여기에 추가할 필요가 없습니다. 선언되지 않은 data.* 경로는
-//     executeDexiePlan 이 .filter() 풀스캔으로 처리하며, 로컬 수천~수만 건 기준 수 ms 입니다.
-//     인덱스는 '카디널리티가 높고 eq/range 로 자주 조회되는 경로' 에만 추가하세요.
-appDb.version(7).stores({
-    ts_queue: 'taskId, type',
-    kv_store: 'key',
-
+//  ⚠️ 여기 없는 무역 필드(marks_numbers, notify_party_name, place_receipt 등)는
+//     executeDexiePlan 이 .filter() 풀스캔으로 처리합니다.
+//     로컬 수천~수만 건 기준 수 ms 이므로 인덱스가 없어도 동작에 지장이 없습니다.
+appDb.version(8).stores({
     items: [
-        // ── 봉투 ──
+        // ── 봉투 (v7 그대로 유지) ──
         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
         'created_at', 'updated_at',
-        // ── 복합 (스코프 + 타입/시간 동시 좁히기) ──
         '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
-        // ── data.* 식별자 (N:N 교차 검색 축) ──
+        // ── commerce 축 (v7 그대로 유지) ──
         'data.index', 'data.no', 'data.code', 'data.tracking_number',
         'data.goods', 'data.order', 'data.tracking',
         'data.stock_keeping_unit', 'data.barcode',
-        // ── data.* 수치/상태 (조건 필터 축) ──
         'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
         'data.quantity', 'data.weight', 'data.discount',
-        // ── data.* 문자/시간 ──
         'data.carrier', 'data.shipping_method',
         'data.started_at', 'data.expired_at',
-        // ── data.* 값 경로 (eq 조회 대상) ──
         'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
-        // ── 동기화 제어 ──
         'data.embed', 'data.digest',
-        // ── 배열 (멀티엔트리) ──
-        '*data.tags'
-    ].join(', '),
-
-    pages: [
-        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
-        'created_at', 'updated_at',
-        'data.type', 'data.origin', 'data.link', 'data.detail'
-    ].join(', '),
-
-    users: [
-        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref',
-        'created_at', 'updated_at',
-        'data.origin', 'data.is_device', 'data.email'
-    ].join(', '),
-
-    talks: [
-        'id', 'task_id', 'role', 'status', 'type', 'mode',
-        'from', 'to', 'cc', 'bcc', 'ref',
-        'created_at', 'updated_at',
-        '[ref+created_at]'
+        '*data.tags',
+        // ── 🌟 trading 축 (신규) ──
+        //  ① 문서 식별 : B/L No, AWB No, PO No, Booking No 를 하나로 흡수
+        'data.doc_type', 'data.doc_number', 'data.issue_date',
+        //  ② 운송 : 선박/항공편 + 출발/도착 항구 (교차 조회 최다 축)
+        'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+        'data.etd', 'data.eta',
+        //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
+        'data.incoterms', 'data.payment_terms', 'data.currency',
+        //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
+        'data.container_number', 'data.seal_number',
+        'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+        //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
+        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+        //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
+        //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
+        //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
+        '[type+created_at]'
     ].join(', ')
 });
 
@@ -3170,10 +3050,17 @@ function applySearchModeUI() {
         }
     });
 
-    // 🌟 [추가] 선택된 모드의 첫 글자를 대문자로 변환하여 Placeholder에 즉시 반영!
+    // 🌟 [MODE LABEL] 내부 코드값(shipping)과 사용자에게 보이는 라벨(Trading)을 분리합니다.
+    //    저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB 나 Rust 쪽 변경이 전혀 없습니다.
     if (searchInput) {
-        const capitalizedMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-        searchInput.placeholder = `${capitalizedMode} Search or Ask`;
+        const MODE_LABEL: Record<string, string> = {
+            commerce: 'Commerce',
+            shipping: 'Trading',
+            analytic: 'Analytic'
+        };
+        const label = MODE_LABEL[currentSearchMode]
+            || (currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1));
+        searchInput.placeholder = `${label} Search or Ask`;
     }
 
     // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
@@ -3882,8 +3769,16 @@ listen("extraction-progress", async (event: any) => {
                     if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
                 }
 
-                let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-                if (currentSearchMode === "commerce") displayMode = "Goods";
+                // 🌟 [MODE LABEL] applySearchModeUI 와 동일한 표기 규칙을 씁니다.
+                //    두 곳이 어긋나면 검색창에는 'Trading', 결과 헤더에는 'Shipping' 이 떠
+                //    사용자가 다른 트랙을 조회했다고 오해합니다.
+                const MODE_LABEL: Record<string, string> = {
+                    commerce: 'Goods',
+                    shipping: 'Trading',
+                    analytic: 'Analytic'
+                };
+                let displayMode = MODE_LABEL[currentSearchMode]
+                    || (currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1));
 
                 // 🌟 카운트는 '렌더링될 문서 수' 로 확정해야 하므로 아래 updateResultCount 가 다시 갱신합니다.
                 //    여기서는 조건 요약만 먼저 노출합니다.
@@ -5354,8 +5249,34 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         //  → SQL 문자열 조립이 사라지므로 DataFusion 문법 에러 클래스가 통째로 소멸합니다.
         //  → 텍스트 검색이 있을 때만 LanceDB(search_documents)를 후보 소스로 사용합니다.
 
+        // 🌟 [TYPE SETS v2 / TRADING FULL COVERAGE]
+        //  app-logis-center 의 get_slice_config 가 분류하던 무역 서식 전체를 흡수합니다.
+        //  기존 shipping 목록은 BL/AWB/CI/PI/PL/CO/LC 7종뿐이어서
+        //  ED/ID/CINV(통관), IC/WC/CA/PHYTO/HC(검사증), DGD/MSDS(위험물),
+        //  POA/BIZ_LIC/INS(법무·보험) 문서가 목록에서 통째로 사라졌습니다.
+        //
+        //  대소문자를 모두 넣는 이유: LLM 분류기가 'BL' 로 뱉는 경로와
+        //  scheduler 의 page_type 이 'tracking' 소문자로 뱉는 경로가 공존하기 때문입니다.
         const TYPE_SETS: Record<string, string[]> = {
-            shipping: ['tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown'],
+            shipping: [
+                // ① 물류/추적 (기존)
+                'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
+                // ② 계약·결제
+                'PO', 'PI', 'SC', 'LC', 'po', 'pi', 'sc', 'lc',
+                // ③ 선적·운송
+                'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
+                'ci', 'pl', 'bl', 'awb', 'sa', 'do', 'an', 'bc',
+                // ④ 통관·신고
+                'ED', 'ID', 'CINV', 'CO', 'ed', 'id', 'cinv', 'co',
+                // ⑤ 검사·증명
+                'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+                'ic', 'wc', 'ca', 'phyto', 'hc', 'ben_cert',
+                // ⑥ 특수·법무
+                'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
+                'dgd', 'msds', 'poa', 'biz_lic', 'ins',
+                // ⑦ 미분류
+                'Unknown', 'unknown'
+            ],
             analytic: ['click', 'hover', 'change', 'report'],
             commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review']
         };

@@ -5930,10 +5930,49 @@ impl LogisModel {
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
+        // 🌟 [TRADING CONTEXT v2]
+        //  기존에는 type 을 'tracking' 하나로 고정해, B/L·AWB·CI 등으로 저장된 문서가
+        //  build_scope_filter 의 `type = 'tracking'` 에서 전량 탈락했습니다.
+        //  (실제로 무역 서식은 doc_type 값 그대로 type 컬럼에 들어갑니다)
+        //  types 배열을 실어 보내면 lib.rs 가 `type IN (...)` 으로 펼쳐 조회합니다.
+        //
+        //  doc_type 조건이 뽑혔다면 그 값을 1순위로 좁히고,
+        //  없으면 무역 서식 전체를 후보로 둡니다. Dexie 가 뒤에서 조건으로 잘라냅니다.
+        let mut trade_types: Vec<String> = Vec::new();
+        if let Some(dt) = extracted_conditions.get("doc_type")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+        {
+            let clean = dt.trim();
+            if !clean.is_empty() {
+                trade_types.push(clean.to_uppercase());
+                trade_types.push(clean.to_lowercase());
+            }
+        }
+        if trade_types.is_empty() {
+            for t in [
+                "tracking", "receiving", "shipping", "shipping_doc",
+                "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
+                "SA", "DO", "AN", "BC", "ED", "ID", "CINV",
+                "IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT",
+                "DGD", "MSDS", "POA", "BIZ_LIC", "INS",
+            ] {
+                trade_types.push(t.to_string());
+            }
+        }
+
+        emit_term(&format!("[STAGE-2] Trade document types in scope: {:?}", trade_types));
+
         let ctx = json!([{
             "type": "tracking",
+            "types": trade_types,
             "text": query.clone(),
-            "condition": extracted_conditions
+            "condition": extracted_conditions,
+            "alternates": {},
+            "unassigned": [],
+            "substantial": "",
+            "find": "",
+            "tier": "TRADING"
         }]);
 
         emit_term("[SUCCESS] Shipping Search Pipeline Completed.");

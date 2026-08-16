@@ -7259,11 +7259,12 @@ async fn process_task(
                             }
                         },
                         Ok(None) => {
-                            // 🌟 [DEDUP FIX v4] 기존 코드는 `json_data LIKE` 를 썼는데,
-                            //    LanceDB 물리 컬럼명은 `data` 입니다. 존재하지 않는 컬럼이라
-                            //    DataFusion 이 매번 실패해 DEDUP 이 사실상 동작하지 않았고,
-                            //    그 결과 중복 draft 가 계속 생성되었습니다.
-                            //    올바른 컬럼명으로 교정합니다.
+                            // 🌟 [DEDUP FIX v5 / KEY-SCOPED]
+                            //    v4 는 `data LIKE '%값%'` 로만 좁혔습니다.
+                            //    값이 짧으면(index "18") 무관한 문서의 다른 키(`"quantity":118`)에 걸려
+                            //    "이미 있다" 고 오판하고 draft 생성을 건너뛰었습니다.
+                            //    그 결과 relay 대상 문서가 영원히 만들어지지 않는 경로가 존재했습니다.
+                            //    쿼리한 컬럼(q.column)까지 needle 에 포함시켜 오탐을 구조적으로 제거합니다.
                             let mut found_existing = false;
                             let val_str_for_search = match &q.value {
                                 serde_json::Value::String(s) => s.clone(),
@@ -7271,11 +7272,13 @@ async fn process_task(
                                 _ => q.value.to_string(),
                             };
                             if !val_str_for_search.is_empty() {
-                                let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                // canonicalize_data 가 식별자류를 String 으로 확정했으므로 `"key":"값"` 형태입니다.
+                                let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
+                                let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                 if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                     if !cross_results.is_empty() {
                                         found_existing = true;
-                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
                                     }
                                 }
                             }
@@ -7286,14 +7289,16 @@ async fn process_task(
                             // index.ts의 relay가 column: primary.type, value: primary.index로 쿼리하는 동작과 동일합니다.
                             if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                 if let Some(order_idx) = extracted_data.get("index") {
+                                    // 🌟 canonicalize_data 가 index / order 를 모두 String 으로 확정했으므로
+                                    //    숫자로 들어와도 문자열로 정규화한 뒤 needle 을 만듭니다.
+                                    //    (Number 로 온 값을 그대로 쓰면 `"order":123` 을 찾아 0건이 됩니다)
                                     let order_idx_str = match order_idx {
                                         serde_json::Value::Number(n) => n.to_string(),
                                         serde_json::Value::String(s) => s.clone(),
-                                        _ => order_idx.to_string(),
+                                        _ => order_idx.to_string().trim_matches('"').to_string(),
                                     };
-                                    // 🌟 v4 : canonicalize 가 order 를 String 으로 확정했으므로
-                                    //    JSON 표현이 "order":"123" 형태입니다. 따옴표까지 포함해 매칭합니다.
-                                    let fallback_filter = format!("type = '{}' AND data LIKE '%\"order\":\"{}\"%'", foreign_type, order_idx_str);
+                                    let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                    let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                     if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                         if !fallback_results.is_empty() {
                                             found_existing = true;
@@ -7395,9 +7400,10 @@ async fn process_task(
                                 }
                             },
                             Ok(None) => {
-                                // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                // 🌟 [DEDUP FIX v5 / KEY-SCOPED] tracking_number 키까지 포함해 오탐을 제거합니다.
                                 let mut found_existing_tracking = false;
-                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
+                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
                                 if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                     if !tracking_cross.is_empty() {
                                         found_existing_tracking = true;
@@ -7939,8 +7945,8 @@ async fn process_task(
                                     }
                                 },
                                 Ok(None) => {
-                                    // 🌟 [DEDUP FIX] relay draft 생성 전, 동일한 foreign_type + 값이
-                                    // 이미 items 테이블에 존재하는지 확인하여 중복 생성을 방지합니다.
+                                    // 🌟 [DEDUP FIX v5 / KEY-SCOPED] 상세 경로와 동일한 교정입니다.
+                                    //    값만으로 LIKE 를 걸면 짧은 식별자가 무관한 수치 컬럼에 걸립니다.
                                     let mut found_existing = false;
                                     let val_str_for_search = match &q.value {
                                         serde_json::Value::String(s) => s.clone(),
@@ -7948,11 +7954,12 @@ async fn process_task(
                                         _ => q.value.to_string(),
                                     };
                                     if !val_str_for_search.is_empty() {
-                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                        let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
+                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                         if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                             if !cross_results.is_empty() {
                                                 found_existing = true;
-                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
                                             }
                                         }
                                     }
@@ -7960,12 +7967,14 @@ async fn process_task(
                                     // 🌟 [ORDER INDEX FALLBACK] goods/tracking relay가 못 찾았을 때 order index로도 검색
                                     if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                         if let Some(order_idx) = single_item.get("index") {
+                                            // 🌟 상세 경로와 동일하게 String 확정 규칙을 따릅니다.
                                             let order_idx_str = match order_idx {
                                                 serde_json::Value::Number(n) => n.to_string(),
                                                 serde_json::Value::String(s) => s.clone(),
-                                                _ => order_idx.to_string(),
+                                                _ => order_idx.to_string().trim_matches('"').to_string(),
                                             };
-                                            let fallback_filter = format!("type = '{}' AND data LIKE '%\"order\":\"{}\"%'", foreign_type, order_idx_str);
+                                            let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                            let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                             if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                                 if !fallback_results.is_empty() {
                                                     found_existing = true;
@@ -8063,9 +8072,10 @@ async fn process_task(
                                         }
                                     },
                                     Ok(None) => {
-                                        // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                        // 🌟 [DEDUP FIX v5 / KEY-SCOPED] 상세 경로와 동일한 교정입니다.
                                         let mut found_existing_tracking = false;
-                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                        let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
+                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
                                         if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                             if !tracking_cross.is_empty() {
                                                 found_existing_tracking = true;

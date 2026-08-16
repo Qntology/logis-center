@@ -102,28 +102,111 @@ pub fn get_trade_category_schema(category: &str, _doc_type: &str) -> String {
     format!("RULES: Follow comments strictly. Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{}", category.to_uppercase(), schema)
 }
 
+// pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+//     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
+// Extract the logistics filters from the natural language query into the JSON format.
+
+// [SCHEMA DEFINITION]
+// Extract the following tracking/trade properties if semantically present in the text:
+// - "no": Tracking number, B/L number, Invoice number.
+// - "status": Shipping status (draft, progress, return, complete, error).
+// - "vessel": Vessel name, Flight No, or Carrier.
+// - "pol": Port of Loading, Origin, Departure point.
+// - "pod": Port of Discharge, Destination, Arrival point.
+// - "sender_name": Shipper, Seller, or Exporter name.
+// - "recipient_name": Consignee, Buyer, or Importer name.
+// - "incoterms": Incoterms (e.g., FOB, CIF, EXW).
+// - "weight": Cargo or gross weight.
+// - "amount": Total financial amount or price.
+
+// [TRANSFORMATION LOGIC]
+// For EVERY extracted field, wrap it in an operator object:
+// { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
+// - Use "contains" for text fields, names, ports, vessels.
+// - Use "eq" for strict identifiers or status.
+
+// [QUERY]
+// {QUERY}
+
+// [OUTPUT FORMAT]
+// { "<property_name>": { "operator": "...", "value": "..." } }
+
+// [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+//     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
+// }
+
 pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+    // 🌟 [TRADING SCHEMA v2]
+    //  app-logis-center 의 get_search_schema_definitions 가 정의하던 무역 축을 전량 흡수합니다.
+    //  기존 10개 필드만으로는 '부킹번호로 찾아줘', '컨테이너 MSCU1234567',
+    //  'ETA 다음주인 건' 같은 실무 질의가 통째로 조건 없이 넘어갔습니다.
+    //
+    //  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
+    //     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
+    //     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
 Extract the logistics filters from the natural language query into the JSON format.
 
 [SCHEMA DEFINITION]
-Extract the following tracking/trade properties if semantically present in the text:
-- "no": Tracking number, B/L number, Invoice number.
+Extract the following trade document properties if semantically present in the text:
+
+# Document Identity
+- "doc_type": Document kind (BL, AWB, CI, PI, PL, PO, SC, LC, CO, ED, ID, DO, AN, BC, DGD, MSDS).
+- "doc_number": Primary document identifier (B/L No, AWB No, Invoice No, PO No, Contract No).
+- "no": Tracking number, parcel number, or any generic reference number.
 - "status": Shipping status (draft, progress, return, complete, error).
-- "vessel": Vessel name, Flight No, or Carrier.
+- "issue_date": Date the document was issued.
+- "expiry_date": Expiry date (mainly L/C).
+
+# Transport
+- "vessel": Vessel name or Flight number.
+- "voyage_number": Voyage or flight leg number.
 - "pol": Port of Loading, Origin, Departure point.
 - "pod": Port of Discharge, Destination, Arrival point.
-- "sender_name": Shipper, Seller, or Exporter name.
+- "place_receipt": Place of Receipt.
+- "place_delivery": Place of Delivery.
+- "etd": Estimated Time of Departure.
+- "eta": Estimated Time of Arrival.
+- "transport_mode": Sea, Air, Road, or Rail.
+
+# Parties
+- "sender_name": Shipper, Seller, Exporter, or Vendor name.
 - "recipient_name": Consignee, Buyer, or Importer name.
-- "incoterms": Incoterms (e.g., FOB, CIF, EXW).
-- "weight": Cargo or gross weight.
-- "amount": Total financial amount or price.
+- "notify_party_name": Notify Party name.
+
+# Commercial Terms
+- "incoterms": Incoterms code (FOB, CIF, EXW, DDP, DAP).
+- "payment_terms": Payment condition (T/T, L/C, Net30).
+- "freight_payment_term": Freight Prepaid or Freight Collect.
+- "currency": ISO 4217 currency code.
+- "amount": Total financial amount.
+- "freight_amount": Freight charges only.
+- "insurance_amount": Insurance charges only.
+- "local_charges": Local handling charges.
+
+# Cargo
+- "container_number": Container number (4 letters + 7 digits).
+- "seal_number": Seal number.
+- "package_count": Number of packages or cartons.
+- "weight_gross": Gross weight.
+- "weight_net": Net weight.
+- "volume": Volume in CBM.
+- "hs_code": HS Code or tariff number.
+- "marks_numbers": Shipping marks and numbers.
+
+# Cross References
+- "reference_invoice": Referenced commercial invoice number.
+- "reference_lc": Referenced letter of credit number.
+- "reference_booking": Referenced booking number.
 
 [TRANSFORMATION LOGIC]
 For EVERY extracted field, wrap it in an operator object:
 { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-- Use "contains" for text fields, names, ports, vessels.
-- Use "eq" for strict identifiers or status.
+- Use "eq" for strict identifiers: doc_number, container_number, seal_number, hs_code, no, status, doc_type, incoterms, currency.
+- Use "contains" for free text: names, ports, vessels, marks_numbers, payment_terms.
+- Use "gte" / "lte" for date ranges and numeric ranges.
+- Omit any field that is NOT explicitly present in the query. Never invent a value.
 
 [QUERY]
 {QUERY}

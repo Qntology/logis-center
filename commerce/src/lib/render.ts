@@ -105,7 +105,18 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
     body += `<div id="${docId}" class="${selector.result}" data-type="${item.type || ''}" data-mode="${modeStr}" data-created-at="${createdTs}" data-updated-at="${updatedTs}">`;
 
     let itemType = item.type || "unknown";
-    const tradeDocs = ['BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'shipping_doc', 'shipping'];
+
+    // 🌟 [TRADING FULL SET] app-logis-center 의 get_slice_config 가 다루던 전 서식을 흡수합니다.
+    //  기존 7종만 있어서 통관(ED/ID/CINV)·검사증(IC/WC/CA/PHYTO/HC)·
+    //  위험물(DGD/MSDS)·법무(POA/BIZ_LIC/INS) 문서가 'unknown' 으로 떨어졌고,
+    //  그 결과 status/title/created_at 3줄만 렌더링되어 실무 정보가 전부 소실됐습니다.
+    const tradeDocs = [
+        'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'PO', 'SC',
+        'SA', 'DO', 'AN', 'BC', 'ED', 'ID', 'CINV',
+        'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+        'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
+        'shipping_doc', 'shipping'
+    ];
     // 🌟 [ANALYTICS ADMIN] 사용자 행동 로그 / 리포트 타입
     const analyticDocs = ['click', 'hover', 'change', 'report'];
 
@@ -152,8 +163,14 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             }
         }
 
-        // 🌟 issue_date 추가
-        if (key === "created_at" || key === "updated_at" || key === "started_at" || key === "expired_at" || key === "issue_date") {
+        // 🌟 [DATE KEYS v2] 무역 서식의 날짜 축(etd/eta/expiry_date)을 추가합니다.
+        //    이 목록에 없으면 원시 타임스탬프(1735689600000)가 그대로 노출됩니다.
+        const DATE_KEYS = [
+            "created_at", "updated_at", "started_at", "expired_at",
+            "issue_date", "etd", "eta", "expiry_date",
+            "shipped_on_board_date", "declaration_date", "contract_date"
+        ];
+        if (DATE_KEYS.includes(key)) {
             if (_value) _value = time2text(_value);
             if (key === "created_at") {
                 _name = _value; 
@@ -214,28 +231,67 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         }
         body += `</div>${Tpl(item, "created_at")}`;
 
-    // 🌟 Shipping 전용 UI 추가
+    // 🌟 Shipping / Trading 전용 UI
     } else if (itemType === "shipping") {
         // 🌟 v4 : status 는 봉투가 아니라 data.status 입니다.
         //    canonicalize 가 정수 코드로 확정했으므로 parseStatus 로 문자열화합니다.
         if (item.data && item.data.status !== undefined) {
             item.data.status = parseStatus(item.data.status);
         }
+
+        // 🌟 [DOC TYPE BADGE] 무역 실무자는 'B/L 인가 AWB 인가' 를 가장 먼저 봅니다.
+        //    doc_type 이 없으면 봉투 type 을 폴백으로 씁니다.
+        if (item.data && !item.data.doc_type && item.type) {
+            item.data.doc_type = item.type;
+        }
+
         body += `
+            ${Tpl(item, "doc_type")}
             ${Tpl(item, "status")}
+            ${Tpl(item, "doc_number")}
             ${Tpl(item, "no")}
             ${Tpl(item, "vessel")}
         `;
         body += `<div class="${selector.more}">`;
         if (more) {
             body += `
+                ${Tpl(item, "voyage_number")}
                 ${Tpl(item, "pol")}
                 ${Tpl(item, "pod")}
+                ${Tpl(item, "place_receipt")}
+                ${Tpl(item, "place_delivery")}
+                ${Tpl(item, "etd")}
+                ${Tpl(item, "eta")}
+                ${Tpl(item, "transport_mode")}
                 ${Tpl(item, "incoterms")}
+                ${Tpl(item, "incoterms_place")}
+                ${Tpl(item, "payment_terms")}
+                ${Tpl(item, "freight_payment_term")}
                 ${Tpl(item, "sender_name")}
+                ${Tpl(item, "sender_address")}
                 ${Tpl(item, "recipient_name")}
+                ${Tpl(item, "recipient_address")}
+                ${Tpl(item, "notify_party_name")}
                 ${Tpl(item, "amount", "currency")}
+                ${Tpl(item, "subtotal_amount", "currency")}
+                ${Tpl(item, "tax_amount", "currency")}
+                ${Tpl(item, "freight_amount", "currency")}
+                ${Tpl(item, "insurance_amount", "currency")}
+                ${Tpl(item, "local_charges", "currency")}
+                ${Tpl(item, "container_number")}
+                ${Tpl(item, "seal_number")}
+                ${Tpl(item, "package_count", "package_unit")}
+                ${Tpl(item, "weight_gross")}
+                ${Tpl(item, "weight_net")}
+                ${Tpl(item, "volume")}
+                ${Tpl(item, "marks_numbers")}
+                ${Tpl(item, "hs_code")}
+                ${Tpl(item, "origin_criterion")}
+                ${Tpl(item, "reference_invoice")}
+                ${Tpl(item, "reference_lc")}
+                ${Tpl(item, "reference_booking")}
                 ${Tpl(item, "issue_date")}
+                ${Tpl(item, "expiry_date")}
             `.trim();
         }
         body += `</div>${Tpl(item, "created_at")}`;
