@@ -31,8 +31,24 @@ const BOOL_KEYS = [
     'bundle_shipping', 'tax_included', 'recipient_match'
 ];
 
+// 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
+//    두 표가 어긋나면 같은 문서가 LanceDB 에서는 9, Dexie 에서는 0 으로 저장되어
+//    data.status 인덱스 조회가 절반을 놓칩니다.
+const STATUS_CODE: Record<string, number> = {
+    progress: 1, stop: 2, cancel: 3, refund: 4, return: 5,
+    error: 6, expire: 7, exchange: 8, complete: 9,
+    draft: 10, show: 11, hide: 12
+};
+
 // 🌟 기본값 시딩을 하지 않는 타입. store.rs 의 `matches!(target, "users" | "pages")` 와 대응합니다.
-const NON_SEED_TYPES = new Set(['team', 'user', 'member', 'users', 'pages', 'page']);
+//    🌟 [ANALYTICS] click / hover / change / report 는 행동 로그이므로
+//       commerce 도메인 필드(sale_price / tracking_number ...)를 가질 이유가 전혀 없습니다.
+//       시딩하면 문서당 48개의 무의미한 키가 붙어 저장 용량과 인덱스를 낭비합니다.
+//       Dexie 는 없는 키를 인덱스에서 조용히 제외할 뿐 에러를 내지 않으므로 시딩이 불필요합니다.
+const NON_SEED_TYPES = new Set([
+    'team', 'user', 'member', 'users', 'pages', 'page',
+    'click', 'hover', 'change', 'report', 'question', 'answer'
+]);
 
 // 🌟 seedDefaults = false 면 '있는 키의 타입 정규화' 만 하고 없는 키는 만들지 않습니다.
 //  users / pages 는 도메인 필드 인덱스가 없으므로 시딩이 불필요하고,
@@ -55,6 +71,12 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
         if (v === undefined || v === null || v === "") {
             if (seedDefaults) out[k] = 0;
             continue;
+        }
+        // 🌟 [STATUS PARITY] status 는 'complete' 같은 상태 문자열로 들어올 수 있습니다.
+        //    Rust 와 동일하게 코드로 환산해야 두 저장소의 인덱스 타입이 일치합니다.
+        if (k === 'status' && typeof v === 'string') {
+            const mapped = STATUS_CODE[v.trim().toLowerCase()];
+            if (mapped !== undefined) { out[k] = mapped; continue; }
         }
         const n = typeof v === 'number' ? v : Number(String(v).replace(/[^\d.\-]/g, ''));
         out[k] = isNaN(n) ? 0 : n;
@@ -382,13 +404,25 @@ async function syncAnalyticsData() {
 
             const textVal = parsed.action || parsed.summary || parsed.cross_action_flow || "";
 
+            // 🌟 [BCC RECONSTRUCT] analytics D1(console-logis-center) 스키마에는 bcc 컬럼이 없습니다.
+            //    (commerce D1 에는 있지만 analytics 는 id/type/flag/from/to/cc/ref/data/created_at/updated_at 뿐)
+            //    서버가 항상 빈 값을 주므로, commerce 트랙과 동일한 규칙으로 클라이언트에서 재구성합니다.
+            //    규칙: bcc = hashId(type + cc) — scheduler.rs 의 bcc 생성식과 동일합니다.
+            //    이 값이 있어야 item_chunks.bcc 스코프와 executeDexiePlan 의 bcc 드라이버가 성립합니다.
+            const rowType = row.type || "click";
+            const rowCc = row.cc || "";
+            let rowBcc = row.bcc || "";
+            if (!rowBcc && rowCc) {
+                rowBcc = await hashId(rowType + rowCc);
+            }
+
             items.push({
                 id: row.id,
-                type: row.type || "click",
+                type: rowType,
                 from: row.from || "",
                 to: row.to || "",
-                cc: row.cc || "",
-                bcc: row.bcc || "",
+                cc: rowCc,
+                bcc: rowBcc,
                 ref: row.ref || "",
                 status: 9,
                 // 🌟 mode 태깅이 있어야 reindex_pending_embeddings / loadMoreDocs 가 analytic 트랙으로 격리합니다.
@@ -400,7 +434,7 @@ async function syncAnalyticsData() {
                 data: {
                     ...parsed,
                     id: row.id,
-                    type: row.type || "click",
+                    type: rowType,
                     mode: "analytic",
                     text: textVal,
                     masked_text: textVal
@@ -558,7 +592,131 @@ const appDb = new DexieLocal("LogisAppDB");
 //   3) 타입 혼재(123 vs "123") 시 equals 가 절반을 놓칩니다.
 //      → 식별자류는 String, 수치류는 Number 로 쓰기 시점에 확정합니다.
 //   4) 여기 선언하지 않은 경로는 .filter() 풀스캔으로 처리합니다. (수천~수만 건 = 수 ms)
-appDb.version(5).stores({
+// appDb.version(5).stores({
+//     ts_queue: 'taskId, type',
+//     kv_store: 'key',
+
+//     items: [
+//         // ── 봉투 ──
+//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+//         'created_at', 'updated_at',
+//         // ── 복합 (스코프 + 타입 동시 좁히기) ──
+//         '[cc+type]', '[mode+type]', '[ref+created_at]',
+//         // ── data.* 식별자 (N:N 교차 검색 축) ──
+//         'data.index', 'data.no', 'data.code', 'data.tracking_number',
+//         'data.goods', 'data.order', 'data.tracking',
+//         'data.stock_keeping_unit', 'data.barcode',
+//         // ── data.* 수치/상태 (조건 필터 축) ──
+//         'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+//         'data.quantity', 'data.weight', 'data.discount',
+//         // ── data.* 문자/시간 ──
+//         'data.carrier', 'data.shipping_method',
+//         'data.started_at', 'data.expired_at',
+//         'data.link', 'data.origin',
+//         // ── 동기화 제어 ──
+//         'data.embed', 'data.digest',
+//         // ── 배열 (멀티엔트리) ──
+//         '*data.tags'
+//     ].join(', '),
+
+//     pages: [
+//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+//         'created_at', 'updated_at',
+//         'data.origin', 'data.link', 'data.detail'
+//     ].join(', '),
+
+//     users: [
+//         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref',
+//         'created_at', 'updated_at',
+//         'data.origin', 'data.is_device', 'data.email'
+//     ].join(', '),
+
+//     talks: [
+//         'id', 'task_id', 'role', 'status',
+//         'from', 'to', 'cc', 'bcc', 'ref',
+//         'created_at', 'updated_at'
+//     ].join(', ')
+// }).upgrade(async (tx: any) => {
+//     // 🌟 [v4 → v5 MIGRATION]
+//     //  ① items : enrichForIndex 가 루트로 복제해 둔 25개 필드를 제거합니다.
+//     //            (data 안에 원본이 그대로 있으므로 데이터 손실 없음)
+//     //  ② users / pages : 기존에 data 객체 없이 json_data 문자열만 들어가 있던
+//     //            행들을 정규화합니다. 이게 없으면 nested 인덱스가 전부 빈 값이 됩니다.
+//     //            (initSession 의 bulkPut(data.users) 경로가 enrichForIndex 를
+//     //             거치지 않아 발생한 기존 결함입니다)
+//     const HOISTED = [
+//         'no', 'code', 'tracking_number', 'goods', 'order', 'tracking',
+//         'stock_keeping_unit', 'barcode', 'index', 'status', 'amount',
+//         'is_masked', 'sale_price', 'supply_price', 'carrier', 'shipping_method',
+//         'width', 'height', 'length', 'weight', 'started_at', 'expired_at',
+//         'domain', 'origin', 'json_data', 'text', 'masked_text'
+//     ];
+
+//     for (const storeName of ['items', 'pages', 'users']) {
+//         try {
+//             await tx.table(storeName).toCollection().modify((row: any) => {
+//                 // data 확보 (json_data 문자열 → 객체)
+//                 let parsed = row.data;
+//                 if (typeof parsed === 'string') {
+//                     try { parsed = JSON.parse(parsed); } catch (e) { parsed = {}; }
+//                 }
+//                 if (!parsed || typeof parsed !== 'object') {
+//                     if (typeof row.json_data === 'string') {
+//                         try { parsed = JSON.parse(row.json_data); } catch (e) { parsed = {}; }
+//                     } else {
+//                         parsed = {};
+//                     }
+//                 }
+
+//                 // 루트에만 있던 값을 data 로 회수 (덮어쓰지 않고 결손만 보충)
+//                 for (const k of HOISTED) {
+//                     if (k === 'json_data') continue;
+//                     if (parsed[k] === undefined && row[k] !== undefined) {
+//                         parsed[k] = row[k];
+//                     }
+//                 }
+
+//                 row.data = canonicalizeData(parsed);
+
+//                 // 루트 복제본 제거
+//                 for (const k of HOISTED) {
+//                     delete row[k];
+//                 }
+//             });
+//         } catch (e) {
+//             console.warn(`[Dexie v5] migration skipped for ${storeName}:`, e);
+//         }
+//     }
+//     console.log('[Dexie v5] Migrated to unified envelope + nested data.* indexes.');
+// });
+
+// 🌟 [v6] 인덱스 보강 전용 세대입니다. 스토어 구조는 v5 와 동일하고 인덱스만 추가하므로
+//  Dexie 가 기존 레코드를 자동 백필합니다. upgrade 콜백이 필요 없습니다.
+//    · pages.data.type  : renderNavigation 이 도메인 타입으로 그룹핑할 때 전량 스캔을 없앱니다.
+//    · talks.type/mode  : analytic / commerce 채팅을 스코프로 분리할 수 있게 합니다.
+//  ⚠️ 새 도메인 필드는 여기에 추가할 필요가 없습니다. 선언되지 않은 data.* 경로는
+//     executeDexiePlan 이 .filter() 풀스캔으로 처리하며, 로컬 수천~수만 건 기준 수 ms 입니다.
+// 🌟 [v7] 인덱스 정합성 정리 세대입니다. 스토어 구조는 v6 과 동일하고 인덱스만 조정하므로
+//  Dexie 가 기존 레코드를 자동 백필합니다. upgrade 콜백이 필요 없습니다.
+//
+//  ── 변경 근거 ──
+//   ① items.data.link / items.data.origin 제거
+//      : 이 두 경로는 executeDexiePlan 에서 항상 contains 로만 조회됩니다.
+//        IndexedDB 에는 substring 인덱스가 없어 어차피 .filter() 풀스캔으로 떨어지므로,
+//        인덱스를 유지하면 쓰기 비용만 늘고 조회 이득이 0입니다.
+//        (pages.data.link 는 loadMoreDocs 의 정확 일치 매칭에 쓰이므로 유지합니다)
+//   ② items.data.title / data.name / data.sender_name / data.recipient_name 추가
+//      : N:N RELAY 와 Dexie 플랜의 eq 조회에 실제로 사용되는 값 경로입니다.
+//   ③ [mode+updated_at] 복합 추가
+//      : renderNavigation 의 draft/count 집계와 loadMoreDocs 의 최신 델타 동기화가
+//        mode 로 좁힌 뒤 updated_at 으로 정렬/필터하므로 range 조회 1회로 끝납니다.
+//   ④ talks.[ref+created_at] 추가
+//      : loadMoreChat 이 ref 스코프 + 시간 커서로 페이징하는 정확한 형태입니다.
+//
+//  ⚠️ 새 도메인 필드는 여기에 추가할 필요가 없습니다. 선언되지 않은 data.* 경로는
+//     executeDexiePlan 이 .filter() 풀스캔으로 처리하며, 로컬 수천~수만 건 기준 수 ms 입니다.
+//     인덱스는 '카디널리티가 높고 eq/range 로 자주 조회되는 경로' 에만 추가하세요.
+appDb.version(7).stores({
     ts_queue: 'taskId, type',
     kv_store: 'key',
 
@@ -566,8 +724,8 @@ appDb.version(5).stores({
         // ── 봉투 ──
         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
         'created_at', 'updated_at',
-        // ── 복합 (스코프 + 타입 동시 좁히기) ──
-        '[cc+type]', '[mode+type]', '[ref+created_at]',
+        // ── 복합 (스코프 + 타입/시간 동시 좁히기) ──
+        '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
         // ── data.* 식별자 (N:N 교차 검색 축) ──
         'data.index', 'data.no', 'data.code', 'data.tracking_number',
         'data.goods', 'data.order', 'data.tracking',
@@ -578,7 +736,8 @@ appDb.version(5).stores({
         // ── data.* 문자/시간 ──
         'data.carrier', 'data.shipping_method',
         'data.started_at', 'data.expired_at',
-        'data.link', 'data.origin',
+        // ── data.* 값 경로 (eq 조회 대상) ──
+        'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
         // ── 동기화 제어 ──
         'data.embed', 'data.digest',
         // ── 배열 (멀티엔트리) ──
@@ -588,7 +747,7 @@ appDb.version(5).stores({
     pages: [
         'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
         'created_at', 'updated_at',
-        'data.origin', 'data.link', 'data.detail'
+        'data.type', 'data.origin', 'data.link', 'data.detail'
     ].join(', '),
 
     users: [
@@ -598,63 +757,13 @@ appDb.version(5).stores({
     ].join(', '),
 
     talks: [
-        'id', 'task_id', 'role', 'status',
+        'id', 'task_id', 'role', 'status', 'type', 'mode',
         'from', 'to', 'cc', 'bcc', 'ref',
-        'created_at', 'updated_at'
+        'created_at', 'updated_at',
+        '[ref+created_at]'
     ].join(', ')
-}).upgrade(async (tx: any) => {
-    // 🌟 [v4 → v5 MIGRATION]
-    //  ① items : enrichForIndex 가 루트로 복제해 둔 25개 필드를 제거합니다.
-    //            (data 안에 원본이 그대로 있으므로 데이터 손실 없음)
-    //  ② users / pages : 기존에 data 객체 없이 json_data 문자열만 들어가 있던
-    //            행들을 정규화합니다. 이게 없으면 nested 인덱스가 전부 빈 값이 됩니다.
-    //            (initSession 의 bulkPut(data.users) 경로가 enrichForIndex 를
-    //             거치지 않아 발생한 기존 결함입니다)
-    const HOISTED = [
-        'no', 'code', 'tracking_number', 'goods', 'order', 'tracking',
-        'stock_keeping_unit', 'barcode', 'index', 'status', 'amount',
-        'is_masked', 'sale_price', 'supply_price', 'carrier', 'shipping_method',
-        'width', 'height', 'length', 'weight', 'started_at', 'expired_at',
-        'domain', 'origin', 'json_data', 'text', 'masked_text'
-    ];
-
-    for (const storeName of ['items', 'pages', 'users']) {
-        try {
-            await tx.table(storeName).toCollection().modify((row: any) => {
-                // data 확보 (json_data 문자열 → 객체)
-                let parsed = row.data;
-                if (typeof parsed === 'string') {
-                    try { parsed = JSON.parse(parsed); } catch (e) { parsed = {}; }
-                }
-                if (!parsed || typeof parsed !== 'object') {
-                    if (typeof row.json_data === 'string') {
-                        try { parsed = JSON.parse(row.json_data); } catch (e) { parsed = {}; }
-                    } else {
-                        parsed = {};
-                    }
-                }
-
-                // 루트에만 있던 값을 data 로 회수 (덮어쓰지 않고 결손만 보충)
-                for (const k of HOISTED) {
-                    if (k === 'json_data') continue;
-                    if (parsed[k] === undefined && row[k] !== undefined) {
-                        parsed[k] = row[k];
-                    }
-                }
-
-                row.data = canonicalizeData(parsed);
-
-                // 루트 복제본 제거
-                for (const k of HOISTED) {
-                    delete row[k];
-                }
-            });
-        } catch (e) {
-            console.warn(`[Dexie v5] migration skipped for ${storeName}:`, e);
-        }
-    }
-    console.log('[Dexie v5] Migrated to unified envelope + nested data.* indexes.');
 });
+
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
 
 // --- kv 헬퍼 (반드시 appDb 선언 바로 아래, 모든 호출부보다 위에 위치) ---
@@ -693,7 +802,14 @@ async function kvRemove(key: string) {
 
 // 🌟 Dexie 스키마에 실제로 선언한 인덱스 경로 목록입니다.
 //  이 집합에 없는 경로는 자동으로 .filter() 로 떨어집니다.
-//  → 새 경로를 인덱스하면 여기에 한 줄 추가하고 version 을 올리면 끝입니다.
+//
+//  ⚠️ [계약] 이 집합은 appDb.version(N).stores() 의 items 선언과 '반드시' 일치해야 합니다.
+//     여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이 where('없는경로') 를 호출해
+//     Dexie 가 SchemaError 를 던집니다. 반대로 스키마에만 있으면 인덱스가 놀 뿐이라 안전합니다.
+//     따라서 스키마를 줄일 때는 반드시 이 집합을 먼저 줄이세요.
+//
+//  🌟 v7 : data.link / data.origin 제거 (contains 전용이라 인덱스 이득 0),
+//          data.title / data.name / data.sender_name / data.recipient_name 추가.
 const DEXIE_INDEXED_PATHS = new Set<string>([
     'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
     'created_at', 'updated_at',
@@ -704,7 +820,7 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.quantity', 'data.weight', 'data.discount',
     'data.carrier', 'data.shipping_method',
     'data.started_at', 'data.expired_at',
-    'data.link', 'data.origin',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
     'data.embed', 'data.digest'
 ]);
 
@@ -752,9 +868,17 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
     if (cond.kind === 'number') {
         const target = typeof cond.value === 'number' ? cond.value : Number(cond.value);
         if (isNaN(target)) return true; // 비교 불가 → 조건 무시(리콜 우선)
+
+        // 🌟 [MISSING VALUE GUARD] 값이 없는 것과 0 은 완전히 다른 사실입니다.
+        //    기존에는 Number('') = 0 으로 떨어져 'sale_price lte 5000' 같은 조건을
+        //    가격 필드가 아예 없는 문서까지 전부 통과시켰습니다.
+        //    neq 만 예외로 통과시킵니다. (없는 값은 target 과 같지 않은 것이 맞습니다)
+        const isMissing = (raw === undefined || raw === null || raw === "");
+        if (isMissing) return cond.op === 'neq';
+
         const actual = typeof raw === 'number'
             ? raw
-            : Number(String(raw ?? '').replace(/[^\d.\-]/g, ''));
+            : Number(String(raw).replace(/[^\d.\-]/g, ''));
         if (isNaN(actual)) return false;
 
         switch (cond.op) {
@@ -837,21 +961,29 @@ async function executeDexiePlan(
         const driver = pickDriverCondition(conds);
 
         if (driver) {
-            const coll = appDb.table('items').where(driver.path);
-            if (driver.op === 'eq') {
-                rows = await coll.equals(driver.value).toArray();
-            } else if (driver.op === 'gt') {
-                rows = await coll.above(driver.value).toArray();
-            } else if (driver.op === 'gte') {
-                rows = await coll.aboveOrEqual(driver.value).toArray();
-            } else if (driver.op === 'lt') {
-                rows = await coll.below(driver.value).toArray();
-            } else if (driver.op === 'lte') {
-                rows = await coll.belowOrEqual(driver.value).toArray();
-            } else {
+            // 🌟 [INDEX FALLBACK] DEXIE_INDEXED_PATHS 와 실제 스키마가 어긋난 세대에서는
+            //    where('없는경로') 가 SchemaError 를 던집니다. 그 경우 조용히 전량 적재로 폴백해
+            //    '검색이 통째로 실패' 하는 대신 '조금 느린 검색' 으로 흡수합니다.
+            try {
+                const coll = appDb.table('items').where(driver.path);
+                if (driver.op === 'eq') {
+                    rows = await coll.equals(driver.value).toArray();
+                } else if (driver.op === 'gt') {
+                    rows = await coll.above(driver.value).toArray();
+                } else if (driver.op === 'gte') {
+                    rows = await coll.aboveOrEqual(driver.value).toArray();
+                } else if (driver.op === 'lt') {
+                    rows = await coll.below(driver.value).toArray();
+                } else if (driver.op === 'lte') {
+                    rows = await coll.belowOrEqual(driver.value).toArray();
+                } else {
+                    rows = await appDb.table('items').toArray();
+                }
+                console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
+            } catch (e) {
+                console.warn(`[DEXIE-PLAN] ⚠️ 드라이버 인덱스 '${driver.path}' 조회 실패. 전량 적재로 폴백합니다.`, e);
                 rows = await appDb.table('items').toArray();
             }
-            console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
         } else if (plan.types && plan.types.length > 0) {
             // 🌟 types 인덱스(anyOf)로 좁힙니다. mode 보다 선택도가 높습니다.
             rows = await appDb.table('items').where('type').anyOf(plan.types).toArray();
@@ -1316,26 +1448,6 @@ if (chatForm) {
                 content: query 
             }));
             console.log("[CHAT] Message sent via WebRTC");
-        }
-
-        // 🌟 [ANALYTICS ADMIN] analytic 모드에서는 console.logis.center 관리자 프롬프트로 라우팅합니다.
-        //    (기존 Client Front SDK(content.js)의 form[name="prompt"] 기능을 이관한 경로)
-        if (currentSearchMode === "analytic") {
-            await askAnalyticsAdmin(query);
-
-            setTimeout(() => {
-                const scrollEl = document.getElementById("chat-scroll");
-                const container = document.querySelector(".chat-container") as HTMLElement;
-                if (scrollEl && container) {
-                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-                    currentY = maxScroll;
-                    scrollEl.style.transition = "transform 0.3s ease-out";
-                    updateTransform();
-                    setTimeout(() => { scrollEl.style.transition = ""; }, 300);
-                }
-            }, 100);
-
-            return;
         }
 
         // 🌟 [ANALYTICS ADMIN] analytic 모드에서는 console.logis.center 관리자 프롬프트로 라우팅합니다.
@@ -2920,11 +3032,17 @@ async function syncData() {
                 // 🌟 [누락 복구] 서버 통계를 LanceDB에 덮어썼다면, 반드시 프론트엔드 Dexie DB 에도 동기화해줘야 화면이 바뀝니다!
                 const newUsers = filteredResults.filter((r: any) => r.type === "team" || r.type === "user" || r.type === "member");
                 
-                // 🌟 [CRITICAL FIX] 클라우드 서버에서 type을 "goods" 등으로 덮어써서 내려보내더라도, 
-                // data.item 이나 data.node 속성을 쥐고 있다면 무조건 페이지 캐시로 분류하여 Dexie에 살려냅니다!
+                // 🌟 [ROUTING FIX] 서버(Client Worker)는 페이지 캐시 행에 table:'pages' 를 실어 보냅니다.
+                //    기존처럼 data.node / data.item 의 '존재 여부' 로 추정하면
+                //    canonicalize_data 가 node / detail 을 0 으로 시딩하는 순간 전 아이템이 참이 되어
+                //    일반 상품/주문까지 Dexie pages 테이블로 오분류됩니다.
+                //    따라서 서버가 명시한 table 을 1순위로 신뢰하고,
+                //    없을 때만 셀렉터 마커의 '값이 truthy 인지' 를 봅니다.
                 const newPages = filteredResults.filter((r: any) => {
+                    if (r.table === "pages" || r.table === "page") return true;
+                    if (r.type === "pages" || r.type === "page") return true;
                     const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
-                    return r.type === "pages" || r.type === "page" || d.node !== undefined || d.item !== undefined;
+                    return !!d.node || !!d.item;
                 });
                 
                 // chrome.js 형태의 talks(채팅) 메시지 추출
@@ -5310,11 +5428,21 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 coll = appDb.table('items').where('mode').equals(currentSearchMode);
             }
 
-            let rows: any[] = await coll.toArray();
+            let rows: any[];
 
-            // 스코프 드라이버가 mode 가 아니었다면 mode 를 추가 검증합니다.
-            rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
-            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+            // 🌟 [COMPOUND DRIVER] 스코프(ref/bcc/cc)가 없을 때는 mode 만으로 훑지 말고
+            //    선언해 둔 '[mode+type]' 복합 인덱스를 anyOf 로 펼칩니다.
+            //    shipping 은 allowedTypes 가 15종이 넘어 mode 단독 스캔 대비 체감 차이가 큽니다.
+            if (!activeContext.ref && !activeContext.bcc && !activeContext.cc) {
+                const pairs = allowedTypes.map(t => [currentSearchMode, t]);
+                rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
+                console.log(`[DEBUG-LIST] 복합 인덱스 [mode+type] anyOf ${pairs.length}쌍 → ${rows.length}건 적재`);
+            } else {
+                rows = await coll.toArray();
+                // 스코프 드라이버가 mode 가 아니었다면 mode 를 추가 검증합니다.
+                rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
+                rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
 
             if (isSync && latestUpdateTime > 0) {
                 rows = rows.filter((r: any) => (r.updated_at || 0) > latestUpdateTime);
@@ -6202,21 +6330,48 @@ async function initSession() {
         //  구버전 사용자는 앱 실행 직후 LanceDB 가 비어 있게 되므로,
         //  '데이터가 사라진 것처럼 보이는' 상황을 사용자에게 정확히 설명해야 합니다.
         //  판정: Dexie 에는 데이터가 있는데 LanceDB(mark_ui_ready)가 비어 있으면 세대 전환입니다.
+        //
+        //  🌟 [MULTI-TABLE RESTORE] 기존 구현은 items 만 복구했습니다.
+        //     그런데 init_all_tables 는 items / users / pages 세 테이블을 '전부' drop 합니다.
+        //     users 가 사라지면 팀 통계(base.pages)가 통째로 날아가 네비게이션 카운트가 0이 되고,
+        //     pages 가 사라지면 셀렉터 캐시가 없어져 모든 페이지를 다시 AI 분석해야 합니다.
+        //     세 테이블을 동일한 절차로 복구합니다.
+        //
+        //  🌟 [TABLE HINT] save_item / upsert_items 는 item.table 힌트를 1순위로 신뢰하므로,
+        //     복구 페이로드에 table 을 명시해야 users / pages 가 items 로 새어 나가지 않습니다.
         try {
-            const dexieCount = await appDb.table("items").count();
-            const lanceCount = (data.items && data.items.length) ? data.items.length : 0;
+            const RESTORE_TABLES: Array<{ name: string; hint: string; lanceKey: string }> = [
+                { name: "items", hint: "items", lanceKey: "items" },
+                { name: "users", hint: "users", lanceKey: "users" },
+                { name: "pages", hint: "pages", lanceKey: "pages" }
+            ];
+
+            let needsRestore = false;
+            for (const t of RESTORE_TABLES) {
+                const dexieCount = await appDb.table(t.name).count();
+                const lanceArr = (data as any)[t.lanceKey];
+                const lanceCount = (lanceArr && lanceArr.length) ? lanceArr.length : 0;
+                if (dexieCount > 0 && lanceCount === 0) {
+                    needsRestore = true;
+                    break;
+                }
+            }
+
             const alreadyNotified = await kvGet("schema_v4_notified");
 
-            if (dexieCount > 0 && lanceCount === 0 && !alreadyNotified) {
+            if (needsRestore && !alreadyNotified) {
                 await kvSet("schema_v4_notified", "true");
-                console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local search index needs re-population.");
+                console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local index needs re-population.");
 
-                // 🌟 Dexie 에 원본이 살아 있으므로 LanceDB 로 되밀어 넣습니다.
-                //    (사용자가 다시 추출할 필요가 없습니다)
-                const allRows = await appDb.table("items").limit(2000).toArray();
-                if (allRows.length > 0) {
+                for (const t of RESTORE_TABLES) {
+                    const allRows = await appDb.table(t.name).limit(5000).toArray();
+                    if (allRows.length === 0) continue;
+
                     const restorePayload = allRows.map((r: any) => ({
+                        // 🌟 봉투를 루트에 펼치고 확장은 스프레드합니다.
+                        //    (upsert_items 가 루트 평탄화 페이로드를 기대합니다)
                         id: r.id,
+                        table: t.hint,
                         type: r.type,
                         flag: r.flag,
                         from: r.from,
@@ -6230,17 +6385,24 @@ async function initSession() {
                         ...(r.data || {})
                     }));
 
-                    console.log(`[SCHEMA] Restoring ${restorePayload.length} document(s) from Dexie into LanceDB v4...`);
-                    // 배치로 나눠 밀어 넣습니다. (한 번에 2000건은 Rust 쪽에서 부담)
+                    console.log(`[SCHEMA] Restoring ${restorePayload.length} '${t.name}' document(s) into LanceDB v4...`);
                     for (let i = 0; i < restorePayload.length; i += 100) {
                         const chunk = restorePayload.slice(i, i + 100);
-                        try { await invoke("upsert_items", { items: chunk }); } catch (e) { console.warn("[SCHEMA] restore chunk failed:", e); }
+                        try {
+                            await invoke("upsert_items", { items: chunk });
+                        } catch (e) {
+                            console.warn(`[SCHEMA] restore chunk failed for ${t.name}:`, e);
+                        }
                     }
-                    console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
-
-                    // 🌟 벡터/청크는 다시 만들어야 하므로 로컬 임베딩을 트리거합니다.
-                    runLocalEmbeddingSync();
                 }
+
+                console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
+
+                // 🌟 벡터/청크는 다시 만들어야 하므로 로컬 임베딩을 트리거합니다.
+                runLocalEmbeddingSync();
+
+                // 🌟 통계/네비게이션이 복구된 users 를 반영하도록 즉시 다시 그립니다.
+                await renderNavigation();
             }
         } catch (e) {
             console.warn("[SCHEMA] Generation check skipped:", e);

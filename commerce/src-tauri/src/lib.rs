@@ -2472,19 +2472,29 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
 
             // 🌟 [v4 ROUTING] 물리 테이블은 items / users / pages 3개뿐입니다.
             //    store.rs 의 resolve_table 과 동일한 규칙을 사용해야 저장/조회가 어긋나지 않습니다.
+            //
+            //    🌟 [ROUTING FIX] 기존 'origin 이 있으면 pages' 휴리스틱을 폐기합니다.
+            //      · proxy/index.ts 는 모든 commerce item.data 에 origin 을 넣습니다.
+            //      · console/index.ts 는 모든 analytics 행동 로그 data 에 origin 을 넣습니다.
+            //      → 그 결과 서버에서 동기화된 아이템 전량이 pages 테이블로 새어 나갔고,
+            //        loadMoreDocs(items 조회)와 reindex_pending_embeddings(items 스캔)이
+            //        동시에 0건이 되어 목록과 로컬 임베딩이 통째로 죽어 있었습니다.
+            //
+            //    Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
+            //    그 명시값을 1순위로 신뢰합니다. (추정이 아니라 계약입니다)
+            let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
+
             let final_table = match type_str.as_str() {
                 "member" | "team" | "user" | "users" => "users",
                 "pages" | "page" => "pages",
-                _ => {
-                    // data.origin 을 가진 셀렉터 캐시는 pages 로 보냅니다. (기존 동작 보존)
-                    if clean_item.get("origin").is_some()
-                        || clean_item.get("data").and_then(|d| d.get("origin")).is_some()
-                    {
-                        "pages"
-                    } else {
-                        "items"
-                    }
-                }
+                // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
+                "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
+                _ => match table_hint {
+                    "pages" | "page" => "pages",
+                    "users" => "users",
+                    // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
+                    _ => "items",
+                },
             };
 
             

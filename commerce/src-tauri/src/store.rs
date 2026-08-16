@@ -672,6 +672,12 @@ impl VectorStore {
         }
 
         // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
+        //
+        // 🌟 [EARLY RETURN 의도] seed_defaults = false 인데 tags 키 자체가 없다면
+        //    '이 문서는 tags 라는 개념이 없는 타입' 이라는 뜻입니다.
+        //    빈 배열을 만들어 넣으면 users / analytics 문서에 불필요한 키가 생기므로
+        //    ID/NUM/BOOL 정규화만 마친 상태로 그대로 반환합니다.
+        //    (이 시점에 위의 세 루프는 이미 전부 실행되었으므로 데이터 손실이 없습니다)
         if obj.get("tags").is_none() && !seed_defaults {
             return v;
         }
@@ -790,7 +796,17 @@ impl VectorStore {
          // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
          //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
          //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
-         let seed_defaults = !matches!(target, "users" | "pages");
+         //
+         //    🌟 [ANALYTICS] analytics 트랙 행동 로그(click / hover / change / report)와
+         //       관리자 Q&A(question / answer)도 commerce 도메인 필드를 갖지 않습니다.
+         //       main.ts 의 NON_SEED_TYPES 와 반드시 동일한 집합이어야 두 저장소가 일치합니다.
+         let non_seed_type = matches!(
+             type_,
+             "team" | "user" | "member"
+                 | "click" | "hover" | "change" | "report"
+                 | "question" | "answer"
+         );
+         let seed_defaults = !matches!(target, "users" | "pages") && !non_seed_type;
          let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
          let json_str = final_data.to_string();
@@ -884,6 +900,15 @@ impl VectorStore {
     // 🌟 [ROW READER] RecordBatch → TradeDocument 변환을 한 곳으로 모읍니다.
     //  기존에는 get_all_items / get_item_by_id 가 컬럼 인덱스를 각자 하드코딩해서
     //  스키마가 바뀔 때마다 두 곳을 동시에 고쳐야 했고, 실제로 어긋난 적이 있습니다.
+    //
+    //  ⚠️ [SCHEMA CONTRACT] 아래 인덱스는 init_all_tables 의 Field 선언 순서와 1:1 대응입니다.
+    //     0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
+    //     9 data / 10 created_at / 11 updated_at / 12 vector / 13 text / 14 masked_text / 15 schema_v4
+    //
+    //     봉투 컬럼을 '중간에' 추가하면 뒤 인덱스가 전부 밀려 search_items(column(9)) 등
+    //     다른 지점까지 조용히 깨집니다. 봉투를 늘려야 한다면 반드시 '끝에' 추가하고
+    //     SCHEMA_VERSION 을 올려 구세대 테이블이 drop 되도록 하세요.
+    //     그보다 먼저 'data.* 로 내릴 수 없는가' 를 검토하는 것이 v4 설계 의도입니다.
     fn batch_to_docs(batch: &RecordBatch) -> Vec<TradeDocument> {
         let ids         = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types       = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();

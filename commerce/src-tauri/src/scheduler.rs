@@ -594,6 +594,19 @@ pub async fn index_item_chunks(
         crate::parsing::get_list_schema_fields(page_type, url, doc_lang)
     };
 
+    // 🌟 [SCHEMA GUARD] analytics 트랙(click / hover / change / report)은 bias.json 에
+    //    대응 스키마가 없어 fields 가 항상 비어 있습니다.
+    //    뱅크가 비면 PLINKO 는 전 청크를 unclassified 로 떨어뜨리므로,
+    //    임베딩 배치를 헛돌리지 않고 여기서 즉시 종료합니다.
+    //    (아이템 레벨 벡터는 reindex_pending_embeddings 가 이미 만들어 두었습니다)
+    if fields.is_empty() {
+        emit(&format!(
+            "  ⏭️ [CHUNK SKIP] type='{}' 에 대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다. (아이템 벡터는 별도 생성됨)",
+            page_type
+        ));
+        return Ok(0);
+    }
+
     let mut idx_field_names: Vec<String> = Vec::new();
     let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
