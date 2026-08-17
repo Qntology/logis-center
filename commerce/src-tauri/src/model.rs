@@ -1242,13 +1242,19 @@ impl LogisModel {
             
             // [PRIVACY] 무역 문서(BL, CI 등) 및 송장(Tracking)은 개인정보 밀집 구역이므로 반드시 마스킹을 적용합니다.
             // 커머스 상품(goods) 이미지인 경우에만 예외적으로 우회합니다.
-            let doc_type = if is_trade_doc { 
+            let doc_type = if is_trade_doc {
+                // 🌟 [DOC TYPE RESOLVE] 두 경로가 doc_type 을 서로 다른 위치에 기록합니다.
+                //   · Slice & Merge 경로   : extracted_data["header"]["doc_type"]
+                //   · TRACKING Fast-Track : extracted_data["doc_type"] (루트)
+                //   기존에는 header 만 봤기 때문에 운송장 라벨이 전부 "shipping_doc" 으로
+                //   저장되어 index_val / hashed_id / DB type 까지 뭉개졌습니다.
                 extracted_data.get("header")
                     .and_then(|h| h.get("doc_type"))
                     .and_then(|s| s.as_str())
-                    .unwrap_or("shipping_doc") 
-            } else { 
-                "goods" 
+                    .or_else(|| extracted_data.get("doc_type").and_then(|s| s.as_str()))
+                    .unwrap_or("shipping_doc")
+            } else {
+                "goods"
             };
             
             let masked_nl = nl.clone(); // 마스킹은 백엔드 push_data 단계에서 동적으로 수행됩니다.
@@ -1305,32 +1311,105 @@ impl LogisModel {
                 final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
                 final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
-                // 🌟 [추가 보완] 무역 문서(Trade Doc)일 경우 Python처럼 핵심 컬럼 평탄화 (Flattening)
+                // 🌟 [TRADING FLATTEN v2] 무역 문서(Trade Doc) 핵심 축 평탄화.
+                //    Dexie v8 이 인덱싱하는 21개 trading 경로를 전부 채워야
+                //    executeDexiePlan 이 where() 드라이버를 잡을 수 있습니다.
+                //    (기존 구현은 7개만 채워서 컨테이너/씰/중량/참조번호 조회가 전부 풀스캔이었습니다)
                 if is_trade_doc {
                     let obj = final_data.as_object_mut().unwrap();
-                    
-                    // Header에서 날짜/문서번호 추출
+
+                    // ── Header : 문서 정체성 ──
                     if let Some(header) = extracted_data.get("header") {
                         obj.insert("issue_date".to_string(), header.get("issue_date").cloned().unwrap_or(json!("")));
-                        obj.insert("no".to_string(), header.get("document_number").cloned().unwrap_or(json!("")));
+                        // 🌟 no 와 doc_number 를 '둘 다' 씁니다.
+                        //    no  : 레거시 commerce 축(이미 인덱싱되어 있음)
+                        //    doc_number : trading 축(normalize_path 가 여기로 모읍니다)
+                        let dnum = header.get("document_number").cloned().unwrap_or(json!(""));
+                        obj.insert("no".to_string(), dnum.clone());
+                        obj.insert("doc_number".to_string(), dnum);
+                        // 🌟 [SCOPE FIX] detected_type 은 위쪽 `if is_trade_doc { ... }` 분류 블록의
+                        //    지역 변수라 이 평탄화 블록에서는 이미 소멸했습니다.
+                        //    바깥 스코프에서 동일한 값으로 확정된 doc_type(&str)을 그대로 씁니다.
+                        //    (doc_type = header.doc_type 이 있으면 그 값, 없으면 "shipping_doc")
+                        obj.insert("doc_type".to_string(), header.get("doc_type").cloned().unwrap_or(json!(doc_type)));
+                        if let Some(v) = header.get("reference_invoice") { obj.insert("reference_invoice".to_string(), v.clone()); }
+                        if let Some(v) = header.get("reference_lc") { obj.insert("reference_lc".to_string(), v.clone()); }
+                        if let Some(v) = header.get("reference_booking") { obj.insert("reference_booking".to_string(), v.clone()); }
+                        if let Some(v) = header.get("reference_buyer") { obj.insert("reference_buyer".to_string(), v.clone()); }
+                        if let Some(v) = header.get("reference_seller") { obj.insert("reference_seller".to_string(), v.clone()); }
+                        if let Some(v) = header.get("reference_carrier") { obj.insert("reference_carrier".to_string(), v.clone()); }
+                        if let Some(v) = header.get("number_of_originals") { obj.insert("number_of_originals".to_string(), v.clone()); }
+                        if let Some(v) = header.get("expiry_date") { obj.insert("expiry_date".to_string(), v.clone()); }
                     }
-                    // Parties에서 화주/수하인 추출
+
+                    // ── Parties : 화주 / 수하인 / 통지처 ──
                     if let Some(parties) = extracted_data.get("parties") {
                         obj.insert("sender_name".to_string(), parties.get("supplier_name").cloned().unwrap_or(json!("")));
                         obj.insert("recipient_name".to_string(), parties.get("buyer_name").cloned().unwrap_or(json!("")));
+                        if let Some(v) = parties.get("supplier_address") { obj.insert("sender_address".to_string(), v.clone()); }
+                        if let Some(v) = parties.get("buyer_address") { obj.insert("recipient_address".to_string(), v.clone()); }
+                        if let Some(v) = parties.get("notify_party_name") { obj.insert("notify_party_name".to_string(), v.clone()); }
                     }
-                    // Logistics에서 선박/항구 추출
+
+                    // ── Logistics : 선박 / 항구 / 일정 ──
                     if let Some(logistics) = extracted_data.get("logistics") {
                         obj.insert("vessel".to_string(), logistics.get("vehicle_name").cloned().unwrap_or(json!("")));
                         obj.insert("pol".to_string(), logistics.get("location_port_of_loading").cloned().unwrap_or(json!("")));
                         obj.insert("pod".to_string(), logistics.get("location_port_of_discharge").cloned().unwrap_or(json!("")));
+                        if let Some(v) = logistics.get("voyage_number") { obj.insert("voyage_number".to_string(), v.clone()); }
+                        if let Some(v) = logistics.get("etd") { obj.insert("etd".to_string(), v.clone()); }
+                        if let Some(v) = logistics.get("eta") { obj.insert("eta".to_string(), v.clone()); }
+                        if let Some(v) = logistics.get("transport_mode") { obj.insert("transport_mode".to_string(), v.clone()); }
+                        if let Some(v) = logistics.get("place_of_receipt") { obj.insert("place_receipt".to_string(), v.clone()); }
+                        if let Some(v) = logistics.get("place_of_delivery") { obj.insert("place_delivery".to_string(), v.clone()); }
                     }
-                    // Financials/Conditions 추출
+
+                    // ── Financials : 금액 축 ──
                     if let Some(fin) = extracted_data.get("financials") {
                         obj.insert("amount".to_string(), fin.get("amount_total").cloned().unwrap_or(json!(0)));
+                        if let Some(v) = fin.get("currency_code") { obj.insert("currency".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("amount_subtotal") { obj.insert("subtotal_amount".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("amount_tax") { obj.insert("tax_amount".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("amount_freight") { obj.insert("freight_amount".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("amount_insurance") { obj.insert("insurance_amount".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("local_charges_total") { obj.insert("local_charges".to_string(), v.clone()); }
+                        if let Some(v) = fin.get("exchange_rate") { obj.insert("exchange_rate".to_string(), v.clone()); }
                     }
+
+                    // ── Conditions : 거래 조건 ──
                     if let Some(cond) = extracted_data.get("conditions") {
                         obj.insert("incoterms".to_string(), cond.get("incoterms_code").cloned().unwrap_or(json!("")));
+                        if let Some(v) = cond.get("payment_terms") { obj.insert("payment_terms".to_string(), v.clone()); }
+                        if let Some(v) = cond.get("freight_payment_term") { obj.insert("freight_payment_term".to_string(), v.clone()); }
+                        if let Some(v) = cond.get("partial_shipment") { obj.insert("partial_shipment_allowed".to_string(), v.clone()); }
+                        if let Some(v) = cond.get("transshipment") { obj.insert("transshipment_allowed".to_string(), v.clone()); }
+                    }
+
+                    // ── Cargo : 화물 축 ──
+                    if let Some(cargo) = extracted_data.get("cargo") {
+                        if let Some(v) = cargo.get("package_count") { obj.insert("package_count".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("package_unit") { obj.insert("package_unit".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("weight_gross") { obj.insert("weight_gross".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("weight_net") { obj.insert("weight_net".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("volume_measurement") { obj.insert("volume".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("volume") { obj.insert("volume".to_string(), v.clone()); }
+                        if let Some(v) = cargo.get("marks_and_numbers") { obj.insert("marks_numbers".to_string(), v.clone()); }
+                    }
+
+                    // ── Containers : 첫 컨테이너를 대표 축으로 승격 ──
+                    //    (전체 목록은 data.containers 배열에 그대로 남아 있습니다)
+                    if let Some(arr) = extracted_data.get("containers").and_then(|v| v.as_array()) {
+                        if let Some(first) = arr.first() {
+                            if let Some(v) = first.get("container_number") { obj.insert("container_number".to_string(), v.clone()); }
+                            if let Some(v) = first.get("seal_number") { obj.insert("seal_number".to_string(), v.clone()); }
+                        }
+                    }
+
+                    // ── Line items : 첫 HS Code 를 대표 축으로 승격 ──
+                    if let Some(arr) = extracted_data.get("line_items").and_then(|v| v.as_array()) {
+                        if let Some(hs) = arr.iter().find_map(|it| it.get("hs_code")) {
+                            obj.insert("hs_code".to_string(), hs.clone());
+                        }
                     }
                 }
                 

@@ -854,14 +854,33 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     //    여기서는 '별칭만 통일하고 없는 건 그대로 통과' 시킵니다. Dexie 는 .filter() 로 처리 가능합니다.
     fn normalize_path(key: &str) -> String {
         let k = match key {
+            // ── commerce 별칭 ──
             "amount_total" | "total_amount" | "price" => "amount",
-            "document_number" => "no",
-            "supplier_name" | "shipper_name" => "sender_name",
-            "buyer_name" | "consignee_name" => "recipient_name",
-            "vehicle_name" | "flight_no" => "vessel",
-            "location_port_of_loading" => "pol",
-            "location_port_of_discharge" => "pod",
+            "supplier_name" | "shipper_name" | "exporter_name" | "consignor_name" => "sender_name",
+            "buyer_name" | "consignee_name" | "importer_name" => "recipient_name",
+            // ── 🌟 trading 별칭 ──
+            //    extract_shipping_conditions 는 doc_number 를 뱉고,
+            //    이미지 추출 스키마(get_trade_category_schema)는 document_number 를 뱉습니다.
+            //    Dexie 인덱스는 data.doc_number 이므로 그쪽으로 통일합니다.
+            "document_number" | "bl_number" | "awb_number" | "po_number"
+                | "booking_number" | "contract_number" => "doc_number",
+            "document_type" => "doc_type",
+            "vehicle_name" | "flight_no" | "vessel_name" => "vessel",
+            "voyage_no" => "voyage_number",
+            "location_port_of_loading" | "port_of_loading" => "pol",
+            "location_port_of_discharge" | "port_of_discharge" => "pod",
             "incoterms_code" => "incoterms",
+            "payment_term" => "payment_terms",
+            "currency_code" => "currency",
+            "container_no" => "container_number",
+            "seal_no" => "seal_number",
+            "package_qty" => "package_count",
+            "gross_weight" => "weight_gross",
+            "net_weight" => "weight_net",
+            "volume_measurement" | "cbm" => "volume",
+            "lc_number" | "reference_lc_number" => "reference_lc",
+            "reference_invoice_number" => "reference_invoice",
+            "reference_booking_number" => "reference_booking",
             other => other,
         };
         format!("data.{}", k)
@@ -872,10 +891,20 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         if v.is_number() { return "number"; }
         if let Some(s) = v.as_str() {
             // 수치형 경로인데 문자열로 왔으면 숫자로 취급합니다. (canonicalize 규칙과 동일)
-            let is_num_path = ["amount", "sale_price", "supply_price", "quantity", "weight",
-                               "width", "height", "length", "discount", "shipping_fee",
-                               "status", "started_at", "expired_at", "usage_limit", "usage_per"]
-                .iter().any(|p| path.ends_with(p));
+            //
+            // 🌟 [TRADING] weight_gross / package_count 같은 경로는 ends_with("weight") 로
+            //    잡히지 않으므로 반드시 전체 이름을 넣어야 합니다.
+            //    빠지면 kind="string" 이 되어 matchCondition 이 문자열 비교로 처리하고,
+            //    '5000 이하' 같은 range 조건이 통째로 무력화됩니다.
+            let is_num_path = [
+                // ── commerce ──
+                "amount", "price", "sale_price", "supply_price", "quantity", "weight",
+                "width", "height", "length", "discount", "shipping_fee",
+                "status", "started_at", "expired_at", "usage_limit", "usage_per",
+                // ── trading ──
+                "package_count", "weight_gross", "weight_net", "volume",
+                "local_charges", "exchange_rate", "number_of_originals",
+            ].iter().any(|p| path.ends_with(p));
             if is_num_path && s.chars().any(|c| c.is_ascii_digit()) { return "number"; }
         }
         "string"

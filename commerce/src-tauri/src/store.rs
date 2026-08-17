@@ -592,21 +592,40 @@ impl VectorStore {
     //    (users 는 data.origin / data.is_device / data.email 만 인덱싱하므로 시딩이 불필요합니다)
     //    seed_defaults = false 여도 '이미 있는 키의 타입 정규화' 는 그대로 수행합니다.
     fn canonicalize_data(mut v: Value, seed_defaults: bool) -> Value {
-        const ID_KEYS: [&str; 13] = [
+        // 🌟 [PARITY CONTRACT] 이 세 목록은 main.ts 의 ID_KEYS / NUM_KEYS / BOOL_KEYS 와
+        //    '완전히 동일' 해야 합니다. 한쪽만 늘리면 같은 값이
+        //    LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
+        //    where('data.xxx').equals(...) 가 절반을 놓칩니다.
+        const ID_KEYS: [&str; 23] = [
+            // ── commerce ──
             "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
             "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
+            // ── trading : 전부 영숫자 혼합이라 String 으로 확정해야 합니다 ──
+            //   (B/L No 'ABCD1234567', 컨테이너 'MSCU1234567')
+            "doc_number", "container_number", "seal_number",
+            "reference_invoice", "reference_lc", "reference_booking",
+            "reference_buyer", "reference_seller", "reference_carrier", "hs_code",
         ];
-        const NUM_KEYS: [&str; 24] = [
+        const NUM_KEYS: [&str; 35] = [
+            // ── commerce ──
             "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
             "discount", "quantity", "width", "height", "length", "weight",
             "shipping_fee", "shipping_duration", "low_stock_threshold",
             "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
             "started_at", "expired_at", "created_at", "updated_at", "views",
+            // ── trading : '5,000 KGS' 같은 표기로 들어오므로 숫자만 뽑아 확정합니다 ──
+            "package_count", "weight_gross", "weight_net", "volume",
+            "subtotal_amount", "tax_amount", "freight_amount", "insurance_amount",
+            "local_charges", "exchange_rate", "number_of_originals",
         ];
-        const BOOL_KEYS: [&str; 11] = [
+        const BOOL_KEYS: [&str; 16] = [
+            // ── commerce ──
             "detail", "is_masked", "is_device", "embed", "node",
             "new_customer_only", "first_purchase_only", "region_restrictions",
             "bundle_shipping", "tax_included", "recipient_match",
+            // ── trading : IDB 는 boolean 을 키로 인정하지 않으므로 0|1 정수로 내립니다 ──
+            "partial_shipment_allowed", "transshipment_allowed",
+            "freight_prepaid", "marine_pollutant", "is_original",
         ];
 
         let obj = match v.as_object_mut() {
@@ -638,11 +657,32 @@ impl VectorStore {
                 None | Some(Value::Null) => 0.0,
                 Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
                 Some(Value::String(s)) => {
+                    let t = s.trim();
                     // 🌟 status 는 문자열 상태값("complete")이 들어올 수 있으므로 먼저 코드로 환산합니다.
                     if *k == "status" {
-                        crate::logic::parse_status(s) as f64
+                        crate::logic::parse_status(t) as f64
+                    } else if t.len() >= 10
+                        && t.as_bytes().get(4) == Some(&b'-')
+                        && t.as_bytes().get(7) == Some(&b'-')
+                    {
+                        // 🌟 [ISO DATE FIX] scheduler 의 normalize_data 가 started_at / expired_at 을
+                        //    "2024-01-01T12:00:00" ISO 문자열로 만들어 넘깁니다.
+                        //    기존 숫자 추출식은 "2024-01-01120000" 을 만들어 파싱에 실패했고,
+                        //    그 결과 모든 기간 조건이 0 으로 뭉개져 range 쿼리가 통째로 죽었습니다.
+                        //    epoch ms 로 확정해야 Dexie 의 between/above 가 성립합니다.
+                        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S") {
+                            dt.and_utc().timestamp_millis() as f64
+                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S") {
+                            dt.and_utc().timestamp_millis() as f64
+                        } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&t[..10], "%Y-%m-%d") {
+                            d.and_hms_opt(0, 0, 0)
+                                .map(|x| x.and_utc().timestamp_millis() as f64)
+                                .unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
                     } else {
-                        let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                        let cleaned: String = t.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
                         cleaned.parse::<f64>().unwrap_or(0.0)
                     }
                 },
@@ -1169,16 +1209,24 @@ impl VectorStore {
         if target_str.is_empty() { return Ok(None); }
 
         // 🌟 canonicalize_data 와 동일한 분류 규칙입니다. 두 곳이 어긋나면 프리필터가 0건이 됩니다.
-        const ID_KEYS: [&str; 13] = [
+        //    (trading 키를 여기에 넣지 않으면 doc_number / container_number 로 RELAY 조회 시
+        //     needle 이 `"doc_number":123` 형태로 잘못 만들어져 항상 0건이 됩니다)
+        const ID_KEYS: [&str; 23] = [
             "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
             "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
+            "doc_number", "container_number", "seal_number",
+            "reference_invoice", "reference_lc", "reference_booking",
+            "reference_buyer", "reference_seller", "reference_carrier", "hs_code",
         ];
-        const NUM_KEYS: [&str; 24] = [
+        const NUM_KEYS: [&str; 35] = [
             "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
             "discount", "quantity", "width", "height", "length", "weight",
             "shipping_fee", "shipping_duration", "low_stock_threshold",
             "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
             "started_at", "expired_at", "created_at", "updated_at", "views",
+            "package_count", "weight_gross", "weight_net", "volume",
+            "subtotal_amount", "tax_amount", "freight_amount", "insurance_amount",
+            "local_charges", "exchange_rate", "number_of_originals",
         ];
 
         let escaped_prop = property.replace('\'', "''");

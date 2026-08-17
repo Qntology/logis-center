@@ -95,6 +95,26 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
             const mapped = STATUS_CODE[v.trim().toLowerCase()];
             if (mapped !== undefined) { out[k] = mapped; continue; }
         }
+        // 🌟 [ISO DATE FIX] scheduler 가 started_at / expired_at 을 ISO 문자열로 넘깁니다.
+        //    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
+        //    Rust canonicalize_data 와 동일하게 UTC epoch ms 로 확정합니다.
+        if (typeof v === 'string') {
+            const t = v.trim();
+            if (/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) {
+                let ms: number;
+                if (t.length === 10) {
+                    // "2024-01-01" 은 명세상 UTC 로 해석됩니다.
+                    ms = Date.parse(t);
+                } else {
+                    const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
+                    const norm = t.includes('T') ? t : t.replace(' ', 'T');
+                    // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
+                    ms = Date.parse(hasTz ? norm : norm + 'Z');
+                }
+                out[k] = isNaN(ms) ? 0 : ms;
+                continue;
+            }
+        }
         const n = typeof v === 'number' ? v : Number(String(v).replace(/[^\d.\-]/g, ''));
         out[k] = isNaN(n) ? 0 : n;
     }
@@ -436,6 +456,10 @@ async function syncAnalyticsData() {
             items.push({
                 id: row.id,
                 type: rowType,
+                // 🌟 [FLAG] analytics D1 은 flag 컬럼을 실제로 채워 보냅니다(console/analytics 워커 공통).
+                //    여기서 버리면 LanceDB / Dexie 의 flag 봉투가 영원히 빈 문자열이 되어
+                //    지역별 스코프 조회가 불가능해집니다.
+                flag: row.flag || "",
                 from: row.from || "",
                 to: row.to || "",
                 cc: rowCc,
@@ -691,8 +715,10 @@ async function kvRemove(key: string) {
 //  🌟 v7 : data.link / data.origin 제거 (contains 전용이라 인덱스 이득 0),
 //          data.title / data.name / data.sender_name / data.recipient_name 추가.
 const DEXIE_INDEXED_PATHS = new Set<string>([
+    // ── 봉투 ──
     'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
     'created_at', 'updated_at',
+    // ── commerce 축 ──
     'data.index', 'data.no', 'data.code', 'data.tracking_number',
     'data.goods', 'data.order', 'data.tracking',
     'data.stock_keeping_unit', 'data.barcode',
@@ -701,7 +727,17 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.carrier', 'data.shipping_method',
     'data.started_at', 'data.expired_at',
     'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
-    'data.embed', 'data.digest'
+    'data.embed', 'data.digest',
+    // ── 🌟 trading 축 : v8 stores 선언과 1:1 로 일치해야 합니다 ──
+    //    이 21개가 빠져 있으면 선언한 인덱스가 단 한 번도 쓰이지 않고
+    //    모든 무역 조건이 .filter() 풀스캔으로 떨어집니다.
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    'data.container_number', 'data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking'
 ]);
 
 interface DexieCondition {
@@ -795,8 +831,12 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
 //  eq 가 범위보다 선택도가 높고, 식별자 경로가 상태/수치보다 선택도가 높습니다.
 function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
     const HIGH_SELECTIVITY = [
+        // ── commerce 식별자 ──
         'data.tracking_number', 'data.no', 'data.code', 'data.index',
-        'data.barcode', 'data.stock_keeping_unit', 'data.digest'
+        'data.barcode', 'data.stock_keeping_unit', 'data.digest',
+        // ── 🌟 trading 식별자 : 카디널리티가 상품명/항구명보다 압도적으로 높습니다 ──
+        'data.doc_number', 'data.container_number', 'data.seal_number',
+        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking'
     ];
 
     let best: DexieCondition | null = null;
@@ -2906,6 +2946,28 @@ async function syncData() {
             });
 
             if (filteredResults.length > 0) {
+                // 🌟 [MODE TAGGING] 클라우드 D1 에는 mode 컬럼이 없습니다.
+                //    무역 서식 타입은 여기서 mode='shipping' 으로 확정해야
+                //    loadMoreDocs / reindex_pending_embeddings 의 트랙 격리가 성립합니다.
+                //    (TYPE_SETS.shipping 과 동일한 판정을 씁니다)
+                const TRADING_TYPES = new Set([
+                    'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
+                    'PO', 'PI', 'SC', 'LC', 'po', 'pi', 'sc', 'lc',
+                    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
+                    'ci', 'pl', 'bl', 'awb', 'sa', 'do', 'an', 'bc',
+                    'ED', 'ID', 'CINV', 'CO', 'ed', 'id', 'cinv', 'co',
+                    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+                    'ic', 'wc', 'ca', 'phyto', 'hc', 'ben_cert',
+                    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
+                    'dgd', 'msds', 'poa', 'biz_lic', 'ins'
+                ]);
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (r.mode) continue;
+                    const t = String(r.type || "");
+                    r.mode = TRADING_TYPES.has(t) ? "shipping" : "commerce";
+                }
+
                 console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
                 await invoke("upsert_items", { items: filteredResults });
                 
