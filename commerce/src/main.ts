@@ -631,55 +631,98 @@ const appDb = new DexieLocal("LogisAppDB");
 //  ⚠️ 여기 없는 무역 필드(marks_numbers, notify_party_name, place_receipt 등)는
 //     executeDexiePlan 이 .filter() 풀스캔으로 처리합니다.
 //     로컬 수천~수만 건 기준 수 ms 이므로 인덱스가 없어도 동작에 지장이 없습니다.
-appDb.version(8).stores({
-    items: [
-        // ── 봉투 (v7 그대로 유지) ──
-        'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
-        'created_at', 'updated_at',
-        '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
-        // ── commerce 축 (v7 그대로 유지) ──
-        'data.index', 'data.no', 'data.code', 'data.tracking_number',
-        'data.goods', 'data.order', 'data.tracking',
-        'data.stock_keeping_unit', 'data.barcode',
-        'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
-        'data.quantity', 'data.weight', 'data.discount',
-        'data.carrier', 'data.shipping_method',
-        'data.started_at', 'data.expired_at',
-        'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
-        'data.embed', 'data.digest',
-        '*data.tags',
-        // ── 🌟 trading 축 (신규) ──
-        //  ① 문서 식별 : B/L No, AWB No, PO No, Booking No 를 하나로 흡수
-        'data.doc_type', 'data.doc_number', 'data.issue_date',
-        //  ② 운송 : 선박/항공편 + 출발/도착 항구 (교차 조회 최다 축)
-        'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
-        'data.etd', 'data.eta',
-        //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
-        'data.incoterms', 'data.payment_terms', 'data.currency',
-        //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
-        'data.container_number', 'data.seal_number',
-        'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
-        //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
-        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
-        //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
-        //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
-        //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
-        '[type+created_at]'
-    ].join(', ')
+// 🌟 [SCHEMA CONTRACT]
+//  Dexie 는 version(N).stores() 에 '선언되지 않은' object store 를 업그레이드 시점에 삭제합니다.
+//  v8 이 items 하나만 선언한 탓에 kv_store / ts_queue / talks / users / pages 5개가
+//  물리적으로 소멸했고, 그 결과 세션(kv_store)까지 함께 날아가 로그인이 풀렸습니다.
+//  → 앞으로 stores() 에는 '앱이 쓰는 전 테이블' 을 항상 함께 적어야 합니다.
+const ITEMS_SCHEMA = [
+    // ── 봉투 (v7 그대로 유지) ──
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
+    // ── commerce 축 (v7 그대로 유지) ──
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
+    'data.embed', 'data.digest',
+    '*data.tags',
+    // ── 🌟 trading 축 ──
+    //  ① 문서 식별 : B/L No, AWB No, PO No, Booking No 를 하나로 흡수
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    //  ② 운송 : 선박/항공편 + 출발/도착 항구 (교차 조회 최다 축)
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
+    'data.container_number', 'data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
+    //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
+    //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
+    '[type+created_at]'
+].join(', ');
+
+// 🌟 v9 : v8 이 삭제해 버린 5개 테이블을 복구합니다.
+//    items 는 스키마가 동일하므로 diff 가 없어 데이터가 그대로 보존됩니다.
+appDb.version(9).stores({
+    items: ITEMS_SCHEMA,
+
+    // ── 세션 / 설정 / 터미널 로그 / 숨김 페이지 목록 등 KV 저장소 ──
+    //    { key, value } 형태이며 primaryKeys() 순회로 GC 도 수행하므로 pk 는 key 입니다.
+    kv_store: 'key',
+
+    // ── 프론트엔드 작업 대기열 (GlobalTaskManager) ──
+    //    saveQueue() 가 clear() → bulkAdd() 하므로 taskId 를 pk 로 써도 충돌하지 않습니다.
+    ts_queue: 'taskId, type',
+
+    // ── 채팅/작업 말풍선 (봉투 정규화를 거치지 않는 별도 스키마) ──
+    //    role / task_id / status 를 그대로 보존해야 하므로 normalizeEnvelope 를 적용하지 않습니다.
+    talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
+
+    // ── 팀 / 멤버 / 로컬 디바이스 (봉투 정규화 적용, 도메인 필드 시딩 없음) ──
+    users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
+
+    // ── 페이지 셀렉터 캐시 (봉투 정규화 적용, 도메인 필드 시딩 없음) ──
+    pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin'
 });
 
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
 
 // --- kv 헬퍼 (반드시 appDb 선언 바로 아래, 모든 호출부보다 위에 위치) ---
+// 🌟 [FAIL-SOFT] 스토어가 없거나 업그레이드 중이면 예외 대신 null / no-op 으로 흡수합니다.
+//    kvGet 이 throw 하면 initSession 첫 줄에서 전체 초기화가 중단되어
+//    updateAuthUI() 조차 실행되지 않고 Sign Out 버튼이 그대로 노출됩니다.
 async function kvGet(key: string): Promise<any> {
-    const record = await appDb.table("kv_store").get(key);
-    return record ? record.value : null;
+    try {
+        const record = await appDb.table("kv_store").get(key);
+        return record ? record.value : null;
+    } catch (e) {
+        console.warn(`[KV] get('${key}') failed:`, e);
+        return null;
+    }
 }
 async function kvSet(key: string, value: any) {
-    await appDb.table("kv_store").put({ key, value });
+    try {
+        await appDb.table("kv_store").put({ key, value });
+    } catch (e) {
+        console.warn(`[KV] set('${key}') failed:`, e);
+    }
 }
 async function kvRemove(key: string) {
-    await appDb.table("kv_store").delete(key);
+    try {
+        await appDb.table("kv_store").delete(key);
+    } catch (e) {
+        console.warn(`[KV] remove('${key}') failed:`, e);
+    }
 }
 
 // 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
@@ -1049,8 +1092,13 @@ class GlobalTaskManager {
                 console.error("[QUEUE] Failed to log leftover tasks to LanceDB:", e);
             }
 
-            await appDb.table("ts_queue").clear();
-            console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
+            // 🌟 [FAIL-SOFT] 스토어 부재/업그레이드 중이어도 초기화 흐름을 끊지 않습니다.
+            try {
+                await appDb.table("ts_queue").clear();
+                console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
+            } catch (e) {
+                console.warn("[QUEUE] ts_queue clear failed (table may be missing):", e);
+            }
             this.queue = [];
             return;
         }
@@ -2562,8 +2610,16 @@ async function renderNavigation() {
 
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
-            const localUsers = users.filter(u => u.data && u.data.is_device === true);
-            const cloudUsers = users.filter(u => !u.data || u.data.is_device !== true);
+            // 🌟 [BOOL PARITY] canonicalizeData 의 BOOL_KEYS 가 is_device 를 0|1 정수로 확정합니다.
+            //    (IndexedDB 는 boolean 을 유효한 키로 인정하지 않기 때문입니다)
+            //    따라서 === true 비교는 항상 false 가 되어 로컬 디바이스가 전부
+            //    Cloud Members 로 새어 나갔습니다. truthy 판정으로 통일합니다.
+            const isDevice = (u: any) => {
+                const v = u?.data?.is_device;
+                return v === 1 || v === true || v === "1" || v === "true";
+            };
+            const localUsers = users.filter(u => isDevice(u));
+            const cloudUsers = users.filter(u => !isDevice(u));
 
             // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
@@ -4742,7 +4798,9 @@ function finalizeWebRtcConnection(guestSession: any) {
             name: guestName,
             from: guestAddr, 
             to: currentSession.team || "0x0000000000000000000000000000000000000000",    
-            data: { origin: "local", is_device: true } 
+            // 🌟 [BOOL PARITY] IndexedDB 는 boolean 을 키로 인정하지 않습니다.
+            //    저장 시점부터 0|1 정수로 확정해야 data.is_device 인덱스가 실제로 동작합니다.
+            data: { origin: "local", is_device: 1 } 
         };
         
         invoke("upsert_items", { items: [mobileUser] }).then(() => renderNavigation());
@@ -6070,6 +6128,12 @@ async function saveSession() { await kvSet("chat_session", JSON.stringify(curren
 let hiddenPages: string[] = [];
 
 async function initSession() {
+    // 🌟 [AUTH UI FIRST] 어떤 비동기 초기화가 실패하더라도 인증 UI 는 항상 옳은 상태여야 합니다.
+    //    currentSession.email 이 비어 있는 최초 시점에 즉시 호출하면
+    //    Sign Out 버튼이 숨겨지고 QR 인증 버튼이 노출됩니다.
+    //    (세션 복원 후 아래에서 한 번 더 호출해 최종 상태를 확정합니다)
+    updateAuthUI();
+
     // 🌟 [추가] Dexie에서 숨김 페이지 목록을 불러옵니다.
     const savedHiddenPages = await kvGet("hidden_pages");
     if (savedHiddenPages) {
