@@ -252,13 +252,33 @@ async fn reindex_pending_embeddings(
     };
 
     let scan_limit = limit.unwrap_or(20);
-
     // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
     //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
     let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
     let mode_filter = format!("mode = '{}'", target_mode);
-
-    let docs = store.get_all_items("items", 500, 0, Some(mode_filter)).await.map_err(|e| e.to_string())?;
+    // 🌟 [SCAN STARVATION FIX]
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 offset 0 에서 500건만 읽었습니다. 정렬 기준이 고정되어 있으므로
+    //   상위 500건이 전부 임베딩 완료 상태가 되면 pending 이 비고 no_pending 으로 끝나,
+    //   501번째 이후의 미처리 문서는 영원히 처리되지 않았습니다.
+    //   문서가 500건을 넘는 순간 로컬 임베딩이 조용히 멈춥니다.
+    //   scan_limit 만큼 채울 때까지 오프셋을 밀며 순회합니다.
+    const SCAN_PAGE: usize = 500;
+    const SCAN_MAX_PAGES: usize = 40; // 최대 20,000건까지 탐색
+    let mut docs: Vec<TradeDocument> = Vec::new();
+    for page in 0..SCAN_MAX_PAGES {
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        let batch = store
+            .get_all_items("items", SCAN_PAGE, page * SCAN_PAGE, Some(mode_filter.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let fetched = batch.len();
+        docs.extend(batch);
+        if fetched < SCAN_PAGE { break; }
+        // 이번 페이지까지의 후보로 scan_limit 을 채울 수 있으면 더 읽지 않습니다.
+        let rough_pending = docs.iter().filter(|d| !d.id.is_empty()).count();
+        if rough_pending >= scan_limit * 20 { break; }
+    }
 
     // 🌟 [LAZY MODEL LOAD] 대상 선별을 '모델 로드 이전' 으로 끌어올립니다.
     //    기존 구조는 LogisModel::new → ensure_embedding 을 먼저 수행한 뒤 스캔했기 때문에,
@@ -270,7 +290,12 @@ async fn reindex_pending_embeddings(
         if pending.len() >= scan_limit { break; }
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
         if doc.id.is_empty() { continue; }
-        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search" {
+        // 🌟 question / answer 는 관리자 채팅 말풍선 전용 타입입니다.
+        //    upsert_items 가 items 로 라우팅하는데 제외 목록에는 없어 벡터화되고 있었고,
+        //    parse_analytic_query 는 이 두 타입을 검색 스코프에서 제외하므로
+        //    만들기만 하고 한 번도 쓰이지 않는 벡터였습니다.
+        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search"
+            || doc.r#type == "question" || doc.r#type == "answer" {
             continue;
         }
         // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
@@ -940,13 +965,24 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     // ── status : 문자열 상태값을 코드로 환산해서 넣습니다 ──
     if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
         let clean = status.trim();
-        if !clean.is_empty() && clean != "null" {
+        // 🌟 [ZERO GUARD] logic::parse_status 는 매핑에 없는 문자열에 0 을 돌려줍니다.
+        //    그런데 canonicalize_data 가 status 미보유 문서에 0 을 시딩하므로,
+        //    코드 0 을 조건으로 내보내면 '상태가 없는 문서 전부' 를 매칭하게 됩니다.
+        //    (bias.json 의 status_filters.remove 가 정확히 이 경로였습니다)
+        //    코드가 확정되지 않으면 조건 자체를 만들지 않는 편이 리콜에 안전합니다.
+        let code = crate::logic::parse_status(clean);
+        if !clean.is_empty() && clean != "null" && code != 0 {
             conditions.push(json!({
                 "path": "data.status",
                 "op": "eq",
-                "value": crate::logic::parse_status(clean),
+                "value": code,
                 "kind": "number"
             }));
+        } else if !clean.is_empty() && clean != "null" {
+            println!(
+                "[DEXIE-PLAN] ⚪ status='{}' 는 parse_status 매핑이 없어(코드 0) 조건에서 제외합니다.",
+                clean
+            );
         }
     }
 
@@ -1313,10 +1349,16 @@ async fn ai_search_complex(
 
     emit_term("[QUEUE] AI Engine acquired. Starting process...");
 
-    // [REMOVE] 백엔드 자체 검색 락 변수 조작 제거
-    // 프론트엔드의 GlobalTaskManager가 이미 입구를 막고 있으므로 
-    // 백엔드는 별도의 AtomicBool 락 없이 즉시 실행 로직에 집중합니다.
-
+    // 🌟 [SEARCH FLAG RESTORE]
+    //  ── 무엇이 문제였나 ──
+    //   프론트엔드가 입구를 막는다는 이유로 IS_SEARCHING.store(true) 를 제거했는데,
+    //   이 플래그를 '읽는' 가드는 unload_model 과 reindex_pending_embeddings 에
+    //   그대로 남아 있습니다. 플래그가 영원히 false 이므로 두 가드가 사문화되었고,
+    //   특히 unload_model 은 ACTIVE_TASK_MEM 가드가 없어
+    //   검색 도중 들어온 언로드 요청이 그대로 통과합니다.
+    //   플래그를 다시 세우는 편이 가드를 지우는 것보다 안전합니다.
+    //   (해제는 아래 search_process 종료부에서 이미 두 번 수행됩니다)
+    IS_SEARCHING.store(true, Ordering::SeqCst);
     {
         // 최소한의 동기화 정보만 업데이트 (UI 복구용)
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
@@ -1415,7 +1457,14 @@ async fn ai_search_complex(
                 tokio::task::yield_now().await;
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if text.is_empty() { continue; }
+                // 🌟 [CONDITION-ONLY CONTEXT] STAGE-3 은 텍스트가 비어도 조건이 있으면
+                //    컨텍스트를 발행합니다(union_text 가 비고 condition 이 있는 경우).
+                //    기존처럼 텍스트만 보고 continue 하면 dexie_plans.push 까지 건너뛰어
+                //    그 컨텍스트의 조건이 프론트엔드에 전달조차 되지 않았습니다.
+                let has_condition = ctx.get("condition")
+                    .and_then(|v| v.as_object())
+                    .map_or(false, |o| !o.is_empty());
+                if text.trim().is_empty() && !has_condition { continue; }
                 let raw_ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
                 if raw_ctx_type == "ignore" {
@@ -1428,8 +1477,41 @@ async fn ai_search_complex(
                 //    (저장 테이블과 조회 테이블이 어긋날 수 있는 경로 자체가 사라졌습니다)
                 //    구버전 STAGE-3 가 만든 컨텍스트와의 호환을 위해 접미사만 벗겨 냅니다.
                 let ctx_type: &str = raw_ctx_type.strip_suffix("_items").unwrap_or(raw_ctx_type);
-
-                let search_text = text.to_string();
+                // 🌟 [SEARCH TEXT SYNTHESIS] 텍스트가 비고 조건만 있는 컨텍스트는
+                //    FTS 검색어가 없어 임베딩이 빈 문자열 벡터가 됩니다.
+                //    조건 값과 unassigned 키워드로 검색어를 합성해 리콜을 확보합니다.
+                //    (조건 자체는 dexie_plan 이 정확히 실행하므로 여기서는 후보만 넓히면 됩니다)
+                let search_text = if !text.trim().is_empty() {
+                    text.to_string()
+                } else {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
+                        for (_, v) in cond {
+                            if let Some(s) = v.get("value").and_then(|x| x.as_str()) {
+                                let t = s.trim();
+                                if !t.is_empty() && !parts.iter().any(|p| p == t) {
+                                    parts.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(un) = ctx.get("unassigned").and_then(|v| v.as_array()) {
+                        for u in un {
+                            if let Some(s) = u.as_str() {
+                                let t = s.trim();
+                                if !t.is_empty() && !parts.iter().any(|p| p == t) {
+                                    parts.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let synthesized = parts.join(" ");
+                    println!(
+                        "[AI-SEARCH] 🧪 [SEARCH TEXT SYNTHESIS] type='{}' | 텍스트 부재 → 조건 값으로 합성: \"{}\"",
+                        ctx_type, synthesized
+                    );
+                    synthesized
+                };
 
                 // 🌟 [TABLE ROUTING v4] users / pages 만 물리 분리, 나머지는 전부 items.
                 //    scheduler 저장 매핑과 lib 조회 매핑이 어긋나 'review 는 items 에 저장되는데
@@ -1448,6 +1530,18 @@ async fn ai_search_complex(
                     // 폴백 접미사가 붙은 type 이 SQL 에 그대로 나가면 `type = 'review_items'` 가 되어
                     // 항상 0건이 됩니다. 정규화된 이름으로 교체합니다.
                     o.insert("type".to_string(), json!(ctx_type));
+                    // 🌟 [TENANT SCOPE] build_scope_filter 는 cc / bcc / ref 를 읽도록 되어 있는데
+                    //    STAGE-3 / parse_shipping_query / parse_analytic_query 가 만드는 컨텍스트에는
+                    //    그 키가 하나도 없어 해당 블록이 통째로 죽어 있었습니다.
+                    //    그 결과 AI 검색이 전 팀·전 사이트 문서를 무차별로 반환했습니다.
+                    //    ai_search_complex 가 인자로 이미 받고 있으므로 여기서 주입합니다.
+                    //
+                    //    ⚠️ bcc / ref 는 넣지 않습니다.
+                    //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
+                    //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
+                    if !cc.trim().is_empty() {
+                        o.insert("cc".to_string(), json!(cc.clone()));
+                    }
                 }
                 let scope_filter = build_scope_filter(&scope_ctx, &search_mode);
                 let dexie_plan = build_dexie_plan(&scope_ctx, &search_mode);
@@ -1481,10 +1575,17 @@ async fn ai_search_complex(
                         Vec::new()
                     });
 
-                // 🌟 [SCOPE FALLBACK] 스코프가 지나치게 좁아 0건이면 mode 만으로 한 번 더 긁습니다.
+                // 🌟 [SCOPE FALLBACK] 스코프가 지나치게 좁아 0건이면 도메인 조건만 완화해 한 번 더 긁습니다.
                 //    기존 A/FULL → B/NARROWED → C/RECALL 3티어가 하던 일을 여기서 1회로 흡수합니다.
+                //    🌟 [TENANT PRESERVE] 완화 대상은 'type / 시간' 같은 도메인 스코프뿐입니다.
+                //       cc(팀·사이트)까지 버리면 폴백 한 번으로 타 팀 문서가 그대로 새어 나가므로,
+                //       테넌트 스코프는 폴백에서도 반드시 유지합니다.
                 let final_results = if final_results.is_empty() {
-                    let mode_only = format!("mode = '{}'", search_mode);
+                    let mode_only = if cc.trim().is_empty() {
+                        format!("mode = '{}'", search_mode)
+                    } else {
+                        format!("mode = '{}' AND `cc` = '{}'", search_mode, cc.replace('\'', "''"))
+                    };
                     println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
                     store
                         .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
@@ -1891,10 +1992,20 @@ async fn ai_search_complex(
             // chunk_match = true 인 항목은 프론트엔드에서
             // "어떤 속성이 매칭되었는지" 를 배지로 표시할 수 있습니다.
             //
-            // limit: 프론트엔드 렌더링 부하 방지를 위해 최대 20개 반환
-            let final_limit = 20usize;
-            if ranked_results.len() > final_limit {
-                ranked_results.truncate(final_limit);
+            // 🌟 [RECALL PRESERVE] 기존 20건 절단은 v4 설계와 정면으로 충돌했습니다.
+            //    이 시점의 ranked_results 는 '도메인 조건이 하나도 적용되지 않은 리콜 후보' 입니다.
+            //    정렬 기준도 벡터·FTS 점수뿐이므로, 조건을 만족하는 정답이 21위였다면
+            //    Dexie(executeDexiePlan)가 그 조건을 실행할 기회 자체를 잃습니다.
+            //    컨텍스트가 3개면 RECALL_LIMIT 50 × 3 = 150 후보가 20건으로 잘립니다.
+            //    최종 표시 개수는 조건을 적용한 프론트엔드가 결정해야 합니다.
+            //    (여기서는 전송량 상한만 둡니다)
+            const FINAL_LIMIT: usize = 200;
+            if ranked_results.len() > FINAL_LIMIT {
+                println!(
+                    "[AI-SEARCH] ✂️ [TRANSPORT CAP] 리콜 후보 {}건 → {}건으로 상한 적용 (조건 적용은 Dexie 담당)",
+                    ranked_results.len(), FINAL_LIMIT
+                );
+                ranked_results.truncate(FINAL_LIMIT);
             }
 
             // ── 검색 통계 로그 출력 ──

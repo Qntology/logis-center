@@ -125,6 +125,20 @@
       }
     }
   },
+  "verb": {
+    "bias": {
+      "ko": "찾다, 알려주다, 보여주다, 검색하다, 조회하다, 확인하다, 요청하다, 질문하다, 설명하다, 요약하다, 추천하다, 분석하다, 정리하다, 비교하다",
+      "en": "find, search, show, tell, get, query, request, ask, explain, summarize, recommend, analyze, compare, list",
+      "english": "find, search, show, tell, get, query, request, ask, explain, summarize, recommend, analyze, compare, list"
+    }
+  },
+  "expression": {
+    "bias": {
+      "ko": "해줘, 주세요, 부탁해, 좀, 어때, 인가요, 인지, 될까요, 싶어, 하고 싶다",
+      "en": "please, could you, would you, i want to, i need to, how about, is it, can you",
+      "english": "please, could you, would you, i want to, i need to, how about, is it, can you"
+    }
+  },
   "insight": {
     "conversion_insight": {
       "target_domain": ["order"],

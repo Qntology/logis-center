@@ -45,7 +45,12 @@ const NUM_CONTAINS = [
 ];
 const NUM_EXACT = new Set(['width', 'height', 'length']);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
-const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match', '_shipping'];
+// 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
+//    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
+//    bool 변환식이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
+//    bias_schema.rs 도 add("bundle_shipping", "String", ...) 로 선언하므로
+//    문자열로 두는 것이 Rust 쪽과도 일치합니다.
+const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match'];
 
 function kindOf(key: string): CanonKind {
     const k = key.toLowerCase();
@@ -56,7 +61,8 @@ function kindOf(key: string): CanonKind {
     if (FORCE_NUM.has(k)) return 'num';
     if (FORCE_BOOL.has(k)) return 'bool';
 
-    // 🌟 Boolean 을 먼저 검사합니다. 'bundle_shipping' 이 '_shipping' 접미사로 잡혀야 합니다.
+    // 🌟 Boolean 을 수치보다 먼저 검사합니다.
+    //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
     if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
     if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
 
@@ -80,9 +86,22 @@ const SEED_KEYS: Array<[string, CanonKind]> = [
     ['id', 'id'], ['no', 'id'], ['code', 'id'], ['index', 'id'],
     ['tracking_number', 'id'], ['goods', 'id'], ['order', 'id'], ['tracking', 'id'],
     ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
-    ['status', 'num'], ['amount', 'num'], ['sale_price', 'num'], ['supply_price', 'num'],
-    ['quantity', 'num'], ['weight', 'num'], ['discount', 'num'],
-    ['started_at', 'num'], ['expired_at', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
+    // 🌟 [NUMERIC SEED REMOVED]
+    //  ── 무엇이 문제였나 ──
+    //   amount / sale_price / quantity / weight / discount / started_at / expired_at 을
+    //   0 으로 시딩하면, matchCondition 의 MISSING VALUE GUARD 가
+    //   raw === 0 을 '값이 있음' 으로 판정해 발화하지 못합니다.
+    //   그 결과 'sale_price lte 5000' 같은 조건이
+    //   가격 필드가 아예 없는 문서(무역 서식 등)를 전부 통과시켰습니다.
+    //   가드를 도입한 목적이 시딩에 의해 정확히 원위치된 상태였습니다.
+    //  ── 시딩을 빼도 되는 이유 ──
+    //   Dexie 는 키가 없는 레코드를 해당 인덱스에서 조용히 제외합니다.
+    //   즉 where('data.sale_price').belowOrEqual(5000) 이
+    //   '가격을 가진 문서' 만 돌려주는데, 그것이 정확히 옳은 동작입니다.
+    //  ⚠️ status / created_at / updated_at 은 남깁니다.
+    //     status 0 은 build_dexie_plan 의 ZERO GUARD 가 조건으로 만들지 않고,
+    //     created_at / updated_at 은 봉투 필드라 항상 실제 값이 들어옵니다.
+    ['status', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
     ['embed', 'bool'],
     ['tags', 'tags']
 ];
@@ -271,7 +290,14 @@ const TYPE_SETS: Record<string, string[]> = {
         'Unknown', 'unknown'
     ],
     analytic: ['click', 'hover', 'change', 'report'],
-    commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review']
+    // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
+    //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
+    //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
+    //    shipping 탭에는 타입은 있으나 mode 가 달라 역시 탈락 →
+    //    결과적으로 두 탭 어디에서도 보이지 않는 고아 문서가 되었습니다.
+    //    (mode 컬럼이 트랙을 이미 격리하므로 읽기 목록 중첩은 무해합니다)
+    commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
+               'receiving', 'shipping']
 };
 
 /**
@@ -525,17 +551,43 @@ async function runLocalEmbeddingSync() {
         if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
         isReindexing = true;
         try {
-            const res = await invoke<any>("reindex_pending_embeddings", {
-                limit: 20,
-                devicePreference: getDevicePref(),
-                // 🌟 [MODE ROUTING] 현재 트랙(commerce / shipping / analytic)을 그대로 백엔드에 전달
-                mode: currentSearchMode
-            });
-            if (res && res.processed && res.processed > 0) {
-                console.log(`[EMBED] Locally embedded ${res.processed} cloud-synced item(s). (mode: ${res.mode || currentSearchMode})`);
-                if (res.vectors && res.vectors.length > 0) {
-                    await pushLocalVectorsToCloud(res.vectors, res.mode || currentSearchMode);
+            // 🌟 [ALL-TRACK EMBEDDING]
+            //  ── 무엇이 문제였나 ──
+            //   기존에는 currentSearchMode 하나만 넘겼습니다.
+            //   그래서 사용자가 Trading 탭을 한 번도 열지 않으면
+            //   무역 문서가 영원히 벡터화되지 않았고,
+            //   syncAnalyticsData 직후 호출도 현재 탭이 commerce 면
+            //   analytic 문서를 건너뛰었습니다.
+            //   벡터가 없으면 search_items 는 0벡터와 비교하고
+            //   search_chunks 는 청크가 없어 검색이 구조적으로 0건이 됩니다.
+            //  ── 비용 ──
+            //   백엔드는 대상이 0건이면 임베딩 모델을 올리기 전에
+            //   'no_pending' 으로 즉시 반환하므로(LanceDB 조회 1회),
+            //   세 트랙을 순회해도 유휴 시 부담이 사실상 없습니다.
+            //   현재 탭을 먼저 처리해 체감 지연을 최소화합니다.
+            const trackOrder = [currentSearchMode,
+                ...["commerce", "shipping", "analytic"].filter(m => m !== currentSearchMode)];
+
+            let totalProcessed = 0;
+            for (const track of trackOrder) {
+                if (isSearching || isExtracting || GlobalTaskManager.isBusy) break;
+
+                const res = await invoke<any>("reindex_pending_embeddings", {
+                    limit: 20,
+                    devicePreference: getDevicePref(),
+                    mode: track
+                });
+
+                if (res && res.processed && res.processed > 0) {
+                    totalProcessed += res.processed;
+                    console.log(`[EMBED] Locally embedded ${res.processed} item(s). (mode: ${res.mode || track})`);
+                    if (res.vectors && res.vectors.length > 0) {
+                        await pushLocalVectorsToCloud(res.vectors, res.mode || track);
+                    }
                 }
+            }
+
+            if (totalProcessed > 0) {
                 await renderNavigation();
                 if (currentTab === "list") {
                     await loadMoreDocs(false, true);
@@ -1187,16 +1239,32 @@ async function executeDexiePlan(
     // ── top / bottom 백분위 : 정렬 후 슬라이스 ──
     for (const rc of rankConds) {
         if (rows.length === 0) break;
-        const pct = Math.max(1, Math.min(100, rc.percent ?? 20));
-        const take = Math.max(1, Math.ceil(rows.length * (pct / 100)));
 
-        const sorted = [...rows].sort((a, b) => {
-            const av = Number(readPath(a, rc.path)) || 0;
-            const bv = Number(readPath(b, rc.path)) || 0;
+        // 🌟 [RANK MISSING GUARD] 값이 없는 문서는 순위 자체가 성립하지 않습니다.
+        //    Number(undefined) || 0 으로 떨어지면 bottom 20% 가
+        //    '해당 축을 아예 갖지 않은 문서' 로 채워집니다.
+        //    (수치 시딩을 제거한 뒤에는 결손이 실제로 발생하므로 반드시 필요합니다)
+        const ranked = rows.filter(r => {
+            const v = readPath(r, rc.path);
+            if (v === undefined || v === null || v === "") return false;
+            return !isNaN(Number(v));
+        });
+        const skipped = rows.length - ranked.length;
+        if (ranked.length === 0) {
+            console.log(`[DEXIE-PLAN] ${rc.op} ${rc.path}: 값을 가진 문서가 0건이라 랭킹을 건너뜁니다.`);
+            continue;
+        }
+
+        const pct = Math.max(1, Math.min(100, rc.percent ?? 20));
+        const take = Math.max(1, Math.ceil(ranked.length * (pct / 100)));
+
+        const sorted = [...ranked].sort((a, b) => {
+            const av = Number(readPath(a, rc.path));
+            const bv = Number(readPath(b, rc.path));
             return rc.op === 'top' ? bv - av : av - bv;
         });
         rows = sorted.slice(0, take);
-        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건`);
+        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
     }
 
     // ── keywords : 조건이 되지 못한 청크로 보조 스코어링 ──
@@ -4156,17 +4224,26 @@ listen("extraction-progress", async (event: any) => {
                         }
                         console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
 
-                        // 🌟 [PLAN RECALL] 후보 안에서 0건이면 Dexie 전체에서 다시 찾습니다.
-                        //  LanceDB 리콜이 놓친 문서를 조건만으로 건져 올리는 경로입니다.
-                        //  (기존 C/RECALL, E/TABLE-FALLBACK 티어가 하던 일을 여기서 흡수)
-                        if (passed.length === 0) {
+                        // 🌟 [PLAN RECALL v2] 조건이 있는 플랜은 '항상' Dexie 전체를 한 번 더 훑습니다.
+                        //  ── 왜 조건부를 없애는가 ──
+                        //   candidateIds 는 lib.rs 가 점수 상위 N건으로 자른 배열이고,
+                        //   그 정렬 기준에는 도메인 조건이 아직 반영되어 있지 않습니다.
+                        //   기존처럼 passed.length === 0 일 때만 구출하면,
+                        //   후보 안에서 1건이라도 통과하는 순간 구출이 멈춰
+                        //   순위 밖의 정답이 그대로 사라집니다.
+                        //   조건 필터링은 Dexie 인덱스로 O(log n) 이므로
+                        //   항상 도는 편이 안전하고, 리콜이 전송 상한과 완전히 분리됩니다.
+                        {
                             const rescued = await executeDexiePlan(plan, { limit: 200 });
+                            let added = 0;
                             for (const p of rescued) {
+                                if (accepted.has(p.id)) continue;
                                 accepted.add(p.id);
                                 planBadges.set(p.id, `🛟 recall`);
+                                added++;
                             }
-                            if (rescued.length > 0) {
-                                console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${rescued.length}건 구출 (LanceDB 리콜 누락 보정)`);
+                            if (added > 0) {
+                                console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${added}건 추가 확보 (전송 상한과 무관한 조건 리콜)`);
                             }
                         }
                     } catch (e) {

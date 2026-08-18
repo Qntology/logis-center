@@ -991,8 +991,8 @@ impl LogisModel {
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
-        let current_size = *self.current_size.lock().await;
-        
+        // 🌟 current_size 를 읽고 한 번도 쓰지 않아 불필요한 뮤텍스 획득만 발생했습니다.
+        //    아래에서 제너레이터 슬롯을 순서대로 확인하므로 이 값이 필요 없습니다.
         let max_context_length: usize = if is_detail { 60_000 } else { 9_000 };
         let tokenizer_path = &self.qwen_model_path;
 
@@ -1286,11 +1286,41 @@ impl LogisModel {
                 let hashed_cc = crate::utils::hash::hash_id(if is_trade_doc { "local.shipping" } else { "local.commerce" });
 
                 // 식별자(ID) 추출 기준 분기
-                let raw_no = if is_trade_doc {
-                    extracted_data.get("document_number").and_then(|s| s.as_str()).unwrap_or(&task_id)
+                // 🌟 [DOC NUMBER RESOLVE]
+                //  ── 무엇이 문제였나 ──
+                //   Slice & Merge 경로의 extracted_data 는 { header:{...}, parties:{...}, ... } 중첩이라
+                //   루트에 document_number 가 없고, TRACKING Fast-Track 경로는 루트에 tracking_number 를 넣습니다.
+                //   기존 코드는 무역 모드에서 '루트 document_number' 하나만 봤기 때문에
+                //   두 경로 모두 항상 None → raw_no = task_id 였습니다.
+                //   task_id 는 스캔마다 새로 생기므로 index/id/ref 가 매번 달라져
+                //   같은 문서를 다시 스캔해도 upsert 가 아니라 신규 행이 계속 쌓였습니다.
+                //  ── 탐색 순서 ──
+                //   header.document_number → header.doc_number
+                //   → 루트 document_number → 루트 doc_number → 루트 tracking_number
+                //   "N/A" 는 LLM 이 '못 찾았다' 는 뜻으로 쓰는 값이라 식별자가 될 수 없습니다.
+                let raw_no_owned: String = if is_trade_doc {
+                    let from_header = extracted_data.get("header")
+                        .and_then(|h| h.get("document_number").or_else(|| h.get("doc_number")))
+                        .and_then(|s| s.as_str());
+                    let from_root = extracted_data.get("document_number")
+                        .or_else(|| extracted_data.get("doc_number"))
+                        .or_else(|| extracted_data.get("tracking_number"))
+                        .and_then(|s| s.as_str());
+                    from_header
+                        .or(from_root)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+                        .unwrap_or_else(|| task_id.clone())
                 } else {
-                    extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id)
+                    extracted_data.get("tracking_number")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+                        .unwrap_or_else(|| task_id.clone())
                 };
+                let raw_no: &str = raw_no_owned.as_str();
+                emit_term(&format!("[STAGE-3] 문서 식별자 확정: '{}' (task_id 폴백 여부: {})",
+                    raw_no, raw_no == task_id.as_str()));
                 
                 let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
                 
@@ -2115,7 +2145,10 @@ impl LogisModel {
             "korean" | "ko" => "ko",
             "english" | "en" => "en",
             "japanese" | "ja" => "ja",
-            "chinese" | "zh" | "zh-tw" | "zh-hk" => "zh-hans",
+            // 🌟 whatlang::Lang::Cmn → query_lang 이 "zh-hans" 를 돌려주는데
+            //    기존 arm 에 그 값 자체가 없어 _ => "en" 으로 떨어졌습니다.
+            //    중국어 질의가 영어 Stanza 모델로 분석되어 POS 태그가 전량 오염됩니다.
+            "chinese" | "zh" | "zh-hans" | "zh-hant" | "zh-tw" | "zh-hk" => "zh-hans",
             "french" | "fr" => "fr",
             "german" | "de" => "de",
             "spanish" | "es" => "es",
@@ -2127,6 +2160,11 @@ impl LogisModel {
             "thai" | "th" => "th",
             "hindi" | "hi" => "hi",
             "bengali" | "bn" => "bn",
+            // 🌟 query_lang 이 실제로 발행하는 값인데 arm 이 없어 en 으로 떨어졌습니다.
+            //    모델 디렉터리가 없으면 아래 stanza_lang_dir.exists() 가 걸러
+            //    공백 분할로 안전하게 폴백합니다. 영어 모델을 잘못 쓰는 것보다 낫습니다.
+            "telugu" | "te" => "te",
+            "khmer" | "km" => "km",
             "greek" | "el" => "el",
             "hebrew" | "he" => "he",
             "vietnamese" | "vi" => "vi",
@@ -3019,15 +3057,27 @@ impl LogisModel {
                     bias_texts.push(bias);
                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                     
-                    // 🌟 [DB SCHEMA CHECK] 스키마 설명(desc)에서 실제 데이터 타입을 추출합니다.
-                    // 언더바(_)를 기준으로 단어를 분리(split)하여 price, amount, quantity 등 특정 키워드가 독립적으로 존재하는지 검사하여 Number/Boolean 타입을 자동 인식합니다.
+                    // 🌟 [DB SCHEMA CHECK v2 / DELEGATED]
+                    //  ── 무엇이 바뀌었나 ──
+                    //   기존에는 ["price","amount","quantity","discount","fee","weight",
+                    //   "width","height","length","limit"] 완전 일치 목록을 여기와 DFS 루프
+                    //   두 곳에 각각 복제해 두었습니다. 커머스 전용 목록이라
+                    //   volume / package_count / local_charges / exchange_rate 같은
+                    //   무역 수치 축이 전부 String 으로 떨어졌고, 그 결과
+                    //     · 연산자가 contains 로 강제되어 수치 비교가 불가능
+                    //     · NUMERIC REROUTE 의 Numeric 후보 루프에서 제외
+                    //   가 동시에 발생했습니다.
+                    //   ai_utils::detect_field_format 이 이미 같은 판정을 하고 있으므로
+                    //   그쪽 한 곳으로 위임하여 구현이 갈라지는 원인을 없앱니다.
+                    //   Boolean 은 detect_field_format 에 없는 축이라 기존 규칙을 유지합니다.
                     let parts: Vec<&str> = lower_key.split('_').collect();
-                    let is_number = parts.iter().any(|&p| ["price", "amount", "quantity", "discount", "fee", "weight", "width", "height", "length", "limit"].contains(&p));
                     let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
-
-                    let type_str = if desc.contains("Number") || is_number { "Number" }
+                    let fmt_is_number = crate::utils::ai_utils::detect_field_format(&lower_key)
+                        == crate::utils::ai_utils::FieldFormat::Numeric;
+                    let type_str = if desc.contains("Number") { "Number" }
                                    else if desc.contains("Boolean") || is_boolean { "Boolean" }
                                    else if desc.contains("Array") { "Array" }
+                                   else if fmt_is_number { "Number" }
                                    else { "String" };
                     prop_types.insert(key, type_str);
                 }
@@ -3072,15 +3122,18 @@ impl LogisModel {
                                     bias_texts.push(bias);
                                     prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
                                     
-                                    // 언더바(_)를 기준으로 단어를 분리(split)하여 price, amount, quantity 등 특정 키워드가 독립적으로 존재하는지 검사하여 Number/Boolean 타입을 자동 인식합니다.
+                                    // 🌟 [DB SCHEMA CHECK v2 / DELEGATED] 위 스키마 필드 루프와 동일 규칙입니다.
+                                    //    두 곳에 복제해 두었던 수치 키워드 목록을
+                                    //    ai_utils::detect_field_format 한 곳으로 위임합니다.
                                     let node_key_lower = node_key.to_lowercase();
                                     let parts: Vec<&str> = node_key_lower.split('_').collect();
-                                    let is_number = parts.iter().any(|&p| ["price", "amount", "quantity", "discount", "fee", "weight", "width", "height", "length", "limit"].contains(&p));
                                     let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
-
-                                    let type_str = if desc.contains("Number") || is_number { "Number" }
+                                    let fmt_is_number = crate::utils::ai_utils::detect_field_format(&node_key_lower)
+                                        == crate::utils::ai_utils::FieldFormat::Numeric;
+                                    let type_str = if desc.contains("Number") { "Number" }
                                                    else if desc.contains("Boolean") || is_boolean { "Boolean" }
                                                    else if desc.contains("Array") { "Array" }
+                                                   else if fmt_is_number { "Number" }
                                                    else { "String" };
                                     prop_types.insert(node_key.clone(), type_str);
                                     loaded_globals.push(node_key);
@@ -3171,7 +3224,12 @@ impl LogisModel {
                     }
 
                     // 🌟 다국어 값 어휘 축 편입 (역방향 indexing_anchor_text 와 동일 노드)
-                    let mv = crate::utils::ai_utils::multilingual_value_anchor_phrases(&prop_keys[i]);
+                    //    🌟 [DOMAIN SCOPE] bias.json 키는 "goods.title" / "review.title" / "tracking.title" 인데
+                    //       ai_utils 의 접미 매칭(rsplitn)이 세 도메인을 전부 병합했습니다.
+                    //       그 결과 review 검색의 title 뱅크에 의류 어휘 200여 구가 실려
+                    //       review.title 과 goods.title 이 벡터 공간에서 구분되지 않았습니다.
+                    //       seg_type 을 함께 넘겨 이 세그먼트의 도메인 축만 편입합니다.
+                    let mv = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped(&seg_type, &prop_keys[i]);
                     if !mv.is_empty() {
                         mv_anchor_log.push(format!("{}({}구)", prop_keys[i], mv.len()));
                     }
@@ -3725,10 +3783,6 @@ impl LogisModel {
                             "    🚫 [ACTION VERB IGNORED] '{}' | POS: {} | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
                             word, word_pos, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
                         ));
-                        emit_term(&format!(
-                            "    🚫 [ACTION VERB IGNORED] '{}' | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
-                            word, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
-                        ));
 
                         // 🌟 [FTS 정화용 기록] 벡터로 확정된 순수 명령어만 STAGE-3 검색 텍스트에서 제거합니다.
                         //    다국어 어휘 하드코딩 없이 이 목록만 소비합니다.
@@ -3819,7 +3873,7 @@ impl LogisModel {
                     //    무관한 단어는 전 뱅크에서 음수가 나와 라우팅 자체가 일어나지 않습니다.
                     //
                     //    🌟 숫자를 포함한 단어는 '정도' 가 아니라 '값' 이므로 게이트를 건너뜁니다.
-                    let word_has_digit = word.chars().any(|c| c.is_ascii_digit());
+                    //    (word_has_digit 는 ACTION VERB 게이트 직전에 이미 선언되어 있습니다)
                     if !word_has_digit && !all_filter_embs.is_empty() {
                         let we = self.get_embedding(effective_word.clone()).await.unwrap_or(vec![0.0; 384]);
                         if !we.iter().all(|&v| v == 0.0) {
@@ -6079,9 +6133,15 @@ impl LogisModel {
         //   LanceDB = 리콜(넓게), Dexie = 정밀도(정확히 자르기).
         //   스코프는 항상 무역 서식 전체로 두고, doc_type 은 조건으로 내려보냅니다.
         //   맞았다면 Dexie 가 정확히 자르고, 틀렸다면 후보가 남아 구출됩니다.
+        // 🌟 [CASE PARITY] extract_from_image 의 TRACKING Fast-Track 은
+        //    doc_type 을 대문자 "TRACKING" 으로 저장하고 그 값이 그대로 DB type 이 됩니다.
+        //    SQL 문자열 비교는 대소문자를 구분하므로 소문자 "tracking" 만으로는
+        //    로컬 스캔한 운송장 라벨이 무역 검색에서 전량 탈락했습니다.
         let mut trade_types: Vec<String> = vec![
-            "tracking".to_string(), "receiving".to_string(),
-            "shipping".to_string(), "shipping_doc".to_string(),
+            "tracking".to_string(), "TRACKING".to_string(),
+            "receiving".to_string(), "Receiving".to_string(),
+            "shipping".to_string(), "Shipping".to_string(),
+            "shipping_doc".to_string(),
         ];
         for t in [
             "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
@@ -6335,7 +6395,17 @@ fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {
         } else if let Some(target_obj) = target.as_object_mut() {
             if let Some(source_obj) = actual_data.as_object() {
                 for (k, v) in source_obj {
-                    if !v.is_null() && v != "" && v != 0 { target_obj.insert(k.clone(), v.clone()); }
+                    // 🌟 [ZERO IS DATA] 기존 `v != 0` 은 값이 실제로 0 인 축을 통째로 버렸습니다.
+                    //    freight_amount 0(Freight Prepaid), package_count 0, weight_net 0 은
+                    //    모두 '못 찾음' 이 아니라 확정된 값입니다.
+                    //    LLM 이 '못 찾음' 을 표현하는 방식은 null / "" / "N/A" 세 가지뿐이므로
+                    //    그 셋만 걸러냅니다.
+                    if v.is_null() { continue; }
+                    if let Some(s) = v.as_str() {
+                        let t = s.trim();
+                        if t.is_empty() || t == "N/A" { continue; }
+                    }
+                    target_obj.insert(k.clone(), v.clone());
                 }
             }
         }

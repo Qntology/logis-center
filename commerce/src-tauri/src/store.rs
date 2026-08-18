@@ -173,9 +173,34 @@ impl VectorStore {
         cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>,
         from: Option<&str>, to: Option<&str>, type_: Option<&str>, data: Option<&str>
     ) -> Result<()> {
+        // 🌟 [DELEGATE] 삽입 로직을 add_message_at 한 곳으로 모읍니다.
+        //    기존 구현은 updated_at 을 0 으로 고정했는데,
+        //    main.ts 의 loadMoreChat 이 `updated_at > latestUpdateTime` 으로
+        //    델타 동기화를 시도하므로 그 경로가 영구히 죽어 있었습니다.
+        //    (매 폴링마다 전량을 다시 가져오고 있었습니다)
+        self.add_message_at(
+            id, role, text, task_id, status,
+            cc, bcc, r#ref, from, to, type_, data,
+            None
+        ).await
+    }
+
+    /// 🌟 [MESSAGE UPDATE HELPER] created_at 을 명시적으로 지정할 수 있는 삽입 함수입니다.
+    ///  update_message_status 가 '삭제 후 재삽입' 방식이라,
+    ///  기존 add_message 를 그대로 쓰면 created_at 이 매번 현재 시각으로 갱신되어
+    ///  main.ts 가 유지하던 '질문 → 작업' 정렬이 흔들립니다.
+    ///  updated_at 도 0 대신 현재 시각을 넣어 프론트엔드의 델타 동기화
+    ///  (`updated_at > latestUpdateTime`)가 실제로 동작하게 합니다.
+    pub async fn add_message_at(
+        &self, id: &str, role: &str, text: &str, task_id: Option<&str>, status: Option<i32>,
+        cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>,
+        from: Option<&str>, to: Option<&str>, type_: Option<&str>, data: Option<&str>,
+        created_at: Option<i64>
+    ) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
         let schema = table.schema().await?;
         let now = chrono::Utc::now().timestamp_millis();
+        let created = created_at.filter(|v| *v > 0).unwrap_or(now);
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -191,8 +216,8 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![data.unwrap_or("").to_string()])),
                 Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
                 Arc::new(Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(Int64Array::from(vec![created])),
                 Arc::new(Int64Array::from(vec![now])),
-                Arc::new(Int64Array::from(vec![0])), // updated_at
             ],
         )?;
         table.add(vec![batch]).execute().await?;
@@ -338,9 +363,66 @@ impl VectorStore {
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, text: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
+
+        // 🌟 [SCOPE PRESERVE]
+        //  ── 무엇이 문제였나 ──
+        //   기존에는 삭제 후 cc / bcc / ref / from / to 를 전부 None 으로 재삽입했습니다.
+        //   ai_search_complex 는 최초 add_message 에 스코프를 담아 넣는데,
+        //   첫 상태 전환(10 → 1)에서 그 값이 통째로 사라집니다.
+        //   main.ts 의 loadMoreChat 은 ref / bcc / cc 로 채팅을 조회하므로,
+        //   그 순간부터 작업 말풍선이 필터에서 탈락해 화면에서 사라졌습니다.
+        //   created_at 도 현재 시각으로 덮여 '질문 → 작업' 정렬이 흔들렸습니다.
+        //  ── 해결 ──
+        //   삭제 '전' 에 기존 행의 봉투와 created_at 을 읽어 두고 그대로 복원합니다.
+        let mut prev_type = "talk".to_string();
+        let mut prev_from = String::new();
+        let mut prev_to = String::new();
+        let mut prev_cc = String::new();
+        let mut prev_bcc = String::new();
+        let mut prev_ref = String::new();
+        let mut prev_created: i64 = 0;
+
+        if let Ok(res) = table.query()
+            .only_if(format!("task_id = '{}'", task_id))
+            .limit(1)
+            .execute()
+            .await
+        {
+            if let Ok(batches) = res.try_collect::<Vec<_>>().await {
+                for b in batches {
+                    if b.num_rows() == 0 { continue; }
+                    // 컬럼 순서는 init_task_table 의 msg_schema 와 1:1 대응입니다.
+                    // 0 id / 1 type / 2 role / 3 from / 4 to / 5 cc / 6 bcc / 7 ref
+                    // 8 text / 9 data / 10 task_id / 11 status / 12 created_at / 13 updated_at
+                    let types = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                    let froms = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+                    let tos   = b.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+                    let ccs   = b.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+                    let bccs  = b.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+                    let refs  = b.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+                    let crs   = b.column(12).as_any().downcast_ref::<Int64Array>().unwrap();
+                    prev_type    = types.value(0).to_string();
+                    prev_from    = froms.value(0).to_string();
+                    prev_to      = tos.value(0).to_string();
+                    prev_cc      = ccs.value(0).to_string();
+                    prev_bcc     = bccs.value(0).to_string();
+                    prev_ref     = refs.value(0).to_string();
+                    prev_created = crs.value(0);
+                    break;
+                }
+            }
+        }
+
         table.delete(&format!("task_id = '{}'", task_id)).await?;
+
         if let Some(t) = text {
-            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", t, Some(task_id), Some(status), None, None, None, None, None, Some("talk"), None).await?;
+            self.add_message_at(
+                &uuid::Uuid::new_v4().to_string(), "system_task", t,
+                Some(task_id), Some(status),
+                Some(&prev_cc), Some(&prev_bcc), Some(&prev_ref),
+                Some(&prev_from), Some(&prev_to), Some(&prev_type), None,
+                Some(prev_created)
+            ).await?;
         }
         Ok(())
     }
@@ -597,6 +679,23 @@ impl VectorStore {
         //    '값이 없을 때 기본값이 있어야 조회가 성립하는' 키만 나열합니다.
         //    이 목록은 main.ts 의 ITEMS_SCHEMA 와 대응하며,
         //    인덱스를 추가하지 않는 단순 확장 필드는 여기 넣을 필요가 없습니다.
+        // 🌟 [NUMERIC SEED REMOVED]
+        //  ── 무엇이 문제였나 ──
+        //   amount / sale_price / supply_price / quantity / weight / discount /
+        //   started_at / expired_at 을 0 으로 시딩하면,
+        //   main.ts 의 matchCondition 이 가진 MISSING VALUE GUARD 가
+        //   raw === 0 을 '값이 있음' 으로 판정해 발화하지 못합니다.
+        //   그 결과 'sale_price lte 5000' 같은 조건이
+        //   가격 필드를 아예 갖지 않는 문서(무역 서식 등)를 전부 통과시켰습니다.
+        //   가드를 도입한 목적이 시딩에 의해 정확히 원위치된 상태였습니다.
+        //  ── 시딩을 빼도 되는 이유 ──
+        //   Dexie 는 키가 없는 레코드를 해당 인덱스에서 조용히 제외합니다.
+        //   where('data.sale_price').belowOrEqual(5000) 이
+        //   '가격을 가진 문서' 만 돌려주는데, 그것이 정확히 옳은 동작입니다.
+        //  ⚠️ status / created_at / updated_at 은 남깁니다.
+        //     status 0 은 build_dexie_plan 의 ZERO GUARD 가 조건으로 만들지 않고,
+        //     created_at / updated_at 은 봉투 필드라 항상 실제 값이 들어옵니다.
+        //  ⚠️ main.ts 의 SEED_KEYS 와 반드시 같은 집합이어야 합니다.
         const SEED_KEYS: &[(&str, CanonKind)] = &[
             // ── 식별자 ──
             ("id", CanonKind::Identifier),
@@ -610,16 +709,8 @@ impl VectorStore {
             ("stock_keeping_unit", CanonKind::Identifier),
             ("barcode", CanonKind::Identifier),
             ("digest", CanonKind::Identifier),
-            // ── 수치 ──
+            // ── 수치 (봉투/상태 축만 유지) ──
             ("status", CanonKind::Numeric),
-            ("amount", CanonKind::Numeric),
-            ("sale_price", CanonKind::Numeric),
-            ("supply_price", CanonKind::Numeric),
-            ("quantity", CanonKind::Numeric),
-            ("weight", CanonKind::Numeric),
-            ("discount", CanonKind::Numeric),
-            ("started_at", CanonKind::Numeric),
-            ("expired_at", CanonKind::Numeric),
             ("created_at", CanonKind::Numeric),
             ("updated_at", CanonKind::Numeric),
             // ── 불리언 ──
@@ -642,24 +733,39 @@ impl VectorStore {
 
             match kind {
                 CanonKind::Identifier => {
+                    // 🌟 [MISSING PARITY] main.ts 의 canonicalizeData 는
+                    //    null / undefined 를 만나면 `continue` 로 건너뜁니다.
+                    //    여기서 String::new() 로 확정하면 같은 문서가
+                    //    LanceDB 에는 "" , Dexie 에는 null 로 저장되어
+                    //    where('data.xxx').equals(...) 결과가 갈립니다.
                     let s = match obj.get(&k) {
-                        Some(Value::Null) => String::new(),
+                        Some(Value::Null) | None => continue,
                         Some(Value::String(s)) => s.clone(),
                         Some(Value::Number(n)) => n.to_string(),
                         Some(Value::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
                         // 배열/객체는 식별자가 될 수 없으므로 건드리지 않습니다.
                         Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
-                        None => String::new(),
                     };
                     obj.insert(k, json!(s));
                 },
                 CanonKind::Numeric => {
+                    // 🌟 [MISSING PARITY / T2 완결]
+                    //  ── 무엇이 문제였나 ──
+                    //   null / "" 를 0.0 으로 확정하면, SEED_KEYS 에서 수치 시딩을 제거해도
+                    //   LLM 이 '못 찾음' 으로 내려보낸 null 이 그대로 0 이 되어
+                    //   matchCondition 의 MISSING VALUE GUARD 가 다시 무력화됩니다.
+                    //   ('sale_price lte 5000' 이 가격 없는 문서를 전부 통과)
+                    //   main.ts 는 이 세 경우를 전부 continue 로 건너뜁니다.
+                    //  ── 파싱 실패도 동일 취급 ──
+                    //   "N/A" 처럼 숫자로 환원 불가능한 값은 '0' 이 아니라 '없음' 입니다.
+                    //   0 으로 확정하면 bottom 랭킹이 그 문서를 최상위로 끌어올립니다.
                     let n: f64 = match obj.get(&k) {
-                        None | Some(Value::Null) => 0.0,
+                        None | Some(Value::Null) => continue,
                         Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
                         Some(Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
                         Some(Value::String(s)) => {
                             let t = s.trim();
+                            if t.is_empty() || t == "null" || t == "N/A" { continue; }
                             // 🌟 status 는 'complete' 같은 상태 문자열이 들어올 수 있습니다.
                             if k == "status" {
                                 crate::logic::parse_status(t) as f64
@@ -673,7 +779,11 @@ impl VectorStore {
                                 let cleaned: String = t.chars()
                                     .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
                                     .collect();
-                                cleaned.parse::<f64>().unwrap_or(0.0)
+                                match cleaned.parse::<f64>() {
+                                    Ok(v) => v,
+                                    // 숫자로 환원 불가 → '값 없음' 으로 두고 키를 건드리지 않습니다.
+                                    Err(_) => continue,
+                                }
                             }
                         },
                         Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
@@ -685,16 +795,28 @@ impl VectorStore {
                     }
                 },
                 CanonKind::Boolean => {
+                    // 🌟 [MISSING PARITY] main.ts 는 null / undefined 를 건너뜁니다.
+                    //    `_ => false` 로 두면 '값 없음' 이 '거짓' 으로 확정되어
+                    //    data.embed / data.is_device 인덱스 판정이 두 저장소에서 갈립니다.
                     let b = match obj.get(&k) {
                         Some(Value::Bool(x)) => *x,
                         Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
-                        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+                        Some(Value::String(s)) => {
+                            let t = s.trim();
+                            if t.is_empty() { continue; }
+                            t == "1" || t.eq_ignore_ascii_case("true")
+                        },
                         Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
-                        _ => false,
+                        None | Some(Value::Null) => continue,
                     };
                     obj.insert(k, json!(if b { 1 } else { 0 }));
                 },
                 CanonKind::Tags => {
+                    // 🌟 [MISSING PARITY] main.ts 는 null 을 건너뜁니다.
+                    //    `_ => Vec::new()` 는 '태그 없음' 을 '빈 배열' 로 확정하는데,
+                    //    Dexie 의 멀티엔트리 인덱스('*data.tags')는 빈 배열도
+                    //    키를 만들지 않으므로 조회 결과는 같지만
+                    //    문서 본문이 두 저장소에서 달라져 digest 비교가 어긋납니다.
                     let tags: Vec<Value> = match obj.get(&k) {
                         Some(Value::Array(arr)) => arr.iter().map(|t| {
                             if let Some(o) = t.as_object() {
@@ -706,6 +828,7 @@ impl VectorStore {
                             }
                         }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
                         Some(Value::String(s)) if !s.is_empty() => vec![json!(s.clone())],
+                        None | Some(Value::Null) => continue,
                         _ => Vec::new(),
                     };
                     obj.insert(k, json!(tags));
@@ -1388,11 +1511,24 @@ impl VectorStore {
         // 기존 동일 chunk_id 삭제 (upsert)
         let _ = table.delete(&format!("chunk_id = '{}'", chunk_id)).await;
 
+        // 🌟 [L2 NORMALIZE / DEFENSIVE]
+        //  search_chunks 는 '저장 벡터가 정규화되어 있다' 는 전제로
+        //  cos = 1 - d/2 변환을 수행합니다(L2² = 2 - 2cos).
+        //  그런데 그 정규화는 호출부(scheduler::index_item_chunks)에만 존재하는
+        //  암묵 계약이라, 새 호출 경로가 생기면 조용히 깨집니다.
+        //  정규화는 멱등이므로(이미 정규화된 벡터를 다시 정규화해도 동일)
+        //  저장 지점에서 한 번 더 확정해 계약을 코드로 강제합니다.
         let safe_vector = match vector {
-            Some(v) if v.len() == 384 => v,
+            Some(v) if v.len() == 384 => {
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    v.iter().map(|x| x / norm).collect::<Vec<f32>>()
+                } else {
+                    v
+                }
+            },
             _ => vec![0.0; 384],
         };
-
         let now = chrono::Utc::now().timestamp_millis();
 
         let values_builder = Float32Array::from(safe_vector);

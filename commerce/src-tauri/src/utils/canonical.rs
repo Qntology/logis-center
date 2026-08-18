@@ -60,7 +60,13 @@ const NUM_EXACT: &[&str] = &[
     "width", "height", "length",
 ];
 const BOOL_PREFIX: &[&str] = &["is_", "has_", "allow_", "use_"];
-const BOOL_SUFFIX: &[&str] = &["_only", "_included", "_allowed", "_match", "_shipping"];
+// 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
+//    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
+//    Boolean 변환이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
+//    bias_schema.rs 도 add("bundle_shipping", "String", ...) 로 선언하므로
+//    문자열(Free)로 두는 것이 스키마와도 일치합니다.
+//    ⚠️ main.ts 의 BOOL_SUFFIX 와 반드시 같은 집합이어야 합니다.
+const BOOL_SUFFIX: &[&str] = &["_only", "_included", "_allowed", "_match"];
 
 /// 🌟 필드 이름만으로 저장 타입을 판정합니다.
 ///    새 필드는 대부분 접미사 규칙에 자동으로 걸리므로 Rust 수정이 불필요합니다.
@@ -73,8 +79,8 @@ pub fn kind_of(key: &str) -> CanonKind {
     if FORCE_NUM.iter().any(|x| *x == k) { return CanonKind::Numeric; }
     if FORCE_BOOL.iter().any(|x| *x == k) { return CanonKind::Boolean; }
 
-    // 🌟 Boolean 을 먼저 검사합니다. 'bundle_shipping' 이 NUM_CONTAINS 의
-    //    'shipping_fee' 와는 다르지만, '_shipping' 접미사로 잡혀야 하기 때문입니다.
+    // 🌟 Boolean 을 수치보다 먼저 검사합니다.
+    //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
     if BOOL_PREFIX.iter().any(|p| k.starts_with(p)) { return CanonKind::Boolean; }
     if BOOL_SUFFIX.iter().any(|s| k.ends_with(s)) { return CanonKind::Boolean; }
 
