@@ -45,61 +45,214 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
 }
 
+// pub fn get_trade_doc_classification_prompt() -> String {
+//     r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
+// Return JSON exactly like: {"doc_type": "BL"}
+// NO EXPLANATION."###.to_string()
+// }
+
 pub fn get_trade_doc_classification_prompt() -> String {
-    r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
-Return JSON exactly like: {"doc_type": "BL"}
-NO EXPLANATION."###.to_string()
+    // 🌟 [CLASSIFIER v2 / 27 CODES]
+    //  ── 왜 늘리는가 ──
+    //   get_trade_doc_slice_config 는 27종 좌표를 갖고 있는데
+    //   분류기가 9종만 낼 수 있어 19개 분기가 도달 불가였습니다.
+    //   extract_shipping_conditions 도 16종을 조건으로 뽑으므로
+    //   저장(9종) ↔ 조회(16종) 사이에 영구 공백이 있었습니다.
+    //
+    //  ── 오분류 완화 ──
+    //   2B 비전 모델이 27갈래를 정확히 가르기는 어렵습니다.
+    //   다만 slice_config 가 같은 그룹을 한 좌표로 묶어 두었으므로
+    //   (CI|PI|SC / ED|ID|CINV / IC|WC|CA|PHYTO|HC|BEN_CERT / DGD|MSDS / POA|BIZ_LIC|INS)
+    //   그룹 내 혼동은 추출 품질에 영향을 주지 않습니다.
+    //   그래서 아래 프롬프트도 '그룹 → 코드' 순서로 제시합니다.
+    r###"Classify this trade document. Return the single closest code.
+
+[GROUPS]
+1. Contract & Payment
+   PO  = Purchase Order
+   PI  = Proforma Invoice
+   SC  = Sales Contract
+   LC  = Letter of Credit
+2. Shipping & Transport
+   CI  = Commercial Invoice
+   PL  = Packing List
+   BL  = Bill of Lading
+   AWB = Air Waybill
+   SA  = Shipping Advice
+   DO  = Delivery Order
+   AN  = Arrival Notice
+   BC  = Booking Confirmation
+3. Customs
+   ED   = Export Declaration
+   ID   = Import Declaration
+   CINV = Customs Invoice
+   CO   = Certificate of Origin
+4. Inspection & Certificates
+   IC       = Inspection Certificate
+   WC       = Weight Certificate
+   CA       = Certificate of Analysis
+   PHYTO    = Phytosanitary Certificate
+   HC       = Health Certificate
+   BEN_CERT = Beneficiary Certificate
+5. Special & Legal
+   DGD     = Dangerous Goods Declaration
+   MSDS    = Material Safety Data Sheet
+   POA     = Power of Attorney
+   BIZ_LIC = Business License
+   INS     = Insurance Policy
+6. Parcel
+   TRACKING = Courier label / parcel waybill
+
+If none fit, return "Unknown".
+
+[OUTPUT FORMAT]
+{"doc_type": "BL"}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
 }
 
-pub fn get_trade_category_schema(category: &str, _doc_type: &str) -> String {
-    let schema = match category {
-        "header" => r#"{
-  "document_type": "CLASSIFIED TYPE {String}",
-  "document_number": "Primary Identifier (B/L No, Invoice No) {String}",
-  "issue_date": "Date of Creation (YYYY-MM-DD) {String}",
-  "reference_number": "Export Ref, Booking No, PO No {String}"
-}"#,
-        "parties" => r#"{
-  "supplier_name": "Shipper, Seller, Exporter {String}",
-  "supplier_address": "Address of Supplier {String}",
-  "buyer_name": "Consignee, Buyer, Importer {String}",
-  "buyer_address": "Address of Buyer {String}",
-  "notify_party_name": "Notify Party Name {String}"
-}"#,
-        "logistics" => r#"{
-  "vehicle_name": "Vessel Name, Flight No {String}",
-  "voyage_number": "Voyage No {String}",
-  "location_port_of_loading": "POL, Airport of Departure {String}",
-  "location_port_of_discharge": "POD, Airport of Destination {String}"
-}"#,
-        "conditions" => r#"{
-  "incoterms_code": "FOB, CIF, EXW, DDP {String}",
-  "freight_payment_term": "Freight Prepaid, Freight Collect {String}"
-}"#,
-        "financials" => r#"{
-  "currency_code": "Currency Symbol (USD, EUR) {String}",
-  "amount_total": "Grand Total Amount {Number}"
-}"#,
-        "cargo" => r#"{
-  "package_count": "Total Quantity (NOT Money) {Number}",
-  "weight_gross": "Total Gross Weight {Number}",
-  "volume_measurement": "Total Volume (CBM) {Number}",
-  "marks_and_numbers": "Marks & Nos {String}"
-}"#,
-        "items" => r#"[ {
-  "description": "Description of Goods {String}",
-  "quantity": "Line Item Quantity {Number}",
-  "hs_code": "HS Code / Tariff No {String}"
-} ]"#,
-        "containers" => r#"[ {
-  "container_number": "Container No (4 char + 7 digit) {String}",
-  "seal_number": "Seal No {String}",
-  "type_description": "Type (20GP, 40HC) {String}"
-} ]"#,
-        _ => "{}"
+/// 🌟 [TRADE SCHEMA v2 / BASE + OVERLAY]
+///  ── v1 의 결함 ──
+///   시그니처가 `_doc_type` 이었습니다. 즉 27종 서식에 전부 같은 27개 필드를
+///   물어봤습니다. L/C 의 tenor, DGD 의 un_number, CA 의 result_value 처럼
+///   그 서식에만 존재하는 축은 추출 자체가 불가능했습니다.
+///
+///  ── 왜 bias.json 인가 ──
+///   app-logis-center 의 get_category_schema 는 400줄짜리 doc_type 하드코딩입니다.
+///   그대로 옮기면 새 서식마다 Rust 를 고치고 재빌드해야 합니다.
+///   이 코드베이스가 이미 path_alias / multilingual_value_anchor / abstract_bridge 를
+///   bias.json 으로 옮긴 것과 같은 이유로, 스키마도 데이터로 취급합니다.
+///
+///  ── 필드 이름 ──
+///   base 는 extract_shipping_conditions(검색)와 '같은 이름' 을 씁니다.
+///   그래야 저장과 조회가 alias 를 거치지 않고 바로 만납니다.
+///   레거시 데이터는 path_alias 가 흡수합니다.
+pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
+    use serde_json::Value;
+
+    // ── 코드 폴백 base : bias.json 에 trade_schema 노드가 없어도 동작해야 합니다 ──
+    fn fallback_base(category: &str) -> Vec<(&'static str, &'static str)> {
+        match category {
+            "header" => vec![
+                ("doc_type",         "Document kind code {String}"),
+                ("doc_number",       "Primary identifier (B/L No, Invoice No, PO No) {String}"),
+                ("issue_date",       "Date of issue (YYYY-MM-DD) {String}"),
+                ("reference_number", "Any other reference number printed {String}"),
+            ],
+            "parties" => vec![
+                ("sender_name",       "Shipper, Seller, Exporter {String}"),
+                ("sender_address",    "Address of sender {String}"),
+                ("recipient_name",    "Consignee, Buyer, Importer {String}"),
+                ("recipient_address", "Address of recipient {String}"),
+                ("notify_party_name", "Notify party name {String}"),
+            ],
+            "logistics" => vec![
+                ("vessel",         "Vessel name or Flight number {String}"),
+                ("voyage_number",  "Voyage or flight leg number {String}"),
+                ("pol",            "Port of Loading / Airport of Departure {String}"),
+                ("pod",            "Port of Discharge / Airport of Destination {String}"),
+                ("etd",            "Estimated time of departure {String}"),
+                ("eta",            "Estimated time of arrival {String}"),
+                ("transport_mode", "Sea, Air, Road, Rail {String}"),
+            ],
+            "conditions" => vec![
+                ("incoterms",            "FOB, CIF, EXW, DDP, DAP {String}"),
+                ("payment_terms",        "T/T, L/C, Net30 {String}"),
+                ("freight_payment_term", "Freight Prepaid or Freight Collect {String}"),
+            ],
+            "financials" => vec![
+                ("currency",        "ISO 4217 currency code {String}"),
+                ("amount",          "Grand total amount {Number}"),
+                ("amount_subtotal", "Subtotal before tax and charges {Number}"),
+                ("amount_tax",      "Tax or VAT amount {Number}"),
+            ],
+            "cargo" => vec![
+                ("package_count", "Total number of packages (NOT money) {Number}"),
+                ("package_unit",  "Package unit (CTN, PLT, PKG) {String}"),
+                ("weight_gross",  "Total gross weight {Number}"),
+                ("weight_net",    "Total net weight {Number}"),
+                ("volume",        "Total volume in CBM {Number}"),
+                ("marks_numbers", "Marks and numbers {String}"),
+            ],
+            "items" => vec![
+                ("description", "Description of goods {String}"),
+                ("quantity",    "Line item quantity {Number}"),
+                ("unit",        "Unit of measure {String}"),
+                ("hs_code",     "HS code / tariff number {String}"),
+                ("unit_price",  "Unit price {Number}"),
+                ("total_price", "Line total {Number}"),
+            ],
+            "containers" => vec![
+                ("container_number", "Container number (4 letters + 7 digits) {String}"),
+                ("seal_number",      "Seal number {String}"),
+                ("type_size",        "Size and type (20GP, 40HC) {String}"),
+            ],
+            _ => vec![],
+        }
+    }
+
+    // ── bias.json 에서 { field: desc } 맵을 읽습니다 ──
+    fn read_node(path: &[&str]) -> Option<serde_json::Map<String, Value>> {
+        let mut cur: &Value = &crate::parsing::BIAS_DICT;
+        for p in path {
+            cur = cur.get(*p)?;
+        }
+        cur.as_object().cloned()
+    }
+
+    // 1) base
+    let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(obj) = read_node(&["trade_schema", "base", category]) {
+        for (k, v) in obj {
+            fields.push((k, v.as_str().unwrap_or("{String}").to_string()));
+        }
+    } else {
+        for (k, d) in fallback_base(category) {
+            fields.push((k.to_string(), d.to_string()));
+        }
+    }
+
+    // 2) overlay : 이 서식에만 존재하는 축을 덧붙입니다.
+    //    같은 이름이면 overlay 설명이 이깁니다(서식별 뉘앙스가 더 정확하므로).
+    if let Some(obj) = read_node(&["trade_schema", "overlay", doc_type, category]) {
+        for (k, v) in obj {
+            let desc = v.as_str().unwrap_or("{String}").to_string();
+            if let Some(slot) = fields.iter_mut().find(|(n, _)| n == &k) {
+                slot.1 = desc;
+            } else {
+                fields.push((k, desc));
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        return format!(
+            "RULES: Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{{}}",
+            category.to_uppercase()
+        );
+    }
+
+    // 3) 렌더링 : items / containers 는 배열 스키마입니다.
+    //    (merge_json_manual 이 items → line_items 로 매핑하므로 키 이름은 그대로 둡니다)
+    let is_array = category == "items" || category == "containers";
+    let body = fields
+        .iter()
+        .map(|(k, d)| format!("  \"{}\": \"{}\"", k, d.replace('"', "'")))
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    let schema = if is_array {
+        format!("[ {{\n{}\n}} ]", body)
+    } else {
+        format!("{{\n{}\n}}", body)
     };
 
-    format!("RULES: Follow comments strictly. Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{}", category.to_uppercase(), schema)
+    format!(
+        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.\nSCHEMA:\n{}",
+        category.to_uppercase(),
+        doc_type,
+        schema
+    )
 }
 
 // pub fn extract_shipping_conditions(query: &str, language: &str) -> String {

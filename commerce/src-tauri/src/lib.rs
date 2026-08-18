@@ -335,9 +335,18 @@ async fn reindex_pending_embeddings(
         //    action 이 없으면 summary → cross_action_flow 순으로 폴백합니다.
         let analytic_text = data.get("action").and_then(|v| v.as_str()).unwrap_or("")
             .trim().to_string();
-        let analytic_fallback = data.get("summary").and_then(|v| v.as_str())
-            .or_else(|| data.get("cross_action_flow").and_then(|v| v.as_str()))
-            .unwrap_or("").trim().to_string();
+        // 🌟 [EMPTY-AWARE FALLBACK] Option 의 or_else 는 None 일 때만 발화합니다.
+        //    summary 키가 존재하되 빈 문자열이면 Some("") 이 되어
+        //    cross_action_flow 폴백이 영원히 도달하지 않았습니다.
+        let pick = |k: &str| -> Option<String> {
+            data.get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let analytic_fallback = pick("summary")
+            .or_else(|| pick("cross_action_flow"))
+            .unwrap_or_default();
 
         let text = if !analytic_text.is_empty() {
             analytic_text
@@ -852,60 +861,76 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     // 🌟 [PATH ALIAS] LLM 이 뽑아낸 속성명을 실제 data.* 경로로 정규화합니다.
     //    기존 convert_conditions_to_sql 의 mapped_key 는 '물리 컬럼이 없으면 버림' 이었지만,
     //    여기서는 '별칭만 통일하고 없는 건 그대로 통과' 시킵니다. Dexie 는 .filter() 로 처리 가능합니다.
+    // 🌟 [PATH ALIAS v2 / EXTERNAL CONTRACT]
+    //  ── 무엇이 바뀌었나 ──
+    //   별칭 표를 Rust 코드에서 bias.json 의 `search_bridge.path_alias` 노드로 옮겼습니다.
+    //   새 필드의 별칭이 필요해도 JSON 만 고치면 되고 재빌드가 필요 없습니다.
+    //
+    //   bias.json 예시:
+    //   "search_bridge": {
+    //     "path_alias": {
+    //       "amount": ["amount_total", "total_amount", "price"],
+    //       "doc_number": ["document_number", "bl_number", "awb_number", "po_number"],
+    //       "sender_name": ["supplier_name", "shipper_name", "exporter_name"],
+    //       "recipient_name": ["buyer_name", "consignee_name", "importer_name"],
+    //       "vessel": ["vehicle_name", "flight_no", "vessel_name"],
+    //       "pol": ["location_port_of_loading", "port_of_loading"],
+    //       "pod": ["location_port_of_discharge", "port_of_discharge"],
+    //       "incoterms": ["incoterms_code"],
+    //       "container_number": ["container_no"],
+    //       "seal_number": ["seal_no"],
+    //       "weight_gross": ["gross_weight"],
+    //       "weight_net": ["net_weight"],
+    //       "volume": ["volume_measurement", "cbm"]
+    //     }
+    //   }
+    //
+    //   노드가 없으면 별칭 없이 그대로 통과하므로, 기존 동작을 깨지 않습니다.
     fn normalize_path(key: &str) -> String {
-        let k = match key {
-            // ── commerce 별칭 ──
-            "amount_total" | "total_amount" | "price" => "amount",
-            "supplier_name" | "shipper_name" | "exporter_name" | "consignor_name" => "sender_name",
-            "buyer_name" | "consignee_name" | "importer_name" => "recipient_name",
-            // ── 🌟 trading 별칭 ──
-            //    extract_shipping_conditions 는 doc_number 를 뱉고,
-            //    이미지 추출 스키마(get_trade_category_schema)는 document_number 를 뱉습니다.
-            //    Dexie 인덱스는 data.doc_number 이므로 그쪽으로 통일합니다.
-            "document_number" | "bl_number" | "awb_number" | "po_number"
-                | "booking_number" | "contract_number" => "doc_number",
-            "document_type" => "doc_type",
-            "vehicle_name" | "flight_no" | "vessel_name" => "vessel",
-            "voyage_no" => "voyage_number",
-            "location_port_of_loading" | "port_of_loading" => "pol",
-            "location_port_of_discharge" | "port_of_discharge" => "pod",
-            "incoterms_code" => "incoterms",
-            "payment_term" => "payment_terms",
-            "currency_code" => "currency",
-            "container_no" => "container_number",
-            "seal_no" => "seal_number",
-            "package_qty" => "package_count",
-            "gross_weight" => "weight_gross",
-            "net_weight" => "weight_net",
-            "volume_measurement" | "cbm" => "volume",
-            "lc_number" | "reference_lc_number" => "reference_lc",
-            "reference_invoice_number" => "reference_invoice",
-            "reference_booking_number" => "reference_booking",
-            other => other,
-        };
+        let k = key.trim();
+
+        if let Some(alias_obj) = crate::parsing::BIAS_DICT
+            .get("search_bridge")
+            .and_then(|sb| sb.get("path_alias"))
+            .and_then(|v| v.as_object())
+        {
+            for (canonical, list) in alias_obj {
+                if canonical == k {
+                    return format!("data.{}", canonical);
+                }
+                if let Some(arr) = list.as_array() {
+                    if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                        return format!("data.{}", canonical);
+                    }
+                }
+            }
+        }
+
         format!("data.{}", k)
     }
 
     // 🌟 [KIND] Dexie 실행 엔진이 인덱스 쿼리를 쓸지 .filter() 를 쓸지 판정하는 힌트입니다.
+    //  ── 무엇이 바뀌었나 ──
+    //   기존에는 수치 경로 15개를 문자열 배열로 나열해, 새 수치 필드를 추가할 때마다
+    //   여기에도 이름을 넣어야 했습니다. (안 넣으면 kind="string" 이 되어
+    //   '5000 이하' 조건이 문자열 비교로 떨어져 무력화됩니다)
+    //   이제 canonicalize 와 동일한 kind_of() 규칙을 재사용하므로
+    //   Dexie 에 필드를 추가해도 이 함수는 수정할 필요가 없습니다.
     fn value_kind(path: &str, v: &Value) -> &'static str {
+        use crate::utils::canonical::{kind_of, CanonKind};
+
         if v.is_number() { return "number"; }
+
+        // 'data.sale_price' → 'sale_price' 로 잘라 규칙 판정에 넘깁니다.
+        let leaf = path.rsplit('.').next().unwrap_or(path);
+
         if let Some(s) = v.as_str() {
-            // 수치형 경로인데 문자열로 왔으면 숫자로 취급합니다. (canonicalize 규칙과 동일)
-            //
-            // 🌟 [TRADING] weight_gross / package_count 같은 경로는 ends_with("weight") 로
-            //    잡히지 않으므로 반드시 전체 이름을 넣어야 합니다.
-            //    빠지면 kind="string" 이 되어 matchCondition 이 문자열 비교로 처리하고,
-            //    '5000 이하' 같은 range 조건이 통째로 무력화됩니다.
-            let is_num_path = [
-                // ── commerce ──
-                "amount", "price", "sale_price", "supply_price", "quantity", "weight",
-                "width", "height", "length", "discount", "shipping_fee",
-                "status", "started_at", "expired_at", "usage_limit", "usage_per",
-                // ── trading ──
-                "package_count", "weight_gross", "weight_net", "volume",
-                "local_charges", "exchange_rate", "number_of_originals",
-            ].iter().any(|p| path.ends_with(p));
-            if is_num_path && s.chars().any(|c| c.is_ascii_digit()) { return "number"; }
+            match kind_of(leaf) {
+                CanonKind::Numeric | CanonKind::Boolean => {
+                    if s.chars().any(|c| c.is_ascii_digit()) { return "number"; }
+                },
+                _ => {}
+            }
         }
         "string"
     }

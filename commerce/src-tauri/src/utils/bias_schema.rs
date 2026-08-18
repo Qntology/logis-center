@@ -7,16 +7,28 @@ pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
     serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
 });
 
+/// 🌟 [LANG CODE] 언어 문자열에서 ISO-639-1 2자 코드를 안전하게 추출합니다.
+///  ── 왜 필요한가 ──
+///   기존 코드는 `&lang[0..2]` 로 '바이트' 를 잘랐습니다.
+///   ASCII 입력("korean" → "ko")은 우연히 맞지만, 비ASCII 가 들어오면
+///   char boundary 위반으로 즉시 panic 합니다. ("한국어".len()=9 라 게이트를 통과한 뒤
+///   0..2 가 '한'(3바이트) 한가운데를 자릅니다)
+///  ── 부수 효과 ──
+///   zh-tw / zh-hk 번체 분기를 get_localized_page_type 한 곳에서만 처리하고 있어
+///   나머지 10개 함수는 전부 "zh" 로 뭉개고 있었습니다. 여기서 함께 통일합니다.
+pub fn lang_code_of(lang: &str) -> String {
+    let l = lang.trim().to_lowercase();
+    if l.starts_with("zh-tw") || l.starts_with("zh-hk") || l.starts_with("zh-hant") {
+        return "zh-tw".to_string();
+    }
+    let code: String = l.chars().take_while(|c| c.is_ascii_alphabetic()).take(2).collect();
+    if code.chars().count() >= 2 { code } else { "en".to_string() }
+}
+
 pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
-    let lang_lower = lang.to_lowercase();
-    // zh-tw와 zh-hk 같은 번체자 환경을 정확하게 분리하여 추출
-    let lang_code = if lang_lower.starts_with("zh-tw") || lang_lower.starts_with("zh-hk") {
-        "zh-tw"
-    } else if lang_lower.len() >= 2 {
-        &lang_lower[0..2]
-    } else {
-        "en"
-    };
+    // 🌟 zh-tw / zh-hk 번체 분기 포함, 바이트 슬라이싱 없이 안전하게 코드를 뽑습니다.
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let matched_str = match lang_code {
         "ko" => match page_type { "order" => "주문", "goods" => "상품", "tracking" => "배송", "review" => "리뷰", "coupon" | "event" => "이벤트", _ => "문서" },
         "zh-tw" => match page_type { "order" => "訂單", "goods" => "商品", "tracking" => "物流", "review" => "評價", "coupon" | "event" => "活動", _ => "文件" },
@@ -44,7 +56,8 @@ pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
 pub fn get_layout_bias(page_type: &str, lang: &str) -> (String, String) {
     let mut bias = String::from("detail has_list has_form true false");
     let mut prejudice = String::new(); // 🌟 초기화
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(l_list) = localized_obj.get("layout_list") {
@@ -81,7 +94,8 @@ pub fn get_combinatorial_layout_bias(active_types: &[&str], lang: &str) -> (Stri
     let mut combined_list_bias = String::new();
     let mut combined_form_bias = String::new();
     let mut combined_prejudice = std::collections::HashSet::new();
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     // 1. 인입된 모든 활성 도메인 트랙을 순회하며 바이어스 융합 매트릭스 빌드
     for page_type in active_types {
         let localized_type = get_localized_page_type(page_type, lang);
@@ -130,7 +144,8 @@ pub fn get_combinatorial_layout_bias(active_types: &[&str], lang: &str) -> (Stri
 
 pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
     let mut full_bias = String::from(page_type);
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(obj) = localized_obj.as_object() {
@@ -148,7 +163,8 @@ pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
 /// 🌟 [PAGE TYPE CLASSIFICATION 전용] layout_list + layout_form + 로컬라이즈된 타입 이름만 사용하여
 /// 필드 레벨 bias 노이즈(예: sender_name의 "테스트", goods 필드의 상품 예시값 등)를 원천 차단합니다.
 pub fn get_page_type_classification_bias(page_type: &str, lang: &str) -> String {
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::from(page_type);
     bias.push_str(" ");
@@ -189,7 +205,8 @@ pub fn get_page_type_classification_bias(page_type: &str, lang: &str) -> String 
 }
 
 pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut bias = String::from("title name product ");
     let mut prejudice = String::from("address location ");
@@ -204,7 +221,8 @@ pub fn get_title_bias(page_type: &str, lang: &str) -> (String, String) {
 
 pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(String, String, String, String)> {
     let mut fields = Vec::new();
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
         // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
@@ -273,6 +291,7 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
             add("code", "String", "code sku item", "");
             add("status", "String", "status condition", "");
             add("title", "String", "title name product", "");
+            add("color", "String", "color hue shade tint", "");
             add("registration_date", "String", "date registration", "");
             add("sale_price", "Number", "sale price discount", "");
             add("supply_price", "Number", "supply price cost", "");
@@ -322,15 +341,23 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
 }
 
 pub fn get_vision_tracking_bias(lang: &str) -> (String, String) {
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let mut bias = String::from("tracking number barcode awb ");
+    // 🌟 [PREJUDICE RESTORE] 기존에는 이 변수를 만들고 한 번도 채우지 않아
+    //    항상 빈 문자열이 반환되었습니다(unused_mut 경고 동반).
+    //    ko.tracking 의 id,link / carrier prejudice 에는
+    //    '배송상태, 상품명, 등록일, 주소, 무게' 같은 배제 어휘가 이미 있는데
+    //    비전 운송장 판정에서 전혀 쓰이지 않았습니다.
     let mut prejudice = String::new();
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get("tracking")) {
         if let Some(id_obj) = localized_obj.get("id,link") {
             if let Some(b) = id_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {} ", bias, b); }
+            if let Some(p) = id_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {} ", prejudice, p); }
         }
         if let Some(c_obj) = localized_obj.get("carrier") {
             if let Some(b) = c_obj.get("bias").and_then(|v| v.as_str()) { bias = format!("{} {} ", bias, b); }
+            if let Some(p) = c_obj.get("prejudice").and_then(|v| v.as_str()) { prejudice = format!("{} {} ", prejudice, p); }
         }
     }
     (bias, prejudice)
@@ -338,7 +365,8 @@ pub fn get_vision_tracking_bias(lang: &str) -> (String, String) {
 
 // 🌟 글로벌 언어를 한 번에 섞어 넣지 않고, 전달받은 언어 코드의 힌트만 생성합니다.
 pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) {
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut list_words = String::new();
     let mut form_words = String::new();
@@ -360,7 +388,8 @@ pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) 
 // 추상적 검색 의도(Core Intent)를 100% 동적으로 긁어모아 벡터 매칭의 해상도를 극대화합니다.
 pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, String, String)> {
     let mut contexts = Vec::new();
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let inject_domain = |text: &str| -> String {
         if text.trim().is_empty() { return String::new(); }
@@ -446,7 +475,8 @@ pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, Stri
 // 🌟 [CRITICAL FIX] 4개의 반환값(String, String, String, String)으로 확장하여 prejudice를 스케줄러로 넘깁니다.
 pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(String, String, String, String)> {
     let mut fields = Vec::new();
-    let lang_code = if lang.len() >= 2 { &lang[0..2].to_lowercase() } else { "en" };
+    let lang_code_owned = lang_code_of(lang);
+    let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
         // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
@@ -538,6 +568,11 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("description", "String", "description detail", "");
             add("short_description", "String", "short description summary", "");
             add("tags", "Array of Strings", "tags keywords", "");
+            // 🌟 [COLOR] 색상은 bias.json 루트에 전역 노드로만 존재해
+            //    PLINKO 속성 후보로는 올라오는데 추출 스키마에는 없었습니다.
+            //    그래서 data.color 조건이 발행되어도 어떤 문서에도 그 경로가 없어
+            //    matchCondition 이 false 를 돌려주고 결과가 통째로 0건이 되었습니다.
+            add("color", "String", "color hue shade tint", "");
             add("origin_country", "String", "origin country", "");
             add("manufacturer", "String", "manufacturer", "");
             add("release_date", "String", "release date", "");
@@ -616,10 +651,73 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("completed", "Boolean", "completed purchased", "");
             add("registration_date", "String", "date registration time", "");
         },
+        // 🌟 [TRADE DOC SCHEMA] 무역 서식 도메인.
+        //  ── 왜 필요한가 ──
+        //   기존에는 BL / AWB / LC 등 27종이 전부 `_` 로 떨어져
+        //   id,link / title / status 세 개짜리 속성 뱅크만 받았습니다.
+        //   extract_shipping_conditions 는 33개 축을 조건으로 뽑는데
+        //   그 조건을 받아 줄 속성이 스키마에 존재하지 않아,
+        //   벡터 매칭이 필요한 어떤 경로도 무역 필드를 짚지 못했습니다.
+        //  ── 필드 이름 ──
+        //   extract_shipping_conditions(검색) / get_trade_category_schema(추출)와
+        //   동일한 canonical 이름을 씁니다. 세 곳이 같은 이름 공간을 공유해야
+        //   저장·조회·질의가 alias 없이 바로 만납니다.
+        //  ⚠️ 'shipping' 과 'receiving' 은 넣지 않습니다.
+        //     proxy 가 택배 라벨에 붙이는 commerce 계열 타입이라
+        //     여기 넣으면 운송장이 tracking 스키마 대신 무역 스키마로 빠집니다.
+        "shipping_doc"
+        | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
+        | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
+        | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" => {
+            add("id,link", "", "id link document", "");
+            add("doc_type", "String", "document type kind form", "");
+            add("doc_number", "String", "document number identifier", "");
+            add("no", "String", "tracking number reference", "");
+            add("status", "String", "status state", "");
+            add("issue_date", "String", "issue date", "");
+            add("expiry_date", "String", "expiry date", "");
+            add("sender_name", "String", "shipper seller exporter name", "");
+            add("sender_address", "String", "shipper address", "");
+            add("recipient_name", "String", "consignee buyer importer name", "");
+            add("recipient_address", "String", "consignee address", "");
+            add("notify_party_name", "String", "notify party name", "");
+            add("vessel", "String", "vessel flight carrier", "");
+            add("voyage_number", "String", "voyage flight leg number", "");
+            add("pol", "String", "port of loading origin departure", "");
+            add("pod", "String", "port of discharge destination arrival", "");
+            add("place_receipt", "String", "place of receipt", "");
+            add("place_delivery", "String", "place of delivery", "");
+            add("etd", "String", "estimated time of departure", "");
+            add("eta", "String", "estimated time of arrival", "");
+            add("transport_mode", "String", "sea air road rail", "");
+            add("incoterms", "String", "incoterms fob cif exw ddp dap", "");
+            add("payment_terms", "String", "payment terms", "");
+            add("freight_payment_term", "String", "freight prepaid collect", "");
+            add("currency", "String", "currency", "");
+            add("amount", "Number", "total amount", "");
+            add("freight_amount", "Number", "freight charges", "");
+            add("insurance_amount", "Number", "insurance charges", "");
+            add("local_charges", "Number", "local handling charges", "");
+            add("container_number", "String", "container number", "");
+            add("seal_number", "String", "seal number", "");
+            add("package_count", "Number", "package carton count", "");
+            add("weight_gross", "Number", "gross weight", "");
+            add("weight_net", "Number", "net weight", "");
+            add("volume", "Number", "volume cbm measurement", "");
+            add("hs_code", "String", "hs code tariff number", "");
+            add("marks_numbers", "String", "shipping marks and numbers", "");
+            add("reference_invoice", "String", "referenced invoice number", "");
+            add("reference_lc", "String", "referenced letter of credit number", "");
+            add("reference_booking", "String", "referenced booking number", "");
+        },
         _ => {
             add("id,link", "", "id link", "");
             add("title", "String", "title name", "");
             add("status", "String", "status state", "");
+            // 🌟 get_list_schema_fields 의 동일 분기에는 있는데 여기만 빠져 있어,
+            //    목록에서는 등록일이 잡히고 상세에서는 잡히지 않았습니다.
+            add("registration_date", "String", "date registration", "");
         }
     }
     fields

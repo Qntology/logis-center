@@ -861,3 +861,127 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
     let document = Html::parse_document(html);
     split_doc_to_pug_list(&document, selector_str, mode)
 }
+
+/// 🌟 [TRADE SLICE CONFIG] 무역 서식별 크롭 좌표.
+///  ── 출처 ──
+///   app-logis-center/rust/src-tauri/src/model.rs 의 get_slice_config 를 이식했습니다.
+///   원본은 Mission 구조체를 돌려주지만, cron 의 extract_from_image 가
+///   (카테고리, top, bottom) 튜플을 기대하므로 형태만 맞췄습니다.
+///
+///  ── 왜 이식하는가 ──
+///   cron 은 CI/PI/BL/AWB 4종 + 폴백 1개만 갖고 있었고,
+///   폴백에는 cargo / financials / logistics 슬라이스가 없어
+///   LC·ED·ID·PHYTO·DGD 등 22종에서 화물·금액·운송 정보가
+///   구조적으로 추출되지 않았습니다.
+pub fn get_trade_doc_slice_config(doc_type: &str) -> Vec<(&'static str, f32, f32)> {
+    match doc_type {
+        // --- 1. 계약 · 결제 ---
+        "CI" | "PI" | "SC" => vec![
+            ("header",     0.00, 0.25),
+            ("parties",    0.00, 0.40),
+            ("logistics",  0.20, 0.50),
+            ("items",      0.30, 0.70),
+            ("items",      0.50, 0.85),
+            ("financials", 0.70, 0.95),
+            ("conditions", 0.80, 1.00),
+        ],
+        "PO" => vec![
+            ("header",     0.00, 0.25),
+            ("parties",    0.00, 0.40),
+            ("logistics",  0.20, 0.50),
+            ("items",      0.30, 0.80),
+            ("financials", 0.70, 0.95),
+            ("conditions", 0.80, 1.00),
+        ],
+        "LC" => vec![
+            ("header",     0.00, 0.30),
+            ("parties",    0.00, 0.40),
+            ("financials", 0.20, 0.60), // L/C 는 금융 조항 밀도가 가장 높습니다
+            ("logistics",  0.40, 0.70),
+            ("conditions", 0.50, 1.00), // 본문 대부분이 조건절입니다
+        ],
+
+        // --- 2. 선적 · 운송 ---
+        "PL" | "SA" => vec![
+            ("header",     0.00, 0.20),
+            ("parties",    0.00, 0.40),
+            ("logistics",  0.20, 0.50),
+            ("items",      0.30, 0.80),
+            ("cargo",      0.60, 0.95),
+            ("conditions", 0.85, 1.00),
+        ],
+        "BL" => vec![
+            ("header",     0.00, 0.20),
+            ("parties",    0.00, 0.60),
+            ("logistics",  0.35, 0.65),
+            ("cargo",      0.50, 0.90),
+            ("conditions", 0.80, 1.00),
+        ],
+        "AWB" => vec![
+            ("header",     0.00, 0.15),
+            ("parties",    0.00, 0.40),
+            ("logistics",  0.10, 0.40),
+            ("cargo",      0.30, 0.70),
+            ("financials", 0.60, 0.90),
+            ("conditions", 0.85, 1.00),
+        ],
+        "BC" => vec![
+            ("header",    0.00, 0.25),
+            ("parties",   0.00, 0.50),
+            ("logistics", 0.30, 0.70),
+            ("cargo",     0.50, 0.90),
+        ],
+        "AN" | "DO" => vec![
+            ("header",     0.00, 0.25),
+            ("parties",    0.00, 0.50),
+            ("logistics",  0.30, 0.70),
+            ("financials", 0.50, 0.90), // Arrival Notice 는 로컬 charge 가 핵심
+            ("cargo",      0.60, 1.00),
+        ],
+
+        // --- 3. 통관 · 신고 ---
+        "ED" | "ID" | "CINV" => vec![
+            ("header",     0.00, 0.20),
+            ("parties",    0.00, 0.30),
+            ("logistics",  0.20, 0.50),
+            ("financials", 0.40, 0.70),
+            ("items",      0.50, 0.90),
+            ("conditions", 0.80, 1.00),
+        ],
+        "CO" => vec![
+            ("header",     0.00, 0.20),
+            ("parties",    0.00, 0.40),
+            ("logistics",  0.30, 0.50),
+            ("items",      0.40, 0.80),
+            ("conditions", 0.75, 1.00),
+        ],
+
+        // --- 4. 검사 · 증명 ---
+        "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT" => vec![
+            ("header",     0.00, 0.25),
+            ("parties",    0.00, 0.40),
+            ("items",      0.30, 0.80), // 시험 항목 / 학명 리스트
+            ("conditions", 0.70, 1.00), // "We hereby certify..." 선언문
+        ],
+
+        // --- 5. 특수 · 법무 ---
+        "DGD" | "MSDS" => vec![
+            ("header",    0.00, 0.25),
+            ("logistics", 0.20, 0.50),
+            ("cargo",     0.40, 0.90), // 위험물은 화물 속성이 본문입니다
+        ],
+        "POA" | "BIZ_LIC" | "INS" => vec![
+            ("header",     0.00, 0.30),
+            ("parties",    0.10, 0.50),
+            ("conditions", 0.40, 1.00), // 법률 문언
+        ],
+
+        // --- 폴백 ---
+        _ => vec![
+            ("header",     0.00, 0.30),
+            ("parties",    0.00, 0.50),
+            ("items",      0.30, 0.80),
+            ("conditions", 0.70, 1.00),
+        ],
+    }
+}

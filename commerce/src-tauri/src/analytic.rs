@@ -108,7 +108,9 @@ pub async fn process_analytic_task(
                 for record in records {
                     if let Some(rec_id) = record.get("id").and_then(|v| v.as_str()) {
                         if let Some(orig_item) = items_map.get(rec_id) {
-                            let summary = record.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                            // 🌟 summary 는 프롬프트 스키마상 records 밖(track 레벨)입니다.
+                            //    record.get("summary") 는 영구히 None 이므로 track 에서 읽습니다.
+                            let summary = track.get("summary").and_then(|v| v.as_str()).unwrap_or("");
                             let action = record.get("action").and_then(|v| v.as_str()).unwrap_or("");
                             let relate = record.get("relate").and_then(|v| v.as_array()).cloned().unwrap_or(vec![]);
                             

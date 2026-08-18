@@ -14,38 +14,77 @@ import { hashId, time2text } from "./lib/utils";
 //  boolean / undefined 는 아예 인덱스에서 조용히 빠집니다.
 //  따라서 '쓰기 시점'에 딱 한 번 정규화해서 저장합니다.
 //  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
-const ID_KEYS = [
-    'id', 'no', 'code', 'index', 'tracking_number', 'goods', 'order', 'tracking',
-    'stock_keeping_unit', 'barcode', 'digest', 'gtin', 'mpn',
-    // 🌟 [TRADING] 무역 서식의 식별자 계열.
-    //  전부 String 으로 확정해야 Dexie 인덱스 equals 가 절반을 놓치지 않습니다.
-    //  (B/L No 는 'ABCD1234567', 컨테이너는 'MSCU1234567' 처럼 영숫자 혼합입니다)
-    'doc_number', 'container_number', 'seal_number',
-    'reference_invoice', 'reference_lc', 'reference_booking',
-    'reference_buyer', 'reference_seller', 'reference_carrier', 'hs_code'
+// 🌟 [CANONICAL CONTRACT / TS]
+//  ⚠️ 이 파일의 판정은 store.rs 가 쓰는 utils/canonical.rs 의 kind_of() 와
+//     '비트 단위로 동일' 해야 합니다. 한쪽만 바뀌면 같은 값이
+//     LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
+//     where('data.xxx').equals(...) 가 절반을 놓칩니다.
+//
+//  ── 왜 이름 목록을 없앴나 ──
+//   기존에는 ID/NUM/BOOL 배열에 필드명을 일일이 등록해야 했습니다.
+//   이제 접미사/부분일치 규칙으로 자동 판정하므로,
+//   Dexie 에 새 필드를 추가해도 이 목록을 건드릴 필요가 없습니다.
+type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
+
+// ── ① 명시 예외 : 규칙만으로 판정 불가능한 이름 (새 필드로 커지지 않습니다) ──
+const FORCE_ID = new Set(['id', 'no', 'index', 'goods', 'order', 'tracking', 'digest']);
+const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at']);
+const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
+
+// ── ② 접미사 / 부분일치 규칙 : 새 필드는 여기에 자동으로 걸립니다 ──
+const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin', '_mpn'];
+const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
+const NUM_SUFFIX = [
+    '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
+    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges'
 ];
-const NUM_KEYS = [
-    'status', 'amount', 'total_amount', 'sale_price', 'supply_price', 'compare_at_price',
-    'discount', 'quantity', 'width', 'height', 'length', 'weight',
-    'shipping_fee', 'shipping_duration', 'low_stock_threshold',
-    'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per',
-    'started_at', 'expired_at', 'created_at', 'updated_at', 'views',
-    // 🌟 [TRADING] 무역 서식의 수치 계열.
-    //  package_count / weight_gross 는 '5,000 KGS' 같은 표기로 들어오므로
-    //  canonicalize 가 숫자만 추출해 Number 로 확정해야 range 조회가 성립합니다.
-    'package_count', 'weight_gross', 'weight_net', 'volume',
-    'subtotal_amount', 'tax_amount', 'freight_amount', 'insurance_amount',
-    'local_charges', 'exchange_rate', 'number_of_originals'
+const NUM_CONTAINS = [
+    'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
+    'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
+    'local_charges', 'number_of_'
 ];
-const BOOL_KEYS = [
-    'detail', 'is_masked', 'is_device', 'embed', 'node',
-    'new_customer_only', 'first_purchase_only', 'region_restrictions',
-    'bundle_shipping', 'tax_included', 'recipient_match',
-    // 🌟 [TRADING] 무역 서식의 불리언 계열.
-    //  IDB 는 boolean 을 키로 인정하지 않으므로 반드시 0|1 정수로 내려야
-    //  '부분선적 허용' 같은 조건이 인덱스에서 조용히 빠지지 않습니다.
-    'partial_shipment_allowed', 'transshipment_allowed',
-    'freight_prepaid', 'marine_pollutant', 'is_original'
+const NUM_EXACT = new Set(['width', 'height', 'length']);
+const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
+const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match', '_shipping'];
+
+function kindOf(key: string): CanonKind {
+    const k = key.toLowerCase();
+
+    if (k === 'tags') return 'tags';
+
+    if (FORCE_ID.has(k)) return 'id';
+    if (FORCE_NUM.has(k)) return 'num';
+    if (FORCE_BOOL.has(k)) return 'bool';
+
+    // 🌟 Boolean 을 먼저 검사합니다. 'bundle_shipping' 이 '_shipping' 접미사로 잡혀야 합니다.
+    if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
+    if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
+
+    if (NUM_EXACT.has(k)) return 'num';
+    if (NUM_SUFFIX.some(s => k.endsWith(s))) return 'num';
+
+    // 🌟 식별자를 수치보다 먼저 봅니다.
+    //    'doc_number' 는 '_number' 로 수치에도 걸리지만
+    //    실제로는 'ABCD1234567' 영숫자 혼합이므로 String 이어야 합니다.
+    if (ID_SUFFIX.some(s => k.endsWith(s))) return 'id';
+    if (ID_CONTAINS.some(c => k.includes(c))) return 'id';
+
+    if (NUM_CONTAINS.some(c => k.includes(c))) return 'num';
+
+    return 'free';
+}
+
+// 🌟 [SEED KEYS] Dexie stores() 의 data.* 인덱스 중 기본값이 필요한 키만 나열합니다.
+//    store.rs 의 SEED_KEYS 와 동일해야 합니다.
+const SEED_KEYS: Array<[string, CanonKind]> = [
+    ['id', 'id'], ['no', 'id'], ['code', 'id'], ['index', 'id'],
+    ['tracking_number', 'id'], ['goods', 'id'], ['order', 'id'], ['tracking', 'id'],
+    ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
+    ['status', 'num'], ['amount', 'num'], ['sale_price', 'num'], ['supply_price', 'num'],
+    ['quantity', 'num'], ['weight', 'num'], ['discount', 'num'],
+    ['started_at', 'num'], ['expired_at', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
+    ['embed', 'bool'],
+    ['tags', 'tags']
 ];
 
 // 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
@@ -67,82 +106,205 @@ const NON_SEED_TYPES = new Set([
     'click', 'hover', 'change', 'report', 'question', 'answer'
 ]);
 
-// 🌟 seedDefaults = false 면 '있는 키의 타입 정규화' 만 하고 없는 키는 만들지 않습니다.
-//  users / pages 는 도메인 필드 인덱스가 없으므로 시딩이 불필요하고,
-//  시딩하면 팀 통계 문서에 sale_price: 0 같은 키가 48개 붙습니다.
-//  (store.rs 의 canonicalize_data 와 동일한 규칙 — 두 곳이 어긋나면 인덱스가 깨집니다)
+// 🌟 [ISO DATE] Rust 의 iso_to_epoch_ms 와 동일 규칙.
+//    scheduler 가 started_at / expired_at 을 "2024-01-01T12:00:00" 으로 만듭니다.
+//    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
+function isoToEpochMs(t: string): number | null {
+    if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) return null;
+    let ms: number;
+    if (t.length === 10) {
+        ms = Date.parse(t); // "2024-01-01" 은 명세상 UTC 로 해석됩니다.
+    } else {
+        const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
+        const norm = t.includes('T') ? t : t.replace(' ', 'T');
+        // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
+        ms = Date.parse(hasTz ? norm : norm + 'Z');
+    }
+    return isNaN(ms) ? null : ms;
+}
+
 function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     if (!parsed || typeof parsed !== 'object') return {};
     const out: any = { ...parsed };
 
-    for (const k of ID_KEYS) {
+    // ── ① 기존 키 전량 정규화 (규칙 기반) ──
+    //    새 필드도 여기서 자동 처리되므로 이 함수는 확장 시 수정할 필요가 없습니다.
+    for (const k of Object.keys(out)) {
+        const kind = kindOf(k);
+        if (kind === 'free') continue;
+
         const v = out[k];
-        if (v === undefined || v === null) {
-            if (seedDefaults) out[k] = "";
+
+        if (kind === 'id') {
+            if (v === undefined || v === null) continue;
+            // 배열/객체는 식별자가 될 수 없으므로 건드리지 않습니다.
+            if (typeof v === 'object') continue;
+            out[k] = String(v);
             continue;
         }
-        out[k] = String(v);
-    }
-    for (const k of NUM_KEYS) {
-        const v = out[k];
-        if (v === undefined || v === null || v === "") {
-            if (seedDefaults) out[k] = 0;
-            continue;
-        }
-        // 🌟 [STATUS PARITY] status 는 'complete' 같은 상태 문자열로 들어올 수 있습니다.
-        //    Rust 와 동일하게 코드로 환산해야 두 저장소의 인덱스 타입이 일치합니다.
-        if (k === 'status' && typeof v === 'string') {
-            const mapped = STATUS_CODE[v.trim().toLowerCase()];
-            if (mapped !== undefined) { out[k] = mapped; continue; }
-        }
-        // 🌟 [ISO DATE FIX] scheduler 가 started_at / expired_at 을 ISO 문자열로 넘깁니다.
-        //    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
-        //    Rust canonicalize_data 와 동일하게 UTC epoch ms 로 확정합니다.
-        if (typeof v === 'string') {
-            const t = v.trim();
-            if (/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) {
-                let ms: number;
-                if (t.length === 10) {
-                    // "2024-01-01" 은 명세상 UTC 로 해석됩니다.
-                    ms = Date.parse(t);
-                } else {
-                    const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
-                    const norm = t.includes('T') ? t : t.replace(' ', 'T');
-                    // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
-                    ms = Date.parse(hasTz ? norm : norm + 'Z');
-                }
-                out[k] = isNaN(ms) ? 0 : ms;
-                continue;
+
+        if (kind === 'num') {
+            if (v === undefined || v === null || v === "") continue;
+            if (typeof v === 'object') continue;
+            if (typeof v === 'number') { out[k] = v; continue; }
+            if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
+
+            const s = String(v).trim();
+            // 🌟 [STATUS PARITY] status 는 'complete' 같은 상태 문자열로 들어올 수 있습니다.
+            if (k === 'status') {
+                const mapped = STATUS_CODE[s.toLowerCase()];
+                if (mapped !== undefined) { out[k] = mapped; continue; }
             }
-        }
-        const n = typeof v === 'number' ? v : Number(String(v).replace(/[^\d.\-]/g, ''));
-        out[k] = isNaN(n) ? 0 : n;
-    }
-    for (const k of BOOL_KEYS) {
-        const v = out[k];
-        if (v === undefined || v === null) {
-            if (seedDefaults) out[k] = 0;
+            const ms = isoToEpochMs(s);
+            if (ms !== null) { out[k] = ms; continue; }
+
+            const n = Number(s.replace(/[^\d.\-]/g, ''));
+            out[k] = isNaN(n) ? 0 : n;
             continue;
         }
-        // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
-        out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
+
+        if (kind === 'bool') {
+            if (v === undefined || v === null) continue;
+            if (typeof v === 'object') continue;
+            // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
+            out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
+            continue;
+        }
+
+        if (kind === 'tags') {
+            if (v === undefined || v === null) continue;
+            if (!Array.isArray(v)) {
+                out[k] = [String(v)].filter(Boolean);
+            } else {
+                out[k] = v
+                    .map((t: any) => (typeof t === 'object' && t !== null ? (t.tag ?? "") : String(t)))
+                    .filter(Boolean);
+            }
+            continue;
+        }
     }
-    // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
-    if (out.tags === undefined || out.tags === null) {
-        if (seedDefaults) out.tags = [];
-    } else if (!Array.isArray(out.tags)) {
-        out.tags = [String(out.tags)];
-    } else {
-        out.tags = out.tags.map((t: any) => (typeof t === 'object' ? (t.tag ?? "") : String(t))).filter(Boolean);
+
+    // ── ② 조회 축 기본값 시딩 ──
+    if (seedDefaults) {
+        for (const [k, kind] of SEED_KEYS) {
+            if (out[k] !== undefined && out[k] !== null) continue;
+            out[k] = kind === 'id' ? "" : kind === 'tags' ? [] : 0;
+        }
     }
 
     return out;
+}
+
+// =====================================================================
+// 🌟 [MODE CONTRACT v1] 모드 ↔ 타입 매핑 단일 진실 공급원
+// ---------------------------------------------------------------------
+//  ── 왜 단일화하는가 ──
+//   기존에는 syncData 의 TRADING_TYPES 와 loadMoreDocs 의 TYPE_SETS 가
+//   각자 하드코딩되어 있었고, 두 목록 모두 'tracking' 을 포함했습니다.
+//   그 결과 proxy/index.ts 의 Relay("tracking","order") 가 만든
+//   'commerce 주문 배송추적' 문서가 mode='shipping' 으로 오염되어
+//   commerce 목록에서 통째로 사라졌습니다.
+//
+//  ── 두 목록의 역할이 다르다 ──
+//   MODE_OF_TYPE  : "이 문서를 어느 트랙에 소속시킬 것인가" (쓰기 시점, 배타적)
+//   TYPE_SETS     : "이 모드에서 어떤 타입을 보여줄 것인가" (읽기 시점, 중첩 허용)
+//   tracking 은 소속은 commerce 이지만, shipping 모드에서도 조회 대상입니다.
+//   (mode 컬럼이 이미 걸러 주므로 조회 목록에 중복 등재해도 무해합니다)
+//
+//  ⚠️ D1(commerce / analytics) 어디에도 mode 컬럼이 없습니다.
+//     따라서 mode 는 '동기화 시점에 클라이언트가 확정하는 값' 입니다.
+// =====================================================================
+
+// ── 무역 서식 코드 : app-logis-center 의 get_slice_config 분류 전량 ──
+//    ① 계약·결제 ② 선적·운송 ③ 통관·신고 ④ 검사·증명 ⑤ 특수·법무
+const TRADING_DOC_CODES = [
+    'PO', 'PI', 'SC', 'LC',
+    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
+    'ED', 'ID', 'CINV', 'CO',
+    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS'
+];
+
+// 🌟 LLM 분류기는 대문자('BL')로, scheduler 의 page_type 은 소문자('tracking')로
+//    뱉는 두 경로가 공존하므로 양쪽을 모두 등재합니다.
+const TRADING_DOC_TYPE_SET = new Set<string>([
+    ...TRADING_DOC_CODES,
+    ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
+    'shipping_doc', 'TRACKING', 'Unknown', 'unknown'
+]);
+
+// ── commerce 도메인 타입 : proxy/index.ts 의 Relay 대상 전량 ──
+const COMMERCE_TYPE_SET = new Set<string>([
+    'sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
+    'receiving', 'shipping',
+    'member', 'team', 'user', 'users', 'pages', 'page', 'talk', 'prompt', 'ai_search'
+]);
+
+// ── analytics 행동 로그 / 관리자 Q&A ──
+const ANALYTIC_TYPE_SET = new Set<string>([
+    'click', 'hover', 'change', 'report', 'question', 'answer'
+]);
+
+/**
+ * 🌟 [MODE TAGGING] D1 응답 행의 type 만 보고 소속 트랙을 확정합니다.
+ *  commerce 를 먼저 판정해야 'tracking' 이 shipping 으로 새어 나가지 않습니다.
+ *  (TRADING_DOC_TYPE_SET 에는 소문자 'tracking' 이 없으므로 충돌하지 않지만,
+ *   순서를 고정해 두면 이후 코드가 추가되어도 안전합니다)
+ */
+function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
+    const s = String(t || '');
+    if (ANALYTIC_TYPE_SET.has(s)) return 'analytic';
+    if (COMMERCE_TYPE_SET.has(s)) return 'commerce';
+    if (TRADING_DOC_TYPE_SET.has(s)) return 'shipping';
+    return 'commerce';
+}
+
+/**
+ * 🌟 [READ SCOPE] 각 모드에서 목록/검색에 노출할 타입 목록입니다.
+ *  mode 컬럼이 이미 트랙을 격리하므로 여기서는 중첩을 허용합니다.
+ */
+const TYPE_SETS: Record<string, string[]> = {
+    shipping: [
+        'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
+        ...TRADING_DOC_CODES,
+        ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
+        'Unknown', 'unknown'
+    ],
+    analytic: ['click', 'hover', 'change', 'report'],
+    commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review']
+};
+
+/**
+ * 🌟 [MODE LABEL] 내부 코드값과 사용자 표기를 분리합니다.
+ *  저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB · Rust 변경이 없습니다.
+ *  ⚠️ 이 표가 유일한 정의입니다. applySearchModeUI 와 검색 결과 헤더가 공유합니다.
+ */
+const MODE_LABEL: Record<string, string> = {
+    commerce: 'Commerce',
+    shipping: 'Trading',
+    analytic: 'Analytic'
+};
+
+function modeLabel(m: string): string {
+    return MODE_LABEL[m] || (m.charAt(0).toUpperCase() + m.slice(1));
 }
 
 // 🌟 [NORMALIZE ENVELOPE] Rust(TradeDocument) / Cloudflare(D1 row) / 로컬 생성 객체를
 //  하나의 봉투 형태로 통일합니다. 루트에는 봉투 12개만 남기고, 나머지는 전부 data 로 내립니다.
 //  → 값이 2벌 저장되던 문제(enrichForIndex 호이스팅)가 사라집니다.
 //  → 새 도메인 필드가 생겨도 이 함수는 영원히 그대로입니다.
+// 🌟 [ENVELOPE KEYS] 루트에 남겨 둘 봉투 12개.
+//    이 집합에 없는 루트 키는 전부 '확장 필드' 로 간주해 data 로 하강시킵니다.
+const ENVELOPE_ROOT_KEYS = new Set([
+    'id', 'uuid', 'type', 'doc_type', 'flag', 'from', 'to', 'cc', 'bcc',
+    'ref', 'ref_val', 'mode', 'created_at', 'updated_at',
+    'created_at_ts', 'updated_at_ts',
+    // 아래 4개는 data 안으로 별도 승격되므로 하강 루프에서 제외합니다.
+    'data', 'json_data', 'text', 'masked_text',
+    // 클라우드 응답 전용 라우팅 힌트 (도메인 값이 아님)
+    'table', 'digest', 'current', 'score', 'name'
+]);
+
 const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     let parsed: any = {};
     if (typeof d.json_data === 'string') {
@@ -153,6 +315,26 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         try { parsed = JSON.parse(d.data) || {}; } catch (e) { parsed = {}; }
     } else {
         parsed = {};
+    }
+
+    // 🌟 [ROOT ABSORB] Cloudflare D1 의 sales / tracking / event 테이블은
+    //    확장 필드를 gzip data 가 아니라 '물리 컬럼' 으로만 저장합니다.
+    //    (proxy/index.ts 의 INSERT INTO sales(... sale_price, quantity, weight ...) 참고)
+    //    그래서 GET 응답에서는 그 값들이 행 최상위에 실려 옵니다.
+    //    이 루프가 없으면 봉투 12개만 취하고 나머지를 통째로 버려서
+    //    Dexie 의 data.sale_price / data.weight 조건이 전부 오판합니다.
+    //    로컬 추출 경로(scheduler → upsert_item)는 이미 data 에 전부 넣으므로
+    //    parsed 에 값이 있으면 그쪽을 우선하고, 없을 때만 루트에서 끌어옵니다.
+    for (const k in d) {
+        if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
+        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+        const v = d[k];
+        if (v === undefined || v === null) continue;
+        // 함수/DOM 등 직렬화 불가 값은 IndexedDB structured clone 에서 터지므로 제외합니다.
+        if (typeof v === 'function') continue;
+        if (parsed[k] === undefined || parsed[k] === null || parsed[k] === "") {
+            parsed[k] = v;
+        }
     }
 
     // 검색/표시용 텍스트도 data 안으로 통일합니다.
@@ -223,6 +405,9 @@ interface ChatSession {
     name?: string;
     cc?: string;
     sender?: string;
+    // 🌟 [FLAG] Client Worker 가 GeoIP 로 확정해 내려주는 국가 코드입니다.
+    //    commerce D1 items 테이블에 flag 컬럼이 없어, 동기화 시 이 값으로 보강합니다.
+    flag?: string;
 }
 
 // --- State ---
@@ -453,13 +638,20 @@ async function syncAnalyticsData() {
                 rowBcc = await hashId(rowType + rowCc);
             }
 
+            // 🌟 [MODE TAGGING] analytics 트랙도 modeOfType() 을 통과시켜
+            //    commerce/shipping 과 동일한 단일 판정 경로를 씁니다.
+            //    (rowType 은 click/hover/change/report 뿐이므로 항상 'analytic' 입니다.
+            //     혹시 워커가 새 타입을 내려보내도 여기서 자동으로 올바른 트랙에 배치됩니다)
+            const rowMode = modeOfType(rowType);
+
             items.push({
                 id: row.id,
                 type: rowType,
                 // 🌟 [FLAG] analytics D1 은 flag 컬럼을 실제로 채워 보냅니다(console/analytics 워커 공통).
                 //    여기서 버리면 LanceDB / Dexie 의 flag 봉투가 영원히 빈 문자열이 되어
                 //    지역별 스코프 조회가 불가능해집니다.
-                flag: row.flag || "",
+                //    워커가 비워 보낸 경우에는 세션 flag 로 보강합니다.
+                flag: row.flag || String((currentSession as any).flag || ""),
                 from: row.from || "",
                 to: row.to || "",
                 cc: rowCc,
@@ -467,7 +659,7 @@ async function syncAnalyticsData() {
                 ref: row.ref || "",
                 status: 9,
                 // 🌟 mode 태깅이 있어야 reindex_pending_embeddings / loadMoreDocs 가 analytic 트랙으로 격리합니다.
-                mode: "analytic",
+                mode: rowMode,
                 created_at: row.created_at || now,
                 updated_at: row.updated_at || now,
                 text: textVal,
@@ -476,7 +668,7 @@ async function syncAnalyticsData() {
                     ...parsed,
                     id: row.id,
                     type: rowType,
-                    mode: "analytic",
+                    mode: rowMode,
                     text: textVal,
                     masked_text: textVal
                 }
@@ -3002,26 +3194,60 @@ async function syncData() {
             });
 
             if (filteredResults.length > 0) {
-                // 🌟 [MODE TAGGING] 클라우드 D1 에는 mode 컬럼이 없습니다.
-                //    무역 서식 타입은 여기서 mode='shipping' 으로 확정해야
-                //    loadMoreDocs / reindex_pending_embeddings 의 트랙 격리가 성립합니다.
-                //    (TYPE_SETS.shipping 과 동일한 판정을 씁니다)
-                const TRADING_TYPES = new Set([
-                    'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
-                    'PO', 'PI', 'SC', 'LC', 'po', 'pi', 'sc', 'lc',
-                    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
-                    'ci', 'pl', 'bl', 'awb', 'sa', 'do', 'an', 'bc',
-                    'ED', 'ID', 'CINV', 'CO', 'ed', 'id', 'cinv', 'co',
-                    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
-                    'ic', 'wc', 'ca', 'phyto', 'hc', 'ben_cert',
-                    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
-                    'dgd', 'msds', 'poa', 'biz_lic', 'ins'
-                ]);
+                // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
+                //    mode 는 '동기화 시점에 클라이언트가 확정하는 값' 이며,
+                //    판정은 파일 상단의 modeOfType() 단일 함수가 전담합니다.
+                //
+                //    ── v1 의 결함 ──
+                //     TRADING_TYPES 에 소문자 'tracking' 이 들어 있어
+                //     proxy 의 Relay("tracking","order") 가 만든 commerce 배송추적 문서가
+                //     전부 mode='shipping' 으로 오염되었고,
+                //     loadMoreDocs 의 mode 필터에서 commerce 목록이 통째로 비었습니다.
                 for (const r of filteredResults) {
                     if (!r) continue;
                     if (r.mode) continue;
-                    const t = String(r.type || "");
-                    r.mode = TRADING_TYPES.has(t) ? "shipping" : "commerce";
+                    r.mode = modeOfType(String(r.type || ""));
+                }
+
+                // 🌟 [FLAG RECOVERY] commerce D1 의 items 테이블에는 flag 컬럼이 없습니다.
+                //    (analytics D1 · LanceDB · Dexie 에는 모두 존재)
+                //    그대로 두면 commerce 트랙 전 문서의 flag 가 영구 공백이 되어
+                //    지역 스코프 조회가 성립하지 않습니다.
+                //    세션 flag(= Client Worker 가 GeoIP 로 확정한 국가 코드)로 보강합니다.
+                const sessionFlag = String((currentSession as any).flag || "");
+                if (sessionFlag) {
+                    let flagFilled = 0;
+                    for (const r of filteredResults) {
+                        if (!r) continue;
+                        if (r.flag) continue;
+                        // data 안에 이미 flag 가 있으면(users/team 문서) 그쪽을 신뢰합니다.
+                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
+                        if (inner) { r.flag = inner; continue; }
+                        r.flag = sessionFlag;
+                        flagFilled++;
+                    }
+                    if (flagFilled > 0) {
+                        console.log(`[SYNC] flag 컬럼 부재 문서 ${flagFilled}건을 세션 flag('${sessionFlag}')로 보강했습니다.`);
+                    }
+                }
+
+                // 🌟 [ROOT ABSORB / RUST] Rust 의 upsert_items 는 item.data 객체의 알맹이를
+                //    루트로 끌어올리는 방향만 처리합니다. 반대로 '루트에만 있는 물리 컬럼' 은
+                //    data 로 내려 주지 않으므로, 여기서 미리 합쳐 보냅니다.
+                //    (normalizeEnvelope 의 ROOT ABSORB 와 동일 규칙이어야 두 저장소가 일치합니다)
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (!r.data || typeof r.data !== 'object') continue;
+                    for (const k in r) {
+                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+                        const v = r[k];
+                        if (v === undefined || v === null) continue;
+                        if (typeof v === 'function') continue;
+                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
+                            r.data[k] = v;
+                        }
+                    }
                 }
 
                 console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
@@ -3168,17 +3394,10 @@ function applySearchModeUI() {
         }
     });
 
-    // 🌟 [MODE LABEL] 내부 코드값(shipping)과 사용자에게 보이는 라벨(Trading)을 분리합니다.
+    // 🌟 [MODE LABEL] 파일 상단의 modeLabel() 단일 정의를 씁니다.
     //    저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB 나 Rust 쪽 변경이 전혀 없습니다.
     if (searchInput) {
-        const MODE_LABEL: Record<string, string> = {
-            commerce: 'Commerce',
-            shipping: 'Trading',
-            analytic: 'Analytic'
-        };
-        const label = MODE_LABEL[currentSearchMode]
-            || (currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1));
-        searchInput.placeholder = `${label} Search or Ask`;
+        searchInput.placeholder = `${modeLabel(currentSearchMode)} Search or Ask`;
     }
 
     // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
@@ -3887,16 +4106,9 @@ listen("extraction-progress", async (event: any) => {
                     if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
                 }
 
-                // 🌟 [MODE LABEL] applySearchModeUI 와 동일한 표기 규칙을 씁니다.
-                //    두 곳이 어긋나면 검색창에는 'Trading', 결과 헤더에는 'Shipping' 이 떠
-                //    사용자가 다른 트랙을 조회했다고 오해합니다.
-                const MODE_LABEL: Record<string, string> = {
-                    commerce: 'Goods',
-                    shipping: 'Trading',
-                    analytic: 'Analytic'
-                };
-                let displayMode = MODE_LABEL[currentSearchMode]
-                    || (currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1));
+                // 🌟 [MODE LABEL] 파일 상단 modeLabel() 단일 정의를 사용합니다.
+                //    (v1 에서는 여기만 'Goods' 로 되어 있어 검색창 라벨과 어긋났습니다)
+                let displayMode = modeLabel(currentSearchMode);
 
                 // 🌟 카운트는 '렌더링될 문서 수' 로 확정해야 하므로 아래 updateResultCount 가 다시 갱신합니다.
                 //    여기서는 조건 요약만 먼저 노출합니다.
@@ -5369,37 +5581,11 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         //  → SQL 문자열 조립이 사라지므로 DataFusion 문법 에러 클래스가 통째로 소멸합니다.
         //  → 텍스트 검색이 있을 때만 LanceDB(search_documents)를 후보 소스로 사용합니다.
 
-        // 🌟 [TYPE SETS v2 / TRADING FULL COVERAGE]
-        //  app-logis-center 의 get_slice_config 가 분류하던 무역 서식 전체를 흡수합니다.
-        //  기존 shipping 목록은 BL/AWB/CI/PI/PL/CO/LC 7종뿐이어서
-        //  ED/ID/CINV(통관), IC/WC/CA/PHYTO/HC(검사증), DGD/MSDS(위험물),
-        //  POA/BIZ_LIC/INS(법무·보험) 문서가 목록에서 통째로 사라졌습니다.
-        //
-        //  대소문자를 모두 넣는 이유: LLM 분류기가 'BL' 로 뱉는 경로와
-        //  scheduler 의 page_type 이 'tracking' 소문자로 뱉는 경로가 공존하기 때문입니다.
-        const TYPE_SETS: Record<string, string[]> = {
-            shipping: [
-                // ① 물류/추적 (기존)
-                'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
-                // ② 계약·결제
-                'PO', 'PI', 'SC', 'LC', 'po', 'pi', 'sc', 'lc',
-                // ③ 선적·운송
-                'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
-                'ci', 'pl', 'bl', 'awb', 'sa', 'do', 'an', 'bc',
-                // ④ 통관·신고
-                'ED', 'ID', 'CINV', 'CO', 'ed', 'id', 'cinv', 'co',
-                // ⑤ 검사·증명
-                'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
-                'ic', 'wc', 'ca', 'phyto', 'hc', 'ben_cert',
-                // ⑥ 특수·법무
-                'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
-                'dgd', 'msds', 'poa', 'biz_lic', 'ins',
-                // ⑦ 미분류
-                'Unknown', 'unknown'
-            ],
-            analytic: ['click', 'hover', 'change', 'report'],
-            commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review']
-        };
+        // 🌟 [READ SCOPE] 파일 상단의 TYPE_SETS 단일 정의를 그대로 씁니다.
+        //  ── 왜 지역 정의를 없앴는가 ──
+        //   기존에는 이 목록과 syncData 의 TRADING_TYPES 가 별도로 하드코딩되어
+        //   한쪽만 고치면 '태깅한 mode' 와 '조회하는 type' 이 어긋났습니다.
+        //   이제 쓰기(modeOfType)와 읽기(TYPE_SETS)가 같은 파일 상단에서 관리됩니다.
         const allowedTypes = TYPE_SETS[currentSearchMode] || TYPE_SETS.commerce;
 
         const textQuery = searchInput?.value.trim() || "";

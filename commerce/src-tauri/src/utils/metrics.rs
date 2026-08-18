@@ -73,24 +73,39 @@ pub async fn update_team_base_metrics(
 
     // Min/Max 업데이트는 items 내의 데이터에 한해서 진행
     {
-        // 🌟 [v4] amount / total_amount 를 추가합니다.
-        //    v4 에서 amount 는 LanceDB 물리 컬럼에서 사라지고 data.amount 로 내려갔습니다.
-        //    Dexie 의 top / bottom 백분위 조건은 이 min/max 통계를 기준으로 범위를 잡으므로,
-        //    통계에 amount 가 없으면 '가장 비싼 20%' 같은 질의가 부정확해집니다.
-        let properties = [
-            "price", "amount", "total_amount", "quantity", "width", "height", "length", "weight",
-            "shipping_fee", "shipping_duration", "sale_price", "supply_price", "low_stock_threshold",
-            "discount", "min_order_amount", "max_discount_amount", "usage_limit",
-            "usage_per", "started_at", "expired_at"
-        ];
+        // 🌟 [METRICS v5 / RULE-BASED]
+        //  ── 무엇이 바뀌었나 ──
+        //   기존에는 수치 필드 20개를 배열로 나열해, 새 수치 필드를 추가할 때마다
+        //   여기에도 이름을 넣어야 통계(top/bottom 백분위)에 잡혔습니다.
+        //   이제 item 이 실제로 들고 있는 키를 순회하며
+        //   canonical::kind_of() 로 Numeric 판정을 받은 것만 집계합니다.
+        //   → Dexie 에 새 수치 필드를 추가해도 이 함수는 수정할 필요가 없습니다.
+        //
+        //  ── 시간 축 제외 ──
+        //   created_at / updated_at 은 통계 대상이 아니라 봉투 시각이므로 건너뜁니다.
+        //   status 는 코드값이라 min/max 가 의미 없습니다.
+        use crate::utils::canonical::{kind_of, CanonKind};
+        const METRIC_SKIP: [&str; 4] = ["created_at", "updated_at", "status", "index"];
 
         for item in items {
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+            // 이 문서가 실제로 들고 있는 수치 키만 뽑습니다.
+            let numeric_keys: Vec<String> = item.as_object()
+                .map(|o| o.keys()
+                    .filter(|k| !METRIC_SKIP.iter().any(|s| s == &k.as_str()))
+                    .filter(|k| kind_of(k) == CanonKind::Numeric)
+                    .cloned()
+                    .collect())
+                .unwrap_or_default();
+
+            if numeric_keys.is_empty() { continue; }
+
             let base = team_data.as_object_mut().unwrap().entry("base").or_insert(json!({ "pages": {} })).as_object_mut().unwrap();
             let global_type_node = base.entry(item_type).or_insert(json!({ "draft": 0, "count": 0 })).as_object_mut().unwrap();
 
-            for prop in properties.iter() {
-                if let Some(val) = item.get(*prop) {
+            for prop in numeric_keys.iter() {
+                if let Some(val) = item.get(prop.as_str()) {
                     let num_val = if val.is_number() {
                         val.as_f64().unwrap_or(0.0)
                     } else if let Some(s) = val.as_str() {
@@ -119,7 +134,7 @@ pub async fn update_team_base_metrics(
                     //    0 은 '미설정' 이지 유효한 하한이 아니므로 모든 속성에서 동일하게 제외합니다.
                     if num_val == 0.0 { continue; }
 
-                    let prop_node = global_type_node.entry(*prop).or_insert(json!({ "min": 0.0, "max": 0.0 })).as_object_mut().unwrap();
+                    let prop_node = global_type_node.entry(prop.clone()).or_insert(json!({ "min": 0.0, "max": 0.0 })).as_object_mut().unwrap();
 
                     let current_min = prop_node.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
                     let current_max = prop_node.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);

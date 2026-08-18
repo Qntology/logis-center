@@ -1162,12 +1162,10 @@ impl LogisModel {
                     emit_term("[STAGE-2] 🚢 Initiating Slice & Merge Pipeline...");
                     
                     // Step B: 판별된 문서에 따른 자르기(Slice) 미션 설정
-                    let missions = match detected_type.as_str() {
-                        "CI" | "PI" => vec![("header", 0.0, 0.20), ("parties", 0.0, 0.40), ("logistics", 0.20, 0.50), ("items", 0.30, 0.85), ("financials", 0.70, 0.95), ("conditions", 0.80, 1.0)],
-                        "BL" => vec![("header", 0.0, 0.20), ("parties", 0.0, 0.60), ("logistics", 0.35, 0.65), ("cargo", 0.50, 0.90), ("conditions", 0.80, 1.0)],
-                        "AWB" => vec![("header", 0.0, 0.15), ("parties", 0.0, 0.40), ("logistics", 0.10, 0.40), ("cargo", 0.30, 0.70), ("financials", 0.60, 0.90)],
-                        _ => vec![("header", 0.0, 0.30), ("parties", 0.0, 0.50), ("items", 0.30, 0.80), ("conditions", 0.70, 1.0)],
-                    };
+                    //  🌟 좌표표를 parsing.rs 로 옮겼습니다. app-logis-center 가 갖고 있던
+                    //     27종 무역 서식 좌표를 그대로 이식한 것이며,
+                    //     새 서식이 추가돼도 이 파일은 수정할 필요가 없습니다.
+                    let missions = crate::parsing::get_trade_doc_slice_config(&detected_type);
 
                     let w = dynamic_image.width();
                     let h = dynamic_image.height();
@@ -1311,106 +1309,105 @@ impl LogisModel {
                 final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
                 final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
-                // 🌟 [TRADING FLATTEN v2] 무역 문서(Trade Doc) 핵심 축 평탄화.
-                //    Dexie v8 이 인덱싱하는 21개 trading 경로를 전부 채워야
-                //    executeDexiePlan 이 where() 드라이버를 잡을 수 있습니다.
-                //    (기존 구현은 7개만 채워서 컨테이너/씰/중량/참조번호 조회가 전부 풀스캔이었습니다)
+                // 🌟 [TRADING FLATTEN v3 / RULE-BASED]
+                //  ── 무엇이 바뀌었나 ──
+                //   v2 는 header/parties/logistics/financials/conditions/cargo 6개 그룹의
+                //   필드 60여 개를 손으로 나열했습니다. 그래서
+                //     ① get_trade_category_schema 에 필드를 추가하면 여기도 같이 고쳐야 했고
+                //     ② 여기 없는 필드는 data 루트에 올라오지 않아,
+                //        executeDexiePlan 의 contains 판정이 false 를 돌려주며
+                //        '조건 무시' 가 아니라 '문서 탈락' 으로 이어졌습니다.
+                //   v3 는 '중첩 객체의 잎을 전부 끌어올린다' 는 구조적 규칙만 남깁니다.
+                //   별칭은 build_dexie_plan 의 normalize_path 와 동일한
+                //   bias.json search_bridge.path_alias 노드를 재사용하므로,
+                //   저장(정방향)과 조회(역방향)가 같은 이름 공간을 씁니다.
                 if is_trade_doc {
-                    let obj = final_data.as_object_mut().unwrap();
+                    // 잎을 끌어올릴 중첩 그룹. 배열(line_items/containers)은 아래에서 따로 처리합니다.
+                    const TRADE_GROUPS: [&str; 6] =
+                        ["header", "parties", "logistics", "financials", "conditions", "cargo"];
 
-                    // ── Header : 문서 정체성 ──
-                    if let Some(header) = extracted_data.get("header") {
-                        obj.insert("issue_date".to_string(), header.get("issue_date").cloned().unwrap_or(json!("")));
-                        // 🌟 no 와 doc_number 를 '둘 다' 씁니다.
-                        //    no  : 레거시 commerce 축(이미 인덱싱되어 있음)
-                        //    doc_number : trading 축(normalize_path 가 여기로 모읍니다)
-                        let dnum = header.get("document_number").cloned().unwrap_or(json!(""));
+                    // bias.json 의 path_alias 를 역방향(alias -> canonical)으로 사용합니다.
+                    // build_dexie_plan 은 canonical 로 조건을 모으므로,
+                    // 저장 시점에도 canonical 이름으로 올려야 두 방향이 만납니다.
+                    fn canonical_name(raw: &str) -> String {
+                        let k = raw.trim();
+                        if let Some(alias_obj) = crate::parsing::BIAS_DICT
+                            .get("search_bridge")
+                            .and_then(|sb| sb.get("path_alias"))
+                            .and_then(|v| v.as_object())
+                        {
+                            for (canonical, list) in alias_obj {
+                                if canonical == k { return canonical.clone(); }
+                                if let Some(arr) = list.as_array() {
+                                    if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                                        return canonical.clone();
+                                    }
+                                }
+                            }
+                        }
+                        k.to_string()
+                    }
+
+                    let mut hoisted: Vec<String> = Vec::new();
+
+                    for group in TRADE_GROUPS.iter() {
+                        let src = match extracted_data.get(*group).and_then(|v| v.as_object()) {
+                            Some(o) => o.clone(),
+                            None => continue,
+                        };
+                        let obj = final_data.as_object_mut().unwrap();
+                        for (k, v) in src {
+                            if v.is_null() { continue; }
+                            if let Some(s) = v.as_str() {
+                                // "N/A" 는 LLM 이 '못 찾았다' 는 뜻으로 쓰는 값이라 조건이 될 수 없습니다.
+                                if s.trim().is_empty() || s == "N/A" { continue; }
+                            }
+                            let name = canonical_name(&k);
+                            // 이미 채워진 축은 덮어쓰지 않습니다. (아래 식별자 블록이 우선)
+                            if obj.get(&name).map_or(false, |x| !x.is_null()) { continue; }
+                            obj.insert(name.clone(), v.clone());
+                            hoisted.push(name);
+                        }
+                    }
+
+                    // ── 문서 식별자 : no(레거시 commerce 축)와 doc_number(trading 축)를 동시 유지 ──
+                    {
+                        let obj = final_data.as_object_mut().unwrap();
+                        let dnum = obj.get("doc_number").cloned()
+                            .or_else(|| obj.get("document_number").cloned())
+                            .unwrap_or(json!(""));
                         obj.insert("no".to_string(), dnum.clone());
                         obj.insert("doc_number".to_string(), dnum);
-                        // 🌟 [SCOPE FIX] detected_type 은 위쪽 `if is_trade_doc { ... }` 분류 블록의
-                        //    지역 변수라 이 평탄화 블록에서는 이미 소멸했습니다.
-                        //    바깥 스코프에서 동일한 값으로 확정된 doc_type(&str)을 그대로 씁니다.
-                        //    (doc_type = header.doc_type 이 있으면 그 값, 없으면 "shipping_doc")
-                        obj.insert("doc_type".to_string(), header.get("doc_type").cloned().unwrap_or(json!(doc_type)));
-                        if let Some(v) = header.get("reference_invoice") { obj.insert("reference_invoice".to_string(), v.clone()); }
-                        if let Some(v) = header.get("reference_lc") { obj.insert("reference_lc".to_string(), v.clone()); }
-                        if let Some(v) = header.get("reference_booking") { obj.insert("reference_booking".to_string(), v.clone()); }
-                        if let Some(v) = header.get("reference_buyer") { obj.insert("reference_buyer".to_string(), v.clone()); }
-                        if let Some(v) = header.get("reference_seller") { obj.insert("reference_seller".to_string(), v.clone()); }
-                        if let Some(v) = header.get("reference_carrier") { obj.insert("reference_carrier".to_string(), v.clone()); }
-                        if let Some(v) = header.get("number_of_originals") { obj.insert("number_of_originals".to_string(), v.clone()); }
-                        if let Some(v) = header.get("expiry_date") { obj.insert("expiry_date".to_string(), v.clone()); }
-                    }
-
-                    // ── Parties : 화주 / 수하인 / 통지처 ──
-                    if let Some(parties) = extracted_data.get("parties") {
-                        obj.insert("sender_name".to_string(), parties.get("supplier_name").cloned().unwrap_or(json!("")));
-                        obj.insert("recipient_name".to_string(), parties.get("buyer_name").cloned().unwrap_or(json!("")));
-                        if let Some(v) = parties.get("supplier_address") { obj.insert("sender_address".to_string(), v.clone()); }
-                        if let Some(v) = parties.get("buyer_address") { obj.insert("recipient_address".to_string(), v.clone()); }
-                        if let Some(v) = parties.get("notify_party_name") { obj.insert("notify_party_name".to_string(), v.clone()); }
-                    }
-
-                    // ── Logistics : 선박 / 항구 / 일정 ──
-                    if let Some(logistics) = extracted_data.get("logistics") {
-                        obj.insert("vessel".to_string(), logistics.get("vehicle_name").cloned().unwrap_or(json!("")));
-                        obj.insert("pol".to_string(), logistics.get("location_port_of_loading").cloned().unwrap_or(json!("")));
-                        obj.insert("pod".to_string(), logistics.get("location_port_of_discharge").cloned().unwrap_or(json!("")));
-                        if let Some(v) = logistics.get("voyage_number") { obj.insert("voyage_number".to_string(), v.clone()); }
-                        if let Some(v) = logistics.get("etd") { obj.insert("etd".to_string(), v.clone()); }
-                        if let Some(v) = logistics.get("eta") { obj.insert("eta".to_string(), v.clone()); }
-                        if let Some(v) = logistics.get("transport_mode") { obj.insert("transport_mode".to_string(), v.clone()); }
-                        if let Some(v) = logistics.get("place_of_receipt") { obj.insert("place_receipt".to_string(), v.clone()); }
-                        if let Some(v) = logistics.get("place_of_delivery") { obj.insert("place_delivery".to_string(), v.clone()); }
-                    }
-
-                    // ── Financials : 금액 축 ──
-                    if let Some(fin) = extracted_data.get("financials") {
-                        obj.insert("amount".to_string(), fin.get("amount_total").cloned().unwrap_or(json!(0)));
-                        if let Some(v) = fin.get("currency_code") { obj.insert("currency".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("amount_subtotal") { obj.insert("subtotal_amount".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("amount_tax") { obj.insert("tax_amount".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("amount_freight") { obj.insert("freight_amount".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("amount_insurance") { obj.insert("insurance_amount".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("local_charges_total") { obj.insert("local_charges".to_string(), v.clone()); }
-                        if let Some(v) = fin.get("exchange_rate") { obj.insert("exchange_rate".to_string(), v.clone()); }
-                    }
-
-                    // ── Conditions : 거래 조건 ──
-                    if let Some(cond) = extracted_data.get("conditions") {
-                        obj.insert("incoterms".to_string(), cond.get("incoterms_code").cloned().unwrap_or(json!("")));
-                        if let Some(v) = cond.get("payment_terms") { obj.insert("payment_terms".to_string(), v.clone()); }
-                        if let Some(v) = cond.get("freight_payment_term") { obj.insert("freight_payment_term".to_string(), v.clone()); }
-                        if let Some(v) = cond.get("partial_shipment") { obj.insert("partial_shipment_allowed".to_string(), v.clone()); }
-                        if let Some(v) = cond.get("transshipment") { obj.insert("transshipment_allowed".to_string(), v.clone()); }
-                    }
-
-                    // ── Cargo : 화물 축 ──
-                    if let Some(cargo) = extracted_data.get("cargo") {
-                        if let Some(v) = cargo.get("package_count") { obj.insert("package_count".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("package_unit") { obj.insert("package_unit".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("weight_gross") { obj.insert("weight_gross".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("weight_net") { obj.insert("weight_net".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("volume_measurement") { obj.insert("volume".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("volume") { obj.insert("volume".to_string(), v.clone()); }
-                        if let Some(v) = cargo.get("marks_and_numbers") { obj.insert("marks_numbers".to_string(), v.clone()); }
-                    }
-
-                    // ── Containers : 첫 컨테이너를 대표 축으로 승격 ──
-                    //    (전체 목록은 data.containers 배열에 그대로 남아 있습니다)
-                    if let Some(arr) = extracted_data.get("containers").and_then(|v| v.as_array()) {
-                        if let Some(first) = arr.first() {
-                            if let Some(v) = first.get("container_number") { obj.insert("container_number".to_string(), v.clone()); }
-                            if let Some(v) = first.get("seal_number") { obj.insert("seal_number".to_string(), v.clone()); }
+                        if obj.get("doc_type").map_or(true, |v| v.as_str().unwrap_or("").is_empty()) {
+                            obj.insert("doc_type".to_string(), json!(doc_type));
                         }
                     }
 
-                    // ── Line items : 첫 HS Code 를 대표 축으로 승격 ──
-                    if let Some(arr) = extracted_data.get("line_items").and_then(|v| v.as_array()) {
-                        if let Some(hs) = arr.iter().find_map(|it| it.get("hs_code")) {
-                            obj.insert("hs_code".to_string(), hs.clone());
+                    // ── 배열 축 : 첫 원소만 대표 축으로 승격 ──
+                    //    (전체 목록은 data.containers / data.line_items 배열에 그대로 남습니다)
+                    for (arr_key, promote) in [
+                        ("containers", vec!["container_number", "seal_number"]),
+                        ("line_items", vec!["hs_code"]),
+                    ] {
+                        let arr = match extracted_data.get(arr_key).and_then(|v| v.as_array()) {
+                            Some(a) => a.clone(),
+                            None => continue,
+                        };
+                        let obj = final_data.as_object_mut().unwrap();
+                        for field in promote {
+                            if obj.get(field).map_or(false, |x| !x.is_null()) { continue; }
+                            if let Some(v) = arr.iter().find_map(|it| it.get(field)) {
+                                obj.insert(field.to_string(), v.clone());
+                                hoisted.push(field.to_string());
+                            }
                         }
                     }
+
+                    emit_term(&format!(
+                        "[TRADING FLATTEN v3] data 루트로 승격한 축 {}개: {:?}",
+                        hoisted.len(),
+                        hoisted.iter().take(12).collect::<Vec<_>>()
+                    ));
                 }
                 
                 let _ = db.upsert_item(
@@ -6003,7 +6000,61 @@ impl LogisModel {
         // 🌟 추출된 결과를 터미널 화면에 꽂아줍니다!
         emit_term(&format!("[STAGE-1 RESULT]\n{}", res));
 
-        let extracted_conditions = crate::parsing::parse_json_from_llm(&res);
+        // 🌟 [CONDITION NORMALIZE v4]
+        //  build_dexie_plan 은 { "필드": { "operator": ..., "value": ... } } 형태만 읽고,
+        //  value 키가 없으면 `continue` 로 그 조건을 통째로 버립니다.
+        //  0.6B 출력은 평문 / operator 누락 형태가 섞여 오므로
+        //  "조건을 뽑았는데 검색에는 반영되지 않는" 경로가 상시 존재했습니다.
+        //  여기서 형태를 한 번만 확정해 그 경로를 없앱니다.
+        fn normalize_trade_conditions(raw: &Value) -> Value {
+            let src = match raw.as_object() {
+                Some(o) => o,
+                None => return json!({}),
+            };
+            let mut out = serde_json::Map::new();
+
+            for (k, v) in src {
+                let (op, val) = match v {
+                    Value::Object(o) => {
+                        let op = o.get("operator").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let val = match o.get("value") { Some(x) => x.clone(), None => continue };
+                        (op, val)
+                    },
+                    Value::Null => continue,
+                    other => (String::new(), other.clone()),
+                };
+
+                // 빈 값은 조건이 아니라 노이즈입니다.
+                let is_empty = match &val {
+                    Value::Null => true,
+                    Value::String(s) => s.trim().is_empty() || s == "null" || s == "N/A",
+                    _ => false,
+                };
+                if is_empty { continue; }
+
+                // 연산자가 비었으면 값의 형태로 결정론 판정합니다.
+                //  수치 → eq / 문자열 → contains (부분 일치가 리콜에 유리)
+                let op = if !op.trim().is_empty() {
+                    op.trim().to_lowercase()
+                } else if val.is_number() {
+                    "eq".to_string()
+                } else {
+                    "contains".to_string()
+                };
+
+                out.insert(k.clone(), json!({ "operator": op, "value": val }));
+            }
+
+            Value::Object(out)
+        }
+
+        let extracted_conditions = normalize_trade_conditions(&crate::parsing::parse_json_from_llm(&res));
+
+        emit_term(&format!(
+            "[STAGE-1 CONDITIONS] 정규화 조건 {}개: {}",
+            extracted_conditions.as_object().map(|o| o.len()).unwrap_or(0),
+            serde_json::to_string(&extracted_conditions).unwrap_or_default()
+        ));
         
         let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
         let _ = app_handle.emit("extraction-progress", &payload);
@@ -6017,26 +6068,51 @@ impl LogisModel {
         //
         //  doc_type 조건이 뽑혔다면 그 값을 1순위로 좁히고,
         //  없으면 무역 서식 전체를 후보로 둡니다. Dexie 가 뒤에서 조건으로 잘라냅니다.
-        let mut trade_types: Vec<String> = Vec::new();
+        // 🌟 [TRADING CONTEXT v3 / RECALL-WIDE]
+        //  ── v2 의 결함 ──
+        //   doc_type 이 뽑히면 스코프를 그 값 하나로 '교체' 했습니다.
+        //   그 값은 0.6B 가 자연어에서 추정한 것이라 틀릴 수 있고,
+        //   틀리는 순간 `type IN ('BL','bl')` 로 좁혀져 LanceDB 가 후보를 안 줍니다.
+        //   Dexie 가 구출할 재료가 없으니 되살릴 경로 자체가 없습니다.
+        //
+        //  ── v4 원칙 ──
+        //   LanceDB = 리콜(넓게), Dexie = 정밀도(정확히 자르기).
+        //   스코프는 항상 무역 서식 전체로 두고, doc_type 은 조건으로 내려보냅니다.
+        //   맞았다면 Dexie 가 정확히 자르고, 틀렸다면 후보가 남아 구출됩니다.
+        let mut trade_types: Vec<String> = vec![
+            "tracking".to_string(), "receiving".to_string(),
+            "shipping".to_string(), "shipping_doc".to_string(),
+        ];
+        for t in [
+            "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
+            "SA", "DO", "AN", "BC", "ED", "ID", "CINV",
+            "IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT",
+            "DGD", "MSDS", "POA", "BIZ_LIC", "INS",
+        ] {
+            trade_types.push(t.to_string());
+            trade_types.push(t.to_lowercase());
+        }
+
+        // 🌟 doc_type 은 '스코프' 가 아니라 '조건' 입니다.
+        //    extract_from_image(FLATTEN v3)가 data.doc_type 을 채우고
+        //    Dexie v8 이 'data.doc_type' 을 인덱싱하므로 O(log n) 으로 처리됩니다.
+        let mut final_conditions = extracted_conditions.clone();
         if let Some(dt) = extracted_conditions.get("doc_type")
             .and_then(|v| v.get("value"))
             .and_then(|v| v.as_str())
         {
             let clean = dt.trim();
             if !clean.is_empty() {
-                trade_types.push(clean.to_uppercase());
-                trade_types.push(clean.to_lowercase());
-            }
-        }
-        if trade_types.is_empty() {
-            for t in [
-                "tracking", "receiving", "shipping", "shipping_doc",
-                "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
-                "SA", "DO", "AN", "BC", "ED", "ID", "CINV",
-                "IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT",
-                "DGD", "MSDS", "POA", "BIZ_LIC", "INS",
-            ] {
-                trade_types.push(t.to_string());
+                if let Some(o) = final_conditions.as_object_mut() {
+                    o.insert("doc_type".to_string(), json!({
+                        "operator": "contains",
+                        "value": clean
+                    }));
+                }
+                emit_term(&format!(
+                    "[STAGE-2] doc_type='{}' → 스코프가 아닌 Dexie 조건으로 전달 (리콜 보존)",
+                    clean
+                ));
             }
         }
 
@@ -6046,9 +6122,9 @@ impl LogisModel {
             "type": "tracking",
             "types": trade_types,
             "text": query.clone(),
-            "condition": extracted_conditions,
+            "condition": final_conditions,
             "alternates": {},
-            "unassigned": [],
+            "unassigned": query.split_whitespace().collect::<Vec<_>>(),
             "substantial": "",
             "find": "",
             "tier": "TRADING"
@@ -6087,16 +6163,45 @@ impl LogisModel {
             return Ok(json!({ "context": [], "cancelled": true }));
         }
 
-        // [TODO] 향후 여기에 통계 분석 전용 프롬프트 및 LLM 추론 로직 (Graph2Metrics 등) 추가 예정
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 임시 대기
+        // 🌟 [ANALYTIC CONTEXT v4]
+        //  ── 무엇이 고쳐졌나 ──
+        //   기존 더미는 type 을 "sales" 로 고정했습니다. 그런데
+        //     · build_scope_filter 가 여기에 mode = 'analytic' 을 AND 로 붙이고
+        //     · analytic 문서의 type 은 click / hover / change / report 뿐이라
+        //   최종 SQL 이 `type = 'sales' AND mode = 'analytic'` 이 되어
+        //   analytic 로컬 검색은 구조적으로 항상 0건이었습니다.
+        //
+        //  ── 왜 LLM 을 부르지 않는가 ──
+        //   analytic 문서의 본문은 Cron Worker 가 이미 자연어 한 문장으로 구조화한
+        //   action / summary 입니다. reindex_pending_embeddings 도 그 문장을
+        //   그대로 벡터화합니다(analytic_text 우선). 질의도 문장, 저장도 문장이므로
+        //   FTS + 벡터만으로 리콜이 성립하고, 조건화할 도메인 컬럼 자체가 없습니다.
+        //   여기서 0.6B 를 부르면 VRAM 만 쓰고 얻는 것이 없습니다.
+        emit_term(&format!("[STAGE-1] Building analytic context (no LLM required) for: '{}'", query));
 
-        emit_term(&format!("[STAGE-1] Dummy parsing analytic intent from query: '{}'", query));
-        
-        // 검색 쿼리에 걸리도록 임시 컨텍스트(sales 등)를 뱉어냅니다.
+        // 🌟 analytics D1(console-logis-center)이 실제로 발행하는 전 타입입니다.
+        //    question / answer 는 채팅 말풍선 전용이라 검색 스코프에서 제외합니다.
+        //    (main.ts 의 TYPE_SETS.analytic 과 반드시 같은 집합이어야 합니다)
+        let analytic_types = vec!["report", "click", "hover", "change"];
+
+        // 🌟 [UNASSIGNED] 질의 토큰을 그대로 넘겨 Dexie 가 keywords 가산점으로 씁니다.
+        //    조건이 0개인 트랙이므로 이 축이 사실상 유일한 정밀도 신호입니다.
+        let keywords: Vec<String> = query
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+
         let ctx = json!([{
-            "type": "sales", // 검색을 위한 기본 타겟 테이블 (임시)
+            "type": "report",
+            "types": analytic_types,
             "text": query.clone(),
-            "condition": {}
+            "status": "",
+            "substantial": "",
+            "find": "",
+            "condition": {},
+            "alternates": {},
+            "unassigned": keywords,
+            "tier": "ANALYTIC"
         }]);
 
         let payload_done = json!({ "task_id": task_id, "category": "Done", "summary": "Analytic processing complete (Dummy).", "spinner": "✅" });

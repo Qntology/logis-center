@@ -500,7 +500,9 @@ pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
     let mut phrases: Vec<String> = Vec::new();
 
     // ① [최우선] 다국어 값 도메인 축 — 크로스링구얼 매칭의 유일한 근거
-    for p in multilingual_value_anchor_phrases(field_name) {
+    //    🌟 page_type 이 이미 인자로 들어와 있는데 쓰지 않아, 저장 벡터에도
+    //       goods/review/tracking 세 도메인 어휘가 전부 섞여 있었습니다.
+    for p in multilingual_value_anchor_phrases_scoped(page_type, field_name) {
         if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
     }
 
@@ -560,7 +562,15 @@ pub fn indexing_leaf_label(doc_lang: &str, page_type: &str, field_name: &str) ->
 //    다국어 크로스링구얼 매칭이 이 노드의 유일한 존재 이유이므로 상한을 두지 않습니다.
 //    (Max-Pool 은 구 개수가 늘어도 최댓값만 취하고, 뱅크 크기 편향은
 //     bank_size_equalized_mask() 가 질의 시점에 상대 통계로 별도 정규화합니다)
-pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
+// 🌟 [DOMAIN-SCOPED ANCHOR] bias.json 의 키는 "goods.title" / "review.title" / "tracking.title"
+//    처럼 도메인 접두를 갖습니다. 그런데 기존 판정은
+//        target.rsplitn(2, '.').next()   →  "goods.title" 에서 "title"
+//    이라 field_name="title" 하나로 세 도메인이 전부 병합되었습니다.
+//    그 결과 review 검색의 title 뱅크에 의류 어휘 200여 구가 실려
+//    review.title 과 goods.title 이 벡터 공간에서 구분되지 않습니다.
+//    page_type 을 알고 있으면 "page_type.field_name" 정확 일치를 우선하고,
+//    그 도메인 항목이 없을 때만 기존 접미 일치로 폴백합니다.
+pub fn multilingual_value_anchor_phrases_scoped(page_type: &str, field_name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let node = match crate::parsing::BIAS_DICT
         .get("search_bridge")
@@ -568,6 +578,28 @@ pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
         .and_then(|v| v.as_object())
     { Some(n) => n, None => return out };
 
+    let scoped_key = if page_type.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}.{}", page_type.trim(), field_name)
+    };
+
+    // ① 도메인 정확 일치 (goods.title 질의에는 goods.title 만)
+    if !scoped_key.is_empty() {
+        if let Some(val) = node.get(&scoped_key) {
+            for field in ["semantic", "bias"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                    for p in split_bias_phrases_full(s) {
+                        if !out.iter().any(|e| e == &p) { out.push(p); }
+                    }
+                }
+            }
+        }
+    }
+    if !out.is_empty() { return out; }
+
+    // ② 폴백 : 이 필드에 도메인 항목이 아예 없을 때만 접미 일치로 전 도메인 수집.
+    //    (page_type 이 비어 오는 호출부의 기존 동작을 그대로 보존합니다)
     for (target, val) in node {
         let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
         if key != field_name { continue; }
@@ -580,6 +612,11 @@ pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
         }
     }
     out
+}
+
+pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
+    // 🌟 도메인을 모르는 레거시 호출부용. 기존 접미 일치 동작을 그대로 유지합니다.
+    multilingual_value_anchor_phrases_scoped("", field_name)
 }
 
 // 🌟 [METRICS FAMILY] bias.json 의 metrics.* 노드를 (family_key, phrase) 목록으로 펼칩니다.

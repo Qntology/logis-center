@@ -575,57 +575,57 @@ impl VectorStore {
         Ok(())
     }
     
-    // 🌟 [CANONICALIZE / RUST SIDE]
-    //  Dexie 의 canonicalizeData(main.ts) 와 '완전히 동일한 규칙'으로 data 를 정규화합니다.
-    //  두 곳의 규칙이 어긋나면 같은 값이 LanceDB 에는 "123", Dexie 에는 123 으로 들어가
-    //  where('data.no').equals("123") 이 절반을 놓칩니다.
+// 🌟 [CANONICALIZE v5 / RULE-BASED]
+    //  ── 무엇이 바뀌었나 ──
+    //   기존은 ID_KEYS / NUM_KEYS / BOOL_KEYS 라는 '이름 화이트리스트' 였습니다.
+    //   그래서 Dexie 에 data.container_number 를 추가하면 여기 배열과
+    //   find_item_by_property 의 복제본까지 총 4곳(배열 길이 상수 포함)을 고쳐야 했습니다.
     //
-    //  규칙:
-    //    ① 식별자류 → String (없으면 "")
-    //    ② 수치류   → Number (없거나 파싱 실패 시 0)
-    //    ③ 불리언류 → 0|1 정수 (IndexedDB 는 boolean 을 키로 인정하지 않음)
-    //    ④ tags     → 배열 (멀티엔트리 인덱스 대상)
-    // 🌟 [SEED GUARD] seed_defaults = true 일 때만 '없는 키에 기본값을 삽입' 합니다.
-    //    Dexie 의 data.* 인덱스는 undefined 값을 조용히 제외하므로 items 에는 기본값이 필요하지만,
-    //    users / pages 문서에 48개 도메인 키를 붙이면 통계 트리 옆에 의미 없는
-    //    sale_price: 0 / tracking_number: "" 가 잔뜩 생깁니다.
-    //    (users 는 data.origin / data.is_device / data.email 만 인덱싱하므로 시딩이 불필요합니다)
-    //    seed_defaults = false 여도 '이미 있는 키의 타입 정규화' 는 그대로 수행합니다.
+    //   이제는 '이미 존재하는 키를 순회' 하면서 crate::utils::canonical::kind_of() 로
+    //   접미사/부분일치 규칙 판정을 받습니다.
+    //   → 새 필드를 Dexie 에 추가해도 이 함수는 영원히 수정할 필요가 없습니다.
+    //
+    //  ── seed_defaults 의 의미 ──
+    //   Dexie 의 data.* 인덱스는 undefined 값을 조용히 제외합니다.
+    //   그래서 items 문서에는 '조회 축으로 쓰는 최소 기본값' 을 시딩해야 합니다.
+    //   시딩 목록은 SEED_KEYS 하나로만 관리하며, 조회 축이 늘 때만 손댑니다.
+    //   (조회 축이 아닌 단순 저장 필드는 시딩이 전혀 필요 없습니다)
     fn canonicalize_data(mut v: Value, seed_defaults: bool) -> Value {
-        // 🌟 [PARITY CONTRACT] 이 세 목록은 main.ts 의 ID_KEYS / NUM_KEYS / BOOL_KEYS 와
-        //    '완전히 동일' 해야 합니다. 한쪽만 늘리면 같은 값이
-        //    LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
-        //    where('data.xxx').equals(...) 가 절반을 놓칩니다.
-        const ID_KEYS: [&str; 23] = [
-            // ── commerce ──
-            "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
-            "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
-            // ── trading : 전부 영숫자 혼합이라 String 으로 확정해야 합니다 ──
-            //   (B/L No 'ABCD1234567', 컨테이너 'MSCU1234567')
-            "doc_number", "container_number", "seal_number",
-            "reference_invoice", "reference_lc", "reference_booking",
-            "reference_buyer", "reference_seller", "reference_carrier", "hs_code",
-        ];
-        const NUM_KEYS: [&str; 35] = [
-            // ── commerce ──
-            "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
-            "discount", "quantity", "width", "height", "length", "weight",
-            "shipping_fee", "shipping_duration", "low_stock_threshold",
-            "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
-            "started_at", "expired_at", "created_at", "updated_at", "views",
-            // ── trading : '5,000 KGS' 같은 표기로 들어오므로 숫자만 뽑아 확정합니다 ──
-            "package_count", "weight_gross", "weight_net", "volume",
-            "subtotal_amount", "tax_amount", "freight_amount", "insurance_amount",
-            "local_charges", "exchange_rate", "number_of_originals",
-        ];
-        const BOOL_KEYS: [&str; 16] = [
-            // ── commerce ──
-            "detail", "is_masked", "is_device", "embed", "node",
-            "new_customer_only", "first_purchase_only", "region_restrictions",
-            "bundle_shipping", "tax_included", "recipient_match",
-            // ── trading : IDB 는 boolean 을 키로 인정하지 않으므로 0|1 정수로 내립니다 ──
-            "partial_shipment_allowed", "transshipment_allowed",
-            "freight_prepaid", "marine_pollutant", "is_original",
+        use crate::utils::canonical::{kind_of, iso_to_epoch_ms, CanonKind};
+
+        // 🌟 [SEED KEYS] Dexie stores() 에 인덱스로 선언된 data.* 경로 중
+        //    '값이 없을 때 기본값이 있어야 조회가 성립하는' 키만 나열합니다.
+        //    이 목록은 main.ts 의 ITEMS_SCHEMA 와 대응하며,
+        //    인덱스를 추가하지 않는 단순 확장 필드는 여기 넣을 필요가 없습니다.
+        const SEED_KEYS: &[(&str, CanonKind)] = &[
+            // ── 식별자 ──
+            ("id", CanonKind::Identifier),
+            ("no", CanonKind::Identifier),
+            ("code", CanonKind::Identifier),
+            ("index", CanonKind::Identifier),
+            ("tracking_number", CanonKind::Identifier),
+            ("goods", CanonKind::Identifier),
+            ("order", CanonKind::Identifier),
+            ("tracking", CanonKind::Identifier),
+            ("stock_keeping_unit", CanonKind::Identifier),
+            ("barcode", CanonKind::Identifier),
+            ("digest", CanonKind::Identifier),
+            // ── 수치 ──
+            ("status", CanonKind::Numeric),
+            ("amount", CanonKind::Numeric),
+            ("sale_price", CanonKind::Numeric),
+            ("supply_price", CanonKind::Numeric),
+            ("quantity", CanonKind::Numeric),
+            ("weight", CanonKind::Numeric),
+            ("discount", CanonKind::Numeric),
+            ("started_at", CanonKind::Numeric),
+            ("expired_at", CanonKind::Numeric),
+            ("created_at", CanonKind::Numeric),
+            ("updated_at", CanonKind::Numeric),
+            // ── 불리언 ──
+            ("embed", CanonKind::Boolean),
+            // ── 배열 ──
+            ("tags", CanonKind::Tags),
         ];
 
         let obj = match v.as_object_mut() {
@@ -633,108 +633,101 @@ impl VectorStore {
             None => return json!({}),
         };
 
-        for k in ID_KEYS.iter() {
-            if obj.get(*k).is_none() {
-                if seed_defaults { obj.insert(k.to_string(), json!("")); }
-                continue;
-            }
-            let s = match obj.get(*k) {
-                Some(Value::Null) => String::new(),
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Number(n)) => n.to_string(),
-                Some(other) => other.to_string().trim_matches('"').to_string(),
-                None => String::new(),
-            };
-            obj.insert(k.to_string(), json!(s));
-        }
+        // ── ① 기존 키 전량 정규화 (규칙 기반) ──
+        //    새 필드도 여기서 자동으로 처리되므로 Rust 수정이 불필요합니다.
+        let existing: Vec<String> = obj.keys().cloned().collect();
+        for k in existing {
+            let kind = kind_of(&k);
+            if kind == CanonKind::Free { continue; }
 
-        for k in NUM_KEYS.iter() {
-            if obj.get(*k).is_none() {
-                if seed_defaults { obj.insert(k.to_string(), json!(0)); }
-                continue;
-            }
-            let n: f64 = match obj.get(*k) {
-                None | Some(Value::Null) => 0.0,
-                Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
-                Some(Value::String(s)) => {
-                    let t = s.trim();
-                    // 🌟 status 는 문자열 상태값("complete")이 들어올 수 있으므로 먼저 코드로 환산합니다.
-                    if *k == "status" {
-                        crate::logic::parse_status(t) as f64
-                    } else if t.len() >= 10
-                        && t.as_bytes().get(4) == Some(&b'-')
-                        && t.as_bytes().get(7) == Some(&b'-')
-                    {
-                        // 🌟 [ISO DATE FIX] scheduler 의 normalize_data 가 started_at / expired_at 을
-                        //    "2024-01-01T12:00:00" ISO 문자열로 만들어 넘깁니다.
-                        //    기존 숫자 추출식은 "2024-01-01120000" 을 만들어 파싱에 실패했고,
-                        //    그 결과 모든 기간 조건이 0 으로 뭉개져 range 쿼리가 통째로 죽었습니다.
-                        //    epoch ms 로 확정해야 Dexie 의 between/above 가 성립합니다.
-                        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S") {
-                            dt.and_utc().timestamp_millis() as f64
-                        } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S") {
-                            dt.and_utc().timestamp_millis() as f64
-                        } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&t[..10], "%Y-%m-%d") {
-                            d.and_hms_opt(0, 0, 0)
-                                .map(|x| x.and_utc().timestamp_millis() as f64)
-                                .unwrap_or(0.0)
-                        } else {
-                            0.0
-                        }
+            match kind {
+                CanonKind::Identifier => {
+                    let s = match obj.get(&k) {
+                        Some(Value::Null) => String::new(),
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Number(n)) => n.to_string(),
+                        Some(Value::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
+                        // 배열/객체는 식별자가 될 수 없으므로 건드리지 않습니다.
+                        Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
+                        None => String::new(),
+                    };
+                    obj.insert(k, json!(s));
+                },
+                CanonKind::Numeric => {
+                    let n: f64 = match obj.get(&k) {
+                        None | Some(Value::Null) => 0.0,
+                        Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
+                        Some(Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
+                        Some(Value::String(s)) => {
+                            let t = s.trim();
+                            // 🌟 status 는 'complete' 같은 상태 문자열이 들어올 수 있습니다.
+                            if k == "status" {
+                                crate::logic::parse_status(t) as f64
+                            } else if let Some(ms) = iso_to_epoch_ms(t) {
+                                // 🌟 [ISO DATE] scheduler 의 normalize_data 가 만든
+                                //    "2024-01-01T12:00:00" 을 epoch ms 로 확정합니다.
+                                //    이 처리가 없으면 숫자만 추출해 파싱에 실패하고
+                                //    모든 기간 조건이 0 으로 뭉개집니다.
+                                ms as f64
+                            } else {
+                                let cleaned: String = t.chars()
+                                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                                    .collect();
+                                cleaned.parse::<f64>().unwrap_or(0.0)
+                            }
+                        },
+                        Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
+                    };
+                    if n.fract() == 0.0 && n.abs() < 9e15 {
+                        obj.insert(k, json!(n as i64));
                     } else {
-                        let cleaned: String = t.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
-                        cleaned.parse::<f64>().unwrap_or(0.0)
+                        obj.insert(k, json!(n));
                     }
                 },
-                Some(Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
-                _ => 0.0,
-            };
-            // 정수로 떨어지면 정수로 저장해 Dexie 인덱스 타입과 일치시킵니다.
-            if n.fract() == 0.0 && n.abs() < 9e15 {
-                obj.insert(k.to_string(), json!(n as i64));
-            } else {
-                obj.insert(k.to_string(), json!(n));
+                CanonKind::Boolean => {
+                    let b = match obj.get(&k) {
+                        Some(Value::Bool(x)) => *x,
+                        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+                        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+                        Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
+                        _ => false,
+                    };
+                    obj.insert(k, json!(if b { 1 } else { 0 }));
+                },
+                CanonKind::Tags => {
+                    let tags: Vec<Value> = match obj.get(&k) {
+                        Some(Value::Array(arr)) => arr.iter().map(|t| {
+                            if let Some(o) = t.as_object() {
+                                json!(o.get("tag").and_then(|x| x.as_str()).unwrap_or(""))
+                            } else if let Some(s) = t.as_str() {
+                                json!(s)
+                            } else {
+                                json!(t.to_string().trim_matches('"'))
+                            }
+                        }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
+                        Some(Value::String(s)) if !s.is_empty() => vec![json!(s.clone())],
+                        _ => Vec::new(),
+                    };
+                    obj.insert(k, json!(tags));
+                },
+                CanonKind::Free => {},
             }
         }
 
-        for k in BOOL_KEYS.iter() {
-            if obj.get(*k).is_none() {
-                if seed_defaults { obj.insert(k.to_string(), json!(0)); }
-                continue;
+        // ── ② 조회 축 기본값 시딩 ──
+        if seed_defaults {
+            for (k, kind) in SEED_KEYS.iter() {
+                if obj.get(*k).is_some() { continue; }
+                let d = match kind {
+                    CanonKind::Identifier => json!(""),
+                    CanonKind::Numeric => json!(0),
+                    CanonKind::Boolean => json!(0),
+                    CanonKind::Tags => json!([]),
+                    CanonKind::Free => continue,
+                };
+                obj.insert(k.to_string(), d);
             }
-            let b = match obj.get(*k) {
-                Some(Value::Bool(x)) => *x,
-                Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
-                Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
-                _ => false,
-            };
-            obj.insert(k.to_string(), json!(if b { 1 } else { 0 }));
         }
-
-        // tags 는 멀티엔트리 인덱스 대상이므로 배열이 아니면 배열로 승격합니다.
-        //
-        // 🌟 [EARLY RETURN 의도] seed_defaults = false 인데 tags 키 자체가 없다면
-        //    '이 문서는 tags 라는 개념이 없는 타입' 이라는 뜻입니다.
-        //    빈 배열을 만들어 넣으면 users / analytics 문서에 불필요한 키가 생기므로
-        //    ID/NUM/BOOL 정규화만 마친 상태로 그대로 반환합니다.
-        //    (이 시점에 위의 세 루프는 이미 전부 실행되었으므로 데이터 손실이 없습니다)
-        if obj.get("tags").is_none() && !seed_defaults {
-            return v;
-        }
-        let tags: Vec<Value> = match obj.get("tags") {
-            Some(Value::Array(arr)) => arr.iter().map(|t| {
-                if let Some(o) = t.as_object() {
-                    json!(o.get("tag").and_then(|x| x.as_str()).unwrap_or(""))
-                } else if let Some(s) = t.as_str() {
-                    json!(s)
-                } else {
-                    json!(t.to_string().trim_matches('"'))
-                }
-            }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
-            Some(Value::String(s)) if !s.is_empty() => vec![json!(s)],
-            _ => Vec::new(),
-        };
-        obj.insert("tags".to_string(), json!(tags));
 
         v
     }
@@ -1208,38 +1201,20 @@ impl VectorStore {
         };
         if target_str.is_empty() { return Ok(None); }
 
-        // 🌟 canonicalize_data 와 동일한 분류 규칙입니다. 두 곳이 어긋나면 프리필터가 0건이 됩니다.
-        //    (trading 키를 여기에 넣지 않으면 doc_number / container_number 로 RELAY 조회 시
-        //     needle 이 `"doc_number":123` 형태로 잘못 만들어져 항상 0건이 됩니다)
-        const ID_KEYS: [&str; 23] = [
-            "id", "no", "code", "index", "tracking_number", "goods", "order", "tracking",
-            "stock_keeping_unit", "barcode", "digest", "gtin", "mpn",
-            "doc_number", "container_number", "seal_number",
-            "reference_invoice", "reference_lc", "reference_booking",
-            "reference_buyer", "reference_seller", "reference_carrier", "hs_code",
-        ];
-        const NUM_KEYS: [&str; 35] = [
-            "status", "amount", "total_amount", "sale_price", "supply_price", "compare_at_price",
-            "discount", "quantity", "width", "height", "length", "weight",
-            "shipping_fee", "shipping_duration", "low_stock_threshold",
-            "min_order_amount", "max_discount_amount", "usage_limit", "usage_per",
-            "started_at", "expired_at", "created_at", "updated_at", "views",
-            "package_count", "weight_gross", "weight_net", "volume",
-            "subtotal_amount", "tax_amount", "freight_amount", "insurance_amount",
-            "local_charges", "exchange_rate", "number_of_originals",
-        ];
+        // 🌟 [SINGLE SOURCE] canonicalize_data 와 '완전히 같은 판정 함수' 를 씁니다.
+        //    기존에는 배열이 복제되어 있어 한쪽만 고치면
+        //    needle 이 `"key":123` vs `"key":"123"` 으로 어긋나 프리필터가 0건이 됐습니다.
+        use crate::utils::canonical::{kind_of, CanonKind};
 
         let escaped_prop = property.replace('\'', "''");
         let escaped_val = target_str.replace('\'', "''");
 
         // 🌟 [KEY-SCOPED NEEDLE] serde_json 은 공백 없이 `"key":value` 로 직렬화합니다.
-        let needle = if ID_KEYS.iter().any(|k| *k == property) {
-            format!("\"{}\":\"{}\"", escaped_prop, escaped_val)
-        } else if NUM_KEYS.iter().any(|k| *k == property) {
-            format!("\"{}\":{}", escaped_prop, escaped_val)
-        } else {
-            // 분류 밖의 키는 형태를 확신할 수 없으므로 값만으로 좁히고 아래에서 정확 비교합니다.
-            escaped_val.clone()
+        let needle = match kind_of(property) {
+            CanonKind::Identifier => format!("\"{}\":\"{}\"", escaped_prop, escaped_val),
+            CanonKind::Numeric | CanonKind::Boolean => format!("\"{}\":{}", escaped_prop, escaped_val),
+            // 배열/미분류 키는 형태를 확신할 수 없으므로 값만으로 좁히고 아래에서 정확 비교합니다.
+            _ => escaped_val.clone(),
         };
 
         let prefilter = format!("data LIKE '%{}%'", needle);
