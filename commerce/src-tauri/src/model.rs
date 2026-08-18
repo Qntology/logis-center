@@ -2100,7 +2100,7 @@ impl LogisModel {
 
         // 🌟 [추가] 서술어구(verb_expression) 타이브레이커 가이드 벡터 생성
         let mut prefixed_verb_b_vals = Vec::new();
-        for lang in [query_lang.as_str(), "english"] {
+        for lang in [query_lang.as_str(), "en"] {
             let verb_val = crate::parsing::BIAS_DICT.get("verb").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("verb, predicate");
             let expr_val = crate::parsing::BIAS_DICT.get("expression").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("idiom, phrase");
             let combined_verb_expr = format!("{}, {}", verb_val, expr_val);

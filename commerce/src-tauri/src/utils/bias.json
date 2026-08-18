@@ -129,14 +129,32 @@
     "bias": {
       "ko": "찾다, 알려주다, 보여주다, 검색하다, 조회하다, 확인하다, 요청하다, 질문하다, 설명하다, 요약하다, 추천하다, 분석하다, 정리하다, 비교하다",
       "en": "find, search, show, tell, get, query, request, ask, explain, summarize, recommend, analyze, compare, list",
-      "english": "find, search, show, tell, get, query, request, ask, explain, summarize, recommend, analyze, compare, list"
+      "de": "finden, suchen, zeigen, sagen, holen, abfragen, anfragen, fragen, erklären, zusammenfassen, empfehlen, analysieren, sortieren, vergleichen",
+      "es": "encontrar, buscar, mostrar, decir, obtener, consultar, solicitar, preguntar, explicar, resumir, recomendar, analizar, organizar, comparar",
+      "fr": "trouver, chercher, afficher, dire, obtenir, consulter, demander, questionner, expliquer, résumer, recommander, analyser, organiser, comparer",
+      "ja": "探す, 調べる, 表示する, 教えて, 取得, 検索, リクエスト, 質問, 説明, 要約, おすすめ, 分析, 整理, 比較",
+      "pt": "encontrar, buscar, mostrar, dizer, obter, consultar, solicitar, perguntar, explicar, resumir, recomendar, analisar, organizar, comparar",
+      "ar": "بحث, عرض, إخبار, جلب, استعلام, طلب, سؤال, شرح, تلخيص, توصية, تحليل, ترتيب, مقارنة, إيجاد",
+      "cs": "najít, hledat, zobrazit, říct, získat, dotaz, požádat, zeptat se, vysvětlit, shrnout, doporučit, analyzovat, uspořádat, porovnat",
+      "it": "trovare, cercare, mostrare, dire, ottenere, consultare, richiedere, chiedere, spiegare, riassumere, raccomandare, analizzare, organizzare, confrontare",
+      "nl": "vinden, zoeken, tonen, vertellen, ophalen, opvragen, verzoeken, vragen, uitleggen, samenvatten, aanbevelen, analyseren, organiseren, vergelijken",
+      "zh": "查找, 搜索, 显示, 告诉, 获取, 查询, 请求, 询问, 解释, 总结, 推荐, 分析, 整理, 比较"
     }
   },
   "expression": {
     "bias": {
       "ko": "해줘, 주세요, 부탁해, 좀, 어때, 인가요, 인지, 될까요, 싶어, 하고 싶다",
       "en": "please, could you, would you, i want to, i need to, how about, is it, can you",
-      "english": "please, could you, would you, i want to, i need to, how about, is it, can you"
+      "de": "bitte, könntest du, würdest du, ich möchte, ich brauche, wie wäre es, ist es, kannst du",
+      "es": "por favor, podrías, te gustaría, quiero, necesito, qué tal, es, puedes",
+      "fr": "s'il te plaît, pourrais-tu, voudrais-tu, je veux, j'ai besoin, qu'en est-il, est-ce, peux-tu",
+      "ja": "して, ください, お願い, ちょっと, どう, ですか, の, でしょうか, したい, したいです",
+      "pt": "por favor, poderia, gostaria, eu quero, eu preciso, que tal, é, pode",
+      "ar": "من فضلك, هل يمكنك, هل تريد, أريد, أحتاج, كيف, هل, هل تستطيع",
+      "cs": "prosím, mohl bys, chtěl bys, chci, potřebuji, co takhle, je to, můžeš",
+      "it": "per favore, potresti, vorresti, voglio, ho bisogno, che ne dici, è, puoi",
+      "nl": "alsjeblieft, zou je, wil je, ik wil, ik heb nodig, hoe zit het, is het, kun je",
+      "zh": "请, 能不能, 可以, 我想, 我需要, 怎么样, 是不是, 可以吗"
     }
   },
   "insight": {
