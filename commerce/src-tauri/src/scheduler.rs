@@ -7147,12 +7147,21 @@ async fn process_task(
             e.1 += 1;
             e.2 += 1;
         } else if was_draft {
-            // 🌟 [CRITICAL FIX] update_team_base_metrics가 items_to_process를 스캔하여
-            // updated_at > 0인 항목을 자동으로 count로 분류합니다.
-            // 여기서 수동으로 draft--, count++를 적용하면 update_team_base_metrics의
-            // 자동 분류와 겹쳐 이중 카운트가 발생합니다.
-            // extracted_data의 updated_at을 now로 설정하는 것만으로 충분합니다.
-            // (was_draft 판정은 updated_at 업데이트 트리거로만 사용)
+            // 🌟 [DRAFT → COUNT 전환]
+            //  ── 기존 주석의 전제가 사실과 달랐습니다 ──
+            //   "update_team_base_metrics 가 items_to_process 를 스캔해
+            //    updated_at > 0 인 항목을 자동으로 count 로 분류한다" 고 적혀 있었지만,
+            //   metrics.rs 의 items 순회 블록은 min/max 만 계산합니다.
+            //   draft / count 는 오직 stats_diff 만 반영하므로,
+            //   여기서 감산하지 않으면 목록 스캔이 만든 draft 가
+            //   상세 추출로 완성되어도 base 통계에서 영원히 줄지 않습니다.
+            //   (relay 경로는 was_foreign_draft 분기에서 이미 동일하게 감산합니다)
+            //  ── 이중 카운트가 없는 이유 ──
+            //   이 문서의 draft 를 감산하는 지점이 코드 전체에 여기 하나뿐입니다.
+            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
+            e.0 -= 1;
+            e.1 += 1;
+            e.2 += 1;
             if let Some(obj) = extracted_data.as_object_mut() {
                 obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
             }
