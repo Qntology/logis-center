@@ -27,8 +27,8 @@ import { hashId, time2text } from "./lib/utils";
 type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
 
 // ── ① 명시 예외 : 규칙만으로 판정 불가능한 이름 (새 필드로 커지지 않습니다) ──
-const FORCE_ID = new Set(['id', 'no', 'index', 'goods', 'order', 'tracking', 'digest']);
-const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at']);
+const FORCE_ID = new Set(['id', 'no', 'digest']);
+const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
 const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
 
 // ── ② 접미사 / 부분일치 규칙 : 새 필드는 여기에 자동으로 걸립니다 ──
@@ -91,24 +91,9 @@ function kindOf(key: string): CanonKind {
 // 🌟 [SEED KEYS] Dexie stores() 의 data.* 인덱스 중 기본값이 필요한 키만 나열합니다.
 //    store.rs 의 SEED_KEYS 와 동일해야 합니다.
 const SEED_KEYS: Array<[string, CanonKind]> = [
-    ['id', 'id'], ['no', 'id'], ['code', 'id'], ['index', 'id'],
-    ['tracking_number', 'id'], ['goods', 'id'], ['order', 'id'], ['tracking', 'id'],
-    ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
-    // 🌟 [NUMERIC SEED REMOVED]
-    //  ── 무엇이 문제였나 ──
-    //   amount / sale_price / quantity / weight / discount / started_at / expired_at 을
-    //   0 으로 시딩하면, matchCondition 의 MISSING VALUE GUARD 가
-    //   raw === 0 을 '값이 있음' 으로 판정해 발화하지 못합니다.
-    //   그 결과 'sale_price lte 5000' 같은 조건이
-    //   가격 필드가 아예 없는 문서(무역 서식 등)를 전부 통과시켰습니다.
-    //   가드를 도입한 목적이 시딩에 의해 정확히 원위치된 상태였습니다.
-    //  ── 시딩을 빼도 되는 이유 ──
-    //   Dexie 는 키가 없는 레코드를 해당 인덱스에서 조용히 제외합니다.
-    //   즉 where('data.sale_price').belowOrEqual(5000) 이
-    //   '가격을 가진 문서' 만 돌려주는데, 그것이 정확히 옳은 동작입니다.
-    //  ⚠️ status / created_at / updated_at 은 남깁니다.
-    //     status 0 은 build_dexie_plan 의 ZERO GUARD 가 조건으로 만들지 않고,
-    //     created_at / updated_at 은 봉투 필드라 항상 실제 값이 들어옵니다.
+    ['id', 'id'], ['no', 'id'], ['code', 'id'],
+    ['tracking_number', 'id'], ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
+    ['index', 'num'], ['goods', 'num'], ['order', 'num'], ['tracking', 'num'],
     ['status', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
     ['embed', 'bool'],
     ['tags', 'tags']
@@ -4380,8 +4365,8 @@ listen("extraction-progress", async (event: any) => {
                     ];
 
                     // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼
-                    const findLinked = async (value: string): Promise<any[]> => {
-                        if (!value) return [];
+                    const findLinked = async (value: string | number): Promise<any[]> => {
+                        if (value === "" || value === 0 || value == null) return [];
                         let coll = appDb.table("items").where(LINK_PATHS[0]).equals(value);
                         for (let i = 1; i < LINK_PATHS.length; i++) {
                             coll = coll.or(LINK_PATHS[i]).equals(value);
@@ -4403,7 +4388,7 @@ listen("extraction-progress", async (event: any) => {
                         const parsedData = doc.data || {};
 
                         // 1) 정방향 : 내 index 를 참조하는 문서들
-                        const selfIndex = parsedData.index ? String(parsedData.index) : "";
+                        const selfIndex = parsedData.index != null ? Number(parsedData.index) : 0;
                         if (selfIndex) {
                             for (const match of await findLinked(selfIndex)) {
                                 if (match.id === doc.id) continue;
@@ -4416,9 +4401,10 @@ listen("extraction-progress", async (event: any) => {
                         for (const key of refKeys) {
                             const rawRef = parsedData[key];
                             if (rawRef === undefined || rawRef === null || rawRef === "") continue;
-                            const refStr = String(rawRef);
-
-                            for (const match of await findLinked(refStr)) {
+                            const refVal: string | number = (key === "goods" || key === "order" || key === "tracking")
+                                ? Number(rawRef)
+                                : String(rawRef);
+                            for (const match of await findLinked(refVal)) {
                                 if (match.id === doc.id) continue;
                                 if (!absorb(match, "backward")) continue;
 

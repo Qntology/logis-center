@@ -31,10 +31,11 @@ pub enum CanonKind {
 //    이 목록은 '새 필드가 늘어난다고 커지지 않습니다'.
 //    규칙과 충돌하는 기존 이름을 고정하기 위한 최소 집합입니다.
 const FORCE_ID: &[&str] = &[
-    "id", "no", "index", "goods", "order", "tracking", "digest",
+    "id", "no", "digest",
 ];
 const FORCE_NUM: &[&str] = &[
     "status", "views", "created_at", "updated_at",
+    "index", "goods", "order", "tracking",
 ];
 const FORCE_BOOL: &[&str] = &[
     "detail", "node", "embed",
