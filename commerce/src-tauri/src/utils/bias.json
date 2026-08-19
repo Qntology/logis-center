@@ -1,4 +1,104 @@
 {
+  "trade_schema": {
+    "base": {
+      "header": {
+        "doc_type": "Document kind code {String}",
+        "doc_number": "Primary identifier (B/L No, Invoice No, PO No) {String}",
+        "issue_date": "Date of issue (YYYY-MM-DD) {String}",
+        "reference_number": "Any other reference number printed {String}"
+      },
+      "parties": {
+        "sender_name": "Shipper, Seller, Exporter {String}",
+        "sender_address": "Address of sender {String}",
+        "recipient_name": "Consignee, Buyer, Importer {String}",
+        "recipient_address": "Address of recipient {String}",
+        "notify_party_name": "Notify party name {String}"
+      },
+      "logistics": {
+        "vessel": "Vessel name or Flight number {String}",
+        "voyage_number": "Voyage or flight leg number {String}",
+        "pol": "Port of Loading / Airport of Departure {String}",
+        "pod": "Port of Discharge / Airport of Destination {String}",
+        "etd": "Estimated time of departure {String}",
+        "eta": "Estimated time of arrival {String}",
+        "transport_mode": "Sea, Air, Road, Rail {String}"
+      },
+      "conditions": {
+        "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
+        "payment_terms": "T/T, L/C, Net30 {String}",
+        "freight_payment_term": "Freight Prepaid or Freight Collect {String}"
+      },
+      "financials": {
+        "currency": "ISO 4217 currency code {String}",
+        "amount": "Grand total amount {Number}",
+        "amount_subtotal": "Subtotal before tax and charges {Number}",
+        "amount_tax": "Tax or VAT amount {Number}"
+      },
+      "cargo": {
+        "package_count": "Total number of packages (NOT money) {Number}",
+        "package_unit": "Package unit (CTN, PLT, PKG) {String}",
+        "weight_gross": "Total gross weight {Number}",
+        "weight_net": "Total net weight {Number}",
+        "volume": "Total volume in CBM {Number}",
+        "marks_numbers": "Marks and numbers {String}"
+      },
+      "items": {
+        "description": "Description of goods {String}",
+        "quantity": "Line item quantity {Number}",
+        "unit": "Unit of measure {String}",
+        "hs_code": "HS code / tariff number {String}",
+        "unit_price": "Unit price {Number}",
+        "total_price": "Line total {Number}"
+      },
+      "containers": {
+        "container_number": "Container number (4 letters + 7 digits) {String}",
+        "seal_number": "Seal number {String}",
+        "type_size": "Size and type (20GP, 40HC) {String}"
+      }
+    },
+    "overlay": {
+      "LC": {
+        "financials": {
+          "tenor": "Tenor: at sight, 30 days, 60 days, 90 days {String}",
+          "lc_number": "Letter of Credit number {String}",
+          "issuing_bank": "Issuing bank name {String}",
+          "expiry_date": "L/C expiry date {String}"
+        }
+      },
+      "DGD": {
+        "cargo": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}"
+        }
+      },
+      "PHYTO": {
+        "conditions": {
+          "treatment_type": "Fumigation, Heat treatment, Cold treatment {String}"
+        }
+      },
+      "HC": {
+        "conditions": {
+          "health_status": "Health certification status {String}"
+        }
+      },
+      "BEN_CERT": {
+        "conditions": {
+          "beneficiary_statement": "Beneficiary certification statement {String}"
+        }
+      },
+      "INS": {
+        "financials": {
+          "insured_amount": "Insured amount {Number}",
+          "premium_amount": "Insurance premium {Number}"
+        },
+        "conditions": {
+          "policy_number": "Insurance policy number {String}",
+          "coverage_type": "Coverage type (All Risks, FPA, WA) {String}"
+        }
+      }
+    }
+  },
   "search_bridge": {
     "sales_to_order": {
       "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",

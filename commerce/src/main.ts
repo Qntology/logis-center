@@ -4332,12 +4332,15 @@ listen("extraction-progress", async (event: any) => {
                     console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay v4) 시작...`);
                     const relayDocs = new Map<string, any>();
                     const existingIds = new Set(docs.map(d => d.id));
-
                     // 연관 축으로 사용할 data.* 경로 (전부 인덱스 선언되어 있음)
                     const LINK_PATHS = [
                         'data.index', 'data.no', 'data.code', 'data.tracking_number',
                         'data.goods', 'data.order', 'data.tracking',
-                        'data.stock_keeping_unit', 'data.barcode'
+                        'data.stock_keeping_unit', 'data.barcode',
+                        // 🌟 [TRADE LINK PATHS] 무역 문서 간 연결 축
+                        'data.doc_number', 'data.reference_invoice',
+                        'data.reference_lc', 'data.reference_booking',
+                        'data.container_number', 'data.seal_number'
                     ];
 
                     // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼

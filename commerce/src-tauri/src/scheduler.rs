@@ -1114,6 +1114,17 @@ async fn process_task(
     
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
 
+    // 🌟 [TRADING BRANCH] HTML 전처리 트랙에서 trading 모드이면 전용 파이프라인으로 분기합니다.
+    //    기존 process_task 는 commerce 6도메인(order/goods/tracking/review/coupon/event) 전용이므로
+    //    BL/AWB/CI 등 27종 무역 서식은 이 경로에서 처리할 수 없습니다.
+    //    image_extraction 트랙은 model.rs extract_from_image 가 이미 is_trade_doc 분기를 갖고 있으므로
+    //    여기서 분기하지 않습니다.
+    if search_mode == "shipping" && task.r#type == "html_extraction" {
+        return process_trading_task(
+            task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
+        ).await;
+    }
+
     let kv_name = if task.r#type == "image_extraction" {
         Some("image".to_string())
     } else {
@@ -8483,5 +8494,387 @@ async fn process_task(
     log_task_progress(app_handle, &task.id, &payload);
     
     println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
+    Ok(())
+}
+
+
+async fn process_trading_task(
+    task: Task,
+    store_mutex: &Arc<Mutex<Option<VectorStore>>>,
+    model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+    cancellation_token: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    device_preference: Option<String>,
+) -> Result<()> {
+    let app_handle_clone = app_handle.clone();
+    let tid_clone = task.id.clone();
+    let emit_term = move |msg: &str| {
+        println!("{}", msg);
+        use tauri::Emitter;
+        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
+    };
+
+    let zero_addr = "0x0000000000000000000000000000000000000000";
+    let from_addr = if task.from.is_empty() { zero_addr.to_string() } else { task.from.clone() };
+    let team_id = if task.to.is_empty() || task.to == zero_addr {
+        crate::utils::hash::hash_id(&from_addr)
+    } else {
+        task.to.clone()
+    };
+
+    emit_term("\n=======================================");
+    emit_term(&format!("[TRADING] ⚙️ Task {} started trading extraction.", task.id));
+
+    let payload = json!({
+        "task_id": task.id,
+        "task_type": task.r#type,
+        "category": "Processing", "summary": "Starting trading extraction...", "spinner": "⠋"
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
+
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let language = "english";
+    let mut doc_lang = "en".to_string();
+
+    // ── 모델 로드 ──
+    let model = {
+        println!("[TRADING] 🛡️ Attempting to acquire Model Lock...");
+        let mut model_lock = model_mutex.lock().await;
+        println!("[TRADING] ✅ Model Lock acquired.");
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[TRADING] Device preference mismatch. Reloading model...");
+                m.deep_purge_resources().await;
+                *model_lock = None;
+            }
+        }
+        if model_lock.is_none() {
+            println!("[TRADING] Model not initialized. Starting LogisModel::new...");
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => {
+                    println!("[TRADING] LogisModel::new successful.");
+                    *model_lock = Some(m);
+                },
+                Err(e) => {
+                    println!("[TRADING] ❌ LogisModel::new failed: {}", e);
+                    return Err(anyhow::anyhow!("Model Load Failed: {}", e));
+                }
+            }
+        }
+        model_lock.as_ref().unwrap().clone()
+    };
+
+    // ── HTML 전처리 ──
+    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        let content = raw_html.to_string();
+        if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
+        content
+    } else {
+        return Err(anyhow::anyhow!("Trading extraction requires HTML content in task data"));
+    };
+
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    let clean_html_content = parsing::pre_clean_html(&raw_html_content);
+    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, None);
+    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
+
+    // 문서 언어 감지
+    doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
+    println!("[TRADING] Detected document language: {}", doc_lang);
+
+    // ── URL 파싱 ──
+    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP A] doc_type 분류 (27종 무역 서식)
+    // ---------------------------------------------------------------------
+    // commerce 의 page_type 분류(6도메인) 대신,
+    // get_trade_doc_classification_prompt() 가 정의한 27종 코드로 분류합니다.
+    // 분류 결과가 get_trade_doc_slice_config / get_trade_category_schema 의
+    // 분기 키로 그대로 사용되므로, 여기서 나온 코드가 이후 모든 단계의 기준입니다.
+    // =====================================================================
+    emit_term("[TRADING STEP A] Classifying trade document type...");
+    log_task_progress(app_handle, &task.id, &json!({
+        "category": "Classification", "summary": "Identifying trade document type...", "spinner": "⠋"
+    }));
+
+    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+
+    let doc_type = {
+        let class_prompt = crate::parsing::get_trade_doc_classification_prompt();
+        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            let params = crate::openai_types::ChatCompletionParameters {
+                messages: vec![
+                    crate::openai_types::ChatCompletionRequestMessage::System(
+                        crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: format!("[HTML CONTENT]\n{}", light_pug),
+                            name: None,
+                        }
+                    ),
+                    crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(class_prompt),
+                            name: None,
+                        }
+                    )
+                ],
+                model: "qwen3.5".to_string(),
+                max_tokens: Some(64),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let res = gen.generate(
+                params,
+                Some(cancellation_token.clone()),
+                Some(format!("{}_doctype", task.id)),
+                None, None, None
+            ).await?;
+            crate::parsing::parse_json_from_llm(&res)
+                .get("doc_type").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string()
+        } else {
+            return Err(anyhow::anyhow!("Qwen3.5 Generator not available for doc_type classification"));
+        }
+    };
+
+    emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {}", doc_type));
+
+    // =====================================================================
+    // 🌟 [TRADING STEP B] 카테고리별 필드 추출
+    // ---------------------------------------------------------------------
+    // commerce 의 get_detail_schema_fields(필드 나열) 대신,
+    // get_trade_category_schema(category, doc_type) 가 bias.json 의
+    // trade_schema.base + trade_schema.overlay.{doc_type}.{category} 를 읽어
+    // 이 서식에 실제로 존재하는 축만 반환합니다.
+    //
+    // 예: doc_type = "LC" 이면
+    //   financials 카테고리에 tenor, lc_number, issuing_bank 가 overlay 로 추가되고
+    //   doc_type = "DGD" 이면
+    //   cargo 카테고리에 un_number, packing_group, proper_shipping_name 이 추가됩니다.
+    //
+    // 뎁스 구조:
+    //   카테고리 루프 → 각 카테고리마다 LLM 1회 호출 → merge_json_manual 로 병합
+    // =====================================================================
+    emit_term("[TRADING STEP B] Extracting fields by category...");
+
+    let categories = ["header", "parties", "logistics", "conditions", "financials", "cargo", "items", "containers"];
+
+    let mut final_data_map = serde_json::Map::new();
+
+    // 기본 뼈대 생성 (merge_json_manual 과 동일한 8개 키)
+    final_data_map.insert("header".to_string(), json!({"doc_type": doc_type.clone()}));
+    final_data_map.insert("parties".to_string(), json!({}));
+    final_data_map.insert("logistics".to_string(), json!({}));
+    final_data_map.insert("conditions".to_string(), json!({}));
+    final_data_map.insert("financials".to_string(), json!({}));
+    final_data_map.insert("cargo".to_string(), json!({}));
+    final_data_map.insert("line_items".to_string(), json!([]));
+    final_data_map.insert("containers".to_string(), json!([]));
+
+    for cat in &categories {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // 🌟 get_trade_category_schema 가 이 서식 + 이 카테고리에 실제로 존재하는 필드만 반환합니다.
+        //    필드가 없는 카테고리(예: DGD 의 financials)는 빈 스키마를 반환하므로
+        //    LLM 호출 전에 건너뛸 수 있습니다.
+        let schema_prompt = crate::parsing::get_trade_category_schema(cat, &doc_type);
+
+        // 빈 스키마 체크: "SCHEMA:\n{}" 또는 "SCHEMA:\n[ {} ]" 이면 추출 대상 없음
+        if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
+            emit_term(&format!("[TRADING STEP B] Category '{}' has no fields for {}. Skipping.", cat.to_uppercase(), doc_type));
+            continue;
+        }
+
+        emit_term(&format!("[TRADING STEP B] Extracting category '{}' for {}...", cat.to_uppercase(), doc_type));
+        log_task_progress(app_handle, &task.id, &json!({
+            "category": format!("Extraction ({})", cat.to_uppercase()),
+            "summary": format!("Extracting {} fields...", cat),
+            "spinner": "⠋"
+        }));
+
+        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            let params = crate::openai_types::ChatCompletionParameters {
+                messages: vec![
+                    crate::openai_types::ChatCompletionRequestMessage::System(
+                        crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: format!("[HTML CONTENT]\n{}", light_pug),
+                            name: None,
+                        }
+                    ),
+                    crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(schema_prompt),
+                            name: None,
+                        }
+                    )
+                ],
+                model: "qwen3.5".to_string(),
+                max_tokens: Some(1024),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let res = gen.generate(
+                params,
+                Some(cancellation_token.clone()),
+                Some(format!("{}_{}", task.id, cat)),
+                None, None, None
+            ).await?;
+            let tile_json = crate::parsing::parse_json_from_llm(&res);
+            merge_json_manual(&mut final_data_map, cat, tile_json);
+        }
+    }
+
+    // 모델 해제 후 임베딩 준비
+    model.deep_purge_resources().await;
+    crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+
+    let mut extracted_data = Value::Object(final_data_map);
+
+    // =====================================================================
+    // 🌟 [TRADING STEP C] 자연어 변환 + 임베딩 텍스트 생성
+    // =====================================================================
+    {
+        let natural_text = parsing::json_to_natural_language(&extracted_data);
+        let masked_text = natural_text.clone();
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("text".to_string(), json!(natural_text));
+            obj.insert("masked_text".to_string(), json!(masked_text));
+            obj.insert("mode".to_string(), json!("shipping"));
+            obj.insert("type".to_string(), json!(doc_type.clone()));
+        }
+    }
+
+    // =====================================================================
+    // 🌟 [TRADING STEP D] 저장
+    // ---------------------------------------------------------------------
+    // bcc 규칙: commerce 는 hash("{page_type}{cc}") 이지만,
+    // trading 은 hash("{doc_type}{cc}") 를 사용합니다.
+    // 이렇게 해야 같은 cc 안에서 BL / CI / PL 이 각각 다른 bcc 로 분리되어
+    // 프론트엔드 TYPE_SETS.shipping 필터에서 서식별로 조회할 수 있습니다.
+    // =====================================================================
+    let store = {
+        let store_guard = store_mutex.lock().await;
+        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+    };
+
+    // doc_number 로 고유 ID 생성 (extract_from_image 와 동일 규칙)
+    let doc_number = extracted_data.get("header")
+        .and_then(|h| h.get("doc_number").or_else(|| h.get("document_number")))
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+        .unwrap_or_else(|| task.id.clone());
+
+    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&doc_number)
+        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", doc_type, team_id, clean_no)));
+    let hashed_item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+
+    if let Some(obj) = extracted_data.as_object_mut() {
+        obj.insert("id".to_string(), json!(hashed_item_id.clone()));
+        obj.insert("index".to_string(), json!(index_val));
+        obj.insert("doc_type".to_string(), json!(doc_type.clone()));
+        obj.insert("doc_number".to_string(), json!(doc_number.clone()));
+        obj.insert("no".to_string(), json!(doc_number.clone()));
+        obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+    }
+
+    let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+    let item_digest = crate::utils::hash::digest(&text_to_embed);
+    let item_vector = model.get_embedding(text_to_embed.clone()).await.unwrap_or(vec![0.0; 384]);
+
+    // 🌟 trading bcc: doc_type 기반 (commerce 의 page_type 기반과 구분)
+    let cc_val = task.cc.clone();
+    let bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, cc_val));
+    let ref_val = task.r#ref.clone();
+
+    // 🌟 v4 : items 단일 저장.
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector),
+        &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP E] Trading Relay (무역 서식 간 N:N 관계)
+    // ---------------------------------------------------------------------
+    // logic.rs 의 relay() 는 commerce 전용이라 trading 서식 간 관계가 없습니다.
+    // 여기서 trading 전용 relay 를 직접 수행합니다.
+    //
+    // 관계 정의:
+    //   BL  ↔ CI  : reference_invoice 로 연결
+    //   CI  ↔ PL  : reference_invoice 로 연결
+    //   BL  ↔ PL  : reference_booking 로 연결
+    //   PO  ↔ PI  : doc_number 로 연결
+    //   LC  ↔ CI  : reference_lc 로 연결
+    // =====================================================================
+    let relay_targets = crate::logic::related_trading(&doc_type);
+    for foreign_type in relay_targets {
+        if let Some(relay_field) = crate::logic::trading_relay_field(&doc_type, foreign_type) {
+            if let Some(ref_val_raw) = extracted_data.get(relay_field).and_then(|v| v.as_str()) {
+                if !ref_val_raw.trim().is_empty() && ref_val_raw.trim() != "N/A" {
+                    let clean_ref = ref_val_raw.trim().to_string();
+                    match store.find_item_by_property("items", relay_field, &json!(clean_ref)).await {
+                        Ok(Some((foreign_id, mut foreign_data))) => {
+                            emit_term(&format!("[TRADING RELAY] Found existing {} document '{}' via {}='{}'.", foreign_type, foreign_id, relay_field, clean_ref));
+                            // 양방향 참조 주입
+                            foreign_data.as_object_mut().unwrap().insert(
+                                format!("reference_{}", doc_type.to_lowercase()),
+                                json!(doc_number.clone())
+                            );
+                            extracted_data.as_object_mut().unwrap().insert(
+                                format!("reference_{}", foreign_type.to_lowercase()),
+                                json!(clean_ref.clone())
+                            );
+                            let merged_text = parsing::json_to_natural_language(&foreign_data);
+                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                            foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
+                            foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
+                            save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
+                        },
+                        Ok(None) => {
+                            emit_term(&format!("[TRADING RELAY] No existing {} document found for {}='{}'. Skipping.", foreign_type, relay_field, clean_ref));
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // 최종 저장 (relay 로 updated 필드가 추가된 경우)
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector),
+        &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP F] Metrics + 완료
+    // =====================================================================
+    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+    let e = stats_diff.entry(doc_type.clone()).or_insert((0, 0, 0));
+    e.1 += 1; // count
+    e.2 += 1; // global count
+
+    let metrics_input = vec![extracted_data.clone()];
+    let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &metrics_input, stats_diff.clone()).await;
+
+    let _ = store.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Trading Extraction Complete")).await;
+
+    let payload_done = json!({
+        "task_id": task.id,
+        "category": "Done",
+        "summary": format!("Trading extraction complete. Document type: {}", doc_type),
+        "spinner": "✅",
+        "data": null
+    });
+    let _ = app_handle.emit("extraction-progress", &payload_done);
+    log_task_progress(app_handle, &task.id, &payload_done);
+
+    println!("[TRADING] Task {} completed. Document type: {}.", task.id, doc_type);
     Ok(())
 }

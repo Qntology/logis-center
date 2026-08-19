@@ -1442,9 +1442,9 @@ impl LogisModel {
                 
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
-                    &hashed_id, 
-                    doc_type, 
-                    final_data, 
+                    &hashed_id,
+                    doc_type,
+                    final_data.clone(),
                     None,
                     Some(from_addr),
                     Some(&team_id),
@@ -1453,7 +1453,155 @@ impl LogisModel {
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
-                
+
+                // =====================================================================
+                // 🌟 [TRADE RELAY] 무역 서식 간 연결고리 처리
+                // Commerce의 TRACKING RELAY와 동일한 패턴:
+                //   1. 현재 문서의 참조 필드(reference_invoice 등)에서 연결 키 추출
+                //   2. 해당 키로 타겟 서식 검색
+                //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
+                // =====================================================================
+                if is_trade_doc {
+                    let relay_rules = crate::logic::trade_relay_rules(doc_type);
+                    for (target_type, target_field, source_field) in relay_rules {
+                        // 현재 문서에서 연결 키 값 추출
+                        let link_value = final_data.get(source_field)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if link_value.is_empty() || link_value == "N/A" { continue; }
+
+                        emit_term(&format!(
+                            "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
+                            doc_type, target_type, target_field, link_value
+                        ));
+
+                        // 타겟 서식 검색: data.{target_field} = link_value
+                        let needle = format!("\"{}\":\"{}\"", target_field.replace('\'', "''"), link_value.replace('\'', "''"));
+                        let relay_filter = format!("type = '{}' AND data LIKE '%{}%'", target_type, needle);
+                        match db.get_all_items("items", 1, 0, Some(relay_filter)).await {
+                            Ok(results) if !results.is_empty() => {
+                                let existing_id = &results[0].id;
+                                if let Ok(Some(mut existing_doc)) = db.get_item_by_id("items", existing_id).await {
+                                    if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_doc.json_data) {
+                                        let mut needs_update = false;
+
+                                        // 현재 문서의 doc_number를 타겟의 참조 필드에 역주입
+                                        if let Some(my_doc_number) = final_data.get("doc_number").and_then(|v| v.as_str()) {
+                                            if !my_doc_number.is_empty() && my_doc_number != "N/A" {
+                                                let reverse_field = match doc_type {
+                                                    "CI" => "reference_invoice",
+                                                    "LC" => "reference_lc",
+                                                    "BC" => "reference_booking",
+                                                    _ => "",
+                                                };
+                                                if !reverse_field.is_empty() {
+                                                    let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
+                                                    if existing_ref.is_empty() || existing_ref == "N/A" {
+                                                        ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
+                                                        needs_update = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // 물류 정보 상호 보완 (vessel, pol, pod, etd, eta)
+                                        for field in ["vessel", "voyage_number", "pol", "pod", "etd", "eta"] {
+                                            let my_val = final_data.get("logistics")
+                                                .and_then(|l| l.get(field))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if my_val.is_empty() || my_val == "N/A" { continue; }
+                                            let their_val = ej.get("logistics")
+                                                .and_then(|l| l.get(field))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if their_val.is_empty() || their_val == "N/A" {
+                                                if let Some(logistics_obj) = ej.get_mut("logistics").and_then(|l| l.as_object_mut()) {
+                                                    logistics_obj.insert(field.to_string(), json!(my_val));
+                                                    needs_update = true;
+                                                }
+                                            }
+                                        }
+
+                                        // 화물 정보 상호 보완 (container_number, seal_number, weight)
+                                        for field in ["container_number", "seal_number"] {
+                                            let my_val = final_data.get("containers")
+                                                .and_then(|c| c.as_array())
+                                                .and_then(|arr| arr.first())
+                                                .and_then(|c| c.get(field))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if my_val.is_empty() || my_val == "N/A" { continue; }
+                                            let their_containers = ej.get("containers").and_then(|c| c.as_array());
+                                            let their_has = their_containers.map_or(false, |arr| {
+                                                arr.iter().any(|c| c.get(field).and_then(|v| v.as_str()).map_or(false, |v| v == my_val))
+                                            });
+                                            if !their_has {
+                                                if let Some(containers_arr) = ej.get_mut("containers").and_then(|c| c.as_array_mut()) {
+                                                    if containers_arr.is_empty() {
+                                                        containers_arr.push(json!({ field: my_val }));
+                                                    } else if let Some(first) = containers_arr.first_mut() {
+                                                        if let Some(obj) = first.as_object_mut() {
+                                                            if obj.get(field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                                                                obj.insert(field.to_string(), json!(my_val));
+                                                            }
+                                                        }
+                                                    }
+                                                    needs_update = true;
+                                                }
+                                            }
+                                        }
+
+                                        if needs_update {
+                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                            let merged_text = crate::parsing::json_to_natural_language(&ej);
+                                            ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                            ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                            let _ = db.upsert_item(
+                                                "items", existing_id, target_type, ej, None,
+                                                Some(from_addr), Some(&team_id), Some(&hashed_cc),
+                                                Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                                Some(&ref_val), None
+                                            ).await;
+                                            emit_term(&format!(
+                                                "  ✅ [TRADE RELAY] 기존 {} 문서 '{}' 에 {} 정보 병합 완료.",
+                                                target_type, existing_id, doc_type
+                                            ));
+                                        }
+                                    }
+                                }
+                            },
+                            Ok(_) => {
+                                // 미발견: draft 생성
+                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value));
+                                let mut draft_data = json!({});
+                                if let Some(obj) = draft_data.as_object_mut() {
+                                    obj.insert("id".to_string(), json!(draft_id.clone()));
+                                    obj.insert("type".to_string(), json!(target_type));
+                                    obj.insert(target_field.to_string(), json!(link_value.clone()));
+                                    obj.insert("doc_type".to_string(), json!(target_type));
+                                    obj.insert("updated_at".to_string(), json!(0));
+                                    obj.insert("mode".to_string(), json!("shipping"));
+                                    obj.insert("text".to_string(), json!(format!("{} {}", target_type, link_value)));
+                                }
+                                let _ = db.upsert_item(
+                                    "items", &draft_id, target_type, draft_data, None,
+                                    Some(from_addr), Some(&team_id), Some(&hashed_cc),
+                                    Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                    Some(&ref_val), None
+                                ).await;
+                                emit_term(&format!(
+                                    "  📝 [TRADE RELAY] {} draft '{}' 생성 ({}: {}).",
+                                    target_type, draft_id, target_field, link_value
+                                ));
+                            },
+                            Err(_) => {}
+                        }
+                    }
+                }
+
                 // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
                 // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
                 let _ = db.update_task_status(&task_id, 9).await;
