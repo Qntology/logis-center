@@ -684,7 +684,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     color: #333;
 }
 
-.nav-section{margin-bottom: 2em;}
+.nav-section{position: relative; margin-bottom: 2em;}
 /* Nav Lists */
 .nav-section h3 {
     margin: 0;

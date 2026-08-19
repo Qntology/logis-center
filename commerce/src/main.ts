@@ -440,6 +440,334 @@ let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
 // 🌟 [추가] 누락된 전역 상태 변수 선언
+// =====================================================================
+// 🌟 [OAUTH-NETWORK REGISTRATION] api.oauth.network 사이트 등록 기능
+// ---------------------------------------------------------------------
+//  www/docs/index.html 의 <form name="api.oauth.network"> 기능을
+//  Tauri proxy_fetch 경유로 이식합니다.
+//
+//  통신 대상: https://api.oauth.network (Vercel, api/index.js)
+//  목적: mode=analytic 에서 특정 도메인의 데이터를 조회하기 위한
+//        Client 등록 절차 (client_id / client_secret 발급)
+//
+//  CORS: proxy_fetch 는 Rust 백엔드(reqwest) 에서 요청을 보내므로
+//        브라우저 CORS 정책이 적용되지 않습니다. 별도 대응 불필요.
+//
+//  응답 파싱: api/index.js 는 HTML+postMessage 형식으로 응답합니다.
+//        proxy_fetch 가 JSON 파싱 실패 시 { text: "..." } 로 래핑하므로
+//        프론트엔드에서 <script> 내부 JSON 을 추출합니다.
+// =====================================================================
+
+const OAUTH_API_HOST = "https://api.oauth.network";
+
+/** api/index.js 의 HTML 응답에서 JSON 페이로드를 추출합니다. */
+function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: number } {
+    let text = "";
+    if (typeof raw === "string") {
+        text = raw;
+    } else if (raw && typeof raw === "object") {
+        if (raw.text) {
+            text = raw.text;
+        } else if (raw.rows) {
+            // 이미 JSON 으로 파싱된 경우 (향후 api/index.js 수정 시)
+            return { rows: raw.rows || [], cookies: raw.cookies || {}, count: raw.count || 0 };
+        }
+    }
+    // <script> 내부의 parent.postMessage(JSON.stringify({...}), ...) 에서 JSON 추출
+    const match = text.match(/parent\.postMessage\(JSON\.stringify\((\{[\s\S]*?\})\)/);
+    if (!match) {
+        return { rows: [], cookies: {}, count: 0 };
+    }
+    try {
+        const parsed = JSON.parse(match[1]);
+        let cookies = {};
+        if (typeof parsed.cookies === "string") {
+            try { cookies = JSON.parse(parsed.cookies); } catch (_e) { cookies = {}; }
+        } else if (parsed.cookies && typeof parsed.cookies === "object") {
+            cookies = parsed.cookies;
+        }
+        return {
+            rows: Array.isArray(parsed.rows) ? parsed.rows : [],
+            cookies,
+            count: parsed.count || 0
+        };
+    } catch (_e) {
+        return { rows: [], cookies: {}, count: 0 };
+    }
+}
+
+/** api.oauth.network 에 사이트 등록 POST 요청을 보냅니다. */
+async function submitOAuthRegistration(hostUrl: string): Promise<{
+    success: boolean;
+    client_id: string;
+    client_secret: string;
+    error: string;
+}> {
+    if (!currentSession.hash || !currentSession.token) {
+        return { success: false, client_id: "", client_secret: "", error: "로그인이 필요합니다." };
+    }
+    try {
+        const response = await invoke<any>("proxy_fetch", {
+            url: OAUTH_API_HOST,
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: {
+                host: hostUrl,
+                hash: currentSession.hash,
+                token: currentSession.token
+            },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        if (parsed.rows.length > 0) {
+            const row = parsed.rows[0];
+            if (row.client_id && row.client_secret) {
+                // kv_store 에 등록 정보 영구 저장
+                const existing = await kvGet("oauth_registered_sites") || [];
+                const alreadyExists = existing.some((s: any) => s.host === hostUrl);
+                if (!alreadyExists) {
+                    existing.push({
+                        host: hostUrl,
+                        client_id: row.client_id,
+                        client_secret: row.client_secret,
+                        registered_at: Date.now()
+                    });
+                    await kvSet("oauth_registered_sites", existing);
+                }
+                return {
+                    success: true,
+                    client_id: row.client_id,
+                    client_secret: row.client_secret,
+                    error: ""
+                };
+            }
+        }
+        return { success: false, client_id: "", client_secret: "", error: "사이트 소유 확인이 필요합니다. 메타 태그를 사이트 <head>에 추가하세요." };
+    } catch (e: any) {
+        return { success: false, client_id: "", client_secret: "", error: String(e) };
+    }
+}
+
+/** api.oauth.network 에서 등록된 사이트의 Cc(경로) 목록을 조회합니다. */
+async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
+    try {
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&distinct=Cc&id=%23LOG`,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        return parsed.rows
+            .map((r: any) => r.Cc)
+            .filter((c: string) => !!c);
+    } catch (_e) {
+        return [];
+    }
+}
+
+/** api.oauth.network 에서 시간별 접속량 통계를 조회합니다. */
+async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<number> {
+    try {
+        const now = Date.now();
+        const from = new Date(now - hoursBack * 3600 * 1000).toISOString();
+        const to = new Date(now).toISOString();
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&id=%23LOG&cnt=true&date=${encodeURIComponent(from)}&date=${encodeURIComponent(to)}`,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        return parsed.count;
+    } catch (_e) {
+        return 0;
+    }
+}
+
+function renderOAuthRegistrationForm() {
+    const existing = document.getElementById("oauth-registration-modal");
+    if (existing) existing.remove();
+
+    const modal = document.createElement("div");
+    modal.id = "oauth-registration-modal";
+    modal.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);  pointer-events: initial;";
+    modal.innerHTML = `
+<div style="background:#fff;border-radius:12px;padding:24px;width:90%;max-width:480px;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:1.1rem;font-weight:700;">사이트 등록 (Analytic)</h3>
+        <button id="oauth-modal-close" style="background:none;border:none;font-size:1.2rem;cursor:pointer;color:#666;">✕</button>
+    </div>
+
+    <!-- Step 1: 도메인 입력 -->
+    <div style="margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 도메인</label>
+        <input id="oauth-reg-host" type="url" placeholder="https://example.com" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.9rem;">
+        <p style="margin:4px 0 0;font-size:0.75rem;color:#888;">예시: (O) https://example.com (X) https://www.example.com</p>
+    </div>
+
+    <!-- Step 2: 소유 확인 메타 태그 (도메인 입력 시 즉시 생성) -->
+    <div id="oauth-reg-meta" style="display:none;margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 소유 확인 메타 태그</label>
+        <p style="margin:0 0 6px;font-size:0.75rem;color:#666;">
+            아래 메타 태그를 복사하여 사이트 홈페이지의 <code>&lt;head&gt;</code> 섹션에 붙여넣으세요.<br>
+            등록 버튼 클릭 시 서버가 이 태그의 존재 여부를 검증합니다.
+        </p>
+        <textarea id="oauth-reg-meta-tag" readonly style="width:100%;min-height:100px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:0.72rem;resize:none;box-sizing:border-box;background:#f8f9fa;line-height:1.6;"></textarea>
+        <button id="oauth-meta-copy" style="margin-top:6px;padding:6px 14px;border:1px solid #6366f1;border-radius:4px;background:#fff;color:#6366f1;font-size:0.78rem;cursor:pointer;">태그 복사</button>
+    </div>
+
+    <!-- 결과 메시지 -->
+    <div id="oauth-reg-result" style="display:none;margin-bottom:12px;padding:12px;border-radius:6px;font-size:0.85rem;"></div>
+
+    <!-- 등록 성공 후 Client 정보 -->
+    <div id="oauth-reg-credentials" style="display:none;margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Id (Address)</label>
+        <input id="oauth-reg-client-id" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;margin-bottom:8px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Secret (Private Key)</label>
+        <input id="oauth-reg-client-secret" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;">
+    </div>
+
+    <button id="oauth-reg-submit" style="width:100%;padding:12px;border:none;border-radius:8px;background:#6366f1;color:#fff;font-size:0.95rem;font-weight:700;cursor:pointer;">추가</button>
+</div>`;
+    document.body.appendChild(modal);
+
+    // 닫기
+    document.getElementById("oauth-modal-close")!.addEventListener("click", () => modal.remove());
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+
+    // 🌟 [META TAG GENERATION] 도메인 입력 시 즉시 메타 태그를 생성합니다.
+    //    api/index.js 의 검증 로직:
+    //      clientAddress = ethers.computeAddress(ethers.hashMessage(email))
+    //    즉, 현재 로그인한 사용자의 email 기반으로 해시를 만들어
+    //    사이트 <head> 에 메타 태그로 삽입해야 소유 증명이 됩니다.
+    //
+    //    그러나 Tauri 앱에서는 currentSession.email 이 있으므로
+    //    사전에 태그를 만들어 보여줄 수 있습니다.
+    //    (api/index.js 는 서버에서 같은 값으로 검증합니다)
+    const hostInput = document.getElementById("oauth-reg-host") as HTMLInputElement;
+    const metaDiv = document.getElementById("oauth-reg-meta") as HTMLDivElement;
+    const metaTextarea = document.getElementById("oauth-reg-meta-tag") as HTMLTextAreaElement;
+    const metaCopyBtn = document.getElementById("oauth-meta-copy") as HTMLButtonElement;
+
+    let metaDebounce: number | null = null;
+    hostInput.addEventListener("input", () => {
+        if (metaDebounce) clearTimeout(metaDebounce);
+        metaDebounce = window.setTimeout(() => {
+            const url = hostInput.value.trim();
+            if (!url || !url.startsWith("http")) {
+                metaDiv.style.display = "none";
+                return;
+            }
+            try {
+                // api/index.js 검증 로직과 동일한 해시 생성:
+                //   clientAddress = ethers.computeAddress(ethers.hashMessage(email))
+                // Tauri 에서는 currentSession.email 이 있으므로 사전 계산 가능
+                const email = currentSession.email || "";
+                const hashMessage = ethers.hashMessage(email);
+                const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
+
+                const tags = `<meta name="oauth-network-verification" content="${clientAddress}" />
+<meta name="privacy" content="/개인정보약관 경로/" />
+<meta name="terms" content="/이용약관 경로/" />`;
+                metaTextarea.value = tags;
+                metaDiv.style.display = "block";
+            } catch (e) {
+                metaDiv.style.display = "none";
+            }
+        }, 300);
+    });
+
+    // 태그 복사 버튼
+    metaCopyBtn.addEventListener("click", () => {
+        const text = metaTextarea.value;
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+            metaCopyBtn.textContent = "복사됨 ✓";
+            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
+        }).catch(() => {
+            // clipboard API 실패 시 textarea 선택 방식
+            metaTextarea.focus();
+            metaTextarea.select();
+            document.execCommand("copy");
+            metaCopyBtn.textContent = "복사됨 ✓";
+            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
+        });
+    });
+
+    // 제출
+    document.getElementById("oauth-reg-submit")!.addEventListener("click", async () => {
+        const resultDiv = document.getElementById("oauth-reg-result") as HTMLDivElement;
+        const credDiv = document.getElementById("oauth-reg-credentials") as HTMLDivElement;
+        const submitBtn = document.getElementById("oauth-reg-submit") as HTMLButtonElement;
+
+        const hostUrl = hostInput.value.trim();
+        if (!hostUrl) {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fef2f2";
+            resultDiv.style.color = "#dc2626";
+            resultDiv.textContent = "도메인을 입력하세요.";
+            return;
+        }
+
+        // 메타 태그가 아직 생성되지 않은 경우 생성 유도
+        if (metaDiv.style.display === "none") {
+            const email = currentSession.email || "";
+            const hashMessage = ethers.hashMessage(email);
+            const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
+            metaTextarea.value = `<meta name="oauth-network-verification" content="${clientAddress}" />
+<meta name="privacy" content="/개인정보약관 경로/" />
+<meta name="terms" content="/이용약관 경로/" />`;
+            metaDiv.style.display = "block";
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fffbeb";
+            resultDiv.style.color = "#d97706";
+            resultDiv.textContent = "위 메타 태그를 사이트 <head>에 추가한 후 다시 등록하세요.";
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "등록 중...";
+        resultDiv.style.display = "none";
+
+        const res = await submitOAuthRegistration(hostUrl);
+
+        submitBtn.disabled = false;
+        submitBtn.textContent = "추가";
+
+        if (res.success) {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#f0fdf4";
+            resultDiv.style.color = "#16a34a";
+            resultDiv.textContent = "등록 완료!";
+            metaDiv.style.display = "none";
+            credDiv.style.display = "block";
+            (document.getElementById("oauth-reg-client-id") as HTMLInputElement).value = res.client_id;
+            (document.getElementById("oauth-reg-client-secret") as HTMLInputElement).value = res.client_secret;
+            // 네비게이션 갱신
+            await renderNavigation();
+        } else {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fef2f2";
+            resultDiv.style.color = "#dc2626";
+            resultDiv.textContent = res.error;
+            // 소유 확인 실패 시 메타 태그를 다시 강조 표시
+            metaDiv.style.display = "block";
+            metaTextarea.style.border = "2px solid #ef4444";
+            setTimeout(() => { metaTextarea.style.border = "1px solid #ddd"; }, 3000);
+        }
+    });
+}
+
 let isSearching = false;
 let isExtracting = false;
 
@@ -2652,8 +2980,36 @@ async function renderNavigation() {
         }
         
         const navSection = pageList.closest('.nav-section') as HTMLElement;
-
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+
+        // 🌟 [OAUTH REGISTER BUTTON] Pages nav-section 상단에 사이트 등록 버튼을 삽입합니다.
+        //    매 렌더링마다 중복 생성을 방지하기 위해 기존 버튼을 먼저 제거합니다.
+        if (navSection) {
+            const existingBtn = navSection.querySelector("#btn-oauth-register");
+            if (existingBtn) existingBtn.remove();
+
+            // analytic 모드에서만 등록 버튼 노출 (이 버튼의 목적이 analytic 조회이므로)
+            if (currentSearchMode === "analytic" && !isSettingsOpen) {
+                const h3 = navSection.querySelector("h3");
+                const registerBtn = document.createElement("button");
+                registerBtn.id = "btn-oauth-register";
+                registerBtn.style.cssText = "position: absolute; left: 1em; top: -20px; border: 0; padding: 0; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
+                registerBtn.textContent = "+ 사이트 등록 (Analytic)";
+                registerBtn.addEventListener("click", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    renderOAuthRegistrationForm();
+                });
+                // h3 바로 아래, pageList 위에 삽입
+                if (h3 && h3.nextSibling) {
+                    navSection.insertBefore(registerBtn, h3.nextSibling);
+                } else if (h3) {
+                    navSection.appendChild(registerBtn);
+                } else {
+                    navSection.insertBefore(registerBtn, pageList);
+                }
+            }
+        }
 
         if (_pages.length === 0) {
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
