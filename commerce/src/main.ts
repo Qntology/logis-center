@@ -45,6 +45,9 @@ const NUM_CONTAINS = [
 ];
 const NUM_EXACT = new Set(['width', 'height', 'length']);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
+// 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
+//    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
+const NUM_PREFIX = ['rel_'];
 // 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
 //    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
 //    bool 변환식이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
@@ -60,6 +63,11 @@ function kindOf(key: string): CanonKind {
     if (FORCE_ID.has(k)) return 'id';
     if (FORCE_NUM.has(k)) return 'num';
     if (FORCE_BOOL.has(k)) return 'bool';
+
+    // 🌟 [TRADING INDEX] 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
+    //    ID_CONTAINS 의 'reference_' 보다 먼저 검사해야
+    //    'rel_' 이 id(String)로 오분류되지 않습니다.
+    if (NUM_PREFIX.some(p => k.startsWith(p))) return 'num';
 
     // 🌟 Boolean 을 수치보다 먼저 검사합니다.
     //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
@@ -909,15 +917,25 @@ const ITEMS_SCHEMA = [
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    //  ⑤-1 🌟 [TRADING INDEX RELAY] commerce 의 data.order / data.tracking 과 동일한 역할입니다.
+    //     logic::trading_index_column() 이 만드는 crc32 숫자 인덱스 컬럼으로,
+    //     'BL 하나로 연결된 CI/PL 전부 조회' 를 O(log n) 으로 처리합니다.
+    //     문자열 doc_number 를 그대로 쓰면 표기 흔들림(대소문자/하이픈)에 매번 어긋납니다.
+    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+    'data.rel_ed', 'data.rel_id', 'data.rel_cinv',
     //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
     //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
     //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
     '[type+created_at]'
 ].join(', ');
 
-// 🌟 v9 : v8 이 삭제해 버린 5개 테이블을 복구합니다.
-//    items 는 스키마가 동일하므로 diff 가 없어 데이터가 그대로 보존됩니다.
-appDb.version(9).stores({
+// 🌟 v10 : trading 참조 인덱스(data.rel_*) 16개를 추가합니다.
+//    스토어 구조는 v9 와 동일하고 인덱스만 늘어나므로 Dexie 가 자동 백필합니다.
+//    ⚠️ stores() 에는 '앱이 쓰는 전 테이블' 을 항상 함께 적어야 합니다.
+//       (v8 이 items 만 적어서 kv_store 등 5개 테이블이 소멸한 사고 재발 방지)
+appDb.version(10).stores({
     items: ITEMS_SCHEMA,
 
     // ── 세션 / 설정 / 터미널 로그 / 숨김 페이지 목록 등 KV 저장소 ──
@@ -1024,7 +1042,13 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.incoterms', 'data.payment_terms', 'data.currency',
     'data.container_number', 'data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
-    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking'
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
+    //    여기에 없으면 선언한 인덱스가 한 번도 쓰이지 않고 .filter() 풀스캔으로 떨어집니다.
+    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+    'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
 ]);
 
 interface DexieCondition {
@@ -1123,7 +1147,12 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
         'data.barcode', 'data.stock_keeping_unit', 'data.digest',
         // ── 🌟 trading 식별자 : 카디널리티가 상품명/항구명보다 압도적으로 높습니다 ──
         'data.doc_number', 'data.container_number', 'data.seal_number',
-        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking'
+        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+        // ── 🌟 trading 인덱스 참조 : crc32 숫자라 카디널리티가 최상입니다 ──
+        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
     ];
 
     let best: DexieCondition | null = null;
@@ -4340,7 +4369,14 @@ listen("extraction-progress", async (event: any) => {
                         // 🌟 [TRADE LINK PATHS] 무역 문서 간 연결 축
                         'data.doc_number', 'data.reference_invoice',
                         'data.reference_lc', 'data.reference_booking',
-                        'data.container_number', 'data.seal_number'
+                        'data.container_number', 'data.seal_number',
+                        // 🌟 [TRADE INDEX LINK] commerce 의 data.order / data.tracking 과 동일한
+                        //    'index 로 서로를 가리키는' 축입니다.
+                        //    문자열 doc_number 는 표기가 흔들려도 이 숫자는 절대 흔들리지 않습니다.
+                        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+                        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+                        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+                        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
                     ];
 
                     // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼

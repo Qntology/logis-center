@@ -6515,7 +6515,7 @@ impl LogisModel {
 //     }
 }
 
-fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {
+pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {
     let target_key = if cat == "items" { "line_items" } else if cat == "containers" { "containers" } else { cat };
     
     // Some models might wrap the result in the category name or target_key

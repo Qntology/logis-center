@@ -207,35 +207,96 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
     }
 }
 
-// 🌟 [TRADING RELAY FIELD] 두 무역 서식 사이를 연결하는 참조 필드명을 반환합니다.
-//    related_trading() 이 '어떤 서식과 연결되는지'를 정의하고,
-//    이 함수가 '어떤 필드로 연결되는지'를 정의합니다.
-pub fn trading_relay_field(from_type: &str, to_type: &str) -> Option<&'static str> {
+// 🌟 [TRADING RELAY FIELD v2 / DIRECTIONAL PAIR]
+//  ── 무엇이 문제였나 ──
+//   v1 은 (from, to) 쌍에 대해 '단 하나의 필드명'만 돌려주었습니다.
+//   그런데 실무 서식은 방향에 따라 참조 필드가 다릅니다.
+//     BL.reference_invoice = CI.doc_number   (BL 쪽 필드는 reference_invoice)
+//     CI.doc_number        = BL.reference_invoice
+//   v1 은 양쪽 모두 "reference_invoice" 를 반환했기 때문에,
+//   CI 문서에서 relay 를 돌 때 `CI.reference_invoice` 라는 존재하지 않는 값을 읽어
+//   조회가 항상 0건이었습니다.
+//
+//  반환값: (내 문서에서 값을 읽어올 필드, 상대 문서에서 조회할 필드)
+pub fn trading_relay_pair(from_type: &str, to_type: &str) -> Option<(&'static str, &'static str)> {
     match (from_type, to_type) {
-        ("BL", "CI") | ("CI", "BL") => Some("reference_invoice"),
-        ("BL", "PL") | ("PL", "BL") => Some("reference_booking"),
-        ("CI", "PL") | ("PL", "CI") => Some("reference_invoice"),
-        ("CI", "LC") | ("LC", "CI") => Some("reference_lc"),
-        ("PO", "PI") | ("PI", "PO") => Some("doc_number"),
-        ("PO", "SC") | ("SC", "PO") => Some("doc_number"),
-        ("PI", "SC") | ("SC", "PI") => Some("doc_number"),
-        ("CO", "CI") | ("CI", "CO") => Some("reference_invoice"),
-        ("AWB", "CI") | ("CI", "AWB") => Some("reference_invoice"),
-        ("AWB", "PL") | ("PL", "AWB") => Some("reference_booking"),
-        ("SA", "BL") | ("BL", "SA") => Some("reference_booking"),
-        ("SA", "CI") | ("CI", "SA") => Some("reference_invoice"),
-        ("DO", "BL") | ("BL", "DO") => Some("reference_booking"),
-        ("DO", "AN") | ("AN", "DO") => Some("reference_booking"),
-        ("AN", "BL") | ("BL", "AN") => Some("reference_booking"),
-        ("BC", "BL") | ("BL", "BC") => Some("reference_booking"),
-        ("BC", "CI") | ("CI", "BC") => Some("reference_invoice"),
-        ("ED", "CI") | ("CI", "ED") => Some("reference_invoice"),
-        ("ED", "PL") | ("PL", "ED") => Some("reference_invoice"),
-        ("ID", "CI") | ("CI", "ID") => Some("reference_invoice"),
-        ("ID", "PL") | ("PL", "ID") => Some("reference_invoice"),
-        ("CINV", "CI") | ("CI", "CINV") => Some("reference_invoice"),
+        // ── 인보이스 참조 축 ──
+        ("BL",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "BL")  => Some(("doc_number", "reference_invoice")),
+        ("PL",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "PL")  => Some(("doc_number", "reference_invoice")),
+        ("CO",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "CO")  => Some(("doc_number", "reference_invoice")),
+        ("AWB", "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "AWB") => Some(("doc_number", "reference_invoice")),
+        ("SA",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "SA")  => Some(("doc_number", "reference_invoice")),
+        ("BC",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "BC")  => Some(("doc_number", "reference_invoice")),
+        ("ED",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "ED")  => Some(("doc_number", "reference_invoice")),
+        ("ID",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "ID")  => Some(("doc_number", "reference_invoice")),
+        ("CINV","CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "CINV")=> Some(("doc_number", "reference_invoice")),
+        ("ED",  "PL")  => Some(("reference_invoice", "reference_invoice")),
+        ("PL",  "ED")  => Some(("reference_invoice", "reference_invoice")),
+        ("ID",  "PL")  => Some(("reference_invoice", "reference_invoice")),
+        ("PL",  "ID")  => Some(("reference_invoice", "reference_invoice")),
+
+        // ── 부킹 참조 축 ──
+        ("BL",  "PL")  => Some(("reference_booking", "reference_booking")),
+        ("PL",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("AWB", "PL")  => Some(("reference_booking", "reference_booking")),
+        ("PL",  "AWB") => Some(("reference_booking", "reference_booking")),
+        ("BL",  "BC")  => Some(("reference_booking", "doc_number")),
+        ("BC",  "BL")  => Some(("doc_number", "reference_booking")),
+        ("SA",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "SA")  => Some(("reference_booking", "reference_booking")),
+        ("DO",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "DO")  => Some(("reference_booking", "reference_booking")),
+        ("DO",  "AN")  => Some(("reference_booking", "reference_booking")),
+        ("AN",  "DO")  => Some(("reference_booking", "reference_booking")),
+        ("AN",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "AN")  => Some(("reference_booking", "reference_booking")),
+
+        // ── L/C 참조 축 ──
+        ("CI",  "LC")  => Some(("reference_lc", "doc_number")),
+        ("LC",  "CI")  => Some(("doc_number", "reference_lc")),
+
+        // ── 계약 3종 상호 참조 ──
+        ("PO",  "PI")  => Some(("doc_number", "doc_number")),
+        ("PI",  "PO")  => Some(("doc_number", "doc_number")),
+        ("PO",  "SC")  => Some(("doc_number", "doc_number")),
+        ("SC",  "PO")  => Some(("doc_number", "doc_number")),
+        ("PI",  "SC")  => Some(("doc_number", "doc_number")),
+        ("SC",  "PI")  => Some(("doc_number", "doc_number")),
+
         _ => None,
     }
+}
+
+// 🌟 [BACK-COMPAT] 기존 호출부(trading_relay_field)를 살려 둡니다.
+//  '내 쪽 필드'만 반환하므로 v1 과 동일하게 동작합니다.
+pub fn trading_relay_field(from_type: &str, to_type: &str) -> Option<&'static str> {
+    trading_relay_pair(from_type, to_type).map(|(mine, _)| mine)
+}
+
+// 🌟 [TRADING INDEX COLUMN] commerce 가 order↔tracking 을 'order'/'tracking' 이라는
+//  숫자 index 컬럼으로 잇는 것과 동일한 구조를 무역 서식에 부여합니다.
+//
+//  commerce:
+//     order.tracking  = crc32(hash_id("tracking" + team_id + tracking_number))
+//     tracking.order  = crc32(hash_id("order"    + team_id + order_no))
+//
+//  trading (이 함수가 정의):
+//     BL.ci = crc32(hash_id("CI" + team_id + 정규화된 CI doc_number))
+//     CI.bl = crc32(hash_id("BL" + team_id + 정규화된 BL doc_number))
+//
+//  반환값은 data.* 인덱스 경로에 쓰일 소문자 컬럼명입니다.
+//  (Dexie 의 'data.rel_ci' 인덱스와 1:1 대응)
+pub fn trading_index_column(doc_type: &str) -> String {
+    format!("rel_{}", doc_type.to_lowercase())
 }
 
 pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>, MergeInfo)> {

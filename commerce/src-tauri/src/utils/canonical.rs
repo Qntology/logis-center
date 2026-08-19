@@ -47,6 +47,11 @@ const ID_SUFFIX: &[&str] = &[
 const ID_CONTAINS: &[&str] = &[
     "code", "barcode", "gtin", "mpn", "sku", "reference_", "container", "seal",
 ];
+// 🌟 [TRADING INDEX PREFIX] trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 계열은
+//    crc32 결과를 담는 '숫자 인덱스' 이므로 Numeric 으로 확정해야
+//    Dexie 의 where('data.rel_ci').equals(123) 가 성립합니다.
+//    (String 으로 굳으면 equals(123) 이 절반을 놓칩니다)
+const NUM_PREFIX: &[&str] = &["rel_"];
 const NUM_SUFFIX: &[&str] = &[
     "_price", "_amount", "_fee", "_rate", "_count", "_qty", "_at",
     "_weight", "_volume", "_duration", "_limit", "_threshold", "_charges",
@@ -78,6 +83,11 @@ pub fn kind_of(key: &str) -> CanonKind {
     if FORCE_ID.iter().any(|x| *x == k) { return CanonKind::Identifier; }
     if FORCE_NUM.iter().any(|x| *x == k) { return CanonKind::Numeric; }
     if FORCE_BOOL.iter().any(|x| *x == k) { return CanonKind::Boolean; }
+
+    // 🌟 [TRADING INDEX] 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
+    //    ID_CONTAINS 의 'reference_' 보다 먼저 검사해야
+    //    'rel_' 이 Identifier(String)로 오분류되지 않습니다.
+    if NUM_PREFIX.iter().any(|p| k.starts_with(p)) { return CanonKind::Numeric; }
 
     // 🌟 Boolean 을 수치보다 먼저 검사합니다.
     //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)

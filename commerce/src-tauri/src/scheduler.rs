@@ -8593,23 +8593,163 @@ async fn process_trading_task(
     let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
 
     // =====================================================================
-    // 🌟 [TRADING STEP A] doc_type 분류 (27종 무역 서식)
+    // 🌟 [TRADING STEP A v2] doc_type 2뎁스 분류 (그룹 → 코드)
     // ---------------------------------------------------------------------
-    // commerce 의 page_type 분류(6도메인) 대신,
-    // get_trade_doc_classification_prompt() 가 정의한 27종 코드로 분류합니다.
-    // 분류 결과가 get_trade_doc_slice_config / get_trade_category_schema 의
-    // 분기 키로 그대로 사용되므로, 여기서 나온 코드가 이후 모든 단계의 기준입니다.
+    //  ── 왜 2뎁스인가 ──
+    //   commerce 는 6개 도메인(order/goods/tracking/review/coupon/event)을
+    //   벡터 1회로 갈랐지만, trading 은 27개라 1회 코사인으로 정확히 가를 수 없습니다.
+    //   (get_trade_doc_classification_prompt 도 같은 이유로 GROUPS 를 먼저 제시합니다)
+    //
+    //   그래서 slice_config 가 이미 좌표를 공유하는 그룹 단위로 먼저 좁힙니다.
+    //     ① Contract & Payment   : PO / PI / SC / LC
+    //     ② Shipping & Transport : CI / PL / BL / AWB / SA / DO / AN / BC
+    //     ③ Customs              : ED / ID / CINV / CO
+    //     ④ Inspection           : IC / WC / CA / PHYTO / HC / BEN_CERT
+    //     ⑤ Special & Legal      : DGD / MSDS / POA / BIZ_LIC / INS
+    //     ⑥ Parcel               : TRACKING
+    //
+    //   그룹 내 혼동은 slice_config / category_schema 가 동일 좌표·동일 스키마를
+    //   공유하므로 추출 품질에 영향이 없습니다. 그룹 간 오분류만 막으면 됩니다.
+    //
+    //  ── LLM 호출 절감 ──
+    //   코사인 마진이 충분하면 LLM 을 아예 부르지 않습니다.
+    //   마진이 부족한 경우에만 '그 그룹의 코드 목록'만 제시하여 1회 호출합니다.
     // =====================================================================
-    emit_term("[TRADING STEP A] Classifying trade document type...");
+    emit_term("[TRADING STEP A] Classifying trade document type (2-depth)...");
     log_task_progress(app_handle, &task.id, &json!({
-        "category": "Classification", "summary": "Identifying trade document type...", "spinner": "⠋"
+        "category": "Classification", "summary": "Identifying trade document group...", "spinner": "⠋"
     }));
 
-    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+    // ── 임베딩 모델 확보 (LLM 이전에 코사인 분류부터) ──
+    model.check_embedding_downloaded().await?;
+    model.ensure_embedding().await?;
 
-    let doc_type = {
-        let class_prompt = crate::parsing::get_trade_doc_classification_prompt();
-        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+    // 🌟 [DEPTH 1] 그룹 앵커 텍스트.
+    //    코드 리터럴이 아니라 '그 그룹이 무엇을 다루는가' 라는 의미 문장을 씁니다.
+    //    문서 언어가 무엇이든 다국어 임베딩이 연결합니다.
+    const TRADE_GROUPS: [(&str, &str); 6] = [
+        ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, payment terms, contract number, buyer seller agreement, tenor, issuing bank"),
+        ("shipping",  "commercial invoice, packing list, bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage, port of loading, port of discharge, container seal"),
+        ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff, customs clearance, declaration number"),
+        ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, treatment"),
+        ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, packing group, policy number, coverage"),
+        ("parcel",    "courier label, parcel waybill, tracking number, delivery company, recipient address, sender address, parcel weight"),
+    ];
+
+    const GROUP_CODES: [(&str, &[&str]); 6] = [
+        ("contract",   &["PO", "PI", "SC", "LC"]),
+        ("shipping",   &["CI", "PL", "BL", "AWB", "SA", "DO", "AN", "BC"]),
+        ("customs",    &["ED", "ID", "CINV", "CO"]),
+        ("inspection", &["IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT"]),
+        ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS"]),
+        ("parcel",     &["TRACKING"]),
+    ];
+
+    // 🌟 [DEPTH 2] 코드별 앵커. bias.json 을 손대지 않고 프롬프트가 이미 갖고 있는
+    //    정의문(= get_trade_doc_classification_prompt 의 GROUPS 설명)을 그대로 씁니다.
+    fn trade_code_anchor(code: &str) -> &'static str {
+        match code {
+            "PO"       => "purchase order, order confirmation, buyer issues to seller, order number, delivery date requested",
+            "PI"       => "proforma invoice, quotation, preliminary invoice, offer to buyer before shipment",
+            "SC"       => "sales contract, agreement between seller and buyer, contract terms and clauses",
+            "LC"       => "letter of credit, documentary credit, issuing bank, beneficiary, tenor at sight, expiry date, advising bank",
+            "CI"       => "commercial invoice, seller bills buyer, unit price, total amount, incoterms, invoice number",
+            "PL"       => "packing list, carton details, gross weight, net weight, measurement, marks and numbers",
+            "BL"       => "bill of lading, ocean carrier document, shipper consignee notify party, vessel voyage, port of loading, port of discharge, freight prepaid collect",
+            "AWB"      => "air waybill, airline document, flight number, airport of departure, airport of destination, chargeable weight",
+            "SA"       => "shipping advice, shipment notification to buyer, dispatch details",
+            "DO"       => "delivery order, release cargo to consignee, pickup location, container release",
+            "AN"       => "arrival notice, cargo arrival notification, local charges, free time, terminal",
+            "BC"       => "booking confirmation, space booking with carrier, booking number, cut off time",
+            "ED"       => "export declaration, customs export filing, declaration number, exporter, hs code",
+            "ID"       => "import declaration, customs import filing, importer, duty, tax, hs code",
+            "CINV"     => "customs invoice, invoice prepared for customs valuation",
+            "CO"       => "certificate of origin, country of origin declaration, chamber of commerce stamp",
+            "IC"       => "inspection certificate, quality inspection result, inspected by",
+            "WC"       => "weight certificate, certified weight measurement",
+            "CA"       => "certificate of analysis, laboratory test result, specification value",
+            "PHYTO"    => "phytosanitary certificate, plant health, fumigation, treatment type",
+            "HC"       => "health certificate, sanitary certificate, fit for human consumption",
+            "BEN_CERT" => "beneficiary certificate, beneficiary statement, we hereby certify that",
+            "DGD"      => "dangerous goods declaration, un number, proper shipping name, packing group, hazard class",
+            "MSDS"     => "material safety data sheet, chemical hazard information, first aid measures",
+            "POA"      => "power of attorney, authorization letter, attorney in fact",
+            "BIZ_LIC"  => "business license, business registration certificate, company registration number",
+            "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
+            "TRACKING" => "courier parcel label, tracking number barcode, delivery company, recipient",
+            _          => "trade document",
+        }
+    }
+
+    // ── 문서 전체 임베딩 (뎁스 1/2 공통 질의 벡터) ──
+    let doc_emb = model.get_embedding(light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
+
+    // ── 뎁스 1 : 그룹 코사인 ──
+    let group_texts: Vec<String> = TRADE_GROUPS.iter().map(|(_, t)| t.to_string()).collect();
+    let group_embs = model.get_embedding_batch(group_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; group_texts.len()]);
+
+    let mut group_scores: Vec<(String, f32)> = Vec::new();
+    for (gi, (gname, _)) in TRADE_GROUPS.iter().enumerate() {
+        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &group_embs[gi]);
+        group_scores.push((gname.to_string(), s));
+        emit_term(&format!("  📐 [TRADE GROUP] {} | Cosine: {:.4}", gname, s));
+    }
+    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best_group = group_scores[0].0.clone();
+    let group_margin = group_scores[0].1 - group_scores.get(1).map(|x| x.1).unwrap_or(0.0);
+    emit_term(&format!("  👑 [TRADE GROUP SELECTED] '{}' | Top: {:.4} | Margin: {:+.4}",
+        best_group, group_scores[0].1, group_margin));
+
+    // ── 뎁스 2 : 그룹 내 코드 코사인 ──
+    let codes: Vec<&str> = GROUP_CODES.iter()
+        .find(|(g, _)| *g == best_group)
+        .map(|(_, c)| c.to_vec())
+        .unwrap_or_else(|| vec!["Unknown"]);
+
+    let code_texts: Vec<String> = codes.iter().map(|c| trade_code_anchor(c).to_string()).collect();
+    let code_embs = model.get_embedding_batch(code_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; code_texts.len()]);
+
+    let mut code_scores: Vec<(String, f32)> = Vec::new();
+    for (ci, c) in codes.iter().enumerate() {
+        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &code_embs[ci]);
+        code_scores.push((c.to_string(), s));
+        emit_term(&format!("    📐 [TRADE CODE] {} | Cosine: {:.4}", c, s));
+    }
+    code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let cosine_code = code_scores[0].0.clone();
+    let code_margin = code_scores[0].1 - code_scores.get(1).map(|x| x.1).unwrap_or(0.0);
+    emit_term(&format!("  👑 [TRADE CODE COSINE] '{}' | Top: {:.4} | Margin: {:+.4}",
+        cosine_code, code_scores[0].1, code_margin));
+
+    // ── 뎁스 3 : 마진 부족 시에만 LLM 폴백 (그룹 내 코드만 제시) ──
+    //    마진 기준은 절대 임계치가 아니라 '2순위와 사실상 동률인가' 라는 부호 판정입니다.
+    //    코사인 공간에서 0.01 미만은 노이즈 수준이므로 구분 불가로 간주합니다.
+    let doc_type = if codes.len() == 1 {
+        emit_term(&format!("  ⚡ [TRADE CODE DETERMINISTIC] 그룹 '{}' 의 코드가 1개뿐이라 LLM 호출을 생략합니다.", best_group));
+        cosine_code
+    } else if code_margin > 0.01 {
+        emit_term(&format!("  ⚡ [TRADE CODE DETERMINISTIC] 코사인 마진 {:+.4} 로 '{}' 확정. LLM 호출을 생략합니다.", code_margin, cosine_code));
+        cosine_code
+    } else {
+        emit_term(&format!("  ⚠️ [TRADE CODE AMBIGUOUS] 코사인 마진 {:+.4} 부족. 그룹 '{}' 내 {}개 코드로 LLM 재판정합니다.",
+            code_margin, best_group, codes.len()));
+
+        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+
+        let scoped_prompt = {
+            let mut s = String::from("[TASK]\nClassify this trade document. Return the single closest code.\n\n[CANDIDATE CODES]\n");
+            for (c, sc) in &code_scores {
+                s.push_str(&format!("{} = {} (vector score {:.4})\n", c, trade_code_anchor(c), sc));
+            }
+            s.push_str("\nIf none fit, return \"Unknown\".\n\n[OUTPUT FORMAT]\n{\"doc_type\": \"BL\"}\n\n[ACTION] JSON ONLY. NO EXPLANATION. /no_think");
+            s
+        };
+
+        let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
@@ -8620,7 +8760,7 @@ async fn process_trading_task(
                     ),
                     crate::openai_types::ChatCompletionRequestMessage::User(
                         crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(class_prompt),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(scoped_prompt),
                             name: None,
                         }
                     )
@@ -8638,37 +8778,47 @@ async fn process_trading_task(
                 None, None, None
             ).await?;
             crate::parsing::parse_json_from_llm(&res)
-                .get("doc_type").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string()
+                .get("doc_type").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
         } else {
-            return Err(anyhow::anyhow!("Qwen3.5 Generator not available for doc_type classification"));
+            String::new()
+        };
+
+        // 🌟 [SCOPE GUARD] LLM 이 그룹 밖 코드를 뱉으면 폐기하고 코사인 결과를 씁니다.
+        if !picked.is_empty() && codes.iter().any(|c| *c == picked.as_str()) {
+            emit_term(&format!("  🤖 [TRADE CODE LLM] LLM 이 '{}' 로 확정했습니다.", picked));
+            picked
+        } else {
+            if !picked.is_empty() {
+                emit_term(&format!("  🚫 [TRADE CODE LLM REJECT] LLM 이 반환한 '{}' 는 그룹 '{}' 후보에 없어 폐기합니다.", picked, best_group));
+            }
+            cosine_code
         }
     };
 
-    emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {}", doc_type));
+    emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
 
     // =====================================================================
-    // 🌟 [TRADING STEP B] 카테고리별 필드 추출
+    // 🌟 [TRADING STEP B v2] PLINKO 선행 + 미확정 카테고리만 LLM
     // ---------------------------------------------------------------------
-    // commerce 의 get_detail_schema_fields(필드 나열) 대신,
-    // get_trade_category_schema(category, doc_type) 가 bias.json 의
-    // trade_schema.base + trade_schema.overlay.{doc_type}.{category} 를 읽어
-    // 이 서식에 실제로 존재하는 축만 반환합니다.
+    //  ── 무엇이 바뀌었나 ──
+    //   v1 은 light_pug 전체를 System 에 넣고 카테고리 8개에 LLM 을 8번 호출했습니다.
+    //   bias.json 의 무역 bias/prejudice 뱅크(bias_schema.rs 의 27종 분기)를
+    //   단 한 번도 쓰지 않았고, 형식 게이트도 없어
+    //   "총 중량 | 1,250" 셀이 amount 로 들어가도 막을 방법이 없었습니다.
     //
-    // 예: doc_type = "LC" 이면
-    //   financials 카테고리에 tenor, lc_number, issuing_bank 가 overlay 로 추가되고
-    //   doc_type = "DGD" 이면
-    //   cargo 카테고리에 un_number, packing_group, proper_shipping_name 이 추가됩니다.
-    //
-    // 뎁스 구조:
-    //   카테고리 루프 → 각 카테고리마다 LLM 1회 호출 → merge_json_manual 로 병합
+    //  ── v2 구조 (commerce 상세 경로와 동일) ──
+    //   B-1  구조적 라벨-값 페어 수집   (collect_detail_label_value_pairs)
+    //   B-2  라벨 뱅크 / 편견 뱅크 구축 (label_phrase_bank / prejudice_phrase_bank)
+    //   B-3  형식 게이트                (detect_field_format / value_matches_format)
+    //   B-4  이중 센터링 + 배타 배정    (double_center_matrix / exclusive_assign_by_score)
+    //   B-5  확정된 필드는 LLM 없이 주입
+    //   B-6  미확정 카테고리만 LLM 호출
     // =====================================================================
-    emit_term("[TRADING STEP B] Extracting fields by category...");
+    emit_term("[TRADING STEP B] Running PLINKO field assignment before LLM...");
 
     let categories = ["header", "parties", "logistics", "conditions", "financials", "cargo", "items", "containers"];
 
     let mut final_data_map = serde_json::Map::new();
-
-    // 기본 뼈대 생성 (merge_json_manual 과 동일한 8개 키)
     final_data_map.insert("header".to_string(), json!({"doc_type": doc_type.clone()}));
     final_data_map.insert("parties".to_string(), json!({}));
     final_data_map.insert("logistics".to_string(), json!({}));
@@ -8678,19 +8828,306 @@ async fn process_trading_task(
     final_data_map.insert("line_items".to_string(), json!([]));
     final_data_map.insert("containers".to_string(), json!([]));
 
+    // ── B-0 : 상세 모드 PUG 재생성 (값을 살려야 페어 추출이 가능) ──
+    let content_pug = {
+        let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::DetailMode, Some(&url));
+        model.truncate_pug_context(&full_pug, true, 2000, None).await
+    };
+    let pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
+    let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
+
+    // ── B-1 : 구조적 라벨-값 페어 ──
+    let detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
+    emit_term(&format!("  🧷 [TRADING PAIR] 구조적 라벨-값 페어 {}개 확보", detail_pairs.len()));
+    for p in &detail_pairs {
+        emit_term(&format!(
+            "    Line {} | Section: '{}' | Label: '{}' | Value: '{}'",
+            p.primary_line + 1, p.section, p.label, p.value
+        ));
+    }
+
+    // ── B-2 : 스키마 필드 + 라벨/편견 뱅크 ──
+    //    bias_schema.rs 의 무역 분기(27종)가 이미 40여 필드를 정의하고 있습니다.
+    let trade_fields = crate::parsing::get_detail_schema_fields(&doc_type, &url, &doc_lang);
+    emit_term(&format!("  📐 [TRADING SCHEMA] doc_type '{}' 에 대응하는 스키마 필드 {}개 로드", doc_type, trade_fields.len()));
+
+    let mut t_field_names: Vec<String> = Vec::new();
+    let mut t_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut t_label_weights: Vec<Vec<f32>> = Vec::new();
+    let mut t_prej_raw: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut t_prej_texts: Vec<Vec<String>> = Vec::new();
+
+    for (fname, _, _, _) in &trade_fields {
+        let (lp, lw) = crate::utils::ai_utils::label_phrase_bank(&doc_lang, &doc_type, fname);
+        if lp.is_empty() { continue; }
+        let pp = crate::utils::ai_utils::prejudice_phrase_bank(&doc_lang, &doc_type, fname);
+        let le = model.get_embedding_batch(lp.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; lp.len()]);
+        let pe = if pp.is_empty() {
+            Vec::new()
+        } else {
+            model.get_embedding_batch(pp.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
+        };
+        t_field_names.push(fname.clone());
+        t_label_embs.push(le);
+        t_label_weights.push(lw);
+        t_prej_raw.push(pe);
+        t_prej_texts.push(pp);
+    }
+
+    // 🌟 [SELF-POISON GUARD] commerce 와 동일하게 자기 자신을 설명하는 편견 구를 박탈합니다.
+    let mut t_prej_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(t_field_names.len());
+    for f in 0..t_field_names.len() {
+        let mask = crate::utils::ai_utils::self_poisoned_prejudice_mask(
+            &t_label_embs[f], &t_prej_raw[f], &t_label_embs, f
+        );
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let mut dropped = 0usize;
+        for (pi, poisoned) in mask.iter().enumerate() {
+            if *poisoned {
+                dropped += 1;
+                if dropped <= 4 {
+                    emit_term(&format!("    🧪 [SELF-POISON DROP] '{}' 의 편견 구 '{}' 박탈",
+                        t_field_names[f], t_prej_texts[f].get(pi).cloned().unwrap_or_default()));
+                }
+            } else {
+                kept.push(t_prej_raw[f][pi].clone());
+            }
+        }
+        emit_term(&format!("  🏷️ [TRADING LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개 (자기오염 {}개 제거)",
+            t_field_names[f], t_label_embs[f].len(), kept.len(), dropped));
+        t_prej_embs.push(kept);
+    }
+
+    // ── B-3 : 페어 라벨 임베딩 + 형식 게이트 ──
+    let mut unique_labels: Vec<String> = Vec::new();
+    let mut unique_leaf: Vec<String> = Vec::new();
+    let mut unique_section: Vec<String> = Vec::new();
+    let mut label_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in &detail_pairs { *label_count.entry(p.label.clone()).or_insert(0) += 1; }
+
+    let mut pair_phrases: Vec<String> = Vec::with_capacity(detail_pairs.len());
+    for p in &detail_pairs {
+        let dup = label_count.get(&p.label).copied().unwrap_or(0) > 1;
+        if dup && !p.section.trim().is_empty() {
+            pair_phrases.push(format!("{} {}", p.section.trim(), p.label));
+        } else {
+            pair_phrases.push(p.label.clone());
+        }
+    }
+    for (pi, ph) in pair_phrases.iter().enumerate() {
+        if unique_labels.iter().any(|e| e == ph) { continue; }
+        unique_labels.push(ph.clone());
+        unique_leaf.push(detail_pairs[pi].label.clone());
+        unique_section.push(detail_pairs[pi].section.trim().to_string());
+    }
+
+    let mut assigned_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    if !unique_labels.is_empty() && !t_field_names.is_empty() {
+        let leaf_embs = model.get_embedding_batch(unique_leaf.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_leaf.len()]);
+        let section_texts: Vec<String> = unique_section.iter()
+            .map(|s| if s.is_empty() { " ".to_string() } else { s.clone() })
+            .collect();
+        let section_embs = model.get_embedding_batch(section_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; section_texts.len()]);
+
+        // 각 유일 라벨의 대표값 / 병합값 사전 계산
+        let mut phrase_single: Vec<String> = vec![String::new(); unique_labels.len()];
+        let mut phrase_multi: Vec<String> = vec![String::new(); unique_labels.len()];
+        let mut phrase_line: Vec<usize> = vec![0usize; unique_labels.len()];
+        for (pi, ph) in pair_phrases.iter().enumerate() {
+            let h = match unique_labels.iter().position(|u| u == ph) { Some(v) => v, None => continue };
+            let p = &detail_pairs[pi];
+            if phrase_single[h].is_empty() && !p.value.trim().is_empty() {
+                phrase_single[h] = p.value.clone();
+                phrase_line[h] = p.primary_line;
+            }
+            let av = p.value_all.trim();
+            if !av.is_empty() && !phrase_multi[h].contains(av) {
+                if phrase_multi[h].is_empty() {
+                    phrase_multi[h] = av.to_string();
+                } else {
+                    phrase_multi[h].push(' ');
+                    phrase_multi[h].push_str(av);
+                }
+            }
+        }
+
+        // 행렬 구축 (형식 게이트 + 편견 게이트를 배정 '전'에 적용)
+        let pair_abs_floor = 0.50f32;
+        let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+        let mut sec_raw:  Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+
+        for f in 0..t_field_names.len() {
+            let f_fmt = crate::utils::ai_utils::detect_field_format(&t_field_names[f]);
+            let f_multi = crate::utils::ai_utils::is_multi_value_field(&t_field_names[f]);
+            let f_strict = matches!(
+                f_fmt,
+                crate::utils::ai_utils::FieldFormat::Date
+                    | crate::utils::ai_utils::FieldFormat::TrackingCode
+                    | crate::utils::ai_utils::FieldFormat::Numeric
+                    | crate::utils::ai_utils::FieldFormat::Phone
+                    | crate::utils::ai_utils::FieldFormat::Address
+                    | crate::utils::ai_utils::FieldFormat::Text
+            );
+
+            for h in 0..unique_labels.len() {
+                if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                let own = crate::utils::ai_utils::weighted_max_pool_sim(
+                    &leaf_embs[h], &t_label_embs[f], &t_label_weights[f]
+                );
+                if own < pair_abs_floor { continue; }
+
+                let prej = if t_prej_embs[f].is_empty() {
+                    0.0
+                } else {
+                    crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &t_prej_embs[f])
+                };
+                if prej >= own {
+                    emit_term(&format!("    🚫 [TRADING PREJUDICE GATE] '{}' → '{}' | Label: {:.4} <= Prej: {:.4}",
+                        unique_labels[h], t_field_names[f], own, prej));
+                    continue;
+                }
+
+                let pair_val = if f_multi { &phrase_multi[h] } else { &phrase_single[h] };
+                if f_strict {
+                    if pair_val.trim().is_empty()
+                        || !crate::utils::ai_utils::value_matches_format(f_fmt, pair_val) {
+                        emit_term(&format!("    🚫 [TRADING VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 형식 불일치",
+                            unique_labels[h], t_field_names[f], f_fmt, pair_val));
+                        continue;
+                    }
+                }
+                if f_fmt == crate::utils::ai_utils::FieldFormat::Enum
+                    && crate::utils::ai_utils::is_pure_numeric_value(pair_val) {
+                    emit_term(&format!("    🚫 [TRADING ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치",
+                        unique_labels[h], t_field_names[f], pair_val));
+                    continue;
+                }
+
+                leaf_raw[f][h] = own;
+
+                if unique_section[h].is_empty() { continue; }
+                if section_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                sec_raw[f][h] = crate::utils::ai_utils::weighted_max_pool_sim(
+                    &section_embs[h], &t_label_embs[f], &t_label_weights[f]
+                );
+            }
+        }
+
+        // ── B-4 : 섹션 대비 항 + 배타 배정 ──
+        const SECTION_WEIGHT: f32 = 0.5f32;
+        let mut t_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+        for h in 0..unique_labels.len() {
+            let mut sec_sum = 0.0f32;
+            let mut sec_cnt = 0usize;
+            for f in 0..t_field_names.len() {
+                if leaf_raw[f][h] < 0.0 { continue; }
+                if sec_raw[f][h] < 0.0 { continue; }
+                sec_sum += sec_raw[f][h];
+                sec_cnt += 1;
+            }
+            let sec_mean = if sec_cnt > 0 { sec_sum / (sec_cnt as f32) } else { 0.0 };
+            for f in 0..t_field_names.len() {
+                if leaf_raw[f][h] < 0.0 { continue; }
+                let sec_term = if sec_cnt > 1 && sec_raw[f][h] >= 0.0 {
+                    sec_raw[f][h] - sec_mean
+                } else {
+                    0.0
+                };
+                t_matrix[f][h] = leaf_raw[f][h] + SECTION_WEIGHT * sec_term;
+            }
+        }
+
+        let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
+
+        // ── B-5 : 확정된 필드를 카테고리 슬롯에 직접 주입 ──
+        //    카테고리 매핑은 bias.json 의 trade_schema.base 키 구조를 그대로 따릅니다.
+        fn trade_field_category(field: &str) -> &'static str {
+            match field {
+                "doc_type" | "doc_number" | "issue_date" | "expiry_date"
+                    | "reference_number" | "no" => "header",
+                "sender_name" | "sender_address" | "recipient_name"
+                    | "recipient_address" | "notify_party_name" => "parties",
+                "vessel" | "voyage_number" | "pol" | "pod" | "place_receipt"
+                    | "place_delivery" | "etd" | "eta" | "transport_mode" => "logistics",
+                "incoterms" | "payment_terms" | "freight_payment_term" => "conditions",
+                "currency" | "amount" | "amount_subtotal" | "amount_tax"
+                    | "freight_amount" | "insurance_amount" | "local_charges" => "financials",
+                "container_number" | "seal_number" | "package_count" | "package_unit"
+                    | "weight_gross" | "weight_net" | "volume" | "marks_numbers" => "cargo",
+                _ => "",
+            }
+        }
+
+        for (f, a) in t_assign.iter().enumerate() {
+            let (h, score, margin) = match a { Some(v) => *v, None => continue };
+            let fname = t_field_names[f].clone();
+            if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
+
+            let f_multi = crate::utils::ai_utils::is_multi_value_field(&fname);
+            let val = if f_multi { phrase_multi[h].clone() } else { phrase_single[h].clone() };
+            if val.trim().is_empty() { continue; }
+
+            let cat = trade_field_category(&fname);
+            if cat.is_empty() {
+                emit_term(&format!("    ⚪ [TRADING CATEGORY UNMAPPED] '{}' 는 8개 카테고리에 매핑되지 않아 루트에만 주입합니다.", fname));
+            } else if let Some(slot) = final_data_map.get_mut(cat).and_then(|v| v.as_object_mut()) {
+                slot.insert(fname.clone(), json!(val.clone()));
+            }
+
+            assigned_fields.insert(fname.clone(), val.clone());
+            emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
+                unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
+        }
+
+        emit_term(&format!("  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료.", assigned_fields.len()));
+    }
+
+    // ── B-6 : PLINKO 로 확정되지 못한 카테고리만 LLM 호출 ──
+    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+
     for cat in &categories {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // 🌟 get_trade_category_schema 가 이 서식 + 이 카테고리에 실제로 존재하는 필드만 반환합니다.
-        //    필드가 없는 카테고리(예: DGD 의 financials)는 빈 스키마를 반환하므로
-        //    LLM 호출 전에 건너뛸 수 있습니다.
         let schema_prompt = crate::parsing::get_trade_category_schema(cat, &doc_type);
 
-        // 빈 스키마 체크: "SCHEMA:\n{}" 또는 "SCHEMA:\n[ {} ]" 이면 추출 대상 없음
         if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
             emit_term(&format!("[TRADING STEP B] Category '{}' has no fields for {}. Skipping.", cat.to_uppercase(), doc_type));
             continue;
         }
+
+        // 🌟 [PLINKO SKIP] 이 카테고리의 필드가 전부 PLINKO 로 확정되었으면 LLM 을 부르지 않습니다.
+        //    (line_items / containers 는 배열이라 개수를 알 수 없으므로 항상 LLM 을 탑니다)
+        if *cat != "items" && *cat != "containers" {
+            let filled = final_data_map.get(*cat)
+                .and_then(|v| v.as_object())
+                .map(|o| o.iter().filter(|(k, _)| *k != "doc_type").count())
+                .unwrap_or(0);
+            // 스키마 필드 수를 프롬프트에서 세어 비교합니다. (라인당 필드 1개)
+            let schema_field_count = schema_prompt.lines()
+                .filter(|l| l.trim_start().starts_with('"'))
+                .count();
+            if schema_field_count > 0 && filled >= schema_field_count {
+                emit_term(&format!("  ⚡ [TRADING LLM SKIP] Category '{}' 는 PLINKO 가 {}/{} 필드를 전부 확정하여 LLM 호출을 생략합니다.",
+                    cat.to_uppercase(), filled, schema_field_count));
+                continue;
+            }
+        }
+
+        // 🌟 [ALREADY CLAIMED] PLINKO 가 이미 가져간 값을 LLM 이 다시 반환하지 못하게 막습니다.
+        let claimed_ctx = if assigned_fields.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<serde_json::Value> = assigned_fields.iter()
+                .map(|(k, v)| json!({ "target_column": k, "extracted_value": v }))
+                .collect();
+            format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
+                serde_json::to_string_pretty(&list).unwrap_or_default())
+        };
 
         emit_term(&format!("[TRADING STEP B] Extracting category '{}' for {}...", cat.to_uppercase(), doc_type));
         log_task_progress(app_handle, &task.id, &json!({
@@ -8704,7 +9141,7 @@ async fn process_trading_task(
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[HTML CONTENT]\n{}", light_pug),
+                            content: format!("[HTML CONTENT]\n{}{}", content_pug, claimed_ctx),
                             name: None,
                         }
                     ),
@@ -8727,8 +9164,20 @@ async fn process_trading_task(
                 Some(format!("{}_{}", task.id, cat)),
                 None, None, None
             ).await?;
-            let tile_json = crate::parsing::parse_json_from_llm(&res);
-            merge_json_manual(&mut final_data_map, cat, tile_json);
+            let mut tile_json = crate::parsing::parse_json_from_llm(&res);
+
+            // 🌟 [PLINKO PROTECT] PLINKO 가 확정한 필드는 LLM 결과로 덮어쓰지 않습니다.
+            if let Some(obj) = tile_json.as_object_mut() {
+                let ks: Vec<String> = obj.keys().cloned().collect();
+                for k in ks {
+                    if assigned_fields.contains_key(&k) {
+                        obj.remove(&k);
+                        emit_term(&format!("    🛡️ [PLINKO PROTECT] '{}' 는 결정론 확정값을 유지하고 LLM 결과를 폐기합니다.", k));
+                    }
+                }
+            }
+
+            crate::model::merge_json_manual(&mut final_data_map, cat, tile_json);
         }
     }
 
@@ -8739,9 +9188,89 @@ async fn process_trading_task(
     let mut extracted_data = Value::Object(final_data_map);
 
     // =====================================================================
-    // 🌟 [TRADING STEP C] 자연어 변환 + 임베딩 텍스트 생성
+    // 🌟 [TRADING STEP C v2] 루트 평탄화 + 자연어 변환 + 임베딩 텍스트 생성
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 빠져 있었나 ──
+    //   v1 은 중첩 구조({ header:{...}, logistics:{...} })를 그대로 저장했습니다.
+    //   그런데 Dexie 인덱스는 'data.vessel' / 'data.pol' 같은 1뎁스 경로만 봅니다.
+    //   extract_from_image 는 TRADING FLATTEN v3 로 이 문제를 이미 해결했지만
+    //   HTML 경로에는 그 블록이 없어, 같은 문서라도 입력 경로에 따라
+    //   검색 가능 여부가 달라지는 상태였습니다.
+    //
+    //  ── 규칙 ──
+    //   중첩 그룹의 잎을 전부 루트로 끌어올리고,
+    //   이름은 bias.json 의 search_bridge.path_alias 로 canonical 화합니다.
+    //   (build_dexie_plan 의 normalize_path 와 같은 이름 공간을 씁니다)
     // =====================================================================
     {
+        const TRADE_GROUPS_FLAT: [&str; 6] =
+            ["header", "parties", "logistics", "financials", "conditions", "cargo"];
+
+        fn canonical_name(raw: &str) -> String {
+            let k = raw.trim();
+            if let Some(alias_obj) = crate::parsing::BIAS_DICT
+                .get("search_bridge")
+                .and_then(|sb| sb.get("path_alias"))
+                .and_then(|v| v.as_object())
+            {
+                for (canonical, list) in alias_obj {
+                    if canonical == k { return canonical.clone(); }
+                    if let Some(arr) = list.as_array() {
+                        if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                            return canonical.clone();
+                        }
+                    }
+                }
+            }
+            k.to_string()
+        }
+
+        let source = extracted_data.clone();
+        let mut hoisted: Vec<String> = Vec::new();
+
+        for group in TRADE_GROUPS_FLAT.iter() {
+            let src = match source.get(*group).and_then(|v| v.as_object()) {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let obj = extracted_data.as_object_mut().unwrap();
+            for (k, v) in src {
+                if v.is_null() { continue; }
+                if let Some(s) = v.as_str() {
+                    if s.trim().is_empty() || s == "N/A" { continue; }
+                }
+                let name = canonical_name(&k);
+                if obj.get(&name).map_or(false, |x| !x.is_null()) { continue; }
+                obj.insert(name.clone(), v.clone());
+                hoisted.push(name);
+            }
+        }
+
+        // ── 배열 축 : 첫 원소만 대표 축으로 승격 ──
+        for (arr_key, promote) in [
+            ("containers", vec!["container_number", "seal_number"]),
+            ("line_items", vec!["hs_code"]),
+        ] {
+            let arr = match source.get(arr_key).and_then(|v| v.as_array()) {
+                Some(a) => a.clone(),
+                None => continue,
+            };
+            let obj = extracted_data.as_object_mut().unwrap();
+            for field in promote {
+                if obj.get(field).map_or(false, |x| !x.is_null()) { continue; }
+                if let Some(v) = arr.iter().find_map(|it| it.get(field)) {
+                    obj.insert(field.to_string(), v.clone());
+                    hoisted.push(field.to_string());
+                }
+            }
+        }
+
+        emit_term(&format!(
+            "[TRADING STEP C] 🌟 [TRADING FLATTEN v3] data 루트로 승격한 축 {}개: {:?}",
+            hoisted.len(),
+            hoisted.iter().take(12).collect::<Vec<_>>()
+        ));
+
         let natural_text = parsing::json_to_natural_language(&extracted_data);
         let masked_text = natural_text.clone();
         if let Some(obj) = extracted_data.as_object_mut() {
@@ -8797,60 +9326,175 @@ async fn process_trading_task(
     let ref_val = task.r#ref.clone();
 
     // 🌟 v4 : items 단일 저장.
-    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector),
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector.clone()),
         &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
 
     // =====================================================================
-    // 🌟 [TRADING STEP E] Trading Relay (무역 서식 간 N:N 관계)
+    // 🌟 [TRADING STEP E v2] Index 기반 양방향 Relay + Draft 생성
     // ---------------------------------------------------------------------
-    // logic.rs 의 relay() 는 commerce 전용이라 trading 서식 간 관계가 없습니다.
-    // 여기서 trading 전용 relay 를 직접 수행합니다.
+    //  ── v1 의 결함 3가지 ──
+    //   ① trading_relay_field 가 (from, to) 에 대해 '단 하나의 필드'만 돌려주어
+    //      CI 쪽에서는 존재하지 않는 CI.reference_invoice 를 읽어 항상 0건이었습니다.
+    //   ② 참조를 문자열 doc_number 로만 저장해 표기 흔들림(대소문자/하이픈)에 어긋났고,
+    //      reference_bl / reference_ci 는 Dexie 인덱스가 없어 풀스캔이었습니다.
+    //   ③ 상대 문서가 아직 없으면 그냥 Skip 해서, 나중에 그 문서가 들어와도
+    //      먼저 들어온 문서와 절대 연결되지 않았습니다.
+    //      (commerce 는 draft 를 만들어 두고 나중에 채웁니다)
     //
-    // 관계 정의:
-    //   BL  ↔ CI  : reference_invoice 로 연결
-    //   CI  ↔ PL  : reference_invoice 로 연결
-    //   BL  ↔ PL  : reference_booking 로 연결
-    //   PO  ↔ PI  : doc_number 로 연결
-    //   LC  ↔ CI  : reference_lc 로 연결
+    //  ── v2 구조 (commerce order↔tracking 과 동일) ──
+    //   내 index  = crc32(hash_id(doc_type   + team_id + 정규화 doc_number))
+    //   상대 index = crc32(hash_id(foreign_t + team_id + 정규화 참조번호))
+    //   내 문서에  data.rel_{foreign}  = 상대 index
+    //   상대 문서에 data.rel_{mine}    = 내 index
+    //   상대가 없으면 draft 를 만들어 rel_ 축을 미리 채웁니다.
     // =====================================================================
     let relay_targets = crate::logic::related_trading(&doc_type);
     for foreign_type in relay_targets {
-        if let Some(relay_field) = crate::logic::trading_relay_field(&doc_type, foreign_type) {
-            if let Some(ref_val_raw) = extracted_data.get(relay_field).and_then(|v| v.as_str()) {
-                if !ref_val_raw.trim().is_empty() && ref_val_raw.trim() != "N/A" {
-                    let clean_ref = ref_val_raw.trim().to_string();
-                    match store.find_item_by_property("items", relay_field, &json!(clean_ref)).await {
-                        Ok(Some((foreign_id, mut foreign_data))) => {
-                            emit_term(&format!("[TRADING RELAY] Found existing {} document '{}' via {}='{}'.", foreign_type, foreign_id, relay_field, clean_ref));
-                            // 양방향 참조 주입
-                            foreign_data.as_object_mut().unwrap().insert(
-                                format!("reference_{}", doc_type.to_lowercase()),
-                                json!(doc_number.clone())
-                            );
-                            extracted_data.as_object_mut().unwrap().insert(
-                                format!("reference_{}", foreign_type.to_lowercase()),
-                                json!(clean_ref.clone())
-                            );
-                            let merged_text = parsing::json_to_natural_language(&foreign_data);
-                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                            foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
-                            foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
-                            save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                        },
-                        Ok(None) => {
-                            emit_term(&format!("[TRADING RELAY] No existing {} document found for {}='{}'. Skipping.", foreign_type, relay_field, clean_ref));
-                        },
-                        _ => {}
-                    }
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        let (mine_field, foreign_field) = match crate::logic::trading_relay_pair(&doc_type, foreign_type) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // 🌟 내 문서에서 '상대를 가리키는 값' 을 읽습니다.
+        //    v1 은 항상 relay_field(=상대 필드명)를 읽어 방향이 뒤집혀 있었습니다.
+        let ref_raw = extracted_data.get(mine_field)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.as_str() != "N/A");
+
+        let clean_ref = match ref_raw {
+            Some(r) => crate::utils::hash::normalize_numeric_homoglyphs(&r)
+                .replace("-", "").replace("_", "").replace(".", "").replace(",", ""),
+            None => continue,
+        };
+        if clean_ref.is_empty() { continue; }
+
+        // 🌟 상대 index 를 결정론으로 계산합니다. (commerce 의 tracking_index 와 동일 규칙)
+        let foreign_index = crate::utils::hash::crc32(
+            &crate::utils::hash::hash_id(&format!("{}{}{}", foreign_type, team_id, clean_ref))
+        );
+        let mine_col = crate::logic::trading_index_column(&doc_type);
+        let foreign_col = crate::logic::trading_index_column(foreign_type);
+
+        // 내 문서에 상대 index 를 꽂습니다.
+        extracted_data.as_object_mut().unwrap().insert(foreign_col.clone(), json!(foreign_index));
+        emit_term(&format!("  🔑 [TRADING INDEX] {}.{} = {} (from {}='{}')",
+            doc_type, foreign_col, foreign_index, mine_field, clean_ref));
+
+        // 상대 문서 조회 : ① 상대 index 로 ② 그래도 없으면 상대 필드 문자열로
+        let mut hit: Option<(String, Value)> = None;
+        if let Ok(Some(v)) = store.find_item_by_property("items", "index", &json!(foreign_index.to_string())).await {
+            hit = Some(v);
+        }
+        if hit.is_none() {
+            if let Ok(Some(v)) = store.find_item_by_property("items", foreign_field, &json!(clean_ref.clone())).await {
+                hit = Some(v);
+            }
+        }
+
+        match hit {
+            Some((foreign_id, mut foreign_data)) => {
+                let was_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                emit_term(&format!("[TRADING RELAY] Found existing {} document '{}' (draft: {}).", foreign_type, foreign_id, was_draft));
+
+                // 상대 문서에 내 index 를 꽂습니다. (양방향)
+                foreign_data.as_object_mut().unwrap().insert(mine_col.clone(), json!(index_val));
+                // 문자열 참조도 남겨 FTS 리콜을 보존합니다.
+                foreign_data.as_object_mut().unwrap().insert(
+                    format!("reference_{}", doc_type.to_lowercase()),
+                    json!(doc_number.clone())
+                );
+                if was_draft {
+                    foreign_data.as_object_mut().unwrap().insert(
+                        "updated_at".to_string(),
+                        json!(chrono::Utc::now().timestamp_millis())
+                    );
                 }
+                if foreign_data.get("mode").is_none() {
+                    foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!("shipping"));
+                }
+
+                let merged_text = parsing::json_to_natural_language(&foreign_data);
+                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
+                foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
+
+                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
+                emit_term(&format!("  ✅ [TRADING RELAY] {} '{}' 에 {}.{} = {} 역주입 완료.",
+                    foreign_type, foreign_id, foreign_type, mine_col, index_val));
+            },
+            None => {
+                // 🌟 [DRAFT] commerce 와 동일하게 상대 문서 draft 를 미리 만들어 둡니다.
+                //    나중에 그 문서가 실제로 들어오면 같은 index 를 갖게 되어 자동으로 이어집니다.
+                let draft_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, foreign_index));
+                let mut draft_data = json!({});
+                if let Some(o) = draft_data.as_object_mut() {
+                    o.insert("id".to_string(), json!(draft_id.clone()));
+                    o.insert("type".to_string(), json!(foreign_type));
+                    o.insert("doc_type".to_string(), json!(foreign_type));
+                    o.insert("index".to_string(), json!(foreign_index));
+                    o.insert(foreign_field.to_string(), json!(clean_ref.clone()));
+                    o.insert(mine_col.clone(), json!(index_val));
+                    o.insert("updated_at".to_string(), json!(0));
+                    o.insert("mode".to_string(), json!("shipping"));
+                    o.insert("text".to_string(), json!(format!("{} {}", foreign_type, clean_ref)));
+                }
+                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                save_item(&store, "items", &draft_id, foreign_type, draft_data, None,
+                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
+                emit_term(&format!("  📝 [TRADING RELAY DRAFT] {} draft '{}' 생성 ({}='{}', index={}).",
+                    foreign_type, draft_id, foreign_field, clean_ref, foreign_index));
             }
         }
     }
 
     // 최종 저장 (relay 로 updated 필드가 추가된 경우)
-    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector),
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector.clone()),
         &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP E-2] 청크 인덱싱 (PHASE A~E)
+    // ---------------------------------------------------------------------
+    //  ── 왜 필요한가 ──
+    //   lib.rs 의 STAGE-4 는 item_chunks 테이블을 코사인 검색합니다.
+    //   commerce 는 상세/리스트 양쪽 모두 청크를 저장하는데,
+    //   trading 은 이 단계가 없어 "선적항이 부산인 B/L" 같은 필드 레벨 질의가
+    //   구조적으로 0건이었습니다. (아이템 벡터 1개만으로는 값이 희석됩니다)
+    //
+    //  ── index_item_chunks 재사용 ──
+    //   이 함수는 이미 PHASE A(분할) ~ PHASE E(저장) 전 과정과
+    //   음차 별칭 생성까지 포함하고 있으므로 그대로 호출합니다.
+    //   bias_schema.rs 의 무역 분기가 doc_type 에 대응하는 필드를 돌려주므로
+    //   뱅크가 비어 조기 종료되는 일도 없습니다.
+    // =====================================================================
+    {
+        let chunk_count = index_item_chunks(
+            &store,
+            &model,
+            &hashed_item_id,
+            &doc_type,
+            &doc_lang,
+            &extracted_data,
+            true,               // is_detail : 무역 서식은 항상 단일 문서 상세
+            &task.cc,
+            &bcc,
+            &ref_val,
+            "shipping",
+            &url,
+            cancellation_token,
+            app_handle,
+            &task.id,
+        ).await.unwrap_or(0);
+
+        emit_term(&format!(
+            "  🧩 [TRADING CHUNK INDEX] item_id='{}' | 청크 {}건 인덱싱 완료 (doc_type='{}')",
+            hashed_item_id, chunk_count, doc_type
+        ));
+    }
 
     // =====================================================================
     // 🌟 [TRADING STEP F] Metrics + 완료
