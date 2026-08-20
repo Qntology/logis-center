@@ -35,6 +35,26 @@ pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tok
 Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
 
 // =====================================================================
+// 🌟 [TRANSLIT MEM CACHE] 프로세스 전역 음차 캐시
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   generate_transliteration_aliases 의 HashMap 은 '아이템 1개' 범위입니다.
+//   그래서 아이템이 바뀔 때마다 같은 값을 다시 물어보느라
+//   emit → Dexie 조회 → invoke 왕복(수십~수백 ms)이 반복됐습니다.
+//   Dexie 는 '앱 재시작을 넘는 영구 캐시', 이 맵은 '프로세스 내 즉답 캐시' 로
+//   역할을 나눕니다. (Dexie 히트 시 이 맵에도 승격 저장합니다)
+//
+//  ⚠️ 키에 반드시 lang 을 포함합니다. 음차는 '문서 언어 표기로의 변환' 이므로
+//     같은 원문이라도 doc_lang 이 다르면 결과가 달라야 합니다.
+pub static TRANSLIT_MEM_CACHE: Lazy<StdMutex<std::collections::HashMap<String, (String, String)>>> =
+Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+/// 음차 캐시 키. Dexie 의 복합 인덱스 [source_word+doc_lang] 와 동일한 축입니다.
+fn translit_cache_key(word: &str, lang: &str) -> String {
+    format!("{}\u{1}{}", lang.trim().to_lowercase(), word.trim())
+}
+
+// =====================================================================
 // 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
 // ---------------------------------------------------------------------
 // 흐름:
@@ -54,53 +74,98 @@ Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
 // 🌟 [TRANSLIT CACHE HELPER] Dexie 캐시 조회 / 저장 (프론트 경유)
 // =====================================================================
 
-/// 프론트엔드 Dexie 에서 음차 캐시를 조회합니다.
-/// 캐시 히트 시 Some((native, roman)), 미스 시 None 반환.
-/// 타임아웃 5초 — 프론트가 응답 없으면 캐시 미스로 처리합니다.
+/// 음차 캐시를 조회합니다. ① 프로세스 전역 메모리 → ② 프론트엔드 Dexie 순서입니다.
+///
+/// 반환값 계약:
+///   Some(("네이티브", "로마자")) → 캐시 히트
+///   Some(("", ""))              → 네거티브 캐시 히트 ('음차 불가' 로 이미 확정된 값)
+///   None                        → 캐시 미스 (레코드 자체가 없음 / 통신 실패)
+///
+/// ⚠️ 호출부는 Some 이면 값이 비어 있어도 '히트' 로 취급해야 합니다.
+///    기존 구현은 빈 값을 미스로 보고 매번 LLM 을 다시 불렀습니다.
 async fn query_translit_cache(
     app_handle: &tauri::AppHandle,
     word: &str,
     lang: &str,
 ) -> Option<(String, String)> {
+    let key = translit_cache_key(word, lang);
+
+    // ── ① 프로세스 전역 메모리 캐시 ──
+    if let Ok(map) = TRANSLIT_MEM_CACHE.lock() {
+        if let Some(hit) = map.get(&key) {
+            println!(
+                "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                word, lang, hit.0, hit.1
+            );
+            return Some(hit.clone());
+        }
+    }
+
+    // ── ② 프론트엔드 Dexie 영구 캐시 ──
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
 
-    // 전역 맵에 sender 등록
     {
         let mut map = crate::scheduler::TRANSLIT_PENDING.lock().unwrap();
         map.insert(request_id.clone(), tx);
     }
 
-    // 프론트엔드에 조회 요청 emit
     let _ = app_handle.emit("translit-cache-query", json!({
         "request_id": request_id,
         "word": word,
         "lang": lang
     }));
 
-    // 프론트 응답 대기 (5초 타임아웃)
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         rx
     ).await;
 
+    // 어떤 경로로 끝나든 pending 엔트리는 반드시 회수합니다. (누수 방지)
+    let _ = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id);
+
     match result {
         Ok(Ok(candidates)) => {
             if candidates.is_empty() {
+                println!(
+                    "  🔍 [TRANSLIT CACHE / MISS] '{}' (lang='{}') — Dexie 에 레코드가 없습니다.",
+                    word, lang
+                );
                 None
             } else {
-                Some(candidates[0].clone())
+                let hit = candidates[0].clone();
+                if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
+                    map.insert(key, hit.clone());
+                }
+                println!(
+                    "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                    word, lang, hit.0, hit.1
+                );
+                Some(hit)
             }
         },
-        _ => {
-            // 타임아웃 또는 채널 에러 → 맵에서 정리
-            let _ = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id);
+        Ok(Err(_)) => {
+            println!(
+                "  ⚠️ [TRANSLIT CACHE] '{}' (lang='{}') 응답 채널이 닫혔습니다. 캐시 미스로 처리합니다.",
+                word, lang
+            );
+            None
+        },
+        Err(_) => {
+            println!(
+                "  ⚠️ [TRANSLIT CACHE] '{}' (lang='{}') 프론트엔드 응답 5초 타임아웃. 캐시 미스로 처리합니다.",
+                word, lang
+            );
             None
         }
     }
 }
 
-/// 프론트엔드 Dexie 에 음차 캐시를 저장합니다. (fire-and-forget)
+/// 음차 결과를 캐시에 저장합니다.
+/// ① 프로세스 전역 메모리에 즉시 반영 ② 프론트엔드 Dexie 에 영구 저장 요청(fire-and-forget)
+///
+/// native / roman 이 모두 빈 문자열이면 '음차 불가' 라는 판정 자체를 저장합니다(네거티브 캐시).
+/// 이 값이 없으면 다음 태스크에서 같은 판정을 위해 LLM 을 또 호출하게 됩니다.
 fn save_translit_cache(
     app_handle: &tauri::AppHandle,
     word: &str,
@@ -108,6 +173,23 @@ fn save_translit_cache(
     native: &str,
     roman: &str,
 ) {
+    let key = translit_cache_key(word, lang);
+    if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
+        map.insert(key, (native.to_string(), roman.to_string()));
+    }
+
+    if native.trim().is_empty() && roman.trim().is_empty() {
+        println!(
+            "  💾 [TRANSLIT CACHE / SAVE-NEGATIVE] '{}' (lang='{}') — 음차 불가 판정을 영구 저장합니다.",
+            word, lang
+        );
+    } else {
+        println!(
+            "  💾 [TRANSLIT CACHE / SAVE] '{}' (lang='{}') → native='{}' | roman='{}'",
+            word, lang, native, roman
+        );
+    }
+
     let _ = app_handle.emit("translit-cache-save", json!({
         "word": word,
         "lang": lang,
@@ -158,31 +240,38 @@ async fn generate_transliteration_aliases(
             continue;
         }
 
-        // 🌟 [DEXIE CACHE HIT] 로컬 캐시 이전에 Dexie 영구 캐시를 먼저 조회합니다.
-        //    같은 앱 세션 내 재실행뿐 아니라 앱 재시작 후에도 캐시가 유효합니다.
+        // 🌟 [CACHE LOOKUP] ① 아이템 로컬 → ② 프로세스 전역 메모리 → ③ Dexie 영구
         if let Some(hit) = cache.get(&src) {
             out[i] = hit.clone();
             reused += 1;
             continue;
         }
 
-        // Dexie 캐시 조회 (프론트엔드 경유)
         if let Some(dexie_hit) = query_translit_cache(app_handle, &src, doc_lang).await {
-            let (d_native, d_roman) = dexie_hit;
-            if !d_native.is_empty() || !d_roman.is_empty() {
-                println!("  💾 [DEXIE CACHE HIT] '{}' → native='{}' | roman='{}' (Qwen3.5 생략)", src, d_native, d_roman);
-                let pair = (d_native, d_roman);
-                cache.insert(src.clone(), pair.clone());
-                out[i] = pair;
+            // 🌟 [NEGATIVE CACHE] 빈 값도 '음차 불가로 이미 확정된 사실' 이므로 히트로 인정합니다.
+            //    기존 구현은 빈 값을 미스로 보고 Qwen3.5 를 매번 다시 호출했습니다.
+            let is_negative = dexie_hit.0.trim().is_empty() && dexie_hit.1.trim().is_empty();
+            cache.insert(src.clone(), dexie_hit.clone());
+            out[i] = dexie_hit;
+            if is_negative {
+                skipped += 1;
+                println!(
+                    "  ⚪ [TRANSLIT CACHE / NEGATIVE HIT] '{}' 는 이전에 '음차 불가' 로 확정된 값입니다. LLM 을 호출하지 않습니다.",
+                    src
+                );
+            } else {
                 reused += 1;
-                continue;
+                println!("  💾 [DEXIE CACHE HIT] '{}' (Qwen3.5 생략)", src);
             }
+            continue;
         }
 
         // 1차 음차 가능 여부 판정.
         // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
         if !crate::nl_convert::can_transliterate(&src, doc_lang) {
             cache.insert(src.clone(), (String::new(), String::new()));
+            // 🌟 이 판정 자체를 영구 저장해야 다음 태스크에서도 조회 1회로 끝납니다.
+            save_translit_cache(app_handle, &src, doc_lang, "", "");
             skipped += 1;
             continue;
         }
@@ -1406,6 +1495,37 @@ async fn process_task(
         light_pug = model.truncate_pug_context(&raw_pug, true, 2000, None).await;
     }
 
+    // =====================================================================
+    // 🌟 [DOC LANG EARLY DETECT] 문서 언어를 '캐시 히트 여부와 무관하게' 확정합니다.
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 detect_document_language 호출이 `if !skip_ai_analysis { .. }`
+    //   블록 안에만 있었습니다. 페이지 셀렉터 캐시가 히트하면 그 블록을 통째로
+    //   건너뛰므로 doc_lang 이 초기값 "en" 인 채로 파이프라인 끝까지 흘러갔습니다.
+    //
+    //  ── 그로 인한 실측 피해 (log 대조) ──
+    //   ① 음차 캐시 키가 (word,"ko") ↔ (word,"en") 로 갈려 영구 미스
+    //      : 1차 태스크 '쇼핑몰화면 진열보기' → korean 음차 저장
+    //        2차 태스크 동일 원문 → "language":"english" 로 재생성
+    //   ② 영어 상품명이 '라틴→라틴' 이 되어 can_transliterate 에서 전량 탈락
+    //      : "음차 별칭 0개" 가 2차 태스크 전 아이템에서 발생
+    //   ③ get_list_schema_fields 의 bias/prejudice 가 한국어 라벨·예시를 잃음
+    //      : "goods 식별자, goods 상품명, .." → "goods id link , goods code sku item"
+    //        그 결과 status='show', currency='USD' 같은 오추출이 발생
+    //   ④ indexing_anchor_text / indexing_leaf_label 이 잘못된 언어로 생성되어
+    //      저장 벡터 자체가 1차 태스크와 어긋남
+    //
+    //  ── 비용 ──
+    //   detect_document_language 는 문자 통계 기반 결정론 함수라 모델이 필요 없고
+    //   비용이 사실상 0 입니다. 여기서 확정해도 손해가 없습니다.
+    //   (노이즈 제거 후 더 정확한 재확정은 STEP A 안에서 그대로 수행됩니다)
+    // =====================================================================
+    doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
+    println!(
+        "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
+        doc_lang
+    );
+
     let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
     } else {
@@ -2079,7 +2199,17 @@ async fn process_task(
                 }
             }
 
-            doc_lang = crate::utils::lang_utils::detect_document_language(&filtered_light_pug);
+            // 🌟 [DOC LANG REFINE] 조기 확정값을 노이즈 제거 후 PUG 로 정밀 재확정합니다.
+            //    값이 바뀌면 음차 캐시 키도 바뀌므로 반드시 로그로 남깁니다.
+            //    (캐시 미스가 발생했을 때 '언어가 흔들렸는지' 를 로그만으로 판별하기 위함)
+            let refined_lang = crate::utils::lang_utils::detect_document_language(&filtered_light_pug);
+            if refined_lang != doc_lang {
+                emit_term(&format!(
+                    "  🌐 [DOC LANG REFINE] 노이즈 제거 후 언어 재확정: '{}' → '{}' (음차 캐시 키가 함께 이동합니다)",
+                    doc_lang, refined_lang
+                ));
+            }
+            doc_lang = refined_lang;
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 

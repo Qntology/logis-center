@@ -1228,24 +1228,26 @@ const ITEMS_SCHEMA = [
 ].join(', ');
 
 
-
-// 🌟 v11 : 음차(Transliteration) 캐시 테이블 추가.
-//    (source_word + doc_lang) 복합 인덱스로 조회합니다.
-//    같은 원문에 대해 LLM 이 매번 약간 다른 음차를 생성할 수 있으므로
-//    후보를 여러 개 저장하고, 검색 시 코사인 유사도로 최적 후보를 선택합니다.
-//    스토어 구조는 v10 과 동일하고 translit_cache 만 추가하므로 Dexie 가 자동 백필합니다.
-appDb.version(11).stores({
+// 🌟 v12 : translit_cache 에 source_word / doc_lang 단독 인덱스를 추가합니다.
+//  ── 왜 필요한가 ──
+//   Dexie 의 복합 인덱스 '[source_word+doc_lang]' 는 source_word 단독 where 조회에
+//   사용할 수 없습니다. 그래서 "이 원문이 다른 언어 키로 저장돼 있는가?" 를
+//   확인할 방법이 아예 없었고, 캐시 미스의 원인이 (a) 저장 실패인지
+//   (b) 언어 축이 갈린 것인지 로그만으로 구분할 수 없었습니다.
+//   (실측: doc_lang 이 캐시 히트 태스크에서 'en' 으로 고정되어 'ko' 로 저장된
+//    레코드를 영원히 못 찾는 상태였습니다)
+//
+//  ⚠️ stores() 에는 앱이 쓰는 전 테이블을 항상 함께 적어야 합니다.
+//     Dexie 는 선언되지 않은 object store 를 업그레이드 시점에 삭제합니다.
+//     인덱스만 추가하는 변경이므로 upgrade 콜백은 필요 없습니다(자동 백필).
+appDb.version(12).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
     ts_queue: 'taskId, type',
     talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
     users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
     pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin',
-    // ── 음차 캐시 ──
-    //    pk: ++id (auto-increment)
-    //    복합 인덱스: [source_word+doc_lang] — 캐시 조회 키
-    //    created_at: 최신 우선 정렬용
-    translit_cache: '++id, [source_word+doc_lang], created_at'
+    translit_cache: '++id, source_word, doc_lang, [source_word+doc_lang], created_at'
 });
 
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
@@ -8567,8 +8569,22 @@ initDevicePreference();
 // =====================================================================
 
 // ── 캐시 조회 리스너 ──
+//  응답 계약 (Rust query_translit_cache 와 1:1):
+//    []                     → 캐시 미스 (레코드 자체가 없음)
+//    [[native, roman]]      → 캐시 히트
+//    [["", ""]]             → 네거티브 캐시 히트 ('음차 불가' 로 확정된 값)
+//  ⚠️ 빈 문자열 레코드도 반드시 반환해야 Rust 가 LLM 재호출을 생략합니다.
 listen("translit-cache-query", async (event: any) => {
     const { request_id, word, lang } = event.payload;
+
+    const respond = async (results: Array<[string, string]>) => {
+        try {
+            await invoke("translit_cache_respond", { requestId: request_id, results });
+        } catch (e) {
+            console.warn("[TRANSLIT CACHE] respond failed:", e);
+        }
+    };
+
     try {
         const candidates = await appDb.table("translit_cache")
             .where("[source_word+doc_lang]")
@@ -8576,42 +8592,55 @@ listen("translit-cache-query", async (event: any) => {
             .toArray();
 
         if (!candidates || candidates.length === 0) {
-            // 캐시 미스 → Rust 에 빈 배열 반환
-            await invoke("translit_cache_respond", {
-                requestId: request_id,
-                results: []
-            });
+            // 🌟 [LANG AXIS DIAGNOSTIC] 같은 원문이 '다른 언어 키' 로 저장돼 있는지 확인합니다.
+            //    이 경고가 뜨면 캐시가 깨진 게 아니라 doc_lang 이 흔들린 것입니다.
+            //    (실측 사례: 페이지 셀렉터 캐시 히트 시 doc_lang 이 'en' 으로 고정되어
+            //     'ko' 로 저장된 레코드를 영원히 찾지 못했습니다)
+            try {
+                const others = await appDb.table("translit_cache")
+                    .where("source_word").equals(word).toArray();
+                if (others && others.length > 0) {
+                    const langs = Array.from(new Set(others.map((o: any) => String(o.doc_lang))));
+                    console.warn(
+                        `[TRANSLIT CACHE] ⚠️ MISS on lang='${lang}' but the same word exists under langs=[${langs.join(', ')}]. ` +
+                        `doc_lang 확정 경로(scheduler.rs DOC LANG EARLY DETECT)를 확인하세요. word='${word}'`
+                    );
+                }
+            } catch (_e) {
+                // v12 미적용 세대에서는 source_word 단독 인덱스가 없어 실패할 수 있습니다.
+                // 진단 전용 경로이므로 조용히 흡수합니다.
+            }
+            console.log(`[TRANSLIT CACHE] MISS word='${word}' lang='${lang}'`);
+            await respond([]);
             return;
         }
 
-        // 복수 후보가 있으면 코사인 유사도로 최적 선택
+        // 단일 후보(정상 경로): upsert 정책상 대부분 여기에 해당합니다.
         if (candidates.length === 1) {
-            await invoke("translit_cache_respond", {
-                requestId: request_id,
-                results: [[candidates[0].native, candidates[0].roman]]
-            });
+            const c = candidates[0];
+            const nv = c.native || "";
+            const rm = c.roman || "";
+            console.log(
+                `[TRANSLIT CACHE] ${(!nv && !rm) ? "NEGATIVE HIT" : "HIT"} word='${word}' lang='${lang}' → native='${nv}' roman='${rm}'`
+            );
+            await respond([[nv, rm]]);
             return;
         }
 
-        // 복수 후보: Rust 의 임베딩 모델을 통해 코사인 계산
-        // 각 후보의 native + roman 을 텍스트로 묶어 임베딩 요청
+        // 복수 후보: 원문과의 코사인 유사도로 최적 후보를 고릅니다.
         const candidateTexts = candidates.map((c: any) =>
-            `${c.native} ${c.roman}`.trim()
+            `${c.native || ""} ${c.roman || ""}`.trim()
         );
 
         try {
-            // Rust 에 임베딩 배치 요청
             const embeddings: number[][] = await invoke("get_embedding_batch_for_translit", {
                 texts: candidateTexts
             });
-
-            // 쿼리 텍스트(원문) 임베딩도 획득
             const queryEmb: number[] = await invoke("get_query_embedding", {
                 text: word,
                 devicePreference: null
             });
 
-            // 코사인 계산 후 최적 후보 선택
             let bestIdx = 0;
             let bestSim = -1;
             for (let i = 0; i < embeddings.length; i++) {
@@ -8621,34 +8650,35 @@ listen("translit-cache-query", async (event: any) => {
                     bestIdx = i;
                 }
             }
-
-            await invoke("translit_cache_respond", {
-                requestId: request_id,
-                results: [[candidates[bestIdx].native, candidates[bestIdx].roman]]
-            });
+            const best = candidates[bestIdx];
+            console.log(
+                `[TRANSLIT CACHE] HIT(cosine ${bestSim.toFixed(4)}, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[best.native || "", best.roman || ""]]);
         } catch (embErr) {
             // 임베딩 실패 시 최신 후보 폴백
-            const sorted = [...candidates].sort((a: any, b: any) => b.created_at - a.created_at);
-            await invoke("translit_cache_respond", {
-                requestId: request_id,
-                results: [[sorted[0].native, sorted[0].roman]]
-            });
+            const sorted = [...candidates].sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+            console.log(
+                `[TRANSLIT CACHE] HIT(latest fallback, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[sorted[0].native || "", sorted[0].roman || ""]]);
         }
     } catch (e) {
         console.warn("[TRANSLIT CACHE] query failed:", e);
-        await invoke("translit_cache_respond", {
-            requestId: request_id,
-            results: []
-        }).catch(() => {});
+        await respond([]);
     }
 });
 
 // ── 캐시 저장 리스너 ──
+//  native / roman 이 모두 빈 문자열이어도 반드시 저장합니다(네거티브 캐시).
+//  '이 원문은 이 언어에서 음차가 성립하지 않는다' 는 판정 자체가 재사용 가치가 있습니다.
 listen("translit-cache-save", async (event: any) => {
     const { word, lang, native, roman } = event.payload;
+    const nv = native || "";
+    const rm = roman || "";
     try {
         // 기존 동일 키 삭제 후 삽입 (upsert)
-        await appDb.table("translit_cache")
+        const removed = await appDb.table("translit_cache")
             .where("[source_word+doc_lang]")
             .equals([word, lang])
             .delete();
@@ -8656,12 +8686,22 @@ listen("translit-cache-save", async (event: any) => {
         await appDb.table("translit_cache").add({
             source_word: word,
             doc_lang: lang,
-            native: native || "",
-            roman: roman || "",
+            native: nv,
+            roman: rm,
             created_at: Date.now()
         });
+
+        console.log(
+            `[TRANSLIT CACHE] SAVED${(!nv && !rm) ? "(negative)" : ""} word='${word}' lang='${lang}' ` +
+            `→ native='${nv}' roman='${rm}' (replaced ${removed})`
+        );
     } catch (e) {
-        console.warn("[TRANSLIT CACHE] save failed:", e);
+        // 🌟 저장 실패는 '다음 태스크에서 LLM 재호출' 로 직결되므로 반드시 표면화합니다.
+        //    (기존에는 warn 만 찍혀 원인 추적이 불가능했습니다)
+        console.error(
+            `[TRANSLIT CACHE] ❌ SAVE FAILED word='${word}' lang='${lang}'. ` +
+            `이 값은 다음 태스크에서 다시 LLM 으로 생성됩니다.`, e
+        );
     }
 });
 
