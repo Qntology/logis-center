@@ -10,17 +10,29 @@ use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-
 use once_cell::sync::OnceCell;
-
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
 use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, exclusive_assign_by_score, self_poisoned_prejudice_mask, collect_select_groups, enum_status_keys, status_key_phrases, double_center_matrix, detect_field_format, value_matches_format, is_pure_numeric_value, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
 use crate::utils::logger::log_task_progress;
-
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / ONESHOT] Rust → 프론트엔드(Dexie) 음차 캐시 조회 왕복용
+// ---------------------------------------------------------------------
+//  scheduler 가 emit("translit-cache-query") 로 요청을 보내면,
+//  프론트엔드가 Dexie 를 조회한 뒤 invoke("translit_cache_respond") 로
+//  응답합니다. 그 응답을 여기서 oneshot receiver 로 await 합니다.
+//
+//  키: request_id (UUID)
+//  값: oneshot::Sender — 프론트 응답을 scheduler 에 전달
+// =====================================================================
+use once_cell::sync::Lazy;
+use std::sync::Mutex as StdMutex;
+
+pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<(String, String)>>>>> =
+Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
 
 // =====================================================================
 // 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
@@ -38,10 +50,78 @@ pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::
 //   2차 목표 표기 = 원문 값 그 자체          → 언어 테이블 자체가 불필요
 // =====================================================================
 
+// =====================================================================
+// 🌟 [TRANSLIT CACHE HELPER] Dexie 캐시 조회 / 저장 (프론트 경유)
+// =====================================================================
+
+/// 프론트엔드 Dexie 에서 음차 캐시를 조회합니다.
+/// 캐시 히트 시 Some((native, roman)), 미스 시 None 반환.
+/// 타임아웃 5초 — 프론트가 응답 없으면 캐시 미스로 처리합니다.
+async fn query_translit_cache(
+    app_handle: &tauri::AppHandle,
+    word: &str,
+    lang: &str,
+) -> Option<(String, String)> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
+
+    // 전역 맵에 sender 등록
+    {
+        let mut map = crate::scheduler::TRANSLIT_PENDING.lock().unwrap();
+        map.insert(request_id.clone(), tx);
+    }
+
+    // 프론트엔드에 조회 요청 emit
+    let _ = app_handle.emit("translit-cache-query", json!({
+        "request_id": request_id,
+        "word": word,
+        "lang": lang
+    }));
+
+    // 프론트 응답 대기 (5초 타임아웃)
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx
+    ).await;
+
+    match result {
+        Ok(Ok(candidates)) => {
+            if candidates.is_empty() {
+                None
+            } else {
+                Some(candidates[0].clone())
+            }
+        },
+        _ => {
+            // 타임아웃 또는 채널 에러 → 맵에서 정리
+            let _ = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id);
+            None
+        }
+    }
+}
+
+/// 프론트엔드 Dexie 에 음차 캐시를 저장합니다. (fire-and-forget)
+fn save_translit_cache(
+    app_handle: &tauri::AppHandle,
+    word: &str,
+    lang: &str,
+    native: &str,
+    roman: &str,
+) {
+    let _ = app_handle.emit("translit-cache-save", json!({
+        "word": word,
+        "lang": lang,
+        "native": native,
+        "roman": roman
+    }));
+}
+
 /// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
 /// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
 ///
 /// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
+/// 🌟 [DEXIE CACHE] 생성 전에 Dexie 캐시를 먼저 조회하고,
+///    캐시 히트 시 Qwen3.5 호출을 완전히 생략합니다.
 async fn generate_transliteration_aliases(
     model: &LogisModel,
     chunks: &[&crate::nl_convert::ChunkMetadata],
@@ -78,10 +158,25 @@ async fn generate_transliteration_aliases(
             continue;
         }
 
+        // 🌟 [DEXIE CACHE HIT] 로컬 캐시 이전에 Dexie 영구 캐시를 먼저 조회합니다.
+        //    같은 앱 세션 내 재실행뿐 아니라 앱 재시작 후에도 캐시가 유효합니다.
         if let Some(hit) = cache.get(&src) {
             out[i] = hit.clone();
             reused += 1;
             continue;
+        }
+
+        // Dexie 캐시 조회 (프론트엔드 경유)
+        if let Some(dexie_hit) = query_translit_cache(app_handle, &src, doc_lang).await {
+            let (d_native, d_roman) = dexie_hit;
+            if !d_native.is_empty() || !d_roman.is_empty() {
+                println!("  💾 [DEXIE CACHE HIT] '{}' → native='{}' | roman='{}' (Qwen3.5 생략)", src, d_native, d_roman);
+                let pair = (d_native, d_roman);
+                cache.insert(src.clone(), pair.clone());
+                out[i] = pair;
+                reused += 1;
+                continue;
+            }
         }
 
         // 1차 음차 가능 여부 판정.
@@ -413,6 +508,12 @@ async fn generate_transliteration_aliases(
             }
         }
         cache.insert(src.clone(), final_pair.clone());
+
+        // 🌟 [DEXIE CACHE SAVE] LLM 으로 생성한 결과를 Dexie 에 영구 저장합니다.
+        //    다음 태스크(또는 앱 재시작 후)부터는 Qwen3.5 호출 없이 캐시 히트됩니다.
+        //    ⚠️ out[i] 할당(move) '전에' 호출해야 borrow-after-move 를 피합니다.
+        save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
+
         out[i] = final_pair;
     }
 

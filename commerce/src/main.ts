@@ -1227,30 +1227,25 @@ const ITEMS_SCHEMA = [
     '[type+created_at]'
 ].join(', ');
 
-// 🌟 v10 : trading 참조 인덱스(data.rel_*) 16개를 추가합니다.
-//    스토어 구조는 v9 와 동일하고 인덱스만 늘어나므로 Dexie 가 자동 백필합니다.
-//    ⚠️ stores() 에는 '앱이 쓰는 전 테이블' 을 항상 함께 적어야 합니다.
-//       (v8 이 items 만 적어서 kv_store 등 5개 테이블이 소멸한 사고 재발 방지)
-appDb.version(10).stores({
+
+
+// 🌟 v11 : 음차(Transliteration) 캐시 테이블 추가.
+//    (source_word + doc_lang) 복합 인덱스로 조회합니다.
+//    같은 원문에 대해 LLM 이 매번 약간 다른 음차를 생성할 수 있으므로
+//    후보를 여러 개 저장하고, 검색 시 코사인 유사도로 최적 후보를 선택합니다.
+//    스토어 구조는 v10 과 동일하고 translit_cache 만 추가하므로 Dexie 가 자동 백필합니다.
+appDb.version(11).stores({
     items: ITEMS_SCHEMA,
-
-    // ── 세션 / 설정 / 터미널 로그 / 숨김 페이지 목록 등 KV 저장소 ──
-    //    { key, value } 형태이며 primaryKeys() 순회로 GC 도 수행하므로 pk 는 key 입니다.
     kv_store: 'key',
-
-    // ── 프론트엔드 작업 대기열 (GlobalTaskManager) ──
-    //    saveQueue() 가 clear() → bulkAdd() 하므로 taskId 를 pk 로 써도 충돌하지 않습니다.
     ts_queue: 'taskId, type',
-
-    // ── 채팅/작업 말풍선 (봉투 정규화를 거치지 않는 별도 스키마) ──
-    //    role / task_id / status 를 그대로 보존해야 하므로 normalizeEnvelope 를 적용하지 않습니다.
     talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
-
-    // ── 팀 / 멤버 / 로컬 디바이스 (봉투 정규화 적용, 도메인 필드 시딩 없음) ──
     users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
-
-    // ── 페이지 셀렉터 캐시 (봉투 정규화 적용, 도메인 필드 시딩 없음) ──
-    pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin'
+    pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin',
+    // ── 음차 캐시 ──
+    //    pk: ++id (auto-increment)
+    //    복합 인덱스: [source_word+doc_lang] — 캐시 조회 키
+    //    created_at: 최신 우선 정렬용
+    translit_cache: '++id, [source_word+doc_lang], created_at'
 });
 
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
@@ -4601,7 +4596,7 @@ listen("extraction-progress", async (event: any) => {
 
             // 🌟 [CRITICAL FIX] isSearching = true 인 상태에서 탭을 전환해야 초기화(refreshList)가 방어됩니다!
             openWidget("list");
-            
+
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
             
@@ -6909,7 +6904,7 @@ async function initSession() {
                 // key 포맷: search_res_search_1715610000000 -> 타임스탬프 숫자만 추출
                 const timestampStr = key.replace("search_res_search_", "");
                 const timestamp = parseInt(timestampStr, 10);
-                
+
                 // 유효한 숫자인지 확인 후, 30일이 경과했으면 로컬 DB에서 삭제
                 if (!isNaN(timestamp) && (nowTimeMs - timestamp > thirtyDaysMs)) {
                     console.log(`[GC] Deleting expired search result (older than 30 days): ${key}`);
@@ -6919,6 +6914,23 @@ async function initSession() {
         }
     }
 
+    // 🌟 [TRANSLIT CACHE GC] 90일이 지난 음차 캐시 정리.
+    //    음차는 원문 값이 바뀌면 키가 달라지므로 자동 무효화되지만,
+    //    삭제된 아이템의 잔재가 쌓이는 것을 방지하기 위해 주기적으로 청소합니다.
+    try {
+        const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+        const cutoff = nowTimeMs - ninetyDaysMs;
+        const staleCount = await appDb.table("translit_cache")
+            .where("created_at")
+            .below(cutoff)
+            .delete();
+
+        if (staleCount > 0) {
+            console.log(`[GC] Deleted ${staleCount} stale translit cache entries (older than 90 days).`);
+        }
+    } catch (e) {
+        console.warn("[GC] translit_cache cleanup failed:", e);
+    }
     // 🌟 search_mode 도 여기서 비동기로 불러와 초기화합니다.
     const savedSearchMode = await kvGet("search_mode");
     if (savedSearchMode) {
@@ -8536,6 +8548,135 @@ initSession();
 setWindowSize(false);
 syncBrowserStatus();
 initDevicePreference();
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / DEXIE] Rust 스케줄러 ↔ 프론트엔드 Dexie 음차 캐시 통신
+// ---------------------------------------------------------------------
+//  Rust(scheduler.rs) 가 음차 생성 전에 캐시를 조회하거나,
+//  생성 후에 캐시를 저장할 때 emit 하는 이벤트를 여기서 수신합니다.
+//
+//  조회 흐름:
+//    Rust emit("translit-cache-query", {request_id, word, lang})
+//    → 프론트 listen → Dexie 조회 → 코사인 계산(복수 후보)
+//    → invoke("translit_cache_respond", {request_id, results})
+//    → Rust oneshot receiver 에서 await
+//
+//  저장 흐름:
+//    Rust emit("translit-cache-save", {word, lang, native, roman})
+//    → 프론트 listen → Dexie upsert
+// =====================================================================
+
+// ── 캐시 조회 리스너 ──
+listen("translit-cache-query", async (event: any) => {
+    const { request_id, word, lang } = event.payload;
+    try {
+        const candidates = await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .toArray();
+
+        if (!candidates || candidates.length === 0) {
+            // 캐시 미스 → Rust 에 빈 배열 반환
+            await invoke("translit_cache_respond", {
+                requestId: request_id,
+                results: []
+            });
+            return;
+        }
+
+        // 복수 후보가 있으면 코사인 유사도로 최적 선택
+        if (candidates.length === 1) {
+            await invoke("translit_cache_respond", {
+                requestId: request_id,
+                results: [[candidates[0].native, candidates[0].roman]]
+            });
+            return;
+        }
+
+        // 복수 후보: Rust 의 임베딩 모델을 통해 코사인 계산
+        // 각 후보의 native + roman 을 텍스트로 묶어 임베딩 요청
+        const candidateTexts = candidates.map((c: any) =>
+            `${c.native} ${c.roman}`.trim()
+        );
+
+        try {
+            // Rust 에 임베딩 배치 요청
+            const embeddings: number[][] = await invoke("get_embedding_batch_for_translit", {
+                texts: candidateTexts
+            });
+
+            // 쿼리 텍스트(원문) 임베딩도 획득
+            const queryEmb: number[] = await invoke("get_query_embedding", {
+                text: word,
+                devicePreference: null
+            });
+
+            // 코사인 계산 후 최적 후보 선택
+            let bestIdx = 0;
+            let bestSim = -1;
+            for (let i = 0; i < embeddings.length; i++) {
+                const sim = cosineSimLocal(queryEmb, embeddings[i]);
+                if (sim > bestSim) {
+                    bestSim = sim;
+                    bestIdx = i;
+                }
+            }
+
+            await invoke("translit_cache_respond", {
+                requestId: request_id,
+                results: [[candidates[bestIdx].native, candidates[bestIdx].roman]]
+            });
+        } catch (embErr) {
+            // 임베딩 실패 시 최신 후보 폴백
+            const sorted = [...candidates].sort((a: any, b: any) => b.created_at - a.created_at);
+            await invoke("translit_cache_respond", {
+                requestId: request_id,
+                results: [[sorted[0].native, sorted[0].roman]]
+            });
+        }
+    } catch (e) {
+        console.warn("[TRANSLIT CACHE] query failed:", e);
+        await invoke("translit_cache_respond", {
+            requestId: request_id,
+            results: []
+        }).catch(() => {});
+    }
+});
+
+// ── 캐시 저장 리스너 ──
+listen("translit-cache-save", async (event: any) => {
+    const { word, lang, native, roman } = event.payload;
+    try {
+        // 기존 동일 키 삭제 후 삽입 (upsert)
+        await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .delete();
+
+        await appDb.table("translit_cache").add({
+            source_word: word,
+            doc_lang: lang,
+            native: native || "",
+            roman: roman || "",
+            created_at: Date.now()
+        });
+    } catch (e) {
+        console.warn("[TRANSLIT CACHE] save failed:", e);
+    }
+});
+
+// ── 로컬 코사인 계산 헬퍼 (프론트 전용) ──
+function cosineSimLocal(a: number[], b: number[]): number {
+    if (a.length !== b.length || a.length === 0) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    const denom = Math.sqrt(na) * Math.sqrt(nb);
+    return denom === 0 ? 0 : dot / denom;
+}
 
 function stopDesktopCamera() {
     if (desktopStream) {

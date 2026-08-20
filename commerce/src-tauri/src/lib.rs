@@ -173,6 +173,50 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 // =====================================================================
+// 🌟 [TRANSLIT CACHE / RESPOND] 프론트엔드 → Rust 음차 캐시 응답 수신
+// ---------------------------------------------------------------------
+//  프론트엔드가 Dexie 를 조회한 뒤 invoke("translit_cache_respond") 로
+//  결과를 보내면, 여기서 oneshot sender 를 통해 scheduler 에 전달합니다.
+// =====================================================================
+#[tauri::command]
+async fn translit_cache_respond(
+    request_id: String,
+    results: Vec<(String, String)>,
+) -> Result<(), String> {
+    if let Some(sender) = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id) {
+        let _ = sender.send(results);
+    }
+    Ok(())
+}
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / EMBEDDING BATCH] 복수 음차 후보 코사인 계산용
+// ---------------------------------------------------------------------
+//  프론트엔드가 복수 후보의 임베딩을 한 번에 요청할 때 사용합니다.
+//  get_embedding_batch 를 Tauri command 로 노출합니다.
+// =====================================================================
+#[tauri::command]
+async fn get_embedding_batch_for_translit(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let model = {
+        let mut model_guard = state.model.lock().await;
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), None).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+        model_guard.as_ref().unwrap().clone()
+    };
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+    model.get_embedding_batch(texts).await.map_err(|e| e.to_string())
+}
+
+// =====================================================================
 // 🌟 [CLIENT-SIDE EMBEDDING] Cloud AI 모드에서도 임베딩은 무조건 로컬에서 수행합니다.
 //    ① get_query_embedding      : 클라우드 검색용 질의 벡터를 로컬 모델로 생성
 //    ② reindex_pending_embeddings : 클라우드가 내려준 아이템을 로컬에서 벡터화 + 청크 인덱싱
@@ -3334,7 +3378,8 @@ pub fn run() {
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
-            get_query_embedding, reindex_pending_embeddings
+            get_query_embedding, reindex_pending_embeddings,
+            translit_cache_respond, get_embedding_batch_for_translit
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
