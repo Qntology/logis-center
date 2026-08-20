@@ -600,7 +600,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 
 #settings-panel{padding: 0.7rem;}
 
-.settings-toggle{position: absolute; right: 5px; top: 0;}
+.settings-toggle{position: absolute; right: 5px; top: 0; z-index: 1;}
 .settings-toggle label{cursor: pointer; color: rgb(100, 100, 100); font-size: 0.8rem; background: rgba(255, 255, 255, 0.1); padding: 10px 10px; border-radius: 6px; transition: 0.2s; display: block; text-decoration: underline;  opacity: 1; color: #000;}
 .settings-toggle:hover label{font-style: italic;}
 .settings-toggle label.on{display: none;}

@@ -348,7 +348,6 @@ async fn reindex_pending_embeddings(
     model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
     model.ensure_embedding().await.map_err(|e| e.to_string())?;
 
-    let mut vectors: Vec<Value> = Vec::new();
     let mut processed = 0usize;
 
     for doc in pending {
@@ -434,28 +433,6 @@ async fn reindex_pending_embeddings(
             &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync"
         ).await;
 
-        // 🌟 [CLOUD PAYLOAD] Cloudflare Vectorize 메타데이터는 봉투 필드만 사용합니다.
-        //    'table' 은 서버가 Vectorize 인덱스를 고르는 키인데, v4 에서는
-        //    도메인 테이블이 사라졌으므로 항상 items 로 고정됩니다.
-        //    (서버는 레거시로 남겨 두므로 값은 계속 보내되 의미만 고정합니다)
-        vectors.push(json!({
-            "id": doc.id,
-            "table": "items",
-            "type": doc.r#type,
-            "mode": target_mode,
-            "no": data.get("no").and_then(|v| v.as_str()).unwrap_or(""),
-            "from": doc.from,
-            "to": doc.to,
-            "cc": doc.cc,
-            "bcc": doc.bcc,
-            "ref": doc.r#ref,
-            // 🌟 [ANALYTICS METADATA] console.logis.center Vectorize 메타데이터로 그대로 넘어갑니다.
-            "summary": data.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
-            "action": data.get("action").and_then(|v| v.as_str()).unwrap_or(""),
-            "relate": data.get("relate").cloned().unwrap_or(json!([])),
-            "values": emb
-        }));
-
         processed += 1;
     }
 
@@ -465,7 +442,7 @@ async fn reindex_pending_embeddings(
 
     model.unload_embedding().await;
 
-    Ok(json!({ "processed": processed, "vectors": vectors, "mode": target_mode }))
+    Ok(json!({ "processed": processed, "mode": target_mode }))
 }
 
 #[tauri::command]
@@ -2521,6 +2498,7 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
 async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
+        let items_total = items.len();
         let mut count = 0;
         for item in items {
             
@@ -2648,12 +2626,13 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             //    Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
             //    그 명시값을 1순위로 신뢰합니다. (추정이 아니라 계약입니다)
             let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
-
             let final_table = match type_str.as_str() {
                 "member" | "team" | "user" | "users" => "users",
                 "pages" | "page" => "pages",
                 // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
                 "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
+                "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
+                | "receiving" | "shipping" => "items",
                 _ => match table_hint {
                     "pages" | "page" => "pages",
                     "users" => "users",
@@ -2696,6 +2675,10 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 count += 1;
             }
         }
+        println!(
+            "[SYNC-RESULT] upsert_items 완료: 수신 {}건 → LanceDB 쓰기 {}건 (나머지는 digest 동일 스킵 또는 messages 테이블행)",
+            items_total, count
+        );
         Ok(format!("Synced {} items", count))
     } else {
         Err("DB not initialized".to_string())

@@ -637,7 +637,7 @@ function renderOAuthRegistrationForm() {
         <input id="oauth-reg-client-secret" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;">
     </div>
 
-    <button id="oauth-reg-submit" style="width:100%;padding:12px;border:none;border-radius:8px;background:#6366f1;color:#fff;font-size:0.95rem;font-weight:700;cursor:pointer;">추가</button>
+    <button id="oauth-reg-submit" style="width:100%;padding:12px;border:none;border-radius:8px;background:#eee;color:#000;font-size:0.95rem;font-weight:700;cursor:pointer;">추가</button>
 </div>`;
     document.body.appendChild(modal);
 
@@ -800,58 +800,6 @@ interface CloudPendingMeta {
 let cloudPendingTasks = new Map<string, CloudPendingMeta>();
 let isReindexing = false;
 
-// 🌟 로컬에서 계산한 벡터를 Cloudflare(Vectorize)로 밀어 넣습니다.
-// 🌟 [MODE ROUTING] commerce / shipping → commerce.logis.center, analytic → console.logis.center
-async function pushLocalVectorsToCloud(vectors: any[], mode: string = "commerce") {
-    if (!vectors || vectors.length === 0) return;
-    if (!currentSession.hash) return;
-
-    const isAnalytic = mode === "analytic";
-
-    // commerce 트랙은 이메일 인증(팀 소속)이 있어야 서버 스코프가 잡힙니다.
-    // analytic 트랙은 hash 기준의 단말 스코프이므로 이메일이 없어도 동작합니다.
-    if (!isAnalytic && !currentSession.email) return;
-
-    try {
-        const origin = isAnalytic ? "https://console.logis.center" : "https://commerce.logis.center";
-        const apiHost = isAnalytic ? ANALYTICS_API_HOST : API_HOST;
-        const fallbackHref = isAnalytic ? "https://console.logis.center/" : "https://commerce.logis.center/tracking";
-
-        const now = Date.now();
-        const createdAt = now - timezoneOffset;
-
-        let targetHref = currentDetectedUrl || fallbackHref;
-        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
-            targetHref = fallbackHref;
-        }
-
-        const params = new URLSearchParams({
-            origin: origin,
-            created_at: createdAt.toString(),
-            hash: currentSession.hash,
-            token: currentSession.token || "",
-            href: targetHref,
-            type: "vector",
-            from: currentSession.address || "",
-            to: currentSession.team || ""
-        });
-
-        await invoke<any>("proxy_fetch", {
-            url: `${apiHost}/?${params.toString()}`,
-            method: "PUT",
-            headers: {
-                "Content-Type": "application/json",
-                "Content-Encoding": "gzip"
-            },
-            body: { items: vectors },
-            session_params: { hash: currentSession.hash, token: currentSession.token }
-        });
-
-        console.log(`[EMBED] Pushed ${vectors.length} locally-computed vectors to ${isAnalytic ? "console" : "commerce"}.logis.center Vectorize.`);
-    } catch (e) {
-        console.warn("[EMBED] Failed to push local vectors to cloud:", e);
-    }
-}
 
 // 🌟 [EMBED DEBOUNCE] runLocalEmbeddingSync 중복 호출 방지를 위한 스케줄링 변수
 let reindexScheduled = false;
@@ -902,9 +850,8 @@ async function runLocalEmbeddingSync() {
                 if (res && res.processed && res.processed > 0) {
                     totalProcessed += res.processed;
                     console.log(`[EMBED] Locally embedded ${res.processed} item(s). (mode: ${res.mode || track})`);
-                    if (res.vectors && res.vectors.length > 0) {
-                        await pushLocalVectorsToCloud(res.vectors, res.mode || track);
-                    }
+                } else if (res && res.skipped) {
+                    console.log(`[EMBED] 트랙 '${track}' 임베딩 스킵: 사유=${res.skipped}`);
                 }
             }
 
@@ -1070,108 +1017,144 @@ async function syncAnalyticsData() {
     }
 }
 
-// 🌟 [ANALYTICS ADMIN] 기존 Client Front SDK(content.js)의 관리자 프롬프트 기능을 Client App 으로 이관한 함수입니다.
-//    질의 벡터는 반드시 로컬 임베딩 모델로 만들어 함께 전송하며, 서버는 그 벡터로 Vectorize 를 조회만 합니다.
-async function askAnalyticsAdmin(query: string) {
-    if (!currentSession.hash) return;
-
-    const taskId = `analytic_${Date.now()}`;
-    const now = Date.now();
-
+// 🌟 [COMMERCE BACKGROUND SYNC] analytic 모드에서도 commerce.logis.center D1 과
+//    양방향 동기화를 수행합니다. syncData() 의 commerce 경로를 재사용하되,
+//    UI 갱신(renderNavigation / loadMoreDocs)은 현재 탭이 commerce 일 때만 수행합니다.
+let isCommerceSyncRunning = false;
+async function syncCommerceInBackground() {
+    if (isCommerceSyncRunning) return;
+    if (!currentSession.hash || !currentSession.email) return;
+    isCommerceSyncRunning = true;
     try {
-        renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
-
-        let queryVector: number[] = [];
-        try {
-            queryVector = await invoke<number[]>("get_query_embedding", {
-                text: query,
-                devicePreference: getDevicePref()
-            });
-            console.log(`[ANALYTIC] Local query vector generated. dim = ${queryVector.length}`);
-        } catch (err) {
-            console.warn("[ANALYTIC] Local embedding failed:", err);
-        }
-
+        const origin = "https://commerce.logis.center";
+        const now = Date.now();
         const createdAt = now - timezoneOffset;
-
-        let targetHref = currentDetectedUrl || "https://console.logis.center/";
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
         if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
-            targetHref = "https://console.logis.center/";
+            targetHref = "https://commerce.logis.center/tracking";
         }
-
-        const params = new URLSearchParams({
-            origin: "https://console.logis.center",
+        const queryParams: any = {
+            origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
             token: currentSession.token || "",
-            href: targetHref,
-            text: encodeURIComponent(query)
-        });
-
-        renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Querying analytics console...", spinner: "☁️" });
-
+            href: targetHref
+        };
+        let syncEffectiveCc = activeContext.cc;
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+        if (!syncEffectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            try {
+                const urlObj = new URL(targetHref.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                syncEffectiveCc = await hashId(rootDomain);
+            } catch(e) {}
+        }
+        if (syncEffectiveCc) queryParams.cc = syncEffectiveCc;
+        const params = new URLSearchParams(queryParams);
+        const url = `${API_HOST}/?${params.toString()}`;
         const response = await invoke<any>("proxy_fetch", {
-            url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Content-Encoding": "gzip"
-            },
-            body: { query: query, vector: queryVector },
-            session_params: { hash: currentSession.hash, token: currentSession.token }
+            url: url,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token, cc: activeContext.cc || "" }
         });
-
-        renderProgressToUI({ task_id: taskId, category: "Done", summary: "Analytics answer received.", spinner: "✅" });
-
-        if (response && response.results && Array.isArray(response.results)) {
-            const pako = (window as any).pako;
-
-            for (const row of response.results) {
-                if (!row) continue;
-                if (row.type !== "question" && row.type !== "answer") continue;
-
-                let parsed: any = {};
-                try {
-                    const rawData = row.data;
-                    const raw = rawData && (rawData.data || rawData);
-                    let arr: Uint8Array | null = null;
-
-                    if (Array.isArray(raw)) {
-                        arr = new Uint8Array(raw);
-                    } else if (raw && raw.buffer) {
-                        arr = new Uint8Array(raw.buffer);
-                    } else if (raw && typeof raw === "object" && Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
-                        arr = new Uint8Array(Object.values(raw) as number[]);
-                    }
-
-                    if (arr) {
-                        try {
-                            parsed = JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
-                        } catch (e) {
-                            parsed = JSON.parse(new TextDecoder('utf-8').decode(arr));
+        if (response.results && Array.isArray(response.results)) {
+            try {
+                const pako = (window as any).pako;
+                for (let i = 0; i < response.results.length; i++) {
+                    let item = response.results[i];
+                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
+                        let arrData = item.data.data || item.data;
+                        let arr: Uint8Array | null = null;
+                        if (Array.isArray(arrData)) {
+                            arr = new Uint8Array(arrData);
+                        } else if (arrData.buffer) {
+                            arr = new Uint8Array(arrData.buffer);
+                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
+                            arr = new Uint8Array(Object.values(arrData) as number[]);
                         }
-                    } else if (raw && typeof raw === "object") {
-                        parsed = raw;
+                        if (arr) {
+                            try {
+                                if (pako) {
+                                    const decompressed = pako.ungzip(arr, { to: 'string' });
+                                    item.data = JSON.parse(decompressed);
+                                } else {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                }
+                            } catch (e) {
+                                try {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                } catch (err) {}
+                            }
+                        }
                     }
-                } catch (e) {
-                    parsed = {};
                 }
-
-                await renderMessage({
-                    id: row.id,
-                    role: row.type === "question" ? "user" : "system",
-                    text: parsed.text || "",
-                    status: 9,
-                    created_at: Number(row.created_at) || now,
-                    updated_at: Number(row.updated_at) || now
-                });
+            } catch (err) {
+                console.warn("[SYNC-BG] pako decompression failed:", err);
+            }
+            const filteredResults = response.results.filter((newItem: any) => {
+                const existingEl = document.getElementById(newItem.id);
+                if (!existingEl) return true;
+                let localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
+                const serverUpdated = newItem.updated_at || newItem.created_at || 0;
+                return serverUpdated > localUpdated;
+            });
+            if (filteredResults.length > 0) {
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (r.mode) continue;
+                    r.mode = modeOfType(String(r.type || ""));
+                }
+                const sessionFlag = String((currentSession as any).flag || "");
+                if (sessionFlag) {
+                    for (const r of filteredResults) {
+                        if (!r) continue;
+                        if (r.flag) continue;
+                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
+                        if (inner) { r.flag = inner; continue; }
+                        r.flag = sessionFlag;
+                    }
+                }
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (!r.data || typeof r.data !== 'object') continue;
+                    for (const k in r) {
+                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+                        const v = r[k];
+                        if (v === undefined || v === null) continue;
+                        if (typeof v === 'function') continue;
+                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
+                            r.data[k] = v;
+                        }
+                    }
+                }
+                console.log(`[SYNC-BG] Commerce D1 background sync: ${filteredResults.length} item(s)`);
+                await invoke("upsert_items", { items: filteredResults });
+                const newItems = filteredResults.filter((r: any) =>
+                    r.type !== "team" && r.type !== "user" && r.type !== "member"
+                    && r.type !== "pages" && r.type !== "page"
+                    && r.type !== "talk" && r.table !== "talks"
+                );
+                if (newItems.length > 0 && appDb) {
+                    await appDb.table("items").bulkPut(normalizeEnvelope(newItems)).catch(() => null);
+                }
+                // 현재 탭이 commerce/list 일 때만 UI 갱신
+                if (currentSearchMode === "commerce" && currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+                runLocalEmbeddingSync();
             }
         }
     } catch (e) {
-        console.error("[ANALYTIC] Admin prompt failed:", e);
-        renderProgressToUI({ task_id: taskId, category: "Error", summary: "Analytics request failed.", spinner: "❌" });
+        console.warn("[SYNC-BG] Commerce background sync failed:", e);
+    } finally {
+        isCommerceSyncRunning = false;
     }
 }
+
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
 if (!(window as any).Dexie) {
@@ -2020,14 +2003,45 @@ if (chatForm) {
             console.log("[CHAT] Message sent via WebRTC");
         }
 
-        // 🌟 [ANALYTICS ADMIN] analytic 모드에서는 console.logis.center 관리자 프롬프트로 라우팅합니다.
-        //    (기존 Client Front SDK(content.js)의 form[name="prompt"] 기능을 이관한 경로)
+        // 🌟 [ANALYTIC LOCAL] analytic 모드에서도 로컬 LanceDB 검색(ai_search_complex)을 사용합니다.
+        //    서버 Vectorize POST 를 제거하고, commerce/shipping 과 동일한 검색 큐로 합류시킵니다.
+        //    parse_analytic_query 가 질의를 파싱하고, 로컬 item_chunks + Dexie 가 결과를 반환합니다.
         if (currentSearchMode === "analytic") {
-            await askAnalyticsAdmin(query);
+            const taskId = `search_${Date.now()}`;
+            const startTime = Date.now();
+
+            // 사용자 질문 말풍선 즉시 렌더링
+            await renderMessage({
+                id: `${taskId}_query`,
+                role: "user",
+                text: query,
+                status: 9,
+                created_at: startTime,
+                updated_at: startTime
+            });
+
+            try {
+                const devicePref = getDevicePref();
+
+                // 로컬 검색 큐에 등록 (ai_search_complex 가 mode="analytic" 으로 동작)
+                await GlobalTaskManager.addToQueue(taskId, "ai_search", {
+                    taskId: taskId,
+                    query: query,
+                    language: "korean",
+                    devicePreference: devicePref,
+                    searchMode: "analytic",
+                    cc: activeContext.cc || "",
+                    bcc: activeContext.bcc || "",
+                    refId: activeContext.ref || ""
+                });
+            } catch (e) {
+                console.error("[ANALYTIC-LOCAL] Search queue failed:", e);
+            }
 
             setTimeout(() => {
                 const scrollEl = document.getElementById("chat-scroll");
                 const container = document.querySelector(".chat-container") as HTMLElement;
+
                 if (scrollEl && container) {
                     const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
                     currentY = maxScroll;
@@ -3506,9 +3520,11 @@ async function syncData() {
     // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
     if (currentSearchMode === "analytic") {
         await syncAnalyticsData();
+        if (currentSession.hash && currentSession.email) {
+            syncCommerceInBackground();
+        }
         return;
     }
-
     if (!currentSession.hash || !currentSession.email) return;
     
     console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
@@ -3801,10 +3817,11 @@ async function syncData() {
                 await fetchChatHistory(false, true);
             }
 
-             // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
-             //    runLocalEmbeddingSync 내부의 2초 디바운스가 initSession의 4초 타이머와
-             //    겹치는 중복 호출을 자동으로 병합하여 1회만 실행합니다.
-             runLocalEmbeddingSync();
+            // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
+            //    runLocalEmbeddingSync 내부의 2초 디바운스가 initSession의 4초 타이머와
+            //    겹치는 중복 호출을 자동으로 병합하여 1회만 실행합니다.
+            console.log("[SYNC] 4. 로컬 임베딩 파이프라인 스케줄링 (2초 디바운스 적용)...");
+            runLocalEmbeddingSync();
         }
         
     } catch (e) { 
@@ -4495,10 +4512,96 @@ listen("extraction-progress", async (event: any) => {
 
         // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
-            const response = payload.data; 
+            const response = payload.data;
+
+            // 🌟 [ANALYTIC LOCAL RENDER] analytic 모드 검색 결과는 리스트 탭이 아닌
+            //    채팅 탭에 말풍선으로 렌더링합니다.
+            //    parse_analytic_query → search_items(mode='analytic') → search_chunks → Dexie Plan
+            //    순서로 로컬에서 확정된 결과를 그대로 보여줍니다.
+            if (currentSearchMode === "analytic") {
+                const resultCount = response.results ? response.results.length : 0;
+
+                // ① 요약 말풍선
+                let summaryText = `Analytic 검색 완료: ${resultCount}건`;
+                if (response.structured && response.structured.original_text) {
+                    summaryText = `${response.structured.original_text} → ${resultCount}건`;
+                }
+                await renderMessage({
+                    id: `${payload.task_id}_answer`,
+                    role: "system",
+                    text: summaryText,
+                    status: 9,
+                    created_at: Date.now(),
+                    updated_at: Date.now()
+                });
+
+                // ② Dexie Plan 실행 → 상세 결과 말풍선
+                if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
+                    const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
+                    for (const plan of response.dexie_plans) {
+                        const condCount = plan.conditions ? plan.conditions.length : 0;
+                        if (condCount === 0) continue;
+                        try {
+                            const passed = await executeDexiePlan(plan, { candidateIds, limit: 20 });
+                            for (const p of passed) {
+                                const d = p.data || {};
+                                const actionText = d.action || "";
+                                const summaryDoc = d.summary || "";
+                                const crossFlow = d.cross_action_flow || "";
+                                const text = d.text || "";
+                                const displayText = actionText || summaryDoc || crossFlow || text;
+                                if (displayText) {
+                                    await renderMessage({
+                                        id: `analytic_res_${p.id}`,
+                                        role: "system",
+                                        text: displayText,
+                                        status: 9,
+                                        created_at: Date.now(),
+                                        updated_at: Date.now()
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.warn("[ANALYTIC-LOCAL] Dexie plan execution failed:", e);
+                        }
+                    }
+                }
+
+                // ③ 결과 없음 안내
+                if (resultCount === 0) {
+                    await renderMessage({
+                        id: `${payload.task_id}_empty`,
+                        role: "system",
+                        text: "해당 조건에 맞는 행동 로그를 찾지 못했습니다.",
+                        status: 9,
+                        created_at: Date.now(),
+                        updated_at: Date.now()
+                    });
+                }
+
+                // ④ 상태 정리
+                isSearching = false;
+                stopSpinner();
+                updateExtractButtonVisibility();
+
+                // ⑤ 채팅 스크롤 맨 아래로
+                setTimeout(() => {
+                    const scrollEl = document.getElementById("chat-scroll");
+                    const container = document.querySelector(".chat-container") as HTMLElement;
+                    if (scrollEl && container) {
+                        const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                        currentY = maxScroll;
+                        scrollEl.style.transition = "transform 0.3s ease-out";
+                        updateTransform();
+                        setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+                    }
+                }, 100);
+                return;
+            }
 
             // 🌟 [CRITICAL FIX] isSearching = true 인 상태에서 탭을 전환해야 초기화(refreshList)가 방어됩니다!
             openWidget("list");
+            
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
             
@@ -6630,6 +6733,9 @@ async function checkAuthStatus() {
             currentSession = { ...currentSession, ...session };
             await saveSession();
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
+
+            console.log('currentSession',currentSession);
+
             if (currentSession.email) { 
                 await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" }); 
                 updateAuthUI(); fetchChatHistory(); syncData();
@@ -6649,6 +6755,8 @@ function updateAuthUI() {
     
     // 🌟 [추가] Cloud Members 섹션을 통째로 잡습니다.
     const cloudMembersSection = document.getElementById("nav-list-users")?.closest(".nav-section") as HTMLElement;
+
+    console.log('currentSession',currentSession);
 
     if (currentSession.email) {
         if (authStatus) authStatus.innerText = "Authenticated";
