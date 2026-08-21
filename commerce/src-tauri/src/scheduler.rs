@@ -215,8 +215,20 @@ async fn generate_transliteration_aliases(
 ) -> Vec<(String, String)> {
     let emit = |msg: &str| {
         println!("{}", msg);
-        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}
+", msg)}));
     };
+
+    // 🌟 [TRANSLIT TYPE GUARD] 비검색 타입은 음차 생성 자체가 무의미합니다.
+    //    pages/talk/prompt 는 셀렉터 캐시·채팅 말풍선이라 값 음차가 필요 없습니다.
+    //    team/user/member 는 통계 문서라 음차 대상이 아닙니다.
+    const TRANSLIT_EXCLUDE_TYPES: [&str; 10] = [
+        "pages", "page", "talk", "prompt", "ai_search",
+        "question", "answer", "team", "user", "member",
+    ];
+    if TRANSLIT_EXCLUDE_TYPES.iter().any(|t| page_type == *t) {
+        return vec![(String::new(), String::new()); chunks.len()];
+    }
 
     let mut out: Vec<(String, String)> = vec![(String::new(), String::new()); chunks.len()];
     let mut cache: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
@@ -789,6 +801,20 @@ pub async fn index_item_chunks(
     //    뱅크가 비면 PLINKO 는 전 청크를 unclassified 로 떨어뜨리므로,
     //    임베딩 배치를 헛돌리지 않고 여기서 즉시 종료합니다.
     //    (아이템 레벨 벡터는 reindex_pending_embeddings 가 이미 만들어 두었습니다)
+    // 🌟 [CHUNK TYPE GUARD] 비검색 타입은 스키마 필드 조회 전에 구조적으로 차단합니다.
+    //    fields.is_empty() 판정만으로는 bias.json 에 우연히 남은 키가 있으면
+    //    불필요한 임베딩 배치가 실행됩니다.
+    const CHUNK_EXCLUDE_TYPES: [&str; 10] = [
+        "pages", "page", "talk", "prompt", "ai_search",
+        "question", "answer", "team", "user", "member",
+    ];
+    if CHUNK_EXCLUDE_TYPES.iter().any(|t| page_type == *t) {
+        emit(&format!(
+            "  ⏭️ [CHUNK SKIP] type='{}' 은 검색/음차/청크 인덱싱 대상이 아닙니다.",
+            page_type
+        ));
+        return Ok(0);
+    }
     if fields.is_empty() {
         emit(&format!(
             "  ⏭️ [CHUNK SKIP] type='{}' 에 대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다. (아이템 벡터는 별도 생성됨)",
@@ -1248,7 +1274,7 @@ pub async fn start_background_worker(
     });
 }
 
-async fn process_task(
+pub async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
@@ -1256,26 +1282,32 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
-    
-    
+    // 🌟 [RESET GUARD] btn-reset-db 가 stop_current_extraction 을 호출하면
+    //    cancellation_token 이 true 가 됩니다.
+    //    스케줄러 루프가 이미 이 태스크를 픽업했더라도,
+    //    process_task 진입 즉시 재확인하여 테이블 drop 이후의
+    //    upsert_item / 임베딩 / relay 쓰기를 원천 차단합니다.
+    if cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("[PROCESS] 🛑 Task {} aborted at entry — cancellation token already set (reset in progress).", task.id);
+        return Err(anyhow::anyhow!("Task cancelled at entry"));
+    }
     let app_handle_clone = app_handle.clone();
     let tid_clone = task.id.clone();
     let emit_term = move |msg: &str| {
         println!("{}", msg);
         use tauri::Emitter;
-        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
+        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}
+", msg)}));
     };
-
-    
     let zero_addr = "0x0000000000000000000000000000000000000000";
     let from_addr = if task.from.is_empty() { zero_addr.to_string() } else { task.from.clone() };
-    let team_id = if task.to.is_empty() || task.to == zero_addr { 
-        crate::utils::hash::hash_id(&from_addr) 
-    } else { 
-        task.to.clone() 
+    let team_id = if task.to.is_empty() || task.to == zero_addr {
+        crate::utils::hash::hash_id(&from_addr)
+    } else {
+        task.to.clone()
     };
-
-    emit_term("\n=======================================");
+    emit_term("
+=======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
 
     if task.r#type == "analytic_extraction" {

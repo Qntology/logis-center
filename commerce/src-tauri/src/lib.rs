@@ -107,9 +107,12 @@ async fn stop_current_extraction(
 
             println!("[STOP] Task {} cleared from DB and temporary files deleted.", id);
         } else {
-            
             let _ = db.cleanup_unfinished_tasks_on_startup().await;
             println!("[STOP] All pending tasks cleared from DB.");
+            // 🌟 [LOGOUT SCOPE RESET] 로그아웃 시 ACTIVE_TASK_MEM 만 정리합니다.
+            //    LanceDB 문서 자체는 삭제하지 않습니다.
+            //    (재로그인 시 migrate_team_identity 가 to 필드만 갱신)
+            //    만약 완전 초기화가 필요하면 프론트엔드에서 reset_lancedb 를 호출합니다.
         }
     }
     drop(store_guard); // 다음 단계(Model Clear) 진행을 위해 즉시 락 해제
@@ -338,8 +341,23 @@ async fn reindex_pending_embeddings(
         //    upsert_items 가 items 로 라우팅하는데 제외 목록에는 없어 벡터화되고 있었고,
         //    parse_analytic_query 는 이 두 타입을 검색 스코프에서 제외하므로
         //    만들기만 하고 한 번도 쓰이지 않는 벡터였습니다.
-        if doc.r#type == "pages" || doc.r#type == "talk" || doc.r#type == "prompt" || doc.r#type == "ai_search"
-            || doc.r#type == "question" || doc.r#type == "answer" {
+        // 🌟 [EMBED TYPE GUARD] 검색 벡터화가 무의미한 타입을 구조적으로 배제합니다.
+        //    pages/talk/prompt/ai_search/question/answer 는 검색 대상이 아니며,
+        //    click/hover/change/report 는 analytics 전용이라 청크 인덱싱이 불필요합니다.
+        //    team/user/member 는 통계 문서라 임베딩 대상이 아닙니다.
+        const EMBED_EXCLUDE_TYPES: [&str; 12] = [
+            "pages", "page", "talk", "prompt", "ai_search",
+            "question", "answer", "team", "user", "member",
+            "click", "hover",
+        ];
+        if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
+            continue;
+        }
+        // 🌟 [REPORT GUARD] analytics report 는 action 텍스트가 이미
+        //    reindex 상단에서 analytic_text 로 벡터화되므로,
+        //    청크 인덱싱(index_item_chunks)은 스키마 부재로 조기 종료됩니다.
+        //    여기서도 명시적으로 건너뛰어 불필요한 모델 호출을 방지합니다.
+        if doc.r#type == "report" || doc.r#type == "change" {
             continue;
         }
         // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
@@ -2353,6 +2371,21 @@ async fn initialize_hub(
 ) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
+        // 🌟 [ZERO-TO-REAL MIGRATION] 로그인 전 ZERO_ADDRESS 로 생성된 문서를
+        //    실제 address 기반 team_id 로 일괄 이전합니다.
+        let zero_addr = "0x0000000000000000000000000000000000000000";
+        let old_team_id = crate::utils::hash::hash_id(zero_addr);
+        let new_team_id = crate::utils::hash::hash_id(&address);
+        if old_team_id != new_team_id {
+            match store.migrate_team_identity(&old_team_id, &new_team_id, &address).await {
+                Ok(n) => {
+                    if n > 0 {
+                        println!("[HUB] Migrated {} docs from ZERO team to real team.", n);
+                    }
+                },
+                Err(e) => println!("[HUB] Migration warning: {}", e),
+            }
+        }
         match store.initialize_user_profiles(&address, &email, &flag).await {
             Ok(_) => Ok(format!("Hub initialized for address: {}", address)),
             Err(e) => Err(format!("Initialization failed: {}", e)),
@@ -2575,7 +2608,14 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     if let Some(v) = item.get("created_at") { obj.insert("created_at".to_string(), v.clone()); }
                 }
                 if obj.get("updated_at").is_none() {
-                    if let Some(v) = item.get("updated_at") { obj.insert("updated_at".to_string(), v.clone()); }
+                    if let Some(v) = item.get("updated_at") {
+                        obj.insert("updated_at".to_string(), v.clone());
+                    } else {
+                        // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 루트에도 data 에도 없으면
+                        //    0(draft) 을 시딩합니다. 이 처리가 없으면 store.rs upsert_item 이
+                        //    '키 없음 → 현재 시각' 경로를 타 draft → count 가 됩니다.
+                        obj.insert("updated_at".to_string(), serde_json::json!(0));
+                    }
                 }
                 if obj.get("flag").is_none() {
                     if let Some(v) = item.get("flag") { obj.insert("flag".to_string(), v.clone()); }
@@ -2677,9 +2717,16 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
                 "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
                 | "receiving" | "shipping" => "items",
+                // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
+                //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
+                //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
+                //    방어적으로 여기서도 pages/users 로 라우팅합니다.
+                "talk" | "prompt" | "ai_search" => continue,
                 _ => match table_hint {
                     "pages" | "page" => "pages",
                     "users" => "users",
+                    // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
+                    "talks" => continue,
                     // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
                     _ => "items",
                 },
@@ -2702,15 +2749,27 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 //    🌟 v4 : canonicalize_data 가 embed 를 0|1 정수로 확정하므로
                 //    as_i64() 비교가 안정적으로 동작합니다.
                 //    (기존에는 true / "1" / 1 이 섞여 들어와 간헐적으로 실패했습니다)
+                //
+                //    🌟 [CC-INDEPENDENT DEDUP] cc 값이 달라도 동일 id 이면
+                //    이미 임베딩된 문서로 간주합니다. digest 가 cc 포함 해시라면
+                //    cc 변경 시 digest 가 달라져 스킵 가드가 무력화되므로,
+                //    embed 플래그 + chunk_count 를 이중 확인합니다.
                 if let Ok(Some(existing)) = db.get_item_by_id(final_table, &id).await {
+                    let mut already_embedded = false;
                     if let Ok(existing_data) = serde_json::from_str::<Value>(&existing.json_data) {
-                        let already = existing_data.get("embed")
+                        already_embedded = existing_data.get("embed")
                             .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
                             .unwrap_or(false);
-                        if already {
-                            if let Some(obj) = clean_item.as_object_mut() {
-                                obj.insert("embed".to_string(), json!(1));
-                            }
+                    }
+                    // 🌟 chunk_count 가 0보다 크면 물리적으로 청크가 존재하므로
+                    //    embed 플래그와 무관하게 재인덱싱 불필요
+                    if !already_embedded {
+                        let cc = db.count_chunks_by_item(&id).await.unwrap_or(0);
+                        if cc > 0 { already_embedded = true; }
+                    }
+                    if already_embedded {
+                        if let Some(obj) = clean_item.as_object_mut() {
+                            obj.insert("embed".to_string(), json!(1));
                         }
                     }
                 }

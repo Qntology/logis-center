@@ -361,9 +361,14 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
     if (parsed.mode === undefined) parsed.mode = d.mode ?? 'commerce';
     if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
-
     const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
-    const updated = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0;
+    // 🌟 [DRAFT PRESERVE] updated_at 폴백 체인에서 created_at 으로 빠지는 경로를 제거합니다.
+    //    기존에는 updated_at 이 없으면 created_at(현재 시각) 으로 폴백되어
+    //    draft(updated_at=0) 가 count 로 승격되었습니다.
+    //    updated_at 이 어디에도 없으면 0(draft) 으로 남겨야
+    //    renderNavigation 의 Dexie 카운트가 올바릅니다.
+    const updatedRaw = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at;
+    const updated = updatedRaw !== undefined && updatedRaw !== null ? updatedRaw : 0;
     parsed.created_at = Number(created) || 0;
     parsed.updated_at = Number(updated) || 0;
 
@@ -2794,20 +2799,35 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 //    cc+type 단위 단일 통계이므로 리스트 노드와 상세 노드가 같은 total 을 공유하고,
                 //    리스트 노드는 total.draft 를, 상세 노드는 total.count 를 표시합니다.
                 //    (이 구조 자체가 base.pages[cc][type] 와 동일합니다)
-                if (nodeType !== 'team' && nodeType !== 'user' && nodeType !== 'member'
-                    && nodeType !== 'pages' && nodeType !== 'page' && cc && appDb) {
+                if (
+                    nodeType !== 'team' &&
+                    nodeType !== 'user' &&
+                    nodeType !== 'member' &&
+                    nodeType !== 'pages' &&
+                    nodeType !== 'page' &&
+                    cc &&
+                    appDb
+                ) {
                     try {
                         const rows = await appDb.table('items')
-                            .where('[cc+type]').equals([cc, nodeType])
+                            .where('[cc+type]')
+                            .equals([cc, nodeType])
                             .toArray();
+
                         for (const r of rows) {
-                            // 🌟 updated_at 이 0 / undefined / null 이면 draft.
-                            //    (store.rs 가 0 을 보존하도록 수정된 이후에만 정상 동작합니다)
-                            const up = Number(r.updated_at || 0);
+                            // 🌟 [DRAFT COUNT v2] 봉투 루트 updated_at 과 data.updated_at 둘 다 확인합니다.
+                            //    normalizeEnvelope 가 data.* 로 내린 뒤에도 루트 updated_at 이
+                            //    별도 경로(syncData bulkPut 이전)로 갱신될 수 있으므로 이중 판정합니다.
+                            const rootUp = Number(r.updated_at ?? 0);
+                            const dataUp = Number(r.data?.updated_at ?? rootUp);
+                            const up = dataUp;
+
                             if (up > 0) total.count++;
                             else total.draft++;
                         }
+
                         console.log(`[NAV-COUNT] cc=${cc} type=${nodeType} | 총 ${rows.length}건 → draft ${total.draft} / count ${total.count}`);
+
                         if (rows.length > 0 && total.draft === 0 && total.count === rows.length) {
                             console.warn(`[NAV-COUNT] ⚠️ 전 건이 count 로 분류되었습니다. store.rs 의 updated_at=0 보존 수정이 반영되었는지 확인하세요.`);
                         }
@@ -3000,7 +3020,10 @@ async function renderNavigation() {
             if (existingBtn) existingBtn.remove();
 
             // analytic 모드에서만 등록 버튼 노출 (이 버튼의 목적이 analytic 조회이므로)
-            if (currentSearchMode === "analytic" && !isSettingsOpen) {
+            // 🌟 [LOGIN GATE] 로그인(currentSession.email)이 되어 있어야만 버튼을 노출합니다.
+            //    미로그인 상태에서 등록을 시도하면 submitOAuthRegistration 내부에서
+            //    "로그인이 필요합니다." 에러가 반환되므로, 사전에 UI에서 차단합니다.
+            if (currentSearchMode === "analytic" && !isSettingsOpen && currentSession.email) {
                 const h3 = navSection.querySelector("h3");
                 const registerBtn = document.createElement("button");
                 registerBtn.id = "btn-oauth-register";
@@ -3011,6 +3034,7 @@ async function renderNavigation() {
                     e.stopPropagation();
                     renderOAuthRegistrationForm();
                 });
+
                 // h3 바로 아래, pageList 위에 삽입
                 if (h3 && h3.nextSibling) {
                     navSection.insertBefore(registerBtn, h3.nextSibling);
@@ -3658,6 +3682,18 @@ async function syncData() {
                     if (!r) continue;
                     if (r.mode) continue;
                     r.mode = modeOfType(String(r.type || ""));
+                }
+                // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 없으면
+                //    Rust upsert_item 이 현재 시각을 부여해 draft → count 가 됩니다.
+                //    data 내부에도 없으면 여기서 0 을 명시해 draft 계약을 보존합니다.
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    const hasRoot = r.updated_at !== undefined && r.updated_at !== null;
+                    const inner = (r.data && typeof r.data === 'object') ? r.data.updated_at : undefined;
+                    const hasInner = inner !== undefined && inner !== null;
+                    if (!hasRoot && !hasInner) {
+                        r.updated_at = 0;
+                    }
                 }
 
                 // 🌟 [FLAG RECOVERY] commerce D1 의 items 테이블에는 flag 컬럼이 없습니다.
@@ -6733,8 +6769,10 @@ async function checkAuthStatus() {
 
             console.log('currentSession',currentSession);
 
-            if (currentSession.email) { 
-                await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" }); 
+            if (currentSession.email) {
+                // 🌟 [TEAM MIGRATION TRIGGER] initialize_hub 내부에서 ZERO_ADDRESS → 실제 address
+                //    마이그레이션이 자동으로 수행됩니다.
+                await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" });
                 updateAuthUI(); fetchChatHistory(); syncData();
             }
         }
@@ -6789,6 +6827,39 @@ function updateAuthUI() {
     }
 }
 
+let authPollInterval: number | null = null;
+
+function stopAuthPolling() {
+    if (authPollInterval) {
+        clearTimeout(authPollInterval);
+        authPollInterval = null;
+    }
+}
+
+function startAuthPolling() {
+    if (authPollInterval) clearTimeout(authPollInterval);
+    const poll = async () => {
+        // 인증이 완료되었으면 폴링 중단
+        if (currentSession.email) {
+            stopAuthPolling();
+            return;
+        }
+        
+        // 서버에 세션 인증 상태 확인 요청
+        await checkAuthStatus();
+        
+        // 아직 인증되지 않았으면 3초 후 다시 재귀 요청
+        if (!currentSession.email) {
+            authPollInterval = window.setTimeout(poll, 3000);
+        } else {
+            stopAuthPolling();
+        }
+    };
+    
+    // 첫 요청은 3초 후 실행
+    authPollInterval = window.setTimeout(poll, 3000);
+}
+
 async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     const existing = document.getElementById("msg-qr-auth");
@@ -6802,6 +6873,9 @@ async function performQrAuth() {
         const scroll = document.getElementById("chat-scroll");
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     }
+    
+    // 🌟 QR 코드 노출 후 3초 간격으로 세션 인증 상태 반복 확인 시작
+    startAuthPolling();
 }
 
 // 🌟 [PARITY] Window Focus/Blur 이벤트 리스너 추가
@@ -6951,8 +7025,12 @@ async function initSession() {
     }
     
     await saveSession(); 
-    currentSession.address = currentSession.address || ZERO_ADDRESS; 
-    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); 
+    currentSession.address = currentSession.address || ZERO_ADDRESS;
+    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
+    // 🌟 [LOGOUT STATE GUARD] 로그아웃 후 reload 시 currentSession 이 초기화되어
+    //    address/team 이 ZERO 로 리셋됩니다. 이 상태에서 syncData 가 호출되면
+    //    ZERO 기반 cc 로 서버에 요청하므로, 미로그인 시 sync 를 건너뜁니다.
+    //    (initSession 하단의 syncData 호출은 currentSession.email 체크로 이미 방어됨)
     updateAuthUI(); 
     startPolling();
 
@@ -7248,28 +7326,70 @@ async function initSession() {
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
 
-// 🌟 [수정] 로그아웃 시 Dexie DB의 세션까지 완벽히 제거합니다.
-document.getElementById("btn-logout")?.addEventListener("click", async () => { 
-    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) { 
+document.getElementById("btn-logout")?.addEventListener("click", async () => {
+    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) {
         // 1. 메모리상의 세션 데이터 초기화
         currentSession = { hash: "", cc: "logis.center" };
-        
         // 2. Dexie DB 내 저장된 세션 및 터미널 로그 영구 삭제
         await kvRemove("chat_session");
-        
+        // 🌟 [LOGOUT CLEANUP] 이전 계정 기반 검색 모드 / 숨김 페이지 / 음차 캐시 정리
+        await kvRemove("search_mode");
+        await kvRemove("hidden_pages");
+        // 🌟 [LOGOUT EMBED RESET] 이전 계정 문서의 embed 플래그를 리셋하지 않습니다.
+        //    LanceDB 는 계정 무관 로컬 저장소이므로, 재로그인 시
+        //    initialize_hub 의 migrate_team_identity 가 to 필드만 갱신합니다.
+        //    embed/청크는 그대로 유지하여 재임베딩 비용을 방지합니다.
         // 3. sessionStorage 및 기타 상태 초기화
-        sessionStorage.clear(); 
-        
+        sessionStorage.clear();
+        // 🌟 [LOGOUT BACKEND RESET] 백엔드 모델 메모리 해제
+        try {
+            await invoke("unload_model");
+        } catch (_e) { /* 이미 해제된 경우 무시 */ }
         // 4. 앱 강제 새로고침하여 초기 상태(새 해시 생성 등)로 복귀
         window.location.reload();
-    } 
+    }
 });
 
 // 🌟 [추가] Dexie DB 초기화 및 앱 리셋 버튼 로직
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
-            // 1. 프론트엔드 전역 상태 초기화
+            // 🌟 [RESET STEP 0] 백엔드 활성 태스크 및 스케줄러 중단
+            //    reset_lancedb 전에 반드시 호출해야 합니다.
+            //    스케줄러 백그라운드 워커가 이미 픽업한 태스크가
+            //    테이블 drop 이후에도 upsert_item 을 시도하거나,
+            //    reindex_pending_embeddings 가 빈 테이블에 임베딩을
+            //    계속 쓰는 것을 방지합니다.
+            //    taskId: null → 전체 정리 모드 (모든 pending 태스크 폐기)
+            await invoke("stop_current_extraction", { taskId: null }).catch(() => null);
+            console.log("[RESET] Backend extraction stopped and cancellation token set.");
+
+            // 🌟 [RESET STEP 1] 백엔드 모델 및 스토어 완전 언로드
+            //    모델이 로드된 상태에서 reset 하면
+            //    deep_purge_resources 가 미호출되어 VRAM 이 잔존하고,
+            //    재시작 후 모델 재로드 시 이전 KV 캐시 참조 오류가 발생할 수 있습니다.
+            await invoke("unload_model").catch(() => null);
+            console.log("[RESET] Backend model and store unloaded.");
+
+            // 🌟 [RESET STEP 2] 프론트엔드 폴링 / 스케줄링 타이머 정리
+            //    syncData 폴링(3초)이 reset 직후에도 upsert_items 를 호출하면
+            //    방금 비운 테이블에 데이터가 다시 채워집니다.
+            //    reindex 디바운스 타이머(2초)도 동일하게 임베딩을 재실행합니다.
+            if (chatPollInterval) {
+                clearTimeout(chatPollInterval);
+                chatPollInterval = null;
+            }
+            stopAuthPolling();
+            isCommerceSyncRunning = false;
+            if (reindexDebounceTimer) {
+                clearTimeout(reindexDebounceTimer);
+                reindexDebounceTimer = null;
+            }
+            reindexScheduled = false;
+            isReindexing = false;
+            console.log("[RESET] All frontend polling and scheduling timers cleared.");
+
+            // 3. 프론트엔드 전역 상태 초기화
             await GlobalTaskManager.forceReset();
             isExtracting = false;
             isSearching = false;
@@ -7282,24 +7402,19 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             activeContext = { cc: "", bcc: "", ref: "" };
             if (docListContainer) docListContainer.innerHTML = "";
             if (chatTalks) chatTalks.innerHTML = "";
-            
-            // 2. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
+            // 4. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
             await invoke("reset_lancedb");
             console.log("[RESET] LanceDB backend reset complete.");
-            
-            // 3. 프론트엔드 Dexie DB 완전 삭제 후 재생성
+            // 5. 프론트엔드 Dexie DB 완전 삭제 후 재생성
             await appDb.delete();
             await appDb.open();
             console.log("[RESET] Dexie DB deleted and reopened.");
-
             // 🌟 v4 : 세대 전환 안내 플래그도 함께 초기화합니다.
             //    (전체 초기화 후에는 복구할 원본이 없으므로 안내가 다시 뜨면 안 됩니다)
             await kvRemove("schema_v4_notified");
-
-            // 4. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
+            // 6. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
             sessionStorage.clear();
-
-            // 5. 앱 강제 새로고침
+            // 7. 앱 강제 새로고침
             window.location.reload();
         } catch (e) {
             console.error("DB Initialization failed:", e);

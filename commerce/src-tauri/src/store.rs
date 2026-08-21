@@ -856,72 +856,104 @@ impl VectorStore {
     }
 
     pub async fn upsert_item(
-        &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
+        &self, table_name: &str, id: &str, type_: &str, mut data_val: Value, vector: Option<Vec<f32>>,
         from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
-         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
-         let table = self.conn.open_table(target).execute().await?;
+        let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
+        let table = self.conn.open_table(target).execute().await?;
 
-         let final_id = if id.is_empty() {
-             data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-         } else { id.to_string() };
+        let final_id = if id.is_empty() {
+            data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        } else { id.to_string() };
 
-         if final_id.is_empty() { return Ok(()); }
+        if final_id.is_empty() { return Ok(()); }
 
-         // 🌟 [SKIP GUARD] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
-         //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
-         let new_digest = digest.unwrap_or("").to_string();
-         let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        // 🌟 [SKIP GUARD] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
+        //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
+        let new_digest = digest.unwrap_or("").to_string();
+        let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Some(doc) = self.get_item_by_id(target, &final_id).await? {
+            if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() {
+                let old_digest = serde_json::from_str::<Value>(&doc.json_data)
+                    .ok()
+                    .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                if old_digest == new_digest {
+                    return Ok(());
+                }
+            }
+            // 🌟 [CC-INDEPENDENT SKIP] digest 가 달라도 embed=1 이고 chunk 가 존재하면
+            //    '이미 임베딩 완료된 문서의 cc 변경' 으로 간주하여
+            //    upsert 는 수행하되 embed 플래그를 data 에 강제 주입합니다.
+            //    (upsert 자체는 막지 않습니다 — cc/bcc/ref 갱신은 필요하므로)
+            let old_data = serde_json::from_str::<Value>(&doc.json_data).ok();
+            let old_embedded = old_data.as_ref()
+                .and_then(|v| v.get("embed"))
+                .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            if old_embedded {
+                if let Some(obj) = data_val.as_object_mut() {
+                    if obj.get("embed").map_or(true, |v| v.as_i64().unwrap_or(0) != 1) {
+                        obj.insert("embed".to_string(), json!(1));
+                    }
+                }
+            }
+        }
 
-         if let Some(doc) = self.get_item_by_id(target, &final_id).await? {
-             if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() {
-                 let old_digest = serde_json::from_str::<Value>(&doc.json_data)
-                     .ok()
-                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
-                     .unwrap_or_default();
-                 if old_digest == new_digest {
-                     return Ok(());
-                 }
-             }
-         }
+        println!("[DEBUG] store.upsert_item (v4) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
 
-         println!("[DEBUG] store.upsert_item (v4) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
+        let _ = table.delete(&format!("id = '{}'", final_id)).await;
 
-         let _ = table.delete(&format!("id = '{}'", final_id)).await;
+        let mut final_data = data_val.clone();
 
-         let mut final_data = data_val.clone();
+        // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
+        if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
+            if blob_base64.len() > 50 {
+                use base64::prelude::BASE64_STANDARD;
+                use base64::Engine;
+                if let Ok(decoded) = BASE64_STANDARD.decode(blob_base64) {
+                    if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
+                        final_data = decompressed;
+                    }
+                }
+            }
+        }
 
-         // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
-         if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
-             if blob_base64.len() > 50 {
-                 use base64::prelude::BASE64_STANDARD;
-                 use base64::Engine;
-                 if let Ok(decoded) = BASE64_STANDARD.decode(blob_base64) {
-                     if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
-                         final_data = decompressed;
-                     }
-                 }
-             }
-         }
+        // 🌟 봉투 값들을 data 안에도 동봉합니다.
+        //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
+        let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
 
-         // 🌟 봉투 값들을 data 안에도 동봉합니다.
-         //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
-         let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
-
-         // 🌟 [DRAFT MARKER PRESERVE] updated_at = 0 은 '값 없음' 이 아니라
-         //    '리스트 스캔으로 껍데기만 만들어진 draft' 라는 3개 저장소 공통 계약입니다.
-         //    (proxy/src/index.ts 의 `if(updated_at){ count++ } else { draft++ }` 와 동일 규칙)
-         //
-         //    기존 코드는 `if new_updated_at > 0 { .. } else { now() }` 로 0 을 현재 시각으로
-         //    덮어써 버렸고, 그 결과 scheduler 가 넣은 draft(0) / relay draft(0) /
-         //    서버가 내려준 draft(0) 이 전부 count 로 승격되어
-         //    Pages 트리의 Draft 표기가 항상 0 이 되었습니다.
-         //
-         //    판정 기준은 '값이 0인가' 가 아니라 '키가 존재하는가' 입니다.
-         //    키가 아예 없는 경우(pages 캐시 등)에만 현재 시각을 부여합니다.
-         let has_updated_key = data_val.get("updated_at").is_some();
-         let wall_now = chrono::Utc::now().timestamp_millis();
-         let updated_ts = if has_updated_key { new_updated_at } else { wall_now };
+        // 🌟 [DRAFT MARKER PRESERVE] updated_at = 0 은 '값 없음' 이 아니라
+        //    '리스트 스캔으로 껍데기만 만들어진 draft' 라는 3개 저장소 공통 계약입니다.
+        //    (proxy/src/index.ts 의 `if(updated_at){ count++ } else { draft++ }` 와 동일 규칙)
+        //
+        //    기존 코드는 `if new_updated_at > 0 { .. } else { now() }` 로 0 을 현재 시각으로
+        //    덮어써 버렸고, 그 결과 scheduler 가 넣은 draft(0) / relay draft(0) /
+        //    서버가 내려준 draft(0) 이 전부 count 로 승격되어
+        //    Pages 트리의 Draft 표기가 항상 0 이 되었습니다.
+        //
+        //    판정 기준은 '값이 0인가' 가 아니라 '키가 존재하는가' 입니다.
+        //    키가 아예 없는 경우(pages 캐시 등)에만 현재 시각을 부여합니다.
+        //
+        //    🌟 [DRAFT CONTRACT EXTENDED] data 내부의 항목 중 '목록 스캔으로 생성된
+        //    아이템'(type 이 commerce 6도메인 또는 trading 서식 코드에 해당)은
+        //    updated_at 키가 없어도 draft 로 간주합니다.
+        //    서버(Client Worker)가 items 행을 내려보낼 때 data 안에 updated_at 을
+        //    포함하지 않는 경우가 있으므로, 여기서 현재 시각을 부여하면
+        //    syncData 폴링마다 draft → count 승격이 반복됩니다.
+        let has_updated_key = data_val.get("updated_at").is_some();
+        let wall_now = chrono::Utc::now().timestamp_millis();
+        // 🌟 items 테이블의 도메인 타입은 '목록 스캔 → 상세 추출' 2단계를 거치므로,
+        //    updated_at 키가 없으면 draft(0) 로 시딩합니다.
+        //    users / pages 는 도메인 아이템이 아니므로 기존 규칙(현재 시각)을 유지합니다.
+        let is_domain_item = matches!(target, "items");
+        let updated_ts = if has_updated_key {
+            new_updated_at
+        } else if is_domain_item {
+            0
+        } else {
+            wall_now
+        };
 
          // 🌟 created_at 은 draft 여부와 무관하게 항상 실제 시각이어야 합니다.
          //    (기존에는 now_ts 를 폴백으로 써서 updated_at 과 결합돼 있었습니다)
@@ -1051,6 +1083,59 @@ impl VectorStore {
         self.upsert_item("users", &team_id, "team", team_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         self.upsert_item("users", user_address, "user", user_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         Ok(())
+    }
+
+    /// 🌟 [TEAM IDENTITY MIGRATION] 로그인 전 ZERO_ADDRESS 기반으로 생성된 문서들의
+    ///    `to` 필드를 실제 team_id 로 일괄 갱신합니다.
+    ///
+    ///  호출 시점: initialize_user_profiles 직후 (main.ts 의 initSession 에서
+    ///             currentSession.address 가 확정된 후)
+    ///
+    ///  대상: items / users / pages 3개 테이블에서
+    ///        `to = hash_id(ZERO_ADDRESS)` 인 행 전부
+    ///
+    ///  방식: get_all_items 로 스캔 → to 필드 교체 → upsert_item 재저장
+    ///        (LanceDB 는 UPDATE 가 없으므로 delete + add 패턴)
+    pub async fn migrate_team_identity(
+        &self,
+        old_to: &str,
+        new_to: &str,
+        new_from: &str,
+    ) -> Result<usize> {
+        if old_to == new_to { return Ok(0); }
+        let mut migrated = 0usize;
+        let tables = ["items", "users", "pages"];
+        for table in tables {
+            let filter = format!("`to` = '{}'", old_to);
+            let docs = self.get_all_items(table, 5000, 0, Some(filter)).await.unwrap_or_default();
+            for doc in docs {
+                let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("to".to_string(), json!(new_to));
+                    obj.insert("from".to_string(), json!(new_from));
+                }
+                // 기존 vector 를 재사용합니다 (임베딩 재생성 불필요)
+                let vec = if doc.vector.len() == 384 { Some(doc.vector.clone()) } else { None };
+                let _ = self.upsert_item(
+                    table,
+                    &doc.id,
+                    &doc.r#type,
+                    data,
+                    vec,
+                    Some(new_from),
+                    Some(new_to),
+                    Some(&doc.cc),
+                    Some(&doc.bcc),
+                    Some(&doc.r#ref),
+                    None,
+                ).await;
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            println!("[MIGRATE] team identity '{}' → '{}' : {} docs migrated", old_to, new_to, migrated);
+        }
+        Ok(migrated)
     }
 
     // 🌟 [ROW READER] RecordBatch → TradeDocument 변환을 한 곳으로 모읍니다.
