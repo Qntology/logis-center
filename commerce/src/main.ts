@@ -1101,13 +1101,26 @@ async function syncCommerceInBackground() {
             } catch (err) {
                 console.warn("[SYNC-BG] pako decompression failed:", err);
             }
+            // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
+            //    syncData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
+            const bgTombstones = await loadTalkTombstones();
+            let bgTombBlocked = 0;
+
             const filteredResults = response.results.filter((newItem: any) => {
+                if (bgTombstones.has(String(newItem.id))) {
+                    bgTombBlocked++;
+                    return false;
+                }
                 const existingEl = document.getElementById(newItem.id);
                 if (!existingEl) return true;
                 let localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
                 const serverUpdated = newItem.updated_at || newItem.created_at || 0;
                 return serverUpdated > localUpdated;
             });
+
+            if (bgTombBlocked > 0) {
+                console.log(`[TOMBSTONE] 🪦 [BG] 삭제된 메시지 ${bgTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
+            }
             if (filteredResults.length > 0) {
                 for (const r of filteredResults) {
                     if (!r) continue;
@@ -1235,26 +1248,33 @@ const ITEMS_SCHEMA = [
 ].join(', ');
 
 
-// 🌟 v12 : translit_cache 에 source_word / doc_lang 단독 인덱스를 추가합니다.
+// 🌟 v13 : talk_tombstones 추가 — 삭제한 채팅의 '묘비'
 //  ── 왜 필요한가 ──
-//   Dexie 의 복합 인덱스 '[source_word+doc_lang]' 는 source_word 단독 where 조회에
-//   사용할 수 없습니다. 그래서 "이 원문이 다른 언어 키로 저장돼 있는가?" 를
-//   확인할 방법이 아예 없었고, 캐시 미스의 원인이 (a) 저장 실패인지
-//   (b) 언어 축이 갈린 것인지 로그만으로 구분할 수 없었습니다.
-//   (실측: doc_lang 이 캐시 히트 태스크에서 'en' 으로 고정되어 'ko' 로 저장된
-//    레코드를 영원히 못 찾는 상태였습니다)
+//   Client Worker(index.ts)에는 talk 개별 삭제 엔드포인트가 없습니다.
+//     DELETE 핸들러 = { type=crons → tasks 삭제 } | { 그 외 → S3 인증 해시 삭제(로그아웃) }
+//   PUT 은 talk.id 를 hashId() 난수로 새로 발급하므로 기존 행을 지목할 수도 없습니다.
+//   따라서 서버 행은 살아남고, 로컬에서만 지우면 다음 syncData 폴링(3초)이
+//   `!existingEl && !localMap.has(id)` 조건을 통과시켜 그대로 부활시킵니다.
+//   '이 id 는 내가 의도적으로 지웠다' 는 사실을 로컬에 영구 기록해야
+//   재삽입을 구조적으로 차단할 수 있습니다.
 //
-//  ⚠️ stores() 에는 앱이 쓰는 전 테이블을 항상 함께 적어야 합니다.
-//     Dexie 는 선언되지 않은 object store 를 업그레이드 시점에 삭제합니다.
-//     인덱스만 추가하는 변경이므로 upgrade 콜백은 필요 없습니다(자동 백필).
-appDb.version(12).stores({
+//  ── 왜 GC 를 하지 않는가 ──
+//   서버 행이 살아 있는 한 묘비를 지우는 순간 메시지가 되살아납니다.
+//   서버 행의 소멸 여부를 클라이언트가 확인할 방법이 없으므로 만료를 두지 않습니다.
+//   행 하나는 (42자 id + 타임스탬프) 이므로 1만 건 삭제해도 1MB 미만입니다.
+//   전체 초기화(btn-reset-db)는 Dexie DB 자체를 삭제하므로 함께 정리됩니다.
+//
+//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
+//     업그레이드 시점에 삭제합니다. 아래에는 v12 의 전 테이블이 그대로 포함되어 있습니다.
+appDb.version(13).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
     ts_queue: 'taskId, type',
     talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
     users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
     pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin',
-    translit_cache: '++id, source_word, doc_lang, [source_word+doc_lang], created_at'
+    translit_cache: '++id, source_word, doc_lang, [source_word+doc_lang], created_at',
+    talk_tombstones: 'id, deleted_at, ref'
 });
 
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
@@ -1285,6 +1305,123 @@ async function kvRemove(key: string) {
     } catch (e) {
         console.warn(`[KV] remove('${key}') failed:`, e);
     }
+}
+
+// =====================================================================
+// 🌟 [TALK TOMBSTONE] 삭제한 채팅의 묘비
+// ---------------------------------------------------------------------
+//  삭제 범위 계약:
+//    ① 내 PC   : LanceDB messages + Dexie talks + DOM 에서 완전 제거
+//    ② 내 PC   : 묘비를 남겨 서버 폴링의 재삽입을 영구 차단
+//    ③ 서버    : 행은 그대로 남습니다 (워커에 talk 삭제 엔드포인트 없음)
+//    ④ 타 사용자: 각자의 로컬 원장에 그대로 남아 계속 노출됩니다
+//                 (syncData 는 가산 전용이라 서버에서 사라져도 지우지 않습니다)
+// =====================================================================
+let talkTombstoneCache: Set<string> | null = null;
+
+/** 묘비 목록을 메모리에 적재합니다. 최초 1회만 Dexie 를 읽습니다. */
+async function loadTalkTombstones(): Promise<Set<string>> {
+    if (talkTombstoneCache) return talkTombstoneCache;
+    const s = new Set<string>();
+    try {
+        const rows = await appDb.table("talk_tombstones").toArray();
+        for (const r of rows) {
+            if (r && r.id) s.add(String(r.id));
+        }
+        if (s.size > 0) {
+            console.log(`[TOMBSTONE] 삭제 묘비 ${s.size}건 적재 완료. 해당 메시지는 서버 폴링으로 부활하지 않습니다.`);
+        }
+    } catch (e) {
+        console.warn("[TOMBSTONE] load failed:", e);
+    }
+    talkTombstoneCache = s;
+    return s;
+}
+
+/** 동기 조회용. loadTalkTombstones() 가 선행되어야 정확합니다. */
+function isTalkTombstoned(id: string): boolean {
+    if (!id) return false;
+    return talkTombstoneCache ? talkTombstoneCache.has(String(id)) : false;
+}
+
+/** 묘비를 세웁니다. 메모리 캐시와 Dexie 를 동시에 갱신합니다. */
+async function addTalkTombstone(id: string, refVal: string = "") {
+    if (!id) return;
+    const cache = await loadTalkTombstones();
+    cache.add(String(id));
+    try {
+        await appDb.table("talk_tombstones").put({
+            id: String(id),
+            ref: refVal || "",
+            deleted_at: Date.now()
+        });
+    } catch (e) {
+        console.warn(`[TOMBSTONE] put('${id}') failed:`, e);
+    }
+}
+
+/**
+ * 🌟 [DELETE CHAT MESSAGE] 채팅 한 건을 내 기기에서 삭제합니다.
+ *
+ *  순서가 중요합니다. 묘비를 '가장 먼저' 세워야
+ *  삭제 도중에 폴링이 끼어들어도 재삽입되지 않습니다.
+ *    ① 묘비 기록          → 재삽입 영구 차단
+ *    ② LanceDB messages   → get_chat_messages 조회 결과에서 제거
+ *    ③ Dexie talks 캐시   → syncData 의 localMap 잔재 제거
+ *    ④ DOM                → 화면 즉시 반영
+ *
+ *  ⚠️ 서버 호출은 하지 않습니다. index.ts 의 DELETE 는
+ *     `type=crons` 가 아니면 S3 인증 해시(/hash/{hash})를 지워
+ *     사용자를 강제 로그아웃시키기 때문입니다.
+ */
+async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } = {}): Promise<boolean> {
+    if (!msgId) return false;
+
+    if (!opts.skipConfirm) {
+        const confirmed = await ask(
+            "이 메시지를 삭제하시겠습니까?\n\n" +
+            "· 내 기기에서 완전히 사라지며 다시 나타나지 않습니다.\n" +
+            "· 이미 메시지를 받아간 다른 팀원의 화면에는 그대로 남습니다.",
+            { title: "Delete Message", kind: "warning" }
+        );
+        if (!confirmed) return false;
+    }
+
+    const el = document.getElementById(msgId) as HTMLElement | null;
+    const refVal = el?.dataset.ref || activeContext.ref || "";
+
+    // ① 묘비 (가장 먼저)
+    await addTalkTombstone(msgId, refVal);
+
+    // ② LanceDB messages
+    //    upsert_items 의 talk 분기가 task_id 에 자기 id 를 각인하므로
+    //    delete_message(taskId) 가 정확히 이 한 행만 지웁니다.
+    try {
+        await invoke("delete_message", { taskId: msgId });
+    } catch (e) {
+        console.warn(`[CHAT] LanceDB delete_message('${msgId}') failed:`, e);
+    }
+
+    // ③ Dexie talks 캐시
+    try {
+        if (appDb) await appDb.table("talks").delete(msgId);
+    } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+    // ④ DOM
+    if (el) el.remove();
+
+    // 마지막 한 건을 지웠다면 안내 문구를 복원합니다.
+    if (chatTalks && chatTalks.querySelectorAll('.chat-talk').length === 0) {
+        if (!chatTalks.querySelector('.no-msg')) {
+            chatTalks.insertAdjacentHTML(
+                'beforeend',
+                "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.8rem;'>No messages yet.</div>"
+            );
+        }
+    }
+
+    console.log(`[CHAT] 🗑️ [DELETED] '${msgId}' 를 내 기기에서 삭제했습니다. (서버 행 및 타 사용자 로컬 원장은 유지)`);
+    return true;
 }
 
 // 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
@@ -2212,6 +2349,35 @@ if (chatForm) {
                 setTimeout(() => { scrollEl.style.transition = ""; }, 300);
             }
         }, 100);
+    });
+}
+
+// 🌟 [DELETE DELEGATION] 삭제 버튼은 말풍선이 재렌더링될 때마다 새로 만들어지므로
+//  개별 노드에 리스너를 붙이면 upsertChatMessages 의 replaceChild 시점에 유실됩니다.
+//  컨테이너에 위임 리스너 하나만 두면 이후 어떤 렌더링 경로에서도 그대로 동작합니다.
+if (chatTalks) {
+    chatTalks.addEventListener("click", async (e) => {
+        const target = e.target as HTMLElement;
+        const btn = target.closest('.btn-delete-talk') as HTMLElement | null;
+        if (!btn) return;
+
+        // 🌟 태스크 말풍선의 handleTaskClick 이 함께 발화하지 않도록 반드시 차단합니다.
+        e.preventDefault();
+        e.stopPropagation();
+
+        const talkId = btn.dataset.talkId;
+        if (!talkId) return;
+
+        btn.style.pointerEvents = "none";
+        btn.style.opacity = "0.15";
+
+        const ok = await deleteChatMessage(talkId);
+
+        if (!ok) {
+            // 사용자가 취소했으면 버튼을 원상복구합니다.
+            btn.style.pointerEvents = "";
+            btn.style.opacity = "0.35";
+        }
     });
 }
 
@@ -3750,7 +3916,20 @@ async function syncData() {
                 localMap.set(item.id, item.updated_at_ts || item.updated_at || item.created_at_ts || item.created_at || 0);
             });
 
+            // 🌟 [TOMBSTONE GUARD] 내가 삭제한 메시지는 서버에 행이 남아 있으므로
+            //    매 폴링마다 다시 내려옵니다. 그때 로컬에는 DOM 도 Dexie 도 없으니
+            //    바로 아래 `!existingEl && !localMap.has(id)` 조건을 통과해 재삽입됩니다.
+            //    묘비 조회는 메모리 Set 이라 폴링 비용이 사실상 0 입니다.
+            const tombstones = await loadTalkTombstones();
+            let tombBlocked = 0;
+
             const filteredResults = response.results.filter((newItem: any) => {
+                // 🌟 삭제 의사가 기록된 id 는 어떤 조건보다 먼저, 무조건 차단합니다.
+                if (tombstones.has(String(newItem.id))) {
+                    tombBlocked++;
+                    return false;
+                }
+
                 const existingEl = document.getElementById(newItem.id);
                 
                 // 🌟 완전 신규 데이터 (DOM에도 없고 로컬 DB 캐시에도 없는 경우)는 조건 없이 즉시 통과
@@ -3769,6 +3948,10 @@ async function syncData() {
                 const serverUpdated = newItem.updated_at || newItem.created_at || 0;
                 return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
             });
+
+            if (tombBlocked > 0) {
+                console.log(`[TOMBSTONE] 🪦 삭제된 메시지 ${tombBlocked}건의 서버 재삽입을 차단했습니다.`);
+            }
 
             if (filteredResults.length > 0) {
                 // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
@@ -6835,7 +7018,9 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 async function checkAuthStatus() {
-    if (!currentSession.hash) return;
+    // 🌟 [BOOTSTRAP 허용] 기존에는 hash 가 없으면 즉시 return 했습니다.
+    //    이제 hash 발급을 서버에 위임하므로, hash 가 없는 상태에서도
+    //    '자격증명 없는 bootstrap 요청' 을 보내 서버가 유효한 쌍을 발급하게 합니다.
     const origin = "https://commerce.logis.center"; 
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
@@ -6850,10 +7035,30 @@ async function checkAuthStatus() {
         const queryParams: Record<string, string> = { 
             origin: origin, 
             created_at: createdAt.toString(), 
-            hash: currentSession.hash, 
             href: targetHref 
         };
-        if (currentSession.token) queryParams.token = currentSession.token;
+
+        // 🌟 [PAIRED CREDENTIAL] hash 와 token 은 반드시 '함께' 보내야 합니다.
+        //  ── 근거 ──
+        //   워커의 세션 게이트는 다음 한 줄입니다.
+        //     if(cookies.hash || (req.query.hash && req.query.token))
+        //   Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를 전혀 보내지 않으므로
+        //   cookies.hash 는 항상 빈 값이고, (hash && token) 쌍이 유일한 통과 조건입니다.
+        //   게이트를 통과해야만 S3 HEAD 가 실행되어 balance 가 정의되고,
+        //   balance 가 undefined 로 남으면 아래 블록이 무조건 발동합니다.
+        //     if(typeof balance == "undefined"){ ... ethers.Wallet.createRandom() ... }
+        //   즉 hash 만 단독으로 보내는 순간 서버는 100% 새 hash 를 발급하고,
+        //   화면의 QR 주소가 바뀝니다. 이것이 '요청할 때마다 주소가 달라지는' 원인입니다.
+        //
+        //  둘 중 하나라도 없으면 아예 보내지 않고 깨끗하게 재발급받습니다.
+        //  (반쪽짜리 자격증명을 보내는 것과 결과가 같으면서, 서버 쪽 로그가 명확해집니다)
+        const hasPairedCredential = !!(currentSession.hash && currentSession.token);
+        if (hasPairedCredential) {
+            queryParams.hash = currentSession.hash;
+            queryParams.token = currentSession.token as string;
+        } else {
+            console.log("[AUTH] 🔑 자격증명 쌍이 없어 bootstrap 요청을 보냅니다. 서버가 (hash, token) 을 새로 발급합니다.");
+        }
 
         // 🌟 [SENDER IMPRINT] Client Worker(index.ts)는 method 와 무관하게
         //    매 요청의 세션 블록에서 아래를 수행합니다.
@@ -6873,8 +7078,18 @@ async function checkAuthStatus() {
 
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
-        
-        const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: { hash: currentSession.hash, token: currentSession.token } });
+
+        // 🌟 [SESSION PARAMS GUARD] proxy_fetch 는 session_params 의 hash/token 을
+        //    쿼리에 '한 번 더' append 합니다. (Rust proxy_fetch 의 DETAIL 1 블록)
+        //    쌍이 온전하지 않을 때 hash 만 append 되면 위 쿼리 조립을 무력화하므로,
+        //    쌍이 있을 때만 넘깁니다.
+        const sessionParams = hasPairedCredential
+            ? { hash: currentSession.hash, token: currentSession.token }
+            : null;
+
+        const sentHash = currentSession.hash || "";
+
+        const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: sessionParams });
         
         // [FIX] Step the spinner frame only when result arrives
         stepQrSpinner();
@@ -6882,8 +7097,24 @@ async function checkAuthStatus() {
         let session = data.session || data; 
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
+
+            // 🌟 [CREDENTIAL ROTATION DETECT] 온전한 쌍을 보냈는데도 서버가 다른 hash 를 돌려줬다면
+            //    S3 의 /hash/{hash} 객체가 사라졌거나 워커 try 블록이 예외로 빠진 것입니다.
+            //    조용히 넘어가면 원인 추적이 불가능하므로 반드시 표면화합니다.
+            if (hashChanged && hasPairedCredential) {
+                console.warn(
+                    `[AUTH] ⚠️ 서버가 자격증명을 거부하고 hash 를 회전시켰습니다. ` +
+                    `sent='${sentHash}' → issued='${session.hash}'. ` +
+                    `(S3 /hash/{hash} 객체 소실 또는 워커 세션 블록 예외 가능성)`
+                );
+            }
+
             currentSession = { ...currentSession, ...session };
             await saveSession();
+
+            // 🌟 서버가 응답으로 돌려준 hash 이므로 이제 QR 을 그려도 되는 '살아 있는 주소' 입니다.
+            isHashServerConfirmed = true;
+
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
 
             console.log('currentSession',currentSession);
@@ -6948,6 +7179,18 @@ function updateAuthUI() {
 
 let authPollInterval: number | null = null;
 
+// 🌟 [QR IDEMPOTENCY] 마지막으로 QR 캔버스를 그린 hash 값입니다.
+//  performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
+//  채팅이 갱신될 때마다 QR 노드를 파괴·재생성하고 있었습니다.
+//  같은 hash 라면 다시 그릴 이유가 없으므로 이 값으로 차단합니다.
+let renderedQrHash = "";
+
+// 🌟 [SERVER-CONFIRMED HASH] 서버가 실제로 응답으로 돌려준 hash 인지 여부입니다.
+//  클라이언트가 로컬에서 만든 임시 hash 는 S3 에 객체가 없어
+//  스캔해도 절대 인증되지 않는 '죽은 주소' 입니다.
+//  서버가 확인해 준 hash 로만 QR 을 그리기 위해 구분합니다.
+let isHashServerConfirmed = false;
+
 function stopAuthPolling() {
     if (authPollInterval) {
         clearTimeout(authPollInterval);
@@ -6980,7 +7223,43 @@ function startAuthPolling() {
 }
 
 async function performQrAuth() {
-    if (!chatTalks || !currentSession.hash) return;
+    if (!chatTalks) return;
+
+    // 🌟 [DEAD ADDRESS GUARD] 서버가 확인해 주지 않은 hash 로는 QR 을 그리지 않습니다.
+    //    그런 hash 는 S3 에 객체가 없어 스캔해도 인증 메일이 매칭되지 않는 죽은 주소이며,
+    //    잠시 뒤 서버가 새 hash 를 내려주면 화면의 주소가 바뀌어 사용자를 혼란시킵니다.
+    //    대신 '준비 중' 안내를 띄우고, checkAuthStatus 가 hash 를 확보하는 즉시
+    //    hashChanged 분기가 이 함수를 다시 불러 실제 QR 로 교체합니다.
+    if (!currentSession.hash || !isHashServerConfirmed) {
+        const placeholderId = "msg-qr-auth";
+        if (!document.getElementById(placeholderId)) {
+            chatTalks.insertAdjacentHTML('beforeend',
+                `<div class="chat-talk system" id="${placeholderId}" data-created-at="9999999999999">
+                    <div class="chat-message" style="padding:0; background:#fff; color:#000; border:0;">
+                        <div style="font-size:0.8rem; font-weight:bold; color:#333;">
+                            <span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Preparing secure session...
+                        </div>
+                    </div>
+                </div>`
+            );
+        }
+        // 서버에서 hash 를 받아와야 하므로 폴링은 반드시 가동합니다.
+        startAuthPolling();
+        return;
+    }
+
+    // 🌟 [IDEMPOTENT RENDER] 같은 hash 로 이미 QR 을 그려 두었다면 다시 그리지 않습니다.
+    //    performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
+    //    채팅이 갱신될 때마다 QR 노드를 remove → insert → 캔버스 재생성 하고 있었고,
+    //    함수 말미의 startAuthPolling() 이 3초 타이머를 계속 리셋해
+    //    인증 상태 확인이 지연되는 부작용까지 있었습니다.
+    const alreadyRendered = document.getElementById("qr-code-target");
+    if (alreadyRendered && renderedQrHash === currentSession.hash) {
+        // 폴링이 꺼져 있을 수 있으므로 그것만 보증하고 즉시 반환합니다.
+        if (!authPollInterval && !currentSession.email) startAuthPolling();
+        return;
+    }
+
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
     const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.8rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
@@ -6988,7 +7267,13 @@ async function performQrAuth() {
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
         qrTarget.innerHTML = "";
-        new (window as any).QRCode(qrTarget, { text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
+        const mailtoAddr = `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`;
+        new (window as any).QRCode(qrTarget, { text: mailtoAddr, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
+
+        // 🌟 이 hash 로 그렸다는 사실을 기록해 다음 호출부터 재생성을 차단합니다.
+        renderedQrHash = currentSession.hash;
+        console.log(`[AUTH] 🔳 QR rendered for server-confirmed hash '${currentSession.hash}'`);
+
         const scroll = document.getElementById("chat-scroll");
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     }
@@ -7082,6 +7367,11 @@ async function initSession() {
         try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
     }
 
+    // 🌟 [TOMBSTONE PRELOAD] 삭제 묘비를 메모리에 먼저 올립니다.
+    //    startPolling() 이 첫 syncData 를 쏘기 전에 캐시가 채워져야
+    //    앱 재시작 직후 한 번의 폴링 동안 삭제된 메시지가 되살아나는 창이 생기지 않습니다.
+    await loadTalkTombstones();
+
     // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기 및 30일이 지난 오래된 검색 결과를 완벽 청소합니다!
     const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
     const nowTimeMs = Date.now();
@@ -7136,13 +7426,42 @@ async function initSession() {
     const saved = await kvGet("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = await kvGet("device_hash"); if (legacy) currentSession.hash = legacy; }
-    
-    if (!currentSession.hash && ethers) { 
-        const w = ethers.Wallet.createRandom(); 
-        currentSession.hash = w.address.toLowerCase().replace("0x", ""); 
-        await saveSession(); 
+
+    // 🌟 [BOOTSTRAP HASH 폐기]
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 여기서 ethers.Wallet.createRandom() 으로 임시 hash 를 만들었습니다.
+    //   그런데 이 값은
+    //     ① S3 의 /hash/{hash} 객체가 존재하지 않고
+    //     ② 짝이 되는 token 이 없습니다.
+    //   Client Worker(index.ts)의 세션 게이트는
+    //     if(cookies.hash || (req.query.hash && req.query.token))
+    //   인데, Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를
+    //   전혀 보내지 않으므로 워커의 cookies.hash 는 항상 빈 값입니다.
+    //   결국 (hash && token) 쌍이 유일한 통과 조건인데 임시 hash 는 token 이 없어
+    //   반드시 게이트에서 탈락하고, 그러면
+    //     if(typeof balance == "undefined"){ ... createRandom() ... }
+    //   가 발동해 서버가 새 hash 를 발급합니다.
+    //   즉 이 임시 hash 로 그린 QR 은 '스캔해도 절대 인증되지 않는 죽은 주소' 이고,
+    //   서버 응답이 오는 순간 화면의 주소가 바뀌는 원인이었습니다.
+    //
+    //  ── 해결 ──
+    //   hash 발급은 전적으로 서버에 위임합니다.
+    //   hash 가 비어 있으면 checkAuthStatus 가 자격증명 없이 bootstrap 요청을 보내고,
+    //   서버가 S3 에 PUT 까지 마친 유효한 (hash, token) 쌍을 돌려줍니다.
+    //   그 값으로만 QR 을 그리므로 주소가 흔들릴 여지가 사라집니다.
+    if (currentSession.hash && currentSession.token) {
+        // 저장된 자격증명이 온전한 쌍이면 서버 확인 전까지는 잠정 신뢰합니다.
+        isHashServerConfirmed = true;
+    } else if (currentSession.hash && !currentSession.token) {
+        // 🌟 [ORPHAN CREDENTIAL] hash 만 남고 token 이 유실된 상태입니다.
+        //    이 hash 를 그대로 보내면 게이트에서 탈락해 서버가 매번 새 hash 를 발급합니다.
+        //    쌍을 깨뜨려 버리고 깨끗한 bootstrap 을 유도하는 편이 안전합니다.
+        console.warn(`[AUTH] ⚠️ hash 는 있으나 token 이 없어 세션이 성립하지 않습니다. 폐기 후 서버에서 재발급받습니다. (orphan hash: ${currentSession.hash})`);
+        currentSession.hash = "";
+        currentSession.token = undefined;
+        isHashServerConfirmed = false;
     }
-    
+
     await saveSession(); 
     currentSession.address = currentSession.address || ZERO_ADDRESS;
     currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
@@ -8286,6 +8605,11 @@ interface ChatMessage {
     status: number;
     task_id?: string;
     content?: string | any;
+    // 🌟 [OWNERSHIP] 삭제 버튼 노출 판정에 사용합니다.
+    //    upsertChatMessages 는 from === currentSession.address 일 때 role 을 'user' 로 재계산하므로
+    //    실제 판정은 role 로 하되, DOM 에 원본 from 을 남겨 두면 이후 감사·디버깅이 쉬워집니다.
+    from?: string;
+    ref?: string;
 }
 
 // 🌟 [LOCAL ECHO] 낙관적 로컬 저장 행의 id 접두사입니다.
@@ -8404,6 +8728,22 @@ async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string
 
 async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
+
+    // 🌟 [TOMBSTONE GATE] 렌더링 직전 최종 방어선입니다.
+    //    syncData 를 거치지 않는 경로(loadMoreChat → get_chat_messages,
+    //    renderMessage 직접 호출 등)가 새로 생겨도 삭제한 메시지가
+    //    화면에 되살아나지 않도록 여기서 한 번 더 걸러냅니다.
+    if (messages && messages.length > 0) {
+        const tombs = await loadTalkTombstones();
+        if (tombs.size > 0) {
+            const before = messages.length;
+            messages = messages.filter(m => !tombs.has(String(m.id || "")) && !tombs.has(String(m.task_id || "")));
+            if (before !== messages.length) {
+                console.log(`[TOMBSTONE] 🪦 [RENDER] 삭제된 메시지 ${before - messages.length}건을 렌더링 대상에서 제외했습니다.`);
+            }
+            if (messages.length === 0) return;
+        }
+    }
 
     // 🌟 [EMPTY NOTICE SWEEP] "No messages yet." 안내는 infoNodes 로 분류되어
     //    아래 정렬 로직에서 항상 최상단에 유지됩니다.
@@ -8646,16 +8986,32 @@ function createMessageHTML(msg: ChatMessage) {
     // 🌟 핵심: msg.text가 비어있지 않도록 보장하여 새로고침 시에도 내용 표시
     const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
 
+    // 🌟 [DELETE AFFORDANCE] 삭제 버튼은 '내가 쓴 순수 채팅' 에만 노출합니다.
+    //  · 태스크 말풍선(검색/추출 진행 상태)은 제외
+    //    → delete_message(task_id) 가 그 태스크의 질문 말풍선까지 함께 지우고,
+    //      중단은 이미 btn-stop-task 가 담당합니다.
+    //  · 상대방 메시지는 제외
+    //    → 삭제는 어차피 내 기기 로컬에만 적용되므로 남의 글을 지우는 것은
+    //      권한 행사가 아니라 '내 화면 숨김' 에 불과해 오해를 부릅니다.
+    //  role 은 upsertChatMessages 가 from === currentSession.address 로 재계산한 값입니다.
+    const canDelete = !isTaskBubble && msg.role === 'user' && !!msg.id;
+    const deleteBtn = canDelete
+        ? `<button class="btn-delete-talk" data-talk-id="${domId}" title="Delete for me"
+                style="background:none; border:none; color:inherit; opacity:0.35; cursor:pointer; font-size:0.75rem; line-height:1; padding:0 0 0 8px;">✕</button>`
+        : "";
+
     return `<div id="${domId}" class="chat-talk ${roleClass} ${bubbleClass}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
         data-updated-at="${msg.updated_at}"
         data-created-at="${msg.created_at}"
+        data-from="${msg.from || ''}"
+        data-ref="${msg.ref || ''}"
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
-            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
                 <span>${msg.role === 'user' ? '@YOU' : 'LOGIS AI'}</span>
-                <span>${timeStr}</span>
+                <span style="display:flex; align-items:center;">${timeStr}${deleteBtn}</span>
             </div>
             <div class="content">${displayContent}</div>
             ${isTaskBubble && msg.status !== 0 ? `
@@ -8894,8 +9250,16 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 chatTalks.insertAdjacentHTML('afterbegin', endHtml);
             }
 
+            // 🌟 [QR RE-RENDER GUARD] 이 호출은 채팅이 갱신될 때마다 발생합니다.
+            //    performQrAuth 내부에 renderedQrHash 멱등성 검사가 들어갔으므로
+            //    이미 같은 hash 로 그려져 있으면 즉시 반환하고 노드를 건드리지 않습니다.
+            //    다만 이미 그려져 있고 hash 도 동일하다면 함수 호출 자체를 생략해
+            //    불필요한 DOM 조회조차 하지 않도록 여기서 한 번 더 걸러 냅니다.
             if (!currentSession.email && currentTab === "settings") {
-                performQrAuth();
+                const qrExists = !!document.getElementById("qr-code-target");
+                if (!qrExists || renderedQrHash !== currentSession.hash) {
+                    performQrAuth();
+                }
             }
         }
     } catch (e) { 
