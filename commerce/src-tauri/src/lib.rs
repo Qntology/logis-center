@@ -341,23 +341,26 @@ async fn reindex_pending_embeddings(
         //    upsert_items 가 items 로 라우팅하는데 제외 목록에는 없어 벡터화되고 있었고,
         //    parse_analytic_query 는 이 두 타입을 검색 스코프에서 제외하므로
         //    만들기만 하고 한 번도 쓰이지 않는 벡터였습니다.
-        // 🌟 [EMBED TYPE GUARD] 검색 벡터화가 무의미한 타입을 구조적으로 배제합니다.
-        //    pages/talk/prompt/ai_search/question/answer 는 검색 대상이 아니며,
-        //    click/hover/change/report 는 analytics 전용이라 청크 인덱싱이 불필요합니다.
+        // 🌟 [EMBED TYPE GUARD] 검색 벡터화가 무의미한 타입만 배제합니다.
+        //    pages/talk/prompt/ai_search 는 검색 대상이 아니고,
+        //    question/answer 는 parse_analytic_query 가 검색 스코프에서 제외하며,
         //    team/user/member 는 통계 문서라 임베딩 대상이 아닙니다.
-        const EMBED_EXCLUDE_TYPES: [&str; 12] = [
+        //
+        //    🌟 [ANALYTICS ALLOW]
+        //     ── 무엇이 문제였나 ──
+        //      click / hover 를 이 목록에 넣고, 바로 아래에서 report 까지 별도로 건너뛰어
+        //      analytics 4종(click/hover/change/report) 중 change 하나만 벡터화되었습니다.
+        //      나머지 3종은 vector 컬럼이 0벡터로 남아 search_items 의 ANN 트랙이
+        //      의미 없는 비교를 하게 되고, item_chunks 도 없어 STAGE-4 가 통째로 비었습니다.
+        //      "D1 에서 이벤트를 받아와도 검색이 아무것도 못 찾는" 상태의 직접 원인입니다.
+        //     ── 비용 ──
+        //      analytics 도메인 타입은 get_detail_schema_fields 에 스키마가 없어
+        //      index_item_chunks 가 조기 종료됩니다. 즉 추가 비용은 '문서 벡터 1개' 뿐입니다.
+        const EMBED_EXCLUDE_TYPES: [&str; 10] = [
             "pages", "page", "talk", "prompt", "ai_search",
             "question", "answer", "team", "user", "member",
-            "click", "hover",
         ];
         if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
-            continue;
-        }
-        // 🌟 [REPORT GUARD] analytics report 는 action 텍스트가 이미
-        //    reindex 상단에서 analytic_text 로 벡터화되므로,
-        //    청크 인덱싱(index_item_chunks)은 스키마 부재로 조기 종료됩니다.
-        //    여기서도 명시적으로 건너뛰어 불필요한 모델 호출을 방지합니다.
-        if doc.r#type == "report" || doc.r#type == "change" {
             continue;
         }
         // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
@@ -429,16 +432,47 @@ async fn reindex_pending_embeddings(
     model.ensure_embedding().await.map_err(|e| e.to_string())?;
 
     let mut processed = 0usize;
-
     for doc in pending {
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
-
         let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
-
+        // 🌟 [BLOB DECODE GUARD] json_data 내부의 "data" 키가 아직
+        //    base64(gzip) 문자열로 남아 있으면 해제합니다.
+        //    upsert_items 가 이미 처리하지만, 구버전 저장 데이터나
+        //    직접 LanceDB 에 삽입된 행에는 미처리 상태가 있을 수 있습니다.
+        if let Some(blob_b64) = data.get("data").and_then(|v| v.as_str()) {
+            if blob_b64.len() > 50 {
+                use base64::prelude::BASE64_STANDARD;
+                use base64::Engine;
+                if let Ok(decoded) = BASE64_STANDARD.decode(blob_b64) {
+                    if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
+                        // 해제된 내용을 현재 data 에 병합합니다.
+                        if let (Some(base_obj), Some(inner_obj)) = (data.as_object_mut(), decompressed.as_object()) {
+                            for (k, v) in inner_obj {
+                                if !base_obj.contains_key(k) {
+                                    base_obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                            base_obj.remove("data");
+                        }
+                    }
+                }
+            }
+        }
         // 🌟 [ANALYTICS] Cron Worker 가 구조화한 'action'(사용자 의도 문장)이 벡터의 본체입니다.
-        //    action 이 없으면 summary → cross_action_flow 순으로 폴백합니다.
-        let analytic_text = data.get("action").and_then(|v| v.as_str()).unwrap_or("")
-            .trim().to_string();
+        //    action 이 없으면 summary → cross_action_flow → intent_evolution 순으로 폴백합니다.
+        //
+        //    🌟 [RAW ARRAY GUARD] content.js 가 처음 올린 원시 이벤트의 action 은
+        //      ["<div class=...>...</div>"] 형태의 '배열' 입니다.
+        //      as_str() 이 None 을 돌려주므로 값 자체는 무해했지만,
+        //      아래 폴백 체인 끝의 json_to_natural_language 가 relate(HTML 배열)까지
+        //      통째로 펼쳐 벡터에 HTML 덩어리를 밀어 넣습니다.
+        //      Worker 의 GET 은 updated_at > 0 인 구조화 완료 행만 내려주므로
+        //      정상 경로에서는 배열이 오지 않지만, 구버전 잔재를 위해 명시적으로 배제합니다.
+        let analytic_text = data.get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         // 🌟 [EMPTY-AWARE FALLBACK] Option 의 or_else 는 None 일 때만 발화합니다.
         //    summary 키가 존재하되 빈 문자열이면 Some("") 이 되어
         //    cross_action_flow 폴백이 영원히 도달하지 않았습니다.
@@ -450,7 +484,12 @@ async fn reindex_pending_embeddings(
         };
         let analytic_fallback = pick("summary")
             .or_else(|| pick("cross_action_flow"))
+            .or_else(|| pick("intent_evolution"))
             .unwrap_or_default();
+        // 🌟 [RAW EVENT DETECT] 구조화 전 원시 이벤트인지 판정합니다.
+        //    action 이 배열이거나 relate 가 배열이면 Cron Worker 가 아직 손대지 않은 행입니다.
+        let is_raw_event = data.get("action").map_or(false, |v| v.is_array())
+            || data.get("relate").map_or(false, |v| v.is_array());
 
         let text = if !analytic_text.is_empty() {
             analytic_text
@@ -458,6 +497,18 @@ async fn reindex_pending_embeddings(
             doc.text.clone()
         } else if !analytic_fallback.is_empty() {
             analytic_fallback
+        } else if doc.mode == "analytic" || is_raw_event {
+            // 🌟 [RAW GUARD] analytics 문서에 구조화 문장이 하나도 없으면
+            //    json_to_natural_language 가 relate(원시 outerHTML 배열)를 전부 펼쳐
+            //    수천 토큰짜리 HTML 을 임베딩 입력으로 만듭니다.
+            //    그 벡터는 어떤 질의와도 유사하지 않고, 저장 용량만 잡아먹으며,
+            //    embed=1 로 마킹되어 Cron Worker 가 나중에 구조화해도 재인덱싱되지 않습니다.
+            //    Cron 구조화 이후 updated_at 이 갱신되면 다시 후보로 잡히도록 여기서 건너뜁니다.
+            println!(
+                "[EMBED-LOCAL] ⏭️ analytics 문서 '{}' (type='{}') 는 아직 구조화 문장(action/summary/cross_action_flow)이 없어 임베딩을 보류합니다.",
+                doc.id, doc.r#type
+            );
+            continue;
         } else {
             crate::parsing::json_to_natural_language(&data)
         };
@@ -2255,17 +2306,29 @@ async fn proxy_fetch(
 
 
     // [DETAIL 1] Inject Session into Query Params (Content.js logic)
-
     if let Some(sp) = session_params {
+        // 🌟 [BORROW FIX] query_pairs_mut() 가변 빌드 중에는
+        //    query_pairs() 불변 빌드를 호출할 수 없습니다.
+        //    따라서 href 존재 여부를 가변 빌드 '시작 전'에 확인합니다.
+        let has_href = target_url.query_pairs().any(|(k, _)| k == "href");
 
         let mut query = target_url.query_pairs_mut();
-
         if let Some(hash) = sp.get("hash").and_then(|v| v.as_str()) { query.append_pair("hash", hash); }
-
         if let Some(token) = sp.get("token").and_then(|v| v.as_str()) { query.append_pair("token", token); }
-
         if let Some(cc) = sp.get("cc").and_then(|v| v.as_str()) { query.append_pair("cc", cc); }
-
+        // 🌟 [ANALYTICS SYNC] console.logis.center Worker 는
+        //    cookies.href = decodeURIComponent(req.query.href) 를
+        //    무조건 실행하므로, 이 값이 없으면 500 에러가 발생합니다.
+        //    href 가 없으면 현재 앱의 기본 도메인을 시딩합니다.
+        if sp.get("href").is_none() {
+            if !has_href {
+                query.append_pair("href", "https://console.logis.center/");
+            }
+        } else if let Some(href) = sp.get("href").and_then(|v| v.as_str()) {
+            if !has_href {
+                query.append_pair("href", href);
+            }
+        }
     }
 
 
@@ -2611,7 +2674,6 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str.clone()));
-
                 // 🌟 [v4] 루트 호이스팅 복원 블록을 제거했습니다.
                 //    프론트엔드(normalizeEnvelope)가 이미 봉투/확장을 분리해서 보내고,
                 //    Rust 쪽 canonicalize_data 가 타입까지 확정하므로
@@ -2620,7 +2682,22 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 //    다만 봉투 값 중 data 안에 반드시 있어야 하는 것들(mode / 시간)은
                 //    상위 페이로드에만 있을 수 있으므로 결손일 때만 보충합니다.
                 if obj.get("mode").is_none() {
-                    if let Some(mode) = item.get("mode") { obj.insert("mode".to_string(), mode.clone()); }
+                    if let Some(mode) = item.get("mode") {
+                        obj.insert("mode".to_string(), mode.clone());
+                    } else {
+                        // 🌟 [ANALYTICS MODE AUTO-TAG] 서버(D1)에서 내려온
+                        //    analytics 트랙 항목은 mode 컬럼이 없습니다.
+                        //    reindex_pending_embeddings 가 mode = 'analytic' 으로
+                        //    필터링하므로, 여기서 자동 주입하지 않으면
+                        //    동기화되어도 임베딩 대상에서 전량 탈락합니다.
+                        let is_analytic_type = matches!(
+                            type_str.as_str(),
+                            "click" | "hover" | "change" | "report" | "question" | "answer"
+                        );
+                        if is_analytic_type {
+                            obj.insert("mode".to_string(), serde_json::json!("analytic"));
+                        }
+                    }
                 }
                 if obj.get("created_at").is_none() {
                     if let Some(v) = item.get("created_at") { obj.insert("created_at".to_string(), v.clone()); }

@@ -905,15 +905,27 @@ impl VectorStore {
         let _ = table.delete(&format!("id = '{}'", final_id)).await;
 
         let mut final_data = data_val.clone();
-
         // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
+        // 🌟 [MERGE FIX] 기존에는 final_data 를 decompressed 로 '전체 교체' 하여
+        //    봉투 필드(id, type, cc, from, to, mode, created_at 등)가 전부 사라졌습니다.
+        //    이제는 내부 객체만 병합하고 "data" 키만 제거합니다.
         if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
             if blob_base64.len() > 50 {
                 use base64::prelude::BASE64_STANDARD;
                 use base64::Engine;
                 if let Ok(decoded) = BASE64_STANDARD.decode(blob_base64) {
                     if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
-                        final_data = decompressed;
+                        if let Some(base_obj) = final_data.as_object_mut() {
+                            if let Some(inner_obj) = decompressed.as_object() {
+                                for (k, v) in inner_obj {
+                                    // 봉투 필드는 덮어쓰지 않습니다.
+                                    if !base_obj.contains_key(k) || k == "action" || k == "summary" || k == "relate" || k == "text" || k == "masked_text" || k == "embed" || k == "href" || k == "link" || k == "origin" {
+                                        base_obj.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
+                            base_obj.remove("data");
+                        }
                     }
                 }
             }

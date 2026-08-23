@@ -284,7 +284,11 @@ const TYPE_SETS: Record<string, string[]> = {
         ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
         'Unknown', 'unknown'
     ],
-    analytic: ['click', 'hover', 'change', 'report'],
+    // 🌟 [Q&A VISIBLE] question / answer 는 콘솔에서 오간 관리자 Q&A 입니다.
+    //    기존에는 syncAnalyticsData 가 아예 버렸고 이 목록에도 없어
+    //    앱 어디에서도 확인할 수 없었습니다. 이제 저장하므로 목록에도 노출합니다.
+    //    (검색 스코프에서는 parse_analytic_query 가 별도로 제외하므로 충돌하지 않습니다)
+    analytic: ['click', 'hover', 'change', 'report', 'question', 'answer'],
     // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
     //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
     //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
@@ -876,152 +880,360 @@ async function runLocalEmbeddingSync() {
     }, 2000);
 }
 
-// 🌟 [ANALYTICS TRACK] console.logis.center(analytics Client Worker)에서 구조화 결과를 내려받아
-//    LanceDB / Dexie 에 mode='analytic' 으로 태깅 저장한 뒤, 로컬 임베딩을 트리거합니다.
-//    (서버는 임베딩을 하지 않으므로 벡터화는 전적으로 이 앱이 담당합니다)
-async function syncAnalyticsData() {
-    if (!currentSession.hash) return;
+// =====================================================================
+// 🌟 [ANALYTICS TRACK v2] console.logis.center(Client Worker) ↔ 로컬 동기화
+// ---------------------------------------------------------------------
+//  ── Worker 계약 (console-logis-center/src/index.ts 실측) ──
+//    cookies.href = decodeURIComponent(req.query.href).toLowerCase()
+//    var url      = new URL(cookies.href)
+//    cookies.cc   = hashId(url.host)            ← req.query.cc 는 '전혀' 읽지 않음
+//    GET(JSON)    = SELECT * FROM items
+//                   WHERE "cc" = <cookies.cc>
+//                     AND "updated_at" > 0
+//                     AND "created_at" < <req.query.created_at>
+//                   ORDER BY created_at DESC LIMIT 1000
+//
+//  ── 그래서 무엇이 바뀌었나 ──
+//   ① [TDZ 사망] 기존 코드는 `const params` 선언 '이전' 에 params.append() 를 호출해
+//      매 호출마다 ReferenceError 로 즉사했고, 바깥 catch 가 조용히 삼켰습니다.
+//      HTTP 요청이 단 한 번도 나가지 않았습니다.
+//   ② [cc 불일치] Worker 는 cc 파라미터를 무시하고 href 의 host 로 cc 를 만듭니다.
+//      브라우저가 꺼져 있으면 href 가 "https://console.logis.center/" 로 폴백되어
+//      cc = hashId("console.logis.center") 를 조회 → 영원히 0건이었습니다.
+//      이제 '추적 대상 사이트의 origin' 을 해석해 사이트마다 1회씩 조회합니다.
+//   ③ [풀 호스트] Worker 는 hashId(url.host) 즉 'abc.cafe24.com' 을 씁니다.
+//      getRootDomain() 이 만드는 hashId('cafe24.com') 과 애초에 다른 값이므로
+//      로컬 계산 규칙도 Worker 와 동일하게 풀 호스트로 통일합니다.
+//   ④ [시간대] created_at 은 '상한 커서' 입니다. now - timezoneOffset 은
+//      UTC- 지역(예: EST, offset=+300)에서 now-5h 가 되어 최근 5시간 이벤트를
+//      통째로 잘라냈습니다. 반드시 미래 시각이어야 합니다.
+//   ⑤ [question/answer] 버리지 않고 analytic 아이템으로 보존합니다.
+// =====================================================================
+
+let isAnalyticsSyncRunning = false;
+let lastAnalyticsSyncAt = 0;
+
+/**
+ * 🌟 [ORIGIN RESOLUTION] 이벤트를 조회할 '추적 대상 사이트' 목록을 확정합니다.
+ *  Worker 가 cc 를 href 의 host 로 만들기 때문에, 조회 단위는 곧 origin 입니다.
+ *
+ *  수집 소스 (우선순위 무관, 중복 제거)
+ *   ① kv_store 의 oauth_registered_sites  : 사용자가 명시적으로 등록한 사이트
+ *   ② currentDetectedUrl                  : 지금 브라우저가 보고 있는 사이트
+ *   ③ Dexie 의 기존 analytic 문서 data.origin : 과거에 한 번이라도 받아온 사이트
+ *
+ *  ⚠️ origin(스킴+호스트)만 사용합니다. 경로/쿼리를 붙이면 Worker 의
+ *     decodeURIComponent(req.query.href) 가 2중 디코딩되어 '%' 가 들어간 경로에서
+ *     URIError 로 418 을 맞습니다. (cc 는 host 로만 결정되므로 경로는 불필요)
+ */
+async function resolveAnalyticsOrigins(): Promise<string[]> {
+    const origins = new Set<string>();
+
+    const push = (raw: any) => {
+        if (!raw || typeof raw !== "string") return;
+        const s = raw.trim().toLowerCase();
+        if (!s.startsWith("http")) return;
+        try {
+            const u = new URL(s);
+            if (!u.hostname) return;
+            if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return;
+            // logis.center 계열은 content.js 의 isShop 게이트에서 애초에 제외되므로
+            // 이벤트가 존재할 수 없습니다. 조회해 봐야 0건이라 왕복만 낭비합니다.
+            if (u.hostname.endsWith("logis.center")) return;
+            origins.add(u.origin);
+        } catch (e) {}
+    };
 
     try {
-        const now = Date.now();
-        const createdAt = now - timezoneOffset;
+        const sites = await kvGet("oauth_registered_sites");
+        if (Array.isArray(sites)) {
+            for (const s of sites) push(s && s.host);
+        }
+    } catch (e) {}
 
-        let targetHref = currentDetectedUrl || "https://console.logis.center/";
-        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
-            targetHref = "https://console.logis.center/";
+    push(currentDetectedUrl);
+
+    try {
+        if (appDb) {
+            const rows = await appDb.table("items").where("mode").equals("analytic").limit(2000).toArray();
+            for (const r of rows) push(r && r.data && r.data.origin);
+        }
+    } catch (e) {}
+
+    return Array.from(origins);
+}
+
+/**
+ * 🌟 [TEXT EXTRACT] Cron Worker 가 구조화한 문장을 골라냅니다.
+ *  원시 이벤트의 action 은 [outerHTML] '배열' 이므로 문자열일 때만 채택합니다.
+ *  (배열을 그대로 text 로 쓰면 HTML 덩어리가 FTS/임베딩에 들어갑니다)
+ */
+function extractAnalyticText(parsed: any): string {
+    const pick = (v: any): string => (typeof v === "string" ? v.trim() : "");
+    return pick(parsed?.action)
+        || pick(parsed?.summary)
+        || pick(parsed?.cross_action_flow)
+        || pick(parsed?.intent_evolution)
+        || pick(parsed?.text);
+}
+
+/** 🌟 D1 BLOB(number[] / ArrayBuffer / base64) → JSON 객체로 복원합니다. */
+function decodeAnalyticBlob(rawData: any): any {
+    const pako = (window as any).pako;
+    try {
+        if (rawData && typeof rawData === "object") {
+            const raw = rawData.data || rawData;
+            let arr: Uint8Array | null = null;
+
+            if (Array.isArray(raw)) {
+                arr = new Uint8Array(raw);
+            } else if (raw.buffer) {
+                arr = new Uint8Array(raw.buffer);
+            } else if (Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
+                arr = new Uint8Array(Object.values(raw) as number[]);
+            }
+
+            if (arr) {
+                try {
+                    return JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
+                } catch (e) {
+                    return JSON.parse(new TextDecoder('utf-8').decode(arr));
+                }
+            }
+            return raw;
         }
 
-        const params = new URLSearchParams({
-            origin: "https://console.logis.center",
-            created_at: createdAt.toString(),
-            hash: currentSession.hash,
-            token: currentSession.token || "",
-            href: targetHref
-        });
+        if (typeof rawData === "string") {
+            // 🌟 [BASE64 GZIP PATH] Worker 가 BLOB 을 base64 로 직렬화했거나
+            //    구버전 Rust upsert_items 가 base64(gzip) 로 저장한 경우를 처리합니다.
+            try {
+                return JSON.parse(rawData);
+            } catch (_jsonErr) {
+                try {
+                    const rawBytes = Uint8Array.from(atob(rawData), c => c.charCodeAt(0));
+                    if (rawBytes.length > 50 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
+                        return JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
+                    }
+                    return JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                } catch (_b64Err) {
+                    return {};
+                }
+            }
+        }
+    } catch (e) {}
+    return {};
+}
 
-        const response = await invoke<any>("proxy_fetch", {
+/** 🌟 origin 하나에 대해 GET 1회를 수행하고 저장한 건수를 돌려줍니다. */
+async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<number> {
+    // Worker 와 '동일한 규칙' 으로 cc 를 계산합니다. (풀 호스트, 루트 도메인 아님)
+    let expectedCc = "";
+    try {
+        expectedCc = await hashId(new URL(origin).host);
+    } catch (e) {}
+
+    const params = new URLSearchParams({
+        origin: "https://console.logis.center",
+        created_at: cursor.toString(),
+        hash: currentSession.hash,
+        token: currentSession.token || "",
+        // ⚠️ 경로 없는 origin + '/' 만 보냅니다. Worker 의 2중 디코딩 대비.
+        href: origin + "/"
+    });
+    if (expectedCc) params.append("cc", expectedCc);
+
+    let response: any = null;
+    try {
+        response = await invoke<any>("proxy_fetch", {
             url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
             method: "GET",
             headers: { "Content-Type": "application/json" },
-            session_params: { hash: currentSession.hash, token: currentSession.token }
+            session_params: { hash: currentSession.hash, token: currentSession.token, cc: expectedCc }
         });
+    } catch (e) {
+        console.warn(`[SYNC-ANALYTIC] ❌ '${origin}' 조회 실패 (cc=${expectedCc}):`, e);
+        return 0;
+    }
 
-        stepQrSpinner();
+    stepQrSpinner();
 
-        if (!response || !response.results || !Array.isArray(response.results)) return;
+    if (!response || !response.results || !Array.isArray(response.results)) {
+        console.log(`[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 응답에 results 없음`);
+        return 0;
+    }
 
-        const pako = (window as any).pako;
-        const items: any[] = [];
+    if (response.results.length === 0) {
+        console.log(
+            `[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 0건. ` +
+            `Worker 조회 조건은 cc = hashId('${(() => { try { return new URL(origin).host; } catch (e) { return "?"; } })()}') ` +
+            `AND updated_at > 0 AND created_at < ${cursor} 입니다. ` +
+            `updated_at 이 0 인 원시 이벤트는 Cron Worker 구조화 전이라 내려오지 않습니다.`
+        );
+        return 0;
+    }
 
-        for (let i = 0; i < response.results.length; i++) {
-            const row = response.results[i];
-            if (!row || !row.id) continue;
+    const now = Date.now();
+    const items: any[] = [];
 
-            // question / answer 는 채팅 말풍선 전용이므로 리스트 동기화 대상에서 제외합니다.
-            if (row.type === "question" || row.type === "answer") continue;
-
-            let parsed: any = {};
-            try {
-                const rawData = row.data;
-                if (rawData && typeof rawData === "object") {
-                    const raw = rawData.data || rawData;
-                    let arr: Uint8Array | null = null;
-
-                    if (Array.isArray(raw)) {
-                        arr = new Uint8Array(raw);
-                    } else if (raw.buffer) {
-                        arr = new Uint8Array(raw.buffer);
-                    } else if (Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
-                        arr = new Uint8Array(Object.values(raw) as number[]);
-                    }
-
-                    if (arr) {
-                        try {
-                            parsed = JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
-                        } catch (e) {
-                            parsed = JSON.parse(new TextDecoder('utf-8').decode(arr));
-                        }
-                    } else {
-                        parsed = raw;
-                    }
-                } else if (typeof rawData === "string") {
-                    parsed = JSON.parse(rawData);
-                }
-            } catch (e) {
-                parsed = {};
+    // 🌟 [DELTA GUARD] 이미 같은 updated_at 으로 로컬에 있는 행은 쓰기를 생략합니다.
+    const localMap = new Map<string, number>();
+    try {
+        if (appDb) {
+            const ids = response.results.map((r: any) => r && r.id).filter(Boolean);
+            if (ids.length > 0) {
+                const rows = await appDb.table("items").where("id").anyOf(ids).toArray();
+                for (const r of rows) localMap.set(String(r.id), Number(r.updated_at || 0));
             }
+        }
+    } catch (e) {}
 
-            const textVal = parsed.action || parsed.summary || parsed.cross_action_flow || "";
+    let skipped = 0;
 
-            // 🌟 [BCC RECONSTRUCT] analytics D1(console-logis-center) 스키마에는 bcc 컬럼이 없습니다.
-            //    (commerce D1 에는 있지만 analytics 는 id/type/flag/from/to/cc/ref/data/created_at/updated_at 뿐)
-            //    서버가 항상 빈 값을 주므로, commerce 트랙과 동일한 규칙으로 클라이언트에서 재구성합니다.
-            //    규칙: bcc = hashId(type + cc) — scheduler.rs 의 bcc 생성식과 동일합니다.
-            //    이 값이 있어야 item_chunks.bcc 스코프와 executeDexiePlan 의 bcc 드라이버가 성립합니다.
-            const rowType = row.type || "click";
-            const rowCc = row.cc || "";
-            let rowBcc = row.bcc || "";
-            if (!rowBcc && rowCc) {
-                rowBcc = await hashId(rowType + rowCc);
-            }
+    for (let i = 0; i < response.results.length; i++) {
+        const row = response.results[i];
+        if (!row || !row.id) continue;
 
-            // 🌟 [MODE TAGGING] analytics 트랙도 modeOfType() 을 통과시켜
-            //    commerce/shipping 과 동일한 단일 판정 경로를 씁니다.
-            //    (rowType 은 click/hover/change/report 뿐이므로 항상 'analytic' 입니다.
-            //     혹시 워커가 새 타입을 내려보내도 여기서 자동으로 올바른 트랙에 배치됩니다)
-            const rowMode = modeOfType(rowType);
+        const serverUpdated = Number(row.updated_at || 0);
+        const localUpdated = localMap.get(String(row.id));
+        if (localUpdated !== undefined && serverUpdated <= localUpdated) {
+            skipped++;
+            continue;
+        }
 
-            items.push({
+        const parsed: any = decodeAnalyticBlob(row.data) || {};
+
+        // 🌟 [ORIGIN SEED] question / answer 의 data 에는 origin 이 없습니다.
+        //    다음 라운드의 resolveAnalyticsOrigins() 가 이 사이트를 계속 발견하려면
+        //    반드시 채워 두어야 합니다.
+        if (!parsed.origin) parsed.origin = origin;
+
+        const textVal = extractAnalyticText(parsed);
+
+        // 🌟 [BCC RECONSTRUCT] analytics D1 스키마에는 bcc 컬럼이 없습니다.
+        //    (id/type/flag/from/to/cc/ref/data/created_at/updated_at 뿐)
+        //    commerce 와 동일한 규칙 bcc = hashId(type + cc) 로 클라이언트가 재구성합니다.
+        const rowType = String(row.type || "click");
+        const rowCc = String(row.cc || expectedCc || "");
+        let rowBcc = String(row.bcc || "");
+        if (!rowBcc && rowCc) {
+            rowBcc = await hashId(rowType + rowCc);
+        }
+
+        // 🌟 [MODE TAGGING] modeOfType() 단일 판정 경로를 그대로 사용합니다.
+        const rowMode = modeOfType(rowType);
+
+        items.push({
+            id: row.id,
+            type: rowType,
+            // 🌟 [FLAG] analytics D1 은 flag 를 실제로 채워 보냅니다. 비었을 때만 세션 flag 로 보강.
+            flag: row.flag || String((currentSession as any).flag || ""),
+            from: row.from || "",
+            to: row.to || "",
+            cc: rowCc,
+            bcc: rowBcc,
+            ref: row.ref || "",
+            status: 9,
+            mode: rowMode,
+            created_at: Number(row.created_at || now),
+            // ⚠️ updated_at 은 draft/count 계약이므로 서버 값을 그대로 보존합니다.
+            updated_at: serverUpdated > 0 ? serverUpdated : now,
+            text: textVal,
+            masked_text: textVal,
+            data: {
+                ...parsed,
                 id: row.id,
                 type: rowType,
-                // 🌟 [FLAG] analytics D1 은 flag 컬럼을 실제로 채워 보냅니다(console/analytics 워커 공통).
-                //    여기서 버리면 LanceDB / Dexie 의 flag 봉투가 영원히 빈 문자열이 되어
-                //    지역별 스코프 조회가 불가능해집니다.
-                //    워커가 비워 보낸 경우에는 세션 flag 로 보강합니다.
-                flag: row.flag || String((currentSession as any).flag || ""),
-                from: row.from || "",
-                to: row.to || "",
-                cc: rowCc,
-                bcc: rowBcc,
-                ref: row.ref || "",
-                status: 9,
-                // 🌟 mode 태깅이 있어야 reindex_pending_embeddings / loadMoreDocs 가 analytic 트랙으로 격리합니다.
                 mode: rowMode,
-                created_at: row.created_at || now,
-                updated_at: row.updated_at || now,
                 text: textVal,
-                masked_text: textVal,
-                data: {
-                    ...parsed,
-                    id: row.id,
-                    type: rowType,
-                    mode: rowMode,
-                    text: textVal,
-                    masked_text: textVal
-                }
-            });
-        }
-
-        if (items.length > 0) {
-            await invoke("upsert_items", { items });
-            if (appDb) {
-                await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
+                masked_text: textVal
             }
-            console.log(`[SYNC-ANALYTIC] Synced ${items.length} analytics item(s) from console.logis.center.`);
+        });
+    }
+
+    if (items.length === 0) {
+        console.log(`[SYNC-ANALYTIC] '${origin}' 수신 ${response.results.length}건 → 전부 최신 상태(스킵 ${skipped}건)`);
+        return 0;
+    }
+
+    await invoke("upsert_items", { items });
+    if (appDb) {
+        await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
+    }
+
+    const typeBrief: Record<string, number> = {};
+    for (const it of items) typeBrief[it.type] = (typeBrief[it.type] || 0) + 1;
+
+    console.log(
+        `[SYNC-ANALYTIC] ✅ '${origin}' (cc=${expectedCc}) → 수신 ${response.results.length}건 / ` +
+        `저장 ${items.length}건 / 스킵 ${skipped}건 ${JSON.stringify(typeBrief)}`
+    );
+
+    return items.length;
+}
+
+async function syncAnalyticsData() {
+    if (!currentSession.hash) return;
+    if (isAnalyticsSyncRunning) return;
+
+    isAnalyticsSyncRunning = true;
+
+    try {
+        const origins = await resolveAnalyticsOrigins();
+
+        if (origins.length === 0) {
+            console.warn(
+                "[SYNC-ANALYTIC] 조회할 추적 대상 사이트가 없습니다. " +
+                "Analytic 탭의 '+ 사이트 등록' 으로 도메인을 등록하거나, " +
+                "브라우저로 추적 대상 사이트를 열어 두세요. " +
+                "(Worker 는 cc 파라미터가 아니라 href 의 host 로 조회 대상을 결정합니다)"
+            );
+            return;
         }
 
-        if (currentTab === "list") {
-            await loadMoreDocs(false, true);
+        // 🌟 [CURSOR] created_at 은 상한 커서입니다. 반드시 '현재보다 미래' 여야
+        //    UTC- 지역에서 최근 이벤트가 잘려 나가지 않습니다.
+        const now = Date.now();
+        const cursor = Math.max(now, now - timezoneOffset) + 60_000;
+
+        console.log(`[SYNC-ANALYTIC] 대상 사이트 ${origins.length}곳 조회 시작: ${JSON.stringify(origins)} | cursor=${cursor}`);
+
+        let totalStored = 0;
+        for (const origin of origins) {
+            totalStored += await fetchAnalyticsOrigin(origin, cursor);
         }
 
-        // 🌟 [CLIENT-SIDE EMBEDDING] 서버가 벡터를 만들지 않으므로 여기서 즉시 로컬 임베딩을 수행합니다.
-        runLocalEmbeddingSync();
+        if (totalStored > 0) {
+            if (currentSearchMode === "analytic") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+            // 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않으므로 로컬에서 즉시 임베딩합니다.
+            runLocalEmbeddingSync();
+        }
+
+        console.log(`[SYNC-ANALYTIC] 완료. 총 저장 ${totalStored}건.`);
 
     } catch (e) {
         console.warn("[SYNC-ANALYTIC] Failed:", e);
     } finally {
+        isAnalyticsSyncRunning = false;
+        lastAnalyticsSyncAt = Date.now();
         if (!isExtracting && !isSearching) stopSpinner();
     }
+}
+
+// 🌟 [ANALYTICS BACKGROUND SYNC] commerce / shipping 탭에 있어도 analytics 이벤트가
+//    계속 흘러 들어오도록 하는 역방향 경로입니다.
+//    (기존에는 syncCommerceInBackground 만 있고 이 방향이 없어서,
+//     Analytic 탭 + 채팅 화면 + 위젯 확장 3조건이 동시에 성립할 때만 동기화되었습니다)
+//    폴링 주기(3초)마다 N개 사이트를 왕복하면 과하므로 30초 스로틀을 겁니다.
+async function syncAnalyticsInBackground() {
+    if (!currentSession.hash) return;
+    if (isAnalyticsSyncRunning) return;
+    if (Date.now() - lastAnalyticsSyncAt < 30_000) return;
+    await syncAnalyticsData();
 }
 
 // 🌟 [COMMERCE BACKGROUND SYNC] analytic 모드에서도 commerce.logis.center D1 과
@@ -1095,6 +1307,19 @@ async function syncCommerceInBackground() {
                                     item.data = JSON.parse(decompressed);
                                 } catch (err) {}
                             }
+                        }
+                    } else if (typeof item.data === 'string' && item.data.length > 50) {
+                        // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
+                        //    data 가 base64(gzip) 문자열로 내려오는 경우를 커버합니다.
+                        try {
+                            const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
+                            if (rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
+                                item.data = JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
+                            } else {
+                                item.data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                            }
+                        } catch (_strErr) {
+                            // JSON 도 base64 도 아니면 원본 문자열을 그대로 둡니다.
                         }
                     }
                 }
@@ -3806,6 +4031,15 @@ async function syncData() {
         }
         return;
     }
+    // 🌟 [ANALYTICS BACKGROUND] commerce / shipping 탭에 있어도 analytics 이벤트를 계속 받습니다.
+    //    ── 왜 필요한가 ──
+    //     기존 구조는 analytic 탭을 열어야만 D1 이벤트를 가져왔습니다.
+    //     그 사이 쌓인 이벤트는 탭을 열기 전까지 로컬에 존재하지 않았고,
+    //     Worker 의 LIMIT 1000 창 밖으로 밀려나면 영구히 유실됩니다.
+    //     30초 스로틀이 걸려 있어 폴링 부하는 사실상 없습니다.
+    if (currentSession.hash) {
+        syncAnalyticsInBackground();
+    }
     if (!currentSession.hash || !currentSession.email) return;
     
     console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
@@ -4190,14 +4424,34 @@ function applySearchModeUI() {
 document.querySelectorAll('.mode-tab').forEach(btn => {
     btn.addEventListener('click', async (e) => {
         const target = e.target as HTMLElement;
+        const prevMode = currentSearchMode;
         currentSearchMode = target.dataset.mode || "commerce";
-        
+
+        // 🌟 [SCOPE RESET] 트랙마다 cc 네임스페이스가 다릅니다.
+        //  ── 무엇이 문제였나 ──
+        //   commerce 는 activeContext.cc = hashId(getRootDomain(host)) 즉 'cafe24.com' 해시이고,
+        //   analytic 은 Worker 가 넣은 hashId(url.host) 즉 'abc.cafe24.com' 해시입니다.
+        //   commerce 에서 페이지를 클릭한 뒤 analytic 으로 넘어오면
+        //   loadMoreDocs 가 그 cc 를 드라이버 인덱스로 삼아 무조건 0건이 됩니다.
+        //   (검색 태그도 같은 이유로 남아 있으면 안 됩니다)
+        if (prevMode !== currentSearchMode) {
+            activeContext = { cc: "", bcc: "", ref: "" };
+            activeTags = [];
+            updateTagsUI();
+        }
+
         // 🌟 탭 클릭 시 상태 저장 및 UI 업데이트
         await kvSet("search_mode", currentSearchMode);
         applySearchModeUI();
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
         await refreshList(); 
+
+        // 🌟 [IMMEDIATE PULL] analytic 으로 전환했으면 폴링 주기를 기다리지 않고 즉시 1회 당겨옵니다.
+        if (currentSearchMode === "analytic" && currentSession.hash) {
+            lastAnalyticsSyncAt = 0; // 스로틀 해제
+            syncAnalyticsData();
+        }
     });
 });
 
@@ -7333,6 +7587,19 @@ function startPolling() {
                 }
             } catch (e) {
                 console.error("[POLLING] Error during poll:", e);
+            }
+        } else {
+            // 🌟 [ANALYTICS ALWAYS-ON] 채팅 화면이 닫혀 있거나 위젯이 접혀 있어도
+            //    analytics 이벤트 수집은 계속되어야 합니다.
+            //    (Worker 의 GET 은 로그인 없이 hash 만으로도 동작하지만,
+            //     사용자 요구사항이 '로그인 이후에도' 이므로 hash 확보 시점부터 돌립니다)
+            //    syncAnalyticsInBackground 내부의 30초 스로틀이 왕복을 억제합니다.
+            if (currentSession.hash) {
+                try {
+                    await syncAnalyticsInBackground();
+                } catch (e) {
+                    console.error("[POLLING] Analytics background sync error:", e);
+                }
             }
         }
 
