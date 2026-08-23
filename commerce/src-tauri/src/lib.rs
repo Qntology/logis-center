@@ -369,6 +369,24 @@ async fn reindex_pending_embeddings(
         //    chunk_count가 0이지만 embed가 1인 경우(청크 삭제 후 재인덱싱 대기 등)
         //    불필요한 재처리를 방지합니다.
         if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
+            // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 type 이 도메인 타입(tracking/goods/...)
+            //    이라서 EMBED_EXCLUDE_TYPES 문자열 목록으로는 절대 잡히지 않습니다.
+            //    (서버 index.ts 의 home 문서 = { table:'pages', type:'tracking', data:{node,item} })
+            //    그래서 '구조 마커' 로 판정합니다. 셀렉터 캐시는 검색 대상이 아니므로
+            //    임베딩도, 청크 인덱싱도, 음차도 전부 불필요합니다.
+            let is_page_cache = data_val.get("table")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |t| t == "pages" || t == "page")
+                || data_val.get("node").is_some()
+                || data_val.get("item").is_some();
+            if is_page_cache {
+                println!(
+                    "[EMBED-LOCAL] ⏭️ 페이지 셀렉터 캐시 문서 '{}' (type='{}') 는 검색 대상이 아니므로 임베딩을 건너뜁니다.",
+                    doc.id, doc.r#type
+                );
+                continue;
+            }
+
             let already = data_val.get("embed")
                 .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
                 .unwrap_or(false);
@@ -2679,18 +2697,55 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 let bcc_val = clean_item.get("bcc").and_then(|v| v.as_str()).unwrap_or("");
                 let ref_val = clean_item.get("ref").and_then(|v| v.as_str()).unwrap_or("");
                 let status_val = clean_item.get("status").and_then(|v| v.as_i64()).unwrap_or(9) as i32;
-                let created_at_val = clean_item.get("created_at").map(|v| v.to_string()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis().to_string());
-                
+
+                // 🌟 [ARG SHIFT FIX] 기존 코드는 add_message 의 마지막 인자(data)에
+                //    created_at 문자열을 넘기고 있었습니다.
+                //      add_message(..., type_: Option<&str>, data: Option<&str>)
+                //    그래서 talks.data 컬럼에 "1735689600000" 같은 숫자 문자열이 저장되고,
+                //    실제 created_at 은 add_message_at 내부에서 현재 시각으로 대체되어
+                //    서버에서 내려온 과거 메시지 시각이 전부 '지금' 으로 찍혔습니다.
+                //    (프론트엔드 upsertChatMessages 의 시간순 정렬이 통째로 무너집니다)
+                //    created_at 은 add_message_at 의 전용 인자로 분리해 넘깁니다.
+                let created_at_num = clean_item.get("created_at")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| clean_item.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.trim().parse::<i64>().ok()))
+                    .filter(|v| *v > 0)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+                // 🌟 data 컬럼에는 바로 위에서 조립한 { text, link, origin } 을 그대로 넣습니다.
+                let data_json_str = clean_item.get("data")
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| json!({
+                        "text": text_val.clone(),
+                        "link": link_val.clone(),
+                        "origin": origin_val.clone()
+                    }).to_string());
+
                 // Chrome.js처럼 role 구분 (프론트에서 address 비교로 재교정되므로 기본값 user 지정)
                 let role_val = if type_str == "talk" { "user" } else { "system_task" };
 
                 if !id.is_empty() {
-                    let _ = db.add_message(
-                        &id, role_val, &text_val, 
-                        None, Some(status_val), 
-                        Some(cc_val), Some(bcc_val), Some(ref_val), 
-                        Some(from_val), Some(to_val), Some(type_str.as_str()), 
-                        Some(created_at_val.as_str())
+                    // 🌟 [DELETE HANDLE] 기존에는 task_id 자리에 None 을 넘겨 전 talk 행이
+                    //    빈 문자열 task_id 로 저장되었습니다. 그 결과 유일한 삭제 커맨드인
+                    //      delete_message(task_id) → delete_message_by_task_id
+                    //    로 '특정 한 행' 을 지목할 방법이 없었습니다.
+                    //    (task_id = '' 로 지우면 서버에서 내려온 talk 전체가 날아갑니다)
+                    //
+                    //    낙관적 로컬 행을 서버 행으로 승계할 때 그 행만 정확히 삭제해야 하므로
+                    //    자기 자신의 id 를 task_id 로 각인합니다.
+                    //    · talk / prompt 는 스케줄러 태스크가 아니므로 태스크 id 와 충돌하지 않습니다.
+                    //      (태스크 id 는 task_ / search_ / img_ 접두사)
+                    //    · upsertChatMessages 의 isTask 판정은 task_id 가 "search_" 로 시작할 때만
+                    //      참이므로 0x 주소가 들어가도 말풍선 종류가 바뀌지 않습니다.
+                    let _ = db.add_message_at(
+                        &id, role_val, &text_val,
+                        Some(id.as_str()), Some(status_val),
+                        Some(cc_val), Some(bcc_val), Some(ref_val),
+                        Some(from_val), Some(to_val), Some(type_str.as_str()),
+                        Some(data_json_str.as_str()),
+                        Some(created_at_num)
                     ).await;
                     count += 1;
                 }
@@ -2700,33 +2755,37 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             // 🌟 [v4 ROUTING] 물리 테이블은 items / users / pages 3개뿐입니다.
             //    store.rs 의 resolve_table 과 동일한 규칙을 사용해야 저장/조회가 어긋나지 않습니다.
             //
-            //    🌟 [ROUTING FIX] 기존 'origin 이 있으면 pages' 휴리스틱을 폐기합니다.
-            //      · proxy/index.ts 는 모든 commerce item.data 에 origin 을 넣습니다.
-            //      · console/index.ts 는 모든 analytics 행동 로그 data 에 origin 을 넣습니다.
-            //      → 그 결과 서버에서 동기화된 아이템 전량이 pages 테이블로 새어 나갔고,
-            //        loadMoreDocs(items 조회)와 reindex_pending_embeddings(items 스캔)이
-            //        동시에 0건이 되어 목록과 로컬 임베딩이 통째로 죽어 있었습니다.
+            //    🌟 [HINT-FIRST FIX] 기존 구조는 주석에 "table 명시값을 1순위로 신뢰한다" 고
+            //      적어 놓고 실제로는 type_str 매치를 먼저 돌린 뒤 fallback 으로만 썼습니다.
+            //      그 결과 서버 index.ts 의 `home` 페이지 캐시
+            //          { table:'pages', type:'tracking', data:{ node:true, item:true } }
+            //      가 "tracking" arm 에 걸려 items 로 새어 들어갔고,
+            //      reindex_pending_embeddings 의 items 스캔에 잡혀
+            //      임베딩 → 청크 인덱싱 → 음차까지 전부 돌았습니다.
+            //      (로그 실측: 'Its table is pages' / 'Its node is 1' / 'Its item is true' 청크 11건)
             //
-            //    Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
-            //    그 명시값을 1순위로 신뢰합니다. (추정이 아니라 계약입니다)
+            //      Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
+            //      그 명시값을 '진짜로' 1순위에 둡니다. (추정이 아니라 계약입니다)
             let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
-            let final_table = match type_str.as_str() {
-                "member" | "team" | "user" | "users" => "users",
+            let final_table = match table_hint {
+                // ── 1순위 : 서버가 명시한 물리 테이블 ──
                 "pages" | "page" => "pages",
-                // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
-                "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
-                "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
-                | "receiving" | "shipping" => "items",
-                // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
-                //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
-                //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
-                //    방어적으로 여기서도 pages/users 로 라우팅합니다.
-                "talk" | "prompt" | "ai_search" => continue,
-                _ => match table_hint {
+                "users" => "users",
+                // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
+                "talks" => continue,
+                // ── 2순위 : 힌트가 없거나 레거시(sales/tracking/event)일 때만 type 으로 판정 ──
+                _ => match type_str.as_str() {
+                    "member" | "team" | "user" | "users" => "users",
                     "pages" | "page" => "pages",
-                    "users" => "users",
-                    // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
-                    "talks" => continue,
+                    // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
+                    "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
+                    "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
+                    | "receiving" | "shipping" => "items",
+                    // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
+                    //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
+                    //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
+                    //    방어적으로 여기서도 skip 합니다.
+                    "talk" | "prompt" | "ai_search" => continue,
                     // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
                     _ => "items",
                 },

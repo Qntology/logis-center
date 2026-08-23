@@ -59,7 +59,12 @@ export function time2text(dateVal: any): string {
     return Math.floor(seconds) + " seconds";
 }
 
-function isAlmostEqual(obj1: any, obj2: any): boolean {
+// 🌟 [ALMOST EQUAL] 키 개수가 같고, 값이 다른 키가 '정확히 1개 이하' 일 때 동일 레코드로 판정합니다.
+//  낙관적 로컬 talk 행과 서버가 발급한 talk 행은 { role, text } 가 완전히 같고
+//  id 하나만 다르므로 diffCount === 1 이 되어 여기서 true 가 나옵니다.
+//  서버 id 는 hashId() 난수라 클라이언트가 예측할 수 없기 때문에,
+//  '내용 동일성' 으로 승계 판정을 하는 이 함수가 유일한 조정 수단입니다.
+export function isAlmostEqual(obj1: any, obj2: any): boolean {
     if (!obj1 || !obj2) return false;
     if (Object.keys(obj1).length === 0 || Object.keys(obj2).length === 0) return false;
     const keys1 = Object.keys(obj1);

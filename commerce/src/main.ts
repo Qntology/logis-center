@@ -5,7 +5,9 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
 // Imports for Rendering & Shim
-import { item2html, selector } from "./lib/render";
+// 🌟 isAlmostEqual : 낙관적 로컬 talk 행 ↔ 서버 발급 talk 행 승계 판정에 사용합니다.
+//    (render.ts 에 존재하지만 그동안 한 번도 호출되지 않던 죽은 함수였습니다)
+import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
@@ -2056,6 +2058,71 @@ if (chatForm) {
             return;
         }
 
+        // 🌟 [OPTIMISTIC LOCAL WRITE]
+        //  ── 무엇이 문제였나 ──
+        //   기존 구조는 `if (response.results.length > 0)` 안에서만 로컬에 저장했습니다.
+        //   서버(index.ts)의 PUT 핸들러는 `if(cookies.sender)` 게이트에 막혀
+        //   talks INSERT 를 한 번도 수행하지 못했고, 빈 results 를 돌려주었습니다.
+        //   그래서 LanceDB talks 에 아무것도 안 들어가고
+        //   get_chat_messages 가 0건 → .chat-talks 에 "No messages yet." 이 남았습니다.
+        //
+        //  ── 해결 ──
+        //   이전 구현(content.js / chrome.js)과 동일하게, 사용자가 입력한 즉시
+        //   로컬 messages 테이블에 먼저 적재하고 화면을 그립니다.
+        //   서버 응답이 오면 그 행이 별도 id 로 추가되며(서버가 hashId() 로 새 id 발급),
+        //   upsertChatMessages 의 중복 제거 + 시간순 정렬이 자연스럽게 합칩니다.
+        //   서버가 실패해도 채팅 목록은 절대 사라지지 않습니다.
+        const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
+        {
+            let localLink = "/tracking";
+            let localOrigin = "https://commerce.logis.center";
+            try {
+                let hrefForLink = currentDetectedUrl || "https://commerce.logis.center/tracking";
+                if (hrefForLink.includes("localhost") || hrefForLink.includes("127.0.0.1") || hrefForLink === "about:blank") {
+                    hrefForLink = "https://commerce.logis.center/tracking";
+                }
+                const u = new URL(hrefForLink.toLowerCase());
+                localLink = (u.pathname + u.search).toLowerCase();
+                localOrigin = u.origin;
+            } catch (e) {}
+
+            try {
+                await invoke("upsert_items", {
+                    items: [{
+                        id: localTalkId,
+                        table: "talks",
+                        type: "talk",
+                        from: currentSession.address || "",
+                        to: currentSession.team || "",
+                        cc: effectiveCc || "",
+                        bcc: effectiveBcc || "",
+                        ref: effectiveRef || "",
+                        status: 9,
+                        created_at: now,
+                        updated_at: now,
+                        data: {
+                            text: query,
+                            link: localLink,
+                            origin: localOrigin
+                        }
+                    }]
+                });
+                console.log(`[CHAT] Optimistically stored local talk '${localTalkId}' (ref: ${effectiveRef})`);
+            } catch (e) {
+                console.warn("[CHAT] Local optimistic write failed:", e);
+            }
+
+            // 로컬 저장 직후 즉시 말풍선 렌더링 (서버 왕복을 기다리지 않습니다)
+            await renderMessage({
+                id: localTalkId,
+                role: "user",
+                text: query,
+                status: 9,
+                created_at: now,
+                updated_at: now
+            });
+        }
+
         // 2. 클라우드플레어 Workers (서버)로 PUT 요청 전송 및 정식 응답 처리 (chrome.js 방식)
         try {
             const origin = "https://commerce.logis.center";
@@ -2067,6 +2134,23 @@ if (chatForm) {
                 targetHref = "https://commerce.logis.center/tracking";
             }
 
+            // 🌟 [SENDER GATE] index.ts 의 PUT 핸들러는 아래 게이트를 통과해야만
+            //    INSERT INTO talks 를 실행합니다.
+            //      if(cookies.sender){ if(isAddress(from) && isAddress(to)){ ... } }
+            //    cookies.sender 는 요청 최상단 세션 블록에서
+            //    req.query.sender → data.sender → cookies.sender 순으로 세팅되며,
+            //    이 블록은 method 와 무관하게 매 요청 실행됩니다.
+            //    따라서 이 PUT 요청 자체에 sender 를 실으면 그 자리에서 게이트를 통과합니다.
+            //
+            // 🌟 [TO FIX] 기존에는 to 로 effectiveRef(페이지 ref 해시)를 보냈습니다.
+            //    서버는 talk.to 에 그 값을 그대로 저장하는데,
+            //    GET 조회 쿼리 중 하나가
+            //      SELECT * FROM talks WHERE "from" = team AND "to" = address
+            //    이므로 ref 를 넣으면 대화 상대 축이 어긋납니다.
+            //    ref 는 서버가 자체적으로 hashId(team+cc+link) 로 재계산하므로
+            //    to 에는 소속 팀 주소를 보내는 것이 계약상 올바릅니다.
+            const talkSender = currentSession.email || currentSession.name || "";
+
             const params = new URLSearchParams({
                 origin: origin,
                 created_at: createdAt.toString(),
@@ -2074,8 +2158,9 @@ if (chatForm) {
                 token: currentSession.token || "",
                 href: targetHref,
                 type: "talk",
+                sender: talkSender,
                 from: currentSession.address || "",
-                to: effectiveRef || currentSession.team || "",
+                to: currentSession.team || currentSession.address || "",
                 text: encodeURIComponent(query)
             });
             
@@ -2096,6 +2181,15 @@ if (chatForm) {
                         await appDb.table("talks").put(item);
                     }
                 }
+                console.log(`[CHAT] Server accepted talk. rows=${response.results.length}`);
+            } else {
+                // 🌟 서버가 빈 배열을 돌려주면 cookies.sender 게이트에서 탈락한 것입니다.
+                //    낙관적 로컬 저장 덕분에 화면은 유지되지만 원인을 반드시 표면화합니다.
+                console.warn(
+                    "[CHAT] ⚠️ Server returned no talk rows. " +
+                    "Check that `sender` reached the worker (cookies.sender gate) — " +
+                    `sent sender='${talkSender}', from='${currentSession.address}', to='${currentSession.team}'`
+                );
             }
 
             // 3. 서버 동기화 후 최신 메시지 렌더링
@@ -3567,6 +3661,14 @@ async function syncData() {
             token: currentSession.token || "",
             href: targetHref
         };
+
+        // 🌟 [SENDER IMPRINT] checkAuthStatus 와 동일한 이유입니다.
+        //    syncData 는 currentSession.email 이 확정된 뒤에만 실행되므로
+        //    (함수 상단의 `if (!currentSession.hash || !currentSession.email) return;`)
+        //    여기서 보내는 sender 는 반드시 서버 user.data 에 각인됩니다.
+        //    이 값이 있어야 PUT(talks) / POST(tasks) 가 cookies.sender 게이트를 통과합니다.
+        const syncSender = currentSession.email || currentSession.name || "";
+        if (syncSender) queryParams.sender = syncSender;
 
         // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버 동기화 시, 강제 지정된 사이드바 메뉴가 없다면 현재 URL의 도메인(CC)을 최우선으로 서버에 전달합니다.
         let syncEffectiveCc = activeContext.cc;
@@ -6752,6 +6854,23 @@ async function checkAuthStatus() {
             href: targetHref 
         };
         if (currentSession.token) queryParams.token = currentSession.token;
+
+        // 🌟 [SENDER IMPRINT] Client Worker(index.ts)는 method 와 무관하게
+        //    매 요청의 세션 블록에서 아래를 수행합니다.
+        //      var sender = req.query.sender ? decodeURIComponent(req.query.sender) : data.sender
+        //      if(sender){ data.sender = sender }
+        //      if(data.sender){ cookies.sender = data.sender }
+        //    그런데 신규 유저 생성 시 user_arr 에는 flag/name/title/region/page_count/favicon 만
+        //    들어가고 sender 키가 아예 없어서 cookies.sender 가 영원히 undefined 였습니다.
+        //    그 결과 서버의
+        //      PUT  : if(cookies.sender){ ... INSERT INTO talks ... }
+        //      POST : if(cookies.sender && created_at){ ... INSERT INTO tasks ... }
+        //    두 경로가 통째로 죽어, 채팅이 D1 talks 에 단 한 건도 저장되지 않았습니다.
+        //    여기서 sender 를 실어 보내면 user row 에 영구 각인되어
+        //    이후 모든 요청이 자동으로 통과합니다.
+        const senderName = currentSession.email || currentSession.name || "";
+        if (senderName) queryParams.sender = senderName;
+
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
         
@@ -8169,8 +8288,141 @@ interface ChatMessage {
     content?: string | any;
 }
 
+// 🌟 [LOCAL ECHO] 낙관적 로컬 저장 행의 id 접두사입니다.
+//    서버(index.ts)는 talk.id 를 `hashId()` 로 발급하므로 반드시 '0x' 로 시작합니다.
+//      var talk = { id : hashId(), ... }   // 인자 없음 = 완전 난수 지갑 주소
+//    두 접두사가 절대 겹치지 않는다는 '구조적 사실' 이 승계 판정의 유일한 근거입니다.
+const LOCAL_ECHO_PREFIX = "talk_";
+
+/**
+ * 🌟 [LOCAL ECHO RECONCILE]
+ *  ── 무엇이 문제였나 ──
+ *   채팅 전송 시 화면 반응을 위해 로컬 행을 먼저 만들어 그립니다(낙관적 저장).
+ *   그런데 서버는 talk.id 를 난수로 발급하므로 클라이언트가 그 값을 미리 알 수 없고,
+ *   결과적으로 같은 문장이 서로 다른 id 두 개로 존재하게 됩니다.
+ *     talk_1787456151873_ll0pqw  (로컬)
+ *     0x9568fca1abca47333aa634fbe42e354f74464135  (서버)
+ *   upsertChatMessages 의 중복 제거는 id 일치를 전제로 하므로 둘 다 렌더링됩니다.
+ *
+ *  ── 해결 ──
+ *   render.ts 의 isAlmostEqual 을 사용해 { role, text, id } 중 id 하나만 다른 쌍을
+ *   '동일 메시지' 로 판정하고, 로컬 행을 서버 행에 승계시킵니다.
+ *   승계 처리는 세 곳을 동시에 정리해야 재발하지 않습니다.
+ *     ① DOM 노드 제거          → 화면 즉시 정리
+ *     ② LanceDB messages 삭제  → 앱 재시작 후 부활 방지
+ *     ③ Dexie talks 삭제       → 로컬 캐시 잔재 제거
+ *
+ *  ── 1:1 소비 ──
+ *   같은 문장을 연속으로 두 번 보내면 로컬 에코도 2개, 서버 행도 2개입니다.
+ *   서버 행을 created_at 오름차순으로 순회하며 '아직 승계되지 않은 가장 오래된 에코'
+ *   하나만 소비하므로 개수가 어긋나지 않습니다.
+ *
+ *  @returns 승계 처리되어 이번 렌더링에서 제외해야 할 로컬 행 id 집합
+ */
+async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string>> {
+    const superseded = new Set<string>();
+    if (!chatTalks) return superseded;
+    if (!incoming || incoming.length === 0) return superseded;
+
+    // ── 서버가 발급한 talk 행만 승계 기준이 됩니다 ──
+    const serverRows = incoming
+        .filter(m => String(m.id || "").startsWith("0x"))
+        .filter(m => String(m.text || "").trim().length > 0)
+        .sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+    if (serverRows.length === 0) return superseded;
+
+    // ── 로컬 에코 후보 수집 : ① 이미 그려진 DOM 노드 ② 이번 배치에 함께 실려 온 DB 행 ──
+    //    ②가 필요한 이유 : 앱을 껐다 켜면 로컬 행과 서버 행이 같은 조회 결과에 동시에 담겨
+    //    옵니다. DOM 만 보면 그 경우를 잡지 못해 재시작마다 중복이 되살아납니다.
+    type Echo = { id: string; role: string; text: string; createdAt: number; node: HTMLElement | null };
+    const echoes: Echo[] = [];
+
+    for (const node of Array.from(chatTalks.querySelectorAll('.chat-talk')) as HTMLElement[]) {
+        if (!node.id.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        echoes.push({
+            id: node.id,
+            role: node.classList.contains('user') ? 'user' : 'system',
+            text: node.querySelector('.content')?.textContent?.trim() || "",
+            createdAt: Number(node.dataset.createdAt || 0),
+            node
+        });
+    }
+    for (const m of incoming) {
+        const mid = String(m.id || "");
+        if (!mid.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        if (echoes.some(e => e.id === mid)) continue;
+        echoes.push({
+            id: mid,
+            role: m.role === "user" ? "user" : "system",
+            text: String(m.text || "").trim(),
+            createdAt: Number(m.created_at || 0),
+            node: null
+        });
+    }
+    if (echoes.length === 0) return superseded;
+
+    echoes.sort((a, b) => a.createdAt - b.createdAt);
+
+    for (const srv of serverRows) {
+        const srvFp = {
+            role: srv.role === "user" ? "user" : "system",
+            text: String(srv.text || "").trim(),
+            id: String(srv.id)
+        };
+
+        for (const echo of echoes) {
+            if (superseded.has(echo.id)) continue;
+            const echoFp = { role: echo.role, text: echo.text, id: echo.id };
+
+            // 🌟 키 3개 중 id 하나만 다르면 동일 메시지 (diffCount === 1)
+            if (!isAlmostEqual(echoFp, srvFp)) continue;
+
+            superseded.add(echo.id);
+
+            // ① 화면에서 제거
+            if (echo.node) echo.node.remove();
+
+            // ② LanceDB messages 에서 제거 (upsert_items 가 task_id 에 자기 id 를 각인해 둡니다)
+            try {
+                await invoke("delete_message", { taskId: echo.id });
+            } catch (e) {
+                console.warn(`[CHAT] local echo '${echo.id}' DB delete failed:`, e);
+            }
+
+            // ③ Dexie talks 캐시에서 제거
+            try {
+                if (appDb) await appDb.table("talks").delete(echo.id);
+            } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+            console.log(`[CHAT] ♻️ [LOCAL ECHO RECONCILE] '${echo.id}' → 서버 행 '${srv.id}' 로 승계 (중복 제거)`);
+            break;
+        }
+    }
+
+    return superseded;
+}
+
 async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
+
+    // 🌟 [EMPTY NOTICE SWEEP] "No messages yet." 안내는 infoNodes 로 분류되어
+    //    아래 정렬 로직에서 항상 최상단에 유지됩니다.
+    //    실제 메시지가 한 건이라도 들어오는 순간 이 문구는 거짓이 되므로 즉시 제거합니다.
+    if (messages && messages.length > 0) {
+        const noMsgEl = chatTalks.querySelector('.no-msg');
+        if (noMsgEl) noMsgEl.remove();
+    }
+
+    // 🌟 [RECONCILE FIRST] 서버 행이 도착했다면 그와 짝이 되는 로컬 에코를 먼저 승계 처리합니다.
+    //    반드시 prevScrollHeight 측정 '이전' 에 수행해야 합니다.
+    //    노드를 제거하면 scrollHeight 가 줄어드는데, 측정 이후에 지우면
+    //    아래 스크롤 보정식(heightDiff)이 음수가 되어 화면이 튑니다.
+    const supersededIds = await reconcileLocalEchoes(messages);
+    if (supersededIds.size > 0) {
+        // 승계된 로컬 행이 이번 배치에도 실려 있다면 렌더링 대상에서 제외합니다.
+        messages = messages.filter(m => !supersededIds.has(String(m.id || "")));
+        if (messages.length === 0) return;
+    }
 
     const scrollEl = document.getElementById("chat-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;

@@ -815,6 +815,27 @@ pub async fn index_item_chunks(
         ));
         return Ok(0);
     }
+
+    // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 page_type 이 도메인 타입(tracking/goods/...)
+    //    이므로 위 문자열 목록으로는 절대 걸러지지 않습니다.
+    //    실제 사고 사례: 서버 index.ts 의 home 문서
+    //      { table:'pages', type:'tracking', data:{ origin, link, item:true, node:true } }
+    //    가 items 로 새어 들어와 청크 11건 + 음차 3건이 생성되었습니다.
+    //    셀렉터 캐시는 #global-search 의 검색 대상이 아니므로 구조 마커로 즉시 차단합니다.
+    {
+        let is_page_cache = item_json.get("table")
+                .and_then(|v| v.as_str())
+                .map_or(false, |t| t == "pages" || t == "page")
+            || item_json.get("node").is_some()
+            || item_json.get("item").is_some();
+        if is_page_cache {
+            emit(&format!(
+                "  ⏭️ [CHUNK SKIP / PAGE CACHE] item_id='{}' (type='{}') 는 페이지 셀렉터 캐시이므로 청크 인덱싱과 음차를 모두 생략합니다.",
+                item_id, page_type
+            ));
+            return Ok(0);
+        }
+    }
     if fields.is_empty() {
         emit(&format!(
             "  ⏭️ [CHUNK SKIP] type='{}' 에 대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다. (아이템 벡터는 별도 생성됨)",
