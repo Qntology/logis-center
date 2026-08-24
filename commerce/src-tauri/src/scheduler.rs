@@ -9055,21 +9055,21 @@ async fn process_trading_task(
         };
 
         let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 ListMode PUG를 컨텍스트로 사용합니다.
-            //    content_pug는 이미 pre_clean_html → convert_to_clean_pug(ListMode) →
+            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 NoAttributesMode PUG를 컨텍스트로 사용합니다.
+            //    light_pug는 이미 pre_clean_html → convert_to_clean_pug(NoAttributesMode) →
             //    truncate_pug_context 파이프라인을 거친 결과입니다.
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}", content_pug, claimed_ctx),
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}", light_pug),
                             name: None,
                         },
                     ),
                     crate::openai_types::ChatCompletionRequestMessage::User(
                         crate::openai_types::ChatCompletionRequestUserMessage {
                             content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
-                                schema_prompt,
+                                scoped_prompt,
                             ),
                             name: None,
                         },
@@ -9081,14 +9081,22 @@ async fn process_trading_task(
                 top_p: Some(0.95),
                 ..Default::default()
             };
-            let res = gen.generate(
-                params,
-                Some(cancellation_token.clone()),
-                Some(format!("{}_doctype", task.id)),
-                None, None, None
-            ).await?;
+            let res = gen
+                .generate(
+                    params,
+                    Some(cancellation_token.clone()),
+                    Some(format!("{}_doctype", task.id)),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
             crate::parsing::parse_json_from_llm(&res)
-                .get("doc_type").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+                .get("doc_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
         } else {
             String::new()
         };
