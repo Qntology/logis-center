@@ -464,6 +464,208 @@ Fill out the JSON keys in the exact order specified below. Use 'analysis_*' keys
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
 }
 
+// 🌟 [ANALYTIC SEMANTIC] 원시 outerHTML 을 PUG 로 변환하고 속성을 전부 제거한 뒤,
+//    '태그 구조 + 화면 텍스트' 만 남은 상태에서 Qwen3.5 2B 가 의미를 요약합니다.
+//    ── 왜 속성을 지우는가 ──
+//     class="btn_prd_option_2 on" / id="cnt_capa_1" 같은 값은 사이트마다 제각각이라
+//     LLM 이 그것을 '의미' 로 오인해 존재하지 않는 속성을 지어냅니다.
+//     속성을 제거하면 남는 신호가 (a / li / td / 텍스트) 뿐이므로
+//     모델은 화면에 실제로 인쇄된 문자열만 근거로 삼게 됩니다.
+pub fn analytic_semantic_prompt(
+    event_type: &str,
+    link: &str,
+    lang: &str,
+    target_pug: &str,
+    related_pug: &str,
+) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analysis Expert. The raw HTML has already been converted into an ATTRIBUTE-FREE PUG tree, so ONLY the semantic tag structure and the visible text remain. Interpret that structure and describe what the user did.
+
+[CONTEXT]
+Event Type: {EVENT_TYPE}
+Page: {LINK}
+Output Language: {LANG}
+
+[TARGET ELEMENT — the element the user actually interacted with]
+{TARGET_PUG}
+
+[SURROUNDING ELEMENTS — siblings shown next to it that the user did NOT choose]
+{RELATED_PUG}
+
+[RULES]
+1. "action" MUST name the concrete entity in [TARGET ELEMENT] (product title, option value, menu label, typed value, price) EXACTLY as it is printed there. Never invent a name that is not printed.
+2. "relate" describes only the NEIGHBOURING items in [SURROUNDING ELEMENTS]. Never describe the target itself here. Return an empty array when there is no sibling.
+3. "summary" is ONE sentence explaining what the user was trying to accomplish on this page, and MUST reuse the same entity name used in "action".
+4. Copy every proper noun, product name, code, price and number EXACTLY as printed. Do not translate, round, or reformat them.
+5. If [TARGET ELEMENT] carries no readable text at all, return null for every key. A null answer is correct data; an invented one is corrupted data.
+
+[OUTPUT FORMAT]
+{ "action": String, "relate": [String], "summary": String }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{EVENT_TYPE}", event_type)
+        .replace("{LINK}", link)
+        .replace("{LANG}", lang)
+        .replace("{TARGET_PUG}", target_pug)
+        .replace("{RELATED_PUG}", related_pug)
+}
+
+// 🌟 [ANALYTIC FLOW] 같은 사용자·같은 페이지에서 구조화된 여러 행동을 묶어
+//    흐름(cross_action_flow) / 의도 변화(intent_evolution) / 반복 성향(consistent_preferences)을
+//    한 번에 합성합니다. analytics-logis-center 의 Cron 산출물과 동일한 3축입니다.
+pub fn analytic_flow_prompt(lang: &str, records_json: &str) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analysis Expert. Below is a time-ordered list of ALREADY STRUCTURED user actions taken by ONE user. Synthesize them into a behavioural narrative.
+
+[CONTEXT]
+Output Language: {LANG}
+
+[STRUCTURED ACTION RECORDS]
+{RECORDS}
+
+[RULES]
+1. Use ONLY the facts present in [STRUCTURED ACTION RECORDS]. Never invent a page, product or option that is not listed.
+2. Keep every proper noun, product name and number EXACTLY as printed in the records.
+3. "cross_action_flow": describe the overall path in order (what was viewed, what was compared, what was chosen).
+4. "intent_evolution": describe how the goal shifted from the first action to the last one.
+5. "consistent_preferences": describe the attributes the user repeatedly gravitated toward. Return an empty string when nothing repeats.
+
+[OUTPUT FORMAT]
+{ "cross_action_flow": String, "intent_evolution": String, "consistent_preferences": String }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{LANG}", lang)
+        .replace("{RECORDS}", records_json)
+}
+
+// 🌟 [ANALYTIC QUERY PARSER] parse_commerce_query 의 para2graph + extract_time_intent_prompt
+//    구조를 분석(Analytic) 도메인에 맞춰 하나로 압축한 질의 파서입니다.
+//    ── 왜 별도 파서인가 ──
+//     commerce 는 sale_price / tracking_number 처럼 '컬럼 조건' 을 뽑아야 하지만,
+//     analytic 의 저장 축은 action / summary / relate 세 개의 자유 서술 문장뿐입니다.
+//     따라서 수치 조건 추출은 불필요하고, 실제로 필요한 것은
+//       ① 기간(time_intent / season_intent)
+//       ② 이벤트 종류(click / hover / change / report)
+//       ③ 의미 키워드
+//     세 가지입니다. 기간은 LLM 값을 그대로 쓰지 않고 Rust 가 다시 epoch 로 확정합니다.
+pub fn analytic_query_prompt(query: &str, time_context: &str, lang: &str) -> String {
+    let mut time_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("time_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec![
+            "today".to_string(), "yesterday".to_string(),
+            "this_month".to_string(), "last_month".to_string(),
+            "this_year".to_string(), "last_year".to_string(),
+            "recently".to_string()
+        ]);
+    time_keys.push("".to_string());
+    let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let mut season_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("season_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec![
+            "spring".to_string(), "summer".to_string(),
+            "autumn".to_string(), "winter".to_string()
+        ]);
+    season_keys.push("".to_string());
+    let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Act as a deterministic semantic parser for a USER BEHAVIOUR LOG search engine.
+Split the natural language query into a period, an event kind, and the semantic keywords.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[AVAILABLE TIME INTENTS]
+{TIME_ARRAY}
+
+[AVAILABLE SEASON INTENTS]
+{SEASON_ARRAY}
+
+[AVAILABLE EVENT TYPES]
+- "click"  : the user pressed / selected something
+- "hover"  : the user lingered on something without pressing it
+- "change" : the user typed a value, picked a select option, toggled a checkbox
+- "report" : a synthesized behavioural report over several actions
+- ""       : the query does not restrict the event kind
+
+[QUERY]
+{QUERY}
+
+[RULES]
+1. "time_intent" MUST be chosen from [AVAILABLE TIME INTENTS]. Return "" when the query contains NO explicit temporal word. Never guess a period from context.
+2. "season_intent" MUST be chosen from [AVAILABLE SEASON INTENTS]. Return "" when no season word is printed. A clothing name is NOT a season word.
+3. "event_types" is an array chosen from [AVAILABLE EVENT TYPES]. Return an empty array when the query does not restrict the kind.
+4. "keywords" holds the meaning-bearing chunks of the query in the ORIGINAL language, with every temporal word removed. Never include verbs such as "show me", "find", "tell me".
+5. "target" is one short sentence, in {LANG}, restating what behaviour the user wants to see. It is used as the semantic search sentence.
+6. "original_text" is the query copied character for character.
+
+[OUTPUT FORMAT]
+{ "original_text": String, "time_intent": String, "season_intent": String, "event_types": [String], "keywords": [String], "target": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template
+        .replace("{TIME_CONTEXT}", time_context)
+        .replace("{TIME_ARRAY}", &time_arr_str)
+        .replace("{SEASON_ARRAY}", &season_arr_str)
+        .replace("{QUERY}", query)
+        .replace("{LANG}", lang)
+}
+
+// 🌟 [ANALYTIC REPORT] 벡터 검색으로 회수한 '구조화된 행동 기록' 목록을 근거로
+//    사용자 질의에 답하는 리포트를 작성합니다. 결과는 JSON 이 아니라 마크다운 본문입니다.
+pub fn analytic_report_answer_prompt(
+    query: &str,
+    time_context: &str,
+    scope: &str,
+    records_json: &str,
+    lang: &str,
+) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analyst. Answer the user's question using ONLY the retrieved behaviour records below.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[SEARCH SCOPE]
+{SCOPE}
+
+[USER QUESTION]
+{QUERY}
+
+[RETRIEVED BEHAVIOUR RECORDS]
+{RECORDS}
+
+[RULES]
+1. Every sentence you write MUST be supported by a record above. If the records do not answer the question, say so plainly instead of inventing an answer.
+2. Copy product names, option values, prices and numbers EXACTLY as printed in the records.
+3. Represent users as User A, User B, User C ... Never print the raw address / hash of a user.
+4. Write in {LANG}.
+5. Structure the answer as:
+   - one short headline sentence that directly answers the question
+   - a bullet list of the concrete supporting actions (what, where, when)
+   - one closing sentence on the pattern or the recommended follow-up
+6. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
+
+[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. /no_think"###;
+
+    template
+        .replace("{TIME_CONTEXT}", time_context)
+        .replace("{SCOPE}", scope)
+        .replace("{QUERY}", query)
+        .replace("{RECORDS}", records_json)
+        .replace("{LANG}", lang)
+}
+
 pub fn is_detail_prompt(page_type: &str, title: &str, lang: &str) -> String {
     let (list_hints, form_hints) = crate::parsing::get_layout_prompt_hints(page_type, lang);
 

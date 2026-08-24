@@ -651,6 +651,38 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("completed", "Boolean", "completed purchased", "");
             add("registration_date", "String", "date registration time", "");
         },
+        // 🌟 [ANALYTIC BEHAVIOUR SCHEMA] 사용자 행동 로그 도메인.
+        //  ── 왜 필요한가 ──
+        //   index_item_chunks 는 get_detail_schema_fields 가 빈 배열을 돌려주면
+        //   "대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다" 로 조기 종료합니다.
+        //   그래서 click / hover / change / report 문서는 아이템 벡터 1개만 생기고
+        //   item_chunks 가 0건이라 STAGE-4(청크 코사인)가 항상 비었습니다.
+        //  ── 축 설계 ──
+        //   저장 축은 자유 서술 3개(action / summary / relate)와
+        //   합성 3개(cross_action_flow / intent_evolution / consistent_preferences)입니다.
+        //   bias.json 에 노드를 만들지 않고 en_bias 만으로 뱅크를 세워도
+        //   다국어 임베딩이 교차언어 매칭을 담당하므로 리콜이 성립합니다.
+        "click" | "hover" | "change" | "report" => {
+            add("id,link", "", "id link url address", "");
+            add("action", "String",
+                "user action, user intent, clicked item, selected option, entered value, chosen product, pressed button, picked menu",
+                "identifier, code, url, link, date, price, quantity, status, address, phone number");
+            add("summary", "String",
+                "page goal, what the user tried to accomplish, purpose of the visit, task the user was performing",
+                "identifier, code, url, link, date, price, quantity, status");
+            add("relate", "Array of Strings",
+                "neighbouring items, sibling options, alternatives not selected, surrounding list, competing choices",
+                "identifier, code, url, link, date, price, status");
+            add("cross_action_flow", "String",
+                "overall behaviour flow, journey across pages, sequence of actions, path taken",
+                "identifier, code, url, link, date, price, status");
+            add("intent_evolution", "String",
+                "how the goal changed over time, shifting objective, evolving purpose",
+                "identifier, code, url, link, date, price, status");
+            add("consistent_preferences", "String",
+                "repeated preference, recurring choice, habitual attribute, favourite option",
+                "identifier, code, url, link, date, price, status");
+        },
         // 🌟 [TRADE DOC SCHEMA] 무역 서식 도메인.
         //  ── 왜 필요한가 ──
         //   기존에는 BL / AWB / LC 등 27종이 전부 `_` 로 떨어져

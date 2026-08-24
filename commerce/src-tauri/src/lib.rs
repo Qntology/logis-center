@@ -576,6 +576,107 @@ async fn reindex_pending_embeddings(
     Ok(json!({ "processed": processed, "mode": target_mode }))
 }
 
+// =====================================================================
+// 🌟 [ANALYTIC STRUCTURING ENTRY] D1 → LanceDB 로 내려온 원시 행동 로그를
+//    HTML → PUG → 속성 제거 → Qwen3.5 2B 요약 으로 확정합니다.
+//  ── 호출 시점 ──
+//   main.ts 의 syncAnalyticsData 직후. 임베딩(reindex_pending_embeddings)보다
+//   반드시 먼저 실행되어야 합니다. 텍스트가 없으면 임베딩 경로가
+//   RAW GUARD 로 그 문서를 건너뛰기 때문입니다.
+// =====================================================================
+#[tauri::command]
+async fn structure_pending_analytics(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    limit: Option<usize>,
+    device_preference: Option<String>,
+) -> Result<Value, String> {
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        return Ok(json!({ "processed": 0, "skipped": "searching" }));
+    }
+    if crate::ACTIVE_TASK_MEM.read().unwrap().is_some() {
+        return Ok(json!({ "processed": 0, "skipped": "busy" }));
+    }
+    if state.cancellation_token.load(Ordering::Relaxed) {
+        return Ok(json!({ "processed": 0, "skipped": "cancelled" }));
+    }
+
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            let _ = std::fs::create_dir_all(&db_path);
+            if let Ok(s) = VectorStore::new(&db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
+        }
+        store_guard.as_ref().cloned()
+    };
+
+    let store = match store_opt {
+        Some(s) => s,
+        None => return Err("DB not initialized".to_string()),
+    };
+
+    // 🌟 [LAZY MODEL LOAD] 대상이 0건이면 Qwen3.5 2B 를 아예 올리지 않습니다.
+    //    (LanceDB 조회 1회로 끝나므로 유휴 시 부담이 사실상 없습니다)
+    let type_list = crate::analytic::ANALYTIC_EVENT_TYPES
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let probe_filter = format!(
+        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
+        type_list
+    );
+
+    let probe = store
+        .get_all_items("items", 1, 0, Some(probe_filter))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if probe.is_empty() {
+        return Ok(json!({ "processed": 0, "skipped": "no_pending" }));
+    }
+
+    println!("[ANALYTIC] Pending raw behaviour event detected. Loading Qwen3.5(2B) for structuring...");
+
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    let processed = crate::analytic::run_analytic_structuring(
+        &store,
+        &model,
+        &state.cancellation_token,
+        &app_handle,
+        "analytic_sync",
+        limit.unwrap_or(20),
+    ).await.map_err(|e| e.to_string())?;
+
+    model.deep_purge_resources().await;
+
+    Ok(json!({ "processed": processed }))
+}
+
 #[tauri::command]
 async fn resize_window(app_handle: tauri::AppHandle, width: f64, height: f64) {
     if let Some(window) = app_handle.get_webview_window("main") {
@@ -1548,7 +1649,20 @@ async fn ai_search_complex(
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
             },
             "analytic" => {
-                model.parse_analytic_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
+                // 🌟 [ANALYTIC QUERY v2 → model.rs]
+                //    parse_analytic_search_query 를 model.rs 의 LogisModel 메서드로 이동합니다.
+                //    parse_commerce_query / parse_shipping_query 와 동일한 호출 패턴으로 통일되어,
+                //    모델 로드·임베딩·Qwen3.5 호출을 LogisModel 내부에서 일괄 관리합니다.
+                model
+                    .parse_analytic_search_query(
+                        &task_id,
+                        &app_handle,
+                        query.clone(),
+                        &language,
+                        cancel_token.clone(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
             },
             _ => { // default: commerce
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -2149,15 +2263,173 @@ async fn ai_search_complex(
         // 🌟 [STAGE-5 종료]
         // =====================================================================
 
-        // 🌟 [RESPONSE v4] 프론트엔드는 아래 3개를 받습니다.
+        // =====================================================================
+        // 🌟 [STAGE-6 / ANALYTIC REPORT] 회수한 시맨틱 기록으로 리포트를 작성합니다.
+        // ---------------------------------------------------------------------
+        //  ── 왜 여기서 만드는가 ──
+        //   프론트엔드는 LanceDB 원문(action / summary / relate)을 갖고 있지 않습니다.
+        //   결과 목록만 던지면 사용자는 로그 조각을 직접 읽어야 합니다.
+        //   Rust 가 원문을 다시 꺼내 Qwen3.5 2B 로 답변형 리포트를 합성해
+        //   채팅 말풍선 한 개로 전달합니다.
+        //  ── 근거 고정 ──
+        //   프롬프트는 "회수된 기록만 근거로 삼고, 없으면 없다고 말하라" 를 강제합니다.
+        // =====================================================================
+        let mut analytic_report = String::new();
+
+        if search_mode == "analytic" && !all_results.is_empty() {
+            if let Some(store) = store_opt.as_ref() {
+                let _ = app_handle.emit("extraction-progress", json!({
+                    "task_id": task_id,
+                    "category": "Report",
+                    "summary": "Writing behaviour report...",
+                    "spinner": "⠋"
+                }));
+
+                let mut records: Vec<Value> = Vec::new();
+
+                for item in all_results.iter().take(30) {
+                    if cancel_token.load(Ordering::Relaxed) { break; }
+                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() { continue; }
+
+                    if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
+                        if let Ok(d) = serde_json::from_str::<Value>(&doc.json_data) {
+                            let action = d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let summary = d.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                            let flow = d.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or("");
+                            let evo = d.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("");
+                            let pref = d.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("");
+
+                            if action.is_empty() && summary.is_empty() && flow.is_empty() {
+                                continue;
+                            }
+
+                            let at = d.get("created_at").and_then(|v| v.as_i64()).unwrap_or(doc.created_at_ts);
+                            let at_iso = chrono::DateTime::from_timestamp_millis(at)
+                                .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+                                .unwrap_or_default();
+
+                            records.push(json!({
+                                "user": doc.from,
+                                "type": doc.r#type,
+                                "at": at_iso,
+                                "link": d.get("link").and_then(|v| v.as_str()).unwrap_or(""),
+                                "action": action,
+                                "summary": summary,
+                                "relate": d.get("relate").cloned().unwrap_or(json!([])),
+                                "cross_action_flow": flow,
+                                "intent_evolution": evo,
+                                "consistent_preferences": pref
+                            }));
+                        }
+                    }
+                }
+
+                if !records.is_empty() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
+                        .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+                        .unwrap_or_default();
+
+                    let started_at = structured_query.get("started_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let expired_at = structured_query.get("expired_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let time_intent = structured_query.get("time_intent").and_then(|v| v.as_str()).unwrap_or("");
+                    let season_intent = structured_query.get("season_intent").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let period_str = if started_at > 0 {
+                        let s = chrono::DateTime::from_timestamp_millis(started_at)
+                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let e = chrono::DateTime::from_timestamp_millis(expired_at)
+                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        format!("{} ~ {}", s, e)
+                    } else {
+                        "all time".to_string()
+                    };
+
+                    let scope = format!(
+                        "Period: {} (time_intent='{}', season_intent='{}')\nRecords retrieved: {}",
+                        period_str,
+                        if time_intent.is_empty() { "-" } else { time_intent },
+                        if season_intent.is_empty() { "-" } else { season_intent },
+                        records.len()
+                    );
+
+                    let time_context = format!(
+                        "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".",
+                        current_iso, now_ms, language
+                    );
+
+                    let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
+
+                    let prompt = crate::prompts::analytic_report_answer_prompt(
+                        &query,
+                        &time_context,
+                        &scope,
+                        &records_json,
+                        &language
+                    );
+
+                    model.secure_vram_relay(
+                        crate::model::ModelSize::Qwen3_5,
+                        None,
+                        Some(cancel_token.clone()),
+                        false,
+                        None
+                    ).await.map_err(|e| e.to_string())?;
+
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![
+                            crate::openai_types::ChatCompletionRequestMessage::User(
+                                crate::openai_types::ChatCompletionRequestUserMessage {
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                                    name: None,
+                                }
+                            )
+                        ],
+                        model: "qwen3.5".to_string(),
+                        max_tokens: Some(2048),
+                        temperature: Some(0.2),
+                        top_p: Some(0.95),
+                        ..Default::default()
+                    };
+
+                    if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                        if let Ok(res) = gen.generate(
+                            params,
+                            Some(cancel_token.clone()),
+                            Some(format!("{}_report", task_id)),
+                            None,
+                            None,
+                            None
+                        ).await {
+                            analytic_report = res.trim().to_string();
+                        }
+                    }
+
+                    emit_term(&format!(
+                        "[ANALYTIC-REPORT] 📝 근거 기록 {}건으로 리포트를 작성했습니다. ({}자)",
+                        records.len(),
+                        analytic_report.chars().count()
+                    ));
+                } else {
+                    emit_term("[ANALYTIC-REPORT] ⚪ 회수된 문서에 구조화 문장이 없어 리포트를 생략합니다.");
+                }
+            }
+        }
+
+        // 🌟 [RESPONSE v4] 프론트엔드는 아래 4개를 받습니다.
         //    structured  : PLINKO 가 확정한 의미 구조 (기존과 동일)
         //    results     : LanceDB 리콜 후보 (조건 미적용, 넓게)
         //    dexie_plans : Dexie 가 실행할 정밀 필터 플랜 (조건 100% 보존)
+        //    report      : analytic 모드 전용. Qwen3.5 2B 가 쓴 답변형 리포트
         //  → main.ts 가 results 를 dexie_plans 로 걸러 최종 결과를 확정합니다.
         Ok(json!({
             "structured": structured_query,
             "results": all_results,
-            "dexie_plans": dexie_plans
+            "dexie_plans": dexie_plans,
+            "report": analytic_report
         }))
     }.await; 
 
@@ -3573,7 +3845,7 @@ pub fn run() {
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
-            get_query_embedding, reindex_pending_embeddings,
+            get_query_embedding, reindex_pending_embeddings, structure_pending_analytics,
             translit_cache_respond, get_embedding_batch_for_translit
         ])
         .build(tauri::generate_context!())

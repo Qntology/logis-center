@@ -6420,6 +6420,260 @@ impl LogisModel {
         Ok(json!({ "context": ctx }))
     }
 
+    /// 🌟 [ANALYTIC SEARCH QUERY v2] 자연어 질의를 행동 로그 검색 컨텍스트로 변환합니다.
+    ///   기존 `parse_analytic_query` 는 수치 조건 추출에 특화되어 있어
+    ///   행동 로그(자유 서술) 검색에 부적합했습니다.
+    ///   이 메서드는:
+    ///     ① 결정론 시간 가이드 (bias.json exact_match)
+    ///     ② Qwen3.5 2B 의미 파싱 (기간 / 이벤트 종류 / 키워드)
+    ///     ③ Rust 가 기간을 epoch ms 로 재확정
+    ///   세 단계를 거칩니다.
+    pub async fn parse_analytic_search_query(
+        &self,
+        task_id: &str,
+        app_handle: &tauri::AppHandle,
+        query: String,
+        language: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let app_handle_clone = app_handle.clone();
+        let tid = task_id.to_string();
+        let emit_term = move |msg: &str| {
+            println!("{}", msg);
+            let _ = app_handle_clone.emit(
+                "task-console-log",
+                json!({ "task_id": tid, "text": format!("{}\n", msg) }),
+            );
+        };
+
+        emit_term("\n[ANALYTIC-QUERY] 🔍 행동 로그 질의 파싱 시작");
+        emit_term(&format!("   질의: \"{}\"", query));
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
+            .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+            .unwrap_or_default();
+
+        // ── ① 결정론 시간 가이드 ──
+        let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(&query, language);
+        let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
+        if !det_time_key.is_empty() || !det_season_key.is_empty() {
+            emit_term(&format!(
+                "   ⚡ [EXACT MATCH] bias.json 완전일치로 확정: time='{}' | season='{}'",
+                det_time_key, det_season_key
+            ));
+        }
+
+        let time_context = format!(
+            "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".\n{}",
+            current_iso, now_ms, language, deterministic_time
+        );
+
+        // ── ② Qwen3.5 2B 의미 파싱 ──
+        self.secure_vram_relay(
+            crate::model::ModelSize::Qwen3_5,
+            None,
+            Some(cancel.clone()),
+            false,
+            None,
+        )
+        .await?;
+
+        let prompt = crate::prompts::analytic_query_prompt(&query, &time_context, language);
+        let params = crate::openai_types::ChatCompletionParameters {
+            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                crate::openai_types::ChatCompletionRequestUserMessage {
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
+                        prompt,
+                    ),
+                    name: None,
+                },
+            )],
+            model: "qwen3.5".to_string(),
+            max_tokens: Some(512),
+            temperature: Some(0.0),
+            top_p: Some(0.95),
+            ..Default::default()
+        };
+
+        let res_text = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+            gen.generate(
+                params,
+                Some(cancel.clone()),
+                Some(format!("{}_aq", task_id)),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let parsed = crate::parsing::parse_json_from_llm(&res_text);
+        let mut time_intent = parsed
+            .get("time_intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let mut season_intent = parsed
+            .get("season_intent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        // 🌟 완전일치가 있으면 LLM 판정보다 우선합니다.
+        if !det_time_key.is_empty() {
+            time_intent = det_time_key.clone();
+        }
+        if !det_season_key.is_empty() {
+            season_intent = det_season_key.clone();
+        }
+
+        let keywords: Vec<String> = parsed
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut event_types: Vec<String> = parsed
+            .get("event_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
+                    .filter(|s| crate::analytic::ANALYTIC_SEARCH_TYPES.iter().any(|t| *t == s.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if event_types.is_empty() {
+            event_types = crate::analytic::ANALYTIC_SEARCH_TYPES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        let target = parsed
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if keywords.is_empty() {
+                    query.clone()
+                } else {
+                    keywords.join(" ")
+                }
+            });
+
+        // ── ③ 기간을 Rust 가 재확정 ──
+        let mut started_at: i64 = 0;
+        let mut expired_at: i64 = 0;
+
+        if !season_intent.is_empty() {
+            let (y, _, _) = crate::analytic::ymd_of(now_ms);
+            let year = if time_intent == "last_year" {
+                y - 1
+            } else {
+                y
+            };
+            if let Some((s, e)) = crate::analytic::season_range(&season_intent, year) {
+                started_at = s;
+                expired_at = e;
+            }
+        }
+
+        if started_at == 0 {
+            if let Some((s, e)) = crate::analytic::time_intent_range(&time_intent, now_ms) {
+                started_at = s;
+                expired_at = e;
+            }
+        }
+
+        if started_at > 0 {
+            emit_term(&format!(
+                "   🗓️ [PERIOD CONFIRMED] time='{}' | season='{}' → {} ~ {} (epoch ms)",
+                if time_intent.is_empty() {
+                    "-"
+                } else {
+                    &time_intent
+                },
+                if season_intent.is_empty() {
+                    "-"
+                } else {
+                    &season_intent
+                },
+                started_at,
+                expired_at
+            ));
+        } else {
+            emit_term("   🗓️ [PERIOD] 명시적 기간 표현이 없어 전체 구간을 검색합니다.");
+        }
+
+        // ── ④ 컨텍스트 조립 ──
+        let mut condition = serde_json::Map::new();
+        if started_at > 0 {
+            condition.insert(
+                "created_at".to_string(),
+                json!({ "operator": "gte", "value": started_at }),
+            );
+        }
+
+        let mut contexts: Vec<serde_json::Value> = Vec::new();
+        contexts.push(json!({
+            "text": target,
+            "language": language,
+            "type": event_types[0],
+            "types": event_types,
+            "condition": serde_json::Value::Object(condition.clone()),
+            "unassigned": keywords
+        }));
+
+        if expired_at > 0 {
+            let mut upper = serde_json::Map::new();
+            upper.insert(
+                "created_at".to_string(),
+                json!({ "operator": "lte", "value": expired_at }),
+            );
+            contexts.push(json!({
+                "text": target,
+                "language": language,
+                "type": event_types[0],
+                "types": event_types,
+                "condition": serde_json::Value::Object(upper),
+                "unassigned": keywords
+            }));
+        }
+
+        let out = json!({
+            "original_text": query,
+            "time_intent": time_intent,
+            "season_intent": season_intent,
+            "started_at": started_at,
+            "expired_at": expired_at,
+            "event_types": event_types,
+            "keywords": keywords,
+            "target": target,
+            "context": contexts
+        });
+
+        emit_term(&format!(
+            "[ANALYTIC-QUERY] ✅ 파싱 결과: {}",
+            serde_json::to_string(&out).unwrap_or_default()
+        ));
+
+        Ok(out)
+    }
+
     // --- Ported from Python (search_engine.py) ---
     // --- Ported from Python (logic.py) ---
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {

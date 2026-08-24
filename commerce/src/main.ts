@@ -881,6 +881,50 @@ async function runLocalEmbeddingSync() {
 }
 
 // =====================================================================
+// 🌟 [ANALYTIC STRUCTURING] 원시 행동 로그(HTML) → 시맨틱 문장 확정
+// ---------------------------------------------------------------------
+//  순서가 중요합니다.
+//    ① structure_pending_analytics : HTML → PUG → 속성 제거 → Qwen3.5 2B 요약
+//    ② reindex_pending_embeddings  : 확정된 문장을 임베딩 + item_chunks 인덱싱
+//  ①을 건너뛰면 text 가 비어 있어 ②의 RAW GUARD 가 그 문서를 통째로 보류합니다.
+// =====================================================================
+let isAnalyticStructuring = false;
+
+async function runAnalyticStructuring(): Promise<number> {
+    if (isAnalyticStructuring) return 0;
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return 0;
+
+    isAnalyticStructuring = true;
+    try {
+        const res = await invoke<any>("structure_pending_analytics", {
+            limit: 20,
+            devicePreference: getDevicePref()
+        });
+
+        const processed = (res && res.processed) ? res.processed : 0;
+
+        if (processed > 0) {
+            console.log(`[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`);
+            if (currentSearchMode === "analytic") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+        } else if (res && res.skipped) {
+            console.log(`[ANALYTIC] 구조화 스킵: 사유=${res.skipped}`);
+        }
+
+        return processed;
+    } catch (e) {
+        console.warn("[ANALYTIC] structure_pending_analytics failed:", e);
+        return 0;
+    } finally {
+        isAnalyticStructuring = false;
+    }
+}
+
+// =====================================================================
 // 🌟 [ANALYTICS TRACK v2] console.logis.center(Client Worker) ↔ 로컬 동기화
 // ---------------------------------------------------------------------
 //  ── Worker 계약 (console-logis-center/src/index.ts 실측) ──
@@ -1122,6 +1166,11 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
         // 🌟 [MODE TAGGING] modeOfType() 단일 판정 경로를 그대로 사용합니다.
         const rowMode = modeOfType(rowType);
 
+        // 🌟 [RAW MARKER] 아직 구조화되지 않은 원시 이벤트인지 판정합니다.
+        //    content.js 는 action / relate 를 outerHTML '배열' 로 올리므로
+        //    배열이면 곧 '구조화 전' 이라는 구조적 사실입니다.
+        const isRawEvent = Array.isArray(parsed?.action) || Array.isArray(parsed?.relate);
+
         items.push({
             id: row.id,
             type: rowType,
@@ -1135,8 +1184,14 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
             status: 9,
             mode: rowMode,
             created_at: Number(row.created_at || now),
-            // ⚠️ updated_at 은 draft/count 계약이므로 서버 값을 그대로 보존합니다.
-            updated_at: serverUpdated > 0 ? serverUpdated : now,
+            // ⚠️ updated_at 은 draft/count 계약이자 '구조화 대기' 마커입니다.
+            //    ── 왜 now 로 덮으면 안 되는가 ──
+            //     Rust 의 structure_pending_analytics 는
+            //       mode = 'analytic' AND updated_at = 0
+            //     로 구조화 대상을 찾습니다. 여기서 now 를 넣으면
+            //     원시 outerHTML 이 영원히 요약되지 않아
+            //     text 가 빈 채로 남고, 검색이 구조적으로 0건이 됩니다.
+            updated_at: isRawEvent ? 0 : serverUpdated,
             text: textVal,
             masked_text: textVal,
             data: {
@@ -1144,6 +1199,7 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
                 id: row.id,
                 type: rowType,
                 mode: rowMode,
+                updated_at: isRawEvent ? 0 : serverUpdated,
                 text: textVal,
                 masked_text: textVal
             }
@@ -1209,8 +1265,21 @@ async function syncAnalyticsData() {
                     await loadMoreDocs(false, true);
                 }
             }
+
+            // 🌟 [STRUCTURE FIRST] 원시 outerHTML 을 먼저 시맨틱 문장으로 확정합니다.
+            //    이 단계가 끝나야 text 가 채워지고, 그때서야 임베딩이 의미를 갖습니다.
+            await runAnalyticStructuring();
+
             // 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않으므로 로컬에서 즉시 임베딩합니다.
             runLocalEmbeddingSync();
+        } else {
+            // 🌟 새로 받은 건이 없어도, 이전 라운드에서 구조화하지 못하고 남은
+            //    원시 이벤트가 있으면 이어서 처리합니다.
+            //    (LLM 로드 비용은 대상 0건일 때 백엔드가 probe 단계에서 차단합니다)
+            const structured = await runAnalyticStructuring();
+            if (structured > 0) {
+                runLocalEmbeddingSync();
+            }
         }
 
         console.log(`[SYNC-ANALYTIC] 완료. 총 저장 ${totalStored}건.`);
@@ -5093,10 +5162,25 @@ listen("extraction-progress", async (event: any) => {
             if (currentSearchMode === "analytic") {
                 const resultCount = response.results ? response.results.length : 0;
 
-                // ① 요약 말풍선
+                // ① 요약 말풍선 (질의 · 기간 · 회수 건수)
                 let summaryText = `Analytic 검색 완료: ${resultCount}건`;
                 if (response.structured && response.structured.original_text) {
                     summaryText = `${response.structured.original_text} → ${resultCount}건`;
+                }
+                if (response.structured && Number(response.structured.started_at) > 0) {
+                    const fmt = (ms: number) => {
+                        const d = new Date(Number(ms));
+                        const p = (n: number) => String(n).padStart(2, "0");
+                        return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+                    };
+                    const s = fmt(response.structured.started_at);
+                    const e = Number(response.structured.expired_at) > 0
+                        ? fmt(response.structured.expired_at)
+                        : s;
+                    const ti = response.structured.time_intent || "";
+                    const si = response.structured.season_intent || "";
+                    const tag = [ti, si].filter(Boolean).join(" / ");
+                    summaryText += `\n기간: ${s} ~ ${e}${tag ? ` (${tag})` : ""}`;
                 }
                 await renderMessage({
                     id: `${payload.task_id}_answer`,
@@ -5106,6 +5190,20 @@ listen("extraction-progress", async (event: any) => {
                     created_at: Date.now(),
                     updated_at: Date.now()
                 });
+
+                // 🌟 ①-1 리포트 말풍선
+                //    Rust(STAGE-6)가 회수한 시맨틱 기록만 근거로 Qwen3.5 2B 가 작성한 답변입니다.
+                //    근거가 없으면 백엔드가 빈 문자열을 돌려주므로 그때는 건너뜁니다.
+                if (response.report && String(response.report).trim().length > 0) {
+                    await renderMessage({
+                        id: `${payload.task_id}_report`,
+                        role: "system",
+                        text: String(response.report).trim(),
+                        status: 9,
+                        created_at: Date.now() + 1,
+                        updated_at: Date.now() + 1
+                    });
+                }
 
                 // ② Dexie Plan 실행 → 상세 결과 말풍선
                 if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
@@ -7342,6 +7440,8 @@ async function checkAuthStatus() {
             : null;
 
         const sentHash = currentSession.hash || "";
+
+        console.log('sessionParams',sessionParams);
 
         const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: sessionParams });
         

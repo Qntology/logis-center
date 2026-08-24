@@ -8857,17 +8857,38 @@ async fn process_trading_task(
     // ── HTML 전처리 ──
     let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         let content = raw_html.to_string();
-        if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
+        if let Some(obj) = task_data.as_object_mut() {
+            obj.remove("html");
+        }
         content
     } else {
-        return Err(anyhow::anyhow!("Trading extraction requires HTML content in task data"));
+        return Err(anyhow::anyhow!(
+            "Trading extraction requires HTML content in task data"
+        ));
     };
 
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    if cancellation_token.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!("Task cancelled"));
+    }
 
+    // ── URL 파싱 (raw_pug 생성 전에 반드시 필요) ──
+    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+
+    // 🌟 [PUG PIPELINE] 원문 HTML을 직접 사용하지 않습니다.
+    //    ① pre_clean_html      : script/style/noscript/iframe/svg 제거, 허용 속성만 유지
+    //    ② convert_to_clean_pug : DOM → PUG 변환 (NoAttributesMode = 속성 노이즈 제거)
+    //    ③ truncate_pug_context : 토큰 상한 적용
+    //    이 3단 파이프라인을 거친 결과를 변수에 저장하여
+    //    이후 STEP A(분류) / STEP B(추출)에서 재사용합니다.
     let clean_html_content = parsing::pre_clean_html(&raw_html_content);
-    let raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, None);
-    let light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
+
+    // 🌟 [URL FIX] base_url 을 None 이 아닌 실제 추출 주소로 전달하여
+    //    상대경로 href 가 절대경로 해석되도록 합니다.
+    let raw_pug =
+        parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
+    let light_pug = model
+        .truncate_pug_context(&raw_pug, false, 2000, None)
+        .await;
 
     // 문서 언어 감지
     doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
@@ -9034,23 +9055,28 @@ async fn process_trading_task(
         };
 
         let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 ListMode PUG를 컨텍스트로 사용합니다.
+            //    content_pug는 이미 pre_clean_html → convert_to_clean_pug(ListMode) →
+            //    truncate_pug_context 파이프라인을 거친 결과입니다.
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[HTML CONTENT]\n{}", light_pug),
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}", content_pug, claimed_ctx),
                             name: None,
-                        }
+                        },
                     ),
                     crate::openai_types::ChatCompletionRequestMessage::User(
                         crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(scoped_prompt),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
+                                schema_prompt,
+                            ),
                             name: None,
-                        }
-                    )
+                        },
+                    ),
                 ],
                 model: "qwen3.5".to_string(),
-                max_tokens: Some(64),
+                max_tokens: Some(1024),
                 temperature: Some(0.0),
                 top_p: Some(0.95),
                 ..Default::default()
@@ -9112,10 +9138,24 @@ async fn process_trading_task(
     final_data_map.insert("line_items".to_string(), json!([]));
     final_data_map.insert("containers".to_string(), json!([]));
 
-    // ── B-0 : 상세 모드 PUG 재생성 (값을 살려야 페어 추출이 가능) ──
+    // ── B-0 : 정제된 PUG로 컨텍스트 생성 (원문 HTML 직접 사용 금지) ──
+    //    ── 왜 ListMode 인가 ──
+    //     DetailMode 는 모든 속성(id/class/style/href/onclick...)을 그대로 남기므로
+    //     토큰의 대부분이 사이트별 잡음으로 채워지고,
+    //     0.6B 모델이 그것을 '의미'로 오인해 환각을 생성합니다.
+    //     ListMode 는:
+    //       · id / class / style 을 제거
+    //       · input[value], selected option 텍스트는 보존
+    //       · href 등 필수 이동 속성만 유지
+    //     하여 페어 추출에 필요한 값은 살리면서 속성 노이즈를 제거합니다.
+    //     이는 light_pug(NoAttributesMode)과 동일한 정제 철학이며,
+    //     원문 HTML을 LLM 컨텍스트로 직접 사용하지 않는 원칙을 관철합니다.
     let content_pug = {
-        let full_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::DetailMode, Some(&url));
-        model.truncate_pug_context(&full_pug, true, 2000, None).await
+        let full_pug =
+            parsing::convert_to_clean_pug(&clean_html_content, PugMode::ListMode, Some(&url));
+        model
+            .truncate_pug_context(&full_pug, true, 2000, None)
+            .await
     };
     let pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
     let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
@@ -9421,20 +9461,25 @@ async fn process_trading_task(
         }));
 
         if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 ListMode PUG를 컨텍스트로 사용합니다.
+            //    content_pug는 이미 pre_clean_html → convert_to_clean_pug(ListMode) →
+            //    truncate_pug_context 파이프라인을 거친 결과입니다.
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[HTML CONTENT]\n{}{}", content_pug, claimed_ctx),
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}", content_pug, claimed_ctx),
                             name: None,
-                        }
+                        },
                     ),
                     crate::openai_types::ChatCompletionRequestMessage::User(
                         crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(schema_prompt),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
+                                schema_prompt,
+                            ),
                             name: None,
-                        }
-                    )
+                        },
+                    ),
                 ],
                 model: "qwen3.5".to_string(),
                 max_tokens: Some(1024),
