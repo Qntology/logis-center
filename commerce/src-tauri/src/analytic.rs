@@ -1118,9 +1118,21 @@ pub async fn parse_analytic_search_query(
         if season_intent.is_empty() { "-" } else { &season_intent }, season_score
     ));
 
-    // ── event_types 임베딩 판정 ──
+    // ── event_types NMS 배틀 결과 확정 ──
+    // 슬라이딩 윈도우 + NMS 배틀에서 생존한 스팬 중 이벤트 타입만 추출합니다.
+    // 기존 방식은 질의 전체 벡터 1개로 판정하여
+    // '클릭한거 뭐야' 에서 '클릭' 이 '뭐야' 와 섞여 신호가 희석되는 문제가 있었습니다.
+    // NMS 배틀은 각 단어 윈도우를 독립적으로 경쟁시키므로 이 문제가 없습니다.
+    //
+    // 🌟 [구조 설명]
+    //   수정 1 에서 bank_defs 에 ("event", "click", 구) 등을 추가했으므로
+    //   슬라이딩 윈도우 → SURPRISAL 채점 → NMS 배틀 파이프라인이
+    //   time/season 과 동일하게 이벤트 타입도 처리합니다.
+    //   카테고리별 확정 루프의 "event" 분기가 이미
+    //   vec_events: Vec<(String, f32)> 를 채우고 있으므로
+    //   여기서 그 결과를 그대로 소비합니다.
     let mut event_types: Vec<String> = Vec::new();
-    for event_type in ANALYTIC_SEARCH_TYPES.iter() {
+    for event_type in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
         let anchor_phrases = crate::analytic::event_type_anchor_phrases(event_type);
         let prej_phrases = crate::analytic::event_type_prejudice_phrases(event_type);
         if anchor_phrases.is_empty() { continue; }
@@ -1139,21 +1151,18 @@ pub async fn parse_analytic_search_query(
             "  🎯 [EVENT NMS] '{}' | own: {:.4} | prej: {:.4} | score: {:+.4}",
             event_type, own, prej, score
         ));
-        // 🌟 [NMS THRESHOLD] score > 0 이어야 후보.
-        //    '클릭한거 뭐야' 에서 '클릭' 이 hover/change 보다 현저히 높아야만 선택.
-        //    마진이 부족하면 해당 타입을 제외하지 않고 포함 (리콜 보존).
         if score > 0.0 {
             event_types.push(event_type.to_string());
         }
     }
-    // 🌟 [REPORT ALWAYS-IN] report 는 합성 문서이므로 항상 포함.
+    // report 는 합성 문서이므로 항상 포함
     if !event_types.iter().any(|t| t == "report") {
         event_types.push("report".to_string());
     }
-    // 🌟 전부 탈락하면 전체 타입을 스코프로 (리콜 보존)
+    // 전부 탈락하면 전체 타입을 스코프로 (리콜 보존)
     if event_types.iter().filter(|t| *t != "report").count() == 0 {
         event_types = ANALYTIC_SEARCH_TYPES.iter().map(|s| s.to_string()).collect();
-        emit_term("  🛟 [EVENT FALLBACK] 임베딩 판정으로 확정된 타입이 없어 전체 타입을 스코프로 둡니다.");
+        emit_term("  🛟 [EVENT FALLBACK] NMS 배틀에서 확정된 이벤트 타입이 없어 전체 타입을 스코프로 둡니다.");
     }
     emit_term(&format!("  ✅ [EVENT TYPES FINAL] {:?}", event_types));
 

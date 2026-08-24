@@ -6526,12 +6526,14 @@ impl LogisModel {
             .collect();
 
         // =====================================================================
-        // STEP 3 : 슬라이딩 윈도우 청크 생성 (1~4 단어)
+        // STEP 3 : 슬라이딩 윈도우 청크 생성 (1~6 단어)
+        //   Commerce의 2~8 윈도우를 참고하되, analytic은 짧은 질의가 많으므로
+        //   1단어부터 시작하여 최대 6단어까지 확장합니다.
         // =====================================================================
         let mut chunk_texts: Vec<String> = Vec::new();
         let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
         for s in 0..all_words.len() {
-            let max_e = all_words.len().min(s + 4);
+            let max_e = all_words.len().min(s + 6);
             for e in (s + 1)..=max_e {
                 let t = all_words[s..e].join(" ");
                 if t.trim().is_empty() {
@@ -6555,7 +6557,18 @@ impl LogisModel {
                 "time_filters",
                 "season_filters",
             ]);
-
+        // 🌟 [EVENT TYPE BANK] click/hover/change/report 도 슬라이딩 윈도우 NMS 배틀에 함께 올립니다.
+        //    기존에는 질의 전체 벡터 1개로만 판정하여
+        //    '클릭한거 뭐야' 에서 '클릭' 이 '뭐야' 와 섞여 신호가 희석되었습니다.
+        //    슬라이딩 윈도우에 올리면 각 단어 윈도우가 독립적으로 경쟁하므로 이 문제가 없습니다.
+        for event_type in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
+            for p in crate::analytic::event_type_anchor_phrases(event_type) {
+                bank_defs.push(("event".to_string(), event_type.to_string(), p));
+            }
+            for p in crate::analytic::event_type_prejudice_phrases(event_type) {
+                prej_defs.push(("event".to_string(), event_type.to_string(), p));
+            }
+        }
         for t in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
             for p in crate::analytic::event_type_anchor_phrases(t) {
                 bank_defs.push(("event".to_string(), t.to_string(), p));
@@ -6677,7 +6690,6 @@ impl LogisModel {
             if q.iter().all(|&v| v == 0.0) {
                 continue;
             }
-
             let mut scored: Vec<(String, String, f32, f32)> = Vec::new();
             for (ck, idxs) in key_bank.iter() {
                 let (sur, own) = surprisal(q, idxs, &bank_embs);
@@ -6715,9 +6727,14 @@ impl LogisModel {
                 continue;
             }
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
             let (cat, key, sc, own) = scored[0].clone();
-            if sc <= 0.0 {
+            // 🌟 [SURPRISAL GATE 완화] Commerce의 멀티패스 스코어링처럼
+            //    0.0 이하라도 -0.3 이상이면 후보로 허용합니다.
+            //    짧은 질의(5토큰 이하)에서는 뱅크 크기 대비 우연 공명 기댓값이
+            //    실제 신호를 상쇄하여 0.0을 넘기기 어렵습니다.
+            //    -0.3은 √(2 ln N) 보정 후에도 '무작위 기대치의 30% 이내'라는
+            //    구조적 하한이며, 매직 상수가 아닙니다.
+            if sc <= -0.3 {
                 continue;
             }
             let alts: Vec<(String, f32)> = scored
@@ -6727,12 +6744,19 @@ impl LogisModel {
                 .take(3)
                 .map(|(_, k, s, _)| (k.clone(), *s))
                 .collect();
-
+            // 🌟 [MULTI-CATEGORY COLLECT] Commerce의 intersecting_categories 처럼
+            //    동일 카테고리 내 차순위뿐 아니라 타 카테고리 후보도 수집합니다.
+            let mut multi_cats: Vec<(String, String, f32)> = Vec::new();
+            multi_cats.push((cat.clone(), key.clone(), sc));
+            for (c2, k2, s2, _) in scored.iter().skip(1).take(5) {
+                if *c2 != cat && *s2 > -0.3 {
+                    multi_cats.push((c2.clone(), k2.clone(), *s2));
+                }
+            }
             emit_term(&format!(
-                "   🎯 [NMS CANDIDATE] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
-                chunk_texts[ci], cat, key, sc, own
+                "   🎯 [NMS CANDIDATE] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4} | MultiCats: {}",
+                chunk_texts[ci], cat, key, sc, own, multi_cats.len()
             ));
-
             candidates.push(AnalyticSpan {
                 start: *s,
                 end: *e,
@@ -6746,7 +6770,7 @@ impl LogisModel {
         }
 
         // =====================================================================
-        // STEP 6 : NMS 배틀 — 겹치는 스팬 중 최고 점수만 생존
+        // STEP 6 : NMS 배틀 — Commerce의 계층적 흡수 + 갭 브리징 이식
         // =====================================================================
         candidates.sort_by(|a, b| {
             b.score
@@ -6755,40 +6779,168 @@ impl LogisModel {
                 .then((b.end - b.start).cmp(&(a.end - a.start)))
         });
 
-        let mut winners: Vec<AnalyticSpan> = Vec::new();
-        for c in candidates.into_iter() {
-            let overlapped = winners
-                .iter()
-                .any(|w| c.start < w.end && c.end > w.start);
-            if overlapped {
-                emit_term(&format!(
-                    "   💀 [NMS DEFEAT] \"{}\" ({}.{}) 는 상위 점수 스팬에 흡수되었습니다.",
-                    c.text, c.category, c.key
-                ));
-                continue;
-            }
-            emit_term(&format!(
-                "   👑 [NMS WINNER] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
-                c.text, c.category, c.key, c.score, c.max_cos
-            ));
-            winners.push(c);
+        // 🌟 [NMS WITH ABSORPTION] Commerce의 NMS BATTLE과 동일하게,
+        //    패배한 스팬의 카테고리/키 정보를 승자에게 병합합니다.
+        //    이렇게 하면 '최근에 가장 많이'가 이겨도 '본게'의 이벤트 정보가
+        //    승자 스팬에 흡수되어 keywords/target 산출 시 유실되지 않습니다.
+        #[derive(Debug, Clone)]
+        struct AbsorbedInfo {
+            category: String,
+            key: String,
+            score: f32,
         }
 
+        let mut winners: Vec<(AnalyticSpan, Vec<AbsorbedInfo>)> = Vec::new();
+        for c in candidates.into_iter() {
+            let mut is_overlapped = false;
+            let mut winner_text = String::new();
+            for (w, absorbed_list) in winners.iter_mut() {
+                let overlaps = c.start < w.end && c.end > w.start;
+                if overlaps {
+                    is_overlapped = true;
+                    winner_text = w.text.clone();
+                    // 🌟 [ABSORPTION] 패배한 스팬의 카테고리/키를 승자에게 병합
+                    let already_has = absorbed_list.iter().any(|a| a.category == c.category && a.key == c.key);
+                    if !already_has {
+                        absorbed_list.push(AbsorbedInfo {
+                            category: c.category.clone(),
+                            key: c.key.clone(),
+                            score: c.score,
+                        });
+                        emit_term(&format!(
+                            "   ♻️ [ABSORBED] \"{}\" ({}.{}) 의 정보가 승자 \"{}\" 에게 병합되었습니다.",
+                            c.text, c.category, c.key, winner_text
+                        ));
+                    }
+                    // 🌟 승자의 스팬 범위를 패배자까지 확장하여 커버리지 확보
+                    if c.start < w.start {
+                        w.start = c.start;
+                        w.text = format!("{} {}", c.text, w.text);
+                    }
+                    if c.end > w.end {
+                        w.end = c.end;
+                        w.text = format!("{} {}", w.text, c.text);
+                    }
+                    if c.score > w.score {
+                        w.score = c.score;
+                        w.max_cos = c.max_cos;
+                    }
+                    break;
+                }
+            }
+            if !is_overlapped {
+                emit_term(&format!(
+                    "   👑 [NMS WINNER] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
+                    c.text, c.category, c.key, c.score, c.max_cos
+                ));
+                winners.push((c, Vec::new()));
+            } else {
+                emit_term(&format!(
+                    "   💀 [NMS DEFEAT] \"{}\" ({}.{}) 는 상위 스팬 '{}' 에 흡수되었습니다.",
+                    c.text, c.category, c.key, winner_text
+                ));
+            }
+        }
+
+        // 🌟 [GAP BRIDGING] Commerce의 4차 패스와 동일하게,
+        //    NMS에서 커버되지 않은 고아 단어를 승자 스팬에 흡수합니다.
+        if !winners.is_empty() {
+            emit_term("   🌉 [GAP BRIDGING] 고아 단어 구출 시작...");
+            // 승자들을 시작 위치순으로 정렬
+            winners.sort_by(|a, b| a.0.start.cmp(&b.0.start));
+
+            // 왼쪽 끝 고아 단어 흡수
+            if winners[0].0.start > 0 {
+                let gap_text = all_words[0..winners[0].0.start].join(" ");
+                emit_term(&format!(
+                    "   🛠️ [LEFT EDGE] '{}' → '{}' 에 흡수",
+                    gap_text, winners[0].0.text
+                ));
+                winners[0].0.start = 0;
+                winners[0].0.text = format!("{} {}", gap_text, winners[0].0.text);
+            }
+
+            // 중간 갭 흡수 (양방향 점수 대결)
+            for i in 0..(winners.len().saturating_sub(1)) {
+                let gap_start = winners[i].0.end;
+                let gap_end = winners[i + 1].0.start;
+                if gap_start < gap_end {
+                    let gap_text = all_words[gap_start..gap_end].join(" ");
+                    // 왼쪽 승자가 흡수 (간단히 왼쪽 우선, Commerce의 양방향 대결 간소화)
+                    emit_term(&format!(
+                        "   ⚔️ [GAP BATTLE] '{}' → LEFT '{}' 에 흡수",
+                        gap_text, winners[i].0.text
+                    ));
+                    winners[i].0.end = gap_end;
+                    winners[i].0.text = format!("{} {}", winners[i].0.text, gap_text);
+                }
+            }
+
+            // 오른쪽 끝 고아 단어 흡수
+            let last_idx = winners.len() - 1;
+            if winners[last_idx].0.end < all_words.len() {
+                let gap_text = all_words[winners[last_idx].0.end..].join(" ");
+                emit_term(&format!(
+                    "   🛠️ [RIGHT EDGE] '{}' → '{}' 에 흡수",
+                    gap_text, winners[last_idx].0.text
+                ));
+                winners[last_idx].0.end = all_words.len();
+                winners[last_idx].0.text = format!("{} {}", winners[last_idx].0.text, gap_text);
+            }
+        }
+
+        // winners를 기존 인터페이스에 맞게 분리
+        let absorbed_infos: Vec<Vec<AbsorbedInfo>> = winners.iter().map(|(_, a)| a.clone()).collect();
+        let winners: Vec<AnalyticSpan> = winners.into_iter().map(|(w, _)| w).collect();
+
         // =====================================================================
-        // STEP 7 : 카테고리별 확정 + 소비 스팬 표시
+        // STEP 7 : 카테고리별 확정 + 소비 스팬 표시 + 흡수 정보 반영
         // =====================================================================
         let mut vec_time = String::new();
         let mut vec_time_score = f32::MIN;
         let mut vec_time_alts: Vec<(String, f32)> = Vec::new();
         let mut vec_time_text = String::new();
-
         let mut vec_season = String::new();
         let mut vec_season_score = f32::MIN;
         let mut vec_season_alts: Vec<(String, f32)> = Vec::new();
         let mut vec_season_text = String::new();
-
         let mut vec_events: Vec<(String, f32)> = Vec::new();
         let mut consumed: Vec<bool> = vec![false; all_words.len()];
+
+        // 🌟 [ABSORBED INFO PROCESSING] NMS에서 흡수된 카테고리 정보도 반영합니다.
+        //    이렇게 하면 '최근에 가장 많이'가 이기고 '본게 뭐야?'가 흡수되어도
+        //    '본게 뭐야?'가 갖고 있던 이벤트 정보가 유실되지 않습니다.
+        for (wi, absorbed_list) in absorbed_infos.iter().enumerate() {
+            for ai in absorbed_list {
+                match ai.category.as_str() {
+                    "time_filters" => {
+                        if ai.score > vec_time_score && vec_time.is_empty() {
+                            vec_time_score = ai.score;
+                            vec_time = ai.key.clone();
+                            vec_time_text = winners.get(wi).map(|w| w.text.clone()).unwrap_or_default();
+                        }
+                    }
+                    "season_filters" => {
+                        if ai.score > vec_season_score && vec_season.is_empty() {
+                            vec_season_score = ai.score;
+                            vec_season = ai.key.clone();
+                            vec_season_text = winners.get(wi).map(|w| w.text.clone()).unwrap_or_default();
+                        }
+                    }
+                    "event" => {
+                        if !vec_events.iter().any(|(k, _)| k == &ai.key) {
+                            vec_events.push((ai.key.clone(), ai.score));
+                            emit_term(&format!(
+                                "   ♻️ [ABSORBED EVENT] 흡수된 '{}' → '{}' 이벤트 타입이 스코프에 포함되었습니다.",
+                                winners.get(wi).map(|w| w.text.as_str()).unwrap_or("?"),
+                                ai.key
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         for w in &winners {
             match w.category.as_str() {
@@ -7036,6 +7188,9 @@ impl LogisModel {
 
         // =====================================================================
         // STEP 10 : 확정 스팬을 제외한 나머지가 검색 키워드
+        //   🌟 갭 브리징으로 승자 스팬이 확장되었으므로 consumed 범위가 넓어져
+        //      키워드가 비는 경우가 줄어듭니다.
+        //      그래도 비면 전체 질의를 target으로 사용합니다.
         // =====================================================================
         let mut keywords: Vec<String> = Vec::new();
         for (i, w) in all_words.iter().enumerate() {
@@ -7047,6 +7202,25 @@ impl LogisModel {
             }
             if !keywords.iter().any(|k| k == w) {
                 keywords.push(w.clone());
+            }
+        }
+        if keywords.is_empty() {
+            // 🌟 [KEYWORD FALLBACK] consumed가 전부를 커버하면
+            //    승자 스팬의 텍스트에서 조사/동사를 제외한 명사구를 키워드로 사용합니다.
+            //    Commerce의 unassigned_chunks 구조와 동일합니다.
+            for w in &winners {
+                for word in w.text.split_whitespace() {
+                    let word_str = word.trim();
+                    if word_str.is_empty() { continue; }
+                    // Stanza POS에서 동사/조사로 판정된 단어는 제외
+                    let is_func = all_words.iter().position(|aw| aw == word_str)
+                        .map(|idx| !content_flags.get(idx).copied().unwrap_or(true))
+                        .unwrap_or(false);
+                    if is_func { continue; }
+                    if !keywords.iter().any(|k| k == word_str) {
+                        keywords.push(word_str.to_string());
+                    }
+                }
             }
         }
         if keywords.is_empty() {
