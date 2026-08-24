@@ -10,17 +10,49 @@ use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-
 use once_cell::sync::OnceCell;
-
 use crate::utils::pug_utils::*;
 use crate::js_templates::*;
 use crate::utils::json_utils::merge_node;
 use crate::utils::ai_utils::{cosine_similarity, extract_pug_context as other_extract_pug_context, max_pool_sim, split_bias_phrases, split_bias_phrases_weighted, weighted_max_pool_sim, exclusive_assign, exclusive_assign_by_score, self_poisoned_prejudice_mask, collect_select_groups, enum_status_keys, status_key_phrases, double_center_matrix, detect_field_format, value_matches_format, is_pure_numeric_value, value_token_in_url_pool, is_id_link_field, resolve_id_link_from_lines, extract_url_pattern, apply_url_pattern, find_identifier_token_in_lines, label_phrase_bank, prejudice_phrase_bank, collect_id_link_candidates, collect_id_link_candidates_from_url, collect_labeled_token_candidates, collect_detail_label_value_pairs, DetailPair, pug_line_parts, is_non_value_role_tag, pug_attr_flag, strip_markup_prefix, extract_date_literal, id_shape_signature, id_shape_allowed, same_host, line_real_href, is_multi_value_field, FieldFormat};
 use crate::utils::logger::log_task_progress;
-
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / ONESHOT] Rust → 프론트엔드(Dexie) 음차 캐시 조회 왕복용
+// ---------------------------------------------------------------------
+//  scheduler 가 emit("translit-cache-query") 로 요청을 보내면,
+//  프론트엔드가 Dexie 를 조회한 뒤 invoke("translit_cache_respond") 로
+//  응답합니다. 그 응답을 여기서 oneshot receiver 로 await 합니다.
+//
+//  키: request_id (UUID)
+//  값: oneshot::Sender — 프론트 응답을 scheduler 에 전달
+// =====================================================================
+use once_cell::sync::Lazy;
+use std::sync::Mutex as StdMutex;
+
+pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<(String, String)>>>>> =
+Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+// =====================================================================
+// 🌟 [TRANSLIT MEM CACHE] 프로세스 전역 음차 캐시
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   generate_transliteration_aliases 의 HashMap 은 '아이템 1개' 범위입니다.
+//   그래서 아이템이 바뀔 때마다 같은 값을 다시 물어보느라
+//   emit → Dexie 조회 → invoke 왕복(수십~수백 ms)이 반복됐습니다.
+//   Dexie 는 '앱 재시작을 넘는 영구 캐시', 이 맵은 '프로세스 내 즉답 캐시' 로
+//   역할을 나눕니다. (Dexie 히트 시 이 맵에도 승격 저장합니다)
+//
+//  ⚠️ 키에 반드시 lang 을 포함합니다. 음차는 '문서 언어 표기로의 변환' 이므로
+//     같은 원문이라도 doc_lang 이 다르면 결과가 달라야 합니다.
+pub static TRANSLIT_MEM_CACHE: Lazy<StdMutex<std::collections::HashMap<String, (String, String)>>> =
+Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+/// 음차 캐시 키. Dexie 의 복합 인덱스 [source_word+doc_lang] 와 동일한 축입니다.
+fn translit_cache_key(word: &str, lang: &str) -> String {
+    format!("{}\u{1}{}", lang.trim().to_lowercase(), word.trim())
+}
 
 // =====================================================================
 // 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
@@ -38,10 +70,140 @@ pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::
 //   2차 목표 표기 = 원문 값 그 자체          → 언어 테이블 자체가 불필요
 // =====================================================================
 
+// =====================================================================
+// 🌟 [TRANSLIT CACHE HELPER] Dexie 캐시 조회 / 저장 (프론트 경유)
+// =====================================================================
+
+/// 음차 캐시를 조회합니다. ① 프로세스 전역 메모리 → ② 프론트엔드 Dexie 순서입니다.
+///
+/// 반환값 계약:
+///   Some(("네이티브", "로마자")) → 캐시 히트
+///   Some(("", ""))              → 네거티브 캐시 히트 ('음차 불가' 로 이미 확정된 값)
+///   None                        → 캐시 미스 (레코드 자체가 없음 / 통신 실패)
+///
+/// ⚠️ 호출부는 Some 이면 값이 비어 있어도 '히트' 로 취급해야 합니다.
+///    기존 구현은 빈 값을 미스로 보고 매번 LLM 을 다시 불렀습니다.
+async fn query_translit_cache(
+    app_handle: &tauri::AppHandle,
+    word: &str,
+    lang: &str,
+) -> Option<(String, String)> {
+    let key = translit_cache_key(word, lang);
+
+    // ── ① 프로세스 전역 메모리 캐시 ──
+    if let Ok(map) = TRANSLIT_MEM_CACHE.lock() {
+        if let Some(hit) = map.get(&key) {
+            println!(
+                "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                word, lang, hit.0, hit.1
+            );
+            return Some(hit.clone());
+        }
+    }
+
+    // ── ② 프론트엔드 Dexie 영구 캐시 ──
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
+
+    {
+        let mut map = crate::scheduler::TRANSLIT_PENDING.lock().unwrap();
+        map.insert(request_id.clone(), tx);
+    }
+
+    let _ = app_handle.emit("translit-cache-query", json!({
+        "request_id": request_id,
+        "word": word,
+        "lang": lang
+    }));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        rx
+    ).await;
+
+    // 어떤 경로로 끝나든 pending 엔트리는 반드시 회수합니다. (누수 방지)
+    let _ = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id);
+
+    match result {
+        Ok(Ok(candidates)) => {
+            if candidates.is_empty() {
+                println!(
+                    "  🔍 [TRANSLIT CACHE / MISS] '{}' (lang='{}') — Dexie 에 레코드가 없습니다.",
+                    word, lang
+                );
+                None
+            } else {
+                let hit = candidates[0].clone();
+                if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
+                    map.insert(key, hit.clone());
+                }
+                println!(
+                    "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                    word, lang, hit.0, hit.1
+                );
+                Some(hit)
+            }
+        },
+        Ok(Err(_)) => {
+            println!(
+                "  ⚠️ [TRANSLIT CACHE] '{}' (lang='{}') 응답 채널이 닫혔습니다. 캐시 미스로 처리합니다.",
+                word, lang
+            );
+            None
+        },
+        Err(_) => {
+            println!(
+                "  ⚠️ [TRANSLIT CACHE] '{}' (lang='{}') 프론트엔드 응답 5초 타임아웃. 캐시 미스로 처리합니다.",
+                word, lang
+            );
+            None
+        }
+    }
+}
+
+/// 음차 결과를 캐시에 저장합니다.
+/// ① 프로세스 전역 메모리에 즉시 반영 ② 프론트엔드 Dexie 에 영구 저장 요청(fire-and-forget)
+///
+/// native / roman 이 모두 빈 문자열이면 '음차 불가' 라는 판정 자체를 저장합니다(네거티브 캐시).
+/// 이 값이 없으면 다음 태스크에서 같은 판정을 위해 LLM 을 또 호출하게 됩니다.
+fn save_translit_cache(
+    app_handle: &tauri::AppHandle,
+    word: &str,
+    lang: &str,
+    native: &str,
+    roman: &str,
+) {
+    let key = translit_cache_key(word, lang);
+    if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
+        map.insert(key, (native.to_string(), roman.to_string()));
+    }
+
+    if native.trim().is_empty() && roman.trim().is_empty() {
+        println!(
+            "  💾 [TRANSLIT CACHE / SAVE-NEGATIVE] '{}' (lang='{}') — 음차 불가 판정을 영구 저장합니다.",
+            word, lang
+        );
+    } else {
+        println!(
+            "  💾 [TRANSLIT CACHE / SAVE] '{}' (lang='{}') → native='{}' | roman='{}'",
+            word, lang, native, roman
+        );
+    }
+
+    let _ = app_handle.emit("translit-cache-save", json!({
+        "word": word,
+        "lang": lang,
+        "native": native,
+        "roman": roman
+    }));
+}
+
 /// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
 /// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
 ///
 /// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
+/// 🌟 [DEXIE CACHE] 생성 전에 Dexie 캐시를 먼저 조회하고,
+///    캐시 히트 시 Qwen3.5 호출을 완전히 생략합니다.
 async fn generate_transliteration_aliases(
     model: &LogisModel,
     chunks: &[&crate::nl_convert::ChunkMetadata],
@@ -53,8 +215,20 @@ async fn generate_transliteration_aliases(
 ) -> Vec<(String, String)> {
     let emit = |msg: &str| {
         println!("{}", msg);
-        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}
+", msg)}));
     };
+
+    // 🌟 [TRANSLIT TYPE GUARD] 비검색 타입은 음차 생성 자체가 무의미합니다.
+    //    pages/talk/prompt 는 셀렉터 캐시·채팅 말풍선이라 값 음차가 필요 없습니다.
+    //    team/user/member 는 통계 문서라 음차 대상이 아닙니다.
+    const TRANSLIT_EXCLUDE_TYPES: [&str; 10] = [
+        "pages", "page", "talk", "prompt", "ai_search",
+        "question", "answer", "team", "user", "member",
+    ];
+    if TRANSLIT_EXCLUDE_TYPES.iter().any(|t| page_type == *t) {
+        return vec![(String::new(), String::new()); chunks.len()];
+    }
 
     let mut out: Vec<(String, String)> = vec![(String::new(), String::new()); chunks.len()];
     let mut cache: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
@@ -78,9 +252,29 @@ async fn generate_transliteration_aliases(
             continue;
         }
 
+        // 🌟 [CACHE LOOKUP] ① 아이템 로컬 → ② 프로세스 전역 메모리 → ③ Dexie 영구
         if let Some(hit) = cache.get(&src) {
             out[i] = hit.clone();
             reused += 1;
+            continue;
+        }
+
+        if let Some(dexie_hit) = query_translit_cache(app_handle, &src, doc_lang).await {
+            // 🌟 [NEGATIVE CACHE] 빈 값도 '음차 불가로 이미 확정된 사실' 이므로 히트로 인정합니다.
+            //    기존 구현은 빈 값을 미스로 보고 Qwen3.5 를 매번 다시 호출했습니다.
+            let is_negative = dexie_hit.0.trim().is_empty() && dexie_hit.1.trim().is_empty();
+            cache.insert(src.clone(), dexie_hit.clone());
+            out[i] = dexie_hit;
+            if is_negative {
+                skipped += 1;
+                println!(
+                    "  ⚪ [TRANSLIT CACHE / NEGATIVE HIT] '{}' 는 이전에 '음차 불가' 로 확정된 값입니다. LLM 을 호출하지 않습니다.",
+                    src
+                );
+            } else {
+                reused += 1;
+                println!("  💾 [DEXIE CACHE HIT] '{}' (Qwen3.5 생략)", src);
+            }
             continue;
         }
 
@@ -88,6 +282,8 @@ async fn generate_transliteration_aliases(
         // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
         if !crate::nl_convert::can_transliterate(&src, doc_lang) {
             cache.insert(src.clone(), (String::new(), String::new()));
+            // 🌟 이 판정 자체를 영구 저장해야 다음 태스크에서도 조회 1회로 끝납니다.
+            save_translit_cache(app_handle, &src, doc_lang, "", "");
             skipped += 1;
             continue;
         }
@@ -413,6 +609,12 @@ async fn generate_transliteration_aliases(
             }
         }
         cache.insert(src.clone(), final_pair.clone());
+
+        // 🌟 [DEXIE CACHE SAVE] LLM 으로 생성한 결과를 Dexie 에 영구 저장합니다.
+        //    다음 태스크(또는 앱 재시작 후)부터는 Qwen3.5 호출 없이 캐시 히트됩니다.
+        //    ⚠️ out[i] 할당(move) '전에' 호출해야 borrow-after-move 를 피합니다.
+        save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
+
         out[i] = final_pair;
     }
 
@@ -538,6 +740,327 @@ async fn upsert_alias_chunks(
     }
 
     saved
+}
+
+// =====================================================================
+// 🌟 [CLOUD-SYNC LOCAL EMBEDDING] 클라우드(Cloudflare)가 "구조화만" 수행하고 내려보낸 아이템을
+//    로컬 임베딩 모델로 벡터화 + item_chunks 인덱싱하는 재사용 파이프라인입니다.
+//    - GPU 유무와 무관하게 임베딩은 항상 Client App 트랙에서만 수행됩니다.
+//    - scheduler 의 PHASE A~E 와 동일한 v3 형식 인지 3중 합성 벡터를 생성합니다.
+// =====================================================================
+pub async fn index_item_chunks(
+    store: &VectorStore,
+    model: &LogisModel,
+    item_id: &str,
+    page_type: &str,
+    doc_lang: &str,
+    item_json: &Value,
+    is_detail: bool,
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    search_mode: &str,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> Result<usize> {
+    let emit = |msg: &str| {
+        println!("{}", msg);
+        let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+    };
+
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(0);
+    }
+
+    // 🌟 [MODE GUARD] mode 가 비면 item_chunks 의 mode 컬럼이 빈 문자열이 되고,
+    //    STAGE-4 의 `mode = 'commerce'` 필터에서 전량 탈락합니다.
+    //    (analytic 트랙에서 청크 검색이 0건이던 원인)
+    //    호출부가 빈 값을 넘겨도 안전하도록 여기서 방어합니다.
+    let search_mode = if search_mode.trim().is_empty() {
+        item_json.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce")
+    } else {
+        search_mode
+    };
+
+    let natural_text = crate::nl_convert::json_to_natural_language(item_json);
+    let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
+    if raw_chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let fields = if is_detail {
+        crate::parsing::get_detail_schema_fields(page_type, url, doc_lang)
+    } else {
+        crate::parsing::get_list_schema_fields(page_type, url, doc_lang)
+    };
+
+    // 🌟 [SCHEMA GUARD] analytics 트랙(click / hover / change / report)은 bias.json 에
+    //    대응 스키마가 없어 fields 가 항상 비어 있습니다.
+    //    뱅크가 비면 PLINKO 는 전 청크를 unclassified 로 떨어뜨리므로,
+    //    임베딩 배치를 헛돌리지 않고 여기서 즉시 종료합니다.
+    //    (아이템 레벨 벡터는 reindex_pending_embeddings 가 이미 만들어 두었습니다)
+    // 🌟 [CHUNK TYPE GUARD] 비검색 타입은 스키마 필드 조회 전에 구조적으로 차단합니다.
+    //    fields.is_empty() 판정만으로는 bias.json 에 우연히 남은 키가 있으면
+    //    불필요한 임베딩 배치가 실행됩니다.
+    const CHUNK_EXCLUDE_TYPES: [&str; 10] = [
+        "pages", "page", "talk", "prompt", "ai_search",
+        "question", "answer", "team", "user", "member",
+    ];
+    if CHUNK_EXCLUDE_TYPES.iter().any(|t| page_type == *t) {
+        emit(&format!(
+            "  ⏭️ [CHUNK SKIP] type='{}' 은 검색/음차/청크 인덱싱 대상이 아닙니다.",
+            page_type
+        ));
+        return Ok(0);
+    }
+
+    // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 page_type 이 도메인 타입(tracking/goods/...)
+    //    이므로 위 문자열 목록으로는 절대 걸러지지 않습니다.
+    //    실제 사고 사례: 서버 index.ts 의 home 문서
+    //      { table:'pages', type:'tracking', data:{ origin, link, item:true, node:true } }
+    //    가 items 로 새어 들어와 청크 11건 + 음차 3건이 생성되었습니다.
+    //    셀렉터 캐시는 #global-search 의 검색 대상이 아니므로 구조 마커로 즉시 차단합니다.
+    {
+        let is_page_cache = item_json.get("table")
+                .and_then(|v| v.as_str())
+                .map_or(false, |t| t == "pages" || t == "page")
+            || item_json.get("node").is_some()
+            || item_json.get("item").is_some();
+        if is_page_cache {
+            emit(&format!(
+                "  ⏭️ [CHUNK SKIP / PAGE CACHE] item_id='{}' (type='{}') 는 페이지 셀렉터 캐시이므로 청크 인덱싱과 음차를 모두 생략합니다.",
+                item_id, page_type
+            ));
+            return Ok(0);
+        }
+    }
+    if fields.is_empty() {
+        emit(&format!(
+            "  ⏭️ [CHUNK SKIP] type='{}' 에 대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다. (아이템 벡터는 별도 생성됨)",
+            page_type
+        ));
+        return Ok(0);
+    }
+
+    let mut idx_field_names: Vec<String> = Vec::new();
+    let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
+    let mut idx_field_formats: Vec<String> = Vec::new();
+
+    for (fname, _, bias_target, _) in &fields {
+        let (mut phrases, mut weights) =
+            crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+
+        let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+        for p in bridge_ph {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+            weights.push(1.0);
+        }
+
+        let phrase_embs = if phrases.is_empty() {
+            vec![vec![0.0f32; 384]]
+        } else {
+            model.get_embedding_batch(phrases.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+        };
+
+        let fmt_str = {
+            let lower = fname.to_lowercase();
+            let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+            let has = |k: &str| keys.iter().any(|x| x == k);
+
+            if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+                "Synthesis".to_string()
+            } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+                "TrackingCode".to_string()
+            } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+                "Identifier".to_string()
+            } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+                "Link".to_string()
+            } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+                "Date".to_string()
+            } else if keys.iter().any(|k| {
+                k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+                    || k == "cellphone" || k == "contact" || k == "number"
+            }) {
+                "Phone".to_string()
+            } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+                "Address".to_string()
+            } else if keys.iter().any(|k| {
+                k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+                    || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+            }) {
+                "Enum".to_string()
+            } else if keys.iter().any(|k| {
+                k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+                    || k == "width" || k == "height" || k == "length" || k.contains("fee")
+                    || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+                    || k.contains("duration")
+            }) {
+                "Numeric".to_string()
+            } else {
+                "Text".to_string()
+            }
+        };
+
+        idx_field_names.push(fname.clone());
+        idx_field_phrase_embs.push(phrase_embs);
+        idx_field_phrase_weights.push(weights);
+        idx_field_formats.push(fmt_str);
+    }
+
+    let model_for_embed = model.clone();
+    let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+        &raw_chunks,
+        doc_lang,
+        page_type,
+        &idx_field_names,
+        &idx_field_phrase_embs,
+        &idx_field_phrase_weights,
+        &idx_field_formats,
+        move |text: String| {
+            let m = model_for_embed.clone();
+            async move { m.get_embedding(text).await.unwrap_or(vec![0.0; 384]) }
+        },
+    ).await;
+
+    let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
+        .enumerate()
+        .filter(|(_, c)| c.property != "unclassified")
+        .collect();
+
+    if indexable_chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let chunk_texts: Vec<String> = indexable_chunks.iter().map(|(_, c)| c.chunk_text.clone()).collect();
+    let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
+
+    let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+        indexable_chunks.iter().map(|(_, c)| *c).collect();
+    let alias_pairs = generate_transliteration_aliases(
+        model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
+    ).await;
+
+    let _ = store.delete_chunks_by_item(item_id).await;
+
+    let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+    let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
+    for (_, cm) in indexable_chunks.iter() {
+        let a = crate::utils::ai_utils::indexing_anchor_text(doc_lang, page_type, &cm.property);
+        let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, &cm.property);
+        let v = cm.value_part.trim();
+        let l = if v.is_empty() { leaf.clone() } else { format!("{} {}", leaf, v) };
+        anchor_texts.push(a);
+        localized_texts.push(l);
+    }
+    let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
+    let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+    let mut saved = 0usize;
+
+    for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+        let chunk_id = format!("{}_{}", item_id, ci);
+
+        let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
+            "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
+            _ => (0.40f32, 0.30f32, 0.30f32),
+        };
+
+        let mut final_vec = vec![0.0f32; 384];
+        for d in 0..384 {
+            final_vec[d] = chunk_embs[ei][d] * w_chunk
+                + anchor_embs[ei][d] * w_anchor
+                + localized_embs[ei][d] * w_local;
+        }
+        let norm: f32 = final_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for d in 0..384 { final_vec[d] /= norm; }
+        }
+
+        let _ = store.upsert_chunk(
+            &chunk_id,
+            item_id,
+            page_type,
+            &chunk_meta.chunk_text,
+            &chunk_meta.property,
+            &chunk_meta.property_format,
+            &chunk_meta.value_part,
+            Some(final_vec),
+            Some(cc),
+            Some(bcc),
+            Some(ref_val),
+            Some(search_mode),
+        ).await;
+        saved += 1;
+
+        saved += upsert_alias_chunks(
+            store, model, item_id, &chunk_id, page_type, doc_lang,
+            chunk_meta, &alias_pairs[ei], cc, bcc, ref_val, search_mode,
+        ).await;
+    }
+
+    emit(&format!(
+        "  🧩 [CLOUD-SYNC INDEX] item_id='{}' | 청크 {}건 로컬 인덱싱 완료 (type='{}')",
+        item_id, saved, page_type
+    ));
+
+    Ok(saved)
+}
+
+// =====================================================================
+// 🌟 [SINGLE UPSERT v4]
+// ---------------------------------------------------------------------
+//  v3 까지는 도메인 테이블(sales/tracking/event)과 items 미러 테이블에
+//  같은 문서를 두 번 저장했습니다. 그런데 store.rs 의 resolve_table 이
+//  v4 부터 두 호출을 모두 items 로 접기 때문에,
+//  그대로 두면 '같은 행에 delete → add' 를 두 번 수행하는 낭비가 됩니다.
+//
+//  또한 두 번째 호출의 digest 가 첫 번째와 다르면
+//  upsert_item 의 스킵 가드가 매번 통과되어 무한 재쓰기가 발생할 수 있습니다.
+//
+//  → 저장 지점을 이 헬퍼 하나로 모읍니다.
+//    호출부는 target_table 을 계속 넘겨도 되지만(가독성 유지),
+//    실제 물리 저장은 정확히 1회만 일어납니다.
+async fn save_item(
+    store: &VectorStore,
+    table_hint: &str,
+    id: &str,
+    type_: &str,
+    data: Value,
+    vector: Option<Vec<f32>>,
+    from: &str,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    ref_val: &str,
+    digest: Option<&str>,
+) {
+    // 🌟 [TABLE HINT PRIORITY] hint 가 물리 테이블을 명시하면 그것을 우선합니다.
+    //    기존에는 hint 를 버리고 type_ 로만 라우팅했기 때문에,
+    //    pages 를 저장하려면 type_ 에 "pages" 를 넣어야 했고
+    //    그 값이 upsert_item 안에서 data.type 을 덮어써 도메인 타입(goods/order)을 파괴했습니다.
+    //    hint 로 테이블을 정하면 type_ 에 실제 도메인 타입을 그대로 넘길 수 있습니다.
+    let table = match table_hint {
+        "pages" | "page" => "pages",
+        "users" | "member" | "team" | "user" => "users",
+        _ => match type_ {
+            "member" | "team" | "user" => "users",
+            "pages" | "page" => "pages",
+            _ => "items",
+        },
+    };
+
+    let _ = store.upsert_item(
+        table, id, type_, data, vector,
+        Some(from), Some(to), Some(cc), Some(bcc), Some(ref_val), digest
+    ).await;
 }
 
 pub async fn start_background_worker(
@@ -772,7 +1295,7 @@ pub async fn start_background_worker(
     });
 }
 
-async fn process_task(
+pub async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
@@ -780,26 +1303,32 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
-    
-    
+    // 🌟 [RESET GUARD] btn-reset-db 가 stop_current_extraction 을 호출하면
+    //    cancellation_token 이 true 가 됩니다.
+    //    스케줄러 루프가 이미 이 태스크를 픽업했더라도,
+    //    process_task 진입 즉시 재확인하여 테이블 drop 이후의
+    //    upsert_item / 임베딩 / relay 쓰기를 원천 차단합니다.
+    if cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("[PROCESS] 🛑 Task {} aborted at entry — cancellation token already set (reset in progress).", task.id);
+        return Err(anyhow::anyhow!("Task cancelled at entry"));
+    }
     let app_handle_clone = app_handle.clone();
     let tid_clone = task.id.clone();
     let emit_term = move |msg: &str| {
         println!("{}", msg);
         use tauri::Emitter;
-        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
+        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}
+", msg)}));
     };
-
-    
     let zero_addr = "0x0000000000000000000000000000000000000000";
     let from_addr = if task.from.is_empty() { zero_addr.to_string() } else { task.from.clone() };
-    let team_id = if task.to.is_empty() || task.to == zero_addr { 
-        crate::utils::hash::hash_id(&from_addr) 
-    } else { 
-        task.to.clone() 
+    let team_id = if task.to.is_empty() || task.to == zero_addr {
+        crate::utils::hash::hash_id(&from_addr)
+    } else {
+        task.to.clone()
     };
-
-    emit_term("\n=======================================");
+    emit_term("
+=======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
 
     if task.r#type == "analytic_extraction" {
@@ -827,6 +1356,17 @@ async fn process_task(
     
     
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
+
+    // 🌟 [TRADING BRANCH] HTML 전처리 트랙에서 trading 모드이면 전용 파이프라인으로 분기합니다.
+    //    기존 process_task 는 commerce 6도메인(order/goods/tracking/review/coupon/event) 전용이므로
+    //    BL/AWB/CI 등 27종 무역 서식은 이 경로에서 처리할 수 없습니다.
+    //    image_extraction 트랙은 model.rs extract_from_image 가 이미 is_trade_doc 분기를 갖고 있으므로
+    //    여기서 분기하지 않습니다.
+    if search_mode == "shipping" && task.r#type == "html_extraction" {
+        return process_trading_task(
+            task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
+        ).await;
+    }
 
     let kv_name = if task.r#type == "image_extraction" {
         Some("image".to_string())
@@ -1007,6 +1547,37 @@ async fn process_task(
         raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::FullContent, Some(&url));
         light_pug = model.truncate_pug_context(&raw_pug, true, 2000, None).await;
     }
+
+    // =====================================================================
+    // 🌟 [DOC LANG EARLY DETECT] 문서 언어를 '캐시 히트 여부와 무관하게' 확정합니다.
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 detect_document_language 호출이 `if !skip_ai_analysis { .. }`
+    //   블록 안에만 있었습니다. 페이지 셀렉터 캐시가 히트하면 그 블록을 통째로
+    //   건너뛰므로 doc_lang 이 초기값 "en" 인 채로 파이프라인 끝까지 흘러갔습니다.
+    //
+    //  ── 그로 인한 실측 피해 (log 대조) ──
+    //   ① 음차 캐시 키가 (word,"ko") ↔ (word,"en") 로 갈려 영구 미스
+    //      : 1차 태스크 '쇼핑몰화면 진열보기' → korean 음차 저장
+    //        2차 태스크 동일 원문 → "language":"english" 로 재생성
+    //   ② 영어 상품명이 '라틴→라틴' 이 되어 can_transliterate 에서 전량 탈락
+    //      : "음차 별칭 0개" 가 2차 태스크 전 아이템에서 발생
+    //   ③ get_list_schema_fields 의 bias/prejudice 가 한국어 라벨·예시를 잃음
+    //      : "goods 식별자, goods 상품명, .." → "goods id link , goods code sku item"
+    //        그 결과 status='show', currency='USD' 같은 오추출이 발생
+    //   ④ indexing_anchor_text / indexing_leaf_label 이 잘못된 언어로 생성되어
+    //      저장 벡터 자체가 1차 태스크와 어긋남
+    //
+    //  ── 비용 ──
+    //   detect_document_language 는 문자 통계 기반 결정론 함수라 모델이 필요 없고
+    //   비용이 사실상 0 입니다. 여기서 확정해도 손해가 없습니다.
+    //   (노이즈 제거 후 더 정확한 재확정은 STEP A 안에서 그대로 수행됩니다)
+    // =====================================================================
+    doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
+    println!(
+        "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
+        doc_lang
+    );
 
     let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
@@ -1681,7 +2252,17 @@ async fn process_task(
                 }
             }
 
-            doc_lang = crate::utils::lang_utils::detect_document_language(&filtered_light_pug);
+            // 🌟 [DOC LANG REFINE] 조기 확정값을 노이즈 제거 후 PUG 로 정밀 재확정합니다.
+            //    값이 바뀌면 음차 캐시 키도 바뀌므로 반드시 로그로 남깁니다.
+            //    (캐시 미스가 발생했을 때 '언어가 흔들렸는지' 를 로그만으로 판별하기 위함)
+            let refined_lang = crate::utils::lang_utils::detect_document_language(&filtered_light_pug);
+            if refined_lang != doc_lang {
+                emit_term(&format!(
+                    "  🌐 [DOC LANG REFINE] 노이즈 제거 후 언어 재확정: '{}' → '{}' (음차 캐시 키가 함께 이동합니다)",
+                    doc_lang, refined_lang
+                ));
+            }
+            doc_lang = refined_lang;
 
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
 
@@ -3124,24 +3705,29 @@ async fn process_task(
                 }
 
                 
-                let _ = store.upsert_item("pages", &page_id, &page_type, page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(ref_for_page), None).await;
-                
+                // 🌟 v4 : pages 테이블 1회 저장. items 미러 저장을 제거합니다.
+                //    🌟 type_ 에 "pages" 가 아니라 실제 도메인 타입을 넘깁니다.
+                //       upsert_item 이 data.type 을 type_ 로 덮어쓰기 때문에,
+                //       "pages" 를 넘기면 네비게이션이 카운트 키를 찾지 못합니다.
+                save_item(&store, "pages", &page_id, &page_type, page_data, None,
+                    &task.from, &team_id, &task.cc, &bcc, ref_for_page, None).await;
+
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
 
-                
+
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
                 let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
                     "type": page_type.clone(),
-                    "detail": true,
-                    "node": true,
+                    // 🌟 canonicalize 가 0|1 로 내리지만, 의미를 명확히 하기 위해 정수로 씁니다.
+                    "detail": 1,
+                    "node": 1,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                save_item(&store, "pages", &detail_page_id, &page_type, detail_page_data, None,
+                    &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
 
             } else {
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
@@ -3150,12 +3736,12 @@ async fn process_task(
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
                     "type": page_type.clone(),
-                    "detail": true,
-                    "node": true,
+                    "detail": 1,
+                    "node": 1,
                     "item": ""
                 });
-                let _ = store.upsert_item("pages", &detail_page_id, &page_type, detail_page_data.clone(), None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
-                let _ = store.upsert_item("items", &detail_page_id, "pages", detail_page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&detail_bcc), Some(ref_for_page), None).await;
+                save_item(&store, "pages", &detail_page_id, &page_type, detail_page_data, None,
+                    &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
             }
         }
         
@@ -6764,22 +7350,12 @@ async fn process_task(
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
                     
-                    let _ = store.upsert_item(
-                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(tracking_vector.clone()),
-                        Some(&task.from), Some(&team_id), Some(&task.cc),
-                        Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
-                        Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
-                        None
-                    ).await;
+                    // 🌟 v4 : items 단일 저장. 이중 upsert 제거.
+                    let tracking_bcc = crate::utils::hash::hash_id(&format!("tracking{}", cc_val));
+                    let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
 
-                    
-                    let _ = store.upsert_item(
-                        "items", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
-                        Some(&task.from), Some(&team_id), Some(&task.cc),
-                        Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
-                        Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
-                        None
-                    ).await;
+                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
+                        &task.from, &team_id, &task.cc, &tracking_bcc, &tracking_ref, None).await;
                 }
             }
         }
@@ -6816,27 +7392,18 @@ async fn process_task(
         
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             is_new = false;
-            // 🌟 [CRITICAL FIX] index.ts와 동일하게 "items" 테이블의 updated_at을 기준으로 draft 판정.
-            // target_table(sales)의 updated_at_ts가 0이더라도, items 테이블에서 이미
-            // updated_at이 설정되어 있으면(이전에 상세 스캔된 적 있음) draft가 아님.
-            // 또한 update_team_base_metrics가 items_to_process를 스캔하여 draft/count를
-            // 자동 계산하므로, 여기서 수동으로 stats_diff를 적용하면 이중 카운트 발생.
-            let mut items_doc_updated_at: i64 = -1; // -1 = items 테이블에서 못 찾음
-            if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
-                items_doc_updated_at = items_doc.updated_at_ts;
-            }
-            was_draft = if items_doc_updated_at == 0 {
-                true // items 테이블의 updated_at이 0 → 아직 상세 스캔 안됨 (draft 상태)
-            } else {
-                false // items 테이블의 updated_at > 0 또는 항목 없음 → 이미 상세 스캔됨
-            };
-            
-            if existing_item.digest == item_digest {
-                existing_vector = Some(existing_item.vector);
-            }
+            // 🌟 [v4] target_table 과 "items" 가 이제 같은 물리 테이블이므로
+            //    두 번 조회할 필요가 없습니다. existing_item 하나로 판정합니다.
+            //    (기존에는 sales / items 두 테이블의 updated_at 이 어긋날 수 있어
+            //     이중 조회로 방어했는데, 단일 테이블이 되면서 어긋날 여지가 사라졌습니다)
+            was_draft = existing_item.updated_at_ts == 0;
 
-            
+            // 🌟 [v4] digest 는 물리 컬럼이 아니라 data.digest 입니다.
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                let old_digest = existing_json.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                if old_digest == item_digest {
+                    existing_vector = Some(existing_item.vector);
+                }
                 extracted_data = merge_node(&existing_json, &extracted_data);
             }
         } 
@@ -6850,24 +7417,19 @@ async fn process_task(
             if let Ok(Some((found_id, json_val))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
                 is_new = false;
-                
+
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    let mut items_doc_updated_at: i64 = -1;
-                    if let Ok(Some(items_doc)) = store.get_item_by_id("items", &target_id).await {
-                        items_doc_updated_at = items_doc.updated_at_ts;
-                    }
-                    was_draft = if items_doc_updated_at == 0 {
-                        true
-                    } else {
-                        false
-                    };
-                    
-                    if existing_item.digest == item_digest {
-                        existing_vector = Some(existing_item.vector);
+                    // 🌟 [v4] 단일 테이블이므로 items 재조회 제거.
+                    was_draft = existing_item.updated_at_ts == 0;
+
+                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                        if old_digest == item_digest {
+                            existing_vector = Some(existing_item.vector);
+                        }
                     }
                 }
-                
-                
+
                 extracted_data = merge_node(&json_val, &extracted_data);
                 if let Some(obj) = extracted_data.as_object_mut() {
                     obj.insert("id".to_string(), json!(target_id.clone()));
@@ -6880,12 +7442,21 @@ async fn process_task(
             e.1 += 1;
             e.2 += 1;
         } else if was_draft {
-            // 🌟 [CRITICAL FIX] update_team_base_metrics가 items_to_process를 스캔하여
-            // updated_at > 0인 항목을 자동으로 count로 분류합니다.
-            // 여기서 수동으로 draft--, count++를 적용하면 update_team_base_metrics의
-            // 자동 분류와 겹쳐 이중 카운트가 발생합니다.
-            // extracted_data의 updated_at을 now로 설정하는 것만으로 충분합니다.
-            // (was_draft 판정은 updated_at 업데이트 트리거로만 사용)
+            // 🌟 [DRAFT → COUNT 전환]
+            //  ── 기존 주석의 전제가 사실과 달랐습니다 ──
+            //   "update_team_base_metrics 가 items_to_process 를 스캔해
+            //    updated_at > 0 인 항목을 자동으로 count 로 분류한다" 고 적혀 있었지만,
+            //   metrics.rs 의 items 순회 블록은 min/max 만 계산합니다.
+            //   draft / count 는 오직 stats_diff 만 반영하므로,
+            //   여기서 감산하지 않으면 목록 스캔이 만든 draft 가
+            //   상세 추출로 완성되어도 base 통계에서 영원히 줄지 않습니다.
+            //   (relay 경로는 was_foreign_draft 분기에서 이미 동일하게 감산합니다)
+            //  ── 이중 카운트가 없는 이유 ──
+            //   이 문서의 draft 를 감산하는 지점이 코드 전체에 여기 하나뿐입니다.
+            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
+            e.0 -= 1;
+            e.1 += 1;
+            e.2 += 1;
             if let Some(obj) = extracted_data.as_object_mut() {
                 obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
             }
@@ -6986,20 +7557,18 @@ async fn process_task(
                                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                 foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
 
-                                let _ = store.upsert_item(
-                                    &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                
-                                let _ = store.upsert_item(
-                                    "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
+                                // 🌟 v4 : items 단일 저장.
+                                save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                             }
                         },
                         Ok(None) => {
-                            // 🌟 [DEDUP FIX] 상세 페이지 relay에서 기존 목록 전처리에서 이미 생성된
-                            // goods/tracking이 있는지 "items" 테이블에서 교차 검색합니다.
+                            // 🌟 [DEDUP FIX v5 / KEY-SCOPED]
+                            //    v4 는 `data LIKE '%값%'` 로만 좁혔습니다.
+                            //    값이 짧으면(index "18") 무관한 문서의 다른 키(`"quantity":118`)에 걸려
+                            //    "이미 있다" 고 오판하고 draft 생성을 건너뛰었습니다.
+                            //    그 결과 relay 대상 문서가 영원히 만들어지지 않는 경로가 존재했습니다.
+                            //    쿼리한 컬럼(q.column)까지 needle 에 포함시켜 오탐을 구조적으로 제거합니다.
                             let mut found_existing = false;
                             let val_str_for_search = match &q.value {
                                 serde_json::Value::String(s) => s.clone(),
@@ -7007,11 +7576,13 @@ async fn process_task(
                                 _ => q.value.to_string(),
                             };
                             if !val_str_for_search.is_empty() {
-                                let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                // canonicalize_data 가 식별자류를 String 으로 확정했으므로 `"key":"값"` 형태입니다.
+                                let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
+                                let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                 if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                     if !cross_results.is_empty() {
                                         found_existing = true;
-                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
                                     }
                                 }
                             }
@@ -7022,12 +7593,16 @@ async fn process_task(
                             // index.ts의 relay가 column: primary.type, value: primary.index로 쿼리하는 동작과 동일합니다.
                             if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                 if let Some(order_idx) = extracted_data.get("index") {
+                                    // 🌟 canonicalize_data 가 index / order 를 모두 String 으로 확정했으므로
+                                    //    숫자로 들어와도 문자열로 정규화한 뒤 needle 을 만듭니다.
+                                    //    (Number 로 온 값을 그대로 쓰면 `"order":123` 을 찾아 0건이 됩니다)
                                     let order_idx_str = match order_idx {
                                         serde_json::Value::Number(n) => n.to_string(),
                                         serde_json::Value::String(s) => s.clone(),
-                                        _ => order_idx.to_string(),
+                                        _ => order_idx.to_string().trim_matches('"').to_string(),
                                     };
-                                    let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                    let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                    let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                     if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                         if !fallback_results.is_empty() {
                                             found_existing = true;
@@ -7054,15 +7629,14 @@ async fn process_task(
                                     obj.insert("type".to_string(), json!(foreign_type));
                                     obj.insert(q.column.clone(), q.value.clone());
                                     obj.insert("updated_at".to_string(), json!(0));
+                                    // 🌟 v4 : mode 는 봉투 컬럼이므로 draft 에도 반드시 넣어야
+                                    //    프론트엔드 목록 필터(mode 인덱스)에서 누락되지 않습니다.
+                                    obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                    // 🌟 text 가 비면 LanceDB FTS 대상에서 빠지므로 최소 식별 문구를 넣습니다.
+                                    obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                 }
-                                let _ = store.upsert_item(
-                                    &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
-                                let _ = store.upsert_item(
-                                    "items", &draft_id, foreign_type, draft_data, None,
-                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                ).await;
+                                save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
+                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                             }
                         },
                         _ => {}
@@ -7120,21 +7694,20 @@ async fn process_task(
                                     let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                    let _ = store.upsert_item(
-                                        "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
-                                    let _ = store.upsert_item(
-                                        "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    if tracking_data.get("mode").is_none() {
+                                        tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                    }
+                                    // 🌟 v4 : items 단일 저장.
+                                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
                                 }
                             },
                             Ok(None) => {
-                                // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                // 🌟 [DEDUP FIX v5 / KEY-SCOPED] tracking_number 키까지 포함해 오탐을 제거합니다.
                                 let mut found_existing_tracking = false;
-                                let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
+                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
                                 if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                     if !tracking_cross.is_empty() {
                                         found_existing_tracking = true;
@@ -7155,14 +7728,12 @@ async fn process_task(
                                                     let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                     ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                     ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                    let _ = store.upsert_item(
-                                                        "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
-                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                    ).await;
-                                                    let _ = store.upsert_item(
-                                                        "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                    ).await;
+                                                    if ej.get("mode").is_none() {
+                                                        ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                    }
+                                                    // 🌟 v4 : items 단일 저장.
+                                                    save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                 }
                                                 if let Some(tracking_index) = ej.get("index").cloned() {
                                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -7199,14 +7770,12 @@ async fn process_task(
                                                 let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                 fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                 fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                let _ = store.upsert_item(
-                                                    "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
-                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                ).await;
-                                                let _ = store.upsert_item(
-                                                    "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                ).await;
+                                                if fallback_tdata.get("mode").is_none() {
+                                                    fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                }
+                                                // 🌟 v4 : items 단일 저장.
+                                                save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                 if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
                                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
                                                 }
@@ -7233,16 +7802,13 @@ async fn process_task(
                                             obj.insert("order".to_string(), order_index.clone());
                                         }
                                         obj.insert("updated_at".to_string(), json!(0));
+                                        // 🌟 v4 : mode / text 보존
+                                        obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                        obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
                                     }
                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                    let _ = store.upsert_item(
-                                        "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
-                                    let _ = store.upsert_item(
-                                        "items", &draft_id, "tracking", draft_data, None,
-                                        Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                    ).await;
+                                    save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
+                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
                                 }
                             },
@@ -7253,14 +7819,9 @@ async fn process_task(
             }
         }
 
-        let _ = store.upsert_item(
-            &target_table, &target_id, &page_type, extracted_data.clone(), vector.clone(),
-            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-        ).await;
-        let _ = store.upsert_item(
-            "items", &target_id, &page_type, extracted_data.clone(), vector,
-            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-        ).await;
+        // 🌟 v4 : items 단일 저장. 이중 upsert 로 인한 delete→add 2회 낭비 제거.
+        save_item(&store, &target_table, &target_id, &page_type, extracted_data.clone(), vector,
+            &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
         items_to_process.push(extracted_data.clone());
 
         // =====================================================================
@@ -7596,8 +8157,12 @@ async fn process_task(
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
                     is_new = false;
 
-                    if existing_item.digest == item_digest {
-                        existing_vector = Some(existing_item.vector);
+                    // 🌟 [v4] digest 는 data.digest 입니다.
+                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
+                        if old_digest == item_digest {
+                            existing_vector = Some(existing_item.vector);
+                        }
                     }
                 }
 
@@ -7671,24 +8236,21 @@ async fn process_task(
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
                                         let masked_merged_text = merged_text.clone();
                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                        
+
                                         foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                         foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
+                                        if foreign_data.get("mode").is_none() {
+                                            foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                        }
 
-                                        let _ = store.upsert_item(
-                                            &q.table, &foreign_id, foreign_type, foreign_data.clone(), Some(merged_vector.clone()),
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        
-                                        let _ = store.upsert_item(
-                                            "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
+                                        // 🌟 v4 : items 단일 저장.
+                                        save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     }
                                 },
                                 Ok(None) => {
-                                    // 🌟 [DEDUP FIX] relay draft 생성 전, 동일한 foreign_type + 값이
-                                    // 이미 items 테이블에 존재하는지 확인하여 중복 생성을 방지합니다.
+                                    // 🌟 [DEDUP FIX v5 / KEY-SCOPED] 상세 경로와 동일한 교정입니다.
+                                    //    값만으로 LIKE 를 걸면 짧은 식별자가 무관한 수치 컬럼에 걸립니다.
                                     let mut found_existing = false;
                                     let val_str_for_search = match &q.value {
                                         serde_json::Value::String(s) => s.clone(),
@@ -7696,11 +8258,12 @@ async fn process_task(
                                         _ => q.value.to_string(),
                                     };
                                     if !val_str_for_search.is_empty() {
-                                        let cross_filter = format!("type = '{}' AND json_data LIKE '%{}%'", foreign_type, val_str_for_search.replace("'", "''"));
+                                        let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
+                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                         if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                             if !cross_results.is_empty() {
                                                 found_existing = true;
-                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (값: '{}'). 새 draft 생성을 건너뜁니다.", foreign_type, val_str_for_search));
+                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
                                             }
                                         }
                                     }
@@ -7708,12 +8271,14 @@ async fn process_task(
                                     // 🌟 [ORDER INDEX FALLBACK] goods/tracking relay가 못 찾았을 때 order index로도 검색
                                     if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                         if let Some(order_idx) = single_item.get("index") {
+                                            // 🌟 상세 경로와 동일하게 String 확정 규칙을 따릅니다.
                                             let order_idx_str = match order_idx {
                                                 serde_json::Value::Number(n) => n.to_string(),
                                                 serde_json::Value::String(s) => s.clone(),
-                                                _ => order_idx.to_string(),
+                                                _ => order_idx.to_string().trim_matches('"').to_string(),
                                             };
-                                            let fallback_filter = format!("type = '{}' AND json_data LIKE '%\"order\":{}%'", foreign_type, order_idx_str);
+                                            let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                            let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                             if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                                 if !fallback_results.is_empty() {
                                                     found_existing = true;
@@ -7740,15 +8305,11 @@ async fn process_task(
                                             obj.insert("type".to_string(), json!(foreign_type));
                                             obj.insert(q.column.clone(), q.value.clone());
                                             obj.insert("updated_at".to_string(), json!(0));
+                                            obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                            obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                         }
-                                        let _ = store.upsert_item(
-                                            &q.table, &draft_id, foreign_type, draft_data.clone(), None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
-                                        let _ = store.upsert_item(
-                                            "items", &draft_id, foreign_type, draft_data, None,
-                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                        ).await;
+                                        save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
+                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                     }
                                 },
                                 _ => {}
@@ -7805,21 +8366,20 @@ async fn process_task(
                                             let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                             tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                             tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                            let _ = store.upsert_item(
-                                                "tracking", &tracking_id, "tracking", tracking_data.clone(), Some(merged_vector.clone()),
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
-                                            let _ = store.upsert_item(
-                                                "items", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
+                                            // 🌟 v4 : mode 보존. 없으면 목록 필터에서 사라집니다.
+                                            if tracking_data.get("mode").is_none() {
+                                                tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                            }
+                                            save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
+                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                             emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
                                         }
                                     },
                                     Ok(None) => {
-                                        // 🌟 [DEDUP FIX] tracking_number로 items 테이블에서 기존 tracking 문서 검색
+                                        // 🌟 [DEDUP FIX v5 / KEY-SCOPED] 상세 경로와 동일한 교정입니다.
                                         let mut found_existing_tracking = false;
-                                        let tracking_cross_filter = format!("type = 'tracking' AND json_data LIKE '%{}%'", clean_tn.replace("'", "''"));
+                                        let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
+                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
                                         if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
                                             if !tracking_cross.is_empty() {
                                                 found_existing_tracking = true;
@@ -7839,14 +8399,12 @@ async fn process_task(
                                                             let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                             ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                             ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                            let _ = store.upsert_item(
-                                                                "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector.clone()),
-                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                            ).await;
-                                                            let _ = store.upsert_item(
-                                                                "items", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                            ).await;
+                                                            if ej.get("mode").is_none() {
+                                                                ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                            }
+                                                            // 🌟 v4 : items 단일 저장.
+                                                            save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
+                                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                         }
                                                         if let Some(tracking_index) = ej.get("index").cloned() {
                                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
@@ -7880,14 +8438,12 @@ async fn process_task(
                                                         let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
                                                         fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                                         fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                        let _ = store.upsert_item(
-                                                            "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector.clone()),
-                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                        ).await;
-                                                        let _ = store.upsert_item(
-                                                            "items", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                            Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                                        ).await;
+                                                        if fallback_tdata.get("mode").is_none() {
+                                                            fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                                                        }
+                                                        // 🌟 v4 : items 단일 저장.
+                                                        save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
+                                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                                         if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
                                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
                                                         }
@@ -7914,16 +8470,12 @@ async fn process_task(
                                                     obj.insert("order".to_string(), order_index.clone());
                                                 }
                                                 obj.insert("updated_at".to_string(), json!(0));
+                                                obj.insert("mode".to_string(), json!(search_mode.clone()));
+                                                obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
                                             }
                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                            let _ = store.upsert_item(
-                                                "tracking", &draft_id, "tracking", draft_data.clone(), None,
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
-                                            let _ = store.upsert_item(
-                                                "items", &draft_id, "tracking", draft_data, None,
-                                                Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), None
-                                            ).await;
+                                            save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
+                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
                                             emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
                                         }
                                     },
@@ -7934,14 +8486,9 @@ async fn process_task(
                     }
                 }
 
-                let _ = store.upsert_item(
-                    &target_table, &hashed_item_id, &page_type, single_item.clone(), vector.clone(),
-                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-                ).await;
-                let _ = store.upsert_item(
-                    "items", &hashed_item_id, &page_type, single_item.clone(), vector,
-                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
-                ).await;
+                // 🌟 v4 : items 단일 저장.
+                save_item(&store, &target_table, &hashed_item_id, &page_type, single_item.clone(), vector,
+                    &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
                 items_to_process.push(single_item.clone());
 
                 // =====================================================================
@@ -8194,8 +8741,26 @@ async fn process_task(
     }
 
     if !items_to_process.is_empty() {
-        let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &items_to_process, stats_diff.clone()).await;
-        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", items_to_process.len(), stats_diff);
+        // 🌟 [METRICS GUARD v4] update_team_base_metrics 는 items_to_process 를 스캔해
+        //    updated_at / type / 수치 필드로 draft·count 및 min/max 를 집계합니다.
+        //    canonicalize 가 수치를 정수/실수로 확정했으므로 집계가 안정화되지만,
+        //    mode / type / updated_at 이 누락된 항목이 섞이면 통계가 어긋납니다.
+        //    집계 직전에 최소 계약을 강제합니다.
+        let metrics_input: Vec<Value> = items_to_process.iter().map(|it| {
+            let mut v = it.clone();
+            if let Some(o) = v.as_object_mut() {
+                if o.get("type").is_none() { o.insert("type".to_string(), json!(page_type.clone())); }
+                if o.get("mode").is_none() { o.insert("mode".to_string(), json!(search_mode.clone())); }
+                if o.get("updated_at").is_none() { o.insert("updated_at".to_string(), json!(0)); }
+                if o.get("created_at").is_none() {
+                    o.insert("created_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                }
+            }
+            v
+        }).collect();
+
+        let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &metrics_input, stats_diff.clone()).await;
+        println!("[PROCESS] Metrics Engine updated base statistics for {} items. (Stats Diff: {:?})", metrics_input.len(), stats_diff);
     }
 
     let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some("Extraction Complete")).await;
@@ -8213,5 +8778,1084 @@ async fn process_task(
     log_task_progress(app_handle, &task.id, &payload);
     
     println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
+    Ok(())
+}
+
+
+async fn process_trading_task(
+    task: Task,
+    store_mutex: &Arc<Mutex<Option<VectorStore>>>,
+    model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+    cancellation_token: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    device_preference: Option<String>,
+) -> Result<()> {
+    let app_handle_clone = app_handle.clone();
+    let tid_clone = task.id.clone();
+    let emit_term = move |msg: &str| {
+        println!("{}", msg);
+        use tauri::Emitter;
+        let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
+    };
+
+    let zero_addr = "0x0000000000000000000000000000000000000000";
+    let from_addr = if task.from.is_empty() { zero_addr.to_string() } else { task.from.clone() };
+    let team_id = if task.to.is_empty() || task.to == zero_addr {
+        crate::utils::hash::hash_id(&from_addr)
+    } else {
+        task.to.clone()
+    };
+
+    emit_term("\n=======================================");
+    emit_term(&format!("[TRADING] ⚙️ Task {} started trading extraction.", task.id));
+
+    let payload = json!({
+        "task_id": task.id,
+        "task_type": task.r#type,
+        "category": "Processing", "summary": "Starting trading extraction...", "spinner": "⠋"
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
+
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let language = "english";
+    let mut doc_lang = "en".to_string();
+
+    // ── 모델 로드 ──
+    let model = {
+        println!("[TRADING] 🛡️ Attempting to acquire Model Lock...");
+        let mut model_lock = model_mutex.lock().await;
+        println!("[TRADING] ✅ Model Lock acquired.");
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[TRADING] Device preference mismatch. Reloading model...");
+                m.deep_purge_resources().await;
+                *model_lock = None;
+            }
+        }
+        if model_lock.is_none() {
+            println!("[TRADING] Model not initialized. Starting LogisModel::new...");
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => {
+                    println!("[TRADING] LogisModel::new successful.");
+                    *model_lock = Some(m);
+                },
+                Err(e) => {
+                    println!("[TRADING] ❌ LogisModel::new failed: {}", e);
+                    return Err(anyhow::anyhow!("Model Load Failed: {}", e));
+                }
+            }
+        }
+        model_lock.as_ref().unwrap().clone()
+    };
+
+    // ── HTML 전처리 ──
+    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        let content = raw_html.to_string();
+        if let Some(obj) = task_data.as_object_mut() {
+            obj.remove("html");
+        }
+        content
+    } else {
+        return Err(anyhow::anyhow!(
+            "Trading extraction requires HTML content in task data"
+        ));
+    };
+
+    if cancellation_token.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!("Task cancelled"));
+    }
+
+    // ── URL 파싱 (raw_pug 생성 전에 반드시 필요) ──
+    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+
+    // 🌟 [PUG PIPELINE] 원문 HTML을 직접 사용하지 않습니다.
+    //    ① pre_clean_html      : script/style/noscript/iframe/svg 제거, 허용 속성만 유지
+    //    ② convert_to_clean_pug : DOM → PUG 변환 (NoAttributesMode = 속성 노이즈 제거)
+    //    ③ truncate_pug_context : 토큰 상한 적용
+    //    이 3단 파이프라인을 거친 결과를 변수에 저장하여
+    //    이후 STEP A(분류) / STEP B(추출)에서 재사용합니다.
+    let clean_html_content = parsing::pre_clean_html(&raw_html_content);
+
+    // 🌟 [URL FIX] base_url 을 None 이 아닌 실제 추출 주소로 전달하여
+    //    상대경로 href 가 절대경로 해석되도록 합니다.
+    let raw_pug =
+        parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
+    let light_pug = model
+        .truncate_pug_context(&raw_pug, false, 2000, None)
+        .await;
+
+    // 문서 언어 감지
+    doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
+    println!("[TRADING] Detected document language: {}", doc_lang);
+
+    // ── URL 파싱 ──
+    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP A v2] doc_type 2뎁스 분류 (그룹 → 코드)
+    // ---------------------------------------------------------------------
+    //  ── 왜 2뎁스인가 ──
+    //   commerce 는 6개 도메인(order/goods/tracking/review/coupon/event)을
+    //   벡터 1회로 갈랐지만, trading 은 27개라 1회 코사인으로 정확히 가를 수 없습니다.
+    //   (get_trade_doc_classification_prompt 도 같은 이유로 GROUPS 를 먼저 제시합니다)
+    //
+    //   그래서 slice_config 가 이미 좌표를 공유하는 그룹 단위로 먼저 좁힙니다.
+    //     ① Contract & Payment   : PO / PI / SC / LC
+    //     ② Shipping & Transport : CI / PL / BL / AWB / SA / DO / AN / BC
+    //     ③ Customs              : ED / ID / CINV / CO
+    //     ④ Inspection           : IC / WC / CA / PHYTO / HC / BEN_CERT
+    //     ⑤ Special & Legal      : DGD / MSDS / POA / BIZ_LIC / INS
+    //     ⑥ Parcel               : TRACKING
+    //
+    //   그룹 내 혼동은 slice_config / category_schema 가 동일 좌표·동일 스키마를
+    //   공유하므로 추출 품질에 영향이 없습니다. 그룹 간 오분류만 막으면 됩니다.
+    //
+    //  ── LLM 호출 절감 ──
+    //   코사인 마진이 충분하면 LLM 을 아예 부르지 않습니다.
+    //   마진이 부족한 경우에만 '그 그룹의 코드 목록'만 제시하여 1회 호출합니다.
+    // =====================================================================
+    emit_term("[TRADING STEP A] Classifying trade document type (2-depth)...");
+    log_task_progress(app_handle, &task.id, &json!({
+        "category": "Classification", "summary": "Identifying trade document group...", "spinner": "⠋"
+    }));
+
+    // ── 임베딩 모델 확보 (LLM 이전에 코사인 분류부터) ──
+    model.check_embedding_downloaded().await?;
+    model.ensure_embedding().await?;
+
+    // 🌟 [DEPTH 1] 그룹 앵커 텍스트.
+    //    코드 리터럴이 아니라 '그 그룹이 무엇을 다루는가' 라는 의미 문장을 씁니다.
+    //    문서 언어가 무엇이든 다국어 임베딩이 연결합니다.
+    const TRADE_GROUPS: [(&str, &str); 6] = [
+        ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, payment terms, contract number, buyer seller agreement, tenor, issuing bank"),
+        ("shipping",  "commercial invoice, packing list, bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage, port of loading, port of discharge, container seal"),
+        ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff, customs clearance, declaration number"),
+        ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, treatment"),
+        ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, packing group, policy number, coverage"),
+        ("parcel",    "courier label, parcel waybill, tracking number, delivery company, recipient address, sender address, parcel weight"),
+    ];
+
+    const GROUP_CODES: [(&str, &[&str]); 6] = [
+        ("contract",   &["PO", "PI", "SC", "LC"]),
+        ("shipping",   &["CI", "PL", "BL", "AWB", "SA", "DO", "AN", "BC"]),
+        ("customs",    &["ED", "ID", "CINV", "CO"]),
+        ("inspection", &["IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT"]),
+        ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS"]),
+        ("parcel",     &["TRACKING"]),
+    ];
+
+    // 🌟 [DEPTH 2] 코드별 앵커. bias.json 을 손대지 않고 프롬프트가 이미 갖고 있는
+    //    정의문(= get_trade_doc_classification_prompt 의 GROUPS 설명)을 그대로 씁니다.
+    fn trade_code_anchor(code: &str) -> &'static str {
+        match code {
+            "PO"       => "purchase order, order confirmation, buyer issues to seller, order number, delivery date requested",
+            "PI"       => "proforma invoice, quotation, preliminary invoice, offer to buyer before shipment",
+            "SC"       => "sales contract, agreement between seller and buyer, contract terms and clauses",
+            "LC"       => "letter of credit, documentary credit, issuing bank, beneficiary, tenor at sight, expiry date, advising bank",
+            "CI"       => "commercial invoice, seller bills buyer, unit price, total amount, incoterms, invoice number",
+            "PL"       => "packing list, carton details, gross weight, net weight, measurement, marks and numbers",
+            "BL"       => "bill of lading, ocean carrier document, shipper consignee notify party, vessel voyage, port of loading, port of discharge, freight prepaid collect",
+            "AWB"      => "air waybill, airline document, flight number, airport of departure, airport of destination, chargeable weight",
+            "SA"       => "shipping advice, shipment notification to buyer, dispatch details",
+            "DO"       => "delivery order, release cargo to consignee, pickup location, container release",
+            "AN"       => "arrival notice, cargo arrival notification, local charges, free time, terminal",
+            "BC"       => "booking confirmation, space booking with carrier, booking number, cut off time",
+            "ED"       => "export declaration, customs export filing, declaration number, exporter, hs code",
+            "ID"       => "import declaration, customs import filing, importer, duty, tax, hs code",
+            "CINV"     => "customs invoice, invoice prepared for customs valuation",
+            "CO"       => "certificate of origin, country of origin declaration, chamber of commerce stamp",
+            "IC"       => "inspection certificate, quality inspection result, inspected by",
+            "WC"       => "weight certificate, certified weight measurement",
+            "CA"       => "certificate of analysis, laboratory test result, specification value",
+            "PHYTO"    => "phytosanitary certificate, plant health, fumigation, treatment type",
+            "HC"       => "health certificate, sanitary certificate, fit for human consumption",
+            "BEN_CERT" => "beneficiary certificate, beneficiary statement, we hereby certify that",
+            "DGD"      => "dangerous goods declaration, un number, proper shipping name, packing group, hazard class",
+            "MSDS"     => "material safety data sheet, chemical hazard information, first aid measures",
+            "POA"      => "power of attorney, authorization letter, attorney in fact",
+            "BIZ_LIC"  => "business license, business registration certificate, company registration number",
+            "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
+            "TRACKING" => "courier parcel label, tracking number barcode, delivery company, recipient",
+            _          => "trade document",
+        }
+    }
+
+    // ── 문서 전체 임베딩 (뎁스 1/2 공통 질의 벡터) ──
+    let doc_emb = model.get_embedding(light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
+
+    // ── 뎁스 1 : 그룹 코사인 ──
+    let group_texts: Vec<String> = TRADE_GROUPS.iter().map(|(_, t)| t.to_string()).collect();
+    let group_embs = model.get_embedding_batch(group_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; group_texts.len()]);
+
+    let mut group_scores: Vec<(String, f32)> = Vec::new();
+    for (gi, (gname, _)) in TRADE_GROUPS.iter().enumerate() {
+        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &group_embs[gi]);
+        group_scores.push((gname.to_string(), s));
+        emit_term(&format!("  📐 [TRADE GROUP] {} | Cosine: {:.4}", gname, s));
+    }
+    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best_group = group_scores[0].0.clone();
+    let group_margin = group_scores[0].1 - group_scores.get(1).map(|x| x.1).unwrap_or(0.0);
+    emit_term(&format!("  👑 [TRADE GROUP SELECTED] '{}' | Top: {:.4} | Margin: {:+.4}",
+        best_group, group_scores[0].1, group_margin));
+
+    // ── 뎁스 2 : 그룹 내 코드 코사인 ──
+    let codes: Vec<&str> = GROUP_CODES.iter()
+        .find(|(g, _)| *g == best_group)
+        .map(|(_, c)| c.to_vec())
+        .unwrap_or_else(|| vec!["Unknown"]);
+
+    let code_texts: Vec<String> = codes.iter().map(|c| trade_code_anchor(c).to_string()).collect();
+    let code_embs = model.get_embedding_batch(code_texts.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; code_texts.len()]);
+
+    let mut code_scores: Vec<(String, f32)> = Vec::new();
+    for (ci, c) in codes.iter().enumerate() {
+        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &code_embs[ci]);
+        code_scores.push((c.to_string(), s));
+        emit_term(&format!("    📐 [TRADE CODE] {} | Cosine: {:.4}", c, s));
+    }
+    code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let cosine_code = code_scores[0].0.clone();
+    let code_margin = code_scores[0].1 - code_scores.get(1).map(|x| x.1).unwrap_or(0.0);
+    emit_term(&format!("  👑 [TRADE CODE COSINE] '{}' | Top: {:.4} | Margin: {:+.4}",
+        cosine_code, code_scores[0].1, code_margin));
+
+    // ── 뎁스 3 : 마진 부족 시에만 LLM 폴백 (그룹 내 코드만 제시) ──
+    //    마진 기준은 절대 임계치가 아니라 '2순위와 사실상 동률인가' 라는 부호 판정입니다.
+    //    코사인 공간에서 0.01 미만은 노이즈 수준이므로 구분 불가로 간주합니다.
+    let doc_type = if codes.len() == 1 {
+        emit_term(&format!("  ⚡ [TRADE CODE DETERMINISTIC] 그룹 '{}' 의 코드가 1개뿐이라 LLM 호출을 생략합니다.", best_group));
+        cosine_code
+    } else if code_margin > 0.01 {
+        emit_term(&format!("  ⚡ [TRADE CODE DETERMINISTIC] 코사인 마진 {:+.4} 로 '{}' 확정. LLM 호출을 생략합니다.", code_margin, cosine_code));
+        cosine_code
+    } else {
+        emit_term(&format!("  ⚠️ [TRADE CODE AMBIGUOUS] 코사인 마진 {:+.4} 부족. 그룹 '{}' 내 {}개 코드로 LLM 재판정합니다.",
+            code_margin, best_group, codes.len()));
+
+        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+
+        let scoped_prompt = {
+            let mut s = String::from("[TASK]\nClassify this trade document. Return the single closest code.\n\n[CANDIDATE CODES]\n");
+            for (c, sc) in &code_scores {
+                s.push_str(&format!("{} = {} (vector score {:.4})\n", c, trade_code_anchor(c), sc));
+            }
+            s.push_str("\nIf none fit, return \"Unknown\".\n\n[OUTPUT FORMAT]\n{\"doc_type\": \"BL\"}\n\n[ACTION] JSON ONLY. NO EXPLANATION. /no_think");
+            s
+        };
+
+        let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 NoAttributesMode PUG를 컨텍스트로 사용합니다.
+            //    light_pug는 이미 pre_clean_html → convert_to_clean_pug(NoAttributesMode) →
+            //    truncate_pug_context 파이프라인을 거친 결과입니다.
+            let params = crate::openai_types::ChatCompletionParameters {
+                messages: vec![
+                    crate::openai_types::ChatCompletionRequestMessage::System(
+                        crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}", light_pug),
+                            name: None,
+                        },
+                    ),
+                    crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
+                                scoped_prompt,
+                            ),
+                            name: None,
+                        },
+                    ),
+                ],
+                model: "qwen3.5".to_string(),
+                max_tokens: Some(1024),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let res = gen
+                .generate(
+                    params,
+                    Some(cancellation_token.clone()),
+                    Some(format!("{}_doctype", task.id)),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            crate::parsing::parse_json_from_llm(&res)
+                .get("doc_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        // 🌟 [SCOPE GUARD] LLM 이 그룹 밖 코드를 뱉으면 폐기하고 코사인 결과를 씁니다.
+        if !picked.is_empty() && codes.iter().any(|c| *c == picked.as_str()) {
+            emit_term(&format!("  🤖 [TRADE CODE LLM] LLM 이 '{}' 로 확정했습니다.", picked));
+            picked
+        } else {
+            if !picked.is_empty() {
+                emit_term(&format!("  🚫 [TRADE CODE LLM REJECT] LLM 이 반환한 '{}' 는 그룹 '{}' 후보에 없어 폐기합니다.", picked, best_group));
+            }
+            cosine_code
+        }
+    };
+
+    emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
+
+    // =====================================================================
+    // 🌟 [TRADING STEP B v2] PLINKO 선행 + 미확정 카테고리만 LLM
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 바뀌었나 ──
+    //   v1 은 light_pug 전체를 System 에 넣고 카테고리 8개에 LLM 을 8번 호출했습니다.
+    //   bias.json 의 무역 bias/prejudice 뱅크(bias_schema.rs 의 27종 분기)를
+    //   단 한 번도 쓰지 않았고, 형식 게이트도 없어
+    //   "총 중량 | 1,250" 셀이 amount 로 들어가도 막을 방법이 없었습니다.
+    //
+    //  ── v2 구조 (commerce 상세 경로와 동일) ──
+    //   B-1  구조적 라벨-값 페어 수집   (collect_detail_label_value_pairs)
+    //   B-2  라벨 뱅크 / 편견 뱅크 구축 (label_phrase_bank / prejudice_phrase_bank)
+    //   B-3  형식 게이트                (detect_field_format / value_matches_format)
+    //   B-4  이중 센터링 + 배타 배정    (double_center_matrix / exclusive_assign_by_score)
+    //   B-5  확정된 필드는 LLM 없이 주입
+    //   B-6  미확정 카테고리만 LLM 호출
+    // =====================================================================
+    emit_term("[TRADING STEP B] Running PLINKO field assignment before LLM...");
+
+    let categories = ["header", "parties", "logistics", "conditions", "financials", "cargo", "items", "containers"];
+
+    let mut final_data_map = serde_json::Map::new();
+    final_data_map.insert("header".to_string(), json!({"doc_type": doc_type.clone()}));
+    final_data_map.insert("parties".to_string(), json!({}));
+    final_data_map.insert("logistics".to_string(), json!({}));
+    final_data_map.insert("conditions".to_string(), json!({}));
+    final_data_map.insert("financials".to_string(), json!({}));
+    final_data_map.insert("cargo".to_string(), json!({}));
+    final_data_map.insert("line_items".to_string(), json!([]));
+    final_data_map.insert("containers".to_string(), json!([]));
+
+    // ── B-0 : 정제된 PUG로 컨텍스트 생성 (원문 HTML 직접 사용 금지) ──
+    //    ── 왜 ListMode 인가 ──
+    //     DetailMode 는 모든 속성(id/class/style/href/onclick...)을 그대로 남기므로
+    //     토큰의 대부분이 사이트별 잡음으로 채워지고,
+    //     0.6B 모델이 그것을 '의미'로 오인해 환각을 생성합니다.
+    //     ListMode 는:
+    //       · id / class / style 을 제거
+    //       · input[value], selected option 텍스트는 보존
+    //       · href 등 필수 이동 속성만 유지
+    //     하여 페어 추출에 필요한 값은 살리면서 속성 노이즈를 제거합니다.
+    //     이는 light_pug(NoAttributesMode)과 동일한 정제 철학이며,
+    //     원문 HTML을 LLM 컨텍스트로 직접 사용하지 않는 원칙을 관철합니다.
+    let content_pug = {
+        let full_pug =
+            parsing::convert_to_clean_pug(&clean_html_content, PugMode::ListMode, Some(&url));
+        model
+            .truncate_pug_context(&full_pug, true, 2000, None)
+            .await
+    };
+    let pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
+    let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
+
+    // ── B-1 : 구조적 라벨-값 페어 ──
+    let detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
+    emit_term(&format!("  🧷 [TRADING PAIR] 구조적 라벨-값 페어 {}개 확보", detail_pairs.len()));
+    for p in &detail_pairs {
+        emit_term(&format!(
+            "    Line {} | Section: '{}' | Label: '{}' | Value: '{}'",
+            p.primary_line + 1, p.section, p.label, p.value
+        ));
+    }
+
+    // ── B-2 : 스키마 필드 + 라벨/편견 뱅크 ──
+    //    bias_schema.rs 의 무역 분기(27종)가 이미 40여 필드를 정의하고 있습니다.
+    let trade_fields = crate::parsing::get_detail_schema_fields(&doc_type, &url, &doc_lang);
+    emit_term(&format!("  📐 [TRADING SCHEMA] doc_type '{}' 에 대응하는 스키마 필드 {}개 로드", doc_type, trade_fields.len()));
+
+    let mut t_field_names: Vec<String> = Vec::new();
+    let mut t_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut t_label_weights: Vec<Vec<f32>> = Vec::new();
+    let mut t_prej_raw: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut t_prej_texts: Vec<Vec<String>> = Vec::new();
+
+    for (fname, _, _, _) in &trade_fields {
+        let (lp, lw) = crate::utils::ai_utils::label_phrase_bank(&doc_lang, &doc_type, fname);
+        if lp.is_empty() { continue; }
+        let pp = crate::utils::ai_utils::prejudice_phrase_bank(&doc_lang, &doc_type, fname);
+        let le = model.get_embedding_batch(lp.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; lp.len()]);
+        let pe = if pp.is_empty() {
+            Vec::new()
+        } else {
+            model.get_embedding_batch(pp.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
+        };
+        t_field_names.push(fname.clone());
+        t_label_embs.push(le);
+        t_label_weights.push(lw);
+        t_prej_raw.push(pe);
+        t_prej_texts.push(pp);
+    }
+
+    // 🌟 [SELF-POISON GUARD] commerce 와 동일하게 자기 자신을 설명하는 편견 구를 박탈합니다.
+    let mut t_prej_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(t_field_names.len());
+    for f in 0..t_field_names.len() {
+        let mask = crate::utils::ai_utils::self_poisoned_prejudice_mask(
+            &t_label_embs[f], &t_prej_raw[f], &t_label_embs, f
+        );
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let mut dropped = 0usize;
+        for (pi, poisoned) in mask.iter().enumerate() {
+            if *poisoned {
+                dropped += 1;
+                if dropped <= 4 {
+                    emit_term(&format!("    🧪 [SELF-POISON DROP] '{}' 의 편견 구 '{}' 박탈",
+                        t_field_names[f], t_prej_texts[f].get(pi).cloned().unwrap_or_default()));
+                }
+            } else {
+                kept.push(t_prej_raw[f][pi].clone());
+            }
+        }
+        emit_term(&format!("  🏷️ [TRADING LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개 (자기오염 {}개 제거)",
+            t_field_names[f], t_label_embs[f].len(), kept.len(), dropped));
+        t_prej_embs.push(kept);
+    }
+
+    // ── B-3 : 페어 라벨 임베딩 + 형식 게이트 ──
+    let mut unique_labels: Vec<String> = Vec::new();
+    let mut unique_leaf: Vec<String> = Vec::new();
+    let mut unique_section: Vec<String> = Vec::new();
+    let mut label_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for p in &detail_pairs { *label_count.entry(p.label.clone()).or_insert(0) += 1; }
+
+    let mut pair_phrases: Vec<String> = Vec::with_capacity(detail_pairs.len());
+    for p in &detail_pairs {
+        let dup = label_count.get(&p.label).copied().unwrap_or(0) > 1;
+        if dup && !p.section.trim().is_empty() {
+            pair_phrases.push(format!("{} {}", p.section.trim(), p.label));
+        } else {
+            pair_phrases.push(p.label.clone());
+        }
+    }
+    for (pi, ph) in pair_phrases.iter().enumerate() {
+        if unique_labels.iter().any(|e| e == ph) { continue; }
+        unique_labels.push(ph.clone());
+        unique_leaf.push(detail_pairs[pi].label.clone());
+        unique_section.push(detail_pairs[pi].section.trim().to_string());
+    }
+
+    let mut assigned_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    if !unique_labels.is_empty() && !t_field_names.is_empty() {
+        let leaf_embs = model.get_embedding_batch(unique_leaf.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_leaf.len()]);
+        let section_texts: Vec<String> = unique_section.iter()
+            .map(|s| if s.is_empty() { " ".to_string() } else { s.clone() })
+            .collect();
+        let section_embs = model.get_embedding_batch(section_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; section_texts.len()]);
+
+        // 각 유일 라벨의 대표값 / 병합값 사전 계산
+        let mut phrase_single: Vec<String> = vec![String::new(); unique_labels.len()];
+        let mut phrase_multi: Vec<String> = vec![String::new(); unique_labels.len()];
+        let mut phrase_line: Vec<usize> = vec![0usize; unique_labels.len()];
+        for (pi, ph) in pair_phrases.iter().enumerate() {
+            let h = match unique_labels.iter().position(|u| u == ph) { Some(v) => v, None => continue };
+            let p = &detail_pairs[pi];
+            if phrase_single[h].is_empty() && !p.value.trim().is_empty() {
+                phrase_single[h] = p.value.clone();
+                phrase_line[h] = p.primary_line;
+            }
+            let av = p.value_all.trim();
+            if !av.is_empty() && !phrase_multi[h].contains(av) {
+                if phrase_multi[h].is_empty() {
+                    phrase_multi[h] = av.to_string();
+                } else {
+                    phrase_multi[h].push(' ');
+                    phrase_multi[h].push_str(av);
+                }
+            }
+        }
+
+        // 행렬 구축 (형식 게이트 + 편견 게이트를 배정 '전'에 적용)
+        let pair_abs_floor = 0.50f32;
+        let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+        let mut sec_raw:  Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+
+        for f in 0..t_field_names.len() {
+            let f_fmt = crate::utils::ai_utils::detect_field_format(&t_field_names[f]);
+            let f_multi = crate::utils::ai_utils::is_multi_value_field(&t_field_names[f]);
+            let f_strict = matches!(
+                f_fmt,
+                crate::utils::ai_utils::FieldFormat::Date
+                    | crate::utils::ai_utils::FieldFormat::TrackingCode
+                    | crate::utils::ai_utils::FieldFormat::Numeric
+                    | crate::utils::ai_utils::FieldFormat::Phone
+                    | crate::utils::ai_utils::FieldFormat::Address
+                    | crate::utils::ai_utils::FieldFormat::Text
+            );
+
+            for h in 0..unique_labels.len() {
+                if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                let own = crate::utils::ai_utils::weighted_max_pool_sim(
+                    &leaf_embs[h], &t_label_embs[f], &t_label_weights[f]
+                );
+                if own < pair_abs_floor { continue; }
+
+                let prej = if t_prej_embs[f].is_empty() {
+                    0.0
+                } else {
+                    crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &t_prej_embs[f])
+                };
+                if prej >= own {
+                    emit_term(&format!("    🚫 [TRADING PREJUDICE GATE] '{}' → '{}' | Label: {:.4} <= Prej: {:.4}",
+                        unique_labels[h], t_field_names[f], own, prej));
+                    continue;
+                }
+
+                let pair_val = if f_multi { &phrase_multi[h] } else { &phrase_single[h] };
+                if f_strict {
+                    if pair_val.trim().is_empty()
+                        || !crate::utils::ai_utils::value_matches_format(f_fmt, pair_val) {
+                        emit_term(&format!("    🚫 [TRADING VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 형식 불일치",
+                            unique_labels[h], t_field_names[f], f_fmt, pair_val));
+                        continue;
+                    }
+                }
+                if f_fmt == crate::utils::ai_utils::FieldFormat::Enum
+                    && crate::utils::ai_utils::is_pure_numeric_value(pair_val) {
+                    emit_term(&format!("    🚫 [TRADING ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치",
+                        unique_labels[h], t_field_names[f], pair_val));
+                    continue;
+                }
+
+                leaf_raw[f][h] = own;
+
+                if unique_section[h].is_empty() { continue; }
+                if section_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                sec_raw[f][h] = crate::utils::ai_utils::weighted_max_pool_sim(
+                    &section_embs[h], &t_label_embs[f], &t_label_weights[f]
+                );
+            }
+        }
+
+        // ── B-4 : 섹션 대비 항 + 배타 배정 ──
+        const SECTION_WEIGHT: f32 = 0.5f32;
+        let mut t_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+        for h in 0..unique_labels.len() {
+            let mut sec_sum = 0.0f32;
+            let mut sec_cnt = 0usize;
+            for f in 0..t_field_names.len() {
+                if leaf_raw[f][h] < 0.0 { continue; }
+                if sec_raw[f][h] < 0.0 { continue; }
+                sec_sum += sec_raw[f][h];
+                sec_cnt += 1;
+            }
+            let sec_mean = if sec_cnt > 0 { sec_sum / (sec_cnt as f32) } else { 0.0 };
+            for f in 0..t_field_names.len() {
+                if leaf_raw[f][h] < 0.0 { continue; }
+                let sec_term = if sec_cnt > 1 && sec_raw[f][h] >= 0.0 {
+                    sec_raw[f][h] - sec_mean
+                } else {
+                    0.0
+                };
+                t_matrix[f][h] = leaf_raw[f][h] + SECTION_WEIGHT * sec_term;
+            }
+        }
+
+        let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
+
+        // ── B-5 : 확정된 필드를 카테고리 슬롯에 직접 주입 ──
+        //    카테고리 매핑은 bias.json 의 trade_schema.base 키 구조를 그대로 따릅니다.
+        fn trade_field_category(field: &str) -> &'static str {
+            match field {
+                "doc_type" | "doc_number" | "issue_date" | "expiry_date"
+                    | "reference_number" | "no" => "header",
+                "sender_name" | "sender_address" | "recipient_name"
+                    | "recipient_address" | "notify_party_name" => "parties",
+                "vessel" | "voyage_number" | "pol" | "pod" | "place_receipt"
+                    | "place_delivery" | "etd" | "eta" | "transport_mode" => "logistics",
+                "incoterms" | "payment_terms" | "freight_payment_term" => "conditions",
+                "currency" | "amount" | "amount_subtotal" | "amount_tax"
+                    | "freight_amount" | "insurance_amount" | "local_charges" => "financials",
+                "container_number" | "seal_number" | "package_count" | "package_unit"
+                    | "weight_gross" | "weight_net" | "volume" | "marks_numbers" => "cargo",
+                _ => "",
+            }
+        }
+
+        for (f, a) in t_assign.iter().enumerate() {
+            let (h, score, margin) = match a { Some(v) => *v, None => continue };
+            let fname = t_field_names[f].clone();
+            if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
+
+            let f_multi = crate::utils::ai_utils::is_multi_value_field(&fname);
+            let val = if f_multi { phrase_multi[h].clone() } else { phrase_single[h].clone() };
+            if val.trim().is_empty() { continue; }
+
+            let cat = trade_field_category(&fname);
+            if cat.is_empty() {
+                emit_term(&format!("    ⚪ [TRADING CATEGORY UNMAPPED] '{}' 는 8개 카테고리에 매핑되지 않아 루트에만 주입합니다.", fname));
+            } else if let Some(slot) = final_data_map.get_mut(cat).and_then(|v| v.as_object_mut()) {
+                slot.insert(fname.clone(), json!(val.clone()));
+            }
+
+            assigned_fields.insert(fname.clone(), val.clone());
+            emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
+                unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
+        }
+
+        emit_term(&format!("  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료.", assigned_fields.len()));
+    }
+
+    // ── B-6 : PLINKO 로 확정되지 못한 카테고리만 LLM 호출 ──
+    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+
+    for cat in &categories {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        let schema_prompt = crate::parsing::get_trade_category_schema(cat, &doc_type);
+
+        if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
+            emit_term(&format!("[TRADING STEP B] Category '{}' has no fields for {}. Skipping.", cat.to_uppercase(), doc_type));
+            continue;
+        }
+
+        // 🌟 [PLINKO SKIP] 이 카테고리의 필드가 전부 PLINKO 로 확정되었으면 LLM 을 부르지 않습니다.
+        //    (line_items / containers 는 배열이라 개수를 알 수 없으므로 항상 LLM 을 탑니다)
+        if *cat != "items" && *cat != "containers" {
+            let filled = final_data_map.get(*cat)
+                .and_then(|v| v.as_object())
+                .map(|o| o.iter().filter(|(k, _)| *k != "doc_type").count())
+                .unwrap_or(0);
+            // 스키마 필드 수를 프롬프트에서 세어 비교합니다. (라인당 필드 1개)
+            let schema_field_count = schema_prompt.lines()
+                .filter(|l| l.trim_start().starts_with('"'))
+                .count();
+            if schema_field_count > 0 && filled >= schema_field_count {
+                emit_term(&format!("  ⚡ [TRADING LLM SKIP] Category '{}' 는 PLINKO 가 {}/{} 필드를 전부 확정하여 LLM 호출을 생략합니다.",
+                    cat.to_uppercase(), filled, schema_field_count));
+                continue;
+            }
+        }
+
+        // 🌟 [ALREADY CLAIMED] PLINKO 가 이미 가져간 값을 LLM 이 다시 반환하지 못하게 막습니다.
+        let claimed_ctx = if assigned_fields.is_empty() {
+            String::new()
+        } else {
+            let list: Vec<serde_json::Value> = assigned_fields.iter()
+                .map(|(k, v)| json!({ "target_column": k, "extracted_value": v }))
+                .collect();
+            format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
+                serde_json::to_string_pretty(&list).unwrap_or_default())
+        };
+
+        emit_term(&format!("[TRADING STEP B] Extracting category '{}' for {}...", cat.to_uppercase(), doc_type));
+        log_task_progress(app_handle, &task.id, &json!({
+            "category": format!("Extraction ({})", cat.to_uppercase()),
+            "summary": format!("Extracting {} fields...", cat),
+            "spinner": "⠋"
+        }));
+
+        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 ListMode PUG를 컨텍스트로 사용합니다.
+            //    content_pug는 이미 pre_clean_html → convert_to_clean_pug(ListMode) →
+            //    truncate_pug_context 파이프라인을 거친 결과입니다.
+            let params = crate::openai_types::ChatCompletionParameters {
+                messages: vec![
+                    crate::openai_types::ChatCompletionRequestMessage::System(
+                        crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}", content_pug, claimed_ctx),
+                            name: None,
+                        },
+                    ),
+                    crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
+                                schema_prompt,
+                            ),
+                            name: None,
+                        },
+                    ),
+                ],
+                model: "qwen3.5".to_string(),
+                max_tokens: Some(1024),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let res = gen.generate(
+                params,
+                Some(cancellation_token.clone()),
+                Some(format!("{}_{}", task.id, cat)),
+                None, None, None
+            ).await?;
+            let mut tile_json = crate::parsing::parse_json_from_llm(&res);
+
+            // 🌟 [PLINKO PROTECT] PLINKO 가 확정한 필드는 LLM 결과로 덮어쓰지 않습니다.
+            if let Some(obj) = tile_json.as_object_mut() {
+                let ks: Vec<String> = obj.keys().cloned().collect();
+                for k in ks {
+                    if assigned_fields.contains_key(&k) {
+                        obj.remove(&k);
+                        emit_term(&format!("    🛡️ [PLINKO PROTECT] '{}' 는 결정론 확정값을 유지하고 LLM 결과를 폐기합니다.", k));
+                    }
+                }
+            }
+
+            crate::model::merge_json_manual(&mut final_data_map, cat, tile_json);
+        }
+    }
+
+    // 모델 해제 후 임베딩 준비
+    model.deep_purge_resources().await;
+    crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+
+    let mut extracted_data = Value::Object(final_data_map);
+
+    // =====================================================================
+    // 🌟 [TRADING STEP C v2] 루트 평탄화 + 자연어 변환 + 임베딩 텍스트 생성
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 빠져 있었나 ──
+    //   v1 은 중첩 구조({ header:{...}, logistics:{...} })를 그대로 저장했습니다.
+    //   그런데 Dexie 인덱스는 'data.vessel' / 'data.pol' 같은 1뎁스 경로만 봅니다.
+    //   extract_from_image 는 TRADING FLATTEN v3 로 이 문제를 이미 해결했지만
+    //   HTML 경로에는 그 블록이 없어, 같은 문서라도 입력 경로에 따라
+    //   검색 가능 여부가 달라지는 상태였습니다.
+    //
+    //  ── 규칙 ──
+    //   중첩 그룹의 잎을 전부 루트로 끌어올리고,
+    //   이름은 bias.json 의 search_bridge.path_alias 로 canonical 화합니다.
+    //   (build_dexie_plan 의 normalize_path 와 같은 이름 공간을 씁니다)
+    // =====================================================================
+    {
+        const TRADE_GROUPS_FLAT: [&str; 6] =
+            ["header", "parties", "logistics", "financials", "conditions", "cargo"];
+
+        fn canonical_name(raw: &str) -> String {
+            let k = raw.trim();
+            if let Some(alias_obj) = crate::parsing::BIAS_DICT
+                .get("search_bridge")
+                .and_then(|sb| sb.get("path_alias"))
+                .and_then(|v| v.as_object())
+            {
+                for (canonical, list) in alias_obj {
+                    if canonical == k { return canonical.clone(); }
+                    if let Some(arr) = list.as_array() {
+                        if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                            return canonical.clone();
+                        }
+                    }
+                }
+            }
+            k.to_string()
+        }
+
+        let source = extracted_data.clone();
+        let mut hoisted: Vec<String> = Vec::new();
+
+        for group in TRADE_GROUPS_FLAT.iter() {
+            let src = match source.get(*group).and_then(|v| v.as_object()) {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let obj = extracted_data.as_object_mut().unwrap();
+            for (k, v) in src {
+                if v.is_null() { continue; }
+                if let Some(s) = v.as_str() {
+                    if s.trim().is_empty() || s == "N/A" { continue; }
+                }
+                let name = canonical_name(&k);
+                if obj.get(&name).map_or(false, |x| !x.is_null()) { continue; }
+                obj.insert(name.clone(), v.clone());
+                hoisted.push(name);
+            }
+        }
+
+        // ── 배열 축 : 첫 원소만 대표 축으로 승격 ──
+        for (arr_key, promote) in [
+            ("containers", vec!["container_number", "seal_number"]),
+            ("line_items", vec!["hs_code"]),
+        ] {
+            let arr = match source.get(arr_key).and_then(|v| v.as_array()) {
+                Some(a) => a.clone(),
+                None => continue,
+            };
+            let obj = extracted_data.as_object_mut().unwrap();
+            for field in promote {
+                if obj.get(field).map_or(false, |x| !x.is_null()) { continue; }
+                if let Some(v) = arr.iter().find_map(|it| it.get(field)) {
+                    obj.insert(field.to_string(), v.clone());
+                    hoisted.push(field.to_string());
+                }
+            }
+        }
+
+        emit_term(&format!(
+            "[TRADING STEP C] 🌟 [TRADING FLATTEN v3] data 루트로 승격한 축 {}개: {:?}",
+            hoisted.len(),
+            hoisted.iter().take(12).collect::<Vec<_>>()
+        ));
+
+        let natural_text = parsing::json_to_natural_language(&extracted_data);
+        let masked_text = natural_text.clone();
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("text".to_string(), json!(natural_text));
+            obj.insert("masked_text".to_string(), json!(masked_text));
+            obj.insert("mode".to_string(), json!("shipping"));
+            obj.insert("type".to_string(), json!(doc_type.clone()));
+        }
+    }
+
+    // =====================================================================
+    // 🌟 [TRADING STEP D] 저장
+    // ---------------------------------------------------------------------
+    // bcc 규칙: commerce 는 hash("{page_type}{cc}") 이지만,
+    // trading 은 hash("{doc_type}{cc}") 를 사용합니다.
+    // 이렇게 해야 같은 cc 안에서 BL / CI / PL 이 각각 다른 bcc 로 분리되어
+    // 프론트엔드 TYPE_SETS.shipping 필터에서 서식별로 조회할 수 있습니다.
+    // =====================================================================
+    let store = {
+        let store_guard = store_mutex.lock().await;
+        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+    };
+
+    // doc_number 로 고유 ID 생성 (extract_from_image 와 동일 규칙)
+    let doc_number = extracted_data.get("header")
+        .and_then(|h| h.get("doc_number").or_else(|| h.get("document_number")))
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+        .unwrap_or_else(|| task.id.clone());
+
+    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&doc_number)
+        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", doc_type, team_id, clean_no)));
+    let hashed_item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+
+    if let Some(obj) = extracted_data.as_object_mut() {
+        obj.insert("id".to_string(), json!(hashed_item_id.clone()));
+        obj.insert("index".to_string(), json!(index_val));
+        obj.insert("doc_type".to_string(), json!(doc_type.clone()));
+        obj.insert("doc_number".to_string(), json!(doc_number.clone()));
+        obj.insert("no".to_string(), json!(doc_number.clone()));
+        obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+    }
+
+    let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
+    let item_digest = crate::utils::hash::digest(&text_to_embed);
+    let item_vector = model.get_embedding(text_to_embed.clone()).await.unwrap_or(vec![0.0; 384]);
+
+    // 🌟 trading bcc: doc_type 기반 (commerce 의 page_type 기반과 구분)
+    let cc_val = task.cc.clone();
+    let bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, cc_val));
+    let ref_val = task.r#ref.clone();
+
+    // 🌟 v4 : items 단일 저장.
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector.clone()),
+        &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP E v2] Index 기반 양방향 Relay + Draft 생성
+    // ---------------------------------------------------------------------
+    //  ── v1 의 결함 3가지 ──
+    //   ① trading_relay_field 가 (from, to) 에 대해 '단 하나의 필드'만 돌려주어
+    //      CI 쪽에서는 존재하지 않는 CI.reference_invoice 를 읽어 항상 0건이었습니다.
+    //   ② 참조를 문자열 doc_number 로만 저장해 표기 흔들림(대소문자/하이픈)에 어긋났고,
+    //      reference_bl / reference_ci 는 Dexie 인덱스가 없어 풀스캔이었습니다.
+    //   ③ 상대 문서가 아직 없으면 그냥 Skip 해서, 나중에 그 문서가 들어와도
+    //      먼저 들어온 문서와 절대 연결되지 않았습니다.
+    //      (commerce 는 draft 를 만들어 두고 나중에 채웁니다)
+    //
+    //  ── v2 구조 (commerce order↔tracking 과 동일) ──
+    //   내 index  = crc32(hash_id(doc_type   + team_id + 정규화 doc_number))
+    //   상대 index = crc32(hash_id(foreign_t + team_id + 정규화 참조번호))
+    //   내 문서에  data.rel_{foreign}  = 상대 index
+    //   상대 문서에 data.rel_{mine}    = 내 index
+    //   상대가 없으면 draft 를 만들어 rel_ 축을 미리 채웁니다.
+    // =====================================================================
+    let relay_targets = crate::logic::related_trading(&doc_type);
+    for foreign_type in relay_targets {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        let (mine_field, foreign_field) = match crate::logic::trading_relay_pair(&doc_type, foreign_type) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // 🌟 내 문서에서 '상대를 가리키는 값' 을 읽습니다.
+        //    v1 은 항상 relay_field(=상대 필드명)를 읽어 방향이 뒤집혀 있었습니다.
+        let ref_raw = extracted_data.get(mine_field)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.as_str() != "N/A");
+
+        let clean_ref = match ref_raw {
+            Some(r) => crate::utils::hash::normalize_numeric_homoglyphs(&r)
+                .replace("-", "").replace("_", "").replace(".", "").replace(",", ""),
+            None => continue,
+        };
+        if clean_ref.is_empty() { continue; }
+
+        // 🌟 상대 index 를 결정론으로 계산합니다. (commerce 의 tracking_index 와 동일 규칙)
+        let foreign_index = crate::utils::hash::crc32(
+            &crate::utils::hash::hash_id(&format!("{}{}{}", foreign_type, team_id, clean_ref))
+        );
+        let mine_col = crate::logic::trading_index_column(&doc_type);
+        let foreign_col = crate::logic::trading_index_column(foreign_type);
+
+        // 내 문서에 상대 index 를 꽂습니다.
+        extracted_data.as_object_mut().unwrap().insert(foreign_col.clone(), json!(foreign_index));
+        emit_term(&format!("  🔑 [TRADING INDEX] {}.{} = {} (from {}='{}')",
+            doc_type, foreign_col, foreign_index, mine_field, clean_ref));
+
+        // 상대 문서 조회 : ① 상대 index 로 ② 그래도 없으면 상대 필드 문자열로
+        let mut hit: Option<(String, Value)> = None;
+        if let Ok(Some(v)) = store.find_item_by_property("items", "index", &json!(foreign_index.to_string())).await {
+            hit = Some(v);
+        }
+        if hit.is_none() {
+            if let Ok(Some(v)) = store.find_item_by_property("items", foreign_field, &json!(clean_ref.clone())).await {
+                hit = Some(v);
+            }
+        }
+
+        match hit {
+            Some((foreign_id, mut foreign_data)) => {
+                let was_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                emit_term(&format!("[TRADING RELAY] Found existing {} document '{}' (draft: {}).", foreign_type, foreign_id, was_draft));
+
+                // 상대 문서에 내 index 를 꽂습니다. (양방향)
+                foreign_data.as_object_mut().unwrap().insert(mine_col.clone(), json!(index_val));
+                // 문자열 참조도 남겨 FTS 리콜을 보존합니다.
+                foreign_data.as_object_mut().unwrap().insert(
+                    format!("reference_{}", doc_type.to_lowercase()),
+                    json!(doc_number.clone())
+                );
+                if was_draft {
+                    foreign_data.as_object_mut().unwrap().insert(
+                        "updated_at".to_string(),
+                        json!(chrono::Utc::now().timestamp_millis())
+                    );
+                }
+                if foreign_data.get("mode").is_none() {
+                    foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!("shipping"));
+                }
+
+                let merged_text = parsing::json_to_natural_language(&foreign_data);
+                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
+                foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
+
+                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
+                emit_term(&format!("  ✅ [TRADING RELAY] {} '{}' 에 {}.{} = {} 역주입 완료.",
+                    foreign_type, foreign_id, foreign_type, mine_col, index_val));
+            },
+            None => {
+                // 🌟 [DRAFT] commerce 와 동일하게 상대 문서 draft 를 미리 만들어 둡니다.
+                //    나중에 그 문서가 실제로 들어오면 같은 index 를 갖게 되어 자동으로 이어집니다.
+                let draft_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, foreign_index));
+                let mut draft_data = json!({});
+                if let Some(o) = draft_data.as_object_mut() {
+                    o.insert("id".to_string(), json!(draft_id.clone()));
+                    o.insert("type".to_string(), json!(foreign_type));
+                    o.insert("doc_type".to_string(), json!(foreign_type));
+                    o.insert("index".to_string(), json!(foreign_index));
+                    o.insert(foreign_field.to_string(), json!(clean_ref.clone()));
+                    o.insert(mine_col.clone(), json!(index_val));
+                    o.insert("updated_at".to_string(), json!(0));
+                    o.insert("mode".to_string(), json!("shipping"));
+                    o.insert("text".to_string(), json!(format!("{} {}", foreign_type, clean_ref)));
+                }
+                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                save_item(&store, "items", &draft_id, foreign_type, draft_data, None,
+                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
+                emit_term(&format!("  📝 [TRADING RELAY DRAFT] {} draft '{}' 생성 ({}='{}', index={}).",
+                    foreign_type, draft_id, foreign_field, clean_ref, foreign_index));
+            }
+        }
+    }
+
+    // 최종 저장 (relay 로 updated 필드가 추가된 경우)
+    save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector.clone()),
+        &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
+
+    // =====================================================================
+    // 🌟 [TRADING STEP E-2] 청크 인덱싱 (PHASE A~E)
+    // ---------------------------------------------------------------------
+    //  ── 왜 필요한가 ──
+    //   lib.rs 의 STAGE-4 는 item_chunks 테이블을 코사인 검색합니다.
+    //   commerce 는 상세/리스트 양쪽 모두 청크를 저장하는데,
+    //   trading 은 이 단계가 없어 "선적항이 부산인 B/L" 같은 필드 레벨 질의가
+    //   구조적으로 0건이었습니다. (아이템 벡터 1개만으로는 값이 희석됩니다)
+    //
+    //  ── index_item_chunks 재사용 ──
+    //   이 함수는 이미 PHASE A(분할) ~ PHASE E(저장) 전 과정과
+    //   음차 별칭 생성까지 포함하고 있으므로 그대로 호출합니다.
+    //   bias_schema.rs 의 무역 분기가 doc_type 에 대응하는 필드를 돌려주므로
+    //   뱅크가 비어 조기 종료되는 일도 없습니다.
+    // =====================================================================
+    {
+        let chunk_count = index_item_chunks(
+            &store,
+            &model,
+            &hashed_item_id,
+            &doc_type,
+            &doc_lang,
+            &extracted_data,
+            true,               // is_detail : 무역 서식은 항상 단일 문서 상세
+            &task.cc,
+            &bcc,
+            &ref_val,
+            "shipping",
+            &url,
+            cancellation_token,
+            app_handle,
+            &task.id,
+        ).await.unwrap_or(0);
+
+        emit_term(&format!(
+            "  🧩 [TRADING CHUNK INDEX] item_id='{}' | 청크 {}건 인덱싱 완료 (doc_type='{}')",
+            hashed_item_id, chunk_count, doc_type
+        ));
+    }
+
+    // =====================================================================
+    // 🌟 [TRADING STEP F] Metrics + 완료
+    // =====================================================================
+    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+    let e = stats_diff.entry(doc_type.clone()).or_insert((0, 0, 0));
+    e.1 += 1; // count
+    e.2 += 1; // global count
+
+    let metrics_input = vec![extracted_data.clone()];
+    let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &metrics_input, stats_diff.clone()).await;
+
+    let _ = store.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Trading Extraction Complete")).await;
+
+    let payload_done = json!({
+        "task_id": task.id,
+        "category": "Done",
+        "summary": format!("Trading extraction complete. Document type: {}", doc_type),
+        "spinner": "✅",
+        "data": null
+    });
+    let _ = app_handle.emit("extraction-progress", &payload_done);
+    log_task_progress(app_handle, &task.id, &payload_done);
+
+    println!("[TRADING] Task {} completed. Document type: {}.", task.id, doc_type);
     Ok(())
 }

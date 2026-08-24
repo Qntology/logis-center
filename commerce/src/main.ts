@@ -5,35 +5,401 @@ import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
 // Imports for Rendering & Shim
-import { item2html, selector } from "./lib/render";
+// 🌟 isAlmostEqual : 낙관적 로컬 talk 행 ↔ 서버 발급 talk 행 승계 판정에 사용합니다.
+//    (render.ts 에 존재하지만 그동안 한 번도 호출되지 않던 죽은 함수였습니다)
+import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
-// 🌟 [추가] 어디서든 데이터를 Dexie에 동기화할 수 있도록 전역 헬퍼로 승격
-const enrichForIndex = (docs: any[]) => docs.map(d => {
-    const parsed = typeof d.json_data === 'string' ? (JSON.parse(d.json_data) || {}) : (d.data || d || {});
-    return { 
-        ...d, 
-        no: parsed.no?.toString(), 
-        code: parsed.code?.toString(), 
-        tracking_number: parsed.tracking_number?.toString(), 
-        goods: parsed.goods?.toString(), 
-        order: parsed.order?.toString(), 
-        tracking: parsed.tracking?.toString(), 
-        stock_keeping_unit: parsed.stock_keeping_unit?.toString(), 
-        barcode: parsed.barcode?.toString(), 
-        index: parsed.index?.toString(),
-        status: d.status ?? parsed.status ?? 0,
-        amount: d.amount ?? parsed.amount ?? parsed.total_amount ?? 0,
-        mode: d.mode ?? parsed.mode ?? 'commerce',
-        is_masked: d.is_masked ?? parsed.is_masked ?? false,
-        text: d.text ?? parsed.text ?? "",
-        masked_text: d.masked_text ?? parsed.masked_text ?? "",
-        created_at: d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0,
-        updated_at: d.updated_at_ts ?? d.updated_at ?? parsed.updated_at ?? 0,
-        data: parsed
+// 🌟 [CANONICALIZE] data 안의 값 타입을 확정합니다.
+//  IndexedDB 인덱스는 타입이 혼재하면(123 vs "123") equals 가 절반을 놓치고,
+//  boolean / undefined 는 아예 인덱스에서 조용히 빠집니다.
+//  따라서 '쓰기 시점'에 딱 한 번 정규화해서 저장합니다.
+//  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
+// 🌟 [CANONICAL CONTRACT / TS]
+//  ⚠️ 이 파일의 판정은 store.rs 가 쓰는 utils/canonical.rs 의 kind_of() 와
+//     '비트 단위로 동일' 해야 합니다. 한쪽만 바뀌면 같은 값이
+//     LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
+//     where('data.xxx').equals(...) 가 절반을 놓칩니다.
+//
+//  ── 왜 이름 목록을 없앴나 ──
+//   기존에는 ID/NUM/BOOL 배열에 필드명을 일일이 등록해야 했습니다.
+//   이제 접미사/부분일치 규칙으로 자동 판정하므로,
+//   Dexie 에 새 필드를 추가해도 이 목록을 건드릴 필요가 없습니다.
+type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
+
+// ── ① 명시 예외 : 규칙만으로 판정 불가능한 이름 (새 필드로 커지지 않습니다) ──
+const FORCE_ID = new Set(['id', 'no', 'digest']);
+const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
+const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
+
+// ── ② 접미사 / 부분일치 규칙 : 새 필드는 여기에 자동으로 걸립니다 ──
+const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin', '_mpn'];
+const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
+const NUM_SUFFIX = [
+    '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
+    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges'
+];
+const NUM_CONTAINS = [
+    'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
+    'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
+    'local_charges', 'number_of_'
+];
+const NUM_EXACT = new Set(['width', 'height', 'length']);
+const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
+// 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
+//    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
+const NUM_PREFIX = ['rel_'];
+// 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
+//    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
+//    bool 변환식이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
+//    bias_schema.rs 도 add("bundle_shipping", "String", ...) 로 선언하므로
+//    문자열로 두는 것이 Rust 쪽과도 일치합니다.
+const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match'];
+
+function kindOf(key: string): CanonKind {
+    const k = key.toLowerCase();
+
+    if (k === 'tags') return 'tags';
+
+    if (FORCE_ID.has(k)) return 'id';
+    if (FORCE_NUM.has(k)) return 'num';
+    if (FORCE_BOOL.has(k)) return 'bool';
+
+    // 🌟 [TRADING INDEX] 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
+    //    ID_CONTAINS 의 'reference_' 보다 먼저 검사해야
+    //    'rel_' 이 id(String)로 오분류되지 않습니다.
+    if (NUM_PREFIX.some(p => k.startsWith(p))) return 'num';
+
+    // 🌟 Boolean 을 수치보다 먼저 검사합니다.
+    //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
+    if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
+    if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
+
+    if (NUM_EXACT.has(k)) return 'num';
+    if (NUM_SUFFIX.some(s => k.endsWith(s))) return 'num';
+
+    // 🌟 식별자를 수치보다 먼저 봅니다.
+    //    'doc_number' 는 '_number' 로 수치에도 걸리지만
+    //    실제로는 'ABCD1234567' 영숫자 혼합이므로 String 이어야 합니다.
+    if (ID_SUFFIX.some(s => k.endsWith(s))) return 'id';
+    if (ID_CONTAINS.some(c => k.includes(c))) return 'id';
+
+    if (NUM_CONTAINS.some(c => k.includes(c))) return 'num';
+
+    return 'free';
+}
+
+// 🌟 [SEED KEYS] Dexie stores() 의 data.* 인덱스 중 기본값이 필요한 키만 나열합니다.
+//    store.rs 의 SEED_KEYS 와 동일해야 합니다.
+const SEED_KEYS: Array<[string, CanonKind]> = [
+    ['id', 'id'], ['no', 'id'], ['code', 'id'],
+    ['tracking_number', 'id'], ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
+    ['index', 'num'], ['goods', 'num'], ['order', 'num'], ['tracking', 'num'],
+    ['status', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
+    ['embed', 'bool'],
+    ['tags', 'tags']
+];
+
+// 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
+//    두 표가 어긋나면 같은 문서가 LanceDB 에서는 9, Dexie 에서는 0 으로 저장되어
+//    data.status 인덱스 조회가 절반을 놓칩니다.
+const STATUS_CODE: Record<string, number> = {
+    progress: 1, stop: 2, cancel: 3, refund: 4, return: 5,
+    error: 6, expire: 7, exchange: 8, complete: 9,
+    draft: 10, show: 11, hide: 12
+};
+
+// 🌟 기본값 시딩을 하지 않는 타입. store.rs 의 `matches!(target, "users" | "pages")` 와 대응합니다.
+//    🌟 [ANALYTICS] click / hover / change / report 는 행동 로그이므로
+//       commerce 도메인 필드(sale_price / tracking_number ...)를 가질 이유가 전혀 없습니다.
+//       시딩하면 문서당 48개의 무의미한 키가 붙어 저장 용량과 인덱스를 낭비합니다.
+//       Dexie 는 없는 키를 인덱스에서 조용히 제외할 뿐 에러를 내지 않으므로 시딩이 불필요합니다.
+const NON_SEED_TYPES = new Set([
+    'team', 'user', 'member', 'users', 'pages', 'page',
+    'click', 'hover', 'change', 'report', 'question', 'answer'
+]);
+
+// 🌟 [ISO DATE] Rust 의 iso_to_epoch_ms 와 동일 규칙.
+//    scheduler 가 started_at / expired_at 을 "2024-01-01T12:00:00" 으로 만듭니다.
+//    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
+function isoToEpochMs(t: string): number | null {
+    if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) return null;
+    let ms: number;
+    if (t.length === 10) {
+        ms = Date.parse(t); // "2024-01-01" 은 명세상 UTC 로 해석됩니다.
+    } else {
+        const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
+        const norm = t.includes('T') ? t : t.replace(' ', 'T');
+        // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
+        ms = Date.parse(hasTz ? norm : norm + 'Z');
+    }
+    return isNaN(ms) ? null : ms;
+}
+
+function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: any = { ...parsed };
+
+    // ── ① 기존 키 전량 정규화 (규칙 기반) ──
+    //    새 필드도 여기서 자동 처리되므로 이 함수는 확장 시 수정할 필요가 없습니다.
+    for (const k of Object.keys(out)) {
+        const kind = kindOf(k);
+        if (kind === 'free') continue;
+
+        const v = out[k];
+
+        if (kind === 'id') {
+            if (v === undefined || v === null) continue;
+            // 배열/객체는 식별자가 될 수 없으므로 건드리지 않습니다.
+            if (typeof v === 'object') continue;
+            out[k] = String(v);
+            continue;
+        }
+
+        if (kind === 'num') {
+            if (v === undefined || v === null || v === "") continue;
+            if (typeof v === 'object') continue;
+            if (typeof v === 'number') { out[k] = v; continue; }
+            if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
+
+            const s = String(v).trim();
+            // 🌟 [STATUS PARITY] status 는 'complete' 같은 상태 문자열로 들어올 수 있습니다.
+            if (k === 'status') {
+                const mapped = STATUS_CODE[s.toLowerCase()];
+                if (mapped !== undefined) { out[k] = mapped; continue; }
+            }
+            const ms = isoToEpochMs(s);
+            if (ms !== null) { out[k] = ms; continue; }
+
+            const n = Number(s.replace(/[^\d.\-]/g, ''));
+            out[k] = isNaN(n) ? 0 : n;
+            continue;
+        }
+
+        if (kind === 'bool') {
+            if (v === undefined || v === null) continue;
+            if (typeof v === 'object') continue;
+            // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
+            out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
+            continue;
+        }
+
+        if (kind === 'tags') {
+            if (v === undefined || v === null) continue;
+            if (!Array.isArray(v)) {
+                out[k] = [String(v)].filter(Boolean);
+            } else {
+                out[k] = v
+                    .map((t: any) => (typeof t === 'object' && t !== null ? (t.tag ?? "") : String(t)))
+                    .filter(Boolean);
+            }
+            continue;
+        }
+    }
+
+    // ── ② 조회 축 기본값 시딩 ──
+    if (seedDefaults) {
+        for (const [k, kind] of SEED_KEYS) {
+            if (out[k] !== undefined && out[k] !== null) continue;
+            out[k] = kind === 'id' ? "" : kind === 'tags' ? [] : 0;
+        }
+    }
+
+    return out;
+}
+
+// =====================================================================
+// 🌟 [MODE CONTRACT v1] 모드 ↔ 타입 매핑 단일 진실 공급원
+// ---------------------------------------------------------------------
+//  ── 왜 단일화하는가 ──
+//   기존에는 syncData 의 TRADING_TYPES 와 loadMoreDocs 의 TYPE_SETS 가
+//   각자 하드코딩되어 있었고, 두 목록 모두 'tracking' 을 포함했습니다.
+//   그 결과 proxy/index.ts 의 Relay("tracking","order") 가 만든
+//   'commerce 주문 배송추적' 문서가 mode='shipping' 으로 오염되어
+//   commerce 목록에서 통째로 사라졌습니다.
+//
+//  ── 두 목록의 역할이 다르다 ──
+//   MODE_OF_TYPE  : "이 문서를 어느 트랙에 소속시킬 것인가" (쓰기 시점, 배타적)
+//   TYPE_SETS     : "이 모드에서 어떤 타입을 보여줄 것인가" (읽기 시점, 중첩 허용)
+//   tracking 은 소속은 commerce 이지만, shipping 모드에서도 조회 대상입니다.
+//   (mode 컬럼이 이미 걸러 주므로 조회 목록에 중복 등재해도 무해합니다)
+//
+//  ⚠️ D1(commerce / analytics) 어디에도 mode 컬럼이 없습니다.
+//     따라서 mode 는 '동기화 시점에 클라이언트가 확정하는 값' 입니다.
+// =====================================================================
+
+// ── 무역 서식 코드 : app-logis-center 의 get_slice_config 분류 전량 ──
+//    ① 계약·결제 ② 선적·운송 ③ 통관·신고 ④ 검사·증명 ⑤ 특수·법무
+const TRADING_DOC_CODES = [
+    'PO', 'PI', 'SC', 'LC',
+    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
+    'ED', 'ID', 'CINV', 'CO',
+    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS'
+];
+
+// 🌟 LLM 분류기는 대문자('BL')로, scheduler 의 page_type 은 소문자('tracking')로
+//    뱉는 두 경로가 공존하므로 양쪽을 모두 등재합니다.
+const TRADING_DOC_TYPE_SET = new Set<string>([
+    ...TRADING_DOC_CODES,
+    ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
+    'shipping_doc', 'TRACKING', 'Unknown', 'unknown'
+]);
+
+// ── commerce 도메인 타입 : proxy/index.ts 의 Relay 대상 전량 ──
+const COMMERCE_TYPE_SET = new Set<string>([
+    'sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
+    'receiving', 'shipping',
+    'member', 'team', 'user', 'users', 'pages', 'page', 'talk', 'prompt', 'ai_search'
+]);
+
+// ── analytics 행동 로그 / 관리자 Q&A ──
+const ANALYTIC_TYPE_SET = new Set<string>([
+    'click', 'hover', 'change', 'report', 'question', 'answer'
+]);
+
+/**
+ * 🌟 [MODE TAGGING] D1 응답 행의 type 만 보고 소속 트랙을 확정합니다.
+ *  commerce 를 먼저 판정해야 'tracking' 이 shipping 으로 새어 나가지 않습니다.
+ *  (TRADING_DOC_TYPE_SET 에는 소문자 'tracking' 이 없으므로 충돌하지 않지만,
+ *   순서를 고정해 두면 이후 코드가 추가되어도 안전합니다)
+ */
+function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
+    const s = String(t || '');
+    if (ANALYTIC_TYPE_SET.has(s)) return 'analytic';
+    if (COMMERCE_TYPE_SET.has(s)) return 'commerce';
+    if (TRADING_DOC_TYPE_SET.has(s)) return 'shipping';
+    return 'commerce';
+}
+
+/**
+ * 🌟 [READ SCOPE] 각 모드에서 목록/검색에 노출할 타입 목록입니다.
+ *  mode 컬럼이 이미 트랙을 격리하므로 여기서는 중첩을 허용합니다.
+ */
+const TYPE_SETS: Record<string, string[]> = {
+    shipping: [
+        'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
+        ...TRADING_DOC_CODES,
+        ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
+        'Unknown', 'unknown'
+    ],
+    // 🌟 [Q&A VISIBLE] question / answer 는 콘솔에서 오간 관리자 Q&A 입니다.
+    //    기존에는 syncAnalyticsData 가 아예 버렸고 이 목록에도 없어
+    //    앱 어디에서도 확인할 수 없었습니다. 이제 저장하므로 목록에도 노출합니다.
+    //    (검색 스코프에서는 parse_analytic_query 가 별도로 제외하므로 충돌하지 않습니다)
+    analytic: ['click', 'hover', 'change', 'report', 'question', 'answer'],
+    // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
+    //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
+    //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
+    //    shipping 탭에는 타입은 있으나 mode 가 달라 역시 탈락 →
+    //    결과적으로 두 탭 어디에서도 보이지 않는 고아 문서가 되었습니다.
+    //    (mode 컬럼이 트랙을 이미 격리하므로 읽기 목록 중첩은 무해합니다)
+    commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
+               'receiving', 'shipping']
+};
+
+/**
+ * 🌟 [MODE LABEL] 내부 코드값과 사용자 표기를 분리합니다.
+ *  저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB · Rust 변경이 없습니다.
+ *  ⚠️ 이 표가 유일한 정의입니다. applySearchModeUI 와 검색 결과 헤더가 공유합니다.
+ */
+const MODE_LABEL: Record<string, string> = {
+    commerce: 'Commerce',
+    shipping: 'Trading',
+    analytic: 'Analytic'
+};
+
+function modeLabel(m: string): string {
+    return MODE_LABEL[m] || (m.charAt(0).toUpperCase() + m.slice(1));
+}
+
+// 🌟 [NORMALIZE ENVELOPE] Rust(TradeDocument) / Cloudflare(D1 row) / 로컬 생성 객체를
+//  하나의 봉투 형태로 통일합니다. 루트에는 봉투 12개만 남기고, 나머지는 전부 data 로 내립니다.
+//  → 값이 2벌 저장되던 문제(enrichForIndex 호이스팅)가 사라집니다.
+//  → 새 도메인 필드가 생겨도 이 함수는 영원히 그대로입니다.
+// 🌟 [ENVELOPE KEYS] 루트에 남겨 둘 봉투 12개.
+//    이 집합에 없는 루트 키는 전부 '확장 필드' 로 간주해 data 로 하강시킵니다.
+const ENVELOPE_ROOT_KEYS = new Set([
+    'id', 'uuid', 'type', 'doc_type', 'flag', 'from', 'to', 'cc', 'bcc',
+    'ref', 'ref_val', 'mode', 'created_at', 'updated_at',
+    'created_at_ts', 'updated_at_ts',
+    // 아래 4개는 data 안으로 별도 승격되므로 하강 루프에서 제외합니다.
+    'data', 'json_data', 'text', 'masked_text',
+    // 클라우드 응답 전용 라우팅 힌트 (도메인 값이 아님)
+    'table', 'digest', 'current', 'score', 'name'
+]);
+
+const normalizeEnvelope = (docs: any[]) => docs.map(d => {
+    let parsed: any = {};
+    if (typeof d.json_data === 'string') {
+        try { parsed = JSON.parse(d.json_data) || {}; } catch (e) { parsed = {}; }
+    } else if (d.data && typeof d.data === 'object') {
+        parsed = d.data;
+    } else if (typeof d.data === 'string') {
+        try { parsed = JSON.parse(d.data) || {}; } catch (e) { parsed = {}; }
+    } else {
+        parsed = {};
+    }
+
+    // 🌟 [ROOT ABSORB] Cloudflare D1 의 sales / tracking / event 테이블은
+    //    확장 필드를 gzip data 가 아니라 '물리 컬럼' 으로만 저장합니다.
+    //    (proxy/index.ts 의 INSERT INTO sales(... sale_price, quantity, weight ...) 참고)
+    //    그래서 GET 응답에서는 그 값들이 행 최상위에 실려 옵니다.
+    //    이 루프가 없으면 봉투 12개만 취하고 나머지를 통째로 버려서
+    //    Dexie 의 data.sale_price / data.weight 조건이 전부 오판합니다.
+    //    로컬 추출 경로(scheduler → upsert_item)는 이미 data 에 전부 넣으므로
+    //    parsed 에 값이 있으면 그쪽을 우선하고, 없을 때만 루트에서 끌어옵니다.
+    for (const k in d) {
+        if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
+        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+        const v = d[k];
+        if (v === undefined || v === null) continue;
+        // 함수/DOM 등 직렬화 불가 값은 IndexedDB structured clone 에서 터지므로 제외합니다.
+        if (typeof v === 'function') continue;
+        if (parsed[k] === undefined || parsed[k] === null || parsed[k] === "") {
+            parsed[k] = v;
+        }
+    }
+
+    // 검색/표시용 텍스트도 data 안으로 통일합니다.
+    if (parsed.text === undefined) parsed.text = d.text ?? "";
+    if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
+    if (parsed.mode === undefined) parsed.mode = d.mode ?? 'commerce';
+    if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
+    const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
+    // 🌟 [DRAFT PRESERVE] updated_at 폴백 체인에서 created_at 으로 빠지는 경로를 제거합니다.
+    //    기존에는 updated_at 이 없으면 created_at(현재 시각) 으로 폴백되어
+    //    draft(updated_at=0) 가 count 로 승격되었습니다.
+    //    updated_at 이 어디에도 없으면 0(draft) 으로 남겨야
+    //    renderNavigation 의 Dexie 카운트가 올바릅니다.
+    const updatedRaw = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at;
+    const updated = updatedRaw !== undefined && updatedRaw !== null ? updatedRaw : 0;
+    parsed.created_at = Number(created) || 0;
+    parsed.updated_at = Number(updated) || 0;
+
+    return {
+        // ── 봉투 12개. 이 목록은 앞으로 절대 늘어나지 않습니다 ──
+        id: String(d.id ?? d.uuid ?? parsed.id ?? ""),
+        type: String(d.type ?? d.doc_type ?? parsed.type ?? "unknown"),
+        flag: String(d.flag ?? parsed.flag ?? ""),
+        from: String(d.from ?? parsed.from ?? ""),
+        to: String(d.to ?? parsed.to ?? ""),
+        cc: String(d.cc ?? parsed.cc ?? ""),
+        bcc: String(d.bcc ?? parsed.bcc ?? ""),
+        ref: String(d.ref ?? d.ref_val ?? parsed.ref ?? ""),
+        mode: String(d.mode ?? parsed.mode ?? 'commerce'),
+        created_at: Number(created) || 0,
+        updated_at: Number(updated) || 0,
+        // ── 확장 영역. 여기에 뭘 넣든 스키마 변경 없음 ──
+        //    users / team / pages 는 시딩을 끕니다. (통계 문서 오염 방지)
+        data: canonicalizeData(parsed, !NON_SEED_TYPES.has(String(d.type ?? parsed.type ?? "")))
     };
 });
+
+// 🌟 [BACK-COMPAT] 기존 호출부(enrichForIndex(...))를 그대로 살려 둡니다.
+//  호출부 치환은 Part 3 에서 일괄 정리합니다.
+const enrichForIndex = normalizeEnvelope;
 
 // Access global libs
 const ethers = (window as any).ethers;
@@ -41,6 +407,8 @@ const blockies = (window as any).blockies;
 
 // --- Config ---
 const API_HOST = "https://commerce.logis.center"; 
+// 🌟 [ANALYTICS TRACK] 관리자(Console) 기능 및 사용자 행동 로그 동기화 전용 Client Worker
+const ANALYTICS_API_HOST = "https://console.logis.center";
 const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
 const EXPANDED_HEIGHT = 600;
@@ -67,6 +435,9 @@ interface ChatSession {
     name?: string;
     cc?: string;
     sender?: string;
+    // 🌟 [FLAG] Client Worker 가 GeoIP 로 확정해 내려주는 국가 코드입니다.
+    //    commerce D1 items 테이블에 flag 컬럼이 없어, 동기화 시 이 값으로 보강합니다.
+    flag?: string;
 }
 
 // --- State ---
@@ -80,6 +451,370 @@ let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
 // 🌟 [추가] 누락된 전역 상태 변수 선언
+// =====================================================================
+// 🌟 [OAUTH-NETWORK REGISTRATION] api.oauth.network 사이트 등록 기능
+// ---------------------------------------------------------------------
+//  www/docs/index.html 의 <form name="api.oauth.network"> 기능을
+//  Tauri proxy_fetch 경유로 이식합니다.
+//
+//  통신 대상: https://api.oauth.network (Vercel, api/index.js)
+//  목적: mode=analytic 에서 특정 도메인의 데이터를 조회하기 위한
+//        Client 등록 절차 (client_id / client_secret 발급)
+//
+//  CORS: proxy_fetch 는 Rust 백엔드(reqwest) 에서 요청을 보내므로
+//        브라우저 CORS 정책이 적용되지 않습니다. 별도 대응 불필요.
+//
+//  응답 파싱: api/index.js 는 HTML+postMessage 형식으로 응답합니다.
+//        proxy_fetch 가 JSON 파싱 실패 시 { text: "..." } 로 래핑하므로
+//        프론트엔드에서 <script> 내부 JSON 을 추출합니다.
+// =====================================================================
+
+const OAUTH_API_HOST = "https://api.oauth.network";
+
+/** api/index.js 의 HTML 응답에서 JSON 페이로드를 추출합니다. */
+function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: number } {
+    let text = "";
+    if (typeof raw === "string") {
+        text = raw;
+    } else if (raw && typeof raw === "object") {
+        if (raw.text) {
+            text = raw.text;
+        } else if (raw.rows) {
+            // 이미 JSON 으로 파싱된 경우 (향후 api/index.js 수정 시)
+            return { rows: raw.rows || [], cookies: raw.cookies || {}, count: raw.count || 0 };
+        }
+    }
+    // <script> 내부의 parent.postMessage(JSON.stringify({...}), ...) 에서 JSON 추출
+    const match = text.match(/parent\.postMessage\(JSON\.stringify\((\{[\s\S]*?\})\)/);
+    if (!match) {
+        return { rows: [], cookies: {}, count: 0 };
+    }
+    try {
+        const parsed = JSON.parse(match[1]);
+        let cookies = {};
+        if (typeof parsed.cookies === "string") {
+            try { cookies = JSON.parse(parsed.cookies); } catch (_e) { cookies = {}; }
+        } else if (parsed.cookies && typeof parsed.cookies === "object") {
+            cookies = parsed.cookies;
+        }
+        return {
+            rows: Array.isArray(parsed.rows) ? parsed.rows : [],
+            cookies,
+            count: parsed.count || 0
+        };
+    } catch (_e) {
+        return { rows: [], cookies: {}, count: 0 };
+    }
+}
+
+/** api.oauth.network 에 사이트 등록 POST 요청을 보냅니다. */
+async function submitOAuthRegistration(hostUrl: string): Promise<{
+    success: boolean;
+    client_id: string;
+    client_secret: string;
+    error: string;
+}> {
+    if (!currentSession.hash || !currentSession.token) {
+        return { success: false, client_id: "", client_secret: "", error: "로그인이 필요합니다." };
+    }
+    try {
+        const response = await invoke<any>("proxy_fetch", {
+            url: OAUTH_API_HOST,
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://oauth.network/"
+            },
+            body: {
+                host: hostUrl,
+                hash: currentSession.hash,
+                token: currentSession.token
+            },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        if (parsed.rows.length > 0) {
+            const row = parsed.rows[0];
+            if (row.client_id && row.client_secret) {
+                // kv_store 에 등록 정보 영구 저장
+                const existing = await kvGet("oauth_registered_sites") || [];
+                const alreadyExists = existing.some((s: any) => s.host === hostUrl);
+                if (!alreadyExists) {
+                    existing.push({
+                        host: hostUrl,
+                        client_id: row.client_id,
+                        client_secret: row.client_secret,
+                        registered_at: Date.now()
+                    });
+                    await kvSet("oauth_registered_sites", existing);
+                }
+                return {
+                    success: true,
+                    client_id: row.client_id,
+                    client_secret: row.client_secret,
+                    error: ""
+                };
+            }
+        }
+        // 🌟 [DETAIL ERROR] 서버 응답에 rows 가 비어 있으면 검증 실패입니다.
+        //    사용자가 대조할 수 있도록 '서버가 기대하는 주소' 를 함께 안내합니다.
+        const email = currentSession.email || "";
+        let expectedAddr = "";
+        if (email && typeof ethers !== "undefined") {
+            try {
+                expectedAddr = ethers.computeAddress(ethers.hashMessage(email)).toLowerCase();
+            } catch (_e) { /* ignore */ }
+        }
+        const errMsg = expectedAddr
+            ? `사이트 소유 확인 실패. 사이트 <head>에 아래 태그가 정확히 있는지 확인하세요:\n<meta name="oauth-network-verification" content="${expectedAddr}" />`
+            : "사이트 소유 확인이 필요합니다. 메타 태그를 사이트 <head>에 추가하세요.";
+        return { success: false, client_id: "", client_secret: "", error: errMsg };
+    } catch (e: any) {
+        return { success: false, client_id: "", client_secret: "", error: String(e) };
+    }
+}
+
+/** api.oauth.network 에서 등록된 사이트의 Cc(경로) 목록을 조회합니다. */
+async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
+    try {
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&distinct=Cc&id=%23LOG`,
+            method: "GET",
+            headers: {
+                "Content-Type": "application/json",
+                "Referer": "https://oauth.network/"
+            },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        return parsed.rows
+            .map((r: any) => r.Cc)
+            .filter((c: string) => !!c);
+    } catch (_e) {
+        return [];
+    }
+}
+
+/** api.oauth.network 에서 시간별 접속량 통계를 조회합니다. */
+async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<number> {
+    try {
+        const now = Date.now();
+        const from = new Date(now - hoursBack * 3600 * 1000).toISOString();
+        const to = new Date(now).toISOString();
+        const response = await invoke<any>("proxy_fetch", {
+            url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&id=%23LOG&cnt=true&date=${encodeURIComponent(from)}&date=${encodeURIComponent(to)}`,
+            method: "GET",
+            headers: {
+                "Content-Type": "application/json",
+                "Referer": "https://oauth.network/"
+            },
+            session_params: {
+                hash: currentSession.hash,
+                token: currentSession.token
+            }
+        });
+        const parsed = parseOAuthApiResponse(response);
+        return parsed.count;
+    } catch (_e) {
+        return 0;
+    }
+}
+
+function renderOAuthRegistrationForm() {
+    const existing = document.getElementById("oauth-registration-modal");
+    if (existing) existing.remove();
+
+    const modal = document.createElement("div");
+    modal.id = "oauth-registration-modal";
+    modal.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);  pointer-events: initial;";
+    modal.innerHTML = `
+<div style="background:#fff;border-radius:12px;padding:24px;width:90%;max-width:480px;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <h3 style="margin:0;font-size:1.1rem;font-weight:700;">사이트 등록 (Analytic)</h3>
+        <button id="oauth-modal-close" style="background:none;border:none;font-size:1.2rem;cursor:pointer;color:#666;">✕</button>
+    </div>
+
+    <!-- Step 1: 도메인 입력 -->
+    <div style="margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 도메인</label>
+        <input id="oauth-reg-host" type="url" placeholder="https://example.com" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.9rem;">
+        <p style="margin:4px 0 0;font-size:0.75rem;color:#888;">예시: (O) https://example.com (X) https://www.example.com</p>
+    </div>
+
+    <!-- Step 2: 소유 확인 메타 태그 (도메인 입력 시 즉시 생성) -->
+    <div id="oauth-reg-meta" style="display:none;margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 소유 확인 메타 태그</label>
+        <p style="margin:0 0 6px;font-size:0.75rem;color:#666;">
+            아래 메타 태그를 복사하여 사이트 홈페이지의 <code>&lt;head&gt;</code> 섹션에 붙여넣으세요.<br>
+            등록 버튼 클릭 시 서버가 이 태그의 존재 여부를 검증합니다.
+        </p>
+        <textarea id="oauth-reg-meta-tag" readonly style="width:100%;min-height:100px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:0.72rem;resize:none;box-sizing:border-box;background:#f8f9fa;line-height:1.6;"></textarea>
+        <button id="oauth-meta-copy" style="margin-top:6px;padding:6px 14px;border:1px solid #6366f1;border-radius:4px;background:#fff;color:#6366f1;font-size:0.78rem;cursor:pointer;">태그 복사</button>
+    </div>
+
+    <!-- 결과 메시지 -->
+    <div id="oauth-reg-result" style="display:none;margin-bottom:12px;padding:12px;border-radius:6px;font-size:0.85rem;"></div>
+
+    <!-- 등록 성공 후 Client 정보 -->
+    <div id="oauth-reg-credentials" style="display:none;margin-bottom:16px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Id (Address)</label>
+        <input id="oauth-reg-client-id" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;margin-bottom:8px;">
+        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Secret (Private Key)</label>
+        <input id="oauth-reg-client-secret" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;">
+    </div>
+
+    <button id="oauth-reg-submit" style="width:100%;padding:12px;border:none;border-radius:8px;background:#eee;color:#000;font-size:0.95rem;font-weight:700;cursor:pointer;">추가</button>
+</div>`;
+    document.body.appendChild(modal);
+
+    // 닫기
+    document.getElementById("oauth-modal-close")!.addEventListener("click", () => modal.remove());
+    modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+
+    // 🌟 [META TAG GENERATION] 도메인 입력 시 즉시 메타 태그를 생성합니다.
+    //    api/index.js 의 검증 로직:
+    //      clientAddress = ethers.computeAddress(ethers.hashMessage(email))
+    //    즉, 현재 로그인한 사용자의 email 기반으로 해시를 만들어
+    //    사이트 <head> 에 메타 태그로 삽입해야 소유 증명이 됩니다.
+    //
+    //    그러나 Tauri 앱에서는 currentSession.email 이 있으므로
+    //    사전에 태그를 만들어 보여줄 수 있습니다.
+    //    (api/index.js 는 서버에서 같은 값으로 검증합니다)
+    const hostInput = document.getElementById("oauth-reg-host") as HTMLInputElement;
+    const metaDiv = document.getElementById("oauth-reg-meta") as HTMLDivElement;
+    const metaTextarea = document.getElementById("oauth-reg-meta-tag") as HTMLTextAreaElement;
+    const metaCopyBtn = document.getElementById("oauth-meta-copy") as HTMLButtonElement;
+
+    let metaDebounce: number | null = null;
+    hostInput.addEventListener("input", () => {
+        if (metaDebounce) clearTimeout(metaDebounce);
+        metaDebounce = window.setTimeout(() => {
+            const url = hostInput.value.trim();
+            if (!url || !url.startsWith("http")) {
+                metaDiv.style.display = "none";
+                return;
+            }
+            try {
+                // api/index.js 검증 로직과 동일한 해시 생성:
+                //   clientAddress = ethers.computeAddress(ethers.hashMessage(email))
+                // Tauri 에서는 currentSession.email 이 있으므로 사전 계산 가능
+                const email = currentSession.email || "";
+
+                // 🌟 [EMAIL GUARD] 이메일이 없으면 메타 태그를 생성하지 않습니다.
+                //    빈 문자열로 계산된 주소는 서버 검증과 절대 일치하지 않으므로
+                //    잘못된 태그를 붙여넣게 되는 것을 사전에 차단합니다.
+                if (!email) {
+                    metaDiv.style.display = "none";
+                    return;
+                }
+
+                const hashMessage = ethers.hashMessage(email);
+                const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
+
+                // 🌟 [DEBUG] 생성된 주소를 콘솔에 출력하여 사이트 태그와 대조 가능하게 합니다.
+                console.log(`[OAUTH] Meta tag generated for email='${email}' → content="${clientAddress}"`);
+
+                const tags = `<meta name="oauth-network-verification" content="${clientAddress}" />
+    <meta name="privacy" content="/개인정보약관 경로/" />
+    <meta name="terms" content="/이용약관 경로/" />`;
+
+                metaTextarea.value = tags;
+                metaDiv.style.display = "block";
+            } catch (e) {
+                metaDiv.style.display = "none";
+            }
+        }, 300);
+    });
+
+    // 태그 복사 버튼
+    metaCopyBtn.addEventListener("click", () => {
+        const text = metaTextarea.value;
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+            metaCopyBtn.textContent = "복사됨 ✓";
+            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
+        }).catch(() => {
+            // clipboard API 실패 시 textarea 선택 방식
+            metaTextarea.focus();
+            metaTextarea.select();
+            document.execCommand("copy");
+            metaCopyBtn.textContent = "복사됨 ✓";
+            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
+        });
+    });
+
+    // 제출
+    document.getElementById("oauth-reg-submit")!.addEventListener("click", async () => {
+        const resultDiv = document.getElementById("oauth-reg-result") as HTMLDivElement;
+        const credDiv = document.getElementById("oauth-reg-credentials") as HTMLDivElement;
+        const submitBtn = document.getElementById("oauth-reg-submit") as HTMLButtonElement;
+
+        const hostUrl = hostInput.value.trim();
+        if (!hostUrl) {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fef2f2";
+            resultDiv.style.color = "#dc2626";
+            resultDiv.textContent = "도메인을 입력하세요.";
+            return;
+        }
+
+        // 메타 태그가 아직 생성되지 않은 경우 생성 유도
+        if (metaDiv.style.display === "none") {
+            const email = currentSession.email || "";
+            const hashMessage = ethers.hashMessage(email);
+            const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
+            metaTextarea.value = `<meta name="oauth-network-verification" content="${clientAddress}" />
+<meta name="privacy" content="/개인정보약관 경로/" />
+<meta name="terms" content="/이용약관 경로/" />`;
+            metaDiv.style.display = "block";
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fffbeb";
+            resultDiv.style.color = "#d97706";
+            resultDiv.textContent = "위 메타 태그를 사이트 <head>에 추가한 후 다시 등록하세요.";
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "등록 중...";
+        resultDiv.style.display = "none";
+
+        const res = await submitOAuthRegistration(hostUrl);
+
+        submitBtn.disabled = false;
+        submitBtn.textContent = "추가";
+
+        if (res.success) {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#f0fdf4";
+            resultDiv.style.color = "#16a34a";
+            resultDiv.textContent = "등록 완료!";
+
+            metaDiv.style.display = "none";
+            credDiv.style.display = "block";
+            (document.getElementById("oauth-reg-client-id") as HTMLInputElement).value = res.client_id;
+            (document.getElementById("oauth-reg-client-secret") as HTMLInputElement).value = res.client_secret;
+
+            // 네비게이션 갱신 (Pages 섹션에 등록된 사이트가 즉시 반영됩니다)
+            await renderNavigation();
+        } else {
+            resultDiv.style.display = "block";
+            resultDiv.style.background = "#fef2f2";
+            resultDiv.style.color = "#dc2626";
+            resultDiv.textContent = res.error;
+            // 소유 확인 실패 시 메타 태그를 다시 강조 표시
+            metaDiv.style.display = "block";
+            metaTextarea.style.border = "2px solid #ef4444";
+            setTimeout(() => { metaTextarea.style.border = "1px solid #ddd"; }, 3000);
+        }
+    });
+}
+
 let isSearching = false;
 let isExtracting = false;
 
@@ -98,6 +833,679 @@ export let lastSearchedQuery = "";
 let isBrowserRunning = false;
 let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
 
+/*
+    🌟 [CLOUD AI TRACK]
+    - Cloud 모드로 보낸 작업은 로컬 GPU 큐를 점유하지 않습니다. (락 미사용)
+    - 서버 tasks 테이블에서 해당 task 가 사라지면 = 처리 완료로 간주하여 말풍선을 Done 처리합니다.
+    - 임베딩은 GPU 유무와 무관하게 항상 로컬(Client App)에서 수행합니다.
+*/
+interface CloudPendingMeta {
+    serverId: string;
+    kind: "extract" | "search";
+    createdAt: number;
+}
+let cloudPendingTasks = new Map<string, CloudPendingMeta>();
+let isReindexing = false;
+
+
+// 🌟 [EMBED DEBOUNCE] runLocalEmbeddingSync 중복 호출 방지를 위한 스케줄링 변수
+let reindexScheduled = false;
+let reindexDebounceTimer: number | null = null;
+
+// 🌟 클라우드에서 내려온(벡터 없는) 아이템을 로컬 임베딩 모델로 벡터화 + 청크 인덱싱합니다.
+//    디바운스(2초)를 적용하여 initSession + syncData에서 연속 호출되어도 1회만 실행됩니다.
+async function runLocalEmbeddingSync() {
+    if (isReindexing || reindexScheduled) return;
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+    // 🌟 [DEBOUNCE] 2초 내 재호출 시 타이머를 리셋하여 마지막 호출만 실행
+    reindexScheduled = true;
+    if (reindexDebounceTimer) clearTimeout(reindexDebounceTimer);
+    reindexDebounceTimer = window.setTimeout(async () => {
+        reindexScheduled = false;
+        reindexDebounceTimer = null;
+        // 디바운스 후에도 여전히 바쁘면 스킵
+        if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+        isReindexing = true;
+        try {
+            // 🌟 [ALL-TRACK EMBEDDING]
+            //  ── 무엇이 문제였나 ──
+            //   기존에는 currentSearchMode 하나만 넘겼습니다.
+            //   그래서 사용자가 Trading 탭을 한 번도 열지 않으면
+            //   무역 문서가 영원히 벡터화되지 않았고,
+            //   syncAnalyticsData 직후 호출도 현재 탭이 commerce 면
+            //   analytic 문서를 건너뛰었습니다.
+            //   벡터가 없으면 search_items 는 0벡터와 비교하고
+            //   search_chunks 는 청크가 없어 검색이 구조적으로 0건이 됩니다.
+            //  ── 비용 ──
+            //   백엔드는 대상이 0건이면 임베딩 모델을 올리기 전에
+            //   'no_pending' 으로 즉시 반환하므로(LanceDB 조회 1회),
+            //   세 트랙을 순회해도 유휴 시 부담이 사실상 없습니다.
+            //   현재 탭을 먼저 처리해 체감 지연을 최소화합니다.
+            const trackOrder = [currentSearchMode,
+                ...["commerce", "shipping", "analytic"].filter(m => m !== currentSearchMode)];
+
+            let totalProcessed = 0;
+            for (const track of trackOrder) {
+                if (isSearching || isExtracting || GlobalTaskManager.isBusy) break;
+
+                const res = await invoke<any>("reindex_pending_embeddings", {
+                    limit: 20,
+                    devicePreference: getDevicePref(),
+                    mode: track
+                });
+
+                if (res && res.processed && res.processed > 0) {
+                    totalProcessed += res.processed;
+                    console.log(`[EMBED] Locally embedded ${res.processed} item(s). (mode: ${res.mode || track})`);
+                } else if (res && res.skipped) {
+                    console.log(`[EMBED] 트랙 '${track}' 임베딩 스킵: 사유=${res.skipped}`);
+                }
+            }
+
+            if (totalProcessed > 0) {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+        } catch (e) {
+            console.warn("[EMBED] reindex_pending_embeddings failed:", e);
+        } finally {
+            isReindexing = false;
+        }
+    }, 2000);
+}
+
+// =====================================================================
+// 🌟 [ANALYTIC STRUCTURING] 원시 행동 로그(HTML) → 시맨틱 문장 확정
+// ---------------------------------------------------------------------
+//  순서가 중요합니다.
+//    ① structure_pending_analytics : HTML → PUG → 속성 제거 → Qwen3.5 2B 요약
+//    ② reindex_pending_embeddings  : 확정된 문장을 임베딩 + item_chunks 인덱싱
+//  ①을 건너뛰면 text 가 비어 있어 ②의 RAW GUARD 가 그 문서를 통째로 보류합니다.
+// =====================================================================
+let isAnalyticStructuring = false;
+
+async function runAnalyticStructuring(): Promise<number> {
+    if (isAnalyticStructuring) return 0;
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return 0;
+
+    isAnalyticStructuring = true;
+    try {
+        const res = await invoke<any>("structure_pending_analytics", {
+            limit: 20,
+            devicePreference: getDevicePref()
+        });
+
+        const processed = (res && res.processed) ? res.processed : 0;
+
+        if (processed > 0) {
+            console.log(`[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`);
+            if (currentSearchMode === "analytic") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+        } else if (res && res.skipped) {
+            console.log(`[ANALYTIC] 구조화 스킵: 사유=${res.skipped}`);
+        }
+
+        return processed;
+    } catch (e) {
+        console.warn("[ANALYTIC] structure_pending_analytics failed:", e);
+        return 0;
+    } finally {
+        isAnalyticStructuring = false;
+    }
+}
+
+// =====================================================================
+// 🌟 [ANALYTICS TRACK v2] console.logis.center(Client Worker) ↔ 로컬 동기화
+// ---------------------------------------------------------------------
+//  ── Worker 계약 (console-logis-center/src/index.ts 실측) ──
+//    cookies.href = decodeURIComponent(req.query.href).toLowerCase()
+//    var url      = new URL(cookies.href)
+//    cookies.cc   = hashId(url.host)            ← req.query.cc 는 '전혀' 읽지 않음
+//    GET(JSON)    = SELECT * FROM items
+//                   WHERE "cc" = <cookies.cc>
+//                     AND "updated_at" > 0
+//                     AND "created_at" < <req.query.created_at>
+//                   ORDER BY created_at DESC LIMIT 1000
+//
+//  ── 그래서 무엇이 바뀌었나 ──
+//   ① [TDZ 사망] 기존 코드는 `const params` 선언 '이전' 에 params.append() 를 호출해
+//      매 호출마다 ReferenceError 로 즉사했고, 바깥 catch 가 조용히 삼켰습니다.
+//      HTTP 요청이 단 한 번도 나가지 않았습니다.
+//   ② [cc 불일치] Worker 는 cc 파라미터를 무시하고 href 의 host 로 cc 를 만듭니다.
+//      브라우저가 꺼져 있으면 href 가 "https://console.logis.center/" 로 폴백되어
+//      cc = hashId("console.logis.center") 를 조회 → 영원히 0건이었습니다.
+//      이제 '추적 대상 사이트의 origin' 을 해석해 사이트마다 1회씩 조회합니다.
+//   ③ [풀 호스트] Worker 는 hashId(url.host) 즉 'abc.cafe24.com' 을 씁니다.
+//      getRootDomain() 이 만드는 hashId('cafe24.com') 과 애초에 다른 값이므로
+//      로컬 계산 규칙도 Worker 와 동일하게 풀 호스트로 통일합니다.
+//   ④ [시간대] created_at 은 '상한 커서' 입니다. now - timezoneOffset 은
+//      UTC- 지역(예: EST, offset=+300)에서 now-5h 가 되어 최근 5시간 이벤트를
+//      통째로 잘라냈습니다. 반드시 미래 시각이어야 합니다.
+//   ⑤ [question/answer] 버리지 않고 analytic 아이템으로 보존합니다.
+// =====================================================================
+
+let isAnalyticsSyncRunning = false;
+let lastAnalyticsSyncAt = 0;
+
+/**
+ * 🌟 [ORIGIN RESOLUTION] 이벤트를 조회할 '추적 대상 사이트' 목록을 확정합니다.
+ *  Worker 가 cc 를 href 의 host 로 만들기 때문에, 조회 단위는 곧 origin 입니다.
+ *
+ *  수집 소스 (우선순위 무관, 중복 제거)
+ *   ① kv_store 의 oauth_registered_sites  : 사용자가 명시적으로 등록한 사이트
+ *   ② currentDetectedUrl                  : 지금 브라우저가 보고 있는 사이트
+ *   ③ Dexie 의 기존 analytic 문서 data.origin : 과거에 한 번이라도 받아온 사이트
+ *
+ *  ⚠️ origin(스킴+호스트)만 사용합니다. 경로/쿼리를 붙이면 Worker 의
+ *     decodeURIComponent(req.query.href) 가 2중 디코딩되어 '%' 가 들어간 경로에서
+ *     URIError 로 418 을 맞습니다. (cc 는 host 로만 결정되므로 경로는 불필요)
+ */
+async function resolveAnalyticsOrigins(): Promise<string[]> {
+    const origins = new Set<string>();
+
+    const push = (raw: any) => {
+        if (!raw || typeof raw !== "string") return;
+        const s = raw.trim().toLowerCase();
+        if (!s.startsWith("http")) return;
+        try {
+            const u = new URL(s);
+            if (!u.hostname) return;
+            if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return;
+            // logis.center 계열은 content.js 의 isShop 게이트에서 애초에 제외되므로
+            // 이벤트가 존재할 수 없습니다. 조회해 봐야 0건이라 왕복만 낭비합니다.
+            if (u.hostname.endsWith("logis.center")) return;
+            origins.add(u.origin);
+        } catch (e) {}
+    };
+
+    try {
+        const sites = await kvGet("oauth_registered_sites");
+        if (Array.isArray(sites)) {
+            for (const s of sites) push(s && s.host);
+        }
+    } catch (e) {}
+
+    push(currentDetectedUrl);
+
+    try {
+        if (appDb) {
+            const rows = await appDb.table("items").where("mode").equals("analytic").limit(2000).toArray();
+            for (const r of rows) push(r && r.data && r.data.origin);
+        }
+    } catch (e) {}
+
+    return Array.from(origins);
+}
+
+/**
+ * 🌟 [TEXT EXTRACT] Cron Worker 가 구조화한 문장을 골라냅니다.
+ *  원시 이벤트의 action 은 [outerHTML] '배열' 이므로 문자열일 때만 채택합니다.
+ *  (배열을 그대로 text 로 쓰면 HTML 덩어리가 FTS/임베딩에 들어갑니다)
+ */
+function extractAnalyticText(parsed: any): string {
+    const pick = (v: any): string => (typeof v === "string" ? v.trim() : "");
+    return pick(parsed?.action)
+        || pick(parsed?.summary)
+        || pick(parsed?.cross_action_flow)
+        || pick(parsed?.intent_evolution)
+        || pick(parsed?.text);
+}
+
+/** 🌟 D1 BLOB(number[] / ArrayBuffer / base64) → JSON 객체로 복원합니다. */
+function decodeAnalyticBlob(rawData: any): any {
+    const pako = (window as any).pako;
+    try {
+        if (rawData && typeof rawData === "object") {
+            const raw = rawData.data || rawData;
+            let arr: Uint8Array | null = null;
+
+            if (Array.isArray(raw)) {
+                arr = new Uint8Array(raw);
+            } else if (raw.buffer) {
+                arr = new Uint8Array(raw.buffer);
+            } else if (Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
+                arr = new Uint8Array(Object.values(raw) as number[]);
+            }
+
+            if (arr) {
+                try {
+                    return JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
+                } catch (e) {
+                    return JSON.parse(new TextDecoder('utf-8').decode(arr));
+                }
+            }
+            return raw;
+        }
+
+        if (typeof rawData === "string") {
+            // 🌟 [BASE64 GZIP PATH] Worker 가 BLOB 을 base64 로 직렬화했거나
+            //    구버전 Rust upsert_items 가 base64(gzip) 로 저장한 경우를 처리합니다.
+            try {
+                return JSON.parse(rawData);
+            } catch (_jsonErr) {
+                try {
+                    const rawBytes = Uint8Array.from(atob(rawData), c => c.charCodeAt(0));
+                    if (rawBytes.length > 50 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
+                        return JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
+                    }
+                    return JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                } catch (_b64Err) {
+                    return {};
+                }
+            }
+        }
+    } catch (e) {}
+    return {};
+}
+
+/** 🌟 origin 하나에 대해 GET 1회를 수행하고 저장한 건수를 돌려줍니다. */
+async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<number> {
+    // Worker 와 '동일한 규칙' 으로 cc 를 계산합니다. (풀 호스트, 루트 도메인 아님)
+    let expectedCc = "";
+    try {
+        expectedCc = await hashId(new URL(origin).host);
+    } catch (e) {}
+
+    const params = new URLSearchParams({
+        origin: "https://console.logis.center",
+        created_at: cursor.toString(),
+        hash: currentSession.hash,
+        token: currentSession.token || "",
+        // ⚠️ 경로 없는 origin + '/' 만 보냅니다. Worker 의 2중 디코딩 대비.
+        href: origin + "/"
+    });
+    if (expectedCc) params.append("cc", expectedCc);
+
+    let response: any = null;
+    try {
+        response = await invoke<any>("proxy_fetch", {
+            url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token, cc: expectedCc }
+        });
+    } catch (e) {
+        console.warn(`[SYNC-ANALYTIC] ❌ '${origin}' 조회 실패 (cc=${expectedCc}):`, e);
+        return 0;
+    }
+
+    stepQrSpinner();
+
+    if (!response || !response.results || !Array.isArray(response.results)) {
+        console.log(`[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 응답에 results 없음`);
+        return 0;
+    }
+
+    if (response.results.length === 0) {
+        console.log(
+            `[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 0건. ` +
+            `Worker 조회 조건은 cc = hashId('${(() => { try { return new URL(origin).host; } catch (e) { return "?"; } })()}') ` +
+            `AND updated_at > 0 AND created_at < ${cursor} 입니다. ` +
+            `updated_at 이 0 인 원시 이벤트는 Cron Worker 구조화 전이라 내려오지 않습니다.`
+        );
+        return 0;
+    }
+
+    const now = Date.now();
+    const items: any[] = [];
+
+    // 🌟 [DELTA GUARD] 이미 같은 updated_at 으로 로컬에 있는 행은 쓰기를 생략합니다.
+    const localMap = new Map<string, number>();
+    try {
+        if (appDb) {
+            const ids = response.results.map((r: any) => r && r.id).filter(Boolean);
+            if (ids.length > 0) {
+                const rows = await appDb.table("items").where("id").anyOf(ids).toArray();
+                for (const r of rows) localMap.set(String(r.id), Number(r.updated_at || 0));
+            }
+        }
+    } catch (e) {}
+
+    let skipped = 0;
+
+    for (let i = 0; i < response.results.length; i++) {
+        const row = response.results[i];
+        if (!row || !row.id) continue;
+
+        const serverUpdated = Number(row.updated_at || 0);
+        const localUpdated = localMap.get(String(row.id));
+        if (localUpdated !== undefined && serverUpdated <= localUpdated) {
+            skipped++;
+            continue;
+        }
+
+        const parsed: any = decodeAnalyticBlob(row.data) || {};
+
+        // 🌟 [ORIGIN SEED] question / answer 의 data 에는 origin 이 없습니다.
+        //    다음 라운드의 resolveAnalyticsOrigins() 가 이 사이트를 계속 발견하려면
+        //    반드시 채워 두어야 합니다.
+        if (!parsed.origin) parsed.origin = origin;
+
+        const textVal = extractAnalyticText(parsed);
+
+        // 🌟 [BCC RECONSTRUCT] analytics D1 스키마에는 bcc 컬럼이 없습니다.
+        //    (id/type/flag/from/to/cc/ref/data/created_at/updated_at 뿐)
+        //    commerce 와 동일한 규칙 bcc = hashId(type + cc) 로 클라이언트가 재구성합니다.
+        const rowType = String(row.type || "click");
+        const rowCc = String(row.cc || expectedCc || "");
+        let rowBcc = String(row.bcc || "");
+        if (!rowBcc && rowCc) {
+            rowBcc = await hashId(rowType + rowCc);
+        }
+
+        // 🌟 [MODE TAGGING] modeOfType() 단일 판정 경로를 그대로 사용합니다.
+        const rowMode = modeOfType(rowType);
+
+        // 🌟 [RAW MARKER] 아직 구조화되지 않은 원시 이벤트인지 판정합니다.
+        //    content.js 는 action / relate 를 outerHTML '배열' 로 올리므로
+        //    배열이면 곧 '구조화 전' 이라는 구조적 사실입니다.
+        const isRawEvent = Array.isArray(parsed?.action) || Array.isArray(parsed?.relate);
+
+        items.push({
+            id: row.id,
+            type: rowType,
+            // 🌟 [FLAG] analytics D1 은 flag 를 실제로 채워 보냅니다. 비었을 때만 세션 flag 로 보강.
+            flag: row.flag || String((currentSession as any).flag || ""),
+            from: row.from || "",
+            to: row.to || "",
+            cc: rowCc,
+            bcc: rowBcc,
+            ref: row.ref || "",
+            status: 9,
+            mode: rowMode,
+            created_at: Number(row.created_at || now),
+            // ⚠️ updated_at 은 draft/count 계약이자 '구조화 대기' 마커입니다.
+            //    ── 왜 now 로 덮으면 안 되는가 ──
+            //     Rust 의 structure_pending_analytics 는
+            //       mode = 'analytic' AND updated_at = 0
+            //     로 구조화 대상을 찾습니다. 여기서 now 를 넣으면
+            //     원시 outerHTML 이 영원히 요약되지 않아
+            //     text 가 빈 채로 남고, 검색이 구조적으로 0건이 됩니다.
+            updated_at: isRawEvent ? 0 : serverUpdated,
+            text: textVal,
+            masked_text: textVal,
+            data: {
+                ...parsed,
+                id: row.id,
+                type: rowType,
+                mode: rowMode,
+                updated_at: isRawEvent ? 0 : serverUpdated,
+                text: textVal,
+                masked_text: textVal
+            }
+        });
+    }
+
+    if (items.length === 0) {
+        console.log(`[SYNC-ANALYTIC] '${origin}' 수신 ${response.results.length}건 → 전부 최신 상태(스킵 ${skipped}건)`);
+        return 0;
+    }
+
+    await invoke("upsert_items", { items });
+    if (appDb) {
+        await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
+    }
+
+    const typeBrief: Record<string, number> = {};
+    for (const it of items) typeBrief[it.type] = (typeBrief[it.type] || 0) + 1;
+
+    console.log(
+        `[SYNC-ANALYTIC] ✅ '${origin}' (cc=${expectedCc}) → 수신 ${response.results.length}건 / ` +
+        `저장 ${items.length}건 / 스킵 ${skipped}건 ${JSON.stringify(typeBrief)}`
+    );
+
+    return items.length;
+}
+
+async function syncAnalyticsData() {
+    if (!currentSession.hash) return;
+    if (isAnalyticsSyncRunning) return;
+
+    isAnalyticsSyncRunning = true;
+
+    try {
+        const origins = await resolveAnalyticsOrigins();
+
+        if (origins.length === 0) {
+            console.warn(
+                "[SYNC-ANALYTIC] 조회할 추적 대상 사이트가 없습니다. " +
+                "Analytic 탭의 '+ 사이트 등록' 으로 도메인을 등록하거나, " +
+                "브라우저로 추적 대상 사이트를 열어 두세요. " +
+                "(Worker 는 cc 파라미터가 아니라 href 의 host 로 조회 대상을 결정합니다)"
+            );
+            return;
+        }
+
+        // 🌟 [CURSOR] created_at 은 상한 커서입니다. 반드시 '현재보다 미래' 여야
+        //    UTC- 지역에서 최근 이벤트가 잘려 나가지 않습니다.
+        const now = Date.now();
+        const cursor = Math.max(now, now - timezoneOffset) + 60_000;
+
+        console.log(`[SYNC-ANALYTIC] 대상 사이트 ${origins.length}곳 조회 시작: ${JSON.stringify(origins)} | cursor=${cursor}`);
+
+        let totalStored = 0;
+        for (const origin of origins) {
+            totalStored += await fetchAnalyticsOrigin(origin, cursor);
+        }
+
+        if (totalStored > 0) {
+            if (currentSearchMode === "analytic") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+
+            // 🌟 [STRUCTURE FIRST] 원시 outerHTML 을 먼저 시맨틱 문장으로 확정합니다.
+            //    이 단계가 끝나야 text 가 채워지고, 그때서야 임베딩이 의미를 갖습니다.
+            await runAnalyticStructuring();
+
+            // 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않으므로 로컬에서 즉시 임베딩합니다.
+            runLocalEmbeddingSync();
+        } else {
+            // 🌟 새로 받은 건이 없어도, 이전 라운드에서 구조화하지 못하고 남은
+            //    원시 이벤트가 있으면 이어서 처리합니다.
+            //    (LLM 로드 비용은 대상 0건일 때 백엔드가 probe 단계에서 차단합니다)
+            const structured = await runAnalyticStructuring();
+            if (structured > 0) {
+                runLocalEmbeddingSync();
+            }
+        }
+
+        console.log(`[SYNC-ANALYTIC] 완료. 총 저장 ${totalStored}건.`);
+
+    } catch (e) {
+        console.warn("[SYNC-ANALYTIC] Failed:", e);
+    } finally {
+        isAnalyticsSyncRunning = false;
+        lastAnalyticsSyncAt = Date.now();
+        if (!isExtracting && !isSearching) stopSpinner();
+    }
+}
+
+// 🌟 [ANALYTICS BACKGROUND SYNC] commerce / shipping 탭에 있어도 analytics 이벤트가
+//    계속 흘러 들어오도록 하는 역방향 경로입니다.
+//    (기존에는 syncCommerceInBackground 만 있고 이 방향이 없어서,
+//     Analytic 탭 + 채팅 화면 + 위젯 확장 3조건이 동시에 성립할 때만 동기화되었습니다)
+//    폴링 주기(3초)마다 N개 사이트를 왕복하면 과하므로 30초 스로틀을 겁니다.
+async function syncAnalyticsInBackground() {
+    if (!currentSession.hash) return;
+    if (isAnalyticsSyncRunning) return;
+    if (Date.now() - lastAnalyticsSyncAt < 30_000) return;
+    await syncAnalyticsData();
+}
+
+// 🌟 [COMMERCE BACKGROUND SYNC] analytic 모드에서도 commerce.logis.center D1 과
+//    양방향 동기화를 수행합니다. syncData() 의 commerce 경로를 재사용하되,
+//    UI 갱신(renderNavigation / loadMoreDocs)은 현재 탭이 commerce 일 때만 수행합니다.
+let isCommerceSyncRunning = false;
+async function syncCommerceInBackground() {
+    if (isCommerceSyncRunning) return;
+    if (!currentSession.hash || !currentSession.email) return;
+    isCommerceSyncRunning = true;
+    try {
+        const origin = "https://commerce.logis.center";
+        const now = Date.now();
+        const createdAt = now - timezoneOffset;
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+        const queryParams: any = {
+            origin: origin,
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: targetHref
+        };
+        let syncEffectiveCc = activeContext.cc;
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+        if (!syncEffectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            try {
+                const urlObj = new URL(targetHref.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                syncEffectiveCc = await hashId(rootDomain);
+            } catch(e) {}
+        }
+        if (syncEffectiveCc) queryParams.cc = syncEffectiveCc;
+        const params = new URLSearchParams(queryParams);
+        const url = `${API_HOST}/?${params.toString()}`;
+        const response = await invoke<any>("proxy_fetch", {
+            url: url,
+            method: "GET",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token, cc: activeContext.cc || "" }
+        });
+        if (response.results && Array.isArray(response.results)) {
+            try {
+                const pako = (window as any).pako;
+                for (let i = 0; i < response.results.length; i++) {
+                    let item = response.results[i];
+                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
+                        let arrData = item.data.data || item.data;
+                        let arr: Uint8Array | null = null;
+                        if (Array.isArray(arrData)) {
+                            arr = new Uint8Array(arrData);
+                        } else if (arrData.buffer) {
+                            arr = new Uint8Array(arrData.buffer);
+                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
+                            arr = new Uint8Array(Object.values(arrData) as number[]);
+                        }
+                        if (arr) {
+                            try {
+                                if (pako) {
+                                    const decompressed = pako.ungzip(arr, { to: 'string' });
+                                    item.data = JSON.parse(decompressed);
+                                } else {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                }
+                            } catch (e) {
+                                try {
+                                    const decompressed = new TextDecoder('utf-8').decode(arr);
+                                    item.data = JSON.parse(decompressed);
+                                } catch (err) {}
+                            }
+                        }
+                    } else if (typeof item.data === 'string' && item.data.length > 50) {
+                        // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
+                        //    data 가 base64(gzip) 문자열로 내려오는 경우를 커버합니다.
+                        try {
+                            const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
+                            if (rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
+                                item.data = JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
+                            } else {
+                                item.data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
+                            }
+                        } catch (_strErr) {
+                            // JSON 도 base64 도 아니면 원본 문자열을 그대로 둡니다.
+                        }
+                    }
+                }
+            } catch (err) {
+                console.warn("[SYNC-BG] pako decompression failed:", err);
+            }
+            // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
+            //    syncData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
+            const bgTombstones = await loadTalkTombstones();
+            let bgTombBlocked = 0;
+
+            const filteredResults = response.results.filter((newItem: any) => {
+                if (bgTombstones.has(String(newItem.id))) {
+                    bgTombBlocked++;
+                    return false;
+                }
+                const existingEl = document.getElementById(newItem.id);
+                if (!existingEl) return true;
+                let localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
+                const serverUpdated = newItem.updated_at || newItem.created_at || 0;
+                return serverUpdated > localUpdated;
+            });
+
+            if (bgTombBlocked > 0) {
+                console.log(`[TOMBSTONE] 🪦 [BG] 삭제된 메시지 ${bgTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
+            }
+            if (filteredResults.length > 0) {
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (r.mode) continue;
+                    r.mode = modeOfType(String(r.type || ""));
+                }
+                const sessionFlag = String((currentSession as any).flag || "");
+                if (sessionFlag) {
+                    for (const r of filteredResults) {
+                        if (!r) continue;
+                        if (r.flag) continue;
+                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
+                        if (inner) { r.flag = inner; continue; }
+                        r.flag = sessionFlag;
+                    }
+                }
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (!r.data || typeof r.data !== 'object') continue;
+                    for (const k in r) {
+                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+                        const v = r[k];
+                        if (v === undefined || v === null) continue;
+                        if (typeof v === 'function') continue;
+                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
+                            r.data[k] = v;
+                        }
+                    }
+                }
+                console.log(`[SYNC-BG] Commerce D1 background sync: ${filteredResults.length} item(s)`);
+                await invoke("upsert_items", { items: filteredResults });
+                const newItems = filteredResults.filter((r: any) =>
+                    r.type !== "team" && r.type !== "user" && r.type !== "member"
+                    && r.type !== "pages" && r.type !== "page"
+                    && r.type !== "talk" && r.table !== "talks"
+                );
+                if (newItems.length > 0 && appDb) {
+                    await appDb.table("items").bulkPut(normalizeEnvelope(newItems)).catch(() => null);
+                }
+                // 현재 탭이 commerce/list 일 때만 UI 갱신
+                if (currentSearchMode === "commerce" && currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+                runLocalEmbeddingSync();
+            }
+        }
+    } catch (e) {
+        console.warn("[SYNC-BG] Commerce background sync failed:", e);
+    } finally {
+        isCommerceSyncRunning = false;
+    }
+}
+
+
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
 if (!(window as any).Dexie) {
     console.error("🚨 [ERROR] Dexie library is missing! public 폴더 안의 파일들은 반드시 절대경로(/)로 불러와야 합니다.");
@@ -106,27 +1514,572 @@ const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
 
-appDb.version(3).stores({
-    ts_queue: 'taskId, type',
+// 🌟 [v8 / TRADING INDEXES]
+//  무역(shipping/trading) 트랙 전용 조회 축을 추가합니다.
+//  스토어 구조는 v7 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
+//  → upgrade 콜백이 필요 없습니다.
+//
+//  ── 왜 봉투를 안 늘리는가 ──
+//   app-logis-center 의 TradeDocument 는 vessel/pol/pod/incoterms 등 55개를
+//   Rust 구조체에 못 박아 두어, 새 무역 서식이 추가될 때마다
+//   구조체 → LanceDB 스키마 → 프론트엔드 3곳을 동시에 고쳐야 했습니다.
+//   v4 봉투 구조에서는 값이 전부 data 안에 있으므로,
+//   '자주 eq/range 로 조회하는 경로' 만 여기에 한 줄씩 추가하면 끝입니다.
+//
+//  ⚠️ 여기 없는 무역 필드(marks_numbers, notify_party_name, place_receipt 등)는
+//     executeDexiePlan 이 .filter() 풀스캔으로 처리합니다.
+//     로컬 수천~수만 건 기준 수 ms 이므로 인덱스가 없어도 동작에 지장이 없습니다.
+// 🌟 [SCHEMA CONTRACT]
+//  Dexie 는 version(N).stores() 에 '선언되지 않은' object store 를 업그레이드 시점에 삭제합니다.
+//  v8 이 items 하나만 선언한 탓에 kv_store / ts_queue / talks / users / pages 5개가
+//  물리적으로 소멸했고, 그 결과 세션(kv_store)까지 함께 날아가 로그인이 풀렸습니다.
+//  → 앞으로 stores() 에는 '앱이 쓰는 전 테이블' 을 항상 함께 적어야 합니다.
+const ITEMS_SCHEMA = [
+    // ── 봉투 (v7 그대로 유지) ──
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
+    // ── commerce 축 (v7 그대로 유지) ──
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
+    'data.embed', 'data.digest',
+    '*data.tags',
+    // ── 🌟 trading 축 ──
+    //  ① 문서 식별 : B/L No, AWB No, PO No, Booking No 를 하나로 흡수
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    //  ② 운송 : 선박/항공편 + 출발/도착 항구 (교차 조회 최다 축)
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
+    'data.container_number', 'data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    //  ⑤-1 🌟 [TRADING INDEX RELAY] commerce 의 data.order / data.tracking 과 동일한 역할입니다.
+    //     logic::trading_index_column() 이 만드는 crc32 숫자 인덱스 컬럼으로,
+    //     'BL 하나로 연결된 CI/PL 전부 조회' 를 O(log n) 으로 처리합니다.
+    //     문자열 doc_number 를 그대로 쓰면 표기 흔들림(대소문자/하이픈)에 매번 어긋납니다.
+    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+    'data.rel_ed', 'data.rel_id', 'data.rel_cinv',
+    //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
+    //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
+    //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
+    '[type+created_at]'
+].join(', ');
+
+
+// 🌟 v13 : talk_tombstones 추가 — 삭제한 채팅의 '묘비'
+//  ── 왜 필요한가 ──
+//   Client Worker(index.ts)에는 talk 개별 삭제 엔드포인트가 없습니다.
+//     DELETE 핸들러 = { type=crons → tasks 삭제 } | { 그 외 → S3 인증 해시 삭제(로그아웃) }
+//   PUT 은 talk.id 를 hashId() 난수로 새로 발급하므로 기존 행을 지목할 수도 없습니다.
+//   따라서 서버 행은 살아남고, 로컬에서만 지우면 다음 syncData 폴링(3초)이
+//   `!existingEl && !localMap.has(id)` 조건을 통과시켜 그대로 부활시킵니다.
+//   '이 id 는 내가 의도적으로 지웠다' 는 사실을 로컬에 영구 기록해야
+//   재삽입을 구조적으로 차단할 수 있습니다.
+//
+//  ── 왜 GC 를 하지 않는가 ──
+//   서버 행이 살아 있는 한 묘비를 지우는 순간 메시지가 되살아납니다.
+//   서버 행의 소멸 여부를 클라이언트가 확인할 방법이 없으므로 만료를 두지 않습니다.
+//   행 하나는 (42자 id + 타임스탬프) 이므로 1만 건 삭제해도 1MB 미만입니다.
+//   전체 초기화(btn-reset-db)는 Dexie DB 자체를 삭제하므로 함께 정리됩니다.
+//
+//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
+//     업그레이드 시점에 삭제합니다. 아래에는 v12 의 전 테이블이 그대로 포함되어 있습니다.
+appDb.version(13).stores({
+    items: ITEMS_SCHEMA,
     kv_store: 'key',
-    // 교차 검색에 사용되는 refKeys 및 index를 인덱스로 등록하여 풀스캔 병목을 방지합니다.
-    items: 'id, type, ref, cc, bcc, domain, origin, no, code, tracking_number, goods, order, tracking, stock_keeping_unit, barcode, index',
-    pages: 'id, type, ref, cc, bcc, domain, origin',
-    users: 'id, type, ref, cc, bcc, domain, origin',
-    talks: 'id, task_id'
+    ts_queue: 'taskId, type',
+    talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
+    users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
+    pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin',
+    translit_cache: '++id, source_word, doc_lang, [source_word+doc_lang], created_at',
+    talk_tombstones: 'id, deleted_at, ref'
 });
+
 (window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
 
-// 기존 localStorage를 대체할 Dexie 헬퍼 함수
+// --- kv 헬퍼 (반드시 appDb 선언 바로 아래, 모든 호출부보다 위에 위치) ---
+// 🌟 [FAIL-SOFT] 스토어가 없거나 업그레이드 중이면 예외 대신 null / no-op 으로 흡수합니다.
+//    kvGet 이 throw 하면 initSession 첫 줄에서 전체 초기화가 중단되어
+//    updateAuthUI() 조차 실행되지 않고 Sign Out 버튼이 그대로 노출됩니다.
 async function kvGet(key: string): Promise<any> {
-    const record = await appDb.table("kv_store").get(key);
-    return record ? record.value : null;
+    try {
+        const record = await appDb.table("kv_store").get(key);
+        return record ? record.value : null;
+    } catch (e) {
+        console.warn(`[KV] get('${key}') failed:`, e);
+        return null;
+    }
 }
 async function kvSet(key: string, value: any) {
-    await appDb.table("kv_store").put({ key, value });
+    try {
+        await appDb.table("kv_store").put({ key, value });
+    } catch (e) {
+        console.warn(`[KV] set('${key}') failed:`, e);
+    }
 }
 async function kvRemove(key: string) {
-    await appDb.table("kv_store").delete(key);
+    try {
+        await appDb.table("kv_store").delete(key);
+    } catch (e) {
+        console.warn(`[KV] remove('${key}') failed:`, e);
+    }
+}
+
+// =====================================================================
+// 🌟 [TALK TOMBSTONE] 삭제한 채팅의 묘비
+// ---------------------------------------------------------------------
+//  삭제 범위 계약:
+//    ① 내 PC   : LanceDB messages + Dexie talks + DOM 에서 완전 제거
+//    ② 내 PC   : 묘비를 남겨 서버 폴링의 재삽입을 영구 차단
+//    ③ 서버    : 행은 그대로 남습니다 (워커에 talk 삭제 엔드포인트 없음)
+//    ④ 타 사용자: 각자의 로컬 원장에 그대로 남아 계속 노출됩니다
+//                 (syncData 는 가산 전용이라 서버에서 사라져도 지우지 않습니다)
+// =====================================================================
+let talkTombstoneCache: Set<string> | null = null;
+
+/** 묘비 목록을 메모리에 적재합니다. 최초 1회만 Dexie 를 읽습니다. */
+async function loadTalkTombstones(): Promise<Set<string>> {
+    if (talkTombstoneCache) return talkTombstoneCache;
+    const s = new Set<string>();
+    try {
+        const rows = await appDb.table("talk_tombstones").toArray();
+        for (const r of rows) {
+            if (r && r.id) s.add(String(r.id));
+        }
+        if (s.size > 0) {
+            console.log(`[TOMBSTONE] 삭제 묘비 ${s.size}건 적재 완료. 해당 메시지는 서버 폴링으로 부활하지 않습니다.`);
+        }
+    } catch (e) {
+        console.warn("[TOMBSTONE] load failed:", e);
+    }
+    talkTombstoneCache = s;
+    return s;
+}
+
+/** 동기 조회용. loadTalkTombstones() 가 선행되어야 정확합니다. */
+function isTalkTombstoned(id: string): boolean {
+    if (!id) return false;
+    return talkTombstoneCache ? talkTombstoneCache.has(String(id)) : false;
+}
+
+/** 묘비를 세웁니다. 메모리 캐시와 Dexie 를 동시에 갱신합니다. */
+async function addTalkTombstone(id: string, refVal: string = "") {
+    if (!id) return;
+    const cache = await loadTalkTombstones();
+    cache.add(String(id));
+    try {
+        await appDb.table("talk_tombstones").put({
+            id: String(id),
+            ref: refVal || "",
+            deleted_at: Date.now()
+        });
+    } catch (e) {
+        console.warn(`[TOMBSTONE] put('${id}') failed:`, e);
+    }
+}
+
+/**
+ * 🌟 [DELETE CHAT MESSAGE] 채팅 한 건을 내 기기에서 삭제합니다.
+ *
+ *  순서가 중요합니다. 묘비를 '가장 먼저' 세워야
+ *  삭제 도중에 폴링이 끼어들어도 재삽입되지 않습니다.
+ *    ① 묘비 기록          → 재삽입 영구 차단
+ *    ② LanceDB messages   → get_chat_messages 조회 결과에서 제거
+ *    ③ Dexie talks 캐시   → syncData 의 localMap 잔재 제거
+ *    ④ DOM                → 화면 즉시 반영
+ *
+ *  ⚠️ 서버 호출은 하지 않습니다. index.ts 의 DELETE 는
+ *     `type=crons` 가 아니면 S3 인증 해시(/hash/{hash})를 지워
+ *     사용자를 강제 로그아웃시키기 때문입니다.
+ */
+async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } = {}): Promise<boolean> {
+    if (!msgId) return false;
+
+    if (!opts.skipConfirm) {
+        const confirmed = await ask(
+            "이 메시지를 삭제하시겠습니까?\n\n" +
+            "· 내 기기에서 완전히 사라지며 다시 나타나지 않습니다.\n" +
+            "· 이미 메시지를 받아간 다른 팀원의 화면에는 그대로 남습니다.",
+            { title: "Delete Message", kind: "warning" }
+        );
+        if (!confirmed) return false;
+    }
+
+    const el = document.getElementById(msgId) as HTMLElement | null;
+    const refVal = el?.dataset.ref || activeContext.ref || "";
+
+    // ① 묘비 (가장 먼저)
+    await addTalkTombstone(msgId, refVal);
+
+    // ② LanceDB messages
+    //    upsert_items 의 talk 분기가 task_id 에 자기 id 를 각인하므로
+    //    delete_message(taskId) 가 정확히 이 한 행만 지웁니다.
+    try {
+        await invoke("delete_message", { taskId: msgId });
+    } catch (e) {
+        console.warn(`[CHAT] LanceDB delete_message('${msgId}') failed:`, e);
+    }
+
+    // ③ Dexie talks 캐시
+    try {
+        if (appDb) await appDb.table("talks").delete(msgId);
+    } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+    // ④ DOM
+    if (el) el.remove();
+
+    // 마지막 한 건을 지웠다면 안내 문구를 복원합니다.
+    if (chatTalks && chatTalks.querySelectorAll('.chat-talk').length === 0) {
+        if (!chatTalks.querySelector('.no-msg')) {
+            chatTalks.insertAdjacentHTML(
+                'beforeend',
+                "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.8rem;'>No messages yet.</div>"
+            );
+        }
+    }
+
+    console.log(`[CHAT] 🗑️ [DELETED] '${msgId}' 를 내 기기에서 삭제했습니다. (서버 행 및 타 사용자 로컬 원장은 유지)`);
+    return true;
+}
+
+// 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
+//  (db.ts 가 자체 enrich 복사본을 갖고 있으면 두 규칙이 어긋나 인덱스가 조용히 깨집니다)
+(window as any).normalizeEnvelope = normalizeEnvelope;
+(window as any).canonicalizeData = canonicalizeData;
+
+// =====================================================================
+// 🌟 [DEXIE PLAN ENGINE v4]
+// ---------------------------------------------------------------------
+//  Rust(build_dexie_plan)가 내려준 정밀 필터 플랜을 실제 Dexie 쿼리로 실행합니다.
+//
+//  ── 왜 이 엔진이 필요한가 ──
+//   기존에는 convert_conditions_to_sql 이 valid_cols 7개 밖의 조건을 전부 버렸고,
+//   그 손실을 메우려고 STAGE-3 이 A/FULL ~ E/TABLE-FALLBACK 5티어를 발행했습니다.
+//   v4 는 조건을 하나도 버리지 않고 여기로 넘기므로, 티어 보험이 필요 없어집니다.
+//
+//  ── 실행 전략 ──
+//   ① 인덱스가 선언된 경로  → where().equals()/.between()/.above() (O(log n))
+//   ② 인덱스가 없는 경로    → .filter() 풀스캔 (로컬 수천~수만 건 = 수 ms)
+//   ③ top / bottom          → 정렬 후 백분위 슬라이스
+//   ④ contains/not_contains → .filter() (IndexedDB 는 substring 인덱스가 없음)
+// =====================================================================
+
+// 🌟 Dexie 스키마에 실제로 선언한 인덱스 경로 목록입니다.
+//  이 집합에 없는 경로는 자동으로 .filter() 로 떨어집니다.
+//
+//  ⚠️ [계약] 이 집합은 appDb.version(N).stores() 의 items 선언과 '반드시' 일치해야 합니다.
+//     여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이 where('없는경로') 를 호출해
+//     Dexie 가 SchemaError 를 던집니다. 반대로 스키마에만 있으면 인덱스가 놀 뿐이라 안전합니다.
+//     따라서 스키마를 줄일 때는 반드시 이 집합을 먼저 줄이세요.
+//
+//  🌟 v7 : data.link / data.origin 제거 (contains 전용이라 인덱스 이득 0),
+//          data.title / data.name / data.sender_name / data.recipient_name 추가.
+const DEXIE_INDEXED_PATHS = new Set<string>([
+    // ── 봉투 ──
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    // ── commerce 축 ──
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
+    'data.embed', 'data.digest',
+    // ── 🌟 trading 축 : v8 stores 선언과 1:1 로 일치해야 합니다 ──
+    //    이 21개가 빠져 있으면 선언한 인덱스가 단 한 번도 쓰이지 않고
+    //    모든 무역 조건이 .filter() 풀스캔으로 떨어집니다.
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    'data.container_number', 'data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
+    //    여기에 없으면 선언한 인덱스가 한 번도 쓰이지 않고 .filter() 풀스캔으로 떨어집니다.
+    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+    'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+]);
+
+interface DexieCondition {
+    path: string;
+    op: string;              // eq | neq | gt | gte | lt | lte | contains | not_contains | top | bottom
+    value?: any;
+    percent?: number;
+    kind?: string;           // number | string | rank
+}
+
+interface DexiePlan {
+    type?: string;
+    /** 🌟 v4 : 확정 도메인 + 교차 후보 도메인. LanceDB 의 IN 절과 동일한 집합입니다. */
+    types?: string[];
+    mode?: string;
+    conditions?: DexieCondition[];
+    keywords?: string[];
+    alternates?: Record<string, string[]>;
+    substantial?: string;
+    find?: string;
+}
+
+// 🌟 중첩 경로('data.sale_price')를 안전하게 읽습니다.
+function readPath(row: any, path: string): any {
+    if (!row) return undefined;
+    if (path.indexOf('.') === -1) return row[path];
+    let cur: any = row;
+    for (const seg of path.split('.')) {
+        if (cur === null || cur === undefined) return undefined;
+        cur = cur[seg];
+    }
+    return cur;
+}
+
+// 🌟 조건 하나를 '메모리상의 행'에 적용합니다.
+//  인덱스 경로든 아니든 최종 검증은 전부 이 함수를 통과시켜
+//  인덱스 쿼리의 오탐(타입 혼재 등)을 이중으로 막습니다.
+function matchCondition(row: any, cond: DexieCondition): boolean {
+    // top / bottom 은 개별 행으로 판정 불가. 정렬 단계에서 처리합니다.
+    if (cond.op === 'top' || cond.op === 'bottom') return true;
+
+    const raw = readPath(row, cond.path);
+
+    if (cond.kind === 'number') {
+        const target = typeof cond.value === 'number' ? cond.value : Number(cond.value);
+        if (isNaN(target)) return true; // 비교 불가 → 조건 무시(리콜 우선)
+
+        // 🌟 [MISSING VALUE GUARD] 값이 없는 것과 0 은 완전히 다른 사실입니다.
+        //    기존에는 Number('') = 0 으로 떨어져 'sale_price lte 5000' 같은 조건을
+        //    가격 필드가 아예 없는 문서까지 전부 통과시켰습니다.
+        //    neq 만 예외로 통과시킵니다. (없는 값은 target 과 같지 않은 것이 맞습니다)
+        const isMissing = (raw === undefined || raw === null || raw === "");
+        if (isMissing) return cond.op === 'neq';
+
+        const actual = typeof raw === 'number'
+            ? raw
+            : Number(String(raw).replace(/[^\d.\-]/g, ''));
+        if (isNaN(actual)) return false;
+
+        switch (cond.op) {
+            case 'gt':  return actual >  target;
+            case 'gte': return actual >= target;
+            case 'lt':  return actual <  target;
+            case 'lte': return actual <= target;
+            case 'neq': return actual !== target;
+            default:    return actual === target;
+        }
+    }
+
+    // 문자열 계열
+    const actualStr = (raw === null || raw === undefined) ? '' : String(raw);
+    const targetStr = (cond.value === null || cond.value === undefined) ? '' : String(cond.value);
+    if (!targetStr) return true; // 빈 조건은 무시
+
+    const a = actualStr.toLowerCase();
+    const t = targetStr.toLowerCase();
+
+    switch (cond.op) {
+        case 'contains':     return a.includes(t);
+        case 'not_contains': return !a.includes(t);
+        case 'neq':          return a !== t;
+        case 'gt':           return a >  t;
+        case 'gte':          return a >= t;
+        case 'lt':           return a <  t;
+        case 'lte':          return a <= t;
+        default:             return a === t;
+    }
+}
+
+// 🌟 조건 배열 중 '인덱스 쿼리로 후보를 좁히기에 가장 유리한 것' 하나를 고릅니다.
+//  eq 가 범위보다 선택도가 높고, 식별자 경로가 상태/수치보다 선택도가 높습니다.
+function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
+    const HIGH_SELECTIVITY = [
+        // ── commerce 식별자 ──
+        'data.tracking_number', 'data.no', 'data.code', 'data.index',
+        'data.barcode', 'data.stock_keeping_unit', 'data.digest',
+        // ── 🌟 trading 식별자 : 카디널리티가 상품명/항구명보다 압도적으로 높습니다 ──
+        'data.doc_number', 'data.container_number', 'data.seal_number',
+        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+        // ── 🌟 trading 인덱스 참조 : crc32 숫자라 카디널리티가 최상입니다 ──
+        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+    ];
+
+    let best: DexieCondition | null = null;
+    let bestScore = -1;
+
+    for (const c of conds) {
+        if (!DEXIE_INDEXED_PATHS.has(c.path)) continue;
+        if (c.op === 'top' || c.op === 'bottom') continue;
+        if (c.op === 'contains' || c.op === 'not_contains' || c.op === 'neq') continue;
+
+        let score = 0;
+        if (c.op === 'eq') score += 10;
+        else score += 4; // 범위 연산자
+        if (HIGH_SELECTIVITY.includes(c.path)) score += 20;
+
+        if (score > bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+}
+
+// 🌟 [MAIN] 플랜을 실행해 최종 문서 배열을 돌려줍니다.
+//  candidateIds 가 있으면 LanceDB 리콜 후보 안에서만 필터링하고,
+//  없으면 Dexie 전체를 대상으로 합니다(목록 조회 경로).
+async function executeDexiePlan(
+    plan: DexiePlan,
+    opts: { candidateIds?: string[]; limit?: number; offset?: number } = {}
+): Promise<any[]> {
+    if (!appDb) return [];
+
+    const conds: DexieCondition[] = Array.isArray(plan.conditions) ? plan.conditions : [];
+    const limit = opts.limit ?? 200;
+    const offset = opts.offset ?? 0;
+
+    let rows: any[] = [];
+
+    // ── 후보 집합이 주어진 경우 : LanceDB 리콜 결과 안에서만 정밀 필터 ──
+    if (opts.candidateIds && opts.candidateIds.length > 0) {
+        rows = await appDb.table('items').where('id').anyOf(opts.candidateIds).toArray();
+        console.log(`[DEXIE-PLAN] 후보 ${opts.candidateIds.length}건 → Dexie 적재 ${rows.length}건`);
+    } else {
+        // ── 후보가 없는 경우 : 인덱스로 최대한 좁혀서 적재 ──
+        const driver = pickDriverCondition(conds);
+
+        if (driver) {
+            // 🌟 [INDEX FALLBACK] DEXIE_INDEXED_PATHS 와 실제 스키마가 어긋난 세대에서는
+            //    where('없는경로') 가 SchemaError 를 던집니다. 그 경우 조용히 전량 적재로 폴백해
+            //    '검색이 통째로 실패' 하는 대신 '조금 느린 검색' 으로 흡수합니다.
+            try {
+                const coll = appDb.table('items').where(driver.path);
+                if (driver.op === 'eq') {
+                    rows = await coll.equals(driver.value).toArray();
+                } else if (driver.op === 'gt') {
+                    rows = await coll.above(driver.value).toArray();
+                } else if (driver.op === 'gte') {
+                    rows = await coll.aboveOrEqual(driver.value).toArray();
+                } else if (driver.op === 'lt') {
+                    rows = await coll.below(driver.value).toArray();
+                } else if (driver.op === 'lte') {
+                    rows = await coll.belowOrEqual(driver.value).toArray();
+                } else {
+                    rows = await appDb.table('items').toArray();
+                }
+                console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
+            } catch (e) {
+                console.warn(`[DEXIE-PLAN] ⚠️ 드라이버 인덱스 '${driver.path}' 조회 실패. 전량 적재로 폴백합니다.`, e);
+                rows = await appDb.table('items').toArray();
+            }
+        } else if (plan.types && plan.types.length > 0) {
+            // 🌟 types 인덱스(anyOf)로 좁힙니다. mode 보다 선택도가 높습니다.
+            rows = await appDb.table('items').where('type').anyOf(plan.types).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. type anyOf [${plan.types.join(', ')}] 로 ${rows.length}건 적재`);
+        } else if (plan.mode) {
+            rows = await appDb.table('items').where('mode').equals(plan.mode).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. mode='${plan.mode}' 로 ${rows.length}건 적재`);
+        } else {
+            rows = await appDb.table('items').toArray();
+            console.log(`[DEXIE-PLAN] 전체 적재 ${rows.length}건`);
+        }
+    }
+
+    // ── 스코프 검증 (types / mode) ──
+    //  🌟 v4 : plan.type 하나만 보면 교차 후보 도메인 결과가 전부 잘립니다.
+    //     LanceDB 가 IN 절로 넓힌 만큼 Dexie 도 같은 집합을 통과시켜야 합니다.
+    const allowedTypes: string[] = (plan.types && plan.types.length > 0)
+        ? plan.types
+        : (plan.type ? [plan.type] : []);
+
+    if (allowedTypes.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => allowedTypes.includes(r.type || ''));
+        if (before !== rows.length) {
+            console.log(`[DEXIE-PLAN] types 필터 [${allowedTypes.join(', ')}]: ${before} → ${rows.length}건`);
+        }
+    }
+    if (plan.mode) {
+        rows = rows.filter(r => (r.mode || 'commerce') === plan.mode);
+    }
+
+    // ── 정밀 조건 전량 적용 ──
+    const rankConds = conds.filter(c => c.op === 'top' || c.op === 'bottom');
+    const plainConds = conds.filter(c => c.op !== 'top' && c.op !== 'bottom');
+
+    if (plainConds.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => plainConds.every(c => matchCondition(r, c)));
+        console.log(`[DEXIE-PLAN] 정밀 조건 ${plainConds.length}개 적용: ${before} → ${rows.length}건`);
+        for (const c of plainConds) {
+            const viaIndex = DEXIE_INDEXED_PATHS.has(c.path) ? 'index' : 'scan';
+            console.log(`  ↳ ${c.path} ${c.op} ${JSON.stringify(c.value)} (${c.kind}, ${viaIndex})`);
+        }
+    }
+
+    // ── top / bottom 백분위 : 정렬 후 슬라이스 ──
+    for (const rc of rankConds) {
+        if (rows.length === 0) break;
+
+        // 🌟 [RANK MISSING GUARD] 값이 없는 문서는 순위 자체가 성립하지 않습니다.
+        //    Number(undefined) || 0 으로 떨어지면 bottom 20% 가
+        //    '해당 축을 아예 갖지 않은 문서' 로 채워집니다.
+        //    (수치 시딩을 제거한 뒤에는 결손이 실제로 발생하므로 반드시 필요합니다)
+        const ranked = rows.filter(r => {
+            const v = readPath(r, rc.path);
+            if (v === undefined || v === null || v === "") return false;
+            return !isNaN(Number(v));
+        });
+        const skipped = rows.length - ranked.length;
+        if (ranked.length === 0) {
+            console.log(`[DEXIE-PLAN] ${rc.op} ${rc.path}: 값을 가진 문서가 0건이라 랭킹을 건너뜁니다.`);
+            continue;
+        }
+
+        const pct = Math.max(1, Math.min(100, rc.percent ?? 20));
+        const take = Math.max(1, Math.ceil(ranked.length * (pct / 100)));
+
+        const sorted = [...ranked].sort((a, b) => {
+            const av = Number(readPath(a, rc.path));
+            const bv = Number(readPath(b, rc.path));
+            return rc.op === 'top' ? bv - av : av - bv;
+        });
+        rows = sorted.slice(0, take);
+        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+    }
+
+    // ── keywords : 조건이 되지 못한 청크로 보조 스코어링 ──
+    //  버리지 않고 '가산점' 으로만 씁니다. 여기서 잘라내면 리콜이 무너집니다.
+    if (plan.keywords && plan.keywords.length > 0) {
+        for (const r of rows) {
+            const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.masked_text ?? ''}`.toLowerCase();
+            let hit = 0;
+            for (const k of plan.keywords) {
+                if (k && hay.includes(k.toLowerCase())) hit++;
+            }
+            r.__kw_score = hit;
+        }
+        rows.sort((a, b) => (b.__kw_score || 0) - (a.__kw_score || 0));
+    }
+
+    const start = Math.min(offset, rows.length);
+    const end = Math.min(start + limit, rows.length);
+    return rows.slice(start, end);
 }
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
@@ -195,8 +2148,13 @@ class GlobalTaskManager {
                 console.error("[QUEUE] Failed to log leftover tasks to LanceDB:", e);
             }
 
-            await appDb.table("ts_queue").clear();
-            console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
+            // 🌟 [FAIL-SOFT] 스토어 부재/업그레이드 중이어도 초기화 흐름을 끊지 않습니다.
+            try {
+                await appDb.table("ts_queue").clear();
+                console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
+            } catch (e) {
+                console.warn("[QUEUE] ts_queue clear failed (table may be missing):", e);
+            }
             this.queue = [];
             return;
         }
@@ -516,6 +2474,122 @@ if (chatForm) {
             console.log("[CHAT] Message sent via WebRTC");
         }
 
+        // 🌟 [ANALYTIC LOCAL] analytic 모드에서도 로컬 LanceDB 검색(ai_search_complex)을 사용합니다.
+        //    서버 Vectorize POST 를 제거하고, commerce/shipping 과 동일한 검색 큐로 합류시킵니다.
+        //    parse_analytic_query 가 질의를 파싱하고, 로컬 item_chunks + Dexie 가 결과를 반환합니다.
+        if (currentSearchMode === "analytic") {
+            const taskId = `search_${Date.now()}`;
+            const startTime = Date.now();
+
+            // 사용자 질문 말풍선 즉시 렌더링
+            await renderMessage({
+                id: `${taskId}_query`,
+                role: "user",
+                text: query,
+                status: 9,
+                created_at: startTime,
+                updated_at: startTime
+            });
+
+            try {
+                const devicePref = getDevicePref();
+
+                // 로컬 검색 큐에 등록 (ai_search_complex 가 mode="analytic" 으로 동작)
+                await GlobalTaskManager.addToQueue(taskId, "ai_search", {
+                    taskId: taskId,
+                    query: query,
+                    language: "korean",
+                    devicePreference: devicePref,
+                    searchMode: "analytic",
+                    cc: activeContext.cc || "",
+                    bcc: activeContext.bcc || "",
+                    refId: activeContext.ref || ""
+                });
+            } catch (e) {
+                console.error("[ANALYTIC-LOCAL] Search queue failed:", e);
+            }
+
+            setTimeout(() => {
+                const scrollEl = document.getElementById("chat-scroll");
+                const container = document.querySelector(".chat-container") as HTMLElement;
+
+                if (scrollEl && container) {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    currentY = maxScroll;
+                    scrollEl.style.transition = "transform 0.3s ease-out";
+                    updateTransform();
+                    setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+                }
+            }, 100);
+
+            return;
+        }
+
+        // 🌟 [OPTIMISTIC LOCAL WRITE]
+        //  ── 무엇이 문제였나 ──
+        //   기존 구조는 `if (response.results.length > 0)` 안에서만 로컬에 저장했습니다.
+        //   서버(index.ts)의 PUT 핸들러는 `if(cookies.sender)` 게이트에 막혀
+        //   talks INSERT 를 한 번도 수행하지 못했고, 빈 results 를 돌려주었습니다.
+        //   그래서 LanceDB talks 에 아무것도 안 들어가고
+        //   get_chat_messages 가 0건 → .chat-talks 에 "No messages yet." 이 남았습니다.
+        //
+        //  ── 해결 ──
+        //   이전 구현(content.js / chrome.js)과 동일하게, 사용자가 입력한 즉시
+        //   로컬 messages 테이블에 먼저 적재하고 화면을 그립니다.
+        //   서버 응답이 오면 그 행이 별도 id 로 추가되며(서버가 hashId() 로 새 id 발급),
+        //   upsertChatMessages 의 중복 제거 + 시간순 정렬이 자연스럽게 합칩니다.
+        //   서버가 실패해도 채팅 목록은 절대 사라지지 않습니다.
+        const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
+        {
+            let localLink = "/tracking";
+            let localOrigin = "https://commerce.logis.center";
+            try {
+                let hrefForLink = currentDetectedUrl || "https://commerce.logis.center/tracking";
+                if (hrefForLink.includes("localhost") || hrefForLink.includes("127.0.0.1") || hrefForLink === "about:blank") {
+                    hrefForLink = "https://commerce.logis.center/tracking";
+                }
+                const u = new URL(hrefForLink.toLowerCase());
+                localLink = (u.pathname + u.search).toLowerCase();
+                localOrigin = u.origin;
+            } catch (e) {}
+
+            try {
+                await invoke("upsert_items", {
+                    items: [{
+                        id: localTalkId,
+                        table: "talks",
+                        type: "talk",
+                        from: currentSession.address || "",
+                        to: currentSession.team || "",
+                        cc: effectiveCc || "",
+                        bcc: effectiveBcc || "",
+                        ref: effectiveRef || "",
+                        status: 9,
+                        created_at: now,
+                        updated_at: now,
+                        data: {
+                            text: query,
+                            link: localLink,
+                            origin: localOrigin
+                        }
+                    }]
+                });
+                console.log(`[CHAT] Optimistically stored local talk '${localTalkId}' (ref: ${effectiveRef})`);
+            } catch (e) {
+                console.warn("[CHAT] Local optimistic write failed:", e);
+            }
+
+            // 로컬 저장 직후 즉시 말풍선 렌더링 (서버 왕복을 기다리지 않습니다)
+            await renderMessage({
+                id: localTalkId,
+                role: "user",
+                text: query,
+                status: 9,
+                created_at: now,
+                updated_at: now
+            });
+        }
+
         // 2. 클라우드플레어 Workers (서버)로 PUT 요청 전송 및 정식 응답 처리 (chrome.js 방식)
         try {
             const origin = "https://commerce.logis.center";
@@ -527,6 +2601,23 @@ if (chatForm) {
                 targetHref = "https://commerce.logis.center/tracking";
             }
 
+            // 🌟 [SENDER GATE] index.ts 의 PUT 핸들러는 아래 게이트를 통과해야만
+            //    INSERT INTO talks 를 실행합니다.
+            //      if(cookies.sender){ if(isAddress(from) && isAddress(to)){ ... } }
+            //    cookies.sender 는 요청 최상단 세션 블록에서
+            //    req.query.sender → data.sender → cookies.sender 순으로 세팅되며,
+            //    이 블록은 method 와 무관하게 매 요청 실행됩니다.
+            //    따라서 이 PUT 요청 자체에 sender 를 실으면 그 자리에서 게이트를 통과합니다.
+            //
+            // 🌟 [TO FIX] 기존에는 to 로 effectiveRef(페이지 ref 해시)를 보냈습니다.
+            //    서버는 talk.to 에 그 값을 그대로 저장하는데,
+            //    GET 조회 쿼리 중 하나가
+            //      SELECT * FROM talks WHERE "from" = team AND "to" = address
+            //    이므로 ref 를 넣으면 대화 상대 축이 어긋납니다.
+            //    ref 는 서버가 자체적으로 hashId(team+cc+link) 로 재계산하므로
+            //    to 에는 소속 팀 주소를 보내는 것이 계약상 올바릅니다.
+            const talkSender = currentSession.email || currentSession.name || "";
+
             const params = new URLSearchParams({
                 origin: origin,
                 created_at: createdAt.toString(),
@@ -534,8 +2625,9 @@ if (chatForm) {
                 token: currentSession.token || "",
                 href: targetHref,
                 type: "talk",
+                sender: talkSender,
                 from: currentSession.address || "",
-                to: effectiveRef || currentSession.team || "",
+                to: currentSession.team || currentSession.address || "",
                 text: encodeURIComponent(query)
             });
             
@@ -556,6 +2648,15 @@ if (chatForm) {
                         await appDb.table("talks").put(item);
                     }
                 }
+                console.log(`[CHAT] Server accepted talk. rows=${response.results.length}`);
+            } else {
+                // 🌟 서버가 빈 배열을 돌려주면 cookies.sender 게이트에서 탈락한 것입니다.
+                //    낙관적 로컬 저장 덕분에 화면은 유지되지만 원인을 반드시 표면화합니다.
+                console.warn(
+                    "[CHAT] ⚠️ Server returned no talk rows. " +
+                    "Check that `sender` reached the worker (cookies.sender gate) — " +
+                    `sent sender='${talkSender}', from='${currentSession.address}', to='${currentSession.team}'`
+                );
             }
 
             // 3. 서버 동기화 후 최신 메시지 렌더링
@@ -578,6 +2679,35 @@ if (chatForm) {
                 setTimeout(() => { scrollEl.style.transition = ""; }, 300);
             }
         }, 100);
+    });
+}
+
+// 🌟 [DELETE DELEGATION] 삭제 버튼은 말풍선이 재렌더링될 때마다 새로 만들어지므로
+//  개별 노드에 리스너를 붙이면 upsertChatMessages 의 replaceChild 시점에 유실됩니다.
+//  컨테이너에 위임 리스너 하나만 두면 이후 어떤 렌더링 경로에서도 그대로 동작합니다.
+if (chatTalks) {
+    chatTalks.addEventListener("click", async (e) => {
+        const target = e.target as HTMLElement;
+        const btn = target.closest('.btn-delete-talk') as HTMLElement | null;
+        if (!btn) return;
+
+        // 🌟 태스크 말풍선의 handleTaskClick 이 함께 발화하지 않도록 반드시 차단합니다.
+        e.preventDefault();
+        e.stopPropagation();
+
+        const talkId = btn.dataset.talkId;
+        if (!talkId) return;
+
+        btn.style.pointerEvents = "none";
+        btn.style.opacity = "0.15";
+
+        const ok = await deleteChatMessage(talkId);
+
+        if (!ok) {
+            // 사용자가 취소했으면 버튼을 원상복구합니다.
+            btn.style.pointerEvents = "";
+            btn.style.opacity = "0.35";
+        }
     });
 }
 
@@ -1244,17 +3374,55 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     }
                 }
                 var total = { draft: 0, count: 0 };
-                const pagesStats = (currentSession as any).pages;
                 const cc = node.cc || data.cc;
-                
-                // 🌟 [TRACKING LOG] Accordion 그릴 때 각 노드의 매칭 상태 확인
-                if (nodeType !== 'team' && nodeType !== 'user' && nodeType !== 'member') {
-                    console.log(`[TRACKING-4] 렌더링 노드 타입: ${nodeType}, 대상 CC: ${cc}`);
-                    if (pagesStats && cc && pagesStats[cc] && pagesStats[cc][nodeType]) {
-                        total = pagesStats[cc][nodeType];
-                        console.log(`[TRACKING-5] 매칭 성공! 적용될 카운트:`, total);
-                    } else {
-                        console.log(`[TRACKING-FAIL] 매칭 실패. pagesStats 존재여부: ${!!pagesStats}, CC 존재여부: ${!!cc}`);
+
+                // 🌟 [DEXIE COUNT] team.data.base.pages 증감 통계 대신 Dexie 인덱스로 직접 셉니다.
+                //    ① 증감 방식은 서버(proxy/index.ts)와 로컬(metrics.rs)이 같은 트리를 각자 갱신하므로
+                //       한쪽이 실패하면 영구히 어긋납니다.
+                //    ② relay draft / DEDUP 스킵 / ORDER-INDEX FALLBACK 처럼 분기가 늘 때마다
+                //       증감 지점을 같이 늘려야 합니다.
+                //    ③ '[cc+type]' 복합 인덱스가 이미 선언돼 있어 range 조회 1회면 끝납니다.
+                //
+                //    🌟 [DRAFT 판정 계약] proxy/index.ts 와 완전히 동일합니다.
+                //       updated_at == 0  → draft (리스트 스캔으로 껍데기만 존재)
+                //       updated_at >  0  → count (상세 추출까지 완료)
+                //    cc+type 단위 단일 통계이므로 리스트 노드와 상세 노드가 같은 total 을 공유하고,
+                //    리스트 노드는 total.draft 를, 상세 노드는 total.count 를 표시합니다.
+                //    (이 구조 자체가 base.pages[cc][type] 와 동일합니다)
+                if (
+                    nodeType !== 'team' &&
+                    nodeType !== 'user' &&
+                    nodeType !== 'member' &&
+                    nodeType !== 'pages' &&
+                    nodeType !== 'page' &&
+                    cc &&
+                    appDb
+                ) {
+                    try {
+                        const rows = await appDb.table('items')
+                            .where('[cc+type]')
+                            .equals([cc, nodeType])
+                            .toArray();
+
+                        for (const r of rows) {
+                            // 🌟 [DRAFT COUNT v2] 봉투 루트 updated_at 과 data.updated_at 둘 다 확인합니다.
+                            //    normalizeEnvelope 가 data.* 로 내린 뒤에도 루트 updated_at 이
+                            //    별도 경로(syncData bulkPut 이전)로 갱신될 수 있으므로 이중 판정합니다.
+                            const rootUp = Number(r.updated_at ?? 0);
+                            const dataUp = Number(r.data?.updated_at ?? rootUp);
+                            const up = dataUp;
+
+                            if (up > 0) total.count++;
+                            else total.draft++;
+                        }
+
+                        console.log(`[NAV-COUNT] cc=${cc} type=${nodeType} | 총 ${rows.length}건 → draft ${total.draft} / count ${total.count}`);
+
+                        if (rows.length > 0 && total.draft === 0 && total.count === rows.length) {
+                            console.warn(`[NAV-COUNT] ⚠️ 전 건이 count 로 분류되었습니다. store.rs 의 updated_at=0 보존 수정이 반영되었는지 확인하세요.`);
+                        }
+                    } catch (e) {
+                        console.warn(`[NAV-COUNT] Dexie count failed for ${nodeType}:`, e);
                     }
                 }
 
@@ -1433,8 +3601,40 @@ async function renderNavigation() {
         }
         
         const navSection = pageList.closest('.nav-section') as HTMLElement;
-
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+
+        // 🌟 [OAUTH REGISTER BUTTON] Pages nav-section 상단에 사이트 등록 버튼을 삽입합니다.
+        //    매 렌더링마다 중복 생성을 방지하기 위해 기존 버튼을 먼저 제거합니다.
+        if (navSection) {
+            const existingBtn = navSection.querySelector("#btn-oauth-register");
+            if (existingBtn) existingBtn.remove();
+
+            // analytic 모드에서만 등록 버튼 노출 (이 버튼의 목적이 analytic 조회이므로)
+            // 🌟 [LOGIN GATE] 로그인(currentSession.email)이 되어 있어야만 버튼을 노출합니다.
+            //    미로그인 상태에서 등록을 시도하면 submitOAuthRegistration 내부에서
+            //    "로그인이 필요합니다." 에러가 반환되므로, 사전에 UI에서 차단합니다.
+            if (currentSearchMode === "analytic" && !isSettingsOpen && currentSession.email) {
+                const h3 = navSection.querySelector("h3");
+                const registerBtn = document.createElement("button");
+                registerBtn.id = "btn-oauth-register";
+                registerBtn.style.cssText = "position: absolute; left: 1em; top: -20px; border: 0; padding: 0; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
+                registerBtn.textContent = "+ 사이트 등록 (Analytic)";
+                registerBtn.addEventListener("click", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    renderOAuthRegistrationForm();
+                });
+
+                // h3 바로 아래, pageList 위에 삽입
+                if (h3 && h3.nextSibling) {
+                    navSection.insertBefore(registerBtn, h3.nextSibling);
+                } else if (h3) {
+                    navSection.appendChild(registerBtn);
+                } else {
+                    navSection.insertBefore(registerBtn, pageList);
+                }
+            }
+        }
 
         if (_pages.length === 0) {
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
@@ -1558,6 +3758,156 @@ async function renderNavigation() {
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
 
+            // 🌟 [OAUTH REGISTERED SITES IN PAGES] analytic 모드에서 등록된 사이트를 Pages 섹션에 추가합니다.
+            //    www/docs/index.html 의 form[name="api.oauth.network"] 패턴을 참고하여,
+            //    각 사이트마다 host / client_id / client_secret / 통계 / 삭제 를 표시합니다.
+            if (currentSearchMode === "analytic" && currentSession.email) {
+                try {
+                    const registeredSites = await kvGet("oauth_registered_sites") || [];
+                    if (Array.isArray(registeredSites) && registeredSites.length > 0) {
+                        let oauthHtml = '';
+
+                        for (let si = 0; si < registeredSites.length; si++) {
+                            const site = registeredSites[si];
+                            const siteHost = site.host || "";
+                            const clientId = site.client_id || "";
+                            const clientSecret = site.client_secret || "";
+                            const siteId = `oauth_site_${si}`;
+
+                            let displayHost = siteHost;
+                            try {
+                                displayHost = new URL(siteHost).hostname;
+                            } catch (_e) {}
+
+                            oauthHtml += `
+                            <div class="oauth-site-item" id="${siteId}" style="position:relative; padding:6px 0; border-bottom:1px solid #f0f0f0;">
+                                <div style="display:flex; align-items:center; gap:6px;">
+                                    <span style="font-size:0.8rem; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${displayHost}</span>
+                                    <button class="btn-oauth-more" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; font-style:italic; text-decoration:underline; color:#6366f1; padding:0 4px;">more</button>
+                                    <button class="btn-oauth-hide" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; text-decoration:underline; color:#888; padding:0 4px;">hide</button>
+                                </div>
+                                <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
+                                    <div><strong>Client Id:</strong> ${clientId}</div>
+                                    <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
+                                    <div style="margin-top:8px; text-align:right;">
+                                        <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
+                                    </div>
+                                </div>
+                                <div class="oauth-site-stats" data-site-host="${siteHost}" style="margin-top:15px; border:1px solid #ddd; border-radius:8px; position:relative;">
+                                    <span style="position:absolute; left: 8px; top: -5px; font-size:0.6rem; color:#999; font-weight:100; background:#fff; padding:0 4px;">시간별 접속량</span>
+                                    <table style="width:100%; border-collapse:collapse;">
+                                        <tbody>
+                                            <tr>
+                                                <td class="stat-hour" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">hour</span></cnt>
+                                                </td>
+                                                <td class="stat-day" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">day</span></cnt>
+                                                </td>
+                                                <td class="stat-week" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">week</span></cnt>
+                                                </td>
+                                                <td class="stat-month" style="padding:8px; width:25%; text-align:center;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">month</span></cnt>
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>`;
+                        }
+
+                        oauthHtml += `</div>`;
+                        pageList.insertAdjacentHTML("beforeend", oauthHtml);
+
+                        // "more" 버튼: 토큰 정보 + 삭제 버튼 토글
+                        pageList.querySelectorAll(".btn-oauth-more").forEach((btn: any) => {
+                            btn.onclick = (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = btn.dataset.siteIdx;
+                                const tokenDiv = pageList.querySelector(`.oauth-site-tokens[data-site-idx="${idx}"]`) as HTMLElement;
+                                if (tokenDiv) {
+                                    const isVisible = tokenDiv.style.display !== "none";
+                                    tokenDiv.style.display = isVisible ? "none" : "block";
+                                    btn.textContent = isVisible ? "more" : "fold";
+                                }
+                            };
+                        });
+
+                        // "hide" 버튼: 사이트 항목 숨김
+                        pageList.querySelectorAll(".btn-oauth-hide").forEach((btn: any) => {
+                            btn.onclick = async (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = btn.dataset.siteIdx;
+                                const siteItem = document.getElementById(`oauth_site_${idx}`);
+                                if (siteItem) {
+                                    siteItem.style.display = "none";
+                                }
+                            };
+                        });
+
+                        // 🌟 [DELETE] 삭제 버튼: kv_store 에서 제거 후 네비게이션 재렌더링
+                        pageList.querySelectorAll(".btn-oauth-delete").forEach((btn: any) => {
+                            btn.onclick = async (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = parseInt(btn.dataset.siteIdx, 10);
+                                const confirmed = await ask(
+                                    "이 사이트 등록을 삭제하시겠습니까?\nclient_id / client_secret 이 영구 삭제됩니다.",
+                                    { title: "사이트 삭제 확인", kind: "warning" }
+                                );
+                                if (!confirmed) return;
+                                try {
+                                    const sites = await kvGet("oauth_registered_sites") || [];
+                                    if (Array.isArray(sites) && idx < sites.length) {
+                                        sites.splice(idx, 1);
+                                        await kvSet("oauth_registered_sites", sites);
+                                    }
+                                    await renderNavigation();
+                                } catch (delErr) {
+                                    console.warn("[OAUTH] Delete failed:", delErr);
+                                }
+                            };
+                        });
+
+                        // 🌟 [STATS] 각 사이트의 시간별 접속량을 비동기로 조회하여 채워 넣습니다.
+                        //    www/docs/index.html 의 OAuth3.fetch cnt=true 패턴과 동일합니다.
+                        for (let si = 0; si < registeredSites.length; si++) {
+                            const site = registeredSites[si];
+                            const siteHost = site.host || "";
+                            if (!siteHost) continue;
+                            const statsDiv = pageList.querySelector(`.oauth-site-stats[data-site-host="${siteHost}"]`) as HTMLElement;
+                            if (!statsDiv) continue;
+
+                            // hour: 최근 1시간
+                            fetchOAuthSiteCount(siteHost, 1).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-hour cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // day: 최근 24시간
+                            fetchOAuthSiteCount(siteHost, 24).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-day cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // week: 최근 7일 (168시간)
+                            fetchOAuthSiteCount(siteHost, 168).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-week cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // month: 최근 30일 (720시간)
+                            fetchOAuthSiteCount(siteHost, 720).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-month cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                        }
+                    }
+                } catch (oauthErr) {
+                    console.warn("[NAV] OAuth registered sites render failed:", oauthErr);
+                }
+            }
+
             // 🌟 [추가] Show/Hide 토글 버튼 이벤트 바인딩
             pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {
                 btn.onclick = async (e: Event) => {
@@ -1665,8 +4015,16 @@ async function renderNavigation() {
 
         if (users.length > 0) {
             // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
-            const localUsers = users.filter(u => u.data && u.data.is_device === true);
-            const cloudUsers = users.filter(u => !u.data || u.data.is_device !== true);
+            // 🌟 [BOOL PARITY] canonicalizeData 의 BOOL_KEYS 가 is_device 를 0|1 정수로 확정합니다.
+            //    (IndexedDB 는 boolean 을 유효한 키로 인정하지 않기 때문입니다)
+            //    따라서 === true 비교는 항상 false 가 되어 로컬 디바이스가 전부
+            //    Cloud Members 로 새어 나갔습니다. truthy 판정으로 통일합니다.
+            const isDevice = (u: any) => {
+                const v = u?.data?.is_device;
+                return v === 1 || v === true || v === "1" || v === "true";
+            };
+            const localUsers = users.filter(u => isDevice(u));
+            const cloudUsers = users.filter(u => !isDevice(u));
 
             // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
@@ -1920,6 +4278,23 @@ function showInviteQr(hook: string, email: string) {
 // --- Sync Logic ---
 // main.ts 내부
 async function syncData() {
+    // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
+    if (currentSearchMode === "analytic") {
+        await syncAnalyticsData();
+        if (currentSession.hash && currentSession.email) {
+            syncCommerceInBackground();
+        }
+        return;
+    }
+    // 🌟 [ANALYTICS BACKGROUND] commerce / shipping 탭에 있어도 analytics 이벤트를 계속 받습니다.
+    //    ── 왜 필요한가 ──
+    //     기존 구조는 analytic 탭을 열어야만 D1 이벤트를 가져왔습니다.
+    //     그 사이 쌓인 이벤트는 탭을 열기 전까지 로컬에 존재하지 않았고,
+    //     Worker 의 LIMIT 1000 창 밖으로 밀려나면 영구히 유실됩니다.
+    //     30초 스로틀이 걸려 있어 폴링 부하는 사실상 없습니다.
+    if (currentSession.hash) {
+        syncAnalyticsInBackground();
+    }
     if (!currentSession.hash || !currentSession.email) return;
     
     console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
@@ -1941,6 +4316,14 @@ async function syncData() {
             token: currentSession.token || "",
             href: targetHref
         };
+
+        // 🌟 [SENDER IMPRINT] checkAuthStatus 와 동일한 이유입니다.
+        //    syncData 는 currentSession.email 이 확정된 뒤에만 실행되므로
+        //    (함수 상단의 `if (!currentSession.hash || !currentSession.email) return;`)
+        //    여기서 보내는 sender 는 반드시 서버 user.data 에 각인됩니다.
+        //    이 값이 있어야 PUT(talks) / POST(tasks) 가 cookies.sender 게이트를 통과합니다.
+        const syncSender = currentSession.email || currentSession.name || "";
+        if (syncSender) queryParams.sender = syncSender;
 
         // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버 동기화 시, 강제 지정된 사이드바 메뉴가 없다면 현재 URL의 도메인(CC)을 최우선으로 서버에 전달합니다.
         let syncEffectiveCc = activeContext.cc;
@@ -2022,7 +4405,20 @@ async function syncData() {
                 localMap.set(item.id, item.updated_at_ts || item.updated_at || item.created_at_ts || item.created_at || 0);
             });
 
+            // 🌟 [TOMBSTONE GUARD] 내가 삭제한 메시지는 서버에 행이 남아 있으므로
+            //    매 폴링마다 다시 내려옵니다. 그때 로컬에는 DOM 도 Dexie 도 없으니
+            //    바로 아래 `!existingEl && !localMap.has(id)` 조건을 통과해 재삽입됩니다.
+            //    묘비 조회는 메모리 Set 이라 폴링 비용이 사실상 0 입니다.
+            const tombstones = await loadTalkTombstones();
+            let tombBlocked = 0;
+
             const filteredResults = response.results.filter((newItem: any) => {
+                // 🌟 삭제 의사가 기록된 id 는 어떤 조건보다 먼저, 무조건 차단합니다.
+                if (tombstones.has(String(newItem.id))) {
+                    tombBlocked++;
+                    return false;
+                }
+
                 const existingEl = document.getElementById(newItem.id);
                 
                 // 🌟 완전 신규 데이터 (DOM에도 없고 로컬 DB 캐시에도 없는 경우)는 조건 없이 즉시 통과
@@ -2042,18 +4438,96 @@ async function syncData() {
                 return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
             });
 
+            if (tombBlocked > 0) {
+                console.log(`[TOMBSTONE] 🪦 삭제된 메시지 ${tombBlocked}건의 서버 재삽입을 차단했습니다.`);
+            }
+
             if (filteredResults.length > 0) {
+                // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
+                //    mode 는 '동기화 시점에 클라이언트가 확정하는 값' 이며,
+                //    판정은 파일 상단의 modeOfType() 단일 함수가 전담합니다.
+                //
+                //    ── v1 의 결함 ──
+                //     TRADING_TYPES 에 소문자 'tracking' 이 들어 있어
+                //     proxy 의 Relay("tracking","order") 가 만든 commerce 배송추적 문서가
+                //     전부 mode='shipping' 으로 오염되었고,
+                //     loadMoreDocs 의 mode 필터에서 commerce 목록이 통째로 비었습니다.
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (r.mode) continue;
+                    r.mode = modeOfType(String(r.type || ""));
+                }
+                // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 없으면
+                //    Rust upsert_item 이 현재 시각을 부여해 draft → count 가 됩니다.
+                //    data 내부에도 없으면 여기서 0 을 명시해 draft 계약을 보존합니다.
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    const hasRoot = r.updated_at !== undefined && r.updated_at !== null;
+                    const inner = (r.data && typeof r.data === 'object') ? r.data.updated_at : undefined;
+                    const hasInner = inner !== undefined && inner !== null;
+                    if (!hasRoot && !hasInner) {
+                        r.updated_at = 0;
+                    }
+                }
+
+                // 🌟 [FLAG RECOVERY] commerce D1 의 items 테이블에는 flag 컬럼이 없습니다.
+                //    (analytics D1 · LanceDB · Dexie 에는 모두 존재)
+                //    그대로 두면 commerce 트랙 전 문서의 flag 가 영구 공백이 되어
+                //    지역 스코프 조회가 성립하지 않습니다.
+                //    세션 flag(= Client Worker 가 GeoIP 로 확정한 국가 코드)로 보강합니다.
+                const sessionFlag = String((currentSession as any).flag || "");
+                if (sessionFlag) {
+                    let flagFilled = 0;
+                    for (const r of filteredResults) {
+                        if (!r) continue;
+                        if (r.flag) continue;
+                        // data 안에 이미 flag 가 있으면(users/team 문서) 그쪽을 신뢰합니다.
+                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
+                        if (inner) { r.flag = inner; continue; }
+                        r.flag = sessionFlag;
+                        flagFilled++;
+                    }
+                    if (flagFilled > 0) {
+                        console.log(`[SYNC] flag 컬럼 부재 문서 ${flagFilled}건을 세션 flag('${sessionFlag}')로 보강했습니다.`);
+                    }
+                }
+
+                // 🌟 [ROOT ABSORB / RUST] Rust 의 upsert_items 는 item.data 객체의 알맹이를
+                //    루트로 끌어올리는 방향만 처리합니다. 반대로 '루트에만 있는 물리 컬럼' 은
+                //    data 로 내려 주지 않으므로, 여기서 미리 합쳐 보냅니다.
+                //    (normalizeEnvelope 의 ROOT ABSORB 와 동일 규칙이어야 두 저장소가 일치합니다)
+                for (const r of filteredResults) {
+                    if (!r) continue;
+                    if (!r.data || typeof r.data !== 'object') continue;
+                    for (const k in r) {
+                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+                        const v = r[k];
+                        if (v === undefined || v === null) continue;
+                        if (typeof v === 'function') continue;
+                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
+                            r.data[k] = v;
+                        }
+                    }
+                }
+
                 console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
                 await invoke("upsert_items", { items: filteredResults });
                 
                 // 🌟 [누락 복구] 서버 통계를 LanceDB에 덮어썼다면, 반드시 프론트엔드 Dexie DB 에도 동기화해줘야 화면이 바뀝니다!
                 const newUsers = filteredResults.filter((r: any) => r.type === "team" || r.type === "user" || r.type === "member");
                 
-                // 🌟 [CRITICAL FIX] 클라우드 서버에서 type을 "goods" 등으로 덮어써서 내려보내더라도, 
-                // data.item 이나 data.node 속성을 쥐고 있다면 무조건 페이지 캐시로 분류하여 Dexie에 살려냅니다!
+                // 🌟 [ROUTING FIX] 서버(Client Worker)는 페이지 캐시 행에 table:'pages' 를 실어 보냅니다.
+                //    기존처럼 data.node / data.item 의 '존재 여부' 로 추정하면
+                //    canonicalize_data 가 node / detail 을 0 으로 시딩하는 순간 전 아이템이 참이 되어
+                //    일반 상품/주문까지 Dexie pages 테이블로 오분류됩니다.
+                //    따라서 서버가 명시한 table 을 1순위로 신뢰하고,
+                //    없을 때만 셀렉터 마커의 '값이 truthy 인지' 를 봅니다.
                 const newPages = filteredResults.filter((r: any) => {
+                    if (r.table === "pages" || r.table === "page") return true;
+                    if (r.type === "pages" || r.type === "page") return true;
                     const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
-                    return r.type === "pages" || r.type === "page" || d.node !== undefined || d.item !== undefined;
+                    return !!d.node || !!d.item;
                 });
                 
                 // chrome.js 형태의 talks(채팅) 메시지 추출
@@ -2061,10 +4535,12 @@ async function syncData() {
 
                 const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r) && !newTalks.includes(r));
 
-                if (newUsers.length > 0) await appDb.table("users").bulkPut(newUsers);
-                if (newPages.length > 0) await appDb.table("pages").bulkPut(newPages);
+                // 🌟 v4 : users / pages 도 봉투 정규화를 거칩니다.
+                //  talks 는 스키마가 다르므로(role/task_id/status) 그대로 넣습니다.
+                if (newUsers.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(newUsers));
+                if (newPages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(newPages));
                 if (newTalks.length > 0) await appDb.table("talks").bulkPut(newTalks);
-                if (newItems.length > 0) await appDb.table("items").bulkPut(enrichForIndex(newItems));
+                if (newItems.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(newItems));
 
                 // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
                 // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
@@ -2096,6 +4572,47 @@ async function syncData() {
                 }
             }
             
+            // 🌟 [CLOUD TASK LIFECYCLE] 서버 tasks 목록과 대조하여 클라우드 작업 완료 여부를 판정합니다.
+            if (cloudPendingTasks.size > 0) {
+                const serverTaskIds = new Set<string>();
+                for (const r of response.results) {
+                    if (!r) continue;
+                    if (r.table === "tasks" && r.id) {
+                        serverTaskIds.add(r.id);
+                    }
+                }
+
+                for (const [localTid, meta] of Array.from(cloudPendingTasks.entries())) {
+                    const stillRunning = meta.serverId ? serverTaskIds.has(meta.serverId) : false;
+
+                    if (stillRunning) {
+                        await renderProgressToUI({
+                            task_id: localTid,
+                            category: "Cloud Queue",
+                            summary: "Processing on Logis Center...",
+                            spinner: "☁️"
+                        });
+                        continue;
+                    }
+
+                    // 서버 등록 직후의 레이스 컨디션 방어(최소 5초 유예)
+                    if (Date.now() - meta.createdAt < 5000) continue;
+
+                    cloudPendingTasks.delete(localTid);
+
+                    await renderProgressToUI({
+                        task_id: localTid,
+                        category: "Done",
+                        summary: meta.kind === "search"
+                            ? "Cloud AI search complete."
+                            : "Cloud AI extraction complete.",
+                        spinner: "✅"
+                    });
+
+                    console.log(`[CLOUD] Task ${localTid} (server: ${meta.serverId}) finished on Logis Center.`);
+                }
+            }
+
             console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
             // 3. LanceDB 불러오기
             await renderNavigation();
@@ -2106,6 +4623,12 @@ async function syncData() {
             } else if (currentTab === "settings") {
                 await fetchChatHistory(false, true);
             }
+
+            // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
+            //    runLocalEmbeddingSync 내부의 2초 디바운스가 initSession의 4초 타이머와
+            //    겹치는 중복 호출을 자동으로 병합하여 1회만 실행합니다.
+            console.log("[SYNC] 4. 로컬 임베딩 파이프라인 스케줄링 (2초 디바운스 적용)...");
+            runLocalEmbeddingSync();
         }
         
     } catch (e) { 
@@ -2133,10 +4656,10 @@ function applySearchModeUI() {
         }
     });
 
-    // 🌟 [추가] 선택된 모드의 첫 글자를 대문자로 변환하여 Placeholder에 즉시 반영!
+    // 🌟 [MODE LABEL] 파일 상단의 modeLabel() 단일 정의를 씁니다.
+    //    저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB 나 Rust 쪽 변경이 전혀 없습니다.
     if (searchInput) {
-        const capitalizedMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-        searchInput.placeholder = `${capitalizedMode} Search or Ask`;
+        searchInput.placeholder = `${modeLabel(currentSearchMode)} Search or Ask`;
     }
 
     // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
@@ -2156,14 +4679,34 @@ function applySearchModeUI() {
 document.querySelectorAll('.mode-tab').forEach(btn => {
     btn.addEventListener('click', async (e) => {
         const target = e.target as HTMLElement;
+        const prevMode = currentSearchMode;
         currentSearchMode = target.dataset.mode || "commerce";
-        
+
+        // 🌟 [SCOPE RESET] 트랙마다 cc 네임스페이스가 다릅니다.
+        //  ── 무엇이 문제였나 ──
+        //   commerce 는 activeContext.cc = hashId(getRootDomain(host)) 즉 'cafe24.com' 해시이고,
+        //   analytic 은 Worker 가 넣은 hashId(url.host) 즉 'abc.cafe24.com' 해시입니다.
+        //   commerce 에서 페이지를 클릭한 뒤 analytic 으로 넘어오면
+        //   loadMoreDocs 가 그 cc 를 드라이버 인덱스로 삼아 무조건 0건이 됩니다.
+        //   (검색 태그도 같은 이유로 남아 있으면 안 됩니다)
+        if (prevMode !== currentSearchMode) {
+            activeContext = { cc: "", bcc: "", ref: "" };
+            activeTags = [];
+            updateTagsUI();
+        }
+
         // 🌟 탭 클릭 시 상태 저장 및 UI 업데이트
         await kvSet("search_mode", currentSearchMode);
         applySearchModeUI();
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
         await refreshList(); 
+
+        // 🌟 [IMMEDIATE PULL] analytic 으로 전환했으면 폴링 주기를 기다리지 않고 즉시 1회 당겨옵니다.
+        if (currentSearchMode === "analytic" && currentSession.hash) {
+            lastAnalyticsSyncAt = 0; // 스로틀 해제
+            syncAnalyticsData();
+        }
     });
 });
 
@@ -2350,17 +4893,78 @@ btnSubmit?.addEventListener("click", async () => {
 
     try {
         const devicePref = getDevicePref();
-        // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
-        await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
-            taskId: taskId, 
-            query: query, 
-            language: "korean",
-            devicePreference: devicePref,
-            searchMode: currentSearchMode,
-            cc: activeContext.cc || "",
-            bcc: activeContext.bcc || "",
-            refId: activeContext.ref || ""
-        });
+        const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+        if (isCloudMode && currentSession.hash && currentSession.email) {
+            // ☁️ [CLOUD SEARCH] LLM 은 서버에서 돌지만, 질의 임베딩은 반드시 로컬 모델로 만듭니다.
+            renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
+
+            let queryVector: number[] = [];
+            try {
+                queryVector = await invoke<number[]>("get_query_embedding", {
+                    text: query,
+                    devicePreference: devicePref
+                });
+                console.log(`[CLOUD SEARCH] Local query vector generated. dim = ${queryVector.length}`);
+            } catch (err) {
+                console.warn("[CLOUD SEARCH] Local embedding failed. Server will fall back.", err);
+            }
+
+            const origin = "https://commerce.logis.center";
+            let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+                targetHref = "https://commerce.logis.center/tracking";
+            }
+
+            const urlObj = new URL(API_HOST);
+            urlObj.searchParams.append("origin", origin);
+            urlObj.searchParams.append("created_at", (Date.now() - timezoneOffset).toString());
+            urlObj.searchParams.append("hash", currentSession.hash);
+            urlObj.searchParams.append("token", currentSession.token || "");
+            urlObj.searchParams.append("href", targetHref);
+            urlObj.searchParams.append("from", currentSession.address || "");
+            urlObj.searchParams.append("to", currentSession.team || "");
+
+            const response = await invoke<any>("proxy_fetch", {
+                url: urlObj.toString(),
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip"
+                },
+                body: { query: query, vector: queryVector },
+                session_params: { hash: currentSession.hash, token: currentSession.token }
+            });
+
+            let serverTaskId = "";
+            if (response && response.results && response.results.length > 0) {
+                serverTaskId = response.results[0].id || "";
+            }
+
+            cloudPendingTasks.set(taskId, {
+                serverId: serverTaskId,
+                kind: "search",
+                createdAt: Date.now()
+            });
+
+            renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Query queued on Logis Center. Processing remotely.", spinner: "☁️" });
+
+            isSearching = false;
+            stopSpinner();
+            if (btnSubmit) btnSubmit.style.display = "flex";
+        } else {
+            // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
+            await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
+                taskId: taskId, 
+                query: query, 
+                language: "korean",
+                devicePreference: devicePref,
+                searchMode: currentSearchMode,
+                cc: activeContext.cc || "",
+                bcc: activeContext.bcc || "",
+                refId: activeContext.ref || ""
+            });
+        }
         
         // 🌟 [CRITICAL FIX] 검색을 대기열에 추가한 직후, 현재 주소가 전처리 중인지 여부를 재검사하여 번개 버튼을 확실히 숨깁니다.
         updateExtractButtonVisibility();
@@ -2507,7 +5111,26 @@ btnExtract?.addEventListener("click", async () => {
                 });
 
                 console.log("[SERVER MODE] Task accepted by server:", response);
+
+                // 🌟 [CLOUD TASK LIFECYCLE] 서버가 만든 task.id 를 기억해 두고 syncData 에서 완료를 판정합니다.
+                let serverTaskId = "";
+                if (response && response.results && response.results.length > 0) {
+                    serverTaskId = response.results[0].id || "";
+                }
+
+                cloudPendingTasks.set(taskId, {
+                    serverId: serverTaskId,
+                    kind: "extract",
+                    createdAt: Date.now()
+                });
+
                 renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
+
+                // 클라우드 작업은 로컬 GPU 큐를 점유하지 않으므로 즉시 락을 해제합니다.
+                isExtracting = false;
+                stopSpinner();
+                await GlobalTaskManager.release(taskId, taskId);
+                await updateExtractButtonVisibility();
                 
             } else {
                 // ==========================================
@@ -2677,7 +5300,30 @@ listen("extraction-progress", async (event: any) => {
             stopSpinner();
             updateExtractButtonVisibility();
         }
-        
+        // 🌟 [NEW] 추출 태스크 완료 시 네비게이션 카운트 및 리스트 최신화
+        if ((payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) && payload.category === "Done") {
+            try {
+                const freshDocs = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize,
+                    offset: 0,
+                    filter: `mode = '${currentSearchMode}'`
+                });
+                if (freshDocs.length > 0 && appDb) {
+                    const normalized = normalizeEnvelope(freshDocs);
+                    await appDb.table("items").bulkPut(normalized).catch(() => null);
+                    await renderNavigation();
+                    if (currentTab === "list") {
+                        upsertListItems(normalized, 'prepend');
+                    }
+                }
+            } catch (e) {
+                console.warn("[SYNC] Post-extraction refresh failed:", e);
+                // 폴백: 위 방식 실패 시 완전 새로고침
+                if (currentTab === "list") {
+                    await loadMoreDocs(true);
+                }
+            }
+        }
         // 🌟 [추가] 에러이거나 취소된 경우 H3 복원
         if (payload.task_id.startsWith("search_") && payload.category !== "Done") {
              const resultH3 = document.querySelector('.nav-section.search h3');
@@ -2693,225 +5339,409 @@ listen("extraction-progress", async (event: any) => {
 
         // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
-            const response = payload.data; 
+            const response = payload.data;
+
+            // 🌟 [ANALYTIC LOCAL RENDER] analytic 모드 검색 결과는 리스트 탭이 아닌
+            //    채팅 탭에 말풍선으로 렌더링합니다.
+            //    parse_analytic_query → search_items(mode='analytic') → search_chunks → Dexie Plan
+            //    순서로 로컬에서 확정된 결과를 그대로 보여줍니다.
+            if (currentSearchMode === "analytic") {
+                const resultCount = response.results ? response.results.length : 0;
+
+                // ① 요약 말풍선 (질의 · 기간 · 회수 건수)
+                let summaryText = `Analytic 검색 완료: ${resultCount}건`;
+                if (response.structured && response.structured.original_text) {
+                    summaryText = `${response.structured.original_text} → ${resultCount}건`;
+                }
+                if (response.structured && Number(response.structured.started_at) > 0) {
+                    const fmt = (ms: number) => {
+                        const d = new Date(Number(ms));
+                        const p = (n: number) => String(n).padStart(2, "0");
+                        return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+                    };
+                    const s = fmt(response.structured.started_at);
+                    const e = Number(response.structured.expired_at) > 0
+                        ? fmt(response.structured.expired_at)
+                        : s;
+                    const ti = response.structured.time_intent || "";
+                    const si = response.structured.season_intent || "";
+                    const tag = [ti, si].filter(Boolean).join(" / ");
+                    summaryText += `\n기간: ${s} ~ ${e}${tag ? ` (${tag})` : ""}`;
+                }
+                await renderMessage({
+                    id: `${payload.task_id}_answer`,
+                    role: "system",
+                    text: summaryText,
+                    status: 9,
+                    created_at: Date.now(),
+                    updated_at: Date.now()
+                });
+
+                // 🌟 ①-1 리포트 말풍선
+                //    Rust(STAGE-6)가 회수한 시맨틱 기록만 근거로 Qwen3.5 2B 가 작성한 답변입니다.
+                //    근거가 없으면 백엔드가 빈 문자열을 돌려주므로 그때는 건너뜁니다.
+                if (response.report && String(response.report).trim().length > 0) {
+                    await renderMessage({
+                        id: `${payload.task_id}_report`,
+                        role: "system",
+                        text: String(response.report).trim(),
+                        status: 9,
+                        created_at: Date.now() + 1,
+                        updated_at: Date.now() + 1
+                    });
+                }
+
+                // ② Dexie Plan 실행 → 상세 결과 말풍선
+                if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
+                    const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
+                    for (const plan of response.dexie_plans) {
+                        const condCount = plan.conditions ? plan.conditions.length : 0;
+                        if (condCount === 0) continue;
+                        try {
+                            const passed = await executeDexiePlan(plan, { candidateIds, limit: 20 });
+                            for (const p of passed) {
+                                const d = p.data || {};
+                                const actionText = d.action || "";
+                                const summaryDoc = d.summary || "";
+                                const crossFlow = d.cross_action_flow || "";
+                                const text = d.text || "";
+                                const displayText = actionText || summaryDoc || crossFlow || text;
+                                if (displayText) {
+                                    await renderMessage({
+                                        id: `analytic_res_${p.id}`,
+                                        role: "system",
+                                        text: displayText,
+                                        status: 9,
+                                        created_at: Date.now(),
+                                        updated_at: Date.now()
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.warn("[ANALYTIC-LOCAL] Dexie plan execution failed:", e);
+                        }
+                    }
+                }
+
+                // ③ 결과 없음 안내
+                if (resultCount === 0) {
+                    await renderMessage({
+                        id: `${payload.task_id}_empty`,
+                        role: "system",
+                        text: "해당 조건에 맞는 행동 로그를 찾지 못했습니다.",
+                        status: 9,
+                        created_at: Date.now(),
+                        updated_at: Date.now()
+                    });
+                }
+
+                // ④ 상태 정리
+                isSearching = false;
+                stopSpinner();
+                updateExtractButtonVisibility();
+
+                // ⑤ 채팅 스크롤 맨 아래로
+                setTimeout(() => {
+                    const scrollEl = document.getElementById("chat-scroll");
+                    const container = document.querySelector(".chat-container") as HTMLElement;
+                    if (scrollEl && container) {
+                        const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                        currentY = maxScroll;
+                        scrollEl.style.transition = "transform 0.3s ease-out";
+                        updateTransform();
+                        setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+                    }
+                }, 100);
+                return;
+            }
 
             // 🌟 [CRITICAL FIX] isSearching = true 인 상태에서 탭을 전환해야 초기화(refreshList)가 방어됩니다!
             openWidget("list");
+
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
             
             // 🌟 [추가] 검색어와 카운트 H3에 업데이트
             const resultH3 = document.querySelector('.nav-section.search h3');
             if (resultH3) {
-                // 🌟 [TRACKING EQ] structured_query의 context 배열에서 tracking_number 조건을 추출합니다.
-                let trackingNumberForEq = "";
-                if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
-                    for (const ctx of response.structured.context) {
-                        if (ctx.condition && ctx.condition.tracking_number) {
-                            const tnVal = ctx.condition.tracking_number.value || "";
-                            if (tnVal) {
-                                trackingNumberForEq = tnVal;
-                                break;
+                // 🌟 [CONDITION SUMMARY] dexie_plans 에서 실제 적용된 조건을 요약해 보여줍니다.
+                //  기존에는 tracking_number 만 특별 취급했지만,
+                //  v4 는 모든 조건이 동등하게 플랜에 들어 있으므로 일반화합니다.
+                const applied: string[] = [];
+                const coveredTypes = new Set<string>();
+
+                if (response.dexie_plans && Array.isArray(response.dexie_plans)) {
+                    for (const plan of response.dexie_plans) {
+                        // 🌟 v4 : 어떤 도메인을 훑었는지도 함께 보여줍니다.
+                        const t = (plan.types && plan.types.length > 0) ? plan.types : (plan.type ? [plan.type] : []);
+                        for (const x of t) coveredTypes.add(x);
+
+                        if (!plan.conditions) continue;
+                        for (const c of plan.conditions) {
+                            const label = c.path.replace('data.', '');
+                            if (c.op === 'top' || c.op === 'bottom') {
+                                applied.push(`${label} ${c.op} ${c.percent ?? 20}%`);
+                            } else {
+                                const opSym: Record<string, string> = {
+                                    eq: '=', neq: '≠', gt: '>', gte: '≥', lt: '<', lte: '≤',
+                                    contains: '⊇', not_contains: '⊉'
+                                };
+                                applied.push(`${label} ${opSym[c.op] || c.op} ${c.value}`);
                             }
                         }
                     }
                 }
-                if (trackingNumberForEq) {
-                    // 🌟 [TRACKING EQ] tracking_number가 감지되면 LanceDB FTS 대신 Dexie DB eq 쿼리로 정확 매칭합니다.
-                    const countStr = response.results ? response.results.length : 0;
-                    resultH3.innerHTML = `tracking_number: ${trackingNumberForEq} <strong class="count">(${countStr})</strong>`;
-                } else {
-                    let queryText = "";
-                    if (response.structured && response.structured.original_text) {
-                        queryText = response.structured.original_text;
-                    }
-                    if (!queryText) {
-                        const queryEl = document.getElementById(`${payload.task_id}_query`);
-                        if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
-                    }
-                    let displayMode = currentSearchMode.charAt(0).toUpperCase() + currentSearchMode.slice(1);
-                    if (currentSearchMode === "commerce") displayMode = "Goods";
-                    const countStr = response.results ? response.results.length : 0;
-                    resultH3.innerHTML = `Search ${displayMode}: "${queryText}" <strong class="count">(${countStr})</strong>`;
+
+                console.log(`[SEARCH-DEBUG] 커버 도메인: [${Array.from(coveredTypes).join(', ')}]`);
+
+                let queryText = "";
+                if (response.structured && response.structured.original_text) {
+                    queryText = response.structured.original_text;
                 }
+                if (!queryText) {
+                    const queryEl = document.getElementById(`${payload.task_id}_query`);
+                    if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                }
+
+                // 🌟 [MODE LABEL] 파일 상단 modeLabel() 단일 정의를 사용합니다.
+                //    (v1 에서는 여기만 'Goods' 로 되어 있어 검색창 라벨과 어긋났습니다)
+                let displayMode = modeLabel(currentSearchMode);
+
+                // 🌟 카운트는 '렌더링될 문서 수' 로 확정해야 하므로 아래 updateResultCount 가 다시 갱신합니다.
+                //    여기서는 조건 요약만 먼저 노출합니다.
+                const condStr = applied.length > 0
+                    ? ` <span style="font-size:0.85em; opacity:0.7;">[${applied.slice(0, 3).join(' · ')}${applied.length > 3 ? ` +${applied.length - 3}` : ''}]</span>`
+                    : "";
+
+                resultH3.innerHTML = `Search ${displayMode}: "${queryText}"${condStr} <strong class="count"></strong>`;
             }
 
-            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 원본 검색 결과 수: ${response.results ? response.results.length : 0}`);
+            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 리콜 후보 수: ${response.results ? response.results.length : 0}`);
+            console.log(`[SEARCH-DEBUG] 수신한 Dexie 플랜 수: ${response.dexie_plans ? response.dexie_plans.length : 0}`);
 
-            // 🌟 [TRACKING EQ] tracking_number가 감지되면 Dexie DB eq 쿼리로 정확 매칭 문서를 검색합니다.
-            let trackingEqDocs: any[] = [];
-            if (response.structured && response.structured.context && Array.isArray(response.structured.context)) {
-                for (const ctx of response.structured.context) {
-                    if (ctx.condition && ctx.condition.tracking_number) {
-                        const tnVal = ctx.condition.tracking_number.value || "";
-                        if (tnVal && appDb) {
-                            console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 실행: tracking_number = '${tnVal}'`);
-                            try {
-                                const eqResults = await appDb.table("items")
-                                    .where("tracking_number").equals(tnVal)
-                                    .toArray();
-                                console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과: ${eqResults.length}건`);
-                                for (const match of eqResults) {
-                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                    trackingEqDocs.push({
-                                        id: match.id,
-                                        uuid: match.id,
-                                        type: dData.type || match.type || "tracking",
-                                        data: dData,
-                                        text: dData.text || match.text || "",
-                                        created_at: dData.created_at || match.created_at || 0,
-                                        updated_at: dData.updated_at || match.updated_at || 0,
-                                        search_badge: "📦 Tracking EQ Match"
-                                    });
-                                }
-                            } catch (e) {
-                                console.error("[SEARCH-DEBUG] Dexie eq 쿼리 실패:", e);
+            // 🌟 [DEXIE PLAN EXECUTION]
+            //  LanceDB 는 조건을 적용하지 않은 '리콜 후보' 만 돌려줍니다.
+            //  실제 조건 필터링(가격/수량/송장번호/상태/기간/top·bottom)은 여기서 수행합니다.
+            //  → 기존의 trackingEqDocs 특수 분기는 plan.conditions 의
+            //    data.tracking_number eq 조건으로 일반화되어 사라집니다.
+            let planFilteredIds: Set<string> | null = null;
+            const planBadges = new Map<string, string>();
+
+            if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
+                const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
+                const accepted = new Set<string>();
+
+                for (const plan of response.dexie_plans) {
+                    const condCount = plan.conditions ? plan.conditions.length : 0;
+
+                    // 조건이 하나도 없는 플랜은 후보를 그대로 통과시킵니다. (리콜 우선)
+                    if (condCount === 0) {
+                        for (const id of candidateIds) accepted.add(id);
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 0개 → 후보 전량 통과`);
+                        continue;
+                    }
+
+                    try {
+                        const passed = await executeDexiePlan(plan, { candidateIds, limit: 500 });
+                        for (const p of passed) {
+                            accepted.add(p.id);
+                            // 어떤 조건으로 통과했는지 배지로 남깁니다.
+                            const first = plan.conditions[0];
+                            if (first) {
+                                planBadges.set(p.id, `🎯 ${first.path.replace('data.', '')} ${first.op}`);
                             }
-                            break;
                         }
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
+
+                        // 🌟 [PLAN RECALL v2] 조건이 있는 플랜은 '항상' Dexie 전체를 한 번 더 훑습니다.
+                        //  ── 왜 조건부를 없애는가 ──
+                        //   candidateIds 는 lib.rs 가 점수 상위 N건으로 자른 배열이고,
+                        //   그 정렬 기준에는 도메인 조건이 아직 반영되어 있지 않습니다.
+                        //   기존처럼 passed.length === 0 일 때만 구출하면,
+                        //   후보 안에서 1건이라도 통과하는 순간 구출이 멈춰
+                        //   순위 밖의 정답이 그대로 사라집니다.
+                        //   조건 필터링은 Dexie 인덱스로 O(log n) 이므로
+                        //   항상 도는 편이 안전하고, 리콜이 전송 상한과 완전히 분리됩니다.
+                        {
+                            const rescued = await executeDexiePlan(plan, { limit: 200 });
+                            let added = 0;
+                            for (const p of rescued) {
+                                if (accepted.has(p.id)) continue;
+                                accepted.add(p.id);
+                                planBadges.set(p.id, `🛟 recall`);
+                                added++;
+                            }
+                            if (added > 0) {
+                                console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${added}건 추가 확보 (전송 상한과 무관한 조건 리콜)`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[DEXIE-PLAN] 실행 실패 (type='${plan.type}'):`, e);
+                        // 실패 시 조건을 포기하고 후보를 통과시킵니다. 0건보다 낫습니다.
+                        for (const id of candidateIds) accepted.add(id);
                     }
                 }
+
+                planFilteredIds = accepted;
+                console.log(`[DEXIE-PLAN] 최종 통과 문서 ${accepted.size}건`);
             }
 
             // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
             if (response.results && response.results.length > 0) {
                 if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
-                
+
                 let docs: any[] = [];
-                // 🌟 [TRACKING EQ] Dexie eq 쿼리 결과를 우선 병합합니다.
-                if (trackingEqDocs.length > 0) {
-                    docs.push(...trackingEqDocs);
-                    console.log(`[SEARCH-DEBUG] Dexie eq 쿼리 결과 ${trackingEqDocs.length}건 병합 완료`);
-                }
-                
+                const seenIds = new Set<string>();
+
                 for (const res of response.results) {
                     try {
-                        // 🌟 [CRITICAL FIX] 백엔드가 이미 전체 JSON 데이터를 res.text에 담아 보냈으므로, 
-                        // 프론트엔드에서 get_document를 건건이 재호출(N+1 쿼리)하여 렌더링 병목(두 번 쿼리)이 발생하는 현상을 원천 차단합니다!
+                        // 🌟 [PLAN GATE] 플랜이 존재하면 통과한 문서만 렌더링합니다.
+                        if (planFilteredIds && !planFilteredIds.has(res.id)) continue;
+
+                        // 🌟 백엔드가 data 컬럼(JSON 문자열)을 res.text 로 보냅니다.
+                        //    get_document 를 건건이 재호출하는 N+1 쿼리를 원천 차단합니다.
                         let parsedData: any = {};
                         try { parsedData = JSON.parse(res.text); } catch(e) {}
-                        
-                        let fullDoc: any = { 
-                            id: res.id, 
+
+                        let fullDoc: any = {
+                            id: res.id,
                             uuid: res.id,
                             type: parsedData.type || res.context_type || "unknown",
+                            mode: parsedData.mode || currentSearchMode,
                             data: parsedData,
-                            text: res.text,
+                            text: parsedData.text || "",
                             created_at: parsedData.created_at || 0,
                             updated_at: parsedData.updated_at || 0
                         };
-                        
-                        // 검색 점수 및 컨텍스트 병합
+
                         if (fullDoc.data) {
                             fullDoc.data.search_score = res.score;
                             fullDoc.data.search_context = res.context_type;
-                            // 🌟 [TRACKING BADGE] tracking_number 기반 교차 검색 결과임을 명시합니다.
-                            if (res.relation === "cross_tracking" || res.relation === "cross_items") {
-                                fullDoc.data.search_relation = res.relation;
-                                fullDoc.data.search_badge = "📦 Tracking Match";
-                            }
+                            const badge = planBadges.get(res.id);
+                            if (badge) fullDoc.data.search_badge = badge;
                         }
-                        
+
+                        seenIds.add(res.id);
                         docs.push(fullDoc);
                     } catch (e) {
                         console.error("Failed to process search result:", e);
                     }
                 }
-                
+
+                // 🌟 [RESCUED MERGE] LanceDB 후보에는 없었지만 플랜이 건져 올린 문서를 합칩니다.
+                if (planFilteredIds) {
+                    const rescuedIds = Array.from(planFilteredIds).filter(id => !seenIds.has(id));
+                    if (rescuedIds.length > 0 && appDb) {
+                        const rescuedRows = await appDb.table('items').where('id').anyOf(rescuedIds).toArray();
+                        for (const row of rescuedRows) {
+                            docs.push({
+                                id: row.id,
+                                uuid: row.id,
+                                type: row.type || "unknown",
+                                mode: row.mode || currentSearchMode,
+                                data: { ...(row.data || {}), search_badge: planBadges.get(row.id) || "🛟 recall" },
+                                text: row.data?.text || "",
+                                created_at: row.created_at || 0,
+                                updated_at: row.updated_at || 0
+                            });
+                            seenIds.add(row.id);
+                        }
+                        console.log(`[SEARCH-DEBUG] 플랜 구출 문서 ${rescuedRows.length}건 병합 완료`);
+                    }
+                }
+
                 console.log(`[SEARCH-DEBUG] 1차 파싱 완료. 기본 문서 수: ${docs.length}`);
 
-                // 🌟 [Dexie DB 기반 초고속 N:N 양방향 교차 검색 위임]
+                // 🌟 [N:N RELAY v4] 루트 호이스팅 컬럼(index/goods/order/...) 대신
+                //  data.* 중첩 인덱스를 직접 사용합니다.
+                //  canonicalize 가 식별자를 전부 String 으로 확정했으므로
+                //  기존의 '숫자/문자 두 갈래로 쏘던 타입 방어 쿼리' 가 불필요해집니다.
+                //  (쿼리 수가 절반으로 줄고, 타입 혼재로 절반을 놓치던 문제도 사라집니다)
                 if (appDb && docs.length > 0) {
-                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay) 시작...`);
-                    const relayDocs = new Map();
+                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay v4) 시작...`);
+                    const relayDocs = new Map<string, any>();
+                    const existingIds = new Set(docs.map(d => d.id));
+                    // 연관 축으로 사용할 data.* 경로 (전부 인덱스 선언되어 있음)
+                    const LINK_PATHS = [
+                        'data.index', 'data.no', 'data.code', 'data.tracking_number',
+                        'data.goods', 'data.order', 'data.tracking',
+                        'data.stock_keeping_unit', 'data.barcode',
+                        // 🌟 [TRADE LINK PATHS] 무역 문서 간 연결 축
+                        'data.doc_number', 'data.reference_invoice',
+                        'data.reference_lc', 'data.reference_booking',
+                        'data.container_number', 'data.seal_number',
+                        // 🌟 [TRADE INDEX LINK] commerce 의 data.order / data.tracking 과 동일한
+                        //    'index 로 서로를 가리키는' 축입니다.
+                        //    문자열 doc_number 는 표기가 흔들려도 이 숫자는 절대 흔들리지 않습니다.
+                        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
+                        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
+                        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
+                        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+                    ];
+
+                    // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼
+                    const findLinked = async (value: string | number): Promise<any[]> => {
+                        if (value === "" || value === 0 || value == null) return [];
+                        let coll = appDb.table("items").where(LINK_PATHS[0]).equals(value);
+                        for (let i = 1; i < LINK_PATHS.length; i++) {
+                            coll = coll.or(LINK_PATHS[i]).equals(value);
+                        }
+                        return await coll.toArray();
+                    };
+
+                    const absorb = (match: any, relation: string) => {
+                        if (!match || !match.id) return false;
+                        if (existingIds.has(match.id) || relayDocs.has(match.id)) return false;
+                        const dData = { ...(match.data || {}) };
+                        dData.search_context = match.type;
+                        dData.relation = relation;
+                        relayDocs.set(match.id, { ...match, data: dData });
+                        return true;
+                    };
 
                     for (const doc of docs) {
                         const parsedData = doc.data || {};
-                        const selfIndex = parsedData.index?.toString();
 
-                        // 1. 정방향: 내 index를 포함하는 연관 문서 검색 (DB 인덱스 활용)
+                        // 1) 정방향 : 내 index 를 참조하는 문서들
+                        const selfIndex = parsedData.index != null ? Number(parsedData.index) : 0;
                         if (selfIndex) {
-                            const forwardMatches = await appDb.table("items")
-                                .where("index").equals(selfIndex)
-                                .or("order").equals(selfIndex)
-                                .or("goods").equals(selfIndex)
-                                .or("tracking").equals(selfIndex)
-                                .toArray();
-
-                            for (const match of forwardMatches) {
-                                if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id)) {
-                                    const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                    dData.search_context = match.type;
-                                    match.data = dData;
-                                    relayDocs.set(match.id, match);
-                                }
+                            for (const match of await findLinked(selfIndex)) {
+                                if (match.id === doc.id) continue;
+                                absorb(match, "forward");
                             }
                         }
 
-                        // 2. 역방향: 내부에 포함된 외래키를 통해 부모 문서 검색 (DB 인덱스 활용)
-                        // 🌟 [TRACKING ENHANCEMENT] tracking_number를 최우선으로 배치하여 송장 번호 기반 교차 검색을 강화합니다.
+                        // 2) 역방향 : 내가 참조하는 외래키로 부모 찾기
                         const refKeys = ["tracking_number", "no", "code", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
                         for (const key of refKeys) {
                             const rawRef = parsedData[key];
-                            if (rawRef !== undefined && rawRef !== null && rawRef !== "") {
-                                const refStr = rawRef.toString();
-                                const refNum = !isNaN(Number(rawRef)) ? Number(rawRef) : null;
+                            if (rawRef === undefined || rawRef === null || rawRef === "") continue;
+                            const refVal: string | number = (key === "goods" || key === "order" || key === "tracking")
+                                ? Number(rawRef)
+                                : String(rawRef);
+                            for (const match of await findLinked(refVal)) {
+                                if (match.id === doc.id) continue;
+                                if (!absorb(match, "backward")) continue;
 
-                                // 🌟 [타입 방어 쿼리] 숫자형과 문자열 형식을 모두 인덱스 검색 대상에 포함
-                                let queryCollection = appDb.table("items").where("index").equals(refStr);
-                                if (refNum !== null) {
-                                    queryCollection = queryCollection.or("index").equals(refNum);
-                                }
-
-                                const targetCols = ["no", "code", "tracking_number", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
-                                for (const col of targetCols) {
-                                    queryCollection = queryCollection.or(col).equals(refStr);
-                                    if (refNum !== null) {
-                                        queryCollection = queryCollection.or(col).equals(refNum);
-                                    }
-                                }
-
-                                const backwardMatches = await queryCollection.toArray();
-
-                                for (const match of backwardMatches) {
-                                    if (!docs.some(d => d.id === match.id) && !relayDocs.has(match.id) && match.id !== doc.id) {
-                                        const dData = typeof match.json_data === 'string' ? JSON.parse(match.json_data) : (match.data || match);
-                                        dData.search_context = match.type;
-                                        dData.relation = "backward"; // Rust 패리티 연관 관계 명시
-                                        match.data = dData;
-                                        relayDocs.set(match.id, match);
-
-                                        // 3. 역방향으로 획득한 상위 데이터에서 한번 더 정방향 하위 연관 시도 (2 Depth 체이닝)
-                                        const bIndex = dData.index?.toString();
-                                        if (bIndex) {
-                                            const d2Matches = await appDb.table("items")
-                                                .where("goods").equals(bIndex)
-                                                .or("order").equals(bIndex)
-                                                .or("tracking").equals(bIndex)
-                                                .toArray();
-
-                                            for (const d2Match of d2Matches) {
-                                                if (!docs.some(d => d.id === d2Match.id) && !relayDocs.has(d2Match.id) && d2Match.id !== match.id && d2Match.id !== doc.id) {
-                                                    const d2Data = typeof d2Match.json_data === 'string' ? JSON.parse(d2Match.json_data) : (d2Match.data || d2Match);
-                                                    d2Data.search_context = d2Match.type;
-                                                    d2Data.relation = "backward_chained"; // Rust 패리티 연관 관계 명시
-                                                    d2Match.data = d2Data;
-                                                    relayDocs.set(d2Match.id, d2Match);
-                                                }
-                                            }
-                                        }
-                                    }
+                                // 3) 2-Depth 체이닝 : 부모의 index 로 다시 자식 찾기
+                                const bIndex = match.data?.index ? String(match.data.index) : "";
+                                if (!bIndex) continue;
+                                for (const d2 of await findLinked(bIndex)) {
+                                    if (d2.id === match.id || d2.id === doc.id) continue;
+                                    absorb(d2, "backward_chained");
                                 }
                             }
                         }
                     }
-                    
+
                     console.log(`[SEARCH-DEBUG] 연관 교차 검색으로 추가된 문서 수: ${relayDocs.size}`);
-                    // 연관 문서들을 최종 화면 렌더링 배열에 병합
                     docs.push(...Array.from(relayDocs.values()));
                 }
                 
                 console.log(`[SEARCH-DEBUG] 화면에 렌더링될 최종 문서 수(docs.length): ${docs.length}`);
+
+                // 🌟 [TOTAL COUNT] AI 검색은 단발성 고정 셋이므로 docs.length 가 곧 전체 건수입니다.
+                totalResultCount = docs.length;
 
                 if (docs.length > 0) {
                     upsertListItems(docs, 'append');
@@ -2922,6 +5752,7 @@ listen("extraction-progress", async (event: any) => {
                 }
             } else {
                 if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
+                totalResultCount = 0;
                 hasMore = false; // 🌟 결과가 없을 때도 추가 불러오기 방지
             }
             
@@ -3596,7 +6427,9 @@ function finalizeWebRtcConnection(guestSession: any) {
             name: guestName,
             from: guestAddr, 
             to: currentSession.team || "0x0000000000000000000000000000000000000000",    
-            data: { origin: "local", is_device: true } 
+            // 🌟 [BOOL PARITY] IndexedDB 는 boolean 을 키로 인정하지 않습니다.
+            //    저장 시점부터 0|1 정수로 확정해야 data.is_device 인덱스가 실제로 동작합니다.
+            data: { origin: "local", is_device: 1 } 
         };
         
         invoke("upsert_items", { items: [mobileUser] }).then(() => renderNavigation());
@@ -4140,6 +6973,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (docListContainer) docListContainer.innerHTML = "";
         cachedDocs = [];
         listCurrentY = 0;
+        // 🌟 [TOTAL COUNT] 스코프가 바뀌었으므로 총계를 초기화합니다.
+        totalResultCount = -1;
         updateListTransform();
         // 🌟 [CRITICAL FIX] 검색어가 지워지는 등 새로운 초기화 요청이 들어오면, 기존에 대기 중이던 로딩 락(isLoading)을 강제로 해제하여 먹통 현상을 방지합니다.
         isLoading = false; 
@@ -4158,102 +6993,148 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
     
     try {
-        // 🌟 [CRITICAL FIX] 새로 추가된 DB의 'mode' 컬럼을 이용하여 완벽하게 격리된 데이터를 불러옵니다.
-        let baseFilter = `mode = '${currentSearchMode}'`;
-        
-        if (currentSearchMode === "shipping") {
-            baseFilter += " AND type IN ('tracking', 'receiving', 'shipping', 'bl', 'awb', 'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'TRACKING', 'shipping_doc', 'Unknown')";
-        } else if (currentSearchMode === "analytic") {
-            baseFilter += " AND type IN ('click', 'hover', 'change', 'report')"; 
-        } else {
-            baseFilter += " AND type IN ('sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review')";
-        }
+        // 🌟 [LIST QUERY v4] 목록 조회는 LanceDB 를 거치지 않고 Dexie 에서 직접 처리합니다.
+        //  목록에는 벡터/FTS 가 필요 없고, 필요한 건 스코프 + 타입 + 정렬 + 페이징뿐입니다.
+        //  → SQL 문자열 조립이 사라지므로 DataFusion 문법 에러 클래스가 통째로 소멸합니다.
+        //  → 텍스트 검색이 있을 때만 LanceDB(search_documents)를 후보 소스로 사용합니다.
 
-        // 기존 내비게이션 필터가 있다면 안전하게 괄호로 묶어서 AND 조건 추가
-        if (activeContext.ref) baseFilter = `(${baseFilter}) AND ref = '${activeContext.ref}'`;
-        else if (activeContext.bcc) baseFilter = `(${baseFilter}) AND bcc = '${activeContext.bcc}'`;
-        else if (activeContext.cc) baseFilter = `(${baseFilter}) AND cc = '${activeContext.cc}'`;
+        // 🌟 [READ SCOPE] 파일 상단의 TYPE_SETS 단일 정의를 그대로 씁니다.
+        //  ── 왜 지역 정의를 없앴는가 ──
+        //   기존에는 이 목록과 syncData 의 TRADING_TYPES 가 별도로 하드코딩되어
+        //   한쪽만 고치면 '태깅한 mode' 와 '조회하는 type' 이 어긋났습니다.
+        //   이제 쓰기(modeOfType)와 읽기(TYPE_SETS)가 같은 파일 상단에서 관리됩니다.
+        const allowedTypes = TYPE_SETS[currentSearchMode] || TYPE_SETS.commerce;
 
-        // 🌟 [CRITICAL FIX 4] 사이드바 태그(domain, type)는 위의 activeContext를 통해 SQL 필터로 100% 적용되었습니다.
-        // 이 태그들을 텍스트로 엮어서 억지로 AI 검색에 던지면 검색 결과가 0건이 되고 VRAM이 폭발합니다. 삭제합니다!
         const textQuery = searchInput?.value.trim() || "";
-
-        let finalFilter = baseFilter;
-        let latestUpdateTime = 0;
-        let oldestCreatedAt = 0;
+        const currentOffset = isSync ? 0 : currentPage * pageSize;
 
         // [TIMESTAMPS] Scan UI for current range
+        let latestUpdateTime = 0;
         const allCards = docListContainer.querySelectorAll('.logis-result');
         allCards.forEach(el => {
             const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
-            const cr = parseInt((el as HTMLElement).dataset.createdAt || "0");
             if (up > latestUpdateTime) latestUpdateTime = up;
-            if (oldestCreatedAt === 0 || cr < oldestCreatedAt) oldestCreatedAt = cr;
         });
 
-        if (isSync) {
-            // [Top Pull] Newer than latest update
-            const syncFilter = `updated_at > ${latestUpdateTime}`;
-            finalFilter = baseFilter ? `${baseFilter} AND (${syncFilter})` : syncFilter;
-        } else {
-            // 🌟 [CRITICAL FIX] 무한 스크롤(Bottom Pull) 시 시간 기반 필터가 벡터/텍스트 검색의 score 정렬과 충돌하므로, 안전하게 offset 페이징으로 대체합니다.
-            finalFilter = baseFilter;
-        }
+        console.log(`[DEBUG-LIST] 🔍 문서 조회 시작 | mode=${currentSearchMode} | isSync=${isSync} | offset=${currentOffset}`);
+        console.log(`[DEBUG-LIST] 활성 컨텍스트:`, JSON.stringify(activeContext));
 
         let docs: any[] = [];
-        
-        // 🌟 [CRITICAL FIX] 새로고침/동기화(isSync)가 아닐 경우 currentPage 기반의 offset을 적용합니다.
-        const currentOffset = isSync ? 0 : currentPage * pageSize;
-        
-        console.log(`[DEBUG-LIST] 🔍 문서 조회 요청 시작`);
-        console.log(`[DEBUG-LIST] 현재 모드: ${currentSearchMode}, IsSync: ${isSync}`);
-        console.log(`[DEBUG-LIST] 적용된 SQL 필터(finalFilter):`, finalFilter);
-        console.log(`[DEBUG-LIST] 활성 컨텍스트(activeContext):`, JSON.stringify(activeContext));
-        
+
         if (textQuery) {
+            // ── 텍스트 검색 : LanceDB 로 후보를 긁고 Dexie 로 스코프 검증 ──
+            //   스코프는 봉투 컬럼만 담습니다. (sanitize_scope_filter 가 어차피 걸러냄)
+            let scopeSql = `mode = '${currentSearchMode}'`;
+            if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+            else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+            else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
             const searchResults = await invoke<any[]>("search_documents", {
                 query: textQuery,
-                limit: pageSize,
-                offset: currentOffset,
-                filter: finalFilter || null 
+                limit: pageSize * 4,
+                offset: 0,
+                filter: scopeSql
             });
-            
-            for (const res of searchResults) {
-                const docId = res[0];
-                const fullDoc = await invoke<any>("get_document", { uuid: docId });
-                if (fullDoc) {
-                    // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
-                    if (!fullDoc.data && fullDoc.json_data && typeof fullDoc.json_data === "string") {
-                        try { fullDoc.data = JSON.parse(fullDoc.json_data); } catch(e) {}
-                    }
-                    docs.push(fullDoc);
+
+            const ids = searchResults.map((r: any) => r[0]).filter(Boolean);
+            if (ids.length > 0 && appDb) {
+                const rows = await appDb.table('items').where('id').anyOf(ids).toArray();
+                // LanceDB 점수 순서를 보존합니다.
+                const orderMap = new Map<string, number>();
+                ids.forEach((id: string, i: number) => orderMap.set(id, i));
+                rows.sort((a: any, b: any) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999));
+                docs = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
+
+            // Dexie 에 아직 없는 문서는 Rust 에서 직접 가져옵니다. (최초 진입 대비)
+            if (docs.length === 0 && ids.length > 0) {
+                for (const id of ids.slice(0, pageSize)) {
+                    const fullDoc = await invoke<any>("get_document", { uuid: id });
+                    if (fullDoc) docs.push(fullDoc);
                 }
             }
-        } else {
-            docs = await invoke<any[]>("get_all_documents", {
-                limit: pageSize,
-                offset: currentOffset,
-                filter: finalFilter || null
-            });
-            
-            // 🌟 [CRITICAL FIX] 렌더링 카드 빈칸 오류 해결: Rust에서 가져온 json_data 문자열을 파싱하여 data 객체로 복원합니다!
-            docs = docs.map(doc => {
-                if (!doc.data && doc.json_data && typeof doc.json_data === "string") {
-                    try { doc.data = JSON.parse(doc.json_data); } catch(e) {}
+            // 🌟 [TOTAL COUNT] slice 이전의 전체 매칭 건수를 기록합니다.
+            if (!isSync) totalResultCount = docs.length;
+            docs = docs.slice(currentOffset, currentOffset + pageSize);
+
+        } else if (appDb) {
+            // ── 일반 목록 : Dexie 컬렉션 체이닝 ──
+            let coll: any;
+
+            // 가장 좁은 스코프 인덱스를 드라이버로 선택합니다.
+            if (activeContext.ref) {
+                coll = appDb.table('items').where('ref').equals(activeContext.ref);
+            } else if (activeContext.bcc) {
+                coll = appDb.table('items').where('bcc').equals(activeContext.bcc);
+            } else if (activeContext.cc) {
+                coll = appDb.table('items').where('cc').equals(activeContext.cc);
+            } else {
+                coll = appDb.table('items').where('mode').equals(currentSearchMode);
+            }
+
+            let rows: any[];
+
+            // 🌟 [COMPOUND DRIVER] 스코프(ref/bcc/cc)가 없을 때는 mode 만으로 훑지 말고
+            //    선언해 둔 '[mode+type]' 복합 인덱스를 anyOf 로 펼칩니다.
+            //    shipping 은 allowedTypes 가 15종이 넘어 mode 단독 스캔 대비 체감 차이가 큽니다.
+            if (!activeContext.ref && !activeContext.bcc && !activeContext.cc) {
+                const pairs = allowedTypes.map(t => [currentSearchMode, t]);
+                rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
+                console.log(`[DEBUG-LIST] 복합 인덱스 [mode+type] anyOf ${pairs.length}쌍 → ${rows.length}건 적재`);
+            } else {
+                rows = await coll.toArray();
+                // 스코프 드라이버가 mode 가 아니었다면 mode 를 추가 검증합니다.
+                rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
+                rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
+
+            if (isSync && latestUpdateTime > 0) {
+                rows = rows.filter((r: any) => (r.updated_at || 0) > latestUpdateTime);
+            }
+
+            rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+
+            // 🌟 [TOTAL COUNT] slice 이전의 '스코프 전체 건수' 를 기록합니다.
+            //    isSync(상단 당김 갱신)는 최신 델타만 가져오므로 총계를 갱신하지 않습니다.
+            if (!isSync) totalResultCount = rows.length;
+
+            console.log(`[DEBUG-LIST] Dexie 스코프 조회: ${rows.length}건 (allowedTypes=${allowedTypes.length}종)`);
+            docs = isSync ? rows.slice(0, pageSize) : rows.slice(currentOffset, currentOffset + pageSize);
+
+            // 🌟 [COLD START] Dexie 가 비어 있으면 Rust 에서 끌어와 캐시를 채웁니다.
+            //  (앱 최초 실행 / DB 초기화 직후 경로)
+            if (rows.length === 0 && currentPage === 0) {
+                let scopeSql = `mode = '${currentSearchMode}'`;
+                if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+                else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+                else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
+                const fromRust = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize * 5,
+                    offset: 0,
+                    filter: scopeSql
+                });
+                if (fromRust.length > 0) {
+                    console.log(`[DEBUG-LIST] ❄️ Cold start: Rust 에서 ${fromRust.length}건 적재 후 Dexie 캐시 채움`);
+                    await appDb.table("items").bulkPut(normalizeEnvelope(fromRust)).catch(() => null);
+                    const coldRows = normalizeEnvelope(fromRust)
+                        .filter((r: any) => allowedTypes.includes(r.type));
+                    // 🌟 [TOTAL COUNT] Cold start 경로도 slice 이전 값을 총계로 씁니다.
+                    if (!isSync) totalResultCount = coldRows.length;
+                    docs = coldRows.slice(0, pageSize);
                 }
-                return doc;
-            });
-        }
-        
-        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
-        if (docs.length === 0) {
-            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다! 필터 조건이 너무 엄격하거나 DB에 해당 도메인/타입의 데이터가 존재하지 않습니다.`);
+            }
         }
 
-        // 🌟 [CRITICAL FIX] N:N 교차 검색(Dexie)을 돌리기 전에, 로컬에서 방금 파싱된 최신 데이터를 Dexie DB에 동기화해줍니다! (Local Cache Warming)
+        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
+        if (docs.length === 0) {
+            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다. 스코프가 좁거나 해당 타입 데이터가 없습니다.`);
+        }
+
+        // 🌟 [CACHE WARM] Rust 경유로 들어온 문서를 Dexie 봉투 형태로 정규화해 저장합니다.
         if (appDb && docs.length > 0) {
             try {
-                await appDb.table("items").bulkPut(enrichForIndex(docs));
+                await appDb.table("items").bulkPut(normalizeEnvelope(docs));
             } catch (e) {
                 console.error("[Dexie] Local cache update failed:", e);
             }
@@ -4311,6 +7192,10 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
 }
 
+// 🌟 [TOTAL COUNT] 화면에 렌더링된 카드 수가 아니라 '스코프/검색 전체 건수' 를 보관합니다.
+//    -1 = 아직 집계되지 않음(→ DOM 카운트로 폴백)
+let totalResultCount = -1;
+
 // 🌟 [추가] 리스트 결과 개수 카운트 업데이트 헬퍼 함수
 function updateResultCount() {
     const h3El = document.querySelector('.nav-section.search h3');
@@ -4319,9 +7204,11 @@ function updateResultCount() {
     }
     const countEl = document.querySelector('.nav-section.search h3 strong.count');
     if (countEl) {
-        const count = document.querySelectorAll('#doc-list .logis-result').length;
-        console.log(`[SEARCH-DEBUG] DOM 업데이트 감지: 현재 화면에 표시된 카드 개수 = ${count}`);
-        countEl.textContent = count > 0 ? `(${count})` : "";
+        const rendered = document.querySelectorAll('#doc-list .logis-result').length;
+        // 🌟 페이징으로 몇 장을 그렸든 상관없이 전체 건수를 표기합니다.
+        const total = totalResultCount >= 0 ? totalResultCount : rendered;
+        console.log(`[COUNT] 전체 ${total}건 / 현재 렌더링 ${rendered}건`);
+        countEl.textContent = total > 0 ? `(${total})` : "";
     } else {
         console.log(`[SEARCH-DEBUG] DOM 업데이트 실패: H3 카운트 요소(strong.count)를 찾을 수 없습니다.`);
     }
@@ -4440,24 +7327,36 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
     try {
         const docId = doc.id || doc.uuid;
         const docRef = doc.ref;
-        
-        // 1. 나를 부모로 가지는 자식들 (ref = 내 ID)
-        let filterStr = `ref = '${docId}'`; 
-        
-        // 2. 나와 같은 출신(링크)을 가진 형제들 (ref = 내 출처)
-        if (docRef && docRef !== "") {
-            filterStr += ` OR ref = '${docRef}'`; 
-        }
-        
-        // 백엔드(LanceDB)에 쿼리 전송
-        const relatedDocs = await invoke<any[]>("get_all_documents", {
-            limit: 10,
-            offset: 0,
-            filter: filterStr
-        });
 
-        // 본인 제외 및 중복 제거
-        const uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+        // 🌟 v4 : 연관 조회도 Dexie 인덱스로 처리합니다.
+        //  기존에는 LanceDB 에 `ref = A OR ref = B` SQL 을 보냈는데,
+        //  OR 절이 DataFusion 에서 전량 스캔으로 떨어져 느렸습니다.
+        //  Dexie 의 ref 인덱스 anyOf 는 O(log n + k) 입니다.
+        let uniqueDocs: any[] = [];
+
+        if (appDb) {
+            const refTargets = [docId];
+            if (docRef && docRef !== "") refTargets.push(docRef);
+
+            const rows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
+            uniqueDocs = rows
+                .filter((r: any) => r.id !== docId)
+                .slice(0, 10);
+        }
+
+        // Dexie 가 비어 있으면 Rust 로 폴백합니다.
+        if (uniqueDocs.length === 0) {
+            let filterStr = `\`ref\` = '${docId}'`;
+            if (docRef && docRef !== "") {
+                filterStr += ` OR \`ref\` = '${docRef}'`;
+            }
+            const relatedDocs = await invoke<any[]>("get_all_documents", {
+                limit: 10,
+                offset: 0,
+                filter: filterStr
+            });
+            uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+        }
 
         if (uniqueDocs.length > 0) {
             const relatedHtml = uniqueDocs.map(d => {
@@ -4657,7 +7556,9 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 async function checkAuthStatus() {
-    if (!currentSession.hash) return;
+    // 🌟 [BOOTSTRAP 허용] 기존에는 hash 가 없으면 즉시 return 했습니다.
+    //    이제 hash 발급을 서버에 위임하므로, hash 가 없는 상태에서도
+    //    '자격증명 없는 bootstrap 요청' 을 보내 서버가 유효한 쌍을 발급하게 합니다.
     const origin = "https://commerce.logis.center"; 
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
@@ -4672,14 +7573,63 @@ async function checkAuthStatus() {
         const queryParams: Record<string, string> = { 
             origin: origin, 
             created_at: createdAt.toString(), 
-            hash: currentSession.hash, 
             href: targetHref 
         };
-        if (currentSession.token) queryParams.token = currentSession.token;
+
+        // 🌟 [PAIRED CREDENTIAL] hash 와 token 은 반드시 '함께' 보내야 합니다.
+        //  ── 근거 ──
+        //   워커의 세션 게이트는 다음 한 줄입니다.
+        //     if(cookies.hash || (req.query.hash && req.query.token))
+        //   Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를 전혀 보내지 않으므로
+        //   cookies.hash 는 항상 빈 값이고, (hash && token) 쌍이 유일한 통과 조건입니다.
+        //   게이트를 통과해야만 S3 HEAD 가 실행되어 balance 가 정의되고,
+        //   balance 가 undefined 로 남으면 아래 블록이 무조건 발동합니다.
+        //     if(typeof balance == "undefined"){ ... ethers.Wallet.createRandom() ... }
+        //   즉 hash 만 단독으로 보내는 순간 서버는 100% 새 hash 를 발급하고,
+        //   화면의 QR 주소가 바뀝니다. 이것이 '요청할 때마다 주소가 달라지는' 원인입니다.
+        //
+        //  둘 중 하나라도 없으면 아예 보내지 않고 깨끗하게 재발급받습니다.
+        //  (반쪽짜리 자격증명을 보내는 것과 결과가 같으면서, 서버 쪽 로그가 명확해집니다)
+        const hasPairedCredential = !!(currentSession.hash && currentSession.token);
+        if (hasPairedCredential) {
+            queryParams.hash = currentSession.hash;
+            queryParams.token = currentSession.token as string;
+        } else {
+            console.log("[AUTH] 🔑 자격증명 쌍이 없어 bootstrap 요청을 보냅니다. 서버가 (hash, token) 을 새로 발급합니다.");
+        }
+
+        // 🌟 [SENDER IMPRINT] Client Worker(index.ts)는 method 와 무관하게
+        //    매 요청의 세션 블록에서 아래를 수행합니다.
+        //      var sender = req.query.sender ? decodeURIComponent(req.query.sender) : data.sender
+        //      if(sender){ data.sender = sender }
+        //      if(data.sender){ cookies.sender = data.sender }
+        //    그런데 신규 유저 생성 시 user_arr 에는 flag/name/title/region/page_count/favicon 만
+        //    들어가고 sender 키가 아예 없어서 cookies.sender 가 영원히 undefined 였습니다.
+        //    그 결과 서버의
+        //      PUT  : if(cookies.sender){ ... INSERT INTO talks ... }
+        //      POST : if(cookies.sender && created_at){ ... INSERT INTO tasks ... }
+        //    두 경로가 통째로 죽어, 채팅이 D1 talks 에 단 한 건도 저장되지 않았습니다.
+        //    여기서 sender 를 실어 보내면 user row 에 영구 각인되어
+        //    이후 모든 요청이 자동으로 통과합니다.
+        const senderName = currentSession.email || currentSession.name || "";
+        if (senderName) queryParams.sender = senderName;
+
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
-        
-        const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: { hash: currentSession.hash, token: currentSession.token } });
+
+        // 🌟 [SESSION PARAMS GUARD] proxy_fetch 는 session_params 의 hash/token 을
+        //    쿼리에 '한 번 더' append 합니다. (Rust proxy_fetch 의 DETAIL 1 블록)
+        //    쌍이 온전하지 않을 때 hash 만 append 되면 위 쿼리 조립을 무력화하므로,
+        //    쌍이 있을 때만 넘깁니다.
+        const sessionParams = hasPairedCredential
+            ? { hash: currentSession.hash, token: currentSession.token }
+            : null;
+
+        const sentHash = currentSession.hash || "";
+
+        console.log('sessionParams',sessionParams);
+
+        const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: sessionParams });
         
         // [FIX] Step the spinner frame only when result arrives
         stepQrSpinner();
@@ -4687,11 +7637,32 @@ async function checkAuthStatus() {
         let session = data.session || data; 
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
+
+            // 🌟 [CREDENTIAL ROTATION DETECT] 온전한 쌍을 보냈는데도 서버가 다른 hash 를 돌려줬다면
+            //    S3 의 /hash/{hash} 객체가 사라졌거나 워커 try 블록이 예외로 빠진 것입니다.
+            //    조용히 넘어가면 원인 추적이 불가능하므로 반드시 표면화합니다.
+            if (hashChanged && hasPairedCredential) {
+                console.warn(
+                    `[AUTH] ⚠️ 서버가 자격증명을 거부하고 hash 를 회전시켰습니다. ` +
+                    `sent='${sentHash}' → issued='${session.hash}'. ` +
+                    `(S3 /hash/{hash} 객체 소실 또는 워커 세션 블록 예외 가능성)`
+                );
+            }
+
             currentSession = { ...currentSession, ...session };
             await saveSession();
+
+            // 🌟 서버가 응답으로 돌려준 hash 이므로 이제 QR 을 그려도 되는 '살아 있는 주소' 입니다.
+            isHashServerConfirmed = true;
+
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
-            if (currentSession.email) { 
-                await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" }); 
+
+            console.log('currentSession',currentSession);
+
+            if (currentSession.email) {
+                // 🌟 [TEAM MIGRATION TRIGGER] initialize_hub 내부에서 ZERO_ADDRESS → 실제 address
+                //    마이그레이션이 자동으로 수행됩니다.
+                await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" });
                 updateAuthUI(); fetchChatHistory(); syncData();
             }
         }
@@ -4709,6 +7680,8 @@ function updateAuthUI() {
     
     // 🌟 [추가] Cloud Members 섹션을 통째로 잡습니다.
     const cloudMembersSection = document.getElementById("nav-list-users")?.closest(".nav-section") as HTMLElement;
+
+    console.log('currentSession',currentSession);
 
     if (currentSession.email) {
         if (authStatus) authStatus.innerText = "Authenticated";
@@ -4744,8 +7717,89 @@ function updateAuthUI() {
     }
 }
 
+let authPollInterval: number | null = null;
+
+// 🌟 [QR IDEMPOTENCY] 마지막으로 QR 캔버스를 그린 hash 값입니다.
+//  performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
+//  채팅이 갱신될 때마다 QR 노드를 파괴·재생성하고 있었습니다.
+//  같은 hash 라면 다시 그릴 이유가 없으므로 이 값으로 차단합니다.
+let renderedQrHash = "";
+
+// 🌟 [SERVER-CONFIRMED HASH] 서버가 실제로 응답으로 돌려준 hash 인지 여부입니다.
+//  클라이언트가 로컬에서 만든 임시 hash 는 S3 에 객체가 없어
+//  스캔해도 절대 인증되지 않는 '죽은 주소' 입니다.
+//  서버가 확인해 준 hash 로만 QR 을 그리기 위해 구분합니다.
+let isHashServerConfirmed = false;
+
+function stopAuthPolling() {
+    if (authPollInterval) {
+        clearTimeout(authPollInterval);
+        authPollInterval = null;
+    }
+}
+
+function startAuthPolling() {
+    if (authPollInterval) clearTimeout(authPollInterval);
+    const poll = async () => {
+        // 인증이 완료되었으면 폴링 중단
+        if (currentSession.email) {
+            stopAuthPolling();
+            return;
+        }
+        
+        // 서버에 세션 인증 상태 확인 요청
+        await checkAuthStatus();
+        
+        // 아직 인증되지 않았으면 3초 후 다시 재귀 요청
+        if (!currentSession.email) {
+            authPollInterval = window.setTimeout(poll, 3000);
+        } else {
+            stopAuthPolling();
+        }
+    };
+    
+    // 첫 요청은 3초 후 실행
+    authPollInterval = window.setTimeout(poll, 3000);
+}
+
 async function performQrAuth() {
-    if (!chatTalks || !currentSession.hash) return;
+    if (!chatTalks) return;
+
+    // 🌟 [DEAD ADDRESS GUARD] 서버가 확인해 주지 않은 hash 로는 QR 을 그리지 않습니다.
+    //    그런 hash 는 S3 에 객체가 없어 스캔해도 인증 메일이 매칭되지 않는 죽은 주소이며,
+    //    잠시 뒤 서버가 새 hash 를 내려주면 화면의 주소가 바뀌어 사용자를 혼란시킵니다.
+    //    대신 '준비 중' 안내를 띄우고, checkAuthStatus 가 hash 를 확보하는 즉시
+    //    hashChanged 분기가 이 함수를 다시 불러 실제 QR 로 교체합니다.
+    if (!currentSession.hash || !isHashServerConfirmed) {
+        const placeholderId = "msg-qr-auth";
+        if (!document.getElementById(placeholderId)) {
+            chatTalks.insertAdjacentHTML('beforeend',
+                `<div class="chat-talk system" id="${placeholderId}" data-created-at="9999999999999">
+                    <div class="chat-message" style="padding:0; background:#fff; color:#000; border:0;">
+                        <div style="font-size:0.8rem; font-weight:bold; color:#333;">
+                            <span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Preparing secure session...
+                        </div>
+                    </div>
+                </div>`
+            );
+        }
+        // 서버에서 hash 를 받아와야 하므로 폴링은 반드시 가동합니다.
+        startAuthPolling();
+        return;
+    }
+
+    // 🌟 [IDEMPOTENT RENDER] 같은 hash 로 이미 QR 을 그려 두었다면 다시 그리지 않습니다.
+    //    performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
+    //    채팅이 갱신될 때마다 QR 노드를 remove → insert → 캔버스 재생성 하고 있었고,
+    //    함수 말미의 startAuthPolling() 이 3초 타이머를 계속 리셋해
+    //    인증 상태 확인이 지연되는 부작용까지 있었습니다.
+    const alreadyRendered = document.getElementById("qr-code-target");
+    if (alreadyRendered && renderedQrHash === currentSession.hash) {
+        // 폴링이 꺼져 있을 수 있으므로 그것만 보증하고 즉시 반환합니다.
+        if (!authPollInterval && !currentSession.email) startAuthPolling();
+        return;
+    }
+
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
     const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.8rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
@@ -4753,10 +7807,19 @@ async function performQrAuth() {
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
         qrTarget.innerHTML = "";
-        new (window as any).QRCode(qrTarget, { text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
+        const mailtoAddr = `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`;
+        new (window as any).QRCode(qrTarget, { text: mailtoAddr, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
+
+        // 🌟 이 hash 로 그렸다는 사실을 기록해 다음 호출부터 재생성을 차단합니다.
+        renderedQrHash = currentSession.hash;
+        console.log(`[AUTH] 🔳 QR rendered for server-confirmed hash '${currentSession.hash}'`);
+
         const scroll = document.getElementById("chat-scroll");
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     }
+    
+    // 🌟 QR 코드 노출 후 3초 간격으로 세션 인증 상태 반복 확인 시작
+    startAuthPolling();
 }
 
 // 🌟 [PARITY] Window Focus/Blur 이벤트 리스너 추가
@@ -4811,6 +7874,19 @@ function startPolling() {
             } catch (e) {
                 console.error("[POLLING] Error during poll:", e);
             }
+        } else {
+            // 🌟 [ANALYTICS ALWAYS-ON] 채팅 화면이 닫혀 있거나 위젯이 접혀 있어도
+            //    analytics 이벤트 수집은 계속되어야 합니다.
+            //    (Worker 의 GET 은 로그인 없이 hash 만으로도 동작하지만,
+            //     사용자 요구사항이 '로그인 이후에도' 이므로 hash 확보 시점부터 돌립니다)
+            //    syncAnalyticsInBackground 내부의 30초 스로틀이 왕복을 억제합니다.
+            if (currentSession.hash) {
+                try {
+                    await syncAnalyticsInBackground();
+                } catch (e) {
+                    console.error("[POLLING] Analytics background sync error:", e);
+                }
+            }
         }
 
         // 🌟 [핵심] Rust 백엔드(proxy_fetch)의 응답을 완전히 받은 후, 
@@ -4832,11 +7908,22 @@ async function saveSession() { await kvSet("chat_session", JSON.stringify(curren
 let hiddenPages: string[] = [];
 
 async function initSession() {
+    // 🌟 [AUTH UI FIRST] 어떤 비동기 초기화가 실패하더라도 인증 UI 는 항상 옳은 상태여야 합니다.
+    //    currentSession.email 이 비어 있는 최초 시점에 즉시 호출하면
+    //    Sign Out 버튼이 숨겨지고 QR 인증 버튼이 노출됩니다.
+    //    (세션 복원 후 아래에서 한 번 더 호출해 최종 상태를 확정합니다)
+    updateAuthUI();
+
     // 🌟 [추가] Dexie에서 숨김 페이지 목록을 불러옵니다.
     const savedHiddenPages = await kvGet("hidden_pages");
     if (savedHiddenPages) {
         try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
     }
+
+    // 🌟 [TOMBSTONE PRELOAD] 삭제 묘비를 메모리에 먼저 올립니다.
+    //    startPolling() 이 첫 syncData 를 쏘기 전에 캐시가 채워져야
+    //    앱 재시작 직후 한 번의 폴링 동안 삭제된 메시지가 되살아나는 창이 생기지 않습니다.
+    await loadTalkTombstones();
 
     // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기 및 30일이 지난 오래된 검색 결과를 완벽 청소합니다!
     const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
@@ -4855,7 +7942,7 @@ async function initSession() {
                 // key 포맷: search_res_search_1715610000000 -> 타임스탬프 숫자만 추출
                 const timestampStr = key.replace("search_res_search_", "");
                 const timestamp = parseInt(timestampStr, 10);
-                
+
                 // 유효한 숫자인지 확인 후, 30일이 경과했으면 로컬 DB에서 삭제
                 if (!isNaN(timestamp) && (nowTimeMs - timestamp > thirtyDaysMs)) {
                     console.log(`[GC] Deleting expired search result (older than 30 days): ${key}`);
@@ -4865,6 +7952,23 @@ async function initSession() {
         }
     }
 
+    // 🌟 [TRANSLIT CACHE GC] 90일이 지난 음차 캐시 정리.
+    //    음차는 원문 값이 바뀌면 키가 달라지므로 자동 무효화되지만,
+    //    삭제된 아이템의 잔재가 쌓이는 것을 방지하기 위해 주기적으로 청소합니다.
+    try {
+        const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+        const cutoff = nowTimeMs - ninetyDaysMs;
+        const staleCount = await appDb.table("translit_cache")
+            .where("created_at")
+            .below(cutoff)
+            .delete();
+
+        if (staleCount > 0) {
+            console.log(`[GC] Deleted ${staleCount} stale translit cache entries (older than 90 days).`);
+        }
+    } catch (e) {
+        console.warn("[GC] translit_cache cleanup failed:", e);
+    }
     // 🌟 search_mode 도 여기서 비동기로 불러와 초기화합니다.
     const savedSearchMode = await kvGet("search_mode");
     if (savedSearchMode) {
@@ -4875,16 +7979,49 @@ async function initSession() {
     const saved = await kvGet("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = await kvGet("device_hash"); if (legacy) currentSession.hash = legacy; }
-    
-    if (!currentSession.hash && ethers) { 
-        const w = ethers.Wallet.createRandom(); 
-        currentSession.hash = w.address.toLowerCase().replace("0x", ""); 
-        await saveSession(); 
+
+    // 🌟 [BOOTSTRAP HASH 폐기]
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 여기서 ethers.Wallet.createRandom() 으로 임시 hash 를 만들었습니다.
+    //   그런데 이 값은
+    //     ① S3 의 /hash/{hash} 객체가 존재하지 않고
+    //     ② 짝이 되는 token 이 없습니다.
+    //   Client Worker(index.ts)의 세션 게이트는
+    //     if(cookies.hash || (req.query.hash && req.query.token))
+    //   인데, Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를
+    //   전혀 보내지 않으므로 워커의 cookies.hash 는 항상 빈 값입니다.
+    //   결국 (hash && token) 쌍이 유일한 통과 조건인데 임시 hash 는 token 이 없어
+    //   반드시 게이트에서 탈락하고, 그러면
+    //     if(typeof balance == "undefined"){ ... createRandom() ... }
+    //   가 발동해 서버가 새 hash 를 발급합니다.
+    //   즉 이 임시 hash 로 그린 QR 은 '스캔해도 절대 인증되지 않는 죽은 주소' 이고,
+    //   서버 응답이 오는 순간 화면의 주소가 바뀌는 원인이었습니다.
+    //
+    //  ── 해결 ──
+    //   hash 발급은 전적으로 서버에 위임합니다.
+    //   hash 가 비어 있으면 checkAuthStatus 가 자격증명 없이 bootstrap 요청을 보내고,
+    //   서버가 S3 에 PUT 까지 마친 유효한 (hash, token) 쌍을 돌려줍니다.
+    //   그 값으로만 QR 을 그리므로 주소가 흔들릴 여지가 사라집니다.
+    if (currentSession.hash && currentSession.token) {
+        // 저장된 자격증명이 온전한 쌍이면 서버 확인 전까지는 잠정 신뢰합니다.
+        isHashServerConfirmed = true;
+    } else if (currentSession.hash && !currentSession.token) {
+        // 🌟 [ORPHAN CREDENTIAL] hash 만 남고 token 이 유실된 상태입니다.
+        //    이 hash 를 그대로 보내면 게이트에서 탈락해 서버가 매번 새 hash 를 발급합니다.
+        //    쌍을 깨뜨려 버리고 깨끗한 bootstrap 을 유도하는 편이 안전합니다.
+        console.warn(`[AUTH] ⚠️ hash 는 있으나 token 이 없어 세션이 성립하지 않습니다. 폐기 후 서버에서 재발급받습니다. (orphan hash: ${currentSession.hash})`);
+        currentSession.hash = "";
+        currentSession.token = undefined;
+        isHashServerConfirmed = false;
     }
-    
+
     await saveSession(); 
-    currentSession.address = currentSession.address || ZERO_ADDRESS; 
-    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); 
+    currentSession.address = currentSession.address || ZERO_ADDRESS;
+    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
+    // 🌟 [LOGOUT STATE GUARD] 로그아웃 후 reload 시 currentSession 이 초기화되어
+    //    address/team 이 ZERO 로 리셋됩니다. 이 상태에서 syncData 가 호출되면
+    //    ZERO 기반 cc 로 서버에 요청하므로, 미로그인 시 sync 를 건너뜁니다.
+    //    (initSession 하단의 syncData 호출은 currentSession.email 체크로 이미 방어됨)
     updateAuthUI(); 
     startPolling();
 
@@ -4896,11 +8033,15 @@ async function initSession() {
         
         const data = await invoke<any>("mark_ui_ready");
 
-        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드의 데이터를 로컬 Dexie DB로 즉시 밀어넣어 고속 쿼리(eq) 준비
+        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드 데이터를 봉투 형태로 정규화해 적재합니다.
+        //  ⚠️ 기존 코드의 결함: users / pages 가 normalizeEnvelope 를 거치지 않아
+        //     data 객체 없이 json_data 문자열만 들어갔고, 그래서 db.ts 의 Select 가
+        //     매번 parseItemData 로 다시 파싱해야 했습니다.
+        //     v4 부터 세 테이블 모두 동일하게 정규화합니다.
         try {
-            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(data.users);
-            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(data.pages);
-            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(enrichForIndex(data.items));
+            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(data.users));
+            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(data.pages));
+            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(data.items));
         } catch(dbErr) {
             console.error("[Dexie] Initial sync failed:", dbErr);
         }
@@ -5066,9 +8207,92 @@ async function initSession() {
             await updateExtractButtonVisibility();
         }
 
+        // 🌟 [SCHEMA GENERATION CHECK v4]
+        //  store.rs 의 init_all_tables 는 schema_v4 컬럼이 없으면 테이블을 통째로 drop 합니다.
+        //  구버전 사용자는 앱 실행 직후 LanceDB 가 비어 있게 되므로,
+        //  '데이터가 사라진 것처럼 보이는' 상황을 사용자에게 정확히 설명해야 합니다.
+        //  판정: Dexie 에는 데이터가 있는데 LanceDB(mark_ui_ready)가 비어 있으면 세대 전환입니다.
+        //
+        //  🌟 [MULTI-TABLE RESTORE] 기존 구현은 items 만 복구했습니다.
+        //     그런데 init_all_tables 는 items / users / pages 세 테이블을 '전부' drop 합니다.
+        //     users 가 사라지면 팀 통계(base.pages)가 통째로 날아가 네비게이션 카운트가 0이 되고,
+        //     pages 가 사라지면 셀렉터 캐시가 없어져 모든 페이지를 다시 AI 분석해야 합니다.
+        //     세 테이블을 동일한 절차로 복구합니다.
+        //
+        //  🌟 [TABLE HINT] save_item / upsert_items 는 item.table 힌트를 1순위로 신뢰하므로,
+        //     복구 페이로드에 table 을 명시해야 users / pages 가 items 로 새어 나가지 않습니다.
+        try {
+            const RESTORE_TABLES: Array<{ name: string; hint: string; lanceKey: string }> = [
+                { name: "items", hint: "items", lanceKey: "items" },
+                { name: "users", hint: "users", lanceKey: "users" },
+                { name: "pages", hint: "pages", lanceKey: "pages" }
+            ];
+
+            let needsRestore = false;
+            for (const t of RESTORE_TABLES) {
+                const dexieCount = await appDb.table(t.name).count();
+                const lanceArr = (data as any)[t.lanceKey];
+                const lanceCount = (lanceArr && lanceArr.length) ? lanceArr.length : 0;
+                if (dexieCount > 0 && lanceCount === 0) {
+                    needsRestore = true;
+                    break;
+                }
+            }
+
+            const alreadyNotified = await kvGet("schema_v4_notified");
+
+            if (needsRestore && !alreadyNotified) {
+                await kvSet("schema_v4_notified", "true");
+                console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local index needs re-population.");
+
+                for (const t of RESTORE_TABLES) {
+                    const allRows = await appDb.table(t.name).limit(5000).toArray();
+                    if (allRows.length === 0) continue;
+
+                    const restorePayload = allRows.map((r: any) => ({
+                        // 🌟 봉투를 루트에 펼치고 확장은 스프레드합니다.
+                        //    (upsert_items 가 루트 평탄화 페이로드를 기대합니다)
+                        id: r.id,
+                        table: t.hint,
+                        type: r.type,
+                        flag: r.flag,
+                        from: r.from,
+                        to: r.to,
+                        cc: r.cc,
+                        bcc: r.bcc,
+                        ref: r.ref,
+                        mode: r.mode,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        ...(r.data || {})
+                    }));
+
+                    console.log(`[SCHEMA] Restoring ${restorePayload.length} '${t.name}' document(s) into LanceDB v4...`);
+                    for (let i = 0; i < restorePayload.length; i += 100) {
+                        const chunk = restorePayload.slice(i, i + 100);
+                        try {
+                            await invoke("upsert_items", { items: chunk });
+                        } catch (e) {
+                            console.warn(`[SCHEMA] restore chunk failed for ${t.name}:`, e);
+                        }
+                    }
+                }
+
+                console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
+
+                // 🌟 벡터/청크는 다시 만들어야 하므로 로컬 임베딩을 트리거합니다.
+                runLocalEmbeddingSync();
+
+                // 🌟 통계/네비게이션이 복구된 users 를 반영하도록 즉시 다시 그립니다.
+                await renderNavigation();
+            }
+        } catch (e) {
+            console.warn("[SCHEMA] Generation check skipped:", e);
+        }
+
         // 🌟 [CRITICAL FIX] 렌더링 오염(pages 타입 노출) 해결: 필터링 없이 raw DB 아이템을 무작정 렌더링하던 코드를 삭제합니다.
-        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서 
-        // baseFilter("type IN ('sales'...)")를 거쳐 100% 안전하게 수행됩니다.
+        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서
+        // Dexie 스코프 체이닝을 거쳐 100% 안전하게 수행됩니다.
 
         // 🌟 [CRITICAL FIX] Rust(LanceDB)에서 로드한 초기 데이터를 다시 Rust로 덮어쓰는(역동기화) 치명적인 병목 루프를 제거합니다.
 
@@ -5081,6 +8305,11 @@ async function initSession() {
             syncData(); // await를 제거하여 UI 블로킹 방지
         }
 
+         // 🌟 [CLIENT-SIDE EMBEDDING] 이전 세션에서 클라우드로 받아왔지만 로컬 임베딩이 안 된 아이템을 복구합니다.
+         //    runLocalEmbeddingSync 내부에 2초 디바운스가 있으므로 syncData 완료 후 호출과
+         //    이 4초 타이머 호출이 겹쳐도 1회만 실행됩니다.
+         setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
+
     } catch (e) { 
         console.error("[WIDGET] Handshake failed:", e); 
     }
@@ -5088,28 +8317,70 @@ async function initSession() {
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
 
-// 🌟 [수정] 로그아웃 시 Dexie DB의 세션까지 완벽히 제거합니다.
-document.getElementById("btn-logout")?.addEventListener("click", async () => { 
-    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) { 
+document.getElementById("btn-logout")?.addEventListener("click", async () => {
+    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) {
         // 1. 메모리상의 세션 데이터 초기화
         currentSession = { hash: "", cc: "logis.center" };
-        
         // 2. Dexie DB 내 저장된 세션 및 터미널 로그 영구 삭제
         await kvRemove("chat_session");
-        
+        // 🌟 [LOGOUT CLEANUP] 이전 계정 기반 검색 모드 / 숨김 페이지 / 음차 캐시 정리
+        await kvRemove("search_mode");
+        await kvRemove("hidden_pages");
+        // 🌟 [LOGOUT EMBED RESET] 이전 계정 문서의 embed 플래그를 리셋하지 않습니다.
+        //    LanceDB 는 계정 무관 로컬 저장소이므로, 재로그인 시
+        //    initialize_hub 의 migrate_team_identity 가 to 필드만 갱신합니다.
+        //    embed/청크는 그대로 유지하여 재임베딩 비용을 방지합니다.
         // 3. sessionStorage 및 기타 상태 초기화
-        sessionStorage.clear(); 
-        
+        sessionStorage.clear();
+        // 🌟 [LOGOUT BACKEND RESET] 백엔드 모델 메모리 해제
+        try {
+            await invoke("unload_model");
+        } catch (_e) { /* 이미 해제된 경우 무시 */ }
         // 4. 앱 강제 새로고침하여 초기 상태(새 해시 생성 등)로 복귀
         window.location.reload();
-    } 
+    }
 });
 
 // 🌟 [추가] Dexie DB 초기화 및 앱 리셋 버튼 로직
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
-            // 1. 프론트엔드 전역 상태 초기화
+            // 🌟 [RESET STEP 0] 백엔드 활성 태스크 및 스케줄러 중단
+            //    reset_lancedb 전에 반드시 호출해야 합니다.
+            //    스케줄러 백그라운드 워커가 이미 픽업한 태스크가
+            //    테이블 drop 이후에도 upsert_item 을 시도하거나,
+            //    reindex_pending_embeddings 가 빈 테이블에 임베딩을
+            //    계속 쓰는 것을 방지합니다.
+            //    taskId: null → 전체 정리 모드 (모든 pending 태스크 폐기)
+            await invoke("stop_current_extraction", { taskId: null }).catch(() => null);
+            console.log("[RESET] Backend extraction stopped and cancellation token set.");
+
+            // 🌟 [RESET STEP 1] 백엔드 모델 및 스토어 완전 언로드
+            //    모델이 로드된 상태에서 reset 하면
+            //    deep_purge_resources 가 미호출되어 VRAM 이 잔존하고,
+            //    재시작 후 모델 재로드 시 이전 KV 캐시 참조 오류가 발생할 수 있습니다.
+            await invoke("unload_model").catch(() => null);
+            console.log("[RESET] Backend model and store unloaded.");
+
+            // 🌟 [RESET STEP 2] 프론트엔드 폴링 / 스케줄링 타이머 정리
+            //    syncData 폴링(3초)이 reset 직후에도 upsert_items 를 호출하면
+            //    방금 비운 테이블에 데이터가 다시 채워집니다.
+            //    reindex 디바운스 타이머(2초)도 동일하게 임베딩을 재실행합니다.
+            if (chatPollInterval) {
+                clearTimeout(chatPollInterval);
+                chatPollInterval = null;
+            }
+            stopAuthPolling();
+            isCommerceSyncRunning = false;
+            if (reindexDebounceTimer) {
+                clearTimeout(reindexDebounceTimer);
+                reindexDebounceTimer = null;
+            }
+            reindexScheduled = false;
+            isReindexing = false;
+            console.log("[RESET] All frontend polling and scheduling timers cleared.");
+
+            // 3. 프론트엔드 전역 상태 초기화
             await GlobalTaskManager.forceReset();
             isExtracting = false;
             isSearching = false;
@@ -5122,20 +8393,19 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             activeContext = { cc: "", bcc: "", ref: "" };
             if (docListContainer) docListContainer.innerHTML = "";
             if (chatTalks) chatTalks.innerHTML = "";
-            
-            // 2. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
+            // 4. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
             await invoke("reset_lancedb");
             console.log("[RESET] LanceDB backend reset complete.");
-            
-            // 3. 프론트엔드 Dexie DB 완전 삭제 후 재생성
+            // 5. 프론트엔드 Dexie DB 완전 삭제 후 재생성
             await appDb.delete();
             await appDb.open();
             console.log("[RESET] Dexie DB deleted and reopened.");
-            
-            // 4. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
+            // 🌟 v4 : 세대 전환 안내 플래그도 함께 초기화합니다.
+            //    (전체 초기화 후에는 복구할 원본이 없으므로 안내가 다시 뜨면 안 됩니다)
+            await kvRemove("schema_v4_notified");
+            // 6. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
             sessionStorage.clear();
-            
-            // 5. 앱 강제 새로고침
+            // 7. 앱 강제 새로고침
             window.location.reload();
         } catch (e) {
             console.error("DB Initialization failed:", e);
@@ -5888,10 +9158,164 @@ interface ChatMessage {
     status: number;
     task_id?: string;
     content?: string | any;
+    // 🌟 [OWNERSHIP] 삭제 버튼 노출 판정에 사용합니다.
+    //    upsertChatMessages 는 from === currentSession.address 일 때 role 을 'user' 로 재계산하므로
+    //    실제 판정은 role 로 하되, DOM 에 원본 from 을 남겨 두면 이후 감사·디버깅이 쉬워집니다.
+    from?: string;
+    ref?: string;
+}
+
+// 🌟 [LOCAL ECHO] 낙관적 로컬 저장 행의 id 접두사입니다.
+//    서버(index.ts)는 talk.id 를 `hashId()` 로 발급하므로 반드시 '0x' 로 시작합니다.
+//      var talk = { id : hashId(), ... }   // 인자 없음 = 완전 난수 지갑 주소
+//    두 접두사가 절대 겹치지 않는다는 '구조적 사실' 이 승계 판정의 유일한 근거입니다.
+const LOCAL_ECHO_PREFIX = "talk_";
+
+/**
+ * 🌟 [LOCAL ECHO RECONCILE]
+ *  ── 무엇이 문제였나 ──
+ *   채팅 전송 시 화면 반응을 위해 로컬 행을 먼저 만들어 그립니다(낙관적 저장).
+ *   그런데 서버는 talk.id 를 난수로 발급하므로 클라이언트가 그 값을 미리 알 수 없고,
+ *   결과적으로 같은 문장이 서로 다른 id 두 개로 존재하게 됩니다.
+ *     talk_1787456151873_ll0pqw  (로컬)
+ *     0x9568fca1abca47333aa634fbe42e354f74464135  (서버)
+ *   upsertChatMessages 의 중복 제거는 id 일치를 전제로 하므로 둘 다 렌더링됩니다.
+ *
+ *  ── 해결 ──
+ *   render.ts 의 isAlmostEqual 을 사용해 { role, text, id } 중 id 하나만 다른 쌍을
+ *   '동일 메시지' 로 판정하고, 로컬 행을 서버 행에 승계시킵니다.
+ *   승계 처리는 세 곳을 동시에 정리해야 재발하지 않습니다.
+ *     ① DOM 노드 제거          → 화면 즉시 정리
+ *     ② LanceDB messages 삭제  → 앱 재시작 후 부활 방지
+ *     ③ Dexie talks 삭제       → 로컬 캐시 잔재 제거
+ *
+ *  ── 1:1 소비 ──
+ *   같은 문장을 연속으로 두 번 보내면 로컬 에코도 2개, 서버 행도 2개입니다.
+ *   서버 행을 created_at 오름차순으로 순회하며 '아직 승계되지 않은 가장 오래된 에코'
+ *   하나만 소비하므로 개수가 어긋나지 않습니다.
+ *
+ *  @returns 승계 처리되어 이번 렌더링에서 제외해야 할 로컬 행 id 집합
+ */
+async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string>> {
+    const superseded = new Set<string>();
+    if (!chatTalks) return superseded;
+    if (!incoming || incoming.length === 0) return superseded;
+
+    // ── 서버가 발급한 talk 행만 승계 기준이 됩니다 ──
+    const serverRows = incoming
+        .filter(m => String(m.id || "").startsWith("0x"))
+        .filter(m => String(m.text || "").trim().length > 0)
+        .sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+    if (serverRows.length === 0) return superseded;
+
+    // ── 로컬 에코 후보 수집 : ① 이미 그려진 DOM 노드 ② 이번 배치에 함께 실려 온 DB 행 ──
+    //    ②가 필요한 이유 : 앱을 껐다 켜면 로컬 행과 서버 행이 같은 조회 결과에 동시에 담겨
+    //    옵니다. DOM 만 보면 그 경우를 잡지 못해 재시작마다 중복이 되살아납니다.
+    type Echo = { id: string; role: string; text: string; createdAt: number; node: HTMLElement | null };
+    const echoes: Echo[] = [];
+
+    for (const node of Array.from(chatTalks.querySelectorAll('.chat-talk')) as HTMLElement[]) {
+        if (!node.id.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        echoes.push({
+            id: node.id,
+            role: node.classList.contains('user') ? 'user' : 'system',
+            text: node.querySelector('.content')?.textContent?.trim() || "",
+            createdAt: Number(node.dataset.createdAt || 0),
+            node
+        });
+    }
+    for (const m of incoming) {
+        const mid = String(m.id || "");
+        if (!mid.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        if (echoes.some(e => e.id === mid)) continue;
+        echoes.push({
+            id: mid,
+            role: m.role === "user" ? "user" : "system",
+            text: String(m.text || "").trim(),
+            createdAt: Number(m.created_at || 0),
+            node: null
+        });
+    }
+    if (echoes.length === 0) return superseded;
+
+    echoes.sort((a, b) => a.createdAt - b.createdAt);
+
+    for (const srv of serverRows) {
+        const srvFp = {
+            role: srv.role === "user" ? "user" : "system",
+            text: String(srv.text || "").trim(),
+            id: String(srv.id)
+        };
+
+        for (const echo of echoes) {
+            if (superseded.has(echo.id)) continue;
+            const echoFp = { role: echo.role, text: echo.text, id: echo.id };
+
+            // 🌟 키 3개 중 id 하나만 다르면 동일 메시지 (diffCount === 1)
+            if (!isAlmostEqual(echoFp, srvFp)) continue;
+
+            superseded.add(echo.id);
+
+            // ① 화면에서 제거
+            if (echo.node) echo.node.remove();
+
+            // ② LanceDB messages 에서 제거 (upsert_items 가 task_id 에 자기 id 를 각인해 둡니다)
+            try {
+                await invoke("delete_message", { taskId: echo.id });
+            } catch (e) {
+                console.warn(`[CHAT] local echo '${echo.id}' DB delete failed:`, e);
+            }
+
+            // ③ Dexie talks 캐시에서 제거
+            try {
+                if (appDb) await appDb.table("talks").delete(echo.id);
+            } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+            console.log(`[CHAT] ♻️ [LOCAL ECHO RECONCILE] '${echo.id}' → 서버 행 '${srv.id}' 로 승계 (중복 제거)`);
+            break;
+        }
+    }
+
+    return superseded;
 }
 
 async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
+
+    // 🌟 [TOMBSTONE GATE] 렌더링 직전 최종 방어선입니다.
+    //    syncData 를 거치지 않는 경로(loadMoreChat → get_chat_messages,
+    //    renderMessage 직접 호출 등)가 새로 생겨도 삭제한 메시지가
+    //    화면에 되살아나지 않도록 여기서 한 번 더 걸러냅니다.
+    if (messages && messages.length > 0) {
+        const tombs = await loadTalkTombstones();
+        if (tombs.size > 0) {
+            const before = messages.length;
+            messages = messages.filter(m => !tombs.has(String(m.id || "")) && !tombs.has(String(m.task_id || "")));
+            if (before !== messages.length) {
+                console.log(`[TOMBSTONE] 🪦 [RENDER] 삭제된 메시지 ${before - messages.length}건을 렌더링 대상에서 제외했습니다.`);
+            }
+            if (messages.length === 0) return;
+        }
+    }
+
+    // 🌟 [EMPTY NOTICE SWEEP] "No messages yet." 안내는 infoNodes 로 분류되어
+    //    아래 정렬 로직에서 항상 최상단에 유지됩니다.
+    //    실제 메시지가 한 건이라도 들어오는 순간 이 문구는 거짓이 되므로 즉시 제거합니다.
+    if (messages && messages.length > 0) {
+        const noMsgEl = chatTalks.querySelector('.no-msg');
+        if (noMsgEl) noMsgEl.remove();
+    }
+
+    // 🌟 [RECONCILE FIRST] 서버 행이 도착했다면 그와 짝이 되는 로컬 에코를 먼저 승계 처리합니다.
+    //    반드시 prevScrollHeight 측정 '이전' 에 수행해야 합니다.
+    //    노드를 제거하면 scrollHeight 가 줄어드는데, 측정 이후에 지우면
+    //    아래 스크롤 보정식(heightDiff)이 음수가 되어 화면이 튑니다.
+    const supersededIds = await reconcileLocalEchoes(messages);
+    if (supersededIds.size > 0) {
+        // 승계된 로컬 행이 이번 배치에도 실려 있다면 렌더링 대상에서 제외합니다.
+        messages = messages.filter(m => !supersededIds.has(String(m.id || "")));
+        if (messages.length === 0) return;
+    }
 
     const scrollEl = document.getElementById("chat-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
@@ -6115,16 +9539,32 @@ function createMessageHTML(msg: ChatMessage) {
     // 🌟 핵심: msg.text가 비어있지 않도록 보장하여 새로고침 시에도 내용 표시
     const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
 
+    // 🌟 [DELETE AFFORDANCE] 삭제 버튼은 '내가 쓴 순수 채팅' 에만 노출합니다.
+    //  · 태스크 말풍선(검색/추출 진행 상태)은 제외
+    //    → delete_message(task_id) 가 그 태스크의 질문 말풍선까지 함께 지우고,
+    //      중단은 이미 btn-stop-task 가 담당합니다.
+    //  · 상대방 메시지는 제외
+    //    → 삭제는 어차피 내 기기 로컬에만 적용되므로 남의 글을 지우는 것은
+    //      권한 행사가 아니라 '내 화면 숨김' 에 불과해 오해를 부릅니다.
+    //  role 은 upsertChatMessages 가 from === currentSession.address 로 재계산한 값입니다.
+    const canDelete = !isTaskBubble && msg.role === 'user' && !!msg.id;
+    const deleteBtn = canDelete
+        ? `<button class="btn-delete-talk" data-talk-id="${domId}" title="Delete for me"
+                style="background:none; border:none; color:inherit; opacity:0.35; cursor:pointer; font-size:0.75rem; line-height:1; padding:0 0 0 8px;">✕</button>`
+        : "";
+
     return `<div id="${domId}" class="chat-talk ${roleClass} ${bubbleClass}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
         data-updated-at="${msg.updated_at}"
         data-created-at="${msg.created_at}"
+        data-from="${msg.from || ''}"
+        data-ref="${msg.ref || ''}"
         style="${isTaskBubble ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
-            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
                 <span>${msg.role === 'user' ? '@YOU' : 'LOGIS AI'}</span>
-                <span>${timeStr}</span>
+                <span style="display:flex; align-items:center;">${timeStr}${deleteBtn}</span>
             </div>
             <div class="content">${displayContent}</div>
             ${isTaskBubble && msg.status !== 0 ? `
@@ -6363,8 +9803,16 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 chatTalks.insertAdjacentHTML('afterbegin', endHtml);
             }
 
+            // 🌟 [QR RE-RENDER GUARD] 이 호출은 채팅이 갱신될 때마다 발생합니다.
+            //    performQrAuth 내부에 renderedQrHash 멱등성 검사가 들어갔으므로
+            //    이미 같은 hash 로 그려져 있으면 즉시 반환하고 노드를 건드리지 않습니다.
+            //    다만 이미 그려져 있고 hash 도 동일하다면 함수 호출 자체를 생략해
+            //    불필요한 DOM 조회조차 하지 않도록 여기서 한 번 더 걸러 냅니다.
             if (!currentSession.email && currentTab === "settings") {
-                performQrAuth();
+                const qrExists = !!document.getElementById("qr-code-target");
+                if (!qrExists || renderedQrHash !== currentSession.hash) {
+                    performQrAuth();
+                }
             }
         }
     } catch (e) { 
@@ -6386,6 +9834,173 @@ initSession();
 setWindowSize(false);
 syncBrowserStatus();
 initDevicePreference();
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / DEXIE] Rust 스케줄러 ↔ 프론트엔드 Dexie 음차 캐시 통신
+// ---------------------------------------------------------------------
+//  Rust(scheduler.rs) 가 음차 생성 전에 캐시를 조회하거나,
+//  생성 후에 캐시를 저장할 때 emit 하는 이벤트를 여기서 수신합니다.
+//
+//  조회 흐름:
+//    Rust emit("translit-cache-query", {request_id, word, lang})
+//    → 프론트 listen → Dexie 조회 → 코사인 계산(복수 후보)
+//    → invoke("translit_cache_respond", {request_id, results})
+//    → Rust oneshot receiver 에서 await
+//
+//  저장 흐름:
+//    Rust emit("translit-cache-save", {word, lang, native, roman})
+//    → 프론트 listen → Dexie upsert
+// =====================================================================
+
+// ── 캐시 조회 리스너 ──
+//  응답 계약 (Rust query_translit_cache 와 1:1):
+//    []                     → 캐시 미스 (레코드 자체가 없음)
+//    [[native, roman]]      → 캐시 히트
+//    [["", ""]]             → 네거티브 캐시 히트 ('음차 불가' 로 확정된 값)
+//  ⚠️ 빈 문자열 레코드도 반드시 반환해야 Rust 가 LLM 재호출을 생략합니다.
+listen("translit-cache-query", async (event: any) => {
+    const { request_id, word, lang } = event.payload;
+
+    const respond = async (results: Array<[string, string]>) => {
+        try {
+            await invoke("translit_cache_respond", { requestId: request_id, results });
+        } catch (e) {
+            console.warn("[TRANSLIT CACHE] respond failed:", e);
+        }
+    };
+
+    try {
+        const candidates = await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .toArray();
+
+        if (!candidates || candidates.length === 0) {
+            // 🌟 [LANG AXIS DIAGNOSTIC] 같은 원문이 '다른 언어 키' 로 저장돼 있는지 확인합니다.
+            //    이 경고가 뜨면 캐시가 깨진 게 아니라 doc_lang 이 흔들린 것입니다.
+            //    (실측 사례: 페이지 셀렉터 캐시 히트 시 doc_lang 이 'en' 으로 고정되어
+            //     'ko' 로 저장된 레코드를 영원히 찾지 못했습니다)
+            try {
+                const others = await appDb.table("translit_cache")
+                    .where("source_word").equals(word).toArray();
+                if (others && others.length > 0) {
+                    const langs = Array.from(new Set(others.map((o: any) => String(o.doc_lang))));
+                    console.warn(
+                        `[TRANSLIT CACHE] ⚠️ MISS on lang='${lang}' but the same word exists under langs=[${langs.join(', ')}]. ` +
+                        `doc_lang 확정 경로(scheduler.rs DOC LANG EARLY DETECT)를 확인하세요. word='${word}'`
+                    );
+                }
+            } catch (_e) {
+                // v12 미적용 세대에서는 source_word 단독 인덱스가 없어 실패할 수 있습니다.
+                // 진단 전용 경로이므로 조용히 흡수합니다.
+            }
+            console.log(`[TRANSLIT CACHE] MISS word='${word}' lang='${lang}'`);
+            await respond([]);
+            return;
+        }
+
+        // 단일 후보(정상 경로): upsert 정책상 대부분 여기에 해당합니다.
+        if (candidates.length === 1) {
+            const c = candidates[0];
+            const nv = c.native || "";
+            const rm = c.roman || "";
+            console.log(
+                `[TRANSLIT CACHE] ${(!nv && !rm) ? "NEGATIVE HIT" : "HIT"} word='${word}' lang='${lang}' → native='${nv}' roman='${rm}'`
+            );
+            await respond([[nv, rm]]);
+            return;
+        }
+
+        // 복수 후보: 원문과의 코사인 유사도로 최적 후보를 고릅니다.
+        const candidateTexts = candidates.map((c: any) =>
+            `${c.native || ""} ${c.roman || ""}`.trim()
+        );
+
+        try {
+            const embeddings: number[][] = await invoke("get_embedding_batch_for_translit", {
+                texts: candidateTexts
+            });
+            const queryEmb: number[] = await invoke("get_query_embedding", {
+                text: word,
+                devicePreference: null
+            });
+
+            let bestIdx = 0;
+            let bestSim = -1;
+            for (let i = 0; i < embeddings.length; i++) {
+                const sim = cosineSimLocal(queryEmb, embeddings[i]);
+                if (sim > bestSim) {
+                    bestSim = sim;
+                    bestIdx = i;
+                }
+            }
+            const best = candidates[bestIdx];
+            console.log(
+                `[TRANSLIT CACHE] HIT(cosine ${bestSim.toFixed(4)}, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[best.native || "", best.roman || ""]]);
+        } catch (embErr) {
+            // 임베딩 실패 시 최신 후보 폴백
+            const sorted = [...candidates].sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+            console.log(
+                `[TRANSLIT CACHE] HIT(latest fallback, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[sorted[0].native || "", sorted[0].roman || ""]]);
+        }
+    } catch (e) {
+        console.warn("[TRANSLIT CACHE] query failed:", e);
+        await respond([]);
+    }
+});
+
+// ── 캐시 저장 리스너 ──
+//  native / roman 이 모두 빈 문자열이어도 반드시 저장합니다(네거티브 캐시).
+//  '이 원문은 이 언어에서 음차가 성립하지 않는다' 는 판정 자체가 재사용 가치가 있습니다.
+listen("translit-cache-save", async (event: any) => {
+    const { word, lang, native, roman } = event.payload;
+    const nv = native || "";
+    const rm = roman || "";
+    try {
+        // 기존 동일 키 삭제 후 삽입 (upsert)
+        const removed = await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .delete();
+
+        await appDb.table("translit_cache").add({
+            source_word: word,
+            doc_lang: lang,
+            native: nv,
+            roman: rm,
+            created_at: Date.now()
+        });
+
+        console.log(
+            `[TRANSLIT CACHE] SAVED${(!nv && !rm) ? "(negative)" : ""} word='${word}' lang='${lang}' ` +
+            `→ native='${nv}' roman='${rm}' (replaced ${removed})`
+        );
+    } catch (e) {
+        // 🌟 저장 실패는 '다음 태스크에서 LLM 재호출' 로 직결되므로 반드시 표면화합니다.
+        //    (기존에는 warn 만 찍혀 원인 추적이 불가능했습니다)
+        console.error(
+            `[TRANSLIT CACHE] ❌ SAVE FAILED word='${word}' lang='${lang}'. ` +
+            `이 값은 다음 태스크에서 다시 LLM 으로 생성됩니다.`, e
+        );
+    }
+});
+
+// ── 로컬 코사인 계산 헬퍼 (프론트 전용) ──
+function cosineSimLocal(a: number[], b: number[]): number {
+    if (a.length !== b.length || a.length === 0) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    const denom = Math.sqrt(na) * Math.sqrt(nb);
+    return denom === 0 ? 0 : dot / denom;
+}
 
 function stopDesktopCamera() {
     if (desktopStream) {

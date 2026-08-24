@@ -276,6 +276,7 @@ This project uses the following open-source libraries:
 | anyhow | MIT OR Apache-2.0 |
 | arrow-array | Apache-2.0 |
 | arrow-schema | Apache-2.0 |
+| anyascii | ISC |
 | base64 | MIT OR Apache-2.0 |
 | candle-core | MIT OR Apache-2.0 |
 | candle-flash-attn | MIT OR Apache-2.0 |

@@ -59,7 +59,12 @@ export function time2text(dateVal: any): string {
     return Math.floor(seconds) + " seconds";
 }
 
-function isAlmostEqual(obj1: any, obj2: any): boolean {
+// 🌟 [ALMOST EQUAL] 키 개수가 같고, 값이 다른 키가 '정확히 1개 이하' 일 때 동일 레코드로 판정합니다.
+//  낙관적 로컬 talk 행과 서버가 발급한 talk 행은 { role, text } 가 완전히 같고
+//  id 하나만 다르므로 diffCount === 1 이 되어 여기서 true 가 나옵니다.
+//  서버 id 는 hashId() 난수라 클라이언트가 예측할 수 없기 때문에,
+//  '내용 동일성' 으로 승계 판정을 하는 이 함수가 유일한 조정 수단입니다.
+export function isAlmostEqual(obj1: any, obj2: any): boolean {
     if (!obj1 || !obj2) return false;
     if (Object.keys(obj1).length === 0 || Object.keys(obj2).length === 0) return false;
     const keys1 = Object.keys(obj1);
@@ -96,13 +101,33 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
 
     const docId = item.id || item.uuid || (item.data && item.data.id) || item.index || Math.random().toString(36).substr(2, 9);
     
+    // 🌟 v4 : 봉투 루트를 우선 읽되, 구버전 데이터를 위해 data.* 폴백을 둡니다.
+    const createdTs = item.created_at ?? item.data?.created_at ?? 0;
+    const updatedTs = item.updated_at ?? item.data?.updated_at ?? 0;
+    const modeStr = item.mode ?? item.data?.mode ?? 'commerce';
+
     let body = `<input type="checkbox" id="more-${docId}" class="toggle-more" ${checked ? 'disabled checked' : ''} style="display:none;" />`;
-    body += `<div id="${docId}" class="${selector.result}" data-type="${item.type || ''}" data-created-at="${item.created_at || 0}" data-updated-at="${item.updated_at || 0}">`;
+    body += `<div id="${docId}" class="${selector.result}" data-type="${item.type || ''}" data-mode="${modeStr}" data-created-at="${createdTs}" data-updated-at="${updatedTs}">`;
 
     let itemType = item.type || "unknown";
-    const tradeDocs = ['BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'shipping_doc', 'shipping'];
 
-    if (item.type === "sales" || item.type === "goods" || item.type === "order") {
+    // 🌟 [TRADING FULL SET] app-logis-center 의 get_slice_config 가 다루던 전 서식을 흡수합니다.
+    //  기존 7종만 있어서 통관(ED/ID/CINV)·검사증(IC/WC/CA/PHYTO/HC)·
+    //  위험물(DGD/MSDS)·법무(POA/BIZ_LIC/INS) 문서가 'unknown' 으로 떨어졌고,
+    //  그 결과 status/title/created_at 3줄만 렌더링되어 실무 정보가 전부 소실됐습니다.
+    const tradeDocs = [
+        'BL', 'AWB', 'CI', 'PI', 'PL', 'CO', 'LC', 'PO', 'SC',
+        'SA', 'DO', 'AN', 'BC', 'ED', 'ID', 'CINV',
+        'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
+        'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS',
+        'shipping_doc', 'shipping'
+    ];
+    // 🌟 [ANALYTICS ADMIN] 사용자 행동 로그 / 리포트 타입
+    const analyticDocs = ['click', 'hover', 'change', 'report'];
+
+    if (analyticDocs.includes(item.type)) {
+        itemType = "analytic";
+    } else if (item.type === "sales" || item.type === "goods" || item.type === "order") {
         itemType = "sales";
         // 🌟 [CRITICAL FIX] 화면 표시용 타입을 무조건 'order'로 덮어씌우던 원흉(하드코딩) 제거!
         // 이제 DB에 저장된 실제 타입(goods 등)이 UI에 그대로 노출됩니다.
@@ -143,8 +168,14 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
             }
         }
 
-        // 🌟 issue_date 추가
-        if (key === "created_at" || key === "updated_at" || key === "started_at" || key === "expired_at" || key === "issue_date") {
+        // 🌟 [DATE KEYS v2] 무역 서식의 날짜 축(etd/eta/expiry_date)을 추가합니다.
+        //    이 목록에 없으면 원시 타임스탬프(1735689600000)가 그대로 노출됩니다.
+        const DATE_KEYS = [
+            "created_at", "updated_at", "started_at", "expired_at",
+            "issue_date", "etd", "eta", "expiry_date",
+            "shipped_on_board_date", "declaration_date", "contract_date"
+        ];
+        if (DATE_KEYS.includes(key)) {
             if (_value) _value = time2text(_value);
             if (key === "created_at") {
                 _name = _value; 
@@ -186,24 +217,86 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
     }
 
     // --- 타입별 HTML 조립 (front.js 패리티) ---
-    // 🌟 Shipping 전용 UI 추가
-    if (itemType === "shipping") {
-        if(item.status) item.status = parseStatus(item.status);
+    // 🌟 [ANALYTICS ADMIN] 사용자 행동 로그 / 리포트 전용 UI
+    //    (기존 Client Front SDK(content.js)의 ._item / ._item._user 렌더링을 이관)
+    if (itemType === "analytic") {
         body += `
+            ${Tpl(item, "action")}
+            ${Tpl(item, "summary")}
+            ${Tpl(item, "cross_action_flow")}
+        `;
+        body += `<div class="${selector.more}">`;
+        if (more) {
+            body += `
+                ${Tpl(item, "intent_evolution")}
+                ${Tpl(item, "consistent_preferences")}
+                ${Tpl(item, "relate")}
+                ${Tpl(item, "href")}
+            `.trim();
+        }
+        body += `</div>${Tpl(item, "created_at")}`;
+
+    // 🌟 Shipping / Trading 전용 UI
+    } else if (itemType === "shipping") {
+        // 🌟 v4 : status 는 봉투가 아니라 data.status 입니다.
+        //    canonicalize 가 정수 코드로 확정했으므로 parseStatus 로 문자열화합니다.
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
+
+        // 🌟 [DOC TYPE BADGE] 무역 실무자는 'B/L 인가 AWB 인가' 를 가장 먼저 봅니다.
+        //    doc_type 이 없으면 봉투 type 을 폴백으로 씁니다.
+        if (item.data && !item.data.doc_type && item.type) {
+            item.data.doc_type = item.type;
+        }
+
+        body += `
+            ${Tpl(item, "doc_type")}
             ${Tpl(item, "status")}
+            ${Tpl(item, "doc_number")}
             ${Tpl(item, "no")}
             ${Tpl(item, "vessel")}
         `;
         body += `<div class="${selector.more}">`;
         if (more) {
             body += `
+                ${Tpl(item, "voyage_number")}
                 ${Tpl(item, "pol")}
                 ${Tpl(item, "pod")}
+                ${Tpl(item, "place_receipt")}
+                ${Tpl(item, "place_delivery")}
+                ${Tpl(item, "etd")}
+                ${Tpl(item, "eta")}
+                ${Tpl(item, "transport_mode")}
                 ${Tpl(item, "incoterms")}
+                ${Tpl(item, "incoterms_place")}
+                ${Tpl(item, "payment_terms")}
+                ${Tpl(item, "freight_payment_term")}
                 ${Tpl(item, "sender_name")}
+                ${Tpl(item, "sender_address")}
                 ${Tpl(item, "recipient_name")}
+                ${Tpl(item, "recipient_address")}
+                ${Tpl(item, "notify_party_name")}
                 ${Tpl(item, "amount", "currency")}
+                ${Tpl(item, "subtotal_amount", "currency")}
+                ${Tpl(item, "tax_amount", "currency")}
+                ${Tpl(item, "freight_amount", "currency")}
+                ${Tpl(item, "insurance_amount", "currency")}
+                ${Tpl(item, "local_charges", "currency")}
+                ${Tpl(item, "container_number")}
+                ${Tpl(item, "seal_number")}
+                ${Tpl(item, "package_count", "package_unit")}
+                ${Tpl(item, "weight_gross")}
+                ${Tpl(item, "weight_net")}
+                ${Tpl(item, "volume")}
+                ${Tpl(item, "marks_numbers")}
+                ${Tpl(item, "hs_code")}
+                ${Tpl(item, "origin_criterion")}
+                ${Tpl(item, "reference_invoice")}
+                ${Tpl(item, "reference_lc")}
+                ${Tpl(item, "reference_booking")}
                 ${Tpl(item, "issue_date")}
+                ${Tpl(item, "expiry_date")}
             `.trim();
         }
         body += `</div>${Tpl(item, "created_at")}`;
@@ -238,7 +331,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "tracking") {
-        if(item.status) item.status = parseStatus(item.status);
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "text")}
@@ -258,7 +353,9 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         body += `</div>${Tpl(item, "created_at")}`;
 
     } else if (itemType === "event") {
-        if(item.status) item.status = parseStatus(item.status);
+        if (item.data && item.data.status !== undefined) {
+            item.data.status = parseStatus(item.data.status);
+        }
         body += `
             ${Tpl(item, "status")}
             ${Tpl(item, "title")}
@@ -288,11 +385,20 @@ export function item2html(item: any, checked: boolean = false, currentUrl: strin
         `;
     }
 
-    body += `<input type="hidden" readonly name="${selector.created_at}" value="${item.created_at || 'undefined'}" />`;
-    
-    // Relay 연동을 위한 메타데이터 앵커 태그
-    body += `<div class="${selector.relate}" index="${item.index}" event="${item.event}" views="${item.views}" goods="${item.goods}" tracking="${item.tracking}"></div>`;
-    
+    body += `<input type="hidden" readonly name="${selector.created_at}" value="${createdTs || 'undefined'}" />`;
+
+    // 🌟 [SEARCH BADGE] Dexie 플랜이 어떤 조건으로 이 문서를 통과시켰는지 표시합니다.
+    if (item.data && item.data.search_badge) {
+        body += `<div class="${selector.info} search-badge" style="opacity:0.7;">
+            <strong>match</strong>
+            <span><span class="value">${item.data.search_badge}</span></span>
+        </div>`;
+    }
+
+    // 🌟 [RELAY ANCHOR] v4 : 연관 키가 data.* 로 이동했습니다.
+    const d = item.data || {};
+    body += `<div class="${selector.relate}" index="${d.index ?? ''}" event="${d.event ?? ''}" views="${d.views ?? ''}" goods="${d.goods ?? ''}" tracking="${d.tracking ?? ''}"></div>`;
+
     body += `</div>`; // Close .logis-result
 
     return body;

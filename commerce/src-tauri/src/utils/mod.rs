@@ -18,6 +18,8 @@ pub mod metrics;
 pub mod sync_utils;
 pub mod url_utils;
 pub mod parsing;
+// 🌟 [CANONICAL] data.* 저장 타입 확정 규칙 (store.rs 의 두 복제본을 대체)
+pub mod canonical;
 pub mod bias_schema;
 pub mod json_parse;
 pub mod nl_convert;

@@ -1,4 +1,104 @@
 {
+  "trade_schema": {
+    "base": {
+      "header": {
+        "doc_type": "Document kind code {String}",
+        "doc_number": "Primary identifier (B/L No, Invoice No, PO No) {String}",
+        "issue_date": "Date of issue (YYYY-MM-DD) {String}",
+        "reference_number": "Any other reference number printed {String}"
+      },
+      "parties": {
+        "sender_name": "Shipper, Seller, Exporter {String}",
+        "sender_address": "Address of sender {String}",
+        "recipient_name": "Consignee, Buyer, Importer {String}",
+        "recipient_address": "Address of recipient {String}",
+        "notify_party_name": "Notify party name {String}"
+      },
+      "logistics": {
+        "vessel": "Vessel name or Flight number {String}",
+        "voyage_number": "Voyage or flight leg number {String}",
+        "pol": "Port of Loading / Airport of Departure {String}",
+        "pod": "Port of Discharge / Airport of Destination {String}",
+        "etd": "Estimated time of departure {String}",
+        "eta": "Estimated time of arrival {String}",
+        "transport_mode": "Sea, Air, Road, Rail {String}"
+      },
+      "conditions": {
+        "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
+        "payment_terms": "T/T, L/C, Net30 {String}",
+        "freight_payment_term": "Freight Prepaid or Freight Collect {String}"
+      },
+      "financials": {
+        "currency": "ISO 4217 currency code {String}",
+        "amount": "Grand total amount {Number}",
+        "amount_subtotal": "Subtotal before tax and charges {Number}",
+        "amount_tax": "Tax or VAT amount {Number}"
+      },
+      "cargo": {
+        "package_count": "Total number of packages (NOT money) {Number}",
+        "package_unit": "Package unit (CTN, PLT, PKG) {String}",
+        "weight_gross": "Total gross weight {Number}",
+        "weight_net": "Total net weight {Number}",
+        "volume": "Total volume in CBM {Number}",
+        "marks_numbers": "Marks and numbers {String}"
+      },
+      "items": {
+        "description": "Description of goods {String}",
+        "quantity": "Line item quantity {Number}",
+        "unit": "Unit of measure {String}",
+        "hs_code": "HS code / tariff number {String}",
+        "unit_price": "Unit price {Number}",
+        "total_price": "Line total {Number}"
+      },
+      "containers": {
+        "container_number": "Container number (4 letters + 7 digits) {String}",
+        "seal_number": "Seal number {String}",
+        "type_size": "Size and type (20GP, 40HC) {String}"
+      }
+    },
+    "overlay": {
+      "LC": {
+        "financials": {
+          "tenor": "Tenor: at sight, 30 days, 60 days, 90 days {String}",
+          "lc_number": "Letter of Credit number {String}",
+          "issuing_bank": "Issuing bank name {String}",
+          "expiry_date": "L/C expiry date {String}"
+        }
+      },
+      "DGD": {
+        "cargo": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}"
+        }
+      },
+      "PHYTO": {
+        "conditions": {
+          "treatment_type": "Fumigation, Heat treatment, Cold treatment {String}"
+        }
+      },
+      "HC": {
+        "conditions": {
+          "health_status": "Health certification status {String}"
+        }
+      },
+      "BEN_CERT": {
+        "conditions": {
+          "beneficiary_statement": "Beneficiary certification statement {String}"
+        }
+      },
+      "INS": {
+        "financials": {
+          "insured_amount": "Insured amount {Number}",
+          "premium_amount": "Insurance premium {Number}"
+        },
+        "conditions": {
+          "policy_number": "Insurance policy number {String}",
+          "coverage_type": "Coverage type (All Risks, FPA, WA) {String}"
+        }
+      }
+    }
+  },
   "search_bridge": {
     "sales_to_order": {
       "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",
@@ -45,6 +145,11 @@
         "semantic": "the concrete product being shipped in this parcel",
         "bias": "shipped product, parcel content, item in transit, 배송상품, 운송품목, 소포내용물, 配送商品, 荷物の中身, 包裹内容, producto enviado, contenido del paquete, produit expédié, contenu du colis, versandtes produkt, paketinhalt, produto enviado, prodotto spedito, отправленный товар, содержимое посылки, المنتج المشحون, भेजा गया उत्पाद, สินค้าที่จัดส่ง, sản phẩm được giao, produk yang dikirim",
         "prejudice": "tracking number, identifier, carrier, date, address, phone number, weight, dimension"
+      },
+      "goods.color": {
+        "semantic": "the color a shopper names when narrowing a catalog",
+        "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, rouge, bleu, vert, jaune, marron, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, warna, krem, hitam, putih, merah, biru, hijau, kuning, cokelat, abu-abu, ungu, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, สี, เบจ, ดำ, ขาว, แดง, น้ำเงิน, เขียว, เหลือง, ชมพู, น้ำตาล, เทา, ม่วง",
+        "prejudice": "identifier, code, url, link, date, price, quantity, status, address, phone number, card, bank, payment, size, weight"
       }
     },
     "abstract_bridge": {
@@ -118,6 +223,38 @@
         "bias": "light, weighs little, lightweight, easy to carry, feather weight, barely weighs anything",
         "prejudice": "product name, item title, customer message, review comment, person name, buyer, customer, color, brand, date, address, among these, from these, show me, tell me, cheap, count of items"
       }
+    }
+  },
+  "verb": {
+    "bias": {
+      "ko": "찾다, 알려주다, 보여주다, 검색하다, 조회하다, 확인하다, 요청하다, 질문하다, 설명하다, 요약하다, 추천하다, 분석하다, 정리하다, 비교하다",
+      "en": "find, search, show, tell, get, query, request, ask, explain, summarize, recommend, analyze, compare, list",
+      "de": "finden, suchen, zeigen, sagen, holen, abfragen, anfragen, fragen, erklären, zusammenfassen, empfehlen, analysieren, sortieren, vergleichen",
+      "es": "encontrar, buscar, mostrar, decir, obtener, consultar, solicitar, preguntar, explicar, resumir, recomendar, analizar, organizar, comparar",
+      "fr": "trouver, chercher, afficher, dire, obtenir, consulter, demander, questionner, expliquer, résumer, recommander, analyser, organiser, comparer",
+      "ja": "探す, 調べる, 表示する, 教えて, 取得, 検索, リクエスト, 質問, 説明, 要約, おすすめ, 分析, 整理, 比較",
+      "pt": "encontrar, buscar, mostrar, dizer, obter, consultar, solicitar, perguntar, explicar, resumir, recomendar, analisar, organizar, comparar",
+      "ar": "بحث, عرض, إخبار, جلب, استعلام, طلب, سؤال, شرح, تلخيص, توصية, تحليل, ترتيب, مقارنة, إيجاد",
+      "cs": "najít, hledat, zobrazit, říct, získat, dotaz, požádat, zeptat se, vysvětlit, shrnout, doporučit, analyzovat, uspořádat, porovnat",
+      "it": "trovare, cercare, mostrare, dire, ottenere, consultare, richiedere, chiedere, spiegare, riassumere, raccomandare, analizzare, organizzare, confrontare",
+      "nl": "vinden, zoeken, tonen, vertellen, ophalen, opvragen, verzoeken, vragen, uitleggen, samenvatten, aanbevelen, analyseren, organiseren, vergelijken",
+      "zh": "查找, 搜索, 显示, 告诉, 获取, 查询, 请求, 询问, 解释, 总结, 推荐, 分析, 整理, 比较"
+    }
+  },
+  "expression": {
+    "bias": {
+      "ko": "해줘, 주세요, 부탁해, 좀, 어때, 인가요, 인지, 될까요, 싶어, 하고 싶다",
+      "en": "please, could you, would you, i want to, i need to, how about, is it, can you",
+      "de": "bitte, könntest du, würdest du, ich möchte, ich brauche, wie wäre es, ist es, kannst du",
+      "es": "por favor, podrías, te gustaría, quiero, necesito, qué tal, es, puedes",
+      "fr": "s'il te plaît, pourrais-tu, voudrais-tu, je veux, j'ai besoin, qu'en est-il, est-ce, peux-tu",
+      "ja": "して, ください, お願い, ちょっと, どう, ですか, の, でしょうか, したい, したいです",
+      "pt": "por favor, poderia, gostaria, eu quero, eu preciso, que tal, é, pode",
+      "ar": "من فضلك, هل يمكنك, هل تريد, أريد, أحتاج, كيف, هل, هل تستطيع",
+      "cs": "prosím, mohl bys, chtěl bys, chci, potřebuji, co takhle, je to, můžeš",
+      "it": "per favore, potresti, vorresti, voglio, ho bisogno, che ne dici, è, puoi",
+      "nl": "alsjeblieft, zou je, wil je, ik wil, ik heb nodig, hoe zit het, is het, kun je",
+      "zh": "请, 能不能, 可以, 我想, 我需要, 怎么样, 是不是, 可以吗"
     }
   },
   "insight": {
@@ -223,32 +360,38 @@
     "today": {
       "semantic": "current day, today",
       "bias": "today, current day, this day, right now, present 24 hours, instantaneous",
-      "prejudice": "yesterday, tomorrow, last week, next month, past, future, year, month, ago, history"
+      "prejudice": "yesterday, tomorrow, last week, next month, past, future, year, month, ago, history",
+      "exact_match": ["today", "오늘", "今日", "今天", "hoy", "aujourd'hui", "heute", "сегодня", "اليوم", "आज", "hari ini", "hôm nay", "วันนี้", "oggi", "hoje", "bugün", "vandaag", "dzisiaj", "σήμερα", "היום"]
     },
     "yesterday": {
       "semantic": "previous day, yesterday",
       "bias": "yesterday, previous day, day before today, past 24 hours, one day ago",
-      "prejudice": "today, tomorrow, last week, next month, future, year, month, now, current, present"
+      "prejudice": "today, tomorrow, last week, next month, future, year, month, now, current, present",
+      "exact_match": ["yesterday", "어제", "昨日", "昨天", "ayer", "hier", "gestern", "вчера", "أمس", "kemarin", "hôm qua", "เมื่อวาน", "ieri", "ontem", "dün", "gisteren", "wczoraj", "χθες", "אתמול"]
     },
     "this_month": {
       "semantic": "current month",
       "bias": "this month, current month, present 30 days, current calendar month",
-      "prejudice": "last month, next month, today, yesterday, year, week, day, specific hour, exact minute"
+      "prejudice": "last month, next month, today, yesterday, year, week, day, specific hour, exact minute",
+      "exact_match": ["this month", "이번달", "이번 달", "금월", "今月", "本月", "este mes", "ce mois", "diesen monat", "в этом месяце", "هذا الشهر", "इस महीने", "bulan ini", "tháng này", "เดือนนี้", "questo mese", "este mês", "bu ay"]
     },
     "last_month": {
       "semantic": "previous month",
       "bias": "last month, previous month, past 30 days, preceding calendar month",
-      "prejudice": "this month, next month, today, yesterday, year, week, day, future, present"
+      "prejudice": "this month, next month, today, yesterday, year, week, day, future, present",
+      "exact_match": ["last month", "지난달", "지난 달", "저번달", "전월", "先月", "上个月", "el mes pasado", "le mois dernier", "letzten monat", "в прошлом месяце", "الشهر الماضي", "पिछले महीने", "bulan lalu", "tháng trước", "เดือนที่แล้ว", "il mese scorso", "mês passado", "geçen ay"]
     },
     "this_year": {
       "semantic": "current year",
       "bias": "this year, current year, present 365 days, ongoing twelve months",
-      "prejudice": "last year, next year, month, day, week, specific hour, exact minute, ago"
+      "prejudice": "last year, next year, month, day, week, specific hour, exact minute, ago",
+      "exact_match": ["this year", "올해", "금년", "이번년", "이번 해", "今年", "本年", "este año", "cette année", "dieses jahr", "в этом году", "هذا العام", "इस साल", "tahun ini", "năm nay", "ปีนี้", "quest'anno", "este ano", "bu yıl"]
     },
     "last_year": {
       "semantic": "previous year",
       "bias": "last year, previous year, past 365 days, preceding twelve months",
-      "prejudice": "this year, next year, month, day, week, future, today, tomorrow, present"
+      "prejudice": "this year, next year, month, day, week, future, today, tomorrow, present",
+      "exact_match": ["last year", "작년", "지난해", "지난 해", "전년", "去年", "昨年", "el año pasado", "l'année dernière", "letztes jahr", "в прошлом году", "العام الماضي", "पिछले साल", "tahun lalu", "năm ngoái", "ปีที่แล้ว", "l'anno scorso", "ano passado", "geçen yıl"]
     },
     "recently": {
       "semantic": "recent past, lately",
@@ -538,6 +681,11 @@
         "bias": "가전, 인테리어, 특가상품, 3C",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
       },
+      "color": {
+        "semantic": "색상, 컬러, 색",
+        "bias": "상품색상, 컬러, 색, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드",
+        "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
+      },
       "origin_country": {
         "semantic": "원산지, 제조국",
         "bias": "대한민국, 중국, 베트남, 미국, 일본, Made in Korea",
@@ -558,7 +706,7 @@
         "bias": "상품일자, 상품날짜, 상품시간, 2025-12-01, 2026-02-28",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
       },
-      "expiration_date": {
+      "expired_at": {
         "semantic": "유통기한, 만료일",
         "bias": "상품일자, 상품날짜, 상품시간, 2028-12-31, 2027-06-30",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
@@ -667,6 +815,16 @@
         "semantic": "묶음배송, 합배송",
         "bias": "묶음배송가능, 불가",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
+      },
+      "options": {
+        "semantic": "옵션, 선택항목, 옵션값",
+        "bias": "옵션, 옵션명, 선택항목, 사이즈, 색상선택, 수량선택, 필수옵션, 추가옵션",
+        "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 추가상품, 관련상품"
+      },
+      "additional_goods": {
+        "semantic": "추가상품, 관련상품, 구성상품",
+        "bias": "추가상품, 관련상품, 구성상품, 세트상품, 함께구매, 연관상품",
+        "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목"
       }
     },
     "order": {

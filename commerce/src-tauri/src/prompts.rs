@@ -45,85 +45,321 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
             .replace("{TYPE}", page_type)
 }
 
+// pub fn get_trade_doc_classification_prompt() -> String {
+//     r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
+// Return JSON exactly like: {"doc_type": "BL"}
+// NO EXPLANATION."###.to_string()
+// }
+
 pub fn get_trade_doc_classification_prompt() -> String {
-    r###"Classify document type. Choose strictly from: PI, CI, BL, AWB, PL, CO, LC, TRACKING, Unknown. 
-Return JSON exactly like: {"doc_type": "BL"}
-NO EXPLANATION."###.to_string()
+    // 🌟 [CLASSIFIER v2 / 27 CODES]
+    //  ── 왜 늘리는가 ──
+    //   get_trade_doc_slice_config 는 27종 좌표를 갖고 있는데
+    //   분류기가 9종만 낼 수 있어 19개 분기가 도달 불가였습니다.
+    //   extract_shipping_conditions 도 16종을 조건으로 뽑으므로
+    //   저장(9종) ↔ 조회(16종) 사이에 영구 공백이 있었습니다.
+    //
+    //  ── 오분류 완화 ──
+    //   2B 비전 모델이 27갈래를 정확히 가르기는 어렵습니다.
+    //   다만 slice_config 가 같은 그룹을 한 좌표로 묶어 두었으므로
+    //   (CI|PI|SC / ED|ID|CINV / IC|WC|CA|PHYTO|HC|BEN_CERT / DGD|MSDS / POA|BIZ_LIC|INS)
+    //   그룹 내 혼동은 추출 품질에 영향을 주지 않습니다.
+    //   그래서 아래 프롬프트도 '그룹 → 코드' 순서로 제시합니다.
+    r###"Classify this trade document. Return the single closest code.
+
+[GROUPS]
+1. Contract & Payment
+   PO  = Purchase Order
+   PI  = Proforma Invoice
+   SC  = Sales Contract
+   LC  = Letter of Credit
+2. Shipping & Transport
+   CI  = Commercial Invoice
+   PL  = Packing List
+   BL  = Bill of Lading
+   AWB = Air Waybill
+   SA  = Shipping Advice
+   DO  = Delivery Order
+   AN  = Arrival Notice
+   BC  = Booking Confirmation
+3. Customs
+   ED   = Export Declaration
+   ID   = Import Declaration
+   CINV = Customs Invoice
+   CO   = Certificate of Origin
+4. Inspection & Certificates
+   IC       = Inspection Certificate
+   WC       = Weight Certificate
+   CA       = Certificate of Analysis
+   PHYTO    = Phytosanitary Certificate
+   HC       = Health Certificate
+   BEN_CERT = Beneficiary Certificate
+5. Special & Legal
+   DGD     = Dangerous Goods Declaration
+   MSDS    = Material Safety Data Sheet
+   POA     = Power of Attorney
+   BIZ_LIC = Business License
+   INS     = Insurance Policy
+6. Parcel
+   TRACKING = Courier label / parcel waybill
+
+If none fit, return "Unknown".
+
+[OUTPUT FORMAT]
+{"doc_type": "BL"}
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
 }
 
-pub fn get_trade_category_schema(category: &str, _doc_type: &str) -> String {
-    let schema = match category {
-        "header" => r#"{
-  "document_type": "CLASSIFIED TYPE {String}",
-  "document_number": "Primary Identifier (B/L No, Invoice No) {String}",
-  "issue_date": "Date of Creation (YYYY-MM-DD) {String}",
-  "reference_number": "Export Ref, Booking No, PO No {String}"
-}"#,
-        "parties" => r#"{
-  "supplier_name": "Shipper, Seller, Exporter {String}",
-  "supplier_address": "Address of Supplier {String}",
-  "buyer_name": "Consignee, Buyer, Importer {String}",
-  "buyer_address": "Address of Buyer {String}",
-  "notify_party_name": "Notify Party Name {String}"
-}"#,
-        "logistics" => r#"{
-  "vehicle_name": "Vessel Name, Flight No {String}",
-  "voyage_number": "Voyage No {String}",
-  "location_port_of_loading": "POL, Airport of Departure {String}",
-  "location_port_of_discharge": "POD, Airport of Destination {String}"
-}"#,
-        "conditions" => r#"{
-  "incoterms_code": "FOB, CIF, EXW, DDP {String}",
-  "freight_payment_term": "Freight Prepaid, Freight Collect {String}"
-}"#,
-        "financials" => r#"{
-  "currency_code": "Currency Symbol (USD, EUR) {String}",
-  "amount_total": "Grand Total Amount {Number}"
-}"#,
-        "cargo" => r#"{
-  "package_count": "Total Quantity (NOT Money) {Number}",
-  "weight_gross": "Total Gross Weight {Number}",
-  "volume_measurement": "Total Volume (CBM) {Number}",
-  "marks_and_numbers": "Marks & Nos {String}"
-}"#,
-        "items" => r#"[ {
-  "description": "Description of Goods {String}",
-  "quantity": "Line Item Quantity {Number}",
-  "hs_code": "HS Code / Tariff No {String}"
-} ]"#,
-        "containers" => r#"[ {
-  "container_number": "Container No (4 char + 7 digit) {String}",
-  "seal_number": "Seal No {String}",
-  "type_description": "Type (20GP, 40HC) {String}"
-} ]"#,
-        _ => "{}"
+/// 🌟 [TRADE SCHEMA v2 / BASE + OVERLAY]
+///  ── v1 의 결함 ──
+///   시그니처가 `_doc_type` 이었습니다. 즉 27종 서식에 전부 같은 27개 필드를
+///   물어봤습니다. L/C 의 tenor, DGD 의 un_number, CA 의 result_value 처럼
+///   그 서식에만 존재하는 축은 추출 자체가 불가능했습니다.
+///
+///  ── 왜 bias.json 인가 ──
+///   app-logis-center 의 get_category_schema 는 400줄짜리 doc_type 하드코딩입니다.
+///   그대로 옮기면 새 서식마다 Rust 를 고치고 재빌드해야 합니다.
+///   이 코드베이스가 이미 path_alias / multilingual_value_anchor / abstract_bridge 를
+///   bias.json 으로 옮긴 것과 같은 이유로, 스키마도 데이터로 취급합니다.
+///
+///  ── 필드 이름 ──
+///   base 는 extract_shipping_conditions(검색)와 '같은 이름' 을 씁니다.
+///   그래야 저장과 조회가 alias 를 거치지 않고 바로 만납니다.
+///   레거시 데이터는 path_alias 가 흡수합니다.
+pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
+    use serde_json::Value;
+
+    // ── 코드 폴백 base : bias.json 에 trade_schema 노드가 없어도 동작해야 합니다 ──
+    fn fallback_base(category: &str) -> Vec<(&'static str, &'static str)> {
+        match category {
+            "header" => vec![
+                ("doc_type",         "Document kind code {String}"),
+                ("doc_number",       "Primary identifier (B/L No, Invoice No, PO No) {String}"),
+                ("issue_date",       "Date of issue (YYYY-MM-DD) {String}"),
+                ("reference_number", "Any other reference number printed {String}"),
+            ],
+            "parties" => vec![
+                ("sender_name",       "Shipper, Seller, Exporter {String}"),
+                ("sender_address",    "Address of sender {String}"),
+                ("recipient_name",    "Consignee, Buyer, Importer {String}"),
+                ("recipient_address", "Address of recipient {String}"),
+                ("notify_party_name", "Notify party name {String}"),
+            ],
+            "logistics" => vec![
+                ("vessel",         "Vessel name or Flight number {String}"),
+                ("voyage_number",  "Voyage or flight leg number {String}"),
+                ("pol",            "Port of Loading / Airport of Departure {String}"),
+                ("pod",            "Port of Discharge / Airport of Destination {String}"),
+                ("etd",            "Estimated time of departure {String}"),
+                ("eta",            "Estimated time of arrival {String}"),
+                ("transport_mode", "Sea, Air, Road, Rail {String}"),
+            ],
+            "conditions" => vec![
+                ("incoterms",            "FOB, CIF, EXW, DDP, DAP {String}"),
+                ("payment_terms",        "T/T, L/C, Net30 {String}"),
+                ("freight_payment_term", "Freight Prepaid or Freight Collect {String}"),
+            ],
+            "financials" => vec![
+                ("currency",        "ISO 4217 currency code {String}"),
+                ("amount",          "Grand total amount {Number}"),
+                ("amount_subtotal", "Subtotal before tax and charges {Number}"),
+                ("amount_tax",      "Tax or VAT amount {Number}"),
+            ],
+            "cargo" => vec![
+                ("package_count", "Total number of packages (NOT money) {Number}"),
+                ("package_unit",  "Package unit (CTN, PLT, PKG) {String}"),
+                ("weight_gross",  "Total gross weight {Number}"),
+                ("weight_net",    "Total net weight {Number}"),
+                ("volume",        "Total volume in CBM {Number}"),
+                ("marks_numbers", "Marks and numbers {String}"),
+            ],
+            "items" => vec![
+                ("description", "Description of goods {String}"),
+                ("quantity",    "Line item quantity {Number}"),
+                ("unit",        "Unit of measure {String}"),
+                ("hs_code",     "HS code / tariff number {String}"),
+                ("unit_price",  "Unit price {Number}"),
+                ("total_price", "Line total {Number}"),
+            ],
+            "containers" => vec![
+                ("container_number", "Container number (4 letters + 7 digits) {String}"),
+                ("seal_number",      "Seal number {String}"),
+                ("type_size",        "Size and type (20GP, 40HC) {String}"),
+            ],
+            _ => vec![],
+        }
+    }
+
+    // ── bias.json 에서 { field: desc } 맵을 읽습니다 ──
+    fn read_node(path: &[&str]) -> Option<serde_json::Map<String, Value>> {
+        let mut cur: &Value = &crate::parsing::BIAS_DICT;
+        for p in path {
+            cur = cur.get(*p)?;
+        }
+        cur.as_object().cloned()
+    }
+
+    // 1) base
+    let mut fields: Vec<(String, String)> = Vec::new();
+    if let Some(obj) = read_node(&["trade_schema", "base", category]) {
+        for (k, v) in obj {
+            fields.push((k, v.as_str().unwrap_or("{String}").to_string()));
+        }
+    } else {
+        for (k, d) in fallback_base(category) {
+            fields.push((k.to_string(), d.to_string()));
+        }
+    }
+
+    // 2) overlay : 이 서식에만 존재하는 축을 덧붙입니다.
+    //    같은 이름이면 overlay 설명이 이깁니다(서식별 뉘앙스가 더 정확하므로).
+    if let Some(obj) = read_node(&["trade_schema", "overlay", doc_type, category]) {
+        for (k, v) in obj {
+            let desc = v.as_str().unwrap_or("{String}").to_string();
+            if let Some(slot) = fields.iter_mut().find(|(n, _)| n == &k) {
+                slot.1 = desc;
+            } else {
+                fields.push((k, desc));
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        return format!(
+            "RULES: Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{{}}",
+            category.to_uppercase()
+        );
+    }
+
+    // 3) 렌더링 : items / containers 는 배열 스키마입니다.
+    //    (merge_json_manual 이 items → line_items 로 매핑하므로 키 이름은 그대로 둡니다)
+    let is_array = category == "items" || category == "containers";
+    let body = fields
+        .iter()
+        .map(|(k, d)| format!("  \"{}\": \"{}\"", k, d.replace('"', "'")))
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    let schema = if is_array {
+        format!("[ {{\n{}\n}} ]", body)
+    } else {
+        format!("{{\n{}\n}}", body)
     };
 
-    format!("RULES: Follow comments strictly. Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{}", category.to_uppercase(), schema)
+    format!(
+        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.\nSCHEMA:\n{}",
+        category.to_uppercase(),
+        doc_type,
+        schema
+    )
 }
 
+// pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+//     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
+// Extract the logistics filters from the natural language query into the JSON format.
+
+// [SCHEMA DEFINITION]
+// Extract the following tracking/trade properties if semantically present in the text:
+// - "no": Tracking number, B/L number, Invoice number.
+// - "status": Shipping status (draft, progress, return, complete, error).
+// - "vessel": Vessel name, Flight No, or Carrier.
+// - "pol": Port of Loading, Origin, Departure point.
+// - "pod": Port of Discharge, Destination, Arrival point.
+// - "sender_name": Shipper, Seller, or Exporter name.
+// - "recipient_name": Consignee, Buyer, or Importer name.
+// - "incoterms": Incoterms (e.g., FOB, CIF, EXW).
+// - "weight": Cargo or gross weight.
+// - "amount": Total financial amount or price.
+
+// [TRANSFORMATION LOGIC]
+// For EVERY extracted field, wrap it in an operator object:
+// { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
+// - Use "contains" for text fields, names, ports, vessels.
+// - Use "eq" for strict identifiers or status.
+
+// [QUERY]
+// {QUERY}
+
+// [OUTPUT FORMAT]
+// { "<property_name>": { "operator": "...", "value": "..." } }
+
+// [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+//     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
+// }
+
 pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
+    // 🌟 [TRADING SCHEMA v2]
+    //  app-logis-center 의 get_search_schema_definitions 가 정의하던 무역 축을 전량 흡수합니다.
+    //  기존 10개 필드만으로는 '부킹번호로 찾아줘', '컨테이너 MSCU1234567',
+    //  'ETA 다음주인 건' 같은 실무 질의가 통째로 조건 없이 넘어갔습니다.
+    //
+    //  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
+    //     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
+    //     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
 Extract the logistics filters from the natural language query into the JSON format.
 
 [SCHEMA DEFINITION]
-Extract the following tracking/trade properties if semantically present in the text:
-- "no": Tracking number, B/L number, Invoice number.
+Extract the following trade document properties if semantically present in the text:
+
+# Document Identity
+- "doc_type": Document kind (BL, AWB, CI, PI, PL, PO, SC, LC, CO, ED, ID, DO, AN, BC, DGD, MSDS).
+- "doc_number": Primary document identifier (B/L No, AWB No, Invoice No, PO No, Contract No).
+- "no": Tracking number, parcel number, or any generic reference number.
 - "status": Shipping status (draft, progress, return, complete, error).
-- "vessel": Vessel name, Flight No, or Carrier.
+- "issue_date": Date the document was issued.
+- "expiry_date": Expiry date (mainly L/C).
+
+# Transport
+- "vessel": Vessel name or Flight number.
+- "voyage_number": Voyage or flight leg number.
 - "pol": Port of Loading, Origin, Departure point.
 - "pod": Port of Discharge, Destination, Arrival point.
-- "sender_name": Shipper, Seller, or Exporter name.
+- "place_receipt": Place of Receipt.
+- "place_delivery": Place of Delivery.
+- "etd": Estimated Time of Departure.
+- "eta": Estimated Time of Arrival.
+- "transport_mode": Sea, Air, Road, or Rail.
+
+# Parties
+- "sender_name": Shipper, Seller, Exporter, or Vendor name.
 - "recipient_name": Consignee, Buyer, or Importer name.
-- "incoterms": Incoterms (e.g., FOB, CIF, EXW).
-- "weight": Cargo or gross weight.
-- "amount": Total financial amount or price.
+- "notify_party_name": Notify Party name.
+
+# Commercial Terms
+- "incoterms": Incoterms code (FOB, CIF, EXW, DDP, DAP).
+- "payment_terms": Payment condition (T/T, L/C, Net30).
+- "freight_payment_term": Freight Prepaid or Freight Collect.
+- "currency": ISO 4217 currency code.
+- "amount": Total financial amount.
+- "freight_amount": Freight charges only.
+- "insurance_amount": Insurance charges only.
+- "local_charges": Local handling charges.
+
+# Cargo
+- "container_number": Container number (4 letters + 7 digits).
+- "seal_number": Seal number.
+- "package_count": Number of packages or cartons.
+- "weight_gross": Gross weight.
+- "weight_net": Net weight.
+- "volume": Volume in CBM.
+- "hs_code": HS Code or tariff number.
+- "marks_numbers": Shipping marks and numbers.
+
+# Cross References
+- "reference_invoice": Referenced commercial invoice number.
+- "reference_lc": Referenced letter of credit number.
+- "reference_booking": Referenced booking number.
 
 [TRANSFORMATION LOGIC]
 For EVERY extracted field, wrap it in an operator object:
 { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-- Use "contains" for text fields, names, ports, vessels.
-- Use "eq" for strict identifiers or status.
+- Use "eq" for strict identifiers: doc_number, container_number, seal_number, hs_code, no, status, doc_type, incoterms, currency.
+- Use "contains" for free text: names, ports, vessels, marks_numbers, payment_terms.
+- Use "gte" / "lte" for date ranges and numeric ranges.
+- Omit any field that is NOT explicitly present in the query. Never invent a value.
 
 [QUERY]
 {QUERY}
@@ -226,6 +462,208 @@ Fill out the JSON keys in the exact order specified below. Use 'analysis_*' keys
 }
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+}
+
+// 🌟 [ANALYTIC SEMANTIC] 원시 outerHTML 을 PUG 로 변환하고 속성을 전부 제거한 뒤,
+//    '태그 구조 + 화면 텍스트' 만 남은 상태에서 Qwen3.5 2B 가 의미를 요약합니다.
+//    ── 왜 속성을 지우는가 ──
+//     class="btn_prd_option_2 on" / id="cnt_capa_1" 같은 값은 사이트마다 제각각이라
+//     LLM 이 그것을 '의미' 로 오인해 존재하지 않는 속성을 지어냅니다.
+//     속성을 제거하면 남는 신호가 (a / li / td / 텍스트) 뿐이므로
+//     모델은 화면에 실제로 인쇄된 문자열만 근거로 삼게 됩니다.
+pub fn analytic_semantic_prompt(
+    event_type: &str,
+    link: &str,
+    lang: &str,
+    target_pug: &str,
+    related_pug: &str,
+) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analysis Expert. The raw HTML has already been converted into an ATTRIBUTE-FREE PUG tree, so ONLY the semantic tag structure and the visible text remain. Interpret that structure and describe what the user did.
+
+[CONTEXT]
+Event Type: {EVENT_TYPE}
+Page: {LINK}
+Output Language: {LANG}
+
+[TARGET ELEMENT — the element the user actually interacted with]
+{TARGET_PUG}
+
+[SURROUNDING ELEMENTS — siblings shown next to it that the user did NOT choose]
+{RELATED_PUG}
+
+[RULES]
+1. "action" MUST name the concrete entity in [TARGET ELEMENT] (product title, option value, menu label, typed value, price) EXACTLY as it is printed there. Never invent a name that is not printed.
+2. "relate" describes only the NEIGHBOURING items in [SURROUNDING ELEMENTS]. Never describe the target itself here. Return an empty array when there is no sibling.
+3. "summary" is ONE sentence explaining what the user was trying to accomplish on this page, and MUST reuse the same entity name used in "action".
+4. Copy every proper noun, product name, code, price and number EXACTLY as printed. Do not translate, round, or reformat them.
+5. If [TARGET ELEMENT] carries no readable text at all, return null for every key. A null answer is correct data; an invented one is corrupted data.
+
+[OUTPUT FORMAT]
+{ "action": String, "relate": [String], "summary": String }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{EVENT_TYPE}", event_type)
+        .replace("{LINK}", link)
+        .replace("{LANG}", lang)
+        .replace("{TARGET_PUG}", target_pug)
+        .replace("{RELATED_PUG}", related_pug)
+}
+
+// 🌟 [ANALYTIC FLOW] 같은 사용자·같은 페이지에서 구조화된 여러 행동을 묶어
+//    흐름(cross_action_flow) / 의도 변화(intent_evolution) / 반복 성향(consistent_preferences)을
+//    한 번에 합성합니다. analytics-logis-center 의 Cron 산출물과 동일한 3축입니다.
+pub fn analytic_flow_prompt(lang: &str, records_json: &str) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analysis Expert. Below is a time-ordered list of ALREADY STRUCTURED user actions taken by ONE user. Synthesize them into a behavioural narrative.
+
+[CONTEXT]
+Output Language: {LANG}
+
+[STRUCTURED ACTION RECORDS]
+{RECORDS}
+
+[RULES]
+1. Use ONLY the facts present in [STRUCTURED ACTION RECORDS]. Never invent a page, product or option that is not listed.
+2. Keep every proper noun, product name and number EXACTLY as printed in the records.
+3. "cross_action_flow": describe the overall path in order (what was viewed, what was compared, what was chosen).
+4. "intent_evolution": describe how the goal shifted from the first action to the last one.
+5. "consistent_preferences": describe the attributes the user repeatedly gravitated toward. Return an empty string when nothing repeats.
+
+[OUTPUT FORMAT]
+{ "cross_action_flow": String, "intent_evolution": String, "consistent_preferences": String }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{LANG}", lang)
+        .replace("{RECORDS}", records_json)
+}
+
+// 🌟 [ANALYTIC QUERY PARSER] parse_commerce_query 의 para2graph + extract_time_intent_prompt
+//    구조를 분석(Analytic) 도메인에 맞춰 하나로 압축한 질의 파서입니다.
+//    ── 왜 별도 파서인가 ──
+//     commerce 는 sale_price / tracking_number 처럼 '컬럼 조건' 을 뽑아야 하지만,
+//     analytic 의 저장 축은 action / summary / relate 세 개의 자유 서술 문장뿐입니다.
+//     따라서 수치 조건 추출은 불필요하고, 실제로 필요한 것은
+//       ① 기간(time_intent / season_intent)
+//       ② 이벤트 종류(click / hover / change / report)
+//       ③ 의미 키워드
+//     세 가지입니다. 기간은 LLM 값을 그대로 쓰지 않고 Rust 가 다시 epoch 로 확정합니다.
+pub fn analytic_query_prompt(query: &str, time_context: &str, lang: &str) -> String {
+    let mut time_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("time_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec![
+            "today".to_string(), "yesterday".to_string(),
+            "this_month".to_string(), "last_month".to_string(),
+            "this_year".to_string(), "last_year".to_string(),
+            "recently".to_string()
+        ]);
+    time_keys.push("".to_string());
+    let time_arr_str = serde_json::to_string(&time_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let mut season_keys: Vec<String> = crate::parsing::BIAS_DICT
+        .get("season_filters")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_else(|| vec![
+            "spring".to_string(), "summer".to_string(),
+            "autumn".to_string(), "winter".to_string()
+        ]);
+    season_keys.push("".to_string());
+    let season_arr_str = serde_json::to_string(&season_keys).unwrap_or_else(|_| "[]".to_string());
+
+    let template = r###"[TASK]
+Act as a deterministic semantic parser for a USER BEHAVIOUR LOG search engine.
+Split the natural language query into a period, an event kind, and the semantic keywords.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[AVAILABLE TIME INTENTS]
+{TIME_ARRAY}
+
+[AVAILABLE SEASON INTENTS]
+{SEASON_ARRAY}
+
+[AVAILABLE EVENT TYPES]
+- "click"  : the user pressed / selected something
+- "hover"  : the user lingered on something without pressing it
+- "change" : the user typed a value, picked a select option, toggled a checkbox
+- "report" : a synthesized behavioural report over several actions
+- ""       : the query does not restrict the event kind
+
+[QUERY]
+{QUERY}
+
+[RULES]
+1. "time_intent" MUST be chosen from [AVAILABLE TIME INTENTS]. Return "" when the query contains NO explicit temporal word. Never guess a period from context.
+2. "season_intent" MUST be chosen from [AVAILABLE SEASON INTENTS]. Return "" when no season word is printed. A clothing name is NOT a season word.
+3. "event_types" is an array chosen from [AVAILABLE EVENT TYPES]. Return an empty array when the query does not restrict the kind.
+4. "keywords" holds the meaning-bearing chunks of the query in the ORIGINAL language, with every temporal word removed. Never include verbs such as "show me", "find", "tell me".
+5. "target" is one short sentence, in {LANG}, restating what behaviour the user wants to see. It is used as the semantic search sentence.
+6. "original_text" is the query copied character for character.
+
+[OUTPUT FORMAT]
+{ "original_text": String, "time_intent": String, "season_intent": String, "event_types": [String], "keywords": [String], "target": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
+
+    template
+        .replace("{TIME_CONTEXT}", time_context)
+        .replace("{TIME_ARRAY}", &time_arr_str)
+        .replace("{SEASON_ARRAY}", &season_arr_str)
+        .replace("{QUERY}", query)
+        .replace("{LANG}", lang)
+}
+
+// 🌟 [ANALYTIC REPORT] 벡터 검색으로 회수한 '구조화된 행동 기록' 목록을 근거로
+//    사용자 질의에 답하는 리포트를 작성합니다. 결과는 JSON 이 아니라 마크다운 본문입니다.
+pub fn analytic_report_answer_prompt(
+    query: &str,
+    time_context: &str,
+    scope: &str,
+    records_json: &str,
+    lang: &str,
+) -> String {
+    let template = r###"[TASK]
+You are a User Behavior Analyst. Answer the user's question using ONLY the retrieved behaviour records below.
+
+[SYSTEM TIME & LOCALE CONTEXT]
+{TIME_CONTEXT}
+
+[SEARCH SCOPE]
+{SCOPE}
+
+[USER QUESTION]
+{QUERY}
+
+[RETRIEVED BEHAVIOUR RECORDS]
+{RECORDS}
+
+[RULES]
+1. Every sentence you write MUST be supported by a record above. If the records do not answer the question, say so plainly instead of inventing an answer.
+2. Copy product names, option values, prices and numbers EXACTLY as printed in the records.
+3. Represent users as User A, User B, User C ... Never print the raw address / hash of a user.
+4. Write in {LANG}.
+5. Structure the answer as:
+   - one short headline sentence that directly answers the question
+   - a bullet list of the concrete supporting actions (what, where, when)
+   - one closing sentence on the pattern or the recommended follow-up
+6. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
+
+[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. /no_think"###;
+
+    template
+        .replace("{TIME_CONTEXT}", time_context)
+        .replace("{SCOPE}", scope)
+        .replace("{QUERY}", query)
+        .replace("{RECORDS}", records_json)
+        .replace("{LANG}", lang)
 }
 
 pub fn is_detail_prompt(page_type: &str, title: &str, lang: &str) -> String {

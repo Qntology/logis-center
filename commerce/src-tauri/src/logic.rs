@@ -94,38 +94,210 @@ pub fn parse_status(status: &str) -> i32 {
 
 
 pub fn related(item_type: &str) -> Vec<&str> {
-
     let t = match item_type {
-
         "receiving" | "shipping" => "tracking",
-
         "sales" => "order",
-
         _ => item_type
-
     };
-
     match t {
-
         "goods" => vec!["order", "tracking", "coupon", "event"],
-
         "order" => vec!["goods", "tracking", "coupon", "event"],
-
         "tracking" => vec!["goods", "order", "coupon", "event"],
-
         "coupon" => vec!["goods", "event"],
-
         "event" => vec!["goods", "coupon"],
-
         "review" => vec!["goods", "coupon", "event"],
-
         _ => vec![],
-
     }
+}
 
+/// 🌟 [TRADE RELAY] 무역 서식 간 연결고리 규칙입니다.
+/// Commerce의 relay()가 order↔tracking을 tracking_number로 연결하듯,
+/// 무역 서식은 reference_invoice / reference_lc / reference_booking / container_number로 연결합니다.
+///
+/// 반환값: (연결 대상 서식 타입, 조회할 필드명, 현재 문서에서 가져올 값 필드명)
+pub fn trade_relay_rules(doc_type: &str) -> Vec<(&'static str, &'static str, &'static str)> {
+    match doc_type {
+        // CI가 추출되면 → PL/BL/ED가 CI를 참조하는지 역방향 조회
+        "CI" => vec![
+            ("PL",  "reference_invoice", "doc_number"),
+            ("BL",  "reference_invoice", "doc_number"),
+            ("ED",  "reference_invoice", "doc_number"),
+        ],
+        // PL이 추출되면 → CI를 정방향 조회
+        "PL" => vec![
+            ("CI",  "doc_number", "reference_invoice"),
+            ("BL",  "reference_invoice", "reference_invoice"),
+        ],
+        // BL이 추출되면 → CI/PL/BC를 조회
+        "BL" => vec![
+            ("CI",  "doc_number", "reference_invoice"),
+            ("PL",  "reference_invoice", "reference_invoice"),
+            ("BC",  "doc_number", "reference_booking"),
+        ],
+        // LC가 추출되면 → CI가 LC를 참조하는지 역방향 조회
+        "LC" => vec![
+            ("CI",  "reference_lc", "doc_number"),
+        ],
+        // BC가 추출되면 → BL이 BC를 참조하는지 역방향 조회
+        "BC" => vec![
+            ("BL",  "reference_booking", "doc_number"),
+        ],
+        // ED/ID가 추출되면 → CI를 정방향 조회
+        "ED" | "ID" | "CINV" => vec![
+            ("CI",  "doc_number", "reference_invoice"),
+        ],
+        // CO, SA, DO, AN 등 기타 서식
+        "CO" | "SA" | "DO" | "AN" => vec![
+            ("CI",  "doc_number", "reference_invoice"),
+            ("BL",  "reference_invoice", "reference_invoice"),
+        ],
+        _ => vec![],
+    }
+}
+
+/// 🌟 [TRADE RELATED TYPES] 관련 서식 타입 목록 (N:N 교차 검색용)
+pub fn trade_related(doc_type: &str) -> Vec<&'static str> {
+    match doc_type {
+        "CI" => vec!["PL", "BL", "LC", "BC", "ED", "CO"],
+        "PL" => vec!["CI", "BL", "ED"],
+        "BL" => vec!["CI", "PL", "BC", "AN", "DO"],
+        "LC" => vec!["CI", "BL"],
+        "BC" => vec!["BL", "CI"],
+        "ED" | "ID" | "CINV" => vec!["CI", "PL", "BL"],
+        "CO" => vec!["CI", "BL"],
+        "SA" | "DO" | "AN" => vec!["BL", "CI"],
+        _ => vec![],
+    }
 }
 
 
+
+// 🌟 [TRADING RELAY] 무역 서식 간 N:N 관계 정의.
+//    commerce 의 related() 와 동일한 구조이지만,
+//    무역 서식 코드(BL/AWB/CI/PI/PL/PO/SC/LC/CO 등)를 키로 사용합니다.
+//
+// 관계 규칙:
+//   BL  → CI, PL       : reference_invoice / reference_booking
+//   CI  → BL, PL, LC   : reference_invoice / reference_lc
+//   PL  → BL, CI       : reference_invoice / reference_booking
+//   PO  → PI, SC       : doc_number
+//   PI  → PO, SC       : doc_number
+//   SC  → PO, PI       : doc_number
+//   LC  → CI           : reference_lc
+//   CO  → CI           : reference_invoice
+pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
+    match doc_type {
+        "BL"  => vec!["CI", "PL"],
+        "CI"  => vec!["BL", "PL", "LC"],
+        "PL"  => vec!["BL", "CI"],
+        "PO"  => vec!["PI", "SC"],
+        "PI"  => vec!["PO", "SC"],
+        "SC"  => vec!["PO", "PI"],
+        "LC"  => vec!["CI"],
+        "CO"  => vec!["CI"],
+        "AWB" => vec!["CI", "PL"],
+        "SA"  => vec!["BL", "CI"],
+        "DO"  => vec!["BL", "AN"],
+        "AN"  => vec!["DO", "BL"],
+        "BC"  => vec!["BL", "CI"],
+        "ED"  => vec!["CI", "PL"],
+        "ID"  => vec!["CI", "PL"],
+        "CINV"=> vec!["CI"],
+        _     => vec![],
+    }
+}
+
+// 🌟 [TRADING RELAY FIELD v2 / DIRECTIONAL PAIR]
+//  ── 무엇이 문제였나 ──
+//   v1 은 (from, to) 쌍에 대해 '단 하나의 필드명'만 돌려주었습니다.
+//   그런데 실무 서식은 방향에 따라 참조 필드가 다릅니다.
+//     BL.reference_invoice = CI.doc_number   (BL 쪽 필드는 reference_invoice)
+//     CI.doc_number        = BL.reference_invoice
+//   v1 은 양쪽 모두 "reference_invoice" 를 반환했기 때문에,
+//   CI 문서에서 relay 를 돌 때 `CI.reference_invoice` 라는 존재하지 않는 값을 읽어
+//   조회가 항상 0건이었습니다.
+//
+//  반환값: (내 문서에서 값을 읽어올 필드, 상대 문서에서 조회할 필드)
+pub fn trading_relay_pair(from_type: &str, to_type: &str) -> Option<(&'static str, &'static str)> {
+    match (from_type, to_type) {
+        // ── 인보이스 참조 축 ──
+        ("BL",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "BL")  => Some(("doc_number", "reference_invoice")),
+        ("PL",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "PL")  => Some(("doc_number", "reference_invoice")),
+        ("CO",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "CO")  => Some(("doc_number", "reference_invoice")),
+        ("AWB", "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "AWB") => Some(("doc_number", "reference_invoice")),
+        ("SA",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "SA")  => Some(("doc_number", "reference_invoice")),
+        ("BC",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "BC")  => Some(("doc_number", "reference_invoice")),
+        ("ED",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "ED")  => Some(("doc_number", "reference_invoice")),
+        ("ID",  "CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "ID")  => Some(("doc_number", "reference_invoice")),
+        ("CINV","CI")  => Some(("reference_invoice", "doc_number")),
+        ("CI",  "CINV")=> Some(("doc_number", "reference_invoice")),
+        ("ED",  "PL")  => Some(("reference_invoice", "reference_invoice")),
+        ("PL",  "ED")  => Some(("reference_invoice", "reference_invoice")),
+        ("ID",  "PL")  => Some(("reference_invoice", "reference_invoice")),
+        ("PL",  "ID")  => Some(("reference_invoice", "reference_invoice")),
+
+        // ── 부킹 참조 축 ──
+        ("BL",  "PL")  => Some(("reference_booking", "reference_booking")),
+        ("PL",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("AWB", "PL")  => Some(("reference_booking", "reference_booking")),
+        ("PL",  "AWB") => Some(("reference_booking", "reference_booking")),
+        ("BL",  "BC")  => Some(("reference_booking", "doc_number")),
+        ("BC",  "BL")  => Some(("doc_number", "reference_booking")),
+        ("SA",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "SA")  => Some(("reference_booking", "reference_booking")),
+        ("DO",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "DO")  => Some(("reference_booking", "reference_booking")),
+        ("DO",  "AN")  => Some(("reference_booking", "reference_booking")),
+        ("AN",  "DO")  => Some(("reference_booking", "reference_booking")),
+        ("AN",  "BL")  => Some(("reference_booking", "reference_booking")),
+        ("BL",  "AN")  => Some(("reference_booking", "reference_booking")),
+
+        // ── L/C 참조 축 ──
+        ("CI",  "LC")  => Some(("reference_lc", "doc_number")),
+        ("LC",  "CI")  => Some(("doc_number", "reference_lc")),
+
+        // ── 계약 3종 상호 참조 ──
+        ("PO",  "PI")  => Some(("doc_number", "doc_number")),
+        ("PI",  "PO")  => Some(("doc_number", "doc_number")),
+        ("PO",  "SC")  => Some(("doc_number", "doc_number")),
+        ("SC",  "PO")  => Some(("doc_number", "doc_number")),
+        ("PI",  "SC")  => Some(("doc_number", "doc_number")),
+        ("SC",  "PI")  => Some(("doc_number", "doc_number")),
+
+        _ => None,
+    }
+}
+
+// 🌟 [BACK-COMPAT] 기존 호출부(trading_relay_field)를 살려 둡니다.
+//  '내 쪽 필드'만 반환하므로 v1 과 동일하게 동작합니다.
+pub fn trading_relay_field(from_type: &str, to_type: &str) -> Option<&'static str> {
+    trading_relay_pair(from_type, to_type).map(|(mine, _)| mine)
+}
+
+// 🌟 [TRADING INDEX COLUMN] commerce 가 order↔tracking 을 'order'/'tracking' 이라는
+//  숫자 index 컬럼으로 잇는 것과 동일한 구조를 무역 서식에 부여합니다.
+//
+//  commerce:
+//     order.tracking  = crc32(hash_id("tracking" + team_id + tracking_number))
+//     tracking.order  = crc32(hash_id("order"    + team_id + order_no))
+//
+//  trading (이 함수가 정의):
+//     BL.ci = crc32(hash_id("CI" + team_id + 정규화된 CI doc_number))
+//     CI.bl = crc32(hash_id("BL" + team_id + 정규화된 BL doc_number))
+//
+//  반환값은 data.* 인덱스 경로에 쓰일 소문자 컬럼명입니다.
+//  (Dexie 의 'data.rel_ci' 인덱스와 1:1 대응)
+pub fn trading_index_column(doc_type: &str) -> String {
+    format!("rel_{}", doc_type.to_lowercase())
+}
 
 pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>, MergeInfo)> {
 

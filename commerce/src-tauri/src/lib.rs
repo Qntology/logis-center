@@ -107,9 +107,12 @@ async fn stop_current_extraction(
 
             println!("[STOP] Task {} cleared from DB and temporary files deleted.", id);
         } else {
-            
             let _ = db.cleanup_unfinished_tasks_on_startup().await;
             println!("[STOP] All pending tasks cleared from DB.");
+            // 🌟 [LOGOUT SCOPE RESET] 로그아웃 시 ACTIVE_TASK_MEM 만 정리합니다.
+            //    LanceDB 문서 자체는 삭제하지 않습니다.
+            //    (재로그인 시 migrate_team_identity 가 to 필드만 갱신)
+            //    만약 완전 초기화가 필요하면 프론트엔드에서 reset_lancedb 를 호출합니다.
         }
     }
     drop(store_guard); // 다음 단계(Model Clear) 진행을 위해 즉시 락 해제
@@ -170,6 +173,508 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
 
     println!("[UNLOAD] Model, Store and Cancellation flag cleared.");
     Ok("Memory cleared.".to_string())
+}
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / RESPOND] 프론트엔드 → Rust 음차 캐시 응답 수신
+// ---------------------------------------------------------------------
+//  프론트엔드가 Dexie 를 조회한 뒤 invoke("translit_cache_respond") 로
+//  결과를 보내면, 여기서 oneshot sender 를 통해 scheduler 에 전달합니다.
+// =====================================================================
+#[tauri::command]
+async fn translit_cache_respond(
+    request_id: String,
+    results: Vec<(String, String)>,
+) -> Result<(), String> {
+    if let Some(sender) = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id) {
+        let _ = sender.send(results);
+    }
+    Ok(())
+}
+
+// =====================================================================
+// 🌟 [TRANSLIT CACHE / EMBEDDING BATCH] 복수 음차 후보 코사인 계산용
+// ---------------------------------------------------------------------
+//  프론트엔드가 복수 후보의 임베딩을 한 번에 요청할 때 사용합니다.
+//  get_embedding_batch 를 Tauri command 로 노출합니다.
+// =====================================================================
+#[tauri::command]
+async fn get_embedding_batch_for_translit(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let model = {
+        let mut model_guard = state.model.lock().await;
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), None).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+        model_guard.as_ref().unwrap().clone()
+    };
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+    model.get_embedding_batch(texts).await.map_err(|e| e.to_string())
+}
+
+// =====================================================================
+// 🌟 [CLIENT-SIDE EMBEDDING] Cloud AI 모드에서도 임베딩은 무조건 로컬에서 수행합니다.
+//    ① get_query_embedding      : 클라우드 검색용 질의 벡터를 로컬 모델로 생성
+//    ② reindex_pending_embeddings : 클라우드가 내려준 아이템을 로컬에서 벡터화 + 청크 인덱싱
+// =====================================================================
+#[tauri::command]
+async fn get_query_embedding(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    text: String,
+    device_preference: Option<String>,
+) -> Result<Vec<f32>, String> {
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+
+    let vec = model.get_embedding(text).await.map_err(|e| e.to_string())?;
+
+    println!("[EMBED-LOCAL] Query embedding generated locally. dim = {}", vec.len());
+
+    Ok(vec)
+}
+
+#[tauri::command]
+async fn reindex_pending_embeddings(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    limit: Option<usize>,
+    device_preference: Option<String>,
+    // 🌟 [MODE ROUTING] commerce / shipping / analytic 트랙을 구분합니다.
+    //    analytic 은 console.logis.center, 나머지는 commerce.logis.center 로 벡터가 전송됩니다.
+    mode: Option<String>,
+) -> Result<Value, String> {
+    // 진행 중인 로컬 작업이 있으면 VRAM 충돌 방지를 위해 즉시 반환합니다.
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        return Ok(json!({ "processed": 0, "vectors": [], "skipped": "searching" }));
+    }
+    if crate::ACTIVE_TASK_MEM.read().unwrap().is_some() {
+        return Ok(json!({ "processed": 0, "vectors": [], "skipped": "busy" }));
+    }
+
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            let _ = std::fs::create_dir_all(&db_path);
+            if let Ok(s) = VectorStore::new(&db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
+        }
+        store_guard.as_ref().cloned()
+    };
+
+    let store = match store_opt {
+        Some(s) => s,
+        None => return Err("DB not initialized".to_string()),
+    };
+
+    let scan_limit = limit.unwrap_or(20);
+    // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
+    //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
+    let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
+    let mode_filter = format!("mode = '{}'", target_mode);
+    // 🌟 [SCAN STARVATION FIX]
+    //  ── 무엇이 문제였나 ──
+    //   기존에는 offset 0 에서 500건만 읽었습니다. 정렬 기준이 고정되어 있으므로
+    //   상위 500건이 전부 임베딩 완료 상태가 되면 pending 이 비고 no_pending 으로 끝나,
+    //   501번째 이후의 미처리 문서는 영원히 처리되지 않았습니다.
+    //   문서가 500건을 넘는 순간 로컬 임베딩이 조용히 멈춥니다.
+    //   scan_limit 만큼 채울 때까지 오프셋을 밀며 순회합니다.
+    const SCAN_PAGE: usize = 500;
+    const SCAN_MAX_PAGES: usize = 40; // 최대 20,000건까지 탐색
+    let mut docs: Vec<TradeDocument> = Vec::new();
+    for page in 0..SCAN_MAX_PAGES {
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        let batch = store
+            .get_all_items("items", SCAN_PAGE, page * SCAN_PAGE, Some(mode_filter.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let fetched = batch.len();
+        docs.extend(batch);
+        if fetched < SCAN_PAGE { break; }
+        // 이번 페이지까지의 후보로 scan_limit 을 채울 수 있으면 더 읽지 않습니다.
+        let rough_pending = docs.iter().filter(|d| !d.id.is_empty()).count();
+        if rough_pending >= scan_limit * 20 { break; }
+    }
+
+    // 🌟 [LAZY MODEL LOAD] 대상 선별을 '모델 로드 이전' 으로 끌어올립니다.
+    //    기존 구조는 LogisModel::new → ensure_embedding 을 먼저 수행한 뒤 스캔했기 때문에,
+    //    처리할 문서가 0건이어도 CUDA 컨텍스트와 97M 임베딩 가중치를 매번 올렸다 내렸습니다.
+    //    (로그 실측: [EMBED-LOCAL] 처리 로그가 없는데도 Loading Embedding Model 발생)
+    //    이 스캔 구간은 LanceDB 조회만 사용하므로 모델이 전혀 필요 없습니다.
+    let mut pending: Vec<TradeDocument> = Vec::new();
+    for doc in docs {
+        if pending.len() >= scan_limit { break; }
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        if doc.id.is_empty() { continue; }
+        // 🌟 question / answer 는 관리자 채팅 말풍선 전용 타입입니다.
+        //    upsert_items 가 items 로 라우팅하는데 제외 목록에는 없어 벡터화되고 있었고,
+        //    parse_analytic_query 는 이 두 타입을 검색 스코프에서 제외하므로
+        //    만들기만 하고 한 번도 쓰이지 않는 벡터였습니다.
+        // 🌟 [EMBED TYPE GUARD] 검색 벡터화가 무의미한 타입만 배제합니다.
+        //    pages/talk/prompt/ai_search 는 검색 대상이 아니고,
+        //    question/answer 는 parse_analytic_query 가 검색 스코프에서 제외하며,
+        //    team/user/member 는 통계 문서라 임베딩 대상이 아닙니다.
+        //
+        //    🌟 [ANALYTICS ALLOW]
+        //     ── 무엇이 문제였나 ──
+        //      click / hover 를 이 목록에 넣고, 바로 아래에서 report 까지 별도로 건너뛰어
+        //      analytics 4종(click/hover/change/report) 중 change 하나만 벡터화되었습니다.
+        //      나머지 3종은 vector 컬럼이 0벡터로 남아 search_items 의 ANN 트랙이
+        //      의미 없는 비교를 하게 되고, item_chunks 도 없어 STAGE-4 가 통째로 비었습니다.
+        //      "D1 에서 이벤트를 받아와도 검색이 아무것도 못 찾는" 상태의 직접 원인입니다.
+        //     ── 비용 ──
+        //      analytics 도메인 타입은 get_detail_schema_fields 에 스키마가 없어
+        //      index_item_chunks 가 조기 종료됩니다. 즉 추가 비용은 '문서 벡터 1개' 뿐입니다.
+        const EMBED_EXCLUDE_TYPES: [&str; 10] = [
+            "pages", "page", "talk", "prompt", "ai_search",
+            "question", "answer", "team", "user", "member",
+        ];
+        if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
+            continue;
+        }
+        // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
+        //    가장 먼저 탈락시킵니다. chunk_count는 물리적 사실이라
+        //    embed 플래그(소프트 마커)보다 신뢰도가 높습니다.
+        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
+        if chunk_count > 0 { continue; }
+        // 🌟 [EMBED FLAG CHECK] data 내부의 embed 플래그를 보조 확인합니다.
+        //    chunk_count가 0이지만 embed가 1인 경우(청크 삭제 후 재인덱싱 대기 등)
+        //    불필요한 재처리를 방지합니다.
+        if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
+            // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 type 이 도메인 타입(tracking/goods/...)
+            //    이라서 EMBED_EXCLUDE_TYPES 문자열 목록으로는 절대 잡히지 않습니다.
+            //    (서버 index.ts 의 home 문서 = { table:'pages', type:'tracking', data:{node,item} })
+            //    그래서 '구조 마커' 로 판정합니다. 셀렉터 캐시는 검색 대상이 아니므로
+            //    임베딩도, 청크 인덱싱도, 음차도 전부 불필요합니다.
+            let is_page_cache = data_val.get("table")
+                    .and_then(|v| v.as_str())
+                    .map_or(false, |t| t == "pages" || t == "page")
+                || data_val.get("node").is_some()
+                || data_val.get("item").is_some();
+            if is_page_cache {
+                println!(
+                    "[EMBED-LOCAL] ⏭️ 페이지 셀렉터 캐시 문서 '{}' (type='{}') 는 검색 대상이 아니므로 임베딩을 건너뜁니다.",
+                    doc.id, doc.r#type
+                );
+                continue;
+            }
+
+            let already = data_val.get("embed")
+                .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
+                .unwrap_or(false);
+            if already {
+                continue; // 이미 임베딩 완료된 아이템
+            }
+        }
+        pending.push(doc);
+    }
+
+    // 🌟 [VRAM GUARD] 처리 대상이 없으면 모델을 만들지 않고 즉시 반환합니다.
+    if pending.is_empty() {
+        return Ok(json!({ "processed": 0, "vectors": [], "mode": target_mode, "skipped": "no_pending" }));
+    }
+
+    println!("[EMBED-LOCAL] {} pending item(s) detected. Loading embedding model...", pending.len());
+
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
+    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+
+    let mut processed = 0usize;
+    for doc in pending {
+        if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+        // 🌟 [BLOB DECODE GUARD] json_data 내부의 "data" 키가 아직
+        //    base64(gzip) 문자열로 남아 있으면 해제합니다.
+        //    upsert_items 가 이미 처리하지만, 구버전 저장 데이터나
+        //    직접 LanceDB 에 삽입된 행에는 미처리 상태가 있을 수 있습니다.
+        if let Some(blob_b64) = data.get("data").and_then(|v| v.as_str()) {
+            if blob_b64.len() > 50 {
+                use base64::prelude::BASE64_STANDARD;
+                use base64::Engine;
+                if let Ok(decoded) = BASE64_STANDARD.decode(blob_b64) {
+                    if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
+                        // 해제된 내용을 현재 data 에 병합합니다.
+                        if let (Some(base_obj), Some(inner_obj)) = (data.as_object_mut(), decompressed.as_object()) {
+                            for (k, v) in inner_obj {
+                                if !base_obj.contains_key(k) {
+                                    base_obj.insert(k.clone(), v.clone());
+                                }
+                            }
+                            base_obj.remove("data");
+                        }
+                    }
+                }
+            }
+        }
+        // 🌟 [ANALYTICS] Cron Worker 가 구조화한 'action'(사용자 의도 문장)이 벡터의 본체입니다.
+        //    action 이 없으면 summary → cross_action_flow → intent_evolution 순으로 폴백합니다.
+        //
+        //    🌟 [RAW ARRAY GUARD] content.js 가 처음 올린 원시 이벤트의 action 은
+        //      ["<div class=...>...</div>"] 형태의 '배열' 입니다.
+        //      as_str() 이 None 을 돌려주므로 값 자체는 무해했지만,
+        //      아래 폴백 체인 끝의 json_to_natural_language 가 relate(HTML 배열)까지
+        //      통째로 펼쳐 벡터에 HTML 덩어리를 밀어 넣습니다.
+        //      Worker 의 GET 은 updated_at > 0 인 구조화 완료 행만 내려주므로
+        //      정상 경로에서는 배열이 오지 않지만, 구버전 잔재를 위해 명시적으로 배제합니다.
+        let analytic_text = data.get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // 🌟 [EMPTY-AWARE FALLBACK] Option 의 or_else 는 None 일 때만 발화합니다.
+        //    summary 키가 존재하되 빈 문자열이면 Some("") 이 되어
+        //    cross_action_flow 폴백이 영원히 도달하지 않았습니다.
+        let pick = |k: &str| -> Option<String> {
+            data.get(k)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let analytic_fallback = pick("summary")
+            .or_else(|| pick("cross_action_flow"))
+            .or_else(|| pick("intent_evolution"))
+            .unwrap_or_default();
+        // 🌟 [RAW EVENT DETECT] 구조화 전 원시 이벤트인지 판정합니다.
+        //    action 이 배열이거나 relate 가 배열이면 Cron Worker 가 아직 손대지 않은 행입니다.
+        let is_raw_event = data.get("action").map_or(false, |v| v.is_array())
+            || data.get("relate").map_or(false, |v| v.is_array());
+
+        let text = if !analytic_text.is_empty() {
+            analytic_text
+        } else if !doc.text.trim().is_empty() {
+            doc.text.clone()
+        } else if !analytic_fallback.is_empty() {
+            analytic_fallback
+        } else if doc.mode == "analytic" || is_raw_event {
+            // 🌟 [RAW GUARD] analytics 문서에 구조화 문장이 하나도 없으면
+            //    json_to_natural_language 가 relate(원시 outerHTML 배열)를 전부 펼쳐
+            //    수천 토큰짜리 HTML 을 임베딩 입력으로 만듭니다.
+            //    그 벡터는 어떤 질의와도 유사하지 않고, 저장 용량만 잡아먹으며,
+            //    embed=1 로 마킹되어 Cron Worker 가 나중에 구조화해도 재인덱싱되지 않습니다.
+            //    Cron 구조화 이후 updated_at 이 갱신되면 다시 후보로 잡히도록 여기서 건너뜁니다.
+            println!(
+                "[EMBED-LOCAL] ⏭️ analytics 문서 '{}' (type='{}') 는 아직 구조화 문장(action/summary/cross_action_flow)이 없어 임베딩을 보류합니다.",
+                doc.id, doc.r#type
+            );
+            continue;
+        } else {
+            crate::parsing::json_to_natural_language(&data)
+        };
+
+        if text.trim().is_empty() { continue; }
+
+        let emb = model.get_embedding(text.clone()).await.map_err(|e| e.to_string())?;
+
+        if let Some(o) = data.as_object_mut() {
+            o.insert("text".to_string(), json!(text.clone()));
+            if !o.contains_key("masked_text") {
+                o.insert("masked_text".to_string(), json!(text.clone()));
+            }
+            o.insert("embed".to_string(), json!(1));
+            // 🌟 [UPDATED_AT PRESERVE] reindex는 데이터 변경이 아니라
+            //    임베딩 마킹이므로 updated_at을 현재 시각으로 갱신하지 않습니다.
+            //    기존 updated_at이 없으면 0으로 두어 upsert_item의
+            //    digest 기반 스킵 로직이 정상 동작하도록 합니다.
+            if !o.contains_key("updated_at") {
+                o.insert("updated_at".to_string(), json!(doc.updated_at_ts));
+            }
+        }
+
+        // 🌟 [v4] sales / tracking / event 물리 테이블이 사라졌으므로
+        //    '도메인 테이블 + items 미러' 이중 upsert 를 단일 upsert 로 접습니다.
+        //    (쓰기 횟수가 절반으로 줄고, 두 테이블의 내용이 어긋날 여지가 사라집니다)
+        let target_table = match doc.r#type.as_str() {
+            "member" | "team" | "user" => "users",
+            "pages" | "page" => "pages",
+            _ => "items",
+        };
+
+        let digest = crate::utils::hash::digest(&text);
+
+        let _ = store.upsert_item(
+            target_table, &doc.id, &doc.r#type, data.clone(), Some(emb.clone()),
+            Some(&doc.from), Some(&doc.to), Some(&doc.cc), Some(&doc.bcc), Some(&doc.r#ref), Some(&digest)
+        ).await;
+
+        let link = data.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let doc_lang = crate::utils::lang_utils::detect_document_language(&text);
+        // 🌟 v4 : mode 는 봉투 물리 컬럼이므로 doc.mode 가 항상 채워져 있습니다.
+        //    다만 구버전 데이터를 대비해 data.mode 까지 폴백을 둡니다.
+        let mode = if !doc.mode.trim().is_empty() {
+            doc.mode.clone()
+        } else {
+            data.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string()
+        };
+
+        let cancel = state.cancellation_token.clone();
+        let _ = crate::scheduler::index_item_chunks(
+            &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
+            &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync"
+        ).await;
+
+        processed += 1;
+    }
+
+    if processed > 0 {
+        println!("[EMBED-LOCAL] Cloud-synced items embedded locally: {} item(s). (mode: {})", processed, target_mode);
+    }
+
+    model.unload_embedding().await;
+
+    Ok(json!({ "processed": processed, "mode": target_mode }))
+}
+
+// =====================================================================
+// 🌟 [ANALYTIC STRUCTURING ENTRY] D1 → LanceDB 로 내려온 원시 행동 로그를
+//    HTML → PUG → 속성 제거 → Qwen3.5 2B 요약 으로 확정합니다.
+//  ── 호출 시점 ──
+//   main.ts 의 syncAnalyticsData 직후. 임베딩(reindex_pending_embeddings)보다
+//   반드시 먼저 실행되어야 합니다. 텍스트가 없으면 임베딩 경로가
+//   RAW GUARD 로 그 문서를 건너뛰기 때문입니다.
+// =====================================================================
+#[tauri::command]
+async fn structure_pending_analytics(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    limit: Option<usize>,
+    device_preference: Option<String>,
+) -> Result<Value, String> {
+    if IS_SEARCHING.load(Ordering::SeqCst) {
+        return Ok(json!({ "processed": 0, "skipped": "searching" }));
+    }
+    if crate::ACTIVE_TASK_MEM.read().unwrap().is_some() {
+        return Ok(json!({ "processed": 0, "skipped": "busy" }));
+    }
+    if state.cancellation_token.load(Ordering::Relaxed) {
+        return Ok(json!({ "processed": 0, "skipped": "cancelled" }));
+    }
+
+    let store_opt = {
+        let mut store_guard = state.store.lock().await;
+        if store_guard.is_none() {
+            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+            let _ = std::fs::create_dir_all(&db_path);
+            if let Ok(s) = VectorStore::new(&db_path).await {
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            }
+        }
+        store_guard.as_ref().cloned()
+    };
+
+    let store = match store_opt {
+        Some(s) => s,
+        None => return Err("DB not initialized".to_string()),
+    };
+
+    // 🌟 [LAZY MODEL LOAD] 대상이 0건이면 Qwen3.5 2B 를 아예 올리지 않습니다.
+    //    (LanceDB 조회 1회로 끝나므로 유휴 시 부담이 사실상 없습니다)
+    let type_list = crate::analytic::ANALYTIC_EVENT_TYPES
+        .iter()
+        .map(|t| format!("'{}'", t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let probe_filter = format!(
+        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
+        type_list
+    );
+
+    let probe = store
+        .get_all_items("items", 1, 0, Some(probe_filter))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if probe.is_empty() {
+        return Ok(json!({ "processed": 0, "skipped": "no_pending" }));
+    }
+
+    println!("[ANALYTIC] Pending raw behaviour event detected. Loading Qwen3.5(2B) for structuring...");
+
+    let model = {
+        let mut model_guard = state.model.lock().await;
+
+        if let Some(m) = model_guard.as_ref() {
+            let wants_cpu = device_preference.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.deep_purge_resources().await;
+                *model_guard = None;
+            }
+        }
+
+        if model_guard.is_none() {
+            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+                Ok(m) => { *model_guard = Some(m); },
+                Err(e) => return Err(format!("Model load failed: {}", e)),
+            }
+        }
+
+        model_guard.as_ref().unwrap().clone()
+    };
+
+    let processed = crate::analytic::run_analytic_structuring(
+        &store,
+        &model,
+        &state.cancellation_token,
+        &app_handle,
+        "analytic_sync",
+        limit.unwrap_or(20),
+    ).await.map_err(|e| e.to_string())?;
+
+    model.deep_purge_resources().await;
+
+    Ok(json!({ "processed": processed }))
 }
 
 #[tauri::command]
@@ -341,6 +846,60 @@ async fn summarize_image(
     }
 }
 
+// 🌟 [SCOPE SANITIZE] 프론트엔드가 넘긴 필터에서 봉투 컬럼 술어만 남깁니다.
+//  v4 이전 프론트엔드는 status / amount 같은 도메인 컬럼을 SQL 로 보냈는데,
+//  그 컬럼들이 물리적으로 사라졌으므로 그대로 내려보내면 DataFusion 이 통째로 실패합니다.
+//  (실패 시 필터가 초기화되어 타 팀 데이터가 새어 나오는 보안 문제로 이어집니다)
+//  따라서 여기서 화이트리스트로 걸러 '스코프만' 남기고, 도메인 술어는 조용히 버립니다.
+//  버려진 조건은 프론트엔드 Dexie 가 data.* 로 다시 적용합니다.
+fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
+    const ENVELOPE_COLS: [&str; 9] = [
+        "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
+    ];
+    const TIME_COLS: [&str; 2] = ["created_at", "updated_at"];
+
+    let raw = match filter {
+        Some(f) if !f.trim().is_empty() => f,
+        _ => return None,
+    };
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+
+    for clause in raw.split(" AND ") {
+        let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        if c.is_empty() { continue; }
+
+        // 술어의 좌변 컬럼명을 추출합니다. (백틱/공백/연산자 제거)
+        let lhs: String = c
+            .split(|ch: char| ch == '=' || ch == '<' || ch == '>' || ch == ' ')
+            .next()
+            .unwrap_or("")
+            .trim_matches('`')
+            .trim()
+            .to_lowercase();
+
+        let is_envelope = ENVELOPE_COLS.iter().any(|e| *e == lhs)
+            || TIME_COLS.iter().any(|e| *e == lhs);
+
+        if is_envelope {
+            kept.push(c.to_string());
+        } else {
+            dropped.push(c.to_string());
+        }
+    }
+
+    if !dropped.is_empty() {
+        println!(
+            "[SCOPE SANITIZE] 봉투 컬럼이 아닌 술어 {}개를 LanceDB 필터에서 제외했습니다(Dexie 위임): {:?}",
+            dropped.len(),
+            dropped.iter().take(6).collect::<Vec<_>>()
+        );
+    }
+
+    if kept.is_empty() { None } else { Some(kept.join(" AND ")) }
+}
+
 #[tauri::command]
 async fn search_documents(
     state: State<'_, AppState>,
@@ -351,6 +910,9 @@ async fn search_documents(
 ) -> Result<Vec<(String, String, f32)>, String> {
     
     println!("[DB-SEARCH] 텍스트 검색 요청 수신 (Query: '{}', Filter: {:?})", query, filter);
+
+    // 🌟 v4 : 도메인 술어를 걷어내고 스코프만 남깁니다.
+    let scope = sanitize_scope_filter(filter);
 
     let store_opt = {
         let mut store_guard = state.store.lock().await;
@@ -384,7 +946,7 @@ async fn search_documents(
 
     if let Some(store) = store_opt {
         
-        let search_result = store.search_items("items", &query, query_vec, limit, offset, filter, false).await.map_err(|e| e.to_string());
+        let search_result = store.search_items("items", &query, query_vec, limit, offset, scope, false).await.map_err(|e| e.to_string());
         
         
         match &search_result {
@@ -404,104 +966,349 @@ async fn search_documents(
     }
 }
 
-// Helper to convert structured LLM conditions to SQL filter strings
-fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
-    let mut filters = Vec::new();
-    
-    if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
-        if !t.is_empty() { filters.push(format!("type = '{}'", t)); }
-    }
+// =====================================================================
+// 🌟 [QUERY ROUTER v4] 조건을 '스코프'와 '정밀 필터'로 물리적으로 분리합니다.
+// ---------------------------------------------------------------------
+//  기존 convert_conditions_to_sql 은 하나의 함수가 두 역할을 겸하면서
+//  valid_cols 화이트리스트(7개) 밖의 조건을 전부 '버리고' 있었습니다.
+//  그 손실을 메우려고 STAGE-3 이 A/FULL ~ E/TABLE-FALLBACK 5개 티어를 발행했고,
+//  그래도 못 메운 부분은 tracking_sql 의 LIKE '%..%' 로 땜질했습니다.
+//
+//  v4 구조:
+//    build_scope_filter → LanceDB : 봉투 컬럼만. 조건을 '절대' 버리지 않음(애초에 안 받음)
+//    build_dexie_plan   → Dexie   : 도메인 조건 전량. 버려지는 조건이 0개
+//
+//  → 조건이 버려지지 않으므로 보험 티어(A~E)가 불필요해지고,
+//    새 도메인 필드가 생겨도 이 두 함수는 수정할 필요가 없습니다.
+// =====================================================================
 
-    if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
-        if !status.is_empty() && status != "null" {
-            
-            let status_int = crate::logic::parse_status(status);
-            filters.push(format!("status = {}", status_int));
+/// LanceDB 로 내려보낼 '스코프' SQL 을 만듭니다.
+/// 봉투(Envelope) 물리 컬럼만 사용하므로 DataFusion 문법 에러가 구조적으로 발생할 수 없습니다.
+fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
+    let mut filters: Vec<String> = Vec::new();
+
+    // ── type : 도메인 파티션 ──
+    //  🌟 v4 : STAGE-3 이 types 배열(확정 도메인 + 교차 후보)을 실어 보냅니다.
+    //     v3 는 후보 도메인마다 별도 컨텍스트를 만들어 쿼리를 늘렸는데,
+    //     IN 절 하나로 같은 리콜을 1회 왕복에 얻습니다.
+    let mut type_list: Vec<String> = Vec::new();
+
+    if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(s) = t.as_str() {
+                let clean = s.trim();
+                if clean.is_empty() || clean == "ignore" { continue; }
+                // 구버전 STAGE-3 의 "{domain}_items" 접미사 호환
+                let base = clean.strip_suffix("_items").unwrap_or(clean);
+                if !type_list.iter().any(|x| x == base) { type_list.push(base.to_string()); }
+            }
         }
     }
 
+    if type_list.is_empty() {
+        if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
+            let clean = t.trim();
+            let base = clean.strip_suffix("_items").unwrap_or(clean);
+            if !base.is_empty() && base != "ignore" {
+                type_list.push(base.to_string());
+            }
+        }
+    }
+
+    if type_list.len() == 1 {
+        filters.push(format!("type = '{}'", type_list[0].replace('\'', "''")));
+    } else if type_list.len() > 1 {
+        let quoted: Vec<String> = type_list.iter()
+            .map(|t| format!("'{}'", t.replace('\'', "''")))
+            .collect();
+        filters.push(format!("type IN ({})", quoted.join(", ")));
+    }
+
+    // ── mode : commerce / shipping / analytic 트랙 격리 ──
+    if !search_mode.trim().is_empty() {
+        filters.push(format!("mode = '{}'", search_mode.replace('\'', "''")));
+    }
+
+    // ── cc / bcc / ref : 팀·도메인·페이지 스코프 ──
+    for key in ["cc", "bcc", "ref"] {
+        if let Some(v) = ctx.get(key).and_then(|x| x.as_str()) {
+            let clean = v.trim();
+            if !clean.is_empty() {
+                filters.push(format!("`{}` = '{}'", key, clean.replace('\'', "''")));
+            }
+        }
+    }
+
+    // ── 시간 범위 : created_at / updated_at 은 봉투 물리 컬럼이므로 SQL 로 좁히는 게 이득 ──
+    //    (전체 문서에서 기간 밖 데이터를 미리 걷어내면 벡터 검색 후보가 줄어 리콜 품질이 올라갑니다)
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
+            let envelope_col = match key.as_str() {
+                "created_at" => "created_at",
+                "updated_at" => "updated_at",
+                _ => continue,
+            };
+            let op_str = match val_obj.get("operator").and_then(|v| v.as_str()) {
+                Some(s) => s.trim().to_lowercase(),
+                None => continue,
+            };
+            // 비교 연산자만 SQL 로 내립니다. top/bottom/contains 는 Dexie 담당입니다.
+            let sql_op = if op_str.starts_with("gte") { ">=" }
+                else if op_str.starts_with("gt") { ">" }
+                else if op_str.starts_with("lte") { "<=" }
+                else if op_str.starts_with("lt") { "<" }
+                else if op_str.starts_with("eq") { "=" }
+                else { continue };
 
-            // let valid_cols = [
-            //     "amount", "status", "type", "created_at", "updated_at",
-            //     "no", "carrier", "shipping_method", "sender_address", "recipient_address", 
-            //     "shipping_date", "delivery_date", "weight",
-            //     "vessel", "pol", "pod", "incoterms", "sender_name", "recipient_name", "issue_date",
-            //     "started_at", "expired_at" // 🌟 [CRITICAL FIX] 이벤트/쿠폰 필터링용 날짜 컬럼 복구
-            // ];
-            
-            // let mapped_key = match key.as_str() {
-            //     "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" => "amount",
-            //     "document_number" | "tracking_number" => "no",
-            //     "supplier_name" | "shipper_name" => "sender_name",
-            //     "buyer_name" | "consignee_name" => "recipient_name",
-            //     "amount_total" | "total_amount" => "amount",
-            //     "vehicle_name" | "flight_no" => "vessel",
-            //     "location_port_of_loading" => "pol",
-            //     "location_port_of_discharge" => "pod",
-            //     "incoterms_code" => "incoterms",
-            //     // 🌟 [CRITICAL FIX] 불필요한 가상 키워드를 완전히 제거하고 started_at과 expired_at으로 단일 통일시켰습니다.
-            //     // coupon/event 도메인은 DB 고유의 started_at, expired_at 컬럼을 원본 보호하고 그 외 도메인은 전부 created_at 컬럼으로 연결합니다.
-            //     "started_at" | "expired_at" => {
-            //         let t = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            //         if t == "event" || t == "coupon" {
-            //             if key == "started_at" { "started_at" } else { "expired_at" }
-            //         } else {
-            //             "created_at"
-            //         }
-            //     },
-            //     k if valid_cols.contains(&k) => k,
-            //     _ => "" 
-            // };
-            
-            // 🌟 [CRITICAL FIX] LanceDB 스키마(store.rs)에 실제로 물리적으로 존재하는 컬럼만 명시해야 SQL 에러(Fallback)를 방지할 수 있습니다!
-            // 가상 컬럼(weight, no, started_at 등)이 SQL에 포함되면 DataFusion 쿼리가 실패하여 모든 필터(5000원 등)가 통째로 초기화되는 치명적 버그 수정.
-            // 🌟 [TRACKING FIX] tracking_number는 text 컬럼에 내장되어 있으므로 FTS 검색으로 처리합니다. SQL 필터에서는 무시합니다.
-            let valid_cols = [
-                "amount", "status", "type", "created_at", "updated_at", "mode", "is_masked"
-            ];
-            let mapped_key = match key.as_str() {
-                "price" | "sale_price" | "discount" | "supply_price" | "order" | "goods" | "amount_total" | "total_amount" | "shipping_fee" => "amount",
-                "started_at" | "shipping_date" | "issue_date" | "order_date" | "registration_date" | "release_date" | "manufacture_date" | "payment_date" => "created_at",
-                "expired_at" | "delivery_date" => "updated_at",
-                // 🌟 [TRACKING] tracking_number, no, code는 텍스트 기반 FTS 검색으로 처리하므로 SQL 필터에서는 스킵
-                "tracking_number" | "no" | "code" | "carrier" => "",
-                k if valid_cols.contains(&k) => k,
-                _ => "" 
+            let num = match val_obj.get("value") {
+                Some(Value::Number(n)) => n.to_string(),
+                Some(Value::String(s)) => {
+                    let cleaned: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if cleaned.is_empty() { continue; } else { cleaned }
+                },
+                _ => continue,
+            };
+            filters.push(format!("{} {} {}", envelope_col, sql_op, num));
+        }
+    }
+
+    if filters.is_empty() { None } else { Some(filters.join(" AND ")) }
+}
+
+/// Dexie 가 실행할 '정밀 필터 플랜' 을 만듭니다.
+/// 조건을 하나도 버리지 않고, 프론트엔드가 data.* 인덱스 또는 .filter() 로 처리할 수 있도록
+/// 정규화된 JSON 으로 직렬화합니다.
+///
+/// 산출 형태:
+/// {
+///   "type": "goods",
+///   "mode": "commerce",
+///   "conditions": [
+///     { "path": "data.sale_price", "op": "lte", "value": 5000, "kind": "number" },
+///     { "path": "data.tracking_number", "op": "eq", "value": "123456", "kind": "string" },
+///     { "path": "data.weight", "op": "top", "percent": 20.0, "kind": "rank" }
+///   ],
+///   "keywords": ["니트", "가디건"],
+///   "alternates": { "color": ["title", "tags"] }
+/// }
+fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
+    // 🌟 [PATH ALIAS] LLM 이 뽑아낸 속성명을 실제 data.* 경로로 정규화합니다.
+    //    기존 convert_conditions_to_sql 의 mapped_key 는 '물리 컬럼이 없으면 버림' 이었지만,
+    //    여기서는 '별칭만 통일하고 없는 건 그대로 통과' 시킵니다. Dexie 는 .filter() 로 처리 가능합니다.
+    // 🌟 [PATH ALIAS v2 / EXTERNAL CONTRACT]
+    //  ── 무엇이 바뀌었나 ──
+    //   별칭 표를 Rust 코드에서 bias.json 의 `search_bridge.path_alias` 노드로 옮겼습니다.
+    //   새 필드의 별칭이 필요해도 JSON 만 고치면 되고 재빌드가 필요 없습니다.
+    //
+    //   bias.json 예시:
+    //   "search_bridge": {
+    //     "path_alias": {
+    //       "amount": ["amount_total", "total_amount", "price"],
+    //       "doc_number": ["document_number", "bl_number", "awb_number", "po_number"],
+    //       "sender_name": ["supplier_name", "shipper_name", "exporter_name"],
+    //       "recipient_name": ["buyer_name", "consignee_name", "importer_name"],
+    //       "vessel": ["vehicle_name", "flight_no", "vessel_name"],
+    //       "pol": ["location_port_of_loading", "port_of_loading"],
+    //       "pod": ["location_port_of_discharge", "port_of_discharge"],
+    //       "incoterms": ["incoterms_code"],
+    //       "container_number": ["container_no"],
+    //       "seal_number": ["seal_no"],
+    //       "weight_gross": ["gross_weight"],
+    //       "weight_net": ["net_weight"],
+    //       "volume": ["volume_measurement", "cbm"]
+    //     }
+    //   }
+    //
+    //   노드가 없으면 별칭 없이 그대로 통과하므로, 기존 동작을 깨지 않습니다.
+    fn normalize_path(key: &str) -> String {
+        let k = key.trim();
+
+        if let Some(alias_obj) = crate::parsing::BIAS_DICT
+            .get("search_bridge")
+            .and_then(|sb| sb.get("path_alias"))
+            .and_then(|v| v.as_object())
+        {
+            for (canonical, list) in alias_obj {
+                if canonical == k {
+                    return format!("data.{}", canonical);
+                }
+                if let Some(arr) = list.as_array() {
+                    if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                        return format!("data.{}", canonical);
+                    }
+                }
+            }
+        }
+
+        format!("data.{}", k)
+    }
+
+    // 🌟 [KIND] Dexie 실행 엔진이 인덱스 쿼리를 쓸지 .filter() 를 쓸지 판정하는 힌트입니다.
+    //  ── 무엇이 바뀌었나 ──
+    //   기존에는 수치 경로 15개를 문자열 배열로 나열해, 새 수치 필드를 추가할 때마다
+    //   여기에도 이름을 넣어야 했습니다. (안 넣으면 kind="string" 이 되어
+    //   '5000 이하' 조건이 문자열 비교로 떨어져 무력화됩니다)
+    //   이제 canonicalize 와 동일한 kind_of() 규칙을 재사용하므로
+    //   Dexie 에 필드를 추가해도 이 함수는 수정할 필요가 없습니다.
+    fn value_kind(path: &str, v: &Value) -> &'static str {
+        use crate::utils::canonical::{kind_of, CanonKind};
+
+        if v.is_number() { return "number"; }
+
+        // 'data.sale_price' → 'sale_price' 로 잘라 규칙 판정에 넘깁니다.
+        let leaf = path.rsplit('.').next().unwrap_or(path);
+
+        if let Some(s) = v.as_str() {
+            match kind_of(leaf) {
+                CanonKind::Numeric | CanonKind::Boolean => {
+                    if s.chars().any(|c| c.is_ascii_digit()) { return "number"; }
+                },
+                _ => {}
+            }
+        }
+        "string"
+    }
+
+    let mut conditions: Vec<Value> = Vec::new();
+
+    // ── status : 문자열 상태값을 코드로 환산해서 넣습니다 ──
+    if let Some(status) = ctx.get("status").and_then(|v| v.as_str()) {
+        let clean = status.trim();
+        // 🌟 [ZERO GUARD] logic::parse_status 는 매핑에 없는 문자열에 0 을 돌려줍니다.
+        //    그런데 canonicalize_data 가 status 미보유 문서에 0 을 시딩하므로,
+        //    코드 0 을 조건으로 내보내면 '상태가 없는 문서 전부' 를 매칭하게 됩니다.
+        //    (bias.json 의 status_filters.remove 가 정확히 이 경로였습니다)
+        //    코드가 확정되지 않으면 조건 자체를 만들지 않는 편이 리콜에 안전합니다.
+        let code = crate::logic::parse_status(clean);
+        if !clean.is_empty() && clean != "null" && code != 0 {
+            conditions.push(json!({
+                "path": "data.status",
+                "op": "eq",
+                "value": code,
+                "kind": "number"
+            }));
+        } else if !clean.is_empty() && clean != "null" {
+            println!(
+                "[DEXIE-PLAN] ⚪ status='{}' 는 parse_status 매핑이 없어(코드 0) 조건에서 제외합니다.",
+                clean
+            );
+        }
+    }
+
+    // ── condition : 전량 통과 ──
+    if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
+        for (key, val_obj) in cond {
+            // created_at / updated_at 은 build_scope_filter 가 이미 SQL 로 처리했으므로 중복 제외
+            if key == "created_at" || key == "updated_at" { continue; }
+
+            let path = normalize_path(key);
+            let op_raw = val_obj.get("operator").and_then(|v| v.as_str()).unwrap_or("eq");
+            // 🌟 LLM 이 "lt [Alts: lte, gte]" 같은 쓰레기를 붙여 보내는 사례가 있어 앞부분만 취합니다.
+            let op_clean = op_raw.trim().to_lowercase();
+            let op = if op_clean.starts_with("gte") { "gte" }
+                else if op_clean.starts_with("gt") { "gt" }
+                else if op_clean.starts_with("lte") { "lte" }
+                else if op_clean.starts_with("lt") { "lt" }
+                else if op_clean.starts_with("not_contains") { "not_contains" }
+                else if op_clean.starts_with("contains") { "contains" }
+                else if op_clean.starts_with("top") { "top" }
+                else if op_clean.starts_with("bottom") { "bottom" }
+                else if op_clean.starts_with("neq") { "neq" }
+                else { "eq" };
+
+            // ── top / bottom : 백분위 랭킹. Dexie 가 정렬 후 슬라이스합니다 ──
+            if op == "top" || op == "bottom" {
+                let pct = val_obj.get("percent_total")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                    .unwrap_or(20.0);
+                conditions.push(json!({
+                    "path": path,
+                    "op": op,
+                    "percent": pct,
+                    "kind": "rank"
+                }));
+                continue;
+            }
+
+            let raw_val = match val_obj.get("value") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            // 빈 값은 조건이 아니라 노이즈입니다.
+            let is_empty = match &raw_val {
+                Value::Null => true,
+                Value::String(s) => s.trim().is_empty() || s == "null",
+                _ => false,
+            };
+            if is_empty { continue; }
+
+            let kind = value_kind(&path, &raw_val);
+            let final_val = if kind == "number" {
+                let n = match &raw_val {
+                    Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                    Value::String(s) => {
+                        let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                        cleaned.parse::<f64>().unwrap_or(0.0)
+                    },
+                    _ => 0.0,
+                };
+                // canonicalize_data 와 동일하게 정수는 정수로 내려야 인덱스 타입이 일치합니다.
+                if n.fract() == 0.0 && n.abs() < 9e15 { json!(n as i64) } else { json!(n) }
+            } else {
+                json!(raw_val.as_str().unwrap_or("").trim())
             };
 
-            if mapped_key.is_empty() { continue; } // 유효하지 않은 컬럼은 무시하여 DB 크래시 방어
+            conditions.push(json!({
+                "path": path,
+                "op": op,
+                "value": final_val,
+                "kind": kind
+            }));
+        }
+    }
 
-            if let Some(op_str) = val_obj.get("operator").and_then(|v| v.as_str()) {
-                if let Some(val_val) = val_obj.get("value") {
-                    // 🌟 [CRITICAL FIX] LLM이 "lt [Alts: lte, gte]" 처럼 쓰레기 값을 포함해서 주더라도 앞부분만 파싱하여 안전하게 추출 및 변환합니다.
-                    let clean_op = op_str.trim().to_lowercase();
-                    
-                    // 🌟 [CRITICAL FIX] top, bottom, contains 연산자는 LanceDB 물리적 SQL 필터에서 지원하지 않으므로 무시하여 문법 에러(Crash)를 방지합니다. (UI에는 노출됨)
-                    if clean_op == "top" || clean_op == "bottom" || clean_op == "contains" || clean_op == "not_contains" {
-                        continue;
-                    }
-
-                    let operator = if clean_op.starts_with("gte") { ">=" }
-                    else if clean_op.starts_with("gt") { ">" }
-                    else if clean_op.starts_with("lte") { "<=" }
-                    else if clean_op.starts_with("lt") { "<" }
-                    else { "=" };
-                    
-                    let val_str = if val_val.is_number() {
-                        val_val.to_string()
-                    } else if let Some(s) = val_val.as_str() {
-                        let numeric: String = s.chars().filter(|c| c.is_digit(10) || *c == '.').collect();
-                        if numeric.is_empty() { continue; } else { numeric }
-                    } else { continue; };
-
-                    filters.push(format!("{} {} {}", mapped_key, operator, val_str));
+    // ── keywords : 조건이 되지 못한 청크. Dexie 가 text/masked_text 부분 일치로 보조 필터링 ──
+    let mut keywords: Vec<String> = Vec::new();
+    if let Some(un) = ctx.get("unassigned").and_then(|v| v.as_array()) {
+        for u in un {
+            if let Some(s) = u.as_str() {
+                for w in s.split_whitespace() {
+                    if !keywords.iter().any(|k| k == w) { keywords.push(w.to_string()); }
                 }
             }
         }
     }
-    if filters.is_empty() { None } else { Some(filters.join(" AND ")) }
+
+    // 🌟 [TYPES] Dexie 도 IN 절과 동일하게 여러 타입을 통과시켜야 합니다.
+    //    plan.type 하나만 보면 교차 후보 도메인 결과가 전부 잘려 나갑니다.
+    let mut types: Vec<String> = Vec::new();
+    if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(s) = t.as_str() {
+                let clean = s.trim();
+                if clean.is_empty() || clean == "ignore" { continue; }
+                let base = clean.strip_suffix("_items").unwrap_or(clean);
+                if !types.iter().any(|x| x == base) { types.push(base.to_string()); }
+            }
+        }
+    }
+    if types.is_empty() {
+        if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
+            let base = t.strip_suffix("_items").unwrap_or(t);
+            if !base.is_empty() && base != "ignore" { types.push(base.to_string()); }
+        }
+    }
+
+    json!({
+        "type": ctx.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+        "types": types,
+        "mode": search_mode,
+        "conditions": conditions,
+        "keywords": keywords,
+        "alternates": ctx.get("alternates").cloned().unwrap_or(json!({})),
+        "substantial": ctx.get("substantial").cloned().unwrap_or(json!("")),
+        "find": ctx.get("find").cloned().unwrap_or(json!(""))
+    })
 }
 
 #[tauri::command]
@@ -513,6 +1320,9 @@ async fn get_all_documents(
 ) -> Result<Vec<TradeDocument>, String> {
     
     println!("[DB-FETCH] 리스트 불러오기 요청 수신 (Limit: {}, Filter: {:?})", limit, filter);
+
+    // 🌟 v4 : 봉투 컬럼 술어만 남깁니다. 도메인 조건은 Dexie 가 처리합니다.
+    let scope = sanitize_scope_filter(filter);
 
     let mut store_guard = state.store.lock().await; 
     
@@ -530,7 +1340,7 @@ async fn get_all_documents(
     }
 
     if let Some(store) = store_guard.as_ref() {
-        let mut results = store.get_all_items("items", limit, offset, filter).await.map_err(|e| e.to_string())?;
+        let mut results = store.get_all_items("items", limit, offset, scope).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         for doc in results.iter_mut() {
@@ -552,8 +1362,10 @@ async fn get_document(
 ) -> Result<Option<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
-        
+        // 🌟 v4 : 물리 테이블이 items / users / pages 3개로 줄었습니다.
+        //    (sales / tracking / event 를 순회하던 6회 왕복이 3회로 감소)
+        let tables = vec!["items", "users", "pages"];
+
         // 1. Primary search: Exact ID match
         for table_name in tables.iter() {
             if let Ok(Some(mut doc)) = store.get_item_by_id(table_name, &uuid).await {
@@ -566,42 +1378,24 @@ async fn get_document(
             }
         }
 
-        // 2. Fallback search: If uuid is numeric or a hash, look inside the data JSON
-        // This fixes cases where the top-level 'id' column was saved as an empty string.
-        for table_name in tables {
-            // Try matching against "id" field inside JSON
-            if let Ok(Some((_found_id, json_val))) = store.find_item_by_property(table_name, "id", &json!(uuid)).await {
-                if let Ok(doc) = store.get_item_by_id(table_name, "").await { // Get the row with empty ID
-                    // Double check it's the right one by comparing json_data
-                    if let Some(mut d) = doc {
-                        if d.json_data == json_val.to_string() {
-                            if d.text.is_empty() { d.text = parsing::json_to_natural_language(&json_val); }
-                            return Ok(Some(d));
+        // 2. Fallback search: data JSON 내부의 id / index 로 재탐색합니다.
+        //    🌟 v4 : find_item_by_property 가 data ILIKE 프리필터를 쓰므로
+        //    기존처럼 get_all_items(1000) 로 전량을 다시 긁을 필요가 없습니다.
+        //    또한 canonicalize_data 가 index 를 String 으로 확정했으므로
+        //    숫자/문자 두 갈래로 나눠 쏘던 index_query 분기도 불필요합니다.
+        for table_name in tables.iter() {
+            for prop in ["id", "index", "no", "code"] {
+                if let Ok(Some((found_id, json_val))) = store.find_item_by_property(table_name, prop, &json!(uuid.clone())).await {
+                    if let Ok(Some(mut d)) = store.get_item_by_id(table_name, &found_id).await {
+                        if d.text.is_empty() {
+                            d.text = parsing::json_to_natural_language(&json_val);
                         }
-                    }
-                }
-            }
-            
-            // Try matching against "index" field inside JSON
-            let index_query = uuid.parse::<i64>().map(|n| json!(n)).unwrap_or(json!(uuid));
-            if let Ok(Some((_found_id, _json_val))) = store.find_item_by_property(table_name, "index", &index_query).await {
-                // To be safe, we perform a broader search for any row where data contains the index
-                // Since find_item_by_property already found it, we just need to reconstruct the TradeDocument
-                if let Ok(all_docs) = store.get_all_items(table_name, 1000, 0, None).await {
-                    for mut d in all_docs {
-                        if d.json_data.contains(&uuid) {
-                            if d.text.is_empty() {
-                                if let Ok(jv) = serde_json::from_str::<Value>(&d.json_data) {
-                                    d.text = parsing::json_to_natural_language(&jv);
-                                }
-                            }
-                            return Ok(Some(d));
-                        }
+                        return Ok(Some(d));
                     }
                 }
             }
         }
-        
+
         Ok(None)
     } else {
         Err("DB not initialized".to_string())
@@ -624,8 +1418,9 @@ async fn delete_document(
 ) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        // [DETAIL] 'items' 테이블뿐만 아니라 다른 가능한 테이블에서도 삭제 시도
-        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
+        // 🌟 v4 : 물리 테이블 3개. resolve_table 이 중복 라우팅을 흡수하므로
+        //    같은 테이블에 delete 를 여러 번 쏘던 낭비도 사라집니다.
+        let tables = vec!["items", "users", "pages"];
         for table in tables {
             let _ = store.delete_item(table, &uuid).await;
         }
@@ -643,8 +1438,8 @@ async fn delete_documents(
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
         if uuids.is_empty() { return Ok("No documents to delete.".to_string()); }
-        
-        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
+
+        let tables = vec!["items", "users", "pages"];
         for table in tables {
             let _ = store.delete_items(table, uuids.clone()).await;
         }
@@ -763,10 +1558,16 @@ async fn ai_search_complex(
 
     emit_term("[QUEUE] AI Engine acquired. Starting process...");
 
-    // [REMOVE] 백엔드 자체 검색 락 변수 조작 제거
-    // 프론트엔드의 GlobalTaskManager가 이미 입구를 막고 있으므로 
-    // 백엔드는 별도의 AtomicBool 락 없이 즉시 실행 로직에 집중합니다.
-
+    // 🌟 [SEARCH FLAG RESTORE]
+    //  ── 무엇이 문제였나 ──
+    //   프론트엔드가 입구를 막는다는 이유로 IS_SEARCHING.store(true) 를 제거했는데,
+    //   이 플래그를 '읽는' 가드는 unload_model 과 reindex_pending_embeddings 에
+    //   그대로 남아 있습니다. 플래그가 영원히 false 이므로 두 가드가 사문화되었고,
+    //   특히 unload_model 은 ACTIVE_TASK_MEM 가드가 없어
+    //   검색 도중 들어온 언로드 요청이 그대로 통과합니다.
+    //   플래그를 다시 세우는 편이 가드를 지우는 것보다 안전합니다.
+    //   (해제는 아래 search_process 종료부에서 이미 두 번 수행됩니다)
+    IS_SEARCHING.store(true, Ordering::SeqCst);
     {
         // 최소한의 동기화 정보만 업데이트 (UI 복구용)
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
@@ -825,7 +1626,10 @@ async fn ai_search_complex(
     
     let search_process = async {
         let mut all_results = Vec::new();
-        
+        // 🌟 [DEXIE PLAN] 컨텍스트별 정밀 필터 플랜을 모아 프론트엔드로 전달합니다.
+        //    LanceDB 가 버렸던 조건이 여기에 전부 살아 있습니다.
+        let mut dexie_plans: Vec<Value> = Vec::new();
+
         let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); 
         let mut metrics_json_str = "{}".to_string();
         
@@ -845,7 +1649,20 @@ async fn ai_search_complex(
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
             },
             "analytic" => {
-                model.parse_analytic_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
+                // 🌟 [ANALYTIC QUERY v2 → model.rs]
+                //    parse_analytic_search_query 를 model.rs 의 LogisModel 메서드로 이동합니다.
+                //    parse_commerce_query / parse_shipping_query 와 동일한 호출 패턴으로 통일되어,
+                //    모델 로드·임베딩·Qwen3.5 호출을 LogisModel 내부에서 일괄 관리합니다.
+                model
+                    .parse_analytic_search_query(
+                        &task_id,
+                        &app_handle,
+                        query.clone(),
+                        &language,
+                        cancel_token.clone(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?
             },
             _ => { // default: commerce
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -862,111 +1679,143 @@ async fn ai_search_complex(
                 tokio::task::yield_now().await;
 
                 let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if text.is_empty() { continue; }
+                // 🌟 [CONDITION-ONLY CONTEXT] STAGE-3 은 텍스트가 비어도 조건이 있으면
+                //    컨텍스트를 발행합니다(union_text 가 비고 condition 이 있는 경우).
+                //    기존처럼 텍스트만 보고 continue 하면 dexie_plans.push 까지 건너뛰어
+                //    그 컨텍스트의 조건이 프론트엔드에 전달조차 되지 않았습니다.
+                let has_condition = ctx.get("condition")
+                    .and_then(|v| v.as_object())
+                    .map_or(false, |o| !o.is_empty());
+                if text.trim().is_empty() && !has_condition { continue; }
                 let raw_ctx_type = ctx.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
                 // 🌟 [CRITICAL FIX] "ignore"로 분류된 명령어/분석 요청 청크는 DB 검색 단계에서 완전히 무시합니다!
                 if raw_ctx_type == "ignore" {
                     continue;
                 }
 
-                // 🌟 [TABLE FALLBACK] STAGE-3 이 발행한 "{domain}_items" 폴백 컨텍스트는
-                //    target_table match 에서 어떤 분기에도 걸리지 않아 items(전 타입 미러)로 조회됩니다.
-                //    SQL 필터의 type 컬럼에는 원래 도메인 이름을 넣어야 하므로 접미사만 벗겨냅니다.
-                //    이 경로가 있어야 scheduler 의 저장 테이블과 lib 의 조회 테이블이 어긋나도
-                //    데이터가 존재하는 한 반드시 결과에 포함됩니다.
-                let ctx_type: &str = match raw_ctx_type.strip_suffix("_items") {
-                    Some(base) => {
-                        println!("[AI-SEARCH] Table fallback context detected. Querying 'items' mirror with type = '{}'.", base);
-                        base
-                    },
-                    None => raw_ctx_type,
-                };
-                let is_table_fallback = raw_ctx_type.ends_with("_items");
-                // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
-                // 백엔드 FTS/LIKE 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
-                let search_text = text.to_string();
-                let detected_tracking_number: Option<String> = {
-                    let mut tn: Option<String> = None;
-                    if let Some(cond_obj) = ctx.get("condition").and_then(|v| v.as_object()) {
-                        if let Some(tn_cond) = cond_obj.get("tracking_number") {
-                            if let Some(tn_val) = tn_cond.get("value").and_then(|v| v.as_str()) {
-                                if !tn_val.is_empty() {
-                                    tn = Some(tn_val.to_string());
-                                    println!("[AI-SEARCH] Tracking number '{}' detected. Delegating to Dexie eq query (frontend).", tn_val);
+                // 🌟 [FALLBACK SUFFIX 제거] v4 에서 sales/tracking/event 물리 테이블이 사라지고
+                //    items 단일 테이블 + type 컬럼 파티셔닝이 되었으므로,
+                //    STAGE-3 이 발행하던 "{domain}_items" 폴백 접미사는 존재 이유를 잃었습니다.
+                //    (저장 테이블과 조회 테이블이 어긋날 수 있는 경로 자체가 사라졌습니다)
+                //    구버전 STAGE-3 가 만든 컨텍스트와의 호환을 위해 접미사만 벗겨 냅니다.
+                let ctx_type: &str = raw_ctx_type.strip_suffix("_items").unwrap_or(raw_ctx_type);
+                // 🌟 [SEARCH TEXT SYNTHESIS] 텍스트가 비고 조건만 있는 컨텍스트는
+                //    FTS 검색어가 없어 임베딩이 빈 문자열 벡터가 됩니다.
+                //    조건 값과 unassigned 키워드로 검색어를 합성해 리콜을 확보합니다.
+                //    (조건 자체는 dexie_plan 이 정확히 실행하므로 여기서는 후보만 넓히면 됩니다)
+                let search_text = if !text.trim().is_empty() {
+                    text.to_string()
+                } else {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
+                        for (_, v) in cond {
+                            if let Some(s) = v.get("value").and_then(|x| x.as_str()) {
+                                let t = s.trim();
+                                if !t.is_empty() && !parts.iter().any(|p| p == t) {
+                                    parts.push(t.to_string());
                                 }
                             }
                         }
                     }
-                    tn
-                };
-                let target_table = if is_table_fallback {
-                    // 🌟 items 는 scheduler 가 모든 타입을 이중 upsert 하는 미러 테이블입니다.
-                    "items"
-                } else {
-                    match ctx_type {
-                        "member" | "team" | "user" => "users",
-                        "page" | "pages" => "pages",
-                        "talk" => "talks",
-                        "sales" | "goods" | "order" => "sales",
-                        "tracking" | "shipping" | "receiving" => "tracking",
-                        "event" | "coupon" => "event",
-                        // 🌟 [TABLE MAPPING FIX] scheduler 의 저장 매핑은
-                        //      "event" | "coupon" => "event",  나머지(review 포함) => "items"
-                        //    입니다. 즉 review 는 items 에 저장되는데 여기서 event 를 조회하고 있어
-                        //    데이터가 존재해도 물리적으로 항상 0건이 됩니다.
-                        //    (로그: review A/FULL·B/NARROWED 두 티어 모두 Table: event / total_found: 0)
-                        //    지금까지는 E/TABLE-FALLBACK 티어가 items 를 훑어 리콜을 겨우 보증했습니다.
-                        "review" => "items",
-                        _ => "items",
+                    if let Some(un) = ctx.get("unassigned").and_then(|v| v.as_array()) {
+                        for u in un {
+                            if let Some(s) = u.as_str() {
+                                let t = s.trim();
+                                if !t.is_empty() && !parts.iter().any(|p| p == t) {
+                                    parts.push(t.to_string());
+                                }
+                            }
+                        }
                     }
+                    let synthesized = parts.join(" ");
+                    println!(
+                        "[AI-SEARCH] 🧪 [SEARCH TEXT SYNTHESIS] type='{}' | 텍스트 부재 → 조건 값으로 합성: \"{}\"",
+                        ctx_type, synthesized
+                    );
+                    synthesized
                 };
 
-                // 🌟 [FALLBACK SQL FIX] convert_conditions_to_sql 은 ctx["type"] 을 그대로 SQL 에 넣습니다.
-                //    폴백 컨텍스트의 type 은 "review_items" 같은 라우팅 전용 이름이라
-                //    DB 에 존재하지 않는 값이 되어 `type = 'review_items'` 로 나가고 항상 0건이 됩니다.
-                //    (로그: [AI-SEARCH] Table fallback ... 직후 filter 가 "(type = 'review_items')" 로 출력됨)
-                //    SQL 생성 시에는 접미사를 벗긴 원래 도메인 이름을 사용합니다.
-                let sql_ctx = if is_table_fallback {
-                    let mut c = ctx.clone();
-                    if let Some(o) = c.as_object_mut() { o.insert("type".to_string(), json!(ctx_type)); }
-                    c
-                } else {
-                    ctx.clone()
+                // 🌟 [TABLE ROUTING v4] users / pages 만 물리 분리, 나머지는 전부 items.
+                //    scheduler 저장 매핑과 lib 조회 매핑이 어긋나 'review 는 items 에 저장되는데
+                //    event 에서 조회' 같은 구조적 0건 버그를 만들던 match 문을 제거했습니다.
+                let target_table = match ctx_type {
+                    "member" | "team" | "user" => "users",
+                    "page" | "pages" => "pages",
+                    _ => "items",
                 };
-                let sql_filter = convert_conditions_to_sql(&sql_ctx);
-                let mode_filter = format!("mode = '{}'", search_mode);
-                let final_sql_filter = match sql_filter {
-                    Some(f) => Some(format!("({}) AND {}", f, mode_filter)),
-                    None => Some(mode_filter.clone()),
-                };
-                // 🌟 [TRACKING EXACT MATCH] tracking_number가 감지되면 FTS를 비활성화하고,
-                // text / json_data 컬럼에 SQL LIKE 필터를 걸어 해당 송장번호가 포함된 행만 정확히 조회합니다.
-                let emb = model.get_embedding(search_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                let has_tracking = detected_tracking_number.is_some();
-                let use_fts = !has_tracking;
-                let tracking_sql = if let Some(ref tn) = detected_tracking_number {
-                    let escaped_tn = tn.replace('\'', "''");
-                    let like_clause = format!("(text LIKE '%{}%' OR json_data LIKE '%{}%')", escaped_tn, escaped_tn);
-                    match final_sql_filter.clone() {
-                        Some(f) => Some(format!("({}) AND {}", f, like_clause)),
-                        None => Some(like_clause),
+
+                // 🌟 [SCOPE / PLAN 분리]
+                //    LanceDB 에는 봉투 컬럼만 내려보내고,
+                //    도메인 조건은 하나도 버리지 않고 dexie_plan 으로 프론트에 전달합니다.
+                let mut scope_ctx = ctx.clone();
+                if let Some(o) = scope_ctx.as_object_mut() {
+                    // 폴백 접미사가 붙은 type 이 SQL 에 그대로 나가면 `type = 'review_items'` 가 되어
+                    // 항상 0건이 됩니다. 정규화된 이름으로 교체합니다.
+                    o.insert("type".to_string(), json!(ctx_type));
+                    // 🌟 [TENANT SCOPE] build_scope_filter 는 cc / bcc / ref 를 읽도록 되어 있는데
+                    //    STAGE-3 / parse_shipping_query / parse_analytic_query 가 만드는 컨텍스트에는
+                    //    그 키가 하나도 없어 해당 블록이 통째로 죽어 있었습니다.
+                    //    그 결과 AI 검색이 전 팀·전 사이트 문서를 무차별로 반환했습니다.
+                    //    ai_search_complex 가 인자로 이미 받고 있으므로 여기서 주입합니다.
+                    //
+                    //    ⚠️ bcc / ref 는 넣지 않습니다.
+                    //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
+                    //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
+                    if !cc.trim().is_empty() {
+                        o.insert("cc".to_string(), json!(cc.clone()));
                     }
-                } else {
-                    final_sql_filter.clone()
-                };
-                let search_result = store.search_items(target_table, &search_text, emb.clone(), 5, 0, tracking_sql.clone(), use_fts).await;
-                let final_results = match search_result {
-                    Ok(res) => res,
-                    Err(_) => {
-                        // LIKE 필터가 DataFusion에서 실패하면 mode_filter만으로 폴백
-                        store.search_items(target_table, &search_text, emb.clone(), 5, 0, Some(mode_filter.clone()), use_fts).await.unwrap_or_default()
-                    }
-                };
-                // 🌟 [TRACKING EXACT MATCH] tracking_number는 LanceDB 물리적 컬럼이 아니므로(data JSON 내부 내장),
-                // 백엔드 교차 검색을 수행하지 않습니다. 프론트엔드 Dexie DB의 eq 쿼리로 위임합니다.
-                if let Some(ref tn) = detected_tracking_number {
-                    println!("[AI-SEARCH] Tracking number '{}' cross-search delegated to Dexie eq query (frontend).", tn);
                 }
+                let scope_filter = build_scope_filter(&scope_ctx, &search_mode);
+                let dexie_plan = build_dexie_plan(&scope_ctx, &search_mode);
+
+                println!(
+                    "[AI-SEARCH] 🧭 [ROUTE] type='{}' | table='{}' | scope_sql={:?} | dexie_conditions={}",
+                    ctx_type,
+                    target_table,
+                    scope_filter,
+                    dexie_plan.get("conditions").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0)
+                );
+
+                // 🌟 [PLAN 수집] 프론트엔드가 실행할 정밀 필터 플랜을 응답에 동봉합니다.
+                dexie_plans.push(dexie_plan.clone());
+
+                // 🌟 [TRACKING] tracking_number 는 이제 LIKE 땜질이 아니라
+                //    dexie_plan 의 data.tracking_number eq 조건으로 정확히 처리됩니다.
+                //    여기서는 FTS 를 끄지 않습니다. 리콜을 넓게 가져가는 것이 v4 의 역할이기 때문입니다.
+                let emb = model.get_embedding(search_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                // 🌟 [RECALL LIMIT] Dexie 가 뒤에서 조건으로 잘라내므로 여기서는 넓게 긁습니다.
+                //    기존 limit 5 는 '조건이 SQL 에 이미 적용되었다' 는 전제였는데,
+                //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
+                const RECALL_LIMIT: usize = 50;
+
+                let final_results = store
+                    .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
+                    .await
+                    .unwrap_or_else(|e| {
+                        println!("[AI-SEARCH] ⚠️ scope query failed ({}). Falling back to mode-only scope.", e);
+                        Vec::new()
+                    });
+
+                // 🌟 [SCOPE FALLBACK] 스코프가 지나치게 좁아 0건이면 도메인 조건만 완화해 한 번 더 긁습니다.
+                //    기존 A/FULL → B/NARROWED → C/RECALL 3티어가 하던 일을 여기서 1회로 흡수합니다.
+                //    🌟 [TENANT PRESERVE] 완화 대상은 'type / 시간' 같은 도메인 스코프뿐입니다.
+                //       cc(팀·사이트)까지 버리면 폴백 한 번으로 타 팀 문서가 그대로 새어 나가므로,
+                //       테넌트 스코프는 폴백에서도 반드시 유지합니다.
+                let final_results = if final_results.is_empty() {
+                    let mode_only = if cc.trim().is_empty() {
+                        format!("mode = '{}'", search_mode)
+                    } else {
+                        format!("mode = '{}' AND `cc` = '{}'", search_mode, cc.replace('\'', "''"))
+                    };
+                    println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
+                    store
+                        .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    final_results
+                };
 
                 for (id, content, score) in final_results {
                     // 결과 배열 내 중복 방어
@@ -996,11 +1845,28 @@ async fn ai_search_complex(
                 // =====================================================================
                 {
                     // 4-A: item_chunks 테이블 코사인 검색
-                    //      item_type 필터로 도메인을 좁히고, mode 필터로 검색 모드 일치 보장
-                    let chunk_type_filter = format!("item_type = '{}' AND mode = '{}'", ctx_type, search_mode);
-                    if is_table_fallback {
-                        println!("[AI-SEARCH] 🧩 [STAGE-4] 폴백 컨텍스트 감지. item_type='{}' 로 청크 검색을 수행합니다.", ctx_type);
-                    }
+                    //      🌟 v4 : STAGE-3 의 types 배열을 IN 절로 펼칩니다.
+                    //      교차 후보 도메인의 청크도 함께 훑어야 리콜이 유지됩니다.
+                    let chunk_type_filter = {
+                        let mut list: Vec<String> = Vec::new();
+                        if let Some(arr) = ctx.get("types").and_then(|v| v.as_array()) {
+                            for t in arr {
+                                if let Some(s) = t.as_str() {
+                                    let base = s.strip_suffix("_items").unwrap_or(s).trim();
+                                    if base.is_empty() || base == "ignore" { continue; }
+                                    if !list.iter().any(|x| x == base) { list.push(base.to_string()); }
+                                }
+                            }
+                        }
+                        if list.is_empty() { list.push(ctx_type.to_string()); }
+
+                        if list.len() == 1 {
+                            format!("item_type = '{}' AND mode = '{}'", list[0], search_mode)
+                        } else {
+                            let quoted: Vec<String> = list.iter().map(|t| format!("'{}'", t)).collect();
+                            format!("item_type IN ({}) AND mode = '{}'", quoted.join(", "), search_mode)
+                        }
+                    };
 
                     // 4-B: PLINKO 조건 기반 타겟 속성 목록 구축
                     //      ① condition 키 (PLINKO 가 확정한 속성)
@@ -1348,10 +2214,20 @@ async fn ai_search_complex(
             // chunk_match = true 인 항목은 프론트엔드에서
             // "어떤 속성이 매칭되었는지" 를 배지로 표시할 수 있습니다.
             //
-            // limit: 프론트엔드 렌더링 부하 방지를 위해 최대 20개 반환
-            let final_limit = 20usize;
-            if ranked_results.len() > final_limit {
-                ranked_results.truncate(final_limit);
+            // 🌟 [RECALL PRESERVE] 기존 20건 절단은 v4 설계와 정면으로 충돌했습니다.
+            //    이 시점의 ranked_results 는 '도메인 조건이 하나도 적용되지 않은 리콜 후보' 입니다.
+            //    정렬 기준도 벡터·FTS 점수뿐이므로, 조건을 만족하는 정답이 21위였다면
+            //    Dexie(executeDexiePlan)가 그 조건을 실행할 기회 자체를 잃습니다.
+            //    컨텍스트가 3개면 RECALL_LIMIT 50 × 3 = 150 후보가 20건으로 잘립니다.
+            //    최종 표시 개수는 조건을 적용한 프론트엔드가 결정해야 합니다.
+            //    (여기서는 전송량 상한만 둡니다)
+            const FINAL_LIMIT: usize = 200;
+            if ranked_results.len() > FINAL_LIMIT {
+                println!(
+                    "[AI-SEARCH] ✂️ [TRANSPORT CAP] 리콜 후보 {}건 → {}건으로 상한 적용 (조건 적용은 Dexie 담당)",
+                    ranked_results.len(), FINAL_LIMIT
+                );
+                ranked_results.truncate(FINAL_LIMIT);
             }
 
             // ── 검색 통계 로그 출력 ──
@@ -1387,7 +2263,174 @@ async fn ai_search_complex(
         // 🌟 [STAGE-5 종료]
         // =====================================================================
 
-        Ok(json!({ "structured": structured_query, "results": all_results }))
+        // =====================================================================
+        // 🌟 [STAGE-6 / ANALYTIC REPORT] 회수한 시맨틱 기록으로 리포트를 작성합니다.
+        // ---------------------------------------------------------------------
+        //  ── 왜 여기서 만드는가 ──
+        //   프론트엔드는 LanceDB 원문(action / summary / relate)을 갖고 있지 않습니다.
+        //   결과 목록만 던지면 사용자는 로그 조각을 직접 읽어야 합니다.
+        //   Rust 가 원문을 다시 꺼내 Qwen3.5 2B 로 답변형 리포트를 합성해
+        //   채팅 말풍선 한 개로 전달합니다.
+        //  ── 근거 고정 ──
+        //   프롬프트는 "회수된 기록만 근거로 삼고, 없으면 없다고 말하라" 를 강제합니다.
+        // =====================================================================
+        let mut analytic_report = String::new();
+
+        if search_mode == "analytic" && !all_results.is_empty() {
+            if let Some(store) = store_opt.as_ref() {
+                let _ = app_handle.emit("extraction-progress", json!({
+                    "task_id": task_id,
+                    "category": "Report",
+                    "summary": "Writing behaviour report...",
+                    "spinner": "⠋"
+                }));
+
+                let mut records: Vec<Value> = Vec::new();
+
+                for item in all_results.iter().take(30) {
+                    if cancel_token.load(Ordering::Relaxed) { break; }
+                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() { continue; }
+
+                    if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
+                        if let Ok(d) = serde_json::from_str::<Value>(&doc.json_data) {
+                            let action = d.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                            let summary = d.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                            let flow = d.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or("");
+                            let evo = d.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("");
+                            let pref = d.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("");
+
+                            if action.is_empty() && summary.is_empty() && flow.is_empty() {
+                                continue;
+                            }
+
+                            let at = d.get("created_at").and_then(|v| v.as_i64()).unwrap_or(doc.created_at_ts);
+                            let at_iso = chrono::DateTime::from_timestamp_millis(at)
+                                .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+                                .unwrap_or_default();
+
+                            records.push(json!({
+                                "user": doc.from,
+                                "type": doc.r#type,
+                                "at": at_iso,
+                                "link": d.get("link").and_then(|v| v.as_str()).unwrap_or(""),
+                                "action": action,
+                                "summary": summary,
+                                "relate": d.get("relate").cloned().unwrap_or(json!([])),
+                                "cross_action_flow": flow,
+                                "intent_evolution": evo,
+                                "consistent_preferences": pref
+                            }));
+                        }
+                    }
+                }
+
+                if !records.is_empty() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
+                        .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+                        .unwrap_or_default();
+
+                    let started_at = structured_query.get("started_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let expired_at = structured_query.get("expired_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let time_intent = structured_query.get("time_intent").and_then(|v| v.as_str()).unwrap_or("");
+                    let season_intent = structured_query.get("season_intent").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let period_str = if started_at > 0 {
+                        let s = chrono::DateTime::from_timestamp_millis(started_at)
+                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let e = chrono::DateTime::from_timestamp_millis(expired_at)
+                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        format!("{} ~ {}", s, e)
+                    } else {
+                        "all time".to_string()
+                    };
+
+                    let scope = format!(
+                        "Period: {} (time_intent='{}', season_intent='{}')\nRecords retrieved: {}",
+                        period_str,
+                        if time_intent.is_empty() { "-" } else { time_intent },
+                        if season_intent.is_empty() { "-" } else { season_intent },
+                        records.len()
+                    );
+
+                    let time_context = format!(
+                        "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".",
+                        current_iso, now_ms, language
+                    );
+
+                    let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
+
+                    let prompt = crate::prompts::analytic_report_answer_prompt(
+                        &query,
+                        &time_context,
+                        &scope,
+                        &records_json,
+                        &language
+                    );
+
+                    model.secure_vram_relay(
+                        crate::model::ModelSize::Qwen3_5,
+                        None,
+                        Some(cancel_token.clone()),
+                        false,
+                        None
+                    ).await.map_err(|e| e.to_string())?;
+
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![
+                            crate::openai_types::ChatCompletionRequestMessage::User(
+                                crate::openai_types::ChatCompletionRequestUserMessage {
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                                    name: None,
+                                }
+                            )
+                        ],
+                        model: "qwen3.5".to_string(),
+                        max_tokens: Some(2048),
+                        temperature: Some(0.2),
+                        top_p: Some(0.95),
+                        ..Default::default()
+                    };
+
+                    if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                        if let Ok(res) = gen.generate(
+                            params,
+                            Some(cancel_token.clone()),
+                            Some(format!("{}_report", task_id)),
+                            None,
+                            None,
+                            None
+                        ).await {
+                            analytic_report = res.trim().to_string();
+                        }
+                    }
+
+                    emit_term(&format!(
+                        "[ANALYTIC-REPORT] 📝 근거 기록 {}건으로 리포트를 작성했습니다. ({}자)",
+                        records.len(),
+                        analytic_report.chars().count()
+                    ));
+                } else {
+                    emit_term("[ANALYTIC-REPORT] ⚪ 회수된 문서에 구조화 문장이 없어 리포트를 생략합니다.");
+                }
+            }
+        }
+
+        // 🌟 [RESPONSE v4] 프론트엔드는 아래 4개를 받습니다.
+        //    structured  : PLINKO 가 확정한 의미 구조 (기존과 동일)
+        //    results     : LanceDB 리콜 후보 (조건 미적용, 넓게)
+        //    dexie_plans : Dexie 가 실행할 정밀 필터 플랜 (조건 100% 보존)
+        //    report      : analytic 모드 전용. Qwen3.5 2B 가 쓴 답변형 리포트
+        //  → main.ts 가 results 를 dexie_plans 로 걸러 최종 결과를 확정합니다.
+        Ok(json!({
+            "structured": structured_query,
+            "results": all_results,
+            "dexie_plans": dexie_plans,
+            "report": analytic_report
+        }))
     }.await; 
 
     IS_SEARCHING.store(false, Ordering::SeqCst);
@@ -1535,17 +2578,29 @@ async fn proxy_fetch(
 
 
     // [DETAIL 1] Inject Session into Query Params (Content.js logic)
-
     if let Some(sp) = session_params {
+        // 🌟 [BORROW FIX] query_pairs_mut() 가변 빌드 중에는
+        //    query_pairs() 불변 빌드를 호출할 수 없습니다.
+        //    따라서 href 존재 여부를 가변 빌드 '시작 전'에 확인합니다.
+        let has_href = target_url.query_pairs().any(|(k, _)| k == "href");
 
         let mut query = target_url.query_pairs_mut();
-
         if let Some(hash) = sp.get("hash").and_then(|v| v.as_str()) { query.append_pair("hash", hash); }
-
         if let Some(token) = sp.get("token").and_then(|v| v.as_str()) { query.append_pair("token", token); }
-
         if let Some(cc) = sp.get("cc").and_then(|v| v.as_str()) { query.append_pair("cc", cc); }
-
+        // 🌟 [ANALYTICS SYNC] console.logis.center Worker 는
+        //    cookies.href = decodeURIComponent(req.query.href) 를
+        //    무조건 실행하므로, 이 값이 없으면 500 에러가 발생합니다.
+        //    href 가 없으면 현재 앱의 기본 도메인을 시딩합니다.
+        if sp.get("href").is_none() {
+            if !has_href {
+                query.append_pair("href", "https://console.logis.center/");
+            }
+        } else if let Some(href) = sp.get("href").and_then(|v| v.as_str()) {
+            if !has_href {
+                query.append_pair("href", href);
+            }
+        }
     }
 
 
@@ -1566,7 +2621,7 @@ async fn proxy_fetch(
 
     for (k, v) in headers.iter() { req_builder = req_builder.header(k, v); }
     
-    if let Some(b) = body { 
+    if let Some(b) = body {
         if headers.get("Content-Encoding").map(|v| v.as_str()) == Some("gzip") {
             // [STRICT PARITY] Compress body if Gzip is requested
             if let Ok(compressed) = crate::utils::compression::compress_value(&b) {
@@ -1574,11 +2629,25 @@ async fn proxy_fetch(
             } else {
                 req_builder = req_builder.json(&b);
             }
+        } else if headers.get("Content-Type").map(|v| v.as_str()) == Some("application/x-www-form-urlencoded") {
+            // 🌟 [FORM-ENCODED FIX] Content-Type이 form-urlencoded이면
+            //    .json()이 아니라 .form()으로 전송해야 서버가 파싱할 수 있습니다.
+            //    .json()은 Content-Type을 application/json으로 덮어쓰므로
+            //    api.oauth.network 같은 form 기반 서버에서 500이 발생합니다.
+            if let Some(obj) = b.as_object() {
+                let form_data: Vec<(String, String)> = obj.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                    })
+                    .collect();
+                req_builder = req_builder.form(&form_data);
+            } else {
+                req_builder = req_builder.json(&b);
+            }
         } else {
-            req_builder = req_builder.json(&b); 
+            req_builder = req_builder.json(&b);
         }
     }
-
     let response = req_builder.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     
@@ -1669,6 +2738,21 @@ async fn initialize_hub(
 ) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
+        // 🌟 [ZERO-TO-REAL MIGRATION] 로그인 전 ZERO_ADDRESS 로 생성된 문서를
+        //    실제 address 기반 team_id 로 일괄 이전합니다.
+        let zero_addr = "0x0000000000000000000000000000000000000000";
+        let old_team_id = crate::utils::hash::hash_id(zero_addr);
+        let new_team_id = crate::utils::hash::hash_id(&address);
+        if old_team_id != new_team_id {
+            match store.migrate_team_identity(&old_team_id, &new_team_id, &address).await {
+                Ok(n) => {
+                    if n > 0 {
+                        println!("[HUB] Migrated {} docs from ZERO team to real team.", n);
+                    }
+                },
+                Err(e) => println!("[HUB] Migration warning: {}", e),
+            }
+        }
         match store.initialize_user_profiles(&address, &email, &flag).await {
             Ok(_) => Ok(format!("Hub initialized for address: {}", address)),
             Err(e) => Err(format!("Initialization failed: {}", e)),
@@ -1858,6 +2942,7 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
 async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
+        let items_total = items.len();
         let mut count = 0;
         for item in items {
             
@@ -1875,15 +2960,47 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str.clone()));
-                
-                // 🌟 [CRITICAL FIX] Dexie DB에서 최상단(Root)으로 꺼내졌던 스키마 컬럼들을 
-                // 다시 Rust의 JSON 페이로드(내부 속성)로 안전하게 복원하여 LanceDB 컬럼에 매핑 시 누락되지 않도록 동기화합니다.
-                if let Some(status) = item.get("status") { obj.insert("status".to_string(), status.clone()); }
-                if let Some(amount) = item.get("amount") { obj.insert("amount".to_string(), amount.clone()); }
-                if let Some(mode) = item.get("mode") { obj.insert("mode".to_string(), mode.clone()); }
-                if let Some(is_masked) = item.get("is_masked") { obj.insert("is_masked".to_string(), is_masked.clone()); }
-                if let Some(created_at) = item.get("created_at") { obj.insert("created_at".to_string(), created_at.clone()); }
-                if let Some(updated_at) = item.get("updated_at") { obj.insert("updated_at".to_string(), updated_at.clone()); }
+                // 🌟 [v4] 루트 호이스팅 복원 블록을 제거했습니다.
+                //    프론트엔드(normalizeEnvelope)가 이미 봉투/확장을 분리해서 보내고,
+                //    Rust 쪽 canonicalize_data 가 타입까지 확정하므로
+                //    여기서 status / amount / is_masked 를 다시 끌어올릴 이유가 없습니다.
+                //
+                //    다만 봉투 값 중 data 안에 반드시 있어야 하는 것들(mode / 시간)은
+                //    상위 페이로드에만 있을 수 있으므로 결손일 때만 보충합니다.
+                if obj.get("mode").is_none() {
+                    if let Some(mode) = item.get("mode") {
+                        obj.insert("mode".to_string(), mode.clone());
+                    } else {
+                        // 🌟 [ANALYTICS MODE AUTO-TAG] 서버(D1)에서 내려온
+                        //    analytics 트랙 항목은 mode 컬럼이 없습니다.
+                        //    reindex_pending_embeddings 가 mode = 'analytic' 으로
+                        //    필터링하므로, 여기서 자동 주입하지 않으면
+                        //    동기화되어도 임베딩 대상에서 전량 탈락합니다.
+                        let is_analytic_type = matches!(
+                            type_str.as_str(),
+                            "click" | "hover" | "change" | "report" | "question" | "answer"
+                        );
+                        if is_analytic_type {
+                            obj.insert("mode".to_string(), serde_json::json!("analytic"));
+                        }
+                    }
+                }
+                if obj.get("created_at").is_none() {
+                    if let Some(v) = item.get("created_at") { obj.insert("created_at".to_string(), v.clone()); }
+                }
+                if obj.get("updated_at").is_none() {
+                    if let Some(v) = item.get("updated_at") {
+                        obj.insert("updated_at".to_string(), v.clone());
+                    } else {
+                        // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 루트에도 data 에도 없으면
+                        //    0(draft) 을 시딩합니다. 이 처리가 없으면 store.rs upsert_item 이
+                        //    '키 없음 → 현재 시각' 경로를 타 draft → count 가 됩니다.
+                        obj.insert("updated_at".to_string(), serde_json::json!(0));
+                    }
+                }
+                if obj.get("flag").is_none() {
+                    if let Some(v) = item.get("flag") { obj.insert("flag".to_string(), v.clone()); }
+                }
             }
 
             
@@ -1943,39 +3060,98 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                 let bcc_val = clean_item.get("bcc").and_then(|v| v.as_str()).unwrap_or("");
                 let ref_val = clean_item.get("ref").and_then(|v| v.as_str()).unwrap_or("");
                 let status_val = clean_item.get("status").and_then(|v| v.as_i64()).unwrap_or(9) as i32;
-                let created_at_val = clean_item.get("created_at").map(|v| v.to_string()).unwrap_or_else(|| chrono::Utc::now().timestamp_millis().to_string());
-                
+
+                // 🌟 [ARG SHIFT FIX] 기존 코드는 add_message 의 마지막 인자(data)에
+                //    created_at 문자열을 넘기고 있었습니다.
+                //      add_message(..., type_: Option<&str>, data: Option<&str>)
+                //    그래서 talks.data 컬럼에 "1735689600000" 같은 숫자 문자열이 저장되고,
+                //    실제 created_at 은 add_message_at 내부에서 현재 시각으로 대체되어
+                //    서버에서 내려온 과거 메시지 시각이 전부 '지금' 으로 찍혔습니다.
+                //    (프론트엔드 upsertChatMessages 의 시간순 정렬이 통째로 무너집니다)
+                //    created_at 은 add_message_at 의 전용 인자로 분리해 넘깁니다.
+                let created_at_num = clean_item.get("created_at")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| clean_item.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.trim().parse::<i64>().ok()))
+                    .filter(|v| *v > 0)
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+                // 🌟 data 컬럼에는 바로 위에서 조립한 { text, link, origin } 을 그대로 넣습니다.
+                let data_json_str = clean_item.get("data")
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| json!({
+                        "text": text_val.clone(),
+                        "link": link_val.clone(),
+                        "origin": origin_val.clone()
+                    }).to_string());
+
                 // Chrome.js처럼 role 구분 (프론트에서 address 비교로 재교정되므로 기본값 user 지정)
                 let role_val = if type_str == "talk" { "user" } else { "system_task" };
 
                 if !id.is_empty() {
-                    let _ = db.add_message(
-                        &id, role_val, &text_val, 
-                        None, Some(status_val), 
-                        Some(cc_val), Some(bcc_val), Some(ref_val), 
-                        Some(from_val), Some(to_val), Some(type_str.as_str()), 
-                        Some(created_at_val.as_str())
+                    // 🌟 [DELETE HANDLE] 기존에는 task_id 자리에 None 을 넘겨 전 talk 행이
+                    //    빈 문자열 task_id 로 저장되었습니다. 그 결과 유일한 삭제 커맨드인
+                    //      delete_message(task_id) → delete_message_by_task_id
+                    //    로 '특정 한 행' 을 지목할 방법이 없었습니다.
+                    //    (task_id = '' 로 지우면 서버에서 내려온 talk 전체가 날아갑니다)
+                    //
+                    //    낙관적 로컬 행을 서버 행으로 승계할 때 그 행만 정확히 삭제해야 하므로
+                    //    자기 자신의 id 를 task_id 로 각인합니다.
+                    //    · talk / prompt 는 스케줄러 태스크가 아니므로 태스크 id 와 충돌하지 않습니다.
+                    //      (태스크 id 는 task_ / search_ / img_ 접두사)
+                    //    · upsertChatMessages 의 isTask 판정은 task_id 가 "search_" 로 시작할 때만
+                    //      참이므로 0x 주소가 들어가도 말풍선 종류가 바뀌지 않습니다.
+                    let _ = db.add_message_at(
+                        &id, role_val, &text_val,
+                        Some(id.as_str()), Some(status_val),
+                        Some(cc_val), Some(bcc_val), Some(ref_val),
+                        Some(from_val), Some(to_val), Some(type_str.as_str()),
+                        Some(data_json_str.as_str()),
+                        Some(created_at_num)
                     ).await;
                     count += 1;
                 }
                 continue; // messages 테이블에 저장했으므로 하단의 items/talks 테이블 저장 로직은 건너뜀
             }
 
-            // Determine table based on cleaned type
-            let final_table = match type_str.as_str() {
-                "sales" | "goods" | "order" => "sales",
-                "tracking" | "receiving" | "shipping" => "tracking",
-                "event" | "coupon" => "event",
-                "member" | "team" | "user" => "users",
-                "talk" | "prompt" | "ai_search" => "talks", 
-                "pages" | "page" => "pages", 
-                _ => {
-                    if clean_item.get("data").and_then(|d| d.get("origin")).is_some() {
-                        "pages"
-                    } else {
-                        "items" 
-                    }
-                }
+            // 🌟 [v4 ROUTING] 물리 테이블은 items / users / pages 3개뿐입니다.
+            //    store.rs 의 resolve_table 과 동일한 규칙을 사용해야 저장/조회가 어긋나지 않습니다.
+            //
+            //    🌟 [HINT-FIRST FIX] 기존 구조는 주석에 "table 명시값을 1순위로 신뢰한다" 고
+            //      적어 놓고 실제로는 type_str 매치를 먼저 돌린 뒤 fallback 으로만 썼습니다.
+            //      그 결과 서버 index.ts 의 `home` 페이지 캐시
+            //          { table:'pages', type:'tracking', data:{ node:true, item:true } }
+            //      가 "tracking" arm 에 걸려 items 로 새어 들어갔고,
+            //      reindex_pending_embeddings 의 items 스캔에 잡혀
+            //      임베딩 → 청크 인덱싱 → 음차까지 전부 돌았습니다.
+            //      (로그 실측: 'Its table is pages' / 'Its node is 1' / 'Its item is true' 청크 11건)
+            //
+            //      Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
+            //      그 명시값을 '진짜로' 1순위에 둡니다. (추정이 아니라 계약입니다)
+            let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
+            let final_table = match table_hint {
+                // ── 1순위 : 서버가 명시한 물리 테이블 ──
+                "pages" | "page" => "pages",
+                "users" => "users",
+                // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
+                "talks" => continue,
+                // ── 2순위 : 힌트가 없거나 레거시(sales/tracking/event)일 때만 type 으로 판정 ──
+                _ => match type_str.as_str() {
+                    "member" | "team" | "user" | "users" => "users",
+                    "pages" | "page" => "pages",
+                    // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
+                    "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
+                    "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
+                    | "receiving" | "shipping" => "items",
+                    // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
+                    //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
+                    //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
+                    //    방어적으로 여기서도 skip 합니다.
+                    "talk" | "prompt" | "ai_search" => continue,
+                    // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
+                    _ => "items",
+                },
             };
 
             
@@ -1985,13 +3161,49 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let bcc = item.get("bcc").and_then(|v| v.as_str());
             let r#ref = item.get("ref").and_then(|v| v.as_str());
             let digest = item.get("digest").and_then(|v| v.as_str());
-
             if !id.is_empty() {
+                // 🌟 [EMBED FLAG PRESERVE] 서버에서 받은 데이터에는 embed 플래그가 없으므로,
+                //    기존 DB에 이미 로컬 임베딩이 완료된(embed=1) 아이템이라면
+                //    덮어쓰기 전에 해당 플래그를 clean_item에 복원합니다.
+                //    이 처리가 없으면 syncData() 폴링(3초)마다 embed가 사라져
+                //    reindex_pending_embeddings()가 매번 재인덱싱을 수행하는 무한 루프가 발생합니다.
+                //
+                //    🌟 v4 : canonicalize_data 가 embed 를 0|1 정수로 확정하므로
+                //    as_i64() 비교가 안정적으로 동작합니다.
+                //    (기존에는 true / "1" / 1 이 섞여 들어와 간헐적으로 실패했습니다)
+                //
+                //    🌟 [CC-INDEPENDENT DEDUP] cc 값이 달라도 동일 id 이면
+                //    이미 임베딩된 문서로 간주합니다. digest 가 cc 포함 해시라면
+                //    cc 변경 시 digest 가 달라져 스킵 가드가 무력화되므로,
+                //    embed 플래그 + chunk_count 를 이중 확인합니다.
+                if let Ok(Some(existing)) = db.get_item_by_id(final_table, &id).await {
+                    let mut already_embedded = false;
+                    if let Ok(existing_data) = serde_json::from_str::<Value>(&existing.json_data) {
+                        already_embedded = existing_data.get("embed")
+                            .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
+                            .unwrap_or(false);
+                    }
+                    // 🌟 chunk_count 가 0보다 크면 물리적으로 청크가 존재하므로
+                    //    embed 플래그와 무관하게 재인덱싱 불필요
+                    if !already_embedded {
+                        let cc = db.count_chunks_by_item(&id).await.unwrap_or(0);
+                        if cc > 0 { already_embedded = true; }
+                    }
+                    if already_embedded {
+                        if let Some(obj) = clean_item.as_object_mut() {
+                            obj.insert("embed".to_string(), json!(1));
+                        }
+                    }
+                }
                 // 원본 item 대신 세탁된 clean_item을 DB에 밀어 넣습니다.
                 let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, from, to, cc, bcc, r#ref, digest).await;
                 count += 1;
             }
         }
+        println!(
+            "[SYNC-RESULT] upsert_items 완료: 수신 {}건 → LanceDB 쓰기 {}건 (나머지는 digest 동일 스킵 또는 messages 테이블행)",
+            items_total, count
+        );
         Ok(format!("Synced {} items", count))
     } else {
         Err("DB not initialized".to_string())
@@ -2646,7 +3858,9 @@ pub fn run() {
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
-            get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb
+            get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
+            get_query_embedding, reindex_pending_embeddings, structure_pending_analytics,
+            translit_cache_respond, get_embedding_batch_for_translit
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
