@@ -9935,6 +9935,7 @@ async fn process_trading_task(
             cancellation_token,
             app_handle,
             &task.id,
+            false,              // skip_transliteration: 무역 문서는 음차 필요하므로 false
         ).await.unwrap_or(0);
 
         emit_term(&format!(
