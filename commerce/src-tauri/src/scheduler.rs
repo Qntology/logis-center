@@ -213,6 +213,7 @@ pub async fn transliterate_cross_language(
     app_handle: &tauri::AppHandle,
     task_id: &str,
 ) -> (String, String) {
+    let _ = (app_handle, task_id);
     let src = text.trim().to_string();
     if src.is_empty() { return (String::new(), String::new()); }
 
@@ -229,19 +230,31 @@ pub async fn transliterate_cross_language(
         return (String::new(), String::new());
     }
 
+    // 🌟 [PROMPT / SANITIZE FIX]
+    //  ── 무엇이 문제였나 ──
+    //   ① crate::prompts::transliteration_prompt(&src, doc_lang) 는 ISO 코드("ko")를
+    //      [TARGET LANGUAGE] 에 그대로 꽂아, 모델이 목표 표기 체계를 인식하지 못했습니다.
+    //      (nl_convert::build_transliteration_prompt 는 lang_code_to_full_name 으로 "korean" 을 넣습니다)
+    //   ② transliteration 객체에서 .values().next() 로 '아무 항목이나 하나' 를 꺼내
+    //      다단어 문장의 첫 단어도 아닌 임의 값이 native 로 저장되었습니다.
+    //      (로그 실측: "상품3" → '산마두', "사용자" → '수용자')
+    //   ③ G1(원문 동일) / G2(표기 체계 반전) / G3(길이 상한) 게이트를 통과시키지 않아
+    //      명백한 환각도 그대로 별칭 벡터가 되었습니다.
+    //  ── 해결 ──
+    //   nl_convert 가 이미 갖고 있는 프롬프트 빌더와 정화기를 그대로 재사용합니다.
+
     // 영어 원문 → 문서 언어(비라틴) 방향
     if src_is_latin && !target_is_latin {
-        let prompt = crate::prompts::transliteration_prompt(&src, doc_lang);
-        let res = model.call_qwen3_5_transliteration(&prompt, Some(cancel.clone())).await.unwrap_or_default();
-        let parsed = crate::parsing::parse_json_from_llm(&res);
-        let native = parsed.get("transliteration")
-            .and_then(|v| v.as_object())
-            .and_then(|obj| obj.values().next())
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let prompt = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
+        let res = model
+            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+        let (_t, native) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
         let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
+        if native.is_empty() {
+            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 문서언어 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
+        }
         return (native, roman);
     }
 
@@ -250,16 +263,15 @@ pub async fn transliterate_cross_language(
         if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
             return (String::new(), roman);
         }
-        let prompt = crate::prompts::transliteration_prompt(&src, "english");
-        let res = model.call_qwen3_5_transliteration(&prompt, Some(cancel.clone())).await.unwrap_or_default();
-        let parsed = crate::parsing::parse_json_from_llm(&res);
-        let roman = parsed.get("transliteration")
-            .and_then(|v| v.as_object())
-            .and_then(|obj| obj.values().next())
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let prompt = crate::nl_convert::build_transliteration_prompt(&src, "en");
+        let res = model
+            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+        let (_t, roman) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
+        if roman.is_empty() {
+            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 로마자 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
+        }
         return (String::new(), roman);
     }
 

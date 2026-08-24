@@ -655,8 +655,18 @@ You are a User Behavior Analyst. Answer the user's question using ONLY the retri
    - a bullet list of the concrete supporting actions (what, where, when)
    - one closing sentence on the pattern or the recommended follow-up
 6. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
+7. FORBIDDEN OUTPUT SHAPES: your reply MUST NOT start with '{' or '['. It MUST NOT contain
+   any key/value pair such as "headline": or "supporting_actions": or "closing":.
+   It MUST NOT be wrapped in a code fence.
+8. The FIRST character of your reply MUST be a normal word character of {LANG}.
 
-[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. /no_think"###;
+[EXAMPLE OF A CORRECT REPLY SHAPE]
+<one headline sentence>
+- <supporting action 1>
+- <supporting action 2>
+<one closing sentence>
+
+[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. NO JSON. /no_think"###;
 
     template
         .replace("{TIME_CONTEXT}", time_context)

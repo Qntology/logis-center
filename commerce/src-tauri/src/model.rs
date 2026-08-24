@@ -6475,30 +6475,43 @@ impl LogisModel {
             .unwrap_or_default();
 
         // =====================================================================
-        // STEP 1 : bias.json 완전일치 (벡터·LLM 없이 확정)
+        // STEP 1 : bias.json 완전일치 + 접두일치 (벡터·LLM 없이 확정)
         // =====================================================================
         let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(&query, language);
         let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
         let mut det_event_keys: Vec<String> = Vec::new();
         for w in query.split_whitespace() {
+            // ① 완전일치
             if let Some(k) = crate::analytic::event_type_exact_match(w) {
                 if !det_event_keys.iter().any(|e| e == &k) {
+                    det_event_keys.push(k);
+                }
+                continue;
+            }
+            // 🌟 ② 접두일치 (교착어 대응)
+            //    "클릭한게" 는 exact_match 에 없지만 "클릭" 이 접두이므로 click 으로 확정됩니다.
+            if let Some(k) = crate::analytic::event_type_prefix_key(w) {
+                if !det_event_keys.iter().any(|e| e == &k) {
+                    emit_term(&format!(
+                        "   ⚡ [EVENT PREFIX MATCH] '{}' → analytic_event_filters.{} (교착어 접두 확정)",
+                        w, k
+                    ));
                     det_event_keys.push(k);
                 }
             }
         }
         if !det_time_key.is_empty() || !det_season_key.is_empty() || !det_event_keys.is_empty() {
             emit_term(&format!(
-                "   ⚡ [EXACT MATCH] bias.json 완전일치 확정: time='{}' | season='{}' | events={:?}",
+                "   ⚡ [EXACT MATCH] bias.json 일치 확정: time='{}' | season='{}' | events={:?}",
                 det_time_key, det_season_key, det_event_keys
             ));
         }
 
         // =====================================================================
-        // STEP 2 : Stanza POS 토큰화 (NLP 모델)
+        // STEP 2 : Stanza 형태소 토큰화 (UPOS + Lemma)
         // =====================================================================
         let stanza_code = crate::analytic::stanza_lang_code(language);
-        let tokens = crate::analytic::tokenize_query_with_pos(&query, stanza_code).await;
+        let tokens = crate::analytic::tokenize_query_with_morphology(&query, stanza_code).await;
         if tokens.is_empty() {
             emit_term("   ⚠️ [TOKENIZE] 분석 가능한 토큰이 없습니다. 전체 스코프로 검색합니다.");
         } else {
@@ -6506,10 +6519,10 @@ impl LogisModel {
                 "   🧠 [STANZA POS] {:?}",
                 tokens
                     .iter()
-                    .map(|(w, t)| if t.is_empty() {
-                        w.clone()
-                    } else {
-                        format!("{}({})", w, t)
+                    .map(|(w, t, l)| {
+                        let tag = if t.is_empty() { "-".to_string() } else { t.clone() };
+                        let lem = if l.is_empty() { "-".to_string() } else { l.clone() };
+                        format!("{}(tag:{}, lemma:{})", w, tag, lem)
                     })
                     .collect::<Vec<_>>()
             ));
@@ -6519,28 +6532,89 @@ impl LogisModel {
         //    '클릭한' 이 VERB 로 판정되어도 그것이 event 판정의 유일한 근거이기 때문입니다.
         //    드롭은 keywords / target 산출 시에만 적용합니다.
         const DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
-        let all_words: Vec<String> = tokens.iter().map(|(w, _)| w.clone()).collect();
+        let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let content_flags: Vec<bool> = tokens
             .iter()
-            .map(|(_, t)| !DROP_TAGS.iter().any(|d| d == t))
+            .map(|(_, t, _)| !DROP_TAGS.iter().any(|d| d == t))
             .collect();
 
         // =====================================================================
-        // STEP 3 : 슬라이딩 윈도우 청크 생성 (1~6 단어)
+        // 🌟 STEP 2-B : 형태소 변형 후보 산출 (교착어 원형 복원)
+        // ---------------------------------------------------------------------
+        //  commerce 는 같은 질의의 다른 토큰과 접두를 공유한다는 사실로 어간을 얻지만
+        //  ("제품중에서" ↔ "제품"), analytic 질의는 형제 토큰이 없는 경우가 대부분입니다.
+        //  Lemma → bias.json 접두 사전 → 문자 접두 n-gram 순서로 원형을 복원해
+        //  슬라이딩 윈도우에 '검색 가능한 형태'를 함께 올립니다.
+        // =====================================================================
+        let morph_alts: Vec<Vec<String>> = tokens
+            .iter()
+            .map(|(w, _, l)| crate::analytic::morphological_variants(w, l))
+            .collect();
+        let morph_depth: usize = morph_alts.iter().map(|v| v.len()).max().unwrap_or(0);
+        {
+            let logged: Vec<String> = tokens
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !morph_alts[*i].is_empty())
+                .map(|(i, (w, _, _))| format!("{} → {:?}", w, morph_alts[i]))
+                .collect();
+            if logged.is_empty() {
+                emit_term("   ⚪ [MORPH VARIANT] 원형 복원 후보가 없어 표면형만 사용합니다.");
+            } else {
+                emit_term(&format!("   ✂️ [MORPH VARIANT] 교착어 원형 복원: {:?}", logged));
+            }
+        }
+
+        // =====================================================================
+        // STEP 3 : 슬라이딩 윈도우 청크 생성 (1~6 단어) + 형태소 변형 청크
         //   Commerce의 2~8 윈도우를 참고하되, analytic은 짧은 질의가 많으므로
         //   1단어부터 시작하여 최대 6단어까지 확장합니다.
+        //   🌟 같은 스팬(s,e)에 대해 '표면형 조합'과 '원형 조합'을 모두 올립니다.
+        //      스팬이 동일하므로 NMS 배틀 / consumed 좌표계가 전혀 흔들리지 않습니다.
         // =====================================================================
         let mut chunk_texts: Vec<String> = Vec::new();
         let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
+        let mut seen_chunk: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for s in 0..all_words.len() {
             let max_e = all_words.len().min(s + 6);
             for e in (s + 1)..=max_e {
-                let t = all_words[s..e].join(" ");
-                if t.trim().is_empty() {
-                    continue;
+                // ① 표면형 조합
+                let surface = all_words[s..e].join(" ");
+                if !surface.trim().is_empty() {
+                    let key = format!("{}|{}|{}", s, e, surface);
+                    if seen_chunk.insert(key) {
+                        chunk_texts.push(surface);
+                        chunk_spans.push((s, e));
+                    }
                 }
-                chunk_texts.push(t);
-                chunk_spans.push((s, e));
+
+                // ② 형태소 변형 조합 (깊이별로 순회)
+                for d in 0..morph_depth {
+                    let mut changed = false;
+                    let mut parts: Vec<String> = Vec::with_capacity(e - s);
+                    for i in s..e {
+                        match morph_alts[i].get(d) {
+                            Some(m) => {
+                                changed = true;
+                                parts.push(m.clone());
+                            }
+                            None => parts.push(all_words[i].clone()),
+                        }
+                    }
+                    if !changed {
+                        continue;
+                    }
+                    let mt = parts.join(" ");
+                    if mt.trim().is_empty() {
+                        continue;
+                    }
+                    let key = format!("{}|{}|{}", s, e, mt);
+                    if seen_chunk.insert(key) {
+                        chunk_texts.push(mt);
+                        chunk_spans.push((s, e));
+                    }
+                }
             }
         }
 
@@ -6561,20 +6635,30 @@ impl LogisModel {
         //    기존에는 질의 전체 벡터 1개로만 판정하여
         //    '클릭한거 뭐야' 에서 '클릭' 이 '뭐야' 와 섞여 신호가 희석되었습니다.
         //    슬라이딩 윈도우에 올리면 각 단어 윈도우가 독립적으로 경쟁하므로 이 문제가 없습니다.
+        //
+        //    🌟 [DUPLICATE LOOP FIX] 기존 코드는 동일한 적재 루프를 두 번 실행하여
+        //    event 각 키의 구 개수 N 이 정확히 2배가 되어 있었습니다.
+        //    SURPRISAL 은 √(2 ln N) 을 차감하므로 N 이 2배가 되면 event 키만
+        //    구조적으로 불리해져(√(2 ln 24)=2.78 vs √(2 ln 12)=2.23) time/season 에 밀립니다.
+        //    중복 삽입을 제거하고, 혹시 모를 사전 중복까지 구조적으로 차단합니다.
         for event_type in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
             for p in crate::analytic::event_type_anchor_phrases(event_type) {
+                if bank_defs
+                    .iter()
+                    .any(|(c, k, e)| c == "event" && k == event_type && e == &p)
+                {
+                    continue;
+                }
                 bank_defs.push(("event".to_string(), event_type.to_string(), p));
             }
             for p in crate::analytic::event_type_prejudice_phrases(event_type) {
+                if prej_defs
+                    .iter()
+                    .any(|(c, k, e)| c == "event" && k == event_type && e == &p)
+                {
+                    continue;
+                }
                 prej_defs.push(("event".to_string(), event_type.to_string(), p));
-            }
-        }
-        for t in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
-            for p in crate::analytic::event_type_anchor_phrases(t) {
-                bank_defs.push(("event".to_string(), t.to_string(), p));
-            }
-            for p in crate::analytic::event_type_prejudice_phrases(t) {
-                prej_defs.push(("event".to_string(), t.to_string(), p));
             }
         }
 
@@ -6635,13 +6719,41 @@ impl LogisModel {
         }
 
         // =====================================================================
-        // STEP 5 : SURPRISAL 채점
-        //   surprisal = (max - μ)/σ - √(2 ln N)
-        //   "N개를 무작위로 뽑았을 때의 기대 최댓값보다 실제로 더 가까운가"
+        // STEP 5 : SURPRISAL 채점 (전역 기준선)
+        //   surprisal = (max - μ_global)/σ_global - √(2 ln N)
+        //
+        //  ── 왜 전역 기준선으로 바꾸는가 ──
+        //   직전 구현은 각 (category,key) 뱅크를 '자기 자신의' 평균/표준편차로 표준화했습니다.
+        //   그런데 극값이론이 E[z of max] ≈ √(2 ln N) 을 예측하므로, 그 값을 다시 빼면
+        //   질의와의 관련성과 무관하게 결과가 항상 0 부근으로 수렴합니다(판별력 0).
+        //   (로그 실측: 청크 10개 전부 게이트 미통과 → [NMS CANDIDATE] 0건 →
+        //    EVENT FALLBACK 4종 전체 → 의도한 click 스코프 축소가 영구 실패)
+        //   ai_utils::surprisal_dual_scores 는 이미 같은 문제를 '모든 뱅크를 합친 전역 분포'
+        //   기준선으로 해결해 두었으므로 동일 원리를 이식합니다.
         //   0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
-        //   뱅크 크기가 서로 달라도(time 7키 vs event 4키) 공정하게 비교됩니다.
         // =====================================================================
-        let surprisal = |q: &Vec<f32>, idxs: &Vec<usize>, embs: &Vec<Vec<f32>>| -> (f32, f32) {
+        let global_baseline = |q: &Vec<f32>, embs: &Vec<Vec<f32>>| -> (f32, f32) {
+            let mut pool: Vec<f32> = Vec::with_capacity(embs.len());
+            for e in embs {
+                if e.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                pool.push(cos(q, e));
+            }
+            if pool.len() < 2 {
+                return (0.0f32, 1.0f32);
+            }
+            let n = pool.len() as f32;
+            let mean: f32 = pool.iter().sum::<f32>() / n;
+            let var: f32 = pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+            (mean, var.sqrt().max(1e-6))
+        };
+
+        let surprisal = |q: &Vec<f32>,
+                         idxs: &Vec<usize>,
+                         embs: &Vec<Vec<f32>>,
+                         g_mean: f32,
+                         g_sd: f32| -> (f32, f32) {
             let mut sims: Vec<f32> = Vec::with_capacity(idxs.len());
             for &i in idxs {
                 let e = match embs.get(i) {
@@ -6657,11 +6769,8 @@ impl LogisModel {
                 return (f32::MIN, 0.0);
             }
             let n = sims.len() as f32;
-            let mean: f32 = sims.iter().sum::<f32>() / n;
-            let var: f32 = sims.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
-            let sd = var.sqrt().max(1e-6);
             let mx = sims.iter().cloned().fold(f32::MIN, f32::max);
-            let z = (mx - mean) / sd;
+            let z = (mx - g_mean) / g_sd;
             let expect = (2.0 * n.max(2.0).ln()).sqrt();
             (z - expect, mx)
         };
@@ -6678,6 +6787,11 @@ impl LogisModel {
         }
 
         let mut candidates: Vec<AnalyticSpan> = Vec::new();
+        // 🌟 [COVERAGE RESCUE POOL] 게이트를 통과하지 못했지만
+        //    '전역 분포의 상위 1σ 꼬리' 에 든 최상위 후보를 따로 모아 둡니다.
+        //    (통계적 사실 기반이며 새 매직 상수가 아닙니다)
+        let mut rescue_pool: Vec<AnalyticSpan> = Vec::new();
+
         for (ci, (s, e)) in chunk_spans.iter().enumerate() {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 emit_term("[ANALYTIC-QUERY] 🛑 사용자 취소로 파싱을 중단합니다.");
@@ -6690,9 +6804,13 @@ impl LogisModel {
             if q.iter().all(|&v| v == 0.0) {
                 continue;
             }
+
+            // 🌟 이 청크 하나에 대한 전역 기준선을 먼저 확정합니다.
+            let (g_mean, g_sd) = global_baseline(q, &bank_embs);
+
             let mut scored: Vec<(String, String, f32, f32)> = Vec::new();
             for (ck, idxs) in key_bank.iter() {
-                let (sur, own) = surprisal(q, idxs, &bank_embs);
+                let (sur, own) = surprisal(q, idxs, &bank_embs, g_mean, g_sd);
                 if sur == f32::MIN {
                     continue;
                 }
@@ -6728,15 +6846,7 @@ impl LogisModel {
             }
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
             let (cat, key, sc, own) = scored[0].clone();
-            // 🌟 [SURPRISAL GATE 완화] Commerce의 멀티패스 스코어링처럼
-            //    0.0 이하라도 -0.3 이상이면 후보로 허용합니다.
-            //    짧은 질의(5토큰 이하)에서는 뱅크 크기 대비 우연 공명 기댓값이
-            //    실제 신호를 상쇄하여 0.0을 넘기기 어렵습니다.
-            //    -0.3은 √(2 ln N) 보정 후에도 '무작위 기대치의 30% 이내'라는
-            //    구조적 하한이며, 매직 상수가 아닙니다.
-            if sc <= -0.3 {
-                continue;
-            }
+
             let alts: Vec<(String, f32)> = scored
                 .iter()
                 .skip(1)
@@ -6744,29 +6854,65 @@ impl LogisModel {
                 .take(3)
                 .map(|(_, k, s, _)| (k.clone(), *s))
                 .collect();
+
             // 🌟 [MULTI-CATEGORY COLLECT] Commerce의 intersecting_categories 처럼
             //    동일 카테고리 내 차순위뿐 아니라 타 카테고리 후보도 수집합니다.
             let mut multi_cats: Vec<(String, String, f32)> = Vec::new();
             multi_cats.push((cat.clone(), key.clone(), sc));
             for (c2, k2, s2, _) in scored.iter().skip(1).take(5) {
-                if *c2 != cat && *s2 > -0.3 {
+                if *c2 != cat && *s2 > 0.0 {
                     multi_cats.push((c2.clone(), k2.clone(), *s2));
                 }
             }
-            emit_term(&format!(
-                "   🎯 [NMS CANDIDATE] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4} | MultiCats: {}",
-                chunk_texts[ci], cat, key, sc, own, multi_cats.len()
-            ));
-            candidates.push(AnalyticSpan {
+
+            let span = AnalyticSpan {
                 start: *s,
                 end: *e,
                 text: chunk_texts[ci].clone(),
-                category: cat,
-                key,
+                category: cat.clone(),
+                key: key.clone(),
                 score: sc,
                 max_cos: own,
                 alts,
+            };
+
+            // 🌟 [SURPRISAL GATE] 전역 기준선으로 바뀌었으므로 0 이 다시 의미를 갖습니다.
+            //    surprisal > 0 = "N개를 무작위로 뽑은 기대 최댓값보다 실제로 더 가깝다"
+            if sc > 0.0 {
+                emit_term(&format!(
+                    "   🎯 [NMS CANDIDATE] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4} | μ:{:.4} σ:{:.4} | MultiCats: {}",
+                    chunk_texts[ci], cat, key, sc, own, g_mean, g_sd, multi_cats.len()
+                ));
+                candidates.push(span);
+            } else if own > g_mean + g_sd {
+                emit_term(&format!(
+                    "   🛟 [RESCUE POOL] \"{}\" → {}.{} | Surprisal: {:+.4} (게이트 미통과) | MaxCos: {:.4} > μ+σ({:.4})",
+                    chunk_texts[ci], cat, key, sc, own, g_mean + g_sd
+                ));
+                rescue_pool.push(span);
+            }
+        }
+
+        // 🌟 [COVERAGE RESCUE] 게이트를 넘은 후보가 하나도 없으면
+        //    '전역 분포 상위 1σ' 에 든 후보를 승격시켜 NMS 배틀을 살립니다.
+        //    (승격하지 않으면 EVENT FALLBACK 4종 전체로 스코프가 무조건 넓어집니다)
+        if candidates.is_empty() && !rescue_pool.is_empty() {
+            rescue_pool.sort_by(|a, b| {
+                b.max_cos
+                    .partial_cmp(&a.max_cos)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
+            emit_term(&format!(
+                "   🛟 [COVERAGE RESCUE] 게이트 통과 후보가 0건이라 상위 1σ 후보 {}건을 승격합니다.",
+                rescue_pool.len()
+            ));
+            for r in rescue_pool.into_iter() {
+                emit_term(&format!(
+                    "      ↳ \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
+                    r.text, r.category, r.key, r.score, r.max_cos
+                ));
+                candidates.push(r);
+            }
         }
 
         // =====================================================================
@@ -7149,6 +7295,11 @@ impl LogisModel {
                     ));
                 }
             }
+        } else if vec_time.is_empty() && vec_season.is_empty() {
+            // 🌟 [LOG FIX] 기존에는 후보가 0건이어도 "벡터 마진이 충분하여" 라고 출력해
+            //    NMS CANDIDATE 0건이라는 실제 상태를 로그에서 은폐했습니다.
+            //    마진 판정은 후보가 존재할 때만 성립합니다.
+            emit_term("   ⚪ [NO VECTOR EVIDENCE] 시간/계절 벡터 후보가 0건이라 LLM 재판정 대상이 없습니다.");
         } else {
             emit_term("   ⚡ [DETERMINISTIC] 벡터 마진이 충분하여 LLM 호출을 생략합니다.");
         }

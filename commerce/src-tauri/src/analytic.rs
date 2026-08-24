@@ -143,6 +143,83 @@ pub fn event_type_exact_match(word: &str) -> Option<String> {
     None
 }
 
+/// 🌟 [EVENT PREFIX MATCH] 교착어 어절을 위해 exact_match 배열을 '접두 사전' 으로 재사용합니다.
+///  "클릭한게" 는 exact_match 에 없지만 "클릭" 이 그 접두이므로 click 으로 확정됩니다.
+///  사전은 bias.json 이 소유하므로 코드에는 어떤 언어의 어휘도 등장하지 않습니다.
+pub fn event_type_prefix_key(word: &str) -> Option<String> {
+    let (key, _stem) =
+        crate::utils::ai_utils::prefix_match_filter_stem("analytic_event_filters", word)?;
+    if ANALYTIC_SEARCH_TYPES.iter().any(|t| t == &key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// 🌟 [MORPHOLOGICAL VARIANTS] 교착어 어절 하나에서 '검색 가능한 원형 후보'를 만들어 냅니다.
+///  ── 근거 3단 ──
+///   ① Stanza Lemma      : 모델이 직접 알려준 원형 ("클릭한게" → "클릭")
+///   ② bias.json 접두 사전: exact_match 원소가 표면형의 접두이면 그 원소를 어간으로 확정
+///   ③ 문자 접두 n-gram   : ①②가 모두 실패했을 때의 순수 구조 폴백
+///  ── 왜 필요한가 ──
+///   commerce 는 질의에 다른 토큰('제품')이 함께 있어 shared_prefix_stems 로 어간을 얻지만,
+///   "가장 많이 클릭한게 뭐야?" 처럼 어간을 공유하는 형제 토큰이 없는 질의에서는
+///   그 장치가 동작하지 않습니다. 세 근거를 순서대로 시도합니다.
+///  ── 상한 ──
+///   토큰당 최대 3개. 청크 폭발을 막고, 무의미한 조각은 SURPRISAL/편견 게이트가 걸러냅니다.
+pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
+    let surface = word.trim();
+    let mut out: Vec<String> = Vec::new();
+    if surface.chars().count() < 2 {
+        return out;
+    }
+
+    fn push(v: &mut Vec<String>, surface: &str, cand: String) {
+        let c = cand.trim().to_string();
+        if c.is_empty() { return; }
+        if c.chars().count() < 2 { return; }
+        if c == surface { return; }
+        if v.iter().any(|e| e == &c) { return; }
+        v.push(c);
+    }
+
+    // ① Stanza Lemma 원형
+    let l = lemma.trim();
+    if !l.is_empty() && l != surface {
+        let lc: String = l.chars().filter(|c| c.is_alphanumeric()).collect();
+        let sc: String = surface.chars().filter(|c| c.is_alphanumeric()).collect();
+        if !lc.is_empty()
+            && sc.chars().count() > lc.chars().count()
+            && (sc.starts_with(&lc) || sc.ends_with(&lc))
+        {
+            push(&mut out, surface, lc);
+        } else if !lc.is_empty() {
+            push(&mut out, surface, l.to_string());
+        }
+    }
+
+    // ② bias.json exact_match 접두 사전
+    for cat in ["analytic_event_filters", "time_filters", "season_filters"] {
+        if let Some((_, stem)) = crate::utils::ai_utils::prefix_match_filter_stem(cat, surface) {
+            push(&mut out, surface, stem);
+        }
+    }
+
+    // ③ 문자 접두 n-gram (사전 없이 동작하는 최후 폴백)
+    let chars: Vec<char> = surface.chars().collect();
+    if chars.len() >= 3 {
+        let hi = (chars.len() - 1).min(4);
+        for n in 2..=hi {
+            push(&mut out, surface, chars[..n].iter().collect::<String>());
+        }
+    }
+
+    if out.len() > 3 {
+        out.truncate(3);
+    }
+    out
+}
+
 /// 🌟 [ATTRIBUTE STRIP] PUG 한 줄에서 속성부(`[...]`)를 완전히 제거하고
 ///    `{indent}{tag} | {text}` 형태만 남깁니다.
 ///    pug_line_parts 는 속성값 내부의 파이프를 오인하지 않는 안전 파서이므로
@@ -625,6 +702,88 @@ fn env_doc_origin(doc: &crate::store::TradeDocument) -> Value {
     json!("")
 }
 
+/// 🌟 [REPORT OUTPUT NORMALIZE] Qwen3.5 가 "Do NOT output JSON" 지시를 어기고
+///  { "headline": ..., "supporting_actions": [...], "closing": ... } 형태로 반환하는 경우를 흡수합니다.
+///  ── 왜 코드로 흡수하는가 ──
+///   프롬프트 지시만으로는 2B 모델의 JSON 관성을 100% 막을 수 없고,
+///   말풍선에 원시 JSON 이 그대로 노출되면 사용자가 읽을 수 없습니다.
+///   구조가 무엇이든 '문자열 잎' 만 순서대로 펼치면 항상 읽을 수 있는 텍스트가 됩니다.
+///  ── JSON 이 아니면 원문을 그대로 돌려줍니다 (무해). ──
+pub fn normalize_report_output(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    if t.is_empty() {
+        return t;
+    }
+
+    // ① 코드펜스 제거
+    if t.starts_with("```") {
+        if let Some(p) = t.find('\n') {
+            t = t[p + 1..].to_string();
+        }
+        if let Some(p) = t.rfind("```") {
+            t = t[..p].to_string();
+        }
+        t = t.trim().to_string();
+    }
+
+    // ② JSON 형태가 아니면 그대로 반환
+    if !(t.starts_with('{') || t.starts_with('[')) {
+        return t;
+    }
+
+    let parsed = crate::parsing::parse_json_from_llm(&t);
+    if parsed.is_null() {
+        return t;
+    }
+
+    fn flatten(v: &Value, out: &mut Vec<String>, bullet: bool) {
+        match v {
+            Value::String(s) => {
+                let x = s.trim();
+                if x.is_empty() {
+                    return;
+                }
+                out.push(if bullet { format!("- {}", x) } else { x.to_string() });
+            }
+            Value::Number(n) => {
+                out.push(if bullet { format!("- {}", n) } else { n.to_string() });
+            }
+            Value::Bool(b) => {
+                out.push(if bullet { format!("- {}", b) } else { b.to_string() });
+            }
+            Value::Array(a) => {
+                for it in a {
+                    flatten(it, out, true);
+                }
+            }
+            Value::Object(o) => {
+                for (_, val) in o {
+                    flatten(val, out, bullet);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(obj) = parsed.as_object() {
+        for (_, v) in obj {
+            let is_list = v.is_array();
+            flatten(v, &mut lines, is_list);
+        }
+    } else {
+        flatten(&parsed, &mut lines, false);
+    }
+
+    let joined = lines.join("\n").trim().to_string();
+    if joined.is_empty() {
+        t
+    } else {
+        println!("[ANALYTIC] 🧽 [REPORT NORMALIZE] JSON 응답을 읽을 수 있는 텍스트로 평탄화했습니다.");
+        joined
+    }
+}
+
 // =====================================================================
 // 🌟 [ANALYTIC QUERY PARSER]
 // ---------------------------------------------------------------------
@@ -720,6 +879,7 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
         .collect();
     candidates.push(query.trim().to_string());
 
+    // ── 1차 : 완전일치 ──
     for c in &candidates {
         if t_key.is_empty() {
             if let Some(k) = crate::utils::ai_utils::exact_match_filter_key("time_filters", c) {
@@ -733,6 +893,32 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
         }
         if !t_key.is_empty() && !s_key.is_empty() { break; }
     }
+
+    // 🌟 ── 2차 : 접두 일치 (교착어 대응) ──
+    //    '올해는' / '여름에' 처럼 조사가 붙어 완전일치가 실패한 경우를 구제합니다.
+    //    exact_match 원소가 토큰의 접두일 때만 인정하므로 어휘 하드코딩이 없습니다.
+    if t_key.is_empty() || s_key.is_empty() {
+        for c in &candidates {
+            if t_key.is_empty() {
+                if let Some((k, stem)) =
+                    crate::utils::ai_utils::prefix_match_filter_stem("time_filters", c)
+                {
+                    println!("[ANALYTIC] 🕒 [TIME PREFIX MATCH] '{}' ← 접두 '{}' → time_filters.{}", c, stem, k);
+                    t_key = k;
+                }
+            }
+            if s_key.is_empty() {
+                if let Some((k, stem)) =
+                    crate::utils::ai_utils::prefix_match_filter_stem("season_filters", c)
+                {
+                    println!("[ANALYTIC] 🌤️ [SEASON PREFIX MATCH] '{}' ← 접두 '{}' → season_filters.{}", c, stem, k);
+                    s_key = k;
+                }
+            }
+            if !t_key.is_empty() && !s_key.is_empty() { break; }
+        }
+    }
+
     (t_key, s_key)
 }
 
@@ -765,25 +951,32 @@ pub fn stanza_lang_code(language: &str) -> &'static str {
     }
 }
 
-/// 🌟 [STANZA TOKENIZE] 질의를 어절 단위로 쪼개고 UPOS 태그를 부착합니다.
-///  ── 왜 POS 가 필요한가 ──
-///   '뭐야' / '찾아줘' 같은 용언은 검색 키워드가 아니라 명령어입니다.
-///   그런데 다국어 임베딩에서 한국어 2~3음절 단어는 어떤 뱅크와도
-///   0.6~0.8 대역의 우연 공명을 일으키므로, 코사인만으로는 걸러지지 않습니다.
-///   Stanza 가 VERB / ADP / PUNCT 로 확정한 토큰은 '구조적 사실' 이므로
-///   그 판정을 1차 게이트로 쓰고 코사인은 2차 판정에만 사용합니다.
+/// 🌟 [STANZA TOKENIZE + MORPHOLOGY] 질의를 어절 단위로 쪼개고 UPOS 태그와 Lemma 원형을 함께 부착합니다.
+///  ── 왜 Lemma 까지 필요한가 ──
+///   Stanza 토크나이저는 교착어 어절을 통째로 한 토큰으로 돌려줍니다.
+///     "클릭한게" → 1토큰  (클릭 + 한 + 게)
+///   이 표면형은 bias.json 의 exact_match("클릭")와 완전일치하지 않고,
+///   영어 구 뱅크("clicked", "pressed")와의 코사인도 낮아
+///   슬라이딩 윈도우에서 NMS 후보가 단 하나도 만들어지지 않습니다.
+///   (로그 실측: [NMS CANDIDATE] 0건 → EVENT FALLBACK 4종 전체)
+///   commerce 의 parse_commerce_query 는 이미 lemma_session 을 돌려
+///   '가디건찾아줘' → '가디건' 절단을 수행하고 있으므로, 같은 장치를 이식합니다.
 ///
-///  ── 실패 시 ──
-///   모델 디렉터리가 없거나 ONNX 스키마가 어긋나면 공백 분할로 폴백합니다.
-///   (태그는 빈 문자열이 되고, 호출부는 그것을 '판정 불가' 로 취급합니다)
-pub async fn tokenize_query_with_pos(query: &str, lang_code: &str) -> Vec<(String, String)> {
+///  ── 반환 ──
+///   (표면형, UPOS 태그, Lemma 원형). 실패 시 태그/Lemma 는 빈 문자열입니다.
+pub async fn tokenize_query_with_morphology(
+    query: &str,
+    lang_code: &str,
+) -> Vec<(String, String, String)> {
     let words: Vec<String> = query
         .split_whitespace()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let fallback: Vec<(String, String)> =
-        words.iter().map(|w| (w.clone(), String::new())).collect();
+    let fallback: Vec<(String, String, String)> = words
+        .iter()
+        .map(|w| (w.clone(), String::new(), String::new()))
+        .collect();
     if words.is_empty() {
         return fallback;
     }
@@ -861,7 +1054,9 @@ pub async fn tokenize_query_with_pos(query: &str, lang_code: &str) -> Vec<(Strin
         shape[1] as usize
     };
 
-    let mut out: Vec<(String, String)> = Vec::with_capacity(valid_len);
+    // ── ① UPOS 디코드 + Lemma 세션 입력용 POS ID 수집 ──
+    let mut tags: Vec<String> = Vec::with_capacity(valid_len);
+    let mut pos_ids: Vec<i64> = Vec::with_capacity(valid_len);
     for i in 0..valid_len {
         let mut max_val = f32::MIN;
         let mut max_idx = 0usize;
@@ -872,13 +1067,62 @@ pub async fn tokenize_query_with_pos(query: &str, lang_code: &str) -> Vec<(Strin
                 max_idx = c;
             }
         }
-        let tag = stanza
-            .preprocessor
-            .upos_vocab
-            .get(max_idx)
-            .cloned()
-            .unwrap_or_else(|| "X".to_string());
-        out.push((words[i].clone(), tag));
+        tags.push(
+            stanza
+                .preprocessor
+                .upos_vocab
+                .get(max_idx)
+                .cloned()
+                .unwrap_or_else(|| "X".to_string()),
+        );
+        pos_ids.push(max_idx as i64);
+    }
+
+    // ── ② Lemma 디코드 (commerce parse_commerce_query 와 동일 로직) ──
+    let mut lemmas: Vec<String> = vec![String::new(); valid_len];
+    if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(
+        &padded,
+        &stanza.lemma_session,
+        Some(&pos_ids),
+        None,
+    ) {
+        if let Ok(lemma_outputs) = stanza
+            .lemma_session
+            .run::<'_, '_, '_, i64, f32, _>(lemma_inputs)
+        {
+            let lt = &lemma_outputs[0];
+            let ls = lt.shape();
+            if ls.len() == 3 || ls.len() == 4 {
+                let is_4d = ls.len() == 4;
+                let max_char_len = if is_4d { ls[2] as usize } else { ls[1] as usize };
+                let lemma_classes = if is_4d { ls[3] as usize } else { ls[2] as usize };
+                for i in 0..valid_len {
+                    let mut lemma_str = String::new();
+                    for j in 0..max_char_len {
+                        let mut mv = f32::MIN;
+                        let mut mi = 0usize;
+                        for c in 0..lemma_classes {
+                            let v = if is_4d { lt[[0, i, j, c]] } else { lt[[i, j, c]] };
+                            if v > mv {
+                                mv = v;
+                                mi = c;
+                            }
+                        }
+                        if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(mi as i64)) {
+                            if ch != '<' && ch != '>' && ch != '_' {
+                                lemma_str.push(ch);
+                            }
+                        }
+                    }
+                    lemmas[i] = lemma_str.trim().to_string();
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(String, String, String)> = Vec::with_capacity(valid_len);
+    for i in 0..valid_len {
+        out.push((words[i].clone(), tags[i].clone(), lemmas[i].clone()));
     }
     out
 }

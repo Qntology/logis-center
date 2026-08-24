@@ -2411,7 +2411,9 @@ async fn ai_search_complex(
                             None,
                             None
                         ).await {
-                            analytic_report = res.trim().to_string();
+                            // 🌟 [REPORT NORMALIZE] 2B 모델이 지시를 어기고 JSON 을 반환해도
+                            //    말풍선에 원시 JSON 이 노출되지 않도록 코드에서 평탄화합니다.
+                            analytic_report = crate::analytic::normalize_report_output(&res);
                         }
                     }
 

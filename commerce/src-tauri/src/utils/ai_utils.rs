@@ -1481,6 +1481,48 @@ pub fn exact_match_filter_key(category: &str, chunk: &str) -> Option<String> {
     None
 }
 
+// 🌟 [AGGLUTINATIVE PREFIX MATCH] exact_match 배열을 '접두 사전' 으로 재사용합니다.
+//  ── 왜 필요한가 ──
+//   exact_match_filter_key 는 완전일치(==)만 봅니다. 그런데 교착어는
+//     "클릭" + "한" + "게" → "클릭한게"
+//     "올해" + "는"        → "올해는"
+//   처럼 조사·어미가 어절에 붙어 한 토큰으로 도착하므로 완전일치가 구조적으로 실패합니다.
+//   (로그 실측: exact_match 에 "클릭"/"클릭한" 이 있는데도 "클릭한게" 가 미매칭 →
+//    슬라이딩 윈도우에 원형이 한 번도 올라가지 못해 NMS CANDIDATE 0건)
+//  ── 판정 규칙 ──
+//   exact_match 원소가 토큰의 '접두' 이고, 그 원소가 토큰보다 짧으면 어간으로 확정합니다.
+//   가장 긴 접두를 우선하므로 "클릭한게" 는 "클릭" 보다 "클릭한" 을 먼저 채택합니다.
+//   사전은 bias.json 이 소유하므로 코드에는 어떤 언어의 어휘도 등장하지 않습니다.
+//  ── 반환 ──
+//   Some((필터 키, 매칭된 접두 리터럴)) / 접두 후보가 없으면 None
+pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, String)> {
+    let c = chunk.trim();
+    if c.chars().count() < 3 { return None; }
+    let lower = c.to_lowercase();
+
+    let node = crate::parsing::BIAS_DICT.get(category)?.as_object()?;
+    let mut best_key = String::new();
+    let mut best_stem = String::new();
+
+    for (key, val) in node {
+        let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+        for item in arr {
+            let s = match item.as_str() { Some(x) => x.trim(), None => continue };
+            if s.is_empty() { continue; }
+            let sl = s.to_lowercase();
+            if sl.chars().count() < 2 { continue; }
+            if sl.chars().count() >= lower.chars().count() { continue; }
+            if !lower.starts_with(&sl) { continue; }
+            if sl.chars().count() > best_stem.chars().count() {
+                best_stem = s.to_string();
+                best_key = key.clone();
+            }
+        }
+    }
+
+    if best_stem.is_empty() { None } else { Some((best_key, best_stem)) }
+}
+
 // 🌟 [NUMERIC COMPARISON SPLIT] '5000원 이하로' 처럼 숫자와 비교 표현이 붙은 청크를
 //    (숫자 / 나머지) 로 구조 분해합니다.
 //    로그에서 이 청크는 currency(0.5943) 로 배정되었는데, currency.bias 의 '원' 이
