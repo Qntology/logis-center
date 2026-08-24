@@ -559,9 +559,16 @@ async fn reindex_pending_embeddings(
         };
 
         let cancel = state.cancellation_token.clone();
+        // 🌟 [ANALYTIC TRANSLIT SKIP] analytic 모드는 전처리(run_analytic_structuring)
+        //    단계에서 이미 음차를 완료했습니다.
+        //    임베딩 단계에서 다시 음차하면
+        //    ① Qwen3.5 를 재로딩하거나 상주시켜야 하고
+        //    ② 이미 확정된 문장을 다시 음차하여 결과를 오염시킵니다.
+        let skip_translit = doc.mode == "analytic";
         let _ = crate::scheduler::index_item_chunks(
             &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
-            &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync"
+            &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
+            skip_translit,
         ).await;
 
         processed += 1;

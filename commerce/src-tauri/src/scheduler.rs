@@ -198,7 +198,74 @@ fn save_translit_cache(
     }));
 }
 
-/// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
+/// 🌟 [CROSS-LANGUAGE TRANSLITERATION] 전처리 단계에서 사용하는 교차 언어 음차.
+///    방향: 영어 단어 → 문서 언어(한글/일어/중어 등)
+///    한글→한글 같은 동일 언어 음차는 수행하지 않습니다.
+///    한글→영어(로마자) 역방향도 함께 생성합니다.
+///
+///    이 함수는 `run_analytic_structuring` 에서 호출되며,
+///    Qwen3.5 가 이미 로드되어 있어야 합니다.
+pub async fn transliterate_cross_language(
+    model: &LogisModel,
+    text: &str,
+    doc_lang: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> (String, String) {
+    let src = text.trim().to_string();
+    if src.is_empty() { return (String::new(), String::new()); }
+
+    let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
+    let sample = crate::nl_convert::native_script_sample(doc_lang, "", "");
+    let target_is_latin = crate::nl_convert::is_latin_dominant(&sample);
+
+    // 동일 문자 체계 → 음차 불필요
+    if src_is_latin == target_is_latin && !src_is_latin {
+        // 한글→한글: 무의미. 로마자 역방향만 시도.
+        if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
+            return (String::new(), roman);
+        }
+        return (String::new(), String::new());
+    }
+
+    // 영어 원문 → 문서 언어(비라틴) 방향
+    if src_is_latin && !target_is_latin {
+        let prompt = crate::prompts::transliteration_prompt(&src, doc_lang);
+        let res = model.call_qwen3_5_transliteration(&prompt, Some(cancel.clone())).await.unwrap_or_default();
+        let parsed = crate::parsing::parse_json_from_llm(&res);
+        let native = parsed.get("transliteration")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| obj.values().next())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
+        return (native, roman);
+    }
+
+    // 비라틴 원문 → 로마자(라틴) 역방향
+    if !src_is_latin && target_is_latin {
+        if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
+            return (String::new(), roman);
+        }
+        let prompt = crate::prompts::transliteration_prompt(&src, "english");
+        let res = model.call_qwen3_5_transliteration(&prompt, Some(cancel.clone())).await.unwrap_or_default();
+        let parsed = crate::parsing::parse_json_from_llm(&res);
+        let roman = parsed.get("transliteration")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| obj.values().next())
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (String::new(), roman);
+    }
+
+    (String::new(), String::new())
+}
+/// 🌟 [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
 /// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
 ///
 /// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
@@ -279,13 +346,30 @@ async fn generate_transliteration_aliases(
         }
 
         // 1차 음차 가능 여부 판정.
-        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
+        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 스킵합니다.
         if !crate::nl_convert::can_transliterate(&src, doc_lang) {
             cache.insert(src.clone(), (String::new(), String::new()));
-            // 🌟 이 판정 자체를 영구 저장해야 다음 태스크에서도 조회 1회로 끝납니다.
             save_translit_cache(app_handle, &src, doc_lang, "", "");
             skipped += 1;
             continue;
+        }
+        // 🌟 [SAME-SCRIPT BLOCK] 원문과 대상이 같은 문자 체계면 음차가 성립하지 않습니다.
+        //    한글 문서를 한글로 음차하는 것은 오음차(수용자←사용자)만 양산합니다.
+        //    이 경우 영어 단어가 포함되어 있으면 영어→한글 방향으로 전환하고,
+        //    순수 한글이면 음차 자체를 스킵합니다.
+        let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
+        let target_is_latin = crate::nl_convert::is_latin_dominant(
+            &crate::nl_convert::native_script_sample(doc_lang, "", "")
+        );
+        if src_is_latin == target_is_latin {
+            if src_is_latin && !doc_lang.is_empty() && doc_lang != "en" {
+                // 영어 원문 → 문서 언어(비라틴) 방향: 계속 진행
+            } else {
+                cache.insert(src.clone(), (String::new(), String::new()));
+                save_translit_cache(app_handle, &src, doc_lang, "", "");
+                skipped += 1;
+                continue;
+            }
         }
 
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
@@ -297,7 +381,25 @@ async fn generate_transliteration_aliases(
         let (non_latin_words, latin_words) = crate::nl_convert::split_words_by_script(&src);
         let is_mixed = !non_latin_words.is_empty() && !latin_words.is_empty();
 
-        let s1_transliteration = if is_mixed {
+        // 🌟 [CROSS-LANG DIRECTION]
+        //    기존: 비라틴 원문 → 로마자(라틴) + 라틴 원문 → 문서언어(비라틴)
+        //    변경: 영어 단어 → 문서언어(비라틴) 만 수행.
+        //           비라틴 원문(한글) → 한글 음차는 무의미하므로 스킵.
+        //           한글 → 로마자(라틴) 는 유지 (검색 역방향 리콜용).
+        let doc_lang_is_latin = crate::nl_convert::is_latin_dominant(
+            &crate::nl_convert::native_script_sample(doc_lang, "", "")
+        );
+        let skip_native_translit = !src_is_latin && !doc_lang_is_latin;
+        //    한글→한글 음차는 스킵하되, 한글→로마자(역방향)는 유지.
+        //    영어→한글 은 정상 수행.
+
+        let s1_transliteration = if skip_native_translit && !is_mixed {
+            // 🌟 동일 언어 음차 스킵: 한글→한글 음차는 무의미.
+            //    로마자(역방향)만 생성합니다.
+            println!("    ⚪ [SAME-SCRIPT SKIP] '{}' → '{}' 동일 문자 체계 음차 스킵 (로마자 역방향만 생성)",
+                src, doc_lang);
+            String::new()
+        } else if is_mixed {
             println!("    [TRACK SPLIT] 비라틴: {:?} | 라틴: {:?}", non_latin_words, latin_words);
             // Track A: 비라틴 단어 → 로마자 전사 (target: english)
             // 🌟 [ANY_ASCII FIRST] 비라틴→라틴 방향은 any_ascii로 처리 가능하면 LLM 생략
@@ -752,7 +854,7 @@ pub async fn index_item_chunks(
     store: &VectorStore,
     model: &LogisModel,
     item_id: &str,
-    page_type: &str,
+    item_type: &str,
     doc_lang: &str,
     item_json: &Value,
     is_detail: bool,
@@ -764,7 +866,10 @@ pub async fn index_item_chunks(
     cancel: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle,
     task_id: &str,
+    skip_transliteration: bool,
 ) -> Result<usize> {
+    let page_type = item_type;
+
     let emit = |msg: &str| {
         println!("{}", msg);
         let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
@@ -942,9 +1047,14 @@ pub async fn index_item_chunks(
 
     let metas: Vec<&crate::nl_convert::ChunkMetadata> =
         indexable_chunks.iter().map(|(_, c)| *c).collect();
-    let alias_pairs = generate_transliteration_aliases(
-        model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
-    ).await;
+    // 🌟 [ANALYTIC TRANSLIT SKIP] 전처리에서 이미 음차를 완료한 경우 건너뜁니다.
+    let alias_pairs = if skip_transliteration {
+        vec![(String::new(), String::new()); metas.len()]
+    } else {
+        generate_transliteration_aliases(
+            model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
+        ).await
+    };
 
     let _ = store.delete_chunks_by_item(item_id).await;
 

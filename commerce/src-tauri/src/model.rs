@@ -6420,14 +6420,32 @@ impl LogisModel {
         Ok(json!({ "context": ctx }))
     }
 
-    /// 🌟 [ANALYTIC SEARCH QUERY v2] 자연어 질의를 행동 로그 검색 컨텍스트로 변환합니다.
-    ///   기존 `parse_analytic_query` 는 수치 조건 추출에 특화되어 있어
-    ///   행동 로그(자유 서술) 검색에 부적합했습니다.
-    ///   이 메서드는:
-    ///     ① 결정론 시간 가이드 (bias.json exact_match)
-    ///     ② Qwen3.5 2B 의미 파싱 (기간 / 이벤트 종류 / 키워드)
-    ///     ③ Rust 가 기간을 epoch ms 로 재확정
-    ///   세 단계를 거칩니다.
+    /// 🌟 [ANALYTIC SEARCH QUERY v3 / VECTOR-FIRST NMS]
+    ///  ── v2 의 결함 ──
+    ///   time_intent / event_types 를 Qwen3.5 2B 가 '단독으로' 골랐습니다.
+    ///   프롬프트에는 후보 목록만 있고 벡터 근거가 하나도 없었기 때문에,
+    ///   실측 로그에서
+    ///     · 질의에 기간 표현이 없는데 time_intent = "last_month" 로 창작되어
+    ///       created_at >= 1782864000000 조건이 붙고 오늘 수집한 문서가 전량 탈락
+    ///     · event_types 가 ["click"] 하나로 좁혀져
+    ///       방금 구조화한 hover 3건 + report 1건이 스코프에서 제거
+    ///   되면서 검색 결과가 구조적으로 0건이 되었습니다.
+    ///
+    ///  ── v3 구조 (commerce PLINKO 와 동일 계보) ──
+    ///   ① 완전일치        : bias.json exact_match. 벡터·LLM 없이 확정
+    ///   ② Stanza POS      : VERB/ADP/PUNCT 등 무의미 품사 판정 (NLP 모델)
+    ///   ③ 슬라이딩 윈도우 : 1~4단어 청크 생성
+    ///   ④ Max-Pool 코사인 : time / season / event 3개 뱅크와 구 단위 비교
+    ///   ⑤ SURPRISAL 게이트: 뱅크 크기 편향 제거(√(2 ln N)).
+    ///                       무작위 기대치를 못 넘으면 폐기 → '근거 없으면 조건 없음'
+    ///   ⑥ NMS 배틀        : 겹치는 스팬 중 최고 점수만 생존
+    ///   ⑦ 마진 판정        : 1위-2위가 사실상 동률일 때만 LLM 1회 재판정
+    ///   ⑧ 기간 재확정      : LLM 이 준 날짜는 신뢰하지 않고 Rust 가 epoch 로 계산
+    ///
+    ///  ── 비용 ──
+    ///   대부분의 질의에서 LLM 호출이 0회가 됩니다.
+    ///   (임베딩 배치 3회 + Stanza POS 1회로 종료)
+    ///   그리고 근거가 없으면 조건을 만들지 않으므로 스코프가 좁아지지 않습니다.
     pub async fn parse_analytic_search_query(
         &self,
         task_id: &str,
@@ -6436,6 +6454,8 @@ impl LogisModel {
         language: &str,
         cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<serde_json::Value> {
+        use crate::utils::ai_utils::cosine_similarity as cos;
+
         let app_handle_clone = app_handle.clone();
         let tid = task_id.to_string();
         let emit_term = move |msg: &str| {
@@ -6446,7 +6466,7 @@ impl LogisModel {
             );
         };
 
-        emit_term("\n[ANALYTIC-QUERY] 🔍 행동 로그 질의 파싱 시작");
+        emit_term("\n[ANALYTIC-QUERY] 🔍 행동 로그 질의 파싱 시작 (v3 / Vector-First NMS)");
         emit_term(&format!("   질의: \"{}\"", query));
 
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -6454,144 +6474,615 @@ impl LogisModel {
             .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
 
-        // ── ① 결정론 시간 가이드 ──
+        // =====================================================================
+        // STEP 1 : bias.json 완전일치 (벡터·LLM 없이 확정)
+        // =====================================================================
         let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(&query, language);
         let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
-        if !det_time_key.is_empty() || !det_season_key.is_empty() {
+        let mut det_event_keys: Vec<String> = Vec::new();
+        for w in query.split_whitespace() {
+            if let Some(k) = crate::analytic::event_type_exact_match(w) {
+                if !det_event_keys.iter().any(|e| e == &k) {
+                    det_event_keys.push(k);
+                }
+            }
+        }
+        if !det_time_key.is_empty() || !det_season_key.is_empty() || !det_event_keys.is_empty() {
             emit_term(&format!(
-                "   ⚡ [EXACT MATCH] bias.json 완전일치로 확정: time='{}' | season='{}'",
-                det_time_key, det_season_key
+                "   ⚡ [EXACT MATCH] bias.json 완전일치 확정: time='{}' | season='{}' | events={:?}",
+                det_time_key, det_season_key, det_event_keys
             ));
         }
+
+        // =====================================================================
+        // STEP 2 : Stanza POS 토큰화 (NLP 모델)
+        // =====================================================================
+        let stanza_code = crate::analytic::stanza_lang_code(language);
+        let tokens = crate::analytic::tokenize_query_with_pos(&query, stanza_code).await;
+        if tokens.is_empty() {
+            emit_term("   ⚠️ [TOKENIZE] 분석 가능한 토큰이 없습니다. 전체 스코프로 검색합니다.");
+        } else {
+            emit_term(&format!(
+                "   🧠 [STANZA POS] {:?}",
+                tokens
+                    .iter()
+                    .map(|(w, t)| if t.is_empty() {
+                        w.clone()
+                    } else {
+                        format!("{}({})", w, t)
+                    })
+                    .collect::<Vec<_>>()
+            ));
+        }
+
+        // 🌟 [DUAL AXIS] 드롭 대상 품사도 '청크 후보' 에는 남깁니다.
+        //    '클릭한' 이 VERB 로 판정되어도 그것이 event 판정의 유일한 근거이기 때문입니다.
+        //    드롭은 keywords / target 산출 시에만 적용합니다.
+        const DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+        let all_words: Vec<String> = tokens.iter().map(|(w, _)| w.clone()).collect();
+        let content_flags: Vec<bool> = tokens
+            .iter()
+            .map(|(_, t)| !DROP_TAGS.iter().any(|d| d == t))
+            .collect();
+
+        // =====================================================================
+        // STEP 3 : 슬라이딩 윈도우 청크 생성 (1~4 단어)
+        // =====================================================================
+        let mut chunk_texts: Vec<String> = Vec::new();
+        let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
+        for s in 0..all_words.len() {
+            let max_e = all_words.len().min(s + 4);
+            for e in (s + 1)..=max_e {
+                let t = all_words[s..e].join(" ");
+                if t.trim().is_empty() {
+                    continue;
+                }
+                chunk_texts.push(t);
+                chunk_spans.push((s, e));
+            }
+        }
+
+        // =====================================================================
+        // STEP 4 : 뱅크 구축 + 임베딩 (time / season / event)
+        // =====================================================================
+        self.check_embedding_downloaded().await?;
+        self.ensure_embedding().await?;
+
+        let mut bank_defs: Vec<(String, String, String)> =
+            crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
+        let mut prej_defs: Vec<(String, String, String)> =
+            crate::utils::ai_utils::filter_category_prejudice_phrases(&[
+                "time_filters",
+                "season_filters",
+            ]);
+
+        for t in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
+            for p in crate::analytic::event_type_anchor_phrases(t) {
+                bank_defs.push(("event".to_string(), t.to_string(), p));
+            }
+            for p in crate::analytic::event_type_prejudice_phrases(t) {
+                prej_defs.push(("event".to_string(), t.to_string(), p));
+            }
+        }
+
+        emit_term(&format!(
+            "   📐 [BANK] 판정 구 {}개 | 편견 구 {}개 | 청크 후보 {}개",
+            bank_defs.len(),
+            prej_defs.len(),
+            chunk_texts.len()
+        ));
+
+        let bank_texts: Vec<String> = bank_defs.iter().map(|(_, _, p)| p.clone()).collect();
+        let prej_texts: Vec<String> = prej_defs.iter().map(|(_, _, p)| p.clone()).collect();
+
+        let bank_embs: Vec<Vec<f32>> = if bank_texts.is_empty() {
+            Vec::new()
+        } else {
+            let mut acc: Vec<Vec<f32>> = Vec::with_capacity(bank_texts.len());
+            for part in bank_texts.chunks(200) {
+                let e = self
+                    .get_embedding_batch(part.to_vec())
+                    .await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
+                acc.extend(e);
+            }
+            acc
+        };
+        let prej_embs: Vec<Vec<f32>> = if prej_texts.is_empty() {
+            Vec::new()
+        } else {
+            let mut acc: Vec<Vec<f32>> = Vec::with_capacity(prej_texts.len());
+            for part in prej_texts.chunks(200) {
+                let e = self
+                    .get_embedding_batch(part.to_vec())
+                    .await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
+                acc.extend(e);
+            }
+            acc
+        };
+        let chunk_embs: Vec<Vec<f32>> = if chunk_texts.is_empty() {
+            Vec::new()
+        } else {
+            self.get_embedding_batch(chunk_texts.clone())
+                .await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()])
+        };
+
+        // (category, key) 단위로 뱅크 인덱스를 묶습니다.
+        let mut key_bank: std::collections::HashMap<(String, String), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, (c, k, _)) in bank_defs.iter().enumerate() {
+            key_bank.entry((c.clone(), k.clone())).or_default().push(i);
+        }
+        let mut key_prej: std::collections::HashMap<(String, String), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, (c, k, _)) in prej_defs.iter().enumerate() {
+            key_prej.entry((c.clone(), k.clone())).or_default().push(i);
+        }
+
+        // =====================================================================
+        // STEP 5 : SURPRISAL 채점
+        //   surprisal = (max - μ)/σ - √(2 ln N)
+        //   "N개를 무작위로 뽑았을 때의 기대 최댓값보다 실제로 더 가까운가"
+        //   0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
+        //   뱅크 크기가 서로 달라도(time 7키 vs event 4키) 공정하게 비교됩니다.
+        // =====================================================================
+        let surprisal = |q: &Vec<f32>, idxs: &Vec<usize>, embs: &Vec<Vec<f32>>| -> (f32, f32) {
+            let mut sims: Vec<f32> = Vec::with_capacity(idxs.len());
+            for &i in idxs {
+                let e = match embs.get(i) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if e.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                sims.push(cos(q, e));
+            }
+            if sims.is_empty() {
+                return (f32::MIN, 0.0);
+            }
+            let n = sims.len() as f32;
+            let mean: f32 = sims.iter().sum::<f32>() / n;
+            let var: f32 = sims.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+            let sd = var.sqrt().max(1e-6);
+            let mx = sims.iter().cloned().fold(f32::MIN, f32::max);
+            let z = (mx - mean) / sd;
+            let expect = (2.0 * n.max(2.0).ln()).sqrt();
+            (z - expect, mx)
+        };
+
+        struct AnalyticSpan {
+            start: usize,
+            end: usize,
+            text: String,
+            category: String,
+            key: String,
+            score: f32,
+            max_cos: f32,
+            alts: Vec<(String, f32)>,
+        }
+
+        let mut candidates: Vec<AnalyticSpan> = Vec::new();
+        for (ci, (s, e)) in chunk_spans.iter().enumerate() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                emit_term("[ANALYTIC-QUERY] 🛑 사용자 취소로 파싱을 중단합니다.");
+                break;
+            }
+            let q = match chunk_embs.get(ci) {
+                Some(v) => v,
+                None => continue,
+            };
+            if q.iter().all(|&v| v == 0.0) {
+                continue;
+            }
+
+            let mut scored: Vec<(String, String, f32, f32)> = Vec::new();
+            for (ck, idxs) in key_bank.iter() {
+                let (sur, own) = surprisal(q, idxs, &bank_embs);
+                if sur == f32::MIN {
+                    continue;
+                }
+                // 🌟 [PREJUDICE GATE] 경쟁 개념이 더 잘 설명하면 후보 자격 자체를 박탈합니다.
+                //    점수에서 빼는 방식이 아니라 상대 우위 판정이므로 임계치가 없습니다.
+                let prej = key_prej
+                    .get(ck)
+                    .map(|pi| {
+                        let mut m = 0.0f32;
+                        for &i in pi {
+                            let ee = match prej_embs.get(i) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if ee.iter().all(|&v| v == 0.0) {
+                                continue;
+                            }
+                            let sv = cos(q, ee);
+                            if sv > m {
+                                m = sv;
+                            }
+                        }
+                        m
+                    })
+                    .unwrap_or(0.0);
+                if prej >= own {
+                    continue;
+                }
+                scored.push((ck.0.clone(), ck.1.clone(), sur, own));
+            }
+            if scored.is_empty() {
+                continue;
+            }
+            scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+            let (cat, key, sc, own) = scored[0].clone();
+            if sc <= 0.0 {
+                continue;
+            }
+            let alts: Vec<(String, f32)> = scored
+                .iter()
+                .skip(1)
+                .filter(|(c, _, _, _)| c == &cat)
+                .take(3)
+                .map(|(_, k, s, _)| (k.clone(), *s))
+                .collect();
+
+            emit_term(&format!(
+                "   🎯 [NMS CANDIDATE] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
+                chunk_texts[ci], cat, key, sc, own
+            ));
+
+            candidates.push(AnalyticSpan {
+                start: *s,
+                end: *e,
+                text: chunk_texts[ci].clone(),
+                category: cat,
+                key,
+                score: sc,
+                max_cos: own,
+                alts,
+            });
+        }
+
+        // =====================================================================
+        // STEP 6 : NMS 배틀 — 겹치는 스팬 중 최고 점수만 생존
+        // =====================================================================
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then((b.end - b.start).cmp(&(a.end - a.start)))
+        });
+
+        let mut winners: Vec<AnalyticSpan> = Vec::new();
+        for c in candidates.into_iter() {
+            let overlapped = winners
+                .iter()
+                .any(|w| c.start < w.end && c.end > w.start);
+            if overlapped {
+                emit_term(&format!(
+                    "   💀 [NMS DEFEAT] \"{}\" ({}.{}) 는 상위 점수 스팬에 흡수되었습니다.",
+                    c.text, c.category, c.key
+                ));
+                continue;
+            }
+            emit_term(&format!(
+                "   👑 [NMS WINNER] \"{}\" → {}.{} | Surprisal: {:+.4} | MaxCos: {:.4}",
+                c.text, c.category, c.key, c.score, c.max_cos
+            ));
+            winners.push(c);
+        }
+
+        // =====================================================================
+        // STEP 7 : 카테고리별 확정 + 소비 스팬 표시
+        // =====================================================================
+        let mut vec_time = String::new();
+        let mut vec_time_score = f32::MIN;
+        let mut vec_time_alts: Vec<(String, f32)> = Vec::new();
+        let mut vec_time_text = String::new();
+
+        let mut vec_season = String::new();
+        let mut vec_season_score = f32::MIN;
+        let mut vec_season_alts: Vec<(String, f32)> = Vec::new();
+        let mut vec_season_text = String::new();
+
+        let mut vec_events: Vec<(String, f32)> = Vec::new();
+        let mut consumed: Vec<bool> = vec![false; all_words.len()];
+
+        for w in &winners {
+            match w.category.as_str() {
+                "time_filters" => {
+                    if w.score > vec_time_score {
+                        vec_time_score = w.score;
+                        vec_time = w.key.clone();
+                        vec_time_alts = w.alts.clone();
+                        vec_time_text = w.text.clone();
+                    }
+                }
+                "season_filters" => {
+                    if w.score > vec_season_score {
+                        vec_season_score = w.score;
+                        vec_season = w.key.clone();
+                        vec_season_alts = w.alts.clone();
+                        vec_season_text = w.text.clone();
+                    }
+                }
+                "event" => {
+                    if !vec_events.iter().any(|(k, _)| k == &w.key) {
+                        vec_events.push((w.key.clone(), w.score));
+                    }
+                    // 🌟 [EVENT SIBLING RESCUE] 1위와 사실상 동률인 차순위 타입도 함께 살립니다.
+                    //    '클릭' 이 hover 와 0.9 이상 근접하면 둘 다 스코프에 넣는 편이
+                    //    조건으로 잘라내는 Dexie 구조상 리콜에 유리합니다.
+                    for (ak, asc) in w.alts.iter() {
+                        if *asc >= w.score * 0.9 && *asc > 0.0 {
+                            if !vec_events.iter().any(|(k, _)| k == ak) {
+                                vec_events.push((ak.clone(), *asc));
+                                emit_term(&format!(
+                                    "   🤝 [EVENT SIBLING] \"{}\" 의 차순위 '{}' 이 사실상 동률({:+.4} vs {:+.4})이라 함께 포함합니다.",
+                                    w.text, ak, asc, w.score
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for i in w.start..w.end {
+                if i < consumed.len() {
+                    consumed[i] = true;
+                }
+            }
+        }
+
+        // =====================================================================
+        // STEP 8 : 마진 부족 시에만 LLM 1회 재판정
+        //   (전체 파싱이 아니라 '이미 좁혀진 후보 중 선택' 이므로 창작 여지가 없습니다)
+        // =====================================================================
+        let mut time_intent = if !det_time_key.is_empty() {
+            det_time_key.clone()
+        } else {
+            vec_time.clone()
+        };
+        let mut season_intent = if !det_season_key.is_empty() {
+            det_season_key.clone()
+        } else {
+            vec_season.clone()
+        };
 
         let time_context = format!(
             "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".\n{}",
             current_iso, now_ms, language, deterministic_time
         );
 
-        // ── ② Qwen3.5 2B 의미 파싱 ──
-        self.secure_vram_relay(
-            crate::model::ModelSize::Qwen3_5,
-            None,
-            Some(cancel.clone()),
-            false,
-            None,
-        )
-        .await?;
+        let need_time_llm = det_time_key.is_empty()
+            && !vec_time.is_empty()
+            && vec_time_alts
+                .first()
+                .map_or(false, |(_, s)| *s >= vec_time_score * 0.9);
+        let need_season_llm = det_season_key.is_empty()
+            && !vec_season.is_empty()
+            && vec_season_alts
+                .first()
+                .map_or(false, |(_, s)| *s >= vec_season_score * 0.9);
 
-        let prompt = crate::prompts::analytic_query_prompt(&query, &time_context, language);
-        let params = crate::openai_types::ChatCompletionParameters {
-            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
-                crate::openai_types::ChatCompletionRequestUserMessage {
-                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(
-                        prompt,
-                    ),
-                    name: None,
-                },
-            )],
-            model: "qwen3.5".to_string(),
-            max_tokens: Some(512),
-            temperature: Some(0.0),
-            top_p: Some(0.95),
-            ..Default::default()
-        };
-
-        let res_text = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
-            gen.generate(
-                params,
+        if need_time_llm || need_season_llm {
+            emit_term(&format!(
+                "   ⚖️ [MARGIN GATE] 1위-2위가 사실상 동률이라 LLM 재판정을 1회 수행합니다. (time: {} | season: {})",
+                need_time_llm, need_season_llm
+            ));
+            self.secure_vram_relay(
+                crate::model::ModelSize::Qwen3_5,
+                None,
                 Some(cancel.clone()),
-                Some(format!("{}_aq", task_id)),
-                None,
-                None,
+                false,
                 None,
             )
-            .await
-            .unwrap_or_default()
+            .await?;
+
+            if need_time_llm {
+                let p = crate::parsing::extract_time_intent_prompt(
+                    &vec_time_text,
+                    &time_context,
+                    &vec_time,
+                    vec_time_score,
+                    &vec_time_alts,
+                );
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content:
+                                crate::openai_types::ChatCompletionRequestUserMessageContent::Text(p),
+                            name: None,
+                        },
+                    )],
+                    model: "qwen3.5".to_string(),
+                    max_tokens: Some(128),
+                    temperature: Some(0.0),
+                    top_p: Some(0.95),
+                    ..Default::default()
+                };
+                let r = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                    gen.generate(
+                        params,
+                        Some(cancel.clone()),
+                        Some(format!("{}_aq_time", task_id)),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let picked = crate::parsing::parse_json_from_llm(&r)
+                    .get("time_intent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let allowed = picked == vec_time
+                    || vec_time_alts.iter().any(|(k, _)| k == &picked)
+                    || picked.is_empty();
+                if allowed {
+                    emit_term(&format!(
+                        "   🤖 [TIME LLM] 후보 중 '{}' 로 확정했습니다.",
+                        if picked.is_empty() { "(없음)" } else { &picked }
+                    ));
+                    time_intent = picked;
+                } else {
+                    emit_term(&format!(
+                        "   🚫 [TIME LLM REJECT] '{}' 는 벡터 후보 목록에 없어 폐기하고 '{}' 를 유지합니다.",
+                        picked, vec_time
+                    ));
+                }
+            }
+
+            if need_season_llm {
+                let p = crate::parsing::extract_season_intent_prompt(
+                    &vec_season_text,
+                    &vec_season,
+                    vec_season_score,
+                    &vec_season_alts,
+                );
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content:
+                                crate::openai_types::ChatCompletionRequestUserMessageContent::Text(p),
+                            name: None,
+                        },
+                    )],
+                    model: "qwen3.5".to_string(),
+                    max_tokens: Some(128),
+                    temperature: Some(0.0),
+                    top_p: Some(0.95),
+                    ..Default::default()
+                };
+                let r = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                    gen.generate(
+                        params,
+                        Some(cancel.clone()),
+                        Some(format!("{}_aq_season", task_id)),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let picked = crate::parsing::parse_json_from_llm(&r)
+                    .get("season_intent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let allowed = picked == vec_season
+                    || vec_season_alts.iter().any(|(k, _)| k == &picked)
+                    || picked.is_empty();
+                if allowed {
+                    emit_term(&format!(
+                        "   🤖 [SEASON LLM] 후보 중 '{}' 로 확정했습니다.",
+                        if picked.is_empty() { "(없음)" } else { &picked }
+                    ));
+                    season_intent = picked;
+                } else {
+                    emit_term(&format!(
+                        "   🚫 [SEASON LLM REJECT] '{}' 는 벡터 후보 목록에 없어 폐기하고 '{}' 를 유지합니다.",
+                        picked, vec_season
+                    ));
+                }
+            }
         } else {
-            String::new()
+            emit_term("   ⚡ [DETERMINISTIC] 벡터 마진이 충분하여 LLM 호출을 생략합니다.");
+        }
+
+        // =====================================================================
+        // STEP 9 : 이벤트 타입 확정
+        //   근거가 하나도 없으면 4종 전체를 스코프로 둡니다.
+        //   ('없으면 넓게' 가 리콜 우선 원칙이며, 정밀 필터는 Dexie 가 담당합니다)
+        // =====================================================================
+        let mut event_types: Vec<String> = if !det_event_keys.is_empty() {
+            det_event_keys.clone()
+        } else {
+            vec_events.iter().map(|(k, _)| k.clone()).collect()
         };
-
-        let parsed = crate::parsing::parse_json_from_llm(&res_text);
-        let mut time_intent = parsed
-            .get("time_intent")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let mut season_intent = parsed
-            .get("season_intent")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        // 🌟 완전일치가 있으면 LLM 판정보다 우선합니다.
-        if !det_time_key.is_empty() {
-            time_intent = det_time_key.clone();
-        }
-        if !det_season_key.is_empty() {
-            season_intent = det_season_key.clone();
-        }
-
-        let keywords: Vec<String> = parsed
-            .get("keywords")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut event_types: Vec<String> = parsed
-            .get("event_types")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
-                    .filter(|s| crate::analytic::ANALYTIC_SEARCH_TYPES.iter().any(|t| *t == s.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         if event_types.is_empty() {
             event_types = crate::analytic::ANALYTIC_SEARCH_TYPES
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+            emit_term(
+                "   🛟 [EVENT FALLBACK] 이벤트 종류를 특정할 벡터 근거가 없어 4종 전체를 스코프로 둡니다.",
+            );
+        } else {
+            emit_term(&format!(
+                "   ✅ [EVENT CONFIRMED] event_types = {:?}",
+                event_types
+            ));
         }
 
-        let target = parsed
-            .get("target")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if keywords.is_empty() {
-                    query.clone()
-                } else {
-                    keywords.join(" ")
-                }
-            });
+        // 🌟 [REPORT ALWAYS-IN] report 는 여러 이벤트를 합성한 문서라
+        //    '가장 많이', '패턴', '흐름' 류 질의의 정답을 담고 있습니다.
+        //    특정 이벤트가 확정되어도 report 는 후보에 남겨야 정답이 잘리지 않습니다.
+        if !event_types.iter().any(|t| t == "report") {
+            event_types.push("report".to_string());
+            emit_term("   📊 [REPORT ALWAYS-IN] 합성 리포트를 스코프에 함께 포함합니다.");
+        }
 
-        // ── ③ 기간을 Rust 가 재확정 ──
+        // =====================================================================
+        // STEP 10 : 확정 스팬을 제외한 나머지가 검색 키워드
+        // =====================================================================
+        let mut keywords: Vec<String> = Vec::new();
+        for (i, w) in all_words.iter().enumerate() {
+            if consumed.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if !content_flags.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            if !keywords.iter().any(|k| k == w) {
+                keywords.push(w.clone());
+            }
+        }
+        if keywords.is_empty() {
+            for (i, w) in all_words.iter().enumerate() {
+                if consumed.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                if !keywords.iter().any(|k| k == w) {
+                    keywords.push(w.clone());
+                }
+            }
+        }
+        let target = if keywords.is_empty() {
+            query.clone()
+        } else {
+            keywords.join(" ")
+        };
+        emit_term(&format!(
+            "   🧷 [KEYWORDS] {:?} | target=\"{}\"",
+            keywords, target
+        ));
+
+        // =====================================================================
+        // STEP 11 : 기간을 Rust 가 epoch 로 재확정
+        // =====================================================================
         let mut started_at: i64 = 0;
         let mut expired_at: i64 = 0;
 
         if !season_intent.is_empty() {
             let (y, _, _) = crate::analytic::ymd_of(now_ms);
-            let year = if time_intent == "last_year" {
-                y - 1
-            } else {
-                y
-            };
+            let year = if time_intent == "last_year" { y - 1 } else { y };
             if let Some((s, e)) = crate::analytic::season_range(&season_intent, year) {
                 started_at = s;
                 expired_at = e;
             }
         }
-
         if started_at == 0 {
             if let Some((s, e)) = crate::analytic::time_intent_range(&time_intent, now_ms) {
                 started_at = s;
@@ -6602,24 +7093,20 @@ impl LogisModel {
         if started_at > 0 {
             emit_term(&format!(
                 "   🗓️ [PERIOD CONFIRMED] time='{}' | season='{}' → {} ~ {} (epoch ms)",
-                if time_intent.is_empty() {
-                    "-"
-                } else {
-                    &time_intent
-                },
-                if season_intent.is_empty() {
-                    "-"
-                } else {
-                    &season_intent
-                },
+                if time_intent.is_empty() { "-" } else { &time_intent },
+                if season_intent.is_empty() { "-" } else { &season_intent },
                 started_at,
                 expired_at
             ));
         } else {
-            emit_term("   🗓️ [PERIOD] 명시적 기간 표현이 없어 전체 구간을 검색합니다.");
+            emit_term(
+                "   🗓️ [PERIOD] 벡터가 확정한 기간 표현이 없어 전체 구간을 검색합니다. (근거 없는 기간 조건을 만들지 않습니다)",
+            );
         }
 
-        // ── ④ 컨텍스트 조립 ──
+        // =====================================================================
+        // STEP 12 : 컨텍스트 조립 (lib.rs STAGE-3 계약과 동일)
+        // =====================================================================
         let mut condition = serde_json::Map::new();
         if started_at > 0 {
             condition.insert(
