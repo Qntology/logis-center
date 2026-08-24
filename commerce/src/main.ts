@@ -632,7 +632,7 @@ function renderOAuthRegistrationForm() {
 
     const modal = document.createElement("div");
     modal.id = "oauth-registration-modal";
-    modal.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);  pointer-events: initial;";
+    modal.style.cssText = "position: fixed; inset: 121px 11px 11px; border-bottom-left-radius: 1em; border-bottom-right-radius: 1em; z-index: 99999; display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.88); pointer-events: initial;";
     modal.innerHTML = `
 <div style="background:#fff;border-radius:12px;padding:24px;width:90%;max-width:480px;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -3617,7 +3617,7 @@ async function renderNavigation() {
                 const h3 = navSection.querySelector("h3");
                 const registerBtn = document.createElement("button");
                 registerBtn.id = "btn-oauth-register";
-                registerBtn.style.cssText = "position: absolute; left: 1em; top: -20px; border: 0; padding: 0; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
+                registerBtn.style.cssText = "position: absolute; left: 5em; top: 13px; border: 0px; padding: 0px; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
                 registerBtn.textContent = "+ 사이트 등록 (Analytic)";
                 registerBtn.addEventListener("click", (e) => {
                     e.preventDefault();
@@ -3789,7 +3789,8 @@ async function renderNavigation() {
                                 <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
                                     <div><strong>Client Id:</strong> ${clientId}</div>
                                     <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
-                                    <div style="margin-top:8px; text-align:right;">
+                                    <div style="margin-top:8px; text-align:right; display:flex; gap:6px; justify-content:flex-end;">
+                                        <button class="btn-oauth-reissue" data-site-idx="${si}" style="background:none; border:1px solid #6366f1; color:#6366f1; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">재발급</button>
                                         <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
                                     </div>
                                 </div>
@@ -3844,6 +3845,71 @@ async function renderNavigation() {
                                 const siteItem = document.getElementById(`oauth_site_${idx}`);
                                 if (siteItem) {
                                     siteItem.style.display = "none";
+                                }
+                            };
+                        });
+
+                        // 🌟 [REISSUE] 재발급 버튼: 서버에 host만 보내 새 client_id/client_secret 발급
+                        //   api/index.js 로직: client_id/client_secret 미전송 시
+                        //   "사이트는 존재하지만 자격증명이 매칭되지 않음" → 재발급 분기 진입
+                        pageList.querySelectorAll(".btn-oauth-reissue").forEach((btn: any) => {
+                            btn.onclick = async (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+
+                                const idx = parseInt(btn.dataset.siteIdx, 10);
+                                const sites = (await kvGet("oauth_registered_sites")) || [];
+                                if (!Array.isArray(sites) || idx >= sites.length) return;
+
+                                const site = sites[idx];
+                                const confirmed = await ask(
+                                    `'${site.host}' 의 client_id / client_secret 을 재발급하시겠습니까?\n기존 키는 즉시 무효화됩니다.`,
+                                    { title: "재발급 확인", kind: "warning" }
+                                );
+                                if (!confirmed) return;
+
+                                btn.textContent = "처리 중...";
+                                btn.disabled = true;
+
+                                try {
+                                    const response = await invoke<any>("proxy_fetch", {
+                                        url: OAUTH_API_HOST,
+                                        method: "POST",
+                                        headers: {
+                                            "Content-Type": "application/x-www-form-urlencoded",
+                                            Referer: "https://oauth.network/",
+                                        },
+                                        body: {
+                                            host: site.host,
+                                            hash: currentSession.hash,
+                                            token: currentSession.token,
+                                        },
+                                        session_params: {
+                                            hash: currentSession.hash,
+                                            token: currentSession.token,
+                                        },
+                                    });
+
+                                    const parsed = parseOAuthApiResponse(response);
+                                    if (
+                                        parsed.rows.length > 0 &&
+                                        parsed.rows[0].client_id &&
+                                        parsed.rows[0].client_secret
+                                    ) {
+                                        sites[idx].client_id = parsed.rows[0].client_id;
+                                        sites[idx].client_secret = parsed.rows[0].client_secret;
+                                        sites[idx].registered_at = Date.now();
+                                        await kvSet("oauth_registered_sites", sites);
+                                        await renderNavigation();
+                                    } else {
+                                        btn.textContent = "재발급";
+                                        btn.disabled = false;
+                                        alert("재발급 실패: 사이트 소유 확인 메타 태그를 확인하세요.");
+                                    }
+                                } catch (err: any) {
+                                    btn.textContent = "재발급";
+                                    btn.disabled = false;
+                                    alert("재발급 오류: " + String(err));
                                 }
                             };
                         });

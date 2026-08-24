@@ -107,7 +107,7 @@ body {
 
 .pill-nav:active { cursor: grabbing; }
 
-#search-mode-tabs{margin-bottom: 2em; padding: 0.7rem;}
+#search-mode-tabs{margin-bottom: 0; padding: 0.7rem;}
 #search-mode-tabs button:hover{font-style: italic;}
 #search-mode-tabs button[data-mode="shipping"]{width: 55px;}
 #search-mode-tabs button[data-mode="commerce"]{width: 77px;}
@@ -684,7 +684,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     color: #333;
 }
 
-.nav-section{position: relative; margin-bottom: 2em;}
+.nav-section{position: relative; margin-bottom: 0;}
 /* Nav Lists */
 .nav-section h3 {
     margin: 0;
