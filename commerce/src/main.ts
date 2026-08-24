@@ -521,7 +521,10 @@ async function submitOAuthRegistration(hostUrl: string): Promise<{
         const response = await invoke<any>("proxy_fetch", {
             url: OAUTH_API_HOST,
             method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://oauth.network/"
+            },
             body: {
                 host: hostUrl,
                 hash: currentSession.hash,
@@ -556,7 +559,19 @@ async function submitOAuthRegistration(hostUrl: string): Promise<{
                 };
             }
         }
-        return { success: false, client_id: "", client_secret: "", error: "사이트 소유 확인이 필요합니다. 메타 태그를 사이트 <head>에 추가하세요." };
+        // 🌟 [DETAIL ERROR] 서버 응답에 rows 가 비어 있으면 검증 실패입니다.
+        //    사용자가 대조할 수 있도록 '서버가 기대하는 주소' 를 함께 안내합니다.
+        const email = currentSession.email || "";
+        let expectedAddr = "";
+        if (email && typeof ethers !== "undefined") {
+            try {
+                expectedAddr = ethers.computeAddress(ethers.hashMessage(email)).toLowerCase();
+            } catch (_e) { /* ignore */ }
+        }
+        const errMsg = expectedAddr
+            ? `사이트 소유 확인 실패. 사이트 <head>에 아래 태그가 정확히 있는지 확인하세요:\n<meta name="oauth-network-verification" content="${expectedAddr}" />`
+            : "사이트 소유 확인이 필요합니다. 메타 태그를 사이트 <head>에 추가하세요.";
+        return { success: false, client_id: "", client_secret: "", error: errMsg };
     } catch (e: any) {
         return { success: false, client_id: "", client_secret: "", error: String(e) };
     }
@@ -568,7 +583,10 @@ async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
         const response = await invoke<any>("proxy_fetch", {
             url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&distinct=Cc&id=%23LOG`,
             method: "GET",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "Referer": "https://oauth.network/"
+            },
             session_params: {
                 hash: currentSession.hash,
                 token: currentSession.token
@@ -592,7 +610,10 @@ async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<
         const response = await invoke<any>("proxy_fetch", {
             url: `${OAUTH_API_HOST}/?referer=${encodeURIComponent(referer)}&id=%23LOG&cnt=true&date=${encodeURIComponent(from)}&date=${encodeURIComponent(to)}`,
             method: "GET",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "Referer": "https://oauth.network/"
+            },
             session_params: {
                 hash: currentSession.hash,
                 token: currentSession.token
@@ -684,12 +705,25 @@ function renderOAuthRegistrationForm() {
                 //   clientAddress = ethers.computeAddress(ethers.hashMessage(email))
                 // Tauri 에서는 currentSession.email 이 있으므로 사전 계산 가능
                 const email = currentSession.email || "";
+
+                // 🌟 [EMAIL GUARD] 이메일이 없으면 메타 태그를 생성하지 않습니다.
+                //    빈 문자열로 계산된 주소는 서버 검증과 절대 일치하지 않으므로
+                //    잘못된 태그를 붙여넣게 되는 것을 사전에 차단합니다.
+                if (!email) {
+                    metaDiv.style.display = "none";
+                    return;
+                }
+
                 const hashMessage = ethers.hashMessage(email);
                 const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
 
+                // 🌟 [DEBUG] 생성된 주소를 콘솔에 출력하여 사이트 태그와 대조 가능하게 합니다.
+                console.log(`[OAUTH] Meta tag generated for email='${email}' → content="${clientAddress}"`);
+
                 const tags = `<meta name="oauth-network-verification" content="${clientAddress}" />
-<meta name="privacy" content="/개인정보약관 경로/" />
-<meta name="terms" content="/이용약관 경로/" />`;
+    <meta name="privacy" content="/개인정보약관 경로/" />
+    <meta name="terms" content="/이용약관 경로/" />`;
+
                 metaTextarea.value = tags;
                 metaDiv.style.display = "block";
             } catch (e) {
@@ -760,11 +794,13 @@ function renderOAuthRegistrationForm() {
             resultDiv.style.background = "#f0fdf4";
             resultDiv.style.color = "#16a34a";
             resultDiv.textContent = "등록 완료!";
+
             metaDiv.style.display = "none";
             credDiv.style.display = "block";
             (document.getElementById("oauth-reg-client-id") as HTMLInputElement).value = res.client_id;
             (document.getElementById("oauth-reg-client-secret") as HTMLInputElement).value = res.client_secret;
-            // 네비게이션 갱신
+
+            // 네비게이션 갱신 (Pages 섹션에 등록된 사이트가 즉시 반영됩니다)
             await renderNavigation();
         } else {
             resultDiv.style.display = "block";
@@ -3721,6 +3757,156 @@ async function renderNavigation() {
 
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
+
+            // 🌟 [OAUTH REGISTERED SITES IN PAGES] analytic 모드에서 등록된 사이트를 Pages 섹션에 추가합니다.
+            //    www/docs/index.html 의 form[name="api.oauth.network"] 패턴을 참고하여,
+            //    각 사이트마다 host / client_id / client_secret / 통계 / 삭제 를 표시합니다.
+            if (currentSearchMode === "analytic" && currentSession.email) {
+                try {
+                    const registeredSites = await kvGet("oauth_registered_sites") || [];
+                    if (Array.isArray(registeredSites) && registeredSites.length > 0) {
+                        let oauthHtml = '';
+
+                        for (let si = 0; si < registeredSites.length; si++) {
+                            const site = registeredSites[si];
+                            const siteHost = site.host || "";
+                            const clientId = site.client_id || "";
+                            const clientSecret = site.client_secret || "";
+                            const siteId = `oauth_site_${si}`;
+
+                            let displayHost = siteHost;
+                            try {
+                                displayHost = new URL(siteHost).hostname;
+                            } catch (_e) {}
+
+                            oauthHtml += `
+                            <div class="oauth-site-item" id="${siteId}" style="position:relative; padding:6px 0; border-bottom:1px solid #f0f0f0;">
+                                <div style="display:flex; align-items:center; gap:6px;">
+                                    <span style="font-size:0.8rem; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${displayHost}</span>
+                                    <button class="btn-oauth-more" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; font-style:italic; text-decoration:underline; color:#6366f1; padding:0 4px;">more</button>
+                                    <button class="btn-oauth-hide" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; text-decoration:underline; color:#888; padding:0 4px;">hide</button>
+                                </div>
+                                <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
+                                    <div><strong>Client Id:</strong> ${clientId}</div>
+                                    <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
+                                    <div style="margin-top:8px; text-align:right;">
+                                        <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
+                                    </div>
+                                </div>
+                                <div class="oauth-site-stats" data-site-host="${siteHost}" style="margin-top:15px; border:1px solid #ddd; border-radius:8px; position:relative;">
+                                    <span style="position:absolute; left: 8px; top: -5px; font-size:0.6rem; color:#999; font-weight:100; background:#fff; padding:0 4px;">시간별 접속량</span>
+                                    <table style="width:100%; border-collapse:collapse;">
+                                        <tbody>
+                                            <tr>
+                                                <td class="stat-hour" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">hour</span></cnt>
+                                                </td>
+                                                <td class="stat-day" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">day</span></cnt>
+                                                </td>
+                                                <td class="stat-week" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">week</span></cnt>
+                                                </td>
+                                                <td class="stat-month" style="padding:8px; width:25%; text-align:center;">
+                                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">month</span></cnt>
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>`;
+                        }
+
+                        oauthHtml += `</div>`;
+                        pageList.insertAdjacentHTML("beforeend", oauthHtml);
+
+                        // "more" 버튼: 토큰 정보 + 삭제 버튼 토글
+                        pageList.querySelectorAll(".btn-oauth-more").forEach((btn: any) => {
+                            btn.onclick = (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = btn.dataset.siteIdx;
+                                const tokenDiv = pageList.querySelector(`.oauth-site-tokens[data-site-idx="${idx}"]`) as HTMLElement;
+                                if (tokenDiv) {
+                                    const isVisible = tokenDiv.style.display !== "none";
+                                    tokenDiv.style.display = isVisible ? "none" : "block";
+                                    btn.textContent = isVisible ? "more" : "fold";
+                                }
+                            };
+                        });
+
+                        // "hide" 버튼: 사이트 항목 숨김
+                        pageList.querySelectorAll(".btn-oauth-hide").forEach((btn: any) => {
+                            btn.onclick = async (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = btn.dataset.siteIdx;
+                                const siteItem = document.getElementById(`oauth_site_${idx}`);
+                                if (siteItem) {
+                                    siteItem.style.display = "none";
+                                }
+                            };
+                        });
+
+                        // 🌟 [DELETE] 삭제 버튼: kv_store 에서 제거 후 네비게이션 재렌더링
+                        pageList.querySelectorAll(".btn-oauth-delete").forEach((btn: any) => {
+                            btn.onclick = async (e: Event) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const idx = parseInt(btn.dataset.siteIdx, 10);
+                                const confirmed = await ask(
+                                    "이 사이트 등록을 삭제하시겠습니까?\nclient_id / client_secret 이 영구 삭제됩니다.",
+                                    { title: "사이트 삭제 확인", kind: "warning" }
+                                );
+                                if (!confirmed) return;
+                                try {
+                                    const sites = await kvGet("oauth_registered_sites") || [];
+                                    if (Array.isArray(sites) && idx < sites.length) {
+                                        sites.splice(idx, 1);
+                                        await kvSet("oauth_registered_sites", sites);
+                                    }
+                                    await renderNavigation();
+                                } catch (delErr) {
+                                    console.warn("[OAUTH] Delete failed:", delErr);
+                                }
+                            };
+                        });
+
+                        // 🌟 [STATS] 각 사이트의 시간별 접속량을 비동기로 조회하여 채워 넣습니다.
+                        //    www/docs/index.html 의 OAuth3.fetch cnt=true 패턴과 동일합니다.
+                        for (let si = 0; si < registeredSites.length; si++) {
+                            const site = registeredSites[si];
+                            const siteHost = site.host || "";
+                            if (!siteHost) continue;
+                            const statsDiv = pageList.querySelector(`.oauth-site-stats[data-site-host="${siteHost}"]`) as HTMLElement;
+                            if (!statsDiv) continue;
+
+                            // hour: 최근 1시간
+                            fetchOAuthSiteCount(siteHost, 1).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-hour cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // day: 최근 24시간
+                            fetchOAuthSiteCount(siteHost, 24).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-day cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // week: 최근 7일 (168시간)
+                            fetchOAuthSiteCount(siteHost, 168).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-week cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                            // month: 최근 30일 (720시간)
+                            fetchOAuthSiteCount(siteHost, 720).then(cnt => {
+                                const el = statsDiv.querySelector(".stat-month cnt span") as HTMLElement;
+                                if (el) el.textContent = String(cnt);
+                            });
+                        }
+                    }
+                } catch (oauthErr) {
+                    console.warn("[NAV] OAuth registered sites render failed:", oauthErr);
+                }
+            }
 
             // 🌟 [추가] Show/Hide 토글 버튼 이벤트 바인딩
             pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {

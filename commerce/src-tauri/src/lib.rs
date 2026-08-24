@@ -2621,7 +2621,7 @@ async fn proxy_fetch(
 
     for (k, v) in headers.iter() { req_builder = req_builder.header(k, v); }
     
-    if let Some(b) = body { 
+    if let Some(b) = body {
         if headers.get("Content-Encoding").map(|v| v.as_str()) == Some("gzip") {
             // [STRICT PARITY] Compress body if Gzip is requested
             if let Ok(compressed) = crate::utils::compression::compress_value(&b) {
@@ -2629,11 +2629,25 @@ async fn proxy_fetch(
             } else {
                 req_builder = req_builder.json(&b);
             }
+        } else if headers.get("Content-Type").map(|v| v.as_str()) == Some("application/x-www-form-urlencoded") {
+            // 🌟 [FORM-ENCODED FIX] Content-Type이 form-urlencoded이면
+            //    .json()이 아니라 .form()으로 전송해야 서버가 파싱할 수 있습니다.
+            //    .json()은 Content-Type을 application/json으로 덮어쓰므로
+            //    api.oauth.network 같은 form 기반 서버에서 500이 발생합니다.
+            if let Some(obj) = b.as_object() {
+                let form_data: Vec<(String, String)> = obj.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                    })
+                    .collect();
+                req_builder = req_builder.form(&form_data);
+            } else {
+                req_builder = req_builder.json(&b);
+            }
         } else {
-            req_builder = req_builder.json(&b); 
+            req_builder = req_builder.json(&b);
         }
     }
-
     let response = req_builder.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     
