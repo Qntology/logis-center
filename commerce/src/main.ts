@@ -1450,8 +1450,12 @@ async function resolveAnalyticsOrigins(): Promise<string[]> {
 
     const push = (raw: any) => {
         if (!raw || typeof raw !== "string") return;
-        const s = raw.trim().toLowerCase();
-        if (!s.startsWith("http")) return;
+        let s = raw.trim().toLowerCase();
+        if (!s) return;
+        // 🌟 [SCHEME TOLERANCE] api.oauth.network 메타데이터는 'example.com' 처럼
+        //    스킴 없이 저장됩니다. 기존 startsWith("http") 검사는 그 항목을 전부 버려
+        //    '등록된 사이트' 가 조회 대상에서 통째로 빠졌습니다.
+        if (!/^https?:\/\//.test(s)) s = "https://" + s;
         try {
             const u = new URL(s);
             if (!u.hostname) return;
@@ -1543,6 +1547,53 @@ function decodeAnalyticBlob(rawData: any): any {
     return {};
 }
 
+/**
+ * 🌟 [API KEY LOOKUP] origin 에 대응하는 client_id / client_secret 을 kv_store 에서 찾습니다.
+ *
+ *  ── 왜 필요한가 ──
+ *   console.logis.center 의 로그 조회는 이제 '그 사이트에 발급된 API 키' 를 요구합니다.
+ *   키가 없으면 서버가 0건을 돌려주므로, 아예 왕복하지 않고 건너뛰는 편이 낫습니다.
+ *
+ *  ── 호스트 표기 흔들림 ──
+ *   kv_store 의 host 는 등록 경로에 따라 'https://example.com' 또는 'example.com' 으로
+ *   섞여 저장될 수 있습니다. 양쪽 모두 URL 로 정규화한 뒤 host(도메인+포트)로 비교합니다.
+ */
+async function getOAuthCredentialForOrigin(origin: string): Promise<{ client_id: string; client_secret: string } | null> {
+    const toHost = (raw: any): string => {
+        if (!raw || typeof raw !== "string") return "";
+        let s = raw.trim().toLowerCase();
+        if (!s) return "";
+        if (!/^https?:\/\//.test(s)) s = "https://" + s;
+        try {
+            return new URL(s).host;
+        } catch (_e) {
+            return "";
+        }
+    };
+
+    const targetHost = toHost(origin);
+    if (!targetHost) return null;
+
+    try {
+        const sites = await kvGet("oauth_registered_sites");
+        if (!Array.isArray(sites)) return null;
+
+        for (const s of sites) {
+            if (!s) continue;
+            if (toHost(s.host) !== targetHost) continue;
+            if (!s.client_id) continue;
+            return {
+                client_id: String(s.client_id),
+                client_secret: String(s.client_secret || "")
+            };
+        }
+    } catch (e) {
+        console.warn("[OAUTH] getOAuthCredentialForOrigin failed:", e);
+    }
+
+    return null;
+}
+
 /** 🌟 origin 하나에 대해 GET 1회를 수행하고 저장한 건수를 돌려줍니다. */
 async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<number> {
     // Worker 와 '동일한 규칙' 으로 cc 를 계산합니다. (풀 호스트, 루트 도메인 아님)
@@ -1550,6 +1601,19 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
     try {
         expectedCc = await hashId(new URL(origin).host);
     } catch (e) {}
+
+    // 🌟 [API KEY GATE] Worker 가 이제 client_id 로 사이트 소유를 검증합니다.
+    //    키가 없으면 서버가 0건을 돌려주므로 왕복 자체를 생략합니다.
+    const cred = await getOAuthCredentialForOrigin(origin);
+
+    if (!cred) {
+        console.warn(
+            `[SYNC-ANALYTIC] ⏭️ '${origin}' 은 등록된 API 키가 없어 건너뜁니다. ` +
+            `Analytic 탭의 '+ 사이트 등록' 으로 먼저 등록하세요. ` +
+            `(console.logis.center 는 client_id 검증을 통과한 요청에만 로그를 반환합니다)`
+        );
+        return 0;
+    }
 
     const params = new URLSearchParams({
         origin: "https://console.logis.center",
@@ -1560,6 +1624,10 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
         href: origin + "/"
     });
     if (expectedCc) params.append("cc", expectedCc);
+
+    // 🌟 client_id 는 필수, client_secret 은 있으면 쌍까지 대조합니다.
+    params.append("client_id", cred.client_id);
+    if (cred.client_secret) params.append("client_secret", cred.client_secret);
 
     let response: any = null;
     try {
@@ -1576,6 +1644,17 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
 
     stepQrSpinner();
 
+    // 🌟 [VERIFY ECHO] Worker 가 session.verified / session.verify_reason 을 실어 보냅니다.
+    //    실패 원인이 클라이언트에서 바로 보이도록 표면화합니다.
+    const verifySession = (response && response.session) ? response.session : {};
+    if (verifySession.verify_reason && verifySession.verified === false) {
+        console.warn(
+            `[SYNC-ANALYTIC] 🔐 '${origin}' API 키 검증 실패: reason='${verifySession.verify_reason}' ` +
+            `(client_id='${cred.client_id}'). Analytic 탭에서 '재발급' 후 다시 시도하거나, ` +
+            `사이트 <head> 의 oauth-network-verification 메타 태그를 확인하세요.`
+        );
+    }
+
     if (!response || !response.results || !Array.isArray(response.results)) {
         console.log(`[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 응답에 results 없음`);
         return 0;
@@ -1585,8 +1664,8 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
         console.log(
             `[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 0건. ` +
             `Worker 조회 조건은 cc = hashId('${(() => { try { return new URL(origin).host; } catch (e) { return "?"; } })()}') ` +
-            `AND updated_at > 0 AND created_at < ${cursor} 입니다. ` +
-            `updated_at 이 0 인 원시 이벤트는 Cron Worker 구조화 전이라 내려오지 않습니다.`
+            `AND created_at < ${cursor} 이며, client_id 검증을 통과해야 합니다. ` +
+            `(verify='${verifySession.verify_reason || "unknown"}')`
         );
         return 0;
     }
