@@ -360,4 +360,27 @@ Upsert["pages"] = handleUpsert;
 Upsert["users"] = handleUpsert;
 Upsert["crons"] = handleUpsert;
 
-Delete["items"] = async (q) => { return {}; };
+const handleDelete = async (q: DbQuery = {}) => {
+    try {
+        if (q.key === 'id' && q.value) {
+            // 1. 백엔드(Rust) DB에서 삭제
+            await invoke("delete_document", { uuid: String(q.value) });
+            
+            // 2. 프론트엔드 로컬 Dexie DB에서 삭제 (UI 노출 방지)
+            const appDb = getAppDb();
+            if (appDb) {
+                await appDb.table("items").delete(q.value).catch(() => null);
+                await appDb.table("pages").delete(q.value).catch(() => null);
+                await appDb.table("users").delete(q.value).catch(() => null);
+            }
+        }
+        return { success: true };
+    } catch (e) {
+        console.error("[DB Shim] Delete error:", e);
+        return { success: false };
+    }
+};
+
+Delete["items"] = handleDelete;
+Delete["pages"] = handleDelete;
+Delete["users"] = handleDelete;

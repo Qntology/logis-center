@@ -1434,11 +1434,17 @@ async function syncCommerceInBackground() {
             // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
             //    syncData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
             const bgTombstones = await loadTalkTombstones();
+            const bgItemTombs = await loadItemTombstones();
             let bgTombBlocked = 0;
-
+            let bgItemTombBlocked = 0;
             const filteredResults = response.results.filter((newItem: any) => {
                 if (bgTombstones.has(String(newItem.id))) {
                     bgTombBlocked++;
+                    return false;
+                }
+                // 🌟 [ITEM TOMBSTONE CHECK] 문서 삭제도 백그라운드 재삽입을 차단합니다.
+                if (bgItemTombs.has(String(newItem.id))) {
+                    bgItemTombBlocked++;
                     return false;
                 }
                 const existingEl = document.getElementById(newItem.id);
@@ -1447,9 +1453,11 @@ async function syncCommerceInBackground() {
                 const serverUpdated = newItem.updated_at || newItem.created_at || 0;
                 return serverUpdated > localUpdated;
             });
-
             if (bgTombBlocked > 0) {
                 console.log(`[TOMBSTONE] 🪦 [BG] 삭제된 메시지 ${bgTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
+            }
+            if (bgItemTombBlocked > 0) {
+                console.log(`[ITEM-TOMBSTONE] 🪦 [BG] 삭제된 문서 ${bgItemTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
             }
             if (filteredResults.length > 0) {
                 for (const r of filteredResults) {
@@ -1648,6 +1656,39 @@ async function kvRemove(key: string) {
 //                 (syncData 는 가산 전용이라 서버에서 사라져도 지우지 않습니다)
 // =====================================================================
 let talkTombstoneCache: Set<string> | null = null;
+
+// 🌟 [ITEM TOMBSTONE] 삭제한 문서의 묘비.
+//    서버 D1 에 행이 남아 있으면 syncData 폴링(3초)이 재삽입하므로,
+//    '이 id 는 내가 의도적으로 지웠다' 는 사실을 로컬에 영구 기록합니다.
+//    talk_tombstones 와 동일한 원리이나 대상이 items 테이블입니다.
+let itemTombstoneCache: Set<string> | null = null;
+
+async function loadItemTombstones(): Promise<Set<string>> {
+    if (itemTombstoneCache) return itemTombstoneCache;
+    const s = new Set<string>();
+    try {
+        // kv_store 에 'item_tombstones' 키 하나로 JSON 배열 저장
+        const raw = await kvGet("item_tombstones");
+        if (Array.isArray(raw)) {
+            for (const id of raw) s.add(String(id));
+        }
+    } catch (e) {
+        console.warn("[ITEM-TOMBSTONE] load failed:", e);
+    }
+    itemTombstoneCache = s;
+    return s;
+}
+
+async function addItemTombstone(id: string) {
+    if (!id) return;
+    const cache = await loadItemTombstones();
+    cache.add(String(id));
+    try {
+        await kvSet("item_tombstones", Array.from(cache));
+    } catch (e) {
+        console.warn(`[ITEM-TOMBSTONE] save('${id}') failed:`, e);
+    }
+}
 
 /** 묘비 목록을 메모리에 적재합니다. 최초 1회만 Dexie 를 읽습니다. */
 async function loadTalkTombstones(): Promise<Set<string>> {
@@ -4476,36 +4517,41 @@ async function syncData() {
             //    바로 아래 `!existingEl && !localMap.has(id)` 조건을 통과해 재삽입됩니다.
             //    묘비 조회는 메모리 Set 이라 폴링 비용이 사실상 0 입니다.
             const tombstones = await loadTalkTombstones();
+            // 🌟 [ITEM TOMBSTONE] 문서(items) 삭제도 동일하게 서버 재삽입을 차단합니다.
+            const itemTombs = await loadItemTombstones();
             let tombBlocked = 0;
-
+            let itemTombBlocked = 0;
             const filteredResults = response.results.filter((newItem: any) => {
                 // 🌟 삭제 의사가 기록된 id 는 어떤 조건보다 먼저, 무조건 차단합니다.
                 if (tombstones.has(String(newItem.id))) {
                     tombBlocked++;
                     return false;
                 }
-
+                // 🌟 [ITEM TOMBSTONE CHECK] talk 이 아닌 일반 문서도 차단합니다.
+                if (itemTombs.has(String(newItem.id))) {
+                    itemTombBlocked++;
+                    return false;
+                }
                 const existingEl = document.getElementById(newItem.id);
-                
                 // 🌟 완전 신규 데이터 (DOM에도 없고 로컬 DB 캐시에도 없는 경우)는 조건 없이 즉시 통과
                 if (!existingEl && !localMap.has(newItem.id)) {
                     return true;
                 }
-
                 let localUpdated = 0;
                 if (existingEl) {
                     localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
                 } else if (localMap.has(newItem.id)) {
                     localUpdated = parseInt(localMap.get(newItem.id) || "0");
                 }
-
                 // 🌟 서버의 updated_at이 0일 수 있으므로(기존 index.ts 특성), created_at을 백업 비교값으로 활용
                 const serverUpdated = newItem.updated_at || newItem.created_at || 0;
                 return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
             });
-
             if (tombBlocked > 0) {
                 console.log(`[TOMBSTONE] 🪦 삭제된 메시지 ${tombBlocked}건의 서버 재삽입을 차단했습니다.`);
+            }
+            if (itemTombBlocked > 0) {
+                console.log(`[ITEM-TOMBSTONE] 🪦 삭제된 문서 ${itemTombBlocked}건의 서버 재삽입을 차단했습니다.`);
             }
 
             if (filteredResults.length > 0) {
@@ -4721,23 +4767,26 @@ function applySearchModeUI() {
             el.classList.remove('active');
         }
     });
-
     // 🌟 [MODE LABEL] 파일 상단의 modeLabel() 단일 정의를 씁니다.
     //    저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB 나 Rust 쪽 변경이 전혀 없습니다.
     if (searchInput) {
         searchInput.placeholder = `${modeLabel(currentSearchMode)} Search or Ask`;
     }
-
     // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
     const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
     const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
-    
     if (pagesSection) {
         if (currentSearchMode === "shipping" || isSettingsOpen) {
             pagesSection.style.display = "none"; // Shipping이거나 세팅 패널이 열려있으면 숨김
         } else {
             pagesSection.style.display = "block"; // 🌟 명시적으로 block 처리하여 노출 보장
         }
+    }
+    // 🌟 [ANALYTIC LOGO HIDE] analytic 모드에서는 logo-section 영역을 숨깁니다.
+    //    console.logis.center 기반이므로 상점 로고/브랜딩 영역이 의미가 없습니다.
+    const logoSection = document.querySelector('.logo-section') as HTMLElement;
+    if (logoSection) {
+        logoSection.style.display = currentSearchMode === "analytic" ? "none" : "";
     }
 }
 
@@ -6275,9 +6324,21 @@ listRefreshBtn?.addEventListener("click", refreshList);
 btnDeleteSelected?.addEventListener("click", async () => {
     if (selectedUuids.size === 0) return;
     if (await ask(`Delete ${selectedUuids.size} documents?`, { title: "Confirm Delete", kind: "warning" })) {
-        try { 
-            await invoke("delete_documents", { uuids: Array.from(selectedUuids) }); 
-            await refreshList(); 
+        try {
+            const uuids = Array.from(selectedUuids);
+            await invoke("delete_documents", { uuids });
+            // 🌟 [DEXIE DELETE] 다중 삭제도 Dexie 캐시에서 동기 제거합니다.
+            if (appDb && uuids.length > 0) {
+                try {
+                    await appDb.table("items").bulkDelete(uuids);
+                    await appDb.table("users").bulkDelete(uuids);
+                    await appDb.table("pages").bulkDelete(uuids);
+                    console.log(`[WIDGET] Dexie cache cleared for ${uuids.length} item(s)`);
+                } catch (dexieErr) {
+                    console.warn("[WIDGET] Dexie bulk delete failed (non-critical):", dexieErr);
+                }
+            }
+            await refreshList();
             updateResultCount();
         } catch (e) { console.error(e); }
     }
@@ -6990,25 +7051,38 @@ btnDetailDelete?.addEventListener("click", async () => {
         console.error("[WIDGET] No document UUID selected for deletion.");
         return;
     }
-    
     try {
-        const confirmed = await ask("Are you sure you want to delete this document?", { 
-            title: "Confirm Delete", 
-            kind: "warning" 
+        const confirmed = await ask("Are you sure you want to delete this document?", {
+            title: "Confirm Delete",
+            kind: "warning"
         });
-
         if (confirmed) {
             console.log("[WIDGET] Deletion confirmed for:", currentDetailUuid);
             const res = await invoke<string>("delete_document", { uuid: currentDetailUuid });
             console.log("[WIDGET] Delete response:", res);
-            
-            detailView.style.display = "none"; 
-            listView.style.display = "block"; 
-            await refreshList(); 
+            // 🌟 [DEXIE DELETE] LanceDB 삭제 후 프론트엔드 Dexie 캐시에서도 제거합니다.
+            //    이 처리가 없으면 refreshList() → loadMoreDocs() 가 Dexie 를 조회할 때
+            //    해당 아이템이 여전히 존재하여 화면에 다시 렌더링됩니다.
+            if (appDb && currentDetailUuid) {
+                try {
+                    await appDb.table("items").delete(currentDetailUuid);
+                    await appDb.table("users").delete(currentDetailUuid);
+                    await appDb.table("pages").delete(currentDetailUuid);
+                    console.log(`[WIDGET] Dexie cache cleared for: ${currentDetailUuid}`);
+                } catch (dexieErr) {
+                    console.warn("[WIDGET] Dexie delete failed (non-critical):", dexieErr);
+                }
+            }
+            // 🌟 [ITEM TOMBSTONE] 서버 D1 에 행이 남아 있으면 3초 폴링이 재삽입하므로
+            //    묘비를 세워 영구 차단합니다.
+            await addItemTombstone(currentDetailUuid);
+            detailView.style.display = "none";
+            listView.style.display = "block";
+            await refreshList();
             updateResultCount();
         }
-    } catch (e) { 
-        console.error("[WIDGET] Deletion process failed:", e); 
+    } catch (e) {
+        console.error("[WIDGET] Deletion process failed:", e);
     }
 });
 

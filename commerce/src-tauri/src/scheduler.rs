@@ -9164,27 +9164,29 @@ async fn process_trading_task(
     } else {
         emit_term(&format!("  ⚠️ [TRADE CODE AMBIGUOUS] 코사인 마진 {:+.4} 부족. 그룹 '{}' 내 {}개 코드로 LLM 재판정합니다.",
             code_margin, best_group, codes.len()));
-
         model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
-
+        // 🌟 [PAGE TYPE PROMPT 통합] 하드코딩 대신 개선된 page_type_prompt("shipping") 을 사용합니다.
+        //    코사인 점수를 후보 목록에 동봉하여 벡터 근거를 함께 전달합니다.
+        let base_prompt = crate::prompts::page_type_prompt("shipping");
         let scoped_prompt = {
-            let mut s = String::from("[TASK]\nClassify this trade document. Return the single closest code.\n\n[CANDIDATE CODES]\n");
+            let mut s = String::from("[VECTOR EVIDENCE]
+    The vector engine scored this document against candidate codes:
+    ");
             for (c, sc) in &code_scores {
-                s.push_str(&format!("{} = {} (vector score {:.4})\n", c, trade_code_anchor(c), sc));
+                s.push_str(&format!("- {} (vector score {:.4})
+    ", c, sc));
             }
-            s.push_str("\nIf none fit, return \"Unknown\".\n\n[OUTPUT FORMAT]\n{\"doc_type\": \"BL\"}\n\n[ACTION] JSON ONLY. NO EXPLANATION. /no_think");
+            s.push_str(&format!("
+    {}", base_prompt));
             s
         };
-
         let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 NoAttributesMode PUG를 컨텍스트로 사용합니다.
-            //    light_pug는 이미 pre_clean_html → convert_to_clean_pug(NoAttributesMode) →
-            //    truncate_pug_context 파이프라인을 거친 결과입니다.
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[PUG CONTENT — attribute-stripped]\n{}", light_pug),
+                            content: format!("[PUG CONTENT]
+    {}", light_pug),
                             name: None,
                         },
                     ),
@@ -9213,8 +9215,10 @@ async fn process_trading_task(
                     None,
                 )
                 .await?;
-            crate::parsing::parse_json_from_llm(&res)
-                .get("doc_type")
+            let parsed = crate::parsing::parse_json_from_llm(&res);
+            parsed
+                .get("type")
+                .or_else(|| parsed.get("doc_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim()
@@ -9222,8 +9226,6 @@ async fn process_trading_task(
         } else {
             String::new()
         };
-
-        // 🌟 [SCOPE GUARD] LLM 이 그룹 밖 코드를 뱉으면 폐기하고 코사인 결과를 씁니다.
         if !picked.is_empty() && codes.iter().any(|c| *c == picked.as_str()) {
             emit_term(&format!("  🤖 [TRADE CODE LLM] LLM 이 '{}' 로 확정했습니다.", picked));
             picked
@@ -9234,7 +9236,6 @@ async fn process_trading_task(
             cosine_code
         }
     };
-
     emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
 
     // =====================================================================
