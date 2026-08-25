@@ -198,7 +198,86 @@ fn save_translit_cache(
     }));
 }
 
-/// [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
+/// 🌟 [CROSS-LANGUAGE TRANSLITERATION] 전처리 단계에서 사용하는 교차 언어 음차.
+///    방향: 영어 단어 → 문서 언어(한글/일어/중어 등)
+///    한글→한글 같은 동일 언어 음차는 수행하지 않습니다.
+///    한글→영어(로마자) 역방향도 함께 생성합니다.
+///
+///    이 함수는 `run_analytic_structuring` 에서 호출되며,
+///    Qwen3.5 가 이미 로드되어 있어야 합니다.
+pub async fn transliterate_cross_language(
+    model: &LogisModel,
+    text: &str,
+    doc_lang: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> (String, String) {
+    let _ = (app_handle, task_id);
+    let src = text.trim().to_string();
+    if src.is_empty() { return (String::new(), String::new()); }
+
+    let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
+    let sample = crate::nl_convert::native_script_sample(doc_lang, "", "");
+    let target_is_latin = crate::nl_convert::is_latin_dominant(&sample);
+
+    // 동일 문자 체계 → 음차 불필요
+    if src_is_latin == target_is_latin && !src_is_latin {
+        // 한글→한글: 무의미. 로마자 역방향만 시도.
+        if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
+            return (String::new(), roman);
+        }
+        return (String::new(), String::new());
+    }
+
+    // 🌟 [PROMPT / SANITIZE FIX]
+    //  ── 무엇이 문제였나 ──
+    //   ① crate::prompts::transliteration_prompt(&src, doc_lang) 는 ISO 코드("ko")를
+    //      [TARGET LANGUAGE] 에 그대로 꽂아, 모델이 목표 표기 체계를 인식하지 못했습니다.
+    //      (nl_convert::build_transliteration_prompt 는 lang_code_to_full_name 으로 "korean" 을 넣습니다)
+    //   ② transliteration 객체에서 .values().next() 로 '아무 항목이나 하나' 를 꺼내
+    //      다단어 문장의 첫 단어도 아닌 임의 값이 native 로 저장되었습니다.
+    //      (로그 실측: "상품3" → '산마두', "사용자" → '수용자')
+    //   ③ G1(원문 동일) / G2(표기 체계 반전) / G3(길이 상한) 게이트를 통과시키지 않아
+    //      명백한 환각도 그대로 별칭 벡터가 되었습니다.
+    //  ── 해결 ──
+    //   nl_convert 가 이미 갖고 있는 프롬프트 빌더와 정화기를 그대로 재사용합니다.
+
+    // 영어 원문 → 문서 언어(비라틴) 방향
+    if src_is_latin && !target_is_latin {
+        let prompt = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
+        let res = model
+            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+        let (_t, native) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
+        let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
+        if native.is_empty() {
+            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 문서언어 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
+        }
+        return (native, roman);
+    }
+
+    // 비라틴 원문 → 로마자(라틴) 역방향
+    if !src_is_latin && target_is_latin {
+        if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
+            return (String::new(), roman);
+        }
+        let prompt = crate::nl_convert::build_transliteration_prompt(&src, "en");
+        let res = model
+            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+        let (_t, roman) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
+        if roman.is_empty() {
+            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 로마자 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
+        }
+        return (String::new(), roman);
+    }
+
+    (String::new(), String::new())
+}
+/// 🌟 [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
 /// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
 ///
 /// 동일 값(value_part)은 캐시로 재사용하므로 LLM 호출이 값의 종류 수만큼만 발생합니다.
@@ -279,13 +358,30 @@ async fn generate_transliteration_aliases(
         }
 
         // 1차 음차 가능 여부 판정.
-        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 LLM 호출 없이 skip.
+        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 스킵합니다.
         if !crate::nl_convert::can_transliterate(&src, doc_lang) {
             cache.insert(src.clone(), (String::new(), String::new()));
-            // 🌟 이 판정 자체를 영구 저장해야 다음 태스크에서도 조회 1회로 끝납니다.
             save_translit_cache(app_handle, &src, doc_lang, "", "");
             skipped += 1;
             continue;
+        }
+        // 🌟 [SAME-SCRIPT BLOCK] 원문과 대상이 같은 문자 체계면 음차가 성립하지 않습니다.
+        //    한글 문서를 한글로 음차하는 것은 오음차(수용자←사용자)만 양산합니다.
+        //    이 경우 영어 단어가 포함되어 있으면 영어→한글 방향으로 전환하고,
+        //    순수 한글이면 음차 자체를 스킵합니다.
+        let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
+        let target_is_latin = crate::nl_convert::is_latin_dominant(
+            &crate::nl_convert::native_script_sample(doc_lang, "", "")
+        );
+        if src_is_latin == target_is_latin {
+            if src_is_latin && !doc_lang.is_empty() && doc_lang != "en" {
+                // 영어 원문 → 문서 언어(비라틴) 방향: 계속 진행
+            } else {
+                cache.insert(src.clone(), (String::new(), String::new()));
+                save_translit_cache(app_handle, &src, doc_lang, "", "");
+                skipped += 1;
+                continue;
+            }
         }
 
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
@@ -297,7 +393,25 @@ async fn generate_transliteration_aliases(
         let (non_latin_words, latin_words) = crate::nl_convert::split_words_by_script(&src);
         let is_mixed = !non_latin_words.is_empty() && !latin_words.is_empty();
 
-        let s1_transliteration = if is_mixed {
+        // 🌟 [CROSS-LANG DIRECTION]
+        //    기존: 비라틴 원문 → 로마자(라틴) + 라틴 원문 → 문서언어(비라틴)
+        //    변경: 영어 단어 → 문서언어(비라틴) 만 수행.
+        //           비라틴 원문(한글) → 한글 음차는 무의미하므로 스킵.
+        //           한글 → 로마자(라틴) 는 유지 (검색 역방향 리콜용).
+        let doc_lang_is_latin = crate::nl_convert::is_latin_dominant(
+            &crate::nl_convert::native_script_sample(doc_lang, "", "")
+        );
+        let skip_native_translit = !src_is_latin && !doc_lang_is_latin;
+        //    한글→한글 음차는 스킵하되, 한글→로마자(역방향)는 유지.
+        //    영어→한글 은 정상 수행.
+
+        let s1_transliteration = if skip_native_translit && !is_mixed {
+            // 🌟 동일 언어 음차 스킵: 한글→한글 음차는 무의미.
+            //    로마자(역방향)만 생성합니다.
+            println!("    ⚪ [SAME-SCRIPT SKIP] '{}' → '{}' 동일 문자 체계 음차 스킵 (로마자 역방향만 생성)",
+                src, doc_lang);
+            String::new()
+        } else if is_mixed {
             println!("    [TRACK SPLIT] 비라틴: {:?} | 라틴: {:?}", non_latin_words, latin_words);
             // Track A: 비라틴 단어 → 로마자 전사 (target: english)
             // 🌟 [ANY_ASCII FIRST] 비라틴→라틴 방향은 any_ascii로 처리 가능하면 LLM 생략
@@ -752,7 +866,7 @@ pub async fn index_item_chunks(
     store: &VectorStore,
     model: &LogisModel,
     item_id: &str,
-    page_type: &str,
+    item_type: &str,
     doc_lang: &str,
     item_json: &Value,
     is_detail: bool,
@@ -764,7 +878,10 @@ pub async fn index_item_chunks(
     cancel: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle,
     task_id: &str,
+    skip_transliteration: bool,
 ) -> Result<usize> {
+    let page_type = item_type;
+
     let emit = |msg: &str| {
         println!("{}", msg);
         let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
@@ -942,9 +1059,14 @@ pub async fn index_item_chunks(
 
     let metas: Vec<&crate::nl_convert::ChunkMetadata> =
         indexable_chunks.iter().map(|(_, c)| *c).collect();
-    let alias_pairs = generate_transliteration_aliases(
-        model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
-    ).await;
+    // 🌟 [ANALYTIC TRANSLIT SKIP] 전처리에서 이미 음차를 완료한 경우 건너뜁니다.
+    let alias_pairs = if skip_transliteration {
+        vec![(String::new(), String::new()); metas.len()]
+    } else {
+        generate_transliteration_aliases(
+            model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
+        ).await
+    };
 
     let _ = store.delete_chunks_by_item(item_id).await;
 
@@ -9042,27 +9164,29 @@ async fn process_trading_task(
     } else {
         emit_term(&format!("  ⚠️ [TRADE CODE AMBIGUOUS] 코사인 마진 {:+.4} 부족. 그룹 '{}' 내 {}개 코드로 LLM 재판정합니다.",
             code_margin, best_group, codes.len()));
-
         model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
-
+        // 🌟 [PAGE TYPE PROMPT 통합] 하드코딩 대신 개선된 page_type_prompt("shipping") 을 사용합니다.
+        //    코사인 점수를 후보 목록에 동봉하여 벡터 근거를 함께 전달합니다.
+        let base_prompt = crate::prompts::page_type_prompt("shipping");
         let scoped_prompt = {
-            let mut s = String::from("[TASK]\nClassify this trade document. Return the single closest code.\n\n[CANDIDATE CODES]\n");
+            let mut s = String::from("[VECTOR EVIDENCE]
+    The vector engine scored this document against candidate codes:
+    ");
             for (c, sc) in &code_scores {
-                s.push_str(&format!("{} = {} (vector score {:.4})\n", c, trade_code_anchor(c), sc));
+                s.push_str(&format!("- {} (vector score {:.4})
+    ", c, sc));
             }
-            s.push_str("\nIf none fit, return \"Unknown\".\n\n[OUTPUT FORMAT]\n{\"doc_type\": \"BL\"}\n\n[ACTION] JSON ONLY. NO EXPLANATION. /no_think");
+            s.push_str(&format!("
+    {}", base_prompt));
             s
         };
-
         let picked = if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-            // 🌟 [PUG CONTEXT] 원문 HTML이 아닌, 정제된 NoAttributesMode PUG를 컨텍스트로 사용합니다.
-            //    light_pug는 이미 pre_clean_html → convert_to_clean_pug(NoAttributesMode) →
-            //    truncate_pug_context 파이프라인을 거친 결과입니다.
             let params = crate::openai_types::ChatCompletionParameters {
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[PUG CONTENT — attribute-stripped]\n{}", light_pug),
+                            content: format!("[PUG CONTENT]
+    {}", light_pug),
                             name: None,
                         },
                     ),
@@ -9091,8 +9215,10 @@ async fn process_trading_task(
                     None,
                 )
                 .await?;
-            crate::parsing::parse_json_from_llm(&res)
-                .get("doc_type")
+            let parsed = crate::parsing::parse_json_from_llm(&res);
+            parsed
+                .get("type")
+                .or_else(|| parsed.get("doc_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim()
@@ -9100,8 +9226,6 @@ async fn process_trading_task(
         } else {
             String::new()
         };
-
-        // 🌟 [SCOPE GUARD] LLM 이 그룹 밖 코드를 뱉으면 폐기하고 코사인 결과를 씁니다.
         if !picked.is_empty() && codes.iter().any(|c| *c == picked.as_str()) {
             emit_term(&format!("  🤖 [TRADE CODE LLM] LLM 이 '{}' 로 확정했습니다.", picked));
             picked
@@ -9112,7 +9236,6 @@ async fn process_trading_task(
             cosine_code
         }
     };
-
     emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
 
     // =====================================================================
@@ -9825,6 +9948,7 @@ async fn process_trading_task(
             cancellation_token,
             app_handle,
             &task.id,
+            false,              // skip_transliteration: 무역 문서는 음차 필요하므로 false
         ).await.unwrap_or(0);
 
         emit_term(&format!(

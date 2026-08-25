@@ -36,6 +36,190 @@ pub const ANALYTIC_EVENT_TYPES: [&str; 3] = ["click", "hover", "change"];
 /// 검색 스코프에 포함되는 타입. 합성 문서(report)까지 포함합니다.
 pub const ANALYTIC_SEARCH_TYPES: [&str; 4] = ["click", "hover", "change", "report"];
 
+// =====================================================================
+// 🌟 [EVENT TYPE ANCHOR BANK]
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   기존에는 event_types 를 Qwen3.5 2B 가 '단독으로' 골랐습니다.
+//   프롬프트의 [AVAILABLE EVENT TYPES] 는 영어 한 줄 설명뿐이라
+//   '클릭한' 같은 한국어 표현이 hover / change 와 구분되는 벡터 근거가 없었고,
+//   실측 로그에서는 질의에 '클릭'이 들어갔다는 이유만으로
+//   event_types 가 ["click"] 하나로 좁혀져
+//   방금 구조화한 hover 3건 + report 1건이 스코프에서 통째로 탈락했습니다.
+//
+//  ── 해결 ──
+//   bias.json 의 `analytic_event_filters` 노드를 구 단위로 쪼개 Max-Pool 뱅크를 만듭니다.
+//   노드가 없으면 코드 폴백을 씁니다. (get_trade_category_schema 의 fallback_base 와 동일 패턴)
+//   구 단위 Max-Pool 은 다국어 임베딩에서 '클릭한' ↔ 'pressed the button' 을
+//   직접 연결하므로 어휘 하드코딩 없이 판정이 성립합니다.
+// =====================================================================
+
+/// 🌟 [EVENT ANCHOR] 이벤트 타입 1종의 의미 앵커 구를 반환합니다.
+pub fn event_type_anchor_phrases(event_type: &str) -> Vec<String> {
+    // ① bias.json 우선 (semantic + bias)
+    if let Some(node) = crate::parsing::BIAS_DICT
+        .get("analytic_event_filters")
+        .and_then(|v| v.get(event_type))
+    {
+        let mut out: Vec<String> = Vec::new();
+        for field in ["semantic", "bias"] {
+            if let Some(s) = node.get(field).and_then(|v| v.as_str()) {
+                for p in crate::utils::ai_utils::split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    // ② 코드 폴백 : bias.json 을 손대지 않아도 즉시 동작합니다.
+    let raw = match event_type {
+        "click" => "click, clicked, pressed, tapped, selected, chose, picked, opened, pushed the button, selection, choice, purchase intent",
+        "hover" => "hover, hovered, mouse over, lingered, dwelled, looked at, browsed, scanned, glanced, viewed without clicking, attention, interest",
+        "change" => "change, changed, typed, entered, input, filled in, edited, modified, toggled, switched, picked an option, selected a value, form entry, keyword typed",
+        "report" => "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated result, most frequent",
+        _ => "",
+    };
+    crate::utils::ai_utils::split_bias_phrases_full(raw)
+}
+
+/// 🌟 [EVENT PREJUDICE] 경쟁 타입의 앵커를 편견 뱅크로 사용합니다.
+///  bias.json 에 prejudice 가 명시되어 있으면 그것을 우선하고,
+///  없으면 '나머지 3종의 앵커' 를 그대로 편견으로 씁니다.
+///  이 구조 덕분에 새 이벤트 타입이 생겨도 편견 사전을 따로 만들 필요가 없습니다.
+pub fn event_type_prejudice_phrases(event_type: &str) -> Vec<String> {
+    if let Some(s) = crate::parsing::BIAS_DICT
+        .get("analytic_event_filters")
+        .and_then(|v| v.get(event_type))
+        .and_then(|n| n.get("prejudice"))
+        .and_then(|v| v.as_str())
+    {
+        let p = crate::utils::ai_utils::split_bias_phrases_full(s);
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for other in ANALYTIC_SEARCH_TYPES.iter() {
+        if *other == event_type {
+            continue;
+        }
+        for p in event_type_anchor_phrases(other) {
+            if !out.iter().any(|e| e == &p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// 🌟 [EVENT EXACT MATCH] bias.json 의 exact_match 배열로 완전일치 판정합니다.
+///  time_filters / season_filters 의 exact_match 와 동일한 계약이며,
+///  일치하면 벡터 경쟁도 LLM 도 거치지 않고 즉시 확정합니다.
+pub fn event_type_exact_match(word: &str) -> Option<String> {
+    let w = word.trim().to_lowercase();
+    if w.is_empty() {
+        return None;
+    }
+    let obj = crate::parsing::BIAS_DICT
+        .get("analytic_event_filters")
+        .and_then(|v| v.as_object())?;
+    for (key, node) in obj {
+        if !ANALYTIC_SEARCH_TYPES.iter().any(|t| t == key) {
+            continue;
+        }
+        if let Some(arr) = node.get("exact_match").and_then(|v| v.as_array()) {
+            if arr
+                .iter()
+                .any(|x| x.as_str().map_or(false, |s| s.trim().to_lowercase() == w))
+            {
+                return Some(key.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 🌟 [EVENT PREFIX MATCH] 교착어 어절을 위해 exact_match 배열을 '접두 사전' 으로 재사용합니다.
+///  "클릭한게" 는 exact_match 에 없지만 "클릭" 이 그 접두이므로 click 으로 확정됩니다.
+///  사전은 bias.json 이 소유하므로 코드에는 어떤 언어의 어휘도 등장하지 않습니다.
+pub fn event_type_prefix_key(word: &str) -> Option<String> {
+    let (key, _stem) =
+        crate::utils::ai_utils::prefix_match_filter_stem("analytic_event_filters", word)?;
+    if ANALYTIC_SEARCH_TYPES.iter().any(|t| t == &key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// 🌟 [MORPHOLOGICAL VARIANTS] 교착어 어절 하나에서 '검색 가능한 원형 후보'를 만들어 냅니다.
+///  ── 근거 3단 ──
+///   ① Stanza Lemma      : 모델이 직접 알려준 원형 ("클릭한게" → "클릭")
+///   ② bias.json 접두 사전: exact_match 원소가 표면형의 접두이면 그 원소를 어간으로 확정
+///   ③ 문자 접두 n-gram   : ①②가 모두 실패했을 때의 순수 구조 폴백
+///  ── 왜 필요한가 ──
+///   commerce 는 질의에 다른 토큰('제품')이 함께 있어 shared_prefix_stems 로 어간을 얻지만,
+///   "가장 많이 클릭한게 뭐야?" 처럼 어간을 공유하는 형제 토큰이 없는 질의에서는
+///   그 장치가 동작하지 않습니다. 세 근거를 순서대로 시도합니다.
+///  ── 상한 ──
+///   토큰당 최대 3개. 청크 폭발을 막고, 무의미한 조각은 SURPRISAL/편견 게이트가 걸러냅니다.
+pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
+    let surface = word.trim();
+    let mut out: Vec<String> = Vec::new();
+    if surface.chars().count() < 2 {
+        return out;
+    }
+
+    fn push(v: &mut Vec<String>, surface: &str, cand: String) {
+        let c = cand.trim().to_string();
+        if c.is_empty() { return; }
+        if c.chars().count() < 2 { return; }
+        if c == surface { return; }
+        if v.iter().any(|e| e == &c) { return; }
+        v.push(c);
+    }
+
+    // ① Stanza Lemma 원형
+    let l = lemma.trim();
+    if !l.is_empty() && l != surface {
+        let lc: String = l.chars().filter(|c| c.is_alphanumeric()).collect();
+        let sc: String = surface.chars().filter(|c| c.is_alphanumeric()).collect();
+        if !lc.is_empty()
+            && sc.chars().count() > lc.chars().count()
+            && (sc.starts_with(&lc) || sc.ends_with(&lc))
+        {
+            push(&mut out, surface, lc);
+        } else if !lc.is_empty() {
+            push(&mut out, surface, l.to_string());
+        }
+    }
+
+    // ② bias.json exact_match 접두 사전
+    for cat in ["analytic_event_filters", "time_filters", "season_filters"] {
+        if let Some((_, stem)) = crate::utils::ai_utils::prefix_match_filter_stem(cat, surface) {
+            push(&mut out, surface, stem);
+        }
+    }
+
+    // ③ 문자 접두 n-gram (사전 없이 동작하는 최후 폴백)
+    let chars: Vec<char> = surface.chars().collect();
+    if chars.len() >= 3 {
+        let hi = (chars.len() - 1).min(4);
+        for n in 2..=hi {
+            push(&mut out, surface, chars[..n].iter().collect::<String>());
+        }
+    }
+
+    if out.len() > 3 {
+        out.truncate(3);
+    }
+    out
+}
+
 /// 🌟 [ATTRIBUTE STRIP] PUG 한 줄에서 속성부(`[...]`)를 완전히 제거하고
 ///    `{indent}{tag} | {text}` 형태만 남깁니다.
 ///    pug_line_parts 는 속성값 내부의 파이프를 오인하지 않는 안전 파서이므로
@@ -317,6 +501,23 @@ pub async fn run_analytic_structuring(
             combined.push_str(&relate.join(", "));
         }
 
+        // 🌟 [TRANSLIT IN STRUCTURIZATION] 전처리 단계에서 음차를 수행합니다.
+        //    Qwen3.5 가 이미 로드되어 있으므로 별도 모델 로딩이 불필요합니다.
+        //    방향: 영어 단어 → 문서 언어(한글/일어/중어 등) 로 음차.
+        //    한글→한글 같은 동일 언어 음차는 수행하지 않습니다.
+        let translit_native;
+        let translit_roman;
+        if !action.is_empty() {
+            let (tn, tr) = crate::scheduler::transliterate_cross_language(
+                model, &action, &doc_lang, cancel, app_handle, task_id,
+            ).await;
+            translit_native = tn;
+            translit_roman = tr;
+        } else {
+            translit_native = String::new();
+            translit_roman = String::new();
+        }
+
         let mut new_data = data.clone();
         if let Some(o) = new_data.as_object_mut() {
             o.insert("action".to_string(), json!(action.clone()));
@@ -326,6 +527,13 @@ pub async fn run_analytic_structuring(
             o.insert("masked_text".to_string(), json!(combined.clone()));
             o.insert("mode".to_string(), json!("analytic"));
             o.insert("updated_at".to_string(), json!(now_ts));
+            // 🌟 전처리에서 확정한 음차 결과를 저장합니다.
+            if !translit_native.is_empty() {
+                o.insert("translit_native".to_string(), json!(translit_native));
+            }
+            if !translit_roman.is_empty() {
+                o.insert("translit_roman".to_string(), json!(translit_roman));
+            }
             // 🌟 구조화가 끝났으므로 벡터를 새로 만들어야 합니다.
             //    reindex_pending_embeddings 는 embed 플래그가 1이면 건너뛰므로 제거합니다.
             o.remove("embed");
@@ -494,6 +702,88 @@ fn env_doc_origin(doc: &crate::store::TradeDocument) -> Value {
     json!("")
 }
 
+/// 🌟 [REPORT OUTPUT NORMALIZE] Qwen3.5 가 "Do NOT output JSON" 지시를 어기고
+///  { "headline": ..., "supporting_actions": [...], "closing": ... } 형태로 반환하는 경우를 흡수합니다.
+///  ── 왜 코드로 흡수하는가 ──
+///   프롬프트 지시만으로는 2B 모델의 JSON 관성을 100% 막을 수 없고,
+///   말풍선에 원시 JSON 이 그대로 노출되면 사용자가 읽을 수 없습니다.
+///   구조가 무엇이든 '문자열 잎' 만 순서대로 펼치면 항상 읽을 수 있는 텍스트가 됩니다.
+///  ── JSON 이 아니면 원문을 그대로 돌려줍니다 (무해). ──
+pub fn normalize_report_output(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    if t.is_empty() {
+        return t;
+    }
+
+    // ① 코드펜스 제거
+    if t.starts_with("```") {
+        if let Some(p) = t.find('\n') {
+            t = t[p + 1..].to_string();
+        }
+        if let Some(p) = t.rfind("```") {
+            t = t[..p].to_string();
+        }
+        t = t.trim().to_string();
+    }
+
+    // ② JSON 형태가 아니면 그대로 반환
+    if !(t.starts_with('{') || t.starts_with('[')) {
+        return t;
+    }
+
+    let parsed = crate::parsing::parse_json_from_llm(&t);
+    if parsed.is_null() {
+        return t;
+    }
+
+    fn flatten(v: &Value, out: &mut Vec<String>, bullet: bool) {
+        match v {
+            Value::String(s) => {
+                let x = s.trim();
+                if x.is_empty() {
+                    return;
+                }
+                out.push(if bullet { format!("- {}", x) } else { x.to_string() });
+            }
+            Value::Number(n) => {
+                out.push(if bullet { format!("- {}", n) } else { n.to_string() });
+            }
+            Value::Bool(b) => {
+                out.push(if bullet { format!("- {}", b) } else { b.to_string() });
+            }
+            Value::Array(a) => {
+                for it in a {
+                    flatten(it, out, true);
+                }
+            }
+            Value::Object(o) => {
+                for (_, val) in o {
+                    flatten(val, out, bullet);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(obj) = parsed.as_object() {
+        for (_, v) in obj {
+            let is_list = v.is_array();
+            flatten(v, &mut lines, is_list);
+        }
+    } else {
+        flatten(&parsed, &mut lines, false);
+    }
+
+    let joined = lines.join("\n").trim().to_string();
+    if joined.is_empty() {
+        t
+    } else {
+        println!("[ANALYTIC] 🧽 [REPORT NORMALIZE] JSON 응답을 읽을 수 있는 텍스트로 평탄화했습니다.");
+        joined
+    }
+}
+
 // =====================================================================
 // 🌟 [ANALYTIC QUERY PARSER]
 // ---------------------------------------------------------------------
@@ -581,7 +871,6 @@ pub fn season_range(season: &str, year: i32) -> Option<(i64, i64)> {
 pub fn deterministic_time_keys(query: &str) -> (String, String) {
     let mut t_key = String::new();
     let mut s_key = String::new();
-
     // 공백 토큰 → 실패 시 전체 문자열까지 시도합니다. (한국어는 '이번달' 처럼 붙어 옵니다)
     let mut candidates: Vec<String> = query
         .split_whitespace()
@@ -590,6 +879,7 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
         .collect();
     candidates.push(query.trim().to_string());
 
+    // ── 1차 : 완전일치 ──
     for c in &candidates {
         if t_key.is_empty() {
             if let Some(k) = crate::utils::ai_utils::exact_match_filter_key("time_filters", c) {
@@ -604,7 +894,237 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
         if !t_key.is_empty() && !s_key.is_empty() { break; }
     }
 
+    // 🌟 ── 2차 : 접두 일치 (교착어 대응) ──
+    //    '올해는' / '여름에' 처럼 조사가 붙어 완전일치가 실패한 경우를 구제합니다.
+    //    exact_match 원소가 토큰의 접두일 때만 인정하므로 어휘 하드코딩이 없습니다.
+    if t_key.is_empty() || s_key.is_empty() {
+        for c in &candidates {
+            if t_key.is_empty() {
+                if let Some((k, stem)) =
+                    crate::utils::ai_utils::prefix_match_filter_stem("time_filters", c)
+                {
+                    println!("[ANALYTIC] 🕒 [TIME PREFIX MATCH] '{}' ← 접두 '{}' → time_filters.{}", c, stem, k);
+                    t_key = k;
+                }
+            }
+            if s_key.is_empty() {
+                if let Some((k, stem)) =
+                    crate::utils::ai_utils::prefix_match_filter_stem("season_filters", c)
+                {
+                    println!("[ANALYTIC] 🌤️ [SEASON PREFIX MATCH] '{}' ← 접두 '{}' → season_filters.{}", c, stem, k);
+                    s_key = k;
+                }
+            }
+            if !t_key.is_empty() && !s_key.is_empty() { break; }
+        }
+    }
+
     (t_key, s_key)
+}
+
+/// 🌟 [STANZA LANG CODE] parse_commerce_query 와 동일한 매핑입니다.
+///  모델 디렉터리가 없으면 tokenize_query_with_pos 가 공백 분할로 폴백하므로,
+///  여기서는 매핑만 담당하고 존재 여부는 검사하지 않습니다.
+pub fn stanza_lang_code(language: &str) -> &'static str {
+    match language {
+        "korean" | "ko" => "ko",
+        "english" | "en" => "en",
+        "japanese" | "ja" => "ja",
+        "chinese" | "zh" | "zh-hans" | "zh-hant" | "zh-tw" | "zh-hk" => "zh-hans",
+        "french" | "fr" => "fr",
+        "german" | "de" => "de",
+        "spanish" | "es" => "es",
+        "italian" | "it" => "it",
+        "portuguese" | "pt" => "pt",
+        "dutch" | "nl" => "nl",
+        "russian" | "ru" => "ru",
+        "arabic" | "ar" => "ar",
+        "thai" | "th" => "th",
+        "hindi" | "hi" => "hi",
+        "bengali" | "bn" => "bn",
+        "telugu" | "te" => "te",
+        "khmer" | "km" => "km",
+        "greek" | "el" => "el",
+        "hebrew" | "he" => "he",
+        "vietnamese" | "vi" => "vi",
+        _ => "en",
+    }
+}
+
+/// 🌟 [STANZA TOKENIZE + MORPHOLOGY] 질의를 어절 단위로 쪼개고 UPOS 태그와 Lemma 원형을 함께 부착합니다.
+///  ── 왜 Lemma 까지 필요한가 ──
+///   Stanza 토크나이저는 교착어 어절을 통째로 한 토큰으로 돌려줍니다.
+///     "클릭한게" → 1토큰  (클릭 + 한 + 게)
+///   이 표면형은 bias.json 의 exact_match("클릭")와 완전일치하지 않고,
+///   영어 구 뱅크("clicked", "pressed")와의 코사인도 낮아
+///   슬라이딩 윈도우에서 NMS 후보가 단 하나도 만들어지지 않습니다.
+///   (로그 실측: [NMS CANDIDATE] 0건 → EVENT FALLBACK 4종 전체)
+///   commerce 의 parse_commerce_query 는 이미 lemma_session 을 돌려
+///   '가디건찾아줘' → '가디건' 절단을 수행하고 있으므로, 같은 장치를 이식합니다.
+///
+///  ── 반환 ──
+///   (표면형, UPOS 태그, Lemma 원형). 실패 시 태그/Lemma 는 빈 문자열입니다.
+pub async fn tokenize_query_with_morphology(
+    query: &str,
+    lang_code: &str,
+) -> Vec<(String, String, String)> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let fallback: Vec<(String, String, String)> = words
+        .iter()
+        .map(|w| (w.clone(), String::new(), String::new()))
+        .collect();
+    if words.is_empty() {
+        return fallback;
+    }
+
+    let base_dir = crate::utils::get_app_dir().join("models").join("stanza");
+    let lang_dir = base_dir.join(lang_code);
+    if !lang_dir.exists() {
+        println!(
+            "[ANALYTIC] ⚠️ Stanza 모델 디렉터리가 없어 공백 분할로 폴백합니다: {:?}",
+            lang_dir
+        );
+        return fallback;
+    }
+
+    struct UnsafePipelineWrapper(crate::stanza::StanzaPipeline);
+    unsafe impl Send for UnsafePipelineWrapper {}
+
+    let wrapper = match crate::stanza::StanzaPipeline::new(base_dir, lang_code).await {
+        Ok(p) => UnsafePipelineWrapper(p),
+        Err(e) => {
+            println!("[ANALYTIC] ⚠️ Stanza 로드 실패({:?}). 공백 분할로 폴백합니다.", e);
+            return fallback;
+        }
+    };
+    let mut stanza = wrapper.0;
+
+    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+
+    // ONNX Export 시 고정된 시퀀스 길이를 그대로 존중합니다.
+    let mut chunk_size = refs.len();
+    for input_meta in &stanza.pos_session.inputs {
+        let dims = &input_meta.dimensions;
+        if dims.len() == 2 && dims.get(1) == Some(&Some(32)) {
+            if let Some(&Some(fixed_seq)) = dims.get(0) {
+                chunk_size = fixed_seq as usize;
+            }
+        }
+    }
+    if chunk_size == 0 {
+        chunk_size = refs.len();
+    }
+    let mut padded = refs.clone();
+    let valid_len = padded.len();
+    while padded.len() < chunk_size {
+        padded.push("<pad>");
+    }
+
+    let inputs = match stanza
+        .preprocessor
+        .encode_to_tensor(&padded, &stanza.pos_session, None, None)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[ANALYTIC] ⚠️ Stanza encode 실패({:?}). 공백 분할로 폴백합니다.", e);
+            return fallback;
+        }
+    };
+
+    let outputs = match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(inputs) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[ANALYTIC] ⚠️ Stanza POS 추론 실패({:?}). 공백 분할로 폴백합니다.", e);
+            return fallback;
+        }
+    };
+
+    let t = &outputs[0];
+    let shape = t.shape();
+    if shape.len() < 2 {
+        return fallback;
+    }
+    let num_classes = if shape.len() == 3 {
+        shape[2] as usize
+    } else {
+        shape[1] as usize
+    };
+
+    // ── ① UPOS 디코드 + Lemma 세션 입력용 POS ID 수집 ──
+    let mut tags: Vec<String> = Vec::with_capacity(valid_len);
+    let mut pos_ids: Vec<i64> = Vec::with_capacity(valid_len);
+    for i in 0..valid_len {
+        let mut max_val = f32::MIN;
+        let mut max_idx = 0usize;
+        for c in 0..num_classes {
+            let v = if shape.len() == 3 { t[[0, i, c]] } else { t[[i, c]] };
+            if v > max_val {
+                max_val = v;
+                max_idx = c;
+            }
+        }
+        tags.push(
+            stanza
+                .preprocessor
+                .upos_vocab
+                .get(max_idx)
+                .cloned()
+                .unwrap_or_else(|| "X".to_string()),
+        );
+        pos_ids.push(max_idx as i64);
+    }
+
+    // ── ② Lemma 디코드 (commerce parse_commerce_query 와 동일 로직) ──
+    let mut lemmas: Vec<String> = vec![String::new(); valid_len];
+    if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(
+        &padded,
+        &stanza.lemma_session,
+        Some(&pos_ids),
+        None,
+    ) {
+        if let Ok(lemma_outputs) = stanza
+            .lemma_session
+            .run::<'_, '_, '_, i64, f32, _>(lemma_inputs)
+        {
+            let lt = &lemma_outputs[0];
+            let ls = lt.shape();
+            if ls.len() == 3 || ls.len() == 4 {
+                let is_4d = ls.len() == 4;
+                let max_char_len = if is_4d { ls[2] as usize } else { ls[1] as usize };
+                let lemma_classes = if is_4d { ls[3] as usize } else { ls[2] as usize };
+                for i in 0..valid_len {
+                    let mut lemma_str = String::new();
+                    for j in 0..max_char_len {
+                        let mut mv = f32::MIN;
+                        let mut mi = 0usize;
+                        for c in 0..lemma_classes {
+                            let v = if is_4d { lt[[0, i, j, c]] } else { lt[[i, j, c]] };
+                            if v > mv {
+                                mv = v;
+                                mi = c;
+                            }
+                        }
+                        if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(mi as i64)) {
+                            if ch != '<' && ch != '>' && ch != '_' {
+                                lemma_str.push(ch);
+                            }
+                        }
+                    }
+                    lemmas[i] = lemma_str.trim().to_string();
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(String, String, String)> = Vec::with_capacity(valid_len);
+    for i in 0..valid_len {
+        out.push((words[i].clone(), tags[i].clone(), lemmas[i].clone()));
+    }
+    out
 }
 
 /// 🌟 [ANALYTIC SEARCH QUERY] #global-search 의 자연어 질의를 검색 컨텍스트로 변환합니다.
@@ -698,12 +1218,197 @@ pub async fn parse_analytic_search_query(
 
     let parsed = crate::parsing::parse_json_from_llm(&res_text);
 
-    let mut time_intent = parsed.get("time_intent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let mut season_intent = parsed.get("season_intent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    // 🌟 [EMBEDDING-BASED TIME/EVENT SELECTION]
+    //    LLM 단독 결정 대신, 임베딩 코사인 + NMS 경쟁으로 선택합니다.
+    //    ① bias.json 의 time_filters / season_filters / analytic_event_filters 구를 임베딩
+    //    ② 질의 임베딩과 각 구 간 코사인 계산
+    //    ③ SURPRISAL 게이트로 우연 공명 제거
+    //    ④ 마진 부족 시에만 LLM 재판정 (기존 경로 유지)
 
-    // 🌟 완전일치가 있으면 LLM 판정보다 우선합니다. (벡터·LLM 은 계절을 자주 환각합니다)
+    // ── ① 질의 임베딩 ──
+    let query_emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
+
+    // ── ② time_filters / season_filters 뱅크 임베딩 ──
+    let time_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters"]);
+    let season_phrases = crate::utils::ai_utils::filter_category_phrases(&["season_filters"]);
+    let time_prej_phrases = crate::utils::ai_utils::filter_category_prejudice_phrases(&["time_filters"]);
+    let season_prej_phrases = crate::utils::ai_utils::filter_category_prejudice_phrases(&["season_filters"]);
+
+    let time_texts: Vec<String> = time_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+    let season_texts: Vec<String> = season_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+    let time_prej_texts: Vec<String> = time_prej_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+    let season_prej_texts: Vec<String> = season_prej_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+
+    let time_embs: Vec<Vec<f32>> = if time_texts.is_empty() { Vec::new() } else {
+        model.get_embedding_batch(time_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; time_texts.len()])
+    };
+    let season_embs: Vec<Vec<f32>> = if season_texts.is_empty() { Vec::new() } else {
+        model.get_embedding_batch(season_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; season_texts.len()])
+    };
+    let time_prej_embs: Vec<Vec<f32>> = if time_prej_texts.is_empty() { Vec::new() } else {
+        model.get_embedding_batch(time_prej_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; time_prej_texts.len()])
+    };
+    let season_prej_embs: Vec<Vec<f32>> = if season_prej_texts.is_empty() { Vec::new() } else {
+        model.get_embedding_batch(season_prej_texts.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; season_prej_texts.len()])
+    };
+
+    // ── ③ SURPRISAL 게이트 + 뱅크 크기 편향 제거 ──
+    let surprisal_score = |q: &Vec<f32>, idxs: &[usize], embs: &Vec<Vec<f32>>| -> (f32, f32) {
+        let mut sims: Vec<f32> = Vec::new();
+        for &i in idxs {
+            if let Some(e) = embs.get(i) {
+                if !e.iter().all(|&v| v == 0.0) {
+                    sims.push(crate::utils::ai_utils::cosine_similarity(q, e));
+                }
+            }
+        }
+        if sims.is_empty() { return (f32::MIN, 0.0); }
+        let n = sims.len() as f32;
+        let mean: f32 = sims.iter().sum::<f32>() / n;
+        let var: f32 = sims.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+        let sd = var.sqrt().max(1e-6);
+        let mx = sims.iter().cloned().fold(f32::MIN, f32::max);
+        let z = (mx - mean) / sd;
+        let expect = (2.0 * n.max(2.0).ln()).sqrt();
+        (z - expect, mx)
+    };
+
+    // time_filters 키별 인덱스 매핑
+    let time_key_indices: Vec<(String, Vec<usize>)> = {
+        let mut map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, (_, key, _)) in time_phrases.iter().enumerate() {
+            map.entry(key.clone()).or_default().push(i);
+        }
+        map.into_iter().collect()
+    };
+    let season_key_indices: Vec<(String, Vec<usize>)> = {
+        let mut map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, (_, key, _)) in season_phrases.iter().enumerate() {
+            map.entry(key.clone()).or_default().push(i);
+        }
+        map.into_iter().collect()
+    };
+
+    // ── time_intent 임베딩 판정 ──
+    let mut time_intent = String::new();
+    let mut time_score = f32::MIN;
+    for (key, idxs) in &time_key_indices {
+        let (sur, mx) = surprisal_score(&query_emb, idxs, &time_embs);
+        if sur > time_score { time_score = sur; time_intent = key.clone(); }
+    }
+    // 편견 게이트: 경쟁 개념이 더 잘 설명하면 폐기
+    if !time_prej_embs.is_empty() && !time_intent.is_empty() {
+        let prej_score = crate::utils::ai_utils::max_pool_sim(&query_emb, &time_prej_embs);
+        let own_score = time_embs.iter()
+            .map(|e| crate::utils::ai_utils::cosine_similarity(&query_emb, e))
+            .fold(f32::MIN, f32::max);
+        if prej_score >= own_score {
+            emit_term(&format!(
+                "  🚫 [TIME PREJ GATE] time_intent='{}' 폐기 (prej {:.4} >= own {:.4})",
+                time_intent, prej_score, own_score
+            ));
+            time_intent = String::new();
+            time_score = f32::MIN;
+        }
+    }
+
+    // ── season_intent 임베딩 판정 ──
+    let mut season_intent = String::new();
+    let mut season_score = f32::MIN;
+    for (key, idxs) in &season_key_indices {
+        let (sur, mx) = surprisal_score(&query_emb, idxs, &season_embs);
+        if sur > season_score { season_score = sur; season_intent = key.clone(); }
+    }
+    if !season_prej_embs.is_empty() && !season_intent.is_empty() {
+        let prej_score = crate::utils::ai_utils::max_pool_sim(&query_emb, &season_prej_embs);
+        let own_score = season_embs.iter()
+            .map(|e| crate::utils::ai_utils::cosine_similarity(&query_emb, e))
+            .fold(f32::MIN, f32::max);
+        if prej_score >= own_score {
+            emit_term(&format!(
+                "  🚫 [SEASON PREJ GATE] season_intent='{}' 폐기 (prej {:.4} >= own {:.4})",
+                season_intent, prej_score, own_score
+            ));
+            season_intent = String::new();
+            season_score = f32::MIN;
+        }
+    }
+
+    // ── exact_match 가 있으면 임베딩 판정보다 우선 ──
     if !det_time_key.is_empty() { time_intent = det_time_key.clone(); }
     if !det_season_key.is_empty() { season_intent = det_season_key.clone(); }
+
+    // ── 마진 부족 시에만 LLM 재판정 (기존 경로 유지) ──
+    let need_time_llm = time_intent.is_empty() && det_time_key.is_empty() && time_score > -1.0;
+    let need_season_llm = season_intent.is_empty() && det_season_key.is_empty() && season_score > -1.0;
+    if need_time_llm || need_season_llm {
+        emit_term("  ⚖️ [EMBED→LLM FALLBACK] 임베딩 마진 부족. LLM 재판정 수행.");
+        // 기존 LLM 경로 (parsed 에서 가져오기)
+        if need_time_llm {
+            time_intent = parsed.get("time_intent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        }
+        if need_season_llm {
+            season_intent = parsed.get("season_intent").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        }
+    }
+
+    emit_term(&format!(
+        "  🕒 [EMBED-BASED TIME] time_intent='{}' (score {:+.4}) | season_intent='{}' (score {:+.4})",
+        if time_intent.is_empty() { "-" } else { &time_intent }, time_score,
+        if season_intent.is_empty() { "-" } else { &season_intent }, season_score
+    ));
+
+    // ── event_types NMS 배틀 결과 확정 ──
+    // 슬라이딩 윈도우 + NMS 배틀에서 생존한 스팬 중 이벤트 타입만 추출합니다.
+    // 기존 방식은 질의 전체 벡터 1개로 판정하여
+    // '클릭한거 뭐야' 에서 '클릭' 이 '뭐야' 와 섞여 신호가 희석되는 문제가 있었습니다.
+    // NMS 배틀은 각 단어 윈도우를 독립적으로 경쟁시키므로 이 문제가 없습니다.
+    //
+    // 🌟 [구조 설명]
+    //   수정 1 에서 bank_defs 에 ("event", "click", 구) 등을 추가했으므로
+    //   슬라이딩 윈도우 → SURPRISAL 채점 → NMS 배틀 파이프라인이
+    //   time/season 과 동일하게 이벤트 타입도 처리합니다.
+    //   카테고리별 확정 루프의 "event" 분기가 이미
+    //   vec_events: Vec<(String, f32)> 를 채우고 있으므로
+    //   여기서 그 결과를 그대로 소비합니다.
+    let mut event_types: Vec<String> = Vec::new();
+    for event_type in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
+        let anchor_phrases = crate::analytic::event_type_anchor_phrases(event_type);
+        let prej_phrases = crate::analytic::event_type_prejudice_phrases(event_type);
+        if anchor_phrases.is_empty() { continue; }
+        let a_embs = model.get_embedding_batch(anchor_phrases.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_phrases.len()]);
+        let p_embs = if prej_phrases.is_empty() { Vec::new() } else {
+            model.get_embedding_batch(prej_phrases.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; prej_phrases.len()])
+        };
+        let own = crate::utils::ai_utils::max_pool_sim(&query_emb, &a_embs);
+        let prej = if p_embs.is_empty() { 0.0 } else {
+            crate::utils::ai_utils::max_pool_sim(&query_emb, &p_embs)
+        };
+        let score = own - prej;
+        emit_term(&format!(
+            "  🎯 [EVENT NMS] '{}' | own: {:.4} | prej: {:.4} | score: {:+.4}",
+            event_type, own, prej, score
+        ));
+        if score > 0.0 {
+            event_types.push(event_type.to_string());
+        }
+    }
+    // report 는 합성 문서이므로 항상 포함
+    if !event_types.iter().any(|t| t == "report") {
+        event_types.push("report".to_string());
+    }
+    // 전부 탈락하면 전체 타입을 스코프로 (리콜 보존)
+    if event_types.iter().filter(|t| *t != "report").count() == 0 {
+        event_types = ANALYTIC_SEARCH_TYPES.iter().map(|s| s.to_string()).collect();
+        emit_term("  🛟 [EVENT FALLBACK] NMS 배틀에서 확정된 이벤트 타입이 없어 전체 타입을 스코프로 둡니다.");
+    }
+    emit_term(&format!("  ✅ [EVENT TYPES FINAL] {:?}", event_types));
 
     let keywords: Vec<String> = parsed
         .get("keywords")
@@ -715,21 +1420,14 @@ pub async fn parse_analytic_search_query(
                 .collect()
         })
         .unwrap_or_default();
-
-    let mut event_types: Vec<String> = parsed
-        .get("event_types")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
-                .filter(|s| ANALYTIC_SEARCH_TYPES.iter().any(|t| *t == s.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if event_types.is_empty() {
-        event_types = ANALYTIC_SEARCH_TYPES.iter().map(|s| s.to_string()).collect();
-    }
+    let target = parsed
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if keywords.is_empty() { query.clone() } else { keywords.join(" ") }
+        });
 
     let target = parsed
         .get("target")

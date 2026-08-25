@@ -1,5 +1,67 @@
-pub fn page_type_prompt() -> String { 
-    r###"[TASK]
+pub fn page_type_prompt(search_mode: &str) -> String {
+    match search_mode {
+        "shipping" => {
+            r###"[TASK]
+Based on the provided Pug template, identify the primary trade document category.
+
+[SCHEMA DEFINITIONS]
+- type: The main trade document category. Must be one of:
+  - "PO": Purchase Order, buyer issues to seller.
+  - "PI": Proforma Invoice, quotation or preliminary invoice.
+  - "SC": Sales Contract, agreement between seller and buyer.
+  - "LC": Letter of Credit, documentary credit from issuing bank.
+  - "CI": Commercial Invoice, seller bills buyer for goods.
+  - "PL": Packing List, carton details and weights.
+  - "BL": Bill of Lading, ocean carrier document.
+  - "AWB": Air Waybill, airline transport document.
+  - "SA": Shipping Advice, shipment notification to buyer.
+  - "DO": Delivery Order, release cargo to consignee.
+  - "AN": Arrival Notice, cargo arrival notification.
+  - "BC": Booking Confirmation, space booking with carrier.
+  - "ED": Export Declaration, customs export filing.
+  - "ID": Import Declaration, customs import filing.
+  - "CINV": Customs Invoice, invoice for customs valuation.
+  - "CO": Certificate of Origin, country of origin declaration.
+  - "IC": Inspection Certificate, quality inspection result.
+  - "WC": Weight Certificate, certified weight measurement.
+  - "CA": Certificate of Analysis, laboratory test result.
+  - "PHYTO": Phytosanitary Certificate, plant health.
+  - "HC": Health Certificate, sanitary certificate.
+  - "BEN_CERT": Beneficiary Certificate, beneficiary statement.
+  - "DGD": Dangerous Goods Declaration, hazardous materials.
+  - "MSDS": Material Safety Data Sheet, chemical hazard info.
+  - "POA": Power of Attorney, authorization letter.
+  - "BIZ_LIC": Business License, company registration.
+  - "INS": Insurance Policy, marine cargo insurance.
+  - "TRACKING": Courier label, parcel waybill.
+  - "Unknown": If none of the above match.
+- language: ISO 639-1 language code.
+
+[OUTPUT FORMAT]
+{ "type": "String", "language": "String" }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+        },
+        "analytic" => {
+            r###"[TASK]
+Based on the provided Pug template, identify the user interaction type.
+
+[SCHEMA DEFINITIONS]
+- type: The interaction type. Must be one of:
+  - "click": User pressed or selected an element.
+  - "hover": User lingered over an element without pressing.
+  - "change": User typed, toggled, or picked an option.
+  - "report": A synthesized behavioural summary.
+  - "": If none of the above match.
+- language: ISO 639-1 language code.
+
+[OUTPUT FORMAT]
+{ "type": "String", "language": "String" }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+        },
+        _ => {
+            r###"[TASK]
 Based on the provided Pug template, identify the primary category.
 
 [SCHEMA DEFINITIONS]
@@ -14,7 +76,11 @@ Based on the provided Pug template, identify the primary category.
 - language: ISO 639-1 language code.
 
 [OUTPUT FORMAT]
-{ "type": "String" }"###.to_string() 
+{ "type": "String", "language": "String" }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+        },
+    }
 }
 
 pub fn extract_titles_prompt(page_type: &str) -> String {
@@ -655,8 +721,18 @@ You are a User Behavior Analyst. Answer the user's question using ONLY the retri
    - a bullet list of the concrete supporting actions (what, where, when)
    - one closing sentence on the pattern or the recommended follow-up
 6. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
+7. FORBIDDEN OUTPUT SHAPES: your reply MUST NOT start with '{' or '['. It MUST NOT contain
+   any key/value pair such as "headline": or "supporting_actions": or "closing":.
+   It MUST NOT be wrapped in a code fence.
+8. The FIRST character of your reply MUST be a normal word character of {LANG}.
 
-[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. /no_think"###;
+[EXAMPLE OF A CORRECT REPLY SHAPE]
+<one headline sentence>
+- <supporting action 1>
+- <supporting action 2>
+<one closing sentence>
+
+[ACTION] WRITE THE REPORT ONLY. NO PREAMBLE. NO CODE FENCE. NO JSON. /no_think"###;
 
     template
         .replace("{TIME_CONTEXT}", time_context)
