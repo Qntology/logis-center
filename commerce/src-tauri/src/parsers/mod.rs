@@ -363,6 +363,17 @@ pub fn extract_document_text(file_path: &str) -> anyhow::Result<String> {
         "txt" | "md" | "json" => {
             std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!(e))
         },
+        "pdf" => {
+            let text = pdf_extract::extract_text(path)
+                .map_err(|e| anyhow::anyhow!("PDF text extraction failed: {}", e))?;
+            if text.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "PDF '{}' contains no extractable text (scanned image PDF?). Use image_extraction instead.",
+                    file_path
+                ));
+            }
+            Ok(text)
+        },
         _ => Err(anyhow::anyhow!("Unsupported file extension for text extraction: {}", ext)),
     }
 }
