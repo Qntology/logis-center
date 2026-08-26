@@ -41,20 +41,6 @@ pub struct ForeignInfo {
     pub to: String,
 }
 
-// pub fn merge_node(target: &mut Value, source: &Value) {
-//     if let (Value::Object(target_map), Value::Object(source_map)) = (target, source) {
-//         for (key, source_value) in source_map {
-//             let is_empty = source_value.is_null() || 
-//                            (source_value.is_string() && source_value.as_str() == Some("")) ||
-//                            (source_value.is_number() && source_value.as_f64() == Some(0.0));
-
-//             if !is_empty {
-//                 target_map.insert(key.clone(), source_value.clone());
-//             }
-//         }
-//     }
-// }
-
 #[allow(dead_code)]
 
 pub fn parse_status(status: &str) -> i32 {
@@ -207,17 +193,6 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
     }
 }
 
-// 🌟 [TRADING RELAY FIELD v2 / DIRECTIONAL PAIR]
-//  ── 무엇이 문제였나 ──
-//   v1 은 (from, to) 쌍에 대해 '단 하나의 필드명'만 돌려주었습니다.
-//   그런데 실무 서식은 방향에 따라 참조 필드가 다릅니다.
-//     BL.reference_invoice = CI.doc_number   (BL 쪽 필드는 reference_invoice)
-//     CI.doc_number        = BL.reference_invoice
-//   v1 은 양쪽 모두 "reference_invoice" 를 반환했기 때문에,
-//   CI 문서에서 relay 를 돌 때 `CI.reference_invoice` 라는 존재하지 않는 값을 읽어
-//   조회가 항상 0건이었습니다.
-//
-//  반환값: (내 문서에서 값을 읽어올 필드, 상대 문서에서 조회할 필드)
 pub fn trading_relay_pair(from_type: &str, to_type: &str) -> Option<(&'static str, &'static str)> {
     match (from_type, to_type) {
         // ── 인보이스 참조 축 ──
@@ -282,315 +257,164 @@ pub fn trading_relay_field(from_type: &str, to_type: &str) -> Option<&'static st
     trading_relay_pair(from_type, to_type).map(|(mine, _)| mine)
 }
 
-// 🌟 [TRADING INDEX COLUMN] commerce 가 order↔tracking 을 'order'/'tracking' 이라는
-//  숫자 index 컬럼으로 잇는 것과 동일한 구조를 무역 서식에 부여합니다.
-//
-//  commerce:
-//     order.tracking  = crc32(hash_id("tracking" + team_id + tracking_number))
-//     tracking.order  = crc32(hash_id("order"    + team_id + order_no))
-//
-//  trading (이 함수가 정의):
-//     BL.ci = crc32(hash_id("CI" + team_id + 정규화된 CI doc_number))
-//     CI.bl = crc32(hash_id("BL" + team_id + 정규화된 BL doc_number))
-//
-//  반환값은 data.* 인덱스 경로에 쓰일 소문자 컬럼명입니다.
-//  (Dexie 의 'data.rel_ci' 인덱스와 1:1 대응)
+
 pub fn trading_index_column(doc_type: &str) -> String {
     format!("rel_{}", doc_type.to_lowercase())
 }
 
 pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>, MergeInfo)> {
-
     let mut primary_type = primary_item.get("type")?.as_str()?;
-
-    
-
-    // [STRICT PARITY] Handle type aliasing from server logic
 
     if primary_type == "sales" { primary_type = "order"; }
 
     let f_type = if foreign_type == "receiving" || foreign_type == "shipping" { "tracking" } else { foreign_type };
-
-    
-
     let mut queries = Vec::new();
-
-    
-
     let get_val = |key: &str| -> Option<Value> { primary_item.get(key).cloned() };
 
-    
-
-    // Common include fields for sales/goods merge
-
     let sales_includes = vec![
-
         "event", "width", "height", "length", "weight", "size", "currency", 
-
         "cost_price", "sale_price", "discount", "quantity", "tracking", 
-
         "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", 
-
         "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", 
-
         "lease", "rental", "refurbish", "tax_included", "release_date"
-
     ].into_iter().map(String::from).collect::<Vec<_>>();
-
-
 
     let (merge_from, merge_to) = (f_type.to_string(), primary_type.to_string());
 
-
-
     match (f_type, primary_type) {
-
-                // --- Order as Primary ---
-
-                ("goods", "order") => {
-
-                    if let Some(tracking) = get_val("tracking").or_else(|| get_val("tracking_number")) {
-
-                        queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "tracking".to_string(), value: tracking, status: None });
-
-                        return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
-
-                    } else {
-
-        
+        // --- Order as Primary ---
+        ("goods", "order") => {
+            if let Some(tracking) = get_val("tracking").or_else(|| get_val("tracking_number")) {
+                queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "tracking".to_string(), value: tracking, status: None });
+                return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
+            } else {
 
                 let index_val = get_val("index")?;
 
                 queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "index".to_string(), value: index_val.clone(), status: None });
 
                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { includes: sales_includes, column: Some("index".to_string()), value: Some(index_val), foreign: None, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
-
             }
-
         },
+        ("tracking", "order") => {
+            let index_val = get_val("index")?;
 
-                ("tracking", "order") => {
-
-                    let index_val = get_val("index")?;
-
-                    if get_val("tracking").is_some() || get_val("tracking_number").is_some() {
-
-                        queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
-
-        
-
-                return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
-                    includes: vec!["width", "height", "length", "weight"].into_iter().map(String::from).collect(), 
-
-                    column: Some("index".to_string()), value: Some(index_val), 
-
-                    foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }),
-
-                    from: merge_to.clone(), to: merge_from.clone()
-
-                }), from: merge_from, to: merge_to }));
-
-            } else {
-
+            if get_val("tracking").is_some() || get_val("tracking_number").is_some() {
                 queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
 
                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
-                    includes: vec!["no", "goods", "event"].into_iter().map(String::from).collect(),
-
+                    includes: vec!["width", "height", "length", "weight"].into_iter().map(String::from).collect(), 
                     column: Some("index".to_string()), value: Some(index_val), 
-
                     foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }),
-
-                    from: merge_from.clone(), to: merge_to.clone()
-
+                    from: merge_to.clone(), to: merge_from.clone()
                 }), from: merge_from, to: merge_to }));
 
+            } else {
+                queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
+
+                return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
+                    includes: vec!["no", "goods", "event"].into_iter().map(String::from).collect(),
+                    column: Some("index".to_string()), value: Some(index_val), 
+                    foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }),
+                    from: merge_from.clone(), to: merge_to.clone()
+                }), from: merge_from, to: merge_to }));
             }
-
         },
-
         ("coupon" | "event", "order") => {
-
             let event_val = get_val("event")?;
 
             queries.push(QueryInfo { r#type: f_type.to_string(), table: "event".to_string(), column: "index".to_string(), value: event_val, status: None });
 
-            return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
+            return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge {
                 includes: vec!["discount".to_string()], column: Some("index".to_string()), value: Some(get_val("index")?), 
-
                 foreign: None, from: merge_from.clone(), to: merge_to.clone() 
-
             }), from: merge_from, to: merge_to }));
-
         },
-
-
-
-        // --- Goods as Primary ---
-
         ("order", "goods") => {
-
             let index_val = get_val("index")?;
 
             queries.push(QueryInfo { r#type: f_type.to_string(), table: "sales".to_string(), column: "goods".to_string(), value: index_val.clone(), status: None });
 
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                 includes: sales_includes, column: Some("goods".to_string()), value: Some(index_val), 
-
                 foreign: None, from: merge_to.clone(), to: merge_from.clone() 
-
             }), from: merge_from, to: merge_to }));
-
         },
-
         ("tracking", "goods") => {
-
             queries.push(QueryInfo { r#type: "order".to_string(), table: "tracking".to_string(), column: "goods".to_string(), value: get_val("index")?, status: Some(0) });
 
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                 includes: vec!["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"].into_iter().map(String::from).collect(),
-
                 column: None, value: None, foreign: None, from: merge_to.clone(), to: merge_from.clone() 
-
             }), from: merge_from, to: merge_to }));
-
         },
-
         ("coupon" | "event", "goods") => {
-
             let event_val = get_val("event")?;
 
             queries.push(QueryInfo { r#type: f_type.to_string(), table: "event".to_string(), column: "index".to_string(), value: event_val, status: None });
 
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                 includes: vec!["discount".to_string()], column: Some("index".to_string()), value: Some(get_val("index")?), 
-
                 foreign: None, from: merge_from.clone(), to: merge_to.clone() 
-
             }), from: merge_from, to: merge_to }));
-
         },
-
-
-
-        // --- Tracking as Primary ---
-
         ("goods", "tracking") => {
-
              queries.push(QueryInfo { r#type: "order".to_string(), table: "sales".to_string(), column: "goods".to_string(), value: get_val("goods")?, status: Some(0) });
 
              return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                 includes: vec!["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"].into_iter().map(String::from).collect(),
-
                 column: Some("index".to_string()), value: Some(get_val("index")?), 
-
                 foreign: None, 
-
                 from: merge_from.clone(), to: merge_to.clone() 
-
             }), from: merge_from, to: merge_to }));
-
         },
-
         ("order", "tracking") => {
-
             if let Some(goods_val) = get_val("goods") {
 
                 queries.push(QueryInfo { r#type: f_type.to_string(), table: "sales".to_string(), column: "goods".to_string(), value: goods_val, status: None });
 
                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                     includes: vec!["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"].into_iter().map(String::from).collect(),
-
                     column: Some("tracking".to_string()), value: Some(get_val("index")?), 
-
                     foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }), 
-
                     from: merge_to.clone(), to: merge_from.clone() 
-
                 }), from: merge_from, to: merge_to }));
-
             } else {
-
                 queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: get_val("index")?, status: None });
 
                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                     includes: vec!["no", "order", "goods", "event"].into_iter().map(String::from).collect(),
-
                     column: Some("index".to_string()), value: Some(get_val("index")?), 
-
                     foreign: Some(ForeignInfo { from: "index".to_string(), to: "order".to_string() }), 
-
                     from: merge_from.clone(), to: merge_to.clone() 
-
                 }), from: merge_from, to: merge_to }));
-
             }
-
         },
-
-
-
-        // --- Coupon/Event as Primary ---
-
         ("goods", "coupon" | "event") => {
+            queries.push(QueryInfo { r#type: f_type.to_string(), table: "sales".to_string(), column: "event".to_string(), value: get_val("index")?, status: None });
 
-             queries.push(QueryInfo { r#type: f_type.to_string(), table: "sales".to_string(), column: "event".to_string(), value: get_val("index")?, status: None });
-
-             // No update/upsert info in original logic for this case, just return from/to
-
-             return Some((queries, MergeInfo { upsert: None, update: None, from: merge_to.clone(), to: merge_from.clone() }));
-
+            return Some((queries, MergeInfo { upsert: None, update: None, from: merge_to.clone(), to: merge_from.clone() }));
         },
-
         ("order", "coupon" | "event") => {
-
              queries.push(QueryInfo { r#type: f_type.to_string(), table: "sales".to_string(), column: "event".to_string(), value: get_val("index")?, status: Some(0) });
 
              return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
                 includes: vec!["discount".to_string()], column: Some("event".to_string()), value: Some(get_val("index")?), 
-
                 foreign: None, from: merge_to.clone(), to: merge_from.clone() 
-
             }), from: merge_to.clone(), to: merge_from.clone() }));
-
         },
-
         ("event", "coupon") => {
+            if let Some(event_val) = get_val("event") {
+                queries.push(QueryInfo { r#type: f_type.to_string(), table: "event".to_string(), column: "index".to_string(), value: event_val, status: None });
 
-             if let Some(event_val) = get_val("event") {
-
-                 queries.push(QueryInfo { r#type: f_type.to_string(), table: "event".to_string(), column: "index".to_string(), value: event_val, status: None });
-
-                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
-
+                return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
                     includes: vec!["started_at", "expired_at", "phone", "address", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"].into_iter().map(String::from).collect(), 
-
                     column: Some("index".to_string()), value: Some(get_val("index")?), 
-
                     foreign: None, from: merge_from.clone(), to: merge_to.clone() 
-
                 }), from: merge_from, to: merge_to }));
-
-             }
-
-             None
-
+            }
+            None
         },
-
-
-
         _ => None,
-
     }
-
 }

@@ -1,21 +1,11 @@
 use once_cell::sync::Lazy;
 use serde_json::Value;
 
-// 🌟 [다국어 지원] 빌드 시점에 bias.json 파일을 읽어와 메모리에 영구 등재합니다.
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
     let json_str = include_str!("bias.json");
     serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
 });
 
-/// 🌟 [LANG CODE] 언어 문자열에서 ISO-639-1 2자 코드를 안전하게 추출합니다.
-///  ── 왜 필요한가 ──
-///   기존 코드는 `&lang[0..2]` 로 '바이트' 를 잘랐습니다.
-///   ASCII 입력("korean" → "ko")은 우연히 맞지만, 비ASCII 가 들어오면
-///   char boundary 위반으로 즉시 panic 합니다. ("한국어".len()=9 라 게이트를 통과한 뒤
-///   0..2 가 '한'(3바이트) 한가운데를 자릅니다)
-///  ── 부수 효과 ──
-///   zh-tw / zh-hk 번체 분기를 get_localized_page_type 한 곳에서만 처리하고 있어
-///   나머지 10개 함수는 전부 "zh" 로 뭉개고 있었습니다. 여기서 함께 통일합니다.
 pub fn lang_code_of(lang: &str) -> String {
     let l = lang.trim().to_lowercase();
     if l.starts_with("zh-tw") || l.starts_with("zh-hk") || l.starts_with("zh-hant") {
@@ -383,9 +373,6 @@ pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) 
     (list_hints, form_hints)
 }
 
-// 🌟 [STAGE-1 전용 멀티패스 컨텍스트 추출기]
-// LLM 스키마용(get_detail_schema_fields)과 분리하여, bias.json의 모든 속성(layout_list 등 포함)과
-// 추상적 검색 의도(Core Intent)를 100% 동적으로 긁어모아 벡터 매칭의 해상도를 극대화합니다.
 pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, String, String)> {
     let mut contexts = Vec::new();
     let lang_code_owned = lang_code_of(lang);
@@ -568,10 +555,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("description", "String", "description detail", "");
             add("short_description", "String", "short description summary", "");
             add("tags", "Array of Strings", "tags keywords", "");
-            // 🌟 [COLOR] 색상은 bias.json 루트에 전역 노드로만 존재해
-            //    PLINKO 속성 후보로는 올라오는데 추출 스키마에는 없었습니다.
-            //    그래서 data.color 조건이 발행되어도 어떤 문서에도 그 경로가 없어
-            //    matchCondition 이 false 를 돌려주고 결과가 통째로 0건이 되었습니다.
             add("color", "String", "color hue shade tint", "");
             add("origin_country", "String", "origin country", "");
             add("manufacturer", "String", "manufacturer", "");
@@ -651,17 +634,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("completed", "Boolean", "completed purchased", "");
             add("registration_date", "String", "date registration time", "");
         },
-        // 🌟 [ANALYTIC BEHAVIOUR SCHEMA] 사용자 행동 로그 도메인.
-        //  ── 왜 필요한가 ──
-        //   index_item_chunks 는 get_detail_schema_fields 가 빈 배열을 돌려주면
-        //   "대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다" 로 조기 종료합니다.
-        //   그래서 click / hover / change / report 문서는 아이템 벡터 1개만 생기고
-        //   item_chunks 가 0건이라 STAGE-4(청크 코사인)가 항상 비었습니다.
-        //  ── 축 설계 ──
-        //   저장 축은 자유 서술 3개(action / summary / relate)와
-        //   합성 3개(cross_action_flow / intent_evolution / consistent_preferences)입니다.
-        //   bias.json 에 노드를 만들지 않고 en_bias 만으로 뱅크를 세워도
-        //   다국어 임베딩이 교차언어 매칭을 담당하므로 리콜이 성립합니다.
         "click" | "hover" | "change" | "report" => {
             add("id,link", "", "id link url address", "");
             add("action", "String",
@@ -683,20 +655,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                 "repeated preference, recurring choice, habitual attribute, favourite option",
                 "identifier, code, url, link, date, price, status");
         },
-        // 🌟 [TRADE DOC SCHEMA] 무역 서식 도메인.
-        //  ── 왜 필요한가 ──
-        //   기존에는 BL / AWB / LC 등 27종이 전부 `_` 로 떨어져
-        //   id,link / title / status 세 개짜리 속성 뱅크만 받았습니다.
-        //   extract_shipping_conditions 는 33개 축을 조건으로 뽑는데
-        //   그 조건을 받아 줄 속성이 스키마에 존재하지 않아,
-        //   벡터 매칭이 필요한 어떤 경로도 무역 필드를 짚지 못했습니다.
-        //  ── 필드 이름 ──
-        //   extract_shipping_conditions(검색) / get_trade_category_schema(추출)와
-        //   동일한 canonical 이름을 씁니다. 세 곳이 같은 이름 공간을 공유해야
-        //   저장·조회·질의가 alias 없이 바로 만납니다.
-        //  ⚠️ 'shipping' 과 'receiving' 은 넣지 않습니다.
-        //     proxy 가 택배 라벨에 붙이는 commerce 계열 타입이라
-        //     여기 넣으면 운송장이 tracking 스키마 대신 무역 스키마로 빠집니다.
         "shipping_doc"
         | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
         | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
@@ -747,8 +705,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("id,link", "", "id link", "");
             add("title", "String", "title name", "");
             add("status", "String", "status state", "");
-            // 🌟 get_list_schema_fields 의 동일 분기에는 있는데 여기만 빠져 있어,
-            //    목록에서는 등록일이 잡히고 상세에서는 잡히지 않았습니다.
             add("registration_date", "String", "date registration", "");
         }
     }

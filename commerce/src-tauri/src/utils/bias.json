@@ -1,82 +1,80 @@
 {
-  {
-    "analytic_event_filters": {
-      "click": {
-        "semantic": "the user pressed or selected a specific element",
-        "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",
-        "prejudice": "hover, mouse over, lingered, typed, entered, input, summary, report",
-        "exact_match": [
-          "click", "clicked", 
-          "클릭", "클릭한", "클릭된", 
-          "クリック", "クリックした", 
-          "点击", "单击", 
-          "klick", "geklickt", 
-          "clic", "cliqueado", 
-          "cliqué", "cliquer", 
-          "clique", "clicado", 
-          "نقر", "نقرة", 
-          "klik", "kliknutí", 
-          "cliccato", "cliccare", 
-          "geklikt"
-        ]
-      },
-      "hover": {
-        "semantic": "the user lingered on an element without pressing it",
-        "bias": "hover, hovered, mouse over, linger, lingered, dwell, dwelled, look at, looked at, browse, browsed, scan, glance, viewed without clicking, 호버, 마우스오버, 머물, 둘러봤, 살펴봤, 구경, ホバー, 悬停, survoler, schweben",
-        "prejudice": "click, pressed, selected, typed, entered, input, summary, report",
-        "exact_match": [
-          "hover", "hovered", 
-          "호버", "마우스오버", 
-          "ホバー", "マウスオーバー", 
-          "悬停", "划过", 
-          "gehovert", "schweben", 
-          "pasar el ratón", "sobreponer", 
-          "survol", "survolé", 
-          "passar o mouse", 
-          "تمرير المؤشر", "تحويم", 
-          "najetí myší", "přejetí", 
-          "passaggio del mouse", 
-          "zweven", "eroverheen gaan"
-        ]
-      },
-      "change": {
-        "semantic": "the user typed a value or picked an option in a form control",
-        "bias": "change, changed, type, typed, enter, entered, input, fill in, filled in, edit, edited, modify, toggle, switch, select an option, 입력, 입력한, 변경, 수정, 타이핑, 검색어, 옵션선택, 入力, 変更, 输入, 修改, saisir, eingeben",
-        "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
-        "exact_match": [
-          "change", "changed", "input", 
-          "입력", "입력한", "변경", "수정", 
-          "入力", "変更", 
-          "输入", "修改", "更改", 
-          "änderung", "geändert", "eingabe", 
-          "cambio", "cambiado", "ingreso", 
-          "changement", "changé", "saisie", 
-          "mudança", "alterado", "inserido", 
-          "تغيير", "تعديل", "إدخال", 
-          "změna", "změněno", "zadání", 
-          "modifica", "cambiato", "inserimento", 
-          "wijziging", "gewijzigd", "invoer"
-        ]
-      },
-      "report": {
-        "semantic": "an aggregated behaviour summary across several actions",
-        "bias": "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated, most frequent, most clicked, ranking, 리포트, 요약, 흐름, 패턴, 경향, 분석, 통계, 가장 많이, 가장 자주, 순위, レポート, 要約, 报告, 汇总, rapport, Bericht",
-        "prejudice": "single click, single hover, one keystroke, individual event",
-        "exact_match": [
-          "report", "summary", 
-          "리포트", "요약", "패턴", "통계", 
-          "レポート", "要約", "統計", 
-          "报告", "汇总", "统计", 
-          "bericht", "zusammenfassung", 
-          "informe", "reporte", "resumen", 
-          "rapport", "résumé", 
-          "relatório", "resumo", 
-          "تقرير", "ملخص", "إحصائيات", 
-          "zpráva", "přehled", "statistika", 
-          "rapporto", "riepilogo", 
-          "overzicht", "samenvatting"
-        ]
-      }
+  "analytic_event_filters": {
+    "click": {
+      "semantic": "the user pressed or selected a specific element",
+      "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",
+      "prejudice": "hover, mouse over, lingered, typed, entered, input, summary, report",
+      "exact_match": [
+        "click", "clicked", 
+        "클릭", "클릭한", "클릭된", 
+        "クリック", "クリックした", 
+        "点击", "单击", 
+        "klick", "geklickt", 
+        "clic", "cliqueado", 
+        "cliqué", "cliquer", 
+        "clique", "clicado", 
+        "نقر", "نقرة", 
+        "klik", "kliknutí", 
+        "cliccato", "cliccare", 
+        "geklikt"
+      ]
+    },
+    "hover": {
+      "semantic": "the user lingered on an element without pressing it",
+      "bias": "hover, hovered, mouse over, linger, lingered, dwell, dwelled, look at, looked at, browse, browsed, scan, glance, viewed without clicking, 호버, 마우스오버, 머물, 둘러봤, 살펴봤, 구경, ホバー, 悬停, survoler, schweben",
+      "prejudice": "click, pressed, selected, typed, entered, input, summary, report",
+      "exact_match": [
+        "hover", "hovered", 
+        "호버", "마우스오버", 
+        "ホバー", "マウスオーバー", 
+        "悬停", "划过", 
+        "gehovert", "schweben", 
+        "pasar el ratón", "sobreponer", 
+        "survol", "survolé", 
+        "passar o mouse", 
+        "تمرير المؤشر", "تحويم", 
+        "najetí myší", "přejetí", 
+        "passaggio del mouse", 
+        "zweven", "eroverheen gaan"
+      ]
+    },
+    "change": {
+      "semantic": "the user typed a value or picked an option in a form control",
+      "bias": "change, changed, type, typed, enter, entered, input, fill in, filled in, edit, edited, modify, toggle, switch, select an option, 입력, 입력한, 변경, 수정, 타이핑, 검색어, 옵션선택, 入力, 変更, 输入, 修改, saisir, eingeben",
+      "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
+      "exact_match": [
+        "change", "changed", "input", 
+        "입력", "입력한", "변경", "수정", 
+        "入力", "変更", 
+        "输入", "修改", "更改", 
+        "änderung", "geändert", "eingabe", 
+        "cambio", "cambiado", "ingreso", 
+        "changement", "changé", "saisie", 
+        "mudança", "alterado", "inserido", 
+        "تغيير", "تعديل", "إدخال", 
+        "změna", "změněno", "zadání", 
+        "modifica", "cambiato", "inserimento", 
+        "wijziging", "gewijzigd", "invoer"
+      ]
+    },
+    "report": {
+      "semantic": "an aggregated behaviour summary across several actions",
+      "bias": "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated, most frequent, most clicked, ranking, 리포트, 요약, 흐름, 패턴, 경향, 분석, 통계, 가장 많이, 가장 자주, 순위, レポート, 要約, 报告, 汇总, rapport, Bericht",
+      "prejudice": "single click, single hover, one keystroke, individual event",
+      "exact_match": [
+        "report", "summary", 
+        "리포트", "요약", "패턴", "통계", 
+        "レポート", "要約", "統計", 
+        "报告", "汇总", "统计", 
+        "bericht", "zusammenfassung", 
+        "informe", "reporte", "resumen", 
+        "rapport", "résumé", 
+        "relatório", "resumo", 
+        "تقرير", "ملخص", "إحصائيات", 
+        "zpráva", "přehled", "statistika", 
+        "rapporto", "riepilogo", 
+        "overzicht", "samenvatting"
+      ]
     }
   },
   "trade_schema": {
