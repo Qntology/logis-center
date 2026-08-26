@@ -3022,20 +3022,43 @@ class GlobalTaskManager {
     static async forceReset() {
         this.isBusy = false;
         this.currentTaskId = null;
-        this.currentTaskPayload = null; 
+        this.currentTaskPayload = null;
         this.activeRefs.clear();
         this.queue = [];
         this.backendQueued = []; // 🌟 전체 초기화 반영
-        
-        // 🌟 Dexie DB 완전 초기화 (모든 테이블 비우기)
+        // 🌟 Dexie DB 초기화 (세션/설정 키는 보존)
         try {
             await appDb.table("ts_queue").clear();
-            await appDb.table("kv_store").clear();
-            console.log("[QUEUE] Dexie DB tables fully cleared.");
+            // 🌟 [SESSION PRESERVE] kv_store 를 통째로 clear() 하면
+            //    chat_session(로그인 세션), search_mode, hidden_pages,
+            //    my_sync_seed, oauth_registered_sites 등 사용자 상태가
+            //    전부 소멸하여 앱 재시작 시 로그인이 풀립니다.
+            //    '작업 큐/락/터미널 로그' 관련 키만 선택적으로 삭제합니다.
+            //
+            //    ⚠️ btn-reset-db 경로는 이 함수 호출 '직후' 에
+            //       appDb.delete() 로 Dexie DB 자체를 물리 삭제하므로
+            //       여기서 보존해도 완전 초기화에는 영향이 없습니다.
+            const PRESERVE_KEYS = new Set([
+                "chat_session",
+                "search_mode",
+                "hidden_pages",
+                "my_sync_seed",
+                "oauth_registered_sites",
+                "oauth_client_address",
+                "item_tombstones",
+                "schema_v4_notified",
+                "force_cpu_mode"
+            ]);
+            const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+            for (const key of allKeys) {
+                if (typeof key === "string" && !PRESERVE_KEYS.has(key)) {
+                    await appDb.table("kv_store").delete(key);
+                }
+            }
+            console.log("[QUEUE] Dexie DB tables cleared (session keys preserved).");
         } catch (e) {
             console.error("[QUEUE] Dexie DB clear error:", e);
         }
-
         // 🌟 LanceDB 전면 초기화 호출 (새로고침 전에 백엔드 초기화가 완료되도록 대기)
         try {
             await invoke("reset_lancedb");
@@ -8815,11 +8838,25 @@ async function initSession() {
             const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
             // 🌟 2. DB엔 없어도 TS Queue에 남아있는 녀석은 아직 Rust로 안 넘어간 정당한 대기열입니다.
             const isPendingInQueue = GlobalTaskManager.queue.some(q => q.taskId === currentLockId);
-            
             if (!isTaskStillAlive && !isPendingInQueue) {
                 console.log(`[LOCK] Zombie detected: ${currentLockId} is not active in Backend or Queue. Releasing.`);
                 await kvRemove("sys_lock");
-                await GlobalTaskManager.forceReset();
+                // 🌟 [SESSION PRESERVE] 기존에는 여기서 forceReset() 을 호출하여
+                //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
+                //    Zombie lock 해제는 락과 큐 상태만 정리하면 충분합니다.
+                //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
+                GlobalTaskManager.isBusy = false;
+                GlobalTaskManager.currentTaskId = null;
+                GlobalTaskManager.currentTaskPayload = null;
+                GlobalTaskManager.activeRefs.clear();
+                GlobalTaskManager.queue = [];
+                GlobalTaskManager.backendQueued = [];
+                try {
+                    await appDb.table("ts_queue").clear();
+                } catch (e) {
+                    console.warn("[LOCK] ts_queue clear failed:", e);
+                }
+                console.log("[LOCK] Zombie lock released. Session and settings preserved.");
             } else {
                 console.log(`[LOCK] Valid task detected: ${currentLockId}. Keeping lock.`);
                 if (currentLockId.startsWith("search_")) isSearching = true;
@@ -9335,17 +9372,20 @@ updateModelStatusUI();
 
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
-document.getElementById("unload-btn")?.addEventListener("click", async () => { 
-    try { 
-        // 🌟 메모리 강제 해제 시 진행 중인 프론트엔드 락도 함께 초기화합니다.
-        await GlobalTaskManager.forceReset();
+document.getElementById("unload-btn")?.addEventListener("click", async () => {
+    try {
+        // 🌟 [SESSION PRESERVE] 기존에는 forceReset() 을 호출하여
+        //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
+        //    메모리 해제는 모델/큐 상태만 정리하면 충분하며,
+        //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
+        GlobalTaskManager.isBusy = false;
+        GlobalTaskManager.currentTaskId = null;
+        GlobalTaskManager.currentTaskPayload = null;
         isExtracting = false;
         isSearching = false;
         stopSpinner();
-
-        await invoke("unload_model"); 
-        alert("Memory cleared."); 
-        
+        await invoke("unload_model");
+        alert("Memory cleared.");
         // 버튼 상태 복구
         await updateExtractButtonVisibility();
         if (btnSubmit && searchInput) {
@@ -9358,7 +9398,7 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
         }
     } catch (e) {
         console.error("[WIDGET] Unload failed:", e);
-    } 
+    }
 });
 
 document.getElementById("invite-email-input")?.addEventListener("input", (e) => {
