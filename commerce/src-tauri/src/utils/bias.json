@@ -228,6 +228,36 @@
         "semantic": "the color a shopper names when narrowing a catalog",
         "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, rouge, bleu, vert, jaune, marron, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, warna, krem, hitam, putih, merah, biru, hijau, kuning, cokelat, abu-abu, ungu, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, สี, เบจ, ดำ, ขาว, แดง, น้ำเงิน, เขียว, เหลือง, ชมพู, น้ำตาล, เทา, ม่วง",
         "prejudice": "identifier, code, url, link, date, price, quantity, status, address, phone number, card, bank, payment, size, weight"
+      },
+      "shipping_doc.pol": {
+        "semantic": "the port or airport where the cargo is loaded",
+        "bias": "port of loading, loading port, port of departure, airport of departure, BUSAN, INCHEON, PYEONGTAEK, SHANGHAI, NINGBO, SHENZHEN, QINGDAO, HONG KONG, KAOHSIUNG, TOKYO, YOKOHAMA, KOBE, SINGAPORE, PORT KLANG, LAEM CHABANG, HO CHI MINH, HAIPHONG, JAKARTA, MUMBAI, CHENNAI, JEBEL ALI, ROTTERDAM, HAMBURG, ANTWERP, LE HAVRE, FELIXSTOWE, VALENCIA, GENOA, PIRAEUS, LOS ANGELES, LONG BEACH, NEW YORK, SAVANNAH, VANCOUVER, SANTOS, 선적항, 출발항, 적재항, 부산, 인천, 평택, 상하이, 닝보, 선전, 칭다오, 홍콩, 도쿄, 요코하마, 고베, 싱가포르, 호치민, 하이퐁, 자카르타, 뭄바이, 두바이, 로테르담, 함부르크, 앤트워프, 로스앤젤레스, 롱비치, 뉴욕, 積出港, 船積港, 装货港, 起运港",
+        "prejudice": "port of discharge, destination, place of delivery, document number, issue date, gross weight, amount, container number, vessel name"
+      },
+      "shipping_doc.pod": {
+        "semantic": "the port or airport where the cargo is discharged",
+        "bias": "port of discharge, discharge port, port of destination, airport of destination, final destination, LOS ANGELES, LONG BEACH, NEW YORK, HOUSTON, SAVANNAH, VANCOUVER, ROTTERDAM, HAMBURG, ANTWERP, LE HAVRE, VALENCIA, GENOA, PIRAEUS, JEBEL ALI, SINGAPORE, PORT KLANG, HO CHI MINH, HAIPHONG, MANILA, JAKARTA, SYDNEY, MELBOURNE, SANTOS, BUENOS AIRES, 양륙항, 도착항, 하역항, 최종목적지, 롱비치, 뉴욕, 로테르담, 함부르크, 두바이, 싱가포르, 호치민, 마닐라, 시드니, 揚地港, 卸货港, 目的港, 到着港",
+        "prejudice": "port of loading, departure, place of receipt, document number, issue date, gross weight, amount, container number, vessel name"
+      },
+      "shipping_doc.vessel": {
+        "semantic": "the name of the ship or the flight that carries the cargo",
+        "bias": "vessel, vessel name, ocean vessel, mother vessel, flight number, carrier, MAERSK, MSC, CMA CGM, HAPAG LLOYD, ONE, EVERGREEN, COSCO, HMM, YANG MING, ZIM, OOCL, 선박명, 모선명, 본선명, 항공편명, 편명, 선사, 船名, 母船, 船舶名称, 航班号",
+        "prejudice": "voyage number, port of loading, port of discharge, document number, issue date, container number, gross weight, amount"
+      },
+      "shipping_doc.sender_name": {
+        "semantic": "the party that ships or sells the cargo",
+        "bias": "shipper, exporter, seller, supplier, consignor, vendor, beneficiary, 송하인, 수출자, 판매자, 선적인, 공급자, 발송인, 수익자, 荷送人, 輸出者, 売主, 发货人, 出口商, 卖方, expéditeur, exportateur, vendeur, Absender, Exporteur, Verkäufer, expedidor, exportador, vendedor, mittente, esportatore, venditore, грузоотправитель, экспортёр, продавец, المرسل, المصدر, البائع",
+        "prejudice": "consignee, importer, buyer, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "shipping_doc.recipient_name": {
+        "semantic": "the party that receives or buys the cargo",
+        "bias": "consignee, importer, buyer, receiver, to order, to order of shipper, applicant, 수하인, 수입자, 구매자, 인수인, 수취인, 개설의뢰인, 荷受人, 輸入者, 買主, 收货人, 进口商, 买方, destinataire, importateur, acheteur, Empfänger, Importeur, Käufer, consignatario, importador, comprador, destinatario, importatore, compratore, грузополучатель, импортёр, покупатель, المرسل إليه, المستورد, المشتري",
+        "prejudice": "shipper, exporter, seller, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "shipping_doc.incoterms": {
+        "semantic": "the ICC trade term that fixes cost and risk transfer",
+        "bias": "incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP, ex works, free carrier, free on board, cost and freight, cost insurance and freight, delivered at place, delivered duty paid, 인코텀즈, 무역조건, 가격조건, 정형거래조건, 본선인도, 운임보험료포함, 공장인도, 관세지급인도, インコタームズ, 貿易条件, 国际贸易术语, 贸易条件",
+        "prejudice": "payment terms, freight prepaid, freight collect, currency, amount, weight, document number, issue date, port, vessel"
       }
     },
     "abstract_bridge": {
@@ -1266,6 +1296,128 @@
         "semantic": "등록일, 생성일",
         "bias": "이벤트일자, 이벤트날짜, 이벤트등록일, 2026-02-15",
         "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소"
+      }
+    },
+    "shipping_doc": {
+      "layout_list": {
+        "semantic": "다중 무역 서식을 나열하는 목록, 표, 리스트 페이지",
+        "bias": "서류목록, 무역서류리스트, 선적서류목록, 인보이스목록, document list, shipping document list, invoice list",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "단일 무역 서식의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "bias": "서류상세, 무역서류상세, 선적서류상세, 인보이스상세, document detail, shipping document form, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "식별자, 링크, 서류번호, 문서번호",
+        "bias": "서류번호, 문서번호, 참조번호, document number, doc no, reference number, B/L No, AWB No, Invoice No, PO No",
+        "prejudice": "선적일, 발행일, 발송인, 수하인, 선사, 항구, 컨테이너번호, 씰번호, 중량, 금액, 통화, HS코드, 인코텀즈, 결제조건"
+      },
+      "doc_number": {
+        "semantic": "서류번호, 문서번호, 대표 식별번호",
+        "bias": "서류번호, 문서번호, 선하증권번호, 항공운송장번호, 인보이스번호, 계약번호, document number, bill of lading number, air waybill number, invoice number, contract number, HBL, MBL",
+        "prejudice": "컨테이너번호, 씰번호, HS코드, 부킹번호, 신용장번호, 발행일, 선적일, 중량, 금액"
+      },
+      "doc_type": {
+        "semantic": "서식 종류, 문서 유형",
+        "bias": "서식종류, 문서유형, 선하증권, 항공운송장, 상업송장, 포장명세서, 원산지증명서, 신용장, bill of lading, air waybill, commercial invoice, packing list, certificate of origin, letter of credit",
+        "prejudice": "서류번호, 문서번호, 발행일, 선적일, 발송인, 수하인, 항구, 중량, 금액, 통화"
+      },
+      "status": {
+        "semantic": "상태, 진행상황",
+        "bias": "서류상태, 진행상황, 발행완료, 접수, 통관중, 선적완료, 도착, 인도완료, 취소, issued, in transit, cleared, delivered, cancelled",
+        "prejudice": "서류번호, 문서번호, 발행일, 선적일, 발송인, 수하인, 선사, 항구, 컨테이너번호, 중량, 금액, 통화, HS코드"
+      },
+      "issue_date": {
+        "semantic": "발행일, 작성일",
+        "bias": "발행일, 작성일, 서류일자, 발행일자, issue date, date of issue, issued on, 2026-03-15",
+        "prejudice": "선적일, 출항일, 입항일, 만료일, 유효기일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "sender_name": {
+        "semantic": "송하인, 수출자, 판매자, 선적인 이름",
+        "bias": "송하인, 수출자, 판매자, 선적인, 공급자, 발송인, shipper, exporter, seller, supplier, consignor, vendor",
+        "prejudice": "수하인, 수입자, 구매자, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+      },
+      "recipient_name": {
+        "semantic": "수하인, 수입자, 구매자 이름",
+        "bias": "수하인, 수입자, 구매자, 인수인, consignee, importer, buyer, receiver, to order of",
+        "prejudice": "송하인, 수출자, 판매자, 선적인, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+      },
+      "vessel": {
+        "semantic": "선박명, 항공편명, 운송수단명",
+        "bias": "선박명, 모선명, 항공편명, 편명, vessel, vessel name, ocean vessel, flight number, carrier name, MV, MSC, MAERSK, HMM, EVERGREEN",
+        "prejudice": "항차, 항구, 선적항, 양륙항, 서류번호, 발행일, 발송인, 수하인, 중량, 금액, 컨테이너번호, HS코드"
+      },
+      "pol": {
+        "semantic": "선적항, 출발항, 출발공항",
+        "bias": "선적항, 출발항, 적재항, 출발공항, port of loading, POL, port of departure, airport of departure, loading port, BUSAN, INCHEON, SHANGHAI, NINGBO, SINGAPORE, ROTTERDAM, HAMBURG, LOS ANGELES, 부산, 인천, 상하이, 싱가포르",
+        "prejudice": "양륙항, 도착항, 도착공항, 인도지, 수취지, 선박명, 항차, 서류번호, 발행일, 중량, 금액"
+      },
+      "pod": {
+        "semantic": "양륙항, 도착항, 도착공항",
+        "bias": "양륙항, 도착항, 하역항, 도착공항, port of discharge, POD, port of destination, airport of destination, discharge port, LONG BEACH, NEW YORK, ANTWERP, DUBAI, HO CHI MINH, 롱비치, 뉴욕, 두바이, 호치민",
+        "prejudice": "선적항, 출발항, 출발공항, 수취지, 선박명, 항차, 서류번호, 발행일, 중량, 금액"
+      },
+      "etd": {
+        "semantic": "출항예정일, 출발예정일",
+        "bias": "출항일, 출항예정일, 출발예정일, 선적일, ETD, estimated time of departure, departure date, sailing date",
+        "prejudice": "입항일, 도착예정일, 발행일, 만료일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "eta": {
+        "semantic": "입항예정일, 도착예정일",
+        "bias": "입항일, 입항예정일, 도착예정일, 도착일, ETA, estimated time of arrival, arrival date",
+        "prejudice": "출항일, 출발예정일, 발행일, 만료일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "incoterms": {
+        "semantic": "인코텀즈, 무역조건, 가격조건",
+        "bias": "인코텀즈, 무역조건, 가격조건, 정형거래조건, incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP",
+        "prejudice": "결제조건, 운임조건, 통화, 금액, 중량, 서류번호, 발행일, 항구, 선박명, 컨테이너번호"
+      },
+      "currency": {
+        "semantic": "통화, 화폐 단위",
+        "bias": "통화, 화폐, 결제통화, currency, currency code, USD, EUR, JPY, CNY, KRW, GBP, 달러, 유로, 엔, 위안, 원",
+        "prejudice": "금액, 총액, 운임, 보험료, 중량, 수량, 서류번호, 발행일, 항구, 선박명, 인코텀즈"
+      },
+      "amount": {
+        "semantic": "총액, 합계금액, 송장금액",
+        "bias": "총액, 합계, 총금액, 송장금액, 계약금액, total amount, grand total, invoice value, total value, amount",
+        "prejudice": "운임, 보험료, 로컬차지, 세액, 단가, 중량, 수량, 통화, 서류번호, 발행일, 항구"
+      },
+      "container_number": {
+        "semantic": "컨테이너번호",
+        "bias": "컨테이너번호, 컨테이너 No, container number, container no, CNTR No, MSCU1234567, TGHU7654321",
+        "prejudice": "씰번호, 서류번호, 부킹번호, HS코드, 중량, 금액, 발행일, 항구, 선박명, 발송인, 수하인"
+      },
+      "seal_number": {
+        "semantic": "씰번호, 봉인번호",
+        "bias": "씰번호, 봉인번호, 실번호, seal number, seal no, SEAL",
+        "prejudice": "컨테이너번호, 서류번호, 부킹번호, HS코드, 중량, 금액, 발행일, 항구, 선박명"
+      },
+      "weight_gross": {
+        "semantic": "총중량, 총량",
+        "bias": "총중량, 총량, 그로스웨이트, gross weight, G.W., total gross weight, KGS, KG, MT",
+        "prejudice": "순중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "weight_net": {
+        "semantic": "순중량",
+        "bias": "순중량, 넷웨이트, net weight, N.W., total net weight, KGS, KG",
+        "prejudice": "총중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "volume": {
+        "semantic": "용적, 부피, 재화중량",
+        "bias": "용적, 부피, 재화중량, 큐빅, volume, measurement, CBM, M3",
+        "prejudice": "총중량, 순중량, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "package_count": {
+        "semantic": "포장수, 카톤수, 개수",
+        "bias": "포장수, 카톤수, 박스수, 팔레트수, 개수, package count, number of packages, CTNS, PKGS, PLT, cartons",
+        "prejudice": "총중량, 순중량, 용적, 금액, 통화, 단가, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "hs_code": {
+        "semantic": "HS코드, 관세분류번호",
+        "bias": "HS코드, 세번, 관세분류번호, 품목분류, HS code, HS No, tariff number, tariff classification, HTS",
+        "prejudice": "컨테이너번호, 씰번호, 서류번호, 부킹번호, 중량, 금액, 통화, 발행일, 항구, 선박명"
       }
     },
     "default": {

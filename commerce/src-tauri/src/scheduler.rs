@@ -8902,6 +8902,286 @@ pub async fn process_task(
     Ok(())
 }
 
+/// 🌟 [TRADE STRUCTURE GATE] 국제 표준 '포맷' 만으로 무역 서식 여부를 판정합니다.
+///  ── 왜 하드코딩이 아닌가 ──
+///   여기 등장하는 리터럴은 어떤 언어의 어휘도 아니고 국제 표준 식별자 규격입니다.
+///     · ISO 6346 : 컨테이너 번호 = 대문자 4 + 숫자 7
+///     · IATA     : AWB 번호 = 항공사 3자리 + 8자리
+///     · WCO HS   : 4+2(+2~4) 자리 관세 분류 코드
+///     · Incoterms 2020 : ICC 가 정한 3자 대문자 표준 약어 11종
+///   ai_utils::value_matches_format / id_shape_signature 가 이미 쓰는
+///   '구조 판정' 과 같은 계열이며, bias.json 의 trade_schema 도 동일 규격을 명시합니다.
+///
+///  ── 무엇에 쓰는가 ──
+///   이 증거가 하나라도 잡히면 그 문서는 물리적으로 '택배 라벨' 일 수 없습니다.
+///   택배 라벨에는 컨테이너 번호도, Incoterms 도, HS Code 도 존재하지 않습니다.
+///   따라서 parcel 그룹(= TRACKING) 을 거부하는 veto 근거로만 사용합니다.
+fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
+    let upper = pug.to_uppercase();
+    let mut found: Vec<String> = Vec::new();
+
+    // ① ISO 6346 컨테이너 번호
+    if let Ok(re) = regex::Regex::new(r"\b[A-Z]{4}\s?\d{7}\b") {
+        if let Some(m) = re.find(&upper) {
+            found.push(format!("container:{}", m.as_str().trim()));
+        }
+    }
+
+    // ② IATA Air Waybill 번호
+    if let Ok(re) = regex::Regex::new(r"\b\d{3}-\d{8}\b") {
+        if let Some(m) = re.find(&upper) {
+            found.push(format!("awb:{}", m.as_str()));
+        }
+    }
+
+    // ③ WCO HS Code (구분자 포함 형태만 인정 — 순수 숫자열은 오탐이 큽니다)
+    if let Ok(re) = regex::Regex::new(r"\b\d{4}[.\-]\d{2}[.\-]\d{2,4}\b") {
+        if let Some(m) = re.find(&upper) {
+            found.push(format!("hs:{}", m.as_str()));
+        }
+    }
+
+    // ④ Incoterms 2020 표준 3자 코드 (토큰 완전일치)
+    const INCOTERMS: [&str; 11] = [
+        "EXW", "FCA", "FAS", "FOB", "CFR", "CIF", "CPT", "CIP", "DAP", "DPU", "DDP",
+    ];
+    'inco: for t in INCOTERMS.iter() {
+        for tok in upper.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if tok == *t {
+                found.push(format!("incoterms:{}", t));
+                break 'inco;
+            }
+        }
+    }
+
+    // ⑤ B/L 표기 (해상 선하증권에만 인쇄되는 표준 약어)
+    if upper.contains("B/L") {
+        found.push("bl_label".to_string());
+    }
+
+    (!found.is_empty(), found)
+}
+
+/// 🌟 [PAGE MERGE] 페이지 단위 추출 결과를 하나의 문서 맵으로 접습니다.
+///  ── 병합 규칙 ──
+///   · 객체(header/parties/logistics/conditions/financials/cargo)
+///     : 앞 페이지 값이 우선. 비어 있을 때만 뒤 페이지 값으로 채웁니다.
+///       1페이지가 원본 서식이고 2페이지 이후는 continuation sheet 이기 때문입니다.
+///   · 배열(line_items/containers)
+///     : 뒤 페이지 항목을 이어붙입니다. 완전 동일 항목만 중복 제거합니다.
+///       (품목 목록은 페이지를 넘겨가며 이어지는 것이 정상입니다)
+///
+///  ── merge_json_manual 을 쓰지 않는 이유 ──
+///   그 함수는 객체 병합에서 무조건 덮어씁니다(insert).
+///   페이지 병합은 '앞 페이지 우선' 이어야 하므로 반대 정책이 필요합니다.
+fn merge_trading_page_map(
+    target: &mut serde_json::Map<String, Value>,
+    source: &serde_json::Map<String, Value>,
+) {
+    fn is_empty_val(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::String(s) => {
+                let t = s.trim();
+                t.is_empty() || t == "N/A" || t == "null"
+            },
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        }
+    }
+
+    for (cat, src_val) in source {
+        // ── 배열 축 : 이어붙이기 ──
+        if let Some(src_arr) = src_val.as_array() {
+            let entry = target.entry(cat.clone()).or_insert_with(|| json!([]));
+            if !entry.is_array() { *entry = json!([]); }
+            if let Some(tgt_arr) = entry.as_array_mut() {
+                for item in src_arr {
+                    if is_empty_val(item) { continue; }
+                    if tgt_arr.iter().any(|ex| ex == item) { continue; }
+                    tgt_arr.push(item.clone());
+                }
+            }
+            continue;
+        }
+
+        // ── 객체 축 : 빈 슬롯만 채우기 ──
+        if let Some(src_obj) = src_val.as_object() {
+            let entry = target.entry(cat.clone()).or_insert_with(|| json!({}));
+            if !entry.is_object() { *entry = json!({}); }
+            if let Some(tgt_obj) = entry.as_object_mut() {
+                for (k, v) in src_obj {
+                    if is_empty_val(v) { continue; }
+                    let need = match tgt_obj.get(k) {
+                        None => true,
+                        Some(cur) => is_empty_val(cur),
+                    };
+                    if need { tgt_obj.insert(k.clone(), v.clone()); }
+                }
+            }
+            continue;
+        }
+
+        // ── 스칼라 축 ──
+        if is_empty_val(src_val) { continue; }
+        let need = match target.get(cat) {
+            None => true,
+            Some(cur) => is_empty_val(cur),
+        };
+        if need { target.insert(cat.clone(), src_val.clone()); }
+    }
+}
+
+/// 🌟 [TRADING NORMALIZE] commerce 의 normalize_data 와 같은 역할을 무역 축에 적용합니다.
+///  ── 왜 필요한가 ──
+///   update_team_base_metrics 는 data 루트의 수치 축을 스캔해 min / max / avg 를 만듭니다.
+///   그런데 LLM 은 금액을 "1,250.00 USD", 중량을 "12,500 KG", 날짜를 "15/03/2026" 처럼
+///   문자열로 돌려주므로, 정규화가 없으면 통계 축이 통째로 죽습니다.
+///   commerce 경로에는 normalize_data 가 있지만 trading 경로에는 그 단계 자체가
+///   존재한 적이 없어서 "평균 / 최대 / 최소" 쿼리가 성립하지 않았습니다.
+///
+///  ── 무엇을 하는가 ──
+///   ① 수치 축을 f64 로 확정 (천 단위 콤마 / 통화기호 / 단위 접미어 제거)
+///   ② 날짜 축을 ISO 8601 로 확정
+///   ③ currency 를 대문자 ISO 4217 로 확정, 없으면 문서 언어 기준 기본값
+///   ④ etd / eta 를 started_at / expired_at 로 승격 (commerce 의 기간 축과 동일 이름)
+///   중첩된 line_items / containers 안의 수치도 함께 정규화합니다.
+fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
+    const NUMERIC_KEYS: [&str; 15] = [
+        "amount", "amount_subtotal", "amount_tax", "freight_amount", "insurance_amount",
+        "local_charges", "package_count", "weight_gross", "weight_net", "volume",
+        "unit_price", "total_price", "quantity", "insured_amount", "premium_amount",
+    ];
+    const DATE_KEYS: [&str; 6] = [
+        "issue_date", "expiry_date", "etd", "eta", "shipping_date", "registration_date",
+    ];
+
+    fn to_number(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let mut buf = String::new();
+                let mut seen_digit = false;
+                for c in s.chars() {
+                    if c.is_ascii_digit() {
+                        buf.push(c);
+                        seen_digit = true;
+                    } else if c == ',' && seen_digit {
+                        continue;
+                    } else if c == '.' && seen_digit && !buf.contains('.') {
+                        buf.push(c);
+                    } else if seen_digit {
+                        break;
+                    }
+                }
+                if !seen_digit { return None; }
+                buf.trim_end_matches('.').parse::<f64>().ok()
+            },
+            _ => None,
+        }
+    }
+
+    fn to_iso_date(v: &Value) -> Option<String> {
+        let s = match v {
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        if s.is_empty() || s == "N/A" || s == "null" { return None; }
+        if s.contains('T') && s.chars().count() >= 19 { return Some(s); }
+
+        let re = regex::Regex::new(r"\d+").ok()?;
+        let nums: Vec<u32> = re.find_iter(&s).filter_map(|m| m.as_str().parse().ok()).collect();
+        if nums.len() < 3 { return None; }
+
+        let (mut year, mut month, mut day) = (nums[0], nums[1], nums[2]);
+        // DD-MM-YYYY 형태 보정
+        if day > 31 && year <= 31 {
+            year = nums[2];
+            day = nums[1];
+            month = nums[0];
+        }
+        if year < 100 { year += if year > 50 { 1900 } else { 2000 }; }
+        // 15/03/2026 처럼 일이 앞에 온 경우 보정
+        if month > 12 && day <= 12 { std::mem::swap(&mut month, &mut day); }
+        month = month.clamp(1, 12);
+        day = day.clamp(1, 31);
+
+        let hour   = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
+        let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
+        let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
+
+        Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second))
+    }
+
+    fn walk(v: &mut Value, numeric: &[&str], date: &[&str]) {
+        match v {
+            Value::Object(map) => {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for k in keys {
+                    if numeric.iter().any(|n| *n == k.as_str()) {
+                        let converted = map.get(&k).and_then(to_number);
+                        if let Some(num) = converted {
+                            map.insert(k.clone(), json!(num));
+                        }
+                        continue;
+                    }
+                    if date.iter().any(|d| *d == k.as_str()) {
+                        let converted = map.get(&k).and_then(to_iso_date);
+                        if let Some(iso) = converted {
+                            map.insert(k.clone(), json!(iso));
+                        }
+                        continue;
+                    }
+                    if let Some(child) = map.get_mut(&k) {
+                        if child.is_object() || child.is_array() {
+                            walk(child, numeric, date);
+                        }
+                    }
+                }
+            },
+            Value::Array(arr) => {
+                for it in arr.iter_mut() { walk(it, numeric, date); }
+            },
+            _ => {}
+        }
+    }
+
+    walk(item, &NUMERIC_KEYS, &DATE_KEYS);
+
+    if let Some(obj) = item.as_object_mut() {
+        let cur = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if cur.is_empty() || cur == "N/A" || cur == "null" {
+            let def = match doc_lang {
+                "ko" => "KRW",
+                "ja" => "JPY",
+                "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
+                "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
+                "ru" => "RUB",
+                "th" => "THB",
+                "vi" => "VND",
+                "hi" | "bn" => "INR",
+                _ => "USD",
+            };
+            obj.insert("currency".to_string(), json!(def));
+        } else {
+            obj.insert("currency".to_string(), json!(cur.to_uppercase()));
+        }
+
+        if obj.get("started_at").is_none() {
+            if let Some(v) = obj.get("etd").cloned() {
+                obj.insert("started_at".to_string(), v);
+            }
+        }
+        if obj.get("expired_at").is_none() {
+            let v = obj.get("eta").cloned().or_else(|| obj.get("expiry_date").cloned());
+            if let Some(v) = v {
+                obj.insert("expired_at".to_string(), v);
+            }
+        }
+    }
+}
 
 async fn process_trading_task(
     task: Task,
@@ -8976,48 +9256,89 @@ async fn process_trading_task(
     };
 
     // ── HTML 전처리 ──
-    // 🌟 [SOURCE RESOLUTION v2] html 키가 있으면 그대로,
-    //    document_extraction 이면 파일에서 텍스트를 추출해 가짜 HTML 을 생성합니다.
-    //    (process_task 의 document_extraction 블록과 동일한 규칙)
-    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+    // 🌟 [SOURCE RESOLUTION v3 / PAGE-WISE]
+    //  ── 무엇이 바뀌었나 ──
+    //   v2 는 문서 전체를 String 하나로 만들었습니다. PDF 5장이 한 덩어리가 되어
+    //   STEP A 가 doc_type 을 1개만 뽑고, STEP B 도 1회만 돌았습니다.
+    //   여기서는 '페이지 배열' 을 만들어 STEP A/B 를 페이지마다 독립 수행하고,
+    //   추론 결과는 STEP C 직전에 doc_type 별로 합칩니다.
+    let page_htmls: Vec<String> = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         let content = raw_html.to_string();
         if let Some(obj) = task_data.as_object_mut() {
             obj.remove("html");
         }
-        content
+        vec![content]
     } else if task.r#type == "document_extraction" {
         let file_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
         let ext = task_data.get("document_ext").and_then(|s| s.as_str()).unwrap_or("");
         let payload = json!({
             "task_id": task.id,
             "category": "Document Parsing",
-            "summary": format!("Parsing {} file format for trading extraction...", ext.to_uppercase()),
+            "summary": format!("Splitting {} file into pages...", ext.to_uppercase()),
             "spinner": "📄"
         });
         let _ = app_handle.emit("extraction-progress", &payload);
         log_task_progress(app_handle, &task.id, &payload);
-        let extracted_text = crate::parsers::extract_document_text(file_path)
+
+        let pages = crate::parsers::extract_document_pages(file_path)
             .map_err(|e| anyhow::anyhow!("Trading document parsing failed: {}", e))?;
-        let fake_html = extracted_text.lines()
-            .map(|line| {
-                let safe_line = line.replace("<", "&lt;").replace(">", "&gt;");
-                format!("<div>{}</div>", safe_line)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("<html><body>{}</body></html>", fake_html)
+
+        let mut out: Vec<String> = Vec::with_capacity(pages.len());
+        for (pi, page_text) in pages.iter().enumerate() {
+            if page_text.trim().is_empty() {
+                emit_term(&format!("[TRADING] ⚪ {}페이지는 추출 가능한 텍스트가 없어 건너뜁니다.", pi + 1));
+                continue;
+            }
+            let fake_html = page_text.lines()
+                .map(|line| {
+                    let safe_line = line.replace("<", "&lt;").replace(">", "&gt;");
+                    format!("<div>{}</div>", safe_line)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push(format!("<html><body>{}</body></html>", fake_html));
+        }
+        if out.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Trading document '{}' produced no usable page after splitting.",
+                file_path
+            ));
+        }
+        emit_term(&format!("[TRADING] 📄 문서를 {}개 페이지로 분해했습니다. 페이지 단위로 개별 추출합니다.", out.len()));
+        out
     } else {
         return Err(anyhow::anyhow!(
             "Trading extraction requires HTML content or a document file in task data"
         ));
     };
 
+    // ── URL 파싱 (페이지 루프 밖에서 1회만) ──
+    //    기존에는 이 함수 안에서 resolve_absolute_url 을 두 번 호출하고
+    //    두 번째가 첫 번째를 shadow 하는 죽은 코드가 있었습니다. 한 번으로 통합합니다.
+    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+
+    let total_pages = page_htmls.len();
+    let mut page_results: Vec<(String, String, serde_json::Map<String, Value>)> = Vec::new();
+
+    // 🌟 [PAGE LOOP OPEN] 이 아래 STEP A / STEP B 전체가 페이지마다 1회씩 수행됩니다.
+    //    (Rust 는 들여쓰기를 문법으로 삼지 않으므로 기존 코드의 들여쓰기는 그대로 둡니다)
+    for (page_idx, page_html) in page_htmls.iter().enumerate() {
+    let raw_html_content: &str = page_html.as_str();
+    let page_label = format!("p{}", page_idx + 1);
+
+    emit_term(&format!("\n[TRADING PAGE {}/{}] ▶ 페이지 단위 추출 시작", page_idx + 1, total_pages));
+    let payload_page = json!({
+        "task_id": task.id,
+        "category": format!("Page {}/{}", page_idx + 1, total_pages),
+        "summary": "Classifying and extracting this page...",
+        "spinner": "📄"
+    });
+    let _ = app_handle.emit("extraction-progress", &payload_page);
+    log_task_progress(app_handle, &task.id, &payload_page);
+
     if cancellation_token.load(Ordering::Relaxed) {
         return Err(anyhow::anyhow!("Task cancelled"));
     }
-
-    // ── URL 파싱 (raw_pug 생성 전에 반드시 필요) ──
-    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
 
     // 🌟 [PUG PIPELINE] 원문 HTML을 직접 사용하지 않습니다.
     //    ① pre_clean_html      : script/style/noscript/iframe/svg 제거, 허용 속성만 유지
@@ -9035,12 +9356,9 @@ async fn process_trading_task(
         .truncate_pug_context(&raw_pug, false, 2000, None)
         .await;
 
-    // 문서 언어 감지
+    // 문서 언어 감지 (페이지마다 재확정 — 다국어 묶음 PDF 대응)
     doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
-    println!("[TRADING] Detected document language: {}", doc_lang);
-
-    // ── URL 파싱 ──
-    let (url, _origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+    println!("[TRADING] Detected document language (page {}): {}", page_idx + 1, doc_lang);
 
     // =====================================================================
     // 🌟 [TRADING STEP A v2] doc_type 2뎁스 분류 (그룹 → 코드)
@@ -9074,16 +9392,29 @@ async fn process_trading_task(
     model.check_embedding_downloaded().await?;
     model.ensure_embedding().await?;
 
-    // 🌟 [DEPTH 1] 그룹 앵커 텍스트.
-    //    코드 리터럴이 아니라 '그 그룹이 무엇을 다루는가' 라는 의미 문장을 씁니다.
-    //    문서 언어가 무엇이든 다국어 임베딩이 연결합니다.
+    // 🌟 [DEPTH 1 / PHRASE BANK] 그룹 앵커 문구를 재정의합니다.
+    //  ── 무엇이 문제였나 ──
+    //   기존 parcel 앵커는 'recipient address, sender address, parcel weight' 처럼
+    //   '모든 운송 서식이 공통으로 갖는 개념' 을 담고 있었습니다.
+    //     · B/L    : shipper address / consignee address / gross weight
+    //     · AWB    : waybill 이라는 단어 그 자체
+    //     · PL     : gross weight / net weight
+    //   그래서 무역 서식이 parcel 앵커와 정면으로 공명해 TRACKING 으로 떨어졌습니다.
+    //   parcel 은 '택배 라벨에만 존재하는 개념' 으로 좁히고,
+    //   나머지 그룹은 서식 고유 개념을 보강합니다.
+    //
+    //  ── 편견(prejudice) 사전을 새로 만들지 않는 이유 ──
+    //   bias_schema 의 get_detail_schema_fields 가 '다른 필드의 bias' 를 그대로
+    //   편견으로 쓰는 것과 동일하게, 여기서도 '다른 그룹의 bias 구' 를 편견으로 씁니다.
+    //   즉 shipping 의 'bill of lading / incoterms / container number' 가
+    //   자동으로 parcel 의 편견이 되므로 별도 사전이 필요 없습니다.
     const TRADE_GROUPS: [(&str, &str); 6] = [
-        ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, payment terms, contract number, buyer seller agreement, tenor, issuing bank"),
-        ("shipping",  "commercial invoice, packing list, bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage, port of loading, port of discharge, container seal"),
-        ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff, customs clearance, declaration number"),
-        ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, treatment"),
-        ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, packing group, policy number, coverage"),
-        ("parcel",    "courier label, parcel waybill, tracking number, delivery company, recipient address, sender address, parcel weight"),
+        ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, documentary credit, payment terms, contract number, buyer seller agreement, tenor at sight, issuing bank, advising bank, beneficiary, applicant, order confirmation, quotation"),
+        ("shipping",  "commercial invoice, packing list, bill of lading, ocean bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage number, port of loading, port of discharge, place of receipt, place of delivery, container number, seal number, notify party, freight prepaid, freight collect, shipper and consignee, gross weight net weight measurement, carton quantity, marks and numbers, incoterms fob cif exw"),
+        ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff classification, customs clearance, declaration number, customs value, duty and tax, chamber of commerce, country of origin"),
+        ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, specification value, fumigation treatment, laboratory report, fit for human consumption, plant health"),
+        ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, proper shipping name, packing group, hazard class, policy number, insured amount, premium, coverage all risks, attorney in fact, business registration number"),
+        ("parcel",    "courier label, parcel waybill sticker, domestic courier service, home delivery parcel, door to door small package, delivery driver, barcode sticker label, parcel pickup, last mile delivery"),
     ];
 
     const GROUP_CODES: [(&str, &[&str]); 6] = [
@@ -9097,6 +9428,8 @@ async fn process_trading_task(
 
     // 🌟 [DEPTH 2] 코드별 앵커. bias.json 을 손대지 않고 프롬프트가 이미 갖고 있는
     //    정의문(= get_trade_doc_classification_prompt 의 GROUPS 설명)을 그대로 씁니다.
+    //    🌟 TRACKING 앵커에서 'recipient' 를 제거합니다. 수하인(consignee)은
+    //       모든 무역 서식이 갖는 개념이라 TRACKING 전용 근거가 될 수 없습니다.
     fn trade_code_anchor(code: &str) -> &'static str {
         match code {
             "PO"       => "purchase order, order confirmation, buyer issues to seller, order number, delivery date requested",
@@ -9126,53 +9459,227 @@ async fn process_trading_task(
             "POA"      => "power of attorney, authorization letter, attorney in fact",
             "BIZ_LIC"  => "business license, business registration certificate, company registration number",
             "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
-            "TRACKING" => "courier parcel label, tracking number barcode, delivery company, recipient",
+            "TRACKING" => "courier parcel label, tracking number barcode sticker, domestic courier service, home delivery small package, delivery driver route",
             _          => "trade document",
         }
     }
 
-    // ── 문서 전체 임베딩 (뎁스 1/2 공통 질의 벡터) ──
-    let doc_emb = model.get_embedding(light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
+    // ── 질의(문서) 측 : 라인 단위 분해 ──
+    //  ── 왜 바꾸는가 ──
+    //   기존에는 light_pug(최대 9000 토큰) 전체를 384차원 1벡터로 만들었습니다.
+    //   문서 전체 평균이라 그룹 간 미세한 차이가 전부 소멸합니다.
+    //   commerce 가 슬라이딩 윈도우를 쓰는 이유와 정확히 같은 문제이므로,
+    //   '텍스트를 지닌 라인' 만 뽑아 라인별로 채점하고 그룹별 최댓값을 취합니다.
+    let doc_lines: Vec<String> = {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        for line in light_pug.lines() {
+            let t = match line.find('|') {
+                Some(p) => line[p + 1..].trim(),
+                None => continue,
+            };
+            if t.chars().count() < 2 { continue; }
+            let key = t.to_string();
+            if !seen.insert(key.clone()) { continue; }
+            out.push(key);
+            if out.len() >= 200 { break; }
+        }
+        if out.is_empty() {
+            out.push(light_pug.chars().take(2000).collect::<String>());
+        }
+        out
+    };
+    emit_term(&format!("  🧱 [TRADE QUERY LINES] 판정 대상 라인 {}개", doc_lines.len()));
 
-    // ── 뎁스 1 : 그룹 코사인 ──
-    let group_texts: Vec<String> = TRADE_GROUPS.iter().map(|(_, t)| t.to_string()).collect();
-    let group_embs = model.get_embedding_batch(group_texts.clone()).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; group_texts.len()]);
+    let line_embs = model.get_embedding_batch(doc_lines.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; doc_lines.len()]);
 
-    let mut group_scores: Vec<(String, f32)> = Vec::new();
-    for (gi, (gname, _)) in TRADE_GROUPS.iter().enumerate() {
-        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &group_embs[gi]);
-        group_scores.push((gname.to_string(), s));
-        emit_term(&format!("  📐 [TRADE GROUP] {} | Cosine: {:.4}", gname, s));
+    // ── 구조 증거 (언어 무관 / 국제 표준 포맷) ──
+    let (has_trade_marker, trade_markers) = trade_structural_evidence(&light_pug);
+    if has_trade_marker {
+        emit_term(&format!("  🔩 [TRADE STRUCTURE] 국제 표준 포맷 증거 발견: {:?}", trade_markers));
+    } else {
+        emit_term("  ⚪ [TRADE STRUCTURE] 국제 표준 포맷 증거가 없습니다. (택배 라벨 가능성 열림)");
     }
-    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let best_group = group_scores[0].0.clone();
-    let group_margin = group_scores[0].1 - group_scores.get(1).map(|x| x.1).unwrap_or(0.0);
-    emit_term(&format!("  👑 [TRADE GROUP SELECTED] '{}' | Top: {:.4} | Margin: {:+.4}",
+    // ── 뎁스 1 : 그룹 구 뱅크 SURPRISAL ──
+    //  surprisal = (max - μ_global)/σ_global - √(2 ln N)
+    //  ai_utils::surprisal_dual_scores 가 이미 구현해 둔 극값이론 정규화를 그대로 씁니다.
+    //  · 센트로이드 폐기 → 구 단위 Max-Pool
+    //  · 뱅크 크기 편향 제거 → shipping(24구) 이 parcel(9구) 보다 불리해지지 않음
+    //  · 편견 상쇄        → 다른 그룹의 bias 구가 자동으로 이 그룹의 편견이 됨
+    //  surprisal > 0 = "N개를 무작위로 뽑은 기대 최댓값보다 실제로 더 가깝다" 이므로
+    //  0 은 극값이론에서 유도된 값이며 매직 상수가 아닙니다.
+    let mut g_bias_defs: Vec<(String, String, String)> = Vec::new();
+    let mut g_prej_defs: Vec<(String, String, String)> = Vec::new();
+    for (gname, raw) in TRADE_GROUPS.iter() {
+        for p in crate::utils::ai_utils::split_bias_phrases_full(raw) {
+            g_bias_defs.push(("group".to_string(), gname.to_string(), p));
+        }
+        for (other, other_raw) in TRADE_GROUPS.iter() {
+            if other == gname { continue; }
+            for p in crate::utils::ai_utils::split_bias_phrases_full(other_raw) {
+                g_prej_defs.push(("group".to_string(), gname.to_string(), p));
+            }
+            let _ = other_raw;
+        }
+    }
+
+    // 구 문자열은 6개 그룹 앵커에서만 나오므로 유일 구만 1회 임베딩하고 재사용합니다.
+    let mut uniq_group_phrases: Vec<String> = Vec::new();
+    for (_, _, p) in g_bias_defs.iter().chain(g_prej_defs.iter()) {
+        if !uniq_group_phrases.iter().any(|e| e == p) { uniq_group_phrases.push(p.clone()); }
+    }
+    let uniq_group_embs = model.get_embedding_batch(uniq_group_phrases.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; uniq_group_phrases.len()]);
+    let group_phrase_emb = |p: &str| -> Vec<f32> {
+        match uniq_group_phrases.iter().position(|e| e == p) {
+            Some(i) => uniq_group_embs[i].clone(),
+            None => vec![0.0f32; 384],
+        }
+    };
+
+    let g_bias_bank: Vec<(String, String, Vec<f32>)> = g_bias_defs.iter()
+        .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
+    let g_prej_bank: Vec<(String, String, Vec<f32>)> = g_prej_defs.iter()
+        .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
+
+    let empty_names: Vec<String> = Vec::new();
+    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
+    let empty_skip: Vec<bool> = Vec::new();
+
+    let mut group_best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for le in line_embs.iter() {
+        if le.iter().all(|&v| v == 0.0) { continue; }
+        let (fs, _) = crate::utils::ai_utils::surprisal_dual_scores(
+            le, &g_bias_bank, &g_prej_bank, &empty_names, &empty_banks, &empty_skip,
+        );
+        for s in fs {
+            let e = group_best.entry(s.key.clone()).or_insert(f32::MIN);
+            if s.surprisal > *e { *e = s.surprisal; }
+        }
+    }
+
+    let mut group_scores: Vec<(String, f32)> = group_best.into_iter().collect();
+    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if group_scores.is_empty() {
+        group_scores.push(("shipping".to_string(), 0.0));
+    }
+    for (g, s) in group_scores.iter() {
+        emit_term(&format!("  📐 [TRADE GROUP] {} | Surprisal(max over lines): {:+.4}", g, s));
+    }
+
+    let mut best_group = group_scores[0].0.clone();
+    let group_margin = group_scores[0].1
+        - group_scores.get(1).map(|x| x.1).unwrap_or(group_scores[0].1);
+
+    // 🌟 [TRACKING VETO] 구조 증거가 존재하는 문서는 물리적으로 택배 라벨일 수 없습니다.
+    //    기존에는 parcel 이 이기면 codes.len()==1 분기로 TRACKING 이 무검증 확정되었습니다.
+    //    여기서 그룹 단계에 veto 를 두면 그 무검증 경로 자체가 도달 불가가 됩니다.
+    if best_group == "parcel" && has_trade_marker {
+        if let Some((alt, alt_s)) = group_scores.iter().find(|(g, _)| g != "parcel").cloned() {
+            emit_term(&format!(
+                "  🚫 [TRACKING VETO] 구조 증거 {:?} 가 존재하므로 parcel 을 거부하고 '{}'({:+.4}) 로 교체합니다.",
+                trade_markers, alt, alt_s
+            ));
+            best_group = alt;
+        }
+    }
+
+    emit_term(&format!("  👑 [TRADE GROUP SELECTED] '{}' | Top: {:+.4} | Margin: {:+.4}",
         best_group, group_scores[0].1, group_margin));
 
-    // ── 뎁스 2 : 그룹 내 코드 코사인 ──
-    let codes: Vec<&str> = GROUP_CODES.iter()
+    // ── 뎁스 2 : 후보 코드 집합 ──
+    //  🌟 group_margin 을 '로그용 미사용 변수' 로 두지 않고 실제 판정에 씁니다.
+    //     증거(surprisal > 0)가 있는 모든 그룹의 코드를 합집합으로 두어,
+    //     1위와 2위가 사실상 동률일 때 그룹으로 잘못 좁히는 사고를 막습니다.
+    let mut codes: Vec<&str> = GROUP_CODES.iter()
         .find(|(g, _)| *g == best_group)
         .map(|(_, c)| c.to_vec())
         .unwrap_or_else(|| vec!["Unknown"]);
-
-    let code_texts: Vec<String> = codes.iter().map(|c| trade_code_anchor(c).to_string()).collect();
-    let code_embs = model.get_embedding_batch(code_texts.clone()).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; code_texts.len()]);
-
-    let mut code_scores: Vec<(String, f32)> = Vec::new();
-    for (ci, c) in codes.iter().enumerate() {
-        let s = crate::utils::ai_utils::cosine_similarity(&doc_emb, &code_embs[ci]);
-        code_scores.push((c.to_string(), s));
-        emit_term(&format!("    📐 [TRADE CODE] {} | Cosine: {:.4}", c, s));
+    for (g, s) in group_scores.iter() {
+        if g == &best_group { continue; }
+        if *s <= 0.0 { continue; }
+        if g == "parcel" && has_trade_marker { continue; }
+        if let Some((_, extra)) = GROUP_CODES.iter().find(|(gn, _)| gn == g) {
+            for c in extra.iter() {
+                if !codes.iter().any(|x| x == c) { codes.push(c); }
+            }
+        }
     }
+    emit_term(&format!("  🎯 [TRADE CODE CANDIDATES] {:?}", codes));
+
+    // ── 코드 구 뱅크 SURPRISAL (편견 = 경쟁 코드의 앵커 구) ──
+    let mut c_bias_defs: Vec<(String, String, String)> = Vec::new();
+    let mut c_prej_defs: Vec<(String, String, String)> = Vec::new();
+    for c in codes.iter() {
+        for p in crate::utils::ai_utils::split_bias_phrases_full(trade_code_anchor(c)) {
+            c_bias_defs.push(("code".to_string(), c.to_string(), p));
+        }
+        for other in codes.iter() {
+            if other == c { continue; }
+            for p in crate::utils::ai_utils::split_bias_phrases_full(trade_code_anchor(other)) {
+                c_prej_defs.push(("code".to_string(), c.to_string(), p));
+            }
+        }
+    }
+
+    let mut uniq_code_phrases: Vec<String> = Vec::new();
+    for (_, _, p) in c_bias_defs.iter().chain(c_prej_defs.iter()) {
+        if !uniq_code_phrases.iter().any(|e| e == p) { uniq_code_phrases.push(p.clone()); }
+    }
+    let uniq_code_embs = model.get_embedding_batch(uniq_code_phrases.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; uniq_code_phrases.len()]);
+    let code_phrase_emb = |p: &str| -> Vec<f32> {
+        match uniq_code_phrases.iter().position(|e| e == p) {
+            Some(i) => uniq_code_embs[i].clone(),
+            None => vec![0.0f32; 384],
+        }
+    };
+
+    let c_bias_bank: Vec<(String, String, Vec<f32>)> = c_bias_defs.iter()
+        .map(|(c, k, p)| (c.clone(), k.clone(), code_phrase_emb(p))).collect();
+    let c_prej_bank: Vec<(String, String, Vec<f32>)> = c_prej_defs.iter()
+        .map(|(c, k, p)| (c.clone(), k.clone(), code_phrase_emb(p))).collect();
+
+    let mut code_best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for le in line_embs.iter() {
+        if le.iter().all(|&v| v == 0.0) { continue; }
+        let (fs, _) = crate::utils::ai_utils::surprisal_dual_scores(
+            le, &c_bias_bank, &c_prej_bank, &empty_names, &empty_banks, &empty_skip,
+        );
+        for s in fs {
+            let e = code_best.entry(s.key.clone()).or_insert(f32::MIN);
+            if s.surprisal > *e { *e = s.surprisal; }
+        }
+    }
+
+    let mut code_scores: Vec<(String, f32)> = code_best.into_iter().collect();
     code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    if code_scores.is_empty() {
+        code_scores.push((codes[0].to_string(), 0.0));
+    }
+    for (c, s) in code_scores.iter() {
+        emit_term(&format!("    📐 [TRADE CODE] {} | Surprisal: {:+.4}", c, s));
+    }
+
+    // 🌟 [FINAL TRACKING VETO] 코드 단계에서도 한 번 더 막습니다.
+    //    합집합 확장으로 TRACKING 이 후보에 들어온 경우를 방어합니다.
+    if has_trade_marker {
+        let before = code_scores.len();
+        code_scores.retain(|(c, _)| c != "TRACKING");
+        if code_scores.len() != before {
+            emit_term("    🚫 [TRACKING VETO / CODE] 구조 증거가 있어 TRACKING 을 코드 후보에서 제거했습니다.");
+        }
+        if code_scores.is_empty() {
+            code_scores.push(("CI".to_string(), 0.0));
+        }
+    }
 
     let cosine_code = code_scores[0].0.clone();
-    let code_margin = code_scores[0].1 - code_scores.get(1).map(|x| x.1).unwrap_or(0.0);
-    emit_term(&format!("  👑 [TRADE CODE COSINE] '{}' | Top: {:.4} | Margin: {:+.4}",
+    let code_margin = code_scores[0].1
+        - code_scores.get(1).map(|x| x.1).unwrap_or(code_scores[0].1);
+    emit_term(&format!("  👑 [TRADE CODE COSINE] '{}' | Top: {:+.4} | Margin: {:+.4}",
         cosine_code, code_scores[0].1, code_margin));
 
     // ── 뎁스 3 : 마진 부족 시에만 LLM 폴백 (그룹 내 코드만 제시) ──
@@ -9228,11 +9735,14 @@ async fn process_trading_task(
                 top_p: Some(0.95),
                 ..Default::default()
             };
+            // 🌟 [KV SESSION PER PAGE] 페이지마다 KV 스냅샷 키를 분리합니다.
+            //    분리하지 않으면 2페이지가 1페이지의 KV 캐시를 재사용해
+            //    1페이지의 문맥으로 2페이지를 분류하게 됩니다.
             let res = gen
                 .generate(
                     params,
                     Some(cancellation_token.clone()),
-                    Some(format!("{}_doctype", task.id)),
+                    Some(format!("{}_{}_doctype", task.id, page_label)),
                     None,
                     None,
                     None,
@@ -9644,7 +10154,8 @@ async fn process_trading_task(
             let res = gen.generate(
                 params,
                 Some(cancellation_token.clone()),
-                Some(format!("{}_{}", task.id, cat)),
+                // 🌟 [KV SESSION PER PAGE] 페이지 × 카테고리 단위로 KV 키를 분리합니다.
+                Some(format!("{}_{}_{}", task.id, page_label, cat)),
                 None, None, None
             ).await?;
             let mut tile_json = crate::parsing::parse_json_from_llm(&res);
@@ -9664,11 +10175,65 @@ async fn process_trading_task(
         }
     }
 
-    // 모델 해제 후 임베딩 준비
+    // 🌟 [PAGE RESULT COLLECT] 이 페이지의 추론 결과를 보관하고 다음 페이지로 넘어갑니다.
+    emit_term(&format!(
+        "[TRADING PAGE {}/{}] ✅ 페이지 추출 완료 (doc_type='{}', lang='{}')",
+        page_idx + 1, total_pages, doc_type, doc_lang
+    ));
+    page_results.push((doc_type.clone(), doc_lang.clone(), final_data_map));
+    }
+    // 🌟 [PAGE LOOP END] 페이지 단위 STEP A / STEP B 종료
+
+    // 모델 해제 후 임베딩 준비 (페이지마다 파기하면 Qwen3.5 를 매 페이지 재로딩하므로
+    // 전 페이지 추출이 끝난 뒤 딱 한 번만 수행합니다)
     model.deep_purge_resources().await;
     crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
 
-    let mut extracted_data = Value::Object(final_data_map);
+    if page_results.is_empty() {
+        return Err(anyhow::anyhow!("Trading extraction produced no result from any page."));
+    }
+
+    // =====================================================================
+    // 🌟 [PAGE MERGE] 페이지별 추론 결과를 doc_type 기준으로 합칩니다.
+    // ---------------------------------------------------------------------
+    //  · 5장짜리 B/L      → doc_type 이 전부 BL → 1건으로 병합
+    //  · CI+PL+BL 묶음    → doc_type 3종 → 3건으로 분리 저장
+    //    (세 서식을 한 아이템에 뭉개면 doc_number 도 amount 도 서로 덮어씁니다)
+    // =====================================================================
+    let mut merged_order: Vec<String> = Vec::new();
+    let mut merged_docs: std::collections::HashMap<String, (String, serde_json::Map<String, Value>, usize)> =
+        std::collections::HashMap::new();
+
+    for (dt, dl, map) in page_results.into_iter() {
+        if !merged_order.iter().any(|x| x == &dt) { merged_order.push(dt.clone()); }
+        let slot = merged_docs
+            .entry(dt.clone())
+            .or_insert_with(|| (dl.clone(), serde_json::Map::new(), 0usize));
+        merge_trading_page_map(&mut slot.1, &map);
+        slot.2 += 1;
+    }
+
+    emit_term(&format!(
+        "[TRADING MERGE] 페이지 {}장 → 문서 {}건으로 병합: {:?}",
+        total_pages,
+        merged_order.len(),
+        merged_order.iter()
+            .map(|d| format!("{}({}p)", d, merged_docs.get(d).map(|s| s.2).unwrap_or(0)))
+            .collect::<Vec<_>>()
+    ));
+
+    // 🌟 [DOC LOOP OPEN] 병합된 문서마다 STEP C ~ STEP F 를 독립 수행합니다.
+    for doc_type in merged_order.into_iter() {
+    let (doc_lang, merged_map, merged_page_count) = match merged_docs.remove(&doc_type) {
+        Some(v) => v,
+        None => continue,
+    };
+    emit_term(&format!(
+        "\n[TRADING DOC] ▶ doc_type='{}' (페이지 {}장 병합) 저장 파이프라인 시작",
+        doc_type, merged_page_count
+    ));
+
+    let mut extracted_data = Value::Object(merged_map);
 
     // =====================================================================
     // 🌟 [TRADING STEP C v2] 루트 평탄화 + 자연어 변환 + 임베딩 텍스트 생성
@@ -9753,6 +10318,13 @@ async fn process_trading_task(
             hoisted.len(),
             hoisted.iter().take(12).collect::<Vec<_>>()
         ));
+
+        // 🌟 [NORMALIZE] commerce 의 normalize_data 에 해당하는 단계가 trading 에는
+        //    아예 없었습니다. 정규화 없이 저장하면 amount 가 "1,250.00 USD" 라는
+        //    문자열이라 update_team_base_metrics 의 min/max/avg 축이 통째로 죽습니다.
+        //    자연어 변환 '이전' 에 수행해야 text 컬럼에도 정규화된 값이 실립니다.
+        normalize_trading_data(&mut extracted_data, &doc_lang);
+        emit_term("[TRADING STEP C] 🔢 [NORMALIZE] 수치/날짜/통화 축 정규화 완료 (팀 통계 집계 가능 상태)");
 
         let natural_text = parsing::json_to_natural_language(&extracted_data);
         let masked_text = natural_text.clone();
@@ -9988,21 +10560,50 @@ async fn process_trading_task(
     e.1 += 1; // count
     e.2 += 1; // global count
 
-    let metrics_input = vec![extracted_data.clone()];
+    // 🌟 [METRICS GUARD] commerce 의 update_team_base_metrics 호출부와 동일한
+    //    '최소 계약' 을 강제합니다.
+    //    · type / mode      : draft·count 분류 키
+    //    · updated_at       : draft 판정 축
+    //    · created_at       : 시간축(최초/최근) 집계 축
+    //    trading 경로는 created_at 을 한 번도 넣은 적이 없어서
+    //    팀 메타데이터의 시간축 통계가 통째로 비어 있었습니다.
+    let now_ms_metrics = chrono::Utc::now().timestamp_millis();
+    let metrics_input: Vec<Value> = vec![extracted_data.clone()].into_iter().map(|it| {
+        let mut v = it;
+        if let Some(o) = v.as_object_mut() {
+            if o.get("type").is_none() { o.insert("type".to_string(), json!(doc_type.clone())); }
+            if o.get("mode").is_none() { o.insert("mode".to_string(), json!("shipping")); }
+            if o.get("updated_at").is_none() { o.insert("updated_at".to_string(), json!(now_ms_metrics)); }
+            if o.get("created_at").is_none() { o.insert("created_at".to_string(), json!(now_ms_metrics)); }
+        }
+        v
+    }).collect();
+
     let _ = crate::utils::metrics::update_team_base_metrics(&store, &team_id, &task.cc, &metrics_input, stats_diff.clone()).await;
+    emit_term(&format!(
+        "  📊 [TEAM METRICS] doc_type='{}' 통계 반영 완료 | 집계 축: amount, amount_subtotal, amount_tax, freight_amount, insurance_amount, local_charges, package_count, weight_gross, weight_net, volume, created_at",
+        doc_type
+    ));
 
     let _ = store.update_message_status(&task.id, crate::logic::parse_status("complete"), Some("Trading Extraction Complete")).await;
+
+    emit_term(&format!(
+        "[TRADING DOC] ✅ doc_type='{}' 저장 완료 (페이지 {}장 병합)",
+        doc_type, merged_page_count
+    ));
+    }
+    // 🌟 [DOC LOOP END] 병합 문서 단위 STEP C ~ STEP F 종료
 
     let payload_done = json!({
         "task_id": task.id,
         "category": "Done",
-        "summary": format!("Trading extraction complete. Document type: {}", doc_type),
+        "summary": format!("Trading extraction complete. {} page(s) processed.", total_pages),
         "spinner": "✅",
         "data": null
     });
     let _ = app_handle.emit("extraction-progress", &payload_done);
     log_task_progress(app_handle, &task.id, &payload_done);
 
-    println!("[TRADING] Task {} completed. Document type: {}.", task.id, doc_type);
+    println!("[TRADING] Task {} completed. {} page(s) processed.", task.id, total_pages);
     Ok(())
 }

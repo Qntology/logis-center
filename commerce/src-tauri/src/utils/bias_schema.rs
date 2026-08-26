@@ -15,6 +15,29 @@ pub fn lang_code_of(lang: &str) -> String {
     if code.chars().count() >= 2 { code } else { "en".to_string() }
 }
 
+/// 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드 27종을 공용 bias 노드로 접습니다.
+///  ── 무엇이 문제였나 ──
+///   get_detail_schema_fields("BL", ...) 의 add() 는 bias.json 에서
+///     BIAS_DICT["ko"]["BL"][field]  → 없음
+///     BIAS_DICT["ko"]["default"][field] → layout_list/layout_form/id,link/title/status 뿐
+///   순서로 찾다가 실패하고, 결국 영어 en_bias 3~4구만 남았습니다.
+///   commerce 의 goods.title 이 200구+ 인 것과 비교하면 뱅크가 사실상 비어 있어
+///   PLINKO / 헤더 코사인 / 청크 인덱싱이 전부 저품질로 떨어집니다.
+///  ── 해결 ──
+///   27종을 'shipping_doc' 하나로 접어 bias.json 에 사전을 한 벌만 두면 됩니다.
+///   서식마다 필드 의미가 갈리지 않으므로(B/L 의 pol 과 AWB 의 pol 은 같은 개념)
+///   공용 사전이 정확도를 해치지 않습니다.
+pub fn canonical_bias_type(page_type: &str) -> &str {
+    match page_type {
+        "shipping_doc"
+        | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
+        | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
+        | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" => "shipping_doc",
+        _ => page_type,
+    }
+}
+
 pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
     // 🌟 zh-tw / zh-hk 번체 분기 포함, 바이트 슬라이싱 없이 안전하게 코드를 뽑습니다.
     let lang_code_owned = lang_code_of(lang);
@@ -226,9 +249,16 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
         let mut final_bias = inject_domain(en_bias, page_type);
         let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
+        // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드(BL/CI/PL...)는 bias.json 에
+        //    개별 노드가 없으므로 공용 'shipping_doc' 노드로 접어서 조회합니다.
+        let bias_type_key = canonical_bias_type(page_type);
         if let Some(localized_obj) = BIAS_DICT
             .get(lang_code)
-            .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+            .and_then(|l| {
+                l.get(page_type)
+                    .or_else(|| if bias_type_key != page_type { l.get(bias_type_key) } else { None })
+                    .or_else(|| l.get("default"))
+            })
             .and_then(|p| p.get(key))
         {
             if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
@@ -477,9 +507,16 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
         let mut final_bias = inject_domain(en_bias, page_type);
         let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
+        // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드(BL/CI/PL...)는 bias.json 에
+        //    개별 노드가 없으므로 공용 'shipping_doc' 노드로 접어서 조회합니다.
+        let bias_type_key = canonical_bias_type(page_type);
         if let Some(localized_obj) = BIAS_DICT
             .get(lang_code)
-            .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+            .and_then(|l| {
+                l.get(page_type)
+                    .or_else(|| if bias_type_key != page_type { l.get(bias_type_key) } else { None })
+                    .or_else(|| l.get("default"))
+            })
             .and_then(|p| p.get(key))
         {
             if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {

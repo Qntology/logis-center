@@ -410,6 +410,8 @@ pub fn split_bias_phrases_weighted_full(raw: &str) -> (Vec<String>, Vec<f32>) {
 //    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
 pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드는 공용 'shipping_doc' 노드로 접습니다.
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
 
     for lk in [doc_lang, "en", "ko"] {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
@@ -420,6 +422,16 @@ pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
             .and_then(|v| v.as_str())
         {
             if !s.trim().is_empty() { return s.to_string(); }
+        }
+        if canon != page_type {
+            if let Some(s) = lang_node
+                .get(canon)
+                .and_then(|p| p.get(field_name))
+                .and_then(|n| n.get("semantic"))
+                .and_then(|v| v.as_str())
+            {
+                if !s.trim().is_empty() { return s.to_string(); }
+            }
         }
         if let Some(s) = lang_node
             .get("default")
@@ -578,10 +590,17 @@ pub fn multilingual_value_anchor_phrases_scoped(page_type: &str, field_name: &st
         .and_then(|v| v.as_object())
     { Some(n) => n, None => return out };
 
+    // 🌟 [BIAS TYPE CANONICALIZE] "BL.pol" 은 bias.json 에 없고 "shipping_doc.pol" 만
+    //    존재합니다. 정규화하지 않으면 무역 문서의 저장 벡터에 다국어 값 축이
+    //    한 구도 실리지 않아 크로스링구얼 리콜이 0 이 됩니다.
     let scoped_key = if page_type.trim().is_empty() {
         String::new()
     } else {
-        format!("{}.{}", page_type.trim(), field_name)
+        format!(
+            "{}.{}",
+            crate::utils::bias_schema::canonical_bias_type(page_type.trim()),
+            field_name
+        )
     };
 
     // ① 도메인 정확 일치 (goods.title 질의에는 goods.title 만)
@@ -1581,11 +1600,21 @@ pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
 //    여기서는 원본 JSON 을 직접 읽어 다국어 구 뱅크를 복원합니다.
 fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<serde_json::Value> {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    // 🌟 [BIAS TYPE CANONICALIZE] BL / CI / PL 등 무역 서식 코드는 bias.json 에
+    //    개별 노드가 없습니다. 공용 'shipping_doc' 노드로 접어 조회하지 않으면
+    //    label_phrase_bank / prejudice_phrase_bank 가 항상 빈 배열을 돌려주고,
+    //    그 결과 무역 문서의 헤더 코사인 맵과 청크 PLINKO 가 판정 근거를 잃습니다.
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
     let lang_keys = [doc_lang, "en", "ko"];
     for lk in lang_keys {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(n) = lang_node.get(page_type).and_then(|p| p.get(field_name)) {
             return Some(n.clone());
+        }
+        if canon != page_type {
+            if let Some(n) = lang_node.get(canon).and_then(|p| p.get(field_name)) {
+                return Some(n.clone());
+            }
         }
         if let Some(n) = lang_node.get("default").and_then(|p| p.get(field_name)) {
             let raw = n.to_string().replace("{TYPE}", page_type);

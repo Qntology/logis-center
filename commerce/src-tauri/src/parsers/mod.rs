@@ -377,3 +377,52 @@ pub fn extract_document_text(file_path: &str) -> anyhow::Result<String> {
         _ => Err(anyhow::anyhow!("Unsupported file extension for text extraction: {}", ext)),
     }
 }
+
+
+/// 🌟 [PAGE-WISE EXTRACT] 문서를 '페이지 단위' 로 분해합니다.
+///  ── 왜 필요한가 ──
+///   기존 extract_document_text 의 PDF 분기는 pdf_extract::extract_text 를 써서
+///   전 페이지를 경계 없이 한 덩어리 String 으로 돌려줍니다.
+///   그 결과 process_trading_task 가 5장짜리 B/L 묶음을 '한 장짜리 문서 1건' 으로
+///   오인해 doc_type 도 1개, 아이템도 1개만 만들었습니다.
+///   (CI + PL + BL 이 한 PDF 에 들어 있으면 세 서식이 통째로 뭉개집니다)
+///
+///  ── 반환 계약 ──
+///   Vec<String> — 인덱스 = 페이지 순서. 빈 페이지도 그대로 유지합니다.
+///   (호출부가 '몇 페이지짜리 문서인지' 를 알아야 로그와 진행률이 정확해집니다)
+///   PDF 이외 형식은 페이지 개념이 없으므로 길이 1 짜리 벡터를 돌려줍니다.
+pub fn extract_document_pages(file_path: &str) -> anyhow::Result<Vec<String>> {
+    use std::path::Path;
+    let path = Path::new(file_path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+
+    match ext.as_str() {
+        "pdf" => {
+            let pages = pdf_extract::extract_text_by_pages(path)
+                .map_err(|e| anyhow::anyhow!("PDF page-wise extraction failed: {}", e))?;
+
+            let cleaned: Vec<String> = pages
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .collect();
+
+            if cleaned.is_empty() || cleaned.iter().all(|p| p.is_empty()) {
+                return Err(anyhow::anyhow!(
+                    "PDF '{}' contains no extractable text on any page (scanned image PDF?). Use image_extraction instead.",
+                    file_path
+                ));
+            }
+
+            println!(
+                "[PARSER] 📄 PDF page-wise split: {} pages (non-empty: {})",
+                cleaned.len(),
+                cleaned.iter().filter(|p| !p.is_empty()).count()
+            );
+            Ok(cleaned)
+        },
+        _ => {
+            let whole = extract_document_text(file_path)?;
+            Ok(vec![whole])
+        }
+    }
+}
