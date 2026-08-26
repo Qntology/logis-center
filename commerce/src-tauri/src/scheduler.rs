@@ -1479,12 +1479,11 @@ pub async fn process_task(
     
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
 
-    // 🌟 [TRADING BRANCH] HTML 전처리 트랙에서 trading 모드이면 전용 파이프라인으로 분기합니다.
-    //    기존 process_task 는 commerce 6도메인(order/goods/tracking/review/coupon/event) 전용이므로
-    //    BL/AWB/CI 등 27종 무역 서식은 이 경로에서 처리할 수 없습니다.
-    //    image_extraction 트랙은 model.rs extract_from_image 가 이미 is_trade_doc 분기를 갖고 있으므로
-    //    여기서 분기하지 않습니다.
-    if search_mode == "shipping" && task.r#type == "html_extraction" {
+    // 🌟 [TRADING BRANCH v2] html_extraction 뿐만 아니라 document_extraction 도
+    //    trading 모드이면 전용 파이프라인으로 분기합니다.
+    //    PDF/문서 파일은 html 키가 없고 image_path 키를 전달하므로
+    //    process_trading_task 내부에서 document_extraction 분기를 추가 처리합니다.
+    if search_mode == "shipping" && (task.r#type == "html_extraction" || task.r#type == "document_extraction") {
         return process_trading_task(
             task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
         ).await;
@@ -8977,15 +8976,39 @@ async fn process_trading_task(
     };
 
     // ── HTML 전처리 ──
+    // 🌟 [SOURCE RESOLUTION v2] html 키가 있으면 그대로,
+    //    document_extraction 이면 파일에서 텍스트를 추출해 가짜 HTML 을 생성합니다.
+    //    (process_task 의 document_extraction 블록과 동일한 규칙)
     let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         let content = raw_html.to_string();
         if let Some(obj) = task_data.as_object_mut() {
             obj.remove("html");
         }
         content
+    } else if task.r#type == "document_extraction" {
+        let file_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
+        let ext = task_data.get("document_ext").and_then(|s| s.as_str()).unwrap_or("");
+        let payload = json!({
+            "task_id": task.id,
+            "category": "Document Parsing",
+            "summary": format!("Parsing {} file format for trading extraction...", ext.to_uppercase()),
+            "spinner": "📄"
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
+        let extracted_text = crate::parsers::extract_document_text(file_path)
+            .map_err(|e| anyhow::anyhow!("Trading document parsing failed: {}", e))?;
+        let fake_html = extracted_text.lines()
+            .map(|line| {
+                let safe_line = line.replace("<", "&lt;").replace(">", "&gt;");
+                format!("<div>{}</div>", safe_line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("<html><body>{}</body></html>", fake_html)
     } else {
         return Err(anyhow::anyhow!(
-            "Trading extraction requires HTML content in task data"
+            "Trading extraction requires HTML content or a document file in task data"
         ));
     };
 
