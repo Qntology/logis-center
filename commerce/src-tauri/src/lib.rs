@@ -647,6 +647,28 @@ async fn structure_pending_analytics(
         return Ok(json!({ "processed": 0, "skipped": "no_pending" }));
     }
 
+    // 🌟 [PRE-FILTER PROBE] 모델 로드 전에 실제 요약 가능한 텍스트가 있는지 사전 확인합니다.
+    //    기존에는 원시 이벤트가 1건 이상이면 무조건 모델을 로드했지만,
+    //    그 이벤트의 PUG 변환 결과가 비어있으면 모델 로드가 무의미합니다.
+    //    이제 사전 필터링으로 처리 가능한 항목이 0건이면 모델 로드 없이 조기 반환합니다.
+    let scan_filter = format!(
+        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
+        crate::analytic::ANALYTIC_EVENT_TYPES
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let scan_docs = store
+        .get_all_items("items", 100, 0, Some(scan_filter))
+        .await
+        .map_err(|e| e.to_string())?;
+    let actionable_count = crate::analytic::count_pending_structuring_targets(&scan_docs, limit.unwrap_or(20));
+    if actionable_count == 0 {
+        println!("[ANALYTIC] ⚪ 원시 이벤트는 있으나 실제 요약 가능한 텍스트가 0건이라 모델 로드를 건너뜁니다.");
+        return Ok(json!({ "processed": 0, "skipped": "no_actionable" }));
+    }
+
     println!("[ANALYTIC] Pending raw behaviour event detected. Loading Qwen3.5(2B) for structuring...");
 
     let model = {
