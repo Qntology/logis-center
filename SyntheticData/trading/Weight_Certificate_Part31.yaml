@@ -1,0 +1,29 @@
+document_type: Weight Certificate
+document_code: WC
+metadata:
+  certificate_number: WC-2026-0826
+  issue_date: '2026-08-26'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+parties:
+  weighing_authority:
+    name: Busan Port Weighing & Inspection Co., Ltd.
+    address: 50 Port-daero, Nam-gu, Busan, South Korea
+    contact_number: +82-51-710-3300
+  applicant:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+weighing_details:
+  weighing_date: '2026-08-26'
+  weighing_location: Busan Port Container Terminal Scale #2
+  container_number: PONU1234567
+  seal_number: SEAL88990
+measured_data:
+  cargo_net_weight_kg: 2300.0
+  cargo_gross_weight_kg: 2500.0
+  container_tare_weight_kg: 3800.0
+  verified_gross_mass_vgm_kg: 6300.0
+  total_measurement_cbm: 15.0
+certification_statement:
+  statement: We hereby certify that the above mentioned container and cargo have been weighed on our calibrated scale and the weights recorded are true and correct for SOLAS VGM compliance.

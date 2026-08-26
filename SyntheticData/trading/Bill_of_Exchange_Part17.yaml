@@ -1,0 +1,29 @@
+document_type: Bill of Exchange
+document_code: BE
+metadata:
+  exchange_number: BE-2026-0828
+  issue_date: '2026-08-28'
+  tenor: At sight
+  currency: USD
+  amount: 78500.0
+  related_lc_number: LC-88492011
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+parties:
+  drawer:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  drawee:
+    name: Bank of America
+    branch: San Francisco Main Branch
+    address: 456 Market St, San Francisco, CA 94104, USA
+  payee:
+    name: Kookmin Bank
+    branch: Seoul Main Branch
+    address: 84 Namdaemun-ro, Jung-gu, Seoul, South Korea
+drawn_under_terms:
+  lc_issuing_bank: Bank of America
+  lc_number: LC-88492011
+  lc_issue_date: '2026-08-15'
+  statement: At sight of this First Bill of Exchange, pay to the order of Kookmin Bank the sum of Seventy-Eight Thousand Five Hundred US Dollars ($78,500.00).

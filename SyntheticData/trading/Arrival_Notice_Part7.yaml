@@ -1,0 +1,38 @@
+document_type: Arrival Notice
+document_code: AN
+metadata:
+  notice_number: AN-SFO-20260908
+  issue_date: '2026-09-08'
+  estimated_time_of_arrival_eta: '2026-09-10'
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+parties:
+  issuer_carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+    contact_number: +1-510-555-8800
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  notify_party:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+shipping_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  terminal_of_discharge: SFO Container Terminal 4
+cargo_summary:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  total_packages: 50 PLTS
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0
+outstanding_charges:
+  currency: USD
+  terminal_handling_charge_thc: 350.0
+  documentation_fee: 65.0
+  total_amount_due: 415.0
+instructions:
+  statement: Please arrange customs clearance and settle all outstanding charges before cargo release. Original endorsed Bill of Lading must be surrendered.

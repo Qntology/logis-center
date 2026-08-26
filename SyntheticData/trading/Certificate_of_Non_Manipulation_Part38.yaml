@@ -1,0 +1,32 @@
+document_type: Certificate of Non-Manipulation
+document_code: CNM
+metadata:
+  certificate_number: CNM-2026-SG-0902
+  issue_date: '2026-09-02'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_co_number: CO-2026-KR-0801
+parties:
+  transshipment_customs_authority:
+    name: Singapore Customs Authority
+    address: 55 Newton Road, Revenue House, Singapore 307987
+  exporter_applicant:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+transshipment_details:
+  port_of_transshipment: Port of Singapore (SGSIN)
+  arrival_vessel: OCEAN VOYAGER V.123E
+  arrival_date: '2026-09-01'
+  departure_vessel: OCEAN VOYAGER V.123E
+  departure_date: '2026-09-02'
+cargo_verification:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  packages: 50 PLTS
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+certification_statement:
+  statement: We hereby certify that the goods specified above remained under customs supervision during transshipment and underwent no operations other than unloading, reloading, or any operation necessary to preserve them in good condition.

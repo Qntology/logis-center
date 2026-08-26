@@ -1,0 +1,32 @@
+document_type: Inspection Certificate
+document_code: IC
+metadata:
+  certificate_number: IC-2026-0825
+  issue_date: '2026-08-25'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_lc_number: LC-88492011
+parties:
+  inspection_agency:
+    name: SGS Korea Co., Ltd.
+    address: 322 Gwanyang-dong, Dongan-gu, Anyang-si, Gyeonggi-do, South Korea
+    contact_number: +82-31-460-8000
+  applicant:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+inspection_details:
+  inspection_date: '2026-08-24'
+  place_of_inspection: Busan Logistics Center, Busan, South Korea
+  inspection_scope: Quantity, Quality, and Packaging Verification
+  result: Passed
+cargo_inspected:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  inspected_quantity: 5000 PCS
+  status: Conform to Specifications
+- item_code: SKU-B200
+  description: Sensor Modules
+  inspected_quantity: 2000 PCS
+  status: Conform to Specifications
+declaration:
+  statement: We hereby certify that the goods listed above have been inspected and found to be in accordance with the quality and quantity specified in PO-99281A.

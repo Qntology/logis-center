@@ -1,0 +1,35 @@
+document_type: Bill of Lading
+document_code: BL
+metadata:
+  bl_number: BL-55432219
+  issue_date: '2026-08-28'
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_lc_number: LC-88492011
+  freight_term: Freight Collect
+parties:
+  shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  notify_party:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  carrier:
+    name: Pacific Ocean Lines
+shipping_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  place_of_receipt: Busan, South Korea
+  place_of_delivery: San Francisco, USA
+cargo_details:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  marks_and_numbers: N.I.L. SFO
+  number_of_packages: 50 PLTS
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0

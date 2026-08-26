@@ -1,0 +1,41 @@
+document_type: Statement of Account
+document_code: SOA
+metadata:
+  statement_number: SOA-2026-0920
+  issue_date: '2026-09-20'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_lc_number: LC-88492011
+  related_debit_note_number: DN-2026-0912
+  related_credit_note_number: CN-2026-0915
+  related_insurance_claim_number: ICF-2026-0914
+parties:
+  exporter_seller:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  importer_buyer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+account_ledger:
+- transaction_date: '2026-08-28'
+  description: Original Commercial Invoice (CI-2026-08001)
+  debit_usd: 78500.0
+  credit_usd: 0.0
+- transaction_date: '2026-09-12'
+  description: Debit Note - Destination Port Terminal Charges (DN-2026-0912)
+  debit_usd: 250.0
+  credit_usd: 0.0
+- transaction_date: '2026-09-15'
+  description: Credit Note - Quantity Variance Adjustment (CN-2026-0915)
+  debit_usd: 0.0
+  credit_usd: 500.0
+- transaction_date: '2026-09-18'
+  description: L/C Bank Settlement Received
+  debit_usd: 0.0
+  credit_usd: 78250.0
+summary:
+  total_invoiced_usd: 78750.0
+  total_credited_usd: 78750.0
+  ending_balance_usd: 0.0
+  account_status: Account Balanced & Closed
+  closure_date: '2026-09-20'

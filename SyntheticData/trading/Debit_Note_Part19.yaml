@@ -1,0 +1,32 @@
+document_type: Debit Note
+document_code: DN
+metadata:
+  debit_note_number: DN-2026-0912
+  issue_date: '2026-09-12'
+  due_date: '2026-09-25'
+  currency: USD
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+  related_an_number: AN-SFO-20260908
+parties:
+  issuer:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+    contact_number: +1-510-555-8800
+  recipient:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+debit_details:
+  reason_for_debit: Additional Terminal Storage and Container Demurrage Fees
+  charges:
+  - description: Overtime Terminal Storage Charge (1 Day)
+    amount: 150.0
+  - description: Container Demurrage Charge
+    amount: 200.0
+  total_debit_amount: 350.0
+payment_instructions:
+  status: Unpaid
+  remittance_bank: Bank of America
+  account_number: 1102-9983-4401

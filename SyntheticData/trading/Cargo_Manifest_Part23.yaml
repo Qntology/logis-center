@@ -1,0 +1,36 @@
+document_type: Cargo Manifest
+document_code: CM
+metadata:
+  manifest_number: CM-2026-0828
+  submission_date: '2026-08-28'
+  related_bl_number: BL-55432219
+  related_export_declaration_number: ED-2026-KR-77102
+parties:
+  carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+    contact_number: +1-510-555-8800
+  shipping_agent:
+    name: Busan Ocean Freight Agency Co., Ltd.
+    address: 12 Central-daero, Jung-gu, Busan, South Korea
+voyage_details:
+  vessel_name: OCEAN VOYAGER V.123E
+  flag_state: Panama
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  departure_date: '2026-08-28'
+consignment_summary:
+- bl_number: BL-55432219
+  shipper: Global Tech Logistics KR
+  consignee: Nova Importers LLC
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  total_packages: 50 PLTS
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0
+summary:
+  total_bills_of_lading: 1
+  total_containers: 1
+  total_packages: 50 PLTS
+  total_gross_weight_kg: 2500.0

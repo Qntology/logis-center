@@ -1,0 +1,46 @@
+document_type: Import Declaration
+document_code: ID
+metadata:
+  declaration_number: ID-2026-US-99120
+  declaration_date: '2026-09-10'
+  clearance_date: '2026-09-11'
+  related_bl_number: BL-55432219
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_co_number: CO-2026-KR-0801
+parties:
+  importer_declarant:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    tax_id: 94-1234567
+  customs_broker:
+    name: SF Bay Customs Clearance Inc.
+    address: 100 Embarcadero, San Francisco, CA 94105, USA
+  customs_office:
+    name: U.S. Customs and Border Protection (CBP)
+    port_code: '2809'
+    port_name: San Francisco, CA
+valuation_and_duties:
+  currency: USD
+  total_invoice_amount: 78500.0
+  dutiable_value: 78500.0
+  total_duty_amount: 1570.0
+  customs_user_fee: 31.40
+  total_amount_paid: 1601.40
+  payment_status: Paid
+goods_classification:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  hs_code: '8542.31'
+  entered_value: 62500.0
+  duty_rate: '2.5%'
+  duty_amount: 1562.50
+- item_code: SKU-B200
+  description: Sensor Modules
+  hs_code: '8543.70'
+  entered_value: 16000.0
+  duty_rate: '0.0%'
+  duty_amount: 0.00
+clearance_status:
+  status: Released
+  inspection_status: Passed

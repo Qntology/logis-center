@@ -1,0 +1,28 @@
+document_type: Proof of Delivery
+document_code: POD
+metadata:
+  pod_number: POD-SFO-20260912
+  delivery_date: '2026-09-12'
+  related_do_number: DO-SFO-20260911
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+parties:
+  carrier_trucker:
+    name: Bay Area Express Logistics LLC
+    address: 120 Harbor Terminal Rd, Oakland, CA 94607, USA
+    contact_number: +1-510-555-9011
+  consignee_recipient:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    received_by: John Miller (Warehouse Manager)
+delivery_details:
+  pickup_location: SFO Port Terminal Warehouse #4
+  delivery_location: Nova Importers Main Warehouse, San Francisco, CA
+  delivery_status: Complete / Delivered in Good Condition
+cargo_summary:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  packages_delivered: 50 PLTS
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0

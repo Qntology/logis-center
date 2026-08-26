@@ -1,0 +1,43 @@
+document_type: Packing List
+document_code: PL
+metadata:
+  packing_list_number: PL-2026-08001
+  issue_date: '2026-08-26'
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_bl_number: BL-55432219
+parties:
+  shipper_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+shipping_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+packing_details:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  quantity: 5000
+  unit: PCS
+  packages: 30
+  package_type: PLTS
+  net_weight_kg: 1400.0
+  gross_weight_kg: 1500.0
+  measurement_cbm: 9.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  quantity: 2000
+  unit: PCS
+  packages: 20
+  package_type: PLTS
+  net_weight_kg: 900.0
+  gross_weight_kg: 1000.0
+  measurement_cbm: 6.0
+summary:
+  total_packages: 50
+  total_net_weight_kg: 2300.0
+  total_gross_weight_kg: 2500.0
+  total_measurement_cbm: 15.0

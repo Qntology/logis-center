@@ -1,0 +1,30 @@
+document_type: Fumigation Certificate
+document_code: FC
+metadata:
+  certificate_number: FC-2026-0825
+  issue_date: '2026-08-25'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+parties:
+  treatment_provider:
+    name: Korea Pest Control & Fumigation Co., Ltd.
+    address: 88 Harbor-ro, Jung-gu, Busan, South Korea
+    license_number: KPC-2024-0012
+  applicant_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+treatment_details:
+  treatment_date: '2026-08-25'
+  place_of_treatment: Busan Port Bonded Area
+  chemical_used: Methyl Bromide (MB)
+  dosage: 48 g/m3
+  exposure_period: 24 Hours
+  minimum_temperature: 21°C
+cargo_details:
+  description: Wooden Pallets for Industrial Microcontrollers and Sensor Modules
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  ispm_15_mark: KR-KPC-0012-HT
+declaration:
+  statement: We hereby certify that the wooden packaging materials used for the consignment detailed above have been treated in accordance with ISPM 15 standards.

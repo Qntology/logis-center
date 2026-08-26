@@ -1,0 +1,33 @@
+document_type: Dangerous Goods Declaration
+document_code: DGD
+metadata:
+  declaration_number: DGD-2026-0827
+  issue_date: '2026-08-27'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+parties:
+  shipper_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    emergency_contact: +82-2-1234-5678 (24/7 Hotline)
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  carrier:
+    name: Pacific Ocean Lines
+transport_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+hazardous_item_details:
+- item_code: SKU-B200
+  description: Sensor Modules with Lithium Batteries
+  proper_shipping_name: Lithium ion batteries contained in equipment
+  un_number: UN3481
+  hazard_class: Class 9 (Miscellaneous Dangerous Goods)
+  packing_group: PG II
+  quantity_and_type_of_packing: 20 PLTS
+  gross_weight_kg: 1000.0
+declaration_statement:
+  statement: I hereby declare that the contents of this consignment are fully and accurately described above by the proper shipping name, and are classified, packaged, marked and labeled/placarded in accordance with applicable IMDG Code regulations.

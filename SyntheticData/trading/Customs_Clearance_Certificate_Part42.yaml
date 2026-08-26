@@ -1,0 +1,29 @@
+document_type: Customs Clearance Certificate
+document_code: CCC
+metadata:
+  certificate_number: CCC-2026-US-99120
+  issue_date: '2026-09-11'
+  related_import_declaration_number: ID-2026-US-99120
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_co_number: CO-2026-KR-0801
+parties:
+  customs_authority:
+    name: U.S. Customs and Border Protection (CBP)
+    port_of_entry: Port of San Francisco (3001)
+  importer_declarant:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+clearance_details:
+  entry_type: 01 - Consumption Entry
+  release_date: '2026-09-11'
+  customs_status: Released / Duties Paid
+  duty_paid_amount_usd: 3925.0
+cargo_summary:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  total_packages: 50 PLTS
+  entered_value_usd: 78500.0
+certification:
+  statement: This certificate verifies that the goods described herein have fulfilled all import customs requirements, duty assessments, and regulatory clearances, and are officially released for domestic entry.

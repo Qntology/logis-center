@@ -1,0 +1,35 @@
+document_type: Insurance Claim Form
+document_code: ICF
+metadata:
+  claim_number: ICF-2026-0914
+  claim_date: '2026-09-14'
+  related_insurance_policy_number: IP-2026-08200
+  related_survey_report_number: CDR-2026-SFO-0912
+  related_bl_number: BL-55432219
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+parties:
+  insurer:
+    name: Korea Trade Insurance Corporation (K-SURE)
+    address: 14 Jong-ro, Jongno-gu, Seoul, South Korea
+  claimant:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_person: Sarah Jenkins (Claims Manager)
+claim_details:
+  cause_of_loss: Heavy weather during ocean transit leading to water and crushing damage
+  place_of_loss: Ocean Transit (Busan to San Francisco)
+  vessel_name: OCEAN VOYAGER V.123E
+claimed_item_details:
+- item_code: SKU-B200
+  description: Sensor Modules
+  damaged_quantity: 200 PCS (2 PLTS)
+  claim_amount_usd: 1600.0
+summary:
+  total_claim_amount_usd: 1600.0
+  reimbursement_bank_account: Bank of America / Account No. 9920-1120-8831
+enclosed_documents:
+- Marine Cargo Insurance Policy (IP-2026-08200)
+- Bill of Lading (BL-55432219)
+- Commercial Invoice (CI-2026-08001)
+- Cargo Survey Report (CDR-2026-SFO-0912)

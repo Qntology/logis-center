@@ -1,0 +1,39 @@
+document_type: Export Declaration
+document_code: ED
+metadata:
+  declaration_number: ED-2026-KR-77102
+  declaration_date: '2026-08-27'
+  clearance_date: '2026-08-27'
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_lc_number: LC-88492011
+parties:
+  exporter_declarant:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    tax_id: 120-81-12345
+  customs_office:
+    name: Busan Customs Office
+    port_code: '030'
+    port_name: Busan Port
+valuation_and_declaration:
+  currency: USD
+  total_fob_amount: 78500.0
+  exchange_rate_krw: 1350.5
+  total_declared_krw: 106014250
+goods_classification:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  hs_code: '8542.31'
+  quantity: 5000 PCS
+  net_weight_kg: 1400.0
+  fob_amount_usd: 62500.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  hs_code: '8543.70'
+  quantity: 2000 PCS
+  net_weight_kg: 900.0
+  fob_amount_usd: 16000.0
+clearance_status:
+  status: Accepted
+  export_permission: Granted

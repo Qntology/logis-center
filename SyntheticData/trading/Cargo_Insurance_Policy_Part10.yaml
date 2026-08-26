@@ -1,0 +1,33 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+metadata:
+  policy_number: IP-2026-08200
+  issue_date: '2026-08-27'
+  effective_date: '2026-08-28'
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_lc_number: LC-88492011
+  related_po_number: PO-99281A
+parties:
+  insurer:
+    name: Hanwha General Insurance Co., Ltd.
+    address: 56 Yeouido-daero, Yeongdeungpo-gu, Seoul, South Korea
+  insured:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+coverage_details:
+  sum_insured: 86350.0
+  currency: USD
+  valuation_basis: CIP Amount (110% of Invoice Value)
+  coverage_conditions: Institute Cargo Clauses (A) - All Risks
+  premium_amount: 215.88
+  claims_payable_at: San Francisco, USA
+transport_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+cargo_details:
+- mark_and_numbers: N.I.L. SFO
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  number_of_packages: 50 PLTS
+  gross_weight_kg: 2500.0

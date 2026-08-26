@@ -1,0 +1,36 @@
+document_type: Letter of Credit
+document_code: LC
+metadata:
+  lc_number: LC-88492011
+  issue_date: '2026-08-15'
+  expiry_date: '2026-10-15'
+  currency: USD
+  amount: 78500.0
+  related_po_number: PO-99281A
+parties:
+  applicant:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  beneficiary:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  issuing_bank:
+    name: Bank of America
+    branch: San Francisco Main Branch
+    swift_code: BOFAUS3N
+  advising_bank:
+    name: Kookmin Bank
+    branch: Seoul Main Branch
+    swift_code: KOOKKRSE
+terms_and_conditions:
+  incoterms: FOB Busan
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  latest_date_of_shipment: '2026-09-05'
+  partial_shipments: Not Allowed
+  transshipment: Not Allowed
+required_documents:
+- Commercial Invoice in 3 originals showing PO Number PO-99281A
+- Full set of clean on board ocean Bill of Lading consigned to order of Issuing Bank
+- Packing List in 3 originals
+- Certificate of Origin issued by authorized Chamber of Commerce

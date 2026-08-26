@@ -1,0 +1,36 @@
+document_type: Cargo Survey Report
+document_code: CDR
+metadata:
+  survey_report_number: CDR-2026-SFO-0912
+  issue_date: '2026-09-12'
+  related_bl_number: BL-55432219
+  related_insurance_policy_number: IP-2026-08200
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_pod_number: POD-SFO-20260912
+parties:
+  surveying_agency:
+    name: Pacific Marine & Cargo Surveyors Inc.
+    address: 350 Embarcadero, San Francisco, CA 94105, USA
+    contact_number: +1-415-555-7722
+  applicant:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+survey_details:
+  inspection_date: '2026-09-12'
+  inspection_location: Nova Importers Main Warehouse, San Francisco, CA
+  vessel_flight: OCEAN VOYAGER V.123E
+  container_number: PONU1234567
+  seal_number: SEAL88990
+findings_and_damage:
+- item_code: SKU-B200
+  description: Sensor Modules
+  affected_quantity: 200 PCS (2 PLTS)
+  nature_of_damage: Exterior carton crushing and partial moisture damage due to heavy sea weather during transit.
+  cause_of_damage: Heavy weather at sea resulting in container stress.
+  estimated_loss_amount_usd: 1600.0
+summary:
+  total_sound_packages: 48 PLTS
+  total_damaged_packages: 2 PLTS
+  total_estimated_loss_usd: 1600.0
+  surveyor_conclusion: Damage occurred during ocean transit prior to warehouse unsealing. Recommended for insurance claim under Marine Cargo Policy IP-2026-08200.

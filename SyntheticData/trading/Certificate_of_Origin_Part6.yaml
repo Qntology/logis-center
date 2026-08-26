@@ -1,0 +1,37 @@
+document_type: Certificate of Origin
+document_code: CO
+metadata:
+  certificate_number: CO-2026-KR-0801
+  issue_date: '2026-08-27'
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_lc_number: LC-88492011
+parties:
+  exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  importer_consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  issuing_authority:
+    name: Korea Chamber of Commerce and Industry
+    address: 39 Sejong-daero, Jung-gu, Seoul, South Korea
+transport_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+cargo_details:
+- marks_and_numbers: N.I.L. SFO
+  description_of_goods: Industrial Microcontrollers (SKU-A100)
+  hs_code: '8542.31'
+  quantity: 5000 PCS
+  gross_weight_kg: 1500.0
+  origin_criterion: Produced entirely in South Korea
+- marks_and_numbers: N.I.L. SFO
+  description_of_goods: Sensor Modules (SKU-B200)
+  hs_code: '8543.70'
+  quantity: 2000 PCS
+  gross_weight_kg: 1000.0
+  origin_criterion: Produced entirely in South Korea
+declaration:
+  statement: We hereby certify that the goods described herein are of South Korea origin.

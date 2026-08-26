@@ -1,0 +1,36 @@
+document_type: Confirmation of Purchasing
+document_code: CP
+metadata:
+  confirmation_number: CP-2026-KR-0419
+  issue_date: '2026-08-12'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_export_declaration_number: ED-2026-KR-77102
+parties:
+  purchaser_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    tax_id: 120-81-12345
+  supplier_manufacturer:
+    name: Microchip Tech Korea Corp.
+    address: 45 Industrial-ro, Yeonsu-gu, Incheon, South Korea
+    tax_id: 131-86-67890
+  issuing_agency:
+    name: Korea International Trade Association (KTNET)
+purchased_items:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  quantity: 5000
+  unit: PCS
+  unit_price_krw: 12150.0
+  total_amount_krw: 60750000.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  quantity: 2000
+  unit: PCS
+  unit_price_krw: 7776.0
+  total_amount_krw: 15552000.0
+summary:
+  total_quantity: 7000
+  total_amount_krw: 76302000.0
+  tax_rate: 0.0% (Zero-rated VAT)
