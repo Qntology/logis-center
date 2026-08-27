@@ -200,10 +200,16 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     fn fallback_base(category: &str) -> Vec<(&'static str, &'static str)> {
         match category {
             "header" => vec![
-                ("doc_type",         "Document kind code {String}"),
-                ("doc_number",       "Primary identifier (B/L No, Invoice No, PO No) {String}"),
-                ("issue_date",       "Date of issue (YYYY-MM-DD) {String}"),
-                ("reference_number", "Any other reference number printed {String}"),
+                ("doc_type",           "Document kind code {String}"),
+                ("doc_number",         "Primary identifier of THIS document (B/L No, Invoice No, PO No) {String}"),
+                ("issue_date",         "Date of issue (YYYY-MM-DD) {String}"),
+                ("reference_po",       "Referenced Purchase Order number printed on this document {String}"),
+                ("reference_invoice",  "Referenced Commercial Invoice number printed on this document {String}"),
+                ("reference_bl",       "Referenced Bill of Lading number printed on this document {String}"),
+                ("reference_lc",       "Referenced Letter of Credit number printed on this document {String}"),
+                ("reference_booking",  "Referenced Booking number printed on this document {String}"),
+                ("reference_contract", "Referenced Sales Contract number printed on this document {String}"),
+                ("reference_number",   "Any OTHER reference number printed that does not fit the fields above {String}"),
             ],
             "parties" => vec![
                 ("sender_name",       "Shipper, Seller, Exporter {String}"),
@@ -313,10 +319,23 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         format!("{{\n{}\n}}", body)
     };
 
+    let reference_rule = if category == "header" {
+        "\nREFERENCE RULES:\n\
+         1. \"doc_number\" is the identifier OF THIS DOCUMENT ITSELF. Never put another document's number there.\n\
+         2. A number printed under a label such as 'Ref', 'Our Ref', 'Your Ref', 'Against', 'Covering', 'Relating to', \
+         'P/O No', 'Invoice No', 'B/L No', 'L/C No', 'Booking No', 'Contract No' belongs to the matching reference_* field, NOT to doc_number.\n\
+         3. Copy each reference number EXACTLY as printed, including its prefix and hyphens (PO-99281A, CI-2026-08001, BL-55432219, LC-88492011).\n\
+         4. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".\n\
+         5. Omit any reference_* field that is not printed. An omitted field is correct data; a guessed one corrupts the document graph."
+    } else {
+        ""
+    };
+
     format!(
-        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.\nSCHEMA:\n{}",
+        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.{}\nSCHEMA:\n{}",
         category.to_uppercase(),
         doc_type,
+        reference_rule,
         schema
     )
 }
@@ -355,77 +374,257 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
 //     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
 // }
 
+/// 🌟 [TRADE CONDITION — DEPTH 1] 질의 청크가 어느 '조건 카테고리' 인지 1갈래만 고릅니다.
+///  ── 왜 쪼개는가 ──
+///   기존 extract_shipping_conditions 는 44개 필드 + 변환 규칙 + 값 예시를
+///   한 프롬프트에 통째로 넣고 2B 모델에게 "알아서 골라라" 라고 시켰습니다.
+///   scheduler.rs STEP A 가 27개 서식 코드를 '그룹 → 코드' 2뎁스로 좁히는 것과
+///   정반대 구조였고, 그래서 Cross References 3축이 44축으로 늘어나는 순간
+///   프롬프트 길이만 폭증하고 정확도는 오히려 떨어집니다.
+///
+///  ── 호출 조건 ──
+///   이 프롬프트는 '항상' 호출되지 않습니다.
+///   model.rs 의 SURPRISAL 게이트가 1위-2위 마진을 확보하면 LLM 없이 확정되고,
+///   사실상 동률일 때만 이 초소형 프롬프트가 1회 호출됩니다.
+///
+///  ── 벡터 근거 동봉 ──
+///   scheduler.rs STEP A 의 [VECTOR EVIDENCE] 와 동일하게, 코사인 점수를
+///   후보 목록에 함께 실어 모델이 근거 없이 창작하지 못하게 만듭니다.
+pub fn trade_condition_category_prompt(
+    chunk: &str,
+    full_query: &str,
+    scored: &[(String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (cat, score) in scored.iter() {
+        let desc = match cat.as_str() {
+            "identity"  => "the document itself: its kind, its own number, its status, its issue or expiry date",
+            "transport" => "how the cargo moves: vessel, flight, voyage, ports, ETD, ETA, transport mode",
+            "parties"   => "who is involved: shipper, exporter, consignee, importer, notify party",
+            "terms"     => "commercial terms: incoterms, payment terms, freight prepaid or collect, currency, amounts",
+            "cargo"     => "the goods themselves: container, seal, packages, weight, volume, HS code, marks",
+            "reference" => "a number belonging to ANOTHER document that this one refers to",
+            "hub"       => "trace one number across EVERY related document, without naming which reference field it is",
+            _           => "other",
+        };
+        cands.push_str(&format!("- \"{}\" (vector score {:+.4}) — {}\n", cat, score, desc));
+    }
+
+    let template = r###"[TASK]
+Decide which SINGLE condition category the highlighted chunk belongs to.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK TO CLASSIFY]
+{CHUNK}
+
+[CANDIDATE CATEGORIES]
+{CANDIDATES}
+
+[RULES]
+1. Choose exactly ONE category from [CANDIDATE CATEGORIES]. Never invent a category name.
+2. "identity" is about THIS document. "reference" is about ANOTHER document that this one points to.
+   "The invoice number is CI-2026-08001" on an invoice  -> identity
+   "against invoice CI-2026-08001" on a bill of lading  -> reference
+3. Choose "hub" ONLY when the query asks to trace one number across every related document
+   and does NOT say which reference role it plays.
+   "show me everything under PO-99281A"  -> hub
+   "referenced purchase order is PO-99281A" -> reference
+4. If the chunk carries no filtering meaning at all, return "".
+
+[OUTPUT FORMAT]
+{ "category": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{CANDIDATES}", &cands)
+}
+
+/// 🌟 [TRADE CONDITION — DEPTH 2] 확정된 카테고리 안에서 파라미터 1개를 고릅니다.
+///  ── 핵심 ──
+///   후보 목록에 '승리한 카테고리의 필드' 만 들어갑니다.
+///   reference 카테고리라면 44축이지만, identity 라면 6축뿐입니다.
+///   모델이 볼 수 있는 선택지 자체를 결정론으로 좁혀 오답 경로를 물리적으로 없앱니다.
+///
+///  ── 호출 조건 ──
+///   exclusive_assign_by_score 가 확정하면 호출되지 않습니다.
+///   1위-2위가 사실상 동률일 때만 1회 호출됩니다.
+pub fn trade_condition_field_prompt(
+    chunk: &str,
+    full_query: &str,
+    category: &str,
+    scored: &[(String, String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (field, desc, score) in scored.iter() {
+        cands.push_str(&format!("- \"{}\" (vector score {:+.4}) — {}\n", field, score, desc));
+    }
+
+    let reference_note = if category == "reference" {
+        "\n[REFERENCE FIELD NOTE]\n\
+         The prefix of the number itself is the strongest clue.\n\
+         PO- -> reference_po / CI- -> reference_invoice / BL- -> reference_bl / LC- -> reference_lc\n\
+         HBL- -> reference_hbl / SWB- -> reference_swb / AWB- -> reference_awb / BK- -> reference_booking\n\
+         DO- -> reference_do / POD- -> reference_pod / CM- -> reference_manifest / FI- -> reference_freight_invoice\n\
+         ED- -> reference_export_decl / ID- -> reference_import_decl / CO- -> reference_origin\n\
+         IC- -> reference_inspection / WC- -> reference_weight / COA- -> reference_analysis\n\
+         IP- -> reference_policy / LG- -> reference_lg / TR- -> reference_tr / CDR- -> reference_survey\n\
+         If the printed prefix names a field in [CANDIDATE FIELDS], choose that field."
+    } else {
+        ""
+    };
+
+    let template = r###"[TASK]
+Decide which SINGLE field inside the '{CATEGORY}' category the highlighted chunk maps to.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK TO MAP]
+{CHUNK}
+
+[CANDIDATE FIELDS]
+{CANDIDATES}{REFERENCE_NOTE}
+
+[RULES]
+1. Choose exactly ONE field from [CANDIDATE FIELDS]. Never invent a field name.
+2. Judge by what the chunk MEANS, not by which candidate is listed first.
+3. If none of the candidates fit, return "".
+
+[OUTPUT FORMAT]
+{ "field": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{CATEGORY}", category)
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{CANDIDATES}", &cands)
+        .replace("{REFERENCE_NOTE}", reference_note)
+}
+
+/// 🌟 [TRADE CONDITION — DEPTH 3] 확정된 필드 하나의 값과 연산자만 뽑습니다.
+///  ── 왜 값까지 LLM 에게 맡기지 않는가 ──
+///   값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
+///   deterministic_condition_value / split_numeric_and_comparator 가
+///   Rust 에서 결정론으로 뽑아내므로, 이 프롬프트는 그 결정론이 실패했을 때만
+///   호출되는 최후 보루입니다.
+///
+///  ── 연산자 고정 ──
+///   trade_default_operator 가 필드 형식으로 기본 연산자를 확정합니다.
+///   모델은 그것을 '바꿀 근거가 있을 때만' 바꿉니다.
+pub fn trade_condition_value_prompt(
+    chunk: &str,
+    full_query: &str,
+    field: &str,
+    field_desc: &str,
+    default_operator: &str,
+) -> String {
+    let template = r###"[TASK]
+Extract the filter VALUE for the field '{FIELD}' from the highlighted chunk.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK]
+{CHUNK}
+
+[FIELD DEFINITION]
+"{FIELD}": {FIELD_DESC}
+
+[DEFAULT OPERATOR]
+"{DEFAULT_OP}"
+
+[RULES]
+1. "value" MUST be an exact literal substring of [CHUNK]. Never translate, reformat, round, or re-type it.
+2. Copy document numbers EXACTLY as printed, including prefix and hyphens. Never strip "PO-", "CI-", "BL-", "LC-".
+3. Keep the [DEFAULT OPERATOR] unless the chunk explicitly demands a comparison.
+   Only these are allowed: "eq", "gt", "gte", "lt", "lte", "contains".
+   "over 5000"  -> "gt"    "under 5000" -> "lt"
+   "at least"   -> "gte"   "up to"      -> "lte"
+   "after 2026-08-01" -> "gte"   "before 2026-09-01" -> "lte"
+4. Strip the operator words from "value". "over 5000 USD" -> value "5000", operator "gt".
+5. If [CHUNK] holds no usable value for this field, return null for both keys.
+   null is correct data; an invented value corrupts the filter.
+
+[OUTPUT FORMAT]
+{ "operator": String, "value": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{FIELD}", field)
+        .replace("{FIELD_DESC}", field_desc)
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{DEFAULT_OP}", default_operator)
+}
+
+/// 🌟 [FALLBACK ONLY] 이 프롬프트는 더 이상 정상 경로가 아닙니다.
+///  ── 언제 호출되는가 ──
+///   parse_shipping_query 의 Depth 1 SURPRISAL 게이트를 통과한 청크가
+///   단 하나도 없을 때(= 벡터 근거가 전무할 때) 최후 1회만 호출됩니다.
+///
+///  ── 왜 축소했는가 ──
+///   v2 는 44개 필드를 전부 나열했습니다. 그러면 프롬프트 길이만 폭증하고
+///   2B 모델이 "어느 칸에든 하나는 채워야 한다" 고 오인해 근거 없는 조건을 창작합니다.
+///   정상 경로는 trade_condition_category_prompt → trade_condition_field_prompt →
+///   trade_condition_value_prompt 3단으로 이미 좁혀지므로,
+///   여기서는 카테고리 대표 축만 남겨 '아무것도 못 뽑는 상황' 을 면하는 역할만 합니다.
+///
+///  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
+///     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
+///     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
 pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
-    // 🌟 [TRADING SCHEMA v2]
-    //  app-logis-center 의 get_search_schema_definitions 가 정의하던 무역 축을 전량 흡수합니다.
-    //  기존 10개 필드만으로는 '부킹번호로 찾아줘', '컨테이너 MSCU1234567',
-    //  'ETA 다음주인 건' 같은 실무 질의가 통째로 조건 없이 넘어갔습니다.
-    //
-    //  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
-    //     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
-    //     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
-Extract the logistics filters from the natural language query into the JSON format.
+The vector engine found NO reliable evidence in this query, so extract only what is unmistakably printed.
 
-[SCHEMA DEFINITION]
-Extract the following trade document properties if semantically present in the text:
-
+[SCHEMA DEFINITION — representative axes only]
 # Document Identity
-- "doc_type": Document kind (BL, AWB, CI, PI, PL, PO, SC, LC, CO, ED, ID, DO, AN, BC, DGD, MSDS).
-- "doc_number": Primary document identifier (B/L No, AWB No, Invoice No, PO No, Contract No).
-- "no": Tracking number, parcel number, or any generic reference number.
-- "status": Shipping status (draft, progress, return, complete, error).
+- "doc_type": Document kind code.
+- "doc_number": Primary identifier OF THE DOCUMENT ITSELF.
+- "no": Tracking number or generic reference number.
+- "status": Document / shipping status.
 - "issue_date": Date the document was issued.
-- "expiry_date": Expiry date (mainly L/C).
 
 # Transport
 - "vessel": Vessel name or Flight number.
-- "voyage_number": Voyage or flight leg number.
-- "pol": Port of Loading, Origin, Departure point.
-- "pod": Port of Discharge, Destination, Arrival point.
-- "place_receipt": Place of Receipt.
-- "place_delivery": Place of Delivery.
+- "pol": Port of Loading.
+- "pod": Port of Discharge.
 - "etd": Estimated Time of Departure.
 - "eta": Estimated Time of Arrival.
-- "transport_mode": Sea, Air, Road, or Rail.
 
 # Parties
-- "sender_name": Shipper, Seller, Exporter, or Vendor name.
-- "recipient_name": Consignee, Buyer, or Importer name.
-- "notify_party_name": Notify Party name.
+- "sender_name": Shipper, Seller, Exporter.
+- "recipient_name": Consignee, Buyer, Importer.
 
 # Commercial Terms
-- "incoterms": Incoterms code (FOB, CIF, EXW, DDP, DAP).
-- "payment_terms": Payment condition (T/T, L/C, Net30).
-- "freight_payment_term": Freight Prepaid or Freight Collect.
+- "incoterms": Incoterms code.
 - "currency": ISO 4217 currency code.
 - "amount": Total financial amount.
-- "freight_amount": Freight charges only.
-- "insurance_amount": Insurance charges only.
-- "local_charges": Local handling charges.
 
 # Cargo
-- "container_number": Container number (4 letters + 7 digits).
-- "seal_number": Seal number.
-- "package_count": Number of packages or cartons.
+- "container_number": Container number.
 - "weight_gross": Gross weight.
-- "weight_net": Net weight.
-- "volume": Volume in CBM.
-- "hs_code": HS Code or tariff number.
-- "marks_numbers": Shipping marks and numbers.
+- "hs_code": HS Code.
 
-# Cross References
-- "reference_invoice": Referenced commercial invoice number.
-- "reference_lc": Referenced letter of credit number.
-- "reference_booking": Referenced booking number.
+# Hub Reference
+- "hub_reference": A document number to trace ACROSS every related document, when the query does NOT say which reference role it plays.
 
 [TRANSFORMATION LOGIC]
 For EVERY extracted field, wrap it in an operator object:
 { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-- Use "eq" for strict identifiers: doc_number, container_number, seal_number, hs_code, no, status, doc_type, incoterms, currency.
-- Use "contains" for free text: names, ports, vessels, marks_numbers, payment_terms.
+- Use "eq" for strict identifiers: doc_number, container_number, hs_code, no, status, doc_type, incoterms, currency.
+- Use "contains" for free text and for hub_reference.
 - Use "gte" / "lte" for date ranges and numeric ranges.
-- Omit any field that is NOT explicitly present in the query. Never invent a value.
+- Copy document numbers EXACTLY as printed, including prefix and hyphens.
+- Omit any field that is NOT explicitly present in the query. Returning an empty object is correct
+  when nothing is printed; an invented condition silently destroys recall.
 
 [QUERY]
 {QUERY}

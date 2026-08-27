@@ -81,9 +81,15 @@
     "base": {
       "header": {
         "doc_type": "Document kind code {String}",
-        "doc_number": "Primary identifier (B/L No, Invoice No, PO No) {String}",
+        "doc_number": "Primary identifier of THIS document (B/L No, Invoice No, PO No) {String}",
         "issue_date": "Date of issue (YYYY-MM-DD) {String}",
-        "reference_number": "Any other reference number printed {String}"
+        "reference_po": "Referenced Purchase Order number printed on this document (e.g. PO-99281A) {String}",
+        "reference_invoice": "Referenced Commercial Invoice number printed on this document (e.g. CI-2026-08001) {String}",
+        "reference_bl": "Referenced Bill of Lading number printed on this document (e.g. BL-55432219) {String}",
+        "reference_lc": "Referenced Letter of Credit number printed on this document (e.g. LC-88492011) {String}",
+        "reference_booking": "Referenced Booking number printed on this document (e.g. BK-2026-0822) {String}",
+        "reference_contract": "Referenced Sales Contract number (e.g. SC-2026-0802) {String}",
+        "reference_number": "Any OTHER reference number printed that does not fit the fields above {String}"
       },
       "parties": {
         "sender_name": "Shipper, Seller, Exporter {String}",
@@ -173,6 +179,108 @@
         "conditions": {
           "policy_number": "Insurance policy number {String}",
           "coverage_type": "Coverage type (All Risks, FPA, WA) {String}"
+        }
+      },
+      "HBL": {
+        "header": {
+          "reference_hbl": "This House B/L number itself (e.g. HBL-55432219-01) {String}"
+        }
+      },
+      "FCR": {
+        "header": {
+          "reference_hbl": "Referenced House B/L number (e.g. HBL-55432219-01) {String}"
+        }
+      },
+      "POD": {
+        "header": {
+          "reference_do": "Referenced Delivery Order number (e.g. DO-SFO-20260911) {String}"
+        }
+      },
+      "LG": {
+        "header": {
+          "reference_bl": "Referenced Bill of Lading number covered by this Letter of Guarantee {String}"
+        }
+      },
+      "TR": {
+        "header": {
+          "reference_lg": "Referenced Letter of Guarantee number (e.g. LG-SFO-20260909) {String}"
+        }
+      },
+      "LLC": {
+        "header": {
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number (e.g. CP-2026-KR-0419) {String}"
+        }
+      },
+      "TI": {
+        "header": {
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number {String}",
+          "reference_local_lc": "Referenced Local L/C number (e.g. LLC-2026-KR-0911) {String}"
+        }
+      },
+      "CP": {
+        "header": {
+          "reference_export_decl": "Referenced Export Declaration number (e.g. ED-2026-KR-77102) {String}"
+        }
+      },
+      "CM": {
+        "header": {
+          "reference_export_decl": "Referenced Export Declaration number {String}"
+        }
+      },
+      "CCC": {
+        "header": {
+          "reference_import_decl": "Referenced Import Declaration number (e.g. ID-2026-US-99120) {String}",
+          "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
+        }
+      },
+      "CNM": {
+        "header": {
+          "reference_origin": "Referenced Certificate of Origin number {String}"
+        }
+      },
+      "PC": {
+        "header": {
+          "reference_fumigation": "Referenced Fumigation Certificate number (e.g. FC-2026-0825) {String}"
+        }
+      },
+      "COA": {
+        "header": {
+          "reference_inspection": "Referenced Inspection Certificate number (e.g. IC-2026-0825) {String}"
+        }
+      },
+      "FI": {
+        "header": {
+          "reference_booking": "Referenced Booking number (e.g. BK-2026-0822) {String}"
+        }
+      },
+      "CDR": {
+        "header": {
+          "reference_policy": "Referenced Insurance Policy number (e.g. IP-2026-08200) {String}",
+          "reference_pod": "Referenced Proof of Delivery number (e.g. POD-SFO-20260912) {String}"
+        }
+      },
+      "ICF": {
+        "header": {
+          "reference_policy": "Referenced Insurance Policy number {String}",
+          "reference_survey": "Referenced Cargo Damage / Survey Report number (e.g. CDR-2026-SFO-0912) {String}"
+        }
+      },
+      "SOA": {
+        "header": {
+          "reference_debit_note": "Referenced Debit Note number (e.g. DN-2026-0912) {String}",
+          "reference_credit_note": "Referenced Credit Note number (e.g. CN-2026-0915) {String}",
+          "reference_claim": "Referenced Insurance Claim number (e.g. ICF-2026-0914) {String}"
+        }
+      },
+      "EL": {
+        "header": {
+          "reference_contract": "Referenced Sales Contract number {String}",
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+        }
+      },
+      "SC": {
+        "header": {
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
         }
       }
     }
