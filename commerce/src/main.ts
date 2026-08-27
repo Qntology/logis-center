@@ -7415,6 +7415,36 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
+listen("app_error_alert", async (event: any) => {
+    const payload = event.payload as any;
+    // 🌟 Settings 탭 자동 열기 + 다운로드 시작
+    if (payload.action === "open_settings") {
+        // 1. 리스트 탭 열기 (설정 패널은 리스트 탭 내부에 있음)
+        openWidget("list");
+        // 2. Settings 패널 내 체크박스 켜기 (설정 패널 보이게)
+        const toggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (toggle) {
+            if (!toggle.checked) {
+                toggle.checked = true;
+            }
+            toggle.dispatchEvent(new Event("change"));
+        }
+        // 3. 모델 목록 렌더링 후 다운로드 시작
+        if (payload.model) {
+            console.log(`[AUTO-DL] ${payload.model} 자동 다운로드 시작...`);
+            try {
+                await invoke("download_model", { modelName: payload.model });
+                console.log(`[AUTO-DL] ${payload.model} 다운로드 명령 전송 완료`);
+            } catch (e) {
+                console.error(`[AUTO-DL] ${payload.model} 다운로드 실패:`, e);
+            }
+        }
+    } else {
+        // 기본 폴백: 기존 alert 동작
+        alert(payload.message || "알 수 없는 오류가 발생했습니다.");
+    }
+});
+
 listen("task-console-log", async (event: any) => {
     const { task_id, text } = event.payload;
     const key = `term_${task_id}`;
@@ -9329,55 +9359,6 @@ listen("download_error", (event: any) => {
     alert(`Error downloading ${payload.model}: ${payload.error}`);
 });
 
-// 🌟 [추가] 임베딩 모델 등 필수 파일 누락 시 알림 및 탭 이동 처리
-let hasAlertedMissingModel = false;
-listen("app_error_alert", (event: any) => {
-    const payload = event.payload as any;
-    
-    // 🌟 Settings 탭 자동 열기 + 다운로드 시작
-    if (payload.action === "open_settings") {
-        // 1. Settings 탭 열기
-        openWidget("settings");
-        
-        // 2. Settings 패널 내 체크박스 켜기 (설정 패널 보이게)
-        const toggle = document.getElementById("settings-toggle") as HTMLInputElement;
-        if (toggle && !toggle.checked) {
-            toggle.checked = true;
-            toggle.dispatchEvent(new Event("change"));
-        }
-        
-        // 3. 모델 목록 렌더링 후 다운로드 시작
-        invoke("check_model_status").then((status) => {
-            console.log("[MODEL-STATUS]", status);
-            
-            // 모델 목록 렌더링 (기존 함수 호출)
-            renderModelStatusUI(status);
-            
-            // 다운로드 시작
-            if (payload.model === "SigLIP2" && !(status as any).SigLIP2) {
-                console.log("[AUTO-DL] SigLIP2 자동 다운로드 시작...");
-                invoke("download_model", { modelName: "SigLIP2" }).then(() => {
-                    console.log("[AUTO-DL] SigLIP2 다운로드 완료");
-                    invoke("check_model_status").then((newStatus) => {
-                        renderModelStatusUI(newStatus);
-                    });
-                });
-            } else if (payload.model === "Embedding" && !(status as any).Embedding) {
-                console.log("[AUTO-DL] Embedding 자동 다운로드 시작...");
-                invoke("download_model", { modelName: "Embedding" }).then(() => {
-                    console.log("[AUTO-DL] Embedding 다운로드 완료");
-                    invoke("check_model_status").then((newStatus) => {
-                        renderModelStatusUI(newStatus);
-                    });
-                });
-            }
-        });
-        return;
-    }
-    
-    // 기본: alert 팝업
-    alert(payload.message);
-});
 
 // 🌟 [MODEL STATUS UI] 모델 상태를 화면에 렌더링하는 함수
 function renderModelStatusUI(status: any) {
@@ -9412,7 +9393,10 @@ function renderModelStatusUI(status: any) {
                 color: ${isDownloaded ? "#4ade80" : "#999"};
             `;
             
+            const safeId = key.replace(/[\s\(\)]+/g, '-');
+
             const statusBtn = document.createElement("button");
+            statusBtn.id = `btn-download-${safeId}`;
             statusBtn.textContent = isDownloaded ? "Downloaded" : "Download";
             statusBtn.style.cssText = `
                 padding: 4px 8px;
@@ -9423,10 +9407,14 @@ function renderModelStatusUI(status: any) {
                 background: ${isDownloaded ? "#6c757d" : "#28a745"};
                 color: white;
             `;
-            
             if (!isDownloaded) {
                 statusBtn.onclick = () => {
                     console.log(`[AUTO-DL] ${key} 다운로드 시작...`);
+                    statusBtn.innerText = "Downloading...";
+                    statusBtn.disabled = true;
+                    statusBtn.style.background = "#6c757d";
+                    const pc = document.getElementById(`progress-container-${safeId}`);
+                    if (pc) pc.style.display = "block";
                     invoke("download_model", { modelName: key }).then(() => {
                         invoke("check_model_status").then((newStatus) => {
                             renderModelStatusUI(newStatus);
@@ -9434,9 +9422,32 @@ function renderModelStatusUI(status: any) {
                     });
                 };
             }
-            
+
+            // 🌟 [추가] 프로그레스 바 컨테이너 및 바 생성
+            const progContainer = document.createElement("div");
+            progContainer.id = `progress-container-${safeId}`;
+            progContainer.style.width = "100%";
+            progContainer.style.background = "rgba(0,0,0,0.1)";
+            progContainer.style.marginTop = "6px";
+            progContainer.style.borderRadius = "4px";
+            progContainer.style.display = "none";
+
+            const progBar = document.createElement("div");
+            progBar.id = `progress-bar-${safeId}`;
+            progBar.style.height = "8px";
+            progBar.style.width = "0%";
+            progBar.style.background = "#007bff";
+            progBar.style.borderRadius = "4px";
+            progBar.style.fontSize = "6px";
+            progBar.style.color = "white";
+            progBar.style.textAlign = "center";
+            progBar.style.lineHeight = "8px";
+
+            progContainer.appendChild(progBar);
+
             row.appendChild(labelSpan);
             row.appendChild(statusBtn);
+            row.appendChild(progContainer);
             container.appendChild(row);
         });
     }

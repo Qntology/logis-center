@@ -932,8 +932,22 @@ impl LogisModel {
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
             
-            // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
-            self.deep_purge_resources().await;
+            // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
+            // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
+            let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
+            if is_vision_pipeline_active {
+                println!("[RELAY] 🛡️ SigLIP2 is resident. Skipping deep purge to protect vision engine.");
+                // Generator 슬롯만 클리어 (KV 캐시 및 스토리지 해제)
+                let mut gen = self.generator.lock().await;
+                if let Some(mut g) = gen.take() {
+                    let _ = g.clear_kv_cache();
+                    let _ = g.qwen.drop_kv_storage();
+                }
+                // Embedding 모델은 이미지 추출 후 단계에서 필요하므로 유지
+            } else {
+                // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
+                self.deep_purge_resources().await;
+            }
             
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
