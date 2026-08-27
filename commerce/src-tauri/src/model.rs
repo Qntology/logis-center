@@ -1717,18 +1717,27 @@ impl LogisModel {
                 }
                 
                 // 🌟 [비전 벡터 저장] 이미지 전체 풀링 벡터를 생성합니다.
-                //    텍스트 전용 문서가 아니므로 여기서만 비전 벡터가 채워집니다.
-                //    SigLIP2 미로드 시 0 벡터로 폴백합니다.
+                // 텍스트 전용 문서가 아니므로 여기서만 비전 벡터가 채워집니다.
+                // SigLIP2 미로드 시 0 벡터로 폴백합니다.
                 let vision_vec: Option<Vec<f32>> = {
                     let siglip_guard = self.siglip2_model.lock().await;
                     match siglip_guard.as_ref() {
                         Some(siglip) => {
-                            crate::models::siglip2::vision_encoder::encode_image_pooled(siglip, &dynamic_image)
-                                .ok()
+                            crate::models::siglip2::vision_encoder::encode_image_pooled(siglip, &dynamic_image).ok()
                         }
                         None => None,
                     }
                 };
+                // 🌟 [VRAM STAGE-FINAL] 비전 벡터 저장 완료. SigLIP2 전체 해제 (~820MB 반환).
+                //    이후 STEP 5 크롭 추출은 Qwen 3.5 단독으로 수행합니다.
+                //    이 시점 이후로 siglip2_model 을 참조하는 코드가 없으므로 안전합니다.
+                {
+                    let mut sig_guard = self.siglip2_model.lock().await;
+                    if sig_guard.is_some() {
+                        *sig_guard = None;
+                        println!("[VRAM] SigLIP2 vision encoder fully released before Qwen3.5 crop OCR (~820MB freed).");
+                    }
+                }
 
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
