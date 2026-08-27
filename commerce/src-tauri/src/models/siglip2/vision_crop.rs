@@ -67,13 +67,40 @@ struct Component {
 // ① + ② 활성 패치 선별 → 연결 성분 추출
 // =====================================================================
 
+/// 양수 점수의 (평균, 표준편차, 개수) 를 돌려줍니다.
+///
+/// 🌟 [WHY] surprisal > 0 만으로는 게이트가 너무 헐겁습니다.
+///    실측(CI 인보이스)에서 cargo 카테고리는 252 패치 중 158개(63%)가 양수였고,
+///    4-이웃 flood fill 이 문서 전면을 단일 성분으로 묶어 버렸습니다.
+///    그 결과 배타 배정에서 header 가 후보를 하나도 못 받고 굶었습니다.
+///    분포의 (평균 + 표준편차) 는 그 분포에서 유도된 값이므로 매직 상수가 아닙니다.
+fn positive_stats(scores: &[f32]) -> (f32, f32, usize) {
+    let pos: Vec<f32> = scores.iter().copied().filter(|s| *s > 0.0).collect();
+    if pos.len() < 2 {
+        return (0.0, 0.0, pos.len());
+    }
+    let n = pos.len() as f32;
+    let mean = pos.iter().sum::<f32>() / n;
+    let var = pos.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+    (mean, var.sqrt(), pos.len())
+}
+
+/// 성분 seed 로 삼을 '핵심(core)' 임계값. (평균 + 표준편차)
+fn core_threshold(scores: &[f32]) -> f32 {
+    let (mean, sd, cnt) = positive_stats(scores);
+    if cnt < 4 {
+        return 0.0;
+    }
+    mean + sd
+}
+
 /// 4-이웃 flood fill 로 활성 패치를 성분으로 묶습니다.
 ///
-/// 🌟 [ACTIVATION GATE] surprisal > 0 만 활성으로 봅니다.
-///    0 은 극값이론에서 유도된 값(√(2 ln N))이므로 매직 상수가 아니며,
-///    "N개를 무작위로 뽑은 기대 최댓값보다 실제로 더 가깝다" 는 뜻입니다.
-///    무관한 카테고리는 전 패치가 음수라 성분이 하나도 생기지 않습니다.
-fn extract_components(scores: &[f32], rows: usize, cols: usize) -> Vec<Component> {
+/// 🌟 [ACTIVATION GATE v2] 게이트를 인자로 받습니다.
+///    · gate = 0.0 → 기존 동작 (surprisal > 0)
+///    · gate = mean+sd → 봉우리만 seed 로 삼아 거대 성분을 방지
+///    확장(이웃 편입)도 같은 게이트를 적용해야 flood 가 다시 전면으로 번지지 않습니다.
+fn extract_components(scores: &[f32], rows: usize, cols: usize, gate: f32) -> Vec<Component> {
     let n = rows * cols;
     if scores.len() < n {
         return Vec::new();
@@ -86,7 +113,7 @@ fn extract_components(scores: &[f32], rows: usize, cols: usize) -> Vec<Component
         if visited[start] {
             continue;
         }
-        if scores[start] <= 0.0 {
+        if scores[start] <= gate {
             visited[start] = true;
             continue;
         }
@@ -124,7 +151,7 @@ fn extract_components(scores: &[f32], rows: usize, cols: usize) -> Vec<Component
                     return;
                 }
                 let idx = nr * cols + nc;
-                if visited[idx] || scores[idx] <= 0.0 {
+                if visited[idx] || scores[idx] <= gate {
                     return;
                 }
                 visited[idx] = true;
@@ -153,6 +180,159 @@ fn extract_components(scores: &[f32], rows: usize, cols: usize) -> Vec<Component
     out
 }
 
+/// 🌟 [CONTENT MASK] 전 카테고리 히트맵의 패치별 최댓값.
+///
+///  ── 무엇을 근사하는가 ──
+///   "이 패치가 어떤 스키마 개념과도 관련이 있는 정도" 입니다.
+///   문서에서 잉크가 찍힌 영역(라벨 텍스트 + 값 텍스트 + 표 셀)의 근사가 되고,
+///   여백·괘선·로고는 전 카테고리에서 음수라 자연히 제외됩니다.
+///
+///  ── 어디에 쓰는가 ──
+///   라벨은 히트맵에 반응하지만 값은 반응하지 않는 경우가 많습니다.
+///   (앵커가 'shipper / exporter' 라서 라벨 셀만 잡히고 회사명 셀은 안 잡힘)
+///   같은 행 밴드 안에서 content 가 이어지는 만큼 좌우로 넓혀
+///   '끊어진 테두리로 분리된 값 셀' 을 함께 담습니다.
+///
+///  반환: (mask, gate) — gate 는 mask 양수값의 평균
+fn build_content_mask(heatmaps: &[CategoryHeatmap], n: usize) -> (Vec<f32>, f32) {
+    let mut mask = vec![f32::MIN; n];
+    for hm in heatmaps.iter() {
+        let m = n.min(hm.scores.len());
+        for i in 0..m {
+            if hm.scores[i] > mask[i] {
+                mask[i] = hm.scores[i];
+            }
+        }
+    }
+    let (mean, _, cnt) = positive_stats(&mask);
+    let gate = if cnt < 4 { 0.0 } else { mean };
+    (mask, gate)
+}
+
+/// 🌟 [OVERSIZED SPLIT] 면적 상한을 넘는 성분을 봉우리 단위로 재분할합니다.
+///
+///  cargo 처럼 앵커가 광범위하게 반응하는 카테고리는 게이트를 올려도
+///  하나의 성분이 문서 대부분을 덮을 수 있습니다.
+///  그 성분 '내부' 점수 분포로 임계를 다시 계산해 봉우리만 남깁니다.
+fn split_oversized(
+    comp: &Component,
+    scores: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Vec<Component> {
+    let n = rows * cols;
+    let mut local = vec![f32::MIN; n];
+    for &i in comp.indices.iter() {
+        if i < n {
+            local[i] = scores[i];
+        }
+    }
+    let gate = core_threshold(&local);
+    if gate <= 0.0 {
+        return vec![comp.clone()];
+    }
+    let sub = extract_components(&local, rows, cols, gate);
+    if sub.is_empty() {
+        vec![comp.clone()]
+    } else {
+        sub
+    }
+}
+
+/// 🌟 [ROW BAND EXPANSION] 라벨↔값 페어를 담기 위한 가로 확장.
+///
+///  문서 레이아웃의 보편 사실:
+///    · 라벨과 값은 같은 행 밴드에 인쇄된다 (좌: 라벨 / 우: 값, 또는 그 반대)
+///    · 셀 테두리가 끊겨 있어도 행 위치는 유지된다
+///  성분의 행 범위를 고정한 채, 그 밴드 안에서 content 가 이어지는 열까지만 넓힙니다.
+///  content 가 끊기면 즉시 멈추므로 이웃 블록을 삼키지 않습니다.
+fn expand_row_band(
+    comp: &Component,
+    content: &[f32],
+    gate: f32,
+    cols: usize,
+) -> (usize, usize, usize, usize) {
+    let mut c_min = comp.c_min;
+    let mut c_max = comp.c_max;
+
+    let band_has = |c: usize| -> bool {
+        (comp.r_min..=comp.r_max).any(|r| {
+            let idx = r * cols + c;
+            idx < content.len() && content[idx] > gate
+        })
+    };
+
+    while c_min > 0 && band_has(c_min - 1) {
+        c_min -= 1;
+    }
+    while c_max + 1 < cols && band_has(c_max + 1) {
+        c_max += 1;
+    }
+
+    (comp.r_min, comp.r_max, c_min, c_max)
+}
+
+/// 🌟 [TABLE UNION] items / containers 전용. 표 전체를 하나의 박스로 잡습니다.
+///
+///  ── 왜 별도 처리인가 ──
+///   items 는 배열 스키마입니다. 한 셀만 크롭하면 나머지 행을 통째로 잃습니다.
+///   실측에서 items 는 단일 패치(r12,c12)만 배정받아 상품표(y 550~634)를
+///   전혀 보지 못했습니다.
+///
+///  ── 판정 근거 ──
+///   표 행은 '가로로 content 가 촘촘히 이어진다' 는 구조적 특징을 갖습니다.
+///   격자 폭의 1/3 이상이 content 인 행을 '표 행' 으로 보고 위아래로 확장합니다.
+fn table_union(
+    comps: &[Component],
+    content: &[f32],
+    gate: f32,
+    rows: usize,
+    cols: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let peak = comps.iter().max_by(|a, b| {
+        a.peak.partial_cmp(&b.peak).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+
+    let dense_cols = (cols / 3).max(2);
+    let row_is_table = |r: usize| -> bool {
+        (0..cols)
+            .filter(|&c| {
+                let idx = r * cols + c;
+                idx < content.len() && content[idx] > gate
+            })
+            .count()
+            >= dense_cols
+    };
+
+    let mut r0 = peak.r_min;
+    let mut r1 = peak.r_max;
+    while r0 > 0 && row_is_table(r0 - 1) {
+        r0 -= 1;
+    }
+    while r1 + 1 < rows && row_is_table(r1 + 1) {
+        r1 += 1;
+    }
+
+    // 표는 가로로 넓습니다. 밴드 안에서 content 가 있는 최좌·최우까지 잡습니다.
+    let mut c0 = cols;
+    let mut c1 = 0usize;
+    for r in r0..=r1 {
+        for c in 0..cols {
+            let idx = r * cols + c;
+            if idx < content.len() && content[idx] > gate {
+                if c < c0 { c0 = c; }
+                if c > c1 { c1 = c; }
+            }
+        }
+    }
+    if c0 > c1 {
+        c0 = peak.c_min;
+        c1 = peak.c_max;
+    }
+
+    Some((r0, r1, c0, c1))
+}
+
 /// 🌟 [FRAGMENT MERGE] 같은 행 대역에 있는 인접 성분을 병합합니다.
 ///
 ///  문서에서 하나의 논리 블록(예: Shipper 박스)은
@@ -165,8 +345,11 @@ fn merge_adjacent(mut comps: Vec<Component>, cols: usize) -> Vec<Component> {
         return comps;
     }
 
-    // 열 간격 허용치: 격자 폭의 1/8 (최소 1). 라벨-값 사이 여백 정도.
-    let gap_tol = (cols / 8).max(1);
+    // 🌟 열 간격 허용치: 격자 폭의 1/6 (최소 2).
+    //    실측 격자가 14열이라 1/8 = 1 이 되어 라벨 셀과 값 셀 사이의
+    //    테두리 여백(2패치 = 약 114px)을 넘지 못했습니다.
+    //    1/6 = 2 로 넓혀 '끊어진 테두리로 분리된 같은 행 셀' 이 병합되게 합니다.
+    let gap_tol = (cols / 6).max(2);
 
     let mut changed = true;
     let mut guard = 0usize;
@@ -372,11 +555,33 @@ pub fn plan_crops(
 
     let rows = grid.grid_rows;
     let cols = grid.grid_cols;
+    let n = rows * cols;
 
-    // ── ①② 카테고리별 성분 추출 + 병합 ──
-    let mut per_cat: Vec<(String, String, Vec<Component>)> = Vec::new();
+    // ── ⓪ CONTENT MASK ──
+    //    라벨만 반응하고 값은 반응하지 않는 경우를 보정하기 위한 '잉크 지도' 입니다.
+    let (content, content_gate) = build_content_mask(heatmaps, n);
+    let content_cnt = content.iter().filter(|v| **v > content_gate).count();
+    emit(&format!(
+        "    🗺️ [CONTENT MASK] 내용 패치 {}/{} | gate {:+.4} (라벨↔값 행 밴드 확장 기준)",
+        content_cnt, n, content_gate
+    ));
+
+    // 🌟 [AREA CAP] 한 카테고리가 문서 전체를 독점할 수 없다는 구조적 사실.
+    //    전체 면적을 경쟁 카테고리 수로 나눈 값이 상한입니다.
+    let area_cap = (n / heatmaps.len().max(1)).max(4);
+
+    // ── ①② 카테고리별 성분 추출 → 거대 성분 재분할 → 인접 병합 → 행 밴드 확장 ──
+    //    (category, top_field, gboxes, peaks, counts)
+    let mut per_cat: Vec<(String, String, Vec<(usize, usize, usize, usize)>, Vec<f32>, Vec<usize>)> =
+        Vec::new();
+
     for hm in heatmaps.iter() {
-        let comps = merge_adjacent(extract_components(&hm.scores, rows, cols), cols);
+        // ① 봉우리 게이트로 seed 확보. 봉우리가 없으면 기존 게이트(0.0)로 폴백.
+        let gate = core_threshold(&hm.scores);
+        let mut comps = extract_components(&hm.scores, rows, cols, gate);
+        if comps.is_empty() {
+            comps = extract_components(&hm.scores, rows, cols, 0.0);
+        }
         if comps.is_empty() {
             emit(&format!(
                 "    ⚪ [NO REGION] '{}' 는 활성 패치가 없어 크롭 대상에서 제외합니다.",
@@ -384,14 +589,82 @@ pub fn plan_crops(
             ));
             continue;
         }
+
+        // ② 거대 성분 재분할
+        let mut split: Vec<Component> = Vec::new();
+        for c in comps.into_iter() {
+            if c.indices.len() > area_cap {
+                let parts = split_oversized(&c, &hm.scores, rows, cols);
+                emit(&format!(
+                    "    ✂️ [OVERSIZED SPLIT] '{}' | 성분 {}패치 > 상한 {}패치 → 봉우리 {}개로 재분할",
+                    hm.category,
+                    c.indices.len(),
+                    area_cap,
+                    parts.len()
+                ));
+                split.extend(parts);
+            } else {
+                split.push(c);
+            }
+        }
+
+        let comps = merge_adjacent(split, cols);
+        if comps.is_empty() {
+            continue;
+        }
+
+        // ③ 표 전용 카테고리는 행 밴드를 union 해 표 전체를 잡습니다.
+        let is_table_cat = hm.category == "items" || hm.category == "containers";
+
+        let mut gboxes: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut peaks: Vec<f32> = Vec::new();
+        let mut counts: Vec<usize> = Vec::new();
+
+        if is_table_cat {
+            if let Some(tb) = table_union(&comps, &content, content_gate, rows, cols) {
+                let area = (tb.1 - tb.0 + 1) * (tb.3 - tb.2 + 1);
+                emit(&format!(
+                    "    🧾 [TABLE UNION] '{}' | 표 밴드 r{}~{}, c{}~{} ({}패치) 로 통합",
+                    hm.category, tb.0, tb.1, tb.2, tb.3, area
+                ));
+                gboxes.push(tb);
+                peaks.push(comps[0].peak);
+                counts.push(area);
+            }
+        }
+
+        if gboxes.is_empty() {
+            for comp in comps.iter() {
+                // ④ 라벨↔값 행 밴드 확장
+                let expanded = expand_row_band(comp, &content, content_gate, cols);
+                if expanded.2 < comp.c_min || expanded.3 > comp.c_max {
+                    emit(&format!(
+                        "    ↔️ [ROW BAND] '{}' | c{}~{} → c{}~{} (같은 행 밴드의 값 셀 편입)",
+                        hm.category, comp.c_min, comp.c_max, expanded.2, expanded.3
+                    ));
+                }
+                gboxes.push(expanded);
+                peaks.push(comp.peak);
+                counts.push(comp.indices.len());
+            }
+        }
+
         emit(&format!(
-            "    🧩 [COMPONENTS] '{}' | 성분 {}개 | Top: {}({:+.4})",
+            "    🧩 [COMPONENTS] '{}' | 영역 {}개 | Gate: {:+.4} | Top: {}({:+.4})",
             hm.category,
-            comps.len(),
+            gboxes.len(),
+            gate,
             if hm.top_field.is_empty() { "-" } else { &hm.top_field },
             hm.top_score
         ));
-        per_cat.push((hm.category.clone(), hm.top_field.clone(), comps));
+
+        per_cat.push((
+            hm.category.clone(),
+            hm.top_field.clone(),
+            gboxes,
+            peaks,
+            counts,
+        ));
     }
 
     if per_cat.is_empty() {
@@ -403,18 +676,14 @@ pub fn plan_crops(
         boxes: Vec::new(),
         counts: Vec::new(),
     };
-    // (cat_idx, comp) -> pool_idx
     let mut cat_pool_scores: Vec<Vec<(usize, f32)>> = Vec::with_capacity(per_cat.len());
 
-    for (_, _, comps) in per_cat.iter() {
+    for (_, _, gboxes, peaks, counts) in per_cat.iter() {
         let mut mine: Vec<(usize, f32)> = Vec::new();
-        for comp in comps.iter() {
-            let gbox = (comp.r_min, comp.r_max, comp.c_min, comp.c_max);
-
-            // 이미 풀에 유사 영역이 있으면 재사용합니다.
+        for (gi, gbox) in gboxes.iter().enumerate() {
             let mut pool_idx: Option<usize> = None;
             for (pi, existing) in pool.boxes.iter().enumerate() {
-                if grid_iou(gbox, *existing) >= 0.5 {
+                if grid_iou(*gbox, *existing) >= 0.5 {
                     pool_idx = Some(pi);
                     break;
                 }
@@ -423,19 +692,19 @@ pub fn plan_crops(
             let pi = match pool_idx {
                 Some(v) => v,
                 None => {
-                    pool.boxes.push(gbox);
-                    pool.counts.push(comp.indices.len());
+                    pool.boxes.push(*gbox);
+                    pool.counts.push(counts[gi]);
                     pool.boxes.len() - 1
                 }
             };
 
-            // 같은 풀 인덱스에 여러 성분이 매핑되면 최고 점수만 남깁니다.
+            let peak = peaks[gi];
             if let Some(slot) = mine.iter_mut().find(|(i, _)| *i == pi) {
-                if comp.peak > slot.1 {
-                    slot.1 = comp.peak;
+                if peak > slot.1 {
+                    slot.1 = peak;
                 }
             } else {
-                mine.push((pi, comp.peak));
+                mine.push((pi, peak));
             }
         }
         cat_pool_scores.push(mine);
@@ -447,13 +716,13 @@ pub fn plan_crops(
     }
 
     emit(&format!(
-        "    🎯 [REGION POOL] 후보 영역 {}개 | 경쟁 카테고리 {}개",
+        "    🎯 [REGION POOL] 후보 영역 {}개 | 경쟁 카테고리 {}개 | 면적 상한 {}패치",
         pool_n,
-        per_cat.len()
+        per_cat.len(),
+        area_cap
     ));
 
     // ── ④ 배타 배정 ──
-    //    행렬[cat][pool] = 점수. 무효 칸은 -1.0 (exclusive_assign_by_score 계약).
     let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; pool_n]; per_cat.len()];
     for (ci, mine) in cat_pool_scores.iter().enumerate() {
         for (pi, score) in mine.iter() {
@@ -464,25 +733,45 @@ pub fn plan_crops(
     let assign = exclusive_assign_by_score(&matrix, 0.0, 0.0);
 
     // ── ⑤ 픽셀 박스 확정 ──
-    //    최소 해상도: 원본의 12% 폭 / 6% 높이 (그보다 작으면 OCR 불가)
     let min_w = ((grid.orig_width as f32 * 0.12) as u32).max(64);
     let min_h = ((grid.orig_height as f32 * 0.06) as u32).max(48);
 
     let mut plans: Vec<CropPlan> = Vec::new();
 
     for (ci, a) in assign.iter().enumerate() {
-        let (pi, score, margin) = match a {
-            Some(v) => *v,
+        // 🌟 [STARVATION RESCUE] 배정에 실패한 카테고리는 자기 히트맵의 최고 봉우리로
+        //    독립 영역을 만들어 구제합니다.
+        //    ── 왜 겹침을 허용하는가 ──
+        //     실측에서 cargo 가 전면을 선점하자 header 가 UNASSIGNED 되었고,
+        //     doc_number 를 잃어 task_id 폴백 → 재스캔마다 중복 문서가 쌓였습니다.
+        //     크롭이 겹치는 비용은 LLM 호출 1회지만, 필드를 통째로 잃는 비용은 영구적입니다.
+        let (gbox, score, margin, patch_count) = match a {
+            Some((pi, score, margin)) => (pool.boxes[*pi], *score, *margin, pool.counts[*pi]),
             None => {
-                emit(&format!(
-                    "    ⚪ [UNASSIGNED] '{}' 는 다른 카테고리에 영역을 선점당해 크롭하지 않습니다.",
-                    per_cat[ci].0
-                ));
-                continue;
+                let (_, _, gboxes, peaks, counts) = &per_cat[ci];
+                let best = peaks
+                    .iter()
+                    .enumerate()
+                    .max_by(|x, y| x.1.partial_cmp(y.1).unwrap_or(std::cmp::Ordering::Equal));
+                match best {
+                    Some((bi, bscore)) => {
+                        emit(&format!(
+                            "    🛟 [STARVATION RESCUE] '{}' 는 영역을 선점당했지만 자기 최고 봉우리({:+.4})로 독립 크롭합니다.",
+                            per_cat[ci].0, bscore
+                        ));
+                        (gboxes[bi], *bscore, 0.0f32, counts[bi])
+                    }
+                    None => {
+                        emit(&format!(
+                            "    ⚪ [UNASSIGNED] '{}' 는 후보 영역이 하나도 없어 크롭하지 않습니다.",
+                            per_cat[ci].0
+                        ));
+                        continue;
+                    }
+                }
             }
         };
 
-        let gbox = pool.boxes[pi];
         let raw = to_pixel_bbox(gbox, grid);
         let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
 
@@ -500,7 +789,7 @@ pub fn plan_crops(
             bbox,
             score,
             margin,
-            patch_count: pool.counts[pi],
+            patch_count,
             top_field: per_cat[ci].1.clone(),
         });
     }

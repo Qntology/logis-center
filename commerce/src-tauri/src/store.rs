@@ -1346,7 +1346,17 @@ impl VectorStore {
              let mut vq = table.query();
              if let Some(ref f) = scope { vq = vq.only_if(f.clone()); }
 
+             // 🌟 [VECTOR COLUMN 명시 — 필수]
+             //  ── 무엇이 문제였나 ──
+             //   v5 스키마부터 items 테이블에는 벡터 컬럼이 두 개입니다.
+             //     vector      FixedSizeList(Float32, 384)   ← 텍스트 임베딩
+             //     vision_vec  FixedSizeList(Float32, 1152)  ← SigLIP2 비전 임베딩
+             //   LanceDB 는 벡터 컬럼이 복수인데 대상을 지정하지 않으면 모호성 에러를 냅니다.
+             //   그 에러가 `if let Ok(...)` 에 조용히 삼켜져 벡터 트랙이 통째로 0건이 되고,
+             //   FTS 트랙만 살아남아 "의미 검색이 안 되는" 상태가 됩니다.
+             //   비전 컬럼을 추가한 순간부터 텍스트 벡터 검색까지 함께 죽어 있었습니다.
              if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
+                 let vq_with_vector = vq_with_vector.column("vector");
                  if let Ok(vres) = vq_with_vector.execute().await {
                      if let Ok(batches) = vres.try_collect::<Vec<_>>().await {
                          let mut rank = 0;
@@ -1362,6 +1372,8 @@ impl VectorStore {
                              }
                          }
                      }
+                 } else {
+                     println!("[STORE] ⚠️ Text vector track failed to execute (column='vector').");
                  }
              }
          }
@@ -1382,10 +1394,21 @@ impl VectorStore {
         // =======================================================
         if let Some(ref vvec) = vision_query_vec {
             let is_empty_vvec = vvec.iter().all(|&x| x == 0.0);
-            if !is_empty_vvec {
+            let dim_ok = vvec.len() == 1152;
+            if !dim_ok {
+                println!(
+                    "[STORE] ⚠️ Vision query vector dim {} != 1152. Vision track skipped.",
+                    vvec.len()
+                );
+            }
+            if !is_empty_vvec && dim_ok {
                 let mut vvq = table.query();
                 if let Some(ref f) = scope { vvq = vvq.only_if(f.clone()); }
                 if let Ok(vvq_with_vector) = vvq.limit(fetch_limit).nearest_to(vvec.clone()) {
+                    // 🌟 [VECTOR COLUMN 명시 — 필수]
+                    //  1152차원 질의를 384차원 `vector` 컬럼에 던지면 차원 불일치로 실패합니다.
+                    //  구버전은 컬럼을 지정하지 않아 이 트랙이 한 번도 발화한 적이 없습니다.
+                    let vvq_with_vector = vvq_with_vector.column("vision_vec");
                     if let Ok(vvres) = vvq_with_vector.execute().await {
                         if let Ok(vbatches) = vvres.try_collect::<Vec<_>>().await {
                             let mut vrank = 0;
@@ -1400,7 +1423,12 @@ impl VectorStore {
                                     vrank += 1;
                                 }
                             }
+                            if vrank > 0 {
+                                println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec'.", vrank);
+                            }
                         }
+                    } else {
+                        println!("[STORE] ⚠️ Vision vector track failed to execute (column='vision_vec').");
                     }
                 }
             }
@@ -1789,9 +1817,12 @@ impl VectorStore {
         //    🌟 property 고정 검색은 캡이 없으므로 오버페치를 더 크게 잡아
         //    원본 청크와 음차 별칭(_tn/_tr)이 함께 창에 들어오도록 보장합니다.
         let overfetch = if property_pinned { limit * 12 } else { limit * 6 };
+        // 🌟 item_chunks 는 벡터 컬럼이 하나뿐이지만, 향후 컬럼이 늘어도
+        //    조용히 죽지 않도록 대상을 명시합니다.
         let results = q
             .limit(overfetch)
             .nearest_to(normalized_query)?
+            .column("vector")
             .execute()
             .await?
             .try_collect::<Vec<_>>()

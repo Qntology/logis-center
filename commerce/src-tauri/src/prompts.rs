@@ -255,6 +255,207 @@ Document group: "{GROUP}"
 ///   base 는 extract_shipping_conditions(검색)와 '같은 이름' 을 씁니다.
 ///   그래야 저장과 조회가 alias 를 거치지 않고 바로 만납니다.
 ///   레거시 데이터는 path_alias 가 흡수합니다.
+/// 🌟 [TYPE MARKER SPLIT] 설명 문자열 끝의 타입 표기를 값에서 떼어냅니다.
+///
+///  ── 무엇이 문제였나 ──
+///   구버전 스키마는 `"voyage_number": "Voyage or flight leg number {String}"` 를
+///   모델에게 그대로 보여 주었습니다. 그러면 값 자리에 문자열이 이미 들어 있으므로
+///   2B 모델은 그 마지막 토큰을 값으로 복사합니다.
+///   (실측 로그: `"voyage_number": "{String}"`)
+///   타입은 '설명' 이지 '값' 이 아니므로 값 위치에서 물리적으로 제거해야 합니다.
+fn split_type_marker(desc: &str) -> (String, &'static str) {
+    let d = desc.trim();
+    for (marker, ty) in [
+        ("{String}", "String"),
+        ("{Number}", "Number"),
+        ("{Boolean}", "Boolean"),
+        ("{Array}", "Array"),
+    ] {
+        if let Some(pos) = d.rfind(marker) {
+            let head = d[..pos].trim().trim_end_matches(':').trim();
+            let tail = d[pos + marker.len()..].trim();
+            let joined = if tail.is_empty() {
+                head.to_string()
+            } else {
+                format!("{} {}", head, tail)
+            };
+            return (joined.trim().to_string(), ty);
+        }
+    }
+    (d.to_string(), "String")
+}
+
+/// 🌟 [EXAMPLE TOKEN HARVEST v2] 설명 안의 '예시 값' 을 뽑아냅니다.
+///
+///  ── 왜 뽑아내는가 ──
+///   `"incoterms": "FOB, CIF, EXW, DDP, DAP {String}"` 를 보여 주면
+///   2B 모델은 목록의 첫 항목을 답으로 복사합니다.
+///   (실측: 정답 DAP 인데 FOB 반환 / 문서에 없는데 CTN 반환)
+///   설명에서 예시를 지우면 '어떤 종류의 값인가' 를 모르게 되므로 지울 수는 없습니다.
+///   대신 그 토큰들을 [FORBIDDEN VALUES] 로 명시해
+///   "이 목록은 값이 아니라 예시" 라는 사실을 프롬프트 안에서 못박습니다.
+///
+///  ── v1 이 놓친 것 ──
+///   v1 은 '대문자·숫자 비율' 하나만 봤습니다. bias.json 의 실제 44개 문자열에 대입하면
+///     "Sea, Air, Road, Rail"                 → Sea(대문자 1/알파벳 3) 전량 미검출
+///     "Freight Prepaid or Freight Collect"   → 15자 상한 초과로 미검출
+///     "(e.g. PO-99281A)"                     → 14자 상한 초과로 미검출
+///     "Tenor: at sight, 30 days, ..."        → 라벨 접두가 붙어 미검출
+///   전부 모델이 그대로 복사할 수 있는 형태입니다.
+///
+///  ── v2 판정 근거 (전부 구조, 어휘 사전 없음) ──
+///   R1 괄호 안 : 설명문의 괄호는 예시 열거입니다.
+///   R2 예시 마커: 마침표로 끝나는 4자 이하 선행 토큰(e.g. / eg. / ex.)은 마커이므로 제거합니다.
+///   R3 짧은 열거: 본문이 2조각 이상으로 쪼개지고 모든 조각이 3단어 이하면
+///                그 본문은 설명이 아니라 값 열거입니다.
+///                ("Sea, Air, Road, Rail" ✓ / "Subtotal before tax and charges" 는 1조각이라 미해당)
+///   R4 라벨 접두: 조각에 ':' 가 있으면 뒤쪽만 취합니다. ("Tenor: at sight" → "at sight")
+///   R5 대문자·숫자 우세: v1 규칙 유지. FOB / 20GP / UN1263 / YYYY-MM-DD 를 잡습니다.
+fn extract_example_tokens(desc: &str) -> Vec<String> {
+    /// 조각 하나를 정규화합니다. (R2 마커 제거 + R4 라벨 접두 제거 + 양끝 비영숫자 제거)
+    fn normalize_segment(raw: &str) -> String {
+        let mut s = raw.trim().to_string();
+
+        // R4 : "Tenor: at sight" → "at sight"
+        if let Some(p) = s.find(':') {
+            let tail = s[p + 1..].trim().to_string();
+            if !tail.is_empty() {
+                s = tail;
+            }
+        }
+
+        // R2 : "e.g. PO-99281A" → "PO-99281A"
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if toks.len() >= 2 {
+            let head = toks[0];
+            if head.ends_with('.') && head.chars().count() <= 4 {
+                s = toks[1..].join(" ");
+            }
+        }
+
+        s.trim()
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string()
+    }
+
+    /// 이 조각이 '값 예시로 쓰일 수 있는 생김새' 인지 최소 자격만 봅니다.
+    fn is_usable(t: &str) -> bool {
+        if t.is_empty() {
+            return false;
+        }
+        if t.chars().count() > 24 {
+            return false;
+        }
+        t.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+    }
+
+    /// R5 : 대문자 + 숫자 비중이 절반 이상인 짧은 토큰
+    fn is_code_like(t: &str) -> bool {
+        if t.chars().count() > 12 {
+            return false;
+        }
+        let alnum = t.chars().filter(|c| c.is_alphanumeric()).count();
+        if alnum < 2 {
+            return false;
+        }
+        let upper = t
+            .chars()
+            .filter(|c| c.is_uppercase() || c.is_ascii_digit())
+            .count();
+        upper * 2 >= alnum
+    }
+
+    /// 콤마 / " or " / '/' 를 공통 나열 구분자로 보고 쪼갭니다.
+    fn split_enum(seg: &str) -> Vec<String> {
+        seg.replace(" or ", ",")
+            .replace('/', ",")
+            .split(',')
+            .map(normalize_segment)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |t: String, out: &mut Vec<String>| {
+        if !is_usable(&t) {
+            return;
+        }
+        if !out.iter().any(|e| e == &t) {
+            out.push(t);
+        }
+    };
+
+    // ── R1 : 괄호/대괄호 안은 무조건 예시 열거로 봅니다 ──
+    let mut depth = 0usize;
+    let mut buf = String::new();
+    let mut paren_segs: Vec<String> = Vec::new();
+    for ch in desc.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                buf.clear();
+            }
+            ')' | ']' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if !buf.trim().is_empty() {
+                        paren_segs.push(buf.clone());
+                    }
+                    buf.clear();
+                }
+            }
+            _ => {
+                if depth > 0 {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    for seg in paren_segs.iter() {
+        for part in split_enum(seg) {
+            // 괄호 안이라도 5단어 이상이면 설명문입니다. ("4 letters + 7 digits")
+            if part.split_whitespace().count() > 4 {
+                continue;
+            }
+            push(part, &mut out);
+        }
+    }
+
+    // ── 괄호를 제거한 본문 ──
+    let flat: String = desc
+        .chars()
+        .map(|c| if c == '(' || c == ')' || c == '[' || c == ']' { ' ' } else { c })
+        .collect();
+    let body_parts = split_enum(&flat);
+
+    // ── R3 : 2조각 이상 + 모든 조각 3단어 이하 → 본문 전체가 값 열거 ──
+    let is_enumeration = body_parts.len() >= 2
+        && body_parts
+            .iter()
+            .all(|p| p.split_whitespace().count() <= 3);
+
+    for part in body_parts.iter() {
+        if is_enumeration {
+            push(part.clone(), &mut out);
+            continue;
+        }
+        // ── R5 : 열거가 아니어도 코드형 토큰은 개별 수확 ──
+        if is_code_like(part) {
+            push(part.clone(), &mut out);
+            continue;
+        }
+        // 조각 내부의 단어 단위로도 코드형 토큰을 찾습니다. ("UN number UN1263" 대비)
+        for w in part.split_whitespace() {
+            let t = w.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+            if is_code_like(&t) {
+                push(t, &mut out);
+            }
+        }
+    }
+
+    out
+}
+
 pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     use serde_json::Value;
 
@@ -366,12 +567,80 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         );
     }
 
-    // 3) 렌더링 : items / containers 는 배열 스키마입니다.
-    //    (merge_json_manual 이 items → line_items 로 매핑하므로 키 이름은 그대로 둡니다)
+    // 3) 렌더링 v2 : '정의' 와 '값 자리' 를 물리적으로 분리합니다.
+    //
+    //  ── 구버전이 만들던 프롬프트 ──
+    //     SCHEMA:
+    //     {
+    //       "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
+    //       "package_unit": "Package unit (CTN, PLT, PKG) {String}"
+    //     }
+    //   값 자리에 이미 문자열이 채워져 있으므로 2B 모델은 그것을 복사합니다.
+    //   실측 결과: 정답 DAP 인데 FOB, 문서에 없는데 CTN, 그리고 "{String}" 원문 그대로.
+    //
+    //  ── 새 프롬프트 ──
+    //     [FIELD DEFINITIONS]
+    //     - "incoterms" (String): FOB, CIF, EXW, DDP, DAP
+    //     [FORBIDDEN VALUES]
+    //     ... FOB, CIF, EXW, DDP, DAP ...
+    //     SCHEMA:
+    //     { "incoterms": null }
+    //   값 자리는 전부 null 이라 복사할 대상이 없고,
+    //   예시는 정의 블록으로 옮겨 '값이 아님' 을 명시합니다.
+    //
+    //  ⚠️ [CONTRACT] 아래 두 계약은 반드시 유지해야 합니다.
+    //     ① get_trade_doc_categories / process_trading_task 가
+    //        "SCHEMA:\n{}" 문자열로 빈 스키마를 판정합니다.
+    //     ② process_trading_task 가 SCHEMA 블록에서 trim_start 후 '"' 로 시작하는
+    //        라인 수로 필드 개수를 셉니다. 정의/금지 블록은 '-' 로 시작시켜 제외합니다.
     let is_array = category == "items" || category == "containers";
-    let body = fields
+
+    let parsed: Vec<(String, String, &'static str)> = fields
         .iter()
-        .map(|(k, d)| format!("  \"{}\": \"{}\"", k, d.replace('"', "'")))
+        .map(|(k, d)| {
+            let (desc, ty) = split_type_marker(d);
+            (k.clone(), desc, ty)
+        })
+        .collect();
+
+    let defs = parsed
+        .iter()
+        .map(|(k, d, t)| format!("- \"{}\" ({}): {}", k, t, d.replace('"', "'")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut forbidden: Vec<String> = Vec::new();
+    for (_, d, _) in parsed.iter() {
+        for tok in extract_example_tokens(d) {
+            if !forbidden.iter().any(|e| e == &tok) {
+                forbidden.push(tok);
+            }
+        }
+    }
+    // 타입 표기 자체도 금지 목록에 넣습니다. (실측: "voyage_number": "{String}")
+    for t in ["String", "Number", "Boolean", "Array"] {
+        let m = format!("{{{}}}", t);
+        if !forbidden.iter().any(|e| e == &m) {
+            forbidden.push(m);
+        }
+    }
+
+    let forbidden_block = if forbidden.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[FORBIDDEN VALUES]\n\
+             The tokens below appear in [FIELD DEFINITIONS] only as EXAMPLES of the kind of value.\n\
+             They are NOT the answer. Returning one of them without reading it off the image is a fabrication.\n\
+             - {}\n\
+             Return one of these ONLY when you can actually read that exact token in the image.",
+            forbidden.join(", ")
+        )
+    };
+
+    let body = parsed
+        .iter()
+        .map(|(k, _, _)| format!("  \"{}\": null", k))
         .collect::<Vec<_>>()
         .join(",\n");
 
@@ -394,10 +663,15 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     };
 
     format!(
-        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.{}\nSCHEMA:\n{}",
+        "RULES: Output JSON ONLY. Every value in SCHEMA is null on purpose — replace a null ONLY with text you can actually read in the image.\n\
+         MISSION: Extract data for category '{}' of a {} document.{}\n\
+         [FIELD DEFINITIONS]\n{}{}\n\
+         SCHEMA:\n{}",
         category.to_uppercase(),
         doc_type,
         reference_rule,
+        defs,
+        forbidden_block,
         schema
     )
 }
@@ -422,6 +696,7 @@ pub fn get_trade_crop_prompt(
     doc_type: &str,
     top_field: &str,
     score: f32,
+    claimed: &[(String, String)],
 ) -> String {
     let base = get_trade_category_schema(category, doc_type);
 
@@ -435,15 +710,43 @@ pub fn get_trade_crop_prompt(
         )
     };
 
+    // 🌟 [ALREADY CLAIMED] 앞선 크롭이 이미 확정한 값 목록.
+    //
+    //  ── 왜 필요한가 ──
+    //   크롭은 카테고리별로 순차 호출되므로 뒤 크롭은 앞 크롭의 결과를 모릅니다.
+    //   그래서 같은 숫자를 두 필드가 각각 자기 값으로 가져가는 사고가 납니다.
+    //   (실측: financials 가 2000.00 을 잡았는데 cargo 도 근처 숫자를 끌어옴)
+    //   scheduler.rs 의 커머스 추출이 [ALREADY CLAIMED VALUES] 로 같은 문제를 막는 것과
+    //   동일한 원리를 비전 크롭에도 적용합니다.
+    let claimed_block = if claimed.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n[ALREADY CLAIMED VALUES]\n\
+             Previous crops of this same document already確 locked these values to other fields.\n\
+             Never return any of them for a field in this crop:\n",
+        );
+        for (k, v) in claimed.iter().take(24) {
+            s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
+        }
+        s
+    };
+
     format!(
         "[INPUT NOTICE]\n\
          The image you receive is NOT the whole page. It is a precise crop that the vision encoder \
          identified as the '{}' region of a {} document. Everything relevant to this category is inside this crop.\n\
-         Therefore: if a field is not visible here, it is not present in the document at all. Return null for it.\n\
-         Never guess a value from a neighbouring number. A null field is correct data; a fabricated one corrupts the document graph.{}\n\n{}",
+         \n\
+         [HOW TO ANSWER]\n\
+         1. Read the crop first. List in your head only the text you can actually SEE.\n\
+         2. Fill a field ONLY from that seen text. If the field's value is not printed in this crop, return null.\n\
+         3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.\n\
+         4. Never take a value from a neighbouring field just because it is the only number nearby.\n\
+         5. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}\n\n{}",
         category.to_uppercase(),
         doc_type,
         evidence,
+        claimed_block,
         base
     )
 }
@@ -713,21 +1016,30 @@ For EVERY extracted field, wrap it in an operator object:
 
 pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
     if page_type == "tracking" {
+        // 🌟 [SCHEMA ECHO 방어] 값 자리의 "string" 은 그대로 복사될 위험이 있습니다.
+        //    실측에서 무역 경로가 "{String}" 을 그대로 뱉은 것과 같은 구조입니다.
+        //    값 자리는 null 로 비우고, 타입은 정의 블록으로 옮깁니다.
         let template = r###"[TASK]
-Convert the image to fit the structured JSON format. 
+Read this shipping label image and fill the structured JSON format.
 
 [CONTEXT]
 Region: {REGION}
 Recipient Address: {ADDRESS}
 Current Language: {LANGUAGE}
 
-[INSTRUCTION]
-1. Extract the tracking_number or document number.
-2. Set recipient_match to true if the label address matches the context address.
-3. Extract all visible barcodes into an array.
+[FIELD DEFINITIONS]
+- "tracking_number" (String): the tracking / waybill number printed on the label
+- "recipient_match" (Boolean): true only when the address on the label matches [CONTEXT] Recipient Address
+- "barcodes" (Array of String): every barcode value you can read on the label
+
+[HOW TO ANSWER]
+1. Every value in [OUTPUT FORMAT] is null on purpose. Replace a null ONLY with text read off the image.
+2. Never answer with a type name such as "string", "number", "boolean", or "{String}".
+3. Copy digits EXACTLY as printed. Never reformat or insert separators.
+4. If a value is not printed on the label, return null. An empty array is correct when no barcode is readable.
 
 [OUTPUT FORMAT]
-{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }
+{ "tracking_number": null, "recipient_match": null, "barcodes": [] }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
         template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
@@ -742,13 +1054,24 @@ Read this product image and fill the structured JSON format.
 Region: {REGION}
 Current Language: {LANGUAGE}
 
-[RULES]
-1. Copy every value EXACTLY as printed on the image. Never translate or reformat.
-2. If a field is not visible, return null. A null field is correct data; a guessed one is corrupted data.
-3. "price" holds digits only. Put the currency symbol or code in "currency".
+[FIELD DEFINITIONS]
+- "title" (String): product name as printed
+- "code" (String): product code / SKU as printed
+- "price" (Number): digits only
+- "currency" (String): ISO 4217 code or the printed symbol
+- "color" (String): colour name as printed
+- "brand_name" (String): brand as printed
+- "barcodes" (Array of String): every readable barcode value
+
+[HOW TO ANSWER]
+1. Every value in [OUTPUT FORMAT] is null on purpose. Replace a null ONLY with text read off the image.
+2. Never answer with a type name such as "String", "Number", or "{String}".
+3. Copy every value EXACTLY as printed. Never translate or reformat.
+4. "price" holds digits only. Put the currency symbol or code in "currency".
+5. If a field is not visible, return null. A null field is correct data; a guessed one is corrupted data.
 
 [OUTPUT FORMAT]
-{ "title": String, "code": String, "price": Number, "currency": String, "color": String, "brand_name": String, "barcodes": [String] }
+{ "title": null, "code": null, "price": null, "currency": null, "color": null, "brand_name": null, "barcodes": [] }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
         template.replace("{REGION}", region).replace("{LANGUAGE}", language)
@@ -775,14 +1098,63 @@ pub fn get_commerce_crop_prompt(
     language: &str,
     top_field: &str,
     score: f32,
+    claimed: &[(String, String)],
 ) -> String {
-    let mut schema = String::new();
+    // 🌟 [SCHEMA ECHO 방어] 무역 크롭과 동일하게 '정의' 와 '값 자리' 를 분리합니다.
+    //    구버전은 `  "price": Number {Number}` 처럼 값 자리에 타입 표기를 노출해
+    //    모델이 그것을 그대로 복사할 수 있었습니다.
+    let mut defs = String::new();
+    let mut body = String::new();
+    let mut forbidden: Vec<String> = Vec::new();
+
     for (name, desc) in fields.iter() {
-        schema.push_str(&format!("  \"{}\": {}\n", name, desc.replace('"', "'")));
+        let (clean, ty) = split_type_marker(desc);
+        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, clean.replace('"', "'")));
+        if !body.is_empty() {
+            body.push_str(",\n");
+        }
+        body.push_str(&format!("  \"{}\": null", name));
+        for tok in extract_example_tokens(&clean) {
+            if !forbidden.iter().any(|e| e == &tok) {
+                forbidden.push(tok);
+            }
+        }
     }
-    if schema.is_empty() {
-        schema.push_str("  \"title\": String\n");
+    if body.is_empty() {
+        defs.push_str("- \"title\" (String): Product title as printed\n");
+        body.push_str("  \"title\": null");
     }
+    for t in ["String", "Number", "Boolean", "Array"] {
+        let m = format!("{{{}}}", t);
+        if !forbidden.iter().any(|e| e == &m) {
+            forbidden.push(m);
+        }
+    }
+
+    let forbidden_block = if forbidden.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[FORBIDDEN VALUES]\n\
+             These tokens appear in [FIELD DEFINITIONS] only as EXAMPLES. They are not the answer.\n\
+             - {}\n",
+            forbidden.join(", ")
+        )
+    };
+
+    let claimed_block = if claimed.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n[ALREADY CLAIMED VALUES]\n\
+             Previous crops of this same screen already locked these values to other fields.\n\
+             Never return any of them for a field in this crop:\n",
+        );
+        for (k, v) in claimed.iter().take(24) {
+            s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
+        }
+        s
+    };
 
     let evidence = if top_field.is_empty() {
         String::new()
@@ -796,21 +1168,26 @@ pub fn get_commerce_crop_prompt(
 
     let template = r###"[INPUT NOTICE]
 The image you receive is NOT the whole screen. It is a precise crop that the vision encoder
-identified as holding the fields listed below. Everything relevant is inside this crop.
-If a field is not visible here, return null for it. Never guess from a neighbouring number.{EVIDENCE}
+identified as holding the fields listed below. Everything relevant is inside this crop.{EVIDENCE}
 
 [CONTEXT]
 Page Type: {TYPE}
 Output Language: {LANGUAGE}
 
-[RULES]
-1. Copy every value EXACTLY as printed. Never translate, round, or reformat.
-2. Numeric fields hold digits only. Strip currency symbols and thousand separators.
-3. Return null for anything not printed in this crop.
+[HOW TO ANSWER]
+1. Read the crop first. Use only the text you can actually SEE.
+2. Every value in [SCHEMA] is null on purpose. Replace a null ONLY with text read off the image.
+3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.
+4. Copy every value EXACTLY as printed. Never translate, round, or reformat.
+5. Numeric fields hold digits only. Strip currency symbols and thousand separators.
+6. Return null for anything not printed in this crop. A null field is correct data.
 
+[FIELD DEFINITIONS]
+{DEFS}{FORBIDDEN}{CLAIMED}
 [SCHEMA]
 {
-{SCHEMA}}
+{BODY}
+}
 
 [ACTION] JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
@@ -818,7 +1195,10 @@ Output Language: {LANGUAGE}
         .replace("{EVIDENCE}", &evidence)
         .replace("{TYPE}", page_type)
         .replace("{LANGUAGE}", language)
-        .replace("{SCHEMA}", &schema)
+        .replace("{DEFS}", &defs)
+        .replace("{FORBIDDEN}", &forbidden_block)
+        .replace("{CLAIMED}", &claimed_block)
+        .replace("{BODY}", &body)
 }
 
 pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_content: &str, reference_row: &str) -> String {

@@ -394,52 +394,29 @@ pub struct ChunkMetadata {
 }
 
 /// [PHASE B] detect_field_format() 결과를 문자열로 변환합니다.
-/// ai_utils.rs 의 FieldFormat enum 을 직접 참조하지 않고
-/// 문자열로 변환하여 nl_convert.rs 의 독립성을 유지합니다.
+///
+/// 🌟 [DUPLICATION REMOVED] 기존에는 ai_utils.rs::detect_field_format 의 판정 로직을
+///    이 함수에 통째로 복제해 두었습니다. "nl_convert.rs 의 독립성" 이 명분이었지만,
+///    실제로는 같은 규칙 두 벌이 서로 다르게 늙어가는 통로가 되었습니다.
+///    (무역 필드 추가 시 ai_utils 만 고치면 인덱싱 경로가 조용히 구버전 판정을 유지)
+///    이 함수의 계약은 '문자열 반환' 이지 '판정 로직 보유' 가 아니므로,
+///    판정은 단일 진실의 원천에 위임하고 여기서는 이름만 붙입니다.
+///    FieldFormat 의 변종과 반환 문자열은 1:1 대응이라 동작 변화가 없습니다.
 pub fn field_format_to_string(field_name: &str) -> String {
-    let lower = field_name.to_lowercase();
-    let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-    let has = |k: &str| keys.iter().any(|x| x == k);
-
-    if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-        return "Synthesis".to_string();
+    use crate::utils::ai_utils::{detect_field_format, FieldFormat};
+    match detect_field_format(field_name) {
+        FieldFormat::Synthesis => "Synthesis",
+        FieldFormat::TrackingCode => "TrackingCode",
+        FieldFormat::Identifier => "Identifier",
+        FieldFormat::Link => "Link",
+        FieldFormat::Date => "Date",
+        FieldFormat::Phone => "Phone",
+        FieldFormat::Address => "Address",
+        FieldFormat::Enum => "Enum",
+        FieldFormat::Numeric => "Numeric",
+        FieldFormat::Text => "Text",
     }
-    if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-        return "TrackingCode".to_string();
-    }
-    if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-        return "Identifier".to_string();
-    }
-    if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-        return "Link".to_string();
-    }
-    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-        return "Date".to_string();
-    }
-    if keys.iter().any(|k| {
-        k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-            || k == "cellphone" || k == "contact" || k == "number"
-    }) {
-        return "Phone".to_string();
-    }
-    if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-        return "Address".to_string();
-    }
-    if keys.iter().any(|k| {
-        k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-            || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-    }) {
-        return "Enum".to_string();
-    }
-    if keys.iter().any(|k| {
-        k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-            || k == "width" || k == "height" || k == "length" || k.contains("fee")
-            || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-            || k.contains("duration")
-    }) {
-        return "Numeric".to_string();
-    }
-    "Text".to_string()
+    .to_string()
 }
 
 /// [PHASE B] bias.json 에서 해당 필드의 semantic + bias 구를 동적으로 읽어옵니다.

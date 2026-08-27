@@ -1659,6 +1659,8 @@ async fn ai_search_complex(
         // 🌟 [DEXIE PLAN] 컨텍스트별 정밀 필터 플랜을 모아 프론트엔드로 전달합니다.
         //    LanceDB 가 버렸던 조건이 여기에 전부 살아 있습니다.
         let mut dexie_plans: Vec<Value> = Vec::new();
+        // 🌟 [VISION QUERY] shipping(무역) 트랙 전용 비전 질의 벡터. 컨텍스트 전체가 공유합니다.
+        let mut vision_qvec: Option<Vec<f32>> = None;
 
         let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); 
         let mut metrics_json_str = "{}".to_string();
@@ -1698,6 +1700,78 @@ async fn ai_search_complex(
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
+
+        // =====================================================================
+        // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
+        //    질의를 1152차원 공유공간에 올려 비전 벡터 검색을 활성화합니다.
+        // ---------------------------------------------------------------------
+        //  ── 무엇이 문제였나 ──
+        //   구버전은 컨텍스트 루프 안에서 `model.siglip2_model` 을 들여다봤지만,
+        //   검색 경로 어디에도 ensure_siglip2() 호출이 없었습니다.
+        //   parse_shipping_query 는 granite(384) 만 올립니다.
+        //   그래서 siglip2_model 은 항상 None → vision_qvec 은 항상 None →
+        //   Track V 가 단 한 번도 발화하지 않았습니다.
+        //   (이미지로 추출한 문서의 vision_vec 이 저장만 되고 검색에는 쓰이지 않는 상태)
+        //
+        //  ── 왜 루프 밖에서 1회만 만드는가 ──
+        //   ① 비전 벡터는 '이미지 전체' 를 대표하는 pooled 벡터입니다.
+        //      컨텍스트별로 쪼갠 텍스트보다 원 질의 문장이 더 적합합니다.
+        //   ② SigLIP2(2.2GB)를 컨텍스트마다 올렸다 내리면 4GB GPU 에서 즉시 OOM 입니다.
+        //      한 번 올려 인코딩하고 즉시 반환합니다.
+        //
+        //  ── VRAM 순서 ──
+        //   parse_shipping_query 가 남긴 Qwen3.5(2GB) 를 먼저 내리고,
+        //   SigLIP2 를 올려 인코딩한 뒤 즉시 반환합니다.
+        //   그 다음 컨텍스트 루프가 granite(384) 를 올립니다. 동시 상주가 없습니다.
+        // =====================================================================
+        if search_mode == "shipping" && !query.trim().is_empty() {
+            if cancel_token.load(Ordering::Relaxed) {
+                return Err("Search cancelled by user".to_string());
+            }
+            emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더로 비전 질의 벡터를 생성합니다...");
+
+            // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
+            model.deep_purge_resources().await;
+
+            match model.check_siglip2_downloaded().await {
+                Err(e) => {
+                    emit_term(&format!(
+                        "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
+                    ));
+                }
+                Ok(_) => {
+                    match model.ensure_siglip2(true).await {
+                        Err(e) => {
+                            emit_term(&format!(
+                                "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
+                            ));
+                        }
+                        Ok(_) => {
+                            {
+                                let guard = model.siglip2_model.lock().await;
+                                if let Some(sig) = guard.as_ref() {
+                                    if sig.has_text() {
+                                        vision_qvec = crate::models::siglip2::vision_encoder::encode_query_text(
+                                            sig, &query,
+                                        ).ok();
+                                    }
+                                }
+                            }
+                            // 인코딩이 끝났으면 즉시 반환합니다. (비전 820MB + 텍스트 1.4GB)
+                            model.release_siglip2("search vision query encoded").await;
+                        }
+                    }
+                }
+            }
+
+            match vision_qvec.as_ref() {
+                Some(v) => emit_term(&format!(
+                    "[VISION TRACK] ✅ 비전 질의 벡터 생성 완료 (dim {}). LanceDB Track V 를 활성화합니다.",
+                    v.len()
+                )),
+                None => emit_term("[VISION TRACK] ⚪ 비전 질의 벡터를 만들지 못해 텍스트 트랙만 사용합니다."),
+            }
+        }
 
         if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
@@ -1819,21 +1893,9 @@ async fn ai_search_complex(
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
                 const RECALL_LIMIT: usize = 50;
 
-                // 🌟 [비전 트랙] trading 모드일 때만 비전 질의 벡터를 생성합니다.
-                //    SigLIP2 텍스트 인코더로 질의를 1152차원으로 변환하여
-                //    비전 벡터 ANN 검색 트랙에 전달합니다.
-                let vision_qvec: Option<Vec<f32>> = if search_mode == "shipping" {
-                    let siglip_guard = model.siglip2_model.lock().await;
-                    match siglip_guard.as_ref() {
-                        Some(siglip) if siglip.has_text() => {
-                            crate::models::siglip2::vision_encoder::encode_query_text(siglip, &search_text).ok()
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
+                // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
+                //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
+                //     항상 None 이었습니다. 자세한 경위는 위 [VISION QUERY TRACK] 주석 참조)
                 let final_results = store
                     .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
                     .await
@@ -2281,8 +2343,9 @@ async fn ai_search_complex(
                 .count();
             let primary_count = ranked_results.len() - chunk_match_count;
 
-            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건)",
-                ranked_results.len(), primary_count, chunk_match_count);
+            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건) | 비전 트랙: {}",
+                ranked_results.len(), primary_count, chunk_match_count,
+                if vision_qvec.is_some() { "활성" } else { "비활성" });
 
             for (rank, item) in ranked_results.iter().enumerate() {
                 let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");

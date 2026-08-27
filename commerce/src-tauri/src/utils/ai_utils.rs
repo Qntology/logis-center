@@ -1974,12 +1974,18 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     let lower = field_name.to_lowercase();
     let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
     let has = |k: &str| keys.iter().any(|x| x == k);
-
     if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
         return FieldFormat::Synthesis;
     }
     if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
         return FieldFormat::TrackingCode;
+    }
+    // 🌟 [TRADE IDENTIFIER] hs_code / container_number / seal_number 는 값이 순수 숫자이거나
+    //    '영문 4자 + 숫자 7자' 구조입니다. Text 로 두면 is_alphabetic() 게이트에서
+    //    "583948392" 가 탈락해 청크가 저장조차 되지 않습니다.
+    //    (has("code") 는 완전일치라 "hs_code" 를 잡지 못했습니다)
+    if has("hs_code") || has("container_number") || has("seal_number") {
+        return FieldFormat::Identifier;
     }
     if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
         return FieldFormat::Identifier;
@@ -1987,7 +1993,9 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
         return FieldFormat::Link;
     }
-    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+    // 🌟 [TRADE DATE] etd / eta 는 'date' 도 '_at' 도 포함하지 않아 Text 로 떨어졌습니다.
+    //    무역 서식에서 이 두 축은 항상 날짜입니다.
+    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at") || k == "etd" || k == "eta") {
         return FieldFormat::Date;
     }
     // 🌟 tracking_number 는 위에서 이미 반환되었으므로 여기의 "number" 는 순수 연락처입니다.
@@ -2000,17 +2008,26 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
         return FieldFormat::Address;
     }
+    // 🌟 [TRADE ENUM] incoterms / transport_mode / payment_terms / freight_payment_term /
+    //    package_unit / unit / type_size 는 전부 '정해진 코드 집합' 입니다.
+    //    Enum 은 어떤 값이든 통과시키므로 오탐이 없고, Text 의 알파벳 요구를 우회합니다.
     if keys.iter().any(|k| {
         k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
             || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+            || k.contains("incoterm") || k.contains("_term") || k.contains("transport_mode")
+            || k == "unit" || k == "package_unit" || k == "type_size"
     }) {
         return FieldFormat::Enum;
     }
+    // 🌟 [TRADE NUMERIC] package_count / volume / local_charges 는 기존 어느 패턴에도
+    //    걸리지 않아 Text 로 떨어졌고, "4" / "12.5" / "150" 이 전부
+    //    FORMAT GATE 에서 unclassified 로 강등 → 인덱싱 대상에서 폐기되었습니다.
     if keys.iter().any(|k| {
         k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
             || k == "width" || k == "height" || k == "length" || k.contains("fee")
             || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
             || k.contains("duration")
+            || k.ends_with("_count") || k == "volume" || k.contains("charge")
     }) {
         return FieldFormat::Numeric;
     }

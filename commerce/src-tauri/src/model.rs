@@ -1098,6 +1098,63 @@ impl LogisModel {
         Ok(())
     }
 
+    /// 🌟 [SigLIP2 RELEASE] 비전+텍스트 인코더를 통째로 내리고 CUDA 캐시까지 반환합니다.
+    ///
+    ///  ── 왜 별도 헬퍼인가 ──
+    ///   기존에는 `*guard = None` 만 수행했습니다. candle 의 CUDA 백엔드는
+    ///   caching allocator 를 쓰므로 그것만으로는 VRAM 이 OS 로 돌아오지 않습니다.
+    ///   `deep_purge_resources` 가 하는 것과 같은 synchronize + 컨텍스트 재생성을
+    ///   여기서도 수행해야 실제 free VRAM 이 올라갑니다.
+    ///
+    ///  ── 언제 부르는가 ──
+    ///   STEP 1~4(패치 임베딩 · 문서분류 · 히트맵 · 크롭계획)가 끝나면
+    ///   SigLIP2 는 더 이상 필요하지 않습니다.
+    ///   그 시점이 곧 Qwen3.5(2B) 를 올려야 하는 시점이므로 여기서 반드시 비웁니다.
+    ///   (실측: 해제 없이 진입 시 첫 크롭에서 free VRAM 147MB)
+    pub async fn release_siglip2(&self, reason: &str) {
+        let released = {
+            let mut guard = self.siglip2_model.lock().await;
+            if guard.is_some() {
+                *guard = None;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !released {
+            return;
+        }
+
+        println!(
+            "[VRAM] SigLIP2 fully released ({}). vision ~820MB + text ~1.4GB returned.",
+            reason
+        );
+
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() {
+                    let _ = dev.synchronize();
+                }
+            })
+            .await;
+            // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+        }
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+    }
+
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
         // 🌟 current_size 를 읽고 한 번도 쓰지 않아 불필요한 뮤텍스 획득만 발생했습니다.
@@ -1311,6 +1368,9 @@ impl LogisModel {
 
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
+                    // 🌟 [VRAM STAGE] 이 경로는 크롭 없이 전체 이미지를 Qwen3.5 에 바로 넘깁니다.
+                    //    SigLIP2 는 여기서 임무가 끝났으므로 즉시 반환합니다.
+                    self.release_siglip2("TRACKING fast-track, before Qwen3.5 load").await;
                     let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
                     let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
                     let result_str = self.chat_with_qwen3_5_image_spinner(
@@ -1353,6 +1413,12 @@ impl LogisModel {
                     }
 
                     // ── STEP 5 : Qwen 3.5 2B 정제 추출 ──
+                    // 🌟 [VRAM STAGE] STEP 1~4 완료. SigLIP2(비전 820MB + 텍스트 1.4GB) 전량 반환.
+                    //    이 해제가 없으면 ensure_qwen3_5 의 `SigLIP2 is resident` 가드가 발동해
+                    //    deep purge 가 통째로 생략되고, 첫 크롭 시 free VRAM 이 147MB 까지 떨어집니다.
+                    //    pooled 벡터는 STEP 1 의 grid.pooled 를 재사용하므로 여기서 내려도 안전합니다.
+                    self.release_siglip2("STEP 1~4 complete, before Qwen3.5 crop OCR").await;
+
                     emit_term(&format!("[STAGE-5] 🤖 크롭 {}개 정제 추출", plans.len()));
 
                     let mut final_data_map = serde_json::Map::new();
@@ -1380,11 +1446,22 @@ impl LogisModel {
                             plan.category, crop.width(), crop.height(), idx + 1, plans.len()
                         ));
 
+                        // 🌟 [ALREADY CLAIMED] 앞선 크롭이 확정한 값을 함께 넘겨
+                        //    같은 숫자를 두 필드가 나눠 갖는 사고를 막습니다.
+                        let claimed = collect_claimed(&final_data_map);
+                        if !claimed.is_empty() {
+                            emit_term(&format!(
+                                "    🔒 [ALREADY CLAIMED] 확정값 {}건을 금지 목록으로 전달합니다.",
+                                claimed.len()
+                            ));
+                        }
+
                         let prompt = crate::parsing::get_trade_crop_prompt(
                             &plan.category,
                             &detected_type,
                             &plan.top_field,
                             plan.score,
+                            &claimed,
                         );
 
                         let tile_res = self.chat_with_qwen3_5_image_spinner(
@@ -1427,6 +1504,11 @@ impl LogisModel {
                     &heatmaps, &grid, &emit_term
                 );
 
+                // 🌟 [VRAM STAGE] 커머스 경로도 여기서 SigLIP2 임무가 끝납니다.
+                //    아래 두 분기(폴백 단일 호출 / 크롭 루프) 모두 Qwen3.5 를 올리므로
+                //    분기 이전에 반환해야 두 경로가 동일한 VRAM 여유를 갖습니다.
+                self.release_siglip2("commerce STEP 1~4 complete, before Qwen3.5").await;
+
                 if plans.is_empty() {
                     // 히트맵 실패 → 기존 단일 호출 폴백
                     emit_term("  🛟 [FALLBACK] 크롭 영역 없음. 전체 화면 단일 호출로 전환.");
@@ -1465,12 +1547,16 @@ impl LogisModel {
                             plan.category, crop.width(), crop.height(), fields.len()
                         ));
 
+                        // 🌟 [ALREADY CLAIMED] 커머스도 동일. 가격과 배송비가 섞이는 사고를 막습니다.
+                        let claimed = collect_claimed(&merged);
+
                         let prompt = crate::parsing::get_commerce_crop_prompt(
                             commerce_page_type,
                             &fields,
                             &language,
                             &plan.top_field,
                             plan.score,
+                            &claimed,
                         );
 
                         let res = self.chat_with_qwen3_5_image_spinner(
@@ -1494,17 +1580,10 @@ impl LogisModel {
                 }
             }
             
-            // 🌟 [VRAM STAGE] STEP 1~3 완료. 텍스트 인코더 + 토크나이저 해제 (~1.4GB 반환).
-            //    비전 인코더는 아래 비전 벡터 저장(encode_image_pooled)에 필요하므로 유지.
-            //    Qwen3.5 는 STEP 5 에서 chat_with_qwen3_5_image_spinner 가 자동 로드.
-            {
-                let mut sig_guard = self.siglip2_model.lock().await;
-                if let Some(sig) = sig_guard.as_mut() {
-                    sig.text = None;
-                    sig.tokenizer = None;
-                    println!("[VRAM] SigLIP2 text encoder + tokenizer released (~1.4GB VRAM freed).");
-                }
-            }
+            // 🌟 [VRAM STAGE] SigLIP2 는 STEP 5 진입 직전에 이미 release_siglip2() 로
+            //    전량 반환되었습니다. 여기서 다시 손댈 대상이 없습니다.
+            //    (구버전은 STEP 5 가 전부 끝난 뒤에야 텍스트 인코더를 내려
+            //     Qwen3.5 로드 구간 내내 2.2GB 를 점유했습니다)
             let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
             emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", mode_name));
 
@@ -1716,28 +1795,20 @@ impl LogisModel {
                     ));
                 }
                 
-                // 🌟 [비전 벡터 저장] 이미지 전체 풀링 벡터를 생성합니다.
-                // 텍스트 전용 문서가 아니므로 여기서만 비전 벡터가 채워집니다.
-                // SigLIP2 미로드 시 0 벡터로 폴백합니다.
-                let vision_vec: Option<Vec<f32>> = {
-                    let siglip_guard = self.siglip2_model.lock().await;
-                    match siglip_guard.as_ref() {
-                        Some(siglip) => {
-                            crate::models::siglip2::vision_encoder::encode_image_pooled(siglip, &dynamic_image).ok()
-                        }
-                        None => None,
-                    }
+                // 🌟 [비전 벡터 저장] STEP 1 의 encode_image() 가 이미 산출해 둔
+                //    L2 정규화 pooled 벡터를 그대로 재사용합니다.
+                //
+                //  ── 무엇이 문제였나 ──
+                //   구버전은 여기서 encode_image_pooled() 를 다시 호출했습니다.
+                //   그러면 전처리 → 패치 임베딩 → 27층 순전파 → 어텐션 풀링이 통째로 재실행되고,
+                //   그 시점까지 SigLIP2 를 붙들고 있어야 하므로 820MB 를 Qwen3.5 와 동시에 점유했습니다.
+                //   (실측 로그에 [SigLIP2/NaFlex] 가 두 번 찍히는 원인)
+                //   PatchGrid.pooled 는 동일한 값이므로 재계산은 순수 낭비입니다.
+                let vision_vec: Option<Vec<f32>> = if grid.pooled.len() == 1152 {
+                    Some(grid.pooled.clone())
+                } else {
+                    None
                 };
-                // 🌟 [VRAM STAGE-FINAL] 비전 벡터 저장 완료. SigLIP2 전체 해제 (~820MB 반환).
-                //    이후 STEP 5 크롭 추출은 Qwen 3.5 단독으로 수행합니다.
-                //    이 시점 이후로 siglip2_model 을 참조하는 코드가 없으므로 안전합니다.
-                {
-                    let mut sig_guard = self.siglip2_model.lock().await;
-                    if sig_guard.is_some() {
-                        *sig_guard = None;
-                        println!("[VRAM] SigLIP2 vision encoder fully released before Qwen3.5 crop OCR (~820MB freed).");
-                    }
-                }
 
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
@@ -8637,6 +8708,76 @@ fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
 ///   ② 배열 필드(items / containers 등)는 이어붙입니다.
 ///   ③ 이미 값이 있는 스칼라 필드는 유지합니다. 먼저 확정된 쪽이 이깁니다.
 ///      (크롭 계획은 점수 순이므로 근거가 강한 쪽이 먼저 들어옵니다)
+/// 🌟 [SCHEMA ECHO GUARD] LLM 이 프롬프트의 스키마 플레이스홀더를 그대로 베낀 경우를 걸러냅니다.
+///
+///  ── 실측 사고 ──
+///   logistics 크롭(서명 영역)에 voyage number 가 없자 2B 모델이
+///   프롬프트의 타입 표기 `{String}` 을 값으로 그대로 반환했습니다.
+///   그대로 저장하면 data.voyage_number = "{String}" 이 되어
+///   Dexie 인덱스와 FTS 를 영구히 오염시킵니다.
+///
+///  ── 판정 근거 ──
+///   어휘 사전이 아니라 '문자 구조' 입니다.
+///   중괄호/꺾쇠로 감싼 토큰, 타입 이름 그 자체, 날짜 포맷 문자열은
+///   어느 언어의 문서에도 값으로 등장하지 않습니다.
+fn is_schema_echo(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    // {String} / {Number} / <value> 같은 플레이스홀더 표기
+    if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('<') && t.ends_with('>')) {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "..." | "null" | "n/a" | "na" | "none" | "undefined" | "unknown"
+            | "string" | "number" | "boolean" | "array" | "object" | "integer" | "float"
+            | "yyyy-mm-dd" | "yyyy-mm-ddthh:mm:ss" | "iso8601" | "iso 8601"
+            | "not specified" | "not available" | "not found"
+    )
+}
+
+/// 🌟 [CLAIMED HARVEST] 지금까지 확정된 (필드, 값) 쌍을 뽑아 다음 크롭에 전달합니다.
+///
+///  ── 왜 필요한가 ──
+///   크롭은 카테고리별로 순차 호출되므로 뒤 크롭은 앞 크롭의 결과를 모릅니다.
+///   그래서 financials 가 이미 2000.00 을 확정했는데
+///   cargo 가 근처의 같은 숫자를 자기 필드로 다시 가져가는 사고가 납니다.
+///   scheduler.rs 의 커머스 추출이 [ALREADY CLAIMED VALUES] 로 같은 문제를 막는 것과
+///   동일한 장치를 비전 크롭 경로에도 부여합니다.
+///
+///  ── 무엇을 넘기는가 ──
+///   스칼라 값만 넘깁니다. 배열(line_items / containers)은 여러 행이 정상이므로
+///   금지 목록에 넣으면 오히려 정답을 막습니다.
+fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in merged.iter() {
+        // 카테고리 그룹 객체는 루트에 이미 미러링되어 있으므로 건너뜁니다.
+        if v.is_object() || v.is_array() {
+            continue;
+        }
+        let s = match v {
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        if s.is_empty() || is_schema_echo(&s) {
+            continue;
+        }
+        // doc_type 은 우리가 시딩한 값이라 금지 대상이 아닙니다.
+        if k == "doc_type" {
+            continue;
+        }
+        if out.iter().any(|(ek, ev)| ek == k && ev == &s) {
+            continue;
+        }
+        out.push((k.clone(), s));
+    }
+    out
+}
+
 fn merge_extracted(
     merged: &mut serde_json::Map<String, Value>,
     category: &str,
@@ -8670,9 +8811,20 @@ fn merge_extracted(
 
     let mut added = 0usize;
     let mut kept = 0usize;
+    let mut echoed = 0usize;
 
     for (k, v) in obj.iter() {
-        // ① 빈 값은 덮지 않습니다.
+        // ① 빈 값 / 스키마 에코는 덮지 않습니다.
+        if let Some(s) = v.as_str() {
+            if is_schema_echo(s) {
+                echoed += 1;
+                emit(&format!(
+                    "    🚫 [SCHEMA ECHO] [{}] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",
+                    category, k, s
+                ));
+                continue;
+            }
+        }
         let is_empty = v.is_null()
             || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
             || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
@@ -8698,7 +8850,7 @@ fn merge_extracted(
         }
 
         // ③ 이미 채워진 스칼라는 유지합니다.
-        match merged.get(k) {
+        let newly_added = match merged.get(k) {
             Some(existing) if !existing.is_null() => {
                 let existing_empty = existing
                     .as_str()
@@ -8707,20 +8859,48 @@ fn merge_extracted(
                 if existing_empty {
                     merged.insert(k.clone(), v.clone());
                     added += 1;
+                    true
                 } else {
                     kept += 1;
+                    false
                 }
             }
             _ => {
                 merged.insert(k.clone(), v.clone());
                 added += 1;
+                true
+            }
+        };
+
+        // 🌟 [CATEGORY SLOT MIRROR] 카테고리 그룹 객체에도 같은 값을 넣습니다.
+        //
+        //  ── 무엇이 문제였나 ──
+        //   구버전은 category 인자를 배열 분기에서만 쓰고, 객체 분기에서는
+        //   최상위에 평평하게 삽입했습니다. 그 결과
+        //     final_data_map["header"] = {"doc_type":"CI"}   ← 초기값 그대로
+        //     final_data_map["doc_number"] = "CI-43726"      ← 루트에 평평하게
+        //   가 되어, STEP C 의 TRADING FLATTEN v3 가 header 그룹을 순회할 때
+        //   승격할 잎이 doc_type 하나뿐이었습니다.
+        //   (실측 로그: "data 루트로 승격한 축 1개: [\"doc_type\"]")
+        //   또 doc_number 탐색이 header.document_number → 루트 순서인데
+        //   header 가 비어 있어 task_id 폴백이 확정되었습니다.
+        //
+        //  ── 왜 미러인가 ──
+        //   루트 평면 배치는 Dexie 인덱스(data.*)가 소비하므로 그대로 둡니다.
+        //   그룹 슬롯은 doc_number 탐색과 FLATTEN 이 소비합니다. 둘 다 필요합니다.
+        if newly_added && category != "items" && category != "containers" {
+            let slot = merged
+                .entry(category.to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(o) = slot.as_object_mut() {
+                o.insert(k.clone(), v.clone());
             }
         }
     }
 
     emit(&format!(
-        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건",
-        category, added, kept
+        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건",
+        category, added, kept, echoed
     ));
 }
 
@@ -8755,12 +8935,19 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
                     // 🌟 [ZERO IS DATA] 기존 `v != 0` 은 값이 실제로 0 인 축을 통째로 버렸습니다.
                     //    freight_amount 0(Freight Prepaid), package_count 0, weight_net 0 은
                     //    모두 '못 찾음' 이 아니라 확정된 값입니다.
-                    //    LLM 이 '못 찾음' 을 표현하는 방식은 null / "" / "N/A" 세 가지뿐이므로
-                    //    그 셋만 걸러냅니다.
                     if v.is_null() { continue; }
                     if let Some(s) = v.as_str() {
-                        let t = s.trim();
-                        if t.is_empty() || t == "N/A" { continue; }
+                        // 🌟 [SCHEMA ECHO GUARD] 텍스트 경로도 get_trade_category_schema 를
+                        //    그대로 쓰므로 비전 경로와 동일한 에코가 발생합니다.
+                        //    "{String}" / "String" / "..." 같은 플레이스홀더를 값으로 저장하면
+                        //    Dexie 인덱스와 FTS 가 영구히 오염됩니다.
+                        if is_schema_echo(s) {
+                            println!(
+                                "[TRADING] 🚫 [SCHEMA ECHO] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",
+                                k, s
+                            );
+                            continue;
+                        }
                     }
                     target_obj.insert(k.clone(), v.clone());
                 }

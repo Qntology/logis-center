@@ -818,6 +818,32 @@ pub const VISION_CHROME_ANCHOR: &str =
      ruled lines, barcode stripes, QR code square, page number footer, printed form template, \
      decorative frame, background texture, scanned paper noise, staple hole, punch hole";
 
+/// 🌟 [TABLE STRUCTURE ANCHOR] 명세 표(line items / containers) 전용 시각 앵커.
+///
+///  ── 왜 필요한가 ──
+///   items 카테고리의 스키마 필드는 `hs_code` 하나뿐입니다.
+///   실측에서 items 히트맵의 최고 점수는 +1.3126 으로 7개 카테고리 중 최하위였고,
+///   상품 표(y 550~634)를 전혀 잡지 못한 채 합계 블록을 크롭했습니다.
+///   표는 '컬럼 헤더 나열 + 반복 행' 이라는 강한 시각 구조를 갖고 있으므로
+///   그 구조 자체를 앵커로 세워야 위치가 잡힙니다.
+///
+///  ── 어휘가 아니라 구조인가 ──
+///   여기 적힌 문구는 전 세계 무역 서식 표의 컬럼 헤더 표준 명칭입니다.
+///   bias.json 의 필드 semantic 과 같은 계보이며, 특정 서식에 종속되지 않습니다.
+pub const TRADE_TABLE_STRUCTURE_ANCHOR: &str =
+    "description of goods, description of merchandise, commodity description, item description, \
+     line item table, itemized list, goods table, product table, \
+     quantity column, unit of measure, unit price column, unit value, total value column, \
+     amount column, qty, pcs, unit weight, net weight column, \
+     country of manufacture, country of origin column, hs code column, tariff code column, \
+     repeating table rows, tabular data grid, column headers row, itemised breakdown";
+
+/// 컨테이너 명세 표 전용 앵커.
+pub const TRADE_CONTAINER_TABLE_ANCHOR: &str =
+    "container list, container number column, seal number column, \
+     container type size, number of packages column, gross weight column, measurement column, \
+     container and seal table, equipment list";
+
 /// Depth 2 보조 : 서식 코드 하나의 앵커 구.
 pub fn trade_code_anchor(code: &str) -> &'static str {
     match code {

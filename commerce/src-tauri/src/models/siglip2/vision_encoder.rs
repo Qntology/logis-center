@@ -527,6 +527,43 @@ pub fn build_column_heatmaps(
         }
     }
 
+    // 🌟 [TABLE STRUCTURE ANCHOR 편입]
+    //  items / containers 는 스키마 필드가 각각 hs_code / container_number 정도뿐이라
+    //  앵커 밀도가 다른 카테고리의 1/10 수준입니다.
+    //  실측에서 items 히트맵이 최하위(+1.3126)로 밀려 상품 표를 놓쳤습니다.
+    //  '표' 라는 시각 구조 자체를 앵커로 세워 위치 신호를 복원합니다.
+    {
+        let table_axes: [(&str, &str, &str); 2] = [
+            ("items", "__table_structure__", crate::logic::TRADE_TABLE_STRUCTURE_ANCHOR),
+            ("containers", "__container_table__", crate::logic::TRADE_CONTAINER_TABLE_ANCHOR),
+        ];
+        for (cat, pseudo_field, anchor) in table_axes.iter() {
+            // 그 카테고리에 실제 스키마 필드가 하나라도 있을 때만 편입합니다.
+            let has_field = field_to_cat.values().any(|c| c == cat);
+            if !has_field {
+                continue;
+            }
+            field_to_cat.insert(pseudo_field.to_string(), cat.to_string());
+            let mut added = 0usize;
+            for p in split_bias_phrases_full(anchor) {
+                if bias_defs
+                    .iter()
+                    .any(|(c, k, e)| c == cat && k == pseudo_field && e == &p)
+                {
+                    continue;
+                }
+                bias_defs.push((cat.to_string(), pseudo_field.to_string(), p));
+                added += 1;
+            }
+            if added > 0 {
+                emit(&format!(
+                    "  🧾 [TABLE ANCHOR] '{}' 카테고리에 표 구조 앵커 {}구 편입 (스키마 필드만으로는 표 위치를 못 잡습니다)",
+                    cat, added
+                ));
+            }
+        }
+    }
+
     if bias_defs.is_empty() {
         emit(&format!(
             "  ⚪ [VISION COLUMN] doc_type='{}' 에 대응하는 스키마 필드가 없어 히트맵을 만들지 않습니다.",
