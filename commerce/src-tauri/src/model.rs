@@ -1849,11 +1849,6 @@ impl LogisModel {
             }
         }
 
-        // [FIX] Removed periodic UI emits from low-level model calls.
-        // Higher-level scheduler will manage the initial and final UI states.
-        // let _ = app_handle.emit(event_name, &base_payload);
-        
-        // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::utils::logger::log_task_progress(app_handle, task_id, &base_payload);
         }
@@ -3335,14 +3330,6 @@ impl LogisModel {
                     }
                 }
 
-                // 🌟 [PHRASE-LEVEL BIAS BANK] 센트로이드 1벡터 임베딩을 완전히 폐기합니다.
-                //    기존: bias_texts[i] = "goods title, goods name, goods 상품명, goods 프리미엄 무선 헤드폰, ..." 을
-                //          통째로 1개 벡터로 만들어 비교 → 9개 개념의 평균이라 어떤 단어와도 0.3x 밖에 안 나왔고,
-                //          그래서 contains() 문자열 포함 시 +0.5 라는 하드코딩 보너스로 억지 보정하고 있었습니다.
-                //    변경: 구 단위로 쪼개 Max-Pool 로 비교하면 원문과 동일한 구는 코사인 1.0 이 되어
-                //          보너스 없이도 압도적으로 승리합니다. (베이지 → color 뱅크의 "베이지" 구와 정확히 일치)
-                //    추가: semantic 앵커(예: title 의 "의류명")를 뱅크에 편입하여 정답 구를 벡터 공간에 올립니다.
-                //
                 // 🌟 [MULTILINGUAL VALUE ANCHOR — 정방향 편입]
                 //    bias.json 의 search_bridge.multilingual_value_anchor 에는
                 //    goods.title = "knit, cardigan, sweater, ..., 니트, 가디건, 스웨터, 코트, ニット, カーディガン, ..."
@@ -6146,15 +6133,6 @@ impl LogisModel {
     }
 
     // 🌟 [SHIPPING QUERY v3 / VECTOR-FIRST NMS]
-    //  ── v2 의 결함 ──
-    //   44개 필드를 한 프롬프트에 통째로 넣고 Qwen3 0.6B 에게 단독 판정을 맡겼습니다.
-    //   scheduler.rs STEP A 가 27개 서식 코드를 '그룹 → 코드' 2뎁스로 좁히고,
-    //   parse_analytic_search_query v3 가 슬라이딩 윈도우 + SURPRISAL + NMS 로
-    //   판정하는 것과 정반대 구조였습니다. 그 결과
-    //     · 44축이 한 창에 들어가 프롬프트만 비대해지고
-    //     · 근거가 없어도 모델이 아무 칸이나 채워 넣고
-    //     · 45종 데이터셋의 허브 키(PO/CI/BL/LC) 질의를 표현할 축 자체가 없었습니다.
-    //
     //  ── v3 구조 (STEP A 와 동일 계보) ──
     //   ① 접두어 완전일치      : 'CI-2026-08001' → reference_invoice. 벡터·LLM 없이 확정
     //   ② Stanza POS 토큰화     : 무의미 품사 사전 제거 (NLP 모델)
@@ -6193,13 +6171,6 @@ impl LogisModel {
 
         // =====================================================================
         // STEP 1 : 문서번호 접두어 완전일치 (벡터·LLM 없이 확정)
-        // ---------------------------------------------------------------------
-        //  ── 왜 최우선인가 ──
-        //   'CI-2026-08001' 의 'CI' 는 어휘가 아니라 서식 코드입니다.
-        //   logic.rs::trade_reference_field_of 가 이미 그 사전을 갖고 있으므로,
-        //   접두어를 잘라 물어보면 코사인 경쟁 자체가 필요 없습니다.
-        //   (로그 실측: BL 문서의 reference_number="CI-2026-08001" 이 소실된 원인이
-        //    바로 이 결정론 경로의 부재였습니다)
         // =====================================================================
         let mut deterministic_refs: Vec<(String, String)> = Vec::new(); // (field, value)
         let mut consumed_words: std::collections::HashSet<String> = std::collections::HashSet::new();

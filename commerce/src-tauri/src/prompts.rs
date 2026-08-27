@@ -340,40 +340,6 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     )
 }
 
-// pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
-//     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
-// Extract the logistics filters from the natural language query into the JSON format.
-
-// [SCHEMA DEFINITION]
-// Extract the following tracking/trade properties if semantically present in the text:
-// - "no": Tracking number, B/L number, Invoice number.
-// - "status": Shipping status (draft, progress, return, complete, error).
-// - "vessel": Vessel name, Flight No, or Carrier.
-// - "pol": Port of Loading, Origin, Departure point.
-// - "pod": Port of Discharge, Destination, Arrival point.
-// - "sender_name": Shipper, Seller, or Exporter name.
-// - "recipient_name": Consignee, Buyer, or Importer name.
-// - "incoterms": Incoterms (e.g., FOB, CIF, EXW).
-// - "weight": Cargo or gross weight.
-// - "amount": Total financial amount or price.
-
-// [TRANSFORMATION LOGIC]
-// For EVERY extracted field, wrap it in an operator object:
-// { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-// - Use "contains" for text fields, names, ports, vessels.
-// - Use "eq" for strict identifiers or status.
-
-// [QUERY]
-// {QUERY}
-
-// [OUTPUT FORMAT]
-// { "<property_name>": { "operator": "...", "value": "..." } }
-
-// [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
-
-//     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
-// }
-
 /// 🌟 [TRADE CONDITION — DEPTH 1] 질의 청크가 어느 '조건 카테고리' 인지 1갈래만 고릅니다.
 ///  ── 왜 쪼개는가 ──
 ///   기존 extract_shipping_conditions 는 44개 필드 + 변환 규칙 + 값 예시를

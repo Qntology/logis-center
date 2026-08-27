@@ -238,7 +238,6 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
     let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
-        // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
         let inject_domain = |text: &str, domain: &str| -> String {
             if text.trim().is_empty() { return String::new(); }
             text.split(',')
@@ -249,8 +248,7 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
         let mut final_bias = inject_domain(en_bias, page_type);
         let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
-        // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드(BL/CI/PL...)는 bias.json 에
-        //    개별 노드가 없으므로 공용 'shipping_doc' 노드로 접어서 조회합니다.
+
         let bias_type_key = canonical_bias_type(page_type);
         if let Some(localized_obj) = BIAS_DICT
             .get(lang_code)
