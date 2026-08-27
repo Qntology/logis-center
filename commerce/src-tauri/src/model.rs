@@ -147,6 +147,10 @@ pub struct LogisModel {
     max_tokens_limit: u32,
     _dtype: Option<DType>, 
     current_size: Arc<TokioMutex<Option<ModelSize>>>,
+
+    pub siglip2_model: Arc<TokioMutex<Option<crate::models::siglip2::Siglip2Model>>>,
+    pub siglip2_config: Option<crate::models::siglip2::Siglip2Config>,
+    pub siglip2_model_path: String,
 }
 
 impl LogisModel {
@@ -989,6 +993,71 @@ impl LogisModel {
         Ok(())
     }
 
+    /// SigLIP2 모델 파일이 디스크에 존재하는지 확인합니다.
+    /// 존재하지 않으면 에러를 반환하며, 호출 측(scheduler)에서
+    /// app_error_alert 이벤트를 발행하여 프론트엔드에 알립니다.
+    pub async fn check_siglip2_downloaded(&self) -> anyhow::Result<()> {
+        let base = std::path::Path::new(&self.siglip2_model_path);
+        let safetensors_path = base.join("model.safetensors");
+        let config_path = base.join("config.json");
+
+        // model.safetensors 존재 + 최소 100MB 체크
+        let model_exists = safetensors_path.exists()
+            && std::fs::metadata(&safetensors_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                > 100_000_000;
+
+        let config_exists = config_path.exists();
+
+        if !model_exists || !config_exists {
+            return Err(anyhow::anyhow!(
+                "SigLIP2 model not downloaded. Please download it in Settings."
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
+        let mut guard = self.siglip2_model.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let path = self.siglip2_model_path.clone();
+        let dev = self.device_config.device.clone();
+        let dtype = if self.is_cpu_mode {
+            candle_core::DType::F32
+        } else {
+            candle_core::DType::BF16
+        };
+
+        println!("[MODEL] Loading SigLIP2 Vision Encoder (BF16)...");
+
+        let model = tokio::task::spawn_blocking(move || {
+            let config_path = std::path::Path::new(&path).join("config.json");
+            let config = crate::models::siglip2::Siglip2Config::from_json(&config_path)?;
+
+            let safetensors_path = std::path::Path::new(&path).join("model.safetensors");
+            let mut model = crate::models::siglip2::Siglip2Model::load_vision_only(
+                &safetensors_path,
+                &config,
+                &dev,
+                dtype,
+            )?;
+
+            if needs_text {
+                model.load_text_encoder(&safetensors_path, &config)?;
+            }
+
+            Ok::<_, anyhow::Error>(model)
+        })
+        .await??;
+
+        *guard = Some(model);
+        println!("[MODEL] SigLIP2 Vision Encoder loaded successfully.");
+        Ok(())
+    }
+
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
         // 🌟 current_size 를 읽고 한 번도 쓰지 않아 불필요한 뮤텍스 획득만 발생했습니다.
@@ -1063,6 +1132,7 @@ impl LogisModel {
         let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-2B-Instruct-gguf"));
+        let siglip2_model_path = normalize_path(base_path.join("siglip2-so400m-patch16-naflex"));
         let embedding_path = base_path.join("granite-embedding-97m-multilingual-r2");
 
         let max_tokens_limit = 65536; 
@@ -1085,6 +1155,10 @@ impl LogisModel {
             max_tokens_limit: max_tokens_limit as u32,
             _dtype: None, 
             current_size: Arc::new(TokioMutex::new(None)),
+
+            siglip2_model: Arc::new(TokioMutex::new(None)),
+            siglip2_config: None,
+            siglip2_model_path,
         })
     }
 

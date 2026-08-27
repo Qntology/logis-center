@@ -3417,11 +3417,14 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     let granite_dir = base_path.join("granite-4.0-h-350m");
     let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
 
+    let siglip2_dir = base_path.join("siglip2-so400m-patch16-naflex");
+
     let mut status_map = serde_json::Map::new();
     status_map.insert("Qwen3".to_string(), serde_json::json!(has_valid_model(&qwen3_dir)));
     status_map.insert("Qwen3.5".to_string(), serde_json::json!(has_valid_model(&qwen3_5_dir)));
     status_map.insert("Granite".to_string(), serde_json::json!(has_valid_model(&granite_dir)));
     status_map.insert("Embedding".to_string(), serde_json::json!(has_valid_model(&embed_dir)));
+    status_map.insert("SigLIP2".to_string(), serde_json::json!(has_valid_model(&siglip2_dir)));
 
     let supported_stanza_langs = [
         "korean", "english", "japanese", "chinese", "french", "german", "spanish", 
@@ -3590,6 +3593,11 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 ],
                 "Granite" => vec![
                     ("https://huggingface.co/ibm-granite/granite-4.0-h-350m/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
+                ],
+                "SigLIP2" => vec![
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/config.json".to_string(), "config.json".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/preprocessor_config.json".to_string(), "preprocessor_config.json".to_string())
                 ],
                 _ => vec![]
             }

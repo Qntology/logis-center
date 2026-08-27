@@ -1281,7 +1281,7 @@ let isExtracting = false;
 // 🚀 모델 다운로드 관련 상태 관리 변수 추가
 let modelStatus: Record<string, boolean> = {};
 const TARGET_MODELS = [
-    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite',
+    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
     'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
     'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
     'stanza_portuguese', 'stanza_dutch', 'stanza_russian', 'stanza_arabic',
@@ -9335,12 +9335,26 @@ listen("app_error_alert", (event: any) => {
     if (!hasAlertedMissingModel) {
         hasAlertedMissingModel = true;
         alert(event.payload.message);
-        
         // 다운로드 UI가 있는 세팅 탭으로 즉시 화면 자동 전환
-        openWidget("settings"); 
-        
+        openWidget("settings");
+
+        // 🌟 [AUTO DOWNLOAD] 백엔드가 특정 모델명을 지목했으면
+        // Settings 탭 렌더링 직후 해당 모델의 다운로드 버튼을 자동 클릭합니다.
+        const missingModel: string = event.payload.model;
+        if (missingModel) {
+            // openWidget("settings")이 DOM 렌더링을 완료할 때까지 대기
+            setTimeout(() => {
+                const safeId = missingModel.replace(/[\s()]+/g, '-');
+                const btn = document.getElementById(`btn-download-${safeId}`) as HTMLButtonElement;
+                if (btn && btn.innerText !== "Downloaded") {
+                    console.log(`[AUTO-DL] ${missingModel} 모델 자동 다운로드 시작...`);
+                    btn.click();
+                }
+            }, 500);
+        }
+
         // 검색창 입력 등 연속 호출로 인한 무한 팝업 스팸을 막기 위해 10초간 방어
-        setTimeout(() => { hasAlertedMissingModel = false; }, 10000); 
+        setTimeout(() => { hasAlertedMissingModel = false; }, 10000);
     }
 });
 

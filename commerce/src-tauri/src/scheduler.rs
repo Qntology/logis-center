@@ -1550,23 +1550,37 @@ pub async fn process_task(
     }
 
     if task.r#type == "image_extraction" {
-        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        
+        // 🌟 [SIGLIP2 GATE] 이미지 추출은 SigLIP2 비전 인코더가 필수입니다.
+        // 파일이 없으면 프론트엔드에 알림을 보내 Settings 탭으로 유도하고
+        // 자동 다운로드를 트리거합니다.
+        if let Err(e) = model.check_siglip2_downloaded().await {
+            println!("[Scheduler] ⚠️ SigLIP2 model missing: {}", e);
+            let _ = app_handle.emit("app_error_alert", json!({
+                "message": "SigLIP2 비전 모델이 필요합니다. Settings에서 다운로드해 주세요.",
+                "model": "SigLIP2",
+                "task_id": task.id.clone()
+            }));
+            // 태스크를 에러 상태로 전환하여 큐에서 제거
+            let error_status = crate::logic::parse_status("error");
+            let _ = store_mutex.lock().await
+                .as_ref()
+                .map(|db| db.update_task_status(&task.id, error_status));
+            return Err(anyhow::anyhow!("{}", e));
+        }
 
+        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
-
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
                 "korean".to_string(),
-                search_mode, 
+                search_mode,
                 app_handle,
                 Some(cancellation_token.clone()),
                 store_mutex,
             ).await?;
-            
-            return Ok(()); 
+            return Ok(());
         }
     }
 
