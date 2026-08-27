@@ -139,7 +139,7 @@ impl Siglip2TextModel {
         let x = self.final_layernorm.forward(&x)?;
 
         // 6. 마지막 토큰 풀링
-        let pooled = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?; // (b, D)
+        let pooled = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?.contiguous()?; // (b, D)
 
         // 7. 프로젝션 헤드
         self.head.forward(&pooled)

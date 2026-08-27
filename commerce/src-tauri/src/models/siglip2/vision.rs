@@ -87,7 +87,6 @@ impl Siglip2Attention {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (b, seq_len, _hidden) = x.dims3()?;
 
-        // Q, K, V 프로젝션: (1, seq, hidden)
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
@@ -95,18 +94,21 @@ impl Siglip2Attention {
         // 멀티헤드 분할: (1, seq, hidden) → (1, num_heads, seq, head_dim)
         let q = q
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?; // (1, heads, seq, head_dim)
+            .transpose(1, 2)?
+            .contiguous()?;                    // ← 추가
         let k = k
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;                    // ← 추가
         let v = v
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;                    // ← 추가
 
         // Scaled Dot-Product Attention
-        // attn_weights: (1, heads, seq, seq)
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;   // ← 추가
+        let attn_weights = q.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
@@ -116,9 +118,9 @@ impl Siglip2Attention {
         // 헤드 재결합: (1, heads, seq, head_dim) → (1, seq, hidden)
         let attn_output = attn_output
             .transpose(1, 2)?
+            .contiguous()?                     // ← 추가
             .reshape((b, seq_len, self.num_heads * self.head_dim))?;
 
-        // 출력 프로젝션
         self.out_proj.forward(&attn_output)
     }
 }
@@ -281,7 +283,6 @@ impl Siglip2AttentionPoolingHead {
     /// 이미지 전체를 하나의 벡터로 풀링합니다. 출력: (b, D)
     pub fn pool(&self, hidden: &Tensor) -> Result<Tensor> {
         let (b, n, _) = hidden.dims3()?;
-
         let probe = self.probe.expand((b, 1, self.hidden))?.contiguous()?;
         let q = self.proj(&probe, 0)?;
         let k = self.proj(hidden, 1)?;
@@ -290,29 +291,29 @@ impl Siglip2AttentionPoolingHead {
         let q = q
             .reshape((b, 1, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?; // (b, H, 1, hd)
+            .contiguous()?;                    // ← 추가
         let k = k
             .reshape((b, n, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?; // (b, H, n, hd)
+            .contiguous()?;                    // ← 추가
         let v = v
             .reshape((b, n, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
-            .contiguous()?;
+            .contiguous()?;                    // ← 추가
 
         let scale = (self.head_dim as f64).sqrt();
-        let attn = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        let k_t = k.transpose(2, 3)?.contiguous()?;   // ← 추가
+        let attn = q.matmul(&k_t)?;
         let attn = (attn / scale)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v)?;
 
-        let out = attn.matmul(&v)?; // (b, H, 1, hd)
         let out = out
             .transpose(1, 2)?
-            .contiguous()?
+            .contiguous()?                     // ← 추가
             .reshape((b, 1, self.hidden))?;
         let out = self.out_proj.forward(&out)?;
         let out = self.residual_block(&out)?;
-
         out.narrow(1, 0, 1)?.squeeze(1)
     }
 

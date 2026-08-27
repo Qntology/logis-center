@@ -943,7 +943,20 @@ impl LogisModel {
                     let _ = g.clear_kv_cache();
                     let _ = g.qwen.drop_kv_storage();
                 }
-                // Embedding 모델은 이미지 추출 후 단계에서 필요하므로 유지
+                // 🌟 [VRAM] 이미지 추출 파이프라인(extract_from_image)에서는
+                //    임베딩 모델(384차원 97M)을 한 번도 사용하지 않습니다.
+                //    해제하여 Qwen3.5 로드 전에 VRAM 을 확보합니다.
+                {
+                    let mut emb = self.embedding_model.lock().await;
+                    if emb.is_some() {
+                        *emb = None;
+                        println!("[RELAY] Embedding model released for VRAM (image pipeline).");
+                    }
+                }
+                {
+                    let mut cache = self.embedding_cache.lock().await;
+                    cache.clear();
+                }
             } else {
                 // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
                 self.deep_purge_resources().await;
@@ -1226,8 +1239,11 @@ impl LogisModel {
         // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
         self.check_siglip2_downloaded().await?;
         self.ensure_siglip2(true).await?;
-        // Qwen3.5 는 크롭 추출용으로 로드 (비전 불필요 — 텍스트 전용)
-        self.ensure_qwen3_5(false).await?;
+        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
+        //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
+        //    SigLIP2(~2.2GB) + Qwen3.5(~2GB) 동시 상주를 피합니다.
+        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
+        //    ensure_qwen3_5 가 필요 시점에 자동 로드합니다.
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
@@ -1478,6 +1494,17 @@ impl LogisModel {
                 }
             }
             
+            // 🌟 [VRAM STAGE] STEP 1~3 완료. 텍스트 인코더 + 토크나이저 해제 (~1.4GB 반환).
+            //    비전 인코더는 아래 비전 벡터 저장(encode_image_pooled)에 필요하므로 유지.
+            //    Qwen3.5 는 STEP 5 에서 chat_with_qwen3_5_image_spinner 가 자동 로드.
+            {
+                let mut sig_guard = self.siglip2_model.lock().await;
+                if let Some(sig) = sig_guard.as_mut() {
+                    sig.text = None;
+                    sig.tokenizer = None;
+                    println!("[VRAM] SigLIP2 text encoder + tokenizer released (~1.4GB VRAM freed).");
+                }
+            }
             let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
             emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", mode_name));
 
