@@ -9547,77 +9547,17 @@ async fn process_trading_task(
     model.check_embedding_downloaded().await?;
     model.ensure_embedding().await?;
 
-    // 🌟 [DEPTH 1 / PHRASE BANK] 그룹 앵커 문구를 재정의합니다.
-    //  ── 무엇이 문제였나 ──
-    //   기존 parcel 앵커는 'recipient address, sender address, parcel weight' 처럼
-    //   '모든 운송 서식이 공통으로 갖는 개념' 을 담고 있었습니다.
-    //     · B/L    : shipper address / consignee address / gross weight
-    //     · AWB    : waybill 이라는 단어 그 자체
-    //     · PL     : gross weight / net weight
-    //   그래서 무역 서식이 parcel 앵커와 정면으로 공명해 TRACKING 으로 떨어졌습니다.
-    //   parcel 은 '택배 라벨에만 존재하는 개념' 으로 좁히고,
-    //   나머지 그룹은 서식 고유 개념을 보강합니다.
+    // 🌟 [ANCHOR SOURCE] 그룹/코드 앵커 사전은 logic.rs 가 소유합니다.
+    //  ── 왜 옮겼는가 ──
+    //   같은 사전을 비전 파이프라인(models/siglip2/vision_encoder.rs)도 씁니다.
+    //   지역 const 로 두면 서식이 하나 늘 때마다 두 곳을 고쳐야 하고,
+    //   텍스트 트랙과 비전 트랙의 판정 근거가 갈라집니다.
+    //   editing point 를 하나로 고정하기 위해 참조만 남깁니다.
     //
-    //  ── 편견(prejudice) 사전을 새로 만들지 않는 이유 ──
-    //   bias_schema 의 get_detail_schema_fields 가 '다른 필드의 bias' 를 그대로
-    //   편견으로 쓰는 것과 동일하게, 여기서도 '다른 그룹의 bias 구' 를 편견으로 씁니다.
-    //   즉 shipping 의 'bill of lading / incoterms / container number' 가
-    //   자동으로 parcel 의 편견이 되므로 별도 사전이 필요 없습니다.
-    const TRADE_GROUPS: [(&str, &str); 6] = [
-        ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, documentary credit, payment terms, contract number, buyer seller agreement, tenor at sight, issuing bank, advising bank, beneficiary, applicant, order confirmation, quotation"),
-        ("shipping",  "commercial invoice, packing list, bill of lading, ocean bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage number, port of loading, port of discharge, place of receipt, place of delivery, container number, seal number, notify party, freight prepaid, freight collect, shipper and consignee, gross weight net weight measurement, carton quantity, marks and numbers, incoterms fob cif exw"),
-        ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff classification, customs clearance, declaration number, customs value, duty and tax, chamber of commerce, country of origin"),
-        ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, specification value, fumigation treatment, laboratory report, fit for human consumption, plant health"),
-        ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, proper shipping name, packing group, hazard class, policy number, insured amount, premium, coverage all risks, attorney in fact, business registration number"),
-        ("parcel",    "courier label, parcel waybill sticker, domestic courier service, home delivery parcel, door to door small package, delivery driver, barcode sticker label, parcel pickup, last mile delivery"),
-    ];
-
-    const GROUP_CODES: [(&str, &[&str]); 6] = [
-        ("contract",   &["PO", "PI", "SC", "LC"]),
-        ("shipping",   &["CI", "PL", "BL", "AWB", "SA", "DO", "AN", "BC"]),
-        ("customs",    &["ED", "ID", "CINV", "CO"]),
-        ("inspection", &["IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT"]),
-        ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS"]),
-        ("parcel",     &["TRACKING"]),
-    ];
-
-    // 🌟 [DEPTH 2] 코드별 앵커. bias.json 을 손대지 않고 프롬프트가 이미 갖고 있는
-    //    정의문(= get_trade_doc_classification_prompt 의 GROUPS 설명)을 그대로 씁니다.
-    //    🌟 TRACKING 앵커에서 'recipient' 를 제거합니다. 수하인(consignee)은
-    //       모든 무역 서식이 갖는 개념이라 TRACKING 전용 근거가 될 수 없습니다.
-    fn trade_code_anchor(code: &str) -> &'static str {
-        match code {
-            "PO"       => "purchase order, order confirmation, buyer issues to seller, order number, delivery date requested",
-            "PI"       => "proforma invoice, quotation, preliminary invoice, offer to buyer before shipment",
-            "SC"       => "sales contract, agreement between seller and buyer, contract terms and clauses",
-            "LC"       => "letter of credit, documentary credit, issuing bank, beneficiary, tenor at sight, expiry date, advising bank",
-            "CI"       => "commercial invoice, seller bills buyer, unit price, total amount, incoterms, invoice number",
-            "PL"       => "packing list, carton details, gross weight, net weight, measurement, marks and numbers",
-            "BL"       => "bill of lading, ocean carrier document, shipper consignee notify party, vessel voyage, port of loading, port of discharge, freight prepaid collect",
-            "AWB"      => "air waybill, airline document, flight number, airport of departure, airport of destination, chargeable weight",
-            "SA"       => "shipping advice, shipment notification to buyer, dispatch details",
-            "DO"       => "delivery order, release cargo to consignee, pickup location, container release",
-            "AN"       => "arrival notice, cargo arrival notification, local charges, free time, terminal",
-            "BC"       => "booking confirmation, space booking with carrier, booking number, cut off time",
-            "ED"       => "export declaration, customs export filing, declaration number, exporter, hs code",
-            "ID"       => "import declaration, customs import filing, importer, duty, tax, hs code",
-            "CINV"     => "customs invoice, invoice prepared for customs valuation",
-            "CO"       => "certificate of origin, country of origin declaration, chamber of commerce stamp",
-            "IC"       => "inspection certificate, quality inspection result, inspected by",
-            "WC"       => "weight certificate, certified weight measurement",
-            "CA"       => "certificate of analysis, laboratory test result, specification value",
-            "PHYTO"    => "phytosanitary certificate, plant health, fumigation, treatment type",
-            "HC"       => "health certificate, sanitary certificate, fit for human consumption",
-            "BEN_CERT" => "beneficiary certificate, beneficiary statement, we hereby certify that",
-            "DGD"      => "dangerous goods declaration, un number, proper shipping name, packing group, hazard class",
-            "MSDS"     => "material safety data sheet, chemical hazard information, first aid measures",
-            "POA"      => "power of attorney, authorization letter, attorney in fact",
-            "BIZ_LIC"  => "business license, business registration certificate, company registration number",
-            "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
-            "TRACKING" => "courier parcel label, tracking number barcode sticker, domestic courier service, home delivery small package, delivery driver route",
-            _          => "trade document",
-        }
-    }
+    //   · logic::TRADE_GROUPS        : 그룹 앵커 (편견 = 다른 그룹의 bias)
+    //   · logic::TRADE_GROUP_CODES   : 그룹 → 코드 목록
+    //   · logic::trade_code_anchor() : 코드별 앵커 구
+    use crate::logic::{TRADE_GROUPS, TRADE_GROUP_CODES as GROUP_CODES, trade_code_anchor};
 
     // ── 질의(문서) 측 : 라인 단위 분해 ──
     //  ── 왜 바꾸는가 ──
@@ -10188,23 +10128,10 @@ async fn process_trading_task(
         let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
 
         // ── B-5 : 확정된 필드를 카테고리 슬롯에 직접 주입 ──
-        //    카테고리 매핑은 bias.json 의 trade_schema.base 키 구조를 그대로 따릅니다.
-        fn trade_field_category(field: &str) -> &'static str {
-            match field {
-                "doc_type" | "doc_number" | "issue_date" | "expiry_date"
-                    | "reference_number" | "no" => "header",
-                "sender_name" | "sender_address" | "recipient_name"
-                    | "recipient_address" | "notify_party_name" => "parties",
-                "vessel" | "voyage_number" | "pol" | "pod" | "place_receipt"
-                    | "place_delivery" | "etd" | "eta" | "transport_mode" => "logistics",
-                "incoterms" | "payment_terms" | "freight_payment_term" => "conditions",
-                "currency" | "amount" | "amount_subtotal" | "amount_tax"
-                    | "freight_amount" | "insurance_amount" | "local_charges" => "financials",
-                "container_number" | "seal_number" | "package_count" | "package_unit"
-                    | "weight_gross" | "weight_net" | "volume" | "marks_numbers" => "cargo",
-                _ => "",
-            }
-        }
+        //    🌟 [SHARED MAPPING] 필드 → 카테고리 매핑은 logic.rs 가 소유합니다.
+        //    비전 히트맵(카테고리 단위 크롭)이 같은 매핑을 써야
+        //    '크롭한 영역' 과 '추출 프롬프트가 요구하는 필드' 가 어긋나지 않습니다.
+        use crate::logic::trade_field_category;
 
         for (f, a) in t_assign.iter().enumerate() {
             let (h, score, margin) = match a { Some(v) => *v, None => continue };

@@ -1,43 +1,52 @@
-use candle_core::{IndexOp, Result, Tensor, D};
-use candle_nn::{Conv2d, Linear, Module, VarBuilder};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{Linear, Module, VarBuilder};
 
 use super::Siglip2Config;
 
 // =====================================================================
-// Patch Embedding: 이미지를 16×16 패치로 분할 → 선형 투영 → 1152차원
+// Patch Embedding (NaFlex)
+// ---------------------------------------------------------------------
+// 🌟 [TENSOR CONTRACT] vision_model.embeddings.patch_embedding.weight 는
+//    [1152, 768] 즉 Linear 입니다. 768 = 16 * 16 * 3.
+//    Conv2d 로 로드하면 candle 이 [1152, 3, 16, 16] 을 요구해 즉시 실패합니다.
+//
+//    flatten 순서는 HF image_processing_siglip2.convert_image_to_patches 와
+//    반드시 동일해야 합니다.
+//      (nh, p, nw, p, C) -> transpose(0,2,1,3,4) -> (nh, nw, p, p, C)
+//    즉 패치 내부 인덱스는 (patch_row, patch_col, channel) 순서이며
+//    채널이 가장 빠르게 변합니다.
 // =====================================================================
 pub struct Siglip2PatchEmbedding {
-    projection: Conv2d,
+    projection: Linear,
     patch_size: usize,
-    device: candle_core::Device,
 }
 
 impl Siglip2PatchEmbedding {
     pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
-        // SigLIP2는 Conv2d(kernel_size=patch_size, stride=patch_size) 사용
-        // in_channels=3, out_channels=hidden_size
-        let projection = candle_nn::conv2d(
-            3,
-            config.vision_hidden_size,
-            config.patch_size,
-            candle_nn::Conv2dConfig {
-                stride: config.patch_size,
-                ..Default::default()
-            },
-            vb.pp("patch_embedding"),
-        )?;
+        let in_dim = config.patch_size * config.patch_size * 3;
+        let projection = candle_nn::linear(in_dim, config.vision_hidden_size, vb)?;
+        Ok(Self {
+            projection,
+            patch_size: config.patch_size,
+        })
     }
 
-    /// 입력: (1, 3, H, W) → 출력: (1, num_patches, hidden_size)
+    /// 입력: (1, 3, H, W)  (H = rows*p, W = cols*p)
+    /// 출력: (1, rows*cols, hidden_size)
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        // Conv2d 적용: (1, 3, H, W) → (1, hidden_size, H/16, W/16)
-        let x = self.projection.forward(pixel_values)?;
-        // (1, hidden_size, grid_h, grid_w) → (1, hidden_size, grid_h * grid_w)
-        let (b, c, gh, gw) = x.dims4()?;
-        let x = x.reshape((b, c, gh * gw))?;
-        // (1, hidden_size, num_patches) → (1, num_patches, hidden_size)
-        let x = x.transpose(1, 2)?;
-        Ok(x)
+        let (b, c, h, w) = pixel_values.dims4()?;
+        let p = self.patch_size;
+        let nh = h / p;
+        let nw = w / p;
+
+        // (b, C, nh, p, nw, p)
+        let x = pixel_values.reshape((b, c, nh, p, nw, p))?;
+        // (b, nh, nw, p, p, C)
+        let x = x.permute(&[0usize, 2, 4, 3, 5, 1][..])?.contiguous()?;
+        // (b, nh*nw, p*p*C)
+        let x = x.reshape((b, nh * nw, p * p * c))?;
+
+        self.projection.forward(&x)
     }
 }
 
@@ -135,9 +144,11 @@ impl Siglip2MLP {
 
     /// 입력: (1, seq, hidden) → 출력: (1, seq, hidden)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // SigLIP2는 GELU 활성화 사용
+        // 🌟 [ACT] config 의 hidden_act 는 "gelu_pytorch_tanh" 입니다.
+        //    candle 의 gelu() 가 tanh 근사, gelu_erf() 가 정확한 erf 구현이므로
+        //    학습 시점과 동일한 tanh 근사를 사용해야 층마다 오차가 누적되지 않습니다.
         let x = self.fc1.forward(x)?;
-        let x = x.gelu_erf()?; // GELU (erf 기반)
+        let x = x.gelu()?;
         self.fc2.forward(&x)
     }
 }
@@ -189,103 +200,305 @@ impl Siglip2EncoderLayer {
 }
 
 // =====================================================================
-// 전체 비전 인코더 (27층 스택)
+// Multihead Attention Pooling Head
+// ---------------------------------------------------------------------
+// 🌟 [TENSOR CONTRACT] vision_model.head 는 Linear 가 아닙니다.
+//    head.probe                     [1, 1, 1152]
+//    head.attention.in_proj_weight  [3456, 1152]   = q|k|v 세로 concat
+//    head.attention.in_proj_bias    [3456]
+//    head.attention.out_proj.weight [1152, 1152]
+//    head.attention.out_proj.bias   [1152]
+//    head.layernorm.weight/bias     [1152]
+//    head.mlp.fc1 / fc2
+//
+//  HF 순전파:
+//    h = MHA(query=probe, key=hidden, value=hidden)
+//    h = h + mlp(layernorm(h))
+//    return h[:, 0]
+// =====================================================================
+pub struct Siglip2AttentionPoolingHead {
+    probe: Tensor,          // (1, 1, D)
+    in_proj_weight: Tensor, // (3D, D)
+    in_proj_bias: Tensor,   // (3D)
+    out_proj: Linear,
+    layernorm: candle_nn::LayerNorm,
+    mlp: Siglip2MLP,
+    num_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+}
+
+impl Siglip2AttentionPoolingHead {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+        let hidden = config.vision_hidden_size;
+        let num_heads = config.vision_num_heads;
+        let head_dim = hidden / num_heads;
+
+        let probe = vb.get((1, 1, hidden), "probe")?;
+
+        let attn_vb = vb.pp("attention");
+        let in_proj_weight = attn_vb.get((3 * hidden, hidden), "in_proj_weight")?;
+        let in_proj_bias = attn_vb.get(3 * hidden, "in_proj_bias")?;
+        let out_proj = candle_nn::linear(hidden, hidden, attn_vb.pp("out_proj"))?;
+
+        let layernorm =
+            candle_nn::layer_norm(hidden, config.vision_layer_norm_eps, vb.pp("layernorm"))?;
+        let mlp = Siglip2MLP::new(config, vb.pp("mlp"))?;
+
+        Ok(Self {
+            probe,
+            in_proj_weight,
+            in_proj_bias,
+            out_proj,
+            layernorm,
+            mlp,
+            num_heads,
+            head_dim,
+            hidden,
+        })
+    }
+
+    /// in_proj_weight 를 q(0) / k(1) / v(2) 로 잘라 선형 투영합니다.
+    fn proj(&self, x: &Tensor, slot: usize) -> Result<Tensor> {
+        let w = self
+            .in_proj_weight
+            .narrow(0, slot * self.hidden, self.hidden)?
+            .contiguous()?;
+        let b = self
+            .in_proj_bias
+            .narrow(0, slot * self.hidden, self.hidden)?
+            .contiguous()?;
+        Linear::new(w, Some(b)).forward(x)
+    }
+
+    /// 헤드의 잔차 블록. (attention 이후 / 패치 투영 이후 공통)
+    fn residual_block(&self, x: &Tensor) -> Result<Tensor> {
+        let residual = x.clone();
+        let h = self.layernorm.forward(x)?;
+        residual + self.mlp.forward(&h)?
+    }
+
+    /// 이미지 전체를 하나의 벡터로 풀링합니다. 출력: (b, D)
+    pub fn pool(&self, hidden: &Tensor) -> Result<Tensor> {
+        let (b, n, _) = hidden.dims3()?;
+
+        let probe = self.probe.expand((b, 1, self.hidden))?.contiguous()?;
+        let q = self.proj(&probe, 0)?;
+        let k = self.proj(hidden, 1)?;
+        let v = self.proj(hidden, 2)?;
+
+        let q = q
+            .reshape((b, 1, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?; // (b, H, 1, hd)
+        let k = k
+            .reshape((b, n, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?; // (b, H, n, hd)
+        let v = v
+            .reshape((b, n, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let scale = (self.head_dim as f64).sqrt();
+        let attn = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        let attn = (attn / scale)?;
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+
+        let out = attn.matmul(&v)?; // (b, H, 1, hd)
+        let out = out
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, 1, self.hidden))?;
+        let out = self.out_proj.forward(&out)?;
+        let out = self.residual_block(&out)?;
+
+        out.narrow(1, 0, 1)?.squeeze(1)
+    }
+
+    /// 🌟 [DENSE FEATURE] 패치별 공유공간 투영.
+    ///
+    ///  어텐션 출력은 out_proj( Σ αᵢ · v(xᵢ) ) 이므로,
+    ///  패치 i 가 풀링 벡터에 기여하는 성분은 정확히 out_proj( v(xᵢ) ) 입니다.
+    ///  여기에 헤드의 잔차 블록을 동일하게 적용하면
+    ///  텍스트 헤드 출력과 같은 좌표계의 dense patch feature 가 됩니다.
+    ///  이 값이 STEP 2 / STEP 3 코사인 히트맵의 원본입니다.
+    ///
+    ///  입력: (b, N, D) → 출력: (b, N, D)
+    pub fn project_patches(&self, hidden: &Tensor) -> Result<Tensor> {
+        let v = self.proj(hidden, 2)?;
+        let o = self.out_proj.forward(&v)?;
+        self.residual_block(&o)
+    }
+}
+
+// =====================================================================
+// 비전 인코더 순전파 산출물
+// =====================================================================
+pub struct VisionForward {
+    /// post_layernorm 직후 패치 표현 (1, N, D)
+    pub patch_hidden: Tensor,
+    /// 텍스트 공유공간으로 투영된 패치 표현 (1, N, D)
+    pub patch_shared: Tensor,
+    /// 이미지 전체 풀링 벡터 (1, D)
+    pub pooled: Tensor,
+}
+
+// =====================================================================
+// 전체 비전 인코더 (27층 스택 + 어텐션 풀링 헤드)
 // =====================================================================
 pub struct Siglip2VisionModel {
     patch_embedding: Siglip2PatchEmbedding,
-    position_embedding: candle_nn::Embedding,
-    max_num_patches: usize,
     layers: Vec<Siglip2EncoderLayer>,
     post_layernorm: candle_nn::LayerNorm,
-    head: candle_nn::Linear,
+    head: Siglip2AttentionPoolingHead,
     hidden_size: usize,
+    /// 🌟 위치 임베딩 원본 격자를 f32 호스트 메모리에 보관합니다.
+    ///    NaFlex 는 (rows, cols) 가 이미지마다 달라지므로
+    ///    매 순전파마다 16×16 격자를 bilinear 로 리샘플링해야 합니다.
+    pos_grid: Vec<f32>,
+    pos_side: usize,
+    device: Device,
+    dtype: DType,
 }
 
 impl Siglip2VisionModel {
     pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
+        let hidden = config.vision_hidden_size;
+        let side = config.pos_grid_side();
+
         let patch_embedding =
             Siglip2PatchEmbedding::new(config, vb.pp("embeddings").pp("patch_embedding"))?;
 
-        // 🌟 [추가] 위치 임베딩: [256, 1152] — 패치 수만큼 슬라이스하여 덧셈
-        let position_embedding = candle_nn::embedding(
-            config.max_num_patches,
-            config.vision_hidden_size,
-            vb.pp("embeddings").pp("position_embedding"),
-        )?;
+        // 위치 임베딩 원본 [256, 1152] 을 f32 로 내려 받아 격자로 보관합니다.
+        let pos_w = vb
+            .pp("embeddings")
+            .pp("position_embedding")
+            .get((config.max_num_patches, hidden), "weight")?;
+        let pos_grid = pos_w
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
 
         let mut layers = Vec::with_capacity(config.vision_num_layers);
         let encoder_vb = vb.pp("encoder");
         for i in 0..config.vision_num_layers {
             let layer_vb = encoder_vb.pp(format!("layers.{}", i));
-            let layer = Siglip2EncoderLayer::new(config, layer_vb)?;
-            layers.push(layer);
+            layers.push(Siglip2EncoderLayer::new(config, layer_vb)?);
         }
 
         let post_layernorm = candle_nn::layer_norm(
-            config.vision_hidden_size,
-            1e-6,
+            hidden,
+            config.vision_layer_norm_eps,
             vb.pp("post_layernorm"),
         )?;
 
-        // 🌟 [추가] 비전 → 텍스트 공간 프로젝션 헤드: [1152, 1152]
-        let head = candle_nn::linear(
-            config.vision_hidden_size,
-            config.vision_hidden_size,
-            vb.pp("head"),
-        )?;
+        let head = Siglip2AttentionPoolingHead::new(config, vb.pp("head"))?;
 
         Ok(Self {
             patch_embedding,
-            position_embedding,
-            max_num_patches: config.max_num_patches,
             layers,
             post_layernorm,
             head,
-            hidden_size: config.vision_hidden_size,
+            hidden_size: hidden,
+            pos_grid,
+            pos_side: side,
+            device,
+            dtype,
         })
     }
 
-    /// 핵심 순전파: 이미지 텐서 → 패치 임베딩 행렬
+    /// 🌟 [NaFlex POSITION INTERPOLATION]
+    ///  16×16 격자를 (rows, cols) 로 bilinear 리샘플링합니다.
+    ///  torch F.interpolate(mode="bilinear", align_corners=False) 규약과 동일한
+    ///  좌표 매핑 ( (i + 0.5) * src / dst - 0.5 ) 을 사용합니다.
+    ///
+    ///  기존 코드처럼 0..N 을 단순 슬라이스하면
+    ///  18×14 격자의 (0,0)~(17,13) 이 원본의 1차원 순번 0..251 에 매핑되어
+    ///  행/열 좌표가 완전히 어긋납니다. 좌표 크롭 파이프라인에서는 치명적입니다.
+    fn interpolate_pos(&self, rows: usize, cols: usize) -> Result<Tensor> {
+        let s = self.pos_side;
+        let d = self.hidden_size;
+        let mut out = vec![0f32; rows * cols * d];
+
+        for r in 0..rows {
+            let fy = (((r as f32) + 0.5) * (s as f32) / (rows as f32) - 0.5)
+                .clamp(0.0, (s - 1) as f32);
+            let y0 = fy.floor() as usize;
+            let y1 = (y0 + 1).min(s - 1);
+            let wy = fy - y0 as f32;
+
+            for c in 0..cols {
+                let fx = (((c as f32) + 0.5) * (s as f32) / (cols as f32) - 0.5)
+                    .clamp(0.0, (s - 1) as f32);
+                let x0 = fx.floor() as usize;
+                let x1 = (x0 + 1).min(s - 1);
+                let wx = fx - x0 as f32;
+
+                let base = (r * cols + c) * d;
+                let p00 = (y0 * s + x0) * d;
+                let p01 = (y0 * s + x1) * d;
+                let p10 = (y1 * s + x0) * d;
+                let p11 = (y1 * s + x1) * d;
+
+                for k in 0..d {
+                    let top = self.pos_grid[p00 + k] * (1.0 - wx) + self.pos_grid[p01 + k] * wx;
+                    let bot = self.pos_grid[p10 + k] * (1.0 - wx) + self.pos_grid[p11 + k] * wx;
+                    out[base + k] = top * (1.0 - wy) + bot * wy;
+                }
+            }
+        }
+
+        Tensor::from_vec(out, (1, rows * cols, d), &self.device)?.to_dtype(self.dtype)
+    }
+
+    /// 핵심 순전파.
     ///
     /// 입력:  pixel_values (1, 3, H, W) — 정규화된 이미지
-    /// 출력:  (1, num_patches, 1152) — 각 패치의 임베딩 벡터
-    ///
-    /// 이 출력이 파이프라인의 STEP 1 결과입니다.
-    /// 각 행이 하나의 16×16 패치에 대응하며,
-    /// 텍스트 앵커 임베딩과 코사인 유사도를 계산합니다.
-    pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        // 1. 패치 임베딩: (1, 3, H, W) → (1, num_patches, 1152)
+    ///        grid_rows / grid_cols     — 전처리기가 확정한 패치 격자
+    /// 출력:  VisionForward { patch_hidden, patch_shared, pooled }
+    pub fn forward(
+        &self,
+        pixel_values: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<VisionForward> {
+        // 1. 패치 임베딩 (Linear)
         let mut x = self.patch_embedding.forward(pixel_values)?;
 
-        // 2. 위치 임베딩 덧셈
-        //    position_embedding.weight: [256, 1152]
-        //    실제 패치 수만큼 슬라이스하여 더합니다.
-        let num_patches = x.dims()[1];
-        let pos_ids: Vec<u32> = (0..num_patches as u32).collect();
-        let pos_ids_tensor = Tensor::new(&pos_ids[..], &self.patch_embedding.device)?;
-        let pos_emb = self.position_embedding.forward(&pos_ids_tensor)?; // (num_patches, 1152)
-        let pos_emb = pos_emb.unsqueeze(0)?; // (1, num_patches, 1152)
-        x = (x + pos_emb)?;
+        // 2. 위치 임베딩 bilinear 보간 후 덧셈
+        let pos = self.interpolate_pos(grid_rows, grid_cols)?;
+        x = (x + pos)?;
 
-        // 3. 27층 Transformer 순전파
+        // 3. 27층 Transformer
         for layer in &self.layers {
             x = layer.forward(&x)?;
         }
 
-        // 4. 최종 LayerNorm
-        let x = self.post_layernorm.forward(&x)?;
+        // 4. post LayerNorm
+        let patch_hidden = self.post_layernorm.forward(&x)?;
 
-        // 5. 프로젝션 헤드: (1, num_patches, 1152) → (1, num_patches, 1152)
-        //    비전 임베딩을 텍스트 임베딩과 동일한 공간으로 변환합니다.
-        let x = self.head.forward(&x)?;
+        // 5. 헤드: 풀링 벡터 + 패치별 공유공간 투영
+        let pooled = self.head.pool(&patch_hidden)?;
+        let patch_shared = self.head.project_patches(&patch_hidden)?;
 
-        Ok(x)
+        Ok(VisionForward {
+            patch_hidden,
+            patch_shared,
+            pooled,
+        })
     }
 
-    /// 편의 메서드: 배치 차원을 제거하고 패치 임베딩만 반환
-    /// 출력: (num_patches, 1152)
-    pub fn get_patch_embeddings(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        let out = self.forward(pixel_values)?; // (1, num_patches, 1152)
-        out.squeeze(0) // (num_patches, 1152)
+    /// 편의 메서드: 공유공간 패치 임베딩만 (num_patches, D) 로 반환합니다.
+    pub fn get_patch_embeddings(
+        &self,
+        pixel_values: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<Tensor> {
+        let out = self.forward(pixel_values, grid_rows, grid_cols)?;
+        out.patch_shared.squeeze(0)
     }
 }

@@ -221,14 +221,25 @@ impl LogisModel {
         println!("[DIAG-PURGE] Step 2: Clearing Embedding Model & Cache...");
         {
             let mut emb = self.embedding_model.lock().await;
-            if let Some(e) = emb.take() { 
-                drop(e); 
+            if let Some(e) = emb.take() {
+                drop(e);
             }
             // 🌟 램 누수 방지를 위해 캐시도 깔끔하게 비워줍니다.
             let mut cache = self.embedding_cache.lock().await;
             cache.clear();
         }
-        
+
+        // 🌟 [SigLIP2] 비전 엔진도 함께 해제합니다.
+        //    mmap 백엔드라 상주량이 LLM 보다 작지만,
+        //    GPU 로 올라간 경우 VRAM 을 계속 점유하므로 반드시 내려야 합니다.
+        {
+            let mut vis_guard = self.siglip2_model.lock().await;
+            if vis_guard.is_some() {
+                *vis_guard = None;
+                println!("[DIAG-PURGE] SigLIP2 vision engine dropped.");
+            }
+        }
+
         // 🌟 [CRITICAL FIX] 모델 사이즈 상태값도 완벽하게 초기화하여 Relay 시스템 꼬임 방지
         {
             let mut size = self.current_size.lock().await;
@@ -1023,6 +1034,7 @@ impl LogisModel {
         if guard.is_some() {
             return Ok(());
         }
+
         let path = self.siglip2_model_path.clone();
         let dev = self.device_config.device.clone();
         let dtype = if self.is_cpu_mode {
@@ -1031,24 +1043,24 @@ impl LogisModel {
             candle_core::DType::BF16
         };
 
-        println!("[MODEL] Loading SigLIP2 Vision Encoder (BF16)...");
+        println!("[MODEL] Loading SigLIP2 Vision Encoder ({:?})...", dtype);
 
         let model = tokio::task::spawn_blocking(move || {
-            let config_path = std::path::Path::new(&path).join("config.json");
+            let dir = std::path::Path::new(&path);
+            let config_path = dir.join("config.json");
             let config = crate::models::siglip2::Siglip2Config::from_json(&config_path)?;
-
-            let safetensors_path = std::path::Path::new(&path).join("model.safetensors");
+            let safetensors_path = dir.join("model.safetensors");
             let mut model = crate::models::siglip2::Siglip2Model::load_vision_only(
                 &safetensors_path,
                 &config,
                 &dev,
                 dtype,
             )?;
-
             if needs_text {
-                model.load_text_encoder(&safetensors_path, &config)?;
+                // 🌟 디렉터리 경로를 전달합니다. 내부에서 model.safetensors 와
+                //    tokenizer.json 을 join 으로 찾습니다.
+                model.load_text_encoder(dir)?;
             }
-
             Ok::<_, anyhow::Error>(model)
         })
         .await??;
@@ -1162,6 +1174,14 @@ impl LogisModel {
         })
     }
 
+    /// 🌟 [VISION PIPELINE] 이미지 1장 → 구조화 JSON → DB 저장.
+    ///
+    ///  ── 5단계 ──
+    ///   STEP 1  SigLIP2 패치 임베딩 격자 생성 (NaFlex, 종횡비 보존)
+    ///   STEP 2  Doc Type NMS Battle       (그룹 → 코드, 동률일 때만 LLM 1회)
+    ///   STEP 3  Column Cosine Matching    (필드 앵커 히트맵)
+    ///   STEP 4  Vision NMS & Cropping     (연결성분 → 배타 배정 → 픽셀 박스)
+    ///   STEP 5  Qwen 3.5 2B 정제 추출      (카테고리별 정밀 크롭 입력)
     pub async fn extract_from_image(
         &self,
         task_id: String,
@@ -1174,7 +1194,6 @@ impl LogisModel {
     ) -> anyhow::Result<()> {
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.clone();
-        
         let emit_term = move |msg: &str| {
             println!("{}", msg);
             use tauri::Emitter;
@@ -1183,69 +1202,129 @@ impl LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
-        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (2B) Vision Model...");
+        emit_term("[STAGE-1] Preparing SigLIP2 Vision Encoder + Qwen3.5 (2B)...");
 
-        // 🌟 [CRITICAL FIX 1] 이미지 추출 5단계를 완벽하게 맞추기 위한 로딩 스텝(2단계) UI 추가!
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload_load);
         crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_load);
 
-        self.ensure_qwen3_5(true).await?; 
+        // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
+        self.check_siglip2_downloaded().await?;
+        self.ensure_siglip2(true).await?;
+        // Qwen3.5 는 크롭 추출용으로 로드 (비전 불필요 — 텍스트 전용)
+        self.ensure_qwen3_5(false).await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
-            
+
             let is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
 
-            if is_trade_doc {
-                emit_term("[STAGE-2] 🚢 Trade Document Mode: Initiating Classification...");
-                
-                // Step A: 문서 종류 1차 판별 (768px 축소 썸네일 사용)
-                let class_img = dynamic_image.resize(768, 768, image::imageops::FilterType::Triangle);
-                let class_prompt = crate::parsing::get_trade_doc_classification_prompt(); // (이 프롬프트 안에 TRACKING 추가됨)
-                let type_res = self.chat_with_qwen3_5_image_spinner(
-                    "You are a document classifier.", &class_prompt, Some(class_img), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision (Step 1/2)", "summary": "Identifying document type..." }), 128, cancel_token.clone(), Some(task_id.clone()), None
-                ).await?;
-                
-                let detected_type = crate::parsing::parse_json_from_llm(&type_res)
-                    .get("doc_type").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                emit_term(&format!("✅ Document identified as: **{}**", detected_type));
+            // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
+            let siglip_guard = self.siglip2_model.lock().await;
+            let siglip = siglip_guard.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
 
-                // 🌟 [개선된 분기 포인트] TRACKING(운송장)으로 판별되면 무거운 Slice & Merge를 우회합니다!
+            let grid = crate::models::siglip2::vision_encoder::encode_image(siglip, &dynamic_image)
+                .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
+            drop(siglip_guard);
+
+            emit_term(&format!(
+                "  🧬 [PATCH GRID] {}x{} = {} patches | scale({:.3}, {:.3})",
+                grid.grid_cols, grid.grid_rows, grid.len(), grid.scale_x, grid.scale_y
+            ));
+
+            if is_trade_doc {
+                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+
+                // ── STEP 2 : Doc Type NMS Battle ──
+                let siglip_guard2 = self.siglip2_model.lock().await;
+                let siglip2 = siglip_guard2.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                let verdict = crate::models::siglip2::vision_encoder::classify_doc_type(
+                    siglip2, &grid, &emit_term
+                ).map_err(|e| anyhow::anyhow!("SigLIP2 classify failed: {}", e))?;
+                drop(siglip_guard2);
+
+                let mut detected_type = verdict.code.clone();
+
+                // 마진 부족 시에만 LLM 재판정 1회
+                if verdict.code_margin < 0.15 && verdict.code_candidates.len() > 1 {
+                    emit_term(&format!(
+                        "  🤝 [TIE BREAK] 코드 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행.",
+                        verdict.code_margin
+                    ));
+                    let prompt = crate::parsing::get_trade_doc_classification_prompt_with_evidence(
+                        &verdict.group,
+                        &verdict.code_candidates,
+                    );
+                    let type_res = self.chat_with_qwen3_5_image_spinner(
+                        "You are a document classifier.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
+                        json!({ "category": "Vision (Step 2)", "summary": "Verifying document type..." }), 64, cancel_token.clone(), Some(task_id.clone()), None
+                    ).await?;
+                    if let Some(v) = crate::parsing::parse_json_from_llm(&type_res).get("doc_type").and_then(|d| d.as_str()) {
+                        if verdict.code_candidates.iter().any(|(c, _)| c == v) {
+                            emit_term(&format!("  ✅ [TIE BREAK] LLM 판정 '{}' 채택.", v));
+                            detected_type = v.to_string();
+                        } else {
+                            emit_term(&format!(
+                                "  🚫 [TIE BREAK] LLM 이 후보 밖 '{}' 반환. 비전 판정 '{}' 유지.",
+                                v, detected_type
+                            ));
+                        }
+                    }
+                }
+
+                emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
+
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
-                    
                     let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
-                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
+                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
                     let result_str = self.chat_with_qwen3_5_image_spinner(
-                        "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
+                        "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
                         json!({ "category": "Vision Analysis", "summary": "Extracting Tracking Label data..." }), 512, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
                     ).await?;
-                    
+
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
-                    
-                    // DB 저장 시 에러가 나지 않도록 doc_type 꼬리표를 강제로 달아줍니다.
                     if let Some(obj) = extracted_data.as_object_mut() {
                         obj.insert("doc_type".to_string(), json!("TRACKING"));
                     }
-                    
-                } else {
-                    // 🌟 B/L, CI 등 밀도 높은 무역 문서일 경우 기존처럼 Slice & Merge 파이프라인을 탑니다.
-                    emit_term("[STAGE-2] 🚢 Initiating Slice & Merge Pipeline...");
-                    
-                    // Step B: 판별된 문서에 따른 자르기(Slice) 미션 설정
-                    //  🌟 좌표표를 parsing.rs 로 옮겼습니다. app-logis-center 가 갖고 있던
-                    //     27종 무역 서식 좌표를 그대로 이식한 것이며,
-                    //     새 서식이 추가돼도 이 파일은 수정할 필요가 없습니다.
-                    let missions = crate::parsing::get_trade_doc_slice_config(&detected_type);
 
-                    let w = dynamic_image.width();
-                    let h = dynamic_image.height();
+                } else {
+                    // 🌟 [STEP 3~5] 히트맵 → 크롭 → Qwen3.5 추출 파이프라인
+                    emit_term("[STAGE-3] 🔥 Column Cosine Matching (Heatmap)...");
+
+                    let siglip_guard3 = self.siglip2_model.lock().await;
+                    let siglip3 = siglip_guard3.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                    // ── STEP 3 : Column Cosine Matching ──
+                    let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                        siglip3, &grid, &detected_type, &language, &emit_term
+                    ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
+                    drop(siglip_guard3);
+
+                    // ── STEP 4 : Vision NMS & Cropping ──
+                    emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
+                    let mut plans = crate::models::siglip2::vision_crop::plan_crops(
+                        &heatmaps, &grid, &emit_term
+                    );
+
+                    if plans.is_empty() {
+                        let cats = crate::parsing::get_trade_doc_categories(&detected_type);
+                        emit_term(&format!(
+                            "  🛟 [FALLBACK] 크롭 영역 미확정. 전체 페이지를 {}개 카테고리에 넘깁니다.",
+                            cats.len()
+                        ));
+                        plans = crate::models::siglip2::vision_crop::whole_page_fallback(&cats, &grid);
+                    }
+
+                    // ── STEP 5 : Qwen 3.5 2B 정제 추출 ──
+                    emit_term(&format!("[STAGE-5] 🤖 크롭 {}개 정제 추출", plans.len()));
+
                     let mut final_data_map = serde_json::Map::new();
-                    
-                    // 🌟 [CRITICAL FIX] Python 패리티: 병합을 위한 7대 기본 뼈대(Skeleton)를 무조건 미리 생성해야 합니다!
                     final_data_map.insert("header".to_string(), json!({"doc_type": detected_type}));
                     final_data_map.insert("parties".to_string(), json!({}));
                     final_data_map.insert("logistics".to_string(), json!({}));
@@ -1255,52 +1334,133 @@ impl LogisModel {
                     final_data_map.insert("line_items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
-                    // Step C: 구역별 분할 크롭 및 LLM 타격
-                    for (idx, (cat, top, bot)) in missions.iter().enumerate() {
+                    for (idx, plan) in plans.iter().enumerate() {
                         if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
                             emit_term("🛑 Task cancelled by user. Terminating safely.");
                             return Ok(());
                         }
-                        
-                        let crop_y = (h as f32 * top) as u32;
-                        let crop_h = (h as f32 * (bot - top)) as u32;
-                        let img_slice = dynamic_image.crop_imm(0, crop_y, w, crop_h);
-                        
-                        let prompt = crate::parsing::get_trade_category_schema(cat, &detected_type);
-                        let summary_msg = format!("Scanning {} ({}%)...", cat.to_uppercase(), (bot * 100.0) as i32);
-                        
+
+                        let crop = crate::models::siglip2::vision_crop::crop_region(
+                            &dynamic_image, plan, 512
+                        );
+
+                        emit_term(&format!(
+                            "    📤 [{}] {}x{} 크롭 전송 ({}/{})",
+                            plan.category, crop.width(), crop.height(), idx + 1, plans.len()
+                        ));
+
+                        let prompt = crate::parsing::get_trade_crop_prompt(
+                            &plan.category,
+                            &detected_type,
+                            &plan.top_field,
+                            plan.score,
+                        );
+
                         let tile_res = self.chat_with_qwen3_5_image_spinner(
-                            "You are a highly precise document data extraction assistant.", &prompt, Some(img_slice), app_handle, "extraction-progress", 
-                            json!({ "category": format!("Vision (Slice {}/{})", idx+1, missions.len()), "summary": summary_msg }), 1024, cancel_token.clone(), Some(task_id.clone()), None
+                            "You are a highly precise document data extraction assistant.",
+                            &prompt,
+                            Some(crop),
+                            app_handle,
+                            "extraction-progress",
+                            json!({ "category": format!("Vision (Crop {}/{})", idx + 1, plans.len()), "summary": format!("Extracting {}...", plan.category) }),
+                            1024,
+                            cancel_token.clone(),
+                            Some(task_id.clone()),
+                            None
                         ).await?;
 
                         let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
-                        
-                        // 🌟 기존 병합 함수 호출 (이제 뼈대가 있으므로 정상적으로 채워집니다)
-                        merge_json_manual(&mut final_data_map, cat, tile_json);
+                        merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                     }
-                    
+
                     extracted_data = Value::Object(final_data_map);
                 }
 
             } else {
                 // ============================================================
-                // 🛒 [Commerce 모드] 커머스 라우팅 보완
+                // 🛒 [Commerce 모드] SigLIP2 히트맵 + 정밀 크롭
                 // ============================================================
-                emit_term("[STAGE-2] 🛒 Commerce Mode: Analyzing Product/Label...");
-                
-                // 🌟 [개선] 기존에 무조건 "goods"(상품) 프롬프트를 먹이던 것을, 
-                // 택배 운송장이 올라올 확률이 높으므로 바코드/송장 번호를 우선 추출하는 "tracking" 기반의 
-                // 범용 커머스 프롬프트로 처리하도록 변경했습니다.
-                let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
-                let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
-                
-                let result_str = self.chat_with_qwen3_5_image_spinner(
-                    "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
-                ).await?;
-                
-                extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
+
+                let commerce_page_type = "goods";
+                let siglip_guard4 = self.siglip2_model.lock().await;
+                let siglip4 = siglip_guard4.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                    siglip4, &grid, commerce_page_type, &language, &emit_term
+                ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
+                drop(siglip_guard4);
+
+                let plans = crate::models::siglip2::vision_crop::plan_crops(
+                    &heatmaps, &grid, &emit_term
+                );
+
+                if plans.is_empty() {
+                    // 히트맵 실패 → 기존 단일 호출 폴백
+                    emit_term("  🛟 [FALLBACK] 크롭 영역 없음. 전체 화면 단일 호출로 전환.");
+                    let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
+                    let result_str = self.chat_with_qwen3_5_image_spinner(
+                        "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
+                        json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
+                    ).await?;
+                    extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                } else {
+                    emit_term(&format!("[STAGE-5] 🤖 커머스 크롭 {}개 정제 추출", plans.len()));
+                    let mut merged = serde_json::Map::new();
+                    let all_fields = crate::parsing::get_detail_schema_fields(commerce_page_type, "", &language);
+
+                    for (idx, plan) in plans.iter().enumerate() {
+                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                            return Ok(());
+                        }
+
+                        let fields: Vec<(String, String)> = all_fields.iter()
+                            .filter(|(name, _, _, _)| {
+                                crate::logic::trade_field_category(name) == plan.category
+                            })
+                            .map(|(name, desc, _, _)| (name.clone(), desc.clone()))
+                            .collect();
+
+                        if fields.is_empty() { continue; }
+
+                        let crop = crate::models::siglip2::vision_crop::crop_region(
+                            &dynamic_image, plan, 512
+                        );
+
+                        emit_term(&format!(
+                            "    📤 [{}] {}x{} 크롭 전송 ({}개 필드)",
+                            plan.category, crop.width(), crop.height(), fields.len()
+                        ));
+
+                        let prompt = crate::parsing::get_commerce_crop_prompt(
+                            commerce_page_type,
+                            &fields,
+                            &language,
+                            &plan.top_field,
+                            plan.score,
+                        );
+
+                        let res = self.chat_with_qwen3_5_image_spinner(
+                            "You are a precise commerce extraction assistant.",
+                            &prompt,
+                            Some(crop),
+                            app_handle,
+                            "extraction-progress",
+                            json!({ "category": format!("Commerce Crop {}/{}", idx + 1, plans.len()), "summary": format!("Extracting {}...", plan.category) }),
+                            1024,
+                            cancel_token.clone(),
+                            Some(task_id.clone()),
+                            None
+                        ).await?;
+
+                        if let Some(v) = crate::parsing::parse_json_from_llm(&res).as_object() {
+                            merge_extracted(&mut merged, &plan.category, &Value::Object(v.clone()), &emit_term);
+                        }
+                    }
+                    extracted_data = Value::Object(merged);
+                }
             }
             
             let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
@@ -8394,6 +8554,106 @@ fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
     } else {
         best_key
     }
+}
+
+/// 🌟 [MERGE POLICY] 카테고리별 추출 결과를 하나의 객체로 합칩니다.
+///
+///  ── 왜 별도 함수인가 ──
+///   기존 merge_json_manual 은 무조건 덮어썼습니다.
+///   header 크롭이 확정한 doc_number 를 parties 크롭이 null 로 덮는 사고가 납니다.
+///   크롭은 서로 다른 영역을 보므로, 값이 없다는 사실은
+///   '그 영역에 없었다' 는 뜻이지 '문서에 없다' 는 뜻이 아닙니다.
+///
+///  ── 규칙 ──
+///   ① null / 빈 문자열 / 빈 배열은 기존 값을 덮지 않습니다.
+///   ② 배열 필드(items / containers 등)는 이어붙입니다.
+///   ③ 이미 값이 있는 스칼라 필드는 유지합니다. 먼저 확정된 쪽이 이깁니다.
+///      (크롭 계획은 점수 순이므로 근거가 강한 쪽이 먼저 들어옵니다)
+fn merge_extracted(
+    merged: &mut serde_json::Map<String, Value>,
+    category: &str,
+    incoming: &Value,
+    emit: &dyn Fn(&str),
+) {
+    let obj = match incoming.as_object() {
+        Some(o) => o,
+        None => {
+            // 카테고리 자체가 배열로 반환되는 경우 (items / containers)
+            if let Some(arr) = incoming.as_array() {
+                if arr.is_empty() { return; }
+                let slot = merged
+                    .entry(category.to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(existing) = slot.as_array_mut() {
+                    for e in arr {
+                        existing.push(e.clone());
+                    }
+                }
+                emit(&format!(
+                    "    ➕ [{}] 배열 {}건 추가 (누적 {}건)",
+                    category,
+                    arr.len(),
+                    merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+                ));
+            }
+            return;
+        }
+    };
+
+    let mut added = 0usize;
+    let mut kept = 0usize;
+
+    for (k, v) in obj.iter() {
+        // ① 빈 값은 덮지 않습니다.
+        let is_empty = v.is_null()
+            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
+        if is_empty { continue; }
+
+        // ② 배열은 이어붙입니다.
+        if let Some(arr) = v.as_array() {
+            let slot = merged
+                .entry(k.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if slot.is_array() {
+                if let Some(existing) = slot.as_array_mut() {
+                    for e in arr {
+                        existing.push(e.clone());
+                    }
+                    added += 1;
+                    continue;
+                }
+            }
+            *slot = v.clone();
+            added += 1;
+            continue;
+        }
+
+        // ③ 이미 채워진 스칼라는 유지합니다.
+        match merged.get(k) {
+            Some(existing) if !existing.is_null() => {
+                let existing_empty = existing
+                    .as_str()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(false);
+                if existing_empty {
+                    merged.insert(k.clone(), v.clone());
+                    added += 1;
+                } else {
+                    kept += 1;
+                }
+            }
+            _ => {
+                merged.insert(k.clone(), v.clone());
+                added += 1;
+            }
+        }
+    }
+
+    emit(&format!(
+        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건",
+        category, added, kept
+    ));
 }
 
 pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {

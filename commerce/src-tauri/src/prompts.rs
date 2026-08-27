@@ -118,16 +118,21 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 // }
 
 pub fn get_trade_doc_classification_prompt() -> String {
-    // 🌟 [CLASSIFIER v2 / 27 CODES]
-    //  ── 왜 늘리는가 ──
-    //   get_trade_doc_slice_config 는 27종 좌표를 갖고 있는데
-    //   분류기가 9종만 낼 수 있어 19개 분기가 도달 불가였습니다.
-    //   extract_shipping_conditions 도 16종을 조건으로 뽑으므로
-    //   저장(9종) ↔ 조회(16종) 사이에 영구 공백이 있었습니다.
+    // 🌟 [CLASSIFIER v3 / VISION-FIRST FALLBACK]
+    //  ── 호출 조건이 바뀌었습니다 ──
+    //   v2 는 이 프롬프트가 '항상' 호출되는 1차 분류기였습니다.
+    //   v3 에서는 SigLIP2 패치 코사인(vision_encoder::classify_doc_type)이 1차이며,
+    //   그 판정의 1위-2위 마진이 사실상 동률일 때만 이 프롬프트가 1회 호출됩니다.
+    //   벡터 근거는 get_trade_doc_classification_prompt_with_evidence 가 동봉합니다.
+    //
+    //  ── 이 함수는 언제 쓰이는가 ──
+    //   SigLIP2 텍스트 인코더 로드 실패 등으로 비전 판정 자체가 불가능할 때의
+    //   최후 폴백입니다. 근거 없이 목록만 제시하므로 정확도가 낮으며,
+    //   정상 경로에서는 도달하지 않습니다.
     //
     //  ── 오분류 완화 ──
     //   2B 비전 모델이 27갈래를 정확히 가르기는 어렵습니다.
-    //   다만 slice_config 가 같은 그룹을 한 좌표로 묶어 두었으므로
+    //   다만 같은 그룹은 bias.json 의 trade_schema 를 공유하므로
     //   (CI|PI|SC / ED|ID|CINV / IC|WC|CA|PHYTO|HC|BEN_CERT / DGD|MSDS / POA|BIZ_LIC|INS)
     //   그룹 내 혼동은 추출 품질에 영향을 주지 않습니다.
     //   그래서 아래 프롬프트도 '그룹 → 코드' 순서로 제시합니다.
@@ -175,6 +180,63 @@ If none fit, return "Unknown".
 {"doc_type": "BL"}
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
+}
+
+/// 🌟 [VISION EVIDENCE CLASSIFIER] 비전 코사인 근거를 동봉한 재판정 프롬프트.
+///
+///  ── 호출 조건 ──
+///   siglip2::vision_encoder::classify_doc_type 의 코드 판정에서
+///   1위와 2위가 사실상 동률(margin ≈ 0)일 때만 1회 호출됩니다.
+///   마진이 충분하면 LLM 을 아예 부르지 않습니다.
+///
+///  ── 왜 근거를 동봉하는가 ──
+///   scheduler.rs STEP A 가 [VECTOR EVIDENCE] 를 실어 보내는 것과 같은 이유입니다.
+///   후보 목록만 주면 2B 모델이 목록 첫 항목이나 가장 흔한 서식(BL / CI)으로
+///   쏠립니다. 코사인 점수를 함께 주면 모델은 '이미 좁혀진 선택지 중 하나' 를
+///   고르는 작업만 하게 되어 창작 여지가 사라집니다.
+///
+///  ── 후보 제한 ──
+///   candidates 는 비전이 통과시킨 코드만 담습니다.
+///   모델이 그 밖의 코드를 반환하면 호출부가 폐기합니다.
+pub fn get_trade_doc_classification_prompt_with_evidence(
+    group: &str,
+    candidates: &[(String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (code, score) in candidates.iter().take(8) {
+        cands.push_str(&format!(
+            "- \"{}\" (vision cosine surprisal {:+.4}) — {}\n",
+            code,
+            score,
+            crate::logic::trade_code_anchor(code)
+        ));
+    }
+
+    let template = r###"[TASK]
+The vision encoder already narrowed this document down. Pick the single closest code.
+
+[VISION VERDICT]
+Document group: "{GROUP}"
+
+[CANDIDATE CODES]
+{CANDIDATES}
+
+[RULES]
+1. Choose exactly ONE code from [CANDIDATE CODES]. Never invent a code that is not listed.
+2. The scores come from patch-level cosine matching against each code's concept anchor.
+   A higher score means more of the page visually matched that concept.
+   Two nearly identical scores mean the page is genuinely ambiguous — decide by what you actually see.
+3. Judge by the printed title and the structural layout of the page, not by which candidate is listed first.
+4. If none of the candidates match what you see, return "Unknown".
+
+[OUTPUT FORMAT]
+{ "doc_type": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{GROUP}", group)
+        .replace("{CANDIDATES}", &cands)
 }
 
 /// 🌟 [TRADE SCHEMA v2 / BASE + OVERLAY]
@@ -337,6 +399,52 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         doc_type,
         reference_rule,
         schema
+    )
+}
+
+/// 🌟 [VISION CROP PROMPT] 정밀 크롭 이미지 전용 스키마 프롬프트.
+///
+///  ── get_trade_category_schema 와 무엇이 다른가 ──
+///   기존 프롬프트는 '전체 페이지 또는 고정 세로 슬라이스' 를 전제로 합니다.
+///   그래서 모델은 화면 어딘가에 값이 있을 것이라 가정하고 탐색하며,
+///   찾지 못하면 근처 숫자를 끌어와 채워 넣습니다.
+///
+///   이 프롬프트의 입력은 SigLIP2 코사인 히트맵이 지목한 '그 카테고리 영역만' 입니다.
+///   즉 "여기 없으면 문서 어디에도 없다" 가 성립합니다.
+///   그 사실을 명시해야 모델이 null 을 자신 있게 돌려줍니다.
+///
+///  ── 왜 null 이 중요한가 ──
+///   무역 문서 그래프는 참조 번호로 연결됩니다.
+///   없는 번호를 창작하면 잘못된 문서끼리 relay 되어 그래프가 통째로 오염됩니다.
+///   빈 값은 되돌릴 수 있지만 잘못된 연결은 되돌릴 수 없습니다.
+pub fn get_trade_crop_prompt(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+) -> String {
+    let base = get_trade_category_schema(category, doc_type);
+
+    let evidence = if top_field.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[VISION EVIDENCE]\nThe vision encoder located this region by matching the concept \"{}\" \
+             (cosine surprisal {:+.4}). The value for that field is almost certainly printed inside this crop.",
+            top_field, score
+        )
+    };
+
+    format!(
+        "[INPUT NOTICE]\n\
+         The image you receive is NOT the whole page. It is a precise crop that the vision encoder \
+         identified as the '{}' region of a {} document. Everything relevant to this category is inside this crop.\n\
+         Therefore: if a field is not visible here, it is not present in the document at all. Return null for it.\n\
+         Never guess a value from a neighbouring number. A null field is correct data; a fabricated one corrupts the document graph.{}\n\n{}",
+        category.to_uppercase(),
+        doc_type,
+        evidence,
+        base
     )
 }
 
@@ -604,7 +712,7 @@ For EVERY extracted field, wrap it in an operator object:
 }
 
 pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
-    if page_type == "tracking" || page_type == "goods" {
+    if page_type == "tracking" {
         let template = r###"[TASK]
 Convert the image to fit the structured JSON format. 
 
@@ -623,9 +731,94 @@ Current Language: {LANGUAGE}
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
         template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
+    } else if page_type == "goods" {
+        // 🌟 [COMMERCE GOODS] 기존에는 tracking 과 같은 템플릿을 공유해
+        //    상품 이미지에서도 tracking_number / barcodes 만 물었습니다.
+        //    상품명·가격·색상 같은 실제 커머스 축이 통째로 빠져 있었습니다.
+        let template = r###"[TASK]
+Read this product image and fill the structured JSON format.
+
+[CONTEXT]
+Region: {REGION}
+Current Language: {LANGUAGE}
+
+[RULES]
+1. Copy every value EXACTLY as printed on the image. Never translate or reformat.
+2. If a field is not visible, return null. A null field is correct data; a guessed one is corrupted data.
+3. "price" holds digits only. Put the currency symbol or code in "currency".
+
+[OUTPUT FORMAT]
+{ "title": String, "code": String, "price": Number, "currency": String, "color": String, "brand_name": String, "barcodes": [String] }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+        template.replace("{REGION}", region).replace("{LANGUAGE}", language)
     } else {
         String::new()
     }
+}
+
+/// 🌟 [COMMERCE CROP PROMPT] 커머스 정밀 크롭 이미지 전용 프롬프트.
+///
+///  ── 커머스에도 비전 크롭이 필요한 이유 ──
+///   상품 상세 캡처나 주문서 스크린샷은 한 장에
+///   상품명 / 가격 / 옵션 / 배송지 / 결제수단이 전부 들어 있습니다.
+///   전체를 통째로 물으면 2B 모델이 가격과 배송비를 섞고,
+///   상품명 자리에 카테고리 배지를 넣습니다.
+///   무역과 동일하게 필드 앵커 히트맵으로 영역을 잘라 하나씩 묻습니다.
+///
+///  ── 필드 목록의 출처 ──
+///   bias_schema::get_detail_schema_fields(page_type) 가 돌려주는
+///   필드명과 설명을 그대로 씁니다. 여기서 새로 나열하지 않습니다.
+pub fn get_commerce_crop_prompt(
+    page_type: &str,
+    fields: &[(String, String)],
+    language: &str,
+    top_field: &str,
+    score: f32,
+) -> String {
+    let mut schema = String::new();
+    for (name, desc) in fields.iter() {
+        schema.push_str(&format!("  \"{}\": {}\n", name, desc.replace('"', "'")));
+    }
+    if schema.is_empty() {
+        schema.push_str("  \"title\": String\n");
+    }
+
+    let evidence = if top_field.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[VISION EVIDENCE]\nThe vision encoder located this region by matching the concept \"{}\" \
+             (cosine surprisal {:+.4}).",
+            top_field, score
+        )
+    };
+
+    let template = r###"[INPUT NOTICE]
+The image you receive is NOT the whole screen. It is a precise crop that the vision encoder
+identified as holding the fields listed below. Everything relevant is inside this crop.
+If a field is not visible here, return null for it. Never guess from a neighbouring number.{EVIDENCE}
+
+[CONTEXT]
+Page Type: {TYPE}
+Output Language: {LANGUAGE}
+
+[RULES]
+1. Copy every value EXACTLY as printed. Never translate, round, or reformat.
+2. Numeric fields hold digits only. Strip currency symbols and thousand separators.
+3. Return null for anything not printed in this crop.
+
+[SCHEMA]
+{
+{SCHEMA}}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{EVIDENCE}", &evidence)
+        .replace("{TYPE}", page_type)
+        .replace("{LANGUAGE}", language)
+        .replace("{SCHEMA}", &schema)
 }
 
 pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_content: &str, reference_row: &str) -> String {

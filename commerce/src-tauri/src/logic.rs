@@ -772,3 +772,122 @@ pub fn trade_default_operator(field: &str) -> &'static str {
         _ => "contains",
     }
 }
+
+// =====================================================================
+// 🌟 [DOC TYPE ANCHOR — 텍스트/비전 공용]
+// ---------------------------------------------------------------------
+//  ── 왜 여기로 옮기는가 ──
+//   기존에는 scheduler.rs 의 process_trading_task 안에
+//   지역 const TRADE_GROUPS / GROUP_CODES / fn trade_code_anchor 로 박혀 있었습니다.
+//   그래서 비전 파이프라인(models/siglip2/vision_encoder.rs)이 같은 사전을
+//   쓰려면 복제해야 했고, 서식이 하나 늘 때마다 두 곳을 고쳐야 했습니다.
+//   판정 근거는 하나여야 하므로 logic.rs 로 승격합니다.
+//
+//  ── 사용처 ──
+//   · scheduler.rs STEP A          : PUG 라인 임베딩 채점 (텍스트 트랙)
+//   · siglip2/vision_encoder.rs    : 이미지 패치 임베딩 채점 (비전 트랙)
+// =====================================================================
+
+/// Depth 1 : 서식 그룹 앵커. 편견은 '다른 그룹의 bias' 를 그대로 씁니다.
+pub const TRADE_GROUPS: [(&str, &str); 6] = [
+    ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, documentary credit, payment terms, contract number, buyer seller agreement, tenor at sight, issuing bank, advising bank, beneficiary, applicant, order confirmation, quotation"),
+    ("shipping",  "commercial invoice, packing list, bill of lading, ocean bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage number, port of loading, port of discharge, place of receipt, place of delivery, container number, seal number, notify party, freight prepaid, freight collect, shipper and consignee, gross weight net weight measurement, carton quantity, marks and numbers, incoterms fob cif exw"),
+    ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff classification, customs clearance, declaration number, customs value, duty and tax, chamber of commerce, country of origin"),
+    ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, specification value, fumigation treatment, laboratory report, fit for human consumption, plant health"),
+    ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, proper shipping name, packing group, hazard class, policy number, insured amount, premium, coverage all risks, attorney in fact, business registration number"),
+    ("parcel",    "courier label, parcel waybill sticker, domestic courier service, home delivery parcel, door to door small package, delivery driver, barcode sticker label, parcel pickup, last mile delivery"),
+];
+
+/// Depth 2 : 그룹 소속 코드 목록.
+pub const TRADE_GROUP_CODES: [(&str, &[&str]); 6] = [
+    ("contract",   &["PO", "PI", "SC", "LC"]),
+    ("shipping",   &["CI", "PL", "BL", "AWB", "SA", "DO", "AN", "BC"]),
+    ("customs",    &["ED", "ID", "CINV", "CO"]),
+    ("inspection", &["IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT"]),
+    ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS"]),
+    ("parcel",     &["TRACKING"]),
+];
+
+/// 🌟 [VISION CHROME] 이미지에만 존재하는 시각 노이즈 앵커.
+///  텍스트(PUG) 트랙에는 없던 축입니다.
+///  로고 / 도장 / 서명 / 표 괘선 / 여백 / QR 은 문서 면적의 상당수를 차지하지만
+///  어떤 스키마 필드의 값도 아닙니다. 모든 그룹·코드·카테고리의 공통 편견입니다.
+pub const VISION_CHROME_ANCHOR: &str =
+    "company logo, brand emblem, letterhead graphic, official round stamp, red seal, \
+     handwritten signature, watermark, blank paper, empty margin, page border, table grid lines, \
+     ruled lines, barcode stripes, QR code square, page number footer, printed form template, \
+     decorative frame, background texture, scanned paper noise, staple hole, punch hole";
+
+/// Depth 2 보조 : 서식 코드 하나의 앵커 구.
+pub fn trade_code_anchor(code: &str) -> &'static str {
+    match code {
+        "PO"       => "purchase order, order confirmation, buyer issues to seller, order number, delivery date requested",
+        "PI"       => "proforma invoice, quotation, preliminary invoice, offer to buyer before shipment",
+        "SC"       => "sales contract, agreement between seller and buyer, contract terms and clauses",
+        "LC"       => "letter of credit, documentary credit, issuing bank, beneficiary, tenor at sight, expiry date, advising bank",
+        "CI"       => "commercial invoice, seller bills buyer, unit price, total amount, incoterms, invoice number",
+        "PL"       => "packing list, carton details, gross weight, net weight, measurement, marks and numbers",
+        "BL"       => "bill of lading, ocean carrier document, shipper consignee notify party, vessel voyage, port of loading, port of discharge, freight prepaid collect",
+        "AWB"      => "air waybill, airline document, flight number, airport of departure, airport of destination, chargeable weight",
+        "SA"       => "shipping advice, shipment notification to buyer, dispatch details",
+        "DO"       => "delivery order, release cargo to consignee, pickup location, container release",
+        "AN"       => "arrival notice, cargo arrival notification, local charges, free time, terminal",
+        "BC"       => "booking confirmation, space booking with carrier, booking number, cut off time",
+        "ED"       => "export declaration, customs export filing, declaration number, exporter, hs code",
+        "ID"       => "import declaration, customs import filing, importer, duty, tax, hs code",
+        "CINV"     => "customs invoice, invoice prepared for customs valuation",
+        "CO"       => "certificate of origin, country of origin declaration, chamber of commerce stamp",
+        "IC"       => "inspection certificate, quality inspection result, inspected by",
+        "WC"       => "weight certificate, certified weight measurement",
+        "CA"       => "certificate of analysis, laboratory test result, specification value",
+        "PHYTO"    => "phytosanitary certificate, plant health, fumigation, treatment type",
+        "HC"       => "health certificate, sanitary certificate, fit for human consumption",
+        "BEN_CERT" => "beneficiary certificate, beneficiary statement, we hereby certify that",
+        "DGD"      => "dangerous goods declaration, un number, proper shipping name, packing group, hazard class",
+        "MSDS"     => "material safety data sheet, chemical hazard information, first aid measures",
+        "POA"      => "power of attorney, authorization letter, attorney in fact",
+        "BIZ_LIC"  => "business license, business registration certificate, company registration number",
+        "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
+        "TRACKING" => "courier parcel label, tracking number barcode sticker, domestic courier service, home delivery small package, delivery driver route",
+        _          => "trade document",
+    }
+}
+
+/// 🌟 [FIELD → CATEGORY] 스키마 필드가 어느 추출 카테고리에 속하는지 판정합니다.
+///
+///  ── 왜 logic.rs 인가 ──
+///   기존에는 scheduler.rs 의 process_trading_task 안에
+///   지역 fn trade_field_category 로 박혀 있어서
+///   비전 히트맵(카테고리 단위)이 같은 매핑을 쓸 수 없었습니다.
+///   저장 스키마(get_trade_category_schema)와 히트맵 축이 어긋나면
+///   크롭 영역과 추출 프롬프트가 서로 다른 필드를 가리키게 됩니다.
+pub fn trade_field_category(field: &str) -> &'static str {
+    if field.starts_with("reference_") {
+        return "header";
+    }
+    match field {
+        "doc_type" | "doc_number" | "issue_date" | "expiry_date"
+            | "reference_number" | "no" | "status" => "header",
+        "sender_name" | "sender_address" | "recipient_name"
+            | "recipient_address" | "notify_party_name" => "parties",
+        "vessel" | "voyage_number" | "pol" | "pod" | "place_receipt"
+            | "place_delivery" | "etd" | "eta" | "transport_mode" => "logistics",
+        "incoterms" | "payment_terms" | "freight_payment_term" => "conditions",
+        "currency" | "amount" | "amount_subtotal" | "amount_tax"
+            | "freight_amount" | "insurance_amount" | "local_charges" => "financials",
+        "container_number" | "seal_number" | "package_count" | "package_unit"
+            | "weight_gross" | "weight_net" | "volume" | "marks_numbers" => "cargo",
+        "hs_code" => "items",
+        _ => "",
+    }
+}
+
+/// 🌟 [EXTRACTION CATEGORIES] 비전 크롭 + LLM 추출이 순회하는 카테고리 목록.
+///
+///  parsing.rs 의 get_trade_category_schema 가 소비하는 8개와 동일합니다.
+///  items / containers 는 배열 스키마이며, 히트맵으로 위치를 찾은 뒤
+///  그 영역 전체를 크롭해 표를 통째로 읽힙니다.
+pub const TRADE_EXTRACTION_CATEGORIES: [&str; 8] = [
+    "header", "parties", "logistics", "conditions",
+    "financials", "cargo", "items", "containers",
+];

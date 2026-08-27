@@ -862,126 +862,88 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
     split_doc_to_pug_list(&document, selector_str, mode)
 }
 
-/// 🌟 [TRADE SLICE CONFIG] 무역 서식별 크롭 좌표.
-///  ── 출처 ──
-///   app-logis-center/rust/src-tauri/src/model.rs 의 get_slice_config 를 이식했습니다.
-///   원본은 Mission 구조체를 돌려주지만, cron 의 extract_from_image 가
-///   (카테고리, top, bottom) 튜플을 기대하므로 형태만 맞췄습니다.
+// =====================================================================
+// 🌟 [DEPRECATED] 무역 서식별 고정 크롭 좌표표
+// ---------------------------------------------------------------------
+//  ── 왜 폐기하는가 ──
+//   이 표는 '문서 세로 비율' 을 서식마다 손으로 적어 둔 것입니다.
+//   실제 문서 레이아웃과 어긋나는 경우가 구조적으로 발생합니다.
+//
+//   ① 가로 2단 배치 붕괴
+//      B/L 은 좌측에 Shipper, 우측에 Consignee 를 나란히 인쇄합니다.
+//      ("parties", 0.00, 0.60) 은 세로 60% 를 통째로 자르므로
+//      두 당사자 + 문서번호 + 선박명이 한 조각에 뭉개져 들어가고,
+//      LLM 은 어느 값이 어느 필드인지 구분할 근거를 잃습니다.
+//
+//   ② 표 위치 불일치
+//      ("items", 0.30, 0.70) 은 품목표가 중단에 있다고 가정합니다.
+//      표가 하단에 몰린 서식(대부분의 Packing List)에서는
+//      이 슬라이스가 빈 여백만 잡아 items 가 항상 빈 배열이 됩니다.
+//
+//   ③ 카테고리 영역 중복
+//      ("header", 0.00, 0.25) 와 ("parties", 0.00, 0.40) 은 0.00~0.25 가 겹칩니다.
+//      같은 픽셀을 두 번 크롭해 LLM 을 두 번 호출하고,
+//      두 호출이 같은 값을 서로 다른 필드로 뱉으면 조건이 오염됩니다.
+//
+//   ④ 서식 확장 비용
+//      45종 데이터셋 중 이 표가 다루는 것은 27종뿐이며,
+//      HBL / SWB / FCR / POD / SOA / TI 등은 폴백 4슬라이스로 떨어져
+//      cargo / financials / logistics 가 아예 추출되지 않았습니다.
+//
+//  ── 무엇으로 대체되었는가 ──
+//   models/siglip2/vision_encoder.rs :: build_column_heatmaps
+//     bias_schema 의 필드 semantic/bias 구를 SigLIP2 텍스트 공간에 올리고
+//     이미지 패치와 코사인을 재서 '실제로 인쇄된 위치' 를 찾습니다.
+//   models/siglip2/vision_crop.rs :: plan_crops
+//     히트맵 → 연결 성분 → 인접 병합 → IoU dedup → 배타 배정 → 픽셀 박스.
+//     한 카테고리는 한 영역만, 한 영역은 한 카테고리만 가져갑니다.
+//
+//   좌표를 코드에 적지 않으므로 서식이 늘어도 이 파일은 수정 대상이 아닙니다.
+//   새 필드가 필요하면 bias.json 의 trade_schema 에만 추가하면 됩니다.
+//
+//  ── 왜 삭제하지 않고 남기는가 ──
+//   호출부가 남아 있으면 컴파일 경고로 즉시 드러나야 하고,
+//   나중에 누군가 '고정 좌표가 필요하다' 며 다시 작성하는 것을 막기 위해
+//   폐기 사유를 코드에 남깁니다.
+// =====================================================================
+#[deprecated(
+    since = "vision-nms",
+    note = "고정 비율 크롭은 폐기되었습니다. \
+            siglip2::vision_encoder::build_column_heatmaps + \
+            siglip2::vision_crop::plan_crops 를 사용하십시오."
+)]
+#[allow(dead_code)]
+pub fn get_trade_doc_slice_config(_doc_type: &str) -> Vec<(&'static str, f32, f32)> {
+    // 🌟 어떤 좌표도 돌려주지 않습니다.
+    //    실수로 호출되더라도 잘못된 영역을 크롭하는 대신
+    //    호출부가 '크롭 계획 없음' 을 인지하고 전체 페이지 폴백으로 가도록 만듭니다.
+    Vec::new()
+}
+
+/// 🌟 [VISION CROP CATEGORIES] 비전 크롭 + LLM 추출이 순회하는 카테고리 목록.
 ///
-///  ── 왜 이식하는가 ──
-///   cron 은 CI/PI/BL/AWB 4종 + 폴백 1개만 갖고 있었고,
-///   폴백에는 cargo / financials / logistics 슬라이스가 없어
-///   LC·ED·ID·PHYTO·DGD 등 22종에서 화물·금액·운송 정보가
-///   구조적으로 추출되지 않았습니다.
-pub fn get_trade_doc_slice_config(doc_type: &str) -> Vec<(&'static str, f32, f32)> {
-    match doc_type {
-        // --- 1. 계약 · 결제 ---
-        "CI" | "PI" | "SC" => vec![
-            ("header",     0.00, 0.25),
-            ("parties",    0.00, 0.40),
-            ("logistics",  0.20, 0.50),
-            ("items",      0.30, 0.70),
-            ("items",      0.50, 0.85),
-            ("financials", 0.70, 0.95),
-            ("conditions", 0.80, 1.00),
-        ],
-        "PO" => vec![
-            ("header",     0.00, 0.25),
-            ("parties",    0.00, 0.40),
-            ("logistics",  0.20, 0.50),
-            ("items",      0.30, 0.80),
-            ("financials", 0.70, 0.95),
-            ("conditions", 0.80, 1.00),
-        ],
-        "LC" => vec![
-            ("header",     0.00, 0.30),
-            ("parties",    0.00, 0.40),
-            ("financials", 0.20, 0.60), // L/C 는 금융 조항 밀도가 가장 높습니다
-            ("logistics",  0.40, 0.70),
-            ("conditions", 0.50, 1.00), // 본문 대부분이 조건절입니다
-        ],
-
-        // --- 2. 선적 · 운송 ---
-        "PL" | "SA" => vec![
-            ("header",     0.00, 0.20),
-            ("parties",    0.00, 0.40),
-            ("logistics",  0.20, 0.50),
-            ("items",      0.30, 0.80),
-            ("cargo",      0.60, 0.95),
-            ("conditions", 0.85, 1.00),
-        ],
-        "BL" => vec![
-            ("header",     0.00, 0.20),
-            ("parties",    0.00, 0.60),
-            ("logistics",  0.35, 0.65),
-            ("cargo",      0.50, 0.90),
-            ("conditions", 0.80, 1.00),
-        ],
-        "AWB" => vec![
-            ("header",     0.00, 0.15),
-            ("parties",    0.00, 0.40),
-            ("logistics",  0.10, 0.40),
-            ("cargo",      0.30, 0.70),
-            ("financials", 0.60, 0.90),
-            ("conditions", 0.85, 1.00),
-        ],
-        "BC" => vec![
-            ("header",    0.00, 0.25),
-            ("parties",   0.00, 0.50),
-            ("logistics", 0.30, 0.70),
-            ("cargo",     0.50, 0.90),
-        ],
-        "AN" | "DO" => vec![
-            ("header",     0.00, 0.25),
-            ("parties",    0.00, 0.50),
-            ("logistics",  0.30, 0.70),
-            ("financials", 0.50, 0.90), // Arrival Notice 는 로컬 charge 가 핵심
-            ("cargo",      0.60, 1.00),
-        ],
-
-        // --- 3. 통관 · 신고 ---
-        "ED" | "ID" | "CINV" => vec![
-            ("header",     0.00, 0.20),
-            ("parties",    0.00, 0.30),
-            ("logistics",  0.20, 0.50),
-            ("financials", 0.40, 0.70),
-            ("items",      0.50, 0.90),
-            ("conditions", 0.80, 1.00),
-        ],
-        "CO" => vec![
-            ("header",     0.00, 0.20),
-            ("parties",    0.00, 0.40),
-            ("logistics",  0.30, 0.50),
-            ("items",      0.40, 0.80),
-            ("conditions", 0.75, 1.00),
-        ],
-
-        // --- 4. 검사 · 증명 ---
-        "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT" => vec![
-            ("header",     0.00, 0.25),
-            ("parties",    0.00, 0.40),
-            ("items",      0.30, 0.80), // 시험 항목 / 학명 리스트
-            ("conditions", 0.70, 1.00), // "We hereby certify..." 선언문
-        ],
-
-        // --- 5. 특수 · 법무 ---
-        "DGD" | "MSDS" => vec![
-            ("header",    0.00, 0.25),
-            ("logistics", 0.20, 0.50),
-            ("cargo",     0.40, 0.90), // 위험물은 화물 속성이 본문입니다
-        ],
-        "POA" | "BIZ_LIC" | "INS" => vec![
-            ("header",     0.00, 0.30),
-            ("parties",    0.10, 0.50),
-            ("conditions", 0.40, 1.00), // 법률 문언
-        ],
-
-        // --- 폴백 ---
-        _ => vec![
-            ("header",     0.00, 0.30),
-            ("parties",    0.00, 0.50),
-            ("items",      0.30, 0.80),
-            ("conditions", 0.70, 1.00),
-        ],
+///  ── get_trade_doc_slice_config 의 유일한 유효 계승분 ──
+///   기존 함수가 실제로 제공하던 정보 중 좌표를 뺀 나머지,
+///   즉 '이 서식에서 어떤 카테고리를 뽑아야 하는가' 만 남깁니다.
+///   좌표는 히트맵이 결정하고, 카테고리 집합은 스키마가 결정합니다.
+///
+///  ── 왜 스키마에서 유도하는가 ──
+///   get_trade_category_schema 가 특정 카테고리에 대해 빈 스키마를 돌려주면
+///   그 카테고리는 이 서식에 존재하지 않는 것입니다.
+///   그 사실을 좌표표에 다시 적을 이유가 없습니다.
+pub fn get_trade_doc_categories(doc_type: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for cat in crate::logic::TRADE_EXTRACTION_CATEGORIES.iter() {
+        let schema = get_trade_category_schema(cat, doc_type);
+        // get_trade_category_schema 는 필드가 없으면 "SCHEMA:\n{}" 또는
+        // "SCHEMA:\n[ {} ]" 를 돌려줍니다. 그 서식에 없는 카테고리입니다.
+        if schema.contains("SCHEMA:\n{}") || schema.contains("SCHEMA:\n[ {} ]") {
+            continue;
+        }
+        out.push(cat);
     }
+    if out.is_empty() {
+        out.push("header");
+    }
+    out
 }

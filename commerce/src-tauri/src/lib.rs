@@ -3597,7 +3597,8 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 "SigLIP2" => vec![
                     ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string()),
                     ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/config.json".to_string(), "config.json".to_string()),
-                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/preprocessor_config.json".to_string(), "preprocessor_config.json".to_string())
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/preprocessor_config.json".to_string(), "preprocessor_config.json".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/tokenizer.json".to_string(), "tokenizer.json".to_string())
                 ],
                 _ => vec![]
             }
