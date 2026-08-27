@@ -45,7 +45,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "json_data", "data", "id", "index", "no", "link", "path",
                         "origin", "mode", "detail",
                         "updated_at", "created_at", "updated_at_ts", "created_at_ts",
-                        "digest", "vector", "from", "to", "cc", "bcc", "ref",
+                        "digest", "vector", "vision_vec", "from", "to", "cc", "bcc", "ref",
                         "is_masked", "tier", "score",
                     ].contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }

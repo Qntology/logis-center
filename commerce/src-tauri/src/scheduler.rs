@@ -1181,6 +1181,7 @@ async fn save_item(
 
     let _ = store.upsert_item(
         table, id, type_, data, vector,
+        None, // 🌟 scheduler 경로는 텍스트 전용이라 비전 벡터 없음
         Some(from), Some(to), Some(cc), Some(bcc), Some(ref_val), digest
     ).await;
 }
@@ -1551,14 +1552,14 @@ pub async fn process_task(
 
     if task.r#type == "image_extraction" {
         // 🌟 [SIGLIP2 GATE] 이미지 추출은 SigLIP2 비전 인코더가 필수입니다.
-        // 파일이 없으면 프론트엔드에 알림을 보내 Settings 탭으로 유도하고
-        // 자동 다운로드를 트리거합니다.
+        // 파일이 없으면 alert 대신 Settings 탭을 열고 자동 다운로드를 트리거합니다.
         if let Err(e) = model.check_siglip2_downloaded().await {
             println!("[Scheduler] ⚠️ SigLIP2 model missing: {}", e);
             let _ = app_handle.emit("app_error_alert", json!({
-                "message": "SigLIP2 비전 모델이 필요합니다. Settings에서 다운로드해 주세요.",
+                "message": "SigLIP2 비전 모델이 필요합니다. Settings 탭이 열리고 자동으로 다운로드합니다.",
                 "model": "SigLIP2",
-                "task_id": task.id.clone()
+                "task_id": task.id.clone(),
+                "action": "open_settings"
             }));
             // 태스크를 에러 상태로 전환하여 큐에서 제거
             let error_status = crate::logic::parse_status("error");

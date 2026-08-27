@@ -967,15 +967,16 @@ impl LogisModel {
         Ok(())
     }
 
-    // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
-    // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
     pub async fn check_embedding_downloaded(&self) -> anyhow::Result<()> {
         let weights_path = self.embedding_path.join("model.safetensors");
         if !weights_path.exists() {
             let err_msg = "Embedding model is missing. Please go to the Settings tab and download the required models.";
             println!("[MODEL] 🚨 {}", err_msg);
             use tauri::Emitter;
-            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({ "message": err_msg }));
+            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({
+                "message": err_msg,
+                "action": "open_settings"
+            }));
             return Err(anyhow::anyhow!(err_msg));
         }
         Ok(())
@@ -1674,12 +1675,27 @@ impl LogisModel {
                     ));
                 }
                 
+                // 🌟 [비전 벡터 저장] 이미지 전체 풀링 벡터를 생성합니다.
+                //    텍스트 전용 문서가 아니므로 여기서만 비전 벡터가 채워집니다.
+                //    SigLIP2 미로드 시 0 벡터로 폴백합니다.
+                let vision_vec: Option<Vec<f32>> = {
+                    let siglip_guard = self.siglip2_model.lock().await;
+                    match siglip_guard.as_ref() {
+                        Some(siglip) => {
+                            crate::models::siglip2::vision_encoder::encode_image_pooled(siglip, &dynamic_image)
+                                .ok()
+                        }
+                        None => None,
+                    }
+                };
+
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
                     &hashed_id,
                     doc_type,
                     final_data.clone(),
                     None,
+                    vision_vec,
                     Some(from_addr),
                     Some(&team_id),
                     Some(&hashed_cc),
@@ -1795,6 +1811,7 @@ impl LogisModel {
                                             ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
                                             let _ = db.upsert_item(
                                                 "items", existing_id, target_type, ej, None,
+                                                None,
                                                 Some(from_addr), Some(&team_id), Some(&hashed_cc),
                                                 Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
                                                 Some(&ref_val), None
@@ -1822,6 +1839,7 @@ impl LogisModel {
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
+                                    None,
                                     Some(from_addr), Some(&team_id), Some(&hashed_cc),
                                     Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
                                     Some(&ref_val), None

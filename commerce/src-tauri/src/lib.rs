@@ -545,6 +545,7 @@ async fn reindex_pending_embeddings(
 
         let _ = store.upsert_item(
             target_table, &doc.id, &doc.r#type, data.clone(), Some(emb.clone()),
+            None, // 🌟 임베딩 경로는 텍스트 전용
             Some(&doc.from), Some(&doc.to), Some(&doc.cc), Some(&doc.bcc), Some(&doc.r#ref), Some(&digest)
         ).await;
 
@@ -975,7 +976,7 @@ async fn search_documents(
 
     if let Some(store) = store_opt {
         
-        let search_result = store.search_items("items", &query, query_vec, limit, offset, scope, false).await.map_err(|e| e.to_string());
+        let search_result = store.search_items("items", &query, query_vec, None, limit, offset, scope, false).await.map_err(|e| e.to_string());
         
         
         match &search_result {
@@ -1818,8 +1819,23 @@ async fn ai_search_complex(
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
                 const RECALL_LIMIT: usize = 50;
 
+                // 🌟 [비전 트랙] trading 모드일 때만 비전 질의 벡터를 생성합니다.
+                //    SigLIP2 텍스트 인코더로 질의를 1152차원으로 변환하여
+                //    비전 벡터 ANN 검색 트랙에 전달합니다.
+                let vision_qvec: Option<Vec<f32>> = if search_mode == "shipping" {
+                    let siglip_guard = model.siglip2_model.lock().await;
+                    match siglip_guard.as_ref() {
+                        Some(siglip) if siglip.has_text() => {
+                            crate::models::siglip2::vision_encoder::encode_query_text(siglip, &search_text).ok()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 let final_results = store
-                    .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
+                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
                     .await
                     .unwrap_or_else(|e| {
                         println!("[AI-SEARCH] ⚠️ scope query failed ({}). Falling back to mode-only scope.", e);
@@ -1839,7 +1855,7 @@ async fn ai_search_complex(
                     };
                     println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
                     store
-                        .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
+                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
                         .await
                         .unwrap_or_default()
                 } else {
@@ -2568,7 +2584,7 @@ async fn deep_research_command(
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
         
-        if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None, false).await {
+        if let Ok(results) = store.search_items("items", &query, emb, None, 3, 0, None, false).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
@@ -3227,7 +3243,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     }
                 }
                 // 원본 item 대신 세탁된 clean_item을 DB에 밀어 넣습니다.
-                let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, from, to, cc, bcc, r#ref, digest).await;
+                let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, None, from, to, cc, bcc, r#ref, digest).await;
                 count += 1;
             }
         }
@@ -3538,6 +3554,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf".to_string(),
                 "Embedding" => "granite-embedding-97m-multilingual-r2".to_string(),
                 "Granite" => "granite-4.0-h-350m".to_string(),
+                "SigLIP2"  => "siglip2-so400m-patch16-naflex".to_string(),
                 _ => "unknown".to_string()
             }
         };

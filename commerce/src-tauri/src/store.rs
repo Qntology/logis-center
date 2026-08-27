@@ -533,7 +533,7 @@ impl VectorStore {
     //  → LanceDB 는 '벡터 + FTS + 스코프 프리필터' 만 담당하고,
     //    도메인 조건(가격/수량/송장번호/상태...)은 Dexie 가 data.* 인덱스로 처리합니다.
     //  → 도메인 필드가 늘어나도 이 스키마는 영원히 그대로입니다. (Rust 재빌드 불필요)
-    pub const SCHEMA_VERSION: &'static str = "v4:unified-envelope";
+    pub const SCHEMA_VERSION: &'static str = "v5:vision-vector";
 
     pub async fn init_all_tables(&self) -> Result<()> {
         // 🌟 [TABLE COLLAPSE] sales / tracking / event 물리 테이블을 폐기합니다.
@@ -557,6 +557,7 @@ impl VectorStore {
         }
 
         let item_field = Field::new("item", DataType::Float32, true);
+        let vision_field = Field::new("item", DataType::Float32, true);
         let schema = Arc::new(Schema::new(vec![
             // ── 봉투(Envelope) : 3개 저장소(D1 / LanceDB / Dexie) 공통 계약 ──
             Field::new("id", DataType::Utf8, false),
@@ -573,6 +574,11 @@ impl VectorStore {
             Field::new("updated_at", DataType::Int64, false),
             // ── 검색 부품 : LanceDB 전용. 도메인 컬럼이 아님 ──
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 384), true),
+            // 🌟 [비전 벡터] SigLIP2 풀링 벡터 (1152차원).
+            //    이미지 추출 문서에만 실제 값이 들어가고,
+            //    텍스트 전용 문서는 0 벡터입니다.
+            //    컬럼 순서: 12=vector, 13=vision_vec, 14=text, 15=masked_text, 16=schema_v4
+            Field::new("vision_vec", DataType::FixedSizeList(Arc::new(vision_field), 1152), true),
             Field::new("text", DataType::Utf8, false),
             Field::new("masked_text", DataType::Utf8, true),
             // ── 스키마 세대 각인 : 세대가 바뀌면 전량 재생성 ──
@@ -591,12 +597,14 @@ impl VectorStore {
                         //    (기존처럼 컬럼을 하나하나 확인하는 방식은 스키마가 바뀔 때마다
                         //     검사 코드를 같이 고쳐야 해서 누락이 반복되었습니다)
                         let is_v4 = current_schema.field_with_name("schema_v4").is_ok();
+                        // 🌟 [비전 벡터 세대] vision_vec 컬럼이 없으면 구세대입니다.
+                        let has_vision_vec = current_schema.field_with_name("vision_vec").is_ok();
                         // 🌟 도메인 컬럼 잔재가 있으면 구세대입니다.
                         let has_legacy_domain = current_schema.field_with_name("status").is_ok()
                             || current_schema.field_with_name("amount").is_ok()
                             || current_schema.field_with_name("is_masked").is_ok();
 
-                        if !is_v4 || has_legacy_domain {
+                        if !is_v4 || !has_vision_vec || has_legacy_domain {
                             println!("[Store] Schema generation mismatch for {} (v4: {}, legacy_domain: {}). Recreating...", name, is_v4, has_legacy_domain);
                             let _ = self.conn.drop_table(name, &[]).await;
                             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
@@ -857,6 +865,7 @@ impl VectorStore {
 
     pub async fn upsert_item(
         &self, table_name: &str, id: &str, type_: &str, mut data_val: Value, vector: Option<Vec<f32>>,
+        vision_vec: Option<Vec<f32>>,
         from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
@@ -967,88 +976,98 @@ impl VectorStore {
             wall_now
         };
 
-         // 🌟 created_at 은 draft 여부와 무관하게 항상 실제 시각이어야 합니다.
-         //    (기존에는 now_ts 를 폴백으로 써서 updated_at 과 결합돼 있었습니다)
-         let created_at = data_val.get("created_at")
-             .and_then(|v| v.as_i64())
-             .filter(|v| *v > 0)
-             .unwrap_or(wall_now);
+        // 🌟 created_at 은 draft 여부와 무관하게 항상 실제 시각이어야 합니다.
+        //    (기존에는 now_ts 를 폴백으로 써서 updated_at 과 결합돼 있었습니다)
+        let created_at = data_val.get("created_at")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+            .unwrap_or(wall_now);
 
-         if let Some(obj) = final_data.as_object_mut() {
-             // 별칭 보정 (기존 동작 유지)
-             if let Some(tn) = obj.get("tracking_number").cloned() {
-                 if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
-             }
-             if let Some(p) = obj.get("price").cloned() {
-                 if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
-             }
+        if let Some(obj) = final_data.as_object_mut() {
+            // 별칭 보정 (기존 동작 유지)
+            if let Some(tn) = obj.get("tracking_number").cloned() {
+                if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
+            }
+            if let Some(p) = obj.get("price").cloned() {
+                if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
+            }
 
-             obj.insert("id".to_string(), json!(final_id.clone()));
-             obj.insert("type".to_string(), json!(type_));
-             obj.insert("mode".to_string(), json!(mode_str.clone()));
-             obj.insert("created_at".to_string(), json!(created_at));
-             obj.insert("updated_at".to_string(), json!(updated_ts));
-             if !new_digest.is_empty() {
-                 obj.insert("digest".to_string(), json!(new_digest.clone()));
-             }
-         }
+            obj.insert("id".to_string(), json!(final_id.clone()));
+            obj.insert("type".to_string(), json!(type_));
+            obj.insert("mode".to_string(), json!(mode_str.clone()));
+            obj.insert("created_at".to_string(), json!(created_at));
+            obj.insert("updated_at".to_string(), json!(updated_ts));
+            if !new_digest.is_empty() {
+                obj.insert("digest".to_string(), json!(new_digest.clone()));
+            }
+        }
 
-         // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
-         //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
-         //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
-         //
-         //    🌟 [ANALYTICS] analytics 트랙 행동 로그(click / hover / change / report)와
-         //       관리자 Q&A(question / answer)도 commerce 도메인 필드를 갖지 않습니다.
-         //       main.ts 의 NON_SEED_TYPES 와 반드시 동일한 집합이어야 두 저장소가 일치합니다.
-         let non_seed_type = matches!(
-             type_,
-             "team" | "user" | "member"
-                 | "click" | "hover" | "change" | "report"
-                 | "question" | "answer"
-         );
-         let seed_defaults = !matches!(target, "users" | "pages") && !non_seed_type;
-         let final_data = Self::canonicalize_data(final_data, seed_defaults);
+        // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
+        //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
+        //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
+        //
+        //    🌟 [ANALYTICS] analytics 트랙 행동 로그(click / hover / change / report)와
+        //       관리자 Q&A(question / answer)도 commerce 도메인 필드를 갖지 않습니다.
+        //       main.ts 의 NON_SEED_TYPES 와 반드시 동일한 집합이어야 두 저장소가 일치합니다.
+        let non_seed_type = matches!(
+            type_,
+            "team" | "user" | "member"
+                | "click" | "hover" | "change" | "report"
+                | "question" | "answer"
+        );
+        let seed_defaults = !matches!(target, "users" | "pages") && !non_seed_type;
+        let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
-         let json_str = final_data.to_string();
-         let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
-         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or(&text_content).to_string();
-         let flag_str = final_data.get("flag").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let json_str = final_data.to_string();
+        let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or(&text_content).to_string();
+        let flag_str = final_data.get("flag").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-         let schema = table.schema().await?;
+        let schema = table.schema().await?;
 
-         let safe_vector = match vector {
-             Some(v) if v.len() == 384 => v,
-             _ => vec![0.0; 384],
-         };
-         let values_builder = Float32Array::from(safe_vector);
-         let list_field = Field::new("item", DataType::Float32, true);
-         let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 384, Arc::new(values_builder), None)?;
+        let safe_vector = match vector {
+            Some(v) if v.len() == 384 => v,
+            _ => vec![0.0; 384],
+        };
+        let values_builder = Float32Array::from(safe_vector);
+        let list_field = Field::new("item", DataType::Float32, true);
+        let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 384, Arc::new(values_builder), None)?;
 
-         // 🌟 컬럼 순서는 init_all_tables 의 schema 정의와 1:1 로 일치해야 합니다.
-         //    0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
-         //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 text / 14 masked_text / 15 schema_v4
-         //    🌟 updated_ts 가 0 이면 draft 입니다. 물리 컬럼에도 0 을 그대로 남겨야
-         //       프론트엔드(Dexie)와 서버(proxy)의 draft 판정이 일치합니다.
-         let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(StringArray::from(vec![final_id])),
-                Arc::new(StringArray::from(vec![type_])),
-                Arc::new(StringArray::from(vec![flag_str])),
-                Arc::new(StringArray::from(vec![from.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![to.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![mode_str])),
-                Arc::new(StringArray::from(vec![json_str])),
-                Arc::new(Int64Array::from(vec![created_at])),
-                Arc::new(Int64Array::from(vec![updated_ts])),
-                Arc::new(list_array),
-                Arc::new(StringArray::from(vec![text_content])),
-                Arc::new(StringArray::from(vec![masked_text_content])),
-                Arc::new(StringArray::from(vec![Self::SCHEMA_VERSION])),
-         ])?;
-         table.add(vec![batch]).execute().await?;
-         Ok(())
+        // 🌟 [비전 벡터] 1152차원. 이미지 미추출 문서는 0 벡터.
+        let safe_vision_vec = match vision_vec {
+            Some(v) if v.len() == 1152 => v,
+            _ => vec![0.0; 1152],
+        };
+        let vision_values_builder = Float32Array::from(safe_vision_vec);
+        let vision_list_field = Field::new("item", DataType::Float32, true);
+        let vision_list_array = FixedSizeListArray::try_new(Arc::new(vision_list_field), 1152, Arc::new(vision_values_builder), None)?;
+
+        // 🌟 컬럼 순서는 init_all_tables 의 schema 정의와 1:1 로 일치해야 합니다.
+        //    0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
+        //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 vision_vec / 14 text / 15 masked_text / 16 schema_v4
+        //    🌟 updated_ts 가 0 이면 draft 입니다. 물리 컬럼에도 0 을 그대로 남겨야
+        //       프론트엔드(Dexie)와 서버(proxy)의 draft 판정이 일치합니다.
+        let batch = RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(StringArray::from(vec![final_id])),
+            Arc::new(StringArray::from(vec![type_])),
+            Arc::new(StringArray::from(vec![flag_str])),
+            Arc::new(StringArray::from(vec![from.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![to.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![mode_str])),
+            Arc::new(StringArray::from(vec![json_str])),
+            Arc::new(Int64Array::from(vec![created_at])),
+            Arc::new(Int64Array::from(vec![updated_ts])),
+            Arc::new(list_array),
+            Arc::new(vision_list_array),
+            Arc::new(StringArray::from(vec![text_content])),
+            Arc::new(StringArray::from(vec![masked_text_content])),
+            Arc::new(StringArray::from(vec![Self::SCHEMA_VERSION])),
+        ])?;
+        table.add(vec![batch]).execute().await?;
+        Ok(())
     }
 
     pub async fn initialize_user_profiles(&self, user_address: &str, user_email: &str, flag: &str) -> Result<()> {
@@ -1092,8 +1111,8 @@ impl VectorStore {
             "text": user_name
         });
 
-        self.upsert_item("users", &team_id, "team", team_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
-        self.upsert_item("users", user_address, "user", user_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
+        self.upsert_item("users", &team_id, "team", team_data, None, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
+        self.upsert_item("users", user_address, "user", user_data, None, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         Ok(())
     }
 
@@ -1134,6 +1153,7 @@ impl VectorStore {
                     &doc.r#type,
                     data,
                     vec,
+                    None, // 🌟 마이그레이션은 비전 벡터를 건드리지 않음
                     Some(new_from),
                     Some(new_to),
                     Some(&doc.cc),
@@ -1175,8 +1195,10 @@ impl VectorStore {
         let jsons       = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
         let createds    = batch.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
         let updateds    = batch.column(11).as_any().downcast_ref::<Int64Array>().unwrap();
-        let texts       = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-        let masked      = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+        // 🌟 12=vector, 13=vision_vec 은 구조체 매핑에서 건너뜁니다.
+        //    14=text, 15=masked_text 로 인덱스가 밀렸습니다.
+        let texts       = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
+        let masked      = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
 
         let mut out = Vec::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
@@ -1196,6 +1218,9 @@ impl VectorStore {
                 text: texts.value(i).to_string(),
                 masked_text: masked.value(i).to_string(),
                 vector: Vec::new(),
+                // 🌟 비전 벡터는 조회 시점에는 비워 둡니다.
+                //    검색 트랙에서 ANN 질의에만 쓰고, 응답에는 싣지 않습니다.
+                vision_vec: Vec::new(),
             });
         }
         out
@@ -1247,7 +1272,7 @@ impl VectorStore {
     //   Dexie   = 정밀도(정확히 자르기). 조건/정렬/페이징 담당.
     //   → 그래서 fetch_limit 을 넉넉히(요청의 4배, 최소 200) 잡습니다.
     //     Dexie 가 뒤에서 조건으로 잘라내므로 여기서 좁히면 정답이 사라집니다.
-    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
+    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, vision_query_vec: Option<Vec<f32>>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
          let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
          let table = self.conn.open_table(target).execute().await?;
 
@@ -1341,13 +1366,53 @@ impl VectorStore {
              }
          }
 
-         // =======================================================
-         // 🌟 [Track C] Scope-Only Recall
-         //  질의 텍스트도 없고 벡터도 0 이면(= 순수 목록 조회) 스코프 결과를 그대로 돌려줍니다.
-         //  기존에는 이 경우 Track 1 이 blanket +3.0 을 뿌려 목록처럼 동작했는데,
-         //  Track 1 을 없앴으므로 명시적 경로로 분리합니다.
-         // =======================================================
-         if combined.is_empty() {
+        // =======================================================
+        // 🌟 [Track V] Vision Vector Search (SigLIP2 1152-dim)
+        //    이미지 추출 문서의 비전 벡터와 질의 벡터의 ANN 검색입니다.
+        //    텍스트 트랙(384)과 독립적으로 동작하며,
+        //    같은 id 가 양쪽 트랙에서 잡히면 점수가 합산되어
+        //    '텍스트 + 비전' 이중 근거 문서가 상위로 올라갑니다.
+        //
+        //    가중치: 1.0 시작, 랭크당 -0.001 (Track B 와 동일 스케일)
+        //
+        //    ⚠️ lancedb 버전별 API 차이:
+        //    - 0.4+: .nearest_to_on("vision_vec", vvec)
+        //    - 0.5+: .vector_column("vision_vec").nearest_to(vvec)
+        //    현재 코드베이스의 lancedb 버전에 맞게 조정하십시오.
+        // =======================================================
+        if let Some(ref vvec) = vision_query_vec {
+            let is_empty_vvec = vvec.iter().all(|&x| x == 0.0);
+            if !is_empty_vvec {
+                let mut vvq = table.query();
+                if let Some(ref f) = scope { vvq = vvq.only_if(f.clone()); }
+                if let Ok(vvq_with_vector) = vvq.limit(fetch_limit).nearest_to(vvec.clone()) {
+                    if let Ok(vvres) = vvq_with_vector.execute().await {
+                        if let Ok(vbatches) = vvres.try_collect::<Vec<_>>().await {
+                            let mut vrank = 0;
+                            for b in vbatches {
+                                let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                                let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+                                for i in 0..b.num_rows() {
+                                    let id = ids.value(i).to_string();
+                                    let v_score = 1.0 - (vrank as f32 * 0.001);
+                                    if let Some((_, s)) = combined.get_mut(&id) { *s += v_score; }
+                                    else { combined.insert(id, (txs.value(i).to_string(), v_score)); }
+                                    vrank += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // =======================================================
+        // 🌟 [Track C] Scope-Only Recall
+        //  질의 텍스트도 없고 벡터도 0 이면(= 순수 목록 조회) 스코프 결과를 그대로 돌려줍니다.
+        //  기존에는 이 경우 Track 1 이 blanket +3.0 을 뿌려 목록처럼 동작했는데,
+        //  Track 1 을 없앴으므로 명시적 경로로 분리합니다.
+        // =======================================================
+        if combined.is_empty() {
              let mut q = table.query();
              if let Some(ref f) = scope { q = q.only_if(f.clone()); }
              if let Ok(res) = q.limit(fetch_limit).execute().await {
@@ -1947,9 +2012,13 @@ pub struct TradeDocument {
     pub created_at_ts: i64,
     #[serde(rename = "updated_at")]
     pub updated_at_ts: i64,
-
     // ── 검색 부품 (LanceDB 전용) ──
     pub text: String,
     pub masked_text: String,
     pub vector: Vec<f32>,
+    /// 🌟 [비전 벡터] SigLIP2 encode_image_pooled 산출물 (1152차원).
+    ///    이미지 추출 시에만 채워지고, 텍스트 전용 문서는 0 벡터입니다.
+    ///    trading 검색의 비전 트랙에서 ANN 질의 대상으로 사용합니다.
+    #[serde(default)]
+    pub vision_vec: Vec<f32>,
 }

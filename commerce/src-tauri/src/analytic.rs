@@ -590,6 +590,7 @@ pub async fn run_analytic_structuring(
                 &doc.r#type,
                 new_data.clone(),
                 None,
+                None, // 🌟 vision_vec: analytic 구조화 경로는 비전 벡터 없음
                 Some(&doc.from),
                 Some(&doc.to),
                 Some(&doc.cc),
@@ -712,6 +713,7 @@ pub async fn run_analytic_structuring(
                 "report",
                 report_data,
                 None,
+                None, // 🌟 vision_vec: report 경로는 비전 벡터 없음
                 Some(&env_doc.from),
                 Some(&env_doc.to),
                 Some(&env_doc.cc),

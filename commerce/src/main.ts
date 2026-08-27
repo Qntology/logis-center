@@ -9332,31 +9332,115 @@ listen("download_error", (event: any) => {
 // 🌟 [추가] 임베딩 모델 등 필수 파일 누락 시 알림 및 탭 이동 처리
 let hasAlertedMissingModel = false;
 listen("app_error_alert", (event: any) => {
-    if (!hasAlertedMissingModel) {
-        hasAlertedMissingModel = true;
-        alert(event.payload.message);
-        // 다운로드 UI가 있는 세팅 탭으로 즉시 화면 자동 전환
+    const payload = event.payload as any;
+    
+    // 🌟 Settings 탭 자동 열기 + 다운로드 시작
+    if (payload.action === "open_settings") {
+        // 1. Settings 탭 열기
         openWidget("settings");
-
-        // 🌟 [AUTO DOWNLOAD] 백엔드가 특정 모델명을 지목했으면
-        // Settings 탭 렌더링 직후 해당 모델의 다운로드 버튼을 자동 클릭합니다.
-        const missingModel: string = event.payload.model;
-        if (missingModel) {
-            // openWidget("settings")이 DOM 렌더링을 완료할 때까지 대기
-            setTimeout(() => {
-                const safeId = missingModel.replace(/[\s()]+/g, '-');
-                const btn = document.getElementById(`btn-download-${safeId}`) as HTMLButtonElement;
-                if (btn && btn.innerText !== "Downloaded") {
-                    console.log(`[AUTO-DL] ${missingModel} 모델 자동 다운로드 시작...`);
-                    btn.click();
-                }
-            }, 500);
+        
+        // 2. Settings 패널 내 체크박스 켜기 (설정 패널 보이게)
+        const toggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (toggle && !toggle.checked) {
+            toggle.checked = true;
+            toggle.dispatchEvent(new Event("change"));
         }
-
-        // 검색창 입력 등 연속 호출로 인한 무한 팝업 스팸을 막기 위해 10초간 방어
-        setTimeout(() => { hasAlertedMissingModel = false; }, 10000);
+        
+        // 3. 모델 목록 렌더링 후 다운로드 시작
+        invoke("check_model_status").then((status) => {
+            console.log("[MODEL-STATUS]", status);
+            
+            // 모델 목록 렌더링 (기존 함수 호출)
+            renderModelStatusUI(status);
+            
+            // 다운로드 시작
+            if (payload.model === "SigLIP2" && !(status as any).SigLIP2) {
+                console.log("[AUTO-DL] SigLIP2 자동 다운로드 시작...");
+                invoke("download_model", { modelName: "SigLIP2" }).then(() => {
+                    console.log("[AUTO-DL] SigLIP2 다운로드 완료");
+                    invoke("check_model_status").then((newStatus) => {
+                        renderModelStatusUI(newStatus);
+                    });
+                });
+            } else if (payload.model === "Embedding" && !(status as any).Embedding) {
+                console.log("[AUTO-DL] Embedding 자동 다운로드 시작...");
+                invoke("download_model", { modelName: "Embedding" }).then(() => {
+                    console.log("[AUTO-DL] Embedding 다운로드 완료");
+                    invoke("check_model_status").then((newStatus) => {
+                        renderModelStatusUI(newStatus);
+                    });
+                });
+            }
+        });
+        return;
     }
+    
+    // 기본: alert 팝업
+    alert(payload.message);
 });
+
+// 🌟 [MODEL STATUS UI] 모델 상태를 화면에 렌더링하는 함수
+function renderModelStatusUI(status: any) {
+    const models: Array<{ key: string; label: string }> = [
+        { key: "Qwen3", label: "Qwen3 (0.6B)" },
+        { key: "Qwen3.5", label: "Qwen3.5 (2B)" },
+        { key: "Granite", label: "Granite Embedding" },
+        { key: "Embedding", label: "Embedding Model" },
+        { key: "SigLIP2", label: "SigLIP2 Vision" },
+    ];
+    
+    // 기존 컨테이너 초기화
+    const container = document.getElementById("model-list-container");
+    if (container) {
+        container.innerHTML = "";
+        
+        models.forEach(({ key, label }) => {
+            const isDownloaded = status[key] === true;
+            const row = document.createElement("div");
+            row.style.cssText = `
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            `;
+            
+            const labelSpan = document.createElement("span");
+            labelSpan.textContent = label;
+            labelSpan.style.cssText = `
+                font-size: 0.75rem;
+                color: ${isDownloaded ? "#4ade80" : "#999"};
+            `;
+            
+            const statusBtn = document.createElement("button");
+            statusBtn.textContent = isDownloaded ? "Downloaded" : "Download";
+            statusBtn.style.cssText = `
+                padding: 4px 8px;
+                font-size: 0.65rem;
+                border-radius: 4px;
+                border: none;
+                cursor: ${isDownloaded ? "default" : "pointer"};
+                background: ${isDownloaded ? "#6c757d" : "#28a745"};
+                color: white;
+            `;
+            
+            if (!isDownloaded) {
+                statusBtn.onclick = () => {
+                    console.log(`[AUTO-DL] ${key} 다운로드 시작...`);
+                    invoke("download_model", { modelName: key }).then(() => {
+                        invoke("check_model_status").then((newStatus) => {
+                            renderModelStatusUI(newStatus);
+                        });
+                    });
+                };
+            }
+            
+            row.appendChild(labelSpan);
+            row.appendChild(statusBtn);
+            container.appendChild(row);
+        });
+    }
+}
 
 document.getElementById("btn-download-all-models")?.addEventListener("click", async () => {
     const missing = TARGET_MODELS.filter(m => !modelStatus[m]);
