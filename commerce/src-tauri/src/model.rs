@@ -2352,8 +2352,8 @@ impl LogisModel {
             messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
             model: "qwen3.5".to_string(),
             max_tokens: Some(max_tokens as u32),
-            temperature: Some(0.1),
-            top_p: Some(0.9),
+            temperature: Some(0.0),
+            top_p: Some(0.95),
             ..Default::default()
         };
         
