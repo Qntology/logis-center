@@ -331,7 +331,222 @@ fn score_patches(
     (best, dropped)
 }
 
-/// 🌟 [STEP 1] 문서 타입을 2뎁스로 확정합니다.
+// =====================================================================
+// 🌟 [DOC TITLE GATE] 무역 서식 '전문(풀 네임)' 에 의한 결정론 게이트
+// ---------------------------------------------------------------------
+//   ── 왜 접두어(code prefix)가 아니라 전문인가 ──
+//    'CI' 같은 짧은 코드는 이 서식_own 번호 접두어일 뿐 아니라
+//    다른 서식에도 인쇄됩니다. ED 는 reference_invoice 셀에 'CI-43726' 을
+//    그대로 찍고, BL / PL 도 인보이스 번호를 인쇄합니다.
+//    접두어 매칭은 그 서식들에서 결정론적으로 오발화합니다.
+//    반면 전문 'COMMERCIAL INVOICE' 는 이 서식의 헤더(제목)이며,
+//    다른 서식은 이 문구를 헤더로 인쇄하지 않습니다.
+//    따라서 게이트의 키는 전문, 값은 코드입니다.
+//
+//   ── 왜 상단 밴드만 보는가 ──
+//    헤더는 문서 상단에 인쇄됩니다. PL 이 본문에 "as per commercial invoice"
+//    라고 적는 경우가 있으므로 상단 30% 행만 제목 밴드로 봅니다.
+//    이것은 레이아웃의 구조적 사실이며 매직 상수가 아닙니다.
+//
+//   ── 왜 surprisal 0 게이트인가 ──
+//    score_patches 와 동일한 극값 기준선을 재사용합니다.
+//    0 = N개를 무작위로 뽑은 기대 최댓값. 전문이 그 기대치를 넘을 때만
+//    '인쇄되어 있다' 고 인정합니다. LLM 을 부르지 않으므로 동일 입력은
+//    항상 동일 출력을 냅니다.
+//    동명 서식(BC/BK, PC/PHYTO, INS/IP)은 마진이 0 이 되어 게이트가
+//    스스로 거부하고 벡터 판정에 위임합니다.
+const TRADE_DOC_TITLES: &[(&str, &str)] = &[
+    ("CI", "commercial invoice"),
+    ("PI", "proforma invoice"),
+    ("CINV", "customs invoice"),
+    ("CSI", "consular invoice"),
+    ("TI", "tax invoice"),
+    ("FI", "freight invoice"),
+    ("PL", "packing list"),
+    ("BL", "bill of lading"),
+    ("HBL", "house bill of lading"),
+    ("SWB", "sea waybill"),
+    ("AWB", "air waybill"),
+    ("SA", "shipping advice"),
+    ("DO", "delivery order"),
+    ("AN", "arrival notice"),
+    ("BC", "booking confirmation"),
+    ("BK", "booking confirmation"),
+    ("SR", "shipping request"),
+    ("FCR", "forwarder certificate of receipt"),
+    ("POD", "proof of delivery"),
+    ("CM", "cargo manifest"),
+    ("WR", "warehouse receipt"),
+    ("ED", "export declaration"),
+    ("ID", "import declaration"),
+    ("CO", "certificate of origin"),
+    ("CNM", "certificate of non manipulation"),
+    ("CCC", "customs clearance certificate"),
+    ("EL", "export license"),
+    ("IC", "inspection certificate"),
+    ("COA", "certificate of analysis"),
+    ("CA", "certificate of analysis"),
+    ("WC", "weight certificate"),
+    ("PHYTO", "phytosanitary certificate"),
+    ("PC", "phytosanitary certificate"),
+    ("FC", "fumigation certificate"),
+    ("HC", "health certificate"),
+    ("BEN_CERT", "beneficiary certificate"),
+    ("CDR", "cargo damage survey report"),
+    ("DGD", "dangerous goods declaration"),
+    ("MSDS", "material safety data sheet"),
+    ("POA", "power of attorney"),
+    ("BIZ_LIC", "business license"),
+    ("INS", "insurance policy"),
+    ("IP", "insurance policy"),
+    ("ICF", "insurance claim form"),
+    ("SOA", "statement of account"),
+    ("DN", "debit note"),
+    ("CN", "credit note"),
+    ("PO", "purchase order"),
+    ("SC", "sales contract"),
+    ("LC", "letter of credit"),
+    ("LLC", "local letter of credit"),
+    ("CP", "purchase confirmation"),
+    ("BE", "bill of exchange"),
+    ("TR", "trust receipt"),
+    ("LG", "letter of guarantee"),
+];
+
+/// 🌟 [TITLE GATE] 산출물. code/group 은 전문에서 역引き한 확정값입니다.
+struct TitleGateVerdict {
+    code: String,
+    group: String,
+    title: String,
+    score: f32,
+    margin: f32,
+}
+
+/// 🌟 [TITLE GATE] 상단 밴드 패치만을 서식 전문 뱅크에 채점합니다.
+///    일부 패치라도 전문의 surprisal 이 0 을 넘고, 1·2위 마진이 양수일 때만
+///    확정값을 돌려줍니다. 아니면 None(벡터 판정 유지) 입니다.
+fn run_title_gate(
+    model: &Siglip2Model,
+    grid: &PatchGrid,
+    chrome_phrases: &[String],
+    emit: &dyn Fn(&str),
+) -> Option<TitleGateVerdict> {
+    let empty_names: Vec<String> = Vec::new();
+    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
+    let empty_skip: Vec<bool> = Vec::new();
+
+    // ── 뱅크: bias = 자기 전문 1구, prejudice = 다른 전문 + 크롬 ──
+    let mut t_bias: Vec<(String, String, String)> = Vec::new();
+    let mut t_prej: Vec<(String, String, String)> = Vec::new();
+
+    for (code, title) in TRADE_DOC_TITLES.iter() {
+        t_bias.push(("title".to_string(), code.to_string(), title.to_string()));
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        for (other, other_title) in TRADE_DOC_TITLES.iter() {
+            if other == code {
+                continue;
+            }
+            if seen.insert(other_title) {
+                t_prej.push(("title".to_string(), code.to_string(), other_title.to_string()));
+            }
+        }
+
+        for p in chrome_phrases.iter() {
+            if seen.insert(p.as_str()) {
+                t_prej.push(("title".to_string(), code.to_string(), p.clone()));
+            }
+        }
+    }
+
+    let bank = match build_anchor_bank(model, &t_bias, &t_prej) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+
+    // ── 상단 30% 행만 제목 밴드로 봅니다 (레이아웃 구조 사실) ──
+    let title_rows = (grid.grid_rows * 3 / 10).max(1);
+    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+
+    for idx in 0..grid.len() {
+        let (r, _) = grid.rc(idx);
+        if r >= title_rows {
+            continue;
+        }
+
+        let p = &grid.patches[idx];
+        if p.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+
+        let (scores, _) = surprisal_dual_scores(
+            p,
+            &bank.bias,
+            &bank.prejudice,
+            &empty_names,
+            &empty_banks,
+            &empty_skip,
+        );
+
+        if scores.is_empty() {
+            continue;
+        }
+        if scores[0].surprisal <= 0.0 {
+            continue;
+        }
+
+        for s in scores {
+            let e = best.entry(s.key.clone()).or_insert(f32::MIN);
+            if s.surprisal > *e {
+                *e = s.surprisal;
+            }
+        }
+    }
+
+    if best.is_empty() {
+        emit("   ⚪ [TITLE GATE] 상단 밴드에 인쇄된 서식 전문이 없습니다. 벡터 판정에 위임합니다.");
+        return None;
+    }
+
+    let mut sorted: Vec<(String, f32)> = best.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (c, s) in sorted.iter() {
+        emit(&format!("     📐 [TITLE GATE] {} | Surprisal: {:+.4}", c, s));
+    }
+
+    let (top_code, top_score) = sorted[0].clone();
+    let margin = top_score - sorted.get(1).map(|x| x.1).unwrap_or(top_score);
+
+    // 동명 서식은 마진 0 → 거부
+    if margin <= 0.0 {
+        emit(&format!(
+            "   ⚪ [TITLE GATE] '{}' 와 2위 전문 점수가 동률(마진 {:+.4})이라 거부하고 벡터 판정에 위임합니다.",
+            top_code, margin
+        ));
+        return None;
+    }
+
+    let title = TRADE_DOC_TITLES
+        .iter()
+        .find(|(c, _)| *c == top_code.as_str())
+        .map(|(_, t)| t.to_string())
+        .unwrap_or_default();
+
+    let group = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .find(|(_, cs)| cs.iter().any(|c| *c == top_code.as_str()))
+        .map(|(g, _)| g.to_string())
+        .unwrap_or_else(|| "shipping".to_string());
+
+    Some(TitleGateVerdict {
+        code: top_code,
+        group,
+        title,
+        score: top_score,
+        margin,
+    })
+}
 ///
 ///  Depth 1 : 그룹 (contract / shipping / customs / inspection / legal / parcel)
 ///  Depth 2 : 코드 (그룹 소속 코드만 경쟁)
@@ -504,19 +719,54 @@ pub fn classify_doc_type(
 
     let c_bank = build_anchor_bank(model, &c_bias, &c_prej)?;
     let (c_scores_map, _) = score_patches(grid, &c_bank);
-
     let mut c_scores: Vec<(String, f32)> = c_scores_map.into_iter().collect();
     c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     if c_scores.is_empty() {
         c_scores.push((codes[0].to_string(), 0.0));
     }
+
     for (c, s) in c_scores.iter() {
         emit(&format!("    📐 [VISION CODE] {} | Surprisal: {:+.4}", c, s));
     }
 
-    let code = c_scores[0].0.clone();
-    let code_score = c_scores[0].1;
-    let code_margin = code_score - c_scores.get(1).map(|x| x.1).unwrap_or(code_score);
+    let mut code = c_scores[0].0.clone();
+    let mut code_score = c_scores[0].1;
+    let mut code_margin = code_score - c_scores.get(1).map(|x| x.1).unwrap_or(code_score);
+    let mut final_group = best_group.clone();
+    let mut final_group_score = group_score;
+    let mut final_group_margin = group_margin;
+
+    // 🌟 [TITLE GATE] 상단 밴드에 인쇄된 서식 전문에 의한 결정론 오버라이드.
+    //    'CI' 접두어·문서번호는 키로 쓰지 않고, 전문 'COMMERCIAL INVOICE' 만 키입니다.
+    //    ED/BL 이 참조 셀에 'CI-43726' 을 인쇄해도 상단 밴드 전문이 다르므로 오발화가 없습니다.
+    if let Some(gate) = run_title_gate(model, grid, &chrome_phrases, emit) {
+        if gate.code != code {
+            emit(&format!(
+                "  🚨 [TITLE GATE OVERRIDE] 상단 밴드 서식 전문 '{}' 근거: 코드 '{}' → '{}' | 그룹 '{}' → '{}'",
+                gate.title, code, gate.code, final_group, gate.group
+            ));
+            code = gate.code.clone();
+            code_score = gate.score;
+            code_margin = gate.margin;
+            final_group = gate.group.clone();
+
+            if let Some(gs) = g_scores.iter().find(|(g, _)| *g == gate.group) {
+                let rest = g_scores
+                    .iter()
+                    .filter(|(g, _)| *g != gate.group)
+                    .map(|(_, s)| *s)
+                    .fold(f32::MIN, f32::max);
+                final_group_score = gs.1;
+                final_group_margin = gs.1 - rest;
+            }
+        } else {
+            emit(&format!(
+                "  ✅ [TITLE GATE CONFIRM] 상단 밴드 서식 전문 '{}' 이 벡터 판정 '{}' 와 일치합니다.",
+                gate.title, code
+            ));
+        }
+    }
 
     emit(&format!(
         "  👑 [VISION CODE SELECTED] '{}' | Top: {:+.4} | Margin: {:+.4}",
@@ -524,9 +774,9 @@ pub fn classify_doc_type(
     ));
 
     Ok(DocTypeVerdict {
-        group: best_group,
-        group_score,
-        group_margin,
+        group: final_group,
+        group_score: final_group_score,
+        group_margin: final_group_margin,
         code,
         code_score,
         code_margin,
