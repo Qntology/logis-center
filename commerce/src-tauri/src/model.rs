@@ -1174,8 +1174,10 @@ impl LogisModel {
     ///   그 시점이 곧 Qwen3.5(2B) 를 올려야 하는 시점이므로 여기서 반드시 비웁니다.
     ///   (실측: 해제 없이 진입 시 첫 크롭에서 free VRAM 147MB)
     pub async fn release_siglip2(&self, reason: &str) {
+        println!("[VRAM] release_siglip2 ENTER ({}) — lock acquiring...", reason);
         let released = {
             let mut guard = self.siglip2_model.lock().await;
+            println!("[VRAM] lock acquired. Dropping SigLIP2 model (cudaFree implicit sync may happen here)...");
             if guard.is_some() {
                 *guard = None;
                 true
@@ -1183,28 +1185,38 @@ impl LogisModel {
                 false
             }
         };
-
         if !released {
+            println!("[VRAM] release_siglip2: already released. skip.");
             return;
         }
-
         println!(
             "[VRAM] SigLIP2 fully released ({}). vision ~820MB + text ~1.4GB returned.",
             reason
         );
-
         if !self.is_cpu_mode {
+            // 🌟 [HANG FIX] 텐서 드롭이 이미 암묵 synchronize 를 수행한 상태에서
+            //    여기서 다시 무한정으로 synchronize 를 기다리면 저VRAM(3.5GB) 환경에서
+            //    드라이버 스톨 시 영구 대기됩니다. 5초 상한을 두고 초과면 그냥 진행합니다.
+            //    (동기화는 '언제' 끝나도 정확성에 영향이 없는 베스트에포트 정리입니다)
             let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() {
-                    let _ = dev.synchronize();
-                }
-            })
+            let sync_res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() {
+                        let _ = dev.synchronize();
+                    }
+                }),
+            )
             .await;
+            match sync_res {
+                Ok(Ok(())) => println!("[VRAM] CUDA synchronize OK."),
+                Ok(Err(e)) => println!("[VRAM] CUDA synchronize join error: {:?}", e),
+                Err(_) => println!("[VRAM] ⚠️ CUDA synchronize 5s timeout — 드라이버 스톨 감지, 동기화 없이 진행합니다."),
+            }
             // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
         }
-
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1450,29 +1462,9 @@ impl LogisModel {
                 ));
 
                 emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
-                //  구분하지 못하므로, 크롭이 착지하면 2B 모델이 무언가를 지어냅니다.
-                //  빈 셀도 같습니다. BUYER (IF NOT CONSIGNEE) 박스는 내용이 비어 있는데
-                //  모델이 헤더 라벨을 값으로 읽어
-                //  recipient_name = "BUYER (IF NOT CONSIGNEE)" 를 반환했습니다.
-                //
-                // 🌟 [왜 임베딩이 아니라 픽셀인가]
-                //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
-                //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
-                //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
-                //
-                // 🌟 [소비처 3곳]
-                //  · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
-                //  · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
-                //  · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
-                //  한 번 계산해서 세 곳이 공유하므로 추가 비용이 없습니다.
-                let legibility = crate::models::siglip2::legibility::build_legibility_map(
-                    &dynamic_image,
-                    grid.grid_rows,
-                    grid.grid_cols,
-                    &emit_term,
-                );
-
-                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+                // 🌟 [LEGIBILITY REUSE] 판독성 맵은 분기 밖 STEP 2.5 에서 1회 계산된
+                //    바인딩을 그대로 사용합니다. 기존 shadowing 재계산은 로그 2회 출력 +
+                //    800x1032 픽셀 스캔 2회의 순수 낭비였습니다.
 
                 // ── STEP 2 : Doc Type NMS Battle ──
                 let siglip_guard2 = self.siglip2_model.lock().await;
@@ -1546,22 +1538,54 @@ impl LogisModel {
                     // 🌟 [STEP 3~5] 히트맵 → 크롭 → Qwen3.5 추출 파이프라인
                     emit_term("[STAGE-3] 🔥 Column Cosine Matching (Heatmap)...");
 
-                    let siglip_guard3 = self.siglip2_model.lock().await;
-                    let siglip3 = siglip_guard3.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                    let title_prej: Vec<String> = if verdict.title_text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![verdict.title_text.clone()]
+                    };
+                    // 🌟 [SCOPED LOCK] tokio Mutex 는 재진입이 불가능합니다.
+                    //    가드가 생존한 채 release_siglip2 가 같은 태스크에서 락을 기다리면
+                    //    영구 정지(셀프 데드록)합니다. 명시적 drop 에 의존하지 않고
+                    //    스코프 블록으로 락 수명을 고정합니다.
+                    let mut heatmaps = {
+                        let siglip_guard3 = self.siglip2_model.lock().await;
+                        let siglip3 = siglip_guard3.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                        crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                            siglip3, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
+                        ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?
+                    };
 
-                    // ── STEP 3 : Column Cosine Matching ──
-                    let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                        siglip3, &grid, &detected_type, &language, Some(&legibility), &emit_term
-                    ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
-                    drop(siglip_guard3);
+                    // 🌟 [TITLE ROW SUPPRESSION] 제목 행은 어떤 필드의 값도 될 수 없습니다.
+                    //    실측에서 header 봉우리가 제목/로고 행(r0)에 착지해 doc_number 가 전멸했습니다.
+                    //    타이틀은 상단 1줄(≈ 격자 행수의 1/9, TITLE GATE 30% 밴드의 1/3)에 인쇄되므로
+                    //    해당 행의 점수를 억제해 header 봉우리가 값 행으로 이동하게 합니다.
+                    {
+                        let title_row_max = (grid.grid_rows / 9).max(0);
+                        let mut suppressed = 0usize;
+                        for hm in heatmaps.iter_mut() {
+                            for r in 0..=title_row_max.min(grid.grid_rows.saturating_sub(1)) {
+                                for c in 0..grid.grid_cols {
+                                    let i = r * grid.grid_cols + c;
+                                    if i < hm.scores.len() && hm.scores[i] > f32::MIN {
+                                        hm.scores[i] = f32::MIN;
+                                        suppressed += 1;
+                                    }
+                                }
+                            }
+                        }
+                        emit_term(&format!(
+                            "  🚫 [TITLE ROW SUPPRESSION] 상단 {}행(제목 밴드) 점수 {}개 억제 → header 봉우리가 값 행으로 재현지화됩니다.",
+                            title_row_max + 1, suppressed
+                        ));
+                    }
 
                     // ── STEP 4 : Vision NMS & Cropping ──
                     emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
                     let mut plans = crate::models::siglip2::vision_crop::plan_crops(
                         &heatmaps, &grid, &emit_term
                     );
-
+                    emit_term(&format!("  🧾 [PLAN DONE] 크롭 계획 {}건 확정. release_siglip2 진입 전...", plans.len()));
                     if plans.is_empty() {
                         let cats = crate::parsing::get_trade_doc_categories(&detected_type);
                         emit_term(&format!(
@@ -1709,14 +1733,15 @@ impl LogisModel {
                 emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
 
                 let commerce_page_type = "goods";
-                let siglip_guard4 = self.siglip2_model.lock().await;
-                let siglip4 = siglip_guard4.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
-
-                let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                    siglip4, &grid, commerce_page_type, &language, Some(&legibility), &emit_term
-                ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
-                drop(siglip_guard4);
+                // 🌟 [SCOPED LOCK] trade 분기와 동일한 셀프 데드락 방지 블록화.
+                let heatmaps = {
+                    let siglip_guard4 = self.siglip2_model.lock().await;
+                    let siglip4 = siglip_guard4.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                    crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                        siglip4, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
+                    ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?
+                };
 
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
                     &heatmaps, &grid, &emit_term
@@ -1840,69 +1865,21 @@ impl LogisModel {
                 // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
                 //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
                 //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
-                let verdicts = match self.ensure_siglip2_ext(false, true).await {
-                    Err(e) => {
-                        emit_term(&format!(
-                            "  ⚪ [GROUNDING SKIP] SigLIP2 재로드 실패로 검증을 건너뜁니다: {}",
-                            e
-                        ));
-                        Vec::new()
-                    }
-                    Ok(_) => {
-                        let v = {
-                            let guard = self.siglip2_model.lock().await;
-                            match guard.as_ref() {
-                                Some(sig) if sig.has_text() => {
-                                    // 🌟 [BATCH ENCODE] 값마다 encode_query_text 를 부르면
-                                    //    텍스트 인코더 순전파가 값 개수만큼 반복됩니다.
-                                    //    고유 값을 한 번에 모아 encode_phrases 로 1회 처리하고,
-                                    //    검증 클로저는 색인 조회만 하도록 만듭니다.
-                                    let mut uniq: Vec<String> = Vec::new();
-                                    for c in grounding_claims.iter() {
-                                        if !uniq.iter().any(|e| e == &c.value) {
-                                            uniq.push(c.value.clone());
-                                        }
-                                    }
-
-                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(sig, &uniq)
-                                        .unwrap_or_default();
-
-                                    let mut table: std::collections::HashMap<&str, &Vec<f32>> =
-                                        std::collections::HashMap::new();
-
-                                    for (i, u) in uniq.iter().enumerate() {
-                                        if let Some(e) = embs.get(i) {
-                                            table.insert(u.as_str(), e);
-                                        }
-                                    }
-
-                                    emit_term(&format!(
-                                        "    🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
-                                        uniq.len()
-                                    ));
-
-                                    crate::models::siglip2::value_grounding::verify_claims(
-                                        &grounding_claims,
-                                        &grid.patches,
-                                        grid.grid_rows,
-                                        grid.grid_cols,
-                                        grid.orig_width,
-                                        grid.orig_height,
-                                        &legibility,
-                                        |t| table.get(t).map(|v| (*v).clone()).unwrap_or_default(),
-                                        &emit_term,
-                                    )
-                                }
-                                _ => {
-                                    emit_term("  ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.");
-                                    Vec::new()
-                                }
-                            }
-                        };
-                        self.release_siglip2("STEP 6 grounding complete").await;
-                        v
-                    }
-                };
+                // 🌟 [GROUNDING v2] v1 코사인 접지는 실측 26건 중 25건을 오폐기했습니다.
+                //    (로그: 🚫 [UNGROUNDED] [items] 'description' = "T-Shirt" | in -0.6821 ≤ 0 → 폐기)
+                //    v2 는 '출처 영역에 판독 가능한 패치가 있는가' 만 봅니다.
+                //    블러/여백에서 읽어낸 값(로그의 sender_name="Michael Johnson" 등)은
+                //    legibility 맵이 이미 잡으므로 여기서도 폐기됩니다.
+                //    SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다.
+                let verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
+                    &grounding_claims,
+                    grid.grid_rows,
+                    grid.grid_cols,
+                    grid.orig_width,
+                    grid.orig_height,
+                    &legibility,
+                    &emit_term,
+                );
 
                 // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
                 //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
@@ -2024,7 +2001,18 @@ impl LogisModel {
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
                 // 🌟 [CRITICAL FIX] 이미지 추출 결과에도 모드 필터를 위한 mode 값을 명시적으로 주입합니다.
-                final_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                // 🌟 [MODE PARITY] MODE REROUTE(commerce→trading) 가 발화하면 저장 모드도
+                //    실제로 실행된 파이프라인과 일치해야 합니다. search_mode 원본("commerce")을
+                //    그대로 저장하면 문서는 commerce 목록에만 박히고, trading 목록의
+                //    `mode = 'shipping'` 필터에서는 영원히 0건이라 UI 에 아무것도 안 나옵니다.
+                //    hashed_cc 가 이미 is_trade_doc 을 쓰는 것과 동일한 규칙으로 통일합니다.
+                //    · shipping 태스크            → is_trade_doc=true  → "shipping" (동작 불변)
+                //    · commerce + 무역 서식 감지  → is_trade_doc=true  → "shipping" (리라우트 일치)
+                //    · commerce + 상품/택배 라벨  → is_trade_doc=false → "commerce" (동작 불변)
+                final_data.as_object_mut().unwrap().insert(
+                    "mode".to_string(),
+                    json!(if is_trade_doc { "shipping" } else { "commerce" }),
+                );
                 final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
                 final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
@@ -2167,7 +2155,15 @@ impl LogisModel {
                 //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
                 // =====================================================================
                 if is_trade_doc {
-                    let relay_rules = crate::logic::trade_relay_rules(doc_type);
+                    let mut relay_rules = crate::logic::trade_relay_rules(doc_type);
+                    // 🌟 [RELAY SOURCE EXTENSION] CI 의 AIRWAYBILL/BILL OF LADING 번호는
+                    //    logistics.flight_number 로 추출되는 경우가 많습니다(실측 93763111837).
+                    //    이 번호를 AWB 서식과의 릴레이 키로 등록해 커머스 tracking 릴레이와
+                    //    동일하게 draft 생성/상호 참조가 동작하게 합니다.
+                    //    (trade_relay_rules 반환이 String 튜플이면 .to_string() 으로 push)
+                    if doc_type == "CI" {
+                        relay_rules.push(("AWB", "doc_number", "flight_number"));
+                    }
                     for (target_type, target_field, source_field) in relay_rules {
                         // 현재 문서에서 연결 키 값 추출
                         let link_value = final_data.get(source_field)

@@ -794,12 +794,36 @@ pub fn plan_crops(
                     //   0 은 'N개를 무작위로 뽑은 기대 최댓값과 같다' 는 뜻입니다.
                     //   즉 근거가 없다는 것을 극값이론이 정의한 지점입니다.
                     Some((bi, bscore)) if *bscore > 0.0 => {
+                        let rescue_cat = per_cat[ci].0.clone();
+                        let is_table_cat = rescue_cat == "items" || rescue_cat == "containers";
+                        let cand_px = to_pixel_bbox(gboxes[bi], grid);
+                        let dup = plans.iter().any(|p| {
+                            let (ax0, ay0, ax1, ay1) = cand_px;
+                            let (bx0, by0, bx1, by1) = p.bbox;
+                            let ix0 = ax0.max(bx0);
+                            let iy0 = ay0.max(by0);
+                            let ix1 = ax1.min(bx1);
+                            let iy1 = ay1.min(by1);
+                            if ix0 >= ix1 || iy0 >= iy1 { return false; }
+                            let inter = (ix1 - ix0) as f32 * (iy1 - iy0) as f32;
+                            let aa = ((ax1 - ax0) as f32 * (ay1 - ay0) as f32).max(1.0);
+                            let bb = ((bx1 - bx0) as f32 * (by1 - by0) as f32).max(1.0);
+                            (inter / aa.min(bb)) > 0.5
+                        });
+                        if dup && !is_table_cat {
+                            emit(&format!(
+                                "    ⚪ [RESCUE SKIP] '{}' 의 최고 봉우리 영역이 이미 배정된 크롭과 절반 이상 겹칩니다. 빈 영역 할루시네이션 유입을 막기 위해 구제하지 않습니다.",
+                                rescue_cat
+                            ));
+                            continue;
+                        }
                         emit(&format!(
                             "    🛟 [STARVATION RESCUE] '{}' 는 영역을 선점당했지만 자기 최고 봉우리({:+.4})로 독립 크롭합니다.",
                             per_cat[ci].0, bscore
                         ));
                         (gboxes[bi], *bscore, 0.0f32, counts[bi])
                     }
+
                     Some((_, bscore)) => {
                         emit(&format!(
                             "    ⚪ [NOT PRESENT] '{}' 는 최고 봉우리가 {:+.4} 로 기대치 이하입니다. 이 문서에 없는 축이므로 크롭하지 않습니다.",

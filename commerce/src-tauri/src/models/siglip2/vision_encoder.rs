@@ -705,11 +705,11 @@ pub fn classify_doc_type(
         ));
         for gn in group_names.iter() {
             let phrases: Vec<&str> = g_bias.iter()
-                .filter(|(c, _, _)| c == gn)
+                .filter(|(_, k, _)| k == gn)
                 .map(|(_, _, p)| p.as_str())
                 .collect();
             let sample: Vec<&str> = phrases.iter().take(4).copied().collect();
-            let prej_cnt = g_prej.iter().filter(|(c, _, _)| c == *gn).count();
+            let prej_cnt = g_prej.iter().filter(|(_, k, _)| k == *gn).count();
             emit(&format!(
                 "    📖 [GROUP '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
                 gn, phrases.len(), prej_cnt, sample
@@ -875,17 +875,17 @@ pub fn classify_doc_type(
     // 🌟 [LOG] 코드 앵커 구 샘플 — 55개 전부 출력하면 과다하므로 상위 8개만 상세
     {
         let mut code_names: Vec<&str> = Vec::new();
-        for (c, _, _) in c_bias.iter() {
-            if !code_names.contains(&c.as_str()) { code_names.push(c.as_str()); }
+        for (_, k, _) in c_bias.iter() {
+            if !code_names.contains(&k.as_str()) { code_names.push(k.as_str()); }
         }
         let sample_limit = code_names.len().min(8);
         for cn in code_names.iter().take(sample_limit) {
             let phrases: Vec<&str> = c_bias.iter()
-                .filter(|(c, _, _)| c == cn)
+                .filter(|(_, k, _)| k == cn)
                 .map(|(_, _, p)| p.as_str())
                 .collect();
             let sample: Vec<&str> = phrases.iter().take(3).copied().collect();
-            let prej_cnt = c_prej.iter().filter(|(c, _, _)| c == *cn).count();
+            let prej_cnt = c_prej.iter().filter(|(_, k, _)| k == *cn).count();
             emit(&format!(
                 "    📖 [CODE '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
                 cn, phrases.len(), prej_cnt, sample
@@ -1032,6 +1032,7 @@ pub fn build_column_heatmaps(
     doc_type: &str,
     doc_lang: &str,
     legibility: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+    title_prejudice: &[String],
     emit: &dyn Fn(&str),
 ) -> anyhow::Result<Vec<CategoryHeatmap>> {
     use std::collections::HashMap;
@@ -1209,6 +1210,15 @@ pub fn build_column_heatmaps(
                 continue;
             }
             prej_defs.push((cat.clone(), cat.clone(), p));
+        }
+        // 🌟 [TITLE PREJUDICE] 문서 전문은 모든 카테고리의 공통 편견입니다.
+        //    제목 행 패치가 히트맵 봉우리가 되어 header 크롭이 제목/로고 행으로
+        //    착지하던 문제(로그: header 커버리지 6%, doc_number 소실)를 차단합니다.
+        for p in title_prejudice.iter() {
+            if seen.contains(p.as_str()) {
+                continue;
+            }
+            prej_defs.push((cat.clone(), cat.clone(), p.clone()));
         }
     }
 
