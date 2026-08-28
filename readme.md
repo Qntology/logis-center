@@ -20,7 +20,7 @@
 
 | Domain | Description |
 |--------|------|
-| **Commerce** | Automatically structures order, goods, tracking, coupon, and review pages of shopping malls (Cafe24, MakeShop, Shopify, etc.) and indexes them into a local vector DB. |
+| **Commerce** | Automatically structures order, goods, tracking, coupon, and review pages of shopping malls and indexes them into a local vector DB. |
 | **Trade & Logistics** | Extracts 55 types of trade forms (B/L, C/I, P/L, L/C, etc.) using SigLIP2 Vision + Qwen3.5 2B and builds a reference graph between documents. |
 | **Website Analytics** | Collects user click, hover, and input events to summarize behavioral flows, preferences, and conversion funnels into natural language reports. |
 
