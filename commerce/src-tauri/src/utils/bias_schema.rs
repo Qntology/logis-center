@@ -960,7 +960,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                     triples.len()
                 );
             }
-        },
             //
             //  ── 실측 피해 ──
             //   · ⓑ에만 있고 ⓐ에 없던 13개(package_unit / description / quantity / unit /
