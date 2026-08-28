@@ -743,7 +743,7 @@ pub fn build_column_heatmaps(
     let empty_skip: Vec<bool> = Vec::new();
     // 🌟 편견 뱅크를 bias 자리에 넣어 채점할 때 쓰는 빈 편견 축입니다.
     //    (편견의 편견은 없으므로 비어 있어야 합니다)
-    let empty_prej: Vec<(String, String, Vec<f32>)> = Vec::new();
+    let empty_prej: Vec<(String, String, std::sync::Arc<Vec<f32>>)> = Vec::new();
 
     let n = grid.len();
     let mut cat_scores: HashMap<String, Vec<f32>> = HashMap::new();

@@ -1053,7 +1053,7 @@ pub fn gumbel_expected_z(n: usize) -> f32 {
 /// 🌟 [O(N²) → O(N)] order 탐색을 HashMap 색인으로 바꿉니다.
 ///    편견 뱅크가 13,598구일 때 구버전은
 ///    13,598 × (그룹수/2) 회 문자열 쌍 비교를 수행했습니다.
-fn group_sims<V: AsRef<[f32]>>(
+fn group_sims<V: AsRef<Vec<f32>>>(
     query: &[f32],
     src: &[(String, String, V)],
     pool: &mut Vec<f32>,
@@ -1086,7 +1086,7 @@ fn group_sims<V: AsRef<[f32]>>(
 /// (bias.json 이 이미 갖고 있는 편견 사전을 필터 경로에서 처음으로 활용)
 /// 🌟 [GENERIC] filter 뱅크의 벡터 소유 형태를 일반화합니다.
 ///    vision_encoder 는 Arc<Vec<f32>>, model.rs 는 Vec<f32> 를 넘깁니다.
-pub fn surprisal_dual_scores<V: AsRef<[f32]>>(
+pub fn surprisal_dual_scores<V: AsRef<Vec<f32>>>(
     query: &[f32],
     filter_bias: &[(String, String, V)],
     filter_prej: &[(String, String, V)],
