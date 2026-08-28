@@ -1,4 +1,4 @@
-# Logis Center — Commerce · Trade & Logistics · Website Analytics
+# Commerce · Trade & Logistics · Website Analytics
 
 > **Local-first AI Operations Platform** — An open-source operational tool where a browser extension and desktop client work seamlessly together to structure, vectorize, and search e-commerce data, trade & logistics documents, and website behavior logs **completely offline**.
 
