@@ -260,6 +260,7 @@ This project integrates and extends the following open-source works:
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Language Model | Apache-2.0 |
 | [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Language Model | Apache-2.0 |
 | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Embedding Model | Apache-2.0 |
+| [google/siglip2-so400m-patch16-naflex](https://huggingface.co/google/siglip2-so400m-patch16-naflex/) | Zero-Shot Image Classification | Apache-2.0 |
 | [stanfordnlp](https://huggingface.co/stanfordnlp) | NLP Model | Apache-2.0 |
 | [jhqxxx/aha](https://github.com/jhqxxx/aha) | Qwen Inference Engine | Apache-2.0 |
 | [ericlbuehler/mistral.rs](https://github.com/ericlbuehler/mistral.rs) | Granite Inference Engine | MIT |
@@ -318,6 +319,7 @@ This project uses the following open-source libraries:
 | scraper | ISC |
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
+| pdf-extract | MIT |
 | sysinfo | MIT |
 | tauri | MIT OR Apache-2.0 |
 | tauri-build | MIT OR Apache-2.0 |
