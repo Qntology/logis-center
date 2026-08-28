@@ -445,11 +445,11 @@ cargo build --release
 ```bash
 cargo tauri dev      # Development mode
 or
-dev_cargo.bat
+.\dev_cargo.bat
 
 cargo tauri build    # Production build
 or
-build_cargo.bat
+.\build_cargo.bat
 ```
 
 ### Model Download

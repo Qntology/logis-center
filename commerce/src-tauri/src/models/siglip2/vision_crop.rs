@@ -882,11 +882,57 @@ pub fn plan_crops(
     plans
 }
 
-/// 크롭 계획 하나를 실제 이미지로 잘라냅니다.
+/// 🌟 [TEXT-AWARE UPSCALE] 확대 배율을 '글자 높이 → 비전 패치 1개' 기준으로 정합니다.
 ///
-/// 🌟 [UPSCALE] 잘린 조각이 작으면 Qwen 3.5 의 비전 인코더가 글자를 못 읽습니다.
-///    짧은 변이 target_short 미만이면 Lanczos3 로 확대합니다.
-///    (원본 픽셀이 이미 존재하므로 정보 손실 없이 가독성만 올립니다)
+///  ── 왜 짧은 변 기준이 틀렸나 ──
+///   현재 규칙은 크롭의 기하만 보고 글자 크기를 전혀 모릅니다.
+///   가로로 긴 띠(515×86)는 6배까지 확대되어 글자가 2.5패치가 되고,
+///   토큰만 4배 쓰면서 판독성은 그대로입니다.
+///   실측: insurance 타일 2048×512, 판독가능 패치 0/10 → 값 창작
+///
+///  ── 배율 근거 ──
+///   Qwen VL 은 14px 패치를 2×2 병합해 토큰 1개당 28×28px 를 봅니다.
+///   글자 높이가 28px 에 도달하면 '한 글자 ≈ 한 토큰' 이 되고,
+///   그 이상은 토큰만 늘고 판독성은 포화합니다.
+///   행 투영 프로파일의 자기상관 주기가 곧 텍스트 라인 피치입니다.
+///   (고전 문서영상 기법이며 어휘 사전이 아닙니다)
+const VISION_PATCH_PX: f32 = 28.0;
+
+fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
+    use image::GenericImageView;
+    let g = img.to_luma8();
+    let (w, h) = g.dimensions();
+    if h < 16 || w < 16 { return None; }
+
+    // ── 행별 잉크 밀도 프로파일 ──
+    let mut prof: Vec<f32> = Vec::with_capacity(h as usize);
+    for y in 0..h {
+        let mut s = 0.0f32;
+        for x in 0..w {
+            s += 255.0 - g.get_pixel(x, y)[0] as f32;
+        }
+        prof.push(s / w as f32);
+    }
+    let mean: f32 = prof.iter().sum::<f32>() / prof.len() as f32;
+    for v in prof.iter_mut() { *v -= mean; }
+
+    // ── 자기상관 최대 주기 = 텍스트 라인 피치 ──
+    let max_lag = ((h / 2) as usize).min(120);
+    let mut best_lag = 0usize;
+    let mut best = f32::MIN;
+    for lag in 4..max_lag {
+        let mut s = 0.0f32;
+        for i in 0..(prof.len() - lag) {
+            s += prof[i] * prof[i + lag];
+        }
+        let norm = s / (prof.len() - lag) as f32;
+        if norm > best { best = norm; best_lag = lag; }
+    }
+    if best_lag == 0 || best <= 0.0 { return None; }
+    // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
+    Some(best_lag as f32 * 0.6)
+}
+
 pub fn crop_region(
     image: &DynamicImage,
     plan: &CropPlan,
@@ -895,22 +941,35 @@ pub fn crop_region(
     let (x0, y0, x1, y1) = plan.bbox;
     let w = x1.saturating_sub(x0).max(1);
     let h = y1.saturating_sub(y0).max(1);
-
     let cropped = image.crop_imm(x0, y0, w, h);
 
-    let short = w.min(h);
-    if short >= target_short {
-        return cropped;
-    }
+    // 🌟 글자 높이를 실측해 필요한 배율만 적용합니다.
+    let factor = match estimate_text_height(&cropped) {
+        Some(th) if th > 0.5 => {
+            let f = (VISION_PATCH_PX / th).clamp(1.0, 4.0);
+            println!(
+                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px → 배율 {:.2}x (목표 {}px/글자)",
+                th, f, VISION_PATCH_PX as u32
+            );
+            f
+        }
+        _ => {
+            // 프로파일에서 주기를 못 찾음 = 텍스트가 거의 없음.
+            // 기존 짧은 변 규칙으로 폴백하되 상한을 낮게 둡니다.
+            let short = w.min(h) as f32;
+            let f = (target_short as f32 / short).clamp(1.0, 2.0);
+            println!(
+                "    📏 [TEXT-AWARE UPSCALE] 라인 주기 미검출(텍스트 희소) → 보수적 배율 {:.2}x",
+                f
+            );
+            f
+        }
+    };
 
-    let factor = target_short as f32 / short as f32;
-    let nw = ((w as f32 * factor).round() as u32).max(1);
-    let nh = ((h as f32 * factor).round() as u32).max(1);
+    if factor <= 1.01 { return cropped; }
 
-    // 지나친 확대는 메모리만 먹고 이득이 없으므로 상한을 둡니다.
-    let nw = nw.min(2048);
-    let nh = nh.min(2048);
-
+    let nw = (((w as f32 * factor).round() as u32).max(1)).min(2048);
+    let nh = (((h as f32 * factor).round() as u32).max(1)).min(2048);
     cropped.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 

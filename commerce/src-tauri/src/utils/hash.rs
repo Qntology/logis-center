@@ -96,3 +96,33 @@ mod tests {
         assert_eq!(result.len(), 42);
     }
 }
+
+/// 🌟 [IDENTIFIER NORMALIZE] 모든 index / id 계산의 단일 진입점입니다.
+///
+///  ── normalize_numeric_homoglyphs 를 직접 쓰면 안 되는 이유 ──
+///   그 함수는 '스캔된 순수 숫자열' 의 OCR 오독을 되돌리기 위한 것입니다.
+///   치환표에 S→5, O→0, I→1, T→7, Z→2, B→8, G→9 가 들어 있어
+///   영숫자 식별자에 적용하면 글자가 통째로 숫자로 바뀝니다.
+///     SC-2026-0802 → 5C20260802
+///     SKU-A1B2     → 5KUA1B2
+///     task_...     → ta5k...        (실측 로그)
+///   그러면 ① 서로 다른 두 값이 같은 index 로 충돌하고
+///          ② 무역 경로(normalize_trade_doc_number)와 결과가 갈립니다.
+///
+///  ── 규칙 ──
+///   ① 구분자(-, _, ., ,, 공백, /) 제거
+///   ② 대문자 통일 (bl-55432219 ↔ BL-55432219 는 같은 문서)
+///   ③ 호모글리프 복원은 '알파벳이 하나도 없을 때' 만 적용
+pub fn normalize_identifier(raw: &str) -> String {
+    let stripped: String = raw
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    if stripped.is_empty() { return stripped; }
+    if stripped.chars().any(|c| c.is_alphabetic()) {
+        stripped
+    } else {
+        normalize_numeric_homoglyphs(&stripped)
+    }
+}

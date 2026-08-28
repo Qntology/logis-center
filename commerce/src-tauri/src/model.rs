@@ -1518,7 +1518,7 @@ impl LogisModel {
 
                     // ── STEP 3 : Column Cosine Matching ──
                     let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                        siglip3, &grid, &detected_type, &language, &emit_term
+                        siglip3, &grid, &detected_type, &language, Some(&legibility), &emit_term
                     ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
                     drop(siglip_guard3);
 
@@ -1559,20 +1559,35 @@ impl LogisModel {
                     // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
 
                     for (idx, plan) in plans.iter().enumerate() {
-                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                        if cancel_token
+                            .as_ref()
+                            .map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed))
+                        {
                             emit_term("🛑 Task cancelled by user. Terminating safely.");
                             return Ok(());
                         }
 
+                        // 🌟 [EMPTY CROP SKIP] 출처 영역에 읽을 것이 없으면 Qwen 호출 자체를 생략합니다.
+                        //    실측: insurance 타일은 판독 가능 패치 0/10 인데 2048x512 로 2회 호출되어
+                        //    "Apr-19-2022" 를 지어냈습니다. 확대는 빈 영역에 정보를 만들지 못합니다.
+                        let (lg_cnt, _il_cnt, _bl_cnt) =
+                            legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
+
+                        if lg_cnt == 0 {
+                            emit_term(&format!(
+                                "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다. Qwen 호출을 생략합니다.",
+                                plan.category
+                            ));
+                            continue;
+                        }
+
                         // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
-                        let (tile_count, _why) =
-                            crate::models::siglip2::vision_crop::decide_tile_count(
-                                plan, &heatmaps, &grid, &legibility, &emit_term
-                            );
+                        let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
+                            plan, &heatmaps, &grid, &legibility, &emit_term
+                        );
                         let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
                             plan.bbox, tile_count, 0.25
                         );
-
                         for tile in tiles.iter() {
                             // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
                             let mut tile_plan = plan.clone();
@@ -1665,7 +1680,7 @@ impl LogisModel {
                     .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
 
                 let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                    siglip4, &grid, commerce_page_type, &language, &emit_term
+                    siglip4, &grid, commerce_page_type, &language, Some(&legibility), &emit_term
                 ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
                 drop(siglip_guard4);
 
@@ -1814,19 +1829,21 @@ impl LogisModel {
                                             uniq.push(c.value.clone());
                                         }
                                     }
-                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(
-                                        sig, &uniq,
-                                    ).unwrap_or_default();
+
+                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(sig, &uniq)
+                                        .unwrap_or_default();
 
                                     let mut table: std::collections::HashMap<&str, &Vec<f32>> =
                                         std::collections::HashMap::new();
+
                                     for (i, u) in uniq.iter().enumerate() {
                                         if let Some(e) = embs.get(i) {
                                             table.insert(u.as_str(), e);
                                         }
                                     }
+
                                     emit_term(&format!(
-                                        "  🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
+                                        "    🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
                                         uniq.len()
                                     ));
 
@@ -1957,7 +1974,10 @@ impl LogisModel {
                 emit_term(&format!("[STAGE-3] 문서 식별자 확정: '{}' (task_id 폴백 여부: {})",
                     raw_no, raw_no == task_id.as_str()));
                 
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
+                // 🌟 [IDENTIFIER NORMALIZE] 무역 문서번호는 'CI-43726' / 'SC-2026-0802' 처럼
+                //    영숫자입니다. 호모글리프 치환을 무조건 적용하면 S→5 로 변조됩니다.
+                //    (실측: task_1787897618841 → ta5k1787897618841)
+                let clean_no = crate::utils::hash::normalize_identifier(raw_no);
                 
                 // 🌟 [CRITICAL FIX] 프론트엔드 리스트(#doc-list)와 완벽 동기화하기 위해 "items" 테이블로 저장 위치를 강제 통합합니다!
                 let table_name = "items"; 

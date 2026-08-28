@@ -7431,8 +7431,7 @@ pub async fn process_task(
         .unwrap_or_default();
     
     
-    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw)
-        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+    let clean_no = crate::utils::hash::normalize_identifier(&id_val_raw);
     
     let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
     let generated_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
@@ -7459,11 +7458,9 @@ pub async fn process_task(
 
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
-                    let clean_g_no = crate::utils::hash::normalize_numeric_homoglyphs(g_no).replace("-", "").replace("_", "");
-                    
-                    
+                    let clean_g_no = crate::utils::hash::normalize_identifier(g_no);
                     let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
-                    let clean_tracking_no = crate::utils::hash::normalize_numeric_homoglyphs(tracking_number).replace("-", "").replace("_", "");
+                    let clean_tracking_no = crate::utils::hash::normalize_identifier(tracking_number);
                     let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tracking_no)));
                     let goods_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("goods{}{}", team_id, clean_g_no)));
                     
@@ -7785,8 +7782,7 @@ pub async fn process_task(
         if page_type == "order" {
             if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
                 if !tn_raw.trim().is_empty() {
-                    let clean_tn = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
-                        .replace("-", "").replace("_", "");
+                    let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
                     if !clean_tn.is_empty() {
                         emit_term(&format!("  📦 [TRACKING RELAY] order 전처리에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
                         match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
@@ -8263,8 +8259,7 @@ pub async fn process_task(
                     .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string());
                 
                 
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&original_id)
-                    .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                let clean_no = crate::utils::hash::normalize_identifier(&original_id);
                 
                 let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
                 let hashed_item_id = if original_id.is_empty() {
@@ -8457,8 +8452,7 @@ pub async fn process_task(
                 if page_type == "order" {
                     if let Some(tn_raw) = single_item.get("tracking_number").and_then(|v| v.as_str()) {
                         if !tn_raw.trim().is_empty() {
-                            let clean_tn = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
-                                .replace("-", "").replace("_", "");
+                            let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
                             if !clean_tn.is_empty() {
                                 emit_term(&format!("  📦 [TRACKING RELAY] order 리스트 아이템에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
                                 match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
