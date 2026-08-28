@@ -1865,7 +1865,18 @@ async fn ai_search_complex(
                     //    ⚠️ bcc / ref 는 넣지 않습니다.
                     //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
                     //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
-                    if !cc.trim().is_empty() {
+                    // 🌟 [LOCAL EXTRACTION SCOPE] 로컬 이미지/문서 추출물은
+                    //    cc = hash_id("local.shipping") / hash_id("local.commerce") 로 저장됩니다.
+                    //    (model.rs 의 extract_from_image 참조)
+                    //    반면 검색의 cc 는 프론트엔드가 넘긴 '웹 도메인 해시' 입니다.
+                    //    (main.ts: hashId(getRootDomain(hostname)))
+                    //    두 값이 구조적으로 일치할 수 없으므로, cc 를 그대로 걸면
+                    //    로컬 추출 문서가 검색에서 100% 탈락합니다.
+                    //
+                    //    shipping 트랙은 애초에 로컬 추출이 주 경로이므로 cc 스코프를 걸지 않습니다.
+                    //    (mode = 'shipping' 만으로도 트랙 격리가 성립합니다)
+                    //    commerce/analytic 은 웹 페이지 추출이 주 경로이므로 기존대로 cc 를 유지합니다.
+                    if !cc.trim().is_empty() && search_mode != "shipping" {
                         o.insert("cc".to_string(), json!(cc.clone()));
                     }
                 }
@@ -1910,7 +1921,8 @@ async fn ai_search_complex(
                 //       cc(팀·사이트)까지 버리면 폴백 한 번으로 타 팀 문서가 그대로 새어 나가므로,
                 //       테넌트 스코프는 폴백에서도 반드시 유지합니다.
                 let final_results = if final_results.is_empty() {
-                    let mode_only = if cc.trim().is_empty() {
+                    // 🌟 shipping 은 위와 동일한 이유로 cc 를 걸지 않습니다.
+                    let mode_only = if cc.trim().is_empty() || search_mode == "shipping" {
                         format!("mode = '{}'", search_mode)
                     } else {
                         format!("mode = '{}' AND `cc` = '{}'", search_mode, cc.replace('\'', "''"))
@@ -2543,7 +2555,12 @@ async fn ai_search_complex(
         }))
     }.await; 
 
-    IS_SEARCHING.store(false, Ordering::SeqCst);
+    // 🌟 [FLAG HOLD] 여기서 해제하면 안 됩니다.
+    //    아래 deep_purge_resources() 는 CUDA 동기화 + OS 메모리 반환으로
+    //    수백 ms~수 초가 걸리는데, 그 사이 unload_model / reindex_pending_embeddings 가
+    //    IS_SEARCHING 가드를 통과해 파기 중인 CUDA 컨텍스트를 건드립니다.
+    //    (ACTIVE_TASK_MEM 도 아래에서 비워지므로 두 가드가 동시에 뚫립니다)
+    //    플래그 해제는 정리 작업이 전부 끝난 뒤 함수 말미에서 한 번만 수행합니다.
     
     if let Some(store) = store_opt.as_ref() {
         match &search_process {
@@ -2573,6 +2590,11 @@ async fn ai_search_complex(
     }
 
     
+    // 🌟 [PURGE FIRST] 자원 파기를 먼저 끝낸 뒤에 가드를 내립니다.
+    //    순서가 뒤집히면 파기 도중에 다른 커맨드가 모델을 올려 컨텍스트가 충돌합니다.
+    model.deep_purge_resources().await;
+    drop(model_guard);
+
     {
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
         if let Some(mem) = mem_guard.as_ref() {
@@ -2582,10 +2604,7 @@ async fn ai_search_complex(
         }
     }
 
-    model.deep_purge_resources().await; 
-    
-    
-    drop(model_guard);
+    // 🌟 정리가 전부 끝난 뒤 단 한 번만 해제합니다.
     IS_SEARCHING.store(false, Ordering::SeqCst);
     
     search_process
@@ -2626,7 +2645,12 @@ async fn deep_research_command(
             return Err("Failed to load model".to_string());
         }
     }
-    let model = model_guard.as_ref().unwrap();
+    // 🌟 [LOCK ORDER] model 락을 쥔 채 store 락을 잡으면
+    //    ai_search_complex(store → model)와 정반대 순서가 되어 데드락이 성립합니다.
+    //    현재는 ai_search_complex 가 store_guard 를 블록 스코프로 즉시 해제해서
+    //    우연히 피해 가고 있을 뿐이므로, 순서 자체를 맞춰 둡니다.
+    let model = model_guard.as_ref().unwrap().clone();
+    drop(model_guard);
 
     // 1. Context Gathering
     let mut context_data = String::new();

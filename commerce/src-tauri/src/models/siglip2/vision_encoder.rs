@@ -40,11 +40,15 @@ use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 // =====================================================================
 
 /// (category, key, phrase) 트리플을 SigLIP2 텍스트 공간으로 인코딩한 결과.
+///
+/// 🌟 [Arc 공유] 같은 구가 여러 (category, key) 에 반복 등장하므로
+///    벡터 실체는 한 벌만 두고 참조만 나눠 갖습니다.
+///    (구버전은 13,943회 복사로 문서당 64MB 를 힙에 쏟아부었습니다)
 pub struct AnchorBank {
     /// bias 축: 이 개념을 설명하는 구
-    pub bias: Vec<(String, String, Vec<f32>)>,
+    pub bias: Vec<(String, String, std::sync::Arc<Vec<f32>>)>,
     /// prejudice 축: 이 개념이 절대 아닌 구
-    pub prejudice: Vec<(String, String, Vec<f32>)>,
+    pub prejudice: Vec<(String, String, std::sync::Arc<Vec<f32>>)>,
 }
 
 impl AnchorBank {
@@ -110,18 +114,36 @@ pub fn build_anchor_bank(
     bias_defs: &[(String, String, String)],
     prej_defs: &[(String, String, String)],
 ) -> anyhow::Result<AnchorBank> {
+    use std::collections::HashMap;
+
+    // 🌟 [O(N²) → O(N)] 구버전은 uniq 구축과 lookup 을 둘 다 선형 탐색으로 했습니다.
+    //    실측 뱅크(bias 345 + prej 13,598 = 13,943구, uniq 345)에서
+    //      uniq 구축 : 13,943 × 345/2 ≈ 240만 문자열 비교
+    //      lookup    : 13,943 × 345/2 ≈ 240만 문자열 비교
+    //    필드가 늘면 이 둘이 제곱으로 커져 STEP 3 이 CPU 에서 먼저 죽습니다.
+    //    HashMap 색인으로 둘 다 O(1) 조회가 됩니다.
+    let mut index: HashMap<&str, usize> = HashMap::new();
     let mut uniq: Vec<String> = Vec::new();
     for (_, _, p) in bias_defs.iter().chain(prej_defs.iter()) {
-        if !uniq.iter().any(|e| e == p) {
+        if !index.contains_key(p.as_str()) {
+            index.insert(p.as_str(), uniq.len());
             uniq.push(p.clone());
         }
     }
     let embs = encode_phrases(model, &uniq)?;
 
-    let lookup = |p: &str| -> Vec<f32> {
-        match uniq.iter().position(|e| e == p) {
-            Some(i) => embs[i].clone(),
-            None => vec![0.0f32; model.config.text_hidden_size],
+    // 🌟 [CLONE 제거] 구버전은 lookup 이 호출될 때마다 1152차원 f32 벡터를 복사했습니다.
+    //    13,943회 × 1152 × 4B ≈ 64MB 힙 할당이 매 문서마다 발생했고,
+    //    그 압박이 [VISION-ADAPTIVE] Free VRAM 669MB 직전 상황에 기여했습니다.
+    //    Arc 로 공유하면 같은 구를 몇 번 참조해도 복사가 일어나지 않습니다.
+    let shared: Vec<std::sync::Arc<Vec<f32>>> =
+        embs.into_iter().map(std::sync::Arc::new).collect();
+    let zero = std::sync::Arc::new(vec![0.0f32; model.config.text_hidden_size]);
+
+    let lookup = |p: &str| -> std::sync::Arc<Vec<f32>> {
+        match index.get(p) {
+            Some(&i) => shared[i].clone(), // Arc clone = 참조 카운트 증가만
+            None => zero.clone(),
         }
     };
 
@@ -174,12 +196,19 @@ pub fn encode_image(
     model: &Siglip2Model,
     image: &DynamicImage,
 ) -> anyhow::Result<PatchGrid> {
+    // 🌟 [OPTIONAL VISION] 텍스트 전용으로 로드된 인스턴스에서는 이미지 처리가 불가능합니다.
+    //    조용히 0 벡터를 돌려주면 히트맵이 전부 무의미해지므로 명시적으로 실패시킵니다.
+    let vision = model
+        .vision
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "SigLIP2 vision encoder is not loaded. Call ensure_siglip2 with needs_vision=true."
+        ))?;
+
     let pre: PreprocessedImage = preprocess_image(image, &model.config, &model.device)?;
 
     let px = pre.pixel_values.to_dtype(model.dtype)?;
-    let out = model
-        .vision
-        .forward(&px, pre.grid_rows, pre.grid_cols)?;
+    let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
 
     let shared = out.patch_shared.squeeze(0)?.to_dtype(DType::F32)?; // (N, D)
     let mut patches: Vec<Vec<f32>> = shared.to_vec2::<f32>()?;
@@ -209,9 +238,16 @@ pub fn encode_image_pooled(
     model: &Siglip2Model,
     image: &DynamicImage,
 ) -> anyhow::Result<Vec<f32>> {
+    let vision = model
+        .vision
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!(
+            "SigLIP2 vision encoder is not loaded. Call ensure_siglip2 with needs_vision=true."
+        ))?;
+
     let pre = preprocess_image(image, &model.config, &model.device)?;
     let px = pre.pixel_values.to_dtype(model.dtype)?;
-    let out = model.vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
+    let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
     let pooled_t = out.pooled.to_dtype(DType::F32)?;
     let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
     l2_normalize(&mut pooled);
@@ -308,27 +344,36 @@ pub fn classify_doc_type(
     emit: &dyn Fn(&str),
 ) -> anyhow::Result<DocTypeVerdict> {
     // ── Depth 1 : 그룹 뱅크 ──
+    //
+    // 🌟 [SPLIT 1회 캐시] 구버전은 split_bias_phrases_full 을 그룹당 (그룹수)번
+    //    재호출했습니다. 6그룹이면 36회, Part 20 확장 후 7그룹이면 49회입니다.
+    //    같은 문자열을 매번 다시 쪼개고 HashSet 을 다시 만드는 순수 낭비입니다.
+    let group_phrases: Vec<(&str, Vec<String>)> = crate::logic::TRADE_GROUPS
+        .iter()
+        .map(|(g, raw)| (*g, split_bias_phrases_full(raw)))
+        .collect();
+    let chrome_phrases: Vec<String> =
+        split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR);
+
     let mut g_bias: Vec<(String, String, String)> = Vec::new();
     let mut g_prej: Vec<(String, String, String)> = Vec::new();
-    for (gname, raw) in crate::logic::TRADE_GROUPS.iter() {
-        for p in split_bias_phrases_full(raw) {
-            g_bias.push(("group".to_string(), gname.to_string(), p));
+    for (gname, phrases) in group_phrases.iter() {
+        for p in phrases.iter() {
+            g_bias.push(("group".to_string(), gname.to_string(), p.clone()));
         }
-        for (other, other_raw) in crate::logic::TRADE_GROUPS.iter() {
+        for (other, other_phrases) in group_phrases.iter() {
             if other == gname {
                 continue;
             }
-            for p in split_bias_phrases_full(other_raw) {
-                g_prej.push(("group".to_string(), gname.to_string(), p));
+            for p in other_phrases.iter() {
+                g_prej.push(("group".to_string(), gname.to_string(), p.clone()));
             }
         }
-    }
-    // 🌟 [VISUAL CHROME] 이미지에만 존재하는 노이즈(로고 / 스탬프 / 여백 / 표 괘선)를
-    //    모든 그룹의 공통 편견으로 추가합니다.
-    //    텍스트 트랙에는 없던 축이지만, 비전에서는 문서 면적의 상당수를 차지합니다.
-    for gname in crate::logic::TRADE_GROUPS.iter().map(|(g, _)| *g) {
-        for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
-            g_prej.push(("group".to_string(), gname.to_string(), p));
+        // 🌟 [VISUAL CHROME] 이미지에만 존재하는 노이즈(로고 / 스탬프 / 여백 / 표 괘선)를
+        //    모든 그룹의 공통 편견으로 추가합니다.
+        //    텍스트 트랙에는 없던 축이지만, 비전에서는 문서 면적의 상당수를 차지합니다.
+        for p in chrome_phrases.iter() {
+            g_prej.push(("group".to_string(), gname.to_string(), p.clone()));
         }
     }
 
@@ -404,24 +449,58 @@ pub fn classify_doc_type(
     }
     emit(&format!("  🎯 [VISION CODE CANDIDATES] {:?}", codes));
 
+    // 🌟 [SPLIT 1회 캐시 + 편견 축약]
+    //
+    //  ── 구버전의 두 가지 낭비 ──
+    //   ① split_bias_phrases_full 이 후보수² 회 호출됩니다.
+    //      27개 후보면 729회, Part 20 확장 후 56개면 3,136회입니다.
+    //   ② c_prej 크기가 후보수 × (후보수-1) × 평균구수 로 폭발합니다.
+    //      56개 후보 × 55 × 평균 12구 ≈ 37,000구. dedup 도 없습니다.
+    //
+    //  ── 왜 축약해도 결과가 같은가 ──
+    //   surprisal_dual_scores 는 (category, key) 그룹의 편견 최댓값 하나만 감산합니다.
+    //   'CI' 의 편견은 "CI 를 제외한 나머지 전부" 인데,
+    //   그 최댓값은 곧 "전체 코드 앵커 중 CI 것을 뺀 최댓값" 입니다.
+    //   따라서 전체 코드 앵커를 한 벌만 두고, 채점 시 자기 코드 구를 제외하면
+    //   같은 값을 얻으면서 저장량이 후보수 배 줄어듭니다.
+    //   여기서는 구조 변경 범위를 좁히기 위해 '중복 구 제거' 만 적용합니다.
+    //   (코드 앵커는 서식마다 문구가 거의 겹치지 않아 실질 절감은 split 호출 쪽이 큽니다)
+    let code_phrases: Vec<(&str, Vec<String>)> = codes
+        .iter()
+        .map(|c| (*c, split_bias_phrases_full(crate::logic::trade_code_anchor(c))))
+        .collect();
+
     let mut c_bias: Vec<(String, String, String)> = Vec::new();
     let mut c_prej: Vec<(String, String, String)> = Vec::new();
-    for c in codes.iter() {
-        for p in split_bias_phrases_full(crate::logic::trade_code_anchor(c)) {
-            c_bias.push(("code".to_string(), c.to_string(), p));
+    for (c, phrases) in code_phrases.iter() {
+        for p in phrases.iter() {
+            c_bias.push(("code".to_string(), c.to_string(), p.clone()));
         }
-        for other in codes.iter() {
+        // 이 코드 하나에 대한 편견 집합. 중복 구는 한 번만 담습니다.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (other, other_phrases) in code_phrases.iter() {
             if other == c {
                 continue;
             }
-            for p in split_bias_phrases_full(crate::logic::trade_code_anchor(other)) {
-                c_prej.push(("code".to_string(), c.to_string(), p));
+            for p in other_phrases.iter() {
+                if seen.insert(p.as_str()) {
+                    c_prej.push(("code".to_string(), c.to_string(), p.clone()));
+                }
             }
         }
-        for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
-            c_prej.push(("code".to_string(), c.to_string(), p));
+        for p in chrome_phrases.iter() {
+            if seen.insert(p.as_str()) {
+                c_prej.push(("code".to_string(), c.to_string(), p.clone()));
+            }
         }
     }
+
+    emit(&format!(
+        "  📐 [VISION CODE BANK] 후보 {}개 | 코드 구 {}개 | 편견 구 {}개",
+        codes.len(),
+        c_bias.len(),
+        c_prej.len()
+    ));
 
     let c_bank = build_anchor_bank(model, &c_bias, &c_prej)?;
     let (c_scores_map, _) = score_patches(grid, &c_bank);
@@ -573,6 +652,38 @@ pub fn build_column_heatmaps(
     }
 
     // ── 2) 편견 : 다른 카테고리의 bias 구 + 시각 노이즈 ──
+    //
+    // 🌟 [PREJUDICE COLLAPSE — 카테고리 단위]
+    //
+    //  ── 무엇이 문제였나 ──
+    //   구버전은 편견을 '필드 단위' 로 만들었습니다.
+    //     for (cat, field, _) in bias_defs   ← 구(phrase)마다 한 번씩 도는 루프
+    //         for (other_cat, _, p) in bias_defs
+    //   dedup 덕분에 (cat, field, phrase) 단위로 접히긴 했지만,
+    //   같은 카테고리의 모든 필드가 '완전히 동일한 편견 집합' 을 중복 보유했습니다.
+    //   header 의 11개 필드가 각각 "header 아닌 229구" 를 따로 들고 있었던 셈입니다.
+    //   그 결과가 실측 로그의 편견 구 13,598개입니다.
+    //
+    //  ── 왜 카테고리 단위로 접어도 결과가 같은가 ──
+    //   surprisal_dual_scores 는 편견을 이렇게 씁니다.
+    //     if let Some(pi) = p_order.iter().position(|(a,b)| a==c && b==k) {
+    //         if ps > 0.0 { sc -= ps; }
+    //     }
+    //   (category, key) 그룹의 '최댓값 하나' 만 감산에 쓰입니다.
+    //   그런데 같은 카테고리의 모든 필드가 동일한 구 집합을 갖고 있었으므로
+    //   그 최댓값도 필드와 무관하게 항상 같은 값이었습니다.
+    //   따라서 key 를 필드명에서 카테고리 공용 키로 바꿔도 감산량이 변하지 않습니다.
+    //
+    //  ── 절감 ──
+    //   편견 구 = Σ_cat (전체구수 - 구수_cat) + 카테고리수 × 21
+    //   44필드 기준 13,598 → 약 2,100 (6.5배 감소)
+    //   dedup 비교는 O(N²) 이므로 9,200만 → 약 220만 (42배 감소)
+    //
+    //  ⚠️ [CONTRACT] 아래 3-단계 채점 루프가 편견 키를 '카테고리명' 으로 조회해야 합니다.
+    //     bias 쪽 key 는 필드명 그대로 두고, 편견만 카테고리명을 씁니다.
+    //     surprisal_dual_scores 가 (category, key) 쌍으로 매칭하므로
+    //     bias 의 (cat, field) 와 편견의 (cat, cat) 은 서로 만나지 않습니다.
+    //     → 이 계약을 지키기 위해 아래 apply_category_prejudice() 로 감산을 직접 수행합니다.
     let cats: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
         for (c, _, _) in bias_defs.iter() {
@@ -583,35 +694,39 @@ pub fn build_column_heatmaps(
         v
     };
 
+    // 카테고리별 구 집합을 미리 색인해 둡니다. (O(N) 1회 순회)
+    let mut cat_phrases: HashMap<String, Vec<String>> = HashMap::new();
+    for (c, _, p) in bias_defs.iter() {
+        let e = cat_phrases.entry(c.clone()).or_insert_with(Vec::new);
+        if !e.iter().any(|x| x == p) {
+            e.push(p.clone());
+        }
+    }
+
+    // 🌟 편견은 카테고리당 1세트. key 에도 카테고리명을 넣어 그룹을 만듭니다.
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
-    for (cat, field, _) in bias_defs.iter() {
-        // 같은 카테고리 내 다른 필드는 편견이 아닙니다(같은 영역에 함께 인쇄됩니다).
-        // 다른 카테고리의 구만 편견으로 씁니다.
-        for (other_cat, _, p) in bias_defs.iter() {
+    for cat in cats.iter() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (other_cat, phrases) in cat_phrases.iter() {
             if other_cat == cat {
                 continue;
             }
-            if prej_defs
-                .iter()
-                .any(|(c, k, e)| c == cat && k == field && e == p)
-            {
-                continue;
+            for p in phrases.iter() {
+                if seen.insert(p.as_str()) {
+                    prej_defs.push((cat.clone(), cat.clone(), p.clone()));
+                }
             }
-            prej_defs.push((cat.clone(), field.clone(), p.clone()));
         }
         for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
-            if prej_defs
-                .iter()
-                .any(|(c, k, e)| c == cat && k == field && e == &p)
-            {
+            if seen.contains(p.as_str()) {
                 continue;
             }
-            prej_defs.push((cat.clone(), field.clone(), p));
+            prej_defs.push((cat.clone(), cat.clone(), p));
         }
     }
 
     emit(&format!(
-        "  📐 [VISION COLUMN BANK] 카테고리 {}개 | 필드 구 {}개 | 편견 구 {}개 | 패치 {}개",
+        "  📐 [VISION COLUMN BANK] 카테고리 {}개 | 필드 구 {}개 | 편견 구 {}개 (카테고리 단위 축약) | 패치 {}개",
         cats.len(),
         bias_defs.len(),
         prej_defs.len(),
@@ -626,6 +741,9 @@ pub fn build_column_heatmaps(
     let empty_names: Vec<String> = Vec::new();
     let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
     let empty_skip: Vec<bool> = Vec::new();
+    // 🌟 편견 뱅크를 bias 자리에 넣어 채점할 때 쓰는 빈 편견 축입니다.
+    //    (편견의 편견은 없으므로 비어 있어야 합니다)
+    let empty_prej: Vec<(String, String, Vec<f32>)> = Vec::new();
 
     let n = grid.len();
     let mut cat_scores: HashMap<String, Vec<f32>> = HashMap::new();
@@ -639,6 +757,10 @@ pub fn build_column_heatmaps(
         if p.iter().all(|&v| v == 0.0) {
             continue;
         }
+        // 🌟 surprisal_dual_scores 는 (category, key) 가 일치하는 편견만 감산합니다.
+        //    이제 편견 key 가 카테고리명이므로 bias 의 필드 key 와는 만나지 않습니다.
+        //    그래서 여기서 카테고리 편견을 직접 조회해 감산합니다.
+        //    (구버전과 감산량이 동일합니다. 21-7 주석의 근거 참조)
         let (scores, _) = surprisal_dual_scores(
             p,
             &bank.bias,
@@ -647,19 +769,45 @@ pub fn build_column_heatmaps(
             &empty_banks,
             &empty_skip,
         );
+
+        // 이 패치에 대한 카테고리별 편견 최댓값. (surprisal 척도)
+        let (prej_scores, _) = surprisal_dual_scores(
+            p,
+            &bank.prejudice,
+            &empty_prej,
+            &empty_names,
+            &empty_banks,
+            &empty_skip,
+        );
+        let mut cat_prej: HashMap<&str, f32> = HashMap::new();
+        for ps in prej_scores.iter() {
+            // 편견 뱅크의 category 와 key 는 둘 다 카테고리명입니다.
+            let e = cat_prej.entry(ps.key.as_str()).or_insert(f32::MIN);
+            if ps.surprisal > *e {
+                *e = ps.surprisal;
+            }
+        }
+
         for s in scores {
             let cat = match field_to_cat.get(&s.key) {
                 Some(c) => c.clone(),
                 None => continue,
             };
+            // 🌟 편견이 자기 기대치를 넘었을 때만 그만큼 상쇄합니다.
+            //    (구버전 surprisal_dual_scores 내부의 `if ps > 0.0 { sc -= ps; }` 와 동일)
+            let adjusted = match cat_prej.get(cat.as_str()) {
+                Some(pv) if *pv > 0.0 => s.surprisal - *pv,
+                _ => s.surprisal,
+            };
+
             if let Some(v) = cat_scores.get_mut(&cat) {
-                if s.surprisal > v[i] {
-                    v[i] = s.surprisal;
+                if adjusted > v[i] {
+                    v[i] = adjusted;
                 }
             }
             if let Some(t) = cat_top.get_mut(&cat) {
-                if s.surprisal > t.1 {
-                    *t = (s.key.clone(), s.surprisal);
+                if adjusted > t.1 {
+                    *t = (s.key.clone(), adjusted);
                 }
             }
         }

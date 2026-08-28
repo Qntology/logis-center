@@ -754,12 +754,34 @@ pub fn plan_crops(
                     .enumerate()
                     .max_by(|x, y| x.1.partial_cmp(y.1).unwrap_or(std::cmp::Ordering::Equal));
                 match best {
-                    Some((bi, bscore)) => {
+                    // 🌟 [RESCUE GATE] 자기 최고 봉우리가 극값 기대치(0)를 넘을 때만 구제합니다.
+                    //
+                    //  ── 왜 게이트가 필요해졌나 ──
+                    //   카테고리가 8개에서 16개로 늘면서(customs / inspection / insurance /
+                    //   hazmat / origin / compliance / settlement / charges),
+                    //   그 문서에 아예 존재하지 않는 카테고리가 다수 생깁니다.
+                    //   무조건 구제하면 CI 인보이스에 hazmat 크롭을 보내게 되고,
+                    //   2B 모델은 빈 영역을 받아도 무언가를 반드시 채우려 듭니다.
+                    //   (실측: 빈 BUYER 박스에서 "BUYER (IF NOT CONSIGNEE)" 를 값으로 읽음)
+                    //   Qwen 호출 낭비이자 할루시네이션 유입구입니다.
+                    //
+                    //  ── 0 이 매직 상수가 아닌 이유 ──
+                    //   surprisal = (max-μ)/σ - √(2 ln N) 이므로
+                    //   0 은 'N개를 무작위로 뽑은 기대 최댓값과 같다' 는 뜻입니다.
+                    //   즉 근거가 없다는 것을 극값이론이 정의한 지점입니다.
+                    Some((bi, bscore)) if *bscore > 0.0 => {
                         emit(&format!(
                             "    🛟 [STARVATION RESCUE] '{}' 는 영역을 선점당했지만 자기 최고 봉우리({:+.4})로 독립 크롭합니다.",
                             per_cat[ci].0, bscore
                         ));
                         (gboxes[bi], *bscore, 0.0f32, counts[bi])
+                    }
+                    Some((_, bscore)) => {
+                        emit(&format!(
+                            "    ⚪ [NOT PRESENT] '{}' 는 최고 봉우리가 {:+.4} 로 기대치 이하입니다. 이 문서에 없는 축이므로 크롭하지 않습니다.",
+                            per_cat[ci].0, bscore
+                        ));
+                        continue;
                     }
                     None => {
                         emit(&format!(
@@ -851,4 +873,354 @@ pub fn whole_page_fallback(categories: &[&str], grid: &PatchGrid) -> Vec<CropPla
             top_field: String::new(),
         })
         .collect()
+}
+
+/// 🌟 [CROP AUDIT] 확정된 크롭이 정말 그 카테고리의 영역인지 재검증합니다.
+///
+///  ── 실측 사고 ──
+///   logistics ← px(114,0)-(800,287)   = INVOICE NUMBER / AIRWAYBILL / DATE 영역
+///   header    ← px(0,630)-(800,1032)  = 선언문 / 서명 / SIGNATORY 영역
+///   두 카테고리가 서로의 영역을 통째로 바꿔 가졌습니다.
+///   그 결과 header 는 doc_number 를 못 찾아 task_id 폴백이 확정되었고,
+///   logistics 는 CI-43726 의 뒤 두 자리를 voyage_number 로 지어냈습니다.
+///
+///  ── 판정 원리 ──
+///   이 카테고리 히트맵의 최댓값을 '크롭 내부' 와 '크롭 외부' 로 나눠
+///   극값 기대치를 차감한 뒤 비교합니다.
+///     surprisal_in  = (max_in  - μ)/σ - √(2 ln N_in)
+///     surprisal_out = (max_out - μ)/σ - √(2 ln N_out)
+///   외부가 이기면 그 크롭은 이 카테고리의 근거지가 아닙니다.
+///
+///  ── 교정 ──
+///   서로를 이긴 두 카테고리가 있으면 크롭을 맞바꿉니다(swap).
+///   맞바꿀 짝이 없으면 그 카테고리의 자체 최고 봉우리 영역으로 재배정합니다.
+///   판정은 이미 계산된 히트맵만 사용하므로 추가 추론 비용이 0 입니다.
+pub fn audit_crops(
+    plans: &mut Vec<CropPlan>,
+    heatmaps: &[CategoryHeatmap],
+    grid: &PatchGrid,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    emit: &dyn Fn(&str),
+) {
+    use crate::utils::ai_utils::gumbel_expected_z;
+
+    if plans.is_empty() {
+        return;
+    }
+    let rows = grid.grid_rows;
+    let cols = grid.grid_cols;
+    let n = rows * cols;
+
+    let in_bbox = |idx: usize, bbox: (u32, u32, u32, u32)| -> bool {
+        let r = idx / cols;
+        let c = idx % cols;
+        let cw = grid.orig_width as f32 / cols as f32;
+        let ch = grid.orig_height as f32 / rows as f32;
+        let cx = (c as f32 + 0.5) * cw;
+        let cy = (r as f32 + 0.5) * ch;
+        cx >= bbox.0 as f32 && cx <= bbox.2 as f32
+            && cy >= bbox.1 as f32 && cy <= bbox.3 as f32
+    };
+
+    // (카테고리, bbox) → (surprisal_in, surprisal_out)
+    let score_pair = |cat: &str, bbox: (u32, u32, u32, u32)| -> (f32, f32) {
+        let hm = match heatmaps.iter().find(|h| h.category == cat) {
+            Some(h) => h,
+            None => return (0.0, 0.0),
+        };
+        let m = n.min(hm.scores.len());
+        if m == 0 {
+            return (0.0, 0.0);
+        }
+        let mean: f32 = hm.scores[..m].iter().sum::<f32>() / m as f32;
+        let var: f32 = hm.scores[..m]
+            .iter()
+            .map(|s| (s - mean) * (s - mean))
+            .sum::<f32>()
+            / m as f32;
+        let std = var.sqrt().max(1e-6);
+
+        let (mut mx_in, mut mx_out) = (f32::MIN, f32::MIN);
+        let (mut n_in, mut n_out) = (0usize, 0usize);
+        for i in 0..m {
+            // 판독 불가 패치는 근거가 될 수 없습니다.
+            if !legibility.is_legible(i) {
+                continue;
+            }
+            if in_bbox(i, bbox) {
+                n_in += 1;
+                if hm.scores[i] > mx_in { mx_in = hm.scores[i]; }
+            } else {
+                n_out += 1;
+                if hm.scores[i] > mx_out { mx_out = hm.scores[i]; }
+            }
+        }
+        let s_in = if n_in == 0 { f32::MIN }
+            else { (mx_in - mean) / std - gumbel_expected_z(n_in) };
+        let s_out = if n_out == 0 { f32::MIN }
+            else { (mx_out - mean) / std - gumbel_expected_z(n_out) };
+        (s_in, s_out)
+    };
+
+    // ── ① 자기 크롭에서 근거를 잃은 카테고리 수집 ──
+    let mut suspects: Vec<usize> = Vec::new();
+    for (pi, p) in plans.iter().enumerate() {
+        let (s_in, s_out) = score_pair(&p.category, p.bbox);
+        if s_out > s_in {
+            emit(&format!(
+                "    🔍 [CROP AUDIT] '{}' 의심 | in {:+.4} < out {:+.4} — 크롭 밖에 더 강한 근거가 있습니다.",
+                p.category, s_in, s_out
+            ));
+            suspects.push(pi);
+        }
+    }
+    if suspects.is_empty() {
+        emit("    ✅ [CROP AUDIT] 전 크롭이 자기 카테고리의 최강 근거지를 점유하고 있습니다.");
+        return;
+    }
+
+    // ── ② 상호 교환 후보 탐색 ──
+    //    A 가 B 의 bbox 에서, B 가 A 의 bbox 에서 각각 더 높은 점수를 받으면 맞바꿉니다.
+    let mut swapped: Vec<bool> = vec![false; plans.len()];
+    for ai in 0..plans.len() {
+        if swapped[ai] { continue; }
+        for bi in (ai + 1)..plans.len() {
+            if swapped[bi] { continue; }
+
+            let a_here = score_pair(&plans[ai].category, plans[ai].bbox).0;
+            let a_there = score_pair(&plans[ai].category, plans[bi].bbox).0;
+            let b_here = score_pair(&plans[bi].category, plans[bi].bbox).0;
+            let b_there = score_pair(&plans[bi].category, plans[ai].bbox).0;
+
+            if a_there > a_here && b_there > b_here {
+                emit(&format!(
+                    "    🔁 [CROP SWAP] '{}' ↔ '{}' | {}: {:+.4}→{:+.4} | {}: {:+.4}→{:+.4}",
+                    plans[ai].category, plans[bi].category,
+                    plans[ai].category, a_here, a_there,
+                    plans[bi].category, b_here, b_there
+                ));
+                let tmp_box = plans[ai].bbox;
+                let tmp_cnt = plans[ai].patch_count;
+                plans[ai].bbox = plans[bi].bbox;
+                plans[ai].patch_count = plans[bi].patch_count;
+                plans[ai].score = a_there;
+                plans[bi].bbox = tmp_box;
+                plans[bi].patch_count = tmp_cnt;
+                plans[bi].score = b_there;
+                swapped[ai] = true;
+                swapped[bi] = true;
+                break;
+            }
+        }
+    }
+
+    // ── ③ 짝이 없는 의심 크롭은 자체 최고 봉우리로 재배정 ──
+    for &pi in suspects.iter() {
+        if swapped[pi] { continue; }
+        let cat = plans[pi].category.clone();
+        let hm = match heatmaps.iter().find(|h| h.category == cat) {
+            Some(h) => h,
+            None => continue,
+        };
+        let m = n.min(hm.scores.len());
+        let mut best = f32::MIN;
+        let mut best_i = usize::MAX;
+        for i in 0..m {
+            if !legibility.is_legible(i) { continue; }
+            if hm.scores[i] > best { best = hm.scores[i]; best_i = i; }
+        }
+        if best_i == usize::MAX { continue; }
+
+        let r = best_i / cols;
+        let c = best_i % cols;
+        let mx = ((cols as f32 * 0.15) as usize).max(2);
+        let my = ((rows as f32 * 0.06) as usize).max(1);
+        let gbox = (
+            r.saturating_sub(my),
+            (r + my).min(rows - 1),
+            c.saturating_sub(mx),
+            (c + mx).min(cols - 1),
+        );
+        let raw = to_pixel_bbox(gbox, grid);
+        let min_w = ((grid.orig_width as f32 * 0.12) as u32).max(64);
+        let min_h = ((grid.orig_height as f32 * 0.06) as u32).max(48);
+        let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
+
+        emit(&format!(
+            "    🎯 [CROP RELOCATE] '{}' → grid(r{}~{}, c{}~{}) px({},{})-({},{}) | 자체 최고 봉우리 {:+.4}",
+            cat, gbox.0, gbox.1, gbox.2, gbox.3,
+            bbox.0, bbox.1, bbox.2, bbox.3, best
+        ));
+        plans[pi].bbox = bbox;
+        plans[pi].score = best;
+    }
+}
+
+/// 🌟 [TILE PLAN] 겹치는 타일 분할.
+///
+///  ── 언제 발화하는가 (무지성 분할 금지) ──
+///   T1 잘림 위험 : 크롭 bbox 밖에 그 카테고리의 활성 패치가 남아 있고,
+///                 그 잔여의 surprisal 이 0 을 넘을 때. (근거가 잘려 나갔다는 뜻)
+///   T2 배열 밀도 : items / containers 에서 '표 행' 으로 판정된 격자 행이
+///                 2줄을 넘을 때. 한 번의 호출로 여러 행을 다 읽어내기 어렵습니다.
+///   T3 해상도    : 실제 내용(판독가능 패치)이 크롭 면적의 소수에 불과할 때.
+///                 실측 items 크롭은 800x746 인데 표는 84px(11%)뿐이라
+///                 다운스케일 후 글자가 뭉개져 2행 중 1행만 읽혔습니다.
+///
+///  ── 겹침 비율 ──
+///   사용자 요구대로 20~30% 를 씁니다. 값 자체는 '표 한 행이 두 타일에 걸쳐도
+///   최소 한쪽에는 온전히 들어간다' 는 구조적 요구에서 나옵니다.
+///   행 높이가 타일 높이의 25% 이하이면 겹침 25% 가 그 조건을 보장합니다.
+///
+///  ── 병합 ──
+///   타일별 추출 결과는 호출부가 dedupe 합니다. (Part 18 참조)
+#[derive(Debug, Clone)]
+pub struct TilePlan {
+    pub bbox: (u32, u32, u32, u32),
+    pub index: usize,
+    pub total: usize,
+}
+
+/// 세로 방향 겹침 분할. 무역 서식의 표는 가로로 넓고 세로로 쌓이므로
+/// 세로 분할이 행 손실을 최소화합니다.
+pub fn plan_overlap_tiles(
+    bbox: (u32, u32, u32, u32),
+    tile_count: usize,
+    overlap_ratio: f32,
+) -> Vec<TilePlan> {
+    let (x0, y0, x1, y1) = bbox;
+    if tile_count <= 1 || y1 <= y0 {
+        return vec![TilePlan { bbox, index: 0, total: 1 }];
+    }
+    let h = (y1 - y0) as f32;
+    // t = 타일 높이. n 타일이 겹침 r 로 전체를 덮으려면
+    //   h = n*t - (n-1)*r*t  →  t = h / (n - (n-1)*r)
+    let n = tile_count as f32;
+    let denom = n - (n - 1.0) * overlap_ratio;
+    if denom <= 0.0 {
+        return vec![TilePlan { bbox, index: 0, total: 1 }];
+    }
+    let t = h / denom;
+    let step = t * (1.0 - overlap_ratio);
+
+    let mut out = Vec::with_capacity(tile_count);
+    for i in 0..tile_count {
+        let ty0 = y0 as f32 + step * i as f32;
+        let ty1 = (ty0 + t).min(y1 as f32);
+        if ty1 <= ty0 + 1.0 {
+            continue;
+        }
+        out.push(TilePlan {
+            bbox: (x0, ty0 as u32, x1, ty1 as u32),
+            index: i,
+            total: tile_count,
+        });
+    }
+    if out.is_empty() {
+        out.push(TilePlan { bbox, index: 0, total: 1 });
+    }
+    let total = out.len();
+    for p in out.iter_mut() {
+        p.total = total;
+    }
+    out
+}
+
+/// 🌟 [TILE DECISION] 이 크롭을 몇 개로 쪼갤지 '점수' 로 결정합니다.
+///
+///  반환 (타일 수, 사유). 1 이면 분할하지 않습니다.
+pub fn decide_tile_count(
+    plan: &CropPlan,
+    heatmaps: &[CategoryHeatmap],
+    grid: &PatchGrid,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    emit: &dyn Fn(&str),
+) -> (usize, String) {
+    use crate::utils::ai_utils::gumbel_expected_z;
+
+    let rows = grid.grid_rows;
+    let cols = grid.grid_cols;
+    let n = rows * cols;
+    let cw = grid.orig_width as f32 / cols as f32;
+    let ch = grid.orig_height as f32 / rows as f32;
+
+    let inside = |i: usize| -> bool {
+        let r = i / cols;
+        let c = i % cols;
+        let cx = (c as f32 + 0.5) * cw;
+        let cy = (r as f32 + 0.5) * ch;
+        cx >= plan.bbox.0 as f32 && cx <= plan.bbox.2 as f32
+            && cy >= plan.bbox.1 as f32 && cy <= plan.bbox.3 as f32
+    };
+
+    // ── T1 : 잘림 위험 ──
+    let mut t1 = false;
+    if let Some(hm) = heatmaps.iter().find(|h| h.category == plan.category) {
+        let m = n.min(hm.scores.len());
+        if m > 0 {
+            let mean: f32 = hm.scores[..m].iter().sum::<f32>() / m as f32;
+            let var: f32 = hm.scores[..m].iter()
+                .map(|s| (s - mean) * (s - mean)).sum::<f32>() / m as f32;
+            let std = var.sqrt().max(1e-6);
+            let (mut mx_out, mut n_out) = (f32::MIN, 0usize);
+            for i in 0..m {
+                if inside(i) || !legibility.is_legible(i) { continue; }
+                n_out += 1;
+                if hm.scores[i] > mx_out { mx_out = hm.scores[i]; }
+            }
+            if n_out > 0 {
+                let s_out = (mx_out - mean) / std - gumbel_expected_z(n_out);
+                if s_out > 0.0 { t1 = true; }
+            }
+        }
+    }
+
+    // ── T2 : 표 행 밀도 (배열 카테고리 전용) ──
+    let is_array_cat = plan.category == "items" || plan.category == "containers";
+    let dense_cols = (cols / 3).max(2);
+    let mut table_rows = 0usize;
+    if is_array_cat {
+        for r in 0..rows {
+            let cnt = (0..cols)
+                .filter(|&c| {
+                    let i = r * cols + c;
+                    inside(i) && legibility.is_legible(i)
+                })
+                .count();
+            if cnt >= dense_cols { table_rows += 1; }
+        }
+    }
+    let t2 = is_array_cat && table_rows > 2;
+
+    // ── T3 : 내용 희소 (해상도 손실) ──
+    let (lg, _il, _bl) =
+        legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
+    let total_in = (0..n).filter(|&i| inside(i)).count().max(1);
+    // 판독 가능 패치가 크롭의 1/4 미만이면 실제 글자가 크롭 면적에 비해 너무 작습니다.
+    let t3 = lg * 4 < total_in;
+
+    if !t1 && !t2 && !t3 {
+        return (1, String::new());
+    }
+
+    // 타일 수는 근거가 되는 구조에서 유도합니다.
+    //  · 표 행이 k 줄이면 두 줄씩 겹쳐 읽도록 ceil(k/2) 타일
+    //  · 그 외에는 2 타일 (상/하)
+    let count = if t2 {
+        ((table_rows + 1) / 2).clamp(2, 4)
+    } else {
+        2
+    };
+
+    let mut why: Vec<&str> = Vec::new();
+    if t1 { why.push("잘림위험"); }
+    if t2 { why.push("표행밀도"); }
+    if t3 { why.push("내용희소"); }
+    let reason = why.join("+");
+
+    emit(&format!(
+        "    🧱 [TILE PLAN] '{}' → {}타일 (겹침 25%) | 사유: {} | 표행 {} | 판독가능 {}/{}",
+        plan.category, count, reason, table_rows, lg, total_in
+    ));
+    (count, reason)
 }

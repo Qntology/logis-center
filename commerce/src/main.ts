@@ -38,14 +38,33 @@ const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin'
 const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
 const NUM_SUFFIX = [
     '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
-    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges'
+    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges',
+    // 🌟 [UNIT / CURRENCY SUFFIX] 무역 서식은 값 이름에 단위를 붙이는 관례가 있습니다.
+    //    total_gross_weight_kg / measurement_cbm / entered_value_usd / amount_krw
+    //    이 넷은 기존 어느 규칙에도 걸리지 않아 'free' 로 떨어졌고,
+    //    LanceDB 에는 Number, Dexie 에는 String 으로 갈라져
+    //    where('data.xxx').between(...) 이 통째로 실패했습니다.
+    //    ⚠️ canonical.rs 의 NUM_SUFFIX 와 반드시 같은 집합이어야 합니다.
+    '_kg', '_cbm', '_m3', '_usd', '_krw', '_eur', '_jpy', '_cny', '_gbp'
 ];
 const NUM_CONTAINS = [
     'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
     'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
-    'local_charges', 'number_of_'
+    'local_charges', 'number_of_',
+    // 🌟 [PACKAGE FAMILY] total_packages / packages_delivered / packages_received /
+    //    total_pieces / number_of_pieces 는 전부 개수입니다.
+    //    'package_count' 완전일치만 있어서 나머지가 전부 새고 있었습니다.
+    'packages', 'pieces',
+    // 🌟 [MEASUREMENT / VALUE] measurement / premium / duty / dutiable / balance /
+    //    flash_point 는 값이 항상 수치입니다.
+    'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
+    'tare_weight', 'chargeable'
 ];
-const NUM_EXACT = new Set(['width', 'height', 'length']);
+// 🌟 단독 명사형 수치 축. canonical.rs 의 NUM_EXACT 와 동일 집합입니다.
+const NUM_EXACT = new Set([
+    'width', 'height', 'length',
+    'premium', 'rate', 'debit', 'credit', 'dosage'
+]);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
 // 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
 //    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
@@ -231,12 +250,31 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
 
 // ── 무역 서식 코드 : app-logis-center 의 get_slice_config 분류 전량 ──
 //    ① 계약·결제 ② 선적·운송 ③ 통관·신고 ④ 검사·증명 ⑤ 특수·법무
+// 🌟 [TRADING DOC CODES v2] 27종 → 55종
+//
+//  ── 무엇이 문제였나 ──
+//   modeOfType() 은 이 목록에 없는 타입을 `return 'commerce'` 로 떨굽니다.
+//   그래서 HBL / SOA / TI / CDR / ICF / LLC 등 28종의 무역 서식이
+//   mode='commerce' 로 태깅되어 Trading 탭에서 통째로 사라졌습니다.
+//   TYPE_SETS.shipping 도 이 배열에서 파생되므로 타입 필터에서도 탈락하여
+//   두 탭 어디에서도 보이지 않는 고아 문서가 됩니다.
+//
+//  ⚠️ src-tauri/src/logic.rs 의 TRADE_GROUP_CODES 및
+//     bias_schema.rs 의 canonical_bias_type 매치 목록과 같은 집합이어야 합니다.
 const TRADING_DOC_CODES = [
-    'PO', 'PI', 'SC', 'LC',
-    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
-    'ED', 'ID', 'CINV', 'CO',
-    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
-    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS'
+    // 계약 · 결제
+    'PO', 'PI', 'SC', 'LC', 'LLC', 'CP', 'BE', 'TR', 'LG', 'EL',
+    // 선적 · 운송
+    'CI', 'PL', 'BL', 'HBL', 'SWB', 'AWB', 'SA', 'DO', 'AN',
+    'BC', 'BK', 'SR', 'FCR', 'POD', 'CM', 'FI', 'WR',
+    // 통관 · 신고
+    'ED', 'ID', 'CINV', 'CO', 'CCC', 'CNM', 'CSI',
+    // 검사 · 증명
+    'IC', 'WC', 'CA', 'COA', 'PHYTO', 'PC', 'HC', 'BEN_CERT', 'FC', 'CDR',
+    // 특수 · 법무 · 보험
+    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS', 'IP', 'ICF',
+    // 정산
+    'SOA', 'DN', 'CN', 'TI'
 ];
 
 // 🌟 LLM 분류기는 대문자('BL')로, scheduler 의 page_type 은 소문자('tracking')로
@@ -2299,10 +2337,30 @@ const ITEMS_SCHEMA = [
     //     logic::trading_index_column() 이 만드는 crc32 숫자 인덱스 컬럼으로,
     //     'BL 하나로 연결된 CI/PL 전부 조회' 를 O(log n) 으로 처리합니다.
     //     문자열 doc_number 를 그대로 쓰면 표기 흔들림(대소문자/하이픈)에 매번 어긋납니다.
-    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-    'data.rel_ed', 'data.rel_id', 'data.rel_cinv',
+    //  ⑤-1 🌟 [TRADING INDEX RELAY] ...
+    //     ⚠️ logic.rs 의 trading_index_column() 은 'rel_{소문자}' 를 45종 전부에 대해
+    //        생성합니다. 여기 없는 축은 인덱스 없이 .filter() 풀스캔으로 떨어집니다.
+    //        (동작은 하지만 문서가 늘수록 느려집니다)
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    //  ⑤-2 🌟 [BASE v2 신규 축] bias.json trade_schema.base v2 에서 추가된 조회 축입니다.
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', 'data.type_size', 'data.hs_code',
     //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
     //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
     //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
@@ -2328,7 +2386,13 @@ const ITEMS_SCHEMA = [
 //
 //  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
 //     업그레이드 시점에 삭제합니다. 아래에는 v12 의 전 테이블이 그대로 포함되어 있습니다.
-appDb.version(13).stores({
+// 🌟 v14 : trading 인덱스 축 확장 (rel_* 45종 + base v2 신규 축)
+//  스토어 구조는 v13 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
+//  → upgrade 콜백이 필요 없습니다.
+//
+//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
+//     업그레이드 시점에 삭제합니다. 아래에는 v13 의 전 테이블이 그대로 포함되어 있습니다.
+appDb.version(14).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
     ts_queue: 'taskId, type',
@@ -2576,11 +2640,29 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
     // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
-    //    여기에 없으면 선언한 인덱스가 한 번도 쓰이지 않고 .filter() 풀스캔으로 떨어집니다.
-    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-    'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+    //    ⚠️ 여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이
+    //       where('없는경로') 를 호출해 Dexie 가 SchemaError 를 던집니다.
+    //       (executeDexiePlan 의 INDEX FALLBACK 이 흡수하지만 매번 예외 비용이 듭니다)
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    // 🌟 [BASE v2 신규 축]
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', 'data.type_size', 'data.hs_code'
 ]);
 
 interface DexieCondition {
@@ -2681,10 +2763,21 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
         'data.doc_number', 'data.container_number', 'data.seal_number',
         'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
         // ── 🌟 trading 인덱스 참조 : crc32 숫자라 카디널리티가 최상입니다 ──
-        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+        //    DEXIE_INDEXED_PATHS 의 rel_* 전량과 동일 집합입니다.
+        'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+        'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+        'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+        'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+        'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+        'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+        'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+        'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+        'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+        'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+        // 🌟 [BASE v2 참조 축] 문서번호와 동급의 카디널리티를 갖습니다.
+        'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+        'data.reference_master_bl', 'data.reference_sr'
     ];
 
     let best: DexieCondition | null = null;

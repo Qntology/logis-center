@@ -137,6 +137,21 @@ pub fn trade_relay_rules(doc_type: &str) -> Vec<(&'static str, &'static str, &'s
             ("CI",  "doc_number", "reference_invoice"),
             ("BL",  "reference_invoice", "reference_invoice"),
         ],
+        // 🌟 [HBL → MBL] House B/L 은 자기 상위 Master B/L 을 가리킵니다.
+        //    이 간선이 없으면 혼재 화물(consolidation)의 문서 체인이
+        //    House 단계에서 끊겨 상위 운송 정보로 이어지지 않습니다.
+        "HBL" => vec![
+            ("BL",  "reference_master_bl", "doc_number"),
+            ("FCR", "reference_hbl", "doc_number"),
+            ("CI",  "doc_number", "reference_invoice"),
+        ],
+        // 🌟 [SWB] Sea Waybill 은 B/L 과 같은 위치의 서식이므로 같은 상대를 봅니다.
+        "SWB" => vec![
+            ("CI",  "doc_number", "reference_invoice"),
+            ("PL",  "reference_invoice", "reference_invoice"),
+            ("DO",  "reference_swb", "doc_number"),
+            ("AN",  "reference_swb", "doc_number"),
+        ],
         _ => vec![],
     }
 }
@@ -333,6 +348,12 @@ pub fn trade_reference_field_of(doc_type: &str) -> Option<&'static str> {
         "CN"       => "reference_credit_note",
         "TI"       => "reference_tax_invoice",
 
+        // 🌟 [MISSING 3] related_trading() 이 참조하는데 이 사전에 없어
+        //    trading_relay_pair() 가 None 을 돌려주던 서식들입니다.
+        //    한쪽이라도 비면 relay 가 성립하지 않으므로 그래프 간선이 통째로 끊깁니다.
+        "SR"       => "reference_sr",
+        "WR"       => "reference_warehouse_receipt",
+        "BE"       => "reference_bill_of_exchange",
         _ => return None,
     };
     Some(f)
@@ -341,7 +362,7 @@ pub fn trade_reference_field_of(doc_type: &str) -> Option<&'static str> {
 /// 🌟 [ALL REFERENCE FIELDS] 무역 문서가 가질 수 있는 모든 참조 축 목록입니다.
 ///  STEP C 정규화(FLATTEN)와 검색 조건 화이트리스트가 같은 목록을 공유해야
 ///  저장(정방향)과 조회(역방향)가 같은 이름 공간에서 만납니다.
-pub const TRADE_REFERENCE_FIELDS: [&str; 48] = [
+pub const TRADE_REFERENCE_FIELDS: [&str; 53] = [
     "reference_po", "reference_proforma", "reference_contract", "reference_lc",
     "reference_local_lc", "reference_purchase_confirm",
     "reference_invoice", "reference_customs_invoice", "reference_consular_invoice",
@@ -363,6 +384,16 @@ pub const TRADE_REFERENCE_FIELDS: [&str; 48] = [
     //    SOA / DN / CN / TI 질의가 조건 축을 찾지 못했습니다.
     "reference_statement", "reference_debit_note",
     "reference_credit_note", "reference_tax_invoice",
+    // 🌟 [SR / WR / BE 축] trade_reference_field_of 에 새로 추가한 3축입니다.
+    //    이 배열과 그 함수의 반환값 집합은 반드시 같아야 합니다.
+    //    (한쪽만 늘리면 저장은 되는데 조회 조건에는 안 잡히는 비대칭이 생깁니다)
+    "reference_sr", "reference_warehouse_receipt", "reference_bill_of_exchange",
+    // 🌟 [MASTER B/L] House → Master 방향은 reference_bl 로는 표현할 수 없습니다.
+    //    HBL 문서가 자기 상위 M B/L 을 가리킬 때 쓰는 전용 축입니다.
+    "reference_master_bl",
+    // 🌟 [GENERIC] bias.json 의 trade_schema.base.header 에 reference_number 가
+    //    이미 존재하는데 이 배열에 없어 조건 순회에서 빠져 있었습니다.
+    "reference_number",
 ];
 
 /// 🌟 [RELAY PAIR v2 / DIRECTION-FIXED]
@@ -578,7 +609,16 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
 /// Depth 1 : 조건 카테고리 앵커.
 ///  편견(prejudice)은 별도 사전을 만들지 않고 '다른 카테고리의 bias' 를 그대로 씁니다.
 ///  (get_detail_schema_fields 가 다른 필드의 bias 를 편견으로 쓰는 것과 동일 원리)
-pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 7] = [
+/// 🌟 [v3] 10갈래.
+///
+///  ── 왜 3개를 더하는가 ──
+///   customs / inspection / settlement 세 축의 질의가 기존 7갈래 어디에도
+///   자연스럽게 들어가지 않았습니다.
+///     "관세 얼마 나왔어?"      → terms 의 amount 로 잘못 떨어짐
+///     "검사 통과한 서류 찾아줘" → identity 의 status 로 잘못 떨어짐
+///     "미결제 잔액 있는 거래"   → terms 의 amount 로 잘못 떨어짐
+///   Depth 1 이 틀리면 Depth 2 는 그 카테고리 안에서만 고르므로 복구가 불가능합니다.
+pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 10] = [
     ("identity",
      "document kind, document type code, document number, bill of lading number, invoice number, purchase order number, contract number, tracking number, parcel number, reference number, document status, draft, in progress, completed, returned, error, issue date, date of issue, expiry date, validity date"),
     ("transport",
@@ -593,6 +633,12 @@ pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 7] = [
      "referenced invoice number, referenced bill of lading number, referenced purchase order number, referenced letter of credit number, referenced booking number, referenced contract number, referenced declaration number, referenced certificate number, referenced policy number, covering document, against document, relating to document, our reference, your reference"),
     ("hub",
      "trace everything related to this number, show every document under this number, all documents linked to, entire document set for, whole paperwork bundle, everything tied to this order, all paperwork for this shipment, full document chain"),
+    ("customs",
+     "customs declaration number, export declaration, import declaration, declaration date, clearance date, customs office code, customs clearance status, entry type, released by customs, duty rate, tariff rate, duty amount, dutiable value, tax base, customs value, entered value, personal customs clearance code, bonded warehouse, customs broker, port code"),
+    ("inspection",
+     "inspection certificate, inspection date, place of inspection, inspection result, pass or fail, certificate number, certified by, laboratory analysis, test result, specification value, treatment date, chemical used, dosage, exposure period, fumigation, heat treatment, cold treatment, ISPM 15 mark, weighing date, verified gross mass, survey report, damage findings, surveyor conclusion, phytosanitary, health certificate"),
+    ("settlement",
+     "statement of account, account ledger, transaction date, debit amount, credit amount, running balance, outstanding balance, ending balance, debit note, credit note, tax invoice, VAT amount, supply amount, reason for debit, reason for credit, payment status, unpaid, settled, due date, overdue, charge code, freight charge breakdown, terminal handling charge, documentation fee"),
 ];
 
 /// Depth 2 : 카테고리별 파라미터 (필드명, 프롬프트 설명, 앵커 구).
@@ -692,6 +738,66 @@ pub fn trade_condition_fields(category: &str) -> Vec<(&'static str, &'static str
             ("hub_reference", "A document number to trace ACROSS every related document",
              "everything related to, all documents under, whole paperwork for, entire document chain of, PO-99281A, CI-2026-08001, BL-55432219, LC-88492011"),
         ],
+        "customs" => vec![
+            ("declaration_number", "Export or import declaration number",
+             "declaration number, customs declaration no, export declaration number, import declaration number, ED-2026-KR-77102, ID-2026-US-99120"),
+            ("declaration_date",   "Date the declaration was filed",
+             "declaration date, filed on, date of declaration, lodged on"),
+            ("clearance_date",     "Date customs released the cargo",
+             "clearance date, released on, date of release, customs release date"),
+            ("customs_office_code","Customs office code",
+             "customs office code, office code, customs house code, port code"),
+            ("customs_status",     "Customs clearance status",
+             "customs status, cleared, pending, under inspection, released, held"),
+            ("entry_type",         "Entry type",
+             "entry type, consumption entry, warehouse entry, informal entry"),
+            ("duty_rate",          "Tariff rate applied",
+             "duty rate, tariff rate, rate of duty, percent duty"),
+            ("duty_amount",        "Total duty assessed",
+             "duty amount, total duty, duty paid, customs duty"),
+            ("dutiable_value",     "Dutiable value or tax base",
+             "dutiable value, tax base, customs value, entered value, assessable value"),
+            ("pccc_number",        "Personal customs clearance code",
+             "personal customs clearance code, PCCC, P번호, personal clearance number"),
+        ],
+        "inspection" => vec![
+            ("certificate_number", "Certificate number of this inspection or test document",
+             "certificate number, cert no, certificate of analysis number, inspection certificate number, IC-2026-0825, COA-2026-0824"),
+            ("inspection_date",    "Date of inspection or survey",
+             "inspection date, date of inspection, surveyed on, examined on"),
+            ("inspection_place",   "Place of inspection",
+             "place of inspection, inspection site, location of survey"),
+            ("inspection_result",  "Result of inspection",
+             "inspection result, pass, fail, conforms, does not conform, satisfactory, overall result"),
+            ("treatment_date",     "Date of fumigation or treatment",
+             "treatment date, fumigation date, date of treatment, treated on"),
+            ("treatment_chemical", "Chemical used in treatment",
+             "chemical used, fumigant, methyl bromide, phosphine, active ingredient, concentration"),
+            ("weighing_date",      "Date of weighing",
+             "weighing date, weighed on, date of weighing"),
+            ("ispm15_mark",        "ISPM 15 mark on wooden packaging",
+             "ISPM 15, ISPM15 mark, heat treated stamp, HT mark, wood packaging mark"),
+        ],
+        "settlement" => vec![
+            ("transaction_date",   "Date of a ledger transaction",
+             "transaction date, posted on, entry date, ledger date"),
+            ("debit",              "Debit amount on a ledger line",
+             "debit, debit amount, charged, owed"),
+            ("credit",             "Credit amount on a ledger line",
+             "credit, credit amount, credited, paid"),
+            ("balance",            "Running or ending balance",
+             "balance, running balance, ending balance, outstanding balance, closing balance"),
+            ("account_status",     "Account status",
+             "account status, open, closed, settled, outstanding, overdue"),
+            ("payment_status",     "Payment status",
+             "payment status, paid, unpaid, partially paid, pending payment"),
+            ("due_date",           "Payment due date",
+             "due date, payable by, payment due, net 30 due"),
+            ("vat_type",           "VAT type on a tax invoice",
+             "VAT type, taxable, zero rated, exempt, 과세, 영세, 면세"),
+            ("charge_amount",      "Amount of an individual charge line",
+             "charge amount, line charge, THC, terminal handling charge, documentation fee, handling charge"),
+        ],
         _ => vec![],
     }
 }
@@ -749,6 +855,14 @@ pub fn trade_reference_anchor(field: &str) -> &'static str {
         "reference_debit_note"        => "referenced debit note number, DN-2026-0912",
         "reference_credit_note"       => "referenced credit note number, CN-2026-0915",
         "reference_tax_invoice"       => "referenced tax invoice number, VAT invoice number, TI-2026-KR-0812",
+        "reference_sr"                => "referenced shipping request number, against S/R, booking request reference, SR-2026-0820",
+        "reference_warehouse_receipt" => "referenced warehouse receipt number, godown receipt reference, WR-2026-0830",
+        "reference_bill_of_exchange"  => "referenced bill of exchange number, draft number, against draft, BE-2026-0905",
+        // 🌟 House B/L 이 자기 상위 Master B/L 을 가리키는 전용 축입니다.
+        //    reference_bl 로 겸용하면 '이 문서가 가리키는 B/L' 과
+        //    '이 문서의 상위 B/L' 이 같은 필드에 섞여 그래프 방향이 무너집니다.
+        "reference_master_bl"         => "referenced master bill of lading number, master B/L, MBL no, ocean carrier B/L covering this house B/L, MBL-55432219",
+        "reference_number"            => "reference number, our reference, your reference, ref no, generic reference printed on this document",
         _                             => "referenced document number",
     }
 }
@@ -760,15 +874,43 @@ pub fn trade_default_operator(field: &str) -> &'static str {
     if field == "hub_reference" { return "contains"; }
     if field.starts_with("reference_") { return "eq"; }
     match field {
+        // ── 코드·식별자 : 완전일치 ──
         "doc_number" | "no" | "status" | "doc_type"
         | "container_number" | "seal_number" | "hs_code"
-        | "incoterms" | "currency" | "freight_payment_term" => "eq",
+        | "incoterms" | "currency" | "freight_payment_term"
+        | "declaration_number" | "certificate_number" | "policy_number"
+        | "claim_number" | "customs_office_code" | "pccc_number"
+        | "charge_code" | "un_number" | "cas_number"
+        | "fta_agreement_code" | "eccn" | "swift_code" | "account_number" => "eq",
 
-        "issue_date" | "expiry_date" | "etd" | "eta" => "gte",
+        // ── 날짜 : 기준일 이후 ──
+        //  질의가 "8월 이후 통관된 건" 처럼 하한을 뜻하는 경우가 압도적입니다.
+        "issue_date" | "expiry_date" | "etd" | "eta"
+        | "departure_date" | "arrival_date"
+        | "declaration_date" | "clearance_date" | "release_date"
+        | "inspection_date" | "treatment_date" | "weighing_date"
+        | "claim_date" | "effective_date" | "transaction_date"
+        | "due_date" | "maturity_date" | "valid_until"
+        | "latest_shipment_date" | "cargo_closing_date"
+        | "expected_ship_date" | "expected_delivery_date"
+        | "estimated_shipment_date" | "date_received" | "closure_date" => "gte",
 
-        "amount" | "freight_amount" | "insurance_amount" | "local_charges"
-        | "package_count" | "weight_gross" | "weight_net" | "volume" => "eq",
+        // ── 수치 : 완전일치 ──
+        //  🌟 [주의] 여기 있는 축은 '값이 정확히 얼마' 라는 질의를 전제합니다.
+        //     '얼마 이상' 은 질의 청크에 비교 표현이 붙어 있고,
+        //     ai_utils::split_numeric_and_comparator 가 연산자를 별도로 확정하므로
+        //     이 기본값이 그 판정을 덮어쓰지 않습니다.
+        "amount" | "amount_subtotal" | "amount_tax"
+        | "freight_amount" | "insurance_amount" | "local_charges"
+        | "package_count" | "weight_gross" | "weight_net" | "volume"
+        | "chargeable_weight" | "exchange_rate"
+        | "duty_rate" | "duty_amount" | "dutiable_value"
+        | "insured_amount" | "premium" | "claim_amount"
+        | "debit" | "credit" | "balance" | "charge_amount"
+        | "usance_tenor_days" | "flash_point"
+        | "unit_price" | "total_price" | "quantity" => "eq",
 
+        // ── 그 외 자유 서술 : 부분일치 ──
         _ => "contains",
     }
 }
@@ -789,22 +931,43 @@ pub fn trade_default_operator(field: &str) -> &'static str {
 // =====================================================================
 
 /// Depth 1 : 서식 그룹 앵커. 편견은 '다른 그룹의 bias' 를 그대로 씁니다.
-pub const TRADE_GROUPS: [(&str, &str); 6] = [
-    ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, documentary credit, payment terms, contract number, buyer seller agreement, tenor at sight, issuing bank, advising bank, beneficiary, applicant, order confirmation, quotation"),
-    ("shipping",  "commercial invoice, packing list, bill of lading, ocean bill of lading, air waybill, shipping advice, delivery order, arrival notice, booking confirmation, vessel voyage number, port of loading, port of discharge, place of receipt, place of delivery, container number, seal number, notify party, freight prepaid, freight collect, shipper and consignee, gross weight net weight measurement, carton quantity, marks and numbers, incoterms fob cif exw"),
-    ("customs",   "export declaration, import declaration, customs invoice, certificate of origin, hs code, tariff classification, customs clearance, declaration number, customs value, duty and tax, chamber of commerce, country of origin"),
-    ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, health certificate, beneficiary certificate, we hereby certify, test result, specification value, fumigation treatment, laboratory report, fit for human consumption, plant health"),
-    ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, un number, proper shipping name, packing group, hazard class, policy number, insured amount, premium, coverage all risks, attorney in fact, business registration number"),
+/// 🌟 [TRADE GROUPS v2] 7갈래.
+///
+///  ── settlement 를 왜 새로 두는가 ──
+///   SOA(거래명세서) / DN(차변표) / CN(대변표) / TI(세금계산서) / FI(운임인보이스)는
+///   '거래가 끝난 뒤의 회계 정산' 이라는 뚜렷한 성격을 갖습니다.
+///   contract 에 억지로 넣으면 '계약 조건' 앵커와 '차변/대변' 앵커가 한 그룹에서
+///   서로를 희석해 Depth 1 판정이 흔들립니다.
+pub const TRADE_GROUPS: [(&str, &str); 7] = [
+    ("contract",  "purchase order, proforma invoice, sales contract, letter of credit, documentary credit, local letter of credit, purchase confirmation, bill of exchange, trust receipt, letter of guarantee, payment terms, contract number, buyer seller agreement, tenor at sight, usance, drawer drawee payee, issuing bank, advising bank, beneficiary, applicant, order confirmation, quotation, export license"),
+    ("shipping",  "commercial invoice, packing list, bill of lading, ocean bill of lading, house bill of lading, sea waybill, air waybill, shipping request, booking confirmation, shipping advice, delivery order, arrival notice, proof of delivery, warehouse receipt, forwarder certificate of receipt, cargo manifest, freight invoice, vessel voyage number, flight number, port of loading, port of discharge, place of receipt, place of delivery, container number, seal number, notify party, freight prepaid, freight collect, shipper and consignee, gross weight net weight measurement, carton quantity, marks and numbers, incoterms fob cif exw"),
+    ("customs",   "export declaration, import declaration, customs invoice, consular invoice, certificate of origin, non manipulation certificate, customs clearance certificate, hs code, tariff classification, customs clearance, declaration number, customs value, duty and tax, chamber of commerce, country of origin, consular visa, legalization"),
+    ("inspection","inspection certificate, weight certificate, certificate of analysis, phytosanitary certificate, fumigation certificate, health certificate, beneficiary certificate, cargo damage survey report, we hereby certify, test result, specification value, fumigation treatment, laboratory report, fit for human consumption, plant health, verified gross mass, surveyor findings"),
+    ("legal",     "dangerous goods declaration, material safety data sheet, power of attorney, business license, insurance policy, insurance claim form, un number, proper shipping name, packing group, hazard class, policy number, insured amount, premium, coverage all risks, attorney in fact, business registration number, claim amount, cause of loss"),
+    ("settlement","statement of account, debit note, credit note, tax invoice, freight invoice, account ledger, opening balance, ending balance, transaction date, debit credit column, reason for debit, reason for credit, VAT amount, supply amount, remittance instructions, outstanding balance, due date, aging report"),
     ("parcel",    "courier label, parcel waybill sticker, domestic courier service, home delivery parcel, door to door small package, delivery driver, barcode sticker label, parcel pickup, last mile delivery"),
 ];
 
 /// Depth 2 : 그룹 소속 코드 목록.
-pub const TRADE_GROUP_CODES: [(&str, &[&str]); 6] = [
-    ("contract",   &["PO", "PI", "SC", "LC"]),
-    ("shipping",   &["CI", "PL", "BL", "AWB", "SA", "DO", "AN", "BC"]),
-    ("customs",    &["ED", "ID", "CINV", "CO"]),
-    ("inspection", &["IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT"]),
-    ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS"]),
+/// 🌟 [TRADE GROUP CODES v2] 27종 → 55종.
+///
+///  ── 무엇이 문제였나 ──
+///   related_trading() 은 HBL / FCR / POD / LG / TR / LLC / TI / CP / CM /
+///   CCC / CNM / PC / COA / FI / CDR / ICF / SOA / EL / BE / SR / BK / WR /
+///   CSI / SWB / IP / DN / CN / FC 를 참조 그래프에 넣어 두었지만,
+///   이 목록에 없으면 STEP 2 의 Depth 2 후보에 오르지 못합니다.
+///   (실측 로그의 VISION CODE CANDIDATES 가 정확히 27개였습니다)
+///   그 결과 House B/L 은 BL 로, 보험증권은 INS 로 오분류되고
+///   trade_relay_rules 가 빈 vec 을 돌려줘 연결 그래프가 통째로 죽습니다.
+pub const TRADE_GROUP_CODES: [(&str, &[&str]); 7] = [
+    ("contract",   &["PO", "PI", "SC", "LC", "LLC", "CP", "BE", "TR", "LG", "EL"]),
+    ("shipping",   &["CI", "PL", "BL", "HBL", "SWB", "AWB", "SA", "DO", "AN",
+                     "BC", "BK", "SR", "FCR", "POD", "CM", "FI", "WR"]),
+    ("customs",    &["ED", "ID", "CINV", "CO", "CCC", "CNM", "CSI"]),
+    ("inspection", &["IC", "WC", "CA", "COA", "PHYTO", "PC", "HC",
+                     "BEN_CERT", "FC", "CDR"]),
+    ("legal",      &["DGD", "MSDS", "POA", "BIZ_LIC", "INS", "IP", "ICF"]),
+    ("settlement", &["SOA", "DN", "CN", "TI"]),
     ("parcel",     &["TRACKING"]),
 ];
 
@@ -874,6 +1037,53 @@ pub fn trade_code_anchor(code: &str) -> &'static str {
         "POA"      => "power of attorney, authorization letter, attorney in fact",
         "BIZ_LIC"  => "business license, business registration certificate, company registration number",
         "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
+
+        // 🌟 [NEW 28] TRADE_GROUP_CODES v2 로 후보에 오르게 된 서식들입니다.
+        //    구버전은 이 코드들이 후보 목록에 없어 판정 자체가 불가능했고,
+        //    설령 도달해도 이 함수가 기본값 "trade document" 를 돌려줘
+        //    Depth 2 채점에서 모든 코드가 동점이 되었습니다.
+        //    앵커 문구는 각 서식의 표준 표제·필수 기재사항입니다.
+
+        // ── 계약 · 결제 ──
+        "LLC"      => "local letter of credit, domestic letter of credit, internal L/C, applicant exporter, beneficiary supplier, local L/C amount in won",
+        "CP"       => "confirmation of purchase, purchase confirmation certificate, supplier manufacturer, purchaser exporter, issuing agency, confirmation number",
+        "BE"       => "bill of exchange, draft, drawer, drawee, payee, pay against this first bill of exchange, drawn under letter of credit, at sight of this draft",
+        "TR"       => "trust receipt, entrustor bank, trustee importer, ownership clause, goods held in trust, maturity date, purpose of release",
+        "LG"       => "letter of guarantee, shipping guarantee, we hereby guarantee, indemnify the carrier, original bill of lading not yet received, bank endorsement",
+        "EL"       => "export license, export permit, licensed items, authorized value, license condition, ECCN, export control classification, issuing authority",
+
+        // ── 선적 · 운송 ──
+        "HBL"      => "house bill of lading, HBL, freight forwarder issued, master bill of lading reference, NVOCC, house B/L number",
+        "SWB"      => "sea waybill, non negotiable waybill, express release, surrender bill, no original required, special instructions",
+        "SR"       => "shipping request, booking request, S/R, request for space, forwarder carrier, shipping details requested",
+        "BK"       => "booking confirmation, booking note, space confirmed, container allocation, cargo closing date, cut off time, booking number",
+        "WR"       => "warehouse receipt, godown receipt, warehouse operator, depositor exporter, storage term, warehouse location, packages received, date received",
+        "FCR"      => "forwarder certificate of receipt, FCR, forwarders cargo receipt, issuing forwarder, undertaking statement, received the goods described",
+        "POD"      => "proof of delivery, delivery receipt, received by, delivery date, delivery status, carrier trucker, consignee recipient, packages delivered",
+        "CM"       => "cargo manifest, ships manifest, shipping agent, flag state, total bills of lading, total containers, submission date, consignment summary",
+        "FI"       => "freight invoice, carrier invoice, charge code, rate, total charges, due date, bill to shipper, terminal handling charge, documentation fee",
+
+        // ── 통관 · 신고 ──
+        "CCC"      => "customs clearance certificate, entry summary, entry type, release date, customs status, entered value, duty paid amount, customs authority",
+        "CNM"      => "certificate of non manipulation, non manipulation certificate, transshipment customs authority, port of transshipment, arrival vessel, departure vessel, certification statement",
+        "CSI"      => "consular invoice, consular visa, legalized by, notary agency, legalization fee, consulate stamp, visa number",
+
+        // ── 검사 · 증명 ──
+        "COA"      => "certificate of analysis, laboratory analysis report, test results table, specification and result, overall result pass, certified by, issuing laboratory",
+        "PC"       => "phytosanitary certificate, plant quarantine certificate, botanical name, declared name of product, place of origin, declared port of entry, disinfestation treatment",
+        "FC"       => "fumigation certificate, treatment certificate, chemical used, dosage, exposure period, minimum temperature, place of treatment, ISPM 15 mark",
+        "CDR"      => "cargo damage report, survey report, surveying agency, findings and damage, nature of damage, cause of damage, estimated loss amount, surveyor conclusion, sound packages damaged packages",
+
+        // ── 보험 · 청구 ──
+        "IP"       => "insurance policy, marine insurance certificate, insurer, insured, sum insured, valuation basis, coverage conditions, claims payable at, effective date",
+        "ICF"      => "insurance claim form, claim application, claimant, claim date, cause of loss, place of loss, damaged quantity, enclosed documents, reimbursement bank account",
+
+        // ── 정산 ──
+        "SOA"      => "statement of account, account ledger, opening balance, transaction date, debit column, credit column, ending balance, account status, closure date",
+        "DN"       => "debit note, debit memo, reason for debit, charges, due date, payment instructions, remittance bank, total debit amount",
+        "CN"       => "credit note, credit memo, reason for credit, adjustments, settlement instructions, total credit amount",
+        "TI"       => "tax invoice, VAT invoice, supply amount, tax amount, VAT type, representative, business registration number, grand total in won",
+
         "TRACKING" => "courier parcel label, tracking number barcode sticker, domestic courier service, home delivery small package, delivery driver route",
         _          => "trade document",
     }
@@ -888,24 +1098,219 @@ pub fn trade_code_anchor(code: &str) -> &'static str {
 ///   저장 스키마(get_trade_category_schema)와 히트맵 축이 어긋나면
 ///   크롭 영역과 추출 프롬프트가 서로 다른 필드를 가리키게 됩니다.
 pub fn trade_field_category(field: &str) -> &'static str {
+    // ── ① 참조 축은 전부 header ──
+    //    (구버전은 match 에도 "reference_number" 를 적어 두었지만
+    //     이 return 이 먼저 실행되어 그 arm 은 도달 불가능한 죽은 코드였습니다)
     if field.starts_with("reference_") {
         return "header";
     }
+
+    // ── ② 명시 매핑 ──
     match field {
+        // ── header ──
         "doc_type" | "doc_number" | "issue_date" | "expiry_date"
-            | "reference_number" | "no" | "status" => "header",
+            | "no" | "status" | "submission_date" => "header",
+
+        // ── parties (스칼라 5축) ──
+        //  🌟 [왜 배열로 바꾸지 않았는가]
+        //   이 5개는 trade_condition_fields / bias.json ko.shipping_doc /
+        //   search_bridge.multilingual_value_anchor / Dexie 인덱스 네 곳이
+        //   이미 이름으로 참조합니다. 배열로 바꾸면 그 배선이 전부 끊깁니다.
+        //   기존 5축은 스칼라로 두고, 나머지 역할은 other_parties 가 받습니다.
         "sender_name" | "sender_address" | "recipient_name"
             | "recipient_address" | "notify_party_name" => "parties",
-        "vessel" | "voyage_number" | "pol" | "pod" | "place_receipt"
-            | "place_delivery" | "etd" | "eta" | "transport_mode" => "logistics",
-        "incoterms" | "payment_terms" | "freight_payment_term" => "conditions",
+
+        // ── other_parties (배열) ──
+        //  🌟 45종 예시에서 확인된 역할은 42개입니다.
+        //     (drawer / drawee / payee / carrier / insurer / issuing_bank /
+        //      advising_bank / customs_broker / warehouse_operator / claimant …)
+        //     개별 필드로 두면 issuing_bank·advising_bank·entrustor_bank 세 축이
+        //     같은 '은행명' 영역을 놓고 경쟁해 근거가 3분할되고 전부 굶습니다.
+        //     role 을 원소 필드로 두면 한 영역에서 여러 역할을 순서대로 읽어내고,
+        //     우리가 예상하지 못한 역할까지 스키마 변경 없이 수용합니다.
+        "party_role" | "party_name" | "party_address"
+            | "party_contact" => "other_parties",
+
+        // ── logistics ──
+        //  🌟 place_receipt / place_delivery 를 되살렸습니다.
+        //     Part 11 에서 "trade_schema 에 없다" 는 이유로 제거를 제안했는데,
+        //     base v2 에 정식으로 추가했으므로 다시 축이 됩니다.
+        //     B/L 과 FCR 의 필수 기재사항이라 빠뜨릴 수 없습니다.
+        "vessel" | "voyage_number" | "flight_number" | "pol" | "pod"
+            | "place_receipt" | "place_delivery" | "etd" | "eta"
+            | "departure_date" | "arrival_date"
+            | "transport_mode" | "means_of_conveyance"
+            | "flag_state" | "terminal_of_discharge"
+            | "port_of_transshipment" | "cargo_closing_date" => "logistics",
+
+        // ── conditions ──
+        "incoterms" | "payment_terms" | "freight_payment_term"
+            | "partial_shipments" | "transshipment_allowed" | "latest_shipment_date"
+            | "governing_law" | "arbitration" | "non_negotiable"
+            | "temperature_control" | "storage_term" | "release_instruction"
+            | "special_instructions" => "conditions",
+
+        // ── financials ──
         "currency" | "amount" | "amount_subtotal" | "amount_tax"
-            | "freight_amount" | "insurance_amount" | "local_charges" => "financials",
-        "container_number" | "seal_number" | "package_count" | "package_unit"
-            | "weight_gross" | "weight_net" | "volume" | "marks_numbers" => "cargo",
-        "hs_code" => "items",
-        _ => "",
+            | "freight_amount" | "insurance_amount" | "local_charges"
+            | "exchange_rate" | "bank_charges" | "usance_tenor_days" | "tenor"
+            | "maturity_date" | "due_date" | "valid_until"
+            | "remittance_reference" | "swift_code" | "account_number" => "financials",
+
+        // ── cargo ──
+        //  🌟 container_number / seal_number 를 여기서 뺐습니다.
+        //     구버전이 이 둘을 cargo 로 보내는 바람에 containers 카테고리에
+        //     배정되는 필드가 0개가 되어, 히트맵이 아예 생성되지 않았습니다.
+        //     (실측 로그가 8개가 아니라 7개 카테고리만 출력한 직접 원인)
+        "package_count" | "package_unit" | "weight_gross" | "weight_net"
+            | "volume" | "marks_numbers" | "chargeable_weight"
+            | "container_tare_weight" => "cargo",
+
+        // ── items (배열) ──
+        //  🌟 구버전은 hs_code 하나뿐이었습니다.
+        //     bias.json 의 trade_schema.base.items 에는 6개가 멀쩡히 있는데
+        //     이 함수가 5개를 버려서 items 히트맵이 단일 앵커로 붕괴했고,
+        //     7개 카테고리 중 최하위(+1.3126)로 밀려 상품 표를 놓쳤습니다.
+        //  🌟 item_ 접두 4축은 cargo 의 동명 필드(weight_net / package_count)와
+        //     이름이 겹치지 않게 하려는 것입니다. 이 함수는 필드명 문자열만 받으므로
+        //     겹치면 소속을 판별할 방법이 없어 한쪽이 앵커를 잃습니다.
+        "description" | "item_code" | "quantity" | "unit" | "hs_code"
+            | "country_of_manufacture" | "unit_price" | "total_price"
+            | "item_net_weight" | "item_gross_weight"
+            | "item_package_count" | "item_package_type" => "items",
+
+        // ── containers (배열) ──
+        "container_number" | "seal_number" | "type_size"
+            | "container_package_count" | "container_gross_weight"
+            | "container_measurement" => "containers",
+
+        // ── customs (신규) ──
+        "declaration_number" | "declaration_date" | "clearance_date"
+            | "customs_office_code" | "duty_rate" | "duty_amount"
+            | "dutiable_value" | "entry_type" | "customs_status"
+            | "pccc_number" | "port_code" | "port_name"
+            | "export_permission" => "customs",
+
+        // ── inspection (신규) ──
+        "inspection_date" | "inspection_place" | "inspection_body"
+            | "inspection_result" | "inspection_scope" | "inspection_status"
+            | "treatment_date" | "treatment_chemical" | "treatment_dosage"
+            | "treatment_duration" | "treatment_temperature" | "treatment_type"
+            | "certificate_number" | "test_summary" | "ispm15_mark"
+            | "health_status" | "beneficiary_statement"
+            | "weighing_date" | "weighing_location" => "inspection",
+
+        // ── insurance (신규) ──
+        "policy_number" | "insured_amount" | "premium" | "premium_amount"
+            | "coverage_condition" | "coverage_type" | "valuation_basis"
+            | "claims_payable_at" | "effective_date"
+            | "claim_number" | "claim_date" | "cause_of_loss" | "place_of_loss" => "insurance",
+
+        // ── hazmat (신규) ──
+        "un_number" | "hazard_class" | "packing_group" | "proper_shipping_name"
+            | "flash_point" | "cas_number" | "emergency_contact" => "hazmat",
+
+        // ── origin (신규) ──
+        "origin_criterion" | "fta_agreement_code" | "preference_indicator"
+            | "origin_certificate_type" | "place_of_origin"
+            | "botanical_name" | "country_of_origin" => "origin",
+
+        // ── compliance (신규) ──
+        "carbon_footprint" | "traceability_code" | "eccn"
+            | "batch_lot_number" | "halal_kosher_cert_no"
+            | "cites_permit_number" | "fda_ema_approval_no" => "compliance",
+
+        // ── charges (배열, 신규) ──
+        "charge_code" | "charge_description" | "charge_rate"
+            | "charge_amount" => "charges",
+
+        // ── settlement (신규) ──
+        "transaction_date" | "debit" | "credit" | "balance"
+            | "account_status" | "closure_date"
+            | "reason_for_credit" | "reason_for_debit"
+            | "vat_type" | "settlement_instructions"
+            | "payment_instructions" | "payment_status" => "settlement",
+
+        _ => trade_field_category_by_rule(field),
     }
+}
+
+/// 🌟 [RULE FALLBACK] 명시 매핑에 없는 필드를 부분일치 규칙으로 라우팅합니다.
+///
+///  ── 왜 필요한가 ──
+///   구버전은 `_ => ""` 였습니다. 그래서 bias.json 의 trade_schema 에 필드를
+///   추가해도 이 함수를 함께 고치지 않으면 그 필드는 카테고리를 못 받고,
+///   히트맵에서 통째로 사라졌습니다.
+///   (실측: items 6필드 중 5개가 정확히 이 경로로 소멸)
+///   규칙 폴백이 있으면 bias.json 만 고쳐도 새 필드가 자동으로 라우팅됩니다.
+///
+///  ── 순서가 의미를 갖습니다 ──
+///   'duty_rate' 는 'rate'(financials) 와 'duty_'(customs) 양쪽에 걸립니다.
+///   좁은 개념(customs / insurance / hazmat)을 먼저 검사해야 올바른 축으로 갑니다.
+fn trade_field_category_by_rule(field: &str) -> &'static str {
+    let f = field;
+
+    // ── 좁은 축부터 ──
+    if f.contains("hazard") || f.contains("packing_group") || f.contains("cas_")
+        || f.contains("un_number") || f.contains("flash_point") {
+        return "hazmat";
+    }
+    if f.contains("customs") || f.contains("duty") || f.contains("dutiable")
+        || f.contains("declaration") || f.contains("clearance") || f.contains("tariff") {
+        return "customs";
+    }
+    if f.contains("insur") || f.contains("polic") || f.contains("premium")
+        || f.contains("claim") || f.contains("coverage") {
+        return "insurance";
+    }
+    if f.contains("inspect") || f.contains("treatment") || f.contains("certificate")
+        || f.contains("survey") || f.contains("weighing") || f.contains("test_") {
+        return "inspection";
+    }
+    if f.contains("origin") || f.contains("fta_") || f.contains("preference") {
+        return "origin";
+    }
+
+    // ── 넓은 축 ──
+    if f.contains("port") || f.contains("vessel") || f.contains("flight")
+        || f.contains("voyage") || f.contains("terminal") || f.contains("conveyance") {
+        return "logistics";
+    }
+    if f.contains("weight") || f.contains("packages") || f.contains("pieces")
+        || f.contains("volume") || f.contains("measurement") || f.contains("marks") {
+        return "cargo";
+    }
+    if f.contains("amount") || f.contains("price") || f.contains("charge")
+        || f.contains("currency") || f.contains("rate") || f.contains("bank")
+        || f.contains("balance") {
+        return "financials";
+    }
+    if f.ends_with("_name") || f.ends_with("_address") || f.contains("party")
+        || f.contains("consignee") || f.contains("shipper") || f.contains("applicant") {
+        return "parties";
+    }
+    if f.contains("date") || f.contains("_no") || f.contains("number") {
+        return "header";
+    }
+
+    ""
+}
+
+/// 🌟 이 카테고리가 배열(반복 행) 스키마인지 답합니다.
+///
+///  ── 왜 이 함수가 logic.rs 에 있는가 ──
+///   merge_extracted(model.rs) 의 배열 승격, get_trade_category_schema(prompts.rs) 의
+///   `[ { ... } ]` 렌더링, plan_crops(vision_crop.rs) 의 TABLE UNION 이
+///   전부 같은 판정을 필요로 합니다. 세 곳이 각자 문자열을 비교하면
+///   카테고리 하나 추가할 때마다 셋이 어긋납니다.
+pub fn is_trade_array_category(category: &str) -> bool {
+    // 🌟 parties 는 스칼라 5축이므로 배열이 아닙니다.
+    //    반복되는 당사자는 other_parties 가 받습니다. (22-7 주석 참조)
+    matches!(
+        category,
+        "items" | "containers" | "other_parties" | "charges"
+            | "test_results" | "findings_and_damage" | "account_ledger"
+    )
 }
 
 /// 🌟 [EXTRACTION CATEGORIES] 비전 크롭 + LLM 추출이 순회하는 카테고리 목록.
@@ -913,7 +1318,32 @@ pub fn trade_field_category(field: &str) -> &'static str {
 ///  parsing.rs 의 get_trade_category_schema 가 소비하는 8개와 동일합니다.
 ///  items / containers 는 배열 스키마이며, 히트맵으로 위치를 찾은 뒤
 ///  그 영역 전체를 크롭해 표를 통째로 읽힙니다.
-pub const TRADE_EXTRACTION_CATEGORIES: [&str; 8] = [
-    "header", "parties", "logistics", "conditions",
+/// 🌟 [EXTRACTION CATEGORIES v2]
+///
+///  ── 왜 8개에서 16개로 늘리는가 ──
+///   45종 예시 대조에서 기존 8개 카테고리에 담을 수 없는 필드가
+///   customs(통관) / inspection(검사) / insurance(보험) / settlement(정산) /
+///   hazmat(위험물) / origin(원산지) / compliance(규제) / charges(요금명세)
+///   여덟 갈래로 나타났습니다.
+///   기존에는 이 필드들이 trade_field_category 에서 "" 를 받아 통째로 사라졌습니다.
+///
+///  ── 카테고리가 늘어도 호출 횟수는 서식마다 다릅니다 ──
+///   히트맵은 '그 서식에 실제로 로드된 필드가 있는 카테고리' 에만 생성됩니다.
+///   bias_schema 의 조건부 로드(base + overlay[doc_type])와 맞물려
+///     · CI 인보이스 → header/parties/logistics/conditions/financials/cargo/items/containers = 8
+///     · DGD        → 위 8 + hazmat = 9
+///     · COA        → 위 8 + inspection = 9
+///     · SOA        → header/parties/financials/settlement/charges = 5
+///   처럼 자동으로 좁혀집니다. 16개가 항상 전부 도는 것이 아닙니다.
+///
+///  ⚠️ 배열 여부는 is_trade_array_category() 가 단독으로 답합니다.
+///     이 배열의 순서는 크롭 추출 순서가 되므로,
+///     식별자(header)를 먼저 확정해 ALREADY CLAIMED 로 뒤 카테고리를 보호합니다.
+pub const TRADE_EXTRACTION_CATEGORIES: [&str; 17] = [
+    // ── base (전 서식 공통) ──
+    "header", "parties", "other_parties", "logistics", "conditions",
     "financials", "cargo", "items", "containers",
+    // ── overlay (서식별 조건부) ──
+    "customs", "inspection", "insurance", "settlement",
+    "hazmat", "origin", "compliance", "charges",
 ];

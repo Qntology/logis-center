@@ -1057,12 +1057,52 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
-        let mut guard = self.siglip2_model.lock().await;
-        if guard.is_some() {
-            return Ok(());
+    /// 🌟 [SIGLIP2 ENSURE v2] 필요한 인코더만 정확히 올립니다.
+    ///
+    ///  ── v1 의 결함 2가지 ──
+    ///   ① needs_text 무시
+    ///      `if guard.is_some() { return Ok(()); }` 가 요구 사양을 보지 않아,
+    ///      비전만 상주한 상태에서 ensure_siglip2(true) 가 그냥 성공했습니다.
+    ///      호출부는 텍스트가 준비된 줄 알고 진행하다가
+    ///        ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.
+    ///      로 조용히 실패합니다. 로그 한 줄만 남아 원인 추적이 불가능했습니다.
+    ///
+    ///   ② 비전 강제
+    ///      load_vision_only 를 무조건 먼저 호출하므로 텍스트만 필요한 경로도
+    ///      820MB 를 함께 올렸습니다. STEP 6 과 검색 질의 벡터 생성이 여기 해당하며,
+    ///      검색은 질의마다 반복되므로 누적 비용이 큽니다.
+    ///
+    ///  ── v2 ──
+    ///   (needs_vision, needs_text) 를 받아 '부족한 쪽만' 부착합니다.
+    ///   이미 상주한 가중치는 그대로 재사용하므로 전체 파기/재로딩이 없습니다.
+    ///   (Qwen3.5 의 VISION-JIT set_vision_active 와 같은 원리)
+    pub async fn ensure_siglip2_ext(&self, needs_vision: bool, needs_text: bool) -> anyhow::Result<()> {
+        let dir = std::path::PathBuf::from(&self.siglip2_model_path);
+
+        // ── ① 이미 상주 중이면 부족한 부분만 부착합니다 ──
+        {
+            let mut guard = self.siglip2_model.lock().await;
+            if let Some(model) = guard.as_mut() {
+                let want_v = needs_vision && !model.has_vision();
+                let want_t = needs_text && !model.has_text();
+                if !want_v && !want_t {
+                    return Ok(());
+                }
+                if want_v {
+                    model.load_vision_encoder(&dir)?;
+                }
+                if want_t {
+                    model.load_text_encoder(&dir)?;
+                }
+                println!(
+                    "[MODEL] SigLIP2 upgraded in place (vision: {}, text: {}). No full reload.",
+                    model.has_vision(), model.has_text()
+                );
+                return Ok(());
+            }
         }
 
+        // ── ② 신규 로드 ──
         let path = self.siglip2_model_path.clone();
         let dev = self.device_config.device.clone();
         let dtype = if self.is_cpu_mode {
@@ -1071,12 +1111,23 @@ impl LogisModel {
             candle_core::DType::BF16
         };
 
-        println!("[MODEL] Loading SigLIP2 Vision Encoder ({:?})...", dtype);
+        println!(
+            "[MODEL] Loading SigLIP2 ({:?}) | vision: {} | text: {}",
+            dtype, needs_vision, needs_text
+        );
 
         let model = tokio::task::spawn_blocking(move || {
             let dir = std::path::Path::new(&path);
             let config_path = dir.join("config.json");
             let config = crate::models::siglip2::Siglip2Config::from_json(&config_path)?;
+
+            // 🌟 텍스트만 필요하면 비전 가중치를 아예 읽지 않습니다. (~820MB 절약)
+            if !needs_vision && needs_text {
+                return crate::models::siglip2::Siglip2Model::load_text_only(
+                    dir, &config, &dev, dtype,
+                );
+            }
+
             let safetensors_path = dir.join("model.safetensors");
             let mut model = crate::models::siglip2::Siglip2Model::load_vision_only(
                 &safetensors_path,
@@ -1084,20 +1135,31 @@ impl LogisModel {
                 &dev,
                 dtype,
             )?;
+
             if needs_text {
-                // 🌟 디렉터리 경로를 전달합니다. 내부에서 model.safetensors 와
-                //    tokenizer.json 을 join 으로 찾습니다.
                 model.load_text_encoder(dir)?;
             }
+
             Ok::<_, anyhow::Error>(model)
         })
         .await??;
 
+        let mut guard = self.siglip2_model.lock().await;
+        if guard.is_some() {
+            // 락을 놓은 사이 다른 태스크가 로드를 마쳤습니다. 방금 만든 것은 버립니다.
+            return Ok(());
+        }
         *guard = Some(model);
-        println!("[MODEL] SigLIP2 Vision Encoder loaded successfully.");
+        println!("[MODEL] SigLIP2 loaded successfully.");
         Ok(())
     }
 
+    /// 🌟 [BACK-COMPAT] 기존 호출부를 살려 둡니다.
+    ///    구 시그니처는 '비전은 항상 필요' 를 전제했으므로 needs_vision=true 로 위임합니다.
+    pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
+        self.ensure_siglip2_ext(true, needs_text).await
+    }
+    
     /// 🌟 [SigLIP2 RELEASE] 비전+텍스트 인코더를 통째로 내리고 CUDA 캐시까지 반환합니다.
     ///
     ///  ── 왜 별도 헬퍼인가 ──
@@ -1317,12 +1379,65 @@ impl LogisModel {
                 .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
             drop(siglip_guard);
 
-            emit_term(&format!(
-                "  🧬 [PATCH GRID] {}x{} = {} patches | scale({:.3}, {:.3})",
-                grid.grid_cols, grid.grid_rows, grid.len(), grid.scale_x, grid.scale_y
-            ));
+            // ── STEP 2.5 : 판독성 맵 ──
+            //
+            // 🌟 [왜 if 블록 밖인가]
+            //  이 맵은 세 곳이 소비합니다.
+            //    · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
+            //    · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
+            //    · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
+            //  STEP 6 은 trade / commerce 분기 '밖' 에서 실행되므로,
+            //  분기 안에 선언하면 스코프를 벗어나 컴파일되지 않습니다.
+            //  커머스 경로도 동일한 판독성 판정이 필요하므로 모드 무관하게 1회 계산합니다.
+            //
+            // 🌟 [왜 임베딩이 아니라 픽셀인가]
+            //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
+            //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
+            //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
+            //  (실측: EXPORTER/CONSIGNEE 블러 블록, 빈 BUYER 박스가 여기서 잡힙니다)
+            let legibility = crate::models::siglip2::legibility::build_legibility_map(
+                &dynamic_image,
+                grid.grid_rows,
+                grid.grid_cols,
+                &emit_term,
+            );
+
+            // 🌟 [GROUNDING CLAIMS] STEP 6 검증에 넘길 (값, 출처 bbox) 기록.
+            //  분기 안에서 선언하면 STEP 6 이 볼 수 없으므로 여기서 만듭니다.
+            //  TRACKING fast-track / commerce 경로도 여기에 주장을 쌓으면
+            //  같은 검증을 그대로 받게 됩니다.
+            let mut grounding_claims:
+                Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
 
             if is_trade_doc {
+                emit_term(&format!(
+                    "  🧬 [PATCH GRID] {}x{} = {} patches | scale({:.3}, {:.3})",
+                    grid.grid_rows, grid.grid_cols, grid.len(), grid.scale_x, grid.scale_y
+                ));
+
+                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+                //  구분하지 못하므로, 크롭이 착지하면 2B 모델이 무언가를 지어냅니다.
+                //  빈 셀도 같습니다. BUYER (IF NOT CONSIGNEE) 박스는 내용이 비어 있는데
+                //  모델이 헤더 라벨을 값으로 읽어
+                //  recipient_name = "BUYER (IF NOT CONSIGNEE)" 를 반환했습니다.
+                //
+                // 🌟 [왜 임베딩이 아니라 픽셀인가]
+                //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
+                //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
+                //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
+                //
+                // 🌟 [소비처 3곳]
+                //  · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
+                //  · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
+                //  · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
+                //  한 번 계산해서 세 곳이 공유하므로 추가 비용이 없습니다.
+                let legibility = crate::models::siglip2::legibility::build_legibility_map(
+                    &dynamic_image,
+                    grid.grid_rows,
+                    grid.grid_cols,
+                    &emit_term,
+                );
+
                 emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
 
                 // ── STEP 2 : Doc Type NMS Battle ──
@@ -1379,10 +1494,20 @@ impl LogisModel {
                     ).await?;
 
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+
+                    // 🌟 [WHOLE-PAGE CLAIM] 크롭이 없으므로 출처 bbox 는 페이지 전체입니다.
+                    //    N_in = 전 패치이므로 √(2 ln 252) = 3.32 를 차감하는 엄격한 시험이 됩니다.
+                    //    그래도 '문서에 없는 운송장번호를 지어낸' 경우는 확실히 걸립니다.
+                    record_grounding_claims(
+                        &mut grounding_claims,
+                        "tracking",
+                        &extracted_data,
+                        (0, 0, grid.orig_width, grid.orig_height),
+                    );
+
                     if let Some(obj) = extracted_data.as_object_mut() {
                         obj.insert("doc_type".to_string(), json!("TRACKING"));
                     }
-
                 } else {
                     // 🌟 [STEP 3~5] 히트맵 → 크롭 → Qwen3.5 추출 파이프라인
                     emit_term("[STAGE-3] 🔥 Column Cosine Matching (Heatmap)...");
@@ -1431,54 +1556,98 @@ impl LogisModel {
                     final_data_map.insert("line_items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
+                    // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
+
                     for (idx, plan) in plans.iter().enumerate() {
                         if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
                             emit_term("🛑 Task cancelled by user. Terminating safely.");
                             return Ok(());
                         }
 
-                        let crop = crate::models::siglip2::vision_crop::crop_region(
-                            &dynamic_image, plan, 512
+                        // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
+                        let (tile_count, _why) =
+                            crate::models::siglip2::vision_crop::decide_tile_count(
+                                plan, &heatmaps, &grid, &legibility, &emit_term
+                            );
+                        let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
+                            plan.bbox, tile_count, 0.25
                         );
 
-                        emit_term(&format!(
-                            "    📤 [{}] {}x{} 크롭 전송 ({}/{})",
-                            plan.category, crop.width(), crop.height(), idx + 1, plans.len()
-                        ));
+                        for tile in tiles.iter() {
+                            // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
+                            let mut tile_plan = plan.clone();
+                            tile_plan.bbox = tile.bbox;
 
-                        // 🌟 [ALREADY CLAIMED] 앞선 크롭이 확정한 값을 함께 넘겨
-                        //    같은 숫자를 두 필드가 나눠 갖는 사고를 막습니다.
-                        let claimed = collect_claimed(&final_data_map);
-                        if !claimed.is_empty() {
+                            let crop = crate::models::siglip2::vision_crop::crop_region(
+                                &dynamic_image, &tile_plan, 512
+                            );
+
+                            let tile_tag = if tile.total > 1 {
+                                format!(" | 타일 {}/{}", tile.index + 1, tile.total)
+                            } else {
+                                String::new()
+                            };
                             emit_term(&format!(
-                                "    🔒 [ALREADY CLAIMED] 확정값 {}건을 금지 목록으로 전달합니다.",
-                                claimed.len()
+                                "    📤 [{}] {}x{} 크롭 전송 ({}/{}){}",
+                                plan.category, crop.width(), crop.height(),
+                                idx + 1, plans.len(), tile_tag
                             ));
+
+                            // 🌟 [ALREADY CLAIMED] 앞선 크롭·타일이 확정한 값을 금지 목록으로 전달합니다.
+                            //    겹침 타일에서 같은 값이 두 번 나오는 것은 정상이므로
+                            //    배열 카테고리는 이 목록을 넘기지 않습니다.
+                            //    (넘기면 두 번째 타일이 정당한 반복 행을 스스로 버립니다)
+                            let is_array_cat =
+                                plan.category == "items" || plan.category == "containers";
+                            let claimed = if is_array_cat {
+                                Vec::new()
+                            } else {
+                                collect_claimed(&final_data_map)
+                            };
+                            if !claimed.is_empty() {
+                                emit_term(&format!(
+                                    "    🔒 [ALREADY CLAIMED] 확정값 {}건을 금지 목록으로 전달합니다.",
+                                    claimed.len()
+                                ));
+                            }
+
+                            let prompt = crate::parsing::get_trade_crop_prompt(
+                                &plan.category,
+                                &detected_type,
+                                &plan.top_field,
+                                plan.score,
+                                &claimed,
+                            );
+
+                            let tile_res = self.chat_with_qwen3_5_image_spinner(
+                                "You are a highly precise document data extraction assistant.",
+                                &prompt,
+                                Some(crop),
+                                app_handle,
+                                "extraction-progress",
+                                json!({
+                                    "category": format!("Vision (Crop {}/{}{})", idx + 1, plans.len(), tile_tag),
+                                    "summary": format!("Extracting {}...", plan.category)
+                                }),
+                                1024,
+                                cancel_token.clone(),
+                                Some(task_id.clone()),
+                                None
+                            ).await?;
+
+                            let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+
+                            // 🌟 병합 '전' 에 이 타일이 주장한 값을 출처 bbox 와 함께 기록합니다.
+                            //    STEP 6 이 이 목록으로 접지 검증을 수행합니다.
+                            record_grounding_claims(
+                                &mut grounding_claims,
+                                &plan.category,
+                                &tile_json,
+                                tile.bbox,
+                            );
+
+                            merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                         }
-
-                        let prompt = crate::parsing::get_trade_crop_prompt(
-                            &plan.category,
-                            &detected_type,
-                            &plan.top_field,
-                            plan.score,
-                            &claimed,
-                        );
-
-                        let tile_res = self.chat_with_qwen3_5_image_spinner(
-                            "You are a highly precise document data extraction assistant.",
-                            &prompt,
-                            Some(crop),
-                            app_handle,
-                            "extraction-progress",
-                            json!({ "category": format!("Vision (Crop {}/{})", idx + 1, plans.len()), "summary": format!("Extracting {}...", plan.category) }),
-                            1024,
-                            cancel_token.clone(),
-                            Some(task_id.clone()),
-                            None
-                        ).await?;
-
-                        let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
-                        merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                     }
 
                     extracted_data = Value::Object(final_data_map);
@@ -1519,6 +1688,12 @@ impl LogisModel {
                         json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
                     ).await?;
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                    record_grounding_claims(
+                        &mut grounding_claims,
+                        "goods",
+                        &extracted_data,
+                        (0, 0, grid.orig_width, grid.orig_height),
+                    );
                 } else {
                     emit_term(&format!("[STAGE-5] 🤖 커머스 크롭 {}개 정제 추출", plans.len()));
                     let mut merged = serde_json::Map::new();
@@ -1572,7 +1747,14 @@ impl LogisModel {
                             None
                         ).await?;
 
-                        if let Some(v) = crate::parsing::parse_json_from_llm(&res).as_object() {
+                        let parsed = crate::parsing::parse_json_from_llm(&res);
+                        record_grounding_claims(
+                            &mut grounding_claims,
+                            &plan.category,
+                            &parsed,
+                            plan.bbox,
+                        );
+                        if let Some(v) = parsed.as_object() {
                             merge_extracted(&mut merged, &plan.category, &Value::Object(v.clone()), &emit_term);
                         }
                     }
@@ -1580,10 +1762,108 @@ impl LogisModel {
                 }
             }
             
-            // 🌟 [VRAM STAGE] SigLIP2 는 STEP 5 진입 직전에 이미 release_siglip2() 로
-            //    전량 반환되었습니다. 여기서 다시 손댈 대상이 없습니다.
-            //    (구버전은 STEP 5 가 전부 끝난 뒤에야 텍스트 인코더를 내려
-            //     Qwen3.5 로드 구간 내내 2.2GB 를 점유했습니다)
+            // ── STEP 6 : 값 접지 검증 ──
+            //
+            // 🌟 [왜 필요한가 — 실측 사고 3건]
+            //  ① reference_invoice = "CI-2026-08001"
+            //     문서 어디에도 없습니다. bias.json 설명문의 (e.g. CI-2026-08001) 복사입니다.
+            //     [SCHEMA ECHO] 게이트는 {String} 같은 플레이스홀더만 잡으므로 통과했습니다.
+            //  ② voyage_number = "26"
+            //     logistics 크롭에 항차가 없는데, 같은 크롭의 CI-43726 뒤 두 자리를 뗐습니다.
+            //  ③ recipient_name = "BUYER (IF NOT CONSIGNEE)"
+            //     빈 박스의 헤더 라벨을 값으로 읽었습니다.
+            //  셋 다 '문법적으로 완벽한 답' 이라 파싱 단계에서는 절대 걸러지지 않습니다.
+            //  픽셀에 그 값이 실제로 있는지 되묻는 것만이 유일한 검증입니다.
+            //
+            // 🌟 [VRAM 순서]
+            //  Qwen3.5(2GB) 해제 → SigLIP2 재로드 → 값 인코딩 1회 → 즉시 해제.
+            //  패치 임베딩(grid.patches)은 STEP 1 산출물이 CPU 메모리에 그대로 있으므로
+            //  (252 × 1152 × 4B ≈ 1.2MB) 비전 순전파를 다시 돌리지 않습니다.
+            if !grounding_claims.is_empty() {
+                emit_term(&format!(
+                    "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
+                    grounding_claims.len()
+                ));
+
+                // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
+                self.deep_purge_resources().await;
+
+                // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
+                //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
+                //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
+                let verdicts = match self.ensure_siglip2_ext(false, true).await {
+                    Err(e) => {
+                        emit_term(&format!(
+                            "  ⚪ [GROUNDING SKIP] SigLIP2 재로드 실패로 검증을 건너뜁니다: {}",
+                            e
+                        ));
+                        Vec::new()
+                    }
+                    Ok(_) => {
+                        let v = {
+                            let guard = self.siglip2_model.lock().await;
+                            match guard.as_ref() {
+                                Some(sig) if sig.has_text() => {
+                                    // 🌟 [BATCH ENCODE] 값마다 encode_query_text 를 부르면
+                                    //    텍스트 인코더 순전파가 값 개수만큼 반복됩니다.
+                                    //    고유 값을 한 번에 모아 encode_phrases 로 1회 처리하고,
+                                    //    검증 클로저는 색인 조회만 하도록 만듭니다.
+                                    let mut uniq: Vec<String> = Vec::new();
+                                    for c in grounding_claims.iter() {
+                                        if !uniq.iter().any(|e| e == &c.value) {
+                                            uniq.push(c.value.clone());
+                                        }
+                                    }
+                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(
+                                        sig, &uniq,
+                                    ).unwrap_or_default();
+
+                                    let mut table: std::collections::HashMap<&str, &Vec<f32>> =
+                                        std::collections::HashMap::new();
+                                    for (i, u) in uniq.iter().enumerate() {
+                                        if let Some(e) = embs.get(i) {
+                                            table.insert(u.as_str(), e);
+                                        }
+                                    }
+                                    emit_term(&format!(
+                                        "  🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
+                                        uniq.len()
+                                    ));
+
+                                    crate::models::siglip2::value_grounding::verify_claims(
+                                        &grounding_claims,
+                                        &grid.patches,
+                                        grid.grid_rows,
+                                        grid.grid_cols,
+                                        grid.orig_width,
+                                        grid.orig_height,
+                                        &legibility,
+                                        |t| table.get(t).map(|v| (*v).clone()).unwrap_or_default(),
+                                        &emit_term,
+                                    )
+                                }
+                                _ => {
+                                    emit_term("  ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.");
+                                    Vec::new()
+                                }
+                            }
+                        };
+                        self.release_siglip2("STEP 6 grounding complete").await;
+                        v
+                    }
+                };
+
+                // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
+                //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
+                //    (TRACKING fast-track / commerce 경로도 같은 변수를 쓰므로 경로 하나로 통일됩니다)
+                if let Some(map) = extracted_data.as_object_mut() {
+                    apply_grounding_verdicts(map, &verdicts, &emit_term);
+                } else {
+                    emit_term("  ⚪ [GROUNDING APPLY SKIP] 추출 결과가 객체가 아니라 폐기 판정을 적용할 수 없습니다.");
+                }
+            }
+
+            // 🌟 [VRAM STAGE-FINAL] 비전 벡터 저장 완료.
             let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
             emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", mode_name));
 
@@ -8778,12 +9058,189 @@ fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, Stri
     out
 }
 
+/// 🌟 [GROUNDING CLAIM 수집] 한 타일이 주장한 (필드, 값) 을 출처 bbox 와 함께 기록합니다.
+///
+///  ── 왜 병합 전에 기록하는가 ──
+///   병합 후에는 '이 값이 어느 크롭에서 왔는지' 가 사라집니다.
+///   접지 검증은 반드시 '값 ↔ 그 값을 주장한 픽셀 영역' 쌍이 있어야 성립하므로
+///   주장 시점에 붙잡아 둡니다.
+fn record_grounding_claims(
+    out: &mut Vec<crate::models::siglip2::value_grounding::GroundingClaim>,
+    category: &str,
+    incoming: &Value,
+    bbox: (u32, u32, u32, u32),
+) {
+    use crate::models::siglip2::value_grounding::GroundingClaim;
+
+    fn push_obj(
+        out: &mut Vec<GroundingClaim>,
+        category: &str,
+        o: &serde_json::Map<String, Value>,
+        bbox: (u32, u32, u32, u32),
+    ) {
+        for (k, v) in o.iter() {
+            let s = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if s.is_empty() || is_schema_echo(&s) {
+                continue;
+            }
+            // 같은 (필드, 값) 이 여러 타일에서 나오면 한 번만 검증합니다.
+            if out.iter().any(|c| c.field == *k && c.value == s) {
+                continue;
+            }
+            out.push(GroundingClaim {
+                category: category.to_string(),
+                field: k.clone(),
+                value: s,
+                bbox,
+            });
+        }
+    }
+
+    if let Some(o) = incoming.as_object() {
+        push_obj(out, category, o, bbox);
+    } else if let Some(arr) = incoming.as_array() {
+        for e in arr {
+            if let Some(o) = e.as_object() {
+                push_obj(out, category, o, bbox);
+            }
+        }
+    }
+}
+
+/// 🌟 [GROUNDING 반영] 접지 검증에서 폐기 판정된 값을 데이터에서 제거합니다.
+///
+///  ── 세 곳을 모두 지워야 합니다 ──
+///   ① 루트 평면 배치      : Dexie 인덱스(data.*)가 소비
+///   ② 카테고리 그룹 슬롯  : doc_number 탐색과 TRADING FLATTEN 이 소비
+///   ③ 배열 원소 필드      : line_items / containers 안의 같은 값
+///   한 곳이라도 남으면 폐기된 값이 그 경로로 되살아나 DB 를 오염시킵니다.
+///
+///  ── 왜 null 이 아니라 제거인가 ──
+///   merge_extracted 는 '빈 값은 덮지 않는다' 는 규칙을 갖습니다.
+///   null 로 남겨 두면 이후 재스캔에서 정상 값이 들어와도
+///   "이미 채워진 스칼라" 로 오인될 여지가 없어야 하므로 키 자체를 제거합니다.
+fn apply_grounding_verdicts(
+    merged: &mut serde_json::Map<String, Value>,
+    verdicts: &[crate::models::siglip2::value_grounding::GroundingVerdict],
+    emit: &dyn Fn(&str),
+) {
+    let rejected: Vec<&crate::models::siglip2::value_grounding::GroundingVerdict> =
+        verdicts.iter().filter(|v| !v.accepted).collect();
+    if rejected.is_empty() {
+        emit("  ✅ [GROUNDING APPLY] 폐기 대상이 없습니다. 전 값이 이미지에 접지되어 있습니다.");
+        return;
+    }
+
+    let same = |v: &Value, target: &str| -> bool {
+        match v {
+            Value::String(s) => s.trim() == target,
+            Value::Number(n) => n.to_string() == target,
+            _ => false,
+        }
+    };
+
+    let mut removed = 0usize;
+    for r in rejected.iter() {
+        // ① 루트
+        let hit_root = merged.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+        if hit_root {
+            merged.remove(&r.field);
+            removed += 1;
+        }
+
+        // ② 카테고리 그룹 슬롯
+        if let Some(slot) = merged.get_mut(&r.category) {
+            if let Some(o) = slot.as_object_mut() {
+                let hit = o.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+                if hit {
+                    o.remove(&r.field);
+                    removed += 1;
+                }
+            }
+        }
+
+        // ③ 배열 원소
+        for key in ["line_items", "items", "containers", "parties", "other_parties", "charges"] {
+            if let Some(arr) = merged.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for e in arr.iter_mut() {
+                    if let Some(o) = e.as_object_mut() {
+                        let hit = o.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+                        if hit {
+                            o.remove(&r.field);
+                            removed += 1;
+                        }
+                    }
+                }
+                // 전 필드가 사라진 빈 원소는 행이 아니라 잔해입니다.
+                arr.retain(|e| {
+                    e.as_object().map(|o| !o.is_empty()).unwrap_or(true)
+                });
+            }
+        }
+
+        emit(&format!(
+            "  🗑️ [GROUNDING APPLY] [{}] '{}' = \"{}\" 제거 | {}",
+            r.category, r.field, r.value, r.reason
+        ));
+    }
+
+    emit(&format!(
+        "  ✅ [GROUNDING APPLY] 폐기 {}건 | 데이터 지점 {}곳에서 제거",
+        rejected.len(),
+        removed
+    ));
+}
+
 fn merge_extracted(
     merged: &mut serde_json::Map<String, Value>,
     category: &str,
     incoming: &Value,
     emit: &dyn Fn(&str),
 ) {
+    // 🌟 [ARRAY CATEGORY COERCION]
+    //
+    //  ── 실측 사고 ──
+    //   items 크롭의 프롬프트 스키마는 `[ { ... } ]` 배열인데,
+    //   2B 모델은 행이 하나만 보이면 `{ ... }` 객체를 반환합니다.
+    //   구버전은 `incoming.as_object()` 가 Some 이면 배열 분기를 타지 않아,
+    //   description / quantity / unit / unit_price / total_price / hs_code 6개가
+    //   전부 '최상위 스칼라' 로 흘러들어갔고 line_items 는 빈 배열로 남았습니다.
+    //   (실측 결과 JSON: line_items: [] 이면서 루트에 description: "T-Shirt")
+    //   그 상태로 저장되면 Dexie 의 line_items 인덱스가 영원히 비고,
+    //   두 번째 행(Shorts)은 애초에 담을 그릇조차 없습니다.
+    //
+    //  ── 처방 ──
+    //   배열 카테고리에서 객체 하나가 오면 원소 1개짜리 배열로 승격합니다.
+    //   '스키마가 배열이면 결과도 배열' 이라는 계약을 코드가 강제합니다.
+    let is_array_category = category == "items" || category == "containers";
+
+    let coerced: Value;
+    let incoming = if is_array_category && incoming.is_object() {
+        let has_content = incoming.as_object().map(|o| {
+            o.values().any(|v| {
+                !(v.is_null()
+                    || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+                    || v.as_array().map(|a| a.is_empty()).unwrap_or(false))
+            })
+        }).unwrap_or(false);
+        if has_content {
+            emit(&format!(
+                "    🔧 [ARRAY COERCE] [{}] 단일 객체 응답을 원소 1개 배열로 승격합니다.",
+                category
+            ));
+            coerced = Value::Array(vec![incoming.clone()]);
+            &coerced
+        } else {
+            return;
+        }
+    } else {
+        incoming
+    };
+
     let obj = match incoming.as_object() {
         Some(o) => o,
         None => {
@@ -8793,15 +9250,44 @@ fn merge_extracted(
                 let slot = merged
                     .entry(category.to_string())
                     .or_insert_with(|| Value::Array(Vec::new()));
+
+                // 🌟 [ROW DEDUPE] 겹침 타일 분할은 같은 표 행을 두 타일이 함께 보게 만듭니다.
+                //    겹침 영역에서 나온 중복 행을 여기서 제거합니다.
+                //    판정은 '의미' 가 아니라 '정규화된 스칼라 값 집합의 완전 일치' 입니다.
+                let row_key = |v: &Value| -> String {
+                    let o = match v.as_object() { Some(o) => o, None => return v.to_string() };
+                    let mut parts: Vec<String> = o
+                        .iter()
+                        .filter_map(|(k, x)| match x {
+                            Value::String(s) if !s.trim().is_empty() => {
+                                Some(format!("{}={}", k, s.trim().to_lowercase()))
+                            }
+                            Value::Number(nn) => Some(format!("{}={}", k, nn)),
+                            _ => None,
+                        })
+                        .collect();
+                    parts.sort();
+                    parts.join("|")
+                };
+
+                let mut added = 0usize;
+                let mut dup = 0usize;
                 if let Some(existing) = slot.as_array_mut() {
+                    let mut keys: Vec<String> = existing.iter().map(row_key).collect();
                     for e in arr {
+                        let k = row_key(e);
+                        if k.is_empty() { continue; }
+                        if keys.iter().any(|x| x == &k) { dup += 1; continue; }
+                        keys.push(k);
                         existing.push(e.clone());
+                        added += 1;
                     }
                 }
                 emit(&format!(
-                    "    ➕ [{}] 배열 {}건 추가 (누적 {}건)",
+                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 (누적 {}건)",
                     category,
-                    arr.len(),
+                    added,
+                    dup,
                     merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
                 ));
             }

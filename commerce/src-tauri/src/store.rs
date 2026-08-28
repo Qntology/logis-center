@@ -911,8 +911,33 @@ impl VectorStore {
 
         println!("[DEBUG] store.upsert_item (v4) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
 
-        let _ = table.delete(&format!("id = '{}'", final_id)).await;
+        // 🌟 [VISION MARKER] '이 문서가 실제 비전 벡터를 갖는가' 를 데이터에 각인합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   비전 벡터가 없는 문서는 vec![0.0; 1152] 로 저장됩니다.
+        //   LanceDB 기본 거리는 L2 제곱이고, 정규화 질의 q 에 대해
+        //     ‖q − 0‖² = ‖q‖² = 1.00
+        //     ‖q − v‖² = 2 − 2·cos(q, v)
+        //   이므로 cos < 0.5 인 모든 실제 이미지 문서가 0 벡터보다 멀리 있습니다.
+        //   SigLIP2 는 logit_scale=4.7188 (temperature ≈ 112) 로 학습되어
+        //   이미지↔텍스트 코사인이 0.05~0.15 대역입니다. 0.5 에 절대 도달하지 않습니다.
+        //   → 비전 트랙이 텍스트 전용 문서 200건으로 창을 채우고
+        //     정작 이미지 문서는 한 건도 반환하지 않습니다. 의도와 정반대입니다.
+        //
+        //  ── 왜 별도 컬럼이 아니라 data 인가 ──
+        //   v4 봉투 계약은 '도메인 값은 전부 data 로' 입니다.
+        //   물리 컬럼을 늘리면 SCHEMA_VERSION 을 올려 전 테이블을 drop 해야 합니다.
+        //   canonical.rs 의 BOOL_PREFIX("has_") 규칙이 이 키를 0|1 로 자동 확정하고,
+        //   main.ts 의 동일 규칙이 Dexie 쪽 판정을 맞추므로 양쪽 수정이 전혀 필요 없습니다.
+        //
+        //  ⚠️ 기존에 저장된 이미지 문서에는 이 키가 없습니다.
+        //     재추출 전까지 비전 트랙에 잡히지 않지만, 잘못된 결과를 내는 것보다 낫습니다.
+        let has_real_vision = vision_vec
+            .as_ref()
+            .map(|v| v.len() == 1152 && v.iter().any(|&x| x != 0.0))
+            .unwrap_or(false);
 
+        let _ = table.delete(&format!("id = '{}'", final_id)).await;
         let mut final_data = data_val.clone();
         // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
         // 🌟 [MERGE FIX] 기존에는 final_data 를 decompressed 로 '전체 교체' 하여
@@ -999,6 +1024,11 @@ impl VectorStore {
             obj.insert("updated_at".to_string(), json!(updated_ts));
             if !new_digest.is_empty() {
                 obj.insert("digest".to_string(), json!(new_digest.clone()));
+            }
+            // 🌟 참일 때만 넣습니다. 키 부재 = 비전 벡터 없음이라는 뜻이 명확해지고,
+            //    LIKE 프리필터가 그대로 성립합니다.
+            if has_real_vision {
+                obj.insert("has_vision".to_string(), json!(1));
             }
         }
 
@@ -1176,7 +1206,8 @@ impl VectorStore {
     //
     //  ⚠️ [SCHEMA CONTRACT] 아래 인덱스는 init_all_tables 의 Field 선언 순서와 1:1 대응입니다.
     //     0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
-    //     9 data / 10 created_at / 11 updated_at / 12 vector / 13 text / 14 masked_text / 15 schema_v4
+    //     9 data / 10 created_at / 11 updated_at
+    //     12 vector(384) / 13 vision_vec(1152) / 14 text / 15 masked_text / 16 schema_v4
     //
     //     봉투 컬럼을 '중간에' 추가하면 뒤 인덱스가 전부 밀려 search_items(column(9)) 등
     //     다른 지점까지 조용히 깨집니다. 봉투를 늘려야 한다면 반드시 '끝에' 추가하고
@@ -1402,8 +1433,16 @@ impl VectorStore {
                 );
             }
             if !is_empty_vvec && dim_ok {
+                // 🌟 [ZERO-VECTOR EXCLUSION] 비전 벡터가 없는 문서를 ANN 대상에서 제외합니다.
+                //    이 필터가 없으면 0 벡터가 거리 1.00 으로 실제 이미지(≈1.80)를 전부 이깁니다.
+                //    (upsert_item 의 VISION MARKER 주석에 계산 근거가 있습니다)
+                //    serde_json 은 공백 없이 `"has_vision":1` 로 직렬화하므로 LIKE 가 정확히 맞습니다.
+                let vision_scope = match &scope {
+                    Some(f) => format!("({}) AND data LIKE '%\"has_vision\":1%'", f),
+                    None => "data LIKE '%\"has_vision\":1%'".to_string(),
+                };
                 let mut vvq = table.query();
-                if let Some(ref f) = scope { vvq = vvq.only_if(f.clone()); }
+                vvq = vvq.only_if(vision_scope.clone());
                 if let Ok(vvq_with_vector) = vvq.limit(fetch_limit).nearest_to(vvec.clone()) {
                     // 🌟 [VECTOR COLUMN 명시 — 필수]
                     //  1152차원 질의를 384차원 `vector` 컬럼에 던지면 차원 불일치로 실패합니다.
@@ -1424,7 +1463,11 @@ impl VectorStore {
                                 }
                             }
                             if vrank > 0 {
-                                println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec'.", vrank);
+                                println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec' (scope: {}).", vrank, vision_scope);
+                            } else {
+                                // 🌟 0건은 '비전 문서가 없다' 는 사실일 수도, 'has_vision 마커가 없는
+                                //    구세대 문서뿐' 이라는 뜻일 수도 있습니다. 둘을 구분해야 추적됩니다.
+                                println!("[STORE] ⚪ Vision track matched 0 rows. 이미지 추출 문서가 없거나, 마커 도입 이전에 저장되어 재추출이 필요합니다.");
                             }
                         }
                     } else {

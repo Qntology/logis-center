@@ -645,7 +645,12 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         .join(",\n");
 
     let schema = if is_array {
-        format!("[ {{\n{}\n}} ]", body)
+        // 🌟 [ARRAY SHAPE ENFORCEMENT] 원소를 두 개 제시해 '반복 구조' 를 눈으로 보여 줍니다.
+        //    구버전은 원소 하나짜리 `[ { ... } ]` 만 보여 줬고,
+        //    2B 모델은 표에서 한 행만 읽으면 대괄호를 벗겨 객체를 반환했습니다.
+        //    (실측: T-Shirt 행만 객체로 반환 → Shorts 행 소실)
+        //    원소를 두 개 세워 두면 '행마다 원소 하나' 라는 계약이 형태로 전달됩니다.
+        format!("[\n  {{\n{}\n  }},\n  {{\n{}\n  }}\n]", body, body)
     } else {
         format!("{{\n{}\n}}", body)
     };
@@ -662,14 +667,29 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         ""
     };
 
+    // 🌟 [ARRAY RULE] 표는 '행이 몇 개인지' 를 모델이 스스로 세어야 합니다.
+    //    실측에서 상품 표에 T-Shirt / Shorts 두 행이 있는데 한 행만 반환되었고,
+    //    두 번째 행은 파이프라인 어디에서도 복구할 수 없었습니다.
+    let array_rule = if is_array {
+        "\n[TABLE RULES]\n\
+         1. This category is a TABLE. Output one array element per printed row, in top-to-bottom order.\n\
+         2. Count the rows before you write. If you see three rows, the array has three elements.\n\
+         3. The two elements shown in SCHEMA are a shape example, not a row count.\n\
+         4. Never merge two rows into one element. Never split one row into two.\n\
+         5. If a cell in a row is blank, that element's field is null — do not borrow the value from the row above."
+    } else {
+        ""
+    };
+
     format!(
         "RULES: Output JSON ONLY. Every value in SCHEMA is null on purpose — replace a null ONLY with text you can actually read in the image.\n\
-         MISSION: Extract data for category '{}' of a {} document.{}\n\
+         MISSION: Extract data for category '{}' of a {} document.{}{}\n\
          [FIELD DEFINITIONS]\n{}{}\n\
          SCHEMA:\n{}",
         category.to_uppercase(),
         doc_type,
         reference_rule,
+        array_rule,
         defs,
         forbidden_block,
         schema

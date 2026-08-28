@@ -30,12 +30,220 @@ pub fn lang_code_of(lang: &str) -> String {
 pub fn canonical_bias_type(page_type: &str) -> &str {
     match page_type {
         "shipping_doc"
+        // ── 기존 27종 ──
         | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
         | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
         | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
-        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" => "shipping_doc",
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
+        // 🌟 [MISSING 18] trade_schema.overlay 에는 존재하는데 이 목록에 없어
+        //    canonical_bias_type 이 자기 자신을 반환하던 서식들입니다.
+        //    그 결과 bias_node() 의 세 경로(ko.{code} / ko.{canon} / ko.default)가
+        //    모두 실패해 label_phrase_bank 와 prejudice_phrase_bank 가
+        //    빈 배열을 돌려주었고, STEP 3 히트맵이 판정 근거를 잃었습니다.
+        //    multilingual_value_anchor_phrases_scoped 도 같은 함수를 쓰므로
+        //    저장 벡터의 다국어 축까지 함께 비어 크로스링구얼 리콜이 0 이 됩니다.
+        | "HBL"  // House Bill of Lading
+        | "FCR"  // Forwarder's Certificate of Receipt
+        | "POD"  // Proof of Delivery
+        | "LG"   // Letter of Guarantee
+        | "TR"   // Trust Receipt
+        | "LLC"  // Local Letter of Credit
+        | "TI"   // Tax Invoice
+        | "CP"   // Confirmation of Purchase
+        | "CM"   // Cargo Manifest
+        | "CCC"  // Customs Clearance Certificate
+        | "CNM"  // Certificate of Non-Manipulation
+        | "PC"   // Phytosanitary Certificate
+        | "COA"  // Certificate of Analysis
+        | "FI"   // Freight Invoice
+        | "CDR"  // Cargo Damage / Survey Report
+        | "ICF"  // Insurance Claim Form
+        | "SOA"  // Statement of Account
+        | "EL"   // Export License
+        // 🌟 [NEW 10] 사용자 지적 '미포함 서식' 중 무역 공용 사전으로 처리 가능한 것들.
+        //    개념이 갈리지 않으므로(SWB 의 pol 과 BL 의 pol 은 같은 개념)
+        //    공용 노드를 그대로 쓰는 것이 정확도를 해치지 않습니다.
+        | "BE"   // Bill of Exchange
+        | "SR"   // Shipping Request
+        | "BK"   // Booking Confirmation
+        | "WR"   // Warehouse Receipt
+        | "CSI"  // Consular Invoice
+        | "SWB"  // Sea Waybill
+        | "IP"   // Insurance Policy
+        | "DN"   // Debit Note
+        | "CN"   // Credit Note
+        | "FC"   // Fumigation Certificate
+        => "shipping_doc",
         _ => page_type,
     }
+}
+
+/// 🌟 [TRADE SCHEMA LOADER] bias.json 의 trade_schema 를 읽어
+///    (category, field, description) 삼중항을 돌려줍니다.
+///
+///  ── 왜 코드가 아니라 데이터가 소유해야 하는가 ──
+///   기존에는 이 목록이 get_detail_schema_fields 의 shipping_doc 분기에
+///   `add(...)` 호출로 하드코딩되어 있었고, 같은 목록이 bias.json 의
+///   trade_schema 에도 따로 존재했습니다.
+///   두 목록이 어긋난 결과가 실측 실패였습니다.
+///     · ⓑ에만 있던 items 6필드 → 비전 앵커 부재 → 표를 못 찾음
+///     · ⓐ에만 있던 place_receipt → 히트맵 질량만 먹고 결과 기여 0
+///   진실의 원천을 bias.json 하나로 고정하면 이 어긋남이 물리적으로 불가능해집니다.
+///
+///  ── 조건부 로드 ──
+///   doc_type 은 STEP 2 에서 이미 확정되어 이 함수에 들어옵니다.
+///   base 전체 + overlay[doc_type] 만 로드하므로,
+///   CI 인보이스에 위험물(un_number) · 식물검역(botanical_name) 앵커가
+///   올라가 히트맵을 오염시키는 일이 사라집니다.
+///
+///  ── 배열 카테고리 ──
+///   items / containers / parties / charges 등은 원소 스키마입니다.
+///   호출부(vision_encoder)가 카테고리 단위로 히트맵을 만들므로
+///   여기서는 평평한 필드 목록으로 돌려주고, 배열 여부는
+///   is_trade_array_category() 가 별도로 답합니다.
+pub fn trade_schema_triples(doc_type: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+
+    let node = match BIAS_DICT.get("trade_schema") {
+        Some(n) => n,
+        None => return out,
+    };
+
+    let mut absorb = |cat_obj: &Value, out: &mut Vec<(String, String, String)>| {
+        let map = match cat_obj.as_object() { Some(m) => m, None => return };
+        for (category, fields) in map {
+            let fmap = match fields.as_object() { Some(f) => f, None => continue };
+            for (field, desc) in fmap {
+                let d = desc.as_str().unwrap_or("").to_string();
+                // overlay 가 base 필드를 덮어쓰는 경우 설명만 교체합니다.
+                if let Some(slot) = out.iter_mut()
+                    .find(|(c, f, _)| c == category && f == field)
+                {
+                    if !d.trim().is_empty() { slot.2 = d; }
+                    continue;
+                }
+                out.push((category.clone(), field.clone(), d));
+            }
+        }
+    };
+
+    if let Some(base) = node.get("base") {
+        absorb(base, &mut out);
+    }
+
+    // 🌟 조건부 : 이 서식의 overlay 만 얹습니다.
+    if let Some(ov) = node.get("overlay").and_then(|o| o.get(doc_type)) {
+        absorb(ov, &mut out);
+    }
+
+    out
+}
+
+/// 🌟 [ALIAS-AWARE TRIPLES] trade_schema 삼중항에 '정준 필드 별칭' 을 앵커로 병합합니다.
+///
+///  ── 왜 여기서 하는가 ──
+///   별칭은 스키마 필드가 아니라 '그 필드를 부르는 다른 이름' 입니다.
+///   필드 목록에 넣으면 근거가 갈라지고, 프롬프트에 넣으면 모델이 중복 출력합니다.
+///   앵커 문자열에 섞는 것이 유일하게 안전한 위치입니다.
+pub fn canonical_trade_triples(doc_type: &str) -> Vec<(String, String, String)> {
+    let mut triples = trade_schema_triples(doc_type);
+
+    // 🌟 [ALIAS TABLE] 45종 예시 서식 대조에서 뽑은 '같은 개념의 다른 이름' 입니다.
+    //    특정 서식에 종속되지 않는 표준 표기이므로 어휘 하드코딩이 아니라
+    //    무역 서식 표기 규약의 목록입니다.
+    const ALIAS: &[(&str, &str)] = &[
+        ("doc_number",
+         "invoice number, commercial invoice number, bill of lading number, B/L no, \
+          air waybill number, AWB no, sea waybill number, house B/L number, HBL no, \
+          purchase order number, PO no, proforma invoice number, PI no, \
+          letter of credit number, L/C no, local L/C number, delivery order number, DO no, \
+          booking number, shipping request number, arrival notice number, shipping advice number, \
+          packing list number, certificate number, cert no, manifest number, \
+          declaration number, export declaration no, import declaration no, license number, \
+          policy number, claim number, statement number, tax invoice number, contract number, \
+          warehouse receipt number, forwarder's certificate of receipt number, FCR no, \
+          proof of delivery number, trust receipt number, bill of exchange number, \
+          consular invoice number, debit note number, credit note number, \
+          confirmation number, survey report number, visa number"),
+        ("package_count",
+         "number of packages, total packages, packages delivered, packages received, \
+          number of pieces, total pieces, no. of pkgs, CTNS, PKGS"),
+        ("weight_gross",
+         "total gross weight, gross weight kg, G.W., cargo gross weight, \
+          verified gross mass, VGM, chargeable weight"),
+        ("weight_net",
+         "total net weight, net weight kg, N.W., cargo net weight"),
+        ("volume",
+         "total measurement, measurement CBM, cubic meter, M3, measurement"),
+        ("amount",
+         "total amount, grand total, grand total amount, total invoice amount, \
+          total charge, total charges, total amount due, total amount paid, invoice amount, \
+          total invoice value, total FOB amount, total declared amount, \
+          total authorized value, total claim amount, total credit amount, total debit amount"),
+        ("amount_subtotal",
+         "sub total, subtotal, total items amount, total supply amount"),
+        ("amount_tax",
+         "total VAT amount, VAT amount, tax amount, supply amount"),
+        ("freight_payment_term",
+         "freight term, freight prepaid, freight collect"),
+        ("issue_date",
+         "submission date, date of issue, issued on"),
+    ];
+
+    for (canon, extra) in ALIAS.iter() {
+        if let Some(slot) = triples.iter_mut().find(|(_, f, _)| f == canon) {
+            // 설명문 뒤에 별칭을 이어 붙입니다. 타입 마커는 trade_desc_to_type 이
+            // 원문에서 읽으므로 순서가 바뀌어도 안전합니다.
+            if !slot.2.contains(extra) {
+                slot.2 = format!("{}, {}", slot.2.trim(), extra);
+            }
+        }
+    }
+
+    triples
+}
+
+/// bias.json 설명문에서 타입 마커를 떼어 앵커 문자열로 만듭니다.
+fn trade_desc_to_anchor(desc: &str) -> String {
+    let mut s = desc.to_string();
+    for m in ["{String}", "{Number}", "{Boolean}", "{Array}"] {
+        s = s.replace(m, " ");
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// bias.json 설명문의 타입 마커를 스키마 타입 문자열로 변환합니다.
+fn trade_desc_to_type(desc: &str) -> &'static str {
+    if desc.contains("{Number}") { "Number" }
+    else if desc.contains("{Boolean}") { "Boolean" }
+    else if desc.contains("{Array}") { "Array of Strings" }
+    else { "String" }
+}
+
+/// 🌟 이 카테고리가 배열(반복 행) 스키마인지 답합니다.
+///
+///  ── 판정 근거 ──
+///   trade_schema 의 값 형태가 아니라 '개념이 반복되는가' 입니다.
+///   items(품목 행) / containers(컨테이너 행) / parties(당사자 역할) /
+///   charges(요금 항목) / test_results(시험 항목) 등은
+///   한 문서에 여러 개가 인쇄되는 것이 정상입니다.
+///   스칼라로 다루면 두 번째 이후가 통째로 소실됩니다.
+///   (실측: 상품 표 2행 중 Shorts 행 소실)
+pub fn is_trade_array_category(category: &str) -> bool {
+    matches!(
+        category,
+        "items"
+            | "containers"
+            | "parties"
+            | "charges"
+            | "test_results"
+            | "findings_and_damage"
+            | "account_ledger"
+            | "adjustments"
+            | "packing_details"
+            | "licensed_items"
+            | "purchased_items"
+    )
 }
 
 pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
@@ -690,18 +898,69 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                 "repeated preference, recurring choice, habitual attribute, favourite option",
                 "identifier, code, url, link, date, price, status");
         },
+        // 🌟 [CONDITIONAL TRADE SCHEMA]
+        //
+        //  ── 왜 하드코딩을 버리는가 ──
+        //   Part 11 에서 이 분기를 bias.json 과 손으로 맞췄지만, 손으로 맞춘 것은
+        //   다음 필드 추가에서 다시 어긋납니다. 목록의 소유자를 하나로 만듭니다.
+        //
+        //  ── 왜 조건부인가 ──
+        //   page_type 은 여기 도달할 시점에 이미 STEP 2 가 확정한 서식 코드입니다.
+        //   (로그: "Document identified as: CI" 가 STAGE-3 보다 먼저 출력됩니다)
+        //   27개 서식 공통 목록을 쓰면
+        //     · CI 인보이스에 un_number / botanical_name / weighing_date 앵커가 올라가
+        //       무관한 영역과 코사인을 만들어 히트맵을 오염시키고
+        //     · 편견 구가 O(필드수 × 전체구수) 로 폭발합니다.
+        //       (실측 44필드에서 이미 13,598구. 388필드면 약 116만 구 = 대조 연산 86배)
+        //   base + overlay[doc_type] 만 로드하면 필드 1.6배 / 연산 2.8배로 그칩니다.
+        //
+        //  ── 별칭은 필드가 아니라 앵커 ──
+        //   invoice_number / bl_number / awb_number 같은 35개 '서식별 자기 번호' 는
+        //   전부 doc_number 입니다. 별도 필드로 만들면 같은 영역을 놓고 경쟁해
+        //   근거가 갈라지고 배타 배정에서 양쪽 다 굶습니다.
+        //   그 라벨들은 bias.json 의 doc_number 앵커(overlay)로 들어갑니다.
+        //   (실측 doc_number = "" 의 원인: 이미지엔 INVOICE NUMBER 라고 적혀 있는데
+        //    앵커에는 "document number identifier" 뿐이었습니다)
         "shipping_doc"
         | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
         | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
         | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
-        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" => {
-            // 🌟 [SCHEMA SOURCE UNIFICATION]
-            //
-            //  ── 무엇이 문제였나 ──
-            //   같은 문서 한 장을 처리하는데 스키마 소스가 두 개였습니다.
-            //     ⓐ 이 함수                      → STEP 3 비전 히트맵 앵커를 만든다
-            //     ⓑ bias.json 의 trade_schema    → STEP 5 크롭 프롬프트 필드를 만든다
-            //   즉 '어디를 볼지 정하는 목록' 과 '무엇을 뽑을지 시키는 목록' 이 달랐습니다.
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
+        | "HBL" | "FCR" | "POD" | "LG" | "TR" | "LLC" | "TI" | "CP" | "CM"
+        | "CCC" | "CNM" | "PC" | "COA" | "FI" | "CDR" | "ICF" | "SOA" | "EL"
+        | "BE" | "SR" | "BK" | "WR" | "CSI" | "SWB" | "IP" | "DN" | "CN" | "FC" => {
+            // ── 봉투/시스템 축 (trade_schema 에는 없지만 저장 파이프라인이 요구) ──
+            add("id,link", "", "id link document", "");
+            add("status", "String", "status state", "");
+
+            // ── trade_schema 에서 조건부 로드 ──
+            let triples = canonical_trade_triples(page_type);
+            if triples.is_empty() {
+                // bias.json 에 trade_schema 노드가 없는 극단 상황의 최소 방어선입니다.
+                add("doc_type", "String", "document type kind form", "");
+                add("doc_number", "String", "document number identifier", "");
+                add("issue_date", "String", "issue date", "");
+            } else {
+                let mut loaded_cats: Vec<String> = Vec::new();
+                for (category, field, desc) in triples.iter() {
+                    if !loaded_cats.iter().any(|c| c == category) {
+                        loaded_cats.push(category.clone());
+                    }
+                    // 🌟 desc 는 bias.json 의 설명문입니다. 여기서 타입 마커를 떼고
+                    //    영어 앵커로 씁니다. bias.json 의 ko.shipping_doc 노드가 있으면
+                    //    add() 내부에서 한국어 앵커가 추가로 붙습니다.
+                    let en_anchor = trade_desc_to_anchor(desc);
+                    let field_type = trade_desc_to_type(desc);
+                    add(field, field_type, &en_anchor, "");
+                }
+                println!(
+                    "[SCHEMA] 🚢 '{}' 조건부 로드: 카테고리 {}개 | 필드 {}개 (base + overlay)",
+                    page_type,
+                    loaded_cats.len(),
+                    triples.len()
+                );
+            }
+        },
             //
             //  ── 실측 피해 ──
             //   · ⓑ에만 있고 ⓐ에 없던 13개(package_unit / description / quantity / unit /

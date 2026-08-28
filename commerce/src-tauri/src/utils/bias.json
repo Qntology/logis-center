@@ -81,14 +81,17 @@
     "base": {
       "header": {
         "doc_type": "Document kind code {String}",
-        "doc_number": "Primary identifier of THIS document (B/L No, Invoice No, PO No) {String}",
+        "doc_number": "Primary identifier of THIS document, printed under the main title. Read the label next to it, whatever it is called on this form {String}",
         "issue_date": "Date of issue (YYYY-MM-DD) {String}",
+        "expiry_date": "Expiry, validity or latest date printed on this document {String}",
         "reference_po": "Referenced Purchase Order number printed on this document (e.g. PO-99281A) {String}",
         "reference_invoice": "Referenced Commercial Invoice number printed on this document (e.g. CI-2026-08001) {String}",
         "reference_bl": "Referenced Bill of Lading number printed on this document (e.g. BL-55432219) {String}",
+        "reference_master_bl": "Referenced Master Bill of Lading number covering this House B/L (e.g. MBL-55432219) {String}",
         "reference_lc": "Referenced Letter of Credit number printed on this document (e.g. LC-88492011) {String}",
         "reference_booking": "Referenced Booking number printed on this document (e.g. BK-2026-0822) {String}",
         "reference_contract": "Referenced Sales Contract number (e.g. SC-2026-0802) {String}",
+        "reference_sr": "Referenced Shipping Request number (e.g. SR-2026-0820) {String}",
         "reference_number": "Any OTHER reference number printed that does not fit the fields above {String}"
       },
       "parties": {
@@ -98,25 +101,50 @@
         "recipient_address": "Address of recipient {String}",
         "notify_party_name": "Notify party name {String}"
       },
+      "other_parties": {
+        "party_role": "The role printed above this party block, exactly as printed (Carrier, Insurer, Issuing Bank, Customs Broker, Drawer, Drawee, Payee, Warehouse Operator, Surveying Agency, Applicant, Claimant, Shipping Agent) {String}",
+        "party_name": "Company or person name of this party {String}",
+        "party_address": "Address of this party {String}",
+        "party_contact": "Phone, fax or email of this party {String}"
+      },
       "logistics": {
         "vessel": "Vessel name or Flight number {String}",
         "voyage_number": "Voyage or flight leg number {String}",
+        "flight_number": "Flight number for air shipments {String}",
         "pol": "Port of Loading / Airport of Departure {String}",
         "pod": "Port of Discharge / Airport of Destination {String}",
+        "place_receipt": "Place of Receipt {String}",
+        "place_delivery": "Place of Delivery {String}",
         "etd": "Estimated time of departure {String}",
         "eta": "Estimated time of arrival {String}",
-        "transport_mode": "Sea, Air, Road, Rail {String}"
+        "departure_date": "Actual departure or sailing date {String}",
+        "arrival_date": "Actual arrival date {String}",
+        "transport_mode": "Sea, Air, Road, Rail {String}",
+        "means_of_conveyance": "Means of conveyance as printed {String}"
       },
       "conditions": {
         "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
         "payment_terms": "T/T, L/C, Net30 {String}",
-        "freight_payment_term": "Freight Prepaid or Freight Collect {String}"
+        "freight_payment_term": "Freight Prepaid or Freight Collect {String}",
+        "latest_shipment_date": "Latest date of shipment allowed {String}",
+        "partial_shipments": "Whether partial shipments are allowed {String}",
+        "transshipment_allowed": "Whether transshipment is allowed {String}",
+        "special_instructions": "Special instructions or remarks printed on this document {String}"
       },
       "financials": {
         "currency": "ISO 4217 currency code {String}",
         "amount": "Grand total amount {Number}",
         "amount_subtotal": "Subtotal before tax and charges {Number}",
-        "amount_tax": "Tax or VAT amount {Number}"
+        "amount_tax": "Tax or VAT amount {Number}",
+        "freight_amount": "Freight charges only {Number}",
+        "insurance_amount": "Insurance charges only {Number}",
+        "local_charges": "Local handling charges {Number}",
+        "exchange_rate": "Exchange rate printed on this document {Number}",
+        "due_date": "Payment due date {String}",
+        "valid_until": "Date until which this document stays valid {String}",
+        "payment_status": "Payment status as printed {String}",
+        "account_number": "Bank account number for remittance {String}",
+        "swift_code": "SWIFT or BIC code {String}"
       },
       "cargo": {
         "package_count": "Total number of packages (NOT money) {Number}",
@@ -124,163 +152,734 @@
         "weight_gross": "Total gross weight {Number}",
         "weight_net": "Total net weight {Number}",
         "volume": "Total volume in CBM {Number}",
+        "chargeable_weight": "Chargeable weight for air freight {Number}",
         "marks_numbers": "Marks and numbers {String}"
       },
       "items": {
         "description": "Description of goods {String}",
+        "item_code": "Item, model or part code for this line {String}",
         "quantity": "Line item quantity {Number}",
         "unit": "Unit of measure {String}",
         "hs_code": "HS code / tariff number {String}",
+        "country_of_manufacture": "Country of manufacture or origin for this line {String}",
         "unit_price": "Unit price {Number}",
-        "total_price": "Line total {Number}"
+        "total_price": "Line total {Number}",
+        "item_net_weight": "Net weight of this line {Number}",
+        "item_gross_weight": "Gross weight of this line {Number}",
+        "item_package_count": "Number of packages for this line {Number}",
+        "item_package_type": "Package type for this line {String}"
       },
       "containers": {
         "container_number": "Container number (4 letters + 7 digits) {String}",
         "seal_number": "Seal number {String}",
-        "type_size": "Size and type (20GP, 40HC) {String}"
+        "type_size": "Size and type (20GP, 40HC) {String}",
+        "container_package_count": "Number of packages inside this container {Number}",
+        "container_gross_weight": "Gross weight of this container {Number}",
+        "container_measurement": "Measurement of this container in CBM {Number}"
       }
     },
     "overlay": {
-      "LC": {
+
+      "CI": {
+        "header": {
+          "doc_number": "The INVOICE NUMBER of this commercial invoice, printed under the title {String}"
+        },
         "financials": {
-          "tenor": "Tenor: at sight, 30 days, 60 days, 90 days {String}",
-          "lc_number": "Letter of Credit number {String}",
-          "issuing_bank": "Issuing bank name {String}",
-          "expiry_date": "L/C expiry date {String}"
+          "freight_charge": "Freight charge line on this invoice {Number}",
+          "insurance": "Insurance charge line on this invoice {Number}",
+          "grand_total_amount": "Grand total after freight and insurance {Number}"
         }
       },
-      "DGD": {
-        "cargo": {
-          "un_number": "UN number (e.g. UN1263) {String}",
-          "packing_group": "Packing group (I, II, III) {String}",
-          "proper_shipping_name": "Proper shipping name {String}"
-        }
-      },
-      "PHYTO": {
-        "conditions": {
-          "treatment_type": "Fumigation, Heat treatment, Cold treatment {String}"
-        }
-      },
-      "HC": {
-        "conditions": {
-          "health_status": "Health certification status {String}"
-        }
-      },
-      "BEN_CERT": {
-        "conditions": {
-          "beneficiary_statement": "Beneficiary certification statement {String}"
-        }
-      },
-      "INS": {
-        "financials": {
-          "insured_amount": "Insured amount {Number}",
-          "premium_amount": "Insurance premium {Number}"
+
+      "PI": {
+        "header": {
+          "doc_number": "The PROFORMA INVOICE NUMBER of this document {String}",
+          "reference_po": "Referenced Purchase Order number (e.g. PO-99281A) {String}"
         },
         "conditions": {
-          "policy_number": "Insurance policy number {String}",
-          "coverage_type": "Coverage type (All Risks, FPA, WA) {String}"
+          "estimated_shipment_date": "Estimated shipment date offered {String}"
         }
       },
-      "HBL": {
+
+      "PO": {
         "header": {
-          "reference_hbl": "This House B/L number itself (e.g. HBL-55432219-01) {String}"
+          "doc_number": "The PURCHASE ORDER NUMBER of this order {String}"
+        },
+        "conditions": {
+          "expected_ship_date": "Expected ship date requested by buyer {String}",
+          "expected_delivery_date": "Expected delivery date requested by buyer {String}"
+        },
+        "financials": {
+          "discount": "Discount applied to this order {Number}"
         }
       },
-      "FCR": {
+
+      "SC": {
         "header": {
-          "reference_hbl": "Referenced House B/L number (e.g. HBL-55432219-01) {String}"
+          "doc_number": "The CONTRACT NUMBER of this sales contract {String}",
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+        },
+        "conditions": {
+          "governing_law": "Governing law clause {String}",
+          "arbitration": "Arbitration clause {String}",
+          "estimated_shipment_date": "Estimated shipment date agreed {String}"
         }
       },
-      "POD": {
+
+      "LC": {
         "header": {
-          "reference_do": "Referenced Delivery Order number (e.g. DO-SFO-20260911) {String}"
+          "doc_number": "The CREDIT NUMBER of this letter of credit {String}"
+        },
+        "financials": {
+          "tenor": "Tenor of this credit as printed {String}",
+          "usance_tenor_days": "Number of days for usance, as a plain number {Number}"
+        },
+        "conditions": {
+          "required_documents": "Documents required for negotiation, as printed {String}"
         }
       },
+
+      "LLC": {
+        "header": {
+          "doc_number": "The LOCAL L/C NUMBER of this domestic credit {String}",
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number (e.g. CP-2026-KR-0419) {String}"
+        },
+        "financials": {
+          "amount_krw": "Credit amount in local currency {Number}"
+        },
+        "conditions": {
+          "latest_shipment_date": "Latest shipment date under this local credit {String}"
+        }
+      },
+
+      "CP": {
+        "header": {
+          "doc_number": "The CONFIRMATION NUMBER of this purchase confirmation {String}",
+          "reference_export_decl": "Referenced Export Declaration number (e.g. ED-2026-KR-77102) {String}"
+        },
+        "financials": {
+          "total_amount_krw": "Total amount in local currency {Number}",
+          "tax_rate": "Tax rate applied {Number}"
+        }
+      },
+
+      "BE": {
+        "header": {
+          "doc_number": "The DRAFT NUMBER or bill of exchange number {String}"
+        },
+        "financials": {
+          "tenor": "Tenor of this draft as printed {String}",
+          "maturity_date": "Maturity date of this draft {String}",
+          "drawn_under_terms": "The credit or contract this draft is drawn under {String}"
+        }
+      },
+
+      "TR": {
+        "header": {
+          "doc_number": "The TRUST RECEIPT NUMBER of this document {String}",
+          "reference_lg": "Referenced Letter of Guarantee number (e.g. LG-SFO-20260909) {String}"
+        },
+        "financials": {
+          "maturity_date": "Maturity date of this trust receipt {Number}"
+        },
+        "conditions": {
+          "ownership_clause": "Ownership clause as printed {String}",
+          "purpose": "Stated purpose of releasing the goods {String}"
+        }
+      },
+
       "LG": {
         "header": {
+          "doc_number": "The GUARANTEE NUMBER of this letter of guarantee {String}",
           "reference_bl": "Referenced Bill of Lading number covered by this Letter of Guarantee {String}"
         }
       },
-      "TR": {
+
+      "EL": {
         "header": {
-          "reference_lg": "Referenced Letter of Guarantee number (e.g. LG-SFO-20260909) {String}"
+          "doc_number": "The LICENCE NUMBER of this export licence {String}",
+          "reference_contract": "Referenced Sales Contract number {String}",
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+        },
+        "compliance": {
+          "eccn": "Export Control Classification Number {String}",
+          "license_condition": "Conditions attached to this licence {String}"
         }
       },
-      "LLC": {
+
+      "PL": {
         "header": {
-          "reference_purchase_confirm": "Referenced Purchase Confirmation number (e.g. CP-2026-KR-0419) {String}"
+          "doc_number": "The PACKING LIST NUMBER of this document {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
         }
       },
-      "TI": {
+
+      "BL": {
         "header": {
-          "reference_purchase_confirm": "Referenced Purchase Confirmation number {String}",
-          "reference_local_lc": "Referenced Local L/C number (e.g. LLC-2026-KR-0911) {String}"
+          "doc_number": "The B/L NUMBER of this bill of lading {String}"
+        },
+        "conditions": {
+          "freight_term": "Freight term as printed on this B/L {String}"
         }
       },
-      "CP": {
+
+      "HBL": {
         "header": {
-          "reference_export_decl": "Referenced Export Declaration number (e.g. ED-2026-KR-77102) {String}"
+          "doc_number": "The HOUSE B/L NUMBER of this document {String}",
+          "reference_master_bl": "The Master B/L number covering this House B/L {String}"
         }
       },
+
+      "SWB": {
+        "header": {
+          "doc_number": "The WAYBILL NUMBER of this sea waybill {String}"
+        },
+        "conditions": {
+          "non_negotiable": "Whether this waybill is marked non-negotiable {String}"
+        }
+      },
+
+      "AWB": {
+        "header": {
+          "doc_number": "The AIR WAYBILL NUMBER of this document {String}"
+        },
+        "logistics": {
+          "airport_of_departure": "Airport of departure {String}",
+          "airport_of_destination": "Airport of destination {String}"
+        },
+        "cargo": {
+          "rate_class": "Rate class code {String}",
+          "number_of_pieces": "Number of pieces {Number}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "SR": {
+        "header": {
+          "doc_number": "The SHIPPING REQUEST NUMBER of this document {String}"
+        }
+      },
+
+      "BC": {
+        "header": {
+          "doc_number": "The BOOKING NUMBER of this confirmation {String}"
+        },
+        "logistics": {
+          "cargo_closing_date": "Cargo closing or cut-off date {String}",
+          "container_allocation": "Container allocation as printed {String}"
+        }
+      },
+
+      "BK": {
+        "header": {
+          "doc_number": "The BOOKING NUMBER of this confirmation {String}",
+          "reference_sr": "Referenced Shipping Request number (e.g. SR-2026-0820) {String}"
+        },
+        "logistics": {
+          "cargo_closing_date": "Cargo closing or cut-off date {String}",
+          "container_allocation": "Container allocation as printed {String}"
+        }
+      },
+
+      "SA": {
+        "header": {
+          "doc_number": "The ADVICE NUMBER of this shipping advice {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "conditions": {
+          "attached_documents": "Documents attached to this advice, as printed {String}"
+        }
+      },
+
+      "DO": {
+        "header": {
+          "doc_number": "The DELIVERY ORDER NUMBER of this document {String}",
+          "reference_bl": "Referenced Bill of Lading number (e.g. BL-55432219) {String}"
+        },
+        "conditions": {
+          "release_instruction": "Release instruction as printed {String}",
+          "pickup_location": "Where the cargo is to be picked up {String}"
+        }
+      },
+
+      "AN": {
+        "header": {
+          "doc_number": "The NOTICE NUMBER of this arrival notice {String}",
+          "reference_bl": "Referenced Bill of Lading number (e.g. BL-55432219) {String}"
+        },
+        "logistics": {
+          "terminal_of_discharge": "Terminal where cargo is discharged {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "POD": {
+        "header": {
+          "doc_number": "The POD NUMBER of this proof of delivery {String}",
+          "reference_do": "Referenced Delivery Order number (e.g. DO-SFO-20260911) {String}"
+        },
+        "conditions": {
+          "delivery_status": "Delivery status as printed {String}",
+          "delivery_location": "Where the cargo was delivered {String}",
+          "received_by": "Name of the person who signed for receipt {String}"
+        }
+      },
+
+      "FCR": {
+        "header": {
+          "doc_number": "The FCR NUMBER of this forwarder's certificate of receipt {String}",
+          "reference_hbl": "Referenced House B/L number (e.g. HBL-55432219-01) {String}"
+        },
+        "conditions": {
+          "undertaking_statement": "The forwarder's undertaking statement as printed {String}",
+          "date_received": "Date the goods were received {String}"
+        }
+      },
+
+      "WR": {
+        "header": {
+          "doc_number": "The RECEIPT NUMBER of this warehouse receipt {String}"
+        },
+        "conditions": {
+          "storage_term": "Storage term as printed {String}",
+          "warehouse_location": "Warehouse location {String}",
+          "date_received": "Date the goods were received into storage {String}",
+          "inspection_on_arrival": "Condition noted on arrival {String}"
+        }
+      },
+
       "CM": {
         "header": {
+          "doc_number": "The MANIFEST NUMBER of this cargo manifest {String}",
           "reference_export_decl": "Referenced Export Declaration number {String}"
+        },
+        "logistics": {
+          "flag_state": "Flag state of the vessel {String}"
+        },
+        "cargo": {
+          "total_bills_of_lading": "Total number of bills of lading on this manifest {Number}",
+          "total_containers": "Total number of containers on this manifest {Number}"
         }
       },
-      "CCC": {
+
+      "FI": {
         "header": {
-          "reference_import_decl": "Referenced Import Declaration number (e.g. ID-2026-US-99120) {String}",
+          "doc_number": "The INVOICE NUMBER of this freight invoice {String}",
+          "reference_booking": "Referenced Booking number (e.g. BK-2026-0822) {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "ED": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this export declaration {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "customs": {
+          "declaration_date": "Date this declaration was filed {String}",
+          "clearance_date": "Date customs cleared this declaration {String}",
+          "customs_office_code": "Customs office code {String}",
+          "port_code": "Port code as printed {String}",
+          "port_name": "Port name as printed {String}",
+          "export_permission": "Export permission status {String}"
+        },
+        "financials": {
+          "exchange_rate": "Exchange rate applied by customs {Number}"
+        }
+      },
+
+      "ID": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this import declaration {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "customs": {
+          "declaration_date": "Date this declaration was filed {String}",
+          "clearance_date": "Date customs cleared this declaration {String}",
+          "customs_office_code": "Customs office code {String}",
+          "duty_rate": "Tariff rate applied {Number}",
+          "duty_amount": "Total duty assessed {Number}",
+          "dutiable_value": "Dutiable value or tax base {Number}",
+          "inspection_status": "Customs inspection status {String}",
+          "pccc_number": "Personal customs clearance code for B2C shipments {String}"
+        }
+      },
+
+      "CINV": {
+        "header": {
+          "doc_number": "The INVOICE NUMBER of this customs invoice {String}",
           "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
         }
       },
+
+      "CSI": {
+        "header": {
+          "doc_number": "The CONSULAR INVOICE NUMBER of this document {String}"
+        },
+        "customs": {
+          "visa_number": "Consular visa number {String}"
+        },
+        "financials": {
+          "legalization_fee": "Legalization fee charged {Number}"
+        }
+      },
+
+      "CO": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of origin {String}"
+        },
+        "origin": {
+          "origin_criterion": "Origin criterion as printed {String}",
+          "origin_certificate_type": "Type of origin certificate {String}",
+          "fta_agreement_code": "FTA agreement under which this certificate is issued {String}",
+          "preference_indicator": "Preferential tariff indicator {String}"
+        },
+        "conditions": {
+          "declaration": "The exporter's declaration text as printed {String}"
+        }
+      },
+
       "CNM": {
         "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this non-manipulation certificate {String}",
           "reference_origin": "Referenced Certificate of Origin number {String}"
+        },
+        "logistics": {
+          "port_of_transshipment": "Port where transshipment took place {String}",
+          "arrival_vessel": "Vessel the cargo arrived on {String}",
+          "departure_vessel": "Vessel the cargo departed on {String}"
+        },
+        "inspection": {
+          "certification_statement": "The certifying statement as printed {String}"
         }
       },
-      "PC": {
+
+      "CCC": {
         "header": {
-          "reference_fumigation": "Referenced Fumigation Certificate number (e.g. FC-2026-0825) {String}"
+          "doc_number": "The CERTIFICATE NUMBER of this customs clearance certificate {String}",
+          "reference_import_decl": "Referenced Import Declaration number (e.g. ID-2026-US-99120) {String}",
+          "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
+        },
+        "customs": {
+          "entry_type": "Entry type as printed {String}",
+          "customs_status": "Customs clearance status {String}",
+          "clearance_date": "Date of release {String}",
+          "dutiable_value": "Entered value {Number}",
+          "duty_amount": "Duty paid {Number}"
         }
       },
+
+      "IC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this inspection certificate {String}"
+        },
+        "inspection": {
+          "inspection_date": "Date of inspection {String}",
+          "inspection_place": "Place of inspection {String}",
+          "inspection_scope": "Scope of the inspection {String}",
+          "inspection_result": "Result of the inspection {String}"
+        }
+      },
+
       "COA": {
         "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}",
           "reference_inspection": "Referenced Inspection Certificate number (e.g. IC-2026-0825) {String}"
+        },
+        "inspection": {
+          "inspection_result": "Overall result as printed {String}",
+          "test_summary": "Summary of the analysis {String}"
+        },
+        "test_results": {
+          "test_item": "Name of the tested item or parameter {String}",
+          "test_method": "Test method used {String}",
+          "test_specification": "Specification or acceptance range {String}",
+          "test_value": "Measured result for this item {String}"
         }
       },
-      "FI": {
+
+      "WC": {
         "header": {
-          "reference_booking": "Referenced Booking number (e.g. BK-2026-0822) {String}"
+          "doc_number": "The CERTIFICATE NUMBER of this weight certificate {String}"
+        },
+        "inspection": {
+          "weighing_date": "Date of weighing {String}",
+          "weighing_location": "Location where weighing took place {String}",
+          "certification_statement": "The certifying statement as printed {String}"
+        },
+        "cargo": {
+          "verified_gross_mass": "Verified gross mass as certified {Number}",
+          "container_tare_weight": "Tare weight of the container {Number}"
         }
       },
+
+      "CA": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}"
+        },
+        "inspection": {
+          "inspection_result": "Overall result as printed {String}",
+          "test_summary": "Summary of the analysis {String}"
+        }
+      },
+
+      "PHYTO": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}"
+        },
+        "inspection": {
+          "treatment_type": "Type of treatment applied {String}",
+          "treatment_date": "Date of treatment {String}",
+          "treatment_chemical": "Chemical and concentration used {String}",
+          "treatment_duration": "Duration and temperature of treatment {String}"
+        },
+        "origin": {
+          "botanical_name": "Botanical name of the plant product {String}",
+          "place_of_origin": "Place of origin as declared {String}"
+        }
+      },
+
+      "PC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}",
+          "reference_fumigation": "Referenced Fumigation Certificate number (e.g. FC-2026-0825) {String}"
+        },
+        "inspection": {
+          "treatment_type": "Type of treatment applied {String}",
+          "treatment_date": "Date of treatment {String}",
+          "treatment_chemical": "Chemical and concentration used {String}",
+          "treatment_duration": "Duration and temperature of treatment {String}"
+        },
+        "origin": {
+          "botanical_name": "Botanical name of the plant product {String}",
+          "place_of_origin": "Place of origin as declared {String}"
+        },
+        "logistics": {
+          "means_of_conveyance": "Means of conveyance as declared {String}"
+        }
+      },
+
+      "FC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this fumigation certificate {String}"
+        },
+        "inspection": {
+          "treatment_date": "Date of treatment {String}",
+          "treatment_place": "Place of treatment {String}",
+          "treatment_chemical": "Chemical used {String}",
+          "treatment_dosage": "Dosage applied {String}",
+          "treatment_duration": "Exposure period {String}",
+          "treatment_temperature": "Minimum temperature during treatment {String}",
+          "ispm15_mark": "Whether the ISPM 15 mark is applied {String}"
+        }
+      },
+
+      "HC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this health certificate {String}"
+        },
+        "inspection": {
+          "health_status": "Health certification status as printed {String}",
+          "certification_statement": "The certifying statement as printed {String}"
+        }
+      },
+
+      "BEN_CERT": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this beneficiary certificate {String}"
+        },
+        "inspection": {
+          "certification_statement": "The beneficiary's certifying statement as printed {String}"
+        }
+      },
+
       "CDR": {
         "header": {
+          "doc_number": "The REPORT NUMBER of this survey report {String}",
           "reference_policy": "Referenced Insurance Policy number (e.g. IP-2026-08200) {String}",
           "reference_pod": "Referenced Proof of Delivery number (e.g. POD-SFO-20260912) {String}"
+        },
+        "inspection": {
+          "inspection_date": "Date of survey {String}",
+          "inspection_place": "Place of survey {String}",
+          "surveyor_conclusion": "The surveyor's conclusion as printed {String}"
+        },
+        "findings_and_damage": {
+          "finding": "What was found on this line {String}",
+          "affected_quantity": "Quantity affected on this line {Number}",
+          "nature_of_damage": "Nature of the damage {String}",
+          "cause_of_damage": "Cause of the damage {String}",
+          "estimated_loss": "Estimated loss amount for this line {Number}"
+        },
+        "cargo": {
+          "sound_packages": "Number of sound packages {Number}",
+          "damaged_packages": "Number of damaged packages {Number}"
         }
       },
+
+      "DGD": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this dangerous goods declaration {String}"
+        },
+        "hazmat": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "hazard_class": "Hazard class {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}",
+          "emergency_contact": "24-hour emergency contact number {String}"
+        }
+      },
+
+      "MSDS": {
+        "hazmat": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "hazard_class": "Hazard class {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}",
+          "cas_number": "CAS registry number of the substance {String}",
+          "flash_point": "Flash point of the substance {Number}",
+          "emergency_contact": "24-hour emergency contact number {String}"
+        }
+      },
+
+      "POA": {
+        "header": {
+          "doc_number": "The REFERENCE NUMBER of this power of attorney {String}"
+        }
+      },
+
+      "BIZ_LIC": {
+        "header": {
+          "doc_number": "The REGISTRATION NUMBER on this business licence {String}"
+        }
+      },
+
+      "INS": {
+        "header": {
+          "doc_number": "The POLICY NUMBER of this insurance policy {String}"
+        },
+        "insurance": {
+          "insured_amount": "Insured amount {Number}",
+          "premium": "Insurance premium {Number}",
+          "coverage_condition": "Coverage conditions as printed {String}",
+          "valuation_basis": "Basis on which the insured value was calculated {String}",
+          "claims_payable_at": "Where claims are payable {String}",
+          "effective_date": "Date cover takes effect {String}"
+        }
+      },
+
+      "IP": {
+        "header": {
+          "doc_number": "The POLICY NUMBER of this insurance policy {String}"
+        },
+        "insurance": {
+          "insured_amount": "Insured amount {Number}",
+          "premium": "Insurance premium {Number}",
+          "coverage_condition": "Coverage conditions as printed {String}",
+          "valuation_basis": "Basis on which the insured value was calculated {String}",
+          "claims_payable_at": "Where claims are payable {String}",
+          "effective_date": "Date cover takes effect {String}"
+        }
+      },
+
       "ICF": {
         "header": {
+          "doc_number": "The CLAIM NUMBER of this insurance claim {String}",
           "reference_policy": "Referenced Insurance Policy number {String}",
           "reference_survey": "Referenced Cargo Damage / Survey Report number (e.g. CDR-2026-SFO-0912) {String}"
+        },
+        "insurance": {
+          "claim_date": "Date the claim was filed {String}",
+          "cause_of_loss": "Cause of the loss {String}",
+          "place_of_loss": "Place where the loss occurred {String}",
+          "claim_amount": "Amount claimed {Number}"
+        },
+        "conditions": {
+          "enclosed_documents": "Documents enclosed with this claim, as printed {String}"
         }
       },
+
       "SOA": {
         "header": {
+          "doc_number": "The STATEMENT NUMBER of this statement of account {String}",
           "reference_debit_note": "Referenced Debit Note number (e.g. DN-2026-0912) {String}",
           "reference_credit_note": "Referenced Credit Note number (e.g. CN-2026-0915) {String}",
           "reference_claim": "Referenced Insurance Claim number (e.g. ICF-2026-0914) {String}"
+        },
+        "settlement": {
+          "account_status": "Account status as printed {String}",
+          "closure_date": "Date the account was closed {String}"
+        },
+        "account_ledger": {
+          "transaction_date": "Date of this transaction {String}",
+          "transaction_reference": "Reference number for this transaction {String}",
+          "debit": "Debit amount on this line {Number}",
+          "credit": "Credit amount on this line {Number}",
+          "balance": "Running balance after this line {Number}"
         }
       },
-      "EL": {
+
+      "DN": {
         "header": {
-          "reference_contract": "Referenced Sales Contract number {String}",
-          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+          "doc_number": "The DEBIT NOTE NUMBER of this document {String}"
+        },
+        "settlement": {
+          "reason_for_debit": "Reason for this debit as printed {String}",
+          "payment_instructions": "Payment instructions as printed {String}",
+          "payment_status": "Payment status as printed {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
         }
       },
-      "SC": {
+
+      "CN": {
         "header": {
-          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+          "doc_number": "The CREDIT NOTE NUMBER of this document {String}"
+        },
+        "settlement": {
+          "reason_for_credit": "Reason for this credit as printed {String}",
+          "settlement_instructions": "Settlement instructions as printed {String}"
+        },
+        "charges": {
+          "charge_code": "Adjustment code as printed {String}",
+          "charge_description": "What this adjustment is for {String}",
+          "charge_rate": "Rate applied to this adjustment {Number}",
+          "charge_amount": "Amount of this adjustment {Number}"
+        }
+      },
+
+      "TI": {
+        "header": {
+          "doc_number": "The TAX INVOICE NUMBER of this document {String}",
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number {String}",
+          "reference_local_lc": "Referenced Local L/C number (e.g. LLC-2026-KR-0911) {String}"
+        },
+        "settlement": {
+          "vat_type": "VAT type as printed {String}"
+        },
+        "financials": {
+          "amount_subtotal": "Total supply amount before tax {Number}",
+          "amount_tax": "Total VAT amount {Number}",
+          "amount": "Grand total including tax {Number}"
         }
       }
     }
@@ -1526,6 +2125,275 @@
         "semantic": "HS코드, 관세분류번호",
         "bias": "HS코드, 세번, 관세분류번호, 품목분류, HS code, HS No, tariff number, tariff classification, HTS",
         "prejudice": "컨테이너번호, 씰번호, 서류번호, 부킹번호, 중량, 금액, 통화, 발행일, 항구, 선박명"
+      },
+
+      "no": {
+        "semantic": "일련번호, 항목번호, 순번",
+        "bias": "번호, 순번, 연번, 항목번호, 일련번호, No, S/No, Item No, line number, serial number",
+        "prejudice": "서류번호, 문서번호, 선하증권번호, 인보이스번호, 컨테이너번호, 씰번호, HS코드, 중량, 금액, 발행일"
+      },
+      "expiry_date": {
+        "semantic": "만료일, 유효기일, 최종기한",
+        "bias": "만료일, 유효기일, 유효기한, 최종기한, 최종선적일, 신용장 유효기일, expiry date, date of expiry, valid until, validity, latest date, expiration date",
+        "prejudice": "발행일, 작성일, 선적일, 출항일, 입항일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+
+      "sender_address": {
+        "semantic": "송하인 주소, 수출자 주소, 판매자 주소",
+        "bias": "송하인 주소, 수출자 주소, 판매자 주소, 선적인 주소, 발송지 주소, 공급자 주소, shipper address, exporter address, seller address, consignor address, address of shipper",
+        "prejudice": "수하인 주소, 수입자 주소, 구매자 주소, 통지처 주소, 송하인 이름, 수출자 상호, 회사명, 전화번호, 팩스, 이메일, 항구, 서류번호"
+      },
+      "recipient_address": {
+        "semantic": "수하인 주소, 수입자 주소, 구매자 주소",
+        "bias": "수하인 주소, 수입자 주소, 구매자 주소, 인수인 주소, 배송지 주소, 도착지 주소, consignee address, importer address, buyer address, address of consignee, delivery address",
+        "prejudice": "송하인 주소, 수출자 주소, 판매자 주소, 통지처 주소, 수하인 이름, 수입자 상호, 회사명, 전화번호, 팩스, 이메일, 항구, 서류번호"
+      },
+      "notify_party_name": {
+        "semantic": "통지처, 착화통지처",
+        "bias": "통지처, 착화통지처, 통지선, 도착통지처, notify party, notify, also notify party, notify address",
+        "prejudice": "송하인, 수출자, 판매자, 수하인, 수입자, 구매자, 선사, 운송인, 항구, 서류번호, 발행일, 중량, 금액"
+      },
+
+      "voyage_number": {
+        "semantic": "항차, 항차번호, 편명번호",
+        "bias": "항차, 항차번호, 항해번호, 운항번호, 편명, 편번호, VOY, V.NO, voyage number, voyage no, voy, flight leg, sailing number, V.123E, 0091E, 2426W",
+        "prejudice": "선박명, 모선명, 본선명, 선사, 서류번호, 문서번호, 인보이스번호, 선하증권번호, 컨테이너번호, 씰번호, 선적항, 양륙항, 발행일, 중량, 금액, 수량"
+      },
+      "flight_number": {
+        "semantic": "항공편명, 편명",
+        "bias": "항공편명, 편명, 항공편, 운항편, flight number, flight no, carrier flight, KE001, OZ201, AF267",
+        "prejudice": "선박명, 항차, 서류번호, 항공운송장번호, 출발공항, 도착공항, 발행일, 중량, 금액"
+      },
+      "place_receipt": {
+        "semantic": "수취지, 화물수취장소",
+        "bias": "수취지, 화물수취장소, 인수지, 수령지, 반입지, place of receipt, received at, point of receipt, pickup place",
+        "prejudice": "인도지, 최종인도지, 선적항, 양륙항, 출발항, 도착항, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "place_delivery": {
+        "semantic": "인도지, 최종인도지",
+        "bias": "인도지, 최종인도지, 화물인도장소, 배송지, 반출지, place of delivery, final destination, delivery place, door delivery",
+        "prejudice": "수취지, 화물수취장소, 선적항, 양륙항, 출발항, 도착항, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "departure_date": {
+        "semantic": "출항일, 실제출발일",
+        "bias": "출항일, 실제출항일, 출발일, 본선적재일, 선적완료일, 반출일, date of departure, sailed on, on board date, shipped on board, departure date",
+        "prejudice": "입항일, 도착일, 발행일, 만료일, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "arrival_date": {
+        "semantic": "입항일, 실제도착일",
+        "bias": "입항일, 실제입항일, 도착일, 양륙일, 반입일, date of arrival, arrived on, arrival date, discharged on",
+        "prejudice": "출항일, 출발일, 발행일, 만료일, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "transport_mode": {
+        "semantic": "운송수단, 운송방식",
+        "bias": "운송수단, 운송방식, 운송형태, 해상운송, 항공운송, 육상운송, 철도운송, 복합운송, 해상, 항공, 육로, 철도, by sea, by air, by road, by rail, sea freight, air freight, ocean, multimodal, intermodal",
+        "prejudice": "선박명, 항차, 선사, 항구, 서류번호, 인코텀즈, 결제조건, 통화, 중량, 금액, 컨테이너번호"
+      },
+      "means_of_conveyance": {
+        "semantic": "운송기관, 운송장비",
+        "bias": "운송기관, 운송장비, 운반수단, 차량, 트럭, 컨테이너선, 화물기, means of conveyance, conveyance, vehicle, truck, vessel type",
+        "prejudice": "선박명, 항차, 운송수단, 항구, 서류번호, 중량, 금액"
+      },
+
+      "payment_terms": {
+        "semantic": "결제조건, 지급조건",
+        "bias": "결제조건, 지급조건, 대금결제조건, 송금방식, 전신환송금, 신용장방식, 일람불, 기한부, 외상, 선급, T/T, TT, L/C, LC, D/A, D/P, at sight, usance, net 30, net 60, payment terms, terms of payment, 30일, 60일, 90일",
+        "prejudice": "인코텀즈, 무역조건, 가격조건, 운임조건, 운임선불, 운임착불, 통화, 금액, 중량, 서류번호, 발행일, 항구"
+      },
+      "freight_payment_term": {
+        "semantic": "운임조건, 운임지급방식",
+        "bias": "운임조건, 운임지급방식, 운임선불, 운임착불, 선불, 착불, 원지불, 도착지불, freight prepaid, freight collect, prepaid, collect, freight term",
+        "prejudice": "결제조건, 지급조건, 인코텀즈, 무역조건, 가격조건, 통화, 금액, 중량, 서류번호, 항구"
+      },
+      "latest_shipment_date": {
+        "semantic": "최종선적기일",
+        "bias": "최종선적기일, 최종선적일, 선적기한, 최종적재일, latest date of shipment, latest shipment date, shipment must be effected by",
+        "prejudice": "발행일, 만료일, 유효기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "partial_shipments": {
+        "semantic": "분할선적 허용여부",
+        "bias": "분할선적, 분할적재, 분할선적허용, 분할선적금지, 부분선적, partial shipment, partial shipments allowed, partial shipments prohibited, allowed, not allowed",
+        "prejudice": "환적, 환적허용, 최종선적기일, 발행일, 중량, 금액, 서류번호"
+      },
+      "transshipment_allowed": {
+        "semantic": "환적 허용여부",
+        "bias": "환적, 환적허용, 환적금지, 적환, transshipment, transhipment, transshipment allowed, transshipment prohibited, allowed, not allowed",
+        "prejudice": "분할선적, 최종선적기일, 환적항, 발행일, 중량, 금액, 서류번호"
+      },
+      "special_instructions": {
+        "semantic": "특기사항, 특별지시사항",
+        "bias": "특기사항, 특별지시사항, 비고, 참고사항, 유의사항, 요청사항, special instructions, remarks, notes, additional information, handling instructions",
+        "prejudice": "서류번호, 발행일, 발송인, 수하인, 항구, 선박명, 중량, 금액, 통화, HS코드"
+      },
+
+      "amount_subtotal": {
+        "semantic": "소계, 세전금액",
+        "bias": "소계, 소계금액, 세전금액, 공급가액, 물품대금, 상품금액, subtotal, sub total, net amount, amount before tax, goods value",
+        "prejudice": "총액, 합계, 총금액, 세액, 부가세, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+      },
+      "amount_tax": {
+        "semantic": "세액, 부가세",
+        "bias": "세액, 부가세, 부가가치세, 세금, 관세, VAT, tax, tax amount, VAT amount, duty",
+        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+      },
+      "freight_amount": {
+        "semantic": "운임, 운송비",
+        "bias": "운임, 운송비, 해상운임, 항공운임, 기본운임, 운임료, freight, freight charge, freight amount, ocean freight, air freight, basic freight",
+        "prejudice": "보험료, 소계, 총액, 합계, 로컬차지, 부대비용, 통화, 중량, 수량, 서류번호"
+      },
+      "insurance_amount": {
+        "semantic": "보험료",
+        "bias": "보험료, 적하보험료, 보험비용, 부보료, insurance, insurance premium, insurance charge, premium",
+        "prejudice": "운임, 소계, 총액, 합계, 로컬차지, 보험금액, 부보금액, 통화, 중량, 서류번호"
+      },
+      "local_charges": {
+        "semantic": "로컬차지, 부대비용",
+        "bias": "로컬차지, 부대비용, 부대비, 현지비용, 터미널화물처리비, 서류발급비, THC, 도착지비용, local charges, terminal handling charge, documentation fee, handling charge, CFS charge, wharfage",
+        "prejudice": "운임, 보험료, 소계, 총액, 합계, 통화, 중량, 수량, 서류번호"
+      },
+      "exchange_rate": {
+        "semantic": "환율, 적용환율",
+        "bias": "환율, 적용환율, 매매기준율, 과세환율, 기준환율, exchange rate, rate of exchange, conversion rate, FX rate, 1350, 1,350.00",
+        "prejudice": "통화, 금액, 총액, 세액, 관세율, 중량, 수량, 서류번호, 발행일"
+      },
+      "due_date": {
+        "semantic": "지급기일, 결제기한",
+        "bias": "지급기일, 결제기한, 납부기한, 지불기일, 만기일, due date, payment due, payable by, due on",
+        "prejudice": "발행일, 만료일, 유효기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "valid_until": {
+        "semantic": "유효기간, 유효기한",
+        "bias": "유효기간, 유효기한, 사용기한, 유효일, valid until, validity, valid through, effective until",
+        "prejudice": "발행일, 지급기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "payment_status": {
+        "semantic": "결제상태, 지급상태",
+        "bias": "결제상태, 지급상태, 입금상태, 미결제, 결제완료, 부분결제, 미납, 완납, payment status, paid, unpaid, partially paid, outstanding, settled, overdue",
+        "prejudice": "서류상태, 진행상황, 통관상태, 금액, 통화, 발행일, 서류번호"
+      },
+      "account_number": {
+        "semantic": "계좌번호, 송금계좌",
+        "bias": "계좌번호, 송금계좌, 입금계좌, 예금주계좌, 은행계좌, account number, A/C No, bank account, IBAN, beneficiary account",
+        "prejudice": "서류번호, 문서번호, 컨테이너번호, 씰번호, 전화번호, 사업자등록번호, 금액, 통화, 중량"
+      },
+      "swift_code": {
+        "semantic": "스위프트코드, 은행식별코드",
+        "bias": "스위프트코드, SWIFT, BIC, 은행식별코드, 전신코드, SWIFT code, BIC code, bank identifier code",
+        "prejudice": "계좌번호, 서류번호, 컨테이너번호, 전화번호, 사업자등록번호, 금액, 통화"
+      },
+
+      "package_unit": {
+        "semantic": "포장단위, 포장형태",
+        "bias": "포장단위, 포장형태, 포장종류, 카톤, 박스, 팔레트, 드럼, 베일, 번들, 상자, CTN, CARTON, PLT, PALLET, PKG, PACKAGE, BOX, DRUM, BALE, BUNDLE, CASE, ROLL, package unit, type of package",
+        "prejudice": "포장수, 카톤수, 개수, 수량, 중량, 용적, 금액, 통화, 서류번호, 컨테이너번호"
+      },
+      "marks_numbers": {
+        "semantic": "화인, 하인, 포장표기",
+        "bias": "화인, 하인, 포장표기, 하물표시, 마크, 케이스마크, 무표시, 화인및번호, shipping marks, marks and numbers, marks, case mark, N/M, NO MARK, AS PER INVOICE",
+        "prejudice": "서류번호, 문서번호, 컨테이너번호, 씰번호, HS코드, 포장수, 중량, 용적, 금액, 통화, 발행일, 항구, 선박명"
+      },
+      "chargeable_weight": {
+        "semantic": "운임중량, 청구중량",
+        "bias": "운임중량, 청구중량, 과금중량, 요금적용중량, 용적중량, chargeable weight, charge weight, volumetric weight, dimensional weight",
+        "prejudice": "총중량, 순중량, 용적, 포장수, 금액, 통화, 서류번호, 컨테이너번호"
+      },
+
+      "description": {
+        "semantic": "품명, 상품명세, 물품명",
+        "bias": "품명, 상품명세, 물품명, 물품명세, 화물명세, 상품설명, 품목명, 명세, description of goods, description, commodity, commodity description, item description, goods description, nature of goods",
+        "prejudice": "품목코드, HS코드, 수량, 단위, 단가, 금액, 중량, 서류번호, 컨테이너번호, 발송인, 수하인"
+      },
+      "item_code": {
+        "semantic": "품목코드, 모델번호",
+        "bias": "품목코드, 상품코드, 모델번호, 품번, 부품번호, 스타일번호, item code, model no, part no, article no, style no, SKU, reference",
+        "prejudice": "HS코드, 서류번호, 컨테이너번호, 씰번호, 품명, 수량, 단가, 금액, 중량"
+      },
+      "quantity": {
+        "semantic": "수량, 개수",
+        "bias": "수량, 개수, 주문수량, 선적수량, 납품수량, quantity, qty, Q'TY, pieces, PCS, units, amount of goods",
+        "prejudice": "단가, 금액, 총액, 중량, 용적, 포장수, 통화, 서류번호, HS코드, 컨테이너번호"
+      },
+      "unit": {
+        "semantic": "단위, 계량단위",
+        "bias": "단위, 계량단위, 수량단위, 개, 세트, 쌍, 박스, 킬로그램, 미터, EA, PCS, SET, PAIR, BOX, KG, KGS, MT, M, MTR, LTR, DZ, unit, unit of measure, UOM",
+        "prejudice": "포장단위, 통화, 수량, 단가, 금액, 중량, 서류번호, HS코드"
+      },
+      "country_of_manufacture": {
+        "semantic": "제조국, 원산지",
+        "bias": "제조국, 원산지, 생산국, 원산지국가, 제조국가, country of manufacture, country of origin, made in, origin, manufactured in, KOREA, CHINA, VIETNAM, JAPAN, USA, GERMANY",
+        "prejudice": "선적항, 양륙항, 목적국, 도착지, 서류번호, 품명, 수량, 단가, 금액, 중량"
+      },
+      "unit_price": {
+        "semantic": "단가, 개당가격",
+        "bias": "단가, 개당가격, 단위가격, 품목단가, 개별단가, unit price, unit value, price per unit, rate, U/PRICE",
+        "prejudice": "총액, 합계, 금액, 소계, 수량, 중량, 통화, 서류번호, HS코드"
+      },
+      "total_price": {
+        "semantic": "품목합계, 라인금액",
+        "bias": "품목합계, 라인금액, 항목금액, 소계금액, 품목별금액, total price, total value, line total, amount, extended price",
+        "prejudice": "단가, 총액, 총합계, 수량, 중량, 통화, 서류번호, HS코드"
+      },
+      "item_net_weight": {
+        "semantic": "품목 순중량",
+        "bias": "품목 순중량, 라인 순중량, 항목별 순중량, net weight, N.W., net weight per item",
+        "prejudice": "총중량, 전체중량, 품목 총중량, 용적, 수량, 단가, 금액"
+      },
+      "item_gross_weight": {
+        "semantic": "품목 총중량",
+        "bias": "품목 총중량, 라인 총중량, 항목별 총중량, gross weight, G.W., gross weight per item",
+        "prejudice": "순중량, 전체중량, 품목 순중량, 용적, 수량, 단가, 금액"
+      },
+      "item_package_count": {
+        "semantic": "품목 포장수",
+        "bias": "품목 포장수, 라인 포장수, 항목별 카톤수, 항목별 박스수, number of packages, packages per item, CTNS",
+        "prejudice": "전체 포장수, 총 카톤수, 수량, 중량, 용적, 단가, 금액"
+      },
+      "item_package_type": {
+        "semantic": "품목 포장형태",
+        "bias": "품목 포장형태, 라인 포장종류, 항목별 포장단위, package type, kind of package, packing type",
+        "prejudice": "전체 포장단위, 수량, 단위, 중량, 용적, 단가, 금액"
+      },
+
+      "type_size": {
+        "semantic": "컨테이너 규격, 컨테이너 종류",
+        "bias": "컨테이너 규격, 컨테이너 종류, 컨테이너 타입, 규격, 20피트, 40피트, 20GP, 40GP, 40HC, 45HC, 20RF, 40RF, 20OT, 40FR, DRY, REEFER, type and size, size type, container type",
+        "prejudice": "컨테이너번호, 씰번호, 서류번호, 포장수, 중량, 용적, 금액, HS코드"
+      },
+      "container_package_count": {
+        "semantic": "컨테이너별 포장수",
+        "bias": "컨테이너별 포장수, 컨테이너 내 카톤수, 컨테이너별 개수, number of packages, packages in container, CTNS per container",
+        "prejudice": "전체 포장수, 컨테이너번호, 씰번호, 중량, 용적, 규격, 금액"
+      },
+      "container_gross_weight": {
+        "semantic": "컨테이너별 총중량",
+        "bias": "컨테이너별 총중량, 컨테이너 총중량, 컨테이너 화물중량, gross weight, G.W. per container, container gross weight",
+        "prejudice": "전체 총중량, 순중량, 컨테이너번호, 씰번호, 용적, 규격, 포장수, 금액"
+      },
+      "container_measurement": {
+        "semantic": "컨테이너별 용적",
+        "bias": "컨테이너별 용적, 컨테이너 용적, 컨테이너 부피, measurement, CBM per container, container measurement, M3",
+        "prejudice": "전체 용적, 중량, 컨테이너번호, 씰번호, 규격, 포장수, 금액"
+      },
+
+      "party_role": {
+        "semantic": "당사자 역할, 관계자 구분",
+        "bias": "역할, 구분, 당사자, 관계자, 운송인, 선사, 보험자, 피보험자, 발행은행, 통지은행, 관세사, 세관, 창고업자, 검사기관, 계량기관, 손해사정인, 청구인, 신청인, 발행인, 지급인, 수취인, 선적대리점, 운송주선인, carrier, insurer, insured, issuing bank, advising bank, customs broker, customs authority, warehouse operator, inspection agency, surveying agency, claimant, applicant, drawer, drawee, payee, shipping agent, freight forwarder",
+        "prejudice": "회사명, 상호, 주소, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_name": {
+        "semantic": "당사자 명칭, 관계자 상호",
+        "bias": "상호, 회사명, 업체명, 기관명, 은행명, 성명, 명칭, company name, name of party, firm name, bank name",
+        "prejudice": "역할, 구분, 주소, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_address": {
+        "semantic": "당사자 주소",
+        "bias": "주소, 소재지, 사업장주소, 본점소재지, address, address of party, location",
+        "prejudice": "역할, 구분, 상호, 회사명, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_contact": {
+        "semantic": "당사자 연락처",
+        "bias": "연락처, 전화번호, 팩스, 이메일, 담당자, TEL, FAX, EMAIL, contact, phone, contact person",
+        "prejudice": "역할, 구분, 상호, 회사명, 주소, 서류번호, 컨테이너번호, 계좌번호, 금액"
       }
     },
     "default": {

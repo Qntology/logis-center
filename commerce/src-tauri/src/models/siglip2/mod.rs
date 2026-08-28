@@ -1,9 +1,14 @@
 pub mod vision;
 pub mod text;
 pub mod preprocessor;
-pub mod tokenizer;
-pub mod vision_encoder;
 pub mod vision_crop;
+pub mod vision_encoder;
+// 🌟 [STEP 2.5] 패치 격자 단위 판독 가능성 지도 (블러 / 마스킹 / 여백 판정)
+pub mod legibility;
+// 🌟 [STEP 6] 추출값이 크롭 안에 실제로 인쇄되어 있는지 검증
+pub mod value_grounding;
+pub mod tokenizer;
+
 
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
@@ -26,7 +31,15 @@ use std::path::Path;
 ///   text_model.head.weight/bias                      [1152,1152] / [1152]
 ///   logit_scale / logit_bias                         [1] / [1]
 pub struct Siglip2Model {
-    pub vision: vision::Siglip2VisionModel,
+    /// 🌟 [OPTIONAL VISION] 텍스트 전용 로드를 허용하기 위해 Option 으로 둡니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   STEP 6 값 접지 검증과 검색 질의 벡터 생성은 텍스트 인코더만 씁니다.
+    ///   패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 이미 있고,
+    ///   질의 벡터는 애초에 이미지와 무관합니다.
+    ///   구조체가 비전을 필수로 요구하면 그 두 경로가 항상 820MB 를 함께 올려야 했습니다.
+    ///   특히 검색은 질의마다 반복되므로 누적 비용이 큽니다.
+    pub vision: Option<vision::Siglip2VisionModel>,
     pub text: Option<text::Siglip2TextModel>,
     pub tokenizer: Option<tokenizer::Siglip2Tokenizer>,
     pub logit_scale: f32,
@@ -136,7 +149,7 @@ impl Siglip2Model {
         );
 
         Ok(Self {
-            vision: vision_model,
+            vision: Some(vision_model),
             text: None,
             tokenizer: None,
             logit_scale,
@@ -145,6 +158,88 @@ impl Siglip2Model {
             dtype,
             config: config.clone(),
         })
+    }
+
+    /// 🌟 텍스트 인코더 + 토크나이저만 로드합니다. 비전 가중치는 올리지 않습니다.
+    ///
+    ///  ── 언제 쓰는가 ──
+    ///   · STEP 6 값 접지 검증 : 값 텍스트만 인코딩. 패치는 STEP 1 산출물을 재사용.
+    ///   · 검색 질의 벡터 생성 : 질의는 텍스트이므로 비전이 애초에 불필요.
+    ///   두 경로 모두 load_vision_only 를 거치면 820MB 를 헛되이 점유합니다.
+    ///
+    ///  ── mmap ──
+    ///   VarBuilder::from_mmaped_safetensors 는 요청한 텐서만 페이지 인 하므로,
+    ///   같은 model.safetensors 를 열어도 text_model.* 만 실제로 상주합니다.
+    pub fn load_text_only(
+        model_dir: &Path,
+        config: &Siglip2Config,
+        device: &Device,
+        dtype: DType,
+    ) -> anyhow::Result<Self> {
+        let safetensors_path = model_dir.join("model.safetensors");
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)?
+        };
+
+        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"))?;
+
+        let logit_scale = vb
+            .get(1, "logit_scale")
+            .ok()
+            .and_then(|t| t.to_dtype(DType::F32).ok())
+            .and_then(|t| t.to_vec1::<f32>().ok())
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0.0);
+        let logit_bias = vb
+            .get(1, "logit_bias")
+            .ok()
+            .and_then(|t| t.to_dtype(DType::F32).ok())
+            .and_then(|t| t.to_vec1::<f32>().ok())
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0.0);
+
+        let tok = tokenizer::Siglip2Tokenizer::from_dir(
+            model_dir,
+            config.text_pad_token_id,
+            config.text_max_positions,
+        )?;
+
+        println!(
+            "[SigLIP2] Text-only mode loaded (layers={}, vocab={}, seq_len={}). Vision weights NOT loaded (~820MB saved).",
+            config.text_num_layers,
+            config.text_vocab_size,
+            config.text_max_positions
+        );
+
+        Ok(Self {
+            vision: None,
+            text: Some(text_model),
+            tokenizer: Some(tok),
+            logit_scale,
+            logit_bias,
+            device: device.clone(),
+            dtype,
+            config: config.clone(),
+        })
+    }
+
+    /// 🌟 비전 인코더 가중치를 나중에 부착합니다.
+    ///    텍스트 전용으로 올린 인스턴스에 이미지 처리가 필요해졌을 때 사용합니다.
+    pub fn load_vision_encoder(&mut self, model_dir: &Path) -> anyhow::Result<()> {
+        if self.vision.is_some() {
+            return Ok(());
+        }
+        let safetensors_path = model_dir.join("model.safetensors");
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &self.device)?
+        };
+        let vision_model = vision::Siglip2VisionModel::new(&self.config, vb.pp("vision_model"))?;
+        self.vision = Some(vision_model);
+        println!(
+            "[SigLIP2] Vision encoder ATTACHED to existing instance (layers={}, patch={}).",
+            self.config.vision_num_layers, self.config.patch_size
+        );
+        Ok(())
     }
 
     /// 텍스트 인코더 + 토크나이저를 추가로 로드합니다.
@@ -178,5 +273,11 @@ impl Siglip2Model {
 
     pub fn has_text(&self) -> bool {
         self.text.is_some() && self.tokenizer.is_some()
+    }
+
+    /// 🌟 비전 인코더가 실제로 상주 중인지 확인합니다.
+    ///    ensure_siglip2 가 '요구 사양과 현재 상태' 를 비교할 때 씁니다.
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
     }
 }
