@@ -1214,14 +1214,26 @@ pub async fn start_background_worker(
         
         let mut delay_secs = 1;
         let mut current_device_pref: Option<String> = None;
-        
         let mut oom_retry_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        
+        // 🌟 [RESUME-ON-START] 워커 (재)진입 = 앱 시작 또는 팩토리 리셋 직후.
+        //    리셋/정지가 남겨둔 정지 신호를 여기서 한 번 해제합니다.
+        //    이 플래그를 끄는 기존 코드는 태스크 처리 후에만 도달하는데,
+        //    플래그가 켜져 있으면 도달할 수 없어 영구 정지되었습니다.
+        crate::utils::set_extraction_stop_signal(false);
+        cancellation_token.store(false, Ordering::SeqCst);
+        let mut stopped_logged = false;
         loop {
             if crate::utils::is_extraction_stopped() {
+                // 🌟 [HEARTBEAT] 의도적 정지 상태임을 로그에 1회 남겨
+                //    "크래시/행" 과 "대기" 를 구분 가능하게 합니다.
+                if !stopped_logged {
+                    println!("[Scheduler] ⏸️ Extraction stop signal active. Waiting for resume...");
+                    stopped_logged = true;
+                }
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
+            stopped_logged = false;
 
             let mut pending_tasks = Vec::new();
             {
@@ -1240,11 +1252,18 @@ pub async fn start_background_worker(
             if pending_tasks.is_empty() {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay_secs)) => {
-                        delay_secs = (delay_secs + 1).min(10); 
+                        delay_secs = (delay_secs + 1).min(10);
                     }
                     _ = crate::utils::sync_utils::TASK_QUEUED_SIGNAL.notified() => {
                         delay_secs = 1;
                         println!("[Scheduler] New task signal received. Waking up immediately.");
+                        // 🌟 [AUTO-RESUME] 새 태스크 신호 = 처리 요구.
+                        //    리셋 잔여 정지 신호가 있으면 여기서 해제합니다.
+                        if crate::utils::is_extraction_stopped() {
+                            println!("[Scheduler] ▶️ New task signal while stop signal active. Auto-resuming extraction.");
+                            crate::utils::set_extraction_stop_signal(false);
+                            cancellation_token.store(false, Ordering::SeqCst);
+                        }
                     }
                 }
                 continue;
