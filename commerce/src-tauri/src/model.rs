@@ -1367,7 +1367,7 @@ impl LogisModel {
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
 
-            let is_trade_doc = search_mode == "shipping";
+            let mut is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
 
             // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
@@ -1408,6 +1408,40 @@ impl LogisModel {
             //  같은 검증을 그대로 받게 됩니다.
             let mut grounding_claims:
                 Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
+
+            // 🌟 [MODE REROUTE] mode="commerce" 로 들어왔더라도,
+            //    상단 밴드에 무역 서식 전문이 인쇄되어 TITLE GATE 가 확정한 경우에만
+            //    trading 파이프라인으로 전환합니다.
+            //    · 상품 사진/스크린샷(커머스) → 전문 없음 → title_confirmed=false → 커머스 유지
+            //    · 택배 라벨 → TRACKING 확정 → 아래 분기에서 기존 커머스 트랙킹 경로 유지
+            //    · 인보이스/B/L 등 → title_confirmed=true && code != TRACKING → trading 전환
+            //    본문 코사인(그룹 점수)은 settlement 이 CI 를 이기는 등 신뢰도가 낮으므로
+            //    리라우트 근거로 쓰지 않습니다. (로그: [VISION GROUP] settlement +4.5884 1위)
+            if !is_trade_doc {
+                let sg = self.siglip2_model.lock().await;
+                if let Some(siglip) = sg.as_ref() {
+                    match crate::models::siglip2::vision_encoder::classify_doc_type(siglip, &grid, &emit_term) {
+                        Ok(v) => {
+                            if v.title_confirmed && v.code != "TRACKING" && v.code != "Unknown" {
+                                emit_term(&format!(
+                                    "  🔀 [MODE REROUTE] mode='commerce' 이지만 서식 전문 '{}' 이 인쇄 확인되었습니다. trading 파이프라인으로 전환합니다. (code='{}', margin {:+.4})",
+                                    v.title_text, v.code, v.code_margin
+                                ));
+                                is_trade_doc = true;
+                            } else {
+                                emit_term(&format!(
+                                    "  🛒 [MODE KEEP] mode='commerce' 유지 (title_confirmed={}, code='{}')",
+                                    v.title_confirmed, v.code
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            emit_term(&format!("  ⚠️ [MODE REROUTE SKIP] 사전 분류 실패로 커머스 경로를 유지합니다: {}", e));
+                        }
+                    }
+                }
+                drop(sg);
+            }
 
             if is_trade_doc {
                 emit_term(&format!(

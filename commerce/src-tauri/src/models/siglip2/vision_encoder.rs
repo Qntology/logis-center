@@ -33,6 +33,7 @@ use image::DynamicImage;
 
 use super::preprocessor::{preprocess_image, PreprocessedImage};
 use super::{Siglip2Config, Siglip2Model};
+use crate::logic::TRADE_DOC_TITLES;
 use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
 // =====================================================================
@@ -278,6 +279,12 @@ pub struct DocTypeVerdict {
     pub prejudice_dropped: usize,
     /// 코드 후보와 각 점수. LLM 재판정 프롬프트에 그대로 실립니다.
     pub code_candidates: Vec<(String, f32)>,
+    /// 🌟 [MODE GATE] 상단 밴드에서 서식 전문이 인쇄되어 확정되었는가.
+    ///    mode 리라우트(commerce→trading)는 이 플래그가 true 일 때만 허용됩니다.
+    ///    본문 코사인만으로는 상품 사진과 무역 문서를 안전히 가를 수 없습니다.
+    pub title_confirmed: bool,
+    /// 🌟 확정된 서식 전문 문자열. 컬럼 히트맵의 TITLE PREJUDICE 로 재사용됩니다.
+    pub title_text: String,
 }
 
 /// 🌟 [BANK-NEUTRAL KEY SCORES] score_patches_bank_neutral 출력을 (key → 패치 최댓값) 으로 축소합니다.
@@ -456,63 +463,6 @@ fn score_patches(
 //    항상 동일 출력을 냅니다.
 //    동명 서식(BC/BK, PC/PHYTO, INS/IP)은 마진이 0 이 되어 게이트가
 //    스스로 거부하고 벡터 판정에 위임합니다.
-const TRADE_DOC_TITLES: &[(&str, &str)] = &[
-    ("CI", "commercial invoice"),
-    ("PI", "proforma invoice"),
-    ("CINV", "customs invoice"),
-    ("CSI", "consular invoice"),
-    ("TI", "tax invoice"),
-    ("FI", "freight invoice"),
-    ("PL", "packing list"),
-    ("BL", "bill of lading"),
-    ("HBL", "house bill of lading"),
-    ("SWB", "sea waybill"),
-    ("AWB", "air waybill"),
-    ("SA", "shipping advice"),
-    ("DO", "delivery order"),
-    ("AN", "arrival notice"),
-    ("BC", "booking confirmation"),
-    ("BK", "booking confirmation"),
-    ("SR", "shipping request"),
-    ("FCR", "forwarder certificate of receipt"),
-    ("POD", "proof of delivery"),
-    ("CM", "cargo manifest"),
-    ("WR", "warehouse receipt"),
-    ("ED", "export declaration"),
-    ("ID", "import declaration"),
-    ("CO", "certificate of origin"),
-    ("CNM", "certificate of non manipulation"),
-    ("CCC", "customs clearance certificate"),
-    ("EL", "export license"),
-    ("IC", "inspection certificate"),
-    ("COA", "certificate of analysis"),
-    ("CA", "certificate of analysis"),
-    ("WC", "weight certificate"),
-    ("PHYTO", "phytosanitary certificate"),
-    ("PC", "phytosanitary certificate"),
-    ("FC", "fumigation certificate"),
-    ("HC", "health certificate"),
-    ("BEN_CERT", "beneficiary certificate"),
-    ("CDR", "cargo damage survey report"),
-    ("DGD", "dangerous goods declaration"),
-    ("MSDS", "material safety data sheet"),
-    ("POA", "power of attorney"),
-    ("BIZ_LIC", "business license"),
-    ("INS", "insurance policy"),
-    ("IP", "insurance policy"),
-    ("ICF", "insurance claim form"),
-    ("SOA", "statement of account"),
-    ("DN", "debit note"),
-    ("CN", "credit note"),
-    ("PO", "purchase order"),
-    ("SC", "sales contract"),
-    ("LC", "letter of credit"),
-    ("LLC", "local letter of credit"),
-    ("CP", "purchase confirmation"),
-    ("BE", "bill of exchange"),
-    ("TR", "trust receipt"),
-    ("LG", "letter of guarantee"),
-];
 
 /// 🌟 [TITLE GATE] 산출물. code/group 은 전문에서 역引き한 확정값입니다.
 struct TitleGateVerdict {
@@ -989,7 +939,13 @@ pub fn classify_doc_type(
     //    기존 '사후 오버라이드' 는 임시방편이었으므로, 단일 점수 축으로 편입해
     //    NMS 자체가 결정론적으로 정답을 내게 합니다.
     //    가중치 2.0: 실측 제목 축 마진(1.3076)이 바디 축 최대 왜곡(약 1.1)보다 커지도록 한 값.
-    if let Some((_gate, title_sorted)) = run_title_gate(model, grid, &chrome_phrases, emit) {
+    let title_gate_result = run_title_gate(model, grid, &chrome_phrases, emit);
+    let title_confirmed = title_gate_result.is_some();
+    let title_text = title_gate_result
+        .as_ref()
+        .map(|(g, _)| g.title.clone())
+        .unwrap_or_default();
+    if let Some((_gate, title_sorted)) = title_gate_result {
         for (cname, cs) in c_scores.iter_mut() {
             if let Some((_, ts)) = title_sorted.iter().find(|(t, _)| t == cname) {
                 *cs += 2.0 * ts;
@@ -1040,6 +996,8 @@ pub fn classify_doc_type(
         code_margin,
         prejudice_dropped: dropped,
         code_candidates: c_scores,
+        title_confirmed,
+        title_text,
     })
 }
 

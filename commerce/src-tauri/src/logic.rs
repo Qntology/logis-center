@@ -1235,6 +1235,73 @@ pub fn trade_field_category(field: &str) -> &'static str {
     }
 }
 
+// 🌟 [TRADE DOC TITLES] vision_encoder.rs 에 하드코딩되어 있던 서식 전문 사전을
+//    logic.rs 로 이관합니다. 텍스트 트랙(scheduler STEP A)과 비전 트랙이
+//    같은 사전을 쓰면 서식이 늘어도 수정 지점이 한 곳으로 고정됩니다.
+//    전문(full name)을 키로 쓰는 이유: 'CI' 같은 접두어는 다른 서식에도
+//    인쇄되지만(ED 의 reference_invoice 등), 전문은 헤더로 인쇄되는 서식 본인뿐입니다.
+pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
+    ("CI", "commercial invoice"),
+    ("PI", "proforma invoice"),
+    ("CINV", "customs invoice"),
+    ("CSI", "consular invoice"),
+    ("TI", "tax invoice"),
+    ("FI", "freight invoice"),
+    ("PL", "packing list"),
+    ("BL", "bill of lading"),
+    ("HBL", "house bill of lading"),
+    ("SWB", "sea waybill"),
+    ("AWB", "air waybill"),
+    ("SA", "shipping advice"),
+    ("DO", "delivery order"),
+    ("AN", "arrival notice"),
+    ("BC", "booking confirmation"),
+    ("BK", "booking confirmation"),
+    ("SR", "shipping request"),
+    ("FCR", "forwarder certificate of receipt"),
+    ("POD", "proof of delivery"),
+    ("CM", "cargo manifest"),
+    ("WR", "warehouse receipt"),
+    ("ED", "export declaration"),
+    ("ID", "import declaration"),
+    ("CO", "certificate of origin"),
+    ("CNM", "certificate of non manipulation"),
+    ("CCC", "customs clearance certificate"),
+    ("EL", "export license"),
+    ("IC", "inspection certificate"),
+    ("COA", "certificate of analysis"),
+    ("CA", "certificate of analysis"),
+    ("WC", "weight certificate"),
+    ("PHYTO", "phytosanitary certificate"),
+    ("PC", "phytosanitary certificate"),
+    ("FC", "fumigation certificate"),
+    ("HC", "health certificate"),
+    ("BEN_CERT", "beneficiary certificate"),
+    ("CDR", "cargo damage survey report"),
+    ("DGD", "dangerous goods declaration"),
+    ("MSDS", "material safety data sheet"),
+    ("POA", "power of attorney"),
+    ("BIZ_LIC", "business license"),
+    ("INS", "insurance policy"),
+    ("IP", "insurance policy"),
+    ("ICF", "insurance claim form"),
+    ("SOA", "statement of account"),
+    ("DN", "debit note"),
+    ("CN", "credit note"),
+    ("PO", "purchase order"),
+    ("SC", "sales contract"),
+    ("LC", "letter of credit"),
+    ("LLC", "local letter of credit"),
+    ("CP", "purchase confirmation"),
+    ("BE", "bill of exchange"),
+    ("TR", "trust receipt"),
+    ("LG", "letter of guarantee"),
+    // 🌟 [COMMERCE/PARCEL AXIS] mode 감지용 추가 축.
+    //    택배 라벨은 무역 서식과 달리 전문이 '라벨' 문구로 인쇄됩니다.
+    //    동명 마진 0 자가거부 규칙 때문에 TRACKING 은 1개 항목만 둡니다.
+    ("TRACKING", "tracking label shipping label parcel waybill"),
+];
+
 /// 🌟 [RULE FALLBACK] 명시 매핑에 없는 필드를 부분일치 규칙으로 라우팅합니다.
 ///
 ///  ── 왜 필요한가 ──
