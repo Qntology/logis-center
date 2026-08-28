@@ -1,0 +1,30 @@
+document_type: Local Letter of Credit
+document_code: LLC
+metadata:
+  local_lc_number: LLC-2026-KR-0911
+  issue_date: '2026-08-16'
+  expiry_date: '2026-09-20'
+  currency: KRW
+  amount_krw: 76302000.0
+  related_master_lc_number: LC-88492011
+  related_po_number: PO-99281A
+  related_cp_number: CP-2026-KR-0419
+parties:
+  applicant_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    tax_id: 120-81-12345
+  beneficiary_supplier:
+    name: Microchip Tech Korea Corp.
+    address: 45 Industrial-ro, Yeonsu-gu, Incheon, South Korea
+    tax_id: 131-86-67890
+  issuing_bank:
+    name: Kookmin Bank
+    branch: Seoul Main Branch
+  advising_bank:
+    name: Shinhan Bank
+    branch: Incheon Branch
+terms_and_conditions:
+  latest_shipment_date: '2026-08-25'
+  payment_terms: Sight draft drawn on issuing bank
+  goods_description: Domestic supply of components for export under PO-99281A

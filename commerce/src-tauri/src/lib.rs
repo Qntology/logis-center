@@ -545,6 +545,7 @@ async fn reindex_pending_embeddings(
 
         let _ = store.upsert_item(
             target_table, &doc.id, &doc.r#type, data.clone(), Some(emb.clone()),
+            None, // 🌟 임베딩 경로는 텍스트 전용
             Some(&doc.from), Some(&doc.to), Some(&doc.cc), Some(&doc.bcc), Some(&doc.r#ref), Some(&digest)
         ).await;
 
@@ -645,6 +646,28 @@ async fn structure_pending_analytics(
 
     if probe.is_empty() {
         return Ok(json!({ "processed": 0, "skipped": "no_pending" }));
+    }
+
+    // 🌟 [PRE-FILTER PROBE] 모델 로드 전에 실제 요약 가능한 텍스트가 있는지 사전 확인합니다.
+    //    기존에는 원시 이벤트가 1건 이상이면 무조건 모델을 로드했지만,
+    //    그 이벤트의 PUG 변환 결과가 비어있으면 모델 로드가 무의미합니다.
+    //    이제 사전 필터링으로 처리 가능한 항목이 0건이면 모델 로드 없이 조기 반환합니다.
+    let scan_filter = format!(
+        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
+        crate::analytic::ANALYTIC_EVENT_TYPES
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let scan_docs = store
+        .get_all_items("items", 100, 0, Some(scan_filter))
+        .await
+        .map_err(|e| e.to_string())?;
+    let actionable_count = crate::analytic::count_pending_structuring_targets(&scan_docs, limit.unwrap_or(20));
+    if actionable_count == 0 {
+        println!("[ANALYTIC] ⚪ 원시 이벤트는 있으나 실제 요약 가능한 텍스트가 0건이라 모델 로드를 건너뜁니다.");
+        return Ok(json!({ "processed": 0, "skipped": "no_actionable" }));
     }
 
     println!("[ANALYTIC] Pending raw behaviour event detected. Loading Qwen3.5(2B) for structuring...");
@@ -953,7 +976,7 @@ async fn search_documents(
 
     if let Some(store) = store_opt {
         
-        let search_result = store.search_items("items", &query, query_vec, limit, offset, scope, false).await.map_err(|e| e.to_string());
+        let search_result = store.search_items("items", &query, query_vec, None, limit, offset, scope, false).await.map_err(|e| e.to_string());
         
         
         match &search_result {
@@ -1636,6 +1659,8 @@ async fn ai_search_complex(
         // 🌟 [DEXIE PLAN] 컨텍스트별 정밀 필터 플랜을 모아 프론트엔드로 전달합니다.
         //    LanceDB 가 버렸던 조건이 여기에 전부 살아 있습니다.
         let mut dexie_plans: Vec<Value> = Vec::new();
+        // 🌟 [VISION QUERY] shipping(무역) 트랙 전용 비전 질의 벡터. 컨텍스트 전체가 공유합니다.
+        let mut vision_qvec: Option<Vec<f32>> = None;
 
         let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); 
         let mut metrics_json_str = "{}".to_string();
@@ -1675,6 +1700,78 @@ async fn ai_search_complex(
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
+
+        // =====================================================================
+        // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
+        //    질의를 1152차원 공유공간에 올려 비전 벡터 검색을 활성화합니다.
+        // ---------------------------------------------------------------------
+        //  ── 무엇이 문제였나 ──
+        //   구버전은 컨텍스트 루프 안에서 `model.siglip2_model` 을 들여다봤지만,
+        //   검색 경로 어디에도 ensure_siglip2() 호출이 없었습니다.
+        //   parse_shipping_query 는 granite(384) 만 올립니다.
+        //   그래서 siglip2_model 은 항상 None → vision_qvec 은 항상 None →
+        //   Track V 가 단 한 번도 발화하지 않았습니다.
+        //   (이미지로 추출한 문서의 vision_vec 이 저장만 되고 검색에는 쓰이지 않는 상태)
+        //
+        //  ── 왜 루프 밖에서 1회만 만드는가 ──
+        //   ① 비전 벡터는 '이미지 전체' 를 대표하는 pooled 벡터입니다.
+        //      컨텍스트별로 쪼갠 텍스트보다 원 질의 문장이 더 적합합니다.
+        //   ② SigLIP2(2.2GB)를 컨텍스트마다 올렸다 내리면 4GB GPU 에서 즉시 OOM 입니다.
+        //      한 번 올려 인코딩하고 즉시 반환합니다.
+        //
+        //  ── VRAM 순서 ──
+        //   parse_shipping_query 가 남긴 Qwen3.5(2GB) 를 먼저 내리고,
+        //   SigLIP2 를 올려 인코딩한 뒤 즉시 반환합니다.
+        //   그 다음 컨텍스트 루프가 granite(384) 를 올립니다. 동시 상주가 없습니다.
+        // =====================================================================
+        if search_mode == "shipping" && !query.trim().is_empty() {
+            if cancel_token.load(Ordering::Relaxed) {
+                return Err("Search cancelled by user".to_string());
+            }
+            emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더로 비전 질의 벡터를 생성합니다...");
+
+            // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
+            model.deep_purge_resources().await;
+
+            match model.check_siglip2_downloaded().await {
+                Err(e) => {
+                    emit_term(&format!(
+                        "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
+                    ));
+                }
+                Ok(_) => {
+                    match model.ensure_siglip2(true).await {
+                        Err(e) => {
+                            emit_term(&format!(
+                                "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
+                            ));
+                        }
+                        Ok(_) => {
+                            {
+                                let guard = model.siglip2_model.lock().await;
+                                if let Some(sig) = guard.as_ref() {
+                                    if sig.has_text() {
+                                        vision_qvec = crate::models::siglip2::vision_encoder::encode_query_text(
+                                            sig, &query,
+                                        ).ok();
+                                    }
+                                }
+                            }
+                            // 인코딩이 끝났으면 즉시 반환합니다. (비전 820MB + 텍스트 1.4GB)
+                            model.release_siglip2("search vision query encoded").await;
+                        }
+                    }
+                }
+            }
+
+            match vision_qvec.as_ref() {
+                Some(v) => emit_term(&format!(
+                    "[VISION TRACK] ✅ 비전 질의 벡터 생성 완료 (dim {}). LanceDB Track V 를 활성화합니다.",
+                    v.len()
+                )),
+                None => emit_term("[VISION TRACK] ⚪ 비전 질의 벡터를 만들지 못해 텍스트 트랙만 사용합니다."),
+            }
+        }
 
         if let (Some(store), Some(ctx_arr)) = (store_opt.clone(), structured_query.get("context").and_then(|v| v.as_array())) {
             for ctx in ctx_arr {
@@ -1768,7 +1865,18 @@ async fn ai_search_complex(
                     //    ⚠️ bcc / ref 는 넣지 않습니다.
                     //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
                     //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
-                    if !cc.trim().is_empty() {
+                    // 🌟 [LOCAL EXTRACTION SCOPE] 로컬 이미지/문서 추출물은
+                    //    cc = hash_id("local.shipping") / hash_id("local.commerce") 로 저장됩니다.
+                    //    (model.rs 의 extract_from_image 참조)
+                    //    반면 검색의 cc 는 프론트엔드가 넘긴 '웹 도메인 해시' 입니다.
+                    //    (main.ts: hashId(getRootDomain(hostname)))
+                    //    두 값이 구조적으로 일치할 수 없으므로, cc 를 그대로 걸면
+                    //    로컬 추출 문서가 검색에서 100% 탈락합니다.
+                    //
+                    //    shipping 트랙은 애초에 로컬 추출이 주 경로이므로 cc 스코프를 걸지 않습니다.
+                    //    (mode = 'shipping' 만으로도 트랙 격리가 성립합니다)
+                    //    commerce/analytic 은 웹 페이지 추출이 주 경로이므로 기존대로 cc 를 유지합니다.
+                    if !cc.trim().is_empty() && search_mode != "shipping" {
                         o.insert("cc".to_string(), json!(cc.clone()));
                     }
                 }
@@ -1796,8 +1904,11 @@ async fn ai_search_complex(
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
                 const RECALL_LIMIT: usize = 50;
 
+                // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
+                //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
+                //     항상 None 이었습니다. 자세한 경위는 위 [VISION QUERY TRACK] 주석 참조)
                 let final_results = store
-                    .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
+                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
                     .await
                     .unwrap_or_else(|e| {
                         println!("[AI-SEARCH] ⚠️ scope query failed ({}). Falling back to mode-only scope.", e);
@@ -1810,14 +1921,15 @@ async fn ai_search_complex(
                 //       cc(팀·사이트)까지 버리면 폴백 한 번으로 타 팀 문서가 그대로 새어 나가므로,
                 //       테넌트 스코프는 폴백에서도 반드시 유지합니다.
                 let final_results = if final_results.is_empty() {
-                    let mode_only = if cc.trim().is_empty() {
+                    // 🌟 shipping 은 위와 동일한 이유로 cc 를 걸지 않습니다.
+                    let mode_only = if cc.trim().is_empty() || search_mode == "shipping" {
                         format!("mode = '{}'", search_mode)
                     } else {
                         format!("mode = '{}' AND `cc` = '{}'", search_mode, cc.replace('\'', "''"))
                     };
                     println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
                     store
-                        .search_items(target_table, &search_text, emb.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
+                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
                         .await
                         .unwrap_or_default()
                 } else {
@@ -2243,8 +2355,9 @@ async fn ai_search_complex(
                 .count();
             let primary_count = ranked_results.len() - chunk_match_count;
 
-            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건)",
-                ranked_results.len(), primary_count, chunk_match_count);
+            println!("[AI-SEARCH] 📊 [STAGE-5] 결과 병합 완료: 총 {}건 (문서 매칭 {}건 + 청크 매칭 {}건) | 비전 트랙: {}",
+                ranked_results.len(), primary_count, chunk_match_count,
+                if vision_qvec.is_some() { "활성" } else { "비활성" });
 
             for (rank, item) in ranked_results.iter().enumerate() {
                 let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -2442,7 +2555,12 @@ async fn ai_search_complex(
         }))
     }.await; 
 
-    IS_SEARCHING.store(false, Ordering::SeqCst);
+    // 🌟 [FLAG HOLD] 여기서 해제하면 안 됩니다.
+    //    아래 deep_purge_resources() 는 CUDA 동기화 + OS 메모리 반환으로
+    //    수백 ms~수 초가 걸리는데, 그 사이 unload_model / reindex_pending_embeddings 가
+    //    IS_SEARCHING 가드를 통과해 파기 중인 CUDA 컨텍스트를 건드립니다.
+    //    (ACTIVE_TASK_MEM 도 아래에서 비워지므로 두 가드가 동시에 뚫립니다)
+    //    플래그 해제는 정리 작업이 전부 끝난 뒤 함수 말미에서 한 번만 수행합니다.
     
     if let Some(store) = store_opt.as_ref() {
         match &search_process {
@@ -2472,6 +2590,11 @@ async fn ai_search_complex(
     }
 
     
+    // 🌟 [PURGE FIRST] 자원 파기를 먼저 끝낸 뒤에 가드를 내립니다.
+    //    순서가 뒤집히면 파기 도중에 다른 커맨드가 모델을 올려 컨텍스트가 충돌합니다.
+    model.deep_purge_resources().await;
+    drop(model_guard);
+
     {
         let mut mem_guard = crate::ACTIVE_TASK_MEM.write().unwrap();
         if let Some(mem) = mem_guard.as_ref() {
@@ -2481,10 +2604,7 @@ async fn ai_search_complex(
         }
     }
 
-    model.deep_purge_resources().await; 
-    
-    
-    drop(model_guard);
+    // 🌟 정리가 전부 끝난 뒤 단 한 번만 해제합니다.
     IS_SEARCHING.store(false, Ordering::SeqCst);
     
     search_process
@@ -2525,7 +2645,12 @@ async fn deep_research_command(
             return Err("Failed to load model".to_string());
         }
     }
-    let model = model_guard.as_ref().unwrap();
+    // 🌟 [LOCK ORDER] model 락을 쥔 채 store 락을 잡으면
+    //    ai_search_complex(store → model)와 정반대 순서가 되어 데드락이 성립합니다.
+    //    현재는 ai_search_complex 가 store_guard 를 블록 스코프로 즉시 해제해서
+    //    우연히 피해 가고 있을 뿐이므로, 순서 자체를 맞춰 둡니다.
+    let model = model_guard.as_ref().unwrap().clone();
+    drop(model_guard);
 
     // 1. Context Gathering
     let mut context_data = String::new();
@@ -2546,7 +2671,7 @@ async fn deep_research_command(
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
         
-        if let Ok(results) = store.search_items("items", &query, emb, 3, 0, None, false).await {
+        if let Ok(results) = store.search_items("items", &query, emb, None, 3, 0, None, false).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
@@ -3205,7 +3330,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     }
                 }
                 // 원본 item 대신 세탁된 clean_item을 DB에 밀어 넣습니다.
-                let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, from, to, cc, bcc, r#ref, digest).await;
+                let _ = db.upsert_item(final_table, &id, &type_str, clean_item, None, None, from, to, cc, bcc, r#ref, digest).await;
                 count += 1;
             }
         }
@@ -3395,11 +3520,14 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     let granite_dir = base_path.join("granite-4.0-h-350m");
     let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
 
+    let siglip2_dir = base_path.join("siglip2-so400m-patch16-naflex");
+
     let mut status_map = serde_json::Map::new();
     status_map.insert("Qwen3".to_string(), serde_json::json!(has_valid_model(&qwen3_dir)));
     status_map.insert("Qwen3.5".to_string(), serde_json::json!(has_valid_model(&qwen3_5_dir)));
     status_map.insert("Granite".to_string(), serde_json::json!(has_valid_model(&granite_dir)));
     status_map.insert("Embedding".to_string(), serde_json::json!(has_valid_model(&embed_dir)));
+    status_map.insert("SigLIP2".to_string(), serde_json::json!(has_valid_model(&siglip2_dir)));
 
     let supported_stanza_langs = [
         "korean", "english", "japanese", "chinese", "french", "german", "spanish", 
@@ -3513,6 +3641,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf".to_string(),
                 "Embedding" => "granite-embedding-97m-multilingual-r2".to_string(),
                 "Granite" => "granite-4.0-h-350m".to_string(),
+                "SigLIP2"  => "siglip2-so400m-patch16-naflex".to_string(),
                 _ => "unknown".to_string()
             }
         };
@@ -3568,6 +3697,12 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 ],
                 "Granite" => vec![
                     ("https://huggingface.co/ibm-granite/granite-4.0-h-350m/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
+                ],
+                "SigLIP2" => vec![
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/config.json".to_string(), "config.json".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/preprocessor_config.json".to_string(), "preprocessor_config.json".to_string()),
+                    ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/tokenizer.json".to_string(), "tokenizer.json".to_string())
                 ],
                 _ => vec![]
             }

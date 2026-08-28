@@ -1,0 +1,40 @@
+document_type: Proforma Invoice
+document_code: PI
+metadata:
+  pi_number: PI-2026-0801
+  issue_date: '2026-08-05'
+  valid_until: '2026-08-31'
+  currency: USD
+  related_po_number: PO-99281A
+parties:
+  seller_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+  buyer_importer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+terms_and_conditions:
+  incoterms: FOB Busan
+  payment_terms: Letter of Credit (L/C) at sight
+  estimated_shipment_date: '2026-08-28'
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+line_items:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  quantity: 5000
+  unit: PCS
+  unit_price: 12.5
+  total_amount: 62500.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  quantity: 2000
+  unit: PCS
+  unit_price: 8.0
+  total_amount: 16000.0
+summary:
+  total_quantity: 7000
+  sub_total: 78500.0
+  grand_total_amount: 78500.0

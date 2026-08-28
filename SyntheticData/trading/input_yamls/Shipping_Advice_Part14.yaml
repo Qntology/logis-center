@@ -1,0 +1,35 @@
+document_type: Shipping Advice
+document_code: SA
+metadata:
+  advice_number: SA-2026-0828
+  issue_date: '2026-08-28'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_lc_number: LC-88492011
+parties:
+  sender_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+  recipient_importer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+shipment_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  estimated_time_of_departure_etd: '2026-08-28'
+  estimated_time_of_arrival_eta: '2026-09-10'
+cargo_summary:
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  total_packages: 50 PLTS
+  gross_weight_kg: 2500.0
+  invoice_amount: 78500.0
+  currency: USD
+attached_documents:
+- Commercial Invoice (CI-2026-08001)
+- Bill of Lading (BL-55432219)
+- Packing List (PL-2026-08001)
+- Certificate of Origin (CO-2026-KR-0801)

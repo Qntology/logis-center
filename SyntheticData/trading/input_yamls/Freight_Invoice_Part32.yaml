@@ -1,0 +1,47 @@
+document_type: Freight Invoice
+document_code: FI
+metadata:
+  invoice_number: FI-2026-0828
+  issue_date: '2026-08-28'
+  due_date: '2026-09-10'
+  currency: USD
+  related_bl_number: BL-55432219
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_booking_number: BK-2026-0822
+parties:
+  issuing_carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+    contact_number: +1-510-555-8800
+  bill_to_shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+shipment_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  container_number: PONU1234567
+charge_details:
+- charge_code: OFT
+  description: Ocean Freight (1 x 40FT HC)
+  rate: 2200.0
+  amount: 2200.0
+- charge_code: THC
+  description: Terminal Handling Charge (Origin)
+  rate: 150.0
+  amount: 150.0
+- charge_code: DOC
+  description: Documentation Fee
+  rate: 50.0
+  amount: 50.0
+- charge_code: SEAL
+  description: Container Seal Fee
+  rate: 10.0
+  amount: 10.0
+summary:
+  total_charges_usd: 2410.0
+  payment_status: Unpaid
+  remittance_bank: Bank of America
+  account_number: 1102-9983-4401

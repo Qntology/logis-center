@@ -1,0 +1,43 @@
+document_type: Forwarder's Cargo Receipt
+document_code: FCR
+metadata:
+  fcr_number: FCR-2026-0827
+  issue_date: '2026-08-27'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_lc_number: LC-88492011
+  related_hbl_number: HBL-55432219-01
+parties:
+  issuing_forwarder:
+    name: Apex Global Logistics Korea Ltd.
+    address: 50 Mapo-daero, Mapo-gu, Seoul, South Korea
+    contact_number: +82-2-700-8000
+  shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+receipt_details:
+  place_of_receipt: Busan Logistics Center, Busan, South Korea
+  date_received: '2026-08-26'
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+cargo_details:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  packages: 30 PLTS
+  gross_weight_kg: 1500.0
+  measurement_cbm: 9.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  packages: 20 PLTS
+  gross_weight_kg: 1000.0
+  measurement_cbm: 6.0
+summary:
+  total_packages: 50 PLTS
+  total_gross_weight_kg: 2500.0
+  total_measurement_cbm: 15.0
+undertaking_statement:
+  statement: We certify that we have taken over the specified consignment in good order and condition for irrevocable dispatch to the consignee in accordance with shipper's instructions.

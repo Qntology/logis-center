@@ -1,21 +1,11 @@
 use once_cell::sync::Lazy;
 use serde_json::Value;
 
-// 🌟 [다국어 지원] 빌드 시점에 bias.json 파일을 읽어와 메모리에 영구 등재합니다.
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
     let json_str = include_str!("bias.json");
     serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
 });
 
-/// 🌟 [LANG CODE] 언어 문자열에서 ISO-639-1 2자 코드를 안전하게 추출합니다.
-///  ── 왜 필요한가 ──
-///   기존 코드는 `&lang[0..2]` 로 '바이트' 를 잘랐습니다.
-///   ASCII 입력("korean" → "ko")은 우연히 맞지만, 비ASCII 가 들어오면
-///   char boundary 위반으로 즉시 panic 합니다. ("한국어".len()=9 라 게이트를 통과한 뒤
-///   0..2 가 '한'(3바이트) 한가운데를 자릅니다)
-///  ── 부수 효과 ──
-///   zh-tw / zh-hk 번체 분기를 get_localized_page_type 한 곳에서만 처리하고 있어
-///   나머지 10개 함수는 전부 "zh" 로 뭉개고 있었습니다. 여기서 함께 통일합니다.
 pub fn lang_code_of(lang: &str) -> String {
     let l = lang.trim().to_lowercase();
     if l.starts_with("zh-tw") || l.starts_with("zh-hk") || l.starts_with("zh-hant") {
@@ -23,6 +13,237 @@ pub fn lang_code_of(lang: &str) -> String {
     }
     let code: String = l.chars().take_while(|c| c.is_ascii_alphabetic()).take(2).collect();
     if code.chars().count() >= 2 { code } else { "en".to_string() }
+}
+
+/// 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드 27종을 공용 bias 노드로 접습니다.
+///  ── 무엇이 문제였나 ──
+///   get_detail_schema_fields("BL", ...) 의 add() 는 bias.json 에서
+///     BIAS_DICT["ko"]["BL"][field]  → 없음
+///     BIAS_DICT["ko"]["default"][field] → layout_list/layout_form/id,link/title/status 뿐
+///   순서로 찾다가 실패하고, 결국 영어 en_bias 3~4구만 남았습니다.
+///   commerce 의 goods.title 이 200구+ 인 것과 비교하면 뱅크가 사실상 비어 있어
+///   PLINKO / 헤더 코사인 / 청크 인덱싱이 전부 저품질로 떨어집니다.
+///  ── 해결 ──
+///   27종을 'shipping_doc' 하나로 접어 bias.json 에 사전을 한 벌만 두면 됩니다.
+///   서식마다 필드 의미가 갈리지 않으므로(B/L 의 pol 과 AWB 의 pol 은 같은 개념)
+///   공용 사전이 정확도를 해치지 않습니다.
+pub fn canonical_bias_type(page_type: &str) -> &str {
+    match page_type {
+        "shipping_doc"
+        // ── 기존 27종 ──
+        | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
+        | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
+        | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
+        // 🌟 [MISSING 18] trade_schema.overlay 에는 존재하는데 이 목록에 없어
+        //    canonical_bias_type 이 자기 자신을 반환하던 서식들입니다.
+        //    그 결과 bias_node() 의 세 경로(ko.{code} / ko.{canon} / ko.default)가
+        //    모두 실패해 label_phrase_bank 와 prejudice_phrase_bank 가
+        //    빈 배열을 돌려주었고, STEP 3 히트맵이 판정 근거를 잃었습니다.
+        //    multilingual_value_anchor_phrases_scoped 도 같은 함수를 쓰므로
+        //    저장 벡터의 다국어 축까지 함께 비어 크로스링구얼 리콜이 0 이 됩니다.
+        | "HBL"  // House Bill of Lading
+        | "FCR"  // Forwarder's Certificate of Receipt
+        | "POD"  // Proof of Delivery
+        | "LG"   // Letter of Guarantee
+        | "TR"   // Trust Receipt
+        | "LLC"  // Local Letter of Credit
+        | "TI"   // Tax Invoice
+        | "CP"   // Confirmation of Purchase
+        | "CM"   // Cargo Manifest
+        | "CCC"  // Customs Clearance Certificate
+        | "CNM"  // Certificate of Non-Manipulation
+        | "PC"   // Phytosanitary Certificate
+        | "COA"  // Certificate of Analysis
+        | "FI"   // Freight Invoice
+        | "CDR"  // Cargo Damage / Survey Report
+        | "ICF"  // Insurance Claim Form
+        | "SOA"  // Statement of Account
+        | "EL"   // Export License
+        // 🌟 [NEW 10] 사용자 지적 '미포함 서식' 중 무역 공용 사전으로 처리 가능한 것들.
+        //    개념이 갈리지 않으므로(SWB 의 pol 과 BL 의 pol 은 같은 개념)
+        //    공용 노드를 그대로 쓰는 것이 정확도를 해치지 않습니다.
+        | "BE"   // Bill of Exchange
+        | "SR"   // Shipping Request
+        | "BK"   // Booking Confirmation
+        | "WR"   // Warehouse Receipt
+        | "CSI"  // Consular Invoice
+        | "SWB"  // Sea Waybill
+        | "IP"   // Insurance Policy
+        | "DN"   // Debit Note
+        | "CN"   // Credit Note
+        | "FC"   // Fumigation Certificate
+        => "shipping_doc",
+        _ => page_type,
+    }
+}
+
+/// 🌟 [TRADE SCHEMA LOADER] bias.json 의 trade_schema 를 읽어
+///    (category, field, description) 삼중항을 돌려줍니다.
+///
+///  ── 왜 코드가 아니라 데이터가 소유해야 하는가 ──
+///   기존에는 이 목록이 get_detail_schema_fields 의 shipping_doc 분기에
+///   `add(...)` 호출로 하드코딩되어 있었고, 같은 목록이 bias.json 의
+///   trade_schema 에도 따로 존재했습니다.
+///   두 목록이 어긋난 결과가 실측 실패였습니다.
+///     · ⓑ에만 있던 items 6필드 → 비전 앵커 부재 → 표를 못 찾음
+///     · ⓐ에만 있던 place_receipt → 히트맵 질량만 먹고 결과 기여 0
+///   진실의 원천을 bias.json 하나로 고정하면 이 어긋남이 물리적으로 불가능해집니다.
+///
+///  ── 조건부 로드 ──
+///   doc_type 은 STEP 2 에서 이미 확정되어 이 함수에 들어옵니다.
+///   base 전체 + overlay[doc_type] 만 로드하므로,
+///   CI 인보이스에 위험물(un_number) · 식물검역(botanical_name) 앵커가
+///   올라가 히트맵을 오염시키는 일이 사라집니다.
+///
+///  ── 배열 카테고리 ──
+///   items / containers / parties / charges 등은 원소 스키마입니다.
+///   호출부(vision_encoder)가 카테고리 단위로 히트맵을 만들므로
+///   여기서는 평평한 필드 목록으로 돌려주고, 배열 여부는
+///   is_trade_array_category() 가 별도로 답합니다.
+pub fn trade_schema_triples(doc_type: &str) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+
+    let node = match BIAS_DICT.get("trade_schema") {
+        Some(n) => n,
+        None => return out,
+    };
+
+    let mut absorb = |cat_obj: &Value, out: &mut Vec<(String, String, String)>| {
+        let map = match cat_obj.as_object() { Some(m) => m, None => return };
+        for (category, fields) in map {
+            let fmap = match fields.as_object() { Some(f) => f, None => continue };
+            for (field, desc) in fmap {
+                let d = desc.as_str().unwrap_or("").to_string();
+                // overlay 가 base 필드를 덮어쓰는 경우 설명만 교체합니다.
+                if let Some(slot) = out.iter_mut()
+                    .find(|(c, f, _)| c == category && f == field)
+                {
+                    if !d.trim().is_empty() { slot.2 = d; }
+                    continue;
+                }
+                out.push((category.clone(), field.clone(), d));
+            }
+        }
+    };
+
+    if let Some(base) = node.get("base") {
+        absorb(base, &mut out);
+    }
+
+    // 🌟 조건부 : 이 서식의 overlay 만 얹습니다.
+    if let Some(ov) = node.get("overlay").and_then(|o| o.get(doc_type)) {
+        absorb(ov, &mut out);
+    }
+
+    out
+}
+
+/// 🌟 [ALIAS-AWARE TRIPLES] trade_schema 삼중항에 '정준 필드 별칭' 을 앵커로 병합합니다.
+///
+///  ── 왜 여기서 하는가 ──
+///   별칭은 스키마 필드가 아니라 '그 필드를 부르는 다른 이름' 입니다.
+///   필드 목록에 넣으면 근거가 갈라지고, 프롬프트에 넣으면 모델이 중복 출력합니다.
+///   앵커 문자열에 섞는 것이 유일하게 안전한 위치입니다.
+pub fn canonical_trade_triples(doc_type: &str) -> Vec<(String, String, String)> {
+    let mut triples = trade_schema_triples(doc_type);
+
+    // 🌟 [ALIAS TABLE] 45종 예시 서식 대조에서 뽑은 '같은 개념의 다른 이름' 입니다.
+    //    특정 서식에 종속되지 않는 표준 표기이므로 어휘 하드코딩이 아니라
+    //    무역 서식 표기 규약의 목록입니다.
+    const ALIAS: &[(&str, &str)] = &[
+        ("doc_number",
+         "invoice number, commercial invoice number, bill of lading number, B/L no, \
+          air waybill number, AWB no, sea waybill number, house B/L number, HBL no, \
+          purchase order number, PO no, proforma invoice number, PI no, \
+          letter of credit number, L/C no, local L/C number, delivery order number, DO no, \
+          booking number, shipping request number, arrival notice number, shipping advice number, \
+          packing list number, certificate number, cert no, manifest number, \
+          declaration number, export declaration no, import declaration no, license number, \
+          policy number, claim number, statement number, tax invoice number, contract number, \
+          warehouse receipt number, forwarder's certificate of receipt number, FCR no, \
+          proof of delivery number, trust receipt number, bill of exchange number, \
+          consular invoice number, debit note number, credit note number, \
+          confirmation number, survey report number, visa number"),
+        ("package_count",
+         "number of packages, total packages, packages delivered, packages received, \
+          number of pieces, total pieces, no. of pkgs, CTNS, PKGS"),
+        ("weight_gross",
+         "total gross weight, gross weight kg, G.W., cargo gross weight, \
+          verified gross mass, VGM, chargeable weight"),
+        ("weight_net",
+         "total net weight, net weight kg, N.W., cargo net weight"),
+        ("volume",
+         "total measurement, measurement CBM, cubic meter, M3, measurement"),
+        ("amount",
+         "total amount, grand total, grand total amount, total invoice amount, \
+          total charge, total charges, total amount due, total amount paid, invoice amount, \
+          total invoice value, total FOB amount, total declared amount, \
+          total authorized value, total claim amount, total credit amount, total debit amount"),
+        ("amount_subtotal",
+         "sub total, subtotal, total items amount, total supply amount"),
+        ("amount_tax",
+         "total VAT amount, VAT amount, tax amount, supply amount"),
+        ("freight_payment_term",
+         "freight term, freight prepaid, freight collect"),
+        ("issue_date",
+         "submission date, date of issue, issued on"),
+    ];
+
+    for (canon, extra) in ALIAS.iter() {
+        if let Some(slot) = triples.iter_mut().find(|(_, f, _)| f == canon) {
+            // 설명문 뒤에 별칭을 이어 붙입니다. 타입 마커는 trade_desc_to_type 이
+            // 원문에서 읽으므로 순서가 바뀌어도 안전합니다.
+            if !slot.2.contains(extra) {
+                slot.2 = format!("{}, {}", slot.2.trim(), extra);
+            }
+        }
+    }
+
+    triples
+}
+
+/// bias.json 설명문에서 타입 마커를 떼어 앵커 문자열로 만듭니다.
+fn trade_desc_to_anchor(desc: &str) -> String {
+    let mut s = desc.to_string();
+    for m in ["{String}", "{Number}", "{Boolean}", "{Array}"] {
+        s = s.replace(m, " ");
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// bias.json 설명문의 타입 마커를 스키마 타입 문자열로 변환합니다.
+fn trade_desc_to_type(desc: &str) -> &'static str {
+    if desc.contains("{Number}") { "Number" }
+    else if desc.contains("{Boolean}") { "Boolean" }
+    else if desc.contains("{Array}") { "Array of Strings" }
+    else { "String" }
+}
+
+/// 🌟 이 카테고리가 배열(반복 행) 스키마인지 답합니다.
+///
+///  ── 판정 근거 ──
+///   trade_schema 의 값 형태가 아니라 '개념이 반복되는가' 입니다.
+///   items(품목 행) / containers(컨테이너 행) / parties(당사자 역할) /
+///   charges(요금 항목) / test_results(시험 항목) 등은
+///   한 문서에 여러 개가 인쇄되는 것이 정상입니다.
+///   스칼라로 다루면 두 번째 이후가 통째로 소실됩니다.
+///   (실측: 상품 표 2행 중 Shorts 행 소실)
+pub fn is_trade_array_category(category: &str) -> bool {
+    matches!(
+        category,
+        "items"
+            | "containers"
+            | "parties"
+            | "charges"
+            | "test_results"
+            | "findings_and_damage"
+            | "account_ledger"
+            | "adjustments"
+            | "packing_details"
+            | "licensed_items"
+            | "purchased_items"
+    )
 }
 
 pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
@@ -225,7 +446,6 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
     let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
-        // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
         let inject_domain = |text: &str, domain: &str| -> String {
             if text.trim().is_empty() { return String::new(); }
             text.split(',')
@@ -236,9 +456,15 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
         let mut final_bias = inject_domain(en_bias, page_type);
         let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
+
+        let bias_type_key = canonical_bias_type(page_type);
         if let Some(localized_obj) = BIAS_DICT
             .get(lang_code)
-            .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+            .and_then(|l| {
+                l.get(page_type)
+                    .or_else(|| if bias_type_key != page_type { l.get(bias_type_key) } else { None })
+                    .or_else(|| l.get("default"))
+            })
             .and_then(|p| p.get(key))
         {
             if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
@@ -383,9 +609,6 @@ pub fn get_layout_prompt_hints(page_type: &str, lang: &str) -> (String, String) 
     (list_hints, form_hints)
 }
 
-// 🌟 [STAGE-1 전용 멀티패스 컨텍스트 추출기]
-// LLM 스키마용(get_detail_schema_fields)과 분리하여, bias.json의 모든 속성(layout_list 등 포함)과
-// 추상적 검색 의도(Core Intent)를 100% 동적으로 긁어모아 벡터 매칭의 해상도를 극대화합니다.
 pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, String, String)> {
     let mut contexts = Vec::new();
     let lang_code_owned = lang_code_of(lang);
@@ -490,9 +713,16 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
         let mut final_bias = inject_domain(en_bias, page_type);
         let mut final_prejudice = inject_domain(en_prejudice, page_type);
         let mut semantic_desc = String::new();
+        // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드(BL/CI/PL...)는 bias.json 에
+        //    개별 노드가 없으므로 공용 'shipping_doc' 노드로 접어서 조회합니다.
+        let bias_type_key = canonical_bias_type(page_type);
         if let Some(localized_obj) = BIAS_DICT
             .get(lang_code)
-            .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
+            .and_then(|l| {
+                l.get(page_type)
+                    .or_else(|| if bias_type_key != page_type { l.get(bias_type_key) } else { None })
+                    .or_else(|| l.get("default"))
+            })
             .and_then(|p| p.get(key))
         {
             if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
@@ -568,10 +798,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("description", "String", "description detail", "");
             add("short_description", "String", "short description summary", "");
             add("tags", "Array of Strings", "tags keywords", "");
-            // 🌟 [COLOR] 색상은 bias.json 루트에 전역 노드로만 존재해
-            //    PLINKO 속성 후보로는 올라오는데 추출 스키마에는 없었습니다.
-            //    그래서 data.color 조건이 발행되어도 어떤 문서에도 그 경로가 없어
-            //    matchCondition 이 false 를 돌려주고 결과가 통째로 0건이 되었습니다.
             add("color", "String", "color hue shade tint", "");
             add("origin_country", "String", "origin country", "");
             add("manufacturer", "String", "manufacturer", "");
@@ -651,17 +877,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("completed", "Boolean", "completed purchased", "");
             add("registration_date", "String", "date registration time", "");
         },
-        // 🌟 [ANALYTIC BEHAVIOUR SCHEMA] 사용자 행동 로그 도메인.
-        //  ── 왜 필요한가 ──
-        //   index_item_chunks 는 get_detail_schema_fields 가 빈 배열을 돌려주면
-        //   "대응하는 스키마 필드가 없어 청크 인덱싱을 건너뜁니다" 로 조기 종료합니다.
-        //   그래서 click / hover / change / report 문서는 아이템 벡터 1개만 생기고
-        //   item_chunks 가 0건이라 STAGE-4(청크 코사인)가 항상 비었습니다.
-        //  ── 축 설계 ──
-        //   저장 축은 자유 서술 3개(action / summary / relate)와
-        //   합성 3개(cross_action_flow / intent_evolution / consistent_preferences)입니다.
-        //   bias.json 에 노드를 만들지 않고 en_bias 만으로 뱅크를 세워도
-        //   다국어 임베딩이 교차언어 매칭을 담당하므로 리콜이 성립합니다.
         "click" | "hover" | "change" | "report" => {
             add("id,link", "", "id link url address", "");
             add("action", "String",
@@ -683,72 +898,169 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                 "repeated preference, recurring choice, habitual attribute, favourite option",
                 "identifier, code, url, link, date, price, status");
         },
-        // 🌟 [TRADE DOC SCHEMA] 무역 서식 도메인.
-        //  ── 왜 필요한가 ──
-        //   기존에는 BL / AWB / LC 등 27종이 전부 `_` 로 떨어져
-        //   id,link / title / status 세 개짜리 속성 뱅크만 받았습니다.
-        //   extract_shipping_conditions 는 33개 축을 조건으로 뽑는데
-        //   그 조건을 받아 줄 속성이 스키마에 존재하지 않아,
-        //   벡터 매칭이 필요한 어떤 경로도 무역 필드를 짚지 못했습니다.
-        //  ── 필드 이름 ──
-        //   extract_shipping_conditions(검색) / get_trade_category_schema(추출)와
-        //   동일한 canonical 이름을 씁니다. 세 곳이 같은 이름 공간을 공유해야
-        //   저장·조회·질의가 alias 없이 바로 만납니다.
-        //  ⚠️ 'shipping' 과 'receiving' 은 넣지 않습니다.
-        //     proxy 가 택배 라벨에 붙이는 commerce 계열 타입이라
-        //     여기 넣으면 운송장이 tracking 스키마 대신 무역 스키마로 빠집니다.
+        // 🌟 [CONDITIONAL TRADE SCHEMA]
+        //
+        //  ── 왜 하드코딩을 버리는가 ──
+        //   Part 11 에서 이 분기를 bias.json 과 손으로 맞췄지만, 손으로 맞춘 것은
+        //   다음 필드 추가에서 다시 어긋납니다. 목록의 소유자를 하나로 만듭니다.
+        //
+        //  ── 왜 조건부인가 ──
+        //   page_type 은 여기 도달할 시점에 이미 STEP 2 가 확정한 서식 코드입니다.
+        //   (로그: "Document identified as: CI" 가 STAGE-3 보다 먼저 출력됩니다)
+        //   27개 서식 공통 목록을 쓰면
+        //     · CI 인보이스에 un_number / botanical_name / weighing_date 앵커가 올라가
+        //       무관한 영역과 코사인을 만들어 히트맵을 오염시키고
+        //     · 편견 구가 O(필드수 × 전체구수) 로 폭발합니다.
+        //       (실측 44필드에서 이미 13,598구. 388필드면 약 116만 구 = 대조 연산 86배)
+        //   base + overlay[doc_type] 만 로드하면 필드 1.6배 / 연산 2.8배로 그칩니다.
+        //
+        //  ── 별칭은 필드가 아니라 앵커 ──
+        //   invoice_number / bl_number / awb_number 같은 35개 '서식별 자기 번호' 는
+        //   전부 doc_number 입니다. 별도 필드로 만들면 같은 영역을 놓고 경쟁해
+        //   근거가 갈라지고 배타 배정에서 양쪽 다 굶습니다.
+        //   그 라벨들은 bias.json 의 doc_number 앵커(overlay)로 들어갑니다.
+        //   (실측 doc_number = "" 의 원인: 이미지엔 INVOICE NUMBER 라고 적혀 있는데
+        //    앵커에는 "document number identifier" 뿐이었습니다)
         "shipping_doc"
         | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
         | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
         | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
-        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" => {
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
+        | "HBL" | "FCR" | "POD" | "LG" | "TR" | "LLC" | "TI" | "CP" | "CM"
+        | "CCC" | "CNM" | "PC" | "COA" | "FI" | "CDR" | "ICF" | "SOA" | "EL"
+        | "BE" | "SR" | "BK" | "WR" | "CSI" | "SWB" | "IP" | "DN" | "CN" | "FC" => {
+            // ── 봉투/시스템 축 (trade_schema 에는 없지만 저장 파이프라인이 요구) ──
             add("id,link", "", "id link document", "");
+            add("status", "String", "status state", "");
+
+            // ── trade_schema 에서 조건부 로드 ──
+            let triples = canonical_trade_triples(page_type);
+            if triples.is_empty() {
+                // bias.json 에 trade_schema 노드가 없는 극단 상황의 최소 방어선입니다.
+                add("doc_type", "String", "document type kind form", "");
+                add("doc_number", "String", "document number identifier", "");
+                add("issue_date", "String", "issue date", "");
+            } else {
+                let mut loaded_cats: Vec<String> = Vec::new();
+                for (category, field, desc) in triples.iter() {
+                    if !loaded_cats.iter().any(|c| c == category) {
+                        loaded_cats.push(category.clone());
+                    }
+                    // 🌟 desc 는 bias.json 의 설명문입니다. 여기서 타입 마커를 떼고
+                    //    영어 앵커로 씁니다. bias.json 의 ko.shipping_doc 노드가 있으면
+                    //    add() 내부에서 한국어 앵커가 추가로 붙습니다.
+                    let en_anchor = trade_desc_to_anchor(desc);
+                    let field_type = trade_desc_to_type(desc);
+                    add(field, field_type, &en_anchor, "");
+                }
+                println!(
+                    "[SCHEMA] 🚢 '{}' 조건부 로드: 카테고리 {}개 | 필드 {}개 (base + overlay)",
+                    page_type,
+                    loaded_cats.len(),
+                    triples.len()
+                );
+            }
+        },
+            //
+            //  ── 실측 피해 ──
+            //   · ⓑ에만 있고 ⓐ에 없던 13개(package_unit / description / quantity / unit /
+            //     unit_price / total_price / type_size / reference_po / reference_bl /
+            //     reference_contract / reference_number / amount_subtotal / amount_tax)는
+            //     비전 앵커가 아예 없어 크롭이 그 영역을 겨냥한 적이 없는데
+            //     프롬프트는 값을 요구했습니다.
+            //     → package_unit 이 문서에 없는데 "CTN" 을 뱉은 직접 원인입니다.
+            //     → items 카테고리 앵커가 hs_code 하나뿐이라 히트맵 최하위(+1.3126)로 밀려
+            //       상품 표(y 550~634)를 통째로 놓쳤습니다.
+            //   · ⓐ에만 있던 9개(id,link / no / status / expiry_date / place_receipt /
+            //     place_delivery / freight_amount / insurance_amount / local_charges)는
+            //     히트맵 질량만 가져가고 결과에는 기여하지 않았습니다.
+            //     특히 place_receipt / place_delivery 는 logistics 앵커를 부풀려
+            //     POL/POD 가 인쇄되지 않은 인보이스에서 서명 블록으로 크롭을 끌고 갔습니다.
+            //
+            //  ── 처방 ──
+            //   trade_schema 를 진실의 원천으로 삼아 이 목록을 정합화합니다.
+            //   아래 주석의 [B] 표시는 bias.json trade_schema 대응 카테고리입니다.
+
+            // ── 봉투/시스템 축 (프롬프트에는 없지만 저장 파이프라인이 요구) ──
+            add("id,link", "", "id link document", "");
+            add("status", "String", "status state", "");
+
+            // ── [B] header ──
             add("doc_type", "String", "document type kind form", "");
             add("doc_number", "String", "document number identifier", "");
-            add("no", "String", "tracking number reference", "");
-            add("status", "String", "status state", "");
             add("issue_date", "String", "issue date", "");
-            add("expiry_date", "String", "expiry date", "");
+            add("reference_po", "String", "referenced purchase order number", "");
+            add("reference_invoice", "String", "referenced invoice number", "");
+            add("reference_bl", "String", "referenced bill of lading number", "");
+            add("reference_lc", "String", "referenced letter of credit number", "");
+            add("reference_booking", "String", "referenced booking number", "");
+            add("reference_contract", "String", "referenced sales contract number", "");
+            add("reference_number", "String", "other reference number", "");
+
+            // ── [B] parties ──
             add("sender_name", "String", "shipper seller exporter name", "");
             add("sender_address", "String", "shipper address", "");
             add("recipient_name", "String", "consignee buyer importer name", "");
             add("recipient_address", "String", "consignee address", "");
             add("notify_party_name", "String", "notify party name", "");
+
+            // ── [B] logistics ──
             add("vessel", "String", "vessel flight carrier", "");
             add("voyage_number", "String", "voyage flight leg number", "");
             add("pol", "String", "port of loading origin departure", "");
             add("pod", "String", "port of discharge destination arrival", "");
-            add("place_receipt", "String", "place of receipt", "");
-            add("place_delivery", "String", "place of delivery", "");
             add("etd", "String", "estimated time of departure", "");
             add("eta", "String", "estimated time of arrival", "");
             add("transport_mode", "String", "sea air road rail", "");
+
+            // ── [B] conditions ──
             add("incoterms", "String", "incoterms fob cif exw ddp dap", "");
             add("payment_terms", "String", "payment terms", "");
             add("freight_payment_term", "String", "freight prepaid collect", "");
+
+            // ── [B] financials ──
             add("currency", "String", "currency", "");
             add("amount", "Number", "total amount", "");
-            add("freight_amount", "Number", "freight charges", "");
-            add("insurance_amount", "Number", "insurance charges", "");
-            add("local_charges", "Number", "local handling charges", "");
-            add("container_number", "String", "container number", "");
-            add("seal_number", "String", "seal number", "");
+            add("amount_subtotal", "Number", "subtotal before tax and charges", "");
+            add("amount_tax", "Number", "tax vat amount", "");
+
+            // ── [B] cargo ──
             add("package_count", "Number", "package carton count", "");
+            add("package_unit", "String", "package unit carton pallet", "");
             add("weight_gross", "Number", "gross weight", "");
             add("weight_net", "Number", "net weight", "");
             add("volume", "Number", "volume cbm measurement", "");
-            add("hs_code", "String", "hs code tariff number", "");
             add("marks_numbers", "String", "shipping marks and numbers", "");
-            add("reference_invoice", "String", "referenced invoice number", "");
-            add("reference_lc", "String", "referenced letter of credit number", "");
-            add("reference_booking", "String", "referenced booking number", "");
+
+            // ── [B] items (배열 스키마) ──
+            //  🌟 이 6개가 ⓐ에 없어서 items 히트맵이 hs_code 단일 앵커로 붕괴했습니다.
+            //     'description of goods' / 'unit of measure' / 'unit price' 는
+            //     전 세계 무역 표의 컬럼 헤더 표준 명칭이므로 표 위치 신호로 직접 작동합니다.
+            add("description", "String", "description of goods commodity description", "");
+            add("quantity", "Number", "line item quantity qty pcs", "");
+            add("unit", "String", "unit of measure uom", "");
+            add("hs_code", "String", "hs code tariff number", "");
+            add("unit_price", "Number", "unit price unit value", "");
+            add("total_price", "Number", "line total total value amount", "");
+
+            // ── [B] containers ──
+            add("container_number", "String", "container number", "");
+            add("seal_number", "String", "seal number", "");
+            add("type_size", "String", "container size and type", "");
+
+            // ── overlay 축 (LC / INS / DGD 등 서식별 확장) ──
+            //  🌟 trade_schema.overlay 는 서식별로만 활성화되지만, 비전 앵커는
+            //     doc_type 확정 이전(STEP 3)에 만들어지므로 전 서식 공통으로 올려 둡니다.
+            //     실제 추출 여부는 STEP 5 의 카테고리 스키마가 결정합니다.
+            add("expiry_date", "String", "expiry date validity", "");
+            add("freight_amount", "Number", "freight charges", "");
+            add("insurance_amount", "Number", "insurance charges", "");
+            add("local_charges", "Number", "local handling charges", "");
         },
         _ => {
             add("id,link", "", "id link", "");
             add("title", "String", "title name", "");
             add("status", "String", "status state", "");
-            // 🌟 get_list_schema_fields 의 동일 분기에는 있는데 여기만 빠져 있어,
-            //    목록에서는 등록일이 잡히고 상세에서는 잡히지 않았습니다.
             add("registration_date", "String", "date registration", "");
         }
     }

@@ -118,16 +118,21 @@ RETURN JSON ONLY. NO EXPLANATION. NO THINKING. /no_think"###;
 // }
 
 pub fn get_trade_doc_classification_prompt() -> String {
-    // 🌟 [CLASSIFIER v2 / 27 CODES]
-    //  ── 왜 늘리는가 ──
-    //   get_trade_doc_slice_config 는 27종 좌표를 갖고 있는데
-    //   분류기가 9종만 낼 수 있어 19개 분기가 도달 불가였습니다.
-    //   extract_shipping_conditions 도 16종을 조건으로 뽑으므로
-    //   저장(9종) ↔ 조회(16종) 사이에 영구 공백이 있었습니다.
+    // 🌟 [CLASSIFIER v3 / VISION-FIRST FALLBACK]
+    //  ── 호출 조건이 바뀌었습니다 ──
+    //   v2 는 이 프롬프트가 '항상' 호출되는 1차 분류기였습니다.
+    //   v3 에서는 SigLIP2 패치 코사인(vision_encoder::classify_doc_type)이 1차이며,
+    //   그 판정의 1위-2위 마진이 사실상 동률일 때만 이 프롬프트가 1회 호출됩니다.
+    //   벡터 근거는 get_trade_doc_classification_prompt_with_evidence 가 동봉합니다.
+    //
+    //  ── 이 함수는 언제 쓰이는가 ──
+    //   SigLIP2 텍스트 인코더 로드 실패 등으로 비전 판정 자체가 불가능할 때의
+    //   최후 폴백입니다. 근거 없이 목록만 제시하므로 정확도가 낮으며,
+    //   정상 경로에서는 도달하지 않습니다.
     //
     //  ── 오분류 완화 ──
     //   2B 비전 모델이 27갈래를 정확히 가르기는 어렵습니다.
-    //   다만 slice_config 가 같은 그룹을 한 좌표로 묶어 두었으므로
+    //   다만 같은 그룹은 bias.json 의 trade_schema 를 공유하므로
     //   (CI|PI|SC / ED|ID|CINV / IC|WC|CA|PHYTO|HC|BEN_CERT / DGD|MSDS / POA|BIZ_LIC|INS)
     //   그룹 내 혼동은 추출 품질에 영향을 주지 않습니다.
     //   그래서 아래 프롬프트도 '그룹 → 코드' 순서로 제시합니다.
@@ -177,6 +182,63 @@ If none fit, return "Unknown".
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###.to_string()
 }
 
+/// 🌟 [VISION EVIDENCE CLASSIFIER] 비전 코사인 근거를 동봉한 재판정 프롬프트.
+///
+///  ── 호출 조건 ──
+///   siglip2::vision_encoder::classify_doc_type 의 코드 판정에서
+///   1위와 2위가 사실상 동률(margin ≈ 0)일 때만 1회 호출됩니다.
+///   마진이 충분하면 LLM 을 아예 부르지 않습니다.
+///
+///  ── 왜 근거를 동봉하는가 ──
+///   scheduler.rs STEP A 가 [VECTOR EVIDENCE] 를 실어 보내는 것과 같은 이유입니다.
+///   후보 목록만 주면 2B 모델이 목록 첫 항목이나 가장 흔한 서식(BL / CI)으로
+///   쏠립니다. 코사인 점수를 함께 주면 모델은 '이미 좁혀진 선택지 중 하나' 를
+///   고르는 작업만 하게 되어 창작 여지가 사라집니다.
+///
+///  ── 후보 제한 ──
+///   candidates 는 비전이 통과시킨 코드만 담습니다.
+///   모델이 그 밖의 코드를 반환하면 호출부가 폐기합니다.
+pub fn get_trade_doc_classification_prompt_with_evidence(
+    group: &str,
+    candidates: &[(String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (code, score) in candidates.iter().take(8) {
+        cands.push_str(&format!(
+            "- \"{}\" (vision cosine surprisal {:+.4}) — {}\n",
+            code,
+            score,
+            crate::logic::trade_code_anchor(code)
+        ));
+    }
+
+    let template = r###"[TASK]
+The vision encoder already narrowed this document down. Pick the single closest code.
+
+[VISION VERDICT]
+Document group: "{GROUP}"
+
+[CANDIDATE CODES]
+{CANDIDATES}
+
+[RULES]
+1. Choose exactly ONE code from [CANDIDATE CODES]. Never invent a code that is not listed.
+2. The scores come from patch-level cosine matching against each code's concept anchor.
+   A higher score means more of the page visually matched that concept.
+   Two nearly identical scores mean the page is genuinely ambiguous — decide by what you actually see.
+3. Judge by the printed title and the structural layout of the page, not by which candidate is listed first.
+4. If none of the candidates match what you see, return "Unknown".
+
+[OUTPUT FORMAT]
+{ "doc_type": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{GROUP}", group)
+        .replace("{CANDIDATES}", &cands)
+}
+
 /// 🌟 [TRADE SCHEMA v2 / BASE + OVERLAY]
 ///  ── v1 의 결함 ──
 ///   시그니처가 `_doc_type` 이었습니다. 즉 27종 서식에 전부 같은 27개 필드를
@@ -193,6 +255,207 @@ If none fit, return "Unknown".
 ///   base 는 extract_shipping_conditions(검색)와 '같은 이름' 을 씁니다.
 ///   그래야 저장과 조회가 alias 를 거치지 않고 바로 만납니다.
 ///   레거시 데이터는 path_alias 가 흡수합니다.
+/// 🌟 [TYPE MARKER SPLIT] 설명 문자열 끝의 타입 표기를 값에서 떼어냅니다.
+///
+///  ── 무엇이 문제였나 ──
+///   구버전 스키마는 `"voyage_number": "Voyage or flight leg number {String}"` 를
+///   모델에게 그대로 보여 주었습니다. 그러면 값 자리에 문자열이 이미 들어 있으므로
+///   2B 모델은 그 마지막 토큰을 값으로 복사합니다.
+///   (실측 로그: `"voyage_number": "{String}"`)
+///   타입은 '설명' 이지 '값' 이 아니므로 값 위치에서 물리적으로 제거해야 합니다.
+fn split_type_marker(desc: &str) -> (String, &'static str) {
+    let d = desc.trim();
+    for (marker, ty) in [
+        ("{String}", "String"),
+        ("{Number}", "Number"),
+        ("{Boolean}", "Boolean"),
+        ("{Array}", "Array"),
+    ] {
+        if let Some(pos) = d.rfind(marker) {
+            let head = d[..pos].trim().trim_end_matches(':').trim();
+            let tail = d[pos + marker.len()..].trim();
+            let joined = if tail.is_empty() {
+                head.to_string()
+            } else {
+                format!("{} {}", head, tail)
+            };
+            return (joined.trim().to_string(), ty);
+        }
+    }
+    (d.to_string(), "String")
+}
+
+/// 🌟 [EXAMPLE TOKEN HARVEST v2] 설명 안의 '예시 값' 을 뽑아냅니다.
+///
+///  ── 왜 뽑아내는가 ──
+///   `"incoterms": "FOB, CIF, EXW, DDP, DAP {String}"` 를 보여 주면
+///   2B 모델은 목록의 첫 항목을 답으로 복사합니다.
+///   (실측: 정답 DAP 인데 FOB 반환 / 문서에 없는데 CTN 반환)
+///   설명에서 예시를 지우면 '어떤 종류의 값인가' 를 모르게 되므로 지울 수는 없습니다.
+///   대신 그 토큰들을 [FORBIDDEN VALUES] 로 명시해
+///   "이 목록은 값이 아니라 예시" 라는 사실을 프롬프트 안에서 못박습니다.
+///
+///  ── v1 이 놓친 것 ──
+///   v1 은 '대문자·숫자 비율' 하나만 봤습니다. bias.json 의 실제 44개 문자열에 대입하면
+///     "Sea, Air, Road, Rail"                 → Sea(대문자 1/알파벳 3) 전량 미검출
+///     "Freight Prepaid or Freight Collect"   → 15자 상한 초과로 미검출
+///     "(e.g. PO-99281A)"                     → 14자 상한 초과로 미검출
+///     "Tenor: at sight, 30 days, ..."        → 라벨 접두가 붙어 미검출
+///   전부 모델이 그대로 복사할 수 있는 형태입니다.
+///
+///  ── v2 판정 근거 (전부 구조, 어휘 사전 없음) ──
+///   R1 괄호 안 : 설명문의 괄호는 예시 열거입니다.
+///   R2 예시 마커: 마침표로 끝나는 4자 이하 선행 토큰(e.g. / eg. / ex.)은 마커이므로 제거합니다.
+///   R3 짧은 열거: 본문이 2조각 이상으로 쪼개지고 모든 조각이 3단어 이하면
+///                그 본문은 설명이 아니라 값 열거입니다.
+///                ("Sea, Air, Road, Rail" ✓ / "Subtotal before tax and charges" 는 1조각이라 미해당)
+///   R4 라벨 접두: 조각에 ':' 가 있으면 뒤쪽만 취합니다. ("Tenor: at sight" → "at sight")
+///   R5 대문자·숫자 우세: v1 규칙 유지. FOB / 20GP / UN1263 / YYYY-MM-DD 를 잡습니다.
+fn extract_example_tokens(desc: &str) -> Vec<String> {
+    /// 조각 하나를 정규화합니다. (R2 마커 제거 + R4 라벨 접두 제거 + 양끝 비영숫자 제거)
+    fn normalize_segment(raw: &str) -> String {
+        let mut s = raw.trim().to_string();
+
+        // R4 : "Tenor: at sight" → "at sight"
+        if let Some(p) = s.find(':') {
+            let tail = s[p + 1..].trim().to_string();
+            if !tail.is_empty() {
+                s = tail;
+            }
+        }
+
+        // R2 : "e.g. PO-99281A" → "PO-99281A"
+        let toks: Vec<&str> = s.split_whitespace().collect();
+        if toks.len() >= 2 {
+            let head = toks[0];
+            if head.ends_with('.') && head.chars().count() <= 4 {
+                s = toks[1..].join(" ");
+            }
+        }
+
+        s.trim()
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string()
+    }
+
+    /// 이 조각이 '값 예시로 쓰일 수 있는 생김새' 인지 최소 자격만 봅니다.
+    fn is_usable(t: &str) -> bool {
+        if t.is_empty() {
+            return false;
+        }
+        if t.chars().count() > 24 {
+            return false;
+        }
+        t.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+    }
+
+    /// R5 : 대문자 + 숫자 비중이 절반 이상인 짧은 토큰
+    fn is_code_like(t: &str) -> bool {
+        if t.chars().count() > 12 {
+            return false;
+        }
+        let alnum = t.chars().filter(|c| c.is_alphanumeric()).count();
+        if alnum < 2 {
+            return false;
+        }
+        let upper = t
+            .chars()
+            .filter(|c| c.is_uppercase() || c.is_ascii_digit())
+            .count();
+        upper * 2 >= alnum
+    }
+
+    /// 콤마 / " or " / '/' 를 공통 나열 구분자로 보고 쪼갭니다.
+    fn split_enum(seg: &str) -> Vec<String> {
+        seg.replace(" or ", ",")
+            .replace('/', ",")
+            .split(',')
+            .map(normalize_segment)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |t: String, out: &mut Vec<String>| {
+        if !is_usable(&t) {
+            return;
+        }
+        if !out.iter().any(|e| e == &t) {
+            out.push(t);
+        }
+    };
+
+    // ── R1 : 괄호/대괄호 안은 무조건 예시 열거로 봅니다 ──
+    let mut depth = 0usize;
+    let mut buf = String::new();
+    let mut paren_segs: Vec<String> = Vec::new();
+    for ch in desc.chars() {
+        match ch {
+            '(' | '[' => {
+                depth += 1;
+                buf.clear();
+            }
+            ')' | ']' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if !buf.trim().is_empty() {
+                        paren_segs.push(buf.clone());
+                    }
+                    buf.clear();
+                }
+            }
+            _ => {
+                if depth > 0 {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    for seg in paren_segs.iter() {
+        for part in split_enum(seg) {
+            // 괄호 안이라도 5단어 이상이면 설명문입니다. ("4 letters + 7 digits")
+            if part.split_whitespace().count() > 4 {
+                continue;
+            }
+            push(part, &mut out);
+        }
+    }
+
+    // ── 괄호를 제거한 본문 ──
+    let flat: String = desc
+        .chars()
+        .map(|c| if c == '(' || c == ')' || c == '[' || c == ']' { ' ' } else { c })
+        .collect();
+    let body_parts = split_enum(&flat);
+
+    // ── R3 : 2조각 이상 + 모든 조각 3단어 이하 → 본문 전체가 값 열거 ──
+    let is_enumeration = body_parts.len() >= 2
+        && body_parts
+            .iter()
+            .all(|p| p.split_whitespace().count() <= 3);
+
+    for part in body_parts.iter() {
+        if is_enumeration {
+            push(part.clone(), &mut out);
+            continue;
+        }
+        // ── R5 : 열거가 아니어도 코드형 토큰은 개별 수확 ──
+        if is_code_like(part) {
+            push(part.clone(), &mut out);
+            continue;
+        }
+        // 조각 내부의 단어 단위로도 코드형 토큰을 찾습니다. ("UN number UN1263" 대비)
+        for w in part.split_whitespace() {
+            let t = w.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+            if is_code_like(&t) {
+                push(t, &mut out);
+            }
+        }
+    }
+
+    out
+}
+
 pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     use serde_json::Value;
 
@@ -200,10 +463,16 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     fn fallback_base(category: &str) -> Vec<(&'static str, &'static str)> {
         match category {
             "header" => vec![
-                ("doc_type",         "Document kind code {String}"),
-                ("doc_number",       "Primary identifier (B/L No, Invoice No, PO No) {String}"),
-                ("issue_date",       "Date of issue (YYYY-MM-DD) {String}"),
-                ("reference_number", "Any other reference number printed {String}"),
+                ("doc_type",           "Document kind code {String}"),
+                ("doc_number",         "Primary identifier of THIS document (B/L No, Invoice No, PO No) {String}"),
+                ("issue_date",         "Date of issue (YYYY-MM-DD) {String}"),
+                ("reference_po",       "Referenced Purchase Order number printed on this document {String}"),
+                ("reference_invoice",  "Referenced Commercial Invoice number printed on this document {String}"),
+                ("reference_bl",       "Referenced Bill of Lading number printed on this document {String}"),
+                ("reference_lc",       "Referenced Letter of Credit number printed on this document {String}"),
+                ("reference_booking",  "Referenced Booking number printed on this document {String}"),
+                ("reference_contract", "Referenced Sales Contract number printed on this document {String}"),
+                ("reference_number",   "Any OTHER reference number printed that does not fit the fields above {String}"),
             ],
             "parties" => vec![
                 ("sender_name",       "Shipper, Seller, Exporter {String}"),
@@ -298,134 +567,461 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         );
     }
 
-    // 3) 렌더링 : items / containers 는 배열 스키마입니다.
-    //    (merge_json_manual 이 items → line_items 로 매핑하므로 키 이름은 그대로 둡니다)
+    // 3) 렌더링 v2 : '정의' 와 '값 자리' 를 물리적으로 분리합니다.
+    //
+    //  ── 구버전이 만들던 프롬프트 ──
+    //     SCHEMA:
+    //     {
+    //       "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
+    //       "package_unit": "Package unit (CTN, PLT, PKG) {String}"
+    //     }
+    //   값 자리에 이미 문자열이 채워져 있으므로 2B 모델은 그것을 복사합니다.
+    //   실측 결과: 정답 DAP 인데 FOB, 문서에 없는데 CTN, 그리고 "{String}" 원문 그대로.
+    //
+    //  ── 새 프롬프트 ──
+    //     [FIELD DEFINITIONS]
+    //     - "incoterms" (String): FOB, CIF, EXW, DDP, DAP
+    //     [FORBIDDEN VALUES]
+    //     ... FOB, CIF, EXW, DDP, DAP ...
+    //     SCHEMA:
+    //     { "incoterms": null }
+    //   값 자리는 전부 null 이라 복사할 대상이 없고,
+    //   예시는 정의 블록으로 옮겨 '값이 아님' 을 명시합니다.
+    //
+    //  ⚠️ [CONTRACT] 아래 두 계약은 반드시 유지해야 합니다.
+    //     ① get_trade_doc_categories / process_trading_task 가
+    //        "SCHEMA:\n{}" 문자열로 빈 스키마를 판정합니다.
+    //     ② process_trading_task 가 SCHEMA 블록에서 trim_start 후 '"' 로 시작하는
+    //        라인 수로 필드 개수를 셉니다. 정의/금지 블록은 '-' 로 시작시켜 제외합니다.
     let is_array = category == "items" || category == "containers";
-    let body = fields
+
+    let parsed: Vec<(String, String, &'static str)> = fields
         .iter()
-        .map(|(k, d)| format!("  \"{}\": \"{}\"", k, d.replace('"', "'")))
+        .map(|(k, d)| {
+            let (desc, ty) = split_type_marker(d);
+            (k.clone(), desc, ty)
+        })
+        .collect();
+
+    let defs = parsed
+        .iter()
+        .map(|(k, d, t)| format!("- \"{}\" ({}): {}", k, t, d.replace('"', "'")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut forbidden: Vec<String> = Vec::new();
+    for (_, d, _) in parsed.iter() {
+        for tok in extract_example_tokens(d) {
+            if !forbidden.iter().any(|e| e == &tok) {
+                forbidden.push(tok);
+            }
+        }
+    }
+    // 타입 표기 자체도 금지 목록에 넣습니다. (실측: "voyage_number": "{String}")
+    for t in ["String", "Number", "Boolean", "Array"] {
+        let m = format!("{{{}}}", t);
+        if !forbidden.iter().any(|e| e == &m) {
+            forbidden.push(m);
+        }
+    }
+
+    let forbidden_block = if forbidden.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[FORBIDDEN VALUES]\n\
+             The tokens below appear in [FIELD DEFINITIONS] only as EXAMPLES of the kind of value.\n\
+             They are NOT the answer. Returning one of them without reading it off the image is a fabrication.\n\
+             - {}\n\
+             Return one of these ONLY when you can actually read that exact token in the image.",
+            forbidden.join(", ")
+        )
+    };
+
+    let body = parsed
+        .iter()
+        .map(|(k, _, _)| format!("  \"{}\": null", k))
         .collect::<Vec<_>>()
         .join(",\n");
 
     let schema = if is_array {
-        format!("[ {{\n{}\n}} ]", body)
+        // 🌟 [ARRAY SHAPE ENFORCEMENT] 원소를 두 개 제시해 '반복 구조' 를 눈으로 보여 줍니다.
+        //    구버전은 원소 하나짜리 `[ { ... } ]` 만 보여 줬고,
+        //    2B 모델은 표에서 한 행만 읽으면 대괄호를 벗겨 객체를 반환했습니다.
+        //    (실측: T-Shirt 행만 객체로 반환 → Shorts 행 소실)
+        //    원소를 두 개 세워 두면 '행마다 원소 하나' 라는 계약이 형태로 전달됩니다.
+        format!("[\n  {{\n{}\n  }},\n  {{\n{}\n  }}\n]", body, body)
     } else {
         format!("{{\n{}\n}}", body)
     };
 
+    let reference_rule = if category == "header" {
+        "\nREFERENCE RULES:\n\
+         1. \"doc_number\" is the identifier OF THIS DOCUMENT ITSELF. Never put another document's number there.\n\
+         2. A number printed under a label such as 'Ref', 'Our Ref', 'Your Ref', 'Against', 'Covering', 'Relating to', \
+         'P/O No', 'Invoice No', 'B/L No', 'L/C No', 'Booking No', 'Contract No' belongs to the matching reference_* field, NOT to doc_number.\n\
+         3. Copy each reference number EXACTLY as printed, including its prefix and hyphens (PO-99281A, CI-2026-08001, BL-55432219, LC-88492011).\n\
+         4. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".\n\
+         5. Omit any reference_* field that is not printed. An omitted field is correct data; a guessed one corrupts the document graph."
+    } else {
+        ""
+    };
+
+    // 🌟 [ARRAY RULE] 표는 '행이 몇 개인지' 를 모델이 스스로 세어야 합니다.
+    //    실측에서 상품 표에 T-Shirt / Shorts 두 행이 있는데 한 행만 반환되었고,
+    //    두 번째 행은 파이프라인 어디에서도 복구할 수 없었습니다.
+    let array_rule = if is_array {
+        "\n[TABLE RULES]\n\
+         1. This category is a TABLE. Output one array element per printed row, in top-to-bottom order.\n\
+         2. Count the rows before you write. If you see three rows, the array has three elements.\n\
+         3. The two elements shown in SCHEMA are a shape example, not a row count.\n\
+         4. Never merge two rows into one element. Never split one row into two.\n\
+         5. If a cell in a row is blank, that element's field is null — do not borrow the value from the row above."
+    } else {
+        ""
+    };
+
     format!(
-        "RULES: Follow comments strictly. Output JSON ONLY. Omit any field not visible in the image.\nMISSION: Extract data for category '{}' of a {} document.\nSCHEMA:\n{}",
+        "RULES: Output JSON ONLY. Every value in SCHEMA is null on purpose — replace a null ONLY with text you can actually read in the image.\n\
+         MISSION: Extract data for category '{}' of a {} document.{}{}\n\
+         [FIELD DEFINITIONS]\n{}{}\n\
+         SCHEMA:\n{}",
         category.to_uppercase(),
         doc_type,
+        reference_rule,
+        array_rule,
+        defs,
+        forbidden_block,
         schema
     )
 }
 
-// pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
-//     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
-// Extract the logistics filters from the natural language query into the JSON format.
+/// 🌟 [VISION CROP PROMPT] 정밀 크롭 이미지 전용 스키마 프롬프트.
+///
+///  ── get_trade_category_schema 와 무엇이 다른가 ──
+///   기존 프롬프트는 '전체 페이지 또는 고정 세로 슬라이스' 를 전제로 합니다.
+///   그래서 모델은 화면 어딘가에 값이 있을 것이라 가정하고 탐색하며,
+///   찾지 못하면 근처 숫자를 끌어와 채워 넣습니다.
+///
+///   이 프롬프트의 입력은 SigLIP2 코사인 히트맵이 지목한 '그 카테고리 영역만' 입니다.
+///   즉 "여기 없으면 문서 어디에도 없다" 가 성립합니다.
+///   그 사실을 명시해야 모델이 null 을 자신 있게 돌려줍니다.
+///
+///  ── 왜 null 이 중요한가 ──
+///   무역 문서 그래프는 참조 번호로 연결됩니다.
+///   없는 번호를 창작하면 잘못된 문서끼리 relay 되어 그래프가 통째로 오염됩니다.
+///   빈 값은 되돌릴 수 있지만 잘못된 연결은 되돌릴 수 없습니다.
+pub fn get_trade_crop_prompt(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+) -> String {
+    let base = get_trade_category_schema(category, doc_type);
 
-// [SCHEMA DEFINITION]
-// Extract the following tracking/trade properties if semantically present in the text:
-// - "no": Tracking number, B/L number, Invoice number.
-// - "status": Shipping status (draft, progress, return, complete, error).
-// - "vessel": Vessel name, Flight No, or Carrier.
-// - "pol": Port of Loading, Origin, Departure point.
-// - "pod": Port of Discharge, Destination, Arrival point.
-// - "sender_name": Shipper, Seller, or Exporter name.
-// - "recipient_name": Consignee, Buyer, or Importer name.
-// - "incoterms": Incoterms (e.g., FOB, CIF, EXW).
-// - "weight": Cargo or gross weight.
-// - "amount": Total financial amount or price.
+    let evidence = if top_field.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[VISION EVIDENCE]\nThe vision encoder located this region by matching the concept \"{}\" \
+             (cosine surprisal {:+.4}). The value for that field is almost certainly printed inside this crop.",
+            top_field, score
+        )
+    };
 
-// [TRANSFORMATION LOGIC]
-// For EVERY extracted field, wrap it in an operator object:
-// { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-// - Use "contains" for text fields, names, ports, vessels.
-// - Use "eq" for strict identifiers or status.
-
-// [QUERY]
-// {QUERY}
-
-// [OUTPUT FORMAT]
-// { "<property_name>": { "operator": "...", "value": "..." } }
-
-// [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
-
-//     template.replace("{QUERY}", query).replace("{LANGUAGE}", language)
-// }
-
-pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
-    // 🌟 [TRADING SCHEMA v2]
-    //  app-logis-center 의 get_search_schema_definitions 가 정의하던 무역 축을 전량 흡수합니다.
-    //  기존 10개 필드만으로는 '부킹번호로 찾아줘', '컨테이너 MSCU1234567',
-    //  'ETA 다음주인 건' 같은 실무 질의가 통째로 조건 없이 넘어갔습니다.
+    // 🌟 [ALREADY CLAIMED] 앞선 크롭이 이미 확정한 값 목록.
     //
-    //  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
-    //     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
-    //     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
+    //  ── 왜 필요한가 ──
+    //   크롭은 카테고리별로 순차 호출되므로 뒤 크롭은 앞 크롭의 결과를 모릅니다.
+    //   그래서 같은 숫자를 두 필드가 각각 자기 값으로 가져가는 사고가 납니다.
+    //   (실측: financials 가 2000.00 을 잡았는데 cargo 도 근처 숫자를 끌어옴)
+    //   scheduler.rs 의 커머스 추출이 [ALREADY CLAIMED VALUES] 로 같은 문제를 막는 것과
+    //   동일한 원리를 비전 크롭에도 적용합니다.
+    let claimed_block = if claimed.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n[ALREADY CLAIMED VALUES]\n\
+             Previous crops of this same document already確 locked these values to other fields.\n\
+             Never return any of them for a field in this crop:\n",
+        );
+        for (k, v) in claimed.iter().take(24) {
+            s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
+        }
+        s
+    };
+
+    format!(
+        "[INPUT NOTICE]\n\
+         The image you receive is NOT the whole page. It is a precise crop that the vision encoder \
+         identified as the '{}' region of a {} document. Everything relevant to this category is inside this crop.\n\
+         \n\
+         [HOW TO ANSWER]\n\
+         1. Read the crop first. List in your head only the text you can actually SEE.\n\
+         2. Fill a field ONLY from that seen text. If the field's value is not printed in this crop, return null.\n\
+         3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.\n\
+         4. Never take a value from a neighbouring field just because it is the only number nearby.\n\
+         5. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}\n\n{}",
+        category.to_uppercase(),
+        doc_type,
+        evidence,
+        claimed_block,
+        base
+    )
+}
+
+/// 🌟 [TRADE CONDITION — DEPTH 1] 질의 청크가 어느 '조건 카테고리' 인지 1갈래만 고릅니다.
+///  ── 왜 쪼개는가 ──
+///   기존 extract_shipping_conditions 는 44개 필드 + 변환 규칙 + 값 예시를
+///   한 프롬프트에 통째로 넣고 2B 모델에게 "알아서 골라라" 라고 시켰습니다.
+///   scheduler.rs STEP A 가 27개 서식 코드를 '그룹 → 코드' 2뎁스로 좁히는 것과
+///   정반대 구조였고, 그래서 Cross References 3축이 44축으로 늘어나는 순간
+///   프롬프트 길이만 폭증하고 정확도는 오히려 떨어집니다.
+///
+///  ── 호출 조건 ──
+///   이 프롬프트는 '항상' 호출되지 않습니다.
+///   model.rs 의 SURPRISAL 게이트가 1위-2위 마진을 확보하면 LLM 없이 확정되고,
+///   사실상 동률일 때만 이 초소형 프롬프트가 1회 호출됩니다.
+///
+///  ── 벡터 근거 동봉 ──
+///   scheduler.rs STEP A 의 [VECTOR EVIDENCE] 와 동일하게, 코사인 점수를
+///   후보 목록에 함께 실어 모델이 근거 없이 창작하지 못하게 만듭니다.
+pub fn trade_condition_category_prompt(
+    chunk: &str,
+    full_query: &str,
+    scored: &[(String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (cat, score) in scored.iter() {
+        let desc = match cat.as_str() {
+            "identity"  => "the document itself: its kind, its own number, its status, its issue or expiry date",
+            "transport" => "how the cargo moves: vessel, flight, voyage, ports, ETD, ETA, transport mode",
+            "parties"   => "who is involved: shipper, exporter, consignee, importer, notify party",
+            "terms"     => "commercial terms: incoterms, payment terms, freight prepaid or collect, currency, amounts",
+            "cargo"     => "the goods themselves: container, seal, packages, weight, volume, HS code, marks",
+            "reference" => "a number belonging to ANOTHER document that this one refers to",
+            "hub"       => "trace one number across EVERY related document, without naming which reference field it is",
+            _           => "other",
+        };
+        cands.push_str(&format!("- \"{}\" (vector score {:+.4}) — {}\n", cat, score, desc));
+    }
+
+    let template = r###"[TASK]
+Decide which SINGLE condition category the highlighted chunk belongs to.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK TO CLASSIFY]
+{CHUNK}
+
+[CANDIDATE CATEGORIES]
+{CANDIDATES}
+
+[RULES]
+1. Choose exactly ONE category from [CANDIDATE CATEGORIES]. Never invent a category name.
+2. "identity" is about THIS document. "reference" is about ANOTHER document that this one points to.
+   "The invoice number is CI-2026-08001" on an invoice  -> identity
+   "against invoice CI-2026-08001" on a bill of lading  -> reference
+3. Choose "hub" ONLY when the query asks to trace one number across every related document
+   and does NOT say which reference role it plays.
+   "show me everything under PO-99281A"  -> hub
+   "referenced purchase order is PO-99281A" -> reference
+4. If the chunk carries no filtering meaning at all, return "".
+
+[OUTPUT FORMAT]
+{ "category": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{CANDIDATES}", &cands)
+}
+
+/// 🌟 [TRADE CONDITION — DEPTH 2] 확정된 카테고리 안에서 파라미터 1개를 고릅니다.
+///  ── 핵심 ──
+///   후보 목록에 '승리한 카테고리의 필드' 만 들어갑니다.
+///   reference 카테고리라면 44축이지만, identity 라면 6축뿐입니다.
+///   모델이 볼 수 있는 선택지 자체를 결정론으로 좁혀 오답 경로를 물리적으로 없앱니다.
+///
+///  ── 호출 조건 ──
+///   exclusive_assign_by_score 가 확정하면 호출되지 않습니다.
+///   1위-2위가 사실상 동률일 때만 1회 호출됩니다.
+pub fn trade_condition_field_prompt(
+    chunk: &str,
+    full_query: &str,
+    category: &str,
+    scored: &[(String, String, f32)],
+) -> String {
+    let mut cands = String::new();
+    for (field, desc, score) in scored.iter() {
+        cands.push_str(&format!("- \"{}\" (vector score {:+.4}) — {}\n", field, score, desc));
+    }
+
+    let reference_note = if category == "reference" {
+        "\n[REFERENCE FIELD NOTE]\n\
+         The prefix of the number itself is the strongest clue.\n\
+         PO- -> reference_po / CI- -> reference_invoice / BL- -> reference_bl / LC- -> reference_lc\n\
+         HBL- -> reference_hbl / SWB- -> reference_swb / AWB- -> reference_awb / BK- -> reference_booking\n\
+         DO- -> reference_do / POD- -> reference_pod / CM- -> reference_manifest / FI- -> reference_freight_invoice\n\
+         ED- -> reference_export_decl / ID- -> reference_import_decl / CO- -> reference_origin\n\
+         IC- -> reference_inspection / WC- -> reference_weight / COA- -> reference_analysis\n\
+         IP- -> reference_policy / LG- -> reference_lg / TR- -> reference_tr / CDR- -> reference_survey\n\
+         If the printed prefix names a field in [CANDIDATE FIELDS], choose that field."
+    } else {
+        ""
+    };
+
+    let template = r###"[TASK]
+Decide which SINGLE field inside the '{CATEGORY}' category the highlighted chunk maps to.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK TO MAP]
+{CHUNK}
+
+[CANDIDATE FIELDS]
+{CANDIDATES}{REFERENCE_NOTE}
+
+[RULES]
+1. Choose exactly ONE field from [CANDIDATE FIELDS]. Never invent a field name.
+2. Judge by what the chunk MEANS, not by which candidate is listed first.
+3. If none of the candidates fit, return "".
+
+[OUTPUT FORMAT]
+{ "field": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{CATEGORY}", category)
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{CANDIDATES}", &cands)
+        .replace("{REFERENCE_NOTE}", reference_note)
+}
+
+/// 🌟 [TRADE CONDITION — DEPTH 3] 확정된 필드 하나의 값과 연산자만 뽑습니다.
+///  ── 왜 값까지 LLM 에게 맡기지 않는가 ──
+///   값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
+///   deterministic_condition_value / split_numeric_and_comparator 가
+///   Rust 에서 결정론으로 뽑아내므로, 이 프롬프트는 그 결정론이 실패했을 때만
+///   호출되는 최후 보루입니다.
+///
+///  ── 연산자 고정 ──
+///   trade_default_operator 가 필드 형식으로 기본 연산자를 확정합니다.
+///   모델은 그것을 '바꿀 근거가 있을 때만' 바꿉니다.
+pub fn trade_condition_value_prompt(
+    chunk: &str,
+    full_query: &str,
+    field: &str,
+    field_desc: &str,
+    default_operator: &str,
+) -> String {
+    let template = r###"[TASK]
+Extract the filter VALUE for the field '{FIELD}' from the highlighted chunk.
+
+[FULL QUERY]
+{FULL_QUERY}
+
+[CHUNK]
+{CHUNK}
+
+[FIELD DEFINITION]
+"{FIELD}": {FIELD_DESC}
+
+[DEFAULT OPERATOR]
+"{DEFAULT_OP}"
+
+[RULES]
+1. "value" MUST be an exact literal substring of [CHUNK]. Never translate, reformat, round, or re-type it.
+2. Copy document numbers EXACTLY as printed, including prefix and hyphens. Never strip "PO-", "CI-", "BL-", "LC-".
+3. Keep the [DEFAULT OPERATOR] unless the chunk explicitly demands a comparison.
+   Only these are allowed: "eq", "gt", "gte", "lt", "lte", "contains".
+   "over 5000"  -> "gt"    "under 5000" -> "lt"
+   "at least"   -> "gte"   "up to"      -> "lte"
+   "after 2026-08-01" -> "gte"   "before 2026-09-01" -> "lte"
+4. Strip the operator words from "value". "over 5000 USD" -> value "5000", operator "gt".
+5. If [CHUNK] holds no usable value for this field, return null for both keys.
+   null is correct data; an invented value corrupts the filter.
+
+[OUTPUT FORMAT]
+{ "operator": String, "value": String }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+
+    template
+        .replace("{FIELD}", field)
+        .replace("{FIELD_DESC}", field_desc)
+        .replace("{FULL_QUERY}", full_query)
+        .replace("{CHUNK}", chunk)
+        .replace("{DEFAULT_OP}", default_operator)
+}
+
+/// 🌟 [FALLBACK ONLY] 이 프롬프트는 더 이상 정상 경로가 아닙니다.
+///  ── 언제 호출되는가 ──
+///   parse_shipping_query 의 Depth 1 SURPRISAL 게이트를 통과한 청크가
+///   단 하나도 없을 때(= 벡터 근거가 전무할 때) 최후 1회만 호출됩니다.
+///
+///  ── 왜 축소했는가 ──
+///   v2 는 44개 필드를 전부 나열했습니다. 그러면 프롬프트 길이만 폭증하고
+///   2B 모델이 "어느 칸에든 하나는 채워야 한다" 고 오인해 근거 없는 조건을 창작합니다.
+///   정상 경로는 trade_condition_category_prompt → trade_condition_field_prompt →
+///   trade_condition_value_prompt 3단으로 이미 좁혀지므로,
+///   여기서는 카테고리 대표 축만 남겨 '아무것도 못 뽑는 상황' 을 면하는 역할만 합니다.
+///
+///  ⚠️ 여기서 뽑힌 조건은 전부 Dexie(executeDexiePlan)가 data.* 경로로 실행합니다.
+///     LanceDB 는 봉투 스코프(mode/type/cc)만 담당하므로,
+///     이 목록에 필드를 추가해도 Rust 스키마나 SQL 을 고칠 필요가 전혀 없습니다.
+pub fn extract_shipping_conditions(query: &str, language: &str) -> String {
     let template = r###"Task: Act as a deterministic shipping and trade logistics semantic parser.
-Extract the logistics filters from the natural language query into the JSON format.
+The vector engine found NO reliable evidence in this query, so extract only what is unmistakably printed.
 
-[SCHEMA DEFINITION]
-Extract the following trade document properties if semantically present in the text:
-
+[SCHEMA DEFINITION — representative axes only]
 # Document Identity
-- "doc_type": Document kind (BL, AWB, CI, PI, PL, PO, SC, LC, CO, ED, ID, DO, AN, BC, DGD, MSDS).
-- "doc_number": Primary document identifier (B/L No, AWB No, Invoice No, PO No, Contract No).
-- "no": Tracking number, parcel number, or any generic reference number.
-- "status": Shipping status (draft, progress, return, complete, error).
+- "doc_type": Document kind code.
+- "doc_number": Primary identifier OF THE DOCUMENT ITSELF.
+- "no": Tracking number or generic reference number.
+- "status": Document / shipping status.
 - "issue_date": Date the document was issued.
-- "expiry_date": Expiry date (mainly L/C).
 
 # Transport
 - "vessel": Vessel name or Flight number.
-- "voyage_number": Voyage or flight leg number.
-- "pol": Port of Loading, Origin, Departure point.
-- "pod": Port of Discharge, Destination, Arrival point.
-- "place_receipt": Place of Receipt.
-- "place_delivery": Place of Delivery.
+- "pol": Port of Loading.
+- "pod": Port of Discharge.
 - "etd": Estimated Time of Departure.
 - "eta": Estimated Time of Arrival.
-- "transport_mode": Sea, Air, Road, or Rail.
 
 # Parties
-- "sender_name": Shipper, Seller, Exporter, or Vendor name.
-- "recipient_name": Consignee, Buyer, or Importer name.
-- "notify_party_name": Notify Party name.
+- "sender_name": Shipper, Seller, Exporter.
+- "recipient_name": Consignee, Buyer, Importer.
 
 # Commercial Terms
-- "incoterms": Incoterms code (FOB, CIF, EXW, DDP, DAP).
-- "payment_terms": Payment condition (T/T, L/C, Net30).
-- "freight_payment_term": Freight Prepaid or Freight Collect.
+- "incoterms": Incoterms code.
 - "currency": ISO 4217 currency code.
 - "amount": Total financial amount.
-- "freight_amount": Freight charges only.
-- "insurance_amount": Insurance charges only.
-- "local_charges": Local handling charges.
 
 # Cargo
-- "container_number": Container number (4 letters + 7 digits).
-- "seal_number": Seal number.
-- "package_count": Number of packages or cartons.
+- "container_number": Container number.
 - "weight_gross": Gross weight.
-- "weight_net": Net weight.
-- "volume": Volume in CBM.
-- "hs_code": HS Code or tariff number.
-- "marks_numbers": Shipping marks and numbers.
+- "hs_code": HS Code.
 
-# Cross References
-- "reference_invoice": Referenced commercial invoice number.
-- "reference_lc": Referenced letter of credit number.
-- "reference_booking": Referenced booking number.
+# Hub Reference
+- "hub_reference": A document number to trace ACROSS every related document, when the query does NOT say which reference role it plays.
 
 [TRANSFORMATION LOGIC]
 For EVERY extracted field, wrap it in an operator object:
 { "operator": "eq" | "gt" | "lt" | "gte" | "lte" | "contains", "value": <extracted_value> }
-- Use "eq" for strict identifiers: doc_number, container_number, seal_number, hs_code, no, status, doc_type, incoterms, currency.
-- Use "contains" for free text: names, ports, vessels, marks_numbers, payment_terms.
+- Use "eq" for strict identifiers: doc_number, container_number, hs_code, no, status, doc_type, incoterms, currency.
+- Use "contains" for free text and for hub_reference.
 - Use "gte" / "lte" for date ranges and numeric ranges.
-- Omit any field that is NOT explicitly present in the query. Never invent a value.
+- Copy document numbers EXACTLY as printed, including prefix and hyphens.
+- Omit any field that is NOT explicitly present in the query. Returning an empty object is correct
+  when nothing is printed; an invented condition silently destroys recall.
 
 [QUERY]
 {QUERY}
@@ -439,28 +1035,190 @@ For EVERY extracted field, wrap it in an operator object:
 }
 
 pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
-    if page_type == "tracking" || page_type == "goods" {
+    if page_type == "tracking" {
+        // 🌟 [SCHEMA ECHO 방어] 값 자리의 "string" 은 그대로 복사될 위험이 있습니다.
+        //    실측에서 무역 경로가 "{String}" 을 그대로 뱉은 것과 같은 구조입니다.
+        //    값 자리는 null 로 비우고, 타입은 정의 블록으로 옮깁니다.
         let template = r###"[TASK]
-Convert the image to fit the structured JSON format. 
+Read this shipping label image and fill the structured JSON format.
 
 [CONTEXT]
 Region: {REGION}
 Recipient Address: {ADDRESS}
 Current Language: {LANGUAGE}
 
-[INSTRUCTION]
-1. Extract the tracking_number or document number.
-2. Set recipient_match to true if the label address matches the context address.
-3. Extract all visible barcodes into an array.
+[FIELD DEFINITIONS]
+- "tracking_number" (String): the tracking / waybill number printed on the label
+- "recipient_match" (Boolean): true only when the address on the label matches [CONTEXT] Recipient Address
+- "barcodes" (Array of String): every barcode value you can read on the label
+
+[HOW TO ANSWER]
+1. Every value in [OUTPUT FORMAT] is null on purpose. Replace a null ONLY with text read off the image.
+2. Never answer with a type name such as "string", "number", "boolean", or "{String}".
+3. Copy digits EXACTLY as printed. Never reformat or insert separators.
+4. If a value is not printed on the label, return null. An empty array is correct when no barcode is readable.
 
 [OUTPUT FORMAT]
-{ "tracking_number": "string", "recipient_match": boolean, "barcodes": ["string"] }
+{ "tracking_number": null, "recipient_match": null, "barcodes": [] }
 
 [ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
         template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
+    } else if page_type == "goods" {
+        // 🌟 [COMMERCE GOODS] 기존에는 tracking 과 같은 템플릿을 공유해
+        //    상품 이미지에서도 tracking_number / barcodes 만 물었습니다.
+        //    상품명·가격·색상 같은 실제 커머스 축이 통째로 빠져 있었습니다.
+        let template = r###"[TASK]
+Read this product image and fill the structured JSON format.
+
+[CONTEXT]
+Region: {REGION}
+Current Language: {LANGUAGE}
+
+[FIELD DEFINITIONS]
+- "title" (String): product name as printed
+- "code" (String): product code / SKU as printed
+- "price" (Number): digits only
+- "currency" (String): ISO 4217 code or the printed symbol
+- "color" (String): colour name as printed
+- "brand_name" (String): brand as printed
+- "barcodes" (Array of String): every readable barcode value
+
+[HOW TO ANSWER]
+1. Every value in [OUTPUT FORMAT] is null on purpose. Replace a null ONLY with text read off the image.
+2. Never answer with a type name such as "String", "Number", or "{String}".
+3. Copy every value EXACTLY as printed. Never translate or reformat.
+4. "price" holds digits only. Put the currency symbol or code in "currency".
+5. If a field is not visible, return null. A null field is correct data; a guessed one is corrupted data.
+
+[OUTPUT FORMAT]
+{ "title": null, "code": null, "price": null, "currency": null, "color": null, "brand_name": null, "barcodes": [] }
+
+[ACTION] JSON ONLY. NO EXPLANATION. /no_think"###;
+        template.replace("{REGION}", region).replace("{LANGUAGE}", language)
     } else {
         String::new()
     }
+}
+
+/// 🌟 [COMMERCE CROP PROMPT] 커머스 정밀 크롭 이미지 전용 프롬프트.
+///
+///  ── 커머스에도 비전 크롭이 필요한 이유 ──
+///   상품 상세 캡처나 주문서 스크린샷은 한 장에
+///   상품명 / 가격 / 옵션 / 배송지 / 결제수단이 전부 들어 있습니다.
+///   전체를 통째로 물으면 2B 모델이 가격과 배송비를 섞고,
+///   상품명 자리에 카테고리 배지를 넣습니다.
+///   무역과 동일하게 필드 앵커 히트맵으로 영역을 잘라 하나씩 묻습니다.
+///
+///  ── 필드 목록의 출처 ──
+///   bias_schema::get_detail_schema_fields(page_type) 가 돌려주는
+///   필드명과 설명을 그대로 씁니다. 여기서 새로 나열하지 않습니다.
+pub fn get_commerce_crop_prompt(
+    page_type: &str,
+    fields: &[(String, String)],
+    language: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+) -> String {
+    // 🌟 [SCHEMA ECHO 방어] 무역 크롭과 동일하게 '정의' 와 '값 자리' 를 분리합니다.
+    //    구버전은 `  "price": Number {Number}` 처럼 값 자리에 타입 표기를 노출해
+    //    모델이 그것을 그대로 복사할 수 있었습니다.
+    let mut defs = String::new();
+    let mut body = String::new();
+    let mut forbidden: Vec<String> = Vec::new();
+
+    for (name, desc) in fields.iter() {
+        let (clean, ty) = split_type_marker(desc);
+        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, clean.replace('"', "'")));
+        if !body.is_empty() {
+            body.push_str(",\n");
+        }
+        body.push_str(&format!("  \"{}\": null", name));
+        for tok in extract_example_tokens(&clean) {
+            if !forbidden.iter().any(|e| e == &tok) {
+                forbidden.push(tok);
+            }
+        }
+    }
+    if body.is_empty() {
+        defs.push_str("- \"title\" (String): Product title as printed\n");
+        body.push_str("  \"title\": null");
+    }
+    for t in ["String", "Number", "Boolean", "Array"] {
+        let m = format!("{{{}}}", t);
+        if !forbidden.iter().any(|e| e == &m) {
+            forbidden.push(m);
+        }
+    }
+
+    let forbidden_block = if forbidden.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[FORBIDDEN VALUES]\n\
+             These tokens appear in [FIELD DEFINITIONS] only as EXAMPLES. They are not the answer.\n\
+             - {}\n",
+            forbidden.join(", ")
+        )
+    };
+
+    let claimed_block = if claimed.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n[ALREADY CLAIMED VALUES]\n\
+             Previous crops of this same screen already locked these values to other fields.\n\
+             Never return any of them for a field in this crop:\n",
+        );
+        for (k, v) in claimed.iter().take(24) {
+            s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
+        }
+        s
+    };
+
+    let evidence = if top_field.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n[VISION EVIDENCE]\nThe vision encoder located this region by matching the concept \"{}\" \
+             (cosine surprisal {:+.4}).",
+            top_field, score
+        )
+    };
+
+    let template = r###"[INPUT NOTICE]
+The image you receive is NOT the whole screen. It is a precise crop that the vision encoder
+identified as holding the fields listed below. Everything relevant is inside this crop.{EVIDENCE}
+
+[CONTEXT]
+Page Type: {TYPE}
+Output Language: {LANGUAGE}
+
+[HOW TO ANSWER]
+1. Read the crop first. Use only the text you can actually SEE.
+2. Every value in [SCHEMA] is null on purpose. Replace a null ONLY with text read off the image.
+3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.
+4. Copy every value EXACTLY as printed. Never translate, round, or reformat.
+5. Numeric fields hold digits only. Strip currency symbols and thousand separators.
+6. Return null for anything not printed in this crop. A null field is correct data.
+
+[FIELD DEFINITIONS]
+{DEFS}{FORBIDDEN}{CLAIMED}
+[SCHEMA]
+{
+{BODY}
+}
+
+[ACTION] JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+
+    template
+        .replace("{EVIDENCE}", &evidence)
+        .replace("{TYPE}", page_type)
+        .replace("{LANGUAGE}", language)
+        .replace("{DEFS}", &defs)
+        .replace("{FORBIDDEN}", &forbidden_block)
+        .replace("{CLAIMED}", &claimed_block)
+        .replace("{BODY}", &body)
 }
 
 pub fn extract_table_structure_prompt(page_type: &str, item_selector: &str, pug_content: &str, reference_row: &str) -> String {

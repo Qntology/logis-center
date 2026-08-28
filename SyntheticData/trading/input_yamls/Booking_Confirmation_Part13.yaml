@@ -1,0 +1,30 @@
+document_type: Booking Confirmation
+document_code: BK
+metadata:
+  booking_number: BK-2026-0822
+  issue_date: '2026-08-22'
+  related_sr_number: SR-2026-0820
+  related_po_number: PO-99281A
+  related_lc_number: LC-88492011
+parties:
+  issuing_carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+    contact_number: +1-510-555-8800
+  shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+booking_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  estimated_time_of_departure_etd: '2026-08-28'
+  estimated_time_of_arrival_eta: '2026-09-10'
+  cargo_closing_date: '2026-08-26'
+  container_allocation: 1 x 40FT HC
+cargo_summary:
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  total_packages: 50 PLTS
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0

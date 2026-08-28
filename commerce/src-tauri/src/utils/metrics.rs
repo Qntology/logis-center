@@ -168,6 +168,7 @@ pub async fn update_team_base_metrics(
         "team",
         team_data,
         None,
+        None, // 🌟 vision_vec: users 테이블은 비전 벡터 불필요
         Some(&t_from),
         Some(&t_to),
         Some(&t_cc),

@@ -292,6 +292,26 @@ fn is_raw_event(data: &Value) -> bool {
         || data.get("relate").map_or(false, |v| v.is_array())
 }
 
+/// 🌟 [STRUCTURING PROBE] 모델 로드 없이 실제 처리 가능한 원시 이벤트 수를 사전 확인합니다.
+///    structure_pending_analytics 에서 모델 로드 전에 호출하여,
+///    처리할 항목이 0건이면 모델 로드 없이 조기 반환합니다.
+///    원시 이벤트가 존재해도 HTML → PUG 변환 결과가 비어있으면 처리 불가능으로 간주합니다.
+pub fn count_pending_structuring_targets(
+    raw_docs: &[crate::store::TradeDocument],
+    limit: usize,
+) -> usize {
+    let mut count = 0usize;
+    for doc in raw_docs.iter() {
+        if count >= limit { break; }
+        let data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+        if !is_raw_event(&data) { continue; }
+        let target_pug = html_array_to_semantic_pug(data.get("action"), 1);
+        if target_pug.trim().is_empty() { continue; }
+        count += 1;
+    }
+    count
+}
+
 /// 🌟 [STRUCTURING] draft(updated_at = 0) 행동 로그를 시맨틱 문장으로 확정합니다.
 ///  반환값 = 구조화에 성공한 이벤트 건수
 pub async fn run_analytic_structuring(
@@ -344,17 +364,42 @@ pub async fn run_analytic_structuring(
         targets.push((doc, data));
     }
 
-    if targets.is_empty() {
+        if targets.is_empty() {
+        return Ok(0);
+    }
+
+    // ── ① [PRE-FILTER / MODEL-LOAD GATE] 모델 로드 전에 실제 요약 가능한 텍스트가 있는지 사전 확인 ──
+    //    원시 이벤트가 존재해도 HTML → PUG 변환 결과가 비어있으면 모델 로드가 무의미합니다.
+    //    기존에는 3건이 들어와도 전부 요약 실패(빈 결과)로 스킵되는 경우에도 모델이 로드되었습니다.
+    //    이제 사전 필터링으로 처리 가능한 항목이 0건이면 모델 로드 없이 즉시 반환합니다.
+    let mut pre_checked: Vec<(crate::store::TradeDocument, Value, String)> = Vec::new();
+    for (doc, data) in targets.into_iter() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let target_pug = html_array_to_semantic_pug(data.get("action"), 1);
+        if target_pug.trim().is_empty() {
+            emit_term(&format!(
+                "  ⚪ [ANALYTIC SKIP] id='{}' 는 대상 엘리먼트에서 읽을 수 있는 텍스트가 없어 건너뜁니다.",
+                doc.id
+            ));
+            continue;
+        }
+        pre_checked.push((doc, data, target_pug));
+    }
+
+    if pre_checked.is_empty() {
+        emit_term("[ANALYTIC] ⚪ 실제 요약 가능한 원시 이벤트가 0건이라 모델 로드를 건너뜁니다.");
         return Ok(0);
     }
 
     emit_term(&format!(
         "[ANALYTIC] 🧠 구조화 대상 원시 이벤트 {}건 발견. HTML → PUG → 속성 제거 → Qwen3.5 2B 요약을 시작합니다.",
-        targets.len()
+        pre_checked.len()
     ));
     log_task_progress(app_handle, task_id, &json!({
         "category": "Analytic Structuring",
-        "summary": format!("Summarizing {} behaviour event(s)...", targets.len()),
+        "summary": format!("Summarizing {} behaviour event(s)...", pre_checked.len()),
         "spinner": "⠋"
     }));
 
@@ -377,9 +422,8 @@ pub async fn run_analytic_structuring(
     let mut flow_envelope: std::collections::HashMap<String, crate::store::TradeDocument> =
         std::collections::HashMap::new();
 
-    let total = targets.len();
-
-    for (idx, (doc, data)) in targets.into_iter().enumerate() {
+    let total = pre_checked.len();
+    for (idx, (doc, data, target_pug_pre)) in pre_checked.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             emit_term("[ANALYTIC] 🛑 사용자 취소로 구조화를 중단합니다.");
             break;
@@ -403,8 +447,8 @@ pub async fn run_analytic_structuring(
             &data.get("action").map(|v| v.to_string()).unwrap_or_default()
         );
 
-        // ── ① HTML → PUG → 속성 전량 제거 ──
-        let mut target_pug = html_array_to_semantic_pug(data.get("action"), 1);
+        // ── ① HTML → PUG → 속성 전량 제거 (사전 계산된 값 재사용) ──
+        let mut target_pug = target_pug_pre;
         let mut related_pug = html_array_to_semantic_pug(data.get("relate"), 8);
 
         if target_pug.trim().is_empty() {
@@ -546,6 +590,7 @@ pub async fn run_analytic_structuring(
                 &doc.r#type,
                 new_data.clone(),
                 None,
+                None, // 🌟 vision_vec: analytic 구조화 경로는 비전 벡터 없음
                 Some(&doc.from),
                 Some(&doc.to),
                 Some(&doc.cc),
@@ -668,6 +713,7 @@ pub async fn run_analytic_structuring(
                 "report",
                 report_data,
                 None,
+                None, // 🌟 vision_vec: report 경로는 비전 벡터 없음
                 Some(&env_doc.from),
                 Some(&env_doc.to),
                 Some(&env_doc.cc),

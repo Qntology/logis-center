@@ -147,6 +147,10 @@ pub struct LogisModel {
     max_tokens_limit: u32,
     _dtype: Option<DType>, 
     current_size: Arc<TokioMutex<Option<ModelSize>>>,
+
+    pub siglip2_model: Arc<TokioMutex<Option<crate::models::siglip2::Siglip2Model>>>,
+    pub siglip2_config: Option<crate::models::siglip2::Siglip2Config>,
+    pub siglip2_model_path: String,
 }
 
 impl LogisModel {
@@ -217,14 +221,25 @@ impl LogisModel {
         println!("[DIAG-PURGE] Step 2: Clearing Embedding Model & Cache...");
         {
             let mut emb = self.embedding_model.lock().await;
-            if let Some(e) = emb.take() { 
-                drop(e); 
+            if let Some(e) = emb.take() {
+                drop(e);
             }
             // 🌟 램 누수 방지를 위해 캐시도 깔끔하게 비워줍니다.
             let mut cache = self.embedding_cache.lock().await;
             cache.clear();
         }
-        
+
+        // 🌟 [SigLIP2] 비전 엔진도 함께 해제합니다.
+        //    mmap 백엔드라 상주량이 LLM 보다 작지만,
+        //    GPU 로 올라간 경우 VRAM 을 계속 점유하므로 반드시 내려야 합니다.
+        {
+            let mut vis_guard = self.siglip2_model.lock().await;
+            if vis_guard.is_some() {
+                *vis_guard = None;
+                println!("[DIAG-PURGE] SigLIP2 vision engine dropped.");
+            }
+        }
+
         // 🌟 [CRITICAL FIX] 모델 사이즈 상태값도 완벽하게 초기화하여 Relay 시스템 꼬임 방지
         {
             let mut size = self.current_size.lock().await;
@@ -917,8 +932,35 @@ impl LogisModel {
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
             
-            // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
-            self.deep_purge_resources().await;
+            // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
+            // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
+            let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
+            if is_vision_pipeline_active {
+                println!("[RELAY] 🛡️ SigLIP2 is resident. Skipping deep purge to protect vision engine.");
+                // Generator 슬롯만 클리어 (KV 캐시 및 스토리지 해제)
+                let mut gen = self.generator.lock().await;
+                if let Some(mut g) = gen.take() {
+                    let _ = g.clear_kv_cache();
+                    let _ = g.qwen.drop_kv_storage();
+                }
+                // 🌟 [VRAM] 이미지 추출 파이프라인(extract_from_image)에서는
+                //    임베딩 모델(384차원 97M)을 한 번도 사용하지 않습니다.
+                //    해제하여 Qwen3.5 로드 전에 VRAM 을 확보합니다.
+                {
+                    let mut emb = self.embedding_model.lock().await;
+                    if emb.is_some() {
+                        *emb = None;
+                        println!("[RELAY] Embedding model released for VRAM (image pipeline).");
+                    }
+                }
+                {
+                    let mut cache = self.embedding_cache.lock().await;
+                    cache.clear();
+                }
+            } else {
+                // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
+                self.deep_purge_resources().await;
+            }
             
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
@@ -952,15 +994,16 @@ impl LogisModel {
         Ok(())
     }
 
-    // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
-    // 🌟 [신규 추가] 모델 파일 존재 여부만 가볍게 체크하는 함수 (메모리 로딩 안 함)
     pub async fn check_embedding_downloaded(&self) -> anyhow::Result<()> {
         let weights_path = self.embedding_path.join("model.safetensors");
         if !weights_path.exists() {
             let err_msg = "Embedding model is missing. Please go to the Settings tab and download the required models.";
             println!("[MODEL] 🚨 {}", err_msg);
             use tauri::Emitter;
-            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({ "message": err_msg }));
+            let _ = self.app_handle.emit("app_error_alert", serde_json::json!({
+                "message": err_msg,
+                "action": "open_settings"
+            }));
             return Err(anyhow::anyhow!(err_msg));
         }
         Ok(())
@@ -987,6 +1030,191 @@ impl LogisModel {
             *emb_guard = Some(emb);
         }
         Ok(())
+    }
+
+    /// SigLIP2 모델 파일이 디스크에 존재하는지 확인합니다.
+    /// 존재하지 않으면 에러를 반환하며, 호출 측(scheduler)에서
+    /// app_error_alert 이벤트를 발행하여 프론트엔드에 알립니다.
+    pub async fn check_siglip2_downloaded(&self) -> anyhow::Result<()> {
+        let base = std::path::Path::new(&self.siglip2_model_path);
+        let safetensors_path = base.join("model.safetensors");
+        let config_path = base.join("config.json");
+
+        // model.safetensors 존재 + 최소 100MB 체크
+        let model_exists = safetensors_path.exists()
+            && std::fs::metadata(&safetensors_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                > 100_000_000;
+
+        let config_exists = config_path.exists();
+
+        if !model_exists || !config_exists {
+            return Err(anyhow::anyhow!(
+                "SigLIP2 model not downloaded. Please download it in Settings."
+            ));
+        }
+        Ok(())
+    }
+
+    /// 🌟 [SIGLIP2 ENSURE v2] 필요한 인코더만 정확히 올립니다.
+    ///
+    ///  ── v1 의 결함 2가지 ──
+    ///   ① needs_text 무시
+    ///      `if guard.is_some() { return Ok(()); }` 가 요구 사양을 보지 않아,
+    ///      비전만 상주한 상태에서 ensure_siglip2(true) 가 그냥 성공했습니다.
+    ///      호출부는 텍스트가 준비된 줄 알고 진행하다가
+    ///        ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.
+    ///      로 조용히 실패합니다. 로그 한 줄만 남아 원인 추적이 불가능했습니다.
+    ///
+    ///   ② 비전 강제
+    ///      load_vision_only 를 무조건 먼저 호출하므로 텍스트만 필요한 경로도
+    ///      820MB 를 함께 올렸습니다. STEP 6 과 검색 질의 벡터 생성이 여기 해당하며,
+    ///      검색은 질의마다 반복되므로 누적 비용이 큽니다.
+    ///
+    ///  ── v2 ──
+    ///   (needs_vision, needs_text) 를 받아 '부족한 쪽만' 부착합니다.
+    ///   이미 상주한 가중치는 그대로 재사용하므로 전체 파기/재로딩이 없습니다.
+    ///   (Qwen3.5 의 VISION-JIT set_vision_active 와 같은 원리)
+    pub async fn ensure_siglip2_ext(&self, needs_vision: bool, needs_text: bool) -> anyhow::Result<()> {
+        let dir = std::path::PathBuf::from(&self.siglip2_model_path);
+
+        // ── ① 이미 상주 중이면 부족한 부분만 부착합니다 ──
+        {
+            let mut guard = self.siglip2_model.lock().await;
+            if let Some(model) = guard.as_mut() {
+                let want_v = needs_vision && !model.has_vision();
+                let want_t = needs_text && !model.has_text();
+                if !want_v && !want_t {
+                    return Ok(());
+                }
+                if want_v {
+                    model.load_vision_encoder(&dir)?;
+                }
+                if want_t {
+                    model.load_text_encoder(&dir)?;
+                }
+                println!(
+                    "[MODEL] SigLIP2 upgraded in place (vision: {}, text: {}). No full reload.",
+                    model.has_vision(), model.has_text()
+                );
+                return Ok(());
+            }
+        }
+
+        // ── ② 신규 로드 ──
+        let path = self.siglip2_model_path.clone();
+        let dev = self.device_config.device.clone();
+        let dtype = if self.is_cpu_mode {
+            candle_core::DType::F32
+        } else {
+            candle_core::DType::BF16
+        };
+
+        println!(
+            "[MODEL] Loading SigLIP2 ({:?}) | vision: {} | text: {}",
+            dtype, needs_vision, needs_text
+        );
+
+        let model = tokio::task::spawn_blocking(move || {
+            let dir = std::path::Path::new(&path);
+            let config_path = dir.join("config.json");
+            let config = crate::models::siglip2::Siglip2Config::from_json(&config_path)?;
+
+            // 🌟 텍스트만 필요하면 비전 가중치를 아예 읽지 않습니다. (~820MB 절약)
+            if !needs_vision && needs_text {
+                return crate::models::siglip2::Siglip2Model::load_text_only(
+                    dir, &config, &dev, dtype,
+                );
+            }
+
+            let safetensors_path = dir.join("model.safetensors");
+            let mut model = crate::models::siglip2::Siglip2Model::load_vision_only(
+                &safetensors_path,
+                &config,
+                &dev,
+                dtype,
+            )?;
+
+            if needs_text {
+                model.load_text_encoder(dir)?;
+            }
+
+            Ok::<_, anyhow::Error>(model)
+        })
+        .await??;
+
+        let mut guard = self.siglip2_model.lock().await;
+        if guard.is_some() {
+            // 락을 놓은 사이 다른 태스크가 로드를 마쳤습니다. 방금 만든 것은 버립니다.
+            return Ok(());
+        }
+        *guard = Some(model);
+        println!("[MODEL] SigLIP2 loaded successfully.");
+        Ok(())
+    }
+
+    /// 🌟 [BACK-COMPAT] 기존 호출부를 살려 둡니다.
+    ///    구 시그니처는 '비전은 항상 필요' 를 전제했으므로 needs_vision=true 로 위임합니다.
+    pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
+        self.ensure_siglip2_ext(true, needs_text).await
+    }
+    
+    /// 🌟 [SigLIP2 RELEASE] 비전+텍스트 인코더를 통째로 내리고 CUDA 캐시까지 반환합니다.
+    ///
+    ///  ── 왜 별도 헬퍼인가 ──
+    ///   기존에는 `*guard = None` 만 수행했습니다. candle 의 CUDA 백엔드는
+    ///   caching allocator 를 쓰므로 그것만으로는 VRAM 이 OS 로 돌아오지 않습니다.
+    ///   `deep_purge_resources` 가 하는 것과 같은 synchronize + 컨텍스트 재생성을
+    ///   여기서도 수행해야 실제 free VRAM 이 올라갑니다.
+    ///
+    ///  ── 언제 부르는가 ──
+    ///   STEP 1~4(패치 임베딩 · 문서분류 · 히트맵 · 크롭계획)가 끝나면
+    ///   SigLIP2 는 더 이상 필요하지 않습니다.
+    ///   그 시점이 곧 Qwen3.5(2B) 를 올려야 하는 시점이므로 여기서 반드시 비웁니다.
+    ///   (실측: 해제 없이 진입 시 첫 크롭에서 free VRAM 147MB)
+    pub async fn release_siglip2(&self, reason: &str) {
+        let released = {
+            let mut guard = self.siglip2_model.lock().await;
+            if guard.is_some() {
+                *guard = None;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !released {
+            return;
+        }
+
+        println!(
+            "[VRAM] SigLIP2 fully released ({}). vision ~820MB + text ~1.4GB returned.",
+            reason
+        );
+
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() {
+                    let _ = dev.synchronize();
+                }
+            })
+            .await;
+            // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+        }
+
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
+        #[cfg(target_os = "linux")]
+        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+        #[cfg(target_os = "macos")]
+        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
     }
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
@@ -1063,6 +1291,7 @@ impl LogisModel {
         let qwen_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf")); 
         let qwen3_5_model_path = normalize_path(base_path.join("Qwen3.5-2B-Instruct-gguf"));
+        let siglip2_model_path = normalize_path(base_path.join("siglip2-so400m-patch16-naflex"));
         let embedding_path = base_path.join("granite-embedding-97m-multilingual-r2");
 
         let max_tokens_limit = 65536; 
@@ -1085,9 +1314,21 @@ impl LogisModel {
             max_tokens_limit: max_tokens_limit as u32,
             _dtype: None, 
             current_size: Arc::new(TokioMutex::new(None)),
+
+            siglip2_model: Arc::new(TokioMutex::new(None)),
+            siglip2_config: None,
+            siglip2_model_path,
         })
     }
 
+    /// 🌟 [VISION PIPELINE] 이미지 1장 → 구조화 JSON → DB 저장.
+    ///
+    ///  ── 5단계 ──
+    ///   STEP 1  SigLIP2 패치 임베딩 격자 생성 (NaFlex, 종횡비 보존)
+    ///   STEP 2  Doc Type NMS Battle       (그룹 → 코드, 동률일 때만 LLM 1회)
+    ///   STEP 3  Column Cosine Matching    (필드 앵커 히트맵)
+    ///   STEP 4  Vision NMS & Cropping     (연결성분 → 배타 배정 → 픽셀 박스)
+    ///   STEP 5  Qwen 3.5 2B 정제 추출      (카테고리별 정밀 크롭 입력)
     pub async fn extract_from_image(
         &self,
         task_id: String,
@@ -1100,7 +1341,6 @@ impl LogisModel {
     ) -> anyhow::Result<()> {
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.clone();
-        
         let emit_term = move |msg: &str| {
             println!("{}", msg);
             use tauri::Emitter;
@@ -1109,69 +1349,204 @@ impl LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
-        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3.5 (2B) Vision Model...");
+        emit_term("[STAGE-1] Preparing SigLIP2 Vision Encoder + Qwen3.5 (2B)...");
 
-        // 🌟 [CRITICAL FIX 1] 이미지 추출 5단계를 완벽하게 맞추기 위한 로딩 스텝(2단계) UI 추가!
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload_load);
         crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_load);
 
-        self.ensure_qwen3_5(true).await?; 
+        // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
+        self.check_siglip2_downloaded().await?;
+        self.ensure_siglip2(true).await?;
+        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
+        //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
+        //    SigLIP2(~2.2GB) + Qwen3.5(~2GB) 동시 상주를 피합니다.
+        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
+        //    ensure_qwen3_5 가 필요 시점에 자동 로드합니다.
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
-            
+
             let is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
 
-            if is_trade_doc {
-                emit_term("[STAGE-2] 🚢 Trade Document Mode: Initiating Classification...");
-                
-                // Step A: 문서 종류 1차 판별 (768px 축소 썸네일 사용)
-                let class_img = dynamic_image.resize(768, 768, image::imageops::FilterType::Triangle);
-                let class_prompt = crate::parsing::get_trade_doc_classification_prompt(); // (이 프롬프트 안에 TRACKING 추가됨)
-                let type_res = self.chat_with_qwen3_5_image_spinner(
-                    "You are a document classifier.", &class_prompt, Some(class_img), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision (Step 1/2)", "summary": "Identifying document type..." }), 128, cancel_token.clone(), Some(task_id.clone()), None
-                ).await?;
-                
-                let detected_type = crate::parsing::parse_json_from_llm(&type_res)
-                    .get("doc_type").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                emit_term(&format!("✅ Document identified as: **{}**", detected_type));
+            // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
+            let siglip_guard = self.siglip2_model.lock().await;
+            let siglip = siglip_guard.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
 
-                // 🌟 [개선된 분기 포인트] TRACKING(운송장)으로 판별되면 무거운 Slice & Merge를 우회합니다!
+            let grid = crate::models::siglip2::vision_encoder::encode_image(siglip, &dynamic_image)
+                .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
+            drop(siglip_guard);
+
+            // ── STEP 2.5 : 판독성 맵 ──
+            //
+            // 🌟 [왜 if 블록 밖인가]
+            //  이 맵은 세 곳이 소비합니다.
+            //    · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
+            //    · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
+            //    · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
+            //  STEP 6 은 trade / commerce 분기 '밖' 에서 실행되므로,
+            //  분기 안에 선언하면 스코프를 벗어나 컴파일되지 않습니다.
+            //  커머스 경로도 동일한 판독성 판정이 필요하므로 모드 무관하게 1회 계산합니다.
+            //
+            // 🌟 [왜 임베딩이 아니라 픽셀인가]
+            //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
+            //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
+            //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
+            //  (실측: EXPORTER/CONSIGNEE 블러 블록, 빈 BUYER 박스가 여기서 잡힙니다)
+            let legibility = crate::models::siglip2::legibility::build_legibility_map(
+                &dynamic_image,
+                grid.grid_rows,
+                grid.grid_cols,
+                &emit_term,
+            );
+
+            // 🌟 [GROUNDING CLAIMS] STEP 6 검증에 넘길 (값, 출처 bbox) 기록.
+            //  분기 안에서 선언하면 STEP 6 이 볼 수 없으므로 여기서 만듭니다.
+            //  TRACKING fast-track / commerce 경로도 여기에 주장을 쌓으면
+            //  같은 검증을 그대로 받게 됩니다.
+            let mut grounding_claims:
+                Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
+
+            if is_trade_doc {
+                emit_term(&format!(
+                    "  🧬 [PATCH GRID] {}x{} = {} patches | scale({:.3}, {:.3})",
+                    grid.grid_rows, grid.grid_cols, grid.len(), grid.scale_x, grid.scale_y
+                ));
+
+                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+                //  구분하지 못하므로, 크롭이 착지하면 2B 모델이 무언가를 지어냅니다.
+                //  빈 셀도 같습니다. BUYER (IF NOT CONSIGNEE) 박스는 내용이 비어 있는데
+                //  모델이 헤더 라벨을 값으로 읽어
+                //  recipient_name = "BUYER (IF NOT CONSIGNEE)" 를 반환했습니다.
+                //
+                // 🌟 [왜 임베딩이 아니라 픽셀인가]
+                //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
+                //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
+                //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
+                //
+                // 🌟 [소비처 3곳]
+                //  · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
+                //  · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
+                //  · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
+                //  한 번 계산해서 세 곳이 공유하므로 추가 비용이 없습니다.
+                let legibility = crate::models::siglip2::legibility::build_legibility_map(
+                    &dynamic_image,
+                    grid.grid_rows,
+                    grid.grid_cols,
+                    &emit_term,
+                );
+
+                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+
+                // ── STEP 2 : Doc Type NMS Battle ──
+                let siglip_guard2 = self.siglip2_model.lock().await;
+                let siglip2 = siglip_guard2.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                let verdict = crate::models::siglip2::vision_encoder::classify_doc_type(
+                    siglip2, &grid, &emit_term
+                ).map_err(|e| anyhow::anyhow!("SigLIP2 classify failed: {}", e))?;
+                drop(siglip_guard2);
+
+                let mut detected_type = verdict.code.clone();
+
+                // 마진 부족 시에만 LLM 재판정 1회
+                if verdict.code_margin < 0.15 && verdict.code_candidates.len() > 1 {
+                    emit_term(&format!(
+                        "  🤝 [TIE BREAK] 코드 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행.",
+                        verdict.code_margin
+                    ));
+                    let prompt = crate::parsing::get_trade_doc_classification_prompt_with_evidence(
+                        &verdict.group,
+                        &verdict.code_candidates,
+                    );
+                    let type_res = self.chat_with_qwen3_5_image_spinner(
+                        "You are a document classifier.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
+                        json!({ "category": "Vision (Step 2)", "summary": "Verifying document type..." }), 64, cancel_token.clone(), Some(task_id.clone()), None
+                    ).await?;
+                    if let Some(v) = crate::parsing::parse_json_from_llm(&type_res).get("doc_type").and_then(|d| d.as_str()) {
+                        if verdict.code_candidates.iter().any(|(c, _)| c == v) {
+                            emit_term(&format!("  ✅ [TIE BREAK] LLM 판정 '{}' 채택.", v));
+                            detected_type = v.to_string();
+                        } else {
+                            emit_term(&format!(
+                                "  🚫 [TIE BREAK] LLM 이 후보 밖 '{}' 반환. 비전 판정 '{}' 유지.",
+                                v, detected_type
+                            ));
+                        }
+                    }
+                }
+
+                emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
+
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
-                    
+                    // 🌟 [VRAM STAGE] 이 경로는 크롭 없이 전체 이미지를 Qwen3.5 에 바로 넘깁니다.
+                    //    SigLIP2 는 여기서 임무가 끝났으므로 즉시 반환합니다.
+                    self.release_siglip2("TRACKING fast-track, before Qwen3.5 load").await;
                     let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
-                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
+                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
                     let result_str = self.chat_with_qwen3_5_image_spinner(
-                        "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
+                        "You are a highly precise logistics data extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
                         json!({ "category": "Vision Analysis", "summary": "Extracting Tracking Label data..." }), 512, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
                     ).await?;
-                    
+
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
-                    
-                    // DB 저장 시 에러가 나지 않도록 doc_type 꼬리표를 강제로 달아줍니다.
+
+                    // 🌟 [WHOLE-PAGE CLAIM] 크롭이 없으므로 출처 bbox 는 페이지 전체입니다.
+                    //    N_in = 전 패치이므로 √(2 ln 252) = 3.32 를 차감하는 엄격한 시험이 됩니다.
+                    //    그래도 '문서에 없는 운송장번호를 지어낸' 경우는 확실히 걸립니다.
+                    record_grounding_claims(
+                        &mut grounding_claims,
+                        "tracking",
+                        &extracted_data,
+                        (0, 0, grid.orig_width, grid.orig_height),
+                    );
+
                     if let Some(obj) = extracted_data.as_object_mut() {
                         obj.insert("doc_type".to_string(), json!("TRACKING"));
                     }
-                    
                 } else {
-                    // 🌟 B/L, CI 등 밀도 높은 무역 문서일 경우 기존처럼 Slice & Merge 파이프라인을 탑니다.
-                    emit_term("[STAGE-2] 🚢 Initiating Slice & Merge Pipeline...");
-                    
-                    // Step B: 판별된 문서에 따른 자르기(Slice) 미션 설정
-                    //  🌟 좌표표를 parsing.rs 로 옮겼습니다. app-logis-center 가 갖고 있던
-                    //     27종 무역 서식 좌표를 그대로 이식한 것이며,
-                    //     새 서식이 추가돼도 이 파일은 수정할 필요가 없습니다.
-                    let missions = crate::parsing::get_trade_doc_slice_config(&detected_type);
+                    // 🌟 [STEP 3~5] 히트맵 → 크롭 → Qwen3.5 추출 파이프라인
+                    emit_term("[STAGE-3] 🔥 Column Cosine Matching (Heatmap)...");
 
-                    let w = dynamic_image.width();
-                    let h = dynamic_image.height();
+                    let siglip_guard3 = self.siglip2_model.lock().await;
+                    let siglip3 = siglip_guard3.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                    // ── STEP 3 : Column Cosine Matching ──
+                    let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                        siglip3, &grid, &detected_type, &language, &emit_term
+                    ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
+                    drop(siglip_guard3);
+
+                    // ── STEP 4 : Vision NMS & Cropping ──
+                    emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
+                    let mut plans = crate::models::siglip2::vision_crop::plan_crops(
+                        &heatmaps, &grid, &emit_term
+                    );
+
+                    if plans.is_empty() {
+                        let cats = crate::parsing::get_trade_doc_categories(&detected_type);
+                        emit_term(&format!(
+                            "  🛟 [FALLBACK] 크롭 영역 미확정. 전체 페이지를 {}개 카테고리에 넘깁니다.",
+                            cats.len()
+                        ));
+                        plans = crate::models::siglip2::vision_crop::whole_page_fallback(&cats, &grid);
+                    }
+
+                    // ── STEP 5 : Qwen 3.5 2B 정제 추출 ──
+                    // 🌟 [VRAM STAGE] STEP 1~4 완료. SigLIP2(비전 820MB + 텍스트 1.4GB) 전량 반환.
+                    //    이 해제가 없으면 ensure_qwen3_5 의 `SigLIP2 is resident` 가드가 발동해
+                    //    deep purge 가 통째로 생략되고, 첫 크롭 시 free VRAM 이 147MB 까지 떨어집니다.
+                    //    pooled 벡터는 STEP 1 의 grid.pooled 를 재사용하므로 여기서 내려도 안전합니다.
+                    self.release_siglip2("STEP 1~4 complete, before Qwen3.5 crop OCR").await;
+
+                    emit_term(&format!("[STAGE-5] 🤖 크롭 {}개 정제 추출", plans.len()));
+
                     let mut final_data_map = serde_json::Map::new();
-                    
-                    // 🌟 [CRITICAL FIX] Python 패리티: 병합을 위한 7대 기본 뼈대(Skeleton)를 무조건 미리 생성해야 합니다!
                     final_data_map.insert("header".to_string(), json!({"doc_type": detected_type}));
                     final_data_map.insert("parties".to_string(), json!({}));
                     final_data_map.insert("logistics".to_string(), json!({}));
@@ -1181,54 +1556,314 @@ impl LogisModel {
                     final_data_map.insert("line_items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
-                    // Step C: 구역별 분할 크롭 및 LLM 타격
-                    for (idx, (cat, top, bot)) in missions.iter().enumerate() {
+                    // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
+
+                    for (idx, plan) in plans.iter().enumerate() {
                         if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
                             emit_term("🛑 Task cancelled by user. Terminating safely.");
                             return Ok(());
                         }
-                        
-                        let crop_y = (h as f32 * top) as u32;
-                        let crop_h = (h as f32 * (bot - top)) as u32;
-                        let img_slice = dynamic_image.crop_imm(0, crop_y, w, crop_h);
-                        
-                        let prompt = crate::parsing::get_trade_category_schema(cat, &detected_type);
-                        let summary_msg = format!("Scanning {} ({}%)...", cat.to_uppercase(), (bot * 100.0) as i32);
-                        
-                        let tile_res = self.chat_with_qwen3_5_image_spinner(
-                            "You are a highly precise document data extraction assistant.", &prompt, Some(img_slice), app_handle, "extraction-progress", 
-                            json!({ "category": format!("Vision (Slice {}/{})", idx+1, missions.len()), "summary": summary_msg }), 1024, cancel_token.clone(), Some(task_id.clone()), None
-                        ).await?;
 
-                        let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
-                        
-                        // 🌟 기존 병합 함수 호출 (이제 뼈대가 있으므로 정상적으로 채워집니다)
-                        merge_json_manual(&mut final_data_map, cat, tile_json);
+                        // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
+                        let (tile_count, _why) =
+                            crate::models::siglip2::vision_crop::decide_tile_count(
+                                plan, &heatmaps, &grid, &legibility, &emit_term
+                            );
+                        let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
+                            plan.bbox, tile_count, 0.25
+                        );
+
+                        for tile in tiles.iter() {
+                            // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
+                            let mut tile_plan = plan.clone();
+                            tile_plan.bbox = tile.bbox;
+
+                            let crop = crate::models::siglip2::vision_crop::crop_region(
+                                &dynamic_image, &tile_plan, 512
+                            );
+
+                            let tile_tag = if tile.total > 1 {
+                                format!(" | 타일 {}/{}", tile.index + 1, tile.total)
+                            } else {
+                                String::new()
+                            };
+                            emit_term(&format!(
+                                "    📤 [{}] {}x{} 크롭 전송 ({}/{}){}",
+                                plan.category, crop.width(), crop.height(),
+                                idx + 1, plans.len(), tile_tag
+                            ));
+
+                            // 🌟 [ALREADY CLAIMED] 앞선 크롭·타일이 확정한 값을 금지 목록으로 전달합니다.
+                            //    겹침 타일에서 같은 값이 두 번 나오는 것은 정상이므로
+                            //    배열 카테고리는 이 목록을 넘기지 않습니다.
+                            //    (넘기면 두 번째 타일이 정당한 반복 행을 스스로 버립니다)
+                            let is_array_cat =
+                                plan.category == "items" || plan.category == "containers";
+                            let claimed = if is_array_cat {
+                                Vec::new()
+                            } else {
+                                collect_claimed(&final_data_map)
+                            };
+                            if !claimed.is_empty() {
+                                emit_term(&format!(
+                                    "    🔒 [ALREADY CLAIMED] 확정값 {}건을 금지 목록으로 전달합니다.",
+                                    claimed.len()
+                                ));
+                            }
+
+                            let prompt = crate::parsing::get_trade_crop_prompt(
+                                &plan.category,
+                                &detected_type,
+                                &plan.top_field,
+                                plan.score,
+                                &claimed,
+                            );
+
+                            let tile_res = self.chat_with_qwen3_5_image_spinner(
+                                "You are a highly precise document data extraction assistant.",
+                                &prompt,
+                                Some(crop),
+                                app_handle,
+                                "extraction-progress",
+                                json!({
+                                    "category": format!("Vision (Crop {}/{}{})", idx + 1, plans.len(), tile_tag),
+                                    "summary": format!("Extracting {}...", plan.category)
+                                }),
+                                1024,
+                                cancel_token.clone(),
+                                Some(task_id.clone()),
+                                None
+                            ).await?;
+
+                            let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+
+                            // 🌟 병합 '전' 에 이 타일이 주장한 값을 출처 bbox 와 함께 기록합니다.
+                            //    STEP 6 이 이 목록으로 접지 검증을 수행합니다.
+                            record_grounding_claims(
+                                &mut grounding_claims,
+                                &plan.category,
+                                &tile_json,
+                                tile.bbox,
+                            );
+
+                            merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
+                        }
                     }
-                    
+
                     extracted_data = Value::Object(final_data_map);
                 }
 
             } else {
                 // ============================================================
-                // 🛒 [Commerce 모드] 커머스 라우팅 보완
+                // 🛒 [Commerce 모드] SigLIP2 히트맵 + 정밀 크롭
                 // ============================================================
-                emit_term("[STAGE-2] 🛒 Commerce Mode: Analyzing Product/Label...");
-                
-                // 🌟 [개선] 기존에 무조건 "goods"(상품) 프롬프트를 먹이던 것을, 
-                // 택배 운송장이 올라올 확률이 높으므로 바코드/송장 번호를 우선 추출하는 "tracking" 기반의 
-                // 범용 커머스 프롬프트로 처리하도록 변경했습니다.
-                let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
-                let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language); // 🌟 Bias 호출
-                
-                let result_str = self.chat_with_qwen3_5_image_spinner(
-                    "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress", 
-                    json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
-                ).await?;
-                
-                extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
+
+                let commerce_page_type = "goods";
+                let siglip_guard4 = self.siglip2_model.lock().await;
+                let siglip4 = siglip_guard4.as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+
+                let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                    siglip4, &grid, commerce_page_type, &language, &emit_term
+                ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
+                drop(siglip_guard4);
+
+                let plans = crate::models::siglip2::vision_crop::plan_crops(
+                    &heatmaps, &grid, &emit_term
+                );
+
+                // 🌟 [VRAM STAGE] 커머스 경로도 여기서 SigLIP2 임무가 끝납니다.
+                //    아래 두 분기(폴백 단일 호출 / 크롭 루프) 모두 Qwen3.5 를 올리므로
+                //    분기 이전에 반환해야 두 경로가 동일한 VRAM 여유를 갖습니다.
+                self.release_siglip2("commerce STEP 1~4 complete, before Qwen3.5").await;
+
+                if plans.is_empty() {
+                    // 히트맵 실패 → 기존 단일 호출 폴백
+                    emit_term("  🛟 [FALLBACK] 크롭 영역 없음. 전체 화면 단일 호출로 전환.");
+                    let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
+                    let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
+                    let result_str = self.chat_with_qwen3_5_image_spinner(
+                        "You are a precise commerce and logistics extraction assistant.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
+                        json!({ "category": "Vision Analysis", "summary": "Analyzing commerce tracking/goods..." }), 1024, cancel_token.clone(), Some(task_id.clone()), Some(&track_prej)
+                    ).await?;
+                    extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+                    record_grounding_claims(
+                        &mut grounding_claims,
+                        "goods",
+                        &extracted_data,
+                        (0, 0, grid.orig_width, grid.orig_height),
+                    );
+                } else {
+                    emit_term(&format!("[STAGE-5] 🤖 커머스 크롭 {}개 정제 추출", plans.len()));
+                    let mut merged = serde_json::Map::new();
+                    let all_fields = crate::parsing::get_detail_schema_fields(commerce_page_type, "", &language);
+
+                    for (idx, plan) in plans.iter().enumerate() {
+                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                            return Ok(());
+                        }
+
+                        let fields: Vec<(String, String)> = all_fields.iter()
+                            .filter(|(name, _, _, _)| {
+                                crate::logic::trade_field_category(name) == plan.category
+                            })
+                            .map(|(name, desc, _, _)| (name.clone(), desc.clone()))
+                            .collect();
+
+                        if fields.is_empty() { continue; }
+
+                        let crop = crate::models::siglip2::vision_crop::crop_region(
+                            &dynamic_image, plan, 512
+                        );
+
+                        emit_term(&format!(
+                            "    📤 [{}] {}x{} 크롭 전송 ({}개 필드)",
+                            plan.category, crop.width(), crop.height(), fields.len()
+                        ));
+
+                        // 🌟 [ALREADY CLAIMED] 커머스도 동일. 가격과 배송비가 섞이는 사고를 막습니다.
+                        let claimed = collect_claimed(&merged);
+
+                        let prompt = crate::parsing::get_commerce_crop_prompt(
+                            commerce_page_type,
+                            &fields,
+                            &language,
+                            &plan.top_field,
+                            plan.score,
+                            &claimed,
+                        );
+
+                        let res = self.chat_with_qwen3_5_image_spinner(
+                            "You are a precise commerce extraction assistant.",
+                            &prompt,
+                            Some(crop),
+                            app_handle,
+                            "extraction-progress",
+                            json!({ "category": format!("Commerce Crop {}/{}", idx + 1, plans.len()), "summary": format!("Extracting {}...", plan.category) }),
+                            1024,
+                            cancel_token.clone(),
+                            Some(task_id.clone()),
+                            None
+                        ).await?;
+
+                        let parsed = crate::parsing::parse_json_from_llm(&res);
+                        record_grounding_claims(
+                            &mut grounding_claims,
+                            &plan.category,
+                            &parsed,
+                            plan.bbox,
+                        );
+                        if let Some(v) = parsed.as_object() {
+                            merge_extracted(&mut merged, &plan.category, &Value::Object(v.clone()), &emit_term);
+                        }
+                    }
+                    extracted_data = Value::Object(merged);
+                }
             }
             
+            // ── STEP 6 : 값 접지 검증 ──
+            //
+            // 🌟 [왜 필요한가 — 실측 사고 3건]
+            //  ① reference_invoice = "CI-2026-08001"
+            //     문서 어디에도 없습니다. bias.json 설명문의 (e.g. CI-2026-08001) 복사입니다.
+            //     [SCHEMA ECHO] 게이트는 {String} 같은 플레이스홀더만 잡으므로 통과했습니다.
+            //  ② voyage_number = "26"
+            //     logistics 크롭에 항차가 없는데, 같은 크롭의 CI-43726 뒤 두 자리를 뗐습니다.
+            //  ③ recipient_name = "BUYER (IF NOT CONSIGNEE)"
+            //     빈 박스의 헤더 라벨을 값으로 읽었습니다.
+            //  셋 다 '문법적으로 완벽한 답' 이라 파싱 단계에서는 절대 걸러지지 않습니다.
+            //  픽셀에 그 값이 실제로 있는지 되묻는 것만이 유일한 검증입니다.
+            //
+            // 🌟 [VRAM 순서]
+            //  Qwen3.5(2GB) 해제 → SigLIP2 재로드 → 값 인코딩 1회 → 즉시 해제.
+            //  패치 임베딩(grid.patches)은 STEP 1 산출물이 CPU 메모리에 그대로 있으므로
+            //  (252 × 1152 × 4B ≈ 1.2MB) 비전 순전파를 다시 돌리지 않습니다.
+            if !grounding_claims.is_empty() {
+                emit_term(&format!(
+                    "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
+                    grounding_claims.len()
+                ));
+
+                // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
+                self.deep_purge_resources().await;
+
+                // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
+                //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
+                //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
+                let verdicts = match self.ensure_siglip2_ext(false, true).await {
+                    Err(e) => {
+                        emit_term(&format!(
+                            "  ⚪ [GROUNDING SKIP] SigLIP2 재로드 실패로 검증을 건너뜁니다: {}",
+                            e
+                        ));
+                        Vec::new()
+                    }
+                    Ok(_) => {
+                        let v = {
+                            let guard = self.siglip2_model.lock().await;
+                            match guard.as_ref() {
+                                Some(sig) if sig.has_text() => {
+                                    // 🌟 [BATCH ENCODE] 값마다 encode_query_text 를 부르면
+                                    //    텍스트 인코더 순전파가 값 개수만큼 반복됩니다.
+                                    //    고유 값을 한 번에 모아 encode_phrases 로 1회 처리하고,
+                                    //    검증 클로저는 색인 조회만 하도록 만듭니다.
+                                    let mut uniq: Vec<String> = Vec::new();
+                                    for c in grounding_claims.iter() {
+                                        if !uniq.iter().any(|e| e == &c.value) {
+                                            uniq.push(c.value.clone());
+                                        }
+                                    }
+                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(
+                                        sig, &uniq,
+                                    ).unwrap_or_default();
+
+                                    let mut table: std::collections::HashMap<&str, &Vec<f32>> =
+                                        std::collections::HashMap::new();
+                                    for (i, u) in uniq.iter().enumerate() {
+                                        if let Some(e) = embs.get(i) {
+                                            table.insert(u.as_str(), e);
+                                        }
+                                    }
+                                    emit_term(&format!(
+                                        "  🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
+                                        uniq.len()
+                                    ));
+
+                                    crate::models::siglip2::value_grounding::verify_claims(
+                                        &grounding_claims,
+                                        &grid.patches,
+                                        grid.grid_rows,
+                                        grid.grid_cols,
+                                        grid.orig_width,
+                                        grid.orig_height,
+                                        &legibility,
+                                        |t| table.get(t).map(|v| (*v).clone()).unwrap_or_default(),
+                                        &emit_term,
+                                    )
+                                }
+                                _ => {
+                                    emit_term("  ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.");
+                                    Vec::new()
+                                }
+                            }
+                        };
+                        self.release_siglip2("STEP 6 grounding complete").await;
+                        v
+                    }
+                };
+
+                // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
+                //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
+                //    (TRACKING fast-track / commerce 경로도 같은 변수를 쓰므로 경로 하나로 통일됩니다)
+                if let Some(map) = extracted_data.as_object_mut() {
+                    apply_grounding_verdicts(map, &verdicts, &emit_term);
+                } else {
+                    emit_term("  ⚪ [GROUNDING APPLY SKIP] 추출 결과가 객체가 아니라 폐기 판정을 적용할 수 없습니다.");
+                }
+            }
+
+            // 🌟 [VRAM STAGE-FINAL] 비전 벡터 저장 완료.
             let mode_name = if is_trade_doc { "Trade Document" } else { "Commerce" };
             emit_term(&format!("[STAGE-2] Generating vision insights for {} mode...", mode_name));
 
@@ -1440,12 +2075,28 @@ impl LogisModel {
                     ));
                 }
                 
+                // 🌟 [비전 벡터 저장] STEP 1 의 encode_image() 가 이미 산출해 둔
+                //    L2 정규화 pooled 벡터를 그대로 재사용합니다.
+                //
+                //  ── 무엇이 문제였나 ──
+                //   구버전은 여기서 encode_image_pooled() 를 다시 호출했습니다.
+                //   그러면 전처리 → 패치 임베딩 → 27층 순전파 → 어텐션 풀링이 통째로 재실행되고,
+                //   그 시점까지 SigLIP2 를 붙들고 있어야 하므로 820MB 를 Qwen3.5 와 동시에 점유했습니다.
+                //   (실측 로그에 [SigLIP2/NaFlex] 가 두 번 찍히는 원인)
+                //   PatchGrid.pooled 는 동일한 값이므로 재계산은 순수 낭비입니다.
+                let vision_vec: Option<Vec<f32>> = if grid.pooled.len() == 1152 {
+                    Some(grid.pooled.clone())
+                } else {
+                    None
+                };
+
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
                     &hashed_id,
                     doc_type,
                     final_data.clone(),
                     None,
+                    vision_vec,
                     Some(from_addr),
                     Some(&team_id),
                     Some(&hashed_cc),
@@ -1561,6 +2212,7 @@ impl LogisModel {
                                             ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
                                             let _ = db.upsert_item(
                                                 "items", existing_id, target_type, ej, None,
+                                                None,
                                                 Some(from_addr), Some(&team_id), Some(&hashed_cc),
                                                 Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
                                                 Some(&ref_val), None
@@ -1588,6 +2240,7 @@ impl LogisModel {
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
+                                    None,
                                     Some(from_addr), Some(&team_id), Some(&hashed_cc),
                                     Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
                                     Some(&ref_val), None
@@ -1849,11 +2502,6 @@ impl LogisModel {
             }
         }
 
-        // [FIX] Removed periodic UI emits from low-level model calls.
-        // Higher-level scheduler will manage the initial and final UI states.
-        // let _ = app_handle.emit(event_name, &base_payload);
-        
-        // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::utils::logger::log_task_progress(app_handle, task_id, &base_payload);
         }
@@ -3335,14 +3983,6 @@ impl LogisModel {
                     }
                 }
 
-                // 🌟 [PHRASE-LEVEL BIAS BANK] 센트로이드 1벡터 임베딩을 완전히 폐기합니다.
-                //    기존: bias_texts[i] = "goods title, goods name, goods 상품명, goods 프리미엄 무선 헤드폰, ..." 을
-                //          통째로 1개 벡터로 만들어 비교 → 9개 개념의 평균이라 어떤 단어와도 0.3x 밖에 안 나왔고,
-                //          그래서 contains() 문자열 포함 시 +0.5 라는 하드코딩 보너스로 억지 보정하고 있었습니다.
-                //    변경: 구 단위로 쪼개 Max-Pool 로 비교하면 원문과 동일한 구는 코사인 1.0 이 되어
-                //          보너스 없이도 압도적으로 승리합니다. (베이지 → color 뱅크의 "베이지" 구와 정확히 일치)
-                //    추가: semantic 앵커(예: title 의 "의류명")를 뱅크에 편입하여 정답 구를 벡터 공간에 올립니다.
-                //
                 // 🌟 [MULTILINGUAL VALUE ANCHOR — 정방향 편입]
                 //    bias.json 의 search_bridge.multilingual_value_anchor 에는
                 //    goods.title = "knit, cardigan, sweater, ..., 니트, 가디건, 스웨터, 코트, ニット, カーディガン, ..."
@@ -6145,9 +6785,17 @@ impl LogisModel {
         Ok(segments)
     }
 
-    // [신규] Shipping 파이프라인 (빠른 단일 처리)
+    // 🌟 [SHIPPING QUERY v3 / VECTOR-FIRST NMS]
+    //  ── v3 구조 (STEP A 와 동일 계보) ──
+    //   ① 접두어 완전일치      : 'CI-2026-08001' → reference_invoice. 벡터·LLM 없이 확정
+    //   ② Stanza POS 토큰화     : 무의미 품사 사전 제거 (NLP 모델)
+    //   ③ 슬라이딩 윈도우       : 1~6단어 청크 생성
+    //   ④ Depth 1 SURPRISAL     : 7개 조건 카테고리 채점 (편견 = 다른 카테고리 bias)
+    //   ⑤ NMS 배틀 + 흡수       : 겹치는 스팬 중 최고 점수만 생존
+    //   ⑥ Depth 2 배타 배정     : 승리 카테고리의 필드만 경쟁, 1청크 1필드
+    //   ⑦ Depth 3 값 확정       : Rust 결정론. 실패 시에만 LLM 1회
+    //  마진이 충분하면 LLM 호출이 0회로 끝납니다.
     pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
-        // 🌟 [CRITICAL FIX] 매크로 제거 후 비동기 우회 함수 장착!
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.to_string();
         let emit_term = move |msg: &str| {
@@ -6162,129 +6810,692 @@ impl LogisModel {
         };
 
         emit_term("\n=======================================");
-        emit_term("[ENGINE] 🚀 Starting Shipping Search Pipeline...");
+        emit_term("[ENGINE] 🚀 Starting Shipping Search Pipeline (v3 / Vector-First NMS)...");
+        emit_term(&format!("   질의: \"{}\"", query));
 
-        let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Extracting logistics filters...", "spinner": "⠋" });
+        let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Segmenting trade conditions...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
-        emit_term("[STAGE-1] Preparing VRAM and Loading Qwen3 (0.6B) Model...");
-        self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
             return Ok(json!({ "context": [], "cancelled": true }));
         }
 
-        emit_term(&format!("[STAGE-1] Extracting shipping filters from query: '{}'", query));
-        let prompt = crate::parsing::extract_shipping_conditions(&query, language);
-        let gen_arc = self.qwen3_generator.clone();
-        let cancel_clone = cancel_token.clone();
-        
-        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = gen_arc.blocking_lock();
-            if let Some(gen) = gen_guard.as_mut() {
-                let params = crate::openai_types::ChatCompletionParameters {
-                    messages: vec![
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                            name: None,
-                        })
-                    ],
-                    model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
-                    ..Default::default()
-                };
-                gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
-            } else {
-                Err(anyhow::anyhow!("Qwen3 Generator is missing"))
+        // =====================================================================
+        // STEP 1 : 문서번호 접두어 완전일치 (벡터·LLM 없이 확정)
+        // =====================================================================
+        let mut deterministic_refs: Vec<(String, String)> = Vec::new(); // (field, value)
+        let mut consumed_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for raw_word in query.split_whitespace() {
+            // 조사/따옴표를 떼어낸 코어 토큰
+            let core: String = raw_word
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if core.chars().count() < 4 { continue; }
+            if !core.contains('-') && !core.contains('_') { continue; }
+            if !core.chars().any(|c| c.is_ascii_digit()) { continue; }
+
+            let prefix: String = core
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_uppercase();
+            if prefix.is_empty() { continue; }
+
+            if let Some(field) = crate::logic::trade_reference_field_of(&prefix) {
+                if deterministic_refs.iter().any(|(f, _)| f == field) { continue; }
+                emit_term(&format!(
+                    "   ⚡ [PREFIX EXACT MATCH] '{}' → 접두어 '{}' 로 '{}' 축 확정 (벡터·LLM 생략)",
+                    core, prefix, field
+                ));
+                deterministic_refs.push((field.to_string(), core.clone()));
+                consumed_words.insert(raw_word.to_string());
             }
-        }).await??;
-
-        // 🌟 추출된 결과를 터미널 화면에 꽂아줍니다!
-        emit_term(&format!("[STAGE-1 RESULT]\n{}", res));
-
-        // 🌟 [CONDITION NORMALIZE v4]
-        //  build_dexie_plan 은 { "필드": { "operator": ..., "value": ... } } 형태만 읽고,
-        //  value 키가 없으면 `continue` 로 그 조건을 통째로 버립니다.
-        //  0.6B 출력은 평문 / operator 누락 형태가 섞여 오므로
-        //  "조건을 뽑았는데 검색에는 반영되지 않는" 경로가 상시 존재했습니다.
-        //  여기서 형태를 한 번만 확정해 그 경로를 없앱니다.
-        fn normalize_trade_conditions(raw: &Value) -> Value {
-            let src = match raw.as_object() {
-                Some(o) => o,
-                None => return json!({}),
-            };
-            let mut out = serde_json::Map::new();
-
-            for (k, v) in src {
-                let (op, val) = match v {
-                    Value::Object(o) => {
-                        let op = o.get("operator").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                        let val = match o.get("value") { Some(x) => x.clone(), None => continue };
-                        (op, val)
-                    },
-                    Value::Null => continue,
-                    other => (String::new(), other.clone()),
-                };
-
-                // 빈 값은 조건이 아니라 노이즈입니다.
-                let is_empty = match &val {
-                    Value::Null => true,
-                    Value::String(s) => s.trim().is_empty() || s == "null" || s == "N/A",
-                    _ => false,
-                };
-                if is_empty { continue; }
-
-                // 연산자가 비었으면 값의 형태로 결정론 판정합니다.
-                //  수치 → eq / 문자열 → contains (부분 일치가 리콜에 유리)
-                let op = if !op.trim().is_empty() {
-                    op.trim().to_lowercase()
-                } else if val.is_number() {
-                    "eq".to_string()
-                } else {
-                    "contains".to_string()
-                };
-
-                out.insert(k.clone(), json!({ "operator": op, "value": val }));
-            }
-
-            Value::Object(out)
         }
 
-        let extracted_conditions = normalize_trade_conditions(&crate::parsing::parse_json_from_llm(&res));
+        // =====================================================================
+        // STEP 2 : Stanza 형태소 토큰화
+        // =====================================================================
+        let stanza_code = crate::analytic::stanza_lang_code(language);
+        let tokens = crate::analytic::tokenize_query_with_morphology(&query, stanza_code).await;
+        if tokens.is_empty() {
+            emit_term("   ⚠️ [TOKENIZE] 분석 가능한 토큰이 없습니다.");
+        } else {
+            emit_term(&format!(
+                "   🧠 [STANZA POS] {:?}",
+                tokens.iter().map(|(w, t, l)| {
+                    let tag = if t.is_empty() { "-".to_string() } else { t.clone() };
+                    let lem = if l.is_empty() { "-".to_string() } else { l.clone() };
+                    format!("{}(tag:{}, lemma:{})", w, tag, lem)
+                }).collect::<Vec<_>>()
+            ));
+        }
+
+        // 🌟 [DUAL AXIS] 드롭 대상 품사도 '청크 후보' 에는 남깁니다.
+        //    '선적된' 이 VERB 로 판정되어도 그것이 transport 판정의 유일한 근거일 수 있습니다.
+        const DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+        let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
+        let content_flags: Vec<bool> = tokens
+            .iter()
+            .map(|(_, t, _)| !DROP_TAGS.iter().any(|d| d == t))
+            .collect();
+
+        let morph_alts: Vec<Vec<String>> = tokens
+            .iter()
+            .map(|(w, _, l)| crate::analytic::morphological_variants(w, l))
+            .collect();
+        let morph_depth: usize = morph_alts.iter().map(|v| v.len()).max().unwrap_or(0);
+
+        // =====================================================================
+        // STEP 3 : 슬라이딩 윈도우 청크 (1~6단어) + 형태소 변형
+        // =====================================================================
+        let mut chunk_texts: Vec<String> = Vec::new();
+        let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
+        let mut seen_chunk: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for s in 0..all_words.len() {
+            // 접두어로 이미 확정된 단어는 청크 생성에서 제외합니다.
+            if consumed_words.contains(&all_words[s]) { continue; }
+            let max_e = all_words.len().min(s + 6);
+            for e in (s + 1)..=max_e {
+                if (s..e).any(|i| consumed_words.contains(&all_words[i])) { continue; }
+
+                let surface = all_words[s..e].join(" ");
+                if !surface.trim().is_empty() {
+                    let key = format!("{}|{}|{}", s, e, surface);
+                    if seen_chunk.insert(key) {
+                        chunk_texts.push(surface);
+                        chunk_spans.push((s, e));
+                    }
+                }
+
+                for d in 0..morph_depth {
+                    let mut changed = false;
+                    let mut parts: Vec<String> = Vec::with_capacity(e - s);
+                    for i in s..e {
+                        match morph_alts[i].get(d) {
+                            Some(m) => { changed = true; parts.push(m.clone()); },
+                            None => parts.push(all_words[i].clone()),
+                        }
+                    }
+                    if !changed { continue; }
+                    let mt = parts.join(" ");
+                    if mt.trim().is_empty() { continue; }
+                    let key = format!("{}|{}|{}", s, e, mt);
+                    if seen_chunk.insert(key) {
+                        chunk_texts.push(mt);
+                        chunk_spans.push((s, e));
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // STEP 4 : Depth 1 뱅크 구축 + 임베딩
+        //   편견은 별도 사전을 만들지 않고 '다른 카테고리의 bias' 를 씁니다.
+        //   (get_detail_schema_fields 가 다른 필드의 bias 를 편견으로 쓰는 것과 동일 원리)
+        // =====================================================================
+        self.check_embedding_downloaded().await?;
+        self.ensure_embedding().await?;
+
+        let mut d1_bias: Vec<(String, String, String)> = Vec::new();
+        let mut d1_prej: Vec<(String, String, String)> = Vec::new();
+        for (cat, raw) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
+            for p in crate::utils::ai_utils::split_bias_phrases_full(raw) {
+                d1_bias.push(("cond".to_string(), cat.to_string(), p));
+            }
+            for (other, other_raw) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
+                if other == cat { continue; }
+                for p in crate::utils::ai_utils::split_bias_phrases_full(other_raw) {
+                    d1_prej.push(("cond".to_string(), cat.to_string(), p));
+                }
+            }
+        }
+
+        // 유일 구만 1회 임베딩하고 재사용합니다.
+        let mut uniq_d1: Vec<String> = Vec::new();
+        for (_, _, p) in d1_bias.iter().chain(d1_prej.iter()) {
+            if !uniq_d1.iter().any(|e| e == p) { uniq_d1.push(p.clone()); }
+        }
+        let mut uniq_d1_embs: Vec<Vec<f32>> = Vec::with_capacity(uniq_d1.len());
+        for part in uniq_d1.chunks(200) {
+            let e = self.get_embedding_batch(part.to_vec()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
+            uniq_d1_embs.extend(e);
+        }
+        let d1_emb_of = |p: &str| -> Vec<f32> {
+            match uniq_d1.iter().position(|e| e == p) {
+                Some(i) => uniq_d1_embs[i].clone(),
+                None => vec![0.0f32; 384],
+            }
+        };
+        let d1_bias_bank: Vec<(String, String, Vec<f32>)> = d1_bias.iter()
+            .map(|(c, k, p)| (c.clone(), k.clone(), d1_emb_of(p))).collect();
+        let d1_prej_bank: Vec<(String, String, Vec<f32>)> = d1_prej.iter()
+            .map(|(c, k, p)| (c.clone(), k.clone(), d1_emb_of(p))).collect();
 
         emit_term(&format!(
-            "[STAGE-1 CONDITIONS] 정규화 조건 {}개: {}",
-            extracted_conditions.as_object().map(|o| o.len()).unwrap_or(0),
-            serde_json::to_string(&extracted_conditions).unwrap_or_default()
+            "   📐 [DEPTH-1 BANK] 카테고리 {}개 | 판정 구 {}개 | 편견 구 {}개 | 청크 후보 {}개",
+            crate::logic::TRADE_CONDITION_CATEGORIES.len(),
+            d1_bias_bank.len(), d1_prej_bank.len(), chunk_texts.len()
         ));
-        
-        let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
-        let _ = app_handle.emit("extraction-progress", &payload);
-        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
-        // 🌟 [TRADING CONTEXT v2]
-        //  기존에는 type 을 'tracking' 하나로 고정해, B/L·AWB·CI 등으로 저장된 문서가
-        //  build_scope_filter 의 `type = 'tracking'` 에서 전량 탈락했습니다.
-        //  (실제로 무역 서식은 doc_type 값 그대로 type 컬럼에 들어갑니다)
-        //  types 배열을 실어 보내면 lib.rs 가 `type IN (...)` 으로 펼쳐 조회합니다.
-        //
-        //  doc_type 조건이 뽑혔다면 그 값을 1순위로 좁히고,
-        //  없으면 무역 서식 전체를 후보로 둡니다. Dexie 가 뒤에서 조건으로 잘라냅니다.
-        // 🌟 [TRADING CONTEXT v3 / RECALL-WIDE]
-        //  ── v2 의 결함 ──
-        //   doc_type 이 뽑히면 스코프를 그 값 하나로 '교체' 했습니다.
-        //   그 값은 0.6B 가 자연어에서 추정한 것이라 틀릴 수 있고,
-        //   틀리는 순간 `type IN ('BL','bl')` 로 좁혀져 LanceDB 가 후보를 안 줍니다.
-        //   Dexie 가 구출할 재료가 없으니 되살릴 경로 자체가 없습니다.
-        //
-        //  ── v4 원칙 ──
-        //   LanceDB = 리콜(넓게), Dexie = 정밀도(정확히 자르기).
-        //   스코프는 항상 무역 서식 전체로 두고, doc_type 은 조건으로 내려보냅니다.
-        //   맞았다면 Dexie 가 정확히 자르고, 틀렸다면 후보가 남아 구출됩니다.
-        // 🌟 [CASE PARITY] extract_from_image 의 TRACKING Fast-Track 은
-        //    doc_type 을 대문자 "TRACKING" 으로 저장하고 그 값이 그대로 DB type 이 됩니다.
-        //    SQL 문자열 비교는 대소문자를 구분하므로 소문자 "tracking" 만으로는
-        //    로컬 스캔한 운송장 라벨이 무역 검색에서 전량 탈락했습니다.
+        let chunk_embs: Vec<Vec<f32>> = if chunk_texts.is_empty() {
+            Vec::new()
+        } else {
+            let mut acc: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
+            for part in chunk_texts.chunks(200) {
+                let e = self.get_embedding_batch(part.to_vec()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
+                acc.extend(e);
+            }
+            acc
+        };
+
+        // =====================================================================
+        // STEP 5 : Depth 1 SURPRISAL 채점
+        //   surprisal = (max - μ_global)/σ_global - √(2 ln N)
+        //   뱅크 크기 편향(reference 44구 vs parties 3구)이 제거됩니다.
+        // =====================================================================
+        struct TradeSpan {
+            start: usize,
+            end: usize,
+            text: String,
+            category: String,
+            score: f32,
+            max_cos: f32,
+            alts: Vec<(String, f32)>,
+        }
+
+        let empty_names: Vec<String> = Vec::new();
+        let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
+        let empty_skip: Vec<bool> = Vec::new();
+
+        let mut candidates: Vec<TradeSpan> = Vec::new();
+        let mut rescue_pool: Vec<TradeSpan> = Vec::new();
+
+        for (ci, (s, e)) in chunk_spans.iter().enumerate() {
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                return Ok(json!({ "context": [], "cancelled": true }));
+            }
+            let q = match chunk_embs.get(ci) { Some(v) => v, None => continue };
+            if q.iter().all(|&v| v == 0.0) { continue; }
+
+            let (f_scores, _) = crate::utils::ai_utils::surprisal_dual_scores(
+                q, &d1_bias_bank, &d1_prej_bank, &empty_names, &empty_banks, &empty_skip,
+            );
+            if f_scores.is_empty() { continue; }
+
+            let top = &f_scores[0];
+            let alts: Vec<(String, f32)> = f_scores.iter().skip(1).take(3)
+                .map(|x| (x.key.clone(), x.surprisal)).collect();
+
+            let span = TradeSpan {
+                start: *s,
+                end: *e,
+                text: chunk_texts[ci].clone(),
+                category: top.key.clone(),
+                score: top.surprisal,
+                max_cos: top.max_cos,
+                alts,
+            };
+
+            if top.surprisal > 0.0 {
+                emit_term(&format!(
+                    "   🎯 [D1 CANDIDATE] \"{}\" → {} | Surprisal: {:+.4} | MaxCos: {:.4} | N={}",
+                    chunk_texts[ci], top.key, top.surprisal, top.max_cos, top.n
+                ));
+                candidates.push(span);
+            } else {
+                rescue_pool.push(span);
+            }
+        }
+
+        // 🌟 [COVERAGE RESCUE] 게이트를 넘은 후보가 0건이면 최상위 후보를 승격합니다.
+        if candidates.is_empty() && !rescue_pool.is_empty() {
+            rescue_pool.sort_by(|a, b| b.max_cos.partial_cmp(&a.max_cos).unwrap_or(std::cmp::Ordering::Equal));
+            emit_term(&format!(
+                "   🛟 [COVERAGE RESCUE] 게이트 통과 후보가 0건이라 상위 후보 {}건을 승격합니다.",
+                rescue_pool.len().min(4)
+            ));
+            for r in rescue_pool.into_iter().take(4) {
+                emit_term(&format!(
+                    "      ↳ \"{}\" → {} | Surprisal: {:+.4} | MaxCos: {:.4}",
+                    r.text, r.category, r.score, r.max_cos
+                ));
+                candidates.push(r);
+            }
+        }
+
+        // =====================================================================
+        // STEP 6 : NMS 배틀 + 흡수 + 갭 브리징
+        // =====================================================================
+        candidates.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                .then((b.end - b.start).cmp(&(a.end - a.start)))
+        });
+
+        let mut winners: Vec<TradeSpan> = Vec::new();
+        for c in candidates.into_iter() {
+            let mut overlapped = false;
+            let mut winner_text = String::new();
+            for w in winners.iter_mut() {
+                if c.start < w.end && c.end > w.start {
+                    overlapped = true;
+                    winner_text = w.text.clone();
+                    if c.start < w.start {
+                        w.start = c.start;
+                        w.text = format!("{} {}", c.text, w.text);
+                    }
+                    if c.end > w.end {
+                        w.end = c.end;
+                        w.text = format!("{} {}", w.text, c.text);
+                    }
+                    if c.score > w.score {
+                        w.score = c.score;
+                        w.max_cos = c.max_cos;
+                        w.category = c.category.clone();
+                    }
+                    break;
+                }
+            }
+            if !overlapped {
+                emit_term(&format!(
+                    "   👑 [NMS WINNER] \"{}\" → {} | Surprisal: {:+.4}",
+                    c.text, c.category, c.score
+                ));
+                winners.push(c);
+            } else {
+                emit_term(&format!(
+                    "   💀 [NMS DEFEAT] \"{}\" ({}) 는 상위 스팬 '{}' 에 흡수되었습니다.",
+                    c.text, c.category, winner_text
+                ));
+            }
+        }
+
+        winners.sort_by(|a, b| a.start.cmp(&b.start));
+
+        // 🌟 [GAP BRIDGING] NMS 에서 커버되지 않은 고아 단어를 인접 승자에 흡수시킵니다.
+        if !winners.is_empty() {
+            if winners[0].start > 0 {
+                let gap = all_words[0..winners[0].start].join(" ");
+                emit_term(&format!("   🛠️ [LEFT EDGE] '{}' → '{}' 에 흡수", gap, winners[0].text));
+                winners[0].start = 0;
+                winners[0].text = format!("{} {}", gap, winners[0].text);
+            }
+            for i in 0..(winners.len().saturating_sub(1)) {
+                let gs = winners[i].end;
+                let ge = winners[i + 1].start;
+                if gs < ge {
+                    let gap = all_words[gs..ge].join(" ");
+                    emit_term(&format!("   ⚔️ [GAP BATTLE] '{}' → LEFT '{}' 에 흡수", gap, winners[i].text));
+                    winners[i].end = ge;
+                    winners[i].text = format!("{} {}", winners[i].text, gap);
+                }
+            }
+            let last = winners.len() - 1;
+            if winners[last].end < all_words.len() {
+                let gap = all_words[winners[last].end..].join(" ");
+                emit_term(&format!("   🛠️ [RIGHT EDGE] '{}' → '{}' 에 흡수", gap, winners[last].text));
+                winners[last].end = all_words.len();
+                winners[last].text = format!("{} {}", winners[last].text, gap);
+            }
+        }
+
+        // =====================================================================
+        // STEP 7 : Depth 1 마진 부족 시에만 LLM 재판정
+        // =====================================================================
+        let mut need_d1_llm: Vec<usize> = Vec::new();
+        for (wi, w) in winners.iter().enumerate() {
+            if w.alts.first().map_or(false, |(_, s)| *s >= w.score * 0.9) {
+                need_d1_llm.push(wi);
+            }
+        }
+
+        if !need_d1_llm.is_empty() {
+            emit_term(&format!(
+                "   ⚖️ [D1 MARGIN GATE] 1위-2위가 사실상 동률인 스팬 {}개에 대해 LLM 재판정을 수행합니다.",
+                need_d1_llm.len()
+            ));
+            self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancel_token.clone()), false, None).await?;
+
+            for wi in need_d1_llm {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let mut scored: Vec<(String, f32)> = vec![(winners[wi].category.clone(), winners[wi].score)];
+                for (k, s) in winners[wi].alts.iter() { scored.push((k.clone(), *s)); }
+
+                let p = crate::parsing::trade_condition_category_prompt(&winners[wi].text, &query, &scored);
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(p),
+                            name: None,
+                        })],
+                    model: "qwen3.5".to_string(),
+                    max_tokens: Some(96),
+                    temperature: Some(0.0),
+                    top_p: Some(0.95),
+                    ..Default::default()
+                };
+                let r = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                    gen.generate(params, Some(cancel_token.clone()), Some(format!("{}_tq_d1_{}", task_id, wi)), None, None, None)
+                        .await.unwrap_or_default()
+                } else { String::new() };
+
+                let picked = crate::parsing::parse_json_from_llm(&r)
+                    .get("category").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                let allowed = scored.iter().any(|(k, _)| k == &picked);
+                if allowed && picked != winners[wi].category {
+                    emit_term(&format!(
+                        "   🤖 [D1 LLM] \"{}\" 의 카테고리를 '{}' → '{}' 로 교정했습니다.",
+                        winners[wi].text, winners[wi].category, picked
+                    ));
+                    winners[wi].category = picked;
+                } else if !picked.is_empty() && !allowed {
+                    emit_term(&format!(
+                        "   🚫 [D1 LLM REJECT] '{}' 는 후보 목록에 없어 폐기하고 '{}' 를 유지합니다.",
+                        picked, winners[wi].category
+                    ));
+                }
+            }
+        } else {
+            emit_term("   ⚡ [D1 DETERMINISTIC] 벡터 마진이 충분하여 카테고리 LLM 호출을 생략합니다.");
+        }
+
+        // =====================================================================
+        // STEP 8 : Depth 2 — 카테고리 내부 파라미터 배타 배정
+        // =====================================================================
+        let mut conditions = serde_json::Map::new();
+        let mut hub_values: Vec<String> = Vec::new();
+        let mut consumed_span: Vec<bool> = vec![false; all_words.len()];
+        let mut claimed_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // ① 접두어로 확정된 축을 먼저 잠급니다.
+        for (field, value) in deterministic_refs.iter() {
+            conditions.insert(field.clone(), json!({
+                "operator": crate::logic::trade_default_operator(field),
+                "value": value
+            }));
+            claimed_fields.insert(field.clone());
+            emit_term(&format!(
+                "   🔒 [D2 LOCKED] '{}' = '{}' (접두어 확정, 벡터 경쟁 대상 아님)",
+                field, value
+            ));
+        }
+
+        // ② 카테고리별로 승리 스팬을 묶어 배타 배정합니다.
+        let mut by_cat: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (wi, w) in winners.iter().enumerate() {
+            by_cat.entry(w.category.clone()).or_default().push(wi);
+        }
+
+        // 카테고리 순회 순서를 고정해 로그 재현성을 확보합니다.
+        let cat_order: Vec<String> = crate::logic::TRADE_CONDITION_CATEGORIES
+            .iter().map(|(c, _)| c.to_string()).collect();
+
+        let mut d2_llm_pending: Vec<(usize, String, Vec<(String, String, f32)>)> = Vec::new();
+
+        for cat in cat_order.iter() {
+            let span_idxs = match by_cat.get(cat) { Some(v) => v.clone(), None => continue };
+            if span_idxs.is_empty() { continue; }
+
+            // 🌟 hub 는 필드가 하나뿐이라 경쟁이 없습니다.
+            if cat == "hub" {
+                for wi in span_idxs.iter() {
+                    let v = crate::utils::ai_utils::deterministic_condition_value(
+                        &vec![winners[*wi].text.clone()], false,
+                    );
+                    if v.trim().is_empty() { continue; }
+                    if !hub_values.iter().any(|x| x == &v) { hub_values.push(v.clone()); }
+                    for i in winners[*wi].start..winners[*wi].end {
+                        if i < consumed_span.len() { consumed_span[i] = true; }
+                    }
+                    emit_term(&format!("   🧲 [D2 HUB] \"{}\" → hub_reference", v));
+                }
+                continue;
+            }
+
+            let fields = crate::logic::trade_condition_fields(cat);
+            if fields.is_empty() { continue; }
+
+            // 필드 앵커 임베딩
+            let mut f_names: Vec<String> = Vec::new();
+            let mut f_descs: Vec<String> = Vec::new();
+            let mut f_banks: Vec<Vec<Vec<f32>>> = Vec::new();
+            let mut f_weights: Vec<Vec<f32>> = Vec::new();
+            for (fname, fdesc, anchor) in fields.iter() {
+                if claimed_fields.contains(*fname) { continue; }
+                let (ph, wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
+                if ph.is_empty() { continue; }
+                let embs = self.get_embedding_batch(ph.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
+                f_names.push(fname.to_string());
+                f_descs.push(fdesc.to_string());
+                f_banks.push(embs);
+                f_weights.push(wt);
+            }
+            if f_names.is_empty() { continue; }
+
+            emit_term(&format!(
+                "   📐 [D2 BANK] 카테고리 '{}' | 후보 필드 {}개 | 대상 스팬 {}개",
+                cat, f_names.len(), span_idxs.len()
+            ));
+
+            // (필드 × 스팬) 행렬
+            let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; span_idxs.len()]; f_names.len()];
+            let mut span_embs: Vec<Vec<f32>> = Vec::with_capacity(span_idxs.len());
+            for wi in span_idxs.iter() {
+                let e = self.get_embedding(winners[*wi].text.clone()).await.unwrap_or(vec![0.0; 384]);
+                span_embs.push(e);
+            }
+
+            for fi in 0..f_names.len() {
+                let fmt = crate::utils::ai_utils::detect_field_format(&f_names[fi]);
+                for (si, wi) in span_idxs.iter().enumerate() {
+                    let e = &span_embs[si];
+                    if e.iter().all(|&v| v == 0.0) { continue; }
+
+                    // 🌟 [FORMAT GATE] 배정 '전' 에 값 생김새부터 검증합니다.
+                    let raw_val = winners[*wi].text.trim();
+                    let ok = match fmt {
+                        crate::utils::ai_utils::FieldFormat::Numeric =>
+                            raw_val.chars().any(|c| c.is_ascii_digit()),
+                        crate::utils::ai_utils::FieldFormat::Date =>
+                            raw_val.chars().any(|c| c.is_ascii_digit()),
+                        _ => true,
+                    };
+                    if !ok { continue; }
+
+                    matrix[fi][si] = crate::utils::ai_utils::weighted_max_pool_sim(
+                        e, &f_banks[fi], &f_weights[fi],
+                    );
+                }
+            }
+
+            let centered = crate::utils::ai_utils::double_center_matrix(&matrix);
+            let assign = crate::utils::ai_utils::exclusive_assign_by_score(&centered, 0.0, 0.0);
+
+            for (fi, a) in assign.iter().enumerate() {
+                let (si, own, margin) = match a { Some(v) => *v, None => continue };
+                let wi = span_idxs[si];
+
+                // 마진이 사실상 0 이면 LLM 재판정 대기열에 넣습니다.
+                if margin.abs() < 0.005 {
+                    let mut scored: Vec<(String, String, f32)> = Vec::new();
+                    for k in 0..f_names.len() {
+                        let s = matrix[k][si];
+                        if s < 0.0 { continue; }
+                        scored.push((f_names[k].clone(), f_descs[k].clone(), s));
+                    }
+                    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.truncate(6);
+                    d2_llm_pending.push((wi, cat.clone(), scored));
+                    emit_term(&format!(
+                        "   ⚖️ [D2 MARGIN GATE] \"{}\" 의 1위-2위 마진 {:+.4} 로 LLM 재판정 대기열에 넣습니다.",
+                        winners[wi].text, margin
+                    ));
+                    continue;
+                }
+
+                let field = f_names[fi].clone();
+                let value = trade_resolve_condition_value(&field, &winners[wi].text);
+                if value.trim().is_empty() {
+                    emit_term(&format!(
+                        "   ⚪ [D2 NO VALUE] '{}' 에 배정된 \"{}\" 에서 값을 뽑지 못해 조건을 만들지 않습니다.",
+                        field, winners[wi].text
+                    ));
+                    continue;
+                }
+
+                let op = trade_resolve_condition_operator(&field, &winners[wi].text);
+                conditions.insert(field.clone(), json!({ "operator": op, "value": value }));
+                claimed_fields.insert(field.clone());
+                for i in winners[wi].start..winners[wi].end {
+                    if i < consumed_span.len() { consumed_span[i] = true; }
+                }
+                emit_term(&format!(
+                    "   🔗 [D2 ASSIGN] \"{}\" → {}.{} {} '{}' | Score: {:+.4} | Margin: {:+.4}",
+                    winners[wi].text, cat, field, op, value, own, margin
+                ));
+            }
+        }
+
+        // =====================================================================
+        // STEP 9 : Depth 2 마진 부족분만 LLM 1회씩
+        // =====================================================================
+        if !d2_llm_pending.is_empty() {
+            self.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancel_token.clone()), false, None).await?;
+            for (idx, (wi, cat, scored)) in d2_llm_pending.into_iter().enumerate() {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+                let p = crate::parsing::trade_condition_field_prompt(&winners[wi].text, &query, &cat, &scored);
+                let params = crate::openai_types::ChatCompletionParameters {
+                    messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(
+                        crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(p),
+                            name: None,
+                        })],
+                    model: "qwen3.5".to_string(),
+                    max_tokens: Some(96),
+                    temperature: Some(0.0),
+                    top_p: Some(0.95),
+                    ..Default::default()
+                };
+                let r = if let Some(gen) = self.qwen3_5_generator.lock().await.as_mut() {
+                    gen.generate(params, Some(cancel_token.clone()), Some(format!("{}_tq_d2_{}", task_id, idx)), None, None, None)
+                        .await.unwrap_or_default()
+                } else { String::new() };
+
+                let picked = crate::parsing::parse_json_from_llm(&r)
+                    .get("field").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+
+                if picked.is_empty() {
+                    emit_term(&format!("   ⚪ [D2 LLM] \"{}\" 는 어느 필드에도 맞지 않아 조건에서 제외합니다.", winners[wi].text));
+                    continue;
+                }
+                if !scored.iter().any(|(f, _, _)| f == &picked) {
+                    emit_term(&format!("   🚫 [D2 LLM REJECT] '{}' 는 후보 목록에 없어 폐기합니다.", picked));
+                    continue;
+                }
+                if claimed_fields.contains(&picked) {
+                    emit_term(&format!("   🚫 [D2 LLM REJECT] '{}' 는 이미 다른 청크가 선점했습니다.", picked));
+                    continue;
+                }
+
+                let value = trade_resolve_condition_value(&picked, &winners[wi].text);
+                if value.trim().is_empty() {
+                    emit_term(&format!("   ⚪ [D2 NO VALUE] '{}' 에서 값을 뽑지 못했습니다.", picked));
+                    continue;
+                }
+                let op = trade_resolve_condition_operator(&picked, &winners[wi].text);
+                conditions.insert(picked.clone(), json!({ "operator": op, "value": value }));
+                claimed_fields.insert(picked.clone());
+                for i in winners[wi].start..winners[wi].end {
+                    if i < consumed_span.len() { consumed_span[i] = true; }
+                }
+                emit_term(&format!(
+                    "   🤖 [D2 LLM] \"{}\" → {} {} '{}'",
+                    winners[wi].text, picked, op, value
+                ));
+            }
+        }
+
+        // =====================================================================
+        // STEP 10 : 벡터 근거가 전무하면 레거시 폴백 1회
+        // =====================================================================
+        if conditions.is_empty() && hub_values.is_empty() {
+            emit_term("   🛟 [FALLBACK] 벡터 근거가 전무하여 레거시 단일 프롬프트를 1회 호출합니다.");
+            self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
+
+            let prompt = crate::parsing::extract_shipping_conditions(&query, language);
+            let gen_arc = self.qwen3_generator.clone();
+            let cancel_clone = cancel_token.clone();
+            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![
+                            crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                                name: None,
+                            })
+                        ],
+                        model: "qwen3".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+                        ..Default::default()
+                    };
+                    gen.generate(params, Some(cancel_clone), None, None).map_err(|e| anyhow::anyhow!("Qwen3 Inference failed: {}", e))
+                } else {
+                    Err(anyhow::anyhow!("Qwen3 Generator is missing"))
+                }
+            }).await??;
+
+            emit_term(&format!("   [FALLBACK RESULT]\n{}", res));
+
+            let parsed = crate::parsing::parse_json_from_llm(&res);
+            if let Some(obj) = parsed.as_object() {
+                for (k, v) in obj {
+                    let op = v.get("operator").and_then(|x| x.as_str()).unwrap_or("").trim().to_lowercase();
+                    let val = match v.get("value") { Some(x) => x.clone(), None => continue };
+                    let is_empty = match &val {
+                        Value::Null => true,
+                        Value::String(s) => s.trim().is_empty() || s == "null" || s == "N/A",
+                        _ => false,
+                    };
+                    if is_empty { continue; }
+
+                    if k == "hub_reference" {
+                        if let Some(s) = val.as_str() {
+                            if !hub_values.iter().any(|x| x == s) { hub_values.push(s.to_string()); }
+                        }
+                        continue;
+                    }
+
+                    let final_op = if !op.is_empty() {
+                        op
+                    } else {
+                        crate::logic::trade_default_operator(k).to_string()
+                    };
+                    conditions.insert(k.clone(), json!({ "operator": final_op, "value": val }));
+                }
+            }
+        }
+
+        // =====================================================================
+        // STEP 11 : 스코프 확정 (45종 전체) + 허브 확장
+        // =====================================================================
+        // 🌟 [SCOPE v4]
+        //  ── v3 의 결함 ──
+        //   27개 코드만 나열해, 45종 데이터셋의
+        //   HBL / FCR / POD / SWB / LLC / LG / TR / CDR / ICF / SOA / TI / CSI /
+        //   EL / CCC / CM / CP / FI / FC / PC / COA / CNM / IP / DN / CN / BK
+        //   가 type IN (...) 에서 전량 탈락했습니다.
+        //  ── v4 ──
+        //   logic.rs 가 소유한 참조 필드 사전과 같은 계보의 코드 목록을 씁니다.
+        //   저장 시 type 컬럼에 doc_type 이 그대로 들어가므로 대소문자를 함께 넣습니다.
         let mut trade_types: Vec<String> = vec![
             "tracking".to_string(), "TRACKING".to_string(),
             "receiving".to_string(), "Receiving".to_string(),
@@ -6292,47 +7503,115 @@ impl LogisModel {
             "shipping_doc".to_string(),
         ];
         for t in [
-            "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
-            "SA", "DO", "AN", "BC", "ED", "ID", "CINV",
-            "IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT",
-            "DGD", "MSDS", "POA", "BIZ_LIC", "INS",
+            // 계약 · 결제
+            "PO", "PI", "SC", "LC", "LLC", "CP",
+            // 상거래 · 선적
+            "CI", "CINV", "CSI", "PL", "BL", "HBL", "SWB", "AWB",
+            "BC", "BK", "SA", "DO", "AN", "FCR", "POD", "CM", "FI",
+            // 통관 · 신고
+            "ED", "ID", "CO", "EL", "CCC",
+            // 검사 · 증명
+            "IC", "WC", "CA", "COA", "PHYTO", "PC", "HC", "BEN_CERT", "FC", "CNM",
+            // 특수 · 법무 · 금융
+            "DGD", "MSDS", "POA", "BIZ_LIC", "INS", "IP",
+            "LG", "TR", "CDR", "ICF", "SOA", "DN", "CN", "TI",
         ] {
-            trade_types.push(t.to_string());
-            trade_types.push(t.to_lowercase());
+            let up = t.to_string();
+            let lo = t.to_lowercase();
+            if !trade_types.iter().any(|x| x == &up) { trade_types.push(up); }
+            if !trade_types.iter().any(|x| x == &lo) { trade_types.push(lo); }
         }
 
-        // 🌟 doc_type 은 '스코프' 가 아니라 '조건' 입니다.
-        //    extract_from_image(FLATTEN v3)가 data.doc_type 을 채우고
-        //    Dexie v8 이 'data.doc_type' 을 인덱싱하므로 O(log n) 으로 처리됩니다.
-        let mut final_conditions = extracted_conditions.clone();
-        if let Some(dt) = extracted_conditions.get("doc_type")
-            .and_then(|v| v.get("value"))
-            .and_then(|v| v.as_str())
-        {
-            let clean = dt.trim();
-            if !clean.is_empty() {
-                if let Some(o) = final_conditions.as_object_mut() {
-                    o.insert("doc_type".to_string(), json!({
-                        "operator": "contains",
-                        "value": clean
-                    }));
+        // 🌟 [HUB EXPANSION] 허브 번호는 어느 참조 축에 들어 있을지 알 수 없습니다.
+        //    그래서 '모든 참조 축 + doc_number' 에 대한 OR 조건으로 펼쳐 내려보냅니다.
+        //    Dexie(executeDexiePlan)가 alternates 를 읽어 재질의하므로,
+        //    LanceDB 스코프를 좁히지 않고도 정밀 필터가 성립합니다.
+        let mut alternates = serde_json::Map::new();
+        if !hub_values.is_empty() {
+            let hub_val = hub_values.join(" ");
+            let mut axes: Vec<String> = vec!["doc_number".to_string(), "no".to_string()];
+            for f in crate::logic::TRADE_REFERENCE_FIELDS.iter() {
+                axes.push(f.to_string());
+            }
+            conditions.insert("hub_reference".to_string(), json!({
+                "operator": "contains",
+                "value": hub_val.clone()
+            }));
+            alternates.insert("hub_reference".to_string(), json!(axes.clone()));
+            emit_term(&format!(
+                "   🧲 [HUB EXPANSION] '{}' 를 doc_number + 참조 축 {}개로 확장했습니다.",
+                hub_val, axes.len()
+            ));
+        }
+
+        // 🌟 [ALTERNATE AXIS] 참조 축은 서로 오배정될 수 있으므로,
+        //    같은 값이 갈 수 있었던 다른 참조 축을 대안으로 함께 실어 보냅니다.
+        for (k, v) in conditions.iter() {
+            if !k.starts_with("reference_") { continue; }
+            let val = v.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            if val.is_empty() { continue; }
+            let mut axes: Vec<String> = Vec::new();
+            for f in crate::logic::TRADE_REFERENCE_FIELDS.iter() {
+                if *f == k.as_str() { continue; }
+                axes.push(f.to_string());
+            }
+            axes.push("doc_number".to_string());
+            alternates.insert(k.clone(), json!(axes));
+        }
+
+        // =====================================================================
+        // STEP 12 : FTS 검색어 (조건으로 소비되지 않은 단어 + 확정 값)
+        // =====================================================================
+        let mut keywords: Vec<String> = Vec::new();
+        for (i, w) in all_words.iter().enumerate() {
+            if consumed_span.get(i).copied().unwrap_or(false) { continue; }
+            if !content_flags.get(i).copied().unwrap_or(true) { continue; }
+            if !keywords.iter().any(|k| k == w) { keywords.push(w.clone()); }
+        }
+        for (_, v) in conditions.iter() {
+            if let Some(s) = v.get("value").and_then(|x| x.as_str()) {
+                for w in s.split_whitespace() {
+                    if !keywords.iter().any(|k| k == w) { keywords.push(w.to_string()); }
                 }
-                emit_term(&format!(
-                    "[STAGE-2] doc_type='{}' → 스코프가 아닌 Dexie 조건으로 전달 (리콜 보존)",
-                    clean
-                ));
             }
         }
+        if keywords.is_empty() {
+            keywords = query.split_whitespace().map(|s| s.to_string()).collect();
+        }
 
-        emit_term(&format!("[STAGE-2] Trade document types in scope: {:?}", trade_types));
+        let target_text = {
+            let mut w: Vec<String> = Vec::new();
+            for x in query.split_whitespace() {
+                if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+            }
+            for x in keywords.iter() {
+                if !w.iter().any(|e| e == x) { w.push(x.clone()); }
+            }
+            w.join(" ")
+        };
+
+        emit_term(&format!(
+            "   🧷 [KEYWORDS] {:?}",
+            keywords.iter().take(16).collect::<Vec<_>>()
+        ));
+        emit_term(&format!(
+            "[STAGE-2 CONDITIONS] 확정 조건 {}개: {}",
+            conditions.len(),
+            serde_json::to_string(&Value::Object(conditions.clone())).unwrap_or_default()
+        ));
+        emit_term(&format!("[STAGE-2] Trade document types in scope: {} 종", trade_types.len()));
+
+        let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Filter extraction complete.", "spinner": "✅" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         let ctx = json!([{
             "type": "tracking",
             "types": trade_types,
-            "text": query.clone(),
-            "condition": final_conditions,
-            "alternates": {},
-            "unassigned": query.split_whitespace().collect::<Vec<_>>(),
+            "text": target_text,
+            "condition": Value::Object(conditions),
+            "alternates": Value::Object(alternates),
+            "unassigned": keywords,
             "substantial": "",
             "find": "",
             "tier": "TRADING"
@@ -7581,6 +8860,536 @@ impl LogisModel {
 //     }
 }
 
+/// 🌟 [TRADE CONDITION VALUE] 조건 값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
+///  ── 왜 LLM 에게 맡기지 않는가 ──
+///   0.6B / 2B 모델은 값 복사 과정에서 'CI-2026-08001' 을 'CI2026 8001' 로 재타이핑하거나
+///   value 키 자체를 누락시킵니다. commerce 경로가 deterministic_condition_value 로
+///   같은 문제를 이미 해결했으므로 동일 원리를 무역 축에 적용합니다.
+///
+///  ── 규칙 ──
+///   ① 문서번호 형태(접두어+구분자+숫자)가 청크 안에 있으면 그것만 뽑습니다.
+///   ② Numeric / Date 필드는 숫자·구분자만 남깁니다.
+///   ③ 그 외는 청크 전체를 공백 정규화해 그대로 씁니다.
+fn trade_resolve_condition_value(field: &str, chunk: &str) -> String {
+    let c = chunk.trim();
+    if c.is_empty() { return String::new(); }
+
+    // ── ① 문서번호 토큰 우선 ──
+    //    'BL-55432219' / 'HBL-55432219-01' / 'AWB-180-99281014'
+    if field == "doc_number" || field == "no" || field.starts_with("reference_") || field == "hub_reference" {
+        for w in c.split_whitespace() {
+            let core: String = w
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '/')
+                .collect();
+            if core.chars().count() < 4 { continue; }
+            if !core.chars().any(|ch| ch.is_ascii_digit()) { continue; }
+            if !core.contains('-') && !core.contains('_') && !core.contains('/') {
+                // 구분자가 없어도 6자 이상 영숫자면 코드로 인정합니다. (컨테이너/씰 번호)
+                if core.chars().count() < 6 { continue; }
+            }
+            return core;
+        }
+    }
+
+    // ── ② 수치 / 날짜 ──
+    match crate::utils::ai_utils::detect_field_format(field) {
+        crate::utils::ai_utils::FieldFormat::Numeric => {
+            let v = crate::utils::ai_utils::deterministic_condition_value(&vec![c.to_string()], true);
+            if !v.is_empty() { return v; }
+        },
+        crate::utils::ai_utils::FieldFormat::Date => {
+            if let Some(d) = crate::utils::ai_utils::extract_date_literal(c) {
+                return d;
+            }
+            let v = crate::utils::ai_utils::deterministic_condition_value(&vec![c.to_string()], true);
+            if !v.is_empty() { return v; }
+        },
+        _ => {},
+    }
+
+    // ── ③ 자유 텍스트 ──
+    crate::utils::ai_utils::deterministic_condition_value(&vec![c.to_string()], false)
+}
+
+/// 🌟 [TRADE CONDITION OPERATOR] 비교 표현이 명시된 경우에만 기본 연산자를 바꿉니다.
+///  ── 근거 ──
+///   split_numeric_and_comparator 가 '5000원 이하로' 를 (숫자, 비교 표현) 으로 분해하고,
+///   bias.json 의 operators 노드가 다국어 비교 표현을 이미 갖고 있습니다.
+///   여기서는 그 구조를 그대로 재사용하되, 임베딩 호출 없이
+///   bias.json 의 exact_match 계열 완전일치만으로 판정합니다.
+///   (임베딩 판정이 필요한 애매한 경우는 Depth 3 프롬프트가 담당합니다)
+fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
+    let default_op = crate::logic::trade_default_operator(field).to_string();
+
+    let fmt = crate::utils::ai_utils::detect_field_format(field);
+    let comparable = matches!(
+        fmt,
+        crate::utils::ai_utils::FieldFormat::Numeric | crate::utils::ai_utils::FieldFormat::Date
+    );
+    if !comparable { return default_op; }
+
+    // 비교 표현 부분만 잘라냅니다.
+    let cmp_part = match crate::utils::ai_utils::split_numeric_and_comparator(chunk) {
+        Some((_, cmp)) => cmp,
+        None => chunk.to_string(),
+    };
+    if cmp_part.trim().is_empty() { return default_op; }
+
+    // bias.json operators.*.bias 구와 토큰 완전일치만 봅니다.
+    let ops = match crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return default_op,
+    };
+
+    let tokens: Vec<String> = cmp_part
+        .split_whitespace()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut best_key = String::new();
+    let mut best_len = 0usize;
+
+    for (key, node) in ops {
+        if key == "top" || key == "bottom" { continue; }
+        for field_name in ["bias", "semantic"] {
+            let raw = match node.get(field_name).and_then(|v| v.as_str()) { Some(s) => s, None => continue };
+            for phrase in crate::utils::ai_utils::split_bias_phrases_full(raw) {
+                let p = phrase.trim().to_lowercase();
+                if p.chars().count() < 2 { continue; }
+                // 완전일치 또는 접두일치 (교착어 대응)
+                let hit = tokens.iter().any(|t| t == &p || (t.chars().count() > p.chars().count() && t.starts_with(&p)));
+                if hit && p.chars().count() > best_len {
+                    best_len = p.chars().count();
+                    best_key = key.clone();
+                }
+            }
+        }
+    }
+
+    if best_key.is_empty() {
+        default_op
+    } else {
+        best_key
+    }
+}
+
+/// 🌟 [MERGE POLICY] 카테고리별 추출 결과를 하나의 객체로 합칩니다.
+///
+///  ── 왜 별도 함수인가 ──
+///   기존 merge_json_manual 은 무조건 덮어썼습니다.
+///   header 크롭이 확정한 doc_number 를 parties 크롭이 null 로 덮는 사고가 납니다.
+///   크롭은 서로 다른 영역을 보므로, 값이 없다는 사실은
+///   '그 영역에 없었다' 는 뜻이지 '문서에 없다' 는 뜻이 아닙니다.
+///
+///  ── 규칙 ──
+///   ① null / 빈 문자열 / 빈 배열은 기존 값을 덮지 않습니다.
+///   ② 배열 필드(items / containers 등)는 이어붙입니다.
+///   ③ 이미 값이 있는 스칼라 필드는 유지합니다. 먼저 확정된 쪽이 이깁니다.
+///      (크롭 계획은 점수 순이므로 근거가 강한 쪽이 먼저 들어옵니다)
+/// 🌟 [SCHEMA ECHO GUARD] LLM 이 프롬프트의 스키마 플레이스홀더를 그대로 베낀 경우를 걸러냅니다.
+///
+///  ── 실측 사고 ──
+///   logistics 크롭(서명 영역)에 voyage number 가 없자 2B 모델이
+///   프롬프트의 타입 표기 `{String}` 을 값으로 그대로 반환했습니다.
+///   그대로 저장하면 data.voyage_number = "{String}" 이 되어
+///   Dexie 인덱스와 FTS 를 영구히 오염시킵니다.
+///
+///  ── 판정 근거 ──
+///   어휘 사전이 아니라 '문자 구조' 입니다.
+///   중괄호/꺾쇠로 감싼 토큰, 타입 이름 그 자체, 날짜 포맷 문자열은
+///   어느 언어의 문서에도 값으로 등장하지 않습니다.
+fn is_schema_echo(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    // {String} / {Number} / <value> 같은 플레이스홀더 표기
+    if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('<') && t.ends_with('>')) {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "..." | "null" | "n/a" | "na" | "none" | "undefined" | "unknown"
+            | "string" | "number" | "boolean" | "array" | "object" | "integer" | "float"
+            | "yyyy-mm-dd" | "yyyy-mm-ddthh:mm:ss" | "iso8601" | "iso 8601"
+            | "not specified" | "not available" | "not found"
+    )
+}
+
+/// 🌟 [CLAIMED HARVEST] 지금까지 확정된 (필드, 값) 쌍을 뽑아 다음 크롭에 전달합니다.
+///
+///  ── 왜 필요한가 ──
+///   크롭은 카테고리별로 순차 호출되므로 뒤 크롭은 앞 크롭의 결과를 모릅니다.
+///   그래서 financials 가 이미 2000.00 을 확정했는데
+///   cargo 가 근처의 같은 숫자를 자기 필드로 다시 가져가는 사고가 납니다.
+///   scheduler.rs 의 커머스 추출이 [ALREADY CLAIMED VALUES] 로 같은 문제를 막는 것과
+///   동일한 장치를 비전 크롭 경로에도 부여합니다.
+///
+///  ── 무엇을 넘기는가 ──
+///   스칼라 값만 넘깁니다. 배열(line_items / containers)은 여러 행이 정상이므로
+///   금지 목록에 넣으면 오히려 정답을 막습니다.
+fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in merged.iter() {
+        // 카테고리 그룹 객체는 루트에 이미 미러링되어 있으므로 건너뜁니다.
+        if v.is_object() || v.is_array() {
+            continue;
+        }
+        let s = match v {
+            Value::String(s) => s.trim().to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        if s.is_empty() || is_schema_echo(&s) {
+            continue;
+        }
+        // doc_type 은 우리가 시딩한 값이라 금지 대상이 아닙니다.
+        if k == "doc_type" {
+            continue;
+        }
+        if out.iter().any(|(ek, ev)| ek == k && ev == &s) {
+            continue;
+        }
+        out.push((k.clone(), s));
+    }
+    out
+}
+
+/// 🌟 [GROUNDING CLAIM 수집] 한 타일이 주장한 (필드, 값) 을 출처 bbox 와 함께 기록합니다.
+///
+///  ── 왜 병합 전에 기록하는가 ──
+///   병합 후에는 '이 값이 어느 크롭에서 왔는지' 가 사라집니다.
+///   접지 검증은 반드시 '값 ↔ 그 값을 주장한 픽셀 영역' 쌍이 있어야 성립하므로
+///   주장 시점에 붙잡아 둡니다.
+fn record_grounding_claims(
+    out: &mut Vec<crate::models::siglip2::value_grounding::GroundingClaim>,
+    category: &str,
+    incoming: &Value,
+    bbox: (u32, u32, u32, u32),
+) {
+    use crate::models::siglip2::value_grounding::GroundingClaim;
+
+    fn push_obj(
+        out: &mut Vec<GroundingClaim>,
+        category: &str,
+        o: &serde_json::Map<String, Value>,
+        bbox: (u32, u32, u32, u32),
+    ) {
+        for (k, v) in o.iter() {
+            let s = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if s.is_empty() || is_schema_echo(&s) {
+                continue;
+            }
+            // 같은 (필드, 값) 이 여러 타일에서 나오면 한 번만 검증합니다.
+            if out.iter().any(|c| c.field == *k && c.value == s) {
+                continue;
+            }
+            out.push(GroundingClaim {
+                category: category.to_string(),
+                field: k.clone(),
+                value: s,
+                bbox,
+            });
+        }
+    }
+
+    if let Some(o) = incoming.as_object() {
+        push_obj(out, category, o, bbox);
+    } else if let Some(arr) = incoming.as_array() {
+        for e in arr {
+            if let Some(o) = e.as_object() {
+                push_obj(out, category, o, bbox);
+            }
+        }
+    }
+}
+
+/// 🌟 [GROUNDING 반영] 접지 검증에서 폐기 판정된 값을 데이터에서 제거합니다.
+///
+///  ── 세 곳을 모두 지워야 합니다 ──
+///   ① 루트 평면 배치      : Dexie 인덱스(data.*)가 소비
+///   ② 카테고리 그룹 슬롯  : doc_number 탐색과 TRADING FLATTEN 이 소비
+///   ③ 배열 원소 필드      : line_items / containers 안의 같은 값
+///   한 곳이라도 남으면 폐기된 값이 그 경로로 되살아나 DB 를 오염시킵니다.
+///
+///  ── 왜 null 이 아니라 제거인가 ──
+///   merge_extracted 는 '빈 값은 덮지 않는다' 는 규칙을 갖습니다.
+///   null 로 남겨 두면 이후 재스캔에서 정상 값이 들어와도
+///   "이미 채워진 스칼라" 로 오인될 여지가 없어야 하므로 키 자체를 제거합니다.
+fn apply_grounding_verdicts(
+    merged: &mut serde_json::Map<String, Value>,
+    verdicts: &[crate::models::siglip2::value_grounding::GroundingVerdict],
+    emit: &dyn Fn(&str),
+) {
+    let rejected: Vec<&crate::models::siglip2::value_grounding::GroundingVerdict> =
+        verdicts.iter().filter(|v| !v.accepted).collect();
+    if rejected.is_empty() {
+        emit("  ✅ [GROUNDING APPLY] 폐기 대상이 없습니다. 전 값이 이미지에 접지되어 있습니다.");
+        return;
+    }
+
+    let same = |v: &Value, target: &str| -> bool {
+        match v {
+            Value::String(s) => s.trim() == target,
+            Value::Number(n) => n.to_string() == target,
+            _ => false,
+        }
+    };
+
+    let mut removed = 0usize;
+    for r in rejected.iter() {
+        // ① 루트
+        let hit_root = merged.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+        if hit_root {
+            merged.remove(&r.field);
+            removed += 1;
+        }
+
+        // ② 카테고리 그룹 슬롯
+        if let Some(slot) = merged.get_mut(&r.category) {
+            if let Some(o) = slot.as_object_mut() {
+                let hit = o.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+                if hit {
+                    o.remove(&r.field);
+                    removed += 1;
+                }
+            }
+        }
+
+        // ③ 배열 원소
+        for key in ["line_items", "items", "containers", "parties", "other_parties", "charges"] {
+            if let Some(arr) = merged.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for e in arr.iter_mut() {
+                    if let Some(o) = e.as_object_mut() {
+                        let hit = o.get(&r.field).map(|v| same(v, &r.value)).unwrap_or(false);
+                        if hit {
+                            o.remove(&r.field);
+                            removed += 1;
+                        }
+                    }
+                }
+                // 전 필드가 사라진 빈 원소는 행이 아니라 잔해입니다.
+                arr.retain(|e| {
+                    e.as_object().map(|o| !o.is_empty()).unwrap_or(true)
+                });
+            }
+        }
+
+        emit(&format!(
+            "  🗑️ [GROUNDING APPLY] [{}] '{}' = \"{}\" 제거 | {}",
+            r.category, r.field, r.value, r.reason
+        ));
+    }
+
+    emit(&format!(
+        "  ✅ [GROUNDING APPLY] 폐기 {}건 | 데이터 지점 {}곳에서 제거",
+        rejected.len(),
+        removed
+    ));
+}
+
+fn merge_extracted(
+    merged: &mut serde_json::Map<String, Value>,
+    category: &str,
+    incoming: &Value,
+    emit: &dyn Fn(&str),
+) {
+    // 🌟 [ARRAY CATEGORY COERCION]
+    //
+    //  ── 실측 사고 ──
+    //   items 크롭의 프롬프트 스키마는 `[ { ... } ]` 배열인데,
+    //   2B 모델은 행이 하나만 보이면 `{ ... }` 객체를 반환합니다.
+    //   구버전은 `incoming.as_object()` 가 Some 이면 배열 분기를 타지 않아,
+    //   description / quantity / unit / unit_price / total_price / hs_code 6개가
+    //   전부 '최상위 스칼라' 로 흘러들어갔고 line_items 는 빈 배열로 남았습니다.
+    //   (실측 결과 JSON: line_items: [] 이면서 루트에 description: "T-Shirt")
+    //   그 상태로 저장되면 Dexie 의 line_items 인덱스가 영원히 비고,
+    //   두 번째 행(Shorts)은 애초에 담을 그릇조차 없습니다.
+    //
+    //  ── 처방 ──
+    //   배열 카테고리에서 객체 하나가 오면 원소 1개짜리 배열로 승격합니다.
+    //   '스키마가 배열이면 결과도 배열' 이라는 계약을 코드가 강제합니다.
+    let is_array_category = category == "items" || category == "containers";
+
+    let coerced: Value;
+    let incoming = if is_array_category && incoming.is_object() {
+        let has_content = incoming.as_object().map(|o| {
+            o.values().any(|v| {
+                !(v.is_null()
+                    || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+                    || v.as_array().map(|a| a.is_empty()).unwrap_or(false))
+            })
+        }).unwrap_or(false);
+        if has_content {
+            emit(&format!(
+                "    🔧 [ARRAY COERCE] [{}] 단일 객체 응답을 원소 1개 배열로 승격합니다.",
+                category
+            ));
+            coerced = Value::Array(vec![incoming.clone()]);
+            &coerced
+        } else {
+            return;
+        }
+    } else {
+        incoming
+    };
+
+    let obj = match incoming.as_object() {
+        Some(o) => o,
+        None => {
+            // 카테고리 자체가 배열로 반환되는 경우 (items / containers)
+            if let Some(arr) = incoming.as_array() {
+                if arr.is_empty() { return; }
+                let slot = merged
+                    .entry(category.to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+
+                // 🌟 [ROW DEDUPE] 겹침 타일 분할은 같은 표 행을 두 타일이 함께 보게 만듭니다.
+                //    겹침 영역에서 나온 중복 행을 여기서 제거합니다.
+                //    판정은 '의미' 가 아니라 '정규화된 스칼라 값 집합의 완전 일치' 입니다.
+                let row_key = |v: &Value| -> String {
+                    let o = match v.as_object() { Some(o) => o, None => return v.to_string() };
+                    let mut parts: Vec<String> = o
+                        .iter()
+                        .filter_map(|(k, x)| match x {
+                            Value::String(s) if !s.trim().is_empty() => {
+                                Some(format!("{}={}", k, s.trim().to_lowercase()))
+                            }
+                            Value::Number(nn) => Some(format!("{}={}", k, nn)),
+                            _ => None,
+                        })
+                        .collect();
+                    parts.sort();
+                    parts.join("|")
+                };
+
+                let mut added = 0usize;
+                let mut dup = 0usize;
+                if let Some(existing) = slot.as_array_mut() {
+                    let mut keys: Vec<String> = existing.iter().map(row_key).collect();
+                    for e in arr {
+                        let k = row_key(e);
+                        if k.is_empty() { continue; }
+                        if keys.iter().any(|x| x == &k) { dup += 1; continue; }
+                        keys.push(k);
+                        existing.push(e.clone());
+                        added += 1;
+                    }
+                }
+                emit(&format!(
+                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 (누적 {}건)",
+                    category,
+                    added,
+                    dup,
+                    merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+                ));
+            }
+            return;
+        }
+    };
+
+    let mut added = 0usize;
+    let mut kept = 0usize;
+    let mut echoed = 0usize;
+
+    for (k, v) in obj.iter() {
+        // ① 빈 값 / 스키마 에코는 덮지 않습니다.
+        if let Some(s) = v.as_str() {
+            if is_schema_echo(s) {
+                echoed += 1;
+                emit(&format!(
+                    "    🚫 [SCHEMA ECHO] [{}] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",
+                    category, k, s
+                ));
+                continue;
+            }
+        }
+        let is_empty = v.is_null()
+            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
+        if is_empty { continue; }
+
+        // ② 배열은 이어붙입니다.
+        if let Some(arr) = v.as_array() {
+            let slot = merged
+                .entry(k.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if slot.is_array() {
+                if let Some(existing) = slot.as_array_mut() {
+                    for e in arr {
+                        existing.push(e.clone());
+                    }
+                    added += 1;
+                    continue;
+                }
+            }
+            *slot = v.clone();
+            added += 1;
+            continue;
+        }
+
+        // ③ 이미 채워진 스칼라는 유지합니다.
+        let newly_added = match merged.get(k) {
+            Some(existing) if !existing.is_null() => {
+                let existing_empty = existing
+                    .as_str()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(false);
+                if existing_empty {
+                    merged.insert(k.clone(), v.clone());
+                    added += 1;
+                    true
+                } else {
+                    kept += 1;
+                    false
+                }
+            }
+            _ => {
+                merged.insert(k.clone(), v.clone());
+                added += 1;
+                true
+            }
+        };
+
+        // 🌟 [CATEGORY SLOT MIRROR] 카테고리 그룹 객체에도 같은 값을 넣습니다.
+        //
+        //  ── 무엇이 문제였나 ──
+        //   구버전은 category 인자를 배열 분기에서만 쓰고, 객체 분기에서는
+        //   최상위에 평평하게 삽입했습니다. 그 결과
+        //     final_data_map["header"] = {"doc_type":"CI"}   ← 초기값 그대로
+        //     final_data_map["doc_number"] = "CI-43726"      ← 루트에 평평하게
+        //   가 되어, STEP C 의 TRADING FLATTEN v3 가 header 그룹을 순회할 때
+        //   승격할 잎이 doc_type 하나뿐이었습니다.
+        //   (실측 로그: "data 루트로 승격한 축 1개: [\"doc_type\"]")
+        //   또 doc_number 탐색이 header.document_number → 루트 순서인데
+        //   header 가 비어 있어 task_id 폴백이 확정되었습니다.
+        //
+        //  ── 왜 미러인가 ──
+        //   루트 평면 배치는 Dexie 인덱스(data.*)가 소비하므로 그대로 둡니다.
+        //   그룹 슬롯은 doc_number 탐색과 FLATTEN 이 소비합니다. 둘 다 필요합니다.
+        if newly_added && category != "items" && category != "containers" {
+            let slot = merged
+                .entry(category.to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(o) = slot.as_object_mut() {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    emit(&format!(
+        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건",
+        category, added, kept, echoed
+    ));
+}
+
 pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {
     let target_key = if cat == "items" { "line_items" } else if cat == "containers" { "containers" } else { cat };
     
@@ -7612,12 +9421,19 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
                     // 🌟 [ZERO IS DATA] 기존 `v != 0` 은 값이 실제로 0 인 축을 통째로 버렸습니다.
                     //    freight_amount 0(Freight Prepaid), package_count 0, weight_net 0 은
                     //    모두 '못 찾음' 이 아니라 확정된 값입니다.
-                    //    LLM 이 '못 찾음' 을 표현하는 방식은 null / "" / "N/A" 세 가지뿐이므로
-                    //    그 셋만 걸러냅니다.
                     if v.is_null() { continue; }
                     if let Some(s) = v.as_str() {
-                        let t = s.trim();
-                        if t.is_empty() || t == "N/A" { continue; }
+                        // 🌟 [SCHEMA ECHO GUARD] 텍스트 경로도 get_trade_category_schema 를
+                        //    그대로 쓰므로 비전 경로와 동일한 에코가 발생합니다.
+                        //    "{String}" / "String" / "..." 같은 플레이스홀더를 값으로 저장하면
+                        //    Dexie 인덱스와 FTS 가 영구히 오염됩니다.
+                        if is_schema_echo(s) {
+                            println!(
+                                "[TRADING] 🚫 [SCHEMA ECHO] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",
+                                k, s
+                            );
+                            continue;
+                        }
                     }
                     target_obj.insert(k.clone(), v.clone());
                 }

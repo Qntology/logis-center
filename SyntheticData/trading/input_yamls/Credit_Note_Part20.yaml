@@ -1,0 +1,26 @@
+document_type: Credit Note
+document_code: CN
+metadata:
+  credit_note_number: CN-2026-0915
+  issue_date: '2026-09-15'
+  currency: USD
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+parties:
+  issuer_seller:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+  recipient_buyer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+credit_details:
+  reason_for_credit: Compensation for minor packaging damage during transit
+  adjustments:
+  - description: Packaging defect allowance for SKU-A100 (50 PCS)
+    amount: 250.0
+  total_credit_amount: 250.0
+settlement_instructions:
+  status: Pending
+  statement: The total credit amount of USD 250.00 will be deducted from the next purchase order or refunded directly to your account.

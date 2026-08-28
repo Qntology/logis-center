@@ -1,0 +1,36 @@
+document_type: Warehouse Receipt
+document_code: WR
+metadata:
+  receipt_number: WR-2026-0826
+  issue_date: '2026-08-26'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_sr_number: SR-2026-0820
+parties:
+  warehouse_operator:
+    name: Busan Port Logistics Center Co., Ltd.
+    address: 100 Gamman-dong, Nam-gu, Busan, South Korea
+    contact_number: +82-51-999-1000
+  depositor_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+storage_details:
+  warehouse_location: Busan Port Bonded Warehouse Area B-3
+  date_received: '2026-08-26'
+  storage_term: Until Loading on Vessel (2026-08-28)
+cargo_details:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  packages_received: 30 PLTS
+  gross_weight_kg: 1500.0
+  measurement_cbm: 9.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  packages_received: 20 PLTS
+  gross_weight_kg: 1000.0
+  measurement_cbm: 6.0
+cargo_status:
+  inspection_on_arrival: Clean / No External Damage
+  total_packages: 50 PLTS
+  total_gross_weight_kg: 2500.0
+  total_measurement_cbm: 15.0

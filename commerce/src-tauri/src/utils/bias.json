@@ -1,91 +1,98 @@
 {
-  {
-    "analytic_event_filters": {
-      "click": {
-        "semantic": "the user pressed or selected a specific element",
-        "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",
-        "prejudice": "hover, mouse over, lingered, typed, entered, input, summary, report",
-        "exact_match": [
-          "click", "clicked", 
-          "클릭", "클릭한", "클릭된", 
-          "クリック", "クリックした", 
-          "点击", "单击", 
-          "klick", "geklickt", 
-          "clic", "cliqueado", 
-          "cliqué", "cliquer", 
-          "clique", "clicado", 
-          "نقر", "نقرة", 
-          "klik", "kliknutí", 
-          "cliccato", "cliccare", 
-          "geklikt"
-        ]
-      },
-      "hover": {
-        "semantic": "the user lingered on an element without pressing it",
-        "bias": "hover, hovered, mouse over, linger, lingered, dwell, dwelled, look at, looked at, browse, browsed, scan, glance, viewed without clicking, 호버, 마우스오버, 머물, 둘러봤, 살펴봤, 구경, ホバー, 悬停, survoler, schweben",
-        "prejudice": "click, pressed, selected, typed, entered, input, summary, report",
-        "exact_match": [
-          "hover", "hovered", 
-          "호버", "마우스오버", 
-          "ホバー", "マウスオーバー", 
-          "悬停", "划过", 
-          "gehovert", "schweben", 
-          "pasar el ratón", "sobreponer", 
-          "survol", "survolé", 
-          "passar o mouse", 
-          "تمرير المؤشر", "تحويم", 
-          "najetí myší", "přejetí", 
-          "passaggio del mouse", 
-          "zweven", "eroverheen gaan"
-        ]
-      },
-      "change": {
-        "semantic": "the user typed a value or picked an option in a form control",
-        "bias": "change, changed, type, typed, enter, entered, input, fill in, filled in, edit, edited, modify, toggle, switch, select an option, 입력, 입력한, 변경, 수정, 타이핑, 검색어, 옵션선택, 入力, 変更, 输入, 修改, saisir, eingeben",
-        "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
-        "exact_match": [
-          "change", "changed", "input", 
-          "입력", "입력한", "변경", "수정", 
-          "入力", "変更", 
-          "输入", "修改", "更改", 
-          "änderung", "geändert", "eingabe", 
-          "cambio", "cambiado", "ingreso", 
-          "changement", "changé", "saisie", 
-          "mudança", "alterado", "inserido", 
-          "تغيير", "تعديل", "إدخال", 
-          "změna", "změněno", "zadání", 
-          "modifica", "cambiato", "inserimento", 
-          "wijziging", "gewijzigd", "invoer"
-        ]
-      },
-      "report": {
-        "semantic": "an aggregated behaviour summary across several actions",
-        "bias": "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated, most frequent, most clicked, ranking, 리포트, 요약, 흐름, 패턴, 경향, 분석, 통계, 가장 많이, 가장 자주, 순위, レポート, 要約, 报告, 汇总, rapport, Bericht",
-        "prejudice": "single click, single hover, one keystroke, individual event",
-        "exact_match": [
-          "report", "summary", 
-          "리포트", "요약", "패턴", "통계", 
-          "レポート", "要約", "統計", 
-          "报告", "汇总", "统计", 
-          "bericht", "zusammenfassung", 
-          "informe", "reporte", "resumen", 
-          "rapport", "résumé", 
-          "relatório", "resumo", 
-          "تقرير", "ملخص", "إحصائيات", 
-          "zpráva", "přehled", "statistika", 
-          "rapporto", "riepilogo", 
-          "overzicht", "samenvatting"
-        ]
-      }
+  "analytic_event_filters": {
+    "click": {
+      "semantic": "the user pressed or selected a specific element",
+      "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",
+      "prejudice": "hover, mouse over, lingered, typed, entered, input, summary, report",
+      "exact_match": [
+        "click", "clicked", 
+        "클릭", "클릭한", "클릭된", 
+        "クリック", "クリックした", 
+        "点击", "单击", 
+        "klick", "geklickt", 
+        "clic", "cliqueado", 
+        "cliqué", "cliquer", 
+        "clique", "clicado", 
+        "نقر", "نقرة", 
+        "klik", "kliknutí", 
+        "cliccato", "cliccare", 
+        "geklikt"
+      ]
+    },
+    "hover": {
+      "semantic": "the user lingered on an element without pressing it",
+      "bias": "hover, hovered, mouse over, linger, lingered, dwell, dwelled, look at, looked at, browse, browsed, scan, glance, viewed without clicking, 호버, 마우스오버, 머물, 둘러봤, 살펴봤, 구경, ホバー, 悬停, survoler, schweben",
+      "prejudice": "click, pressed, selected, typed, entered, input, summary, report",
+      "exact_match": [
+        "hover", "hovered", 
+        "호버", "마우스오버", 
+        "ホバー", "マウスオーバー", 
+        "悬停", "划过", 
+        "gehovert", "schweben", 
+        "pasar el ratón", "sobreponer", 
+        "survol", "survolé", 
+        "passar o mouse", 
+        "تمرير المؤشر", "تحويم", 
+        "najetí myší", "přejetí", 
+        "passaggio del mouse", 
+        "zweven", "eroverheen gaan"
+      ]
+    },
+    "change": {
+      "semantic": "the user typed a value or picked an option in a form control",
+      "bias": "change, changed, type, typed, enter, entered, input, fill in, filled in, edit, edited, modify, toggle, switch, select an option, 입력, 입력한, 변경, 수정, 타이핑, 검색어, 옵션선택, 入力, 変更, 输入, 修改, saisir, eingeben",
+      "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
+      "exact_match": [
+        "change", "changed", "input", 
+        "입력", "입력한", "변경", "수정", 
+        "入力", "変更", 
+        "输入", "修改", "更改", 
+        "änderung", "geändert", "eingabe", 
+        "cambio", "cambiado", "ingreso", 
+        "changement", "changé", "saisie", 
+        "mudança", "alterado", "inserido", 
+        "تغيير", "تعديل", "إدخال", 
+        "změna", "změněno", "zadání", 
+        "modifica", "cambiato", "inserimento", 
+        "wijziging", "gewijzigd", "invoer"
+      ]
+    },
+    "report": {
+      "semantic": "an aggregated behaviour summary across several actions",
+      "bias": "report, summary, overview, behaviour flow, user journey, pattern, trend, analysis, insight, statistics, aggregated, most frequent, most clicked, ranking, 리포트, 요약, 흐름, 패턴, 경향, 분석, 통계, 가장 많이, 가장 자주, 순위, レポート, 要約, 报告, 汇总, rapport, Bericht",
+      "prejudice": "single click, single hover, one keystroke, individual event",
+      "exact_match": [
+        "report", "summary", 
+        "리포트", "요약", "패턴", "통계", 
+        "レポート", "要約", "統計", 
+        "报告", "汇总", "统计", 
+        "bericht", "zusammenfassung", 
+        "informe", "reporte", "resumen", 
+        "rapport", "résumé", 
+        "relatório", "resumo", 
+        "تقرير", "ملخص", "إحصائيات", 
+        "zpráva", "přehled", "statistika", 
+        "rapporto", "riepilogo", 
+        "overzicht", "samenvatting"
+      ]
     }
   },
   "trade_schema": {
     "base": {
       "header": {
         "doc_type": "Document kind code {String}",
-        "doc_number": "Primary identifier (B/L No, Invoice No, PO No) {String}",
+        "doc_number": "Primary identifier of THIS document, printed under the main title. Read the label next to it, whatever it is called on this form {String}",
         "issue_date": "Date of issue (YYYY-MM-DD) {String}",
-        "reference_number": "Any other reference number printed {String}"
+        "expiry_date": "Expiry, validity or latest date printed on this document {String}",
+        "reference_po": "Referenced Purchase Order number printed on this document (e.g. PO-99281A) {String}",
+        "reference_invoice": "Referenced Commercial Invoice number printed on this document (e.g. CI-2026-08001) {String}",
+        "reference_bl": "Referenced Bill of Lading number printed on this document (e.g. BL-55432219) {String}",
+        "reference_master_bl": "Referenced Master Bill of Lading number covering this House B/L (e.g. MBL-55432219) {String}",
+        "reference_lc": "Referenced Letter of Credit number printed on this document (e.g. LC-88492011) {String}",
+        "reference_booking": "Referenced Booking number printed on this document (e.g. BK-2026-0822) {String}",
+        "reference_contract": "Referenced Sales Contract number (e.g. SC-2026-0802) {String}",
+        "reference_sr": "Referenced Shipping Request number (e.g. SR-2026-0820) {String}",
+        "reference_number": "Any OTHER reference number printed that does not fit the fields above {String}"
       },
       "parties": {
         "sender_name": "Shipper, Seller, Exporter {String}",
@@ -94,25 +101,50 @@
         "recipient_address": "Address of recipient {String}",
         "notify_party_name": "Notify party name {String}"
       },
+      "other_parties": {
+        "party_role": "The role printed above this party block, exactly as printed (Carrier, Insurer, Issuing Bank, Customs Broker, Drawer, Drawee, Payee, Warehouse Operator, Surveying Agency, Applicant, Claimant, Shipping Agent) {String}",
+        "party_name": "Company or person name of this party {String}",
+        "party_address": "Address of this party {String}",
+        "party_contact": "Phone, fax or email of this party {String}"
+      },
       "logistics": {
         "vessel": "Vessel name or Flight number {String}",
         "voyage_number": "Voyage or flight leg number {String}",
+        "flight_number": "Flight number for air shipments {String}",
         "pol": "Port of Loading / Airport of Departure {String}",
         "pod": "Port of Discharge / Airport of Destination {String}",
+        "place_receipt": "Place of Receipt {String}",
+        "place_delivery": "Place of Delivery {String}",
         "etd": "Estimated time of departure {String}",
         "eta": "Estimated time of arrival {String}",
-        "transport_mode": "Sea, Air, Road, Rail {String}"
+        "departure_date": "Actual departure or sailing date {String}",
+        "arrival_date": "Actual arrival date {String}",
+        "transport_mode": "Sea, Air, Road, Rail {String}",
+        "means_of_conveyance": "Means of conveyance as printed {String}"
       },
       "conditions": {
         "incoterms": "FOB, CIF, EXW, DDP, DAP {String}",
         "payment_terms": "T/T, L/C, Net30 {String}",
-        "freight_payment_term": "Freight Prepaid or Freight Collect {String}"
+        "freight_payment_term": "Freight Prepaid or Freight Collect {String}",
+        "latest_shipment_date": "Latest date of shipment allowed {String}",
+        "partial_shipments": "Whether partial shipments are allowed {String}",
+        "transshipment_allowed": "Whether transshipment is allowed {String}",
+        "special_instructions": "Special instructions or remarks printed on this document {String}"
       },
       "financials": {
         "currency": "ISO 4217 currency code {String}",
         "amount": "Grand total amount {Number}",
         "amount_subtotal": "Subtotal before tax and charges {Number}",
-        "amount_tax": "Tax or VAT amount {Number}"
+        "amount_tax": "Tax or VAT amount {Number}",
+        "freight_amount": "Freight charges only {Number}",
+        "insurance_amount": "Insurance charges only {Number}",
+        "local_charges": "Local handling charges {Number}",
+        "exchange_rate": "Exchange rate printed on this document {Number}",
+        "due_date": "Payment due date {String}",
+        "valid_until": "Date until which this document stays valid {String}",
+        "payment_status": "Payment status as printed {String}",
+        "account_number": "Bank account number for remittance {String}",
+        "swift_code": "SWIFT or BIC code {String}"
       },
       "cargo": {
         "package_count": "Total number of packages (NOT money) {Number}",
@@ -120,61 +152,734 @@
         "weight_gross": "Total gross weight {Number}",
         "weight_net": "Total net weight {Number}",
         "volume": "Total volume in CBM {Number}",
+        "chargeable_weight": "Chargeable weight for air freight {Number}",
         "marks_numbers": "Marks and numbers {String}"
       },
       "items": {
         "description": "Description of goods {String}",
+        "item_code": "Item, model or part code for this line {String}",
         "quantity": "Line item quantity {Number}",
         "unit": "Unit of measure {String}",
         "hs_code": "HS code / tariff number {String}",
+        "country_of_manufacture": "Country of manufacture or origin for this line {String}",
         "unit_price": "Unit price {Number}",
-        "total_price": "Line total {Number}"
+        "total_price": "Line total {Number}",
+        "item_net_weight": "Net weight of this line {Number}",
+        "item_gross_weight": "Gross weight of this line {Number}",
+        "item_package_count": "Number of packages for this line {Number}",
+        "item_package_type": "Package type for this line {String}"
       },
       "containers": {
         "container_number": "Container number (4 letters + 7 digits) {String}",
         "seal_number": "Seal number {String}",
-        "type_size": "Size and type (20GP, 40HC) {String}"
+        "type_size": "Size and type (20GP, 40HC) {String}",
+        "container_package_count": "Number of packages inside this container {Number}",
+        "container_gross_weight": "Gross weight of this container {Number}",
+        "container_measurement": "Measurement of this container in CBM {Number}"
       }
     },
     "overlay": {
-      "LC": {
+
+      "CI": {
+        "header": {
+          "doc_number": "The INVOICE NUMBER of this commercial invoice, printed under the title {String}"
+        },
         "financials": {
-          "tenor": "Tenor: at sight, 30 days, 60 days, 90 days {String}",
-          "lc_number": "Letter of Credit number {String}",
-          "issuing_bank": "Issuing bank name {String}",
-          "expiry_date": "L/C expiry date {String}"
+          "freight_charge": "Freight charge line on this invoice {Number}",
+          "insurance": "Insurance charge line on this invoice {Number}",
+          "grand_total_amount": "Grand total after freight and insurance {Number}"
         }
       },
-      "DGD": {
-        "cargo": {
-          "un_number": "UN number (e.g. UN1263) {String}",
-          "packing_group": "Packing group (I, II, III) {String}",
-          "proper_shipping_name": "Proper shipping name {String}"
-        }
-      },
-      "PHYTO": {
-        "conditions": {
-          "treatment_type": "Fumigation, Heat treatment, Cold treatment {String}"
-        }
-      },
-      "HC": {
-        "conditions": {
-          "health_status": "Health certification status {String}"
-        }
-      },
-      "BEN_CERT": {
-        "conditions": {
-          "beneficiary_statement": "Beneficiary certification statement {String}"
-        }
-      },
-      "INS": {
-        "financials": {
-          "insured_amount": "Insured amount {Number}",
-          "premium_amount": "Insurance premium {Number}"
+
+      "PI": {
+        "header": {
+          "doc_number": "The PROFORMA INVOICE NUMBER of this document {String}",
+          "reference_po": "Referenced Purchase Order number (e.g. PO-99281A) {String}"
         },
         "conditions": {
-          "policy_number": "Insurance policy number {String}",
-          "coverage_type": "Coverage type (All Risks, FPA, WA) {String}"
+          "estimated_shipment_date": "Estimated shipment date offered {String}"
+        }
+      },
+
+      "PO": {
+        "header": {
+          "doc_number": "The PURCHASE ORDER NUMBER of this order {String}"
+        },
+        "conditions": {
+          "expected_ship_date": "Expected ship date requested by buyer {String}",
+          "expected_delivery_date": "Expected delivery date requested by buyer {String}"
+        },
+        "financials": {
+          "discount": "Discount applied to this order {Number}"
+        }
+      },
+
+      "SC": {
+        "header": {
+          "doc_number": "The CONTRACT NUMBER of this sales contract {String}",
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+        },
+        "conditions": {
+          "governing_law": "Governing law clause {String}",
+          "arbitration": "Arbitration clause {String}",
+          "estimated_shipment_date": "Estimated shipment date agreed {String}"
+        }
+      },
+
+      "LC": {
+        "header": {
+          "doc_number": "The CREDIT NUMBER of this letter of credit {String}"
+        },
+        "financials": {
+          "tenor": "Tenor of this credit as printed {String}",
+          "usance_tenor_days": "Number of days for usance, as a plain number {Number}"
+        },
+        "conditions": {
+          "required_documents": "Documents required for negotiation, as printed {String}"
+        }
+      },
+
+      "LLC": {
+        "header": {
+          "doc_number": "The LOCAL L/C NUMBER of this domestic credit {String}",
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number (e.g. CP-2026-KR-0419) {String}"
+        },
+        "financials": {
+          "amount_krw": "Credit amount in local currency {Number}"
+        },
+        "conditions": {
+          "latest_shipment_date": "Latest shipment date under this local credit {String}"
+        }
+      },
+
+      "CP": {
+        "header": {
+          "doc_number": "The CONFIRMATION NUMBER of this purchase confirmation {String}",
+          "reference_export_decl": "Referenced Export Declaration number (e.g. ED-2026-KR-77102) {String}"
+        },
+        "financials": {
+          "total_amount_krw": "Total amount in local currency {Number}",
+          "tax_rate": "Tax rate applied {Number}"
+        }
+      },
+
+      "BE": {
+        "header": {
+          "doc_number": "The DRAFT NUMBER or bill of exchange number {String}"
+        },
+        "financials": {
+          "tenor": "Tenor of this draft as printed {String}",
+          "maturity_date": "Maturity date of this draft {String}",
+          "drawn_under_terms": "The credit or contract this draft is drawn under {String}"
+        }
+      },
+
+      "TR": {
+        "header": {
+          "doc_number": "The TRUST RECEIPT NUMBER of this document {String}",
+          "reference_lg": "Referenced Letter of Guarantee number (e.g. LG-SFO-20260909) {String}"
+        },
+        "financials": {
+          "maturity_date": "Maturity date of this trust receipt {Number}"
+        },
+        "conditions": {
+          "ownership_clause": "Ownership clause as printed {String}",
+          "purpose": "Stated purpose of releasing the goods {String}"
+        }
+      },
+
+      "LG": {
+        "header": {
+          "doc_number": "The GUARANTEE NUMBER of this letter of guarantee {String}",
+          "reference_bl": "Referenced Bill of Lading number covered by this Letter of Guarantee {String}"
+        }
+      },
+
+      "EL": {
+        "header": {
+          "doc_number": "The LICENCE NUMBER of this export licence {String}",
+          "reference_contract": "Referenced Sales Contract number {String}",
+          "reference_proforma": "Referenced Proforma Invoice number (e.g. PI-2026-0801) {String}"
+        },
+        "compliance": {
+          "eccn": "Export Control Classification Number {String}",
+          "license_condition": "Conditions attached to this licence {String}"
+        }
+      },
+
+      "PL": {
+        "header": {
+          "doc_number": "The PACKING LIST NUMBER of this document {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        }
+      },
+
+      "BL": {
+        "header": {
+          "doc_number": "The B/L NUMBER of this bill of lading {String}"
+        },
+        "conditions": {
+          "freight_term": "Freight term as printed on this B/L {String}"
+        }
+      },
+
+      "HBL": {
+        "header": {
+          "doc_number": "The HOUSE B/L NUMBER of this document {String}",
+          "reference_master_bl": "The Master B/L number covering this House B/L {String}"
+        }
+      },
+
+      "SWB": {
+        "header": {
+          "doc_number": "The WAYBILL NUMBER of this sea waybill {String}"
+        },
+        "conditions": {
+          "non_negotiable": "Whether this waybill is marked non-negotiable {String}"
+        }
+      },
+
+      "AWB": {
+        "header": {
+          "doc_number": "The AIR WAYBILL NUMBER of this document {String}"
+        },
+        "logistics": {
+          "airport_of_departure": "Airport of departure {String}",
+          "airport_of_destination": "Airport of destination {String}"
+        },
+        "cargo": {
+          "rate_class": "Rate class code {String}",
+          "number_of_pieces": "Number of pieces {Number}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "SR": {
+        "header": {
+          "doc_number": "The SHIPPING REQUEST NUMBER of this document {String}"
+        }
+      },
+
+      "BC": {
+        "header": {
+          "doc_number": "The BOOKING NUMBER of this confirmation {String}"
+        },
+        "logistics": {
+          "cargo_closing_date": "Cargo closing or cut-off date {String}",
+          "container_allocation": "Container allocation as printed {String}"
+        }
+      },
+
+      "BK": {
+        "header": {
+          "doc_number": "The BOOKING NUMBER of this confirmation {String}",
+          "reference_sr": "Referenced Shipping Request number (e.g. SR-2026-0820) {String}"
+        },
+        "logistics": {
+          "cargo_closing_date": "Cargo closing or cut-off date {String}",
+          "container_allocation": "Container allocation as printed {String}"
+        }
+      },
+
+      "SA": {
+        "header": {
+          "doc_number": "The ADVICE NUMBER of this shipping advice {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "conditions": {
+          "attached_documents": "Documents attached to this advice, as printed {String}"
+        }
+      },
+
+      "DO": {
+        "header": {
+          "doc_number": "The DELIVERY ORDER NUMBER of this document {String}",
+          "reference_bl": "Referenced Bill of Lading number (e.g. BL-55432219) {String}"
+        },
+        "conditions": {
+          "release_instruction": "Release instruction as printed {String}",
+          "pickup_location": "Where the cargo is to be picked up {String}"
+        }
+      },
+
+      "AN": {
+        "header": {
+          "doc_number": "The NOTICE NUMBER of this arrival notice {String}",
+          "reference_bl": "Referenced Bill of Lading number (e.g. BL-55432219) {String}"
+        },
+        "logistics": {
+          "terminal_of_discharge": "Terminal where cargo is discharged {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "POD": {
+        "header": {
+          "doc_number": "The POD NUMBER of this proof of delivery {String}",
+          "reference_do": "Referenced Delivery Order number (e.g. DO-SFO-20260911) {String}"
+        },
+        "conditions": {
+          "delivery_status": "Delivery status as printed {String}",
+          "delivery_location": "Where the cargo was delivered {String}",
+          "received_by": "Name of the person who signed for receipt {String}"
+        }
+      },
+
+      "FCR": {
+        "header": {
+          "doc_number": "The FCR NUMBER of this forwarder's certificate of receipt {String}",
+          "reference_hbl": "Referenced House B/L number (e.g. HBL-55432219-01) {String}"
+        },
+        "conditions": {
+          "undertaking_statement": "The forwarder's undertaking statement as printed {String}",
+          "date_received": "Date the goods were received {String}"
+        }
+      },
+
+      "WR": {
+        "header": {
+          "doc_number": "The RECEIPT NUMBER of this warehouse receipt {String}"
+        },
+        "conditions": {
+          "storage_term": "Storage term as printed {String}",
+          "warehouse_location": "Warehouse location {String}",
+          "date_received": "Date the goods were received into storage {String}",
+          "inspection_on_arrival": "Condition noted on arrival {String}"
+        }
+      },
+
+      "CM": {
+        "header": {
+          "doc_number": "The MANIFEST NUMBER of this cargo manifest {String}",
+          "reference_export_decl": "Referenced Export Declaration number {String}"
+        },
+        "logistics": {
+          "flag_state": "Flag state of the vessel {String}"
+        },
+        "cargo": {
+          "total_bills_of_lading": "Total number of bills of lading on this manifest {Number}",
+          "total_containers": "Total number of containers on this manifest {Number}"
+        }
+      },
+
+      "FI": {
+        "header": {
+          "doc_number": "The INVOICE NUMBER of this freight invoice {String}",
+          "reference_booking": "Referenced Booking number (e.g. BK-2026-0822) {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "ED": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this export declaration {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "customs": {
+          "declaration_date": "Date this declaration was filed {String}",
+          "clearance_date": "Date customs cleared this declaration {String}",
+          "customs_office_code": "Customs office code {String}",
+          "port_code": "Port code as printed {String}",
+          "port_name": "Port name as printed {String}",
+          "export_permission": "Export permission status {String}"
+        },
+        "financials": {
+          "exchange_rate": "Exchange rate applied by customs {Number}"
+        }
+      },
+
+      "ID": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this import declaration {String}",
+          "reference_invoice": "Referenced Commercial Invoice number (e.g. CI-2026-08001) {String}"
+        },
+        "customs": {
+          "declaration_date": "Date this declaration was filed {String}",
+          "clearance_date": "Date customs cleared this declaration {String}",
+          "customs_office_code": "Customs office code {String}",
+          "duty_rate": "Tariff rate applied {Number}",
+          "duty_amount": "Total duty assessed {Number}",
+          "dutiable_value": "Dutiable value or tax base {Number}",
+          "inspection_status": "Customs inspection status {String}",
+          "pccc_number": "Personal customs clearance code for B2C shipments {String}"
+        }
+      },
+
+      "CINV": {
+        "header": {
+          "doc_number": "The INVOICE NUMBER of this customs invoice {String}",
+          "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
+        }
+      },
+
+      "CSI": {
+        "header": {
+          "doc_number": "The CONSULAR INVOICE NUMBER of this document {String}"
+        },
+        "customs": {
+          "visa_number": "Consular visa number {String}"
+        },
+        "financials": {
+          "legalization_fee": "Legalization fee charged {Number}"
+        }
+      },
+
+      "CO": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of origin {String}"
+        },
+        "origin": {
+          "origin_criterion": "Origin criterion as printed {String}",
+          "origin_certificate_type": "Type of origin certificate {String}",
+          "fta_agreement_code": "FTA agreement under which this certificate is issued {String}",
+          "preference_indicator": "Preferential tariff indicator {String}"
+        },
+        "conditions": {
+          "declaration": "The exporter's declaration text as printed {String}"
+        }
+      },
+
+      "CNM": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this non-manipulation certificate {String}",
+          "reference_origin": "Referenced Certificate of Origin number {String}"
+        },
+        "logistics": {
+          "port_of_transshipment": "Port where transshipment took place {String}",
+          "arrival_vessel": "Vessel the cargo arrived on {String}",
+          "departure_vessel": "Vessel the cargo departed on {String}"
+        },
+        "inspection": {
+          "certification_statement": "The certifying statement as printed {String}"
+        }
+      },
+
+      "CCC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this customs clearance certificate {String}",
+          "reference_import_decl": "Referenced Import Declaration number (e.g. ID-2026-US-99120) {String}",
+          "reference_origin": "Referenced Certificate of Origin number (e.g. CO-2026-KR-0801) {String}"
+        },
+        "customs": {
+          "entry_type": "Entry type as printed {String}",
+          "customs_status": "Customs clearance status {String}",
+          "clearance_date": "Date of release {String}",
+          "dutiable_value": "Entered value {Number}",
+          "duty_amount": "Duty paid {Number}"
+        }
+      },
+
+      "IC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this inspection certificate {String}"
+        },
+        "inspection": {
+          "inspection_date": "Date of inspection {String}",
+          "inspection_place": "Place of inspection {String}",
+          "inspection_scope": "Scope of the inspection {String}",
+          "inspection_result": "Result of the inspection {String}"
+        }
+      },
+
+      "COA": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}",
+          "reference_inspection": "Referenced Inspection Certificate number (e.g. IC-2026-0825) {String}"
+        },
+        "inspection": {
+          "inspection_result": "Overall result as printed {String}",
+          "test_summary": "Summary of the analysis {String}"
+        },
+        "test_results": {
+          "test_item": "Name of the tested item or parameter {String}",
+          "test_method": "Test method used {String}",
+          "test_specification": "Specification or acceptance range {String}",
+          "test_value": "Measured result for this item {String}"
+        }
+      },
+
+      "WC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this weight certificate {String}"
+        },
+        "inspection": {
+          "weighing_date": "Date of weighing {String}",
+          "weighing_location": "Location where weighing took place {String}",
+          "certification_statement": "The certifying statement as printed {String}"
+        },
+        "cargo": {
+          "verified_gross_mass": "Verified gross mass as certified {Number}",
+          "container_tare_weight": "Tare weight of the container {Number}"
+        }
+      },
+
+      "CA": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this certificate of analysis {String}"
+        },
+        "inspection": {
+          "inspection_result": "Overall result as printed {String}",
+          "test_summary": "Summary of the analysis {String}"
+        }
+      },
+
+      "PHYTO": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}"
+        },
+        "inspection": {
+          "treatment_type": "Type of treatment applied {String}",
+          "treatment_date": "Date of treatment {String}",
+          "treatment_chemical": "Chemical and concentration used {String}",
+          "treatment_duration": "Duration and temperature of treatment {String}"
+        },
+        "origin": {
+          "botanical_name": "Botanical name of the plant product {String}",
+          "place_of_origin": "Place of origin as declared {String}"
+        }
+      },
+
+      "PC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this phytosanitary certificate {String}",
+          "reference_fumigation": "Referenced Fumigation Certificate number (e.g. FC-2026-0825) {String}"
+        },
+        "inspection": {
+          "treatment_type": "Type of treatment applied {String}",
+          "treatment_date": "Date of treatment {String}",
+          "treatment_chemical": "Chemical and concentration used {String}",
+          "treatment_duration": "Duration and temperature of treatment {String}"
+        },
+        "origin": {
+          "botanical_name": "Botanical name of the plant product {String}",
+          "place_of_origin": "Place of origin as declared {String}"
+        },
+        "logistics": {
+          "means_of_conveyance": "Means of conveyance as declared {String}"
+        }
+      },
+
+      "FC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this fumigation certificate {String}"
+        },
+        "inspection": {
+          "treatment_date": "Date of treatment {String}",
+          "treatment_place": "Place of treatment {String}",
+          "treatment_chemical": "Chemical used {String}",
+          "treatment_dosage": "Dosage applied {String}",
+          "treatment_duration": "Exposure period {String}",
+          "treatment_temperature": "Minimum temperature during treatment {String}",
+          "ispm15_mark": "Whether the ISPM 15 mark is applied {String}"
+        }
+      },
+
+      "HC": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this health certificate {String}"
+        },
+        "inspection": {
+          "health_status": "Health certification status as printed {String}",
+          "certification_statement": "The certifying statement as printed {String}"
+        }
+      },
+
+      "BEN_CERT": {
+        "header": {
+          "doc_number": "The CERTIFICATE NUMBER of this beneficiary certificate {String}"
+        },
+        "inspection": {
+          "certification_statement": "The beneficiary's certifying statement as printed {String}"
+        }
+      },
+
+      "CDR": {
+        "header": {
+          "doc_number": "The REPORT NUMBER of this survey report {String}",
+          "reference_policy": "Referenced Insurance Policy number (e.g. IP-2026-08200) {String}",
+          "reference_pod": "Referenced Proof of Delivery number (e.g. POD-SFO-20260912) {String}"
+        },
+        "inspection": {
+          "inspection_date": "Date of survey {String}",
+          "inspection_place": "Place of survey {String}",
+          "surveyor_conclusion": "The surveyor's conclusion as printed {String}"
+        },
+        "findings_and_damage": {
+          "finding": "What was found on this line {String}",
+          "affected_quantity": "Quantity affected on this line {Number}",
+          "nature_of_damage": "Nature of the damage {String}",
+          "cause_of_damage": "Cause of the damage {String}",
+          "estimated_loss": "Estimated loss amount for this line {Number}"
+        },
+        "cargo": {
+          "sound_packages": "Number of sound packages {Number}",
+          "damaged_packages": "Number of damaged packages {Number}"
+        }
+      },
+
+      "DGD": {
+        "header": {
+          "doc_number": "The DECLARATION NUMBER of this dangerous goods declaration {String}"
+        },
+        "hazmat": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "hazard_class": "Hazard class {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}",
+          "emergency_contact": "24-hour emergency contact number {String}"
+        }
+      },
+
+      "MSDS": {
+        "hazmat": {
+          "un_number": "UN number (e.g. UN1263) {String}",
+          "hazard_class": "Hazard class {String}",
+          "packing_group": "Packing group (I, II, III) {String}",
+          "proper_shipping_name": "Proper shipping name {String}",
+          "cas_number": "CAS registry number of the substance {String}",
+          "flash_point": "Flash point of the substance {Number}",
+          "emergency_contact": "24-hour emergency contact number {String}"
+        }
+      },
+
+      "POA": {
+        "header": {
+          "doc_number": "The REFERENCE NUMBER of this power of attorney {String}"
+        }
+      },
+
+      "BIZ_LIC": {
+        "header": {
+          "doc_number": "The REGISTRATION NUMBER on this business licence {String}"
+        }
+      },
+
+      "INS": {
+        "header": {
+          "doc_number": "The POLICY NUMBER of this insurance policy {String}"
+        },
+        "insurance": {
+          "insured_amount": "Insured amount {Number}",
+          "premium": "Insurance premium {Number}",
+          "coverage_condition": "Coverage conditions as printed {String}",
+          "valuation_basis": "Basis on which the insured value was calculated {String}",
+          "claims_payable_at": "Where claims are payable {String}",
+          "effective_date": "Date cover takes effect {String}"
+        }
+      },
+
+      "IP": {
+        "header": {
+          "doc_number": "The POLICY NUMBER of this insurance policy {String}"
+        },
+        "insurance": {
+          "insured_amount": "Insured amount {Number}",
+          "premium": "Insurance premium {Number}",
+          "coverage_condition": "Coverage conditions as printed {String}",
+          "valuation_basis": "Basis on which the insured value was calculated {String}",
+          "claims_payable_at": "Where claims are payable {String}",
+          "effective_date": "Date cover takes effect {String}"
+        }
+      },
+
+      "ICF": {
+        "header": {
+          "doc_number": "The CLAIM NUMBER of this insurance claim {String}",
+          "reference_policy": "Referenced Insurance Policy number {String}",
+          "reference_survey": "Referenced Cargo Damage / Survey Report number (e.g. CDR-2026-SFO-0912) {String}"
+        },
+        "insurance": {
+          "claim_date": "Date the claim was filed {String}",
+          "cause_of_loss": "Cause of the loss {String}",
+          "place_of_loss": "Place where the loss occurred {String}",
+          "claim_amount": "Amount claimed {Number}"
+        },
+        "conditions": {
+          "enclosed_documents": "Documents enclosed with this claim, as printed {String}"
+        }
+      },
+
+      "SOA": {
+        "header": {
+          "doc_number": "The STATEMENT NUMBER of this statement of account {String}",
+          "reference_debit_note": "Referenced Debit Note number (e.g. DN-2026-0912) {String}",
+          "reference_credit_note": "Referenced Credit Note number (e.g. CN-2026-0915) {String}",
+          "reference_claim": "Referenced Insurance Claim number (e.g. ICF-2026-0914) {String}"
+        },
+        "settlement": {
+          "account_status": "Account status as printed {String}",
+          "closure_date": "Date the account was closed {String}"
+        },
+        "account_ledger": {
+          "transaction_date": "Date of this transaction {String}",
+          "transaction_reference": "Reference number for this transaction {String}",
+          "debit": "Debit amount on this line {Number}",
+          "credit": "Credit amount on this line {Number}",
+          "balance": "Running balance after this line {Number}"
+        }
+      },
+
+      "DN": {
+        "header": {
+          "doc_number": "The DEBIT NOTE NUMBER of this document {String}"
+        },
+        "settlement": {
+          "reason_for_debit": "Reason for this debit as printed {String}",
+          "payment_instructions": "Payment instructions as printed {String}",
+          "payment_status": "Payment status as printed {String}"
+        },
+        "charges": {
+          "charge_code": "Charge code as printed {String}",
+          "charge_description": "What this charge is for {String}",
+          "charge_rate": "Rate applied to this charge {Number}",
+          "charge_amount": "Amount of this charge {Number}"
+        }
+      },
+
+      "CN": {
+        "header": {
+          "doc_number": "The CREDIT NOTE NUMBER of this document {String}"
+        },
+        "settlement": {
+          "reason_for_credit": "Reason for this credit as printed {String}",
+          "settlement_instructions": "Settlement instructions as printed {String}"
+        },
+        "charges": {
+          "charge_code": "Adjustment code as printed {String}",
+          "charge_description": "What this adjustment is for {String}",
+          "charge_rate": "Rate applied to this adjustment {Number}",
+          "charge_amount": "Amount of this adjustment {Number}"
+        }
+      },
+
+      "TI": {
+        "header": {
+          "doc_number": "The TAX INVOICE NUMBER of this document {String}",
+          "reference_purchase_confirm": "Referenced Purchase Confirmation number {String}",
+          "reference_local_lc": "Referenced Local L/C number (e.g. LLC-2026-KR-0911) {String}"
+        },
+        "settlement": {
+          "vat_type": "VAT type as printed {String}"
+        },
+        "financials": {
+          "amount_subtotal": "Total supply amount before tax {Number}",
+          "amount_tax": "Total VAT amount {Number}",
+          "amount": "Grand total including tax {Number}"
         }
       }
     }
@@ -230,6 +935,36 @@
         "semantic": "the color a shopper names when narrowing a catalog",
         "bias": "color, beige, black, white, red, blue, green, yellow, pink, brown, grey, gray, purple, navy, ivory, silver, gold, 색상, 컬러, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드, 颜色, 米色, 黑色, 白色, 红色, 蓝色, 绿色, 黄色, 粉色, 棕色, 灰色, 紫色, 藏青色, 象牙色, 银色, 金色, カラー, ベージュ, 黒, 白, 赤, 青, 緑, ピンク, 茶色, 紫, ネイビー, アイボリー, シルバー, ゴールド, beige, negro, blanco, rojo, azul, verde, amarillo, rosa, marrón, gris, morado, marino, marfil, plata, oro, couleur, noir, rouge, bleu, vert, jaune, marron, violet, ivoire, argent, farbe, schwarz, weiß, rot, blau, grün, gelb, braun, grau, lila, marineblau, elfenbein, silber, цвет, бежевый, черный, белый, красный, синий, зеленый, желтый, розовый, коричневый, серый, фиолетовый, لون, بيج, أسود, أبيض, أحمر, أزرق, أخضر, أصفر, وردي, بني, رمادي, أرجواني, रंग, बेज, काला, सफेद, लाल, नीला, हरा, पीला, गुलाबी, भूरा, ग्रे, बैंगनी, warna, krem, hitam, putih, merah, biru, hijau, kuning, cokelat, abu-abu, ungu, màu, màu be, đen, trắng, đỏ, xanh da trời, xanh lá, vàng, hồng, nâu, xám, tím, สี, เบจ, ดำ, ขาว, แดง, น้ำเงิน, เขียว, เหลือง, ชมพู, น้ำตาล, เทา, ม่วง",
         "prejudice": "identifier, code, url, link, date, price, quantity, status, address, phone number, card, bank, payment, size, weight"
+      },
+      "shipping_doc.pol": {
+        "semantic": "the port or airport where the cargo is loaded",
+        "bias": "port of loading, loading port, port of departure, airport of departure, BUSAN, INCHEON, PYEONGTAEK, SHANGHAI, NINGBO, SHENZHEN, QINGDAO, HONG KONG, KAOHSIUNG, TOKYO, YOKOHAMA, KOBE, SINGAPORE, PORT KLANG, LAEM CHABANG, HO CHI MINH, HAIPHONG, JAKARTA, MUMBAI, CHENNAI, JEBEL ALI, ROTTERDAM, HAMBURG, ANTWERP, LE HAVRE, FELIXSTOWE, VALENCIA, GENOA, PIRAEUS, LOS ANGELES, LONG BEACH, NEW YORK, SAVANNAH, VANCOUVER, SANTOS, 선적항, 출발항, 적재항, 부산, 인천, 평택, 상하이, 닝보, 선전, 칭다오, 홍콩, 도쿄, 요코하마, 고베, 싱가포르, 호치민, 하이퐁, 자카르타, 뭄바이, 두바이, 로테르담, 함부르크, 앤트워프, 로스앤젤레스, 롱비치, 뉴욕, 積出港, 船積港, 装货港, 起运港",
+        "prejudice": "port of discharge, destination, place of delivery, document number, issue date, gross weight, amount, container number, vessel name"
+      },
+      "shipping_doc.pod": {
+        "semantic": "the port or airport where the cargo is discharged",
+        "bias": "port of discharge, discharge port, port of destination, airport of destination, final destination, LOS ANGELES, LONG BEACH, NEW YORK, HOUSTON, SAVANNAH, VANCOUVER, ROTTERDAM, HAMBURG, ANTWERP, LE HAVRE, VALENCIA, GENOA, PIRAEUS, JEBEL ALI, SINGAPORE, PORT KLANG, HO CHI MINH, HAIPHONG, MANILA, JAKARTA, SYDNEY, MELBOURNE, SANTOS, BUENOS AIRES, 양륙항, 도착항, 하역항, 최종목적지, 롱비치, 뉴욕, 로테르담, 함부르크, 두바이, 싱가포르, 호치민, 마닐라, 시드니, 揚地港, 卸货港, 目的港, 到着港",
+        "prejudice": "port of loading, departure, place of receipt, document number, issue date, gross weight, amount, container number, vessel name"
+      },
+      "shipping_doc.vessel": {
+        "semantic": "the name of the ship or the flight that carries the cargo",
+        "bias": "vessel, vessel name, ocean vessel, mother vessel, flight number, carrier, MAERSK, MSC, CMA CGM, HAPAG LLOYD, ONE, EVERGREEN, COSCO, HMM, YANG MING, ZIM, OOCL, 선박명, 모선명, 본선명, 항공편명, 편명, 선사, 船名, 母船, 船舶名称, 航班号",
+        "prejudice": "voyage number, port of loading, port of discharge, document number, issue date, container number, gross weight, amount"
+      },
+      "shipping_doc.sender_name": {
+        "semantic": "the party that ships or sells the cargo",
+        "bias": "shipper, exporter, seller, supplier, consignor, vendor, beneficiary, 송하인, 수출자, 판매자, 선적인, 공급자, 발송인, 수익자, 荷送人, 輸出者, 売主, 发货人, 出口商, 卖方, expéditeur, exportateur, vendeur, Absender, Exporteur, Verkäufer, expedidor, exportador, vendedor, mittente, esportatore, venditore, грузоотправитель, экспортёр, продавец, المرسل, المصدر, البائع",
+        "prejudice": "consignee, importer, buyer, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "shipping_doc.recipient_name": {
+        "semantic": "the party that receives or buys the cargo",
+        "bias": "consignee, importer, buyer, receiver, to order, to order of shipper, applicant, 수하인, 수입자, 구매자, 인수인, 수취인, 개설의뢰인, 荷受人, 輸入者, 買主, 收货人, 进口商, 买方, destinataire, importateur, acheteur, Empfänger, Importeur, Käufer, consignatario, importador, comprador, destinatario, importatore, compratore, грузополучатель, импортёр, покупатель, المرسل إليه, المستورد, المشتري",
+        "prejudice": "shipper, exporter, seller, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "shipping_doc.incoterms": {
+        "semantic": "the ICC trade term that fixes cost and risk transfer",
+        "bias": "incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP, ex works, free carrier, free on board, cost and freight, cost insurance and freight, delivered at place, delivered duty paid, 인코텀즈, 무역조건, 가격조건, 정형거래조건, 본선인도, 운임보험료포함, 공장인도, 관세지급인도, インコタームズ, 貿易条件, 国际贸易术语, 贸易条件",
+        "prejudice": "payment terms, freight prepaid, freight collect, currency, amount, weight, document number, issue date, port, vessel"
       }
     },
     "abstract_bridge": {
@@ -1270,6 +2005,397 @@
         "prejudice": "식별자, 링크, 주소, 번호, 코드, 정액할인, 정률할인, 무료배송, 타입, 종류, 종류명, 진행상황, 쿠폰명, 이벤트명, 시작일, 시작일시, 발급일, 종료일, 만료일, 마감일, 쿠폰번호, 할인액, 할인율, 수량, 발급수량, 사용제한, 최대사용, 인당사용제한, 신규고객, 신규가입, 첫구매, 첫주문, 최소주문금액, 결제조건, 최대주문금액, 최대할인금액, 할인한도, 지역제한, 배송불가, 전화번호, 연락처, 문의처, 주소, 위치, 장소"
       }
     },
+    "shipping_doc": {
+      "layout_list": {
+        "semantic": "다중 무역 서식을 나열하는 목록, 표, 리스트 페이지",
+        "bias": "서류목록, 무역서류리스트, 선적서류목록, 인보이스목록, document list, shipping document list, invoice list",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "단일 무역 서식의 상세 정보를 보여주거나 입력하는 폼 페이지",
+        "bias": "서류상세, 무역서류상세, 선적서류상세, 인보이스상세, document detail, shipping document form, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "식별자, 링크, 서류번호, 문서번호",
+        "bias": "서류번호, 문서번호, 참조번호, document number, doc no, reference number, B/L No, AWB No, Invoice No, PO No",
+        "prejudice": "선적일, 발행일, 발송인, 수하인, 선사, 항구, 컨테이너번호, 씰번호, 중량, 금액, 통화, HS코드, 인코텀즈, 결제조건"
+      },
+      "doc_number": {
+        "semantic": "서류번호, 문서번호, 대표 식별번호",
+        "bias": "서류번호, 문서번호, 선하증권번호, 항공운송장번호, 인보이스번호, 계약번호, document number, bill of lading number, air waybill number, invoice number, contract number, HBL, MBL",
+        "prejudice": "컨테이너번호, 씰번호, HS코드, 부킹번호, 신용장번호, 발행일, 선적일, 중량, 금액"
+      },
+      "doc_type": {
+        "semantic": "서식 종류, 문서 유형",
+        "bias": "서식종류, 문서유형, 선하증권, 항공운송장, 상업송장, 포장명세서, 원산지증명서, 신용장, bill of lading, air waybill, commercial invoice, packing list, certificate of origin, letter of credit",
+        "prejudice": "서류번호, 문서번호, 발행일, 선적일, 발송인, 수하인, 항구, 중량, 금액, 통화"
+      },
+      "status": {
+        "semantic": "상태, 진행상황",
+        "bias": "서류상태, 진행상황, 발행완료, 접수, 통관중, 선적완료, 도착, 인도완료, 취소, issued, in transit, cleared, delivered, cancelled",
+        "prejudice": "서류번호, 문서번호, 발행일, 선적일, 발송인, 수하인, 선사, 항구, 컨테이너번호, 중량, 금액, 통화, HS코드"
+      },
+      "issue_date": {
+        "semantic": "발행일, 작성일",
+        "bias": "발행일, 작성일, 서류일자, 발행일자, issue date, date of issue, issued on, 2026-03-15",
+        "prejudice": "선적일, 출항일, 입항일, 만료일, 유효기일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "sender_name": {
+        "semantic": "송하인, 수출자, 판매자, 선적인 이름",
+        "bias": "송하인, 수출자, 판매자, 선적인, 공급자, 발송인, shipper, exporter, seller, supplier, consignor, vendor",
+        "prejudice": "수하인, 수입자, 구매자, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+      },
+      "recipient_name": {
+        "semantic": "수하인, 수입자, 구매자 이름",
+        "bias": "수하인, 수입자, 구매자, 인수인, consignee, importer, buyer, receiver, to order of",
+        "prejudice": "송하인, 수출자, 판매자, 선적인, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+      },
+      "vessel": {
+        "semantic": "선박명, 항공편명, 운송수단명",
+        "bias": "선박명, 모선명, 항공편명, 편명, vessel, vessel name, ocean vessel, flight number, carrier name, MV, MSC, MAERSK, HMM, EVERGREEN",
+        "prejudice": "항차, 항구, 선적항, 양륙항, 서류번호, 발행일, 발송인, 수하인, 중량, 금액, 컨테이너번호, HS코드"
+      },
+      "pol": {
+        "semantic": "선적항, 출발항, 출발공항",
+        "bias": "선적항, 출발항, 적재항, 출발공항, port of loading, POL, port of departure, airport of departure, loading port, BUSAN, INCHEON, SHANGHAI, NINGBO, SINGAPORE, ROTTERDAM, HAMBURG, LOS ANGELES, 부산, 인천, 상하이, 싱가포르",
+        "prejudice": "양륙항, 도착항, 도착공항, 인도지, 수취지, 선박명, 항차, 서류번호, 발행일, 중량, 금액"
+      },
+      "pod": {
+        "semantic": "양륙항, 도착항, 도착공항",
+        "bias": "양륙항, 도착항, 하역항, 도착공항, port of discharge, POD, port of destination, airport of destination, discharge port, LONG BEACH, NEW YORK, ANTWERP, DUBAI, HO CHI MINH, 롱비치, 뉴욕, 두바이, 호치민",
+        "prejudice": "선적항, 출발항, 출발공항, 수취지, 선박명, 항차, 서류번호, 발행일, 중량, 금액"
+      },
+      "etd": {
+        "semantic": "출항예정일, 출발예정일",
+        "bias": "출항일, 출항예정일, 출발예정일, 선적일, ETD, estimated time of departure, departure date, sailing date",
+        "prejudice": "입항일, 도착예정일, 발행일, 만료일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "eta": {
+        "semantic": "입항예정일, 도착예정일",
+        "bias": "입항일, 입항예정일, 도착예정일, 도착일, ETA, estimated time of arrival, arrival date",
+        "prejudice": "출항일, 출발예정일, 발행일, 만료일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+      "incoterms": {
+        "semantic": "인코텀즈, 무역조건, 가격조건",
+        "bias": "인코텀즈, 무역조건, 가격조건, 정형거래조건, incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP",
+        "prejudice": "결제조건, 운임조건, 통화, 금액, 중량, 서류번호, 발행일, 항구, 선박명, 컨테이너번호"
+      },
+      "currency": {
+        "semantic": "통화, 화폐 단위",
+        "bias": "통화, 화폐, 결제통화, currency, currency code, USD, EUR, JPY, CNY, KRW, GBP, 달러, 유로, 엔, 위안, 원",
+        "prejudice": "금액, 총액, 운임, 보험료, 중량, 수량, 서류번호, 발행일, 항구, 선박명, 인코텀즈"
+      },
+      "amount": {
+        "semantic": "총액, 합계금액, 송장금액",
+        "bias": "총액, 합계, 총금액, 송장금액, 계약금액, total amount, grand total, invoice value, total value, amount",
+        "prejudice": "운임, 보험료, 로컬차지, 세액, 단가, 중량, 수량, 통화, 서류번호, 발행일, 항구"
+      },
+      "container_number": {
+        "semantic": "컨테이너번호",
+        "bias": "컨테이너번호, 컨테이너 No, container number, container no, CNTR No, MSCU1234567, TGHU7654321",
+        "prejudice": "씰번호, 서류번호, 부킹번호, HS코드, 중량, 금액, 발행일, 항구, 선박명, 발송인, 수하인"
+      },
+      "seal_number": {
+        "semantic": "씰번호, 봉인번호",
+        "bias": "씰번호, 봉인번호, 실번호, seal number, seal no, SEAL",
+        "prejudice": "컨테이너번호, 서류번호, 부킹번호, HS코드, 중량, 금액, 발행일, 항구, 선박명"
+      },
+      "weight_gross": {
+        "semantic": "총중량, 총량",
+        "bias": "총중량, 총량, 그로스웨이트, gross weight, G.W., total gross weight, KGS, KG, MT",
+        "prejudice": "순중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "weight_net": {
+        "semantic": "순중량",
+        "bias": "순중량, 넷웨이트, net weight, N.W., total net weight, KGS, KG",
+        "prejudice": "총중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "volume": {
+        "semantic": "용적, 부피, 재화중량",
+        "bias": "용적, 부피, 재화중량, 큐빅, volume, measurement, CBM, M3",
+        "prejudice": "총중량, 순중량, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "package_count": {
+        "semantic": "포장수, 카톤수, 개수",
+        "bias": "포장수, 카톤수, 박스수, 팔레트수, 개수, package count, number of packages, CTNS, PKGS, PLT, cartons",
+        "prejudice": "총중량, 순중량, 용적, 금액, 통화, 단가, 서류번호, 발행일, 항구, 컨테이너번호"
+      },
+      "hs_code": {
+        "semantic": "HS코드, 관세분류번호",
+        "bias": "HS코드, 세번, 관세분류번호, 품목분류, HS code, HS No, tariff number, tariff classification, HTS",
+        "prejudice": "컨테이너번호, 씰번호, 서류번호, 부킹번호, 중량, 금액, 통화, 발행일, 항구, 선박명"
+      },
+
+      "no": {
+        "semantic": "일련번호, 항목번호, 순번",
+        "bias": "번호, 순번, 연번, 항목번호, 일련번호, No, S/No, Item No, line number, serial number",
+        "prejudice": "서류번호, 문서번호, 선하증권번호, 인보이스번호, 컨테이너번호, 씰번호, HS코드, 중량, 금액, 발행일"
+      },
+      "expiry_date": {
+        "semantic": "만료일, 유효기일, 최종기한",
+        "bias": "만료일, 유효기일, 유효기한, 최종기한, 최종선적일, 신용장 유효기일, expiry date, date of expiry, valid until, validity, latest date, expiration date",
+        "prejudice": "발행일, 작성일, 선적일, 출항일, 입항일, 서류번호, 발송인, 수하인, 항구, 중량, 금액"
+      },
+
+      "sender_address": {
+        "semantic": "송하인 주소, 수출자 주소, 판매자 주소",
+        "bias": "송하인 주소, 수출자 주소, 판매자 주소, 선적인 주소, 발송지 주소, 공급자 주소, shipper address, exporter address, seller address, consignor address, address of shipper",
+        "prejudice": "수하인 주소, 수입자 주소, 구매자 주소, 통지처 주소, 송하인 이름, 수출자 상호, 회사명, 전화번호, 팩스, 이메일, 항구, 서류번호"
+      },
+      "recipient_address": {
+        "semantic": "수하인 주소, 수입자 주소, 구매자 주소",
+        "bias": "수하인 주소, 수입자 주소, 구매자 주소, 인수인 주소, 배송지 주소, 도착지 주소, consignee address, importer address, buyer address, address of consignee, delivery address",
+        "prejudice": "송하인 주소, 수출자 주소, 판매자 주소, 통지처 주소, 수하인 이름, 수입자 상호, 회사명, 전화번호, 팩스, 이메일, 항구, 서류번호"
+      },
+      "notify_party_name": {
+        "semantic": "통지처, 착화통지처",
+        "bias": "통지처, 착화통지처, 통지선, 도착통지처, notify party, notify, also notify party, notify address",
+        "prejudice": "송하인, 수출자, 판매자, 수하인, 수입자, 구매자, 선사, 운송인, 항구, 서류번호, 발행일, 중량, 금액"
+      },
+
+      "voyage_number": {
+        "semantic": "항차, 항차번호, 편명번호",
+        "bias": "항차, 항차번호, 항해번호, 운항번호, 편명, 편번호, VOY, V.NO, voyage number, voyage no, voy, flight leg, sailing number, V.123E, 0091E, 2426W",
+        "prejudice": "선박명, 모선명, 본선명, 선사, 서류번호, 문서번호, 인보이스번호, 선하증권번호, 컨테이너번호, 씰번호, 선적항, 양륙항, 발행일, 중량, 금액, 수량"
+      },
+      "flight_number": {
+        "semantic": "항공편명, 편명",
+        "bias": "항공편명, 편명, 항공편, 운항편, flight number, flight no, carrier flight, KE001, OZ201, AF267",
+        "prejudice": "선박명, 항차, 서류번호, 항공운송장번호, 출발공항, 도착공항, 발행일, 중량, 금액"
+      },
+      "place_receipt": {
+        "semantic": "수취지, 화물수취장소",
+        "bias": "수취지, 화물수취장소, 인수지, 수령지, 반입지, place of receipt, received at, point of receipt, pickup place",
+        "prejudice": "인도지, 최종인도지, 선적항, 양륙항, 출발항, 도착항, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "place_delivery": {
+        "semantic": "인도지, 최종인도지",
+        "bias": "인도지, 최종인도지, 화물인도장소, 배송지, 반출지, place of delivery, final destination, delivery place, door delivery",
+        "prejudice": "수취지, 화물수취장소, 선적항, 양륙항, 출발항, 도착항, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "departure_date": {
+        "semantic": "출항일, 실제출발일",
+        "bias": "출항일, 실제출항일, 출발일, 본선적재일, 선적완료일, 반출일, date of departure, sailed on, on board date, shipped on board, departure date",
+        "prejudice": "입항일, 도착일, 발행일, 만료일, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "arrival_date": {
+        "semantic": "입항일, 실제도착일",
+        "bias": "입항일, 실제입항일, 도착일, 양륙일, 반입일, date of arrival, arrived on, arrival date, discharged on",
+        "prejudice": "출항일, 출발일, 발행일, 만료일, 서류번호, 선박명, 항차, 중량, 금액"
+      },
+      "transport_mode": {
+        "semantic": "운송수단, 운송방식",
+        "bias": "운송수단, 운송방식, 운송형태, 해상운송, 항공운송, 육상운송, 철도운송, 복합운송, 해상, 항공, 육로, 철도, by sea, by air, by road, by rail, sea freight, air freight, ocean, multimodal, intermodal",
+        "prejudice": "선박명, 항차, 선사, 항구, 서류번호, 인코텀즈, 결제조건, 통화, 중량, 금액, 컨테이너번호"
+      },
+      "means_of_conveyance": {
+        "semantic": "운송기관, 운송장비",
+        "bias": "운송기관, 운송장비, 운반수단, 차량, 트럭, 컨테이너선, 화물기, means of conveyance, conveyance, vehicle, truck, vessel type",
+        "prejudice": "선박명, 항차, 운송수단, 항구, 서류번호, 중량, 금액"
+      },
+
+      "payment_terms": {
+        "semantic": "결제조건, 지급조건",
+        "bias": "결제조건, 지급조건, 대금결제조건, 송금방식, 전신환송금, 신용장방식, 일람불, 기한부, 외상, 선급, T/T, TT, L/C, LC, D/A, D/P, at sight, usance, net 30, net 60, payment terms, terms of payment, 30일, 60일, 90일",
+        "prejudice": "인코텀즈, 무역조건, 가격조건, 운임조건, 운임선불, 운임착불, 통화, 금액, 중량, 서류번호, 발행일, 항구"
+      },
+      "freight_payment_term": {
+        "semantic": "운임조건, 운임지급방식",
+        "bias": "운임조건, 운임지급방식, 운임선불, 운임착불, 선불, 착불, 원지불, 도착지불, freight prepaid, freight collect, prepaid, collect, freight term",
+        "prejudice": "결제조건, 지급조건, 인코텀즈, 무역조건, 가격조건, 통화, 금액, 중량, 서류번호, 항구"
+      },
+      "latest_shipment_date": {
+        "semantic": "최종선적기일",
+        "bias": "최종선적기일, 최종선적일, 선적기한, 최종적재일, latest date of shipment, latest shipment date, shipment must be effected by",
+        "prejudice": "발행일, 만료일, 유효기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "partial_shipments": {
+        "semantic": "분할선적 허용여부",
+        "bias": "분할선적, 분할적재, 분할선적허용, 분할선적금지, 부분선적, partial shipment, partial shipments allowed, partial shipments prohibited, allowed, not allowed",
+        "prejudice": "환적, 환적허용, 최종선적기일, 발행일, 중량, 금액, 서류번호"
+      },
+      "transshipment_allowed": {
+        "semantic": "환적 허용여부",
+        "bias": "환적, 환적허용, 환적금지, 적환, transshipment, transhipment, transshipment allowed, transshipment prohibited, allowed, not allowed",
+        "prejudice": "분할선적, 최종선적기일, 환적항, 발행일, 중량, 금액, 서류번호"
+      },
+      "special_instructions": {
+        "semantic": "특기사항, 특별지시사항",
+        "bias": "특기사항, 특별지시사항, 비고, 참고사항, 유의사항, 요청사항, special instructions, remarks, notes, additional information, handling instructions",
+        "prejudice": "서류번호, 발행일, 발송인, 수하인, 항구, 선박명, 중량, 금액, 통화, HS코드"
+      },
+
+      "amount_subtotal": {
+        "semantic": "소계, 세전금액",
+        "bias": "소계, 소계금액, 세전금액, 공급가액, 물품대금, 상품금액, subtotal, sub total, net amount, amount before tax, goods value",
+        "prejudice": "총액, 합계, 총금액, 세액, 부가세, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+      },
+      "amount_tax": {
+        "semantic": "세액, 부가세",
+        "bias": "세액, 부가세, 부가가치세, 세금, 관세, VAT, tax, tax amount, VAT amount, duty",
+        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+      },
+      "freight_amount": {
+        "semantic": "운임, 운송비",
+        "bias": "운임, 운송비, 해상운임, 항공운임, 기본운임, 운임료, freight, freight charge, freight amount, ocean freight, air freight, basic freight",
+        "prejudice": "보험료, 소계, 총액, 합계, 로컬차지, 부대비용, 통화, 중량, 수량, 서류번호"
+      },
+      "insurance_amount": {
+        "semantic": "보험료",
+        "bias": "보험료, 적하보험료, 보험비용, 부보료, insurance, insurance premium, insurance charge, premium",
+        "prejudice": "운임, 소계, 총액, 합계, 로컬차지, 보험금액, 부보금액, 통화, 중량, 서류번호"
+      },
+      "local_charges": {
+        "semantic": "로컬차지, 부대비용",
+        "bias": "로컬차지, 부대비용, 부대비, 현지비용, 터미널화물처리비, 서류발급비, THC, 도착지비용, local charges, terminal handling charge, documentation fee, handling charge, CFS charge, wharfage",
+        "prejudice": "운임, 보험료, 소계, 총액, 합계, 통화, 중량, 수량, 서류번호"
+      },
+      "exchange_rate": {
+        "semantic": "환율, 적용환율",
+        "bias": "환율, 적용환율, 매매기준율, 과세환율, 기준환율, exchange rate, rate of exchange, conversion rate, FX rate, 1350, 1,350.00",
+        "prejudice": "통화, 금액, 총액, 세액, 관세율, 중량, 수량, 서류번호, 발행일"
+      },
+      "due_date": {
+        "semantic": "지급기일, 결제기한",
+        "bias": "지급기일, 결제기한, 납부기한, 지불기일, 만기일, due date, payment due, payable by, due on",
+        "prejudice": "발행일, 만료일, 유효기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "valid_until": {
+        "semantic": "유효기간, 유효기한",
+        "bias": "유효기간, 유효기한, 사용기한, 유효일, valid until, validity, valid through, effective until",
+        "prejudice": "발행일, 지급기일, 출항일, 입항일, 서류번호, 중량, 금액"
+      },
+      "payment_status": {
+        "semantic": "결제상태, 지급상태",
+        "bias": "결제상태, 지급상태, 입금상태, 미결제, 결제완료, 부분결제, 미납, 완납, payment status, paid, unpaid, partially paid, outstanding, settled, overdue",
+        "prejudice": "서류상태, 진행상황, 통관상태, 금액, 통화, 발행일, 서류번호"
+      },
+      "account_number": {
+        "semantic": "계좌번호, 송금계좌",
+        "bias": "계좌번호, 송금계좌, 입금계좌, 예금주계좌, 은행계좌, account number, A/C No, bank account, IBAN, beneficiary account",
+        "prejudice": "서류번호, 문서번호, 컨테이너번호, 씰번호, 전화번호, 사업자등록번호, 금액, 통화, 중량"
+      },
+      "swift_code": {
+        "semantic": "스위프트코드, 은행식별코드",
+        "bias": "스위프트코드, SWIFT, BIC, 은행식별코드, 전신코드, SWIFT code, BIC code, bank identifier code",
+        "prejudice": "계좌번호, 서류번호, 컨테이너번호, 전화번호, 사업자등록번호, 금액, 통화"
+      },
+
+      "package_unit": {
+        "semantic": "포장단위, 포장형태",
+        "bias": "포장단위, 포장형태, 포장종류, 카톤, 박스, 팔레트, 드럼, 베일, 번들, 상자, CTN, CARTON, PLT, PALLET, PKG, PACKAGE, BOX, DRUM, BALE, BUNDLE, CASE, ROLL, package unit, type of package",
+        "prejudice": "포장수, 카톤수, 개수, 수량, 중량, 용적, 금액, 통화, 서류번호, 컨테이너번호"
+      },
+      "marks_numbers": {
+        "semantic": "화인, 하인, 포장표기",
+        "bias": "화인, 하인, 포장표기, 하물표시, 마크, 케이스마크, 무표시, 화인및번호, shipping marks, marks and numbers, marks, case mark, N/M, NO MARK, AS PER INVOICE",
+        "prejudice": "서류번호, 문서번호, 컨테이너번호, 씰번호, HS코드, 포장수, 중량, 용적, 금액, 통화, 발행일, 항구, 선박명"
+      },
+      "chargeable_weight": {
+        "semantic": "운임중량, 청구중량",
+        "bias": "운임중량, 청구중량, 과금중량, 요금적용중량, 용적중량, chargeable weight, charge weight, volumetric weight, dimensional weight",
+        "prejudice": "총중량, 순중량, 용적, 포장수, 금액, 통화, 서류번호, 컨테이너번호"
+      },
+
+      "description": {
+        "semantic": "품명, 상품명세, 물품명",
+        "bias": "품명, 상품명세, 물품명, 물품명세, 화물명세, 상품설명, 품목명, 명세, description of goods, description, commodity, commodity description, item description, goods description, nature of goods",
+        "prejudice": "품목코드, HS코드, 수량, 단위, 단가, 금액, 중량, 서류번호, 컨테이너번호, 발송인, 수하인"
+      },
+      "item_code": {
+        "semantic": "품목코드, 모델번호",
+        "bias": "품목코드, 상품코드, 모델번호, 품번, 부품번호, 스타일번호, item code, model no, part no, article no, style no, SKU, reference",
+        "prejudice": "HS코드, 서류번호, 컨테이너번호, 씰번호, 품명, 수량, 단가, 금액, 중량"
+      },
+      "quantity": {
+        "semantic": "수량, 개수",
+        "bias": "수량, 개수, 주문수량, 선적수량, 납품수량, quantity, qty, Q'TY, pieces, PCS, units, amount of goods",
+        "prejudice": "단가, 금액, 총액, 중량, 용적, 포장수, 통화, 서류번호, HS코드, 컨테이너번호"
+      },
+      "unit": {
+        "semantic": "단위, 계량단위",
+        "bias": "단위, 계량단위, 수량단위, 개, 세트, 쌍, 박스, 킬로그램, 미터, EA, PCS, SET, PAIR, BOX, KG, KGS, MT, M, MTR, LTR, DZ, unit, unit of measure, UOM",
+        "prejudice": "포장단위, 통화, 수량, 단가, 금액, 중량, 서류번호, HS코드"
+      },
+      "country_of_manufacture": {
+        "semantic": "제조국, 원산지",
+        "bias": "제조국, 원산지, 생산국, 원산지국가, 제조국가, country of manufacture, country of origin, made in, origin, manufactured in, KOREA, CHINA, VIETNAM, JAPAN, USA, GERMANY",
+        "prejudice": "선적항, 양륙항, 목적국, 도착지, 서류번호, 품명, 수량, 단가, 금액, 중량"
+      },
+      "unit_price": {
+        "semantic": "단가, 개당가격",
+        "bias": "단가, 개당가격, 단위가격, 품목단가, 개별단가, unit price, unit value, price per unit, rate, U/PRICE",
+        "prejudice": "총액, 합계, 금액, 소계, 수량, 중량, 통화, 서류번호, HS코드"
+      },
+      "total_price": {
+        "semantic": "품목합계, 라인금액",
+        "bias": "품목합계, 라인금액, 항목금액, 소계금액, 품목별금액, total price, total value, line total, amount, extended price",
+        "prejudice": "단가, 총액, 총합계, 수량, 중량, 통화, 서류번호, HS코드"
+      },
+      "item_net_weight": {
+        "semantic": "품목 순중량",
+        "bias": "품목 순중량, 라인 순중량, 항목별 순중량, net weight, N.W., net weight per item",
+        "prejudice": "총중량, 전체중량, 품목 총중량, 용적, 수량, 단가, 금액"
+      },
+      "item_gross_weight": {
+        "semantic": "품목 총중량",
+        "bias": "품목 총중량, 라인 총중량, 항목별 총중량, gross weight, G.W., gross weight per item",
+        "prejudice": "순중량, 전체중량, 품목 순중량, 용적, 수량, 단가, 금액"
+      },
+      "item_package_count": {
+        "semantic": "품목 포장수",
+        "bias": "품목 포장수, 라인 포장수, 항목별 카톤수, 항목별 박스수, number of packages, packages per item, CTNS",
+        "prejudice": "전체 포장수, 총 카톤수, 수량, 중량, 용적, 단가, 금액"
+      },
+      "item_package_type": {
+        "semantic": "품목 포장형태",
+        "bias": "품목 포장형태, 라인 포장종류, 항목별 포장단위, package type, kind of package, packing type",
+        "prejudice": "전체 포장단위, 수량, 단위, 중량, 용적, 단가, 금액"
+      },
+
+      "type_size": {
+        "semantic": "컨테이너 규격, 컨테이너 종류",
+        "bias": "컨테이너 규격, 컨테이너 종류, 컨테이너 타입, 규격, 20피트, 40피트, 20GP, 40GP, 40HC, 45HC, 20RF, 40RF, 20OT, 40FR, DRY, REEFER, type and size, size type, container type",
+        "prejudice": "컨테이너번호, 씰번호, 서류번호, 포장수, 중량, 용적, 금액, HS코드"
+      },
+      "container_package_count": {
+        "semantic": "컨테이너별 포장수",
+        "bias": "컨테이너별 포장수, 컨테이너 내 카톤수, 컨테이너별 개수, number of packages, packages in container, CTNS per container",
+        "prejudice": "전체 포장수, 컨테이너번호, 씰번호, 중량, 용적, 규격, 금액"
+      },
+      "container_gross_weight": {
+        "semantic": "컨테이너별 총중량",
+        "bias": "컨테이너별 총중량, 컨테이너 총중량, 컨테이너 화물중량, gross weight, G.W. per container, container gross weight",
+        "prejudice": "전체 총중량, 순중량, 컨테이너번호, 씰번호, 용적, 규격, 포장수, 금액"
+      },
+      "container_measurement": {
+        "semantic": "컨테이너별 용적",
+        "bias": "컨테이너별 용적, 컨테이너 용적, 컨테이너 부피, measurement, CBM per container, container measurement, M3",
+        "prejudice": "전체 용적, 중량, 컨테이너번호, 씰번호, 규격, 포장수, 금액"
+      },
+
+      "party_role": {
+        "semantic": "당사자 역할, 관계자 구분",
+        "bias": "역할, 구분, 당사자, 관계자, 운송인, 선사, 보험자, 피보험자, 발행은행, 통지은행, 관세사, 세관, 창고업자, 검사기관, 계량기관, 손해사정인, 청구인, 신청인, 발행인, 지급인, 수취인, 선적대리점, 운송주선인, carrier, insurer, insured, issuing bank, advising bank, customs broker, customs authority, warehouse operator, inspection agency, surveying agency, claimant, applicant, drawer, drawee, payee, shipping agent, freight forwarder",
+        "prejudice": "회사명, 상호, 주소, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_name": {
+        "semantic": "당사자 명칭, 관계자 상호",
+        "bias": "상호, 회사명, 업체명, 기관명, 은행명, 성명, 명칭, company name, name of party, firm name, bank name",
+        "prejudice": "역할, 구분, 주소, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_address": {
+        "semantic": "당사자 주소",
+        "bias": "주소, 소재지, 사업장주소, 본점소재지, address, address of party, location",
+        "prejudice": "역할, 구분, 상호, 회사명, 전화번호, 서류번호, 발행일, 항구, 중량, 금액"
+      },
+      "party_contact": {
+        "semantic": "당사자 연락처",
+        "bias": "연락처, 전화번호, 팩스, 이메일, 담당자, TEL, FAX, EMAIL, contact, phone, contact person",
+        "prejudice": "역할, 구분, 상호, 회사명, 주소, 서류번호, 컨테이너번호, 계좌번호, 금액"
+      }
+    },
     "default": {
       "layout_list": {
         "semantic": "다중 항목을 나열하는 목록, 표, 리스트 페이지",
@@ -1295,6 +2421,859 @@
         "semantic": "상태",
         "bias": "{TYPE}상태, {TYPE}진행상황, 정상, 대기, 오류, 완료",
         "prejudice": "식별자, 링크, 주소, 번호, 코드, 제목, 이름, 공지사항, 상품안내, 이벤트"
+      }
+    }
+  },
+  "en": {
+    "tracking": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple shipments, delivery table, shipping list",
+        "bias": "shipping list, tracking list, shipment table, batch dispatch, tracking history, delivery status, unfulfilled list, bulk shipping",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single shipment",
+        "bias": "shipment details, tracking form, shipping input, edit shipment, edit tracking, single shipment view, correct address, return processing, view details",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, tracking number, waybill",
+        "bias": "tracking identifier, tracking number, tracking code, 1Z9999999999999999, 9400100000000000000000, TBA1234567890",
+        "prejudice": "shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "status": {
+        "semantic": "Status, shipping status, progress",
+        "bias": "tracking status, shipment progress, pending, label created, picked up, in transit, out for delivery, delivered, returned",
+        "prejudice": "tracking number, waybill, identifier, number, code, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "title": {
+        "semantic": "Product name, clothing name, item name, title",
+        "bias": "shipped item name, shipment title, Nike Air Force, Samsung Galaxy Book, iPhone Case, Floral Dress Set",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, registration date, received date, dispatch date, departure date, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "registration_date": {
+        "semantic": "Date, registration date, received date",
+        "bias": "shipping date, date created, {TYPE} registration date, 2026-03-15, 05/20/2026, 01/01/26",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, combined shipping, bundled delivery"
+      },
+      "shipping_date": {
+        "semantic": "Dispatch date, shipping date, departure date",
+        "bias": "ship out date, dispatched on, shipping time, 2026-03-16, 05/21/2026",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, combined shipping, bundled delivery"
+      },
+      "sender_name": {
+        "semantic": "Sender, dispatcher, seller, name",
+        "bias": "sender name, from, seller, John Doe, Amazon Inc., Apple, Nike",
+        "prejudice": "link, tracking number, waybill, number, code, shipping status, progress, registration date, received date, dispatch date, departure date, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "sender_address": {
+        "semantic": "Orderer address, sender address, origin location",
+        "bias": "address, street, avenue, floor, building, zip code, USA, city, state, 123 Main St, New York, NY 10001, Los Angeles, CA",
+        "prejudice": "@, .com, .net, identifier, link, tracking number, waybill, number, code, shipping status, progress, sender, dispatcher, seller, full name, registration date, received date, dispatch date, departure date, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "sender_phone": {
+        "semantic": "Sender contact, phone number, mobile",
+        "bias": "+1-800-123-4567, 212-555-1234, 555-9876",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, sender, dispatcher, seller, full name, registration date, received date, dispatch date, departure date, recipient, receiver, buyer, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "recipient_name": {
+        "semantic": "Recipient, receiver, buyer name",
+        "bias": "recipient, ship to, buyer name, Jane Smith, Michael Johnson, Emily Davis",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, destination, shipping address, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "recipient_address": {
+        "semantic": "Recipient address, shipping address, destination",
+        "bias": "address, street, avenue, floor, building, zip code, USA, city, state, 456 Market St, San Francisco, CA 94105, 789 Ocean Dr, Miami, FL",
+        "prejudice": "@, .com, .net, identifier, link, tracking number, waybill, number, code, shipping status, progress, sender, dispatcher, seller, contact, phone number, mobile, recipient, receiver, buyer, full name, registration date, received date, dispatch date, departure date, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "recipient_phone": {
+        "semantic": "Recipient contact, phone number, mobile",
+        "bias": "415-555-7890, 305-555-4321",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, sender, dispatcher, seller, location, contact, phone number, mobile, recipient, receiver, buyer, full name, address, registration date, received date, dispatch date, departure date, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "width": {
+        "semantic": "Width, breadth",
+        "bias": "10in, 25.5cm, 50",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "height": {
+        "semantic": "Height",
+        "bias": "15in, 30.5cm, 40",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "length": {
+        "semantic": "Length, depth",
+        "bias": "20in, 100cm, 15.5",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "weight": {
+        "semantic": "Weight, mass",
+        "bias": "1.5lbs, 500g, 10.5oz",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "carrier": {
+        "semantic": "Carrier, shipping company, courier",
+        "bias": "UPS, FedEx, USPS, DHL, Amazon Logistics",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, full name, address, location, contact, phone number, mobile, width, height, length, depth, weight, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "shipping_fee": {
+        "semantic": "Shipping fee, shipping cost, rate",
+        "bias": "$5.00, 2.50, Free Shipping, Cash on Delivery",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, full name, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "shipping_method": {
+        "semantic": "Shipping method, delivery type",
+        "bias": "Standard Shipping, Expedited, Next Day Air, Prime Delivery, In-store Pickup",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, full name, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "shipping_duration": {
+        "semantic": "Shipping duration, transit days",
+        "bias": "1 day, 2 days, 3-5 business days",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, full name, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, combined shipping, bundled delivery"
+      },
+      "bundle_shipping": {
+        "semantic": "Combined shipping, bundled delivery",
+        "bias": "Eligible for combined shipping, Not eligible, Bundled",
+        "prejudice": "identifier, link, tracking number, waybill, number, code, shipping status, progress, product name, item, name, title, registration date, received date, dispatch date, departure date, full name, address, location, contact, phone number, mobile, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days"
+      }
+    },
+    "goods": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple products, product table, catalog",
+        "bias": "product list, item list, catalog management, inventory management",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single product",
+        "bias": "product details, product form, add product, edit product, add options, WYSIWYG editor, upload thumbnail, related products, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, URL",
+        "bias": "product identifier, product ID, product code, PROD-001, ITEM_9921, /product/view?id=123",
+        "prejudice": "sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "code": {
+        "semantic": "Product code, item number, model number",
+        "bias": "SKU-12345, ABC-9981, NK-AF1-001",
+        "prejudice": "identifier, URL, link, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "status": {
+        "semantic": "Status, sales status, visibility",
+        "bias": "product status, active, out of stock, hidden, discontinued, inactive",
+        "prejudice": "identifier, link, URL, code, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "title": {
+        "semantic": "Product name, clothing name, item name, title",
+        "bias": "product name, item title, Premium Wireless Headphones, 2026 Smartwatch, Men's Leather Wallet",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "registration_date": {
+        "semantic": "Registration date, date added",
+        "bias": "product date, date created, 2026-03-15T12:00:00, 05/20/2026",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "payment_method": {
+        "semantic": "Payment method",
+        "bias": "Credit Card, PayPal, Apple Pay, Google Pay, Bank Transfer, Stripe",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "bank": {
+        "semantic": "Bank, account, wire transfer",
+        "bias": "Chase Bank, Bank of America, Wire Transfer, Routing Number",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "card": {
+        "semantic": "Card, credit card",
+        "bias": "Visa, MasterCard, American Express, Discover, JCB",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "model_name": {
+        "semantic": "Model name",
+        "bias": "Model-X, V2.0, SM-G998U",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "brand_name": {
+        "semantic": "Brand name, manufacturer",
+        "bias": "Samsung, Apple, Nike, Sony",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "condition": {
+        "semantic": "Condition, used, new",
+        "bias": "New, Used, Refurbished, Open Box",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "description": {
+        "semantic": "Detailed description, body content",
+        "bias": "This product is a premium model made with high-quality materials...",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "short_description": {
+        "semantic": "Short description, summary",
+        "bias": "Premium materials, fast shipping, limited time offer",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "tags": {
+        "semantic": "Tags, keywords, search terms",
+        "bias": "Electronics, Home Decor, Sale, 3C",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "color": {
+        "semantic": "Color",
+        "bias": "Beige, Black, White, Red, Blue, Green, Yellow, Pink, Brown, Gray, Purple, Navy, Ivory, Silver, Gold",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "origin_country": {
+        "semantic": "Country of origin, made in",
+        "bias": "USA, China, Vietnam, Japan, Made in USA",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, producer, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "manufacturer": {
+        "semantic": "Manufacturer, producer",
+        "bias": "Samsung Electronics, Apple Inc., Sony",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "release_date": {
+        "semantic": "Release date, launch date",
+        "bias": "2026-01-01, 10/15/2025",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "manufacture_date": {
+        "semantic": "Manufacture date, production date",
+        "bias": "2025-12-01, 02/28/2026",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "expired_at": {
+        "semantic": "Expiration date, valid until",
+        "bias": "2028-12-31, 06/30/2027",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "gtin": {
+        "semantic": "Barcode, GTIN, UPC",
+        "bias": "8801234567890, UPC, EAN",
+        "prejudice": "sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "mpn": {
+        "semantic": "MPN, manufacturer part number",
+        "bias": "PN-1234, PT-98765",
+        "prejudice": "sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "barcode": {
+        "semantic": "Barcode",
+        "bias": "1234567890123",
+        "prejudice": "sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "sale_price": {
+        "semantic": "Sale price, discount price, price",
+        "bias": "$15.00, 29.99, 1,500.00",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, quantity, inventory, stock, low stock alert, unit, unit of measure, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "supply_price": {
+        "semantic": "Supply price, cost price, wholesale price",
+        "bias": "$10.00, 20.00, 1,200.00",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, quantity, inventory, stock, low stock alert, unit, unit of measure, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "currency": {
+        "semantic": "Currency",
+        "bias": "USD, $, EUR, €, GBP, £",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "compare_at_price": {
+        "semantic": "Compare at price, MSRP, original price",
+        "bias": "$20.00, 35.00, 1,800.00",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, quantity, inventory, stock, low stock alert, unit, unit of measure, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "quantity": {
+        "semantic": "Quantity, inventory, stock",
+        "bias": "100, 50, 0, 999",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, MSRP, compare at price, original price, unit, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "stock_keeping_unit": {
+        "semantic": "SKU",
+        "bias": "SKU-123, ITEM-001",
+        "prejudice": "sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "low_stock_threshold": {
+        "semantic": "Low stock threshold, low stock alert",
+        "bias": "10, 5, 20",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, MSRP, compare at price, original price, unit, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "unit": {
+        "semantic": "Unit of measure",
+        "bias": "pcs, box, set, pair",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "tax_included": {
+        "semantic": "Tax included, VAT",
+        "bias": "Tax included, Tax exempt, VAT included",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "tax_code": {
+        "semantic": "Tax code",
+        "bias": "TAX-001, VAT-10",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "main_image_url": {
+        "semantic": "Main image, thumbnail",
+        "bias": "https://example.com/img1.jpg, /images/main.png",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "additional_image_url": {
+        "semantic": "Additional images",
+        "bias": "https://example.com/img2.jpg, /images/detail1.png",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "video_url": {
+        "semantic": "Video URL",
+        "bias": "https://youtube.com/watch?v=123",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "carrier": {
+        "semantic": "Carrier, shipping provider",
+        "bias": "UPS, FedEx, USPS, DHL",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "shipping_fee": {
+        "semantic": "Shipping fee, shipping cost",
+        "bias": "$5.00, Free",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, quantity, inventory, stock, low stock alert, unit, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "shipping_method": {
+        "semantic": "Shipping method, delivery type",
+        "bias": "Standard, Expedited, Next Day Air, Prime Delivery, In-store Pickup",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "shipping_duration": {
+        "semantic": "Shipping duration, transit days",
+        "bias": "1 day, 2 days, Same-day dispatch",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, combined shipping, bundled delivery, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "bundle_shipping": {
+        "semantic": "Combined shipping, bundled delivery",
+        "bias": "Eligible for combined shipping, Not eligible",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, width, height, length, weight, options, variants, additional products, related products"
+      },
+      "options": {
+        "semantic": "Options, variants",
+        "bias": "Variant, Size, Color selection, Quantity, Required option",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, additional products, related products"
+      },
+      "additional_goods": {
+        "semantic": "Additional products, related products",
+        "bias": "Add-ons, Related items, Frequently bought together, Bundles",
+        "prejudice": "identifier, link, URL, code, sales status, visibility, product name, item name, name, registration date, date added, payment method, bank, account, wire transfer, card, credit card, model name, brand name, manufacturer, condition, used, detailed description, body content, short description, tags, keywords, country of origin, made in, release date, launch date, manufacture date, expiration date, valid until, sale price, discount price, price, supply price, wholesale price, cost price, currency, unit, MSRP, compare at price, original price, quantity, inventory, stock, low stock alert, unit of measure, tax included, VAT, tax code, main image, thumbnail, additional images, video URL, carrier, shipping provider, shipping fee, shipping cost, shipping method, delivery type, shipping duration, transit days, combined shipping, bundled delivery, width, height, length, weight, options, variants"
+      }
+    },
+    "order": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple orders, order table",
+        "bias": "order list, order table, order history, transaction history, cancellation/refund list, all orders, fulfillment management",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single order",
+        "bias": "order details, order form, create order, edit order, order history edit, update address, partial cancellation, update payment, edit recipient, admin notes",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, order number",
+        "bias": "order identifier, order ID, ORD-2026-0001, 20260315-123456, 12345-67890",
+        "prejudice": "tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "tracking_number": {
+        "semantic": "Tracking number, waybill",
+        "bias": "tracking number, waybill number, shipping label, 1Z9999999999999999, 9400100000000000000000, TBA1234567890",
+        "prejudice": "number, sequence, index, No, link, order ID, order status, shipping status, status, order date, payment date, date, quantity, count, item total, grand total, shipping fee, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "status": {
+        "semantic": "Order status, shipping status, status",
+        "bias": "order status, progress, Paid, Unfulfilled, Fulfilled, Shipped, Delivered, Cancelled, Returned, Exchanged, Refunded",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "registration_date": {
+        "semantic": "Order date, payment date, date",
+        "bias": "order date and time, date ordered, 2026-03-15T14:16:35, 03/15/2026 2:16 PM",
+        "prejudice": "number, sequence, index, quantity, count, item total, grand total, payment amount, shipping fee, identifier, link, order ID, tracking number, waybill, order status, shipping status, status, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, payment method, payment gateway, PG"
+      },
+      "goods": {
+        "semantic": "Ordered items, product name, item name, item",
+        "bias": "iPhone 15, Wireless Keyboard, Nike Sneakers",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "sender_name": {
+        "semantic": "Customer, buyer, sender, name (billing)",
+        "bias": "customer name, billing name, buyer name, John Doe, Jane Smith, Acme Corp",
+        "prejudice": "link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, contact, phone number, mobile, address, location, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "sender_address": {
+        "semantic": "Billing address, customer address",
+        "bias": "address, street, avenue, floor, building, zip code, USA, city, state, 123 Main St, New York, NY 10001, Los Angeles, CA",
+        "prejudice": "@, .com, .net, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, sender, full name, registration date, received date, dispatch date, departure date, contact, phone number, mobile, recipient, receiver, buyer, width, height, length, depth, weight, carrier, shipping company, freight forwarder, shipping fee, freight charge, rate, shipping method, delivery means, shipping duration, transit days, combined shipping, bundled delivery"
+      },
+      "sender_phone": {
+        "semantic": "Billing phone, customer contact",
+        "bias": "+1-800-123-4567, 212-555-1234, 555-9876",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, recipient, receiver, name, address, location, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "recipient_name": {
+        "semantic": "Recipient, receiver, name (shipping)",
+        "bias": "shipping name, recipient name, Jane Smith, Michael Johnson",
+        "prejudice": "link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, address, location, contact, phone number, mobile, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "recipient_address": {
+        "semantic": "Shipping address, destination",
+        "bias": "address, street, avenue, floor, building, zip code, USA, city, state, 456 Market St, San Francisco, CA 94105",
+        "prejudice": "@, .com, .net, identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "recipient_phone": {
+        "semantic": "Shipping phone, recipient contact",
+        "bias": "415-555-7890, 305-555-4321",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "bank": {
+        "semantic": "Bank, wire transfer, account",
+        "bias": "Chase Bank, Bank of America, Wire Transfer, Routing Number",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, card, credit card, payment card, date paid, payment method, payment gateway, PG"
+      },
+      "card": {
+        "semantic": "Card, credit card, payment card",
+        "bias": "Visa, MasterCard, American Express, Discover",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, date ordered, date paid, payment method, payment gateway, PG"
+      },
+      "order_date": {
+        "semantic": "Order date",
+        "bias": "date ordered, 2026-03-15, 03/15/2026",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, payment method, payment gateway, PG"
+      },
+      "payment_date": {
+        "semantic": "Payment date, date paid",
+        "bias": "payment time, 2026-03-15T14:20:00, 03/15/2026",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, wire transfer, account, card, credit card, payment card, payment method, payment gateway, PG"
+      },
+      "payment_method": {
+        "semantic": "Payment method",
+        "bias": "Credit Card, Wire Transfer, PayPal, Apple Pay, Google Pay, Stripe",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, date ordered, date paid"
+      },
+      "payment_origin": {
+        "semantic": "Payment gateway, PG",
+        "bias": "Stripe, PayPal, Authorize.Net, Square, Braintree",
+        "prejudice": "identifier, link, order ID, tracking number, waybill, order status, shipping status, status, order date, payment date, date, ordered items, product name, item name, item, customer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, date ordered, date paid"
+      }
+    },
+    "review": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple reviews, ratings table",
+        "bias": "review list, ratings table, bulk review management, unreplied reviews",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single review",
+        "bias": "review details, review form, edit review, write reply, flag review, moderate review",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, URL",
+        "bias": "review identifier, review ID, REV-001, 9921, /review/view?id=123",
+        "prejudice": "review status, approved, rejected, pending, hidden, flagged, author, reviewer, name, title, product name, review title, verified purchase, registration date, date posted, date"
+      },
+      "status": {
+        "semantic": "Status, review status",
+        "bias": "review status, progress, approved, pending, rejected, hidden, flagged",
+        "prejudice": "identifier, link, URL, number, code, author, reviewer, name, title, product name, review title, verified purchase, registration date, date posted, date"
+      },
+      "name": {
+        "semantic": "Author, reviewer, name",
+        "bias": "reviewer name, John Doe, Jane Smith",
+        "prejudice": "identifier, link, URL, number, code, review status, approved, rejected, pending, hidden, flagged, title, product name, review title, verified purchase, registration date, date posted, date"
+      },
+      "title": {
+        "semantic": "Title, product name, review title",
+        "bias": "review title, review subject, Fast shipping, Great product, Will buy again",
+        "prejudice": "identifier, link, URL, number, code, review status, approved, rejected, pending, hidden, flagged, author, reviewer, name, verified purchase, registration date, date posted, date"
+      },
+      "completed": {
+        "semantic": "Verified purchase, completed",
+        "bias": "true, false",
+        "prejudice": "identifier, link, URL, number, code, review status, approved, rejected, pending, hidden, flagged, author, reviewer, name, title, product name, review title, registration date, date posted, date"
+      },
+      "registration_date": {
+        "semantic": "Registration date, date posted, date",
+        "bias": "review date, posted on, 2026-03-15, 05/20/2026",
+        "prejudice": "identifier, link, URL, number, code, review status, approved, rejected, pending, hidden, flagged, author, reviewer, name, title, product name, review title, verified purchase"
+      }
+    },
+    "coupon": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple coupons, coupon table",
+        "bias": "coupon list, promotion list, issued coupons, coupon usage history",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single coupon",
+        "bias": "coupon details, coupon form, create coupon, edit coupon, set conditions, set discount rate, target audience, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, URL",
+        "bias": "coupon identifier, coupon ID, promo code ID, EVT-001, COUPON_9921",
+        "prejudice": "fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "type": {
+        "semantic": "Type, discount type",
+        "bias": "Fixed amount, Percentage, Free shipping, Buy X Get Y",
+        "prejudice": "identifier, link, URL, number, code, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "status": {
+        "semantic": "Status",
+        "bias": "coupon status, Active, Expired, Scheduled, Paused, Depleted",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "title": {
+        "semantic": "Title, name, coupon name, event name",
+        "bias": "coupon name, promotion title, Spring Sale, Welcome Bonus, Black Friday",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "started_at": {
+        "semantic": "Start date, valid from",
+        "bias": "coupon start date, valid from, 2026-03-01T00:00:00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "expired_at": {
+        "semantic": "End date, expires on",
+        "bias": "coupon end date, valid until, 2026-03-31T23:59:59",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "code": {
+        "semantic": "Code, coupon code, promo code",
+        "bias": "SPRING26, WELCOME100, SAVE50",
+        "prejudice": "identifier, link, URL, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "discount": {
+        "semantic": "Discount value, discount rate",
+        "bias": "10%, $5.00, 15 percent",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "quantity": {
+        "semantic": "Quantity, total issued",
+        "bias": "1000, 500, 9999",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "usage_limit": {
+        "semantic": "Total usage limit",
+        "bias": "1000, 5000",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "usage_per": {
+        "semantic": "Limit per customer",
+        "bias": "1, 2, 3",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "new_customer_only": {
+        "semantic": "New customers only",
+        "bias": "true, false",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "first_purchase_only": {
+        "semantic": "First purchase only",
+        "bias": "true, false",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "min_order_amount": {
+        "semantic": "Minimum purchase requirement",
+        "bias": "$10.00, $30.00, $50.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "max_order_amount": {
+        "semantic": "Maximum order amount",
+        "bias": "$100.00, $500.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "max_discount_amount": {
+        "semantic": "Maximum discount value, cap",
+        "bias": "$5.00, $10.00, $20.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, region restrictions, phone number, contact, address, location, created date"
+      },
+      "region_restrictions": {
+        "semantic": "Region restrictions",
+        "bias": "Contiguous US only, Excludes Alaska/Hawaii",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, phone number, contact, address, location, created date"
+      },
+      "number": {
+        "semantic": "Contact number, support phone",
+        "bias": "1-800-123-4567, 212-555-1234",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, address, location, created date"
+      },
+      "address": {
+        "semantic": "Address, location",
+        "bias": "New York, NY, 123 Main St, Los Angeles, CA",
+        "prejudice": "identifier, link, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, created date"
+      },
+      "registration_date": {
+        "semantic": "Created date",
+        "bias": "coupon created date, 2026-02-15",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location"
+      }
+    },
+    "event": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple events, event table",
+        "bias": "event list, campaigns, event table, promotion list",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single event",
+        "bias": "event details, event form, create event, edit event, set conditions, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, URL",
+        "bias": "event identifier, event ID, event code, EVT-001, CMP-9921",
+        "prejudice": "fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "type": {
+        "semantic": "Type, event type",
+        "bias": "Fixed amount, Percentage, Free shipping, Free gift",
+        "prejudice": "identifier, link, URL, number, code, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "status": {
+        "semantic": "Status",
+        "bias": "event status, Active, Expired, Scheduled, Paused",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "title": {
+        "semantic": "Title, name, event name",
+        "bias": "event name, campaign title, Spring Sale, Welcome Bonus, Black Friday",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "started_at": {
+        "semantic": "Start date, valid from",
+        "bias": "event start date, 2026-03-01T00:00:00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "expired_at": {
+        "semantic": "End date, expires on",
+        "bias": "event end date, 2026-03-31T23:59:59",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "code": {
+        "semantic": "Code, event code",
+        "bias": "SPRING26, WELCOME100, SAVE50",
+        "prejudice": "identifier, link, URL, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "discount": {
+        "semantic": "Discount value, discount rate",
+        "bias": "10%, $5.00, 15 percent",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "quantity": {
+        "semantic": "Quantity",
+        "bias": "1000, 500, 9999",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "usage_limit": {
+        "semantic": "Total usage limit",
+        "bias": "1000, 5000",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "usage_per": {
+        "semantic": "Limit per customer",
+        "bias": "1, 2, 3",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "new_customer_only": {
+        "semantic": "New customers only",
+        "bias": "true, false",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "first_purchase_only": {
+        "semantic": "First purchase only",
+        "bias": "true, false",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "min_order_amount": {
+        "semantic": "Minimum purchase requirement",
+        "bias": "$10.00, $30.00, $50.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "max_order_amount": {
+        "semantic": "Maximum order amount",
+        "bias": "$100.00, $500.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum discount, cap, region restrictions, phone number, contact, address, location, created date"
+      },
+      "max_discount_amount": {
+        "semantic": "Maximum discount value, cap",
+        "bias": "$5.00, $10.00, $20.00",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, region restrictions, phone number, contact, address, location, created date"
+      },
+      "region_restrictions": {
+        "semantic": "Region restrictions",
+        "bias": "Contiguous US only, Excludes Alaska/Hawaii",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, phone number, contact, address, location, created date"
+      },
+      "number": {
+        "semantic": "Contact number, support phone",
+        "bias": "1-800-123-4567, 212-555-1234",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, address, location, created date"
+      },
+      "address": {
+        "semantic": "Address, location",
+        "bias": "New York, NY, 123 Main St, Los Angeles, CA",
+        "prejudice": "identifier, link, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, created date"
+      },
+      "registration_date": {
+        "semantic": "Created date",
+        "bias": "event created date, 2026-02-15",
+        "prejudice": "identifier, link, URL, number, code, fixed amount, percentage, free shipping, type, category, progress, coupon name, event name, start date, valid from, end date, expires on, coupon code, discount value, quantity, total issued, usage limit, limit per customer, new customers only, first purchase only, minimum purchase requirement, maximum order amount, maximum discount, cap, region restrictions, phone number, contact, address, location"
+      }
+    },
+    "shipping_doc": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple shipping/trade documents",
+        "bias": "document list, shipping document list, invoice list, B/L list",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single shipping document",
+        "bias": "document detail, shipping document form, invoice details, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, document number",
+        "bias": "reference number, document number, doc no, B/L No, AWB No, Invoice No, PO No",
+        "prejudice": "ship date, issue date, shipper, consignee, carrier, port, container number, seal number, weight, amount, currency, HS code, Incoterms, payment terms"
+      },
+      "doc_number": {
+        "semantic": "Document number, primary identifier",
+        "bias": "document number, bill of lading number, air waybill number, invoice number, contract number, HBL, MBL",
+        "prejudice": "container number, seal number, HS code, booking number, L/C number, issue date, ship date, weight, amount"
+      },
+      "doc_type": {
+        "semantic": "Document type",
+        "bias": "document type, Bill of Lading, Air Waybill, Commercial Invoice, Packing List, Certificate of Origin, Letter of Credit",
+        "prejudice": "document number, issue date, ship date, shipper, consignee, port, weight, amount, currency"
+      },
+      "status": {
+        "semantic": "Status, progress",
+        "bias": "document status, Issued, In Transit, Cleared, Delivered, Cancelled",
+        "prejudice": "document number, issue date, ship date, shipper, consignee, carrier, port, container number, weight, amount, currency, HS code"
+      },
+      "issue_date": {
+        "semantic": "Issue date",
+        "bias": "issue date, date of issue, issued on, 2026-03-15",
+        "prejudice": "ship date, departure date, arrival date, expiration date, valid until, document number, shipper, consignee, port, weight, amount"
+      },
+      "sender_name": {
+        "semantic": "Shipper, exporter, seller name",
+        "bias": "shipper, exporter, seller, supplier, consignor, vendor",
+        "prejudice": "consignee, importer, buyer, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "recipient_name": {
+        "semantic": "Consignee, importer, buyer name",
+        "bias": "consignee, importer, buyer, receiver, to order of",
+        "prejudice": "shipper, exporter, seller, supplier, notify party, carrier, port, document number, issue date, weight, amount, container number"
+      },
+      "vessel": {
+        "semantic": "Vessel name, flight number",
+        "bias": "vessel, vessel name, ocean vessel, flight number, carrier name, MV, MSC, MAERSK, HMM, EVERGREEN",
+        "prejudice": "voyage number, port, port of loading, port of discharge, document number, issue date, shipper, consignee, weight, amount, container number, HS code"
+      },
+      "pol": {
+        "semantic": "Port of Loading, POL",
+        "bias": "port of loading, POL, port of departure, airport of departure, loading port, LOS ANGELES, NEW YORK, ROTTERDAM, SHANGHAI, SINGAPORE",
+        "prejudice": "port of discharge, POD, destination port, place of delivery, place of receipt, vessel name, voyage number, document number, issue date, weight, amount"
+      },
+      "pod": {
+        "semantic": "Port of Discharge, POD",
+        "bias": "port of discharge, POD, port of destination, airport of destination, discharge port, LONG BEACH, ANTWERP, DUBAI, MIAMI",
+        "prejudice": "port of loading, POL, departure port, place of receipt, vessel name, voyage number, document number, issue date, weight, amount"
+      },
+      "etd": {
+        "semantic": "Estimated Time of Departure, ETD",
+        "bias": "ETD, estimated time of departure, departure date, sailing date",
+        "prejudice": "ETA, estimated time of arrival, issue date, expiration date, document number, shipper, consignee, port, weight, amount"
+      },
+      "eta": {
+        "semantic": "Estimated Time of Arrival, ETA",
+        "bias": "ETA, estimated time of arrival, arrival date",
+        "prejudice": "ETD, departure date, issue date, expiration date, document number, shipper, consignee, port, weight, amount"
+      },
+      "incoterms": {
+        "semantic": "Incoterms, trade terms",
+        "bias": "incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP",
+        "prejudice": "payment terms, freight terms, currency, amount, weight, document number, issue date, port, vessel name, container number"
+      },
+      "currency": {
+        "semantic": "Currency",
+        "bias": "currency, currency code, USD, EUR, JPY, CNY, GBP",
+        "prejudice": "amount, grand total, freight charge, insurance, weight, quantity, document number, issue date, port, vessel name, incoterms"
+      },
+      "amount": {
+        "semantic": "Total amount, invoice value",
+        "bias": "total amount, grand total, invoice value, total value",
+        "prejudice": "freight charge, insurance, local charge, tax, unit price, weight, quantity, currency, document number, issue date, port"
+      },
+      "container_number": {
+        "semantic": "Container number",
+        "bias": "container number, container no, CNTR No, MSCU1234567, TGHU7654321",
+        "prejudice": "seal number, document number, booking number, HS code, weight, amount, issue date, port, vessel name, shipper, consignee"
+      },
+      "seal_number": {
+        "semantic": "Seal number",
+        "bias": "seal number, seal no, SEAL",
+        "prejudice": "container number, document number, booking number, HS code, weight, amount, issue date, port, vessel name"
+      },
+      "weight_gross": {
+        "semantic": "Gross weight",
+        "bias": "gross weight, G.W., total gross weight, LBS, KGS, MT",
+        "prejudice": "net weight, volume, quantity, package count, amount, currency, document number, issue date, port, container number"
+      },
+      "weight_net": {
+        "semantic": "Net weight",
+        "bias": "net weight, N.W., total net weight, LBS, KGS",
+        "prejudice": "gross weight, volume, quantity, package count, amount, currency, document number, issue date, port, container number"
+      },
+      "volume": {
+        "semantic": "Volume, measurement",
+        "bias": "volume, measurement, CBM, CBF, M3",
+        "prejudice": "gross weight, net weight, quantity, package count, amount, currency, document number, issue date, port, container number"
+      },
+      "package_count": {
+        "semantic": "Package count, number of packages",
+        "bias": "package count, number of packages, CTNS, PKGS, PLT, cartons, pallets",
+        "prejudice": "gross weight, net weight, volume, amount, currency, unit price, document number, issue date, port, container number"
+      },
+      "hs_code": {
+        "semantic": "HS Code, tariff code",
+        "bias": "HS code, HTS code, tariff number, Schedule B, classification",
+        "prejudice": "container number, seal number, document number, booking number, weight, amount, currency, issue date, port, vessel name"
+      }
+    },
+    "default": {
+      "layout_list": {
+        "semantic": "A list page displaying multiple items",
+        "bias": "{TYPE} list, {TYPE} table, directory, index",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "layout_form": {
+        "semantic": "A form page showing or inputting detailed information of a single item",
+        "bias": "{TYPE} details, {TYPE} form, add {TYPE}, edit {TYPE}, input, select, textarea",
+        "prejudice": "global navigation, menus, footers, aside."
+      },
+      "id,link": {
+        "semantic": "Identifier, link, URL",
+        "bias": "{TYPE} identifier, {TYPE} ID, {TYPE} code, ID-001, 12345, /path/to/resource",
+        "prejudice": "title, name, notice, guide, event, active, pending, error, completed, status, progress"
+      },
+      "title": {
+        "semantic": "Title, name",
+        "bias": "{TYPE} name, {TYPE} title, notice, guide, event",
+        "prejudice": "identifier, link, URL, number, code, active, pending, error, completed, status, progress"
+      },
+      "status": {
+        "semantic": "Status",
+        "bias": "{TYPE} status, {TYPE} progress, active, pending, error, completed",
+        "prejudice": "identifier, link, URL, number, code, title, name, notice, guide, event"
       }
     }
   }

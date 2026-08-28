@@ -1,0 +1,39 @@
+document_type: Tax Invoice
+document_code: TI
+metadata:
+  tax_invoice_number: TI-2026-KR-0812
+  issue_date: '2026-08-12'
+  vat_type: Zero-Rated VAT (0.0%)
+  currency: KRW
+  related_cp_number: CP-2026-KR-0419
+  related_po_number: PO-99281A
+  related_llc_number: LLC-2026-KR-0911
+parties:
+  supplier:
+    name: Microchip Tech Korea Corp.
+    address: 45 Industrial-ro, Yeonsu-gu, Incheon, South Korea
+    tax_id: 131-86-67890
+    representative: Sung-Min Park
+  buyer:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    tax_id: 120-81-12345
+    representative: Min-Soo Kim
+line_items:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers (Export Supply)
+  quantity: 5000
+  unit_price_krw: 12150.0
+  supply_amount_krw: 60750000.0
+  tax_amount_krw: 0.0
+- item_code: SKU-B200
+  description: Sensor Modules (Export Supply)
+  quantity: 2000
+  unit_price_krw: 7776.0
+  supply_amount_krw: 15552000.0
+  tax_amount_krw: 0.0
+summary:
+  total_supply_amount_krw: 76302000.0
+  total_vat_amount_krw: 0.0
+  grand_total_amount_krw: 76302000.0
+  remark: Issued based on Confirmation of Purchasing (CP-2026-KR-0419) for export supply.

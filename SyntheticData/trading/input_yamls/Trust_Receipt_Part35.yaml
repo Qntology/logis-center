@@ -1,0 +1,30 @@
+document_type: Trust Receipt
+document_code: TR
+metadata:
+  tr_number: TR-SFO-20260910
+  issue_date: '2026-09-10'
+  maturity_date: '2026-10-10'
+  currency: USD
+  amount: 78500.0
+  related_lc_number: LC-88492011
+  related_bl_number: BL-55432219
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_lg_number: LG-SFO-20260909
+parties:
+  entrustor_bank:
+    name: Bank of America
+    branch: San Francisco Main Branch
+    address: 456 Market St, San Francisco, CA 94104, USA
+  trustee_importer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+cargo_details:
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  vessel_flight: OCEAN VOYAGER V.123E
+  container_number: PONU1234567
+  packages: 50 PLTS
+trust_terms:
+  ownership_clause: The title to the goods and documents shall remain with the Bank as Security until full payment of USD 78,500.00 is remitted.
+  purpose: The Trustee is authorized to take possession of the goods for warehousing and sale solely on behalf of the Bank.

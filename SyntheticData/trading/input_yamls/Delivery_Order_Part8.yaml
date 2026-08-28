@@ -1,0 +1,31 @@
+document_type: Delivery Order
+document_code: DO
+metadata:
+  do_number: DO-SFO-20260911
+  issue_date: '2026-09-11'
+  valid_until: '2026-09-18'
+  related_bl_number: BL-55432219
+  related_an_number: AN-SFO-20260908
+  related_po_number: PO-99281A
+parties:
+  issuing_carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  terminal_warehouse:
+    name: SFO Port Terminal Warehouse #4
+    address: Pier 45, Port of San Francisco, CA 94133, USA
+cargo_details:
+  container_number: PONU1234567
+  seal_number: SEAL88990
+  number_of_packages: 50 PLTS
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  gross_weight_kg: 2500.0
+  measurement_cbm: 15.0
+release_status:
+  bl_surrendered: true
+  charges_paid: true
+  customs_status: Cleared
+  release_instruction: Deliver cargo to designated carrier upon presentation of this Delivery Order.

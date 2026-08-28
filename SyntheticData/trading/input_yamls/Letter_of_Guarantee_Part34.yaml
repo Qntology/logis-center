@@ -1,0 +1,35 @@
+document_type: Letter of Guarantee
+document_code: LG
+metadata:
+  lg_number: LG-SFO-20260909
+  issue_date: '2026-09-09'
+  related_bl_number: BL-55432219
+  related_invoice_number: CI-2026-08001
+  related_lc_number: LC-88492011
+  related_po_number: PO-99281A
+parties:
+  issuing_bank:
+    name: Bank of America
+    branch: San Francisco Main Branch
+    address: 456 Market St, San Francisco, CA 94104, USA
+  applicant_importer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+  carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+shipment_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  container_number: PONU1234567
+  seal_number: SEAL88990
+cargo_summary:
+  description_of_goods: Industrial Microcontrollers and Sensor Modules
+  packages: 50 PLTS
+  gross_weight_kg: 2500.0
+  invoice_value: 78500.0
+  currency: USD
+guarantee_terms:
+  reason: Delay in receipt of Original Bill of Lading
+  indemnity_statement: The undersigned issuing bank and applicant hereby agree to indemnify and hold harmless the carrier against any claims, losses, or costs arising from releasing the cargo without surrender of the original Bill of Lading.

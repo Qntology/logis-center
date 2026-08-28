@@ -1,0 +1,39 @@
+document_type: Air Waybill
+document_code: AWB
+metadata:
+  awb_number: AWB-180-99281014
+  issue_date: '2026-08-28'
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_lc_number: LC-88492011
+  freight_term: Freight Prepaid
+parties:
+  shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+    contact_number: +1-415-555-0199
+  issuing_carrier:
+    name: Korean Air Cargo
+    address: 260 Haneul-gil, Gangseo-gu, Seoul, South Korea
+flight_details:
+  flight_number: KE023
+  airport_of_departure: Incheon International Airport (ICN)
+  airport_of_destination: San Francisco International Airport (SFO)
+  departure_date: '2026-08-28'
+cargo_details:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers (Urgent Express Shipment)
+  number_of_pieces: 10
+  gross_weight_kg: 500.0
+  chargeable_weight_kg: 520.0
+  rate_class: Q
+  total_charge_usd: 2600.0
+summary:
+  total_pieces: 10
+  total_gross_weight_kg: 500.0
+  total_chargeable_weight_kg: 520.0
+  total_freight_charge_usd: 2600.0

@@ -1,0 +1,39 @@
+document_type: Shipping Request
+document_code: SR
+metadata:
+  sr_number: SR-2026-0820
+  issue_date: '2026-08-20'
+  related_po_number: PO-99281A
+  related_lc_number: LC-88492011
+  related_invoice_number: CI-2026-08001
+parties:
+  shipper:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5678
+  forwarder_carrier:
+    name: Pacific Ocean Lines
+    address: 789 Shipping Way, Oakland, CA 94607, USA
+shipping_details:
+  vessel_flight: OCEAN VOYAGER V.123E
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  estimated_time_of_departure_etd: '2026-08-28'
+  incoterms: FOB Busan
+cargo_details:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  quantity: 5000 PCS
+  packages: 30 PLTS
+  gross_weight_kg: 1500.0
+  measurement_cbm: 9.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  quantity: 2000 PCS
+  packages: 20 PLTS
+  gross_weight_kg: 1000.0
+  measurement_cbm: 6.0
+summary:
+  total_packages: 50 PLTS
+  total_gross_weight_kg: 2500.0
+  total_measurement_cbm: 15.0

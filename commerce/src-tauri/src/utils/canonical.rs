@@ -56,14 +56,31 @@ const NUM_PREFIX: &[&str] = &["rel_"];
 const NUM_SUFFIX: &[&str] = &[
     "_price", "_amount", "_fee", "_rate", "_count", "_qty", "_at",
     "_weight", "_volume", "_duration", "_limit", "_threshold", "_charges",
+    // 🌟 [UNIT / CURRENCY SUFFIX] 무역 서식은 값 이름에 단위를 붙이는 관례가 있습니다.
+    //    total_gross_weight_kg / measurement_cbm / entered_value_usd / amount_krw
+    //    이 넷은 기존 어느 규칙에도 걸리지 않아 Free 로 떨어졌고,
+    //    Dexie 에는 문자열, LanceDB 에는 숫자로 갈라져
+    //    where('data.xxx').between(...) 이 통째로 실패합니다.
+    //    ⚠️ main.ts 의 NUM_SUFFIX 와 반드시 같은 집합이어야 합니다.
+    "_kg", "_cbm", "_m3", "_usd", "_krw", "_eur", "_jpy", "_cny", "_gbp",
 ];
 const NUM_CONTAINS: &[&str] = &[
     "price", "amount", "quantity", "discount", "weight", "volume",
     "shipping_fee", "usage_", "threshold", "exchange_rate", "package_count",
     "local_charges", "number_of_",
+    // 🌟 [PACKAGE FAMILY] total_packages / packages_delivered / packages_received /
+    //    total_pieces / number_of_pieces 는 전부 개수입니다.
+    //    'package_count' 완전일치만 있어서 나머지가 전부 새고 있었습니다.
+    "packages", "pieces",
+    // 🌟 [MEASUREMENT / VALUE] measurement / premium / duty / dutiable / balance /
+    //    flash_point 는 값이 항상 수치입니다.
+    "measurement", "premium", "duty_", "dutiable", "balance", "flash_point",
+    "tare_weight", "chargeable",
 ];
 const NUM_EXACT: &[&str] = &[
     "width", "height", "length",
+    // 🌟 단독 명사형 수치 축
+    "premium", "rate", "debit", "credit", "dosage",
 ];
 const BOOL_PREFIX: &[&str] = &["is_", "has_", "allow_", "use_"];
 // 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
@@ -99,8 +116,10 @@ pub fn kind_of(key: &str) -> CanonKind {
     if NUM_SUFFIX.iter().any(|s| k.ends_with(s)) { return CanonKind::Numeric; }
 
     // 🌟 식별자를 수치보다 먼저 봅니다.
-    //    'doc_number' 는 NUM_SUFFIX 의 '_number' 에도 걸리지만
-    //    실제로는 'ABCD1234567' 같은 영숫자 혼합이므로 String 이어야 합니다.
+    //    'doc_number' / 'container_number' / 'seal_number' 는 ID_SUFFIX 의 '_number' 에 걸립니다.
+    //    실제 값이 'ABCD1234567' / 'MSCU1234567' 같은 영숫자 혼합이므로 String 이어야 합니다.
+    //    (NUM_SUFFIX 에는 '_number' 가 없습니다. 구버전 주석이 이를 잘못 적고 있었습니다)
+    //    반대로 'usance_tenor_days' 처럼 순수 수치인 축은 아래 NUM_CONTAINS 가 잡습니다.
     if ID_SUFFIX.iter().any(|s| k.ends_with(s)) { return CanonKind::Identifier; }
     if ID_CONTAINS.iter().any(|c| k.contains(c)) { return CanonKind::Identifier; }
 

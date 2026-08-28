@@ -38,14 +38,33 @@ const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin'
 const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
 const NUM_SUFFIX = [
     '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
-    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges'
+    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges',
+    // 🌟 [UNIT / CURRENCY SUFFIX] 무역 서식은 값 이름에 단위를 붙이는 관례가 있습니다.
+    //    total_gross_weight_kg / measurement_cbm / entered_value_usd / amount_krw
+    //    이 넷은 기존 어느 규칙에도 걸리지 않아 'free' 로 떨어졌고,
+    //    LanceDB 에는 Number, Dexie 에는 String 으로 갈라져
+    //    where('data.xxx').between(...) 이 통째로 실패했습니다.
+    //    ⚠️ canonical.rs 의 NUM_SUFFIX 와 반드시 같은 집합이어야 합니다.
+    '_kg', '_cbm', '_m3', '_usd', '_krw', '_eur', '_jpy', '_cny', '_gbp'
 ];
 const NUM_CONTAINS = [
     'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
     'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
-    'local_charges', 'number_of_'
+    'local_charges', 'number_of_',
+    // 🌟 [PACKAGE FAMILY] total_packages / packages_delivered / packages_received /
+    //    total_pieces / number_of_pieces 는 전부 개수입니다.
+    //    'package_count' 완전일치만 있어서 나머지가 전부 새고 있었습니다.
+    'packages', 'pieces',
+    // 🌟 [MEASUREMENT / VALUE] measurement / premium / duty / dutiable / balance /
+    //    flash_point 는 값이 항상 수치입니다.
+    'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
+    'tare_weight', 'chargeable'
 ];
-const NUM_EXACT = new Set(['width', 'height', 'length']);
+// 🌟 단독 명사형 수치 축. canonical.rs 의 NUM_EXACT 와 동일 집합입니다.
+const NUM_EXACT = new Set([
+    'width', 'height', 'length',
+    'premium', 'rate', 'debit', 'credit', 'dosage'
+]);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
 // 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
 //    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
@@ -231,12 +250,31 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
 
 // ── 무역 서식 코드 : app-logis-center 의 get_slice_config 분류 전량 ──
 //    ① 계약·결제 ② 선적·운송 ③ 통관·신고 ④ 검사·증명 ⑤ 특수·법무
+// 🌟 [TRADING DOC CODES v2] 27종 → 55종
+//
+//  ── 무엇이 문제였나 ──
+//   modeOfType() 은 이 목록에 없는 타입을 `return 'commerce'` 로 떨굽니다.
+//   그래서 HBL / SOA / TI / CDR / ICF / LLC 등 28종의 무역 서식이
+//   mode='commerce' 로 태깅되어 Trading 탭에서 통째로 사라졌습니다.
+//   TYPE_SETS.shipping 도 이 배열에서 파생되므로 타입 필터에서도 탈락하여
+//   두 탭 어디에서도 보이지 않는 고아 문서가 됩니다.
+//
+//  ⚠️ src-tauri/src/logic.rs 의 TRADE_GROUP_CODES 및
+//     bias_schema.rs 의 canonical_bias_type 매치 목록과 같은 집합이어야 합니다.
 const TRADING_DOC_CODES = [
-    'PO', 'PI', 'SC', 'LC',
-    'CI', 'PL', 'BL', 'AWB', 'SA', 'DO', 'AN', 'BC',
-    'ED', 'ID', 'CINV', 'CO',
-    'IC', 'WC', 'CA', 'PHYTO', 'HC', 'BEN_CERT',
-    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS'
+    // 계약 · 결제
+    'PO', 'PI', 'SC', 'LC', 'LLC', 'CP', 'BE', 'TR', 'LG', 'EL',
+    // 선적 · 운송
+    'CI', 'PL', 'BL', 'HBL', 'SWB', 'AWB', 'SA', 'DO', 'AN',
+    'BC', 'BK', 'SR', 'FCR', 'POD', 'CM', 'FI', 'WR',
+    // 통관 · 신고
+    'ED', 'ID', 'CINV', 'CO', 'CCC', 'CNM', 'CSI',
+    // 검사 · 증명
+    'IC', 'WC', 'CA', 'COA', 'PHYTO', 'PC', 'HC', 'BEN_CERT', 'FC', 'CDR',
+    // 특수 · 법무 · 보험
+    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS', 'IP', 'ICF',
+    // 정산
+    'SOA', 'DN', 'CN', 'TI'
 ];
 
 // 🌟 LLM 분류기는 대문자('BL')로, scheduler 의 page_type 은 소문자('tracking')로
@@ -754,9 +792,16 @@ async function fetchOAuthRegisteredSites(): Promise<void> {
         //    '세션이 실제로 성립한 응답' 일 때만 교체합니다.
         const authed = !!(cookies.email || cookies.client_id || cookies["#length"] !== undefined);
         if (!authed) {
+            // 🌟 [DIAGNOSTIC] 소멸 버그의 원인 추적용 상세 로그를 추가합니다.
+            //    cookies 가 완전히 비어 있으면 세션 블록 자체가 예외로 빠진 것이고,
+            //    일부만 비어 있으면 hash/token 쌍 불일치입니다.
+            const cookieKeys = Object.keys(cookies || {});
             console.warn(
                 "[OAUTH] ⚠️ 서버 세션이 성립하지 않아 목록을 갱신하지 않습니다. " +
-                "(hash/token 쌍 불일치 또는 IP 변경 가능성). 로컬 목록은 그대로 유지합니다."
+                `(hash='${(currentSession.hash || "").slice(0, 8)}...', ` +
+                `token 유무=${!!currentSession.token}, ` +
+                `응답 cookies 키=[${cookieKeys.join(", ")}]). ` +
+                "로컬 kv_store 목록은 그대로 유지합니다."
             );
             return;
         }
@@ -843,31 +888,41 @@ async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<
     }
 }
 
-/**
- * 🌟 [OAUTH SITES UI] 등록된 사이트 카드를 Pages 섹션에 렌더링합니다.
- *
- *  ── 왜 함수로 분리하는가 ──
- *   기존에는 renderNavigation() 의 `if (_pages.length === 0) { … } else { … }` 중
- *   'else' 안에만 있었습니다. analytic 모드에서 _pages 는 바로 위에서
- *   currentDomain 으로 필터되므로 대부분 0건이 되고, 그러면 조회도 렌더링도
- *   통째로 건너뛰었습니다. (등록 사이트가 화면에 아예 안 나오던 원인)
- *   분리해 두면 두 분기와 무관하게 항상 실행할 수 있습니다.
- */
+// 🌟 [OAUTH RENDER LOCK] 비동기 양보 구간에서 두 번째 renderNavigation()이
+//    끼어들어 insertAdjacentHTML 이 중복 실행되는 것을 차단합니다.
+let isOAuthSitesRendering = false;
+
 async function renderOAuthSitesUI(pageList: HTMLElement) {
     if (!pageList) return;
     if (currentSearchMode !== "analytic") return;
     if (!currentSession.email) return;
 
+    // 🌟 [CONCURRENT GUARD] 이미 렌더링 중이면 중복 진입을 즉시 차단합니다.
+    //    폴링(3초) + browser-match-found + syncAnalyticsData 가 동시에
+    //    renderNavigation() 을 발동하는 레이스 컨디션에서
+    //    insertAdjacentHTML 이 2회 실행되어 아이템이 복제되던 직접 원인입니다.
+    if (isOAuthSitesRendering) return;
+    isOAuthSitesRendering = true;
+
     try {
+        // 🌟 [IDEMPOTENT CLEANUP] 기존 .oauth-site-item 노드를 전부 제거합니다.
+        //    기존 코드는 insertAdjacentHTML("beforeend") 만 있어서
+        //    renderNavigation() 이 여러 번 호출될 때마다 노드가 누적되었습니다.
+        //    renderAccordion(tree) 가 pageList.innerHTML 을 교체하더라도,
+        //    그 '이후' 에 이 함수가 비동기로 실행되므로
+        //    이전 라운드의 노드가 남아 있을 수 있습니다.
+        const existingItems = pageList.querySelectorAll(".oauth-site-item");
+        if (existingItems.length > 0) {
+            existingItems.forEach((el: Element) => el.remove());
+        }
+
         // 🌟 [OAUTH SYNC] 렌더링 전 서버에서 최신 목록을 조회합니다.
         //    다른 기기에서 등록/삭제한 내역도 이 시점에 반영됩니다.
         await fetchOAuthRegisteredSites();
-
         const registeredSites = await kvGet("oauth_registered_sites") || [];
         if (!Array.isArray(registeredSites) || registeredSites.length === 0) return;
 
         let oauthHtml = '';
-
         for (let si = 0; si < registeredSites.length; si++) {
             const site = registeredSites[si];
             const siteHost = site.host || "";
@@ -881,42 +936,42 @@ async function renderOAuthSitesUI(pageList: HTMLElement) {
             } catch (_e) {}
 
             oauthHtml += `
-            <div class="oauth-site-item" id="${siteId}" style="position:relative; padding:6px 0; border-bottom:1px solid #f0f0f0;">
-                <div style="display:flex; align-items:center; gap:6px;">
-                    <span style="font-size:0.8rem; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${displayHost}</span>
-                    <button class="btn-oauth-more" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; font-style:italic; text-decoration:underline; color:#6366f1; padding:0 4px;">more</button>
-                    <button class="btn-oauth-hide" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; text-decoration:underline; color:#888; padding:0 4px;">hide</button>
-                </div>
-                <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
-                    <div><strong>Client Id:</strong> ${clientId}</div>
-                    <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
-                    <div style="margin-top:8px; text-align:right; display:flex; gap:6px; justify-content:flex-end;">
-                        <button class="btn-oauth-reissue" data-site-idx="${si}" style="background:none; border:1px solid #6366f1; color:#6366f1; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">재발급</button>
-                        <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
-                    </div>
-                </div>
-                <div class="oauth-site-stats" data-site-host="${siteHost}" style="margin-top:15px; border:1px solid #ddd; border-radius:8px; position:relative;">
-                    <span style="position:absolute; left: 8px; top: -5px; font-size:0.6rem; color:#999; font-weight:100; background:#fff; padding:0 4px;">시간별 접속량</span>
-                    <table style="width:100%; border-collapse:collapse;">
-                        <tbody>
-                            <tr>
-                                <td class="stat-hour" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">hour</span></cnt>
-                                </td>
-                                <td class="stat-day" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">day</span></cnt>
-                                </td>
-                                <td class="stat-week" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">week</span></cnt>
-                                </td>
-                                <td class="stat-month" style="padding:8px; width:25%; text-align:center;">
-                                    <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">month</span></cnt>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>`;
+<div class="oauth-site-item" id="${siteId}" style="position:relative; padding:6px 0; border-bottom:1px solid #f0f0f0;">
+    <div style="display:flex; align-items:center; gap:6px;">
+        <span style="font-size:0.8rem; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${displayHost}</span>
+        <button class="btn-oauth-more" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; font-style:italic; text-decoration:underline; color:#6366f1; padding:0 4px;">more</button>
+        <button class="btn-oauth-hide" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; text-decoration:underline; color:#888; padding:0 4px;">hide</button>
+    </div>
+    <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
+        <div><strong>Client Id:</strong> ${clientId}</div>
+        <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
+        <div style="margin-top:8px; text-align:right; display:flex; gap:6px; justify-content:flex-end;">
+            <button class="btn-oauth-reissue" data-site-idx="${si}" style="background:none; border:1px solid #6366f1; color:#6366f1; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">재발급</button>
+            <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
+        </div>
+    </div>
+    <div class="oauth-site-stats" data-site-host="${siteHost}" style="margin-top:15px; border:1px solid #ddd; border-radius:8px; position:relative;">
+        <span style="position:absolute; left: 8px; top: -5px; font-size:0.6rem; color:#999; font-weight:100; background:#fff; padding:0 4px;">시간별 접속량</span>
+        <table style="width:100%; border-collapse:collapse;">
+            <tbody>
+                <tr>
+                    <td class="stat-hour" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">hour</span></cnt>
+                    </td>
+                    <td class="stat-day" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">day</span></cnt>
+                    </td>
+                    <td class="stat-week" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
+                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">week</span></cnt>
+                    </td>
+                    <td class="stat-month" style="padding:8px; width:25%; text-align:center;">
+                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">month</span></cnt>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>`;
         }
 
         pageList.insertAdjacentHTML("beforeend", oauthHtml);
@@ -1055,6 +1110,10 @@ async function renderOAuthSitesUI(pageList: HTMLElement) {
         }
     } catch (oauthErr) {
         console.warn("[NAV] OAuth registered sites render failed:", oauthErr);
+    } finally {
+        // 🌟 [LOCK RELEASE] 예외 여부과 무관하게 락을 해제해야
+        //    다음 renderNavigation() 에서 재렌더링이 가능해집니다.
+        isOAuthSitesRendering = false;
     }
 }
 
@@ -1260,7 +1319,7 @@ let isExtracting = false;
 // 🚀 모델 다운로드 관련 상태 관리 변수 추가
 let modelStatus: Record<string, boolean> = {};
 const TARGET_MODELS = [
-    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite',
+    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
     'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
     'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
     'stanza_portuguese', 'stanza_dutch', 'stanza_russian', 'stanza_arabic',
@@ -1355,6 +1414,54 @@ async function runLocalEmbeddingSync() {
     }, 2000);
 }
 
+/**
+ * 🌟 [ANALYTIC BUBBLE DONE] 구조화 완료 후 채팅 화면에 남아 있는
+ *    analytic_sync 관련 말풍선들을 전부 Done(9) 상태로 전환합니다.
+ *
+ *  ── 무엇이 문제였나 ──
+ *   구조화 진행 중에는 renderProgressToUI 가 "Extracting data (100%)..."
+ *   같은 중간 상태로 말풍선을 갱신합니다. 그런데 구조화가 끝나면
+ *   더 이상 해당 task_id 로 이벤트가 오지 않아
+ *   data-status="1" (PROCESSING) + 스피너가 영원히 멈춰 있습니다.
+ *
+ *  ── 처리 대상 ──
+ *   · analytic_sync_sem_*  (개별 이벤트 구조화)
+ *   · analytic_sync         (흐름 리포트 합성)
+ *   · analytic_sync_flow    (cross_action_flow)
+ *   이 세 접두사로 시작하는 모든 .task-bubble 을 잡습니다.
+ */
+async function finalizeAnalyticBubbles(processedCount: number): Promise<void> {
+    if (!chatTalks) return;
+    const bubbles = chatTalks.querySelectorAll('.chat-talk.task-bubble') as NodeListOf<HTMLElement>;
+    let finalized = 0;
+    for (const el of Array.from(bubbles)) {
+        const taskId = el.dataset.taskId || el.id || "";
+        // analytic_sync 로 시작하는 말풍선만 대상
+        if (!taskId.startsWith("analytic_sync")) continue;
+        const status = parseInt(el.dataset.status || "0");
+        // 이미 완료/에러/정지된 것은 건드리지 않음
+        if ([2, 3, 6, 9].includes(status)) continue;
+        // status → 9 (Done)
+        el.dataset.status = "9";
+        const contentEl = el.querySelector('.content') as HTMLElement;
+        if (contentEl) {
+            contentEl.textContent = `Analytic structuring complete (${processedCount} event(s)).`;
+        }
+        const statusBar = el.querySelector('.status-bar') as HTMLElement;
+        if (statusBar) {
+            statusBar.style.color = "#22c55e";
+            statusBar.innerHTML = `<span>✅</span> DONE`;
+        }
+        // active-spinner 클래스 제거
+        const spinner = el.querySelector('.active-spinner') as HTMLElement;
+        if (spinner) spinner.classList.remove('active-spinner');
+        finalized++;
+    }
+    if (finalized > 0) {
+        console.log(`[ANALYTIC] ✅ ${finalized}개의 구조화 말풍선을 Done 상태로 전환했습니다.`);
+    }
+}
+
 // =====================================================================
 // 🌟 [ANALYTIC STRUCTURING] 원시 행동 로그(HTML) → 시맨틱 문장 확정
 // ---------------------------------------------------------------------
@@ -1370,16 +1477,62 @@ async function runAnalyticStructuring(): Promise<number> {
     if (isSearching || isExtracting || GlobalTaskManager.isBusy) return 0;
 
     isAnalyticStructuring = true;
+
     try {
         const res = await invoke<any>("structure_pending_analytics", {
             limit: 20,
-            devicePreference: getDevicePref()
+            devicePreference: getDevicePref(),
         });
 
-        const processed = (res && res.processed) ? res.processed : 0;
+        const processed = res && res.processed ? res.processed : 0;
 
         if (processed > 0) {
-            console.log(`[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`);
+            console.log(
+                `[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`
+            );
+
+            // 🌟 [DEXIE SYNC] 구조화 후 프론트엔드 Dexie의 updated_at을 갱신합니다.
+            //    기존에는 Rust LanceDB만 updated_at = now_ts로 갱신하고,
+            //    프론트엔드 Dexie는 갱신하지 않아 다음 폴링에서
+            //    '로컬 0 < 서버 updated_at'이 성립하여 구조화 데이터를
+            //    서버 원시 데이터로 덮어쓰는 무한 루프가 발생했습니다.
+            //    이제 Dexie에서 summary가 있는(=구조화 완료) 항목의
+            //    updated_at을 현재 시각으로 갱신하여
+            //    다음 폴링에서 '이미 처리 완료'로 판단되게 합니다.
+            if (appDb) {
+                try {
+                    const nowTs = Date.now();
+                    const rows = await appDb
+                        .table("items")
+                        .where("mode")
+                        .equals("analytic")
+                        .filter((r: any) => Number(r.updated_at || 0) === 0)
+                        .toArray();
+
+                    for (const r of rows) {
+                        if (
+                            r.data &&
+                            (r.data.summary ||
+                                (typeof r.data.action === "string" && r.data.action))
+                        ) {
+                            await appDb
+                                .table("items")
+                                .where("id")
+                                .equals(r.id)
+                                .modify({
+                                    updated_at: nowTs,
+                                    "data.updated_at": nowTs,
+                                });
+                        }
+                    }
+                    console.log(
+                        `[ANALYTIC] Dexie updated_at 갱신 완료 (후보 ${rows.length}건)`
+                    );
+                } catch (e) {
+                    console.warn("[ANALYTIC] Dexie updated_at sync failed:", e);
+                }
+            }
+
             if (currentSearchMode === "analytic") {
                 await renderNavigation();
                 if (currentTab === "list") {
@@ -1431,6 +1584,52 @@ async function runAnalyticStructuring(): Promise<number> {
 
 let isAnalyticsSyncRunning = false;
 let lastAnalyticsSyncAt = 0;
+
+// =====================================================================
+// 🌟 [ADAPTIVE POLLING / BACKOFF] 동일 데이터 반복 동기화 방지
+// ---------------------------------------------------------------------
+//  연속으로 '변경 없음' 이 감지되면 폴링 간격을 1.5배씩 늘립니다.
+//  실제 변경이 오면 즉시 기본 간격(3초)으로 리셋합니다.
+//  최대 30초를 넘기지 않습니다.
+// =====================================================================
+const SYNC_BASE_INTERVAL_MS = 3_000;   // 기본 폴링 간격
+const SYNC_BACKOFF_FACTOR = 1.5;       // 증가 배수
+const SYNC_MAX_INTERVAL_MS = 30_000;   // 최대 간격
+let syncConsecutiveNoChange = 0;       // 연속 '변경 없음' 카운터
+let syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS; // 현재 적용 중인 간격
+
+/**
+ * 🌟 폴링 간격을 계산합니다.
+ *  변경 없음 카운터가 올라갈수록 1.5배씩 증가, 최대 30초.
+ */
+function computeSyncInterval(): number {
+    if (syncConsecutiveNoChange === 0) return SYNC_BASE_INTERVAL_MS;
+    const interval = SYNC_BASE_INTERVAL_MS * Math.pow(SYNC_BACKOFF_FACTOR, syncConsecutiveNoChange);
+    return Math.min(interval, SYNC_MAX_INTERVAL_MS);
+}
+
+/**
+ * 🌟 동기화 결과에 따라 백오프 상태를 갱신합니다.
+ * @param hasChange 실제 데이터 변경이 있었는지 여부
+ */
+function updateSyncBackoff(hasChange: boolean): void {
+    if (hasChange) {
+        if (syncConsecutiveNoChange > 0) {
+            console.log(
+                `[SYNC-BACKOFF] 🔄 변경 감지. 폴링 간격을 ${syncCurrentIntervalMs}ms → ${SYNC_BASE_INTERVAL_MS}ms 로 리셋합니다.`
+            );
+        }
+        syncConsecutiveNoChange = 0;
+        syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS;
+    } else {
+        syncConsecutiveNoChange++;
+        syncCurrentIntervalMs = computeSyncInterval();
+        console.log(
+            `[SYNC-BACKOFF] ⏳ 변경 없음 (${syncConsecutiveNoChange}회 연속). ` +
+            `다음 폴링까지 ${syncCurrentIntervalMs}ms 대기합니다.`
+        );
+    }
+}
 
 /**
  * 🌟 [ORIGIN RESOLUTION] 이벤트를 조회할 '추적 대상 사이트' 목록을 확정합니다.
@@ -1686,15 +1885,23 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
     } catch (e) {}
 
     let skipped = 0;
-
     for (let i = 0; i < response.results.length; i++) {
         const row = response.results[i];
         if (!row || !row.id) continue;
 
         const serverUpdated = Number(row.updated_at || 0);
         const localUpdated = localMap.get(String(row.id));
+
         if (localUpdated !== undefined && serverUpdated <= localUpdated) {
             skipped++;
+            continue;
+        }
+
+        if (localUpdated !== undefined && localUpdated > 0) {
+            skipped++;
+            console.log(
+                `[SYNC-ANALYTIC] ⚪ '${row.id}' 는 이미 구조화 완료되어 서버 원시 데이터로 덮어쓰지 않습니다.`
+            );
             continue;
         }
 
@@ -1819,11 +2026,15 @@ async function syncAnalyticsData() {
                     await loadMoreDocs(false, true);
                 }
             }
-
             // 🌟 [STRUCTURE FIRST] 원시 outerHTML 을 먼저 시맨틱 문장으로 확정합니다.
             //    이 단계가 끝나야 text 가 채워지고, 그때서야 임베딩이 의미를 갖습니다.
-            await runAnalyticStructuring();
-
+            const structuredCount = await runAnalyticStructuring();
+            // 🌟 [STRUCTURE BUBBLE DONE] 구조화 말풍선들을 완료 처리합니다.
+            //    analytic_sync_sem_* / analytic_sync / analytic_sync_flow 가
+            //    status=1(PROCESSING) 에서 영원히 멈춰 있는 것을 방지합니다.
+            if (structuredCount > 0) {
+                await finalizeAnalyticBubbles(structuredCount);
+            }
             // 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않으므로 로컬에서 즉시 임베딩합니다.
             runLocalEmbeddingSync();
         } else {
@@ -1832,6 +2043,7 @@ async function syncAnalyticsData() {
             //    (LLM 로드 비용은 대상 0건일 때 백엔드가 probe 단계에서 차단합니다)
             const structured = await runAnalyticStructuring();
             if (structured > 0) {
+                await finalizeAnalyticBubbles(structured);
                 runLocalEmbeddingSync();
             }
         }
@@ -1844,6 +2056,15 @@ async function syncAnalyticsData() {
         isAnalyticsSyncRunning = false;
         lastAnalyticsSyncAt = Date.now();
         if (!isExtracting && !isSearching) stopSpinner();
+        // 🌟 [SYNC DONE → SUBMIT RESTORE] syncData 와 동일하게 검색 버튼 상태를 복원합니다.
+        if (btnSubmit) {
+            const currentVal = searchInput?.value.trim() || "";
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
     }
 }
 
@@ -1855,7 +2076,10 @@ async function syncAnalyticsData() {
 async function syncAnalyticsInBackground() {
     if (!currentSession.hash) return;
     if (isAnalyticsSyncRunning) return;
-    if (Date.now() - lastAnalyticsSyncAt < 30_000) return;
+    // 🌟 [ADAPTIVE THROTTLE] 기존 고정 30초 대신 백오프 간격을 적용합니다.
+    //    기본 3초에서 시작해 변경 없음이 연속되면 1.5배씩 증가, 최대 30초.
+    const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
+    if (Date.now() - lastAnalyticsSyncAt < throttleMs) return;
     await syncAnalyticsData();
 }
 
@@ -2007,12 +2231,29 @@ async function syncCommerceInBackground() {
                         }
                     }
                 }
+                // 🌟 [BACKOFF RESET] 백그라운드 commerce 동기화에서 변경이 있었으므로 리셋합니다.
+                updateSyncBackoff(true);
                 console.log(`[SYNC-BG] Commerce D1 background sync: ${filteredResults.length} item(s)`);
                 await invoke("upsert_items", { items: filteredResults });
+                // 🌟 [PAGE CACHE GUARD] syncData 와 동일한 규칙으로 페이지 셀렉터 캐시를 분리합니다.
+                //    기존에는 node / item 체크 없이 type 만으로 필터링하여
+                //    { table:'pages', type:'tracking', node:1, item:true } 문서를
+                //    items 테이블에 잘못 저장했습니다.
+                //    (로그: "[DEBUG] Syncing item - ID: , Type: tracking" 의 직접 원인)
+                const bgNewPages = filteredResults.filter((r: any) => {
+                    if (r.table === "pages" || r.table === "page") return true;
+                    if (r.type === "pages" || r.type === "page") return true;
+                    const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
+                    return !!d.node || !!d.item;
+                });
+                if (bgNewPages.length > 0 && appDb) {
+                    await appDb.table("pages").bulkPut(normalizeEnvelope(bgNewPages)).catch(() => null);
+                }
                 const newItems = filteredResults.filter((r: any) =>
                     r.type !== "team" && r.type !== "user" && r.type !== "member"
                     && r.type !== "pages" && r.type !== "page"
                     && r.type !== "talk" && r.table !== "talks"
+                    && !bgNewPages.includes(r)
                 );
                 if (newItems.length > 0 && appDb) {
                     await appDb.table("items").bulkPut(normalizeEnvelope(newItems)).catch(() => null);
@@ -2028,6 +2269,9 @@ async function syncCommerceInBackground() {
         console.warn("[SYNC-BG] Commerce background sync failed:", e);
     } finally {
         isCommerceSyncRunning = false;
+        // 🌟 [BACKOFF] 백그라운드 commerce 동기화에서 변경이 없었으면
+        //    syncData 의 백오프 카운터가 이미 갱신되어 있으므로 여기서는 추가 처리 불필요.
+        //    (syncData 가 filteredResults 판정으로 updateSyncBackoff 를 호출합니다)
     }
 }
 
@@ -2093,10 +2337,30 @@ const ITEMS_SCHEMA = [
     //     logic::trading_index_column() 이 만드는 crc32 숫자 인덱스 컬럼으로,
     //     'BL 하나로 연결된 CI/PL 전부 조회' 를 O(log n) 으로 처리합니다.
     //     문자열 doc_number 를 그대로 쓰면 표기 흔들림(대소문자/하이픈)에 매번 어긋납니다.
-    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-    'data.rel_ed', 'data.rel_id', 'data.rel_cinv',
+    //  ⑤-1 🌟 [TRADING INDEX RELAY] ...
+    //     ⚠️ logic.rs 의 trading_index_column() 은 'rel_{소문자}' 를 45종 전부에 대해
+    //        생성합니다. 여기 없는 축은 인덱스 없이 .filter() 풀스캔으로 떨어집니다.
+    //        (동작은 하지만 문서가 늘수록 느려집니다)
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    //  ⑤-2 🌟 [BASE v2 신규 축] bias.json trade_schema.base v2 에서 추가된 조회 축입니다.
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', 'data.type_size', 'data.hs_code',
     //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
     //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
     //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
@@ -2122,7 +2386,13 @@ const ITEMS_SCHEMA = [
 //
 //  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
 //     업그레이드 시점에 삭제합니다. 아래에는 v12 의 전 테이블이 그대로 포함되어 있습니다.
-appDb.version(13).stores({
+// 🌟 v14 : trading 인덱스 축 확장 (rel_* 45종 + base v2 신규 축)
+//  스토어 구조는 v13 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
+//  → upgrade 콜백이 필요 없습니다.
+//
+//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
+//     업그레이드 시점에 삭제합니다. 아래에는 v13 의 전 테이블이 그대로 포함되어 있습니다.
+appDb.version(14).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
     ts_queue: 'taskId, type',
@@ -2370,11 +2640,29 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
     // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
-    //    여기에 없으면 선언한 인덱스가 한 번도 쓰이지 않고 .filter() 풀스캔으로 떨어집니다.
-    'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-    'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-    'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+    //    ⚠️ 여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이
+    //       where('없는경로') 를 호출해 Dexie 가 SchemaError 를 던집니다.
+    //       (executeDexiePlan 의 INDEX FALLBACK 이 흡수하지만 매번 예외 비용이 듭니다)
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    // 🌟 [BASE v2 신규 축]
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', 'data.type_size', 'data.hs_code'
 ]);
 
 interface DexieCondition {
@@ -2475,10 +2763,21 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
         'data.doc_number', 'data.container_number', 'data.seal_number',
         'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
         // ── 🌟 trading 인덱스 참조 : crc32 숫자라 카디널리티가 최상입니다 ──
-        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+        //    DEXIE_INDEXED_PATHS 의 rel_* 전량과 동일 집합입니다.
+        'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+        'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+        'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+        'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+        'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+        'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+        'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+        'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+        'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+        'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+        // 🌟 [BASE v2 참조 축] 문서번호와 동급의 카디널리티를 갖습니다.
+        'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+        'data.reference_master_bl', 'data.reference_sr'
     ];
 
     let best: DexieCondition | null = null;
@@ -2816,20 +3115,43 @@ class GlobalTaskManager {
     static async forceReset() {
         this.isBusy = false;
         this.currentTaskId = null;
-        this.currentTaskPayload = null; 
+        this.currentTaskPayload = null;
         this.activeRefs.clear();
         this.queue = [];
         this.backendQueued = []; // 🌟 전체 초기화 반영
-        
-        // 🌟 Dexie DB 완전 초기화 (모든 테이블 비우기)
+        // 🌟 Dexie DB 초기화 (세션/설정 키는 보존)
         try {
             await appDb.table("ts_queue").clear();
-            await appDb.table("kv_store").clear();
-            console.log("[QUEUE] Dexie DB tables fully cleared.");
+            // 🌟 [SESSION PRESERVE] kv_store 를 통째로 clear() 하면
+            //    chat_session(로그인 세션), search_mode, hidden_pages,
+            //    my_sync_seed, oauth_registered_sites 등 사용자 상태가
+            //    전부 소멸하여 앱 재시작 시 로그인이 풀립니다.
+            //    '작업 큐/락/터미널 로그' 관련 키만 선택적으로 삭제합니다.
+            //
+            //    ⚠️ btn-reset-db 경로는 이 함수 호출 '직후' 에
+            //       appDb.delete() 로 Dexie DB 자체를 물리 삭제하므로
+            //       여기서 보존해도 완전 초기화에는 영향이 없습니다.
+            const PRESERVE_KEYS = new Set([
+                "chat_session",
+                "search_mode",
+                "hidden_pages",
+                "my_sync_seed",
+                "oauth_registered_sites",
+                "oauth_client_address",
+                "item_tombstones",
+                "schema_v4_notified",
+                "force_cpu_mode"
+            ]);
+            const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+            for (const key of allKeys) {
+                if (typeof key === "string" && !PRESERVE_KEYS.has(key)) {
+                    await appDb.table("kv_store").delete(key);
+                }
+            }
+            console.log("[QUEUE] Dexie DB tables cleared (session keys preserved).");
         } catch (e) {
             console.error("[QUEUE] Dexie DB clear error:", e);
         }
-
         // 🌟 LanceDB 전면 초기화 호출 (새로고침 전에 백엔드 초기화가 완료되도록 대기)
         try {
             await invoke("reset_lancedb");
@@ -4196,6 +4518,11 @@ async function renderNavigation() {
         }
 
         if (_pages.length === 0) {
+            // 🌟 [OAUTH CLEANUP] innerHTML 교체 전에 잔존 oauth 노드를 명시적으로 제거합니다.
+            //    innerHTML = "" 자체가 전부 지우지만, 비동기 레이스에서
+            //    이전 라운드의 insertAdjacentHTML 이 이 할당 '이후' 에 도착하는
+            //    윈도우를 원천 차단하기 위해 쿼리로도 한 번 제거합니다.
+            pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
             // 🌟 [CRITICAL FIX] 데이터가 없더라도 Commerce/Analytic 모드이면 "비어있음" 문구가 노출되도록 통일
             if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
@@ -4315,6 +4642,8 @@ async function renderNavigation() {
             }
 
             // 3. Render
+            // 🌟 [OAUTH CLEANUP] renderAccordion 이전에도 잔존 노드를 제거합니다.
+            pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = await renderAccordion(tree);
 
             // 🌟 [OAUTH SITES] 등록 사이트 렌더링은 renderOAuthSitesUI() 로 분리했습니다.
@@ -4866,6 +5195,7 @@ async function syncData() {
             }
 
             if (filteredResults.length > 0) {
+                updateSyncBackoff(true);
                 // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
                 //    mode 는 '동기화 시점에 클라이언트가 확정하는 값' 이며,
                 //    판정은 파일 상단의 modeOfType() 단일 함수가 전담합니다.
@@ -4968,6 +5298,8 @@ async function syncData() {
                 // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
                 // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
             } else {
+                updateSyncBackoff(false);
+                
                 console.log(`[SYNC] 2. 변경된 데이터가 없어 DB 쓰기를 건너뜁니다.`);
             }
 
@@ -5037,14 +5369,21 @@ async function syncData() {
             }
 
             console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
-            // 3. LanceDB 불러오기
-            await renderNavigation();
-            
-            // 🌟 [CRITICAL FIX] 서버 데이터를 로컬 DB에 밀어넣었으니, 현재 보고 있는 탭에 맞춰 UI를 갱신합니다!
-            if (currentTab === "list") {
-                await loadMoreDocs(false, true); 
-            } else if (currentTab === "settings") {
-                await fetchChatHistory(false, true);
+            // 🌟 [RENDER GATE] 변경된 데이터가 없으면 네비게이션/리스트 재렌더링을 건너뜁니다.
+            //    기존에는 매 폴링마다 renderNavigation + loadMoreDocs 가 돌아
+            //    동일 데이터를 반복 적재하고 콘솔 로그를 낭비했습니다.
+            if (filteredResults.length > 0) {
+                // 3. LanceDB 불러오기
+                await renderNavigation();
+
+                // 🌟 [CRITICAL FIX] 서버 데이터를 로컬 DB에 밀어넣었으니, 현재 보고 있는 탭에 맞춰 UI를 갱신합니다!
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                } else if (currentTab === "settings") {
+                    await fetchChatHistory(false, true);
+                }
+            } else {
+                console.log("[SYNC] 3. 변경 없음 → 네비게이션/리스트 재렌더링을 건너뜁니다.");
             }
 
             // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
@@ -5054,10 +5393,22 @@ async function syncData() {
             runLocalEmbeddingSync();
         }
         
-    } catch (e) { 
-        console.error("[SYNC] 동기화 실패:", e); 
+    } catch (e) {
+        console.error("[SYNC] 동기화 실패:", e);
     } finally {
         if (!isExtracting && !isSearching) stopSpinner();
+        // 🌟 [SYNC DONE → SUBMIT RESTORE] 동기화가 끝나면 검색 입력 상태를 재평가합니다.
+        //    기존에는 stopSpinner() 내부에서만 조건부로 노출했지만,
+        //    syncData 가 백그라운드에서 돌 때 btnSubmit 이 숨겨진 채
+        //    복귀하지 않는 경로가 있었습니다.
+        if (btnSubmit) {
+            const currentVal = searchInput?.value.trim() || "";
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
     }
 }
 
@@ -5100,6 +5451,19 @@ function applySearchModeUI() {
     const existingOAuthBtn = document.getElementById("btn-oauth-register");
     if (existingOAuthBtn && currentSearchMode !== "analytic") {
         existingOAuthBtn.remove();
+    }
+
+    // 🌟 [OAUTH SITE NODE CLEANUP] 모드 전환 시점에 페이지 목록에 남아 있는
+    //    .oauth-site-item 노드를 즉시 제거합니다.
+    //    기존에는 renderNavigation() 의 pageList.innerHTML 교체 시점까지
+    //    노드가 잔존하다가, renderOAuthSitesUI 가 조기 탈락하면
+    //    다음 renderAccordion 에서 삭제되어 '갑자기 사라짐' 이 발생했습니다.
+    //    여기서 명시적으로 지우면 모드 전환 직후 화면이 깨끗하게 정리됩니다.
+    if (currentSearchMode !== "analytic") {
+        const pageListEl = document.getElementById("nav-list-pages");
+        if (pageListEl) {
+            pageListEl.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
+        }
     }
 
     // 🌟 [OAUTH REGISTER BUTTON RESTORE] analytic 모드로 재전환 시 버튼이 없으면 재생성합니다.
@@ -5167,12 +5531,22 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         applySearchModeUI();
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
-        await refreshList(); 
+        // 🌟 [BACKOFF RESET] 사용자가 탭을 전환하면 즉시 폴링을 기본 간격으로 리셋합니다.
+        syncConsecutiveNoChange = 0;
+        syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS;
+        await refreshList();
+
+        await refreshList();
 
         // 🌟 [IMMEDIATE PULL] analytic 으로 전환했으면 폴링 주기를 기다리지 않고 즉시 1회 당겨옵니다.
         if (currentSearchMode === "analytic" && currentSession.hash) {
             lastAnalyticsSyncAt = 0; // 스로틀 해제
             syncAnalyticsData();
+        }
+
+        const _isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+        if (currentSearchMode === "analytic" && currentSession.email && !_isSettingsOpen) {
+            await renderNavigation();
         }
     });
 });
@@ -7134,6 +7508,36 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
+listen("app_error_alert", async (event: any) => {
+    const payload = event.payload as any;
+    // 🌟 Settings 탭 자동 열기 + 다운로드 시작
+    if (payload.action === "open_settings") {
+        // 1. 리스트 탭 열기 (설정 패널은 리스트 탭 내부에 있음)
+        openWidget("list");
+        // 2. Settings 패널 내 체크박스 켜기 (설정 패널 보이게)
+        const toggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (toggle) {
+            if (!toggle.checked) {
+                toggle.checked = true;
+            }
+            toggle.dispatchEvent(new Event("change"));
+        }
+        // 3. 모델 목록 렌더링 후 다운로드 시작
+        if (payload.model) {
+            console.log(`[AUTO-DL] ${payload.model} 자동 다운로드 시작...`);
+            try {
+                await invoke("download_model", { modelName: payload.model });
+                console.log(`[AUTO-DL] ${payload.model} 다운로드 명령 전송 완료`);
+            } catch (e) {
+                console.error(`[AUTO-DL] ${payload.model} 다운로드 실패:`, e);
+            }
+        }
+    } else {
+        // 기본 폴백: 기존 alert 동작
+        alert(payload.message || "알 수 없는 오류가 발생했습니다.");
+    }
+});
+
 listen("task-console-log", async (event: any) => {
     const { task_id, text } = event.payload;
     const key = `term_${task_id}`;
@@ -8351,20 +8755,20 @@ function startPolling() {
         clearTimeout(chatPollInterval);
         chatPollInterval = null;
     }
-    if (!isFocus) return; 
-    
+    if (!isFocus) return;
+
     const poll = async () => {
-        if (!isFocus) return; 
-        
+        if (!isFocus) return;
+
         // 히스토리(Settings) 창이 열려있을 때만 서버에 인증/동기화 요청을 보냅니다!
         if (currentTab === "settings" && isExpanded) {
             try {
                 if (!currentSession.email) {
                     await checkAuthStatus();
                 } else {
-                    // 🌟 [CRITICAL FIX] 로컬 DB만 조회하던 fetchChatHistory 대신, 
+                    // 🌟 [CRITICAL FIX] 로컬 DB만 조회하던 fetchChatHistory 대신,
                     // front.js와 동일하게 실제 서버와 통신하는 syncData를 호출해야 합니다!
-                    await syncData(); 
+                    await syncData();
                 }
             } catch (e) {
                 console.error("[POLLING] Error during poll:", e);
@@ -8384,15 +8788,17 @@ function startPolling() {
             }
         }
 
-        // 🌟 [핵심] Rust 백엔드(proxy_fetch)의 응답을 완전히 받은 후, 
-        // 여전히 앱이 포커스 상태라면 다시 3초를 대기하고 다음 폴링을 예약합니다.
+        // 🌟 [ADAPTIVE POLLING] 고정 3초 대신 백오프 간격을 적용합니다.
+        //    변경이 있으면 3초, 연속 변경 없음이면 4.5초 → 6.75초 → ... → 최대 30초.
+        const nextInterval = computeSyncInterval();
         if (isFocus) {
-            chatPollInterval = window.setTimeout(poll, 3000);
+            chatPollInterval = window.setTimeout(poll, nextInterval);
         }
     };
 
-    // 첫 시작 시 3초 대기 후 실행
-    chatPollInterval = window.setTimeout(poll, 3000);
+    // 첫 시작 시 현재 간격으로 대기 후 실행
+    const initialInterval = computeSyncInterval();
+    chatPollInterval = window.setTimeout(poll, initialInterval);
 }
 
 
@@ -8555,11 +8961,25 @@ async function initSession() {
             const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
             // 🌟 2. DB엔 없어도 TS Queue에 남아있는 녀석은 아직 Rust로 안 넘어간 정당한 대기열입니다.
             const isPendingInQueue = GlobalTaskManager.queue.some(q => q.taskId === currentLockId);
-            
             if (!isTaskStillAlive && !isPendingInQueue) {
                 console.log(`[LOCK] Zombie detected: ${currentLockId} is not active in Backend or Queue. Releasing.`);
                 await kvRemove("sys_lock");
-                await GlobalTaskManager.forceReset();
+                // 🌟 [SESSION PRESERVE] 기존에는 여기서 forceReset() 을 호출하여
+                //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
+                //    Zombie lock 해제는 락과 큐 상태만 정리하면 충분합니다.
+                //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
+                GlobalTaskManager.isBusy = false;
+                GlobalTaskManager.currentTaskId = null;
+                GlobalTaskManager.currentTaskPayload = null;
+                GlobalTaskManager.activeRefs.clear();
+                GlobalTaskManager.queue = [];
+                GlobalTaskManager.backendQueued = [];
+                try {
+                    await appDb.table("ts_queue").clear();
+                } catch (e) {
+                    console.warn("[LOCK] ts_queue clear failed:", e);
+                }
+                console.log("[LOCK] Zombie lock released. Session and settings preserved.");
             } else {
                 console.log(`[LOCK] Valid task detected: ${currentLockId}. Keeping lock.`);
                 if (currentLockId.startsWith("search_")) isSearching = true;
@@ -8735,8 +9155,11 @@ async function initSession() {
             }
 
             const alreadyNotified = await kvGet("schema_v4_notified");
-
-            if (needsRestore && !alreadyNotified) {
+            // 🌟 [LOGIN GATE] 로그아웃 상태에서는 복원을 수행하지 않습니다.
+            //    로그아웃 후 앱 재시작 시 이전 계정 데이터가 복원되어
+            //    로그아웃의 의미가 사라지고, 미로그인 상태에서 서버 데이터가 섞입니다.
+            //    (로그 실측: 로그아웃 직후 upsert_items 3건이 SCHEMA RESTORE 에서 발생)
+            if (needsRestore && !alreadyNotified && currentSession.email) {
                 await kvSet("schema_v4_notified", "true");
                 console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local index needs re-population.");
 
@@ -9029,20 +9452,99 @@ listen("download_error", (event: any) => {
     alert(`Error downloading ${payload.model}: ${payload.error}`);
 });
 
-// 🌟 [추가] 임베딩 모델 등 필수 파일 누락 시 알림 및 탭 이동 처리
-let hasAlertedMissingModel = false;
-listen("app_error_alert", (event: any) => {
-    if (!hasAlertedMissingModel) {
-        hasAlertedMissingModel = true;
-        alert(event.payload.message);
+
+// 🌟 [MODEL STATUS UI] 모델 상태를 화면에 렌더링하는 함수
+function renderModelStatusUI(status: any) {
+    const models: Array<{ key: string; label: string }> = [
+        { key: "Qwen3", label: "Qwen3 (0.6B)" },
+        { key: "Qwen3.5", label: "Qwen3.5 (2B)" },
+        { key: "Granite", label: "Granite Embedding" },
+        { key: "Embedding", label: "Embedding Model" },
+        { key: "SigLIP2", label: "SigLIP2 Vision" },
+    ];
+    
+    // 기존 컨테이너 초기화
+    const container = document.getElementById("model-list-container");
+    if (container) {
+        container.innerHTML = "";
         
-        // 다운로드 UI가 있는 세팅 탭으로 즉시 화면 자동 전환
-        openWidget("settings"); 
-        
-        // 검색창 입력 등 연속 호출로 인한 무한 팝업 스팸을 막기 위해 10초간 방어
-        setTimeout(() => { hasAlertedMissingModel = false; }, 10000); 
+        models.forEach(({ key, label }) => {
+            const isDownloaded = status[key] === true;
+            const row = document.createElement("div");
+            row.style.cssText = `
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            `;
+            
+            const labelSpan = document.createElement("span");
+            labelSpan.textContent = label;
+            labelSpan.style.cssText = `
+                font-size: 0.75rem;
+                color: ${isDownloaded ? "#4ade80" : "#999"};
+            `;
+            
+            const safeId = key.replace(/[\s\(\)]+/g, '-');
+
+            const statusBtn = document.createElement("button");
+            statusBtn.id = `btn-download-${safeId}`;
+            statusBtn.textContent = isDownloaded ? "Downloaded" : "Download";
+            statusBtn.style.cssText = `
+                padding: 4px 8px;
+                font-size: 0.65rem;
+                border-radius: 4px;
+                border: none;
+                cursor: ${isDownloaded ? "default" : "pointer"};
+                background: ${isDownloaded ? "#6c757d" : "#28a745"};
+                color: white;
+            `;
+            if (!isDownloaded) {
+                statusBtn.onclick = () => {
+                    console.log(`[AUTO-DL] ${key} 다운로드 시작...`);
+                    statusBtn.innerText = "Downloading...";
+                    statusBtn.disabled = true;
+                    statusBtn.style.background = "#6c757d";
+                    const pc = document.getElementById(`progress-container-${safeId}`);
+                    if (pc) pc.style.display = "block";
+                    invoke("download_model", { modelName: key }).then(() => {
+                        invoke("check_model_status").then((newStatus) => {
+                            renderModelStatusUI(newStatus);
+                        });
+                    });
+                };
+            }
+
+            // 🌟 [추가] 프로그레스 바 컨테이너 및 바 생성
+            const progContainer = document.createElement("div");
+            progContainer.id = `progress-container-${safeId}`;
+            progContainer.style.width = "100%";
+            progContainer.style.background = "rgba(0,0,0,0.1)";
+            progContainer.style.marginTop = "6px";
+            progContainer.style.borderRadius = "4px";
+            progContainer.style.display = "none";
+
+            const progBar = document.createElement("div");
+            progBar.id = `progress-bar-${safeId}`;
+            progBar.style.height = "8px";
+            progBar.style.width = "0%";
+            progBar.style.background = "#007bff";
+            progBar.style.borderRadius = "4px";
+            progBar.style.fontSize = "6px";
+            progBar.style.color = "white";
+            progBar.style.textAlign = "center";
+            progBar.style.lineHeight = "8px";
+
+            progContainer.appendChild(progBar);
+
+            row.appendChild(labelSpan);
+            row.appendChild(statusBtn);
+            row.appendChild(progContainer);
+            container.appendChild(row);
+        });
     }
-});
+}
 
 document.getElementById("btn-download-all-models")?.addEventListener("click", async () => {
     const missing = TARGET_MODELS.filter(m => !modelStatus[m]);
@@ -9072,17 +9574,20 @@ updateModelStatusUI();
 
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
-document.getElementById("unload-btn")?.addEventListener("click", async () => { 
-    try { 
-        // 🌟 메모리 강제 해제 시 진행 중인 프론트엔드 락도 함께 초기화합니다.
-        await GlobalTaskManager.forceReset();
+document.getElementById("unload-btn")?.addEventListener("click", async () => {
+    try {
+        // 🌟 [SESSION PRESERVE] 기존에는 forceReset() 을 호출하여
+        //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
+        //    메모리 해제는 모델/큐 상태만 정리하면 충분하며,
+        //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
+        GlobalTaskManager.isBusy = false;
+        GlobalTaskManager.currentTaskId = null;
+        GlobalTaskManager.currentTaskPayload = null;
         isExtracting = false;
         isSearching = false;
         stopSpinner();
-
-        await invoke("unload_model"); 
-        alert("Memory cleared."); 
-        
+        await invoke("unload_model");
+        alert("Memory cleared.");
         // 버튼 상태 복구
         await updateExtractButtonVisibility();
         if (btnSubmit && searchInput) {
@@ -9095,7 +9600,7 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
         }
     } catch (e) {
         console.error("[WIDGET] Unload failed:", e);
-    } 
+    }
 });
 
 document.getElementById("invite-email-input")?.addEventListener("input", (e) => {

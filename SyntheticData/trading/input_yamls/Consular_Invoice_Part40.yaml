@@ -1,0 +1,33 @@
+document_type: Consular Invoice
+document_code: CSI
+metadata:
+  consular_invoice_number: CSI-2026-US-0827
+  issue_date: '2026-08-27'
+  related_invoice_number: CI-2026-08001
+  related_po_number: PO-99281A
+  related_bl_number: BL-55432219
+  visa_number: US-CSI-2026-88910
+parties:
+  legalized_by:
+    name: Consulate General of the United States, Busan
+    address: 2-30, Jung-gu, Busan, South Korea
+  shipper_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+consignment_details:
+  port_of_loading: Busan, South Korea
+  port_of_discharge: San Francisco, USA
+  vessel_flight: OCEAN VOYAGER V.123E
+  container_number: PONU1234567
+cargo_summary:
+  total_packages: 50 PLTS
+  gross_weight_kg: 2500.0
+  total_invoice_value_usd: 78500.0
+  origin_of_goods: Republic of Korea
+consular_declaration:
+  statement: I hereby certify that this invoice is true and correct, and that the prices stated herein are the actual market values of the goods described, and that no different invoice has been or will be furnished to anyone.
+  consular_seal: Affixed / Legalized
+  legalization_fee_usd: 150.0

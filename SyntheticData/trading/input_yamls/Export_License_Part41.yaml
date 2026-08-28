@@ -1,0 +1,34 @@
+document_type: Export License
+document_code: EL
+metadata:
+  license_number: EL-2026-KR-0815
+  issue_date: '2026-08-15'
+  expiry_date: '2026-11-15'
+  issuing_authority: Ministry of Trade, Industry and Energy (MOTIE), South Korea
+  related_po_number: PO-99281A
+  related_sc_number: SC-2026-0802
+  related_pi_number: PI-2026-0801
+parties:
+  applicant_exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    tax_id: 120-81-12345
+  consignee_buyer:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+licensed_items:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers (Dual-use Strategic Goods)
+  eccn: 3A991
+  quantity: 5000
+  unit: PCS
+  authorized_value_usd: 62500.0
+- item_code: SKU-B200
+  description: Sensor Modules
+  eccn: EAR99
+  quantity: 2000
+  unit: PCS
+  authorized_value_usd: 16000.0
+summary:
+  total_authorized_value_usd: 78500.0
+  license_condition: Final end-use restricted to commercial industrial automation; re-export without authorization strictly prohibited.

@@ -1,0 +1,44 @@
+document_type: Certificate of Analysis
+document_code: COA
+metadata:
+  certificate_number: COA-2026-0824
+  issue_date: '2026-08-24'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_ic_number: IC-2026-0825
+parties:
+  issuing_laboratory:
+    name: Global Tech Quality Assurance Laboratory
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+    contact_number: +82-2-1234-5690
+  applicant:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+test_results:
+- item_code: SKU-A100
+  description: Industrial Microcontrollers
+  batch_number: BATCH-202608-A
+  test_parameters:
+  - parameter: Operating Voltage
+    specification: 3.3V ± 0.1V
+    result: 3.31V
+    status: Pass
+  - parameter: Clock Frequency
+    specification: 120 MHz
+    result: 120 MHz
+    status: Pass
+- item_code: SKU-B200
+  description: Sensor Modules
+  batch_number: BATCH-202608-B
+  test_parameters:
+  - parameter: Sensitivity Tolerance
+    specification: ± 1.5%
+    result: + 0.8%
+    status: Pass
+  - parameter: Response Time
+    specification: < 10 ms
+    result: 6.2 ms
+    status: Pass
+summary:
+  overall_result: Approved / Pass
+  certified_by: Dr. H. S. Lee (Chief Quality Officer)

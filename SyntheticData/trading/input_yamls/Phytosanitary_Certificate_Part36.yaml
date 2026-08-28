@@ -1,0 +1,36 @@
+document_type: Phytosanitary Certificate
+document_code: PC
+metadata:
+  certificate_number: PC-2026-KR-0826
+  issue_date: '2026-08-26'
+  related_po_number: PO-99281A
+  related_invoice_number: CI-2026-08001
+  related_bl_number: BL-55432219
+  related_fc_number: FC-2026-0825
+parties:
+  issuing_authority:
+    name: Animal and Plant Quarantine Agency (APQA), Republic of Korea
+    address: 177 Hyeoksin 8-ro, Gimcheon-si, Gyeongsangbuk-do, South Korea
+    contact_number: +82-54-912-0114
+  exporter:
+    name: Global Tech Logistics KR
+    address: 123 Teheran-ro, Gangnam-gu, Seoul, South Korea
+  consignee:
+    name: Nova Importers LLC
+    address: 456 Market St, San Francisco, CA 94104, USA
+consignment_details:
+  place_of_origin: Republic of Korea
+  declared_port_of_exit: Busan, South Korea
+  declared_port_of_entry: San Francisco, USA
+  means_of_conveyance: OCEAN VOYAGER V.123E
+  container_number: PONU1234567
+cargo_and_packaging:
+  declared_name_of_product: Wooden Packaging Materials (Pallets) for Electronic Cargo
+  number_and_description_of_packages: 50 PLTS
+  botanical_name: Pinus densiflora (Pine wood)
+disinfestation_treatment:
+  treatment_date: '2026-08-25'
+  chemical_and_concentration: Methyl Bromide (MB) 48 g/m3
+  duration_and_temperature: 24 Hours at 21°C
+declaration:
+  statement: This is to certify that the plant products or regulated articles described herein have been inspected according to appropriate official procedures and considered to be free from quarantine pests.

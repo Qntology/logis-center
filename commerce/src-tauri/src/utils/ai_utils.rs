@@ -410,6 +410,8 @@ pub fn split_bias_phrases_weighted_full(raw: &str) -> (Vec<String>, Vec<f32>) {
 //    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
 pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드는 공용 'shipping_doc' 노드로 접습니다.
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
 
     for lk in [doc_lang, "en", "ko"] {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
@@ -420,6 +422,16 @@ pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
             .and_then(|v| v.as_str())
         {
             if !s.trim().is_empty() { return s.to_string(); }
+        }
+        if canon != page_type {
+            if let Some(s) = lang_node
+                .get(canon)
+                .and_then(|p| p.get(field_name))
+                .and_then(|n| n.get("semantic"))
+                .and_then(|v| v.as_str())
+            {
+                if !s.trim().is_empty() { return s.to_string(); }
+            }
         }
         if let Some(s) = lang_node
             .get("default")
@@ -578,10 +590,17 @@ pub fn multilingual_value_anchor_phrases_scoped(page_type: &str, field_name: &st
         .and_then(|v| v.as_object())
     { Some(n) => n, None => return out };
 
+    // 🌟 [BIAS TYPE CANONICALIZE] "BL.pol" 은 bias.json 에 없고 "shipping_doc.pol" 만
+    //    존재합니다. 정규화하지 않으면 무역 문서의 저장 벡터에 다국어 값 축이
+    //    한 구도 실리지 않아 크로스링구얼 리콜이 0 이 됩니다.
     let scoped_key = if page_type.trim().is_empty() {
         String::new()
     } else {
-        format!("{}.{}", page_type.trim(), field_name)
+        format!(
+            "{}.{}",
+            crate::utils::bias_schema::canonical_bias_type(page_type.trim()),
+            field_name
+        )
     };
 
     // ① 도메인 정확 일치 (goods.title 질의에는 goods.title 만)
@@ -1015,24 +1034,47 @@ pub struct SurprisalScore {
     pub surprisal: f32,
 }
 
-fn gumbel_expected_z(n: usize) -> f32 {
+/// 🌟 [EXTREME VALUE BASELINE] N개를 무작위로 뽑았을 때 기대되는 최댓값의 z 점수.
+///    E[z of max of N] ≈ √(2 ln N)
+///    뱅크(또는 패치 집합) 크기가 다른 두 집단의 최댓값을 공정하게 비교하려면
+///    반드시 이 기대치를 차감해야 합니다.
+///
+///    🌟 [PUB] vision_crop 의 크롭 감사와 value_grounding 의 접지 검증이
+///       같은 기준선을 사용해야 두 판정이 같은 척도가 되므로 공개합니다.
+pub fn gumbel_expected_z(n: usize) -> f32 {
     if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
 }
 
-fn group_sims(
+/// 🌟 [GENERIC OVER VEC / Arc<Vec>] 벡터 소유 형태에 무관하게 동작합니다.
+///    vision_encoder 의 AnchorBank 가 Arc<Vec<f32>> 로 바뀌었지만,
+///    다른 호출부는 Vec<f32> 를 그대로 넘깁니다.
+///    AsRef<[f32]> 로 받으면 두 형태를 한 함수가 모두 처리합니다.
+///
+/// 🌟 [O(N²) → O(N)] order 탐색을 HashMap 색인으로 바꿉니다.
+///    편견 뱅크가 13,598구일 때 구버전은
+///    13,598 × (그룹수/2) 회 문자열 쌍 비교를 수행했습니다.
+fn group_sims<V: AsRef<[f32]>>(
     query: &[f32],
-    src: &[(String, String, Vec<f32>)],
+    src: &[(String, String, V)],
     pool: &mut Vec<f32>,
 ) -> (Vec<(String, String)>, Vec<Vec<f32>>) {
+    use std::collections::HashMap;
     let mut order: Vec<(String, String)> = Vec::new();
     let mut sims: Vec<Vec<f32>> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
     for (c, k, e) in src {
-        if e.iter().all(|&v| v == 0.0) { continue; }
-        let s = cosine_similarity(query, e);
+        let ev = e.as_ref();
+        if ev.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(query, ev);
         pool.push(s);
-        match order.iter().position(|(a, b)| a == c && b == k) {
-            Some(i) => sims[i].push(s),
-            None => { order.push((c.clone(), k.clone())); sims.push(vec![s]); }
+        let key = (c.clone(), k.clone());
+        match index.get(&key) {
+            Some(&i) => sims[i].push(s),
+            None => {
+                index.insert(key.clone(), order.len());
+                order.push(key);
+                sims.push(vec![s]);
+            }
         }
     }
     (order, sims)
@@ -1042,10 +1084,12 @@ fn group_sims(
 /// 두 결과가 같은 척도이므로 그대로 대소 비교할 수 있습니다.
 /// 각 필터 키의 prejudice 구가 자기 기대치를 넘으면 그만큼 상쇄합니다.
 /// (bias.json 이 이미 갖고 있는 편견 사전을 필터 경로에서 처음으로 활용)
-pub fn surprisal_dual_scores(
+/// 🌟 [GENERIC] filter 뱅크의 벡터 소유 형태를 일반화합니다.
+///    vision_encoder 는 Arc<Vec<f32>>, model.rs 는 Vec<f32> 를 넘깁니다.
+pub fn surprisal_dual_scores<V: AsRef<[f32]>>(
     query: &[f32],
-    filter_bias: &[(String, String, Vec<f32>)],
-    filter_prej: &[(String, String, Vec<f32>)],
+    filter_bias: &[(String, String, V)],
+    filter_prej: &[(String, String, V)],
     schema_names: &[String],
     schema_banks: &[Vec<Vec<f32>>],
     schema_skip: &[bool],
@@ -1581,11 +1625,21 @@ pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
 //    여기서는 원본 JSON 을 직접 읽어 다국어 구 뱅크를 복원합니다.
 fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<serde_json::Value> {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    // 🌟 [BIAS TYPE CANONICALIZE] BL / CI / PL 등 무역 서식 코드는 bias.json 에
+    //    개별 노드가 없습니다. 공용 'shipping_doc' 노드로 접어 조회하지 않으면
+    //    label_phrase_bank / prejudice_phrase_bank 가 항상 빈 배열을 돌려주고,
+    //    그 결과 무역 문서의 헤더 코사인 맵과 청크 PLINKO 가 판정 근거를 잃습니다.
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
     let lang_keys = [doc_lang, "en", "ko"];
     for lk in lang_keys {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(n) = lang_node.get(page_type).and_then(|p| p.get(field_name)) {
             return Some(n.clone());
+        }
+        if canon != page_type {
+            if let Some(n) = lang_node.get(canon).and_then(|p| p.get(field_name)) {
+                return Some(n.clone());
+            }
         }
         if let Some(n) = lang_node.get("default").and_then(|p| p.get(field_name)) {
             let raw = n.to_string().replace("{TYPE}", page_type);
@@ -1945,12 +1999,18 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     let lower = field_name.to_lowercase();
     let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
     let has = |k: &str| keys.iter().any(|x| x == k);
-
     if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
         return FieldFormat::Synthesis;
     }
     if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
         return FieldFormat::TrackingCode;
+    }
+    // 🌟 [TRADE IDENTIFIER] hs_code / container_number / seal_number 는 값이 순수 숫자이거나
+    //    '영문 4자 + 숫자 7자' 구조입니다. Text 로 두면 is_alphabetic() 게이트에서
+    //    "583948392" 가 탈락해 청크가 저장조차 되지 않습니다.
+    //    (has("code") 는 완전일치라 "hs_code" 를 잡지 못했습니다)
+    if has("hs_code") || has("container_number") || has("seal_number") {
+        return FieldFormat::Identifier;
     }
     if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
         return FieldFormat::Identifier;
@@ -1958,7 +2018,9 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
         return FieldFormat::Link;
     }
-    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
+    // 🌟 [TRADE DATE] etd / eta 는 'date' 도 '_at' 도 포함하지 않아 Text 로 떨어졌습니다.
+    //    무역 서식에서 이 두 축은 항상 날짜입니다.
+    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at") || k == "etd" || k == "eta") {
         return FieldFormat::Date;
     }
     // 🌟 tracking_number 는 위에서 이미 반환되었으므로 여기의 "number" 는 순수 연락처입니다.
@@ -1971,17 +2033,26 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
         return FieldFormat::Address;
     }
+    // 🌟 [TRADE ENUM] incoterms / transport_mode / payment_terms / freight_payment_term /
+    //    package_unit / unit / type_size 는 전부 '정해진 코드 집합' 입니다.
+    //    Enum 은 어떤 값이든 통과시키므로 오탐이 없고, Text 의 알파벳 요구를 우회합니다.
     if keys.iter().any(|k| {
         k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
             || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+            || k.contains("incoterm") || k.contains("_term") || k.contains("transport_mode")
+            || k == "unit" || k == "package_unit" || k == "type_size"
     }) {
         return FieldFormat::Enum;
     }
+    // 🌟 [TRADE NUMERIC] package_count / volume / local_charges 는 기존 어느 패턴에도
+    //    걸리지 않아 Text 로 떨어졌고, "4" / "12.5" / "150" 이 전부
+    //    FORMAT GATE 에서 unclassified 로 강등 → 인덱싱 대상에서 폐기되었습니다.
     if keys.iter().any(|k| {
         k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
             || k == "width" || k == "height" || k == "length" || k.contains("fee")
             || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
             || k.contains("duration")
+            || k.ends_with("_count") || k == "volume" || k.contains("charge")
     }) {
         return FieldFormat::Numeric;
     }
