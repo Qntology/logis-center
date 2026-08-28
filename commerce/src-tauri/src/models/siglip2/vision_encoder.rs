@@ -299,10 +299,19 @@ fn score_patches(
     let mut best: HashMap<String, f32> = HashMap::new();
     let mut dropped = 0usize;
 
-    for p in grid.patches.iter() {
+    // 🌟 [LOG] 패치별 채점 상세 추적을 위한 카운터
+    let mut total_scored = 0usize;
+    let mut zero_vec_skipped = 0usize;
+    let mut empty_scores_skipped = 0usize;
+    let mut prejudice_dropped_details: Vec<(usize, String, f32)> = Vec::new();
+    let mut top_contributors: Vec<(usize, String, f32, usize, usize)> = Vec::new();
+
+    for (patch_idx, p) in grid.patches.iter().enumerate() {
         if p.iter().all(|&v| v == 0.0) {
+            zero_vec_skipped += 1;
             continue;
         }
+
         let (scores, _) = surprisal_dual_scores(
             p,
             &bank.bias,
@@ -311,20 +320,90 @@ fn score_patches(
             &empty_banks,
             &empty_skip,
         );
+
         if scores.is_empty() {
+            empty_scores_skipped += 1;
             continue;
         }
+
+        total_scored += 1;
+
+        // 🌟 [LOG] 패치별 코사인 상세 — 상위 3개 키의 원시 코사인 + surprisal
+        //    전체 252패치를 출력하면 과다하므로, 채점 카운터로 조절합니다.
+        let patch_idx_for_log = {
+            let mut cnt = 0usize;
+            for pp in grid.patches.iter() {
+                if std::ptr::eq(pp, p) { break; }
+                cnt += 1;
+            }
+            cnt
+        };
+        let log_this_patch = patch_idx_for_log < 12;
+
+        if log_this_patch && !scores.is_empty() {
+            let (r, c) = grid.rc(patch_idx_for_log);
+            let top3: Vec<String> = scores.iter().take(3)
+                .map(|s| format!("{}(cos:{:.4} sur:{:+.4} N:{})", s.key, s.max_cos, s.surprisal, s.n))
+                .collect();
+            println!("    🔬 [PATCH-COSINE r{}c{}] {}", r, c, top3.join(" | "));
+        }
+
         // surprisal_dual_scores 는 이미 prejudice 를 상쇄해 반환합니다.
         // 최상위 점수가 0 이하라면 이 패치는 어떤 개념과도 무관합니다.
         if scores[0].surprisal <= 0.0 {
             dropped += 1;
+            // 🌟 [LOG] 편견 우세로 탈락한 패치의 상세 (샘플)
+            if log_this_patch {
+                let (r, c) = grid.rc(patch_idx_for_log);
+                println!(
+                    "    🚫 [PREJUDICE r{}c{}] top: {} cos:{:.4} sur:{:+.4} ≤ 0 → 편견 우세 탈락",
+                    r, c, scores[0].key, scores[0].max_cos, scores[0].surprisal
+                );
+            }
+            // 🌟 [LOG] 편견 탈락 샘플 수집 (상위 20개)
+            if prejudice_dropped_details.len() < 20 {
+                let (r, c) = grid.rc(patch_idx);
+                prejudice_dropped_details.push((patch_idx, format!("r{}c{} {}", r, c, scores[0].key), scores[0].surprisal));
+            }
             continue;
         }
+
         for s in scores {
             let e = best.entry(s.key.clone()).or_insert(f32::MIN);
             if s.surprisal > *e {
+                // 🌟 [LOG] 키별 최고점 갱신 시 원시 코사인 기록 (샘플)
+                if log_this_patch {
+                    let (r, c) = grid.rc(patch_idx_for_log);
+                    println!(
+                        "    ⬆️ [KEY-UPDATE r{}c{}] '{}' cos:{:.4} sur:{:+.4} (이전 {:+.4})",
+                        r, c, s.key, s.max_cos, s.surprisal, *e
+                    );
+                }
+                // 🌟 [LOG] 키별 최고점 갱신 패치 수집 (상위 30개)
+                if top_contributors.len() < 30 {
+                    let (r, c) = grid.rc(patch_idx);
+                    top_contributors.push((patch_idx, s.key.clone(), s.surprisal, r, c));
+                }
                 *e = s.surprisal;
             }
+        }
+    }
+
+    // 🌟 [LOG] score_patches 상세 요약 출력
+    println!("    📊 [SCORE_PATCHES DETAIL] 총 패치 {} | 제로벡터 스킵 {} | 빈점수 스킵 {} | 편견탈락 {} | 유효채점 {}",
+        grid.patches.len(), zero_vec_skipped, empty_scores_skipped, dropped, total_scored);
+
+    if !prejudice_dropped_details.is_empty() {
+        println!("    📊 [PREJUDICE DROP SAMPLE] (상위 {}개):", prejudice_dropped_details.len());
+        for (idx, desc, sur) in prejudice_dropped_details.iter().take(10) {
+            println!("      ↳ patch[{}] {} | surprisal: {:+.4}", idx, desc, sur);
+        }
+    }
+
+    if !top_contributors.is_empty() {
+        println!("    📊 [TOP CONTRIBUTORS] 키별 최고점 갱신 패치 (상위 {}개):", top_contributors.len());
+        for (_, key, sur, r, c) in top_contributors.iter().take(15) {
+            println!("      ↳ '{}' ← r{}c{} | surprisal: {:+.4}", key, r, c, sur);
         }
     }
 
@@ -468,16 +547,31 @@ fn run_title_gate(
     let title_rows = (grid.grid_rows * 3 / 10).max(1);
     let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
 
+    // 🌟 [LOG] 타이틀 게이트 스캔 범위 및 패치 카운터
+    let mut scanned_patches = 0usize;
+    let mut active_patches = 0usize;
+    let mut positive_patches = 0usize;
+    let mut patch_contributions: Vec<(usize, usize, usize, String, f32)> = Vec::new();
+
+    emit(&format!(
+        "     🔍 [TITLE GATE SCAN] 상단 밴드: {}행 / 전체 {}행 | 스캔 패치 범위: 0~{}",
+        title_rows, grid.grid_rows, title_rows * grid.grid_cols
+    ));
+
     for idx in 0..grid.len() {
-        let (r, _) = grid.rc(idx);
+        let (r, c) = grid.rc(idx);
         if r >= title_rows {
             continue;
         }
+
+        scanned_patches += 1;
 
         let p = &grid.patches[idx];
         if p.iter().all(|&v| v == 0.0) {
             continue;
         }
+
+        active_patches += 1;
 
         let (scores, _) = surprisal_dual_scores(
             p,
@@ -491,15 +585,38 @@ fn run_title_gate(
         if scores.is_empty() {
             continue;
         }
+
         if scores[0].surprisal <= 0.0 {
             continue;
         }
+
+        positive_patches += 1;
 
         for s in scores {
             let e = best.entry(s.key.clone()).or_insert(f32::MIN);
             if s.surprisal > *e {
                 *e = s.surprisal;
+                // 🌟 [LOG] 타이틀 게이트에서 각 전문 키의 최고점을 갱신한 패치 기록
+                if patch_contributions.len() < 20 {
+                    patch_contributions.push((idx, r, c, s.key.clone(), s.surprisal));
+                }
             }
+        }
+    }
+
+    // 🌟 [LOG] 타이틀 게이트 스캔 요약
+    emit(&format!(
+        "     🔍 [TITLE GATE SCAN RESULT] 스캔 {} | 활성 {} | 양수 {} | 전문 키 {}개 발견",
+        scanned_patches, active_patches, positive_patches, best.len()
+    ));
+
+    if !patch_contributions.is_empty() {
+        emit("     🔍 [TITLE GATE CONTRIBUTORS] 전문별 최고점 갱신 패치:");
+        for (idx, r, c, key, sur) in patch_contributions.iter() {
+            emit(&format!(
+                "       ↳ patch[{}] r{}c{} → '{}' {:+.4}",
+                idx, r, c, key, sur
+            ));
         }
     }
 
@@ -513,6 +630,15 @@ fn run_title_gate(
 
     for (c, s) in sorted.iter() {
         emit(&format!("     📐 [TITLE GATE] {} | Surprisal: {:+.4}", c, s));
+    }
+
+    // 🌟 [LOG] 타이틀 게이트 1위-2위 마진
+    if sorted.len() >= 2 {
+        let tg_margin = sorted[0].1 - sorted[1].1;
+        emit(&format!(
+            "     📐 [TITLE GATE MARGIN] 1위 '{}'({:+.4}) - 2위 '{}'({:+.4}) = {:+.4}",
+            sorted[0].0, sorted[0].1, sorted[1].0, sorted[1].1, tg_margin
+        ));
     }
 
     let (top_code, top_score) = sorted[0].clone();
@@ -592,20 +718,72 @@ pub fn classify_doc_type(
         }
     }
 
+    // 🌟 [LOG] 그룹 앵커 구 샘플 — 각 그룹에 어떤 구가 코사인 판정 기준인지 보여줍니다.
+    {
+        let mut group_names: Vec<&str> = Vec::new();
+        for (c, _, _) in g_bias.iter() {
+            if !group_names.contains(&c.as_str()) { group_names.push(c.as_str()); }
+        }
+        emit(&format!(
+            "  📖 [GROUP ANCHOR BANK] 그룹 {}개 | 판정 구 {}개 | 편견 구 {}개",
+            group_names.len(), g_bias.len(), g_prej.len()
+        ));
+        for gn in group_names.iter() {
+            let phrases: Vec<&str> = g_bias.iter()
+                .filter(|(c, _, _)| c == gn)
+                .map(|(_, _, p)| p.as_str())
+                .collect();
+            let sample: Vec<&str> = phrases.iter().take(4).copied().collect();
+            let prej_cnt = g_prej.iter().filter(|(c, _, _)| c == *gn).count();
+            emit(&format!(
+                "    📖 [GROUP '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
+                gn, phrases.len(), prej_cnt, sample
+            ));
+        }
+    }
+
     let g_bank = build_anchor_bank(model, &g_bias, &g_prej)?;
     let (g_scores_map, dropped) = score_patches(grid, &g_bank);
-
     let mut g_scores: Vec<(String, f32)> = g_scores_map.into_iter().collect();
     g_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     if g_scores.is_empty() {
         g_scores.push(("shipping".to_string(), 0.0));
     }
+
+    // 🌟 [LOG] 그룹 점수 분포 상세 — 1위~최하위 전부 + 1위-2위 마진
+    emit(&format!(
+        "  📐 [VISION GROUP DETAIL] 그룹 {}개 채점 완료 | 유효 패치 비중: {}/{}",
+        g_scores.len(),
+        grid.len().saturating_sub(dropped),
+        grid.len()
+    ));
+
     for (g, s) in g_scores.iter() {
         emit(&format!(
             "  📐 [VISION GROUP] {} | Surprisal(max over patches): {:+.4}",
             g, s
         ));
     }
+
+    // 🌟 [LOG] 그룹 1위-2위 마진 상세
+    if g_scores.len() >= 2 {
+        let margin = g_scores[0].1 - g_scores[1].1;
+        emit(&format!(
+            "  📐 [VISION GROUP MARGIN] 1위 '{}'({:+.4}) - 2위 '{}'({:+.4}) = 마진 {:+.4}",
+            g_scores[0].0, g_scores[0].1,
+            g_scores[1].0, g_scores[1].1,
+            margin
+        ));
+        // 마진이 1.0 미만이면 경쟁이 치열했다는 경고
+        if margin < 1.0 {
+            emit(&format!(
+                "  ⚠️ [VISION GROUP LOW MARGIN] 그룹 간 마진 {:+.4} < 1.0 — 경쟁이 치열합니다. 패치 분포 확인 필요.",
+                margin
+            ));
+        }
+    }
+
     emit(&format!(
         "  🧹 [PREJUDICE DROP] 패치 {}개가 편견 우세로 판정에서 제외되었습니다. (전체 {}개)",
         dropped,
@@ -717,6 +895,33 @@ pub fn classify_doc_type(
         c_prej.len()
     ));
 
+    // 🌟 [LOG] 코드 앵커 구 샘플 — 55개 전부 출력하면 과다하므로 상위 8개만 상세
+    {
+        let mut code_names: Vec<&str> = Vec::new();
+        for (c, _, _) in c_bias.iter() {
+            if !code_names.contains(&c.as_str()) { code_names.push(c.as_str()); }
+        }
+        let sample_limit = code_names.len().min(8);
+        for cn in code_names.iter().take(sample_limit) {
+            let phrases: Vec<&str> = c_bias.iter()
+                .filter(|(c, _, _)| c == cn)
+                .map(|(_, _, p)| p.as_str())
+                .collect();
+            let sample: Vec<&str> = phrases.iter().take(3).copied().collect();
+            let prej_cnt = c_prej.iter().filter(|(c, _, _)| c == *cn).count();
+            emit(&format!(
+                "    📖 [CODE '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
+                cn, phrases.len(), prej_cnt, sample
+            ));
+        }
+        if code_names.len() > sample_limit {
+            emit(&format!(
+                "    📖 [CODE ...] 나머지 {}개 코드는 샘플 생략",
+                code_names.len() - sample_limit
+            ));
+        }
+    }
+
     let c_bank = build_anchor_bank(model, &c_bias, &c_prej)?;
     let (c_scores_map, _) = score_patches(grid, &c_bank);
     let mut c_scores: Vec<(String, f32)> = c_scores_map.into_iter().collect();
@@ -726,8 +931,31 @@ pub fn classify_doc_type(
         c_scores.push((codes[0].to_string(), 0.0));
     }
 
-    for (c, s) in c_scores.iter() {
+    // 🌟 [LOG] 코드 점수 상위 10개 + 하위 3개 출력 (55개 전부 출력하면 로그 과다)
+    let top_n = c_scores.len().min(10);
+    let bottom_start = if c_scores.len() > 13 { c_scores.len() - 3 } else { top_n };
+    for (c, s) in c_scores.iter().take(top_n) {
         emit(&format!("    📐 [VISION CODE] {} | Surprisal: {:+.4}", c, s));
+    }
+    if c_scores.len() > top_n {
+        emit(&format!("    📐 [VISION CODE] ... ({}개 생략 아님, 중간 {}개는 아래 요약 참조)", c_scores.len(), c_scores.len() - top_n - (c_scores.len() - bottom_start)));
+        for (c, s) in c_scores.iter().skip(bottom_start) {
+            emit(&format!("    📐 [VISION CODE TAIL] {} | Surprisal: {:+.4}", c, s));
+        }
+    }
+
+    // 🌟 [LOG] 코드 1위-2위 마진 + 양수 점수 개수
+    if c_scores.len() >= 2 {
+        let code_margin = c_scores[0].1 - c_scores[1].1;
+        let positive_count = c_scores.iter().filter(|(_, s)| *s > 0.0).count();
+        emit(&format!(
+            "  📐 [VISION CODE MARGIN] 1위 '{}'({:+.4}) - 2위 '{}'({:+.4}) = 마진 {:+.4} | 양수 점수 코드: {}/{}",
+            c_scores[0].0, c_scores[0].1,
+            c_scores[1].0, c_scores[1].1,
+            code_margin,
+            positive_count,
+            c_scores.len()
+        ));
     }
 
     let mut code = c_scores[0].0.clone();
@@ -742,6 +970,31 @@ pub fn classify_doc_type(
     //    ED/BL 이 참조 셀에 'CI-43726' 을 인쇄해도 상단 밴드 전문이 다르므로 오발화가 없습니다.
     if let Some(gate) = run_title_gate(model, grid, &chrome_phrases, emit) {
         if gate.code != code {
+            // 🌟 [LOG] OVERRIDE 전후 대조 — 벡터 판정 상세 + 타이틀 게이트 상세
+            emit(&format!(
+                "  🔍 [TITLE GATE BEFORE OVERRIDE] 벡터 판정: 코드='{}'({:+.4}) 마진={:+.4} | 그룹='{}'({:+.4})",
+                code, code_score, code_margin, final_group, final_group_score
+            ));
+            emit(&format!(
+                "  🔍 [TITLE GATE EVIDENCE] 타이틀 게이트: 전문='{}' 코드='{}' 점수={:+.4} 마진={:+.4} 그룹='{}'",
+                gate.title, gate.code, gate.score, gate.margin, gate.group
+            ));
+            // 🌟 [LOG] 벡터 판정의 원래 1위가 왜 틀렸는지 추적용 — 원래 1위 코드의 점수 순위 출력
+            let orig_rank = c_scores.iter().position(|(c, _)| c == &code);
+            let gate_rank = c_scores.iter().position(|(c, _)| c == &gate.code);
+            emit(&format!(
+                "  🔍 [TITLE GATE RANK COMPARE] 벡터 1위 '{}' 순위: {:?} | 게이트 코드 '{}' 벡터 순위: {:?}",
+                code, orig_rank, gate.code, gate_rank
+            ));
+            if let Some(gr) = gate_rank {
+                if gr < c_scores.len() {
+                    emit(&format!(
+                        "  🔍 [TITLE GATE RANK DETAIL] 게이트 코드 '{}' 의 벡터 점수: {:+.4} ({}위)",
+                        gate.code, c_scores[gr].1, gr + 1
+                    ));
+                }
+            }
+
             emit(&format!(
                 "  🚨 [TITLE GATE OVERRIDE] 상단 밴드 서식 전문 '{}' 근거: 코드 '{}' → '{}' | 그룹 '{}' → '{}'",
                 gate.title, code, gate.code, final_group, gate.group
@@ -750,7 +1003,6 @@ pub fn classify_doc_type(
             code_score = gate.score;
             code_margin = gate.margin;
             final_group = gate.group.clone();
-
             if let Some(gs) = g_scores.iter().find(|(g, _)| *g == gate.group) {
                 let rest = g_scores
                     .iter()
@@ -975,6 +1227,40 @@ pub fn build_column_heatmaps(
         }
     }
 
+    // 🌟 [LOG] 카테고리별 필드 구 개수 상세
+    {
+        let mut cat_phrase_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (c, _, _) in bias_defs.iter() {
+            *cat_phrase_counts.entry(c.as_str()).or_insert(0) += 1;
+        }
+        let mut cat_detail: Vec<String> = Vec::new();
+        for (c, cnt) in cat_phrase_counts.iter() {
+            cat_detail.push(format!("{}({})", c, cnt));
+        }
+        cat_detail.sort();
+        emit(&format!(
+            "  📐 [VISION COLUMN BANK DETAIL] 카테고리별 필드 구: {}",
+            cat_detail.join(" | ")
+        ));
+    }
+
+    // 🌟 [LOG] 카테고리별 편견 구 개수 상세
+    {
+        let mut cat_prej_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (c, _, _) in prej_defs.iter() {
+            *cat_prej_counts.entry(c.as_str()).or_insert(0) += 1;
+        }
+        let mut prej_detail: Vec<String> = Vec::new();
+        for (c, cnt) in cat_prej_counts.iter() {
+            prej_detail.push(format!("{}({})", c, cnt));
+        }
+        prej_detail.sort();
+        emit(&format!(
+            "  📐 [VISION COLUMN PREJ DETAIL] 카테고리별 편견 구: {}",
+            prej_detail.join(" | ")
+        ));
+    }
+
     emit(&format!(
         "  📐 [VISION COLUMN BANK] 카테고리 {}개 | 필드 구 {}개 | 편견 구 {}개 (카테고리 단위 축약) | 패치 {}개",
         cats.len(),
@@ -982,6 +1268,49 @@ pub fn build_column_heatmaps(
         prej_defs.len(),
         grid.len()
     ));
+
+    // 🌟 [LOG] 카테고리별 필드 앵커 구 샘플
+    {
+        let mut cat_list: Vec<&str> = Vec::new();
+        for (c, _, _) in bias_defs.iter() {
+            if !cat_list.contains(&c.as_str()) { cat_list.push(c.as_str()); }
+        }
+        emit(&format!(
+            "  📖 [FIELD ANCHOR BANK] 카테고리 {}개 | 필드 구 {}개 | 편견 구 {}개",
+            cat_list.len(), bias_defs.len(), prej_defs.len()
+        ));
+        for cat in cat_list.iter() {
+            let fields: Vec<&str> = bias_defs.iter()
+                .filter(|(c, _, _)| c == cat)
+                .map(|(_, f, _)| f.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let phrase_cnt = bias_defs.iter().filter(|(c, _, _)| c == *cat).count();
+            let prej_cnt = prej_defs.iter().filter(|(c, _, _)| c == *cat).count();
+            // 필드별 구 수와 샘플 구 2개씩 (카테고리당 최대 3필드만)
+            let mut field_detail: Vec<String> = Vec::new();
+            for f in fields.iter().take(3) {
+                let f_phrases: Vec<&str> = bias_defs.iter()
+                    .filter(|(c, k, _)| c == cat && k == f)
+                    .map(|(_, _, p)| p.as_str())
+                    .collect();
+                let sample: Vec<&str> = f_phrases.iter().take(2).copied().collect();
+                field_detail.push(format!("{}({}구): {:?}", f, f_phrases.len(), sample));
+            }
+            emit(&format!(
+                "    📖 [CAT '{}' ] 필드 {}개 | 구 {}개 | 편견 {}개 | {}",
+                cat, fields.len(), phrase_cnt, prej_cnt, field_detail.join(" ; ")
+            ));
+            if fields.len() > 3 {
+                emit(&format!(
+                    "    📖 [CAT '{}' ...] 나머지 필드: {:?}",
+                    cat,
+                    fields.iter().skip(3).collect::<Vec<_>>()
+                ));
+            }
+        }
+    }
 
     let bank = build_anchor_bank(model, &bias_defs, &prej_defs)?;
 
@@ -1003,10 +1332,18 @@ pub fn build_column_heatmaps(
         cat_top.insert(c.clone(), (String::new(), f32::MIN));
     }
 
+    // 🌟 [LOG] 패치 채점 추적 카운터
+    let mut patch_scored_count = 0usize;
+    let mut patch_positive_field_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut patch_prej_override_count = 0usize;
+
     for (i, p) in grid.patches.iter().enumerate() {
         if p.iter().all(|&v| v == 0.0) {
             continue;
         }
+
+        patch_scored_count += 1;
+
         // 🌟 surprisal_dual_scores 는 (category, key) 가 일치하는 편견만 감산합니다.
         //    이제 편견 key 가 카테고리명이므로 bias 의 필드 key 와는 만나지 않습니다.
         //    그래서 여기서 카테고리 편견을 직접 조회해 감산합니다.
@@ -1029,6 +1366,7 @@ pub fn build_column_heatmaps(
             &empty_banks,
             &empty_skip,
         );
+
         let mut cat_prej: HashMap<&str, f32> = HashMap::new();
         for ps in prej_scores.iter() {
             // 편견 뱅크의 category 와 key 는 둘 다 카테고리명입니다.
@@ -1043,24 +1381,72 @@ pub fn build_column_heatmaps(
                 Some(c) => c.clone(),
                 None => continue,
             };
+
             // 🌟 편견이 자기 기대치를 넘었을 때만 그만큼 상쇄합니다.
             //    (구버전 surprisal_dual_scores 내부의 `if ps > 0.0 { sc -= ps; }` 와 동일)
-            let adjusted = match cat_prej.get(cat.as_str()) {
-                Some(pv) if *pv > 0.0 => s.surprisal - *pv,
-                _ => s.surprisal,
+            let prejudiced = cat_prej.get(cat.as_str()).copied().unwrap_or(f32::MIN);
+            let adjusted = if prejudiced > 0.0 {
+                s.surprisal - prejudiced
+            } else {
+                s.surprisal
             };
+
+            // 🌟 [LOG] 편견 차감이 발생한 경우만 상세 기록 (샘널 패치 제한)
+            if i < 12 && prejudiced > 0.0 {
+                let (r, c) = grid.rc(i);
+                println!(
+                    "    🔧 [PREJ-SUB r{}c{}] cat='{}' field='{}' 원시:{:+.4} 편견:{:+.4} 차감후:{:+.4}",
+                    r, c, cat, s.key, s.surprisal, prejudiced, adjusted
+                );
+            }
+
+            // 🌟 [LOG] 편견 상쇄 발생 카운트
+            if prejudiced > 0.0 {
+                patch_prej_override_count += 1;
+            }
+
+            // 🌟 [LOG] 양수 조정 점수 카운트
+            if adjusted > 0.0 {
+                *patch_positive_field_counts.entry(cat.clone()).or_insert(0) += 1;
+            }
 
             if let Some(v) = cat_scores.get_mut(&cat) {
                 if adjusted > v[i] {
+                    // 🌟 [LOG] 카테고리 점수 갱신 시 상세 (샘플 패치 제한)
+                    if i < 12 {
+                        let (r, c) = grid.rc(i);
+                        println!(
+                            "    ⬆️ [CAT-UPDATE r{}c{}] '{}' ← field='{}' 원시:{:+.4} 차감후:{:+.4} (이전 {:+.4})",
+                            r, c, cat, s.key, s.surprisal, adjusted, v[i]
+                        );
+                    }
                     v[i] = adjusted;
                 }
             }
+
             if let Some(t) = cat_top.get_mut(&cat) {
                 if adjusted > t.1 {
                     *t = (s.key.clone(), adjusted);
                 }
             }
         }
+    }
+
+    // 🌟 [LOG] 히트맵 채점 요약
+    emit(&format!(
+        "    📊 [HEATMAP SCORING SUMMARY] 채점 패치 {} | 편견 상쇄 발생 {}회",
+        patch_scored_count, patch_prej_override_count
+    ));
+    {
+        let mut pf_detail: Vec<String> = Vec::new();
+        for (cat, cnt) in patch_positive_field_counts.iter() {
+            pf_detail.push(format!("{}({})", cat, cnt));
+        }
+        pf_detail.sort();
+        emit(&format!(
+            "    📊 [HEATMAP POSITIVE FIELDS] 카테고리별 양수 패치 수: {}",
+            pf_detail.join(" | ")
+        ));
     }
 
     let mut out: Vec<CategoryHeatmap> = Vec::with_capacity(cats.len());
@@ -1071,6 +1457,31 @@ pub fn build_column_heatmaps(
             .unwrap_or_else(|| (String::new(), f32::MIN));
 
         let hot = scores.iter().filter(|s| **s > 0.0).count();
+
+        // 🌟 [LOG] 히트맵 점수 분포 상세 — 양수 패치의 평균/최대/최소 + 행별 활성 분포
+        let positive_vals: Vec<f32> = scores.iter().filter(|s| **s > 0.0).copied().collect();
+        let (p_mean, p_max, p_min) = if positive_vals.is_empty() {
+            (0.0f32, 0.0f32, 0.0f32)
+        } else {
+            let mean = positive_vals.iter().sum::<f32>() / positive_vals.len() as f32;
+            let max = positive_vals.iter().cloned().fold(f32::MIN, f32::max);
+            let min = positive_vals.iter().cloned().fold(f32::MAX, f32::min);
+            (mean, max, min)
+        };
+
+        // 🌟 [LOG] 행별 활성 패치 수 — 잘림(상단/하단 편중) 감지용
+        let mut row_active: Vec<usize> = vec![0; grid.grid_rows];
+        for idx in 0..n {
+            if scores[idx] > 0.0 {
+                let (r, _) = grid.rc(idx);
+                row_active[r] += 1;
+            }
+        }
+        let active_rows: Vec<String> = row_active.iter().enumerate()
+            .filter(|(_, cnt)| **cnt > 0)
+            .map(|(r, cnt)| format!("r{}({})", r, cnt))
+            .collect();
+
         emit(&format!(
             "    🔥 [HEATMAP] {} | 활성 패치 {}/{} | Top: {}({:+.4})",
             c,
@@ -1079,6 +1490,35 @@ pub fn build_column_heatmaps(
             if top_field.is_empty() { "-" } else { &top_field },
             top_score
         ));
+
+        // 🌟 [LOG] 히트맵 분포 + 잘림 체크
+        emit(&format!(
+            "    🔥 [HEATMAP DIST] {} | 양수 평균={:+.4} 최대={:+.4} 최소={:+.4} | 활성행: [{}]",
+            c, p_mean, p_max, p_min,
+            active_rows.join(", ")
+        ));
+
+        // 🌟 [LOG] 잘림 감지: 활성 패치가 전체 행의 20% 미만에 몰려 있으면 경고
+        if !active_rows.is_empty() && hot > 0 {
+            let total_rows = grid.grid_rows;
+            let active_row_count = active_rows.len();
+            let coverage = active_row_count as f32 / total_rows as f32;
+            if coverage < 0.20 && hot > 3 {
+                emit(&format!(
+                    "    ⚠️ [HEATMAP TRUNCATION RISK] '{}' 활성 패치가 {}행/{}행({:.0}%)에만 집중 — 크롭 잘림 가능성 확인 필요",
+                    c, active_row_count, total_rows, coverage * 100.0
+                ));
+            }
+            // 상단 2행 또는 하단 2행에 80% 이상 몰려 있으면 편중 경고
+            let top2: usize = row_active.iter().take(2).sum();
+            let bottom2: usize = row_active.iter().rev().take(2).sum();
+            if hot > 0 && (top2 * 5 > hot * 4 || bottom2 * 5 > hot * 4) {
+                emit(&format!(
+                    "    ⚠️ [HEATMAP EDGE BIAS] '{}' 활성 패치 {}개 중 상단2행={} 하단2행={} — 가장자리 편중 감지",
+                    c, hot, top2, bottom2
+                ));
+            }
+        }
 
         out.push(CategoryHeatmap {
             category: c.clone(),

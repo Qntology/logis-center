@@ -570,6 +570,30 @@ pub fn plan_crops(
     //    전체 면적을 경쟁 카테고리 수로 나눈 값이 상한입니다.
     let area_cap = (n / heatmaps.len().max(1)).max(4);
 
+    // 🌟 [LOG] 히트맵 → 크롭 전환 전 전체 상태 요약
+    emit(&format!(
+        "    📊 [PLAN_CROPS INPUT] 히트맵 {}개 | 격자 {}x{}={} | area_cap={} | content 활성 {}/{}",
+        heatmaps.len(), grid.grid_rows, grid.grid_cols, n, area_cap, content_cnt, n
+    ));
+
+    // 🌟 [LOG] 각 히트맵의 활성 패치 비율 — 잘림 감지
+    for hm in heatmaps.iter() {
+        let hot = hm.scores.iter().filter(|s| **s > 0.0).count();
+        let ratio = if n > 0 { hot as f32 / n as f32 } else { 0.0 };
+        if ratio > 0.60 {
+            emit(&format!(
+                "    ⚠️ [HEATMAP FULL PAGE RISK] '{}' 활성 패치 {}/{} ({:.0}%) — 전체 페이지 점유. 표 구조가 전체를 덮거나 히트맵 과잉 확산 가능.",
+                hm.category, hot, n, ratio * 100.0
+            ));
+        }
+        if hot > 0 && hot < 5 {
+            emit(&format!(
+                "    ⚠️ [HEATMAP SPARSE RISK] '{}' 활성 패치 {}개 — 패치 부족으로 크롭 정밀도 저하 가능.",
+                hm.category, hot
+            ));
+        }
+    }
+
     // ── ①② 카테고리별 성분 추출 → 거대 성분 재분할 → 인접 병합 → 행 밴드 확장 ──
     //    (category, top_field, gboxes, peaks, counts)
     let mut per_cat: Vec<(String, String, Vec<(usize, usize, usize, usize)>, Vec<f32>, Vec<usize>)> =
@@ -796,6 +820,45 @@ pub fn plan_crops(
 
         let raw = to_pixel_bbox(gbox, grid);
         let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
+
+        // 🌟 [LOG] 크롭이 히트맵 활성 패치를 얼마나 커버하는지 계산
+        {
+            let hm_opt = heatmaps.iter().find(|h| h.category == per_cat[ci].0);
+            if let Some(hm) = hm_opt {
+                let mut total_hot = 0usize;
+                let mut covered_hot = 0usize;
+                let cw = grid.orig_width as f32 / grid.grid_cols as f32;
+                let ch = grid.orig_height as f32 / grid.grid_rows as f32;
+                for idx in 0..hm.scores.len() {
+                    if hm.scores[idx] <= 0.0 { continue; }
+                    total_hot += 1;
+                    let r = idx / grid.grid_cols;
+                    let c = idx % grid.grid_cols;
+                    let cx = (c as f32 + 0.5) * cw;
+                    let cy = (r as f32 + 0.5) * ch;
+                    if cx >= bbox.0 as f32 && cx <= bbox.2 as f32
+                        && cy >= bbox.1 as f32 && cy <= bbox.3 as f32
+                    {
+                        covered_hot += 1;
+                    }
+                }
+                let coverage = if total_hot > 0 {
+                    covered_hot as f32 / total_hot as f32
+                } else {
+                    1.0
+                };
+                emit(&format!(
+                    "    📊 [CROP COVERAGE] '{}' 히트맵 활성 {}개 중 {}개 커버 ({:.0}%)",
+                    per_cat[ci].0, total_hot, covered_hot, coverage * 100.0
+                ));
+                if coverage < 0.70 && total_hot > 3 {
+                    emit(&format!(
+                        "    ⚠️ [CROP COVERAGE LOSS] '{}' 활성 패치의 {:.0}%가 크롭 밖 — 잘림 발생. 히트맵 확산 또는 크롭 마진 부족 가능.",
+                        per_cat[ci].0, (1.0 - coverage) * 100.0
+                    ));
+                }
+            }
+        }
 
         emit(&format!(
             "    ✂️ [CROP PLAN] '{}' ← grid(r{}~{}, c{}~{}) → px({},{})-({},{}) | Score: {:+.4} | Margin: {:+.4} | Field: {}",
