@@ -1561,7 +1561,11 @@ impl LogisModel {
                     //    타이틀은 상단 1줄(≈ 격자 행수의 1/9, TITLE GATE 30% 밴드의 1/3)에 인쇄되므로
                     //    해당 행의 점수를 억제해 header 봉우리가 값 행으로 이동하게 합니다.
                     {
-                        let title_row_max = (grid.grid_rows / 9).max(0);
+                        // 🌟 [ROW FIX v2] /9(=2) 는 0..=2 세 행을 죽여 "INVOICE NUMBER" 라벨 행(r2)까지
+                        //    함께 억제했고, doc_number 앵커가 근거를 잃어 header 봉우리가
+                        //    숫자 밀집 블록(VAT/EORI, r7~8)으로 탈주했습니다(실측: reference_invoice="CONSIGNEE VAT/EORI").
+                        //    제목 실제 인쇄 행은 r0~1 뿐이므로 /18(=1) 로 0..=1 만 억제합니다.
+                        let title_row_max = (grid.grid_rows / 18).max(1).min(grid.grid_rows.saturating_sub(1));
                         let mut suppressed = 0usize;
                         for hm in heatmaps.iter_mut() {
                             for r in 0..=title_row_max.min(grid.grid_rows.saturating_sub(1)) {
@@ -1575,7 +1579,7 @@ impl LogisModel {
                             }
                         }
                         emit_term(&format!(
-                            "  🚫 [TITLE ROW SUPPRESSION] 상단 {}행(제목 밴드) 점수 {}개 억제 → header 봉우리가 값 행으로 재현지화됩니다.",
+                            "  🚫 [TITLE ROW SUPPRESSION] 상단 {}행(제목 인쇄 행만) 점수 {}개 억제 → r2 라벨 행 생존, header 봉우리가 값 행(r2~r4)에서 결정됩니다.",
                             title_row_max + 1, suppressed
                         ));
                     }
@@ -2154,6 +2158,10 @@ impl LogisModel {
                 //   2. 해당 키로 타겟 서식 검색
                 //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
                 // =====================================================================
+                // 🌟 [SCOPE FIX] relay_starved 는 블록 내부(규칙 푸시)와 블록 외부(집계 출력)
+                //    양쪽에서 사용되므로, is_trade_doc 블록보다 바깥에서 선언합니다.
+                //    커머스가 아닌 경로에서는 비어 있어 출력이 자동 억제됩니다.
+                let mut relay_starved: Vec<String> = Vec::new();
                 if is_trade_doc {
                     let mut relay_rules = crate::logic::trade_relay_rules(doc_type);
                     // 🌟 [RELAY SOURCE EXTENSION] CI 의 AIRWAYBILL/BILL OF LADING 번호는
@@ -2171,7 +2179,12 @@ impl LogisModel {
                             .unwrap_or("")
                             .trim()
                             .to_string();
-                        if link_value.is_empty() || link_value == "N/A" { continue; }
+                        if link_value.is_empty() || link_value == "N/A" {
+                            // 🌟 [RELAY STARVATION LOG] 침묵 스킵이면 원인을 못 봅니다.
+                            //    어떤 규칙이 어떤 빈 키 때문에 굶었는지 집계합니다.
+                            relay_starved.push(format!("{}←{}(빈 키)", target_type, source_field));
+                            continue;
+                        }
 
                         emit_term(&format!(
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
@@ -2306,6 +2319,13 @@ impl LogisModel {
                 }
 
                 // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
+                if !relay_starved.is_empty() {
+                    emit_term(&format!(
+                        "  ⚪ [TRADE RELAY STARVED] 연결 키 공백으로 스된 규칙 {}건: {:?} — doc_number/flight_number 추출 실패가 릴레이 부재의 직접 원인입니다.",
+                        relay_starved.len(),
+                        relay_starved
+                    ));
+                }
                 // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
                 let _ = db.update_task_status(&task_id, 9).await;
                 let _ = db.update_message_status(&task_id, 9, Some("Extraction Complete")).await;
