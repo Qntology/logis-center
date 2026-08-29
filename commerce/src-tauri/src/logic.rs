@@ -101,51 +101,52 @@ pub fn related(item_type: &str) -> Vec<&str> {
 /// 무역 서식은 reference_invoice / reference_lc / reference_booking / container_number로 연결합니다.
 ///
 /// 반환값: (연결 대상 서식 타입, 조회할 필드명, 현재 문서에서 가져올 값 필드명)
+// 🌟 [DEPRECATED] trade_relay_rules 는 parsing.rs 의 plan_trade_relays 로 대체됩니다.
+//    기존은 서식 코드마다 하드코딩된 (target, target_field, source_field) 튜플을
+//    반환했는데, 필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
+//    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
+//
+//    plan_trade_relays 는 역할 기반으로 릴레이 대상을 계산합니다.
+//    같은 역할을 공유하면 서식 코드가 달라도 연결됩니다.
+//    이 함수는 하위 호환을 위해 남겨두지만, 새 코드에서는 사용하지 마십시오.
+#[deprecated(
+    since = "relay-v4",
+    note = "parsing.rs 의 plan_trade_relays 를 사용하십시오. 이 함수는 역할 기반이 아니라 서식 코드 하드코딩입니다."
+)]
 pub fn trade_relay_rules(doc_type: &str) -> Vec<(&'static str, &'static str, &'static str)> {
     match doc_type {
-        // CI가 추출되면 → PL/BL/ED가 CI를 참조하는지 역방향 조회
         "CI" => vec![
             ("PL",  "reference_invoice", "doc_number"),
             ("BL",  "reference_invoice", "doc_number"),
             ("ED",  "reference_invoice", "doc_number"),
         ],
-        // PL이 추출되면 → CI를 정방향 조회
         "PL" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("BL",  "reference_invoice", "reference_invoice"),
         ],
-        // BL이 추출되면 → CI/PL/BC를 조회
         "BL" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("PL",  "reference_invoice", "reference_invoice"),
             ("BC",  "doc_number", "reference_booking"),
         ],
-        // LC가 추출되면 → CI가 LC를 참조하는지 역방향 조회
         "LC" => vec![
             ("CI",  "reference_lc", "doc_number"),
         ],
-        // BC가 추출되면 → BL이 BC를 참조하는지 역방향 조회
         "BC" => vec![
             ("BL",  "reference_booking", "doc_number"),
         ],
-        // ED/ID가 추출되면 → CI를 정방향 조회
         "ED" | "ID" | "CINV" => vec![
             ("CI",  "doc_number", "reference_invoice"),
         ],
-        // CO, SA, DO, AN 등 기타 서식
         "CO" | "SA" | "DO" | "AN" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("BL",  "reference_invoice", "reference_invoice"),
         ],
-        // 🌟 [HBL → MBL] House B/L 은 자기 상위 Master B/L 을 가리킵니다.
-        //    이 간선이 없으면 혼재 화물(consolidation)의 문서 체인이
-        //    House 단계에서 끊겨 상위 운송 정보로 이어지지 않습니다.
         "HBL" => vec![
             ("BL",  "reference_master_bl", "doc_number"),
             ("FCR", "reference_hbl", "doc_number"),
             ("CI",  "doc_number", "reference_invoice"),
         ],
-        // 🌟 [SWB] Sea Waybill 은 B/L 과 같은 위치의 서식이므로 같은 상대를 봅니다.
         "SWB" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("PL",  "reference_invoice", "reference_invoice"),
@@ -198,6 +199,9 @@ pub const TRADE_HUB_TYPES: [&str; 4] = ["PO", "CI", "BL", "LC"];
 
 pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
     // ── ① 서식별 직속 상대 (허브 이외의 근접 관계) ──
+    // 🌟 [MISSING 10] 사용자 지적 '미포함 서식' 중
+    //    related_trading 에 없던 10종을 추가합니다.
+    //    BE / SR / BK / WR / CSI / SWB / IP / DN / CN / FC
     let direct: Vec<&'static str> = match doc_type {
         // 계약 · 결제
         "PO"      => vec!["PI", "SC", "EL", "CP", "LLC", "SOA"],
@@ -206,15 +210,17 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "LC"      => vec!["LLC", "LG", "TR", "SOA"],
         "LLC"     => vec!["CP", "TI"],
         "CP"      => vec!["ED", "TI", "LLC"],
-
+        "BE"      => vec!["LC", "LLC", "SOA"],
         // 선적 · 운송
         "CI"      => vec!["PL", "CINV", "CSI", "CO", "ED", "ID", "FI", "SOA"],
         "PL"      => vec!["ED", "ID", "WC", "CM"],
         "BL"      => vec!["HBL", "SWB", "PL", "DO", "AN", "BC", "CM", "FI", "LG", "TR", "CCC", "CDR"],
         "HBL"     => vec!["FCR", "BC"],
-        "SWB"     => vec!["DO", "AN"],
+        "SWB"     => vec!["DO", "AN", "CI", "PL"],
         "AWB"     => vec!["PL", "DGD"],
-        "BC"      => vec!["FI", "HBL"],
+        "BC"      => vec!["FI", "HBL", "BK"],
+        "BK"      => vec!["BC", "FI", "BL"],
+        "SR"      => vec!["BK", "BC"],
         "SA"      => vec!["PL"],
         "DO"      => vec!["AN", "POD", "LG"],
         "AN"      => vec!["DO", "FI"],
@@ -222,7 +228,7 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "POD"     => vec!["DO", "CDR"],
         "CM"      => vec!["ED"],
         "FI"      => vec!["BC", "AN"],
-
+        "WR"      => vec!["DO", "POD"],
         // 통관 · 신고
         "ED"      => vec!["PL", "CO", "CP", "CM", "EL"],
         "ID"      => vec!["PL", "CO", "CCC"],
@@ -230,7 +236,6 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "CO"      => vec!["CNM", "ED", "ID", "CCC"],
         "EL"      => vec!["SC", "PI", "ED"],
         "CCC"     => vec!["ID", "CO"],
-
         // 검사 · 증명
         "IC"      => vec!["COA", "WC"],
         "WC"      => vec!["PL", "IC"],
@@ -242,26 +247,25 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "BEN_CERT"=> vec![],
         "FC"      => vec!["PHYTO", "PC"],
         "CNM"     => vec!["CO"],
-
         // 특수 · 법무 · 금융
         "DGD"     => vec!["MSDS", "AWB"],
         "MSDS"    => vec!["DGD"],
         "POA"     => vec!["BIZ_LIC"],
         "BIZ_LIC" => vec!["POA"],
         "INS"     => vec!["IP", "CDR", "ICF"],
-        "IP"      => vec!["CDR", "ICF"],
+        "IP"      => vec!["CDR", "ICF", "SOA"],
         "LG"      => vec!["TR", "DO"],
         "TR"      => vec!["LG"],
-        "CDR"     => vec!["IP", "ICF", "POD"],
+        "CDR"     => vec!["IP", "ICF", "SOA"],
         "ICF"     => vec!["IP", "CDR", "SOA"],
         "SOA"     => vec!["DN", "CN", "ICF", "FI", "TI"],
         "DN"      => vec!["SOA"],
         "CN"      => vec!["SOA"],
         "TI"      => vec!["CP", "LLC", "SOA"],
         "CSI"     => vec!["CO"],
-
         _         => vec![],
     };
+    // ...
 
     // ── ② 허브 4종 병합 (자기 자신은 제외) ──
     let mut out: Vec<&'static str> = Vec::with_capacity(direct.len() + TRADE_HUB_TYPES.len());
@@ -288,72 +292,62 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
 pub fn trade_reference_field_of(doc_type: &str) -> Option<&'static str> {
     let f = match doc_type {
         // ── 계약 · 결제 ──
-        "PO"       => "reference_po",
-        "PI"       => "reference_proforma",
-        "SC"       => "reference_contract",
-        "LC"       => "reference_lc",
-        "LLC"      => "reference_local_lc",
-        "CP"       => "reference_purchase_confirm",
-
+        "PO" => "reference_po",
+        "PI" => "reference_proforma",
+        "SC" => "reference_contract",
+        "LC" => "reference_lc",
+        "LLC" => "reference_local_lc",
+        "CP" => "reference_purchase_confirm",
+        "BE" => "reference_bill_of_exchange",
+        "TR" => "reference_tr",
+        "LG" => "reference_lg",
+        "EL" => "reference_export_license",
         // ── 상거래 · 선적 ──
-        "CI"       => "reference_invoice",
-        "CINV"     => "reference_customs_invoice",
-        "CSI"      => "reference_consular_invoice",
-        "PL"       => "reference_packing",
-        "BL"       => "reference_bl",
-        "HBL"      => "reference_hbl",
-        "SWB"      => "reference_swb",
-        "AWB"      => "reference_awb",
-        "BC" | "BK"=> "reference_booking",
-        "SA"       => "reference_shipping_advice",
-        "DO"       => "reference_do",
-        "AN"       => "reference_arrival_notice",
-        "FCR"      => "reference_fcr",
-        "POD"      => "reference_pod",
-        "CM"       => "reference_manifest",
-        "FI"       => "reference_freight_invoice",
-
+        "CI" => "reference_invoice",
+        "CINV" => "reference_customs_invoice",
+        "CSI" => "reference_consular_invoice",
+        "PL" => "reference_packing",
+        "BL" => "reference_bl",
+        "HBL" => "reference_hbl",
+        "SWB" => "reference_swb",
+        "AWB" => "reference_awb",
+        "BC" | "BK" => "reference_booking",
+        "SA" => "reference_shipping_advice",
+        "DO" => "reference_do",
+        "AN" => "reference_arrival_notice",
+        "FCR" => "reference_fcr",
+        "POD" => "reference_pod",
+        "CM" => "reference_manifest",
+        "FI" => "reference_freight_invoice",
+        "WR" => "reference_warehouse_receipt",
+        "SR" => "reference_sr",
         // ── 통관 · 신고 ──
-        "ED"       => "reference_export_decl",
-        "ID"       => "reference_import_decl",
-        "CO"       => "reference_origin",
-        "EL"       => "reference_export_license",
-        "CCC"      => "reference_customs_clearance",
-
+        "ED" => "reference_export_decl",
+        "ID" => "reference_import_decl",
+        "CO" => "reference_origin",
+        "CCC" => "reference_customs_clearance",
+        "CNM" => "reference_non_manipulation",
         // ── 검사 · 증명 ──
-        "IC"       => "reference_inspection",
-        "WC"       => "reference_weight",
-        "CA"       => "reference_analysis",
-        "COA"      => "reference_analysis",
-        "PHYTO"    => "reference_phyto",
-        "PC"       => "reference_phyto",
-        "HC"       => "reference_health",
+        "IC" => "reference_inspection",
+        "WC" => "reference_weight",
+        "CA" | "COA" => "reference_analysis",
+        "PHYTO" | "PC" => "reference_phyto",
+        "HC" => "reference_health",
         "BEN_CERT" => "reference_beneficiary",
-        "FC"       => "reference_fumigation",
-        "CNM"      => "reference_non_manipulation",
-
+        "FC" => "reference_fumigation",
+        "CDR" => "reference_survey",
         // ── 특수 · 법무 · 금융 ──
-        "DGD"      => "reference_dgd",
-        "MSDS"     => "reference_msds",
-        "POA"      => "reference_poa",
-        "BIZ_LIC"  => "reference_biz_license",
-        "INS"      => "reference_policy",
-        "IP"       => "reference_policy",
-        "LG"       => "reference_lg",
-        "TR"       => "reference_tr",
-        "CDR"      => "reference_survey",
-        "ICF"      => "reference_claim",
-        "SOA"      => "reference_statement",
-        "DN"       => "reference_debit_note",
-        "CN"       => "reference_credit_note",
-        "TI"       => "reference_tax_invoice",
-
-        // 🌟 [MISSING 3] related_trading() 이 참조하는데 이 사전에 없어
-        //    trading_relay_pair() 가 None 을 돌려주던 서식들입니다.
-        //    한쪽이라도 비면 relay 가 성립하지 않으므로 그래프 간선이 통째로 끊깁니다.
-        "SR"       => "reference_sr",
-        "WR"       => "reference_warehouse_receipt",
-        "BE"       => "reference_bill_of_exchange",
+        "DGD" => "reference_dgd",
+        "MSDS" => "reference_msds",
+        "POA" => "reference_poa",
+        "BIZ_LIC" => "reference_biz_license",
+        "INS" | "IP" => "reference_policy",
+        "ICF" => "reference_claim",
+        // ── 정산 ──
+        "SOA" => "reference_statement",
+        "DN" => "reference_debit_note",
+        "CN" => "reference_credit_note",
+        "TI" => "reference_tax_invoice",
         _ => return None,
     };
     Some(f)
@@ -1234,6 +1228,73 @@ pub fn trade_field_category(field: &str) -> &'static str {
         _ => trade_field_category_by_rule(field),
     }
 }
+
+// 🌟 [TRADE DOC TITLES] vision_encoder.rs 에 하드코딩되어 있던 서식 전문 사전을
+//    logic.rs 로 이관합니다. 텍스트 트랙(scheduler STEP A)과 비전 트랙이
+//    같은 사전을 쓰면 서식이 늘어도 수정 지점이 한 곳으로 고정됩니다.
+//    전문(full name)을 키로 쓰는 이유: 'CI' 같은 접두어는 다른 서식에도
+//    인쇄되지만(ED 의 reference_invoice 등), 전문은 헤더로 인쇄되는 서식 본인뿐입니다.
+pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
+    ("CI", "commercial invoice"),
+    ("PI", "proforma invoice"),
+    ("CINV", "customs invoice"),
+    ("CSI", "consular invoice"),
+    ("TI", "tax invoice"),
+    ("FI", "freight invoice"),
+    ("PL", "packing list"),
+    ("BL", "bill of lading"),
+    ("HBL", "house bill of lading"),
+    ("SWB", "sea waybill"),
+    ("AWB", "air waybill"),
+    ("SA", "shipping advice"),
+    ("DO", "delivery order"),
+    ("AN", "arrival notice"),
+    ("BC", "booking confirmation"),
+    ("BK", "booking confirmation"),
+    ("SR", "shipping request"),
+    ("FCR", "forwarder certificate of receipt"),
+    ("POD", "proof of delivery"),
+    ("CM", "cargo manifest"),
+    ("WR", "warehouse receipt"),
+    ("ED", "export declaration"),
+    ("ID", "import declaration"),
+    ("CO", "certificate of origin"),
+    ("CNM", "certificate of non manipulation"),
+    ("CCC", "customs clearance certificate"),
+    ("EL", "export license"),
+    ("IC", "inspection certificate"),
+    ("COA", "certificate of analysis"),
+    ("CA", "certificate of analysis"),
+    ("WC", "weight certificate"),
+    ("PHYTO", "phytosanitary certificate"),
+    ("PC", "phytosanitary certificate"),
+    ("FC", "fumigation certificate"),
+    ("HC", "health certificate"),
+    ("BEN_CERT", "beneficiary certificate"),
+    ("CDR", "cargo damage survey report"),
+    ("DGD", "dangerous goods declaration"),
+    ("MSDS", "material safety data sheet"),
+    ("POA", "power of attorney"),
+    ("BIZ_LIC", "business license"),
+    ("INS", "insurance policy"),
+    ("IP", "insurance policy"),
+    ("ICF", "insurance claim form"),
+    ("SOA", "statement of account"),
+    ("DN", "debit note"),
+    ("CN", "credit note"),
+    ("PO", "purchase order"),
+    ("SC", "sales contract"),
+    ("LC", "letter of credit"),
+    ("LLC", "local letter of credit"),
+    ("CP", "purchase confirmation"),
+    ("BE", "bill of exchange"),
+    ("TR", "trust receipt"),
+    ("LG", "letter of guarantee"),
+    // 🌟 [COMMERCE/PARCEL AXIS] mode 감지용 추가 축.
+    //    택배 라벨은 무역 서식과 달리 전문이 '라벨' 문구로 인쇄됩니다.
+    //    동명 마진 0 자가거부 규칙 때문에 TRACKING 은 1개 항목만 둡니다.
+    ("TRACKING", "tracking label shipping label parcel waybill"),
+];
 
 /// 🌟 [RULE FALLBACK] 명시 매핑에 없는 필드를 부분일치 규칙으로 라우팅합니다.
 ///

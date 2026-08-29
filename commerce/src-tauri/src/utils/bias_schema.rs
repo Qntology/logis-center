@@ -37,11 +37,6 @@ pub fn canonical_bias_type(page_type: &str) -> &str {
         | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
         // 🌟 [MISSING 18] trade_schema.overlay 에는 존재하는데 이 목록에 없어
         //    canonical_bias_type 이 자기 자신을 반환하던 서식들입니다.
-        //    그 결과 bias_node() 의 세 경로(ko.{code} / ko.{canon} / ko.default)가
-        //    모두 실패해 label_phrase_bank 와 prejudice_phrase_bank 가
-        //    빈 배열을 돌려주었고, STEP 3 히트맵이 판정 근거를 잃었습니다.
-        //    multilingual_value_anchor_phrases_scoped 도 같은 함수를 쓰므로
-        //    저장 벡터의 다국어 축까지 함께 비어 크로스링구얼 리콜이 0 이 됩니다.
         | "HBL"  // House Bill of Lading
         | "FCR"  // Forwarder's Certificate of Receipt
         | "POD"  // Proof of Delivery
@@ -74,6 +69,7 @@ pub fn canonical_bias_type(page_type: &str) -> &str {
         | "CN"   // Credit Note
         | "FC"   // Fumigation Certificate
         => "shipping_doc",
+        
         _ => page_type,
     }
 }

@@ -918,7 +918,6 @@ impl LogisModel {
                 }
             }
         }
-
         let needs_load = {
             let guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_ref() {
@@ -928,10 +927,8 @@ impl LogisModel {
                 true
             }
         };
-
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
-            
             // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
             // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
             let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
@@ -961,32 +958,51 @@ impl LogisModel {
                 // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
                 self.deep_purge_resources().await;
             }
-            
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
                 *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
             }
-            
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
-            
-            let gen = tokio::task::spawn_blocking(move || {
-                let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
-                let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
-                
-                // 🌟 [수정]
-                let mmproj_gguf = if needs_vision {
-                    gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
-                } else {
-                    None
-                };
-                
-                Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
-            }).await??;
-            
+            // 🌟 [TIMEOUT ADD] 180초 타임아웃으로 무한 로딩 방지
+            let load_result = tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                tokio::task::spawn_blocking(move || {
+                    let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
+                    let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
+                    let mmproj_gguf = if needs_vision {
+                        gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
+                    } else {
+                        None
+                    };
+                    Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
+                })
+            ).await;
+            let gen = match load_result {
+                Ok(Ok(Ok(g))) => g,
+                Ok(Ok(Err(e))) => {
+                    // 로드 실패 시 현재 사이즈 등록을 되돌리고 에러 전파
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 GGUF load failed: {}", e));
+                },
+                Ok(Err(join_err)) => {
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 load task join error: {}", join_err));
+                },
+                Err(_) => {
+                    // 타임아웃
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 load timeout (180s). GPU may be out of memory or driver stalled."));
+                }
+            };
             let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
             *q35_gen_guard = Some(gen);
-            
             // 🌟 [CRITICAL FIX] 시스템 장부에 Qwen3.5가 켜졌음을 명시하여 스냅샷 미아 발생 방지!
             let mut current_size_guard = self.current_size.lock().await;
             *current_size_guard = Some(ModelSize::Qwen3_5);
@@ -1174,8 +1190,10 @@ impl LogisModel {
     ///   그 시점이 곧 Qwen3.5(2B) 를 올려야 하는 시점이므로 여기서 반드시 비웁니다.
     ///   (실측: 해제 없이 진입 시 첫 크롭에서 free VRAM 147MB)
     pub async fn release_siglip2(&self, reason: &str) {
+        println!("[VRAM] release_siglip2 ENTER ({}) — lock acquiring...", reason);
         let released = {
             let mut guard = self.siglip2_model.lock().await;
+            println!("[VRAM] lock acquired. Dropping SigLIP2 model (cudaFree implicit sync may happen here)...");
             if guard.is_some() {
                 *guard = None;
                 true
@@ -1183,28 +1201,44 @@ impl LogisModel {
                 false
             }
         };
-
         if !released {
+            println!("[VRAM] release_siglip2: already released. skip.");
             return;
         }
-
         println!(
             "[VRAM] SigLIP2 fully released ({}). vision ~820MB + text ~1.4GB returned.",
             reason
         );
-
         if !self.is_cpu_mode {
+            // 🌟 [HANG FIX] 텐서 드롭이 이미 암묵 synchronize 를 수행한 상태에서
+            //    여기서 다시 무한정으로 synchronize 를 기다리면 저VRAM(3.5GB) 환경에서
+            //    드라이버 스톨 시 영구 대기됩니다. 5초 상한을 두고 초과면 그냥 진행합니다.
+            //    (동기화는 '언제' 끝나도 정확성에 영향이 없는 베스트에포트 정리입니다)
             let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() {
-                    let _ = dev.synchronize();
-                }
-            })
+            let sync_res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() {
+                        let _ = dev.synchronize();
+                    }
+                }),
+            )
             .await;
+            match sync_res {
+                Ok(Ok(())) => println!("[VRAM] CUDA synchronize OK."),
+                Ok(Err(e)) => println!("[VRAM] CUDA synchronize join error: {:?}", e),
+                Err(_) => println!("[VRAM] ⚠️ CUDA synchronize 5s timeout — 드라이버 스톨 감지, 동기화 없이 진행합니다."),
+            }
             // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
-        }
+            println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
 
+            // 🌟 [VRAM SETTLE AFTER RELEASE] SigLIP2 해제 후 실제 여유 메모리 확인
+            if let Some(token) = None::<Arc<AtomicBool>> {
+                let _ = token;
+            }
+            let _ = self.wait_for_vram_settle(1200, 10, None).await;
+        }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1355,19 +1389,32 @@ impl LogisModel {
         let _ = app_handle.emit("extraction-progress", &payload_load);
         crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_load);
 
-        // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
+        // 🌟 SigLIP2 로드: 비전만 먼저 로드하여 메모리 피크 최소화
+        //    텍스트 인코더는 코드 분류 단계에서 필요하므로 나중에 로드합니다.
         self.check_siglip2_downloaded().await?;
-        self.ensure_siglip2(true).await?;
+        self.ensure_siglip2_ext(true, false).await?;
+
+        // 🌟 [VRAM SETTLE BEFORE QWEN3.5] SigLIP2 로드 후 실제 여유 메모리 확인
+        if !self.is_cpu_mode {
+            self.wait_for_vram_settle(1200, 10, cancel_token.clone()).await.ok();
+        }
+
+        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
+        //    STEP 1~4 는 SigLIP2 만 사용하므로 여기서 로드하면
+        //    SigLIP2 비전(~400MB) + Qwen3.5+mmproj(~2.6GB) = ~3.0GB 동시 상주가 발생합니다.
+        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
+        //    ensure_qwen3_5(image.is_some()) 가 필요 시점에 자동 로드하며,
+        //    그 시점에는 release_siglip2() 가 이미 SigLIP2 를 전량 해제한 후입니다.
+
         // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
         //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
         //    SigLIP2(~2.2GB) + Qwen3.5(~2GB) 동시 상주를 피합니다.
         //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
         //    ensure_qwen3_5 가 필요 시점에 자동 로드합니다.
-
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
 
-            let is_trade_doc = search_mode == "shipping";
+            let mut is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
 
             // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
@@ -1378,6 +1425,18 @@ impl LogisModel {
             let grid = crate::models::siglip2::vision_encoder::encode_image(siglip, &dynamic_image)
                 .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
             drop(siglip_guard);
+
+            // 🌟 비전 인코더 사용 완료 → 메모리 즉시 해제
+            {
+                let mut guard = self.siglip2_model.lock().await;
+                if let Some(m) = guard.as_mut() {
+                    m.vision = None;
+                    println!("[SigLIP2] Vision encoder unloaded after patch extraction ({}x{} patches done).",
+                        grid.grid_rows, grid.grid_cols);
+                }
+            }
+            // 텍스트 인코더 로드 (코드 분류용)
+            self.ensure_siglip2_ext(false, true).await?;
 
             // ── STEP 2.5 : 판독성 맵 ──
             //
@@ -1409,6 +1468,46 @@ impl LogisModel {
             let mut grounding_claims:
                 Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
 
+            // 🌟 [SCOPE FIX] relay_plan 은 if is_trade_doc 블록 내부에서 할당되고,
+            //    블록 외부(STEP 6 이후 저장 구간)에서 참조되므로
+            //    양쪽 분기보다 바깥에서 미리 선언해야 합니다.
+            //    (커머스 경로에서는 빈 Vec 으로 남아 요약 출력이 자동 억제됩니다)
+            let mut relay_plan: Vec<(&'static str, crate::parsing::TradeRelayKey)> = Vec::new();
+
+            // 🌟 [MODE REROUTE] mode="commerce" 로 들어왔더라도,
+            //    상단 밴드에 무역 서식 전문이 인쇄되어 TITLE GATE 가 확정한 경우에만
+            //    trading 파이프라인으로 전환합니다.
+            //    · 상품 사진/스크린샷(커머스) → 전문 없음 → title_confirmed=false → 커머스 유지
+            //    · 택배 라벨 → TRACKING 확정 → 아래 분기에서 기존 커머스 트랙킹 경로 유지
+            //    · 인보이스/B/L 등 → title_confirmed=true && code != TRACKING → trading 전환
+            //    본문 코사인(그룹 점수)은 settlement 이 CI 를 이기는 등 신뢰도가 낮으므로
+            //    리라우트 근거로 쓰지 않습니다. (로그: [VISION GROUP] settlement +4.5884 1위)
+            if !is_trade_doc {
+                let sg = self.siglip2_model.lock().await;
+                if let Some(siglip) = sg.as_ref() {
+                    match crate::models::siglip2::vision_encoder::classify_doc_type(siglip, &grid, &emit_term) {
+                        Ok(v) => {
+                            if v.title_confirmed && v.code != "TRACKING" && v.code != "Unknown" {
+                                emit_term(&format!(
+                                    "  🔀 [MODE REROUTE] mode='commerce' 이지만 서식 전문 '{}' 이 인쇄 확인되었습니다. trading 파이프라인으로 전환합니다. (code='{}', margin {:+.4})",
+                                    v.title_text, v.code, v.code_margin
+                                ));
+                                is_trade_doc = true;
+                            } else {
+                                emit_term(&format!(
+                                    "  🛒 [MODE KEEP] mode='commerce' 유지 (title_confirmed={}, code='{}')",
+                                    v.title_confirmed, v.code
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            emit_term(&format!("  ⚠️ [MODE REROUTE SKIP] 사전 분류 실패로 커머스 경로를 유지합니다: {}", e));
+                        }
+                    }
+                }
+                drop(sg);
+            }
+
             if is_trade_doc {
                 emit_term(&format!(
                     "  🧬 [PATCH GRID] {}x{} = {} patches | scale({:.3}, {:.3})",
@@ -1416,29 +1515,9 @@ impl LogisModel {
                 ));
 
                 emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
-                //  구분하지 못하므로, 크롭이 착지하면 2B 모델이 무언가를 지어냅니다.
-                //  빈 셀도 같습니다. BUYER (IF NOT CONSIGNEE) 박스는 내용이 비어 있는데
-                //  모델이 헤더 라벨을 값으로 읽어
-                //  recipient_name = "BUYER (IF NOT CONSIGNEE)" 를 반환했습니다.
-                //
-                // 🌟 [왜 임베딩이 아니라 픽셀인가]
-                //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
-                //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
-                //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
-                //
-                // 🌟 [소비처 3곳]
-                //  · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
-                //  · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
-                //  · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
-                //  한 번 계산해서 세 곳이 공유하므로 추가 비용이 없습니다.
-                let legibility = crate::models::siglip2::legibility::build_legibility_map(
-                    &dynamic_image,
-                    grid.grid_rows,
-                    grid.grid_cols,
-                    &emit_term,
-                );
-
-                emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
+                // 🌟 [LEGIBILITY REUSE] 판독성 맵은 분기 밖 STEP 2.5 에서 1회 계산된
+                //    바인딩을 그대로 사용합니다. 기존 shadowing 재계산은 로그 2회 출력 +
+                //    800x1032 픽셀 스캔 2회의 순수 낭비였습니다.
 
                 // ── STEP 2 : Doc Type NMS Battle ──
                 let siglip_guard2 = self.siglip2_model.lock().await;
@@ -1512,22 +1591,58 @@ impl LogisModel {
                     // 🌟 [STEP 3~5] 히트맵 → 크롭 → Qwen3.5 추출 파이프라인
                     emit_term("[STAGE-3] 🔥 Column Cosine Matching (Heatmap)...");
 
-                    let siglip_guard3 = self.siglip2_model.lock().await;
-                    let siglip3 = siglip_guard3.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                    let title_prej: Vec<String> = if verdict.title_text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![verdict.title_text.clone()]
+                    };
+                    // 🌟 [SCOPED LOCK] tokio Mutex 는 재진입이 불가능합니다.
+                    //    가드가 생존한 채 release_siglip2 가 같은 태스크에서 락을 기다리면
+                    //    영구 정지(셀프 데드록)합니다. 명시적 drop 에 의존하지 않고
+                    //    스코프 블록으로 락 수명을 고정합니다.
+                    let mut heatmaps = {
+                        let siglip_guard3 = self.siglip2_model.lock().await;
+                        let siglip3 = siglip_guard3.as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                        crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                            siglip3, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
+                        ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?
+                    };
 
-                    // ── STEP 3 : Column Cosine Matching ──
-                    let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                        siglip3, &grid, &detected_type, &language, &emit_term
-                    ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
-                    drop(siglip_guard3);
+                    // 🌟 [TITLE ROW SUPPRESSION] 제목 행은 어떤 필드의 값도 될 수 없습니다.
+                    //    실측에서 header 봉우리가 제목/로고 행(r0)에 착지해 doc_number 가 전멸했습니다.
+                    //    타이틀은 상단 1줄(≈ 격자 행수의 1/9, TITLE GATE 30% 밴드의 1/3)에 인쇄되므로
+                    //    해당 행의 점수를 억제해 header 봉우리가 값 행으로 이동하게 합니다.
+                    {
+                        // 🌟 [ROW FIX v2] /9(=2) 는 0..=2 세 행을 죽여 "INVOICE NUMBER" 라벨 행(r2)까지
+                        //    함께 억제했고, doc_number 앵커가 근거를 잃어 header 봉우리가
+                        //    숫자 밀집 블록(VAT/EORI, r7~8)으로 탈주했습니다(실측: reference_invoice="CONSIGNEE VAT/EORI").
+                        //    제목 실제 인쇄 행은 r0~1 뿐이므로 /18(=1) 로 0..=1 만 억제합니다.
+                        let title_row_max = (grid.grid_rows / 18).max(1).min(grid.grid_rows.saturating_sub(1));
+                        let mut suppressed = 0usize;
+                        for hm in heatmaps.iter_mut() {
+                            for r in 0..=title_row_max.min(grid.grid_rows.saturating_sub(1)) {
+                                for c in 0..grid.grid_cols {
+                                    let i = r * grid.grid_cols + c;
+                                    if i < hm.scores.len() && hm.scores[i] > f32::MIN {
+                                        hm.scores[i] = f32::MIN;
+                                        suppressed += 1;
+                                    }
+                                }
+                            }
+                        }
+                        emit_term(&format!(
+                            "  🚫 [TITLE ROW SUPPRESSION] 상단 {}행(제목 인쇄 행만) 점수 {}개 억제 → r2 라벨 행 생존, header 봉우리가 값 행(r2~r4)에서 결정됩니다.",
+                            title_row_max + 1, suppressed
+                        ));
+                    }
 
                     // ── STEP 4 : Vision NMS & Cropping ──
                     emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
                     let mut plans = crate::models::siglip2::vision_crop::plan_crops(
                         &heatmaps, &grid, &emit_term
                     );
-
+                    emit_term(&format!("  🧾 [PLAN DONE] 크롭 계획 {}건 확정. release_siglip2 진입 전...", plans.len()));
                     if plans.is_empty() {
                         let cats = crate::parsing::get_trade_doc_categories(&detected_type);
                         emit_term(&format!(
@@ -1559,20 +1674,35 @@ impl LogisModel {
                     // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
 
                     for (idx, plan) in plans.iter().enumerate() {
-                        if cancel_token.as_ref().map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                        if cancel_token
+                            .as_ref()
+                            .map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed))
+                        {
                             emit_term("🛑 Task cancelled by user. Terminating safely.");
                             return Ok(());
                         }
 
+                        // 🌟 [EMPTY CROP SKIP] 출처 영역에 읽을 것이 없으면 Qwen 호출 자체를 생략합니다.
+                        //    실측: insurance 타일은 판독 가능 패치 0/10 인데 2048x512 로 2회 호출되어
+                        //    "Apr-19-2022" 를 지어냈습니다. 확대는 빈 영역에 정보를 만들지 못합니다.
+                        let (lg_cnt, _il_cnt, _bl_cnt) =
+                            legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
+
+                        if lg_cnt == 0 {
+                            emit_term(&format!(
+                                "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다. Qwen 호출을 생략합니다.",
+                                plan.category
+                            ));
+                            continue;
+                        }
+
                         // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
-                        let (tile_count, _why) =
-                            crate::models::siglip2::vision_crop::decide_tile_count(
-                                plan, &heatmaps, &grid, &legibility, &emit_term
-                            );
+                        let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
+                            plan, &heatmaps, &grid, &legibility, &emit_term
+                        );
                         let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
                             plan.bbox, tile_count, 0.25
                         );
-
                         for tile in tiles.iter() {
                             // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
                             let mut tile_plan = plan.clone();
@@ -1660,14 +1790,15 @@ impl LogisModel {
                 emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
 
                 let commerce_page_type = "goods";
-                let siglip_guard4 = self.siglip2_model.lock().await;
-                let siglip4 = siglip_guard4.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
-
-                let heatmaps = crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                    siglip4, &grid, commerce_page_type, &language, &emit_term
-                ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
-                drop(siglip_guard4);
+                // 🌟 [SCOPED LOCK] trade 분기와 동일한 셀프 데드락 방지 블록화.
+                let heatmaps = {
+                    let siglip_guard4 = self.siglip2_model.lock().await;
+                    let siglip4 = siglip_guard4.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                    crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                        siglip4, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
+                    ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?
+                };
 
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
                     &heatmaps, &grid, &emit_term
@@ -1791,67 +1922,21 @@ impl LogisModel {
                 // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
                 //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
                 //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
-                let verdicts = match self.ensure_siglip2_ext(false, true).await {
-                    Err(e) => {
-                        emit_term(&format!(
-                            "  ⚪ [GROUNDING SKIP] SigLIP2 재로드 실패로 검증을 건너뜁니다: {}",
-                            e
-                        ));
-                        Vec::new()
-                    }
-                    Ok(_) => {
-                        let v = {
-                            let guard = self.siglip2_model.lock().await;
-                            match guard.as_ref() {
-                                Some(sig) if sig.has_text() => {
-                                    // 🌟 [BATCH ENCODE] 값마다 encode_query_text 를 부르면
-                                    //    텍스트 인코더 순전파가 값 개수만큼 반복됩니다.
-                                    //    고유 값을 한 번에 모아 encode_phrases 로 1회 처리하고,
-                                    //    검증 클로저는 색인 조회만 하도록 만듭니다.
-                                    let mut uniq: Vec<String> = Vec::new();
-                                    for c in grounding_claims.iter() {
-                                        if !uniq.iter().any(|e| e == &c.value) {
-                                            uniq.push(c.value.clone());
-                                        }
-                                    }
-                                    let embs = crate::models::siglip2::vision_encoder::encode_phrases(
-                                        sig, &uniq,
-                                    ).unwrap_or_default();
-
-                                    let mut table: std::collections::HashMap<&str, &Vec<f32>> =
-                                        std::collections::HashMap::new();
-                                    for (i, u) in uniq.iter().enumerate() {
-                                        if let Some(e) = embs.get(i) {
-                                            table.insert(u.as_str(), e);
-                                        }
-                                    }
-                                    emit_term(&format!(
-                                        "  🔤 [GROUNDING ENCODE] 고유 값 {}건을 1회 배치로 인코딩했습니다.",
-                                        uniq.len()
-                                    ));
-
-                                    crate::models::siglip2::value_grounding::verify_claims(
-                                        &grounding_claims,
-                                        &grid.patches,
-                                        grid.grid_rows,
-                                        grid.grid_cols,
-                                        grid.orig_width,
-                                        grid.orig_height,
-                                        &legibility,
-                                        |t| table.get(t).map(|v| (*v).clone()).unwrap_or_default(),
-                                        &emit_term,
-                                    )
-                                }
-                                _ => {
-                                    emit_term("  ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.");
-                                    Vec::new()
-                                }
-                            }
-                        };
-                        self.release_siglip2("STEP 6 grounding complete").await;
-                        v
-                    }
-                };
+                // 🌟 [GROUNDING v2] v1 코사인 접지는 실측 26건 중 25건을 오폐기했습니다.
+                //    (로그: 🚫 [UNGROUNDED] [items] 'description' = "T-Shirt" | in -0.6821 ≤ 0 → 폐기)
+                //    v2 는 '출처 영역에 판독 가능한 패치가 있는가' 만 봅니다.
+                //    블러/여백에서 읽어낸 값(로그의 sender_name="Michael Johnson" 등)은
+                //    legibility 맵이 이미 잡으므로 여기서도 폐기됩니다.
+                //    SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다.
+                let verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
+                    &grounding_claims,
+                    grid.grid_rows,
+                    grid.grid_cols,
+                    grid.orig_width,
+                    grid.orig_height,
+                    &legibility,
+                    &emit_term,
+                );
 
                 // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
                 //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
@@ -1934,18 +2019,38 @@ impl LogisModel {
                 //   → 루트 document_number → 루트 doc_number → 루트 tracking_number
                 //   "N/A" 는 LLM 이 '못 찾았다' 는 뜻으로 쓰는 값이라 식별자가 될 수 없습니다.
                 let raw_no_owned: String = if is_trade_doc {
-                    let from_header = extracted_data.get("header")
-                        .and_then(|h| h.get("document_number").or_else(|| h.get("doc_number")))
-                        .and_then(|s| s.as_str());
-                    let from_root = extracted_data.get("document_number")
-                        .or_else(|| extracted_data.get("doc_number"))
-                        .or_else(|| extracted_data.get("tracking_number"))
-                        .and_then(|s| s.as_str());
-                    from_header
-                        .or(from_root)
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
-                        .unwrap_or_else(|| task_id.clone())
+                    // 🌟 [DOC IDENTITY v3] parsing.rs 의 resolve_trade_doc_identity 가
+                    //    접두어 완전일치 + 벡터 근거로 문서 식별자를 확정합니다.
+                    //    기존은 header / 루트만 훑다가 없으면 즉시 task_id 폴백이었습니다.
+                    //    그 결과 'BL-55432219' 가 r2~r3 에 인쇄되어 있어도
+                    //    doc_number = "" → task_id 폴백 → 재스캔마다 다른 index 가 되어
+                    //    같은 문서가 누적되었습니다.
+                    let (resolved_no, _resolved_idx, _is_fallback) =
+                        crate::parsing::resolve_trade_doc_identity(&doc_type, &extracted_data);
+                    
+                    emit_term(&format!(
+                        "  🔑 [DOC IDENTITY] resolve_trade_doc_identity 결과: '{}' (폴백: {})",
+                        resolved_no, resolved_no.is_empty()
+                    ));
+                    
+                    if !resolved_no.is_empty() {
+                        resolved_no
+                    } else {
+                        // 폴백: header / 루트 직접 탐색 (기존 경로 유지)
+                        let from_header = extracted_data.get("header")
+                            .and_then(|h| h.get("document_number").or_else(|| h.get("doc_number")))
+                            .and_then(|s| s.as_str());
+                        let from_root = extracted_data.get("document_number")
+                            .or_else(|| extracted_data.get("doc_number"))
+                            .or_else(|| extracted_data.get("tracking_number"))
+                            .and_then(|s| s.as_str());
+                        
+                        from_header
+                            .or(from_root)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+                            .unwrap_or_else(|| task_id.clone())
+                    }
                 } else {
                     extracted_data.get("tracking_number")
                         .and_then(|s| s.as_str())
@@ -1956,13 +2061,21 @@ impl LogisModel {
                 let raw_no: &str = raw_no_owned.as_str();
                 emit_term(&format!("[STAGE-3] 문서 식별자 확정: '{}' (task_id 폴백 여부: {})",
                     raw_no, raw_no == task_id.as_str()));
-                
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
-                
-                // 🌟 [CRITICAL FIX] 프론트엔드 리스트(#doc-list)와 완벽 동기화하기 위해 "items" 테이블로 저장 위치를 강제 통합합니다!
-                let table_name = "items"; 
 
-                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, clean_no)));
+                let table_name = "items"; 
+                
+                let clean_no = crate::utils::hash::normalize_identifier(raw_no);
+                // 🌟 [RELAY INDEX v3] hash.rs 의 relay_index 를 사용합니다.
+                //    기존은 `crc32(hash_id(type + clean_no))` 였는데,
+                //    이 경로에는 `normalize_identifier` 의 전각 접기가 반영되지 않았습니다.
+                //    `relay_index` 는 `normalize_identifier` 통과값을 받아
+                //    전각 영숫자(ＣＩ－４３７２６)도 반각과 동일하게 취급합니다.
+                let index_val = if crate::utils::hash::is_valid_relay_key(raw_no) {
+                    crate::utils::hash::relay_index(raw_no)
+                } else {
+                    // 유효하지 않은 키(예: task_id 폴백)는 기존 경로 유지
+                    crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, clean_no)))
+                };
                 let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
                 let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
 
@@ -1970,7 +2083,18 @@ impl LogisModel {
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
                 final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
                 // 🌟 [CRITICAL FIX] 이미지 추출 결과에도 모드 필터를 위한 mode 값을 명시적으로 주입합니다.
-                final_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
+                // 🌟 [MODE PARITY] MODE REROUTE(commerce→trading) 가 발화하면 저장 모드도
+                //    실제로 실행된 파이프라인과 일치해야 합니다. search_mode 원본("commerce")을
+                //    그대로 저장하면 문서는 commerce 목록에만 박히고, trading 목록의
+                //    `mode = 'shipping'` 필터에서는 영원히 0건이라 UI 에 아무것도 안 나옵니다.
+                //    hashed_cc 가 이미 is_trade_doc 을 쓰는 것과 동일한 규칙으로 통일합니다.
+                //    · shipping 태스크            → is_trade_doc=true  → "shipping" (동작 불변)
+                //    · commerce + 무역 서식 감지  → is_trade_doc=true  → "shipping" (리라우트 일치)
+                //    · commerce + 상품/택배 라벨  → is_trade_doc=false → "commerce" (동작 불변)
+                final_data.as_object_mut().unwrap().insert(
+                    "mode".to_string(),
+                    json!(if is_trade_doc { "shipping" } else { "commerce" }),
+                );
                 final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
                 final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
@@ -2112,122 +2236,163 @@ impl LogisModel {
                 //   2. 해당 키로 타겟 서식 검색
                 //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
                 // =====================================================================
+                // 🌟 [SCOPE FIX] relay_starved 는 블록 내부(규칙 푸시)와 블록 외부(집계 출력)
+                //    양쪽에서 사용되므로, is_trade_doc 블록보다 바깥에서 선언합니다.
+                //    커머스가 아닌 경로에서는 비어 있어 출력이 자동 억제됩니다.
+                let mut relay_starved: Vec<String> = Vec::new();
+
+                // 🌟 relay_plan 을 if is_trade_doc 블록 외부에서 선언하여
+                //    블록 내부와 외부 모두에서 접근 가능하게 합니다.
+                
+
                 if is_trade_doc {
-                    let relay_rules = crate::logic::trade_relay_rules(doc_type);
-                    for (target_type, target_field, source_field) in relay_rules {
-                        // 현재 문서에서 연결 키 값 추출
+                    // 🌟 [RELAY v4] parsing.rs 의 plan_trade_relays 를 사용합니다.
+                    //    기존은 logic.rs 의 trade_relay_rules 가 하드코딩한
+                    //    (target, target_field, source_field) 튜플을 순회했는데,
+                    //    필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
+                    //    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
+                    //
+                    //    plan_trade_relays 는 extract_trade_relay_keys 가 확정한
+                    //    역할별 키를 기반으로 릴레이 대상을 계산합니다.
+                    //    역할이 같으면 서식 코드가 달라도 연결됩니다.
+                    relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data);
+                    if relay_plan.is_empty() {
+                        emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");
+                    } else {
+                        emit_term(&format!(
+                            "  🔗 [RELAY v4] 릴레이 계획 {}건: {:?}",
+                            relay_plan.len(),
+                            relay_plan.iter().map(|(t, k)| format!("{}←{}('{}')", t, k.role, k.source_field)).collect::<Vec<_>>()
+                        ));
+                    }
+                    for (target_type, relay_key) in &relay_plan {
+                        let target_field = &relay_key.source_field;
+                        let source_field = &relay_key.source_field;
+                        let link_value = relay_key.raw.clone();
+                        if link_value.is_empty() || link_value == "N/A" {
+                            continue;
+                        }
                         let link_value = final_data.get(source_field)
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .trim()
                             .to_string();
-                        if link_value.is_empty() || link_value == "N/A" { continue; }
-
+                        if link_value.is_empty() || link_value == "N/A" {
+                            relay_starved.push(format!("{}←{}(빈 키)", target_type, source_field));
+                            continue;
+                        }
                         emit_term(&format!(
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
                             doc_type, target_type, target_field, link_value
                         ));
-
-                        // 타겟 서식 검색: data.{target_field} = link_value
-                        let needle = format!("\"{}\":\"{}\"", target_field.replace('\'', "''"), link_value.replace('\'', "''"));
-                        let relay_filter = format!("type = '{}' AND data LIKE '%{}%'", target_type, needle);
-                        match db.get_all_items("items", 1, 0, Some(relay_filter)).await {
-                            Ok(results) if !results.is_empty() => {
-                                let existing_id = &results[0].id;
-                                if let Ok(Some(mut existing_doc)) = db.get_item_by_id("items", existing_id).await {
-                                    if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_doc.json_data) {
-                                        let mut needs_update = false;
-
-                                        // 현재 문서의 doc_number를 타겟의 참조 필드에 역주입
-                                        if let Some(my_doc_number) = final_data.get("doc_number").and_then(|v| v.as_str()) {
-                                            if !my_doc_number.is_empty() && my_doc_number != "N/A" {
-                                                let reverse_field = match doc_type {
-                                                    "CI" => "reference_invoice",
-                                                    "LC" => "reference_lc",
-                                                    "BC" => "reference_booking",
-                                                    _ => "",
-                                                };
-                                                if !reverse_field.is_empty() {
-                                                    let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
-                                                    if existing_ref.is_empty() || existing_ref == "N/A" {
-                                                        ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
-                                                        needs_update = true;
-                                                    }
-                                                }
+                        let relay_result = db.find_item_by_property("items", target_field, &json!(link_value)).await;
+                        match relay_result {
+                            Ok(Some((existing_id, mut ej))) => {
+                                let mut needs_update = false;
+                                // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
+                                //    역할 기반으로 역참조 필드명을 결정합니다.
+                                let reverse_field = crate::logic::trade_reference_field_of(&doc_type)
+                                    .unwrap_or("");
+                                if !reverse_field.is_empty() {
+                                    if let Some(my_doc_number) = extracted_data.get("doc_number").and_then(|v| v.as_str()) {
+                                        if !my_doc_number.is_empty() && my_doc_number != "N/A" {
+                                            let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
+                                            if existing_ref.is_empty() || existing_ref == "N/A" {
+                                                ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
+                                                needs_update = true;
                                             }
-                                        }
-
-                                        // 물류 정보 상호 보완 (vessel, pol, pod, etd, eta)
-                                        for field in ["vessel", "voyage_number", "pol", "pod", "etd", "eta"] {
-                                            let my_val = final_data.get("logistics")
-                                                .and_then(|l| l.get(field))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            if my_val.is_empty() || my_val == "N/A" { continue; }
-                                            let their_val = ej.get("logistics")
-                                                .and_then(|l| l.get(field))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            if their_val.is_empty() || their_val == "N/A" {
-                                                if let Some(logistics_obj) = ej.get_mut("logistics").and_then(|l| l.as_object_mut()) {
-                                                    logistics_obj.insert(field.to_string(), json!(my_val));
-                                                    needs_update = true;
-                                                }
-                                            }
-                                        }
-
-                                        // 화물 정보 상호 보완 (container_number, seal_number, weight)
-                                        for field in ["container_number", "seal_number"] {
-                                            let my_val = final_data.get("containers")
-                                                .and_then(|c| c.as_array())
-                                                .and_then(|arr| arr.first())
-                                                .and_then(|c| c.get(field))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            if my_val.is_empty() || my_val == "N/A" { continue; }
-                                            let their_containers = ej.get("containers").and_then(|c| c.as_array());
-                                            let their_has = their_containers.map_or(false, |arr| {
-                                                arr.iter().any(|c| c.get(field).and_then(|v| v.as_str()).map_or(false, |v| v == my_val))
-                                            });
-                                            if !their_has {
-                                                if let Some(containers_arr) = ej.get_mut("containers").and_then(|c| c.as_array_mut()) {
-                                                    if containers_arr.is_empty() {
-                                                        containers_arr.push(json!({ field: my_val }));
-                                                    } else if let Some(first) = containers_arr.first_mut() {
-                                                        if let Some(obj) = first.as_object_mut() {
-                                                            if obj.get(field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-                                                                obj.insert(field.to_string(), json!(my_val));
-                                                            }
-                                                        }
-                                                    }
-                                                    needs_update = true;
-                                                }
-                                            }
-                                        }
-
-                                        if needs_update {
-                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                            let merged_text = crate::parsing::json_to_natural_language(&ej);
-                                            ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                            ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                            let _ = db.upsert_item(
-                                                "items", existing_id, target_type, ej, None,
-                                                None,
-                                                Some(from_addr), Some(&team_id), Some(&hashed_cc),
-                                                Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
-                                                Some(&ref_val), None
-                                            ).await;
-                                            emit_term(&format!(
-                                                "  ✅ [TRADE RELAY] 기존 {} 문서 '{}' 에 {} 정보 병합 완료.",
-                                                target_type, existing_id, doc_type
-                                            ));
                                         }
                                     }
                                 }
+                                // 🌟 [RELAY INDEX CROSS-LINK] relay_index 를 타겟 문서의 봉투에 주입합니다.
+                                //    이렇게 하면 두 문서가 같은 릴레이 축에서 서로를 찾을 수 있습니다.
+                                let my_relay_idx = if crate::utils::hash::is_valid_relay_key(raw_no) {
+                                    crate::utils::hash::relay_index(raw_no)
+                                } else {
+                                    0
+                                };
+                                if my_relay_idx > 0 {
+                                    let relay_col = crate::logic::trading_index_column(&doc_type);
+                                    let their_relay = ej.get(&relay_col).and_then(|v| v.as_u64()).unwrap_or(0);
+                                    if their_relay == 0 {
+                                        ej.as_object_mut().unwrap().insert(relay_col.clone(), json!(my_relay_idx));
+                                        needs_update = true;
+                                    }
+                                }
+                                // 물류 정보 상호 보완 (vessel, pol, pod, etd, eta)
+                                for field in ["vessel", "voyage_number", "pol", "pod", "etd", "eta"] {
+                                    let my_val = extracted_data.get("logistics")
+                                        .and_then(|l| l.get(field))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if my_val.is_empty() || my_val == "N/A" { continue; }
+                                    let their_val = ej.get("logistics")
+                                        .and_then(|l| l.get(field))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if their_val.is_empty() || their_val == "N/A" {
+                                        if let Some(logistics_obj) = ej.get_mut("logistics").and_then(|l| l.as_object_mut()) {
+                                            logistics_obj.insert(field.to_string(), json!(my_val));
+                                            needs_update = true;
+                                        }
+                                    }
+                                }
+                                // 화물 정보 상호 보완 (container_number, seal_number)
+                                for field in ["container_number", "seal_number"] {
+                                    let my_val = extracted_data.get("containers")
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|arr| arr.first())
+                                        .and_then(|c| c.get(field))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if my_val.is_empty() || my_val == "N/A" { continue; }
+                                    let their_containers = ej.get("containers").and_then(|c| c.as_array());
+                                    let their_has = their_containers.map_or(false, |arr| {
+                                        arr.iter().any(|c| c.get(field).and_then(|v| v.as_str()).map_or(false, |v| v == my_val))
+                                    });
+                                    if !their_has {
+                                        if let Some(containers_arr) = ej.get_mut("containers").and_then(|c| c.as_array_mut()) {
+                                            if containers_arr.is_empty() {
+                                                containers_arr.push(json!({ field: my_val }));
+                                            } else if let Some(first) = containers_arr.first_mut() {
+                                                if let Some(obj) = first.as_object_mut() {
+                                                    if obj.get(field).and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                                                        obj.insert(field.to_string(), json!(my_val));
+                                                    }
+                                                }
+                                            }
+                                            needs_update = true;
+                                        }
+                                    }
+                                }
+                                if needs_update {
+                                    ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                    let merged_text = crate::parsing::json_to_natural_language(&ej);
+                                    ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
+                                    ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
+                                    let _ = db.upsert_item(
+                                        "items", &existing_id, target_type, ej, None,
+                                        None,
+                                        Some(from_addr), Some(&team_id), Some(&hashed_cc),
+                                        Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                        Some(&ref_val), None
+                                    ).await;
+                                    emit_term(&format!(
+                                        "  ✅ [TRADE RELAY v4] 기존 {} 문서 '{}' 에 {} 정보 병합 완료.",
+                                        target_type, existing_id, doc_type
+                                    ));
+                                }
                             },
-                            Ok(_) => {
-                                // 미발견: draft 생성
-                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value));
+                            Ok(None) => {
+                                // 🌟 [DRAFT v4] 미발견 시 draft 생성.
+                                //    기존은 `hash_id(team_id + target_type + link_value)` 였는데,
+                                //    이 경로는 전각 영숫자를 반각과 다르게 취급합니다.
+                                //    `relay_id` 를 사용하면 전각/반각/대소문자 무관 동일 id 가 됩니다.
+                                let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
+                                    crate::utils::hash::relay_id(&link_value)
+                                } else {
+                                    crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
+                                };
                                 let mut draft_data = json!({});
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
@@ -2246,16 +2411,36 @@ impl LogisModel {
                                     Some(&ref_val), None
                                 ).await;
                                 emit_term(&format!(
-                                    "  📝 [TRADE RELAY] {} draft '{}' 생성 ({}: {}).",
+                                    "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
                                     target_type, draft_id, target_field, link_value
                                 ));
                             },
-                            Err(_) => {}
+                            Err(e) => {
+                                emit_term(&format!(
+                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
+                                    target_type, e
+                                ));
+                            }
                         }
                     }
                 }
 
                 // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
+                // 🌟 [RELAY v4 SUMMARY] plan_trade_relays 기반 집계로 교체합니다.
+                if relay_plan.is_empty() {
+                    emit_term("  ⚪ [TRADE RELAY v4] 릴레이 키가 확보되지 않았습니다. 추출 결과에서 유효한 참조 번호가 없습니다.");
+                } else {
+                    let linked = relay_plan.iter()
+                        .filter(|(_, k)| !k.raw.is_empty() && k.raw != "N/A")
+                        .count();
+                    
+                    emit_term(&format!(
+                        "  ✅ [TRADE RELAY v4 SUMMARY] 계획 {}건 | 유효 키 {}건 | 역할: {:?}",
+                        relay_plan.len(),
+                        linked,
+                        relay_plan.iter().map(|(t, k)| format!("{}:{}", t, k.role)).collect::<Vec<_>>()
+                    ));
+                }
                 // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
                 let _ = db.update_task_status(&task_id, 9).await;
                 let _ = db.update_message_status(&task_id, 9, Some("Extraction Complete")).await;

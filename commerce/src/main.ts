@@ -6514,10 +6514,20 @@ listen("extraction-progress", async (event: any) => {
                         // 🌟 [TRADE INDEX LINK] commerce 의 data.order / data.tracking 과 동일한
                         //    'index 로 서로를 가리키는' 축입니다.
                         //    문자열 doc_number 는 표기가 흔들려도 이 숫자는 절대 흔들리지 않습니다.
-                        'data.rel_bl', 'data.rel_awb', 'data.rel_ci', 'data.rel_pi', 'data.rel_pl',
-                        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_co',
-                        'data.rel_bc', 'data.rel_do', 'data.rel_an', 'data.rel_sa',
-                        'data.rel_ed', 'data.rel_id', 'data.rel_cinv'
+                        // 🌟 [FULL 45-CODE] ITEMS_SCHEMA 의 data.rel_* 전량과 1:1 로 일치해야 합니다.
+                        //    기존에는 15종만 있어 나머지 30종의 무역 문서 간 연결이
+                        //    N:N RELAY 교차 검색에서 통째로 누락되었습니다.
+                        'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+                        'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+                        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+                        'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+                        'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+                        'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+                        'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+                        'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+                        'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+                        'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+                        'data.rel_be', 'data.rel_ins', 'data.rel_dgd'
                     ];
 
                     // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼
@@ -8214,32 +8224,84 @@ function bindCardEvents(el: HTMLElement, doc: any) {
 }
 
 // 🌟 [PARITY] 클라우드 Relay 로직의 클라이언트 사이드 이식
+// 🌟 [PARITY] 클라우드 Relay 로직의 클라이언트 사이드 이식
 async function loadRelatedData(doc: any, container: HTMLElement) {
     if (!container || container.dataset.loaded === "true") return;
-    
     // 스피너 표시
     container.innerHTML = `<div style="padding:10px; text-align:center; font-size:0.8rem; color:var(--primary);"><span class="active-spinner">⠋</span> Loading related data...</div>`;
-    
     try {
         const docId = doc.id || doc.uuid;
         const docRef = doc.ref;
-
-        // 🌟 v4 : 연관 조회도 Dexie 인덱스로 처리합니다.
-        //  기존에는 LanceDB 에 `ref = A OR ref = B` SQL 을 보냈는데,
-        //  OR 절이 DataFusion 에서 전량 스캔으로 떨어져 느렸습니다.
-        //  Dexie 의 ref 인덱스 anyOf 는 O(log n + k) 입니다.
+        // 🌟 v5 : 연관 조회를 3단계 인덱스 기반으로 처리합니다.
+        //   ① ref 인덱스        : 기존 경로 유지
+        //   ② 정방향 (정방향)   : 내 문서의 rel_* 값 = 상대 문서의 data.index
+        //   ③ 역방향 (역방향)   : 상대 문서의 rel_* 값 = 내 문서의 data.index
+        //   세 경로 모두 Dexie 인덱스 O(log n) 입니다.
         let uniqueDocs: any[] = [];
-
         if (appDb) {
+            // ── ① ref 인덱스 기반 (기존 경로 유지) ──
             const refTargets = [docId];
             if (docRef && docRef !== "") refTargets.push(docRef);
+            const refRows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
+            for (const r of refRows) {
+                if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                    uniqueDocs.push(r);
+                }
+            }
 
-            const rows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
-            uniqueDocs = rows
-                .filter((r: any) => r.id !== docId)
-                .slice(0, 10);
+            // ── ② 정방향 : 내가 참조하는 문서들 ──
+            // 내 문서의 rel_* 값 = 상대 문서의 data.index
+            // 예: CI 문서의 data.rel_bl = 1234567890
+            //     → BL 문서의 data.index = 1234567890 인 문서를 찾음
+            const relKeys = Object.keys(doc.data || {}).filter(k => k.startsWith("rel_"));
+            for (const relKey of relKeys) {
+                const relVal = doc.data?.[relKey];
+                if (relVal === undefined || relVal === null) continue;
+                const relValNum = Number(relVal);
+                if (isNaN(relValNum)) continue;
+                try {
+                    const revRows = await appDb.table('items')
+                        .where('data.index')
+                        .equals(relValNum)
+                        .limit(5)
+                        .toArray();
+                    for (const r of revRows) {
+                        if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                            uniqueDocs.push(r);
+                        }
+                    }
+                } catch (_e) { /* 인덱스 없으면 무시 */ }
+            }
+
+            // ── ③ 역방향 : 나를 참조하는 문서들 ──
+            // 상대 문서의 rel_* 값 = 내 문서의 data.index
+            // 예: BL 문서의 data.rel_ci = 9876543210
+            //     → 내 문서의 data.index = 9876543210 이므로
+            //     → data.rel_ci = 내 문서의 data.index 인 문서를 찾음
+            const myIndex = doc.data?.index;
+            if (myIndex !== undefined && myIndex !== null) {
+                const myIndexNum = Number(myIndex);
+                if (!isNaN(myIndexNum)) {
+                    // rel_* 컬럼 중 하나로 나를 참조하는 문서들
+                    for (const relKey of relKeys) {
+                        try {
+                            const relRows = await appDb.table('items')
+                                .where(`data.${relKey}`)
+                                .equals(myIndexNum)
+                                .limit(5)
+                                .toArray();
+                            for (const r of relRows) {
+                                if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                                    uniqueDocs.push(r);
+                                }
+                            }
+                        } catch (_e) { /* 인덱스 없으면 무시 */ }
+                    }
+                }
+            }
+
+            uniqueDocs = uniqueDocs.slice(0, 10);
         }
-
         // Dexie 가 비어 있으면 Rust 로 폴백합니다.
         if (uniqueDocs.length === 0) {
             let filterStr = `\`ref\` = '${docId}'`;
@@ -8253,19 +8315,16 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
             });
             uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
         }
-
         if (uniqueDocs.length > 0) {
             const relatedHtml = uniqueDocs.map(d => {
                 // 🌟 하위 아이템은 무한 확장을 막기 위해 checked=true (펼쳐짐) 및 부가 정보 축소 형태로 렌더링
                 return item2html(d, true, currentDetectedUrl);
             }).join("");
-            
             // 연관 데이터 UI 주입
             container.innerHTML = `<div style="margin-top:15px; border-top:1px dashed rgba(255,255,255,0.2); padding-top:10px;">
-                <strong style="font-size:0.8rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
-                ${relatedHtml}
-            </div>`;
-            
+<strong style="font-size:0.8rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
+${relatedHtml}
+</div>`;
             // 내부 연관 카드의 클릭 이벤트(상세 페이지 진입)도 재귀적으로 바인딩
             const newCards = container.querySelectorAll('.logis-result');
             newCards.forEach((card, idx) => {
@@ -8273,11 +8332,9 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
             });
         } else {
             // 연관 데이터가 없으면 깔끔하게 비움
-            container.innerHTML = ""; 
+            container.innerHTML = "";
         }
-        
         container.dataset.loaded = "true"; // 불필요한 중복 쿼리 방지 (캐싱)
-        
     } catch (e) {
         console.error("[Relay] Failed to load related data:", e);
         container.innerHTML = `<div style="color:#ef4444; font-size:0.7rem; padding:5px;">Failed to load related data.</div>`;

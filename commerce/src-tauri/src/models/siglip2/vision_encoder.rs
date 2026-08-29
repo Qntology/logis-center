@@ -33,6 +33,7 @@ use image::DynamicImage;
 
 use super::preprocessor::{preprocess_image, PreprocessedImage};
 use super::{Siglip2Config, Siglip2Model};
+use crate::logic::TRADE_DOC_TITLES;
 use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
 // =====================================================================
@@ -278,6 +279,34 @@ pub struct DocTypeVerdict {
     pub prejudice_dropped: usize,
     /// 코드 후보와 각 점수. LLM 재판정 프롬프트에 그대로 실립니다.
     pub code_candidates: Vec<(String, f32)>,
+    /// 🌟 [MODE GATE] 상단 밴드에서 서식 전문이 인쇄되어 확정되었는가.
+    ///    mode 리라우트(commerce→trading)는 이 플래그가 true 일 때만 허용됩니다.
+    ///    본문 코사인만으로는 상품 사진과 무역 문서를 안전히 가를 수 없습니다.
+    pub title_confirmed: bool,
+    /// 🌟 확정된 서식 전문 문자열. 컬럼 히트맵의 TITLE PREJUDICE 로 재사용됩니다.
+    pub title_text: String,
+}
+
+/// 🌟 [BANK-NEUTRAL KEY SCORES] score_patches_bank_neutral 출력을 (key → 패치 최댓값) 으로 축소합니다.
+///    √(2 ln N) 차감이 없으므로 앵커 구 수에 무관한 공정한 경쟁이 됩니다.
+///    반환: (정렬된 (key, score) 목록, 활성 패치 수)
+fn bank_neutral_key_scores(
+    grid: &PatchGrid,
+    bank: &AnchorBank,
+    legible: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+) -> (Vec<(String, f32)>, usize) {
+    let (keys, matrix) = score_patches_bank_neutral(grid, bank, legible);
+    let mut out: Vec<(String, f32)> = keys
+        .iter()
+        .enumerate()
+        .map(|(ki, k)| {
+            let m = matrix[ki].iter().cloned().fold(f32::MIN, f32::max);
+            (k.clone(), if m == f32::MIN { 0.0 } else { m })
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let active = matrix.iter().flatten().filter(|&&v| v > 0.0).count();
+    (out, active)
 }
 
 /// 패치 임베딩 전체를 뱅크에 채점하여 (key → 최고 surprisal) 맵을 만듭니다.
@@ -434,63 +463,6 @@ fn score_patches(
 //    항상 동일 출력을 냅니다.
 //    동명 서식(BC/BK, PC/PHYTO, INS/IP)은 마진이 0 이 되어 게이트가
 //    스스로 거부하고 벡터 판정에 위임합니다.
-const TRADE_DOC_TITLES: &[(&str, &str)] = &[
-    ("CI", "commercial invoice"),
-    ("PI", "proforma invoice"),
-    ("CINV", "customs invoice"),
-    ("CSI", "consular invoice"),
-    ("TI", "tax invoice"),
-    ("FI", "freight invoice"),
-    ("PL", "packing list"),
-    ("BL", "bill of lading"),
-    ("HBL", "house bill of lading"),
-    ("SWB", "sea waybill"),
-    ("AWB", "air waybill"),
-    ("SA", "shipping advice"),
-    ("DO", "delivery order"),
-    ("AN", "arrival notice"),
-    ("BC", "booking confirmation"),
-    ("BK", "booking confirmation"),
-    ("SR", "shipping request"),
-    ("FCR", "forwarder certificate of receipt"),
-    ("POD", "proof of delivery"),
-    ("CM", "cargo manifest"),
-    ("WR", "warehouse receipt"),
-    ("ED", "export declaration"),
-    ("ID", "import declaration"),
-    ("CO", "certificate of origin"),
-    ("CNM", "certificate of non manipulation"),
-    ("CCC", "customs clearance certificate"),
-    ("EL", "export license"),
-    ("IC", "inspection certificate"),
-    ("COA", "certificate of analysis"),
-    ("CA", "certificate of analysis"),
-    ("WC", "weight certificate"),
-    ("PHYTO", "phytosanitary certificate"),
-    ("PC", "phytosanitary certificate"),
-    ("FC", "fumigation certificate"),
-    ("HC", "health certificate"),
-    ("BEN_CERT", "beneficiary certificate"),
-    ("CDR", "cargo damage survey report"),
-    ("DGD", "dangerous goods declaration"),
-    ("MSDS", "material safety data sheet"),
-    ("POA", "power of attorney"),
-    ("BIZ_LIC", "business license"),
-    ("INS", "insurance policy"),
-    ("IP", "insurance policy"),
-    ("ICF", "insurance claim form"),
-    ("SOA", "statement of account"),
-    ("DN", "debit note"),
-    ("CN", "credit note"),
-    ("PO", "purchase order"),
-    ("SC", "sales contract"),
-    ("LC", "letter of credit"),
-    ("LLC", "local letter of credit"),
-    ("CP", "purchase confirmation"),
-    ("BE", "bill of exchange"),
-    ("TR", "trust receipt"),
-    ("LG", "letter of guarantee"),
-];
 
 /// 🌟 [TITLE GATE] 산출물. code/group 은 전문에서 역引き한 확정값입니다.
 struct TitleGateVerdict {
@@ -509,7 +481,7 @@ fn run_title_gate(
     grid: &PatchGrid,
     chrome_phrases: &[String],
     emit: &dyn Fn(&str),
-) -> Option<TitleGateVerdict> {
+) -> Option<(TitleGateVerdict, Vec<(String, f32)>)> {
     let empty_names: Vec<String> = Vec::new();
     let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
     let empty_skip: Vec<bool> = Vec::new();
@@ -665,13 +637,16 @@ fn run_title_gate(
         .map(|(g, _)| g.to_string())
         .unwrap_or_else(|| "shipping".to_string());
 
-    Some(TitleGateVerdict {
-        code: top_code,
-        group,
-        title,
-        score: top_score,
-        margin,
-    })
+    Some((
+        TitleGateVerdict {
+            code: top_code,
+            group,
+            title,
+            score: top_score,
+            margin,
+        },
+        sorted,
+    ))
 }
 ///
 ///  Depth 1 : 그룹 (contract / shipping / customs / inspection / legal / parcel)
@@ -721,8 +696,8 @@ pub fn classify_doc_type(
     // 🌟 [LOG] 그룹 앵커 구 샘플 — 각 그룹에 어떤 구가 코사인 판정 기준인지 보여줍니다.
     {
         let mut group_names: Vec<&str> = Vec::new();
-        for (c, _, _) in g_bias.iter() {
-            if !group_names.contains(&c.as_str()) { group_names.push(c.as_str()); }
+        for (_, k, _) in g_bias.iter() {
+            if !group_names.contains(&k.as_str()) { group_names.push(k.as_str()); }
         }
         emit(&format!(
             "  📖 [GROUP ANCHOR BANK] 그룹 {}개 | 판정 구 {}개 | 편견 구 {}개",
@@ -730,11 +705,11 @@ pub fn classify_doc_type(
         ));
         for gn in group_names.iter() {
             let phrases: Vec<&str> = g_bias.iter()
-                .filter(|(c, _, _)| c == gn)
+                .filter(|(_, k, _)| k == gn)
                 .map(|(_, _, p)| p.as_str())
                 .collect();
             let sample: Vec<&str> = phrases.iter().take(4).copied().collect();
-            let prej_cnt = g_prej.iter().filter(|(c, _, _)| c == *gn).count();
+            let prej_cnt = g_prej.iter().filter(|(_, k, _)| k == *gn).count();
             emit(&format!(
                 "    📖 [GROUP '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
                 gn, phrases.len(), prej_cnt, sample
@@ -743,9 +718,11 @@ pub fn classify_doc_type(
     }
 
     let g_bank = build_anchor_bank(model, &g_bias, &g_prej)?;
-    let (g_scores_map, dropped) = score_patches(grid, &g_bank);
-    let mut g_scores: Vec<(String, f32)> = g_scores_map.into_iter().collect();
-    g_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 🌟 [BANK-NEUTRAL] √(2 ln N) 차감을 폐기합니다.
+    //    실측: shipping(33구)은 2.644, customs(17구)은 2.380 을 차감받아
+    //    앵커가 많은 그룹이 구조적으로 불리했습니다.
+    let (mut g_scores, g_active) = bank_neutral_key_scores(grid, &g_bank, None);
+    let dropped = grid.len().saturating_sub(g_active);
 
     if g_scores.is_empty() {
         g_scores.push(("shipping".to_string(), 0.0));
@@ -753,9 +730,9 @@ pub fn classify_doc_type(
 
     // 🌟 [LOG] 그룹 점수 분포 상세 — 1위~최하위 전부 + 1위-2위 마진
     emit(&format!(
-        "  📐 [VISION GROUP DETAIL] 그룹 {}개 채점 완료 | 유효 패치 비중: {}/{}",
+        "  📐 [VISION GROUP DETAIL] 그룹 {}개 채점 완료 (BANK-NEUTRAL) | 활성 패치: {}/{}",
         g_scores.len(),
-        grid.len().saturating_sub(dropped),
+        g_active,
         grid.len()
     ));
 
@@ -898,17 +875,17 @@ pub fn classify_doc_type(
     // 🌟 [LOG] 코드 앵커 구 샘플 — 55개 전부 출력하면 과다하므로 상위 8개만 상세
     {
         let mut code_names: Vec<&str> = Vec::new();
-        for (c, _, _) in c_bias.iter() {
-            if !code_names.contains(&c.as_str()) { code_names.push(c.as_str()); }
+        for (_, k, _) in c_bias.iter() {
+            if !code_names.contains(&k.as_str()) { code_names.push(k.as_str()); }
         }
         let sample_limit = code_names.len().min(8);
         for cn in code_names.iter().take(sample_limit) {
             let phrases: Vec<&str> = c_bias.iter()
-                .filter(|(c, _, _)| c == cn)
+                .filter(|(_, k, _)| k == cn)
                 .map(|(_, _, p)| p.as_str())
                 .collect();
             let sample: Vec<&str> = phrases.iter().take(3).copied().collect();
-            let prej_cnt = c_prej.iter().filter(|(c, _, _)| c == *cn).count();
+            let prej_cnt = c_prej.iter().filter(|(_, k, _)| k == *cn).count();
             emit(&format!(
                 "    📖 [CODE '{}' ] 구 {}개 | 편견 {}개 | 샘플: {:?}",
                 cn, phrases.len(), prej_cnt, sample
@@ -923,9 +900,9 @@ pub fn classify_doc_type(
     }
 
     let c_bank = build_anchor_bank(model, &c_bias, &c_prej)?;
-    let (c_scores_map, _) = score_patches(grid, &c_bank);
-    let mut c_scores: Vec<(String, f32)> = c_scores_map.into_iter().collect();
-    c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 🌟 [BANK-NEUTRAL] 실측: ED(3구)은 1.482, CI(6구)은 1.893 을 차감받아
+    //    앵커 적은 코드가 무조건 이기는 구조였습니다. 중립 채점으로 교체합니다.
+    let (mut c_scores, _c_active) = bank_neutral_key_scores(grid, &c_bank, None);
 
     if c_scores.is_empty() {
         c_scores.push((codes[0].to_string(), 0.0));
@@ -958,6 +935,25 @@ pub fn classify_doc_type(
         ));
     }
 
+    // 🌟 [TITLE AXIS NMS INTEGRATION] 상단 밴드 전문 점수를 바디 점수와 합성합니다.
+    //    기존 '사후 오버라이드' 는 임시방편이었으므로, 단일 점수 축으로 편입해
+    //    NMS 자체가 결정론적으로 정답을 내게 합니다.
+    //    가중치 2.0: 실측 제목 축 마진(1.3076)이 바디 축 최대 왜곡(약 1.1)보다 커지도록 한 값.
+    let title_gate_result = run_title_gate(model, grid, &chrome_phrases, emit);
+    let title_confirmed = title_gate_result.is_some();
+    let title_text = title_gate_result
+        .as_ref()
+        .map(|(g, _)| g.title.clone())
+        .unwrap_or_default();
+    if let Some((_gate, title_sorted)) = title_gate_result {
+        for (cname, cs) in c_scores.iter_mut() {
+            if let Some((_, ts)) = title_sorted.iter().find(|(t, _)| t == cname) {
+                *cs += 2.0 * ts;
+            }
+        }
+        c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
     let mut code = c_scores[0].0.clone();
     let mut code_score = c_scores[0].1;
     let mut code_margin = code_score - c_scores.get(1).map(|x| x.1).unwrap_or(code_score);
@@ -965,60 +961,26 @@ pub fn classify_doc_type(
     let mut final_group_score = group_score;
     let mut final_group_margin = group_margin;
 
-    // 🌟 [TITLE GATE] 상단 밴드에 인쇄된 서식 전문에 의한 결정론 오버라이드.
-    //    'CI' 접두어·문서번호는 키로 쓰지 않고, 전문 'COMMERCIAL INVOICE' 만 키입니다.
-    //    ED/BL 이 참조 셀에 'CI-43726' 을 인쇄해도 상단 밴드 전문이 다르므로 오발화가 없습니다.
-    if let Some(gate) = run_title_gate(model, grid, &chrome_phrases, emit) {
-        if gate.code != code {
-            // 🌟 [LOG] OVERRIDE 전후 대조 — 벡터 판정 상세 + 타이틀 게이트 상세
-            emit(&format!(
-                "  🔍 [TITLE GATE BEFORE OVERRIDE] 벡터 판정: 코드='{}'({:+.4}) 마진={:+.4} | 그룹='{}'({:+.4})",
-                code, code_score, code_margin, final_group, final_group_score
-            ));
-            emit(&format!(
-                "  🔍 [TITLE GATE EVIDENCE] 타이틀 게이트: 전문='{}' 코드='{}' 점수={:+.4} 마진={:+.4} 그룹='{}'",
-                gate.title, gate.code, gate.score, gate.margin, gate.group
-            ));
-            // 🌟 [LOG] 벡터 판정의 원래 1위가 왜 틀렸는지 추적용 — 원래 1위 코드의 점수 순위 출력
-            let orig_rank = c_scores.iter().position(|(c, _)| c == &code);
-            let gate_rank = c_scores.iter().position(|(c, _)| c == &gate.code);
-            emit(&format!(
-                "  🔍 [TITLE GATE RANK COMPARE] 벡터 1위 '{}' 순위: {:?} | 게이트 코드 '{}' 벡터 순위: {:?}",
-                code, orig_rank, gate.code, gate_rank
-            ));
-            if let Some(gr) = gate_rank {
-                if gr < c_scores.len() {
-                    emit(&format!(
-                        "  🔍 [TITLE GATE RANK DETAIL] 게이트 코드 '{}' 의 벡터 점수: {:+.4} ({}위)",
-                        gate.code, c_scores[gr].1, gr + 1
-                    ));
-                }
-            }
-
-            emit(&format!(
-                "  🚨 [TITLE GATE OVERRIDE] 상단 밴드 서식 전문 '{}' 근거: 코드 '{}' → '{}' | 그룹 '{}' → '{}'",
-                gate.title, code, gate.code, final_group, gate.group
-            ));
-            code = gate.code.clone();
-            code_score = gate.score;
-            code_margin = gate.margin;
-            final_group = gate.group.clone();
-            if let Some(gs) = g_scores.iter().find(|(g, _)| *g == gate.group) {
-                let rest = g_scores
-                    .iter()
-                    .filter(|(g, _)| *g != gate.group)
-                    .map(|(_, s)| *s)
-                    .fold(f32::MIN, f32::max);
-                final_group_score = gs.1;
-                final_group_margin = gs.1 - rest;
-            }
-        } else {
-            emit(&format!(
-                "  ✅ [TITLE GATE CONFIRM] 상단 밴드 서식 전문 '{}' 이 벡터 판정 '{}' 와 일치합니다.",
-                gate.title, code
-            ));
-        }
+    // 🌟 [GROUP RE-ANCHOR] 그룹은 최종 코드가 속한 그룹으로 재확정합니다.
+    //    그룹 단계가 customs 를 외쳐도 코드 단계가 CI 를 뽑으면 shipping 이 정답입니다.
+    if let Some((g, _)) = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .find(|(_, cs)| cs.iter().any(|c| *c == code.as_str()))
+    {
+        final_group = g.to_string();
+        final_group_score = g_scores
+            .iter()
+            .find(|(n, _)| n == g)
+            .map(|(_, s)| *s)
+            .unwrap_or(final_group_score);
+        let rest = g_scores
+            .iter()
+            .filter(|(n, _)| n != g)
+            .map(|(_, s)| *s)
+            .fold(f32::MIN, f32::max);
+        final_group_margin = final_group_score - rest;
     }
+
 
     emit(&format!(
         "  👑 [VISION CODE SELECTED] '{}' | Top: {:+.4} | Margin: {:+.4}",
@@ -1034,6 +996,8 @@ pub fn classify_doc_type(
         code_margin,
         prejudice_dropped: dropped,
         code_candidates: c_scores,
+        title_confirmed,
+        title_text,
     })
 }
 
@@ -1067,6 +1031,8 @@ pub fn build_column_heatmaps(
     grid: &PatchGrid,
     doc_type: &str,
     doc_lang: &str,
+    legibility: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+    title_prejudice: &[String],
     emit: &dyn Fn(&str),
 ) -> anyhow::Result<Vec<CategoryHeatmap>> {
     use std::collections::HashMap;
@@ -1074,24 +1040,85 @@ pub fn build_column_heatmaps(
     // ── 1) 카테고리 × 필드 앵커 구 수집 ──
     //    필드 → 카테고리 매핑은 logic.rs 가 소유합니다.
     let schema_fields = crate::parsing::get_detail_schema_fields(doc_type, "", doc_lang);
-
     let mut bias_defs: Vec<(String, String, String)> = Vec::new();
     let mut field_to_cat: HashMap<String, String> = HashMap::new();
+
+    // 🌟 [SELF-REFERENCE ANCHOR DROP] 자기 자신을 가리키는 참조 축은 존재할 수 없습니다.
+    //
+    //  ── 실측 사고 ──
+    //   CI 인보이스에서 header 히트맵의 top_field 가 doc_number 가 아니라
+    //   reference_invoice(+4.3688) 였습니다.
+    //   'invoice number' 라는 라벨 하나를 두고 doc_number 와 reference_invoice 의
+    //   앵커가 사실상 동일하기 때문입니다.
+    //   그런데 CI 는 정의상 자기 자신을 참조하지 않으므로 reference_invoice 는
+    //   이 문서에 존재할 수 없는 축입니다. 존재할 수 없는 축이 정체성 축을 이겼고,
+    //   그 결과 header 크롭이 VAT/EORI 행으로 착지해 doc_number 가 null 이 되었습니다.
+    //   doc_number 가 비면 릴레이 키가 사라져 문서 그래프가 통째로 끊깁니다.
+    //
+    //  ── 왜 여기서 자르는가 ──
+    //   scheduler.rs 의 [SELF-REFERENCE DROP] 은 '저장 직전' 에 자기 참조를 지웁니다.
+    //   그 시점에는 이미 크롭이 잘못 착지한 뒤라 되돌릴 수 없습니다.
+    //   같은 판정을 히트맵 단계로 앞당깁니다. 사전은 logic.rs 것을 그대로 씁니다.
+    let self_ref_field = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
 
     for (fname, _, bias_target, _) in schema_fields.iter() {
         let cat = crate::logic::trade_field_category(fname);
         if cat.is_empty() {
             continue;
         }
+        if !self_ref_field.is_empty() && fname == self_ref_field {
+            emit(&format!(
+                "  🧹 [SELF-REFERENCE ANCHOR DROP] '{}' 는 '{}' 문서가 자기 자신을 가리키는 축입니다. doc_number 와 라벨이 완전히 겹쳐 정체성 축을 잠식하므로 히트맵 경쟁에서 제외합니다.",
+                fname, doc_type
+            ));
+            continue;
+        }
         field_to_cat.insert(fname.clone(), cat.to_string());
 
         // semantic 앵커 (필드의 정체성 문구)
+        // 🌟 [LABEL + VALUE 이중 축]
+        //  ── 왜 값 예시를 되살리는가 ──
+        //   텍스트 트랙에서 값 예시를 배제하는 것은 옳습니다. PUG 라인은
+        //   라벨과 값이 이미 '|' 로 분리되어 있어 라벨만 맞히면 되기 때문입니다.
+        //   비전은 반대입니다. 우리가 찾는 것은 '값이 인쇄된 픽셀 영역' 이고,
+        //   라벨 앵커만 두면 히트맵이 캡션에만 반응합니다.
+        //   실측: pol="AIRWAYBILL / BILL OF LADING", recipient_name="BUYER (IF NOT CONSIGNEE)"
+        //        — 네 건 전부 값이 아니라 라벨을 읽은 결과입니다.
+        //   라벨 축과 값 축을 모두 두면 두 봉우리가 생기고,
+        //   expand_row_band 가 같은 행 밴드에서 둘을 이어 붙입니다.
         let sem = crate::utils::ai_utils::semantic_anchor_text(doc_lang, doc_type, fname);
+        let mut label_cnt = 0usize;
+        let mut value_cnt = 0usize;
+        let mut dup_cnt = 0usize;
         for p in split_bias_phrases_full(&sem) {
-            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+            // 🌟 [DUP ANCHOR DROP] 같은 (카테고리, 필드) 안의 중복 구를 제거합니다.
+            //    실측: reference_bl(2구): ["reference bl", "reference bl"]
+            //    score_patches_bank_neutral 은 μ_k(그 뱅크가 이 문서에서 보이는 평균 반응)를
+            //    기준선으로 빼기 때문에, 같은 구가 두 번 들어가면 그 필드의 기준선만
+            //    치우쳐 다른 필드와의 경쟁이 불공정해집니다.
+            //    아래 bias_target 루프에는 이미 같은 dedup 이 있는데 이 루프에만 없었습니다.
+            if bias_defs.iter().any(|(c, k, e)| c == cat && k == fname && e == &p) {
+                dup_cnt += 1;
                 continue;
             }
+            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+                value_cnt += 1;
+            } else {
+                label_cnt += 1;
+            }
             bias_defs.push((cat.to_string(), fname.clone(), p));
+        }
+        if dup_cnt > 0 {
+            emit(&format!(
+                "  🧹 [DUP ANCHOR DROP] '{}' 의 중복 앵커 구 {}개 제거 (BANK-NEUTRAL 기준선 왜곡 방지)",
+                fname, dup_cnt
+            ));
+        }
+        if value_cnt > 0 {
+            emit(&format!(
+                "  🏷️ [LABEL+VALUE] '{}' | 라벨 구 {}개 + 값 예시 구 {}개 (비전은 값이 인쇄된 위치를 찾아야 합니다)",
+                fname, label_cnt, value_cnt
+            ));
         }
         // bias 구 (동의어 나열)
         for p in split_bias_phrases_full(bias_target) {
@@ -1225,6 +1252,15 @@ pub fn build_column_heatmaps(
             }
             prej_defs.push((cat.clone(), cat.clone(), p));
         }
+        // 🌟 [TITLE PREJUDICE] 문서 전문은 모든 카테고리의 공통 편견입니다.
+        //    제목 행 패치가 히트맵 봉우리가 되어 header 크롭이 제목/로고 행으로
+        //    착지하던 문제(로그: header 커버리지 6%, doc_number 소실)를 차단합니다.
+        for p in title_prejudice.iter() {
+            if seen.contains(p.as_str()) {
+                continue;
+            }
+            prej_defs.push((cat.clone(), cat.clone(), p.clone()));
+        }
     }
 
     // 🌟 [LOG] 카테고리별 필드 구 개수 상세
@@ -1337,97 +1373,23 @@ pub fn build_column_heatmaps(
     let mut patch_positive_field_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut patch_prej_override_count = 0usize;
 
-    for (i, p) in grid.patches.iter().enumerate() {
-        if p.iter().all(|&v| v == 0.0) {
-            continue;
-        }
-
-        patch_scored_count += 1;
-
-        // 🌟 surprisal_dual_scores 는 (category, key) 가 일치하는 편견만 감산합니다.
-        //    이제 편견 key 가 카테고리명이므로 bias 의 필드 key 와는 만나지 않습니다.
-        //    그래서 여기서 카테고리 편견을 직접 조회해 감산합니다.
-        //    (구버전과 감산량이 동일합니다. 21-7 주석의 근거 참조)
-        let (scores, _) = surprisal_dual_scores(
-            p,
-            &bank.bias,
-            &bank.prejudice,
-            &empty_names,
-            &empty_banks,
-            &empty_skip,
-        );
-
-        // 이 패치에 대한 카테고리별 편견 최댓값. (surprisal 척도)
-        let (prej_scores, _) = surprisal_dual_scores(
-            p,
-            &bank.prejudice,
-            &empty_prej,
-            &empty_names,
-            &empty_banks,
-            &empty_skip,
-        );
-
-        let mut cat_prej: HashMap<&str, f32> = HashMap::new();
-        for ps in prej_scores.iter() {
-            // 편견 뱅크의 category 와 key 는 둘 다 카테고리명입니다.
-            let e = cat_prej.entry(ps.key.as_str()).or_insert(f32::MIN);
-            if ps.surprisal > *e {
-                *e = ps.surprisal;
+    // 🌟 [BANK-NEUTRAL] 필드별 √(2 ln N) 차감을 폐기하고
+    //    행/열 이중 센터링으로 뱅크 크기·응집도 편향을 제거합니다.
+    //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
+    let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
+    for (ki, fname) in keys.iter().enumerate() {
+        let cat = match field_to_cat.get(fname) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+        for i in 0..n {
+            let v = matrix[ki][i];
+            if v == f32::MIN { continue; }
+            if let Some(slot) = cat_scores.get_mut(&cat) {
+                if v > slot[i] { slot[i] = v; }
             }
-        }
-
-        for s in scores {
-            let cat = match field_to_cat.get(&s.key) {
-                Some(c) => c.clone(),
-                None => continue,
-            };
-
-            // 🌟 편견이 자기 기대치를 넘었을 때만 그만큼 상쇄합니다.
-            //    (구버전 surprisal_dual_scores 내부의 `if ps > 0.0 { sc -= ps; }` 와 동일)
-            let prejudiced = cat_prej.get(cat.as_str()).copied().unwrap_or(f32::MIN);
-            let adjusted = if prejudiced > 0.0 {
-                s.surprisal - prejudiced
-            } else {
-                s.surprisal
-            };
-
-            // 🌟 [LOG] 편견 차감이 발생한 경우만 상세 기록 (샘널 패치 제한)
-            if i < 12 && prejudiced > 0.0 {
-                let (r, c) = grid.rc(i);
-                println!(
-                    "    🔧 [PREJ-SUB r{}c{}] cat='{}' field='{}' 원시:{:+.4} 편견:{:+.4} 차감후:{:+.4}",
-                    r, c, cat, s.key, s.surprisal, prejudiced, adjusted
-                );
-            }
-
-            // 🌟 [LOG] 편견 상쇄 발생 카운트
-            if prejudiced > 0.0 {
-                patch_prej_override_count += 1;
-            }
-
-            // 🌟 [LOG] 양수 조정 점수 카운트
-            if adjusted > 0.0 {
-                *patch_positive_field_counts.entry(cat.clone()).or_insert(0) += 1;
-            }
-
-            if let Some(v) = cat_scores.get_mut(&cat) {
-                if adjusted > v[i] {
-                    // 🌟 [LOG] 카테고리 점수 갱신 시 상세 (샘플 패치 제한)
-                    if i < 12 {
-                        let (r, c) = grid.rc(i);
-                        println!(
-                            "    ⬆️ [CAT-UPDATE r{}c{}] '{}' ← field='{}' 원시:{:+.4} 차감후:{:+.4} (이전 {:+.4})",
-                            r, c, cat, s.key, s.surprisal, adjusted, v[i]
-                        );
-                    }
-                    v[i] = adjusted;
-                }
-            }
-
             if let Some(t) = cat_top.get_mut(&cat) {
-                if adjusted > t.1 {
-                    *t = (s.key.clone(), adjusted);
-                }
+                if v > t.1 { *t = (fname.clone(), v); }
             }
         }
     }
@@ -1573,3 +1535,218 @@ pub fn render_heatmap_ascii(hm: &CategoryHeatmap, grid: &PatchGrid) -> String {
 /// `Device` / `DType` 는 상위 모듈에서만 쓰이므로 미사용 경고를 방지합니다.
 #[allow(dead_code)]
 fn _unused_marker(_d: &Device, _t: DType, _c: &Siglip2Config, _x: &Tensor) {}
+
+/// 🌟 [BANK-NEUTRAL SCORING] 뱅크 크기 편향을 구조적으로 제거한 패치 채점.
+///
+///  ── 왜 √(2 ln N) 을 버리는가 ──
+///   극값이론의 E[max] ≈ √(2 ln N) 은 '뱅크 구가 서로 독립' 일 때만 성립합니다.
+///   그런데 한 필드의 앵커 구는 "Shipper / exporter / consignor" 처럼 동의어 나열이라
+///   실효 표본 수가 N 보다 훨씬 작습니다. 큰 뱅크를 과잉 처벌합니다.
+///
+///   실측(로그 대조):
+///     reference_sr(1구) 차감 ≈ 0     vs  status(19구) 차감 2.427
+///     → 'reference sr' 이라는 무의미 구가 header 를 대표하고
+///       header 크롭이 문서 하단으로 착지 → doc_number 소실 → task_id 폴백
+///
+///  ── 대체 원리 ──
+///   각 뱅크의 '자기 기준선' 을 패치 축으로 실측해 뺍니다.
+///     centered[k][i] = (raw[k][i] - μ_k) / σ_pooled
+///   μ_k 는 그 뱅크가 이 문서에서 보이는 평균 반응이므로,
+///   뱅크가 크든 작든 응집되든 자동으로 상쇄됩니다.
+///   σ 는 뱅크마다 쓰지 않고 전역 pooled 를 씁니다.
+///   (1구 뱅크는 σ_k 가 0 에 가까워 z 가 무한히 부풀기 때문입니다)
+///
+///   그 다음 패치 축으로 한 번 더 센터링합니다.
+///     final[k][i] = centered[k][i] - mean_k(centered[·][i])
+///   '잉크가 빽빽해서 전 개념에 반응하는 패치' 의 공통 성분이 제거됩니다.
+///   이것은 scheduler.rs 의 double_center_matrix 와 동일한 도구입니다.
+///
+///  ── 판독성 ──
+///   μ_k / σ 는 '판독 가능 패치' 로만 계산합니다.
+///   여백 141개가 통계를 끌어내리면 모든 뱅크가 동시에 부풀어 변별력이 사라집니다.
+///
+///  반환: (keys, matrix[key][patch])
+pub fn score_patches_bank_neutral(
+    grid: &PatchGrid,
+    bank: &AnchorBank,
+    legible: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+) -> (Vec<String>, Vec<Vec<f32>>) {
+    use std::collections::HashMap;
+
+    let n = grid.len();
+    if n == 0 || bank.bias.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // ── ① (category, key) 그룹 색인 ──
+    let mut order: Vec<String> = Vec::new();
+    let mut bias_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, k, _)) in bank.bias.iter().enumerate() {
+        if !bias_idx.contains_key(k) {
+            order.push(k.clone());
+        }
+        bias_idx.entry(k.clone()).or_default().push(i);
+    }
+    let mut prej_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, k, _)) in bank.prejudice.iter().enumerate() {
+        prej_idx.entry(k.clone()).or_default().push(i);
+    }
+
+    let dot = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    };
+
+    // ── ② 원시 Max-Pool 행렬 ──
+    let m = order.len();
+    let mut raw_b = vec![vec![f32::MIN; n]; m];
+    let mut raw_p = vec![vec![f32::MIN; n]; m];
+
+    for (ki, key) in order.iter().enumerate() {
+        let bi = &bias_idx[key];
+        let pi = prej_idx.get(key);
+        for i in 0..n {
+            let p = &grid.patches[i];
+            if p.iter().all(|&v| v == 0.0) { continue; }
+            let mut mb = f32::MIN;
+            for &j in bi {
+                let s = dot(p, &bank.bias[j].2);
+                if s > mb { mb = s; }
+            }
+            raw_b[ki][i] = mb;
+            if let Some(pl) = pi {
+                let mut mp = f32::MIN;
+                for &j in pl {
+                    let s = dot(p, &bank.prejudice[j].2);
+                    if s > mp { mp = s; }
+                }
+                raw_p[ki][i] = mp;
+            }
+        }
+    }
+
+    // ── ③ 판독 가능 패치만으로 기준선 산출 ──
+    let usable: Vec<usize> = (0..n)
+        .filter(|&i| legible.map_or(true, |l| l.is_legible(i)))
+        .filter(|&i| !grid.patches[i].iter().all(|&v| v == 0.0))
+        .collect();
+    let base: &[usize] = if usable.len() >= 8 {
+        &usable
+    } else {
+        // 판독 가능 패치가 너무 적으면 전 패치로 폴백합니다.
+        // (스캔 품질이 나쁠 때 통계가 통째로 무너지는 것을 막습니다)
+        &[]
+    };
+    let idx_all: Vec<usize> = (0..n).collect();
+    let base: &[usize] = if base.is_empty() { &idx_all } else { base };
+
+    // 전역 pooled σ : 뱅크마다 σ 를 쓰면 1구 뱅크의 z 가 폭발합니다.
+    let mut pooled_var = 0.0f32;
+    let mut pooled_cnt = 0usize;
+    let mut mu_b = vec![0.0f32; m];
+    let mut mu_p = vec![0.0f32; m];
+    for ki in 0..m {
+        let mut sb = 0.0f32; let mut sp = 0.0f32; let mut c = 0usize;
+        for &i in base {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            sb += raw_b[ki][i];
+            if raw_p[ki][i] != f32::MIN { sp += raw_p[ki][i]; }
+            c += 1;
+        }
+        if c == 0 { continue; }
+        mu_b[ki] = sb / c as f32;
+        mu_p[ki] = sp / c as f32;
+        for &i in base {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            let d = raw_b[ki][i] - mu_b[ki];
+            pooled_var += d * d;
+            pooled_cnt += 1;
+        }
+    }
+    let sd = if pooled_cnt > 1 {
+        (pooled_var / pooled_cnt as f32).sqrt().max(1e-6)
+    } else {
+        1.0
+    };
+
+    // ── ④ 행 센터링 + 편견 상쇄 ──
+    let mut net = vec![vec![f32::MIN; n]; m];
+    for ki in 0..m {
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            let zb = (raw_b[ki][i] - mu_b[ki]) / sd;
+            let zp = if raw_p[ki][i] == f32::MIN {
+                0.0
+            } else {
+                ((raw_p[ki][i] - mu_p[ki]) / sd).max(0.0)
+            };
+            net[ki][i] = zb - zp;
+        }
+    }
+
+    // ── ⑤ 열 센터링 : '전 개념에 반응하는 잉크 패치' 공통 성분 제거 ──
+    for i in 0..n {
+        let mut s = 0.0f32; let mut c = 0usize;
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            s += net[ki][i]; c += 1;
+        }
+        if c < 2 { continue; }
+        let mean = s / c as f32;
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            net[ki][i] -= mean;
+        }
+    }
+
+    println!(
+        "    📐 [BANK-NEUTRAL] 키 {}개 | 기준선 패치 {}개 | pooled σ {:.5} | √(2 ln N) 차감 폐기",
+        m, base.len(), sd
+    );
+
+    (order, net)
+}
+
+/// 🌟 [ROW RUN POOLING] 판독 가능 패치의 가로 연속 구간을 하나의 '텍스트 라인' 으로 봅니다.
+///
+///  ── 왜 필요한가 ──
+///   16×16 패치는 원본 57×57px 입니다. 글자 2~3개밖에 안 들어갑니다.
+///   "customs export filing" 같은 문서 단위 개념을 그 조각과 코사인 비교하는 것은
+///   성립하지 않습니다. scheduler.rs STEP A 가 PUG '라인' 을 단위로 삼는 이유와 같습니다.
+///
+///  ── 반환 ──
+///   (pooled_embeddings, member_patch_indices)
+///   런 점수를 소속 패치에 되돌려 칠하면 위치 해상도를 잃지 않습니다.
+pub fn pool_row_runs(
+    grid: &PatchGrid,
+    legible: &crate::models::siglip2::legibility::LegibilityMap,
+) -> (Vec<Vec<f32>>, Vec<Vec<usize>>) {
+    let mut embs: Vec<Vec<f32>> = Vec::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    let d = grid.patches.first().map(|p| p.len()).unwrap_or(0);
+    if d == 0 { return (embs, members); }
+
+    for r in 0..grid.grid_rows {
+        let mut run: Vec<usize> = Vec::new();
+        for c in 0..=grid.grid_cols {
+            let idx = if c < grid.grid_cols { Some(r * grid.grid_cols + c) } else { None };
+            let ok = idx.map_or(false, |i| legible.is_legible(i));
+            if ok {
+                run.push(idx.unwrap());
+                continue;
+            }
+            if run.is_empty() { continue; }
+            // 런 종료 → 평균 풀링 + L2
+            let mut v = vec![0.0f32; d];
+            for &i in &run {
+                for k in 0..d { v[k] += grid.patches[i][k]; }
+            }
+            let inv = 1.0 / run.len() as f32;
+            for k in 0..d { v[k] *= inv; }
+            let nrm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if nrm > 1e-8 { for k in 0..d { v[k] /= nrm; } }
+            embs.push(v);
+            members.push(std::mem::take(&mut run));
+        }
+    }
+    (embs, members)
+}

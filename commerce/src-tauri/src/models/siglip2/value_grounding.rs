@@ -33,6 +33,7 @@
 //   기록만 남기고 STEP 4.5 크롭 감사에 피드백합니다.
 // =====================================================================
 
+use crate::models::siglip2::legibility::LegibilityMap;
 use crate::utils::ai_utils::{cosine_similarity, gumbel_expected_z};
 
 #[derive(Debug, Clone)]
@@ -265,6 +266,68 @@ where
         out.len(),
         out.len() - dropped,
         dropped
+    ));
+    out
+}
+
+/// 🌟 [GROUNDING v2] SigLIP2 로 '값이 인쇄되어 있는가' 를 묻지 않습니다.
+///
+///  ── v1 이 왜 실패했나 (실측 26건 중 25건 폐기) ──
+///   ① √(2 ln N_in) 이 bbox 크기에 비례해 커집니다.
+///      items 는 전체 페이지 크롭이라 N_in=77 → 문턱 z>2.95 (상위 0.2%).
+///      "T-Shirt" 같은 정답이 통과할 수 없습니다.
+///   ② SigLIP2 는 이미지-캡션 모델입니다. "583948392" 가 이 패치에 인쇄되어
+///      있는지는 원리적으로 판정할 수 없습니다. 문자 단위 접지 능력이 없습니다.
+///   ③ 코사인이 노이즈라 argmax 가 여백(r13c0)에 착지해 정답을 죽였습니다.
+///
+///  ── v2 가 실제로 판정할 수 있는 것 ──
+///   "그 크롭 안에 읽을 것이 있었는가" 뿐입니다. 이건 픽셀 사실이고 확실합니다.
+///     · 판독 가능 패치 0개 → 그 크롭의 전 주장 폐기 (빈 영역에서 창작한 값)
+///     · 그 외 → 유지
+///   의미 판정은 폐기하고, [SCHEMA ECHO] / [ALREADY CLAIMED] 게이트에 맡깁니다.
+///   '틀린 값을 지우는 이득' 보다 '정답 25건을 지우는 손실' 이 압도적으로 큽니다.
+pub fn verify_claims_v2(
+    claims: &[GroundingClaim],
+    grid_rows: usize,
+    grid_cols: usize,
+    orig_w: u32,
+    orig_h: u32,
+    legibility: &LegibilityMap,
+    emit: &dyn Fn(&str),
+) -> Vec<GroundingVerdict> {
+    let mut out = Vec::with_capacity(claims.len());
+    let mut rejected = 0usize;
+    for c in claims {
+        let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
+        let accepted = lg > 0;
+        if !accepted {
+            rejected += 1;
+            emit(&format!(
+                "    🚫 [EMPTY SOURCE] [{}] '{}' = \"{}\" | 출처 영역 판독가능 {} / 불가 {} / 여백 {} → 폐기",
+                c.category, c.field, c.value, lg, il, bl
+            ));
+        }
+        out.push(GroundingVerdict {
+            category: c.category.clone(),
+            field: c.field.clone(),
+            value: c.value.clone(),
+            // 🌟 [V2 NEUTRAL FIELDS] v2 는 코사인 접지를 수행하지 않습니다(설계 의도).
+            //    이 4개 필드는 v1(G-A/G-B 게이트) 전용이라 v2 에서 계산하지 않으므로
+            //    중립 기본값으로 채웁니다. 소비처(apply_grounding_verdicts)는
+            //    category/field/value/accepted/reason 만 읽으므로 동작 변화가 없습니다.
+            //    top_legible 은 accepted 와 동일하게 둡니다.
+            //    (v2 의 수용 조건 자체가 '출처 영역 판독 가능' 이므로)
+            surprisal_in: 0.0,
+            surprisal_out: 0.0,
+            top_patch: 0,
+            top_legible: accepted,
+            accepted,
+            reason: if accepted { String::new() } else { "출처 영역에 읽을 내용이 없음".to_string() },
+        });
+    }
+    emit(&format!(
+        "  ✅ [VALUE GROUNDING v2] 검증 {}건 | 유지 {} | 폐기 {}",
+        claims.len(), claims.len() - rejected, rejected
     ));
     out
 }

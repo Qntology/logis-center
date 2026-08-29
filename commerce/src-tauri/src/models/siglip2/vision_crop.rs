@@ -509,7 +509,6 @@ fn ensure_min_size(
     min_h: u32,
 ) -> (u32, u32, u32, u32) {
     let (mut x0, mut y0, mut x1, mut y1) = bbox;
-
     if x1 - x0 < min_w {
         let need = min_w - (x1 - x0);
         let half = need / 2;
@@ -528,8 +527,374 @@ fn ensure_min_size(
             y0 = y1.saturating_sub(min_h);
         }
     }
-
     (x0, y0, x1.min(orig_w), y1.min(orig_h))
+}
+
+/// 🌟 [PRESENCE GATE] 이 문서에 실제로 인쇄된 카테고리만 크롭 경쟁에 넣습니다.
+///
+///  ── 왜 '> 0' 게이트가 더는 안 통하는가 ──
+///   score_patches_bank_neutral 이 √(2 ln N) 차감을 폐기하면서
+///   점수의 0 은 더 이상 '극값 기대치' 가 아니라 '이중 센터링 후 평균' 이 되었습니다.
+///   실측(CI 인보이스)에서 카테고리 11개 중 9개가 활성 패치 80% 이상을 기록했고
+///   (HEATMAP FULL PAGE RISK), 상업송장에 존재하지도 않는 insurance / settlement 가
+///   크롭을 받아 2B 모델이 빈 영역에서 값을 창작했습니다.
+///     ✅ [insurance]  신규 1건 → {"INSURANCE": {"...ND CORRECT."}}
+///     ✅ [settlement] 신규 1건 → {"SETTLEMENT": {"items": [...]}}
+///   그 두 크롭이 차지한 영역은 header 가 가져갔어야 할 영역입니다.
+///
+///  ── 대체 기준 (무모수 / 임계치 없음) ──
+///   "패치 하나라도 자기가 argmax 인가" 만 봅니다.
+///   전 페이지 어느 패치도 그 카테고리로 가장 잘 설명되지 않는다면
+///   그 축은 이 문서에 인쇄되어 있지 않습니다.
+///   임계치가 없고 카테고리 수·뱅크 크기에도 무관합니다.
+///
+///  ⚠️ [HEADER EXEMPT] header 만은 예외입니다.
+///     doc_number 는 문서 기본키라 잃으면 릴레이가 영구히 끊깁니다.
+///     다른 필드는 다음 스캔에서 채울 수 있지만 기본키는 그럴 수 없습니다.
+fn presence_gate(
+    heatmaps: &[CategoryHeatmap],
+    n: usize,
+    emit: &dyn Fn(&str),
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut wins: HashMap<String, usize> = HashMap::new();
+    for i in 0..n {
+        let mut best = f32::MIN;
+        let mut owner: Option<&str> = None;
+        for hm in heatmaps.iter() {
+            if i >= hm.scores.len() {
+                continue;
+            }
+            if hm.scores[i] > best {
+                best = hm.scores[i];
+                owner = Some(hm.category.as_str());
+            }
+        }
+        if let Some(o) = owner {
+            if best > 0.0 {
+                *wins.entry(o.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out: HashSet<String> = HashSet::new();
+    for hm in heatmaps.iter() {
+        let w = wins.get(&hm.category).copied().unwrap_or(0);
+        // header 는 문서 기본키를 담당하므로 게이트를 면제합니다.
+        if w > 0 || hm.category == "header" {
+            out.insert(hm.category.clone());
+            if w == 0 {
+                emit(&format!(
+                    "    🪪 [PRESENCE GATE / HEADER EXEMPT] 'header' 는 argmax 패치가 0개지만 문서 기본키(doc_number)를 담당하므로 면제합니다. (Top: {:+.4})",
+                    hm.top_score
+                ));
+            }
+        } else {
+            emit(&format!(
+                "    ⚪ [PRESENCE GATE] '{}' 는 패치 {}개 중 단 한 곳에서도 최강 설명이 되지 못했습니다. 이 문서에 없는 축이므로 크롭하지 않습니다. (Top: {:+.4})",
+                hm.category, n, hm.top_score
+            ));
+        }
+    }
+    out
+}
+
+/// 🌟 [IDENTITY BAND GUARANTEE] 'header' 는 반드시 문서 상단 식별 밴드를 점유합니다.
+///
+///  ── 왜 header 만 특별 취급하는가 ──
+///   doc_number 는 다른 필드와 성격이 다릅니다.
+///     · 값이 비면 resolve_trade_doc_identity 가 내용 합성 키로 폴백하고
+///     · 그 키는 참조 번호가 아니므로 릴레이가 영구히 끊기며
+///     · 저장 후에는 되돌릴 방법이 없습니다.
+///   나머지 필드는 비어도 다음 스캔에서 채울 수 있지만 기본키는 그럴 수 없습니다.
+///
+///  ── 실측 사고 ──
+///   확정된 11개 크롭의 y 최솟값이 286px 이었습니다.
+///   INVOICE NUMBER 'CI-43726' 은 y≈181 이라 단 한 번도 전달되지 않았고,
+///   header 는 4순위로 밀려 VAT/EORI 행(px 344~574)을 받아
+///   라벨 텍스트 'EXPORTER VAT/EORI' 를 값으로 복사했습니다.
+///
+///  ── 밴드 정의 (레이아웃 구조 사실 / 어휘 사전 아님) ──
+///   run_title_gate 가 상단 30% 를 제목 밴드로 보는 것과 같은 근거입니다.
+///   서식 전문(제목) 아래 첫 정보 블록에 문서 자신의 번호가 인쇄됩니다.
+///   '내용이 처음 나타나는 행의 다음 행 ~ 상단 40%' 를 식별 밴드로 확정합니다.
+fn ensure_identity_band_crop(
+    plans: &mut Vec<CropPlan>,
+    heatmaps: &[CategoryHeatmap],
+    content: &[f32],
+    content_gate: f32,
+    grid: &PatchGrid,
+    emit: &dyn Fn(&str),
+) {
+    let rows = grid.grid_rows;
+    let cols = grid.grid_cols;
+    if rows < 4 || cols == 0 {
+        return;
+    }
+    let hm = match heatmaps.iter().find(|h| h.category == "header") {
+        Some(h) => h,
+        None => return,
+    };
+
+    let row_has_content = |r: usize| -> bool {
+        (0..cols).any(|c| {
+            let i = r * cols + c;
+            i < content.len() && content[i] > content_gate
+        })
+    };
+    let mut title_row = 0usize;
+    while title_row + 1 < rows && !row_has_content(title_row) {
+        title_row += 1;
+    }
+    let band_start = (title_row + 1).min(rows - 1);
+    let band_end = ((rows as f32 * 0.40) as usize)
+        .max(band_start + 1)
+        .min(rows - 1);
+
+    let cw = grid.orig_width as f32 / cols as f32;
+    let ch = grid.orig_height as f32 / rows as f32;
+    let mut tot = 0usize;
+    let mut cov = 0usize;
+    for r in band_start..=band_end {
+        for c in 0..cols {
+            let i = r * cols + c;
+            if i >= content.len() || content[i] <= content_gate {
+                continue;
+            }
+            tot += 1;
+            let cx = (c as f32 + 0.5) * cw;
+            let cy = (r as f32 + 0.5) * ch;
+            let hit = plans.iter().any(|p| {
+                p.category == "header"
+                    && cx >= p.bbox.0 as f32
+                    && cx <= p.bbox.2 as f32
+                    && cy >= p.bbox.1 as f32
+                    && cy <= p.bbox.3 as f32
+            });
+            if hit {
+                cov += 1;
+            }
+        }
+    }
+    if tot == 0 {
+        emit("    ⚪ [IDENTITY BAND] 상단 식별 밴드에 내용 패치가 없어 추가 크롭하지 않습니다.");
+        return;
+    }
+    if cov * 2 >= tot {
+        emit(&format!(
+            "    ✅ [IDENTITY BAND] 'header' 가 식별 밴드 r{}~{} 의 내용 {}/{} 를 이미 점유하고 있습니다.",
+            band_start, band_end, cov, tot
+        ));
+        return;
+    }
+
+    let mut c0 = cols;
+    let mut c1 = 0usize;
+    for r in band_start..=band_end {
+        for c in 0..cols {
+            let i = r * cols + c;
+            if i < content.len() && content[i] > content_gate {
+                if c < c0 {
+                    c0 = c;
+                }
+                if c > c1 {
+                    c1 = c;
+                }
+            }
+        }
+    }
+    if c0 > c1 {
+        c0 = 0;
+        c1 = cols - 1;
+    }
+
+    let raw = to_pixel_bbox((band_start, band_end, c0, c1), grid);
+    let min_w = ((grid.orig_width as f32 * 0.12) as u32).max(64);
+    let min_h = ((grid.orig_height as f32 * 0.06) as u32).max(48);
+    let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
+
+    let mut peak = f32::MIN;
+    let m = (rows * cols).min(hm.scores.len());
+    for r in band_start..=band_end {
+        for c in c0..=c1 {
+            let i = r * cols + c;
+            if i < m && hm.scores[i] > peak {
+                peak = hm.scores[i];
+            }
+        }
+    }
+
+    emit(&format!(
+        "    🪪 [IDENTITY BAND GUARANTEE] 'header' 가 식별 밴드 내용을 {}/{} 밖에 못 담아 전용 크롭을 추가합니다. r{}~{} c{}~{} → px({},{})-({},{}) | Peak: {:+.4}",
+        cov, tot, band_start, band_end, c0, c1, bbox.0, bbox.1, bbox.2, bbox.3,
+        if peak == f32::MIN { 0.0 } else { peak }
+    ));
+    plans.push(CropPlan {
+        category: "header".to_string(),
+        bbox,
+        score: if peak == f32::MIN { 0.0 } else { peak },
+        margin: 0.0,
+        patch_count: (band_end - band_start + 1) * (c1 - c0 + 1),
+        top_field: "doc_number".to_string(),
+    });
+}
+
+/// 🌟 [COVERAGE GUARANTEE] 어떤 크롭에도 담기지 않은 '내용 행 밴드' 를 구제합니다.
+///
+///  ── 왜 필요한가 (실측 사고) ──
+///   확정된 11개 크롭의 y 최솟값이 286px 이었습니다. 즉 r0~r4(상단 27.7%)가
+///   단 한 번도 LLM 에게 전달되지 않았고, 그 밴드의
+///     INVOICE NUMBER CI-43726 / AIRWAYBILL 93763111837 / EXPORT REFERENCE ORD32829
+///     DATE OF EXPORTATION Apr-19-2022 / EXPORTER / CONSIGNEE
+///   가 통째로 소실되었습니다.
+///   그 결과 doc_number 도 reference_* 도 없어 릴레이 키가 0개가 되었습니다.
+///
+///  ── 판정 근거 ──
+///   build_content_mask 가 만든 '내용 패치'(전 카테고리 히트맵 최댓값 > 평균)는
+///   "어떤 스키마 개념과도 관련이 있는 잉크" 의 근사입니다.
+///   그 패치가 어느 크롭에도 안 들어갔다면 회수 불가능한 손실입니다.
+///   행 단위로 커버리지를 재고, 절반도 못 담긴 행을 밴드로 묶어 구제합니다.
+///
+///  ── 왜 겹침을 허용하는가 ──
+///   STARVATION RESCUE 와 같은 판단입니다.
+///   크롭이 겹치는 비용은 LLM 호출 1회지만, 필드를 통째로 잃는 비용은 영구적입니다.
+fn rescue_uncovered_bands(
+    plans: &mut Vec<CropPlan>,
+    heatmaps: &[CategoryHeatmap],
+    content: &[f32],
+    content_gate: f32,
+    grid: &PatchGrid,
+    emit: &dyn Fn(&str),
+) {
+    let rows = grid.grid_rows;
+    let cols = grid.grid_cols;
+    if rows == 0 || cols == 0 || heatmaps.is_empty() {
+        return;
+    }
+    let cw = grid.orig_width as f32 / cols as f32;
+    let ch = grid.orig_height as f32 / rows as f32;
+
+    let mut need: Vec<bool> = vec![false; rows];
+    let mut total_lost = 0usize;
+    for r in 0..rows {
+        let mut tot = 0usize;
+        let mut cov = 0usize;
+        for c in 0..cols {
+            let i = r * cols + c;
+            if i >= content.len() || content[i] <= content_gate {
+                continue;
+            }
+            tot += 1;
+            let cx = (c as f32 + 0.5) * cw;
+            let cy = (r as f32 + 0.5) * ch;
+            let hit = plans.iter().any(|p| {
+                cx >= p.bbox.0 as f32
+                    && cx <= p.bbox.2 as f32
+                    && cy >= p.bbox.1 as f32
+                    && cy <= p.bbox.3 as f32
+            });
+            if hit {
+                cov += 1;
+            }
+        }
+        if tot > 0 && cov * 2 < tot {
+            need[r] = true;
+            total_lost += tot - cov;
+        }
+    }
+    if total_lost == 0 {
+        emit("    ✅ [COVERAGE GUARANTEE] 모든 내용 행이 최소 하나의 크롭에 포함되어 있습니다.");
+        return;
+    }
+
+    let mut bands: Vec<(usize, usize)> = Vec::new();
+    let mut r = 0usize;
+    while r < rows {
+        if !need[r] {
+            r += 1;
+            continue;
+        }
+        let start = r;
+        while r + 1 < rows && need[r + 1] {
+            r += 1;
+        }
+        bands.push((start, r));
+        r += 1;
+    }
+
+    let min_w = ((grid.orig_width as f32 * 0.12) as u32).max(64);
+    let min_h = ((grid.orig_height as f32 * 0.06) as u32).max(48);
+
+    for (r0, r1) in bands {
+        let mut c0 = cols;
+        let mut c1 = 0usize;
+        for rr in r0..=r1 {
+            for c in 0..cols {
+                let i = rr * cols + c;
+                if i < content.len() && content[i] > content_gate {
+                    if c < c0 {
+                        c0 = c;
+                    }
+                    if c > c1 {
+                        c1 = c;
+                    }
+                }
+            }
+        }
+        if c0 > c1 {
+            c0 = 0;
+            c1 = cols.saturating_sub(1);
+        }
+
+        let mut owner = String::new();
+        let mut owner_field = String::new();
+        let mut best = f32::MIN;
+        for hm in heatmaps.iter() {
+            let m = (rows * cols).min(hm.scores.len());
+            for rr in r0..=r1 {
+                for c in c0..=c1 {
+                    let i = rr * cols + c;
+                    if i >= m {
+                        continue;
+                    }
+                    if hm.scores[i] > best {
+                        best = hm.scores[i];
+                        owner = hm.category.clone();
+                        owner_field = hm.top_field.clone();
+                    }
+                }
+            }
+        }
+        if owner.is_empty() {
+            continue;
+        }
+
+        // 이미 같은 카테고리·같은 밴드로 추가된 식별 밴드 크롭과 중복되면 건너뜁니다.
+        let raw = to_pixel_bbox((r0, r1, c0, c1), grid);
+        let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
+        let dup = plans.iter().any(|p| {
+            p.category == owner
+                && p.bbox.1 <= bbox.1
+                && p.bbox.3 >= bbox.3
+                && p.bbox.0 <= bbox.0
+                && p.bbox.2 >= bbox.2
+        });
+        if dup {
+            continue;
+        }
+
+        emit(&format!(
+            "    🩹 [COVERAGE RESCUE] 미커버 행 밴드 r{}~{} (c{}~{}) 를 '{}' 소유로 추가 크롭합니다. → px({},{})-({},{}) | Peak: {:+.4}",
+            r0, r1, c0, c1, owner, bbox.0, bbox.1, bbox.2, bbox.3, best
+        ));
+        plans.push(CropPlan {
+            category: owner,
+            bbox,
+            score: best,
+            margin: 0.0,
+            patch_count: (r1 - r0 + 1) * (c1 - c0 + 1),
+            top_field: owner_field,
+        });
+    }
 }
 
 // =====================================================================
@@ -539,11 +904,14 @@ fn ensure_min_size(
 /// 🌟 [STEP 3] 히트맵 목록 → 카테고리별 크롭 계획.
 ///
 ///  ── 처리 순서 ──
+///   ⓪ CONTENT MASK + PRESENCE GATE (이 문서에 없는 카테고리 제외)
 ///   ① 카테고리마다 활성 패치를 연결 성분으로 추출
 ///   ② 인접 조각 병합 (라벨-값 여백으로 쪼개진 성분 복구)
 ///   ③ 전 카테고리 성분을 하나의 풀로 모아 IoU dedup
 ///   ④ (카테고리 × 성분) 행렬 → 배타 배정 (1:1)
 ///   ⑤ 격자 박스 → 원본 픽셀 박스 + 컨텍스트 마진 + 최소 해상도 보장
+///   ⑥ IDENTITY BAND GUARANTEE (header 가 문서 기본키 밴드를 반드시 점유)
+///   ⑦ COVERAGE GUARANTEE (어떤 크롭에도 안 담긴 내용 행 밴드 구제)
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
@@ -566,14 +934,19 @@ pub fn plan_crops(
         content_cnt, n, content_gate
     ));
 
+    // 🌟 [PRESENCE GATE] BANK-NEUTRAL 이후 '> 0' 게이트가 의미를 잃었으므로
+    //    "패치 하나라도 자기가 argmax 인가" 라는 무모수 기준으로 대체합니다.
+    let present = presence_gate(heatmaps, n, emit);
+
     // 🌟 [AREA CAP] 한 카테고리가 문서 전체를 독점할 수 없다는 구조적 사실.
-    //    전체 면적을 경쟁 카테고리 수로 나눈 값이 상한입니다.
-    let area_cap = (n / heatmaps.len().max(1)).max(4);
+    //    전체 면적을 '실제로 경쟁하는' 카테고리 수로 나눈 값이 상한입니다.
+    //    존재하지 않는 카테고리까지 분모에 넣으면 상한이 부당하게 낮아집니다.
+    let area_cap = (n / present.len().max(1)).max(4);
 
     // 🌟 [LOG] 히트맵 → 크롭 전환 전 전체 상태 요약
     emit(&format!(
-        "    📊 [PLAN_CROPS INPUT] 히트맵 {}개 | 격자 {}x{}={} | area_cap={} | content 활성 {}/{}",
-        heatmaps.len(), grid.grid_rows, grid.grid_cols, n, area_cap, content_cnt, n
+        "    📊 [PLAN_CROPS INPUT] 히트맵 {}개 (존재 판정 통과 {}개) | 격자 {}x{}={} | area_cap={} | content 활성 {}/{}",
+        heatmaps.len(), present.len(), grid.grid_rows, grid.grid_cols, n, area_cap, content_cnt, n
     ));
 
     // 🌟 [LOG] 각 히트맵의 활성 패치 비율 — 잘림 감지
@@ -600,6 +973,11 @@ pub fn plan_crops(
         Vec::new();
 
     for hm in heatmaps.iter() {
+        // 🌟 [PRESENCE GATE] 이 문서에 인쇄되지 않은 축은 크롭 경쟁 자체에 넣지 않습니다.
+        //    빈 영역을 2B 모델에게 보내면 반드시 무언가를 창작합니다.
+        if !present.contains(&hm.category) {
+            continue;
+        }
         // ① 봉우리 게이트로 seed 확보. 봉우리가 없으면 기존 게이트(0.0)로 폴백.
         let gate = core_threshold(&hm.scores);
         let mut comps = extract_components(&hm.scores, rows, cols, gate);
@@ -794,12 +1172,36 @@ pub fn plan_crops(
                     //   0 은 'N개를 무작위로 뽑은 기대 최댓값과 같다' 는 뜻입니다.
                     //   즉 근거가 없다는 것을 극값이론이 정의한 지점입니다.
                     Some((bi, bscore)) if *bscore > 0.0 => {
+                        let rescue_cat = per_cat[ci].0.clone();
+                        let is_table_cat = rescue_cat == "items" || rescue_cat == "containers";
+                        let cand_px = to_pixel_bbox(gboxes[bi], grid);
+                        let dup = plans.iter().any(|p| {
+                            let (ax0, ay0, ax1, ay1) = cand_px;
+                            let (bx0, by0, bx1, by1) = p.bbox;
+                            let ix0 = ax0.max(bx0);
+                            let iy0 = ay0.max(by0);
+                            let ix1 = ax1.min(bx1);
+                            let iy1 = ay1.min(by1);
+                            if ix0 >= ix1 || iy0 >= iy1 { return false; }
+                            let inter = (ix1 - ix0) as f32 * (iy1 - iy0) as f32;
+                            let aa = ((ax1 - ax0) as f32 * (ay1 - ay0) as f32).max(1.0);
+                            let bb = ((bx1 - bx0) as f32 * (by1 - by0) as f32).max(1.0);
+                            (inter / aa.min(bb)) > 0.5
+                        });
+                        if dup && !is_table_cat {
+                            emit(&format!(
+                                "    ⚪ [RESCUE SKIP] '{}' 의 최고 봉우리 영역이 이미 배정된 크롭과 절반 이상 겹칩니다. 빈 영역 할루시네이션 유입을 막기 위해 구제하지 않습니다.",
+                                rescue_cat
+                            ));
+                            continue;
+                        }
                         emit(&format!(
                             "    🛟 [STARVATION RESCUE] '{}' 는 영역을 선점당했지만 자기 최고 봉우리({:+.4})로 독립 크롭합니다.",
                             per_cat[ci].0, bscore
                         ));
                         (gboxes[bi], *bscore, 0.0f32, counts[bi])
                     }
+
                     Some((_, bscore)) => {
                         emit(&format!(
                             "    ⚪ [NOT PRESENT] '{}' 는 최고 봉우리가 {:+.4} 로 기대치 이하입니다. 이 문서에 없는 축이므로 크롭하지 않습니다.",
@@ -879,14 +1281,68 @@ pub fn plan_crops(
         });
     }
 
+    // ── ⑥ 문서 기본키 밴드 보장 ──
+    //    doc_number 를 잃으면 릴레이가 영구히 끊기므로 header 만은 무조건 보장합니다.
+    ensure_identity_band_crop(&mut plans, heatmaps, &content, content_gate, grid, emit);
+
+    // ── ⑦ 미커버 내용 밴드 구제 ──
+    //    "어떤 크롭에도 안 담긴 잉크" 는 회수 불가능한 손실입니다.
+    rescue_uncovered_bands(&mut plans, heatmaps, &content, content_gate, grid, emit);
+
     plans
 }
 
-/// 크롭 계획 하나를 실제 이미지로 잘라냅니다.
+/// 🌟 [TEXT-AWARE UPSCALE] 확대 배율을 '글자 높이 → 비전 패치 1개' 기준으로 정합니다.
 ///
-/// 🌟 [UPSCALE] 잘린 조각이 작으면 Qwen 3.5 의 비전 인코더가 글자를 못 읽습니다.
-///    짧은 변이 target_short 미만이면 Lanczos3 로 확대합니다.
-///    (원본 픽셀이 이미 존재하므로 정보 손실 없이 가독성만 올립니다)
+///  ── 왜 짧은 변 기준이 틀렸나 ──
+///   현재 규칙은 크롭의 기하만 보고 글자 크기를 전혀 모릅니다.
+///   가로로 긴 띠(515×86)는 6배까지 확대되어 글자가 2.5패치가 되고,
+///   토큰만 4배 쓰면서 판독성은 그대로입니다.
+///   실측: insurance 타일 2048×512, 판독가능 패치 0/10 → 값 창작
+///
+///  ── 배율 근거 ──
+///   Qwen VL 은 14px 패치를 2×2 병합해 토큰 1개당 28×28px 를 봅니다.
+///   글자 높이가 28px 에 도달하면 '한 글자 ≈ 한 토큰' 이 되고,
+///   그 이상은 토큰만 늘고 판독성은 포화합니다.
+///   행 투영 프로파일의 자기상관 주기가 곧 텍스트 라인 피치입니다.
+///   (고전 문서영상 기법이며 어휘 사전이 아닙니다)
+const VISION_PATCH_PX: f32 = 28.0;
+
+fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
+    use image::GenericImageView;
+    let g = img.to_luma8();
+    let (w, h) = g.dimensions();
+    if h < 16 || w < 16 { return None; }
+
+    // ── 행별 잉크 밀도 프로파일 ──
+    let mut prof: Vec<f32> = Vec::with_capacity(h as usize);
+    for y in 0..h {
+        let mut s = 0.0f32;
+        for x in 0..w {
+            s += 255.0 - g.get_pixel(x, y)[0] as f32;
+        }
+        prof.push(s / w as f32);
+    }
+    let mean: f32 = prof.iter().sum::<f32>() / prof.len() as f32;
+    for v in prof.iter_mut() { *v -= mean; }
+
+    // ── 자기상관 최대 주기 = 텍스트 라인 피치 ──
+    let max_lag = ((h / 2) as usize).min(120);
+    let mut best_lag = 0usize;
+    let mut best = f32::MIN;
+    for lag in 4..max_lag {
+        let mut s = 0.0f32;
+        for i in 0..(prof.len() - lag) {
+            s += prof[i] * prof[i + lag];
+        }
+        let norm = s / (prof.len() - lag) as f32;
+        if norm > best { best = norm; best_lag = lag; }
+    }
+    if best_lag == 0 || best <= 0.0 { return None; }
+    // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
+    Some(best_lag as f32 * 0.6)
+}
+
 pub fn crop_region(
     image: &DynamicImage,
     plan: &CropPlan,
@@ -895,22 +1351,35 @@ pub fn crop_region(
     let (x0, y0, x1, y1) = plan.bbox;
     let w = x1.saturating_sub(x0).max(1);
     let h = y1.saturating_sub(y0).max(1);
-
     let cropped = image.crop_imm(x0, y0, w, h);
 
-    let short = w.min(h);
-    if short >= target_short {
-        return cropped;
-    }
+    // 🌟 글자 높이를 실측해 필요한 배율만 적용합니다.
+    let factor = match estimate_text_height(&cropped) {
+        Some(th) if th > 0.5 => {
+            let f = (VISION_PATCH_PX / th).clamp(1.0, 4.0);
+            println!(
+                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px → 배율 {:.2}x (목표 {}px/글자)",
+                th, f, VISION_PATCH_PX as u32
+            );
+            f
+        }
+        _ => {
+            // 프로파일에서 주기를 못 찾음 = 텍스트가 거의 없음.
+            // 기존 짧은 변 규칙으로 폴백하되 상한을 낮게 둡니다.
+            let short = w.min(h) as f32;
+            let f = (target_short as f32 / short).clamp(1.0, 2.0);
+            println!(
+                "    📏 [TEXT-AWARE UPSCALE] 라인 주기 미검출(텍스트 희소) → 보수적 배율 {:.2}x",
+                f
+            );
+            f
+        }
+    };
 
-    let factor = target_short as f32 / short as f32;
-    let nw = ((w as f32 * factor).round() as u32).max(1);
-    let nh = ((h as f32 * factor).round() as u32).max(1);
+    if factor <= 1.01 { return cropped; }
 
-    // 지나친 확대는 메모리만 먹고 이득이 없으므로 상한을 둡니다.
-    let nw = nw.min(2048);
-    let nh = nh.min(2048);
-
+    let nw = (((w as f32 * factor).round() as u32).max(1)).min(2048);
+    let nh = (((h as f32 * factor).round() as u32).max(1)).min(2048);
     cropped.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 
