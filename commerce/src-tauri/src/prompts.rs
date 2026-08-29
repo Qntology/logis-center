@@ -560,6 +560,34 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         }
     }
 
+    // 🌟 [SELF-REFERENCE FIELD DROP] 자기 자신을 가리키는 참조 축은 이 문서에 없습니다.
+    //
+    //  ── 실측 사고 ──
+    //   CI 인보이스의 header 스키마에 doc_number 와 reference_invoice 가 함께 제시되었고,
+    //   2B 모델은 눈에 보이는 'INVOICE NUMBER' 라벨을 reference_invoice 쪽으로 복사한 뒤
+    //   doc_number 를 null 로 반환했습니다.
+    //     [Qwen3.5-DECODING]  ": null,number      ← doc_number
+    //     [Qwen3.5-DECODING]  ",VAT/EORInce      ← reference_invoice
+    //   doc_number 가 비면 문서 기본키가 내용 합성 키로 폴백되어 릴레이가 영구히 끊깁니다.
+    //
+    //  ── 근거 ──
+    //   CI 가 자기 자신을 참조하는 일은 정의상 없습니다.
+    //   서식 코드 → 참조 필드 사전은 logic.rs 가 이미 소유하므로 그대로 재사용합니다.
+    //   (scheduler.rs 의 [SELF-REFERENCE DROP] 과 같은 판정을 프롬프트 생성 단계로 앞당깁니다)
+    if let Some(self_ref) = crate::logic::trade_reference_field_of(doc_type) {
+        fields.retain(|(n, _)| n != self_ref);
+    }
+
+    // 🌟 [IDENTITY FIRST] doc_number 를 항상 첫 필드로 올립니다.
+    //   2B 모델은 [FIELD DEFINITIONS] 앞쪽 항목에 더 강하게 반응합니다.
+    //   문서 기본키가 되는 축은 14개 중 아무 자리가 아니라 첫 줄에 있어야 합니다.
+    if category == "header" {
+        if let Some(pos) = fields.iter().position(|(n, _)| n == "doc_number") {
+            let f = fields.remove(pos);
+            fields.insert(0, f);
+        }
+    }
+
     if fields.is_empty() {
         return format!(
             "RULES: Output JSON ONLY. MISSION: Extract data for category '{}'.\nSCHEMA:\n{{}}",
@@ -655,16 +683,36 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         format!("{{\n{}\n}}", body)
     };
 
+    // 🌟 [PROMPT EXAMPLE PURGE] 규칙 3번에 박혀 있던 예시 문서번호
+    //    (PO-99281A, CI-2026-08001, BL-55432219, LC-88492011) 를 삭제했습니다.
+    //    value_grounding.rs 의 주석이 지목한 환각
+    //      ① reference_invoice = "CI-2026-08001" — 문서 어디에도 없는 값
+    //    의 출처는 bias.json 뿐만이 아니라 이 프롬프트였습니다.
+    //    아래 [FORBIDDEN VALUES] 블록이 '설명문의 예시' 는 막지만
+    //    '규칙문의 예시' 는 forbidden 목록에 들어가지 않아 그대로 새어 나갑니다.
+    //
+    // 🌟 [IDENTITY RULE] doc_number 를 '먼저 읽으라' 고 규칙 0번으로 못박습니다.
+    //    문서 자신의 번호는 제목 바로 아래 식별 블록에 인쇄된다는 레이아웃 사실은
+    //    run_title_gate 가 상단 30% 를 제목 밴드로 보는 것과 같은 근거입니다.
     let reference_rule = if category == "header" {
-        "\nREFERENCE RULES:\n\
-         1. \"doc_number\" is the identifier OF THIS DOCUMENT ITSELF. Never put another document's number there.\n\
-         2. A number printed under a label such as 'Ref', 'Our Ref', 'Your Ref', 'Against', 'Covering', 'Relating to', \
-         'P/O No', 'Invoice No', 'B/L No', 'L/C No', 'Booking No', 'Contract No' belongs to the matching reference_* field, NOT to doc_number.\n\
-         3. Copy each reference number EXACTLY as printed, including its prefix and hyphens (PO-99281A, CI-2026-08001, BL-55432219, LC-88492011).\n\
-         4. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".\n\
-         5. Omit any reference_* field that is not printed. An omitted field is correct data; a guessed one corrupts the document graph."
+        format!(
+            "\nIDENTITY RULE (read this before anything else):\n\
+             0. This page is a {doc}. \"doc_number\" is the number printed in the identity block at the TOP of the page, \
+             directly under or beside the printed document title. Read that block first and fill \"doc_number\" before any other field. \
+             A {doc} never references itself, so its own number is NEVER a reference_* value.\n\
+             \nREFERENCE RULES:\n\
+             1. \"doc_number\" is the identifier OF THIS DOCUMENT ITSELF. Never put another document's number there.\n\
+             2. A number printed under a label such as 'Ref', 'Our Ref', 'Your Ref', 'Against', 'Covering', 'Relating to', \
+             'P/O No', 'Invoice No', 'B/L No', 'L/C No', 'Booking No', 'Contract No' belongs to the matching reference_* field, NOT to doc_number.\n\
+             3. Copy each reference number EXACTLY as printed, including its prefix and hyphens. Never re-type it from memory.\n\
+             4. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".\n\
+             5. Omit any reference_* field that is not printed. An omitted field is correct data; a guessed one corrupts the document graph.\n\
+             6. A caption printed on the page (for example text ending in 'NUMBER', 'NO.', 'REFERENCE', 'VAT/EORI', 'DATE') is a LABEL. \
+             Return the value printed next to it, never the label text itself.",
+            doc = doc_type
+        )
     } else {
-        ""
+        String::new()
     };
 
     // 🌟 [ARRAY RULE] 표는 '행이 몇 개인지' 를 모델이 스스로 세어야 합니다.

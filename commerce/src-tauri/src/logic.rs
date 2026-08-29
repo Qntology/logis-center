@@ -101,51 +101,52 @@ pub fn related(item_type: &str) -> Vec<&str> {
 /// 무역 서식은 reference_invoice / reference_lc / reference_booking / container_number로 연결합니다.
 ///
 /// 반환값: (연결 대상 서식 타입, 조회할 필드명, 현재 문서에서 가져올 값 필드명)
+// 🌟 [DEPRECATED] trade_relay_rules 는 parsing.rs 의 plan_trade_relays 로 대체됩니다.
+//    기존은 서식 코드마다 하드코딩된 (target, target_field, source_field) 튜플을
+//    반환했는데, 필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
+//    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
+//
+//    plan_trade_relays 는 역할 기반으로 릴레이 대상을 계산합니다.
+//    같은 역할을 공유하면 서식 코드가 달라도 연결됩니다.
+//    이 함수는 하위 호환을 위해 남겨두지만, 새 코드에서는 사용하지 마십시오.
+#[deprecated(
+    since = "relay-v4",
+    note = "parsing.rs 의 plan_trade_relays 를 사용하십시오. 이 함수는 역할 기반이 아니라 서식 코드 하드코딩입니다."
+)]
 pub fn trade_relay_rules(doc_type: &str) -> Vec<(&'static str, &'static str, &'static str)> {
     match doc_type {
-        // CI가 추출되면 → PL/BL/ED가 CI를 참조하는지 역방향 조회
         "CI" => vec![
             ("PL",  "reference_invoice", "doc_number"),
             ("BL",  "reference_invoice", "doc_number"),
             ("ED",  "reference_invoice", "doc_number"),
         ],
-        // PL이 추출되면 → CI를 정방향 조회
         "PL" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("BL",  "reference_invoice", "reference_invoice"),
         ],
-        // BL이 추출되면 → CI/PL/BC를 조회
         "BL" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("PL",  "reference_invoice", "reference_invoice"),
             ("BC",  "doc_number", "reference_booking"),
         ],
-        // LC가 추출되면 → CI가 LC를 참조하는지 역방향 조회
         "LC" => vec![
             ("CI",  "reference_lc", "doc_number"),
         ],
-        // BC가 추출되면 → BL이 BC를 참조하는지 역방향 조회
         "BC" => vec![
             ("BL",  "reference_booking", "doc_number"),
         ],
-        // ED/ID가 추출되면 → CI를 정방향 조회
         "ED" | "ID" | "CINV" => vec![
             ("CI",  "doc_number", "reference_invoice"),
         ],
-        // CO, SA, DO, AN 등 기타 서식
         "CO" | "SA" | "DO" | "AN" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("BL",  "reference_invoice", "reference_invoice"),
         ],
-        // 🌟 [HBL → MBL] House B/L 은 자기 상위 Master B/L 을 가리킵니다.
-        //    이 간선이 없으면 혼재 화물(consolidation)의 문서 체인이
-        //    House 단계에서 끊겨 상위 운송 정보로 이어지지 않습니다.
         "HBL" => vec![
             ("BL",  "reference_master_bl", "doc_number"),
             ("FCR", "reference_hbl", "doc_number"),
             ("CI",  "doc_number", "reference_invoice"),
         ],
-        // 🌟 [SWB] Sea Waybill 은 B/L 과 같은 위치의 서식이므로 같은 상대를 봅니다.
         "SWB" => vec![
             ("CI",  "doc_number", "reference_invoice"),
             ("PL",  "reference_invoice", "reference_invoice"),
@@ -198,6 +199,9 @@ pub const TRADE_HUB_TYPES: [&str; 4] = ["PO", "CI", "BL", "LC"];
 
 pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
     // ── ① 서식별 직속 상대 (허브 이외의 근접 관계) ──
+    // 🌟 [MISSING 10] 사용자 지적 '미포함 서식' 중
+    //    related_trading 에 없던 10종을 추가합니다.
+    //    BE / SR / BK / WR / CSI / SWB / IP / DN / CN / FC
     let direct: Vec<&'static str> = match doc_type {
         // 계약 · 결제
         "PO"      => vec!["PI", "SC", "EL", "CP", "LLC", "SOA"],
@@ -206,15 +210,17 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "LC"      => vec!["LLC", "LG", "TR", "SOA"],
         "LLC"     => vec!["CP", "TI"],
         "CP"      => vec!["ED", "TI", "LLC"],
-
+        "BE"      => vec!["LC", "LLC", "SOA"],
         // 선적 · 운송
         "CI"      => vec!["PL", "CINV", "CSI", "CO", "ED", "ID", "FI", "SOA"],
         "PL"      => vec!["ED", "ID", "WC", "CM"],
         "BL"      => vec!["HBL", "SWB", "PL", "DO", "AN", "BC", "CM", "FI", "LG", "TR", "CCC", "CDR"],
         "HBL"     => vec!["FCR", "BC"],
-        "SWB"     => vec!["DO", "AN"],
+        "SWB"     => vec!["DO", "AN", "CI", "PL"],
         "AWB"     => vec!["PL", "DGD"],
-        "BC"      => vec!["FI", "HBL"],
+        "BC"      => vec!["FI", "HBL", "BK"],
+        "BK"      => vec!["BC", "FI", "BL"],
+        "SR"      => vec!["BK", "BC"],
         "SA"      => vec!["PL"],
         "DO"      => vec!["AN", "POD", "LG"],
         "AN"      => vec!["DO", "FI"],
@@ -222,7 +228,7 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "POD"     => vec!["DO", "CDR"],
         "CM"      => vec!["ED"],
         "FI"      => vec!["BC", "AN"],
-
+        "WR"      => vec!["DO", "POD"],
         // 통관 · 신고
         "ED"      => vec!["PL", "CO", "CP", "CM", "EL"],
         "ID"      => vec!["PL", "CO", "CCC"],
@@ -230,7 +236,6 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "CO"      => vec!["CNM", "ED", "ID", "CCC"],
         "EL"      => vec!["SC", "PI", "ED"],
         "CCC"     => vec!["ID", "CO"],
-
         // 검사 · 증명
         "IC"      => vec!["COA", "WC"],
         "WC"      => vec!["PL", "IC"],
@@ -242,26 +247,25 @@ pub fn related_trading(doc_type: &str) -> Vec<&'static str> {
         "BEN_CERT"=> vec![],
         "FC"      => vec!["PHYTO", "PC"],
         "CNM"     => vec!["CO"],
-
         // 특수 · 법무 · 금융
         "DGD"     => vec!["MSDS", "AWB"],
         "MSDS"    => vec!["DGD"],
         "POA"     => vec!["BIZ_LIC"],
         "BIZ_LIC" => vec!["POA"],
         "INS"     => vec!["IP", "CDR", "ICF"],
-        "IP"      => vec!["CDR", "ICF"],
+        "IP"      => vec!["CDR", "ICF", "SOA"],
         "LG"      => vec!["TR", "DO"],
         "TR"      => vec!["LG"],
-        "CDR"     => vec!["IP", "ICF", "POD"],
+        "CDR"     => vec!["IP", "ICF", "SOA"],
         "ICF"     => vec!["IP", "CDR", "SOA"],
         "SOA"     => vec!["DN", "CN", "ICF", "FI", "TI"],
         "DN"      => vec!["SOA"],
         "CN"      => vec!["SOA"],
         "TI"      => vec!["CP", "LLC", "SOA"],
         "CSI"     => vec!["CO"],
-
         _         => vec![],
     };
+    // ...
 
     // ── ② 허브 4종 병합 (자기 자신은 제외) ──
     let mut out: Vec<&'static str> = Vec::with_capacity(direct.len() + TRADE_HUB_TYPES.len());

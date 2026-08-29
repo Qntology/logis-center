@@ -965,6 +965,94 @@ impl VectorStore {
             }
         }
 
+        // 🌟 [CANONICALIZE v4] canonical.rs 의 kind_of 를 사용하여
+        //    필드 이름 기반으로 저장 타입을 확정합니다.
+        //    기존은 ID_KEYS / NUM_KEYS / BOOL_KEYS 배열을 사용했는데,
+        //    새 필드 추가 시 배열을 수정해야 했습니다.
+        //    이제 규칙 기반으로 자동 판정합니다.
+        if let Some(obj) = final_data.as_object_mut() {
+            let existing: Vec<String> = obj.keys().cloned().collect();
+            for k in existing {
+                let kind = crate::utils::canonical::kind_of(&k);
+                if kind == crate::utils::canonical::CanonKind::Free { continue; }
+                
+                match kind {
+                    crate::utils::canonical::CanonKind::Identifier => {
+                        let s = match obj.get(&k) {
+                            Some(serde_json::Value::Null) | None => continue,
+                            Some(serde_json::Value::String(s)) => s.clone(),
+                            Some(serde_json::Value::Number(n)) => n.to_string(),
+                            Some(serde_json::Value::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
+                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
+                        };
+                        obj.insert(k, serde_json::json!(s));
+                    },
+                    crate::utils::canonical::CanonKind::Numeric => {
+                        let n: f64 = match obj.get(&k) {
+                            None | Some(serde_json::Value::Null) => continue,
+                            Some(serde_json::Value::Number(num)) => num.as_f64().unwrap_or(0.0),
+                            Some(serde_json::Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
+                            Some(serde_json::Value::String(s)) => {
+                                let t = s.trim();
+                                if t.is_empty() || t == "null" || t == "N/A" { continue; }
+                                if k == "status" {
+                                    crate::logic::parse_status(t) as f64
+                                } else if let Some(ms) = crate::utils::canonical::iso_to_epoch_ms(t) {
+                                    ms as f64
+                                } else {
+                                    let cleaned: String = t.chars()
+                                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                                        .collect();
+                                    match cleaned.parse::<f64>() {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    }
+                                }
+                            },
+                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
+                        };
+                        if n.fract() == 0.0 && n.abs() < 9e15 {
+                            obj.insert(k, serde_json::json!(n as i64));
+                        } else {
+                            obj.insert(k, serde_json::json!(n));
+                        }
+                    },
+                    crate::utils::canonical::CanonKind::Boolean => {
+                        let b = match obj.get(&k) {
+                            Some(serde_json::Value::Bool(x)) => *x,
+                            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+                            Some(serde_json::Value::String(s)) => {
+                                let t = s.trim();
+                                if t.is_empty() { continue; }
+                                t == "1" || t.eq_ignore_ascii_case("true")
+                            },
+                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
+                            None | Some(serde_json::Value::Null) => continue,
+                        };
+                        obj.insert(k, serde_json::json!(if b { 1 } else { 0 }));
+                    },
+                    crate::utils::canonical::CanonKind::Tags => {
+                        let tags: Vec<serde_json::Value> = match obj.get(&k) {
+                            Some(serde_json::Value::Array(arr)) => arr.iter().map(|t| {
+                                if let Some(o) = t.as_object() {
+                                    serde_json::json!(o.get("tag").and_then(|x| x.as_str()).unwrap_or(""))
+                                } else if let Some(s) = t.as_str() {
+                                    serde_json::json!(s)
+                                } else {
+                                    serde_json::json!(t.to_string().trim_matches('"'))
+                                }
+                            }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
+                            Some(serde_json::Value::String(s)) if !s.is_empty() => vec![serde_json::json!(s.clone())],
+                            None | Some(serde_json::Value::Null) => continue,
+                            _ => Vec::new(),
+                        };
+                        obj.insert(k, serde_json::json!(tags));
+                    },
+                    crate::utils::canonical::CanonKind::Free => {},
+                }
+            }
+        }
+
         // 🌟 봉투 값들을 data 안에도 동봉합니다.
         //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
         let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();

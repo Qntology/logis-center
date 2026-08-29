@@ -3842,8 +3842,7 @@ pub async fn process_task(
             let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path)); 
             
             let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-
+            let bcc = entity_bcc(&page_type, &cc_for_bcc);
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
             
@@ -3871,7 +3870,7 @@ pub async fn process_task(
 
 
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
-                let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
+                let detail_bcc = entity_bcc(&page_type, &task.cc.to_uppercase());
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
@@ -3886,7 +3885,7 @@ pub async fn process_task(
 
             } else {
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
-                let detail_bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, task.cc.to_uppercase()));
+                let detail_bcc = entity_bcc(&page_type, &task.cc.to_uppercase());
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
@@ -7450,10 +7449,10 @@ pub async fn process_task(
         .unwrap_or_default();
     
     
-    let clean_no = crate::utils::hash::normalize_identifier(&id_val_raw);
-    
-    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
-    let generated_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+    // 🌟 [ENTITY KEY v5] index / id 생성을 단일 계약 함수로 통일합니다.
+    //    trading 경로(process_trading_task)와 완전히 같은 식이 됩니다.
+    let index_val = entity_index(&page_type, &team_id, &id_val_raw);
+    let generated_id = entity_id(&team_id, index_val);
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
@@ -7477,13 +7476,19 @@ pub async fn process_task(
 
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
-                    let clean_g_no = crate::utils::hash::normalize_identifier(g_no);
                     let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
-                    let clean_tracking_no = crate::utils::hash::normalize_identifier(tracking_number);
-                    let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tracking_no)));
-                    let goods_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("goods{}{}", team_id, clean_g_no)));
-                    
-                    let tracking_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, clean_tracking_no, clean_g_no));
+                    // 🌟 [ENTITY KEY v5] id 를 반드시 index 로부터 유도합니다.
+                    //
+                    //  ── 기존 결함 ──
+                    //   tracking_id = hash(team + 운송장번호 + 상품번호) 였습니다.
+                    //   같은 운송장인데 상품이 N개면 index 는 하나인데 행이 N개 생겼고,
+                    //   나중에 진짜 tracking 문서가 hash(team + index) 로 저장될 때
+                    //   그 N개 중 어느 것과도 id 가 일치하지 않아 (N+1)번째 행이 되었습니다.
+                    //   "운송장 하나 = 배송 하나" 가 물리적 사실이므로 index 기준으로 접습니다.
+                    let clean_tracking_no = normalize_entity_key(tracking_number);
+                    let tracking_index = entity_index("tracking", &team_id, tracking_number);
+                    let goods_index = entity_index("goods", &team_id, g_no);
+                    let tracking_id = entity_id(&team_id, tracking_index);
                     let mut tracking_data = extracted_data.clone();
                     
                     if let Some(obj) = tracking_data.as_object_mut() {
@@ -7503,7 +7508,9 @@ pub async fn process_task(
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
                     
                     // 🌟 v4 : items 단일 저장. 이중 upsert 제거.
-                    let tracking_bcc = crate::utils::hash::hash_id(&format!("tracking{}", cc_val));
+                    // 🌟 [ENTITY KEY v5] bcc 도 같은 계약 함수로 만듭니다.
+                    let tracking_bcc = entity_bcc("tracking", &cc_val);
+                    // ref 는 index/id 와 다른 네임스페이스(스캔 출처 추적)이므로 그대로 둡니다.
                     let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
 
                     save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
@@ -7524,9 +7531,8 @@ pub async fn process_task(
     }.to_string();
 
     let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-    let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
+    let bcc = entity_bcc(&page_type, &cc_val);
     let ref_val = task.r#ref.clone();
-
     let mut items_to_process = Vec::new();
     let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
@@ -7624,16 +7630,21 @@ pub async fn process_task(
         // index.ts에서는 item.tracking = crc32(hashId('tracking'+team.id+tracking_number))를
         // 릴레이 전에 설정하여 릴레이가 기존 항목을 정확히 찾을 수 있도록 합니다.
         if page_type == "order" {
-            if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
+            if let Some(tn_raw) = extracted_data.get("tracking_number")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()) 
+            {
                 if !tn_raw.trim().is_empty() {
-                    let clean_tn_pre = crate::utils::hash::normalize_numeric_homoglyphs(tn_raw)
-                        .replace("-", "").replace("_", "").replace(".", "").replace(",", "");
+                    // String이 되었으므로 &tn_raw로 전달
+                    let clean_tn_pre = normalize_entity_key(&tn_raw);
                     if !clean_tn_pre.is_empty() {
-                        let tracking_index_pre = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn_pre)));
+                        let tracking_index_pre = entity_index("tracking", &team_id, &tn_raw);
+                        
                         if let Some(obj) = extracted_data.as_object_mut() {
                             obj.insert("tracking".to_string(), json!(tracking_index_pre));
                         }
-                        emit_term(&format!("  🔑 [TRACKING INDEX PRE-COMPUTE] tracking_number '{}' → tracking index {} 사전 설정 완료.", clean_tn_pre, tracking_index_pre));
+                        
+                        emit_term(&format!("  🔑 [TRACKING INDEX PRE-COMPUTE] tracking_number '{}' → 정규화 '{}' → tracking index {} 사전 설정 완료.", tn_raw, clean_tn_pre, tracking_index_pre));
                     }
                 }
             }
@@ -7768,17 +7779,34 @@ pub async fn process_task(
                                 let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                                 e.0 += 1;
                                 e.2 += 1;
-
                                 let mut draft_data = json!({});
                                 let val_str = match &q.value {
                                     serde_json::Value::String(s) => s.clone(),
                                     serde_json::Value::Number(n) => n.to_string(),
                                     _ => q.value.to_string(),
                                 };
-                                let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                                // 🌟 [ENTITY KEY v5] draft 도 본 문서와 '완전히 같은 식' 으로 키를 만듭니다.
+                                //
+                                //  ── 기존 결함 (릴레이가 끊기는 저장 계층 원인) ──
+                                //   draft_id = hash(team + foreign_type + 원시값) 이고
+                                //   index 는 아예 저장하지 않았습니다.
+                                //   나중에 진짜 문서가 index = crc32(hash(type+team+정규화값)),
+                                //   id = hash(team + index) 로 저장되면 id 가 달라
+                                //   upsert 가 아니라 '새 행' 이 됩니다.
+                                //   → draft 는 영구 미아, 통계에는 draft 1건이 남고
+                                //     실데이터는 별개 행으로 쌓입니다.
+                                //   trading draft 는 이미 이 식을 쓰고 있었고 유일하게 정상이었습니다.
+                                let draft_index = entity_index(foreign_type, &team_id, &val_str);
+                                let draft_id = entity_id(&team_id, draft_index);
+                                // 🌟 [BCC FIX] draft 는 foreign_type 의 봉투에 들어가야 합니다.
+                                //    기존에는 '현재 문서 타입' 의 bcc 를 그대로 써서
+                                //    프론트엔드 타입 필터에서 draft 가 통째로 사라졌습니다.
+                                let foreign_bcc = entity_bcc(foreign_type, &cc_val);
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
                                     obj.insert("type".to_string(), json!(foreign_type));
+                                    // 🌟 index 는 릴레이 재현의 유일한 축입니다. 반드시 저장합니다.
+                                    obj.insert("index".to_string(), json!(draft_index));
                                     obj.insert(q.column.clone(), q.value.clone());
                                     obj.insert("updated_at".to_string(), json!(0));
                                     // 🌟 v4 : mode 는 봉투 컬럼이므로 draft 에도 반드시 넣어야
@@ -7788,7 +7816,7 @@ pub async fn process_task(
                                     obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                 }
                                 save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
+                                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
                             }
                         },
                         _ => {}
@@ -7941,8 +7969,12 @@ pub async fn process_task(
                                     let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
                                     e.0 += 1;
                                     e.2 += 1;
-                                    let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
-                                    let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                    // 🌟 [ENTITY KEY v5] index 는 맞게 만들면서 id 만 다른 식이었던
+                                    //    사고를 제거합니다. 진짜 tracking 문서가 들어오면
+                                    //    같은 id 로 계산되어 갱신(upsert)이 성립합니다.
+                                    let tracking_index = entity_index("tracking", &team_id, &clean_tn);
+                                    let draft_id = entity_id(&team_id, tracking_index);
+                                    let tracking_bcc = entity_bcc("tracking", &cc_val);
                                     let mut draft_data = json!({});
                                     if let Some(obj) = draft_data.as_object_mut() {
                                         obj.insert("id".to_string(), json!(draft_id.clone()));
@@ -7959,8 +7991,8 @@ pub async fn process_task(
                                     }
                                     extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
                                     save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                    emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                        &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
+                                    emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
                                 }
                             },
                             _ => {}
@@ -8278,14 +8310,35 @@ pub async fn process_task(
                     .unwrap_or_else(|| single_item.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string());
                 
                 
-                let clean_no = crate::utils::hash::normalize_identifier(&original_id);
-                
-                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
-                let hashed_item_id = if original_id.is_empty() {
-                    crate::utils::hash::hash_id(&format!("{}{}", team_id, uuid::Uuid::new_v4()))
+                // 🌟 [ENTITY KEY v5] UUID 폴백을 폐기합니다.
+                //
+                //  ── 기존 결함 ──
+                //   식별자가 비면 id = hash(team + UUID) 였습니다.
+                //   UUID 는 재스캔마다 값이 바뀌므로 같은 목록을 다시 읽을 때마다
+                //   같은 아이템이 새 행으로 무한히 쌓였고, draft 통계도 매번 +1 되었습니다.
+                //
+                //  ── 대체 ──
+                //   process_trading_task 의 [DOC NUMBER FALLBACK] 과 같은 원리입니다.
+                //   '그 아이템의 내용' 으로 결정론 키를 만듭니다.
+                //   같은 아이템을 다시 읽으면 같은 텍스트 → 같은 digest → 같은 id 가 되어
+                //   신규가 아니라 갱신으로 처리됩니다.
+                let identity_seed = if original_id.trim().is_empty() {
+                    let seed = single_item
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| serde_json::to_string(&single_item).unwrap_or_default());
+                    let auto = format!("AUTO-{}-{}", page_type, crate::utils::hash::digest(&seed));
+                    emit_term(&format!(
+                        "  ⚠️ [ITEM ID FALLBACK] 식별자가 비어 내용 기반 결정론 키 '{}' 를 사용합니다. (UUID 를 쓰면 재스캔마다 중복 행이 생깁니다)",
+                        auto
+                    ));
+                    auto
                 } else {
-                    crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val))
+                    original_id.clone()
                 };
+                let index_val = entity_index(&page_type, &team_id, &identity_seed);
+                let hashed_item_id = entity_id(&team_id, index_val);
 
                 if let Some(obj) = single_item.as_object_mut() {
                     obj.insert("type".to_string(), json!(page_type));
@@ -8442,24 +8495,28 @@ pub async fn process_task(
                                         let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
                                         e.0 += 1;
                                         e.2 += 1;
-
                                         let mut draft_data = json!({});
                                         let val_str = match &q.value {
                                             serde_json::Value::String(s) => s.clone(),
                                             serde_json::Value::Number(n) => n.to_string(),
                                             _ => q.value.to_string(),
                                         };
-                                        let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, foreign_type, val_str));
+                                        // 🌟 [ENTITY KEY v5] 상세 경로와 완전히 같은 식으로 통일합니다.
+                                        //    index 미저장 + id 불일치 + bcc 오류를 한꺼번에 교정합니다.
+                                        let draft_index = entity_index(foreign_type, &team_id, &val_str);
+                                        let draft_id = entity_id(&team_id, draft_index);
+                                        let foreign_bcc = entity_bcc(foreign_type, &cc_val);
                                         if let Some(obj) = draft_data.as_object_mut() {
                                             obj.insert("id".to_string(), json!(draft_id.clone()));
                                             obj.insert("type".to_string(), json!(foreign_type));
+                                            obj.insert("index".to_string(), json!(draft_index));
                                             obj.insert(q.column.clone(), q.value.clone());
                                             obj.insert("updated_at".to_string(), json!(0));
                                             obj.insert("mode".to_string(), json!(search_mode.clone()));
                                             obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
                                         }
                                         save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
+                                            &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
                                     }
                                 },
                                 _ => {}
@@ -8607,8 +8664,10 @@ pub async fn process_task(
                                             let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
                                             e.0 += 1;
                                             e.2 += 1;
-                                            let tracking_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_tn)));
-                                            let draft_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, "tracking", clean_tn));
+                                            // 🌟 [ENTITY KEY v5] 상세 경로와 완전히 같은 식으로 통일합니다.
+                                            let tracking_index = entity_index("tracking", &team_id, &clean_tn);
+                                            let draft_id = entity_id(&team_id, tracking_index);
+                                            let tracking_bcc = entity_bcc("tracking", &cc_val);
                                             let mut draft_data = json!({});
                                             if let Some(obj) = draft_data.as_object_mut() {
                                                 obj.insert("id".to_string(), json!(draft_id.clone()));
@@ -8624,8 +8683,8 @@ pub async fn process_task(
                                             }
                                             single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
                                             save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                            emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}).", draft_id, clean_tn));
+                                                &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
+                                            emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
                                         }
                                     },
                                     _ => {}
@@ -9322,35 +9381,102 @@ fn pdf_page_to_structured_html(page_text: &str) -> (String, usize) {
     (format!("<table>\n{}</table>", rows), pair_cnt)
 }
 
-/// 🌟 [TRADE DOC NUMBER NORMALIZE] 무역 문서번호 전용 정규화입니다.
-///  ── 왜 normalize_numeric_homoglyphs 를 그대로 쓰면 안 되는가 ──
+// =====================================================================
+// 🌟 [ENTITY KEY v5 / SINGLE SOURCE OF TRUTH]
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   같은 '문서 하나' 를 가리키는 index / id 를 만드는 식이 코드 안에서
+//   최소 7가지로 갈라져 있었습니다. 전수 조사 결과입니다.
+//
+//     ① commerce 상세      index = crc32(hash(type + team + normalize_identifier(no)))
+//                          id    = hash(team + index)                        (정상)
+//     ② commerce 리스트    식별자가 비면 id = hash(team + UUID)              (비결정론)
+//     ③ order→tracking     id = hash(team + 운송장번호 + 상품번호)
+//                          → index 와 무관한 별도 식                          (불일치)
+//     ④ commerce draft     index 를 아예 저장하지 않음
+//                          id = hash(team + foreign_type + 원시값)            (불일치 + 누락)
+//     ⑤ tracking draft     index 는 맞게 계산하지만
+//                          id = hash(team + "tracking" + no)                  (불일치)
+//     ⑥ order 사전계산     normalize_numeric_homoglyphs → 구분자 제거 순서
+//                          릴레이 쪽은 normalize_identifier                    (정규화 이중화)
+//     ⑦ trading            normalize_trade_doc_number(로컬 함수)              (정규화 불일치)
+//
+//   ③④⑤ 가 치명적입니다. draft 를 만들 때의 id 와, 나중에 진짜 문서가
+//   저장될 때의 id 가 다르므로 upsert_item 이 갱신이 아니라 '새 행' 을 만듭니다.
+//   draft 는 영구 미아가 되고, 릴레이는 연결된 것처럼 보이지만 실제로는
+//   두 문서가 따로 놉니다.
+//
+//  ── 계약 (이제 이 4개 함수 외에 index/id 를 만드는 식은 존재하지 않습니다) ──
+//   normalize_entity_key(raw)         : 구분자 제거 + 대문자 + (순수 숫자일 때만) 호모글리프
+//   entity_index(type, team, raw_no)  : crc32(hash_id(type + team + normalize_entity_key(no)))
+//   entity_id(team, index)            : hash_id(team + index)
+//   entity_bcc(type, cc)              : hash_id(type + cc)
+//
+//  ⚠️ [MIGRATION] normalize_entity_key 는 대문자로 통일합니다.
+//     기존 데이터에 소문자 알파벳 식별자가 있으면 id 가 달라집니다.
+//     순수 숫자 식별자(커머스 주문번호 / 운송장번호)는 대문자화가 무의미하므로
+//     영향이 전혀 없습니다. 알파벳이 섞인 상품코드가 있으면 factory reset 후
+//     재스캔하거나 마이그레이션으로 재계산해야 합니다.
+//
+//  ⚠️ [LIFT TARGET] 이 4개 함수는 hash_id / crc32 / normalize_numeric_homoglyphs
+//     세 개에만 의존합니다. 그대로 utils/hash.rs 로 옮겨도 동작이 같습니다.
+//     여기 둔 것은 호출부와 함께 리뷰하기 위함이며, hash.rs 로 이관 후
+//     `use crate::utils::hash::{normalize_entity_key, entity_index, entity_id, entity_bcc};`
+//     로 바꾸면 됩니다.
+
+/// 🌟 [ENTITY KEY v5] 식별자 정규화. 커머스/무역 공통 단일 규칙입니다.
+///
+///  ── 왜 normalize_numeric_homoglyphs 를 무조건 쓰면 안 되는가 ──
 ///   그 함수는 커머스 주문번호(순수 숫자열)를 위해 s→5, o→0, i→1 치환을 수행합니다.
 ///   무역 서식 코드에 그대로 적용하면
 ///     SC-2026-0802  → 5C20260802
 ///     SWB-55432219  → 5WB55432219
 ///     SOA-2026-0920 → 50A20260920
-///   처럼 45종 중 S 로 시작하는 서식 전부가 변조됩니다.
+///   처럼 S 로 시작하는 서식 전부가 변조됩니다.
 ///   (로그 실측: task_1787731795587 → ta5k1787731795587)
 ///
 ///  ── 규칙 ──
 ///   ① 구분자(-, _, ., ,, 공백, /)만 제거
 ///   ② 대문자로 통일 (BL-55432219 ↔ bl-55432219 를 같은 문서로 봅니다)
 ///   ③ 호모글리프 치환은 '알파벳이 하나도 없는 순수 숫자열' 일 때만 적용
-fn normalize_trade_doc_number(raw: &str) -> String {
+pub fn normalize_entity_key(raw: &str) -> String {
     let stripped: String = raw
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect::<String>()
         .to_uppercase();
-
-    if stripped.is_empty() { return stripped; }
-
+    if stripped.is_empty() {
+        return stripped;
+    }
     let has_alpha = stripped.chars().any(|c| c.is_alphabetic());
     if has_alpha {
         stripped
     } else {
         crate::utils::hash::normalize_numeric_homoglyphs(&stripped)
     }
+}
+
+/// 🌟 [ENTITY KEY v5] 문서 index. 이 식 외의 index 계산은 존재해서는 안 됩니다.
+pub fn entity_index(type_: &str, team_id: &str, raw_no: &str) -> u32 {
+    let clean = normalize_entity_key(raw_no);
+    crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!(
+        "{}{}{}",
+        type_, team_id, clean
+    )))
+}
+
+/// 🌟 [ENTITY KEY v5] 문서 id. 반드시 index 로부터만 유도합니다.
+///  ── 왜 index 로부터인가 ──
+///   릴레이는 '상대의 index 를 결정론으로 재현' 해서 상대를 찾습니다.
+///   id 가 index 와 무관한 식으로 만들어지면, index 로는 찾았는데
+///   저장은 다른 id 로 되어 같은 문서가 두 행이 됩니다.
+pub fn entity_id(team_id: &str, index: u32) -> String {
+    crate::utils::hash::hash_id(&format!("{}{}", team_id, index))
+}
+
+/// 🌟 [ENTITY KEY v5] 봉투 bcc. 타입별 목록 필터가 이 값으로 동작합니다.
+pub fn entity_bcc(type_: &str, cc: &str) -> String {
+    crate::utils::hash::hash_id(&format!("{}{}", type_, cc))
 }
 
 async fn process_trading_task(
@@ -10474,7 +10600,7 @@ async fn process_trading_task(
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 if !self_ref.is_empty() && !own.is_empty()
-                    && normalize_trade_doc_number(&self_ref) == normalize_trade_doc_number(&own)
+                    && normalize_entity_key(&self_ref) == normalize_entity_key(&own)
                 {
                     extracted_data.as_object_mut().unwrap().remove(self_field);
                     emit_term(&format!(
@@ -10551,11 +10677,11 @@ async fn process_trading_task(
             fallback
         });
 
-    let clean_no = normalize_trade_doc_number(&doc_number);
+    // 🌟 [ENTITY KEY v5] index / id 를 단일 계약 함수로만 만듭니다.
+    let clean_no = normalize_entity_key(&doc_number);
     emit_term(&format!("[TRADING] 🔑 문서 식별자 확정: '{}' → 정규화 '{}'", doc_number, clean_no));
-
-    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", doc_type, team_id, clean_no)));
-    let hashed_item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+    let index_val = entity_index(&doc_type, &team_id, &doc_number);
+    let hashed_item_id = entity_id(&team_id, index_val);
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("id".to_string(), json!(hashed_item_id.clone()));
@@ -10570,9 +10696,9 @@ async fn process_trading_task(
     let item_digest = crate::utils::hash::digest(&text_to_embed);
     let item_vector = model.get_embedding(text_to_embed.clone()).await.unwrap_or(vec![0.0; 384]);
 
-    // 🌟 trading bcc: doc_type 기반 (commerce 의 page_type 기반과 구분)
+    // 🌟 trading bcc: doc_type 기반 (commerce 의 page_type 기반과 같은 역할)
     let cc_val = task.cc.clone();
-    let bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, cc_val));
+    let bcc = entity_bcc(&doc_type, &cc_val);
     let ref_val = task.r#ref.clone();
 
     // 🌟 v4 : items 단일 저장.
@@ -10651,7 +10777,7 @@ async fn process_trading_task(
             }
         };
 
-        let clean_ref = normalize_trade_doc_number(&ref_display);
+        let clean_ref = normalize_entity_key(&ref_display);
         if clean_ref.is_empty() {
             relay_skipped.push(format!("{}({})", foreign_type, mine_field));
             continue;
@@ -10667,11 +10793,9 @@ async fn process_trading_task(
         }
 
         // ── ② 상대 index 를 결정론으로 재현합니다 ──
-        //    상대 문서가 저장될 때 쓰는 식과 완전히 같은 식입니다.
-        //      index_val = crc32(hash(doc_type + team_id + clean_no))
-        let foreign_index = crate::utils::hash::crc32(
-            &crate::utils::hash::hash_id(&format!("{}{}{}", foreign_type, team_id, clean_ref))
-        );
+        //    상대 문서가 저장될 때 쓰는 식과 '완전히 같은 함수' 를 씁니다.
+        //    문자열 조립을 손으로 반복하지 않으므로 인자 순서가 어긋날 여지가 없습니다.
+        let foreign_index = entity_index(foreign_type, &team_id, &ref_display);
         let mine_col = crate::logic::trading_index_column(&doc_type);
         let foreign_col = crate::logic::trading_index_column(foreign_type);
 
@@ -10753,7 +10877,7 @@ async fn process_trading_task(
                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
                 foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
 
-                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                let foreign_bcc = entity_bcc(foreign_type, &cc_val);
                 save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
                     &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
                 relay_linked += 1;
@@ -10765,7 +10889,7 @@ async fn process_trading_task(
             None => {
                 // 🌟 [DRAFT] 상대 문서가 아직 없으면 미리 만들어 둡니다.
                 //    상대가 실제로 들어오면 같은 index 를 갖게 되어 자동으로 이어집니다.
-                let draft_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, foreign_index));
+                let draft_id = entity_id(&team_id, foreign_index);
                 let mut draft_data = json!({});
                 if let Some(o) = draft_data.as_object_mut() {
                     o.insert("id".to_string(), json!(draft_id.clone()));
@@ -10782,7 +10906,7 @@ async fn process_trading_task(
                     o.insert("mode".to_string(), json!("shipping"));
                     o.insert("text".to_string(), json!(format!("{} {} {}", foreign_type, ref_display, doc_number)));
                 }
-                let foreign_bcc = crate::utils::hash::hash_id(&format!("{}{}", foreign_type, cc_val));
+                let foreign_bcc = entity_bcc(foreign_type, &cc_val);
                 save_item(&store, "items", &draft_id, foreign_type, draft_data, None,
                     &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
                 relay_drafted += 1;

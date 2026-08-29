@@ -42,20 +42,31 @@ pub enum PugMode {
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
-    // 1. Filter out non-printable and non-ASCII/Korean characters if they are broken
-    // But we want to keep Korean. Let's filter out known problematic control codes.
+    // 🌟 [ALLOW-LIST 폐기] 기존 구현은 "ASCII + 한글만 통과" 화이트리스트였습니다.
+    //    무역 문서는 다국어가 원칙이므로 이 필터는 값을 조용히 파괴합니다.
+    //      Gaisbergstraße → Gaisbergstrae   (독일 수하인 주소, ß = U+00DF 소멸)
+    //      Köln → Kln,  中国 / 深圳 → 전소  (country_of_manufacture 의 표준 표기)
+    //      € ¥ £ ° № → 전소               (currency / 단위)
+    //    파괴된 문자열은 STAGE-6 접지 검증에서 '이미지에 없는 값' 으로 폐기되거나,
+    //    normalize_identifier 를 통과해도 원본과 다른 index 로 떨어져 릴레이가 끊깁니다.
+    //    따라서 화이트리스트를 버리고, LLM 파이프라인을 실제로 깨뜨리는 문자만
+    //    블랙리스트로 제거합니다.
     let cleaned: String = text.chars()
         .filter(|c| {
             let u = *c as u32;
-            // Keep: standard ASCII, Korean Hangul Jamo/Syllables, Common Punctuation
-            (u >= 32 && u <= 126) || // Basic ASCII
-            (u >= 0xAC00 && u <= 0xD7A3) || // Hangul Syllables
-            (u >= 0x1100 && u <= 0x11FF) || // Hangul Jamo
-            (u >= 0x3130 && u <= 0x318F) || // Hangul Compatibility Jamo
-            u == 10 || u == 13 || u == 9     // \n, \r, \t
+            // 개행/캐리지리턴/탭은 PUG 들여쓰기 구조 그 자체이므로 무조건 보존
+            if u == 9 || u == 10 || u == 13 { return true; }
+            // C0 / C1 제어문자 제거
+            if u < 0x20 || (0x7F..=0x9F).contains(&u) { return false; }
+            // BOM / zero-width / word-joiner : 토크나이저가 단어를 쪼개는 원인
+            if matches!(u, 0xFEFF | 0x200B | 0x200C | 0x200D | 0x2060) { return false; }
+            // bidi override : 시각 순서를 조작하는 프롬프트 인젝션 문자
+            if (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u) { return false; }
+            // private use area : 폰트 깨짐 잔재
+            if (0xE000..=0xF8FF).contains(&u) { return false; }
+            true
         })
         .collect();
-
     // 2. Prevent internal special tokens from being interpreted
     cleaned.replace("<|", "< |").replace("|>", "| >")
 }
@@ -79,7 +90,17 @@ pub fn pre_clean_html(html: &str) -> String {
     
     // 🌟 [CRITICAL FIX] 정규식의 Alternation(|) 우선순위 버그 수정!
     // rows가 앞단에 있으면 rowspan을 만났을 때 rows 부분만 매칭되고 pan="2"가 잘려나가는 현상을 원천 방지하기 위해 긴 단어를 먼저 배치합니다.
-    let re_attr = Regex::new(r#"(?i)\b(id|class|src|href|type|name|value|placeholder|checked|selected|disabled|readonly|rowspan|colspan|rows|cols|scope)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
+    // 🌟 [COLUMN SIGNAL 보존] 추가된 속성의 근거
+    //    headers : HTML 표준에서 '이 셀의 열 헤더가 누구인지' 를 셀이 직접 선언하는 속성.
+    //              컬럼명 추출에서 가장 신뢰도가 높은데 여기서 지워지고 있었습니다.
+    //    abbr    : th 의 짧은 정식 명칭. 'UNIT WEIGHT' 대신 'net weight' 가 실려 옵니다.
+    //    alt/title: 아이콘 컬럼(중량/수량)의 유일한 텍스트 단서.
+    //    data-*  : generate_pug_lines 의 has_meaningful_attrs / always_include 가
+    //              starts_with("data-") 를 검사하는데, 여기서 먼저 지워져
+    //              그 분기가 도달 불가능한 죽은 코드가 되어 있었습니다.
+    //    뒤쪽 (?=[\s/>]|$) 는 format= 안의 for, formaction= 안의 for 처럼
+    //    접두사만 걸리는 오검출을 차단합니다.
+    let re_attr = Regex::new(r#"(?i)\b(data-[a-z0-9\-]+|placeholder|rowspan|colspan|disabled|readonly|selected|summary|headers|checked|class|scope|title|value|abbr|href|type|name|rows|cols|alt|for|src|id)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?(?=[\s/>]|$)"#).unwrap();
     
     let clean = re_tag.replace_all(&clean, |caps: &regex::Captures| {
         let tag_name = &caps[1];
@@ -346,7 +367,12 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &tokenize
     
     // 2. [복구 단계] 절단면 위쪽으로 거슬러 올라가며 필수 부모 껍데기 구출
     let mut extracted_title = None;
-    
+    // 🌟 [역추적 한계선 연결] 파일 상단 주석이 선언한 규칙(html/body/section/main 등을 만나면
+    //    역추적 중단)이 실제로는 한 번도 호출되지 않아 is_root_layout_element 가 죽은 코드였습니다.
+    //    한계선 위의 전역 뼈대는 토큰만 먹고 컨텍스트를 희석하므로 삽입을 멈춥니다.
+    //    다만 title 은 head 안에 있어 body 보다 위쪽 인덱스에 있으므로 루프 자체는 계속 돌립니다.
+    let mut root_reached = false;
+
     if let Some(mut target_indent) = last_valid_indent {
         for i in (0..start_keep_idx).rev() {
             let line = lines[i];
@@ -363,10 +389,10 @@ pub fn truncate_pug_by_tokens(pug: &str, max_tokens: usize, tokenizer: &tokenize
                 }
                 extracted_title = Some(title_block);
             }
-
-            if current_indent < target_indent && !is_void_element(line) {
+            if !root_reached && current_indent < target_indent && !is_void_element(line) {
                 final_kept_lines.insert(0, format!("{}\n", line));
-                target_indent = current_indent; 
+                target_indent = current_indent;
+                if is_root_layout_element(line) { root_reached = true; }
             }
         }
     }
@@ -557,14 +583,35 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 }
             }
 
-            // Inject alt from headers for tbody cells
+            // 🌟 [COLUMN LABEL v2] 헤더 행을 '본문 행 번호 % 헤더 행 수' 로 고르던 식은 두 가지로 틀렸습니다.
+            //    ① 2단 헤더 표에서 본문 2행부터 라벨이 통째로 어긋납니다.
+            //       (본문 r0→헤더 r0, 본문 r1→헤더 r1, 본문 r2→헤더 r0 … 순환)
+            //    ② split_doc_to_pug_list_advanced 는 행마다 ctx 를 새로 만들어
+            //       current_row_idx 가 항상 0 입니다. 결국 언제나 헤더 첫 행만 쓰게 되어
+            //       'UNIT / VALUE' 2단 헤더에서 상위 'UNIT' 만 붙고 'VALUE' 가 사라집니다.
+            //    한 열의 라벨은 '그 열의 모든 헤더 행을 위에서 아래로 이어붙인 것' 하나뿐입니다.
+            //    인쇄 라벨과 스키마 필드명을 파이프로 함께 실어 LLM 이 매핑을 추측하지 않게 합니다.
             if tag_name == "td" || tag_name == "th" {
                 if let Some(c) = ctx.as_mut() {
                     if c.is_in_tbody && !c.headers.is_empty() {
-                        let h_row = &c.headers[c.current_row_idx % c.headers.len()];
-                        if let Some(title) = h_row.get(c.current_col_idx) {
-                            if !title.is_empty() {
-                                other_attributes.push(format!("alt=\"{}\"", title.replace("\"", "'")));
+                        let col = c.current_col_idx;
+                        let mut parts: Vec<&str> = Vec::new();
+                        for h_row in c.headers.iter() {
+                            if let Some(seg) = h_row.get(col) {
+                                let seg = seg.trim();
+                                if !seg.is_empty() && !parts.contains(&seg) {
+                                    parts.push(seg);
+                                }
+                            }
+                        }
+                        let title = parts.join(" ");
+                        if !title.is_empty() {
+                            let safe = title.replace("\"", "'");
+                            let canonical = canonicalize_trade_column(&title);
+                            if canonical.is_empty() {
+                                other_attributes.push(format!("alt=\"{}\"", safe));
+                            } else {
+                                other_attributes.push(format!("alt=\"{}|{}\"", safe, canonical));
                             }
                         }
                     }
@@ -713,7 +760,17 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
 
             // End of Tag Updates
             if tag_name == "tr" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_row_idx += 1; } } }
-            if tag_name == "td" || tag_name == "th" { if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_col_idx += 1; } } }
+            // 🌟 [COLSPAN CURSOR] 셀 하나를 언제나 1열로 세면 colspan 셀 이후의 모든 열이
+            //    한 칸씩 밀려 alt 라벨이 옆 열 것으로 붙습니다.
+            //    (예: '금액' 이 2열을 덮으면 그 뒤 '단가' 셀에 '수량' 라벨이 붙습니다)
+            //    실제 점유 열 수만큼 전진시켜 헤더 격자와 본문 격자를 같은 좌표계로 맞춥니다.
+            if tag_name == "td" || tag_name == "th" {
+                let span = element.attr("colspan")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 64);
+                if let Some(c) = ctx.as_mut() { if c.is_in_tbody { c.current_col_idx += span; } }
+            }
             if tag_name == "tbody" { if let Some(c) = ctx.as_mut() { c.is_in_tbody = false; } }
         }
         Node::Text(text) => {
@@ -820,41 +877,292 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
     pug_list
 }
 
-pub fn extract_table_headers(html: &str, table_selector: &str) -> Vec<Vec<String>> {
-    let document = Html::parse_document(html);
-    let mut all_headers = Vec::new();
-    
-    if let Ok(sel) = Selector::parse(table_selector) {
-        if let Some(first_match) = document.select(&sel).next() {
-            let mut current = first_match.parent();
-            while let Some(parent) = current {
-                if let Some(el) = parent.value().as_element() {
-                    if el.name() == "table" {
-                        if let Some(table_ref) = scraper::ElementRef::wrap(parent) {
-                            if let Ok(thead_sel) = Selector::parse("thead") {
-                                if let Some(thead) = table_ref.select(&thead_sel).next() {
-                                    if let Ok(tr_sel) = Selector::parse("tr") {
-                                        for tr in thead.select(&tr_sel) {
-                                            let mut row_headers = Vec::new();
-                                            if let Ok(cell_sel) = Selector::parse("th, td") {
-                                                for cell in tr.select(&cell_sel) {
-                                                    row_headers.push(cell.text().collect::<Vec<_>>().join(" ").trim().to_string());
-                                                }
-                                            }
-                                            if !row_headers.is_empty() { all_headers.push(row_headers); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-                current = parent.parent();
+// =====================================================================
+// 🌟 [TRADE COLUMN DICTIONARY] 인쇄된 컬럼명 ↔ 스키마 필드명 사전
+// ---------------------------------------------------------------------
+//  이 사전이 없어서 실측 로그에서 'UNIT WEIGHT' 열(값 0.1)이 통째로 버려졌습니다.
+//  스키마 필드는 item_net_weight 인데 인쇄 라벨은 'UNIT WEIGHT' 라서
+//  모델이 둘을 잇지 못하고 item_net_weight / item_gross_weight 를 모두 null 로 반환했습니다.
+//  bias.json 의 의미 구(semantic phrase)는 '위치를 찾는' 용도이고,
+//  이 사전은 '찾은 열의 이름을 확정하는' 용도입니다. 역할이 다르므로 분리합니다.
+// =====================================================================
+pub static TRADE_COLUMN_ALIASES: &[(&str, &[&str])] = &[
+    ("description", &[
+        "description of goods", "description", "goods description", "commodity",
+        "commodity description", "description of merchandise", "article", "articles",
+        "item description", "product", "product name", "name of goods", "nature of goods",
+        "품명", "상품명", "품목", "화물명", "물품명",
+    ]),
+    ("hs_code", &[
+        "hs code", "h s code", "hs-code", "hscode", "hts code", "hs tariff",
+        "tariff code", "commodity code", "hs no", "hs number", "tariff no",
+        "세번", "세번부호", "hs부호",
+    ]),
+    ("country_of_manufacture", &[
+        "country of manufacture", "country of origin", "made in", "origin",
+        "manufacturing country", "country", "coo",
+        "원산지", "생산국", "제조국",
+    ]),
+    ("unit", &[
+        "unit of measure", "unit of measurement", "uom", "measure", "unit",
+        "packing unit", "measurement unit",
+        "단위", "거래단위",
+    ]),
+    ("quantity", &[
+        "qty", "quantity", "q ty", "pieces", "pcs", "no of pcs", "number of units",
+        "number of pieces", "shipped qty",
+        "수량", "주문수량",
+    ]),
+    ("item_net_weight", &[
+        "unit weight", "net weight", "n w", "nw", "net wt", "unit net weight",
+        "weight per unit", "net weight kg",
+        "순중량", "단위중량", "개당중량",
+    ]),
+    ("item_gross_weight", &[
+        "gross weight", "g w", "gw", "gross wt", "total weight", "gross weight kg",
+        "총중량", "총 중량",
+    ]),
+    ("unit_price", &[
+        "unit value", "unit price", "price per unit", "u price", "unit cost",
+        "rate", "price",
+        "단가",
+    ]),
+    ("total_price", &[
+        "total value", "total price", "line total", "extended price", "extended value",
+        "total amount", "amount", "value",
+        "금액", "합계", "공급가액",
+    ]),
+    ("item_code", &[
+        "item code", "item no", "item number", "sku", "part number", "part no",
+        "model", "model no", "article no", "product code", "style no",
+        "품번", "모델", "품목코드",
+    ]),
+    ("item_package_count", &[
+        "packages", "no of packages", "package count", "cartons", "ctns",
+        "no of cartons", "number of packages", "case",
+        "포장수", "박스수", "포장개수",
+    ]),
+    ("item_package_type", &[
+        "package type", "kind of package", "packing", "type of package",
+        "packing type", "kind of packages",
+        "포장형태", "포장종류",
+    ]),
+];
+
+/// 🌟 [LABEL ECHO] 서식의 '박스 라벨' 목록.
+///  실측 로그에서 reference_invoice 가 "CONSIGNEE VAT/EORI" 를,
+///  party_name 이 "SIGNATORY COMPANY" 를 값으로 받았습니다.
+///  기존 '스키마 에코' 필터는 스키마 필드명(reference_invoice 등)만 잡기 때문에
+///  인쇄 라벨이 값 자리로 들어오는 이 경로를 막지 못합니다.
+pub static TRADE_PRINTED_LABELS: &[&str] = &[
+    "invoice number", "invoice no", "invoice total", "airwaybill bill of lading",
+    "date of exportation", "export reference", "exporter", "consignee",
+    "exporter vat eori", "consignee vat eori", "vat eori",
+    "country of export", "buyer if not consignee", "reason for export",
+    "country of ultimate destination", "total number of packages", "total weight",
+    "incoterm", "incoterms", "currency", "signature of exporter",
+    "signatory name", "signatory company", "date", "shipper", "notify party",
+    "description of goods", "hs code", "country of manufacture", "unit of measure",
+    "qty", "unit weight", "unit value", "total value",
+    "품명", "수량", "단가", "금액", "원산지", "세번부호",
+];
+
+/// 라벨 문자열을 비교 가능한 형태로 접습니다. 영숫자 외는 공백으로 바꾸고 소문자화합니다.
+fn fold_column_label(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_lowercase().next().unwrap_or(c) } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 인쇄된 컬럼명을 스키마 필드명으로 확정합니다. 매칭 실패 시 빈 문자열을 돌려줍니다.
+pub fn canonicalize_trade_column(raw_header: &str) -> String {
+    let norm = fold_column_label(raw_header);
+    if norm.is_empty() { return String::new(); }
+
+    // 1. 완전 일치 우선
+    for (field, aliases) in TRADE_COLUMN_ALIASES.iter() {
+        for a in aliases.iter() {
+            if fold_column_label(a) == norm { return field.to_string(); }
+        }
+    }
+
+    // 2. 부분 일치 — 가장 긴 별칭이 이깁니다.
+    //    'unit weight'(11자) 가 'unit'(4자) 보다 먼저 잡혀야
+    //    item_net_weight 로 가고 unit 으로 오배정되지 않습니다.
+    let mut best_len = 0usize;
+    let mut best_field = "";
+    for (field, aliases) in TRADE_COLUMN_ALIASES.iter() {
+        for a in aliases.iter() {
+            let a_norm = fold_column_label(a);
+            if a_norm.is_empty() { continue; }
+            if norm.contains(&a_norm) && a_norm.len() > best_len {
+                best_len = a_norm.len();
+                best_field = field;
             }
         }
     }
-    all_headers
+    best_field.to_string()
+}
+
+/// 추출된 '값' 이 사실은 인쇄 라벨인지 판정합니다. true 면 폐기해야 합니다.
+pub fn is_printed_label_echo(value: &str) -> bool {
+    let norm = fold_column_label(value);
+    if norm.is_empty() { return false; }
+    if TRADE_PRINTED_LABELS.iter().any(|l| fold_column_label(l) == norm) { return true; }
+    TRADE_COLUMN_ALIASES.iter().any(|(_, aliases)| {
+        aliases.iter().any(|a| fold_column_label(a) == norm)
+    })
+}
+
+/// 🌟 [ROW CONTRACT] 표 타일 프롬프트에 실을 계약 문자열을 만듭니다.
+///  실측 로그에서 타일 2 는 T-Shirt 행과 Shorts 행을 둘 다 담고 있었는데
+///  응답이 객체 1개였고, 파이프라인이 그것을 배열 1원소로 승격했습니다.
+///  ("ARRAY COERCE 단일 객체 응답을 원소 1개 배열로 승격합니다")
+///  그 결과 Shorts 행이 영구 소멸했습니다. 행 수 = 타일 수가 되어 버립니다.
+///  타일 스키마를 배열로 고정하고, 인쇄 라벨과 필드명의 대응을 명시해
+///  '보이는 데이터 행 수만큼' 원소를 만들도록 강제합니다.
+pub fn build_table_row_contract(headers: &[Vec<String>]) -> String {
+    if headers.is_empty() { return String::new(); }
+
+    let width = headers.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut mapping = Vec::new();
+    let mut fields = Vec::new();
+
+    for col in 0..width {
+        let mut parts: Vec<&str> = Vec::new();
+        for h_row in headers.iter() {
+            if let Some(seg) = h_row.get(col) {
+                let seg = seg.trim();
+                if !seg.is_empty() && !parts.contains(&seg) { parts.push(seg); }
+            }
+        }
+        let printed = parts.join(" ");
+        if printed.is_empty() { continue; }
+        let field = canonicalize_trade_column(&printed);
+        if field.is_empty() { continue; }
+        mapping.push(format!("  column {} \"{}\" -> \"{}\"", col, printed, field));
+        if !fields.contains(&field) { fields.push(field); }
+    }
+
+    if mapping.is_empty() { return String::new(); }
+
+    let obj = fields.iter()
+        .map(|f| format!("\"{}\": null", f))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+"COLUMN MAP (printed header -> output field):\n{}\n\
+RULES:\n\
+  - Return a JSON ARRAY. One object per printed data row. Never collapse rows.\n\
+  - If the image shows 2 data rows, the array MUST have 2 elements.\n\
+  - Do not output header rows, subtotal rows, or total rows as elements.\n\
+  - Use null for a column that is not printed on that row.\n\
+SCHEMA:\n[ {{ {} }} ]",
+        mapping.join("\n"), obj
+    )
+}
+
+/// 🌟 [HEADER BAND v2] 기존 구현이 못 잡던 3가지를 잡습니다.
+///   ① thead 부재 : 무역 서식 다수는 thead 없이 표의 첫 tr 을 th 로 씁니다.
+///      기존 코드는 이때 빈 배열을 돌려주고, 빈 배열이면 generate_pug_lines 의
+///      alt= 주입 자체가 일어나지 않아 컬럼명이 LLM 에 도달하지 못했습니다.
+///   ② colspan : 'UNIT' 이 2열을 덮는 2단 헤더에서 셀을 1열로 세면
+///      그 뒤 모든 열의 라벨이 한 칸씩 밀립니다.
+///   ③ rowspan : 'DESCRIPTION' 이 2행을 덮으면 아래 행의 그 열이 빈칸이 되어
+///      본문 셀이 라벨을 못 받습니다.
+///   결과는 항상 직사각 격자(모든 행의 길이가 같음)로 반환합니다.
+pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<Vec<String>> {
+    let empty: Vec<Vec<String>> = Vec::new();
+
+    let sel = match Selector::parse(table_selector) { Ok(s) => s, Err(_) => return empty };
+    let first_match = match document.select(&sel).next() { Some(m) => m, None => return empty };
+
+    // 1. 선택자에서 위로 올라가 감싸는 <table> 을 찾습니다. (기존 동작 유지)
+    let mut table_ref = None;
+    let mut current = first_match.parent();
+    while let Some(parent) = current {
+        if let Some(el) = parent.value().as_element() {
+            if el.name() == "table" {
+                table_ref = scraper::ElementRef::wrap(parent);
+                break;
+            }
+        }
+        current = parent.parent();
+    }
+    let table_ref = match table_ref { Some(t) => t, None => return empty };
+
+    let tr_sel = match Selector::parse("tr") { Ok(s) => s, Err(_) => return empty };
+    let cell_sel = match Selector::parse("th, td") { Ok(s) => s, Err(_) => return empty };
+
+    // 2. 헤더 행 후보 수집
+    let mut header_rows: Vec<scraper::ElementRef> = Vec::new();
+    if let Ok(thead_sel) = Selector::parse("thead") {
+        if let Some(thead) = table_ref.select(&thead_sel).next() {
+            header_rows.extend(thead.select(&tr_sel));
+        }
+    }
+    if header_rows.is_empty() {
+        // thead 가 없으면 표 선두에서 'th 우세 행' 또는 'scope=col 보유 행' 이
+        // 이어지는 동안을 헤더 밴드로 봅니다. 데이터 행을 만나면 즉시 중단합니다.
+        for tr in table_ref.select(&tr_sel) {
+            let cells: Vec<_> = tr.select(&cell_sel).collect();
+            if cells.is_empty() { continue; }
+            let th_count = cells.iter()
+                .filter(|c| c.value().name().eq_ignore_ascii_case("th"))
+                .count();
+            let scope_col = cells.iter()
+                .any(|c| c.value().attr("scope").map_or(false, |s| s.eq_ignore_ascii_case("col")));
+            if th_count * 2 >= cells.len() || scope_col {
+                header_rows.push(tr);
+            } else {
+                break;
+            }
+        }
+    }
+    if header_rows.is_empty() { return empty; }
+
+    let band = header_rows.len();
+
+    // 3. colspan / rowspan 을 펼쳐 직사각 격자로 만듭니다.
+    let mut grid: Vec<Vec<String>> = vec![Vec::new(); band];
+    for (r, tr) in header_rows.iter().enumerate() {
+        let mut c = 0usize;
+        for cell in tr.select(&cell_sel) {
+            // 위 행의 rowspan 이 이미 점유한 칸을 건너뜁니다.
+            while grid[r].len() > c && !grid[r][c].is_empty() { c += 1; }
+
+            let colspan = cell.value().attr("colspan")
+                .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 64);
+            let rowspan = cell.value().attr("rowspan")
+                .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 64)
+                .min(band - r); // 헤더 밴드 밖으로 흘러넘치지 않게 잘라냅니다.
+
+            // abbr 가 있으면 그것이 정식 컬럼명입니다. 없으면 인쇄 텍스트를 씁니다.
+            let raw = cell.value().attr("abbr")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| cell.text().collect::<Vec<_>>().join(" "));
+            let title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            for dr in 0..rowspan {
+                let rr = r + dr;
+                for dc in 0..colspan {
+                    let cc = c + dc;
+                    if grid[rr].len() <= cc { grid[rr].resize(cc + 1, String::new()); }
+                    grid[rr][cc] = title.clone();
+                }
+            }
+            c += colspan;
+        }
+    }
+
+    let width = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    if width == 0 { return empty; }
+    for row in grid.iter_mut() { row.resize(width, String::new()); }
+    grid
 }
 
 pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> Vec<String> {
@@ -942,8 +1250,252 @@ pub fn get_trade_doc_categories(doc_type: &str) -> Vec<&'static str> {
         }
         out.push(cat);
     }
+
+    // 🌟 [RELAY FLOOR] 릴레이 키를 담는 카테고리는 스키마 판정과 무관하게 반드시 남깁니다.
+    //    header      : doc_number / reference_bl / reference_po
+    //    logistics   : awb_number / flight_number / vessel
+    //    containers  : container_number
+    //    이 카테고리가 순회 대상에서 빠지면 크롭 계획이 만들어지지 않고,
+    //    "TRADE RELAY STARVED — 빈 키" 가 스키마 단계에서 이미 확정됩니다.
+    for must in ["header", "logistics", "containers"] {
+        if crate::logic::TRADE_EXTRACTION_CATEGORIES.iter().any(|c| *c == must)
+            && !out.contains(&must)
+        {
+            out.push(must);
+        }
+    }
+
     if out.is_empty() {
         out.push("header");
     }
     out
+}
+
+// =====================================================================
+// 🌟 [TRADE RELAY POINT] mode="trading" 의 문서 연결 진입점
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   mode="commerce" 는 type="tracking" 과 type="order" 가
+//     tracking_number → hash::normalize_identifier → crc32 → index
+//   라는 단일 경로로 만나기 때문에 릴레이가 성립합니다.
+//   반면 trading 에는 이 경로에 해당하는 함수가 코드에 존재하지 않았습니다.
+//   parsing.rs 는 '어떤 카테고리를 뽑을지'(get_trade_doc_categories)만 정하고
+//   '무엇으로 문서를 이을지'는 아무 것도 정하지 않았습니다.
+//
+//  ── 실측 실패 ──
+//   ["PL←doc_number(빈 키)", "BL←doc_number(빈 키)",
+//    "ED←doc_number(빈 키)", "AWB←flight_number(빈 키)"]
+//   ① 규칙 3개가 doc_number 하나에만 매달려 있습니다.
+//      CI↔PL 은 인보이스번호, CI↔BL 은 B/L 번호, CI↔PO 는 발주번호로 이어지는데
+//      단일 키로는 셋 중 하나만 맞아도 나머지 둘이 끊깁니다.
+//   ② AWB←flight_number 는 의미가 틀렸습니다. flight_number 는 편명(KE083)이고,
+//      AWB 를 특정하는 것은 항공운송장 번호입니다. 이 서식은 그 번호를
+//      AIRWAYBILL / BILL OF LADING 박스에 93763111837 로 인쇄하고 있습니다.
+//      즉 추출이 완벽했더라도 이 규칙표로는 AWB 릴레이가 성립하지 않습니다.
+//   ③ 키가 하나도 없을 때 task_id 로 폴백했습니다. task_id 는 실행마다 달라지므로
+//      같은 문서가 재실행될 때마다 새 id 를 받습니다. 실측 로그에서
+//      0xef44… (이전 실행) 과 0xcf1c… (이번 실행) 로 갈렸습니다.
+//
+//  좌표를 코드에 적지 않는 vision_crop 의 원칙과 같은 이유로,
+//  키 이름도 문서 종류마다 하드코딩하지 않고 '역할' 로 선언합니다.
+// =====================================================================
+
+/// 릴레이 키의 역할. 같은 역할끼리만 서로 연결됩니다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeRelayKey {
+    pub role: &'static str,   // "self" | "transport" | "booking" | "order" | "contract" | "credit" | "container"
+    pub source_field: String, // 어느 필드에서 나왔는지 (진단용)
+    pub raw: String,          // 인쇄된 원문
+    pub normalized: String,   // normalize_identifier 통과값
+    pub index: u32,           // crc32(normalized) — commerce 의 tracking index 와 같은 축
+    pub id: String,           // hash_id(normalized)
+}
+
+/// 역할별로 훑을 필드 이름을 우선순위 순으로 선언합니다.
+/// 앞쪽 필드가 먼저 채택되고, 같은 역할 안에서 중복 index 는 제거됩니다.
+pub static TRADE_RELAY_FIELDS: &[(&str, &[&str])] = &[
+    // 이 문서 자신을 가리키는 번호. CI 의 INVOICE NUMBER 가 여기 옵니다.
+    ("self",      &["doc_number", "reference_number", "reference_invoice"]),
+    // 운송증권 번호. CI 에도 AWB / B/L 번호가 인쇄되므로 CI↔BL / CI↔AWB 가 여기서 성립합니다.
+    ("transport", &["reference_bl", "reference_master_bl", "bl_number",
+                    "awb_number", "airway_bill_number", "tracking_number"]),
+    ("booking",   &["reference_booking", "booking_number"]),
+    ("order",     &["reference_po", "po_number", "order_number"]),
+    ("contract",  &["reference_contract", "reference_sr", "contract_number"]),
+    ("credit",    &["reference_lc", "lc_number"]),
+    ("container", &["container_number"]),
+];
+
+/// JSON 트리에서 문자열/숫자 값을 얕게 찾아 옵니다.
+/// 루트 → 카테고리 객체(header/logistics/containers …) → 배열 원소 순으로 훑습니다.
+fn find_relay_value(data: &Value, key: &str) -> Option<String> {
+    fn as_text(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+    if let Some(v) = data.get(key) {
+        if let Some(t) = as_text(v) { return Some(t); }
+    }
+    if let Some(map) = data.as_object() {
+        for (_, sub) in map.iter() {
+            match sub {
+                Value::Object(_) => {
+                    if let Some(v) = sub.get(key) {
+                        if let Some(t) = as_text(v) { return Some(t); }
+                    }
+                }
+                Value::Array(items) => {
+                    for it in items.iter() {
+                        if let Some(v) = it.get(key) {
+                            if let Some(t) = as_text(v) { return Some(t); }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// 🌟 추출 JSON 에서 릴레이 키를 전부 뽑습니다.
+///  commerce 의 tracking_number 한 개에 대응하는, trading 쪽의 다중 키 버전입니다.
+/// 🌟 [RELAY KEYS v4]
+///  ── 무엇이 바뀌었나 ──
+///   기존은 `find_relay_value` 로 값을 찾고 `is_printed_label_echo` 로
+///   플레이스홀더를 차단한 뒤 `is_valid_relay_key` 로 유효성을 검증했는데,
+///   이 순서에서 `is_valid_relay_key` 가 `normalize_identifier` 를
+///   내부에서 다시 호출하여 전각 접기가 두 번 수행되었습니다.
+///   또한 `relay_index` 와 `relay_id` 에 원본 `raw` 를 전달했는데,
+///   이 값은 이미 `normalize_identifier` 를 거친 `normalized` 와 다를 수 있습니다.
+///   일관성을 위해 `normalized` 를 기준으로 인덱스와 id 를 계산합니다.
+pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
+    let mut out: Vec<TradeRelayKey> = Vec::new();
+    for (role, fields) in TRADE_RELAY_FIELDS.iter() {
+        for f in fields.iter() {
+            let raw = match find_relay_value(data, f) { Some(r) => r, None => continue };
+            
+            // 🌟 인쇄 라벨이 값 자리로 들어온 경우를 여기서 차단합니다.
+            if is_printed_label_echo(&raw) { continue; }
+            
+            // 🌟 유효성 검증을 먼저 수행합니다.
+            //    is_valid_relay_key 가 내부에서 전각 접기를 수행하므로
+            //    여기서 한 번만 수행됩니다.
+            if !crate::utils::hash::is_valid_relay_key(&raw) { continue; }
+            
+            let normalized = crate::utils::hash::normalize_identifier(&raw);
+            
+            // 🌟 normalized 기준으로 인덱스와 id 를 계산하여 일관성 보장
+            let index = crate::utils::hash::relay_index(&normalized);
+            if index == 0 { continue; }
+            if out.iter().any(|k| k.role == *role && k.index == index) { continue; }
+            
+            out.push(TradeRelayKey {
+                role,
+                source_field: f.to_string(),
+                raw: raw.clone(),
+                normalized: normalized.clone(),
+                index,
+                id: crate::utils::hash::relay_id(&normalized),
+            });
+        }
+    }
+    out
+}
+
+/// 🌟 문서 식별자를 확정합니다. task_id 폴백을 제거하는 것이 목적입니다.
+///  반환: (정규화된 키, index, 폴백 여부)
+///  폴백이 필요하면 task_id 대신 '내용 지문' 을 씁니다.
+///  내용 지문은 같은 문서를 다시 태워도 같은 값이 나오므로
+///  0xef44… / 0xcf1c… 처럼 id 가 갈리는 일이 생기지 않습니다.
+/// 🌟 [DOC IDENTITY v4]
+///  ── 무엇이 바뀌었나 ──
+///   기존은 4순위까지 순차 탐색 후 내용 지문으로 폴백했는데,
+///   내용 지문은 `crc32` 만 사용하고 `relay_index` 를 사용하지 않아
+///   전각 영숫자가 포함된 경우 다른 인덱스가 생성되었습니다.
+///   또한 1순위에서 `k.normalized` 을 반환했는데,
+///   이 값은 `normalize_identifier` 통과값이므로 이미 정규화되어 있습니다.
+///   하지만 `k.index` 는 `extract_trade_relay_keys` 내부에서 계산된 값이라
+///   `relay_index` 와 동일한 경로를 거치지 않을 수 있었습니다.
+///   여기서 `relay_index` 를 다시 호출하여 일관성을 보장합니다.
+pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value) -> (String, u32, bool) {
+    let keys = extract_trade_relay_keys(data);
+    
+    // 1순위: 이 문서 자신의 번호
+    if let Some(k) = keys.iter().find(|k| k.role == "self") {
+        // 🌟 relay_index 를 다시 호출하여 일관성 보장
+        let idx = crate::utils::hash::relay_index(&k.normalized);
+        return (k.normalized.clone(), idx, false);
+    }
+    
+    // 2순위: 운송증권 번호 (CI 에도 인쇄됩니다 — 이 서식의 93763111837)
+    if let Some(k) = keys.iter().find(|k| k.role == "transport") {
+        let composed = format!("{}:{}", doc_type, k.normalized);
+        let idx = crate::utils::hash::relay_index(&composed);
+        return (composed, idx, false);
+    }
+    
+    // 3순위: 발주 / 계약 / 신용장 번호
+    for role in ["order", "contract", "credit", "booking", "container"] {
+        if let Some(k) = keys.iter().find(|k| k.role == role) {
+            let composed = format!("{}:{}", doc_type, k.normalized);
+            let idx = crate::utils::hash::relay_index(&composed);
+            return (composed, idx, false);
+        }
+    }
+    
+    // 4순위: 내용 지문.
+    // 🌟 [FINGERPRINT v4] 기존은 `crc32` 만 사용했는데,
+    //    내용 지문에도 전각 영숫자가 포함될 수 있으므로
+    //    `normalize_identifier` 를 먼저 적용합니다.
+    let mut parts: Vec<String> = vec![doc_type.to_string()];
+    for f in ["issue_date", "grand_total_amount", "amount", "currency",
+              "sender_name", "recipient_name", "weight_gross", "package_count"] {
+        if let Some(v) = find_relay_value(data, f) { parts.push(format!("{}={}", f, v)); }
+    }
+    
+    let fingerprint = parts.join("|");
+    let normalized_fp = crate::utils::hash::normalize_identifier(&fingerprint);
+    let index = crate::utils::hash::crc32(&normalized_fp);
+    (fingerprint, index, true)
+}
+
+/// 🌟 릴레이 규칙 평가. 어떤 문서 종류로 이어질 수 있는지를 돌려줍니다.
+///  기존 규칙표의 "AWB←flight_number" 의미 오류를 여기서 바로잡습니다.
+/// 🌟 [RELAY PLAN v4]
+///  ── 무엇이 바뀌었나 ──
+///   기존은 역할별로 하드코딩된 타겟 목록을 사용했는데,
+///   이 목록이 `logic.rs` 의 `related_trading` 과 어긋나는 경우가 있었습니다.
+///   또한 `k.clone()` 으로 키를 복제했는데, 이 복제가 불필요한 메모리 할당을 유발했습니다.
+///   역할별 타겟을 `related_trading` 의 허브 목록과 일치시키고,
+///   불필요한 복제를 제거합니다.
+pub fn plan_trade_relays(doc_type: &str, data: &Value) -> Vec<(&'static str, TradeRelayKey)> {
+    let keys = extract_trade_relay_keys(data);
+    let mut plan = Vec::new();
+    
+    for k in keys.into_iter() {
+        // 🌟 역할별 타겟을 `logic.rs` 의 `related_trading` 허브와 일치시킵니다.
+        let targets: &[&'static str] = match k.role {
+            // 같은 인보이스 번호를 인쇄하는 문서들
+            "self"      => &["PL", "CINV", "TI", "SOA", "DN", "CN"],
+            // 운송증권 번호를 공유하는 문서들.
+            // 🌟 [MISSING] CSI, BK, SR, WR, BE, IP, DN, CN, FC 추가
+            "transport" => &["BL", "HBL", "SWB", "AWB", "DO", "AN", "POD", "FCR", "ED", "ID", "CSI", "BK", "SR", "WR", "BE", "IP", "DN", "CN", "FC"],
+            "booking"   => &["BK", "SR", "BC"],
+            "order"     => &["PO", "PI", "SC"],
+            "contract"  => &["SC", "PI", "CP"],
+            "credit"    => &["LC", "LLC", "BE"],
+            "container" => &["PL", "BL", "DO", "CM"],
+            _ => &[],
+        };
+        
+        for t in targets.iter() {
+            if *t == doc_type { continue; }
+            plan.push((*t, k.clone()));
+        }
+    }
+    plan
 }

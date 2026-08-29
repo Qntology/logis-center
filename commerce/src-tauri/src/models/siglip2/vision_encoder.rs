@@ -1040,13 +1040,37 @@ pub fn build_column_heatmaps(
     // ── 1) 카테고리 × 필드 앵커 구 수집 ──
     //    필드 → 카테고리 매핑은 logic.rs 가 소유합니다.
     let schema_fields = crate::parsing::get_detail_schema_fields(doc_type, "", doc_lang);
-
     let mut bias_defs: Vec<(String, String, String)> = Vec::new();
     let mut field_to_cat: HashMap<String, String> = HashMap::new();
+
+    // 🌟 [SELF-REFERENCE ANCHOR DROP] 자기 자신을 가리키는 참조 축은 존재할 수 없습니다.
+    //
+    //  ── 실측 사고 ──
+    //   CI 인보이스에서 header 히트맵의 top_field 가 doc_number 가 아니라
+    //   reference_invoice(+4.3688) 였습니다.
+    //   'invoice number' 라는 라벨 하나를 두고 doc_number 와 reference_invoice 의
+    //   앵커가 사실상 동일하기 때문입니다.
+    //   그런데 CI 는 정의상 자기 자신을 참조하지 않으므로 reference_invoice 는
+    //   이 문서에 존재할 수 없는 축입니다. 존재할 수 없는 축이 정체성 축을 이겼고,
+    //   그 결과 header 크롭이 VAT/EORI 행으로 착지해 doc_number 가 null 이 되었습니다.
+    //   doc_number 가 비면 릴레이 키가 사라져 문서 그래프가 통째로 끊깁니다.
+    //
+    //  ── 왜 여기서 자르는가 ──
+    //   scheduler.rs 의 [SELF-REFERENCE DROP] 은 '저장 직전' 에 자기 참조를 지웁니다.
+    //   그 시점에는 이미 크롭이 잘못 착지한 뒤라 되돌릴 수 없습니다.
+    //   같은 판정을 히트맵 단계로 앞당깁니다. 사전은 logic.rs 것을 그대로 씁니다.
+    let self_ref_field = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
 
     for (fname, _, bias_target, _) in schema_fields.iter() {
         let cat = crate::logic::trade_field_category(fname);
         if cat.is_empty() {
+            continue;
+        }
+        if !self_ref_field.is_empty() && fname == self_ref_field {
+            emit(&format!(
+                "  🧹 [SELF-REFERENCE ANCHOR DROP] '{}' 는 '{}' 문서가 자기 자신을 가리키는 축입니다. doc_number 와 라벨이 완전히 겹쳐 정체성 축을 잠식하므로 히트맵 경쟁에서 제외합니다.",
+                fname, doc_type
+            ));
             continue;
         }
         field_to_cat.insert(fname.clone(), cat.to_string());
@@ -1065,13 +1089,30 @@ pub fn build_column_heatmaps(
         let sem = crate::utils::ai_utils::semantic_anchor_text(doc_lang, doc_type, fname);
         let mut label_cnt = 0usize;
         let mut value_cnt = 0usize;
+        let mut dup_cnt = 0usize;
         for p in split_bias_phrases_full(&sem) {
+            // 🌟 [DUP ANCHOR DROP] 같은 (카테고리, 필드) 안의 중복 구를 제거합니다.
+            //    실측: reference_bl(2구): ["reference bl", "reference bl"]
+            //    score_patches_bank_neutral 은 μ_k(그 뱅크가 이 문서에서 보이는 평균 반응)를
+            //    기준선으로 빼기 때문에, 같은 구가 두 번 들어가면 그 필드의 기준선만
+            //    치우쳐 다른 필드와의 경쟁이 불공정해집니다.
+            //    아래 bias_target 루프에는 이미 같은 dedup 이 있는데 이 루프에만 없었습니다.
+            if bias_defs.iter().any(|(c, k, e)| c == cat && k == fname && e == &p) {
+                dup_cnt += 1;
+                continue;
+            }
             if crate::utils::ai_utils::is_value_example_phrase(&p) {
                 value_cnt += 1;
             } else {
                 label_cnt += 1;
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
+        }
+        if dup_cnt > 0 {
+            emit(&format!(
+                "  🧹 [DUP ANCHOR DROP] '{}' 의 중복 앵커 구 {}개 제거 (BANK-NEUTRAL 기준선 왜곡 방지)",
+                fname, dup_cnt
+            ));
         }
         if value_cnt > 0 {
             emit(&format!(
