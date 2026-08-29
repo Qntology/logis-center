@@ -430,7 +430,8 @@ pub struct TableContext {
     pub current_row_idx: usize,
     pub current_col_idx: usize,
     pub is_in_tbody: bool,
-    pub base_url: Option<String>, 
+    pub base_url: Option<String>,
+    pub doc_lang: String, // 🌟 canonicalize_trade_column 언어 필터용. 빈 문자열이면 전체 매칭.
 }
 
 // 🌟 [STRUCTURE GUARD] el_ref.text() 는 '텍스트 노드'만 수집하므로
@@ -607,7 +608,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         let title = parts.join(" ");
                         if !title.is_empty() {
                             let safe = title.replace("\"", "'");
-                            let canonical = canonicalize_trade_column(&title);
+                            let canonical = canonicalize_trade_column(&title, &c.doc_lang);
                             if canonical.is_empty() {
                                 other_attributes.push(format!("alt=\"{}\"", safe));
                             } else {
