@@ -7654,7 +7654,7 @@ pub async fn process_task(
         for foreign_type in related_types {
             if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
                 for q in queries {
-                    match store.find_item_by_property("items", "index", &json!(foreign_index)).await {
+                    match store.find_item_by_property("items", "index", &q.value).await {
                         Ok(Some((foreign_id, mut foreign_data))) => {
                             let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                             let mut needs_update = false;
@@ -7741,11 +7741,11 @@ pub async fn process_task(
                             //    상대 문서의 `data.index` 가 같은 숫자면 매칭됩니다.
                             let mut found_existing = false;
                             if let Ok(cross_results) = store.get_all_items("items", 1, 0,
-                                Some(format!("type = '{}' AND data LIKE '%\"index\":{}%'", foreign_type, foreign_index))
+                                Some(format!("type = '{}' AND data LIKE '%\"index\":{}%'", foreign_type, q.value))
                             ).await {
                                 if !cross_results.is_empty() {
                                     found_existing = true;
-                                    emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (index={}). 새 draft 생성을 건너뜁니다.", foreign_type, foreign_index));
+                                    emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (index={}). 새 draft 생성을 건너뜁니다.", foreign_type, q.value));
                                 }
                             }
 
@@ -8385,7 +8385,7 @@ pub async fn process_task(
                 for foreign_type in related_types {
                     if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
                         for q in queries {
-                            match store.find_item_by_property("items", "index", &json!(foreign_index)).await {
+                            match store.find_item_by_property("items", "index", &q.value).await {
                                 Ok(Some((foreign_id, mut foreign_data))) => {
                                     let mut needs_update = false;
 

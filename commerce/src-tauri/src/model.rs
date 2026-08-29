@@ -1389,19 +1389,22 @@ impl LogisModel {
         let _ = app_handle.emit("extraction-progress", &payload_load);
         crate::utils::logger::log_task_progress(app_handle, &task_id, &payload_load);
 
-        // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
+        // 🌟 SigLIP2 로드: 비전만 먼저 로드하여 메모리 피크 최소화
+        //    텍스트 인코더는 코드 분류 단계에서 필요하므로 나중에 로드합니다.
         self.check_siglip2_downloaded().await?;
-        self.ensure_siglip2(true).await?;
+        self.ensure_siglip2_ext(true, false).await?;
 
         // 🌟 [VRAM SETTLE BEFORE QWEN3.5] SigLIP2 로드 후 실제 여유 메모리 확인
         if !self.is_cpu_mode {
             self.wait_for_vram_settle(1200, 10, cancel_token.clone()).await.ok();
         }
 
-        // 🌟 [QWEN3.5 VISION PRELOAD] 이미지 추출에서는 2B 비전 모델이 반드시 필요합니다.
-        //    STEP 5 에서 동적으로 로드하면 시점이 불명확해지므로,
-        //    여기서 명시적으로 로드하여 이후 행동을 결정론적으로 만듭니다.
-        self.ensure_qwen3_5(true).await?;
+        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
+        //    STEP 1~4 는 SigLIP2 만 사용하므로 여기서 로드하면
+        //    SigLIP2 비전(~400MB) + Qwen3.5+mmproj(~2.6GB) = ~3.0GB 동시 상주가 발생합니다.
+        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
+        //    ensure_qwen3_5(image.is_some()) 가 필요 시점에 자동 로드하며,
+        //    그 시점에는 release_siglip2() 가 이미 SigLIP2 를 전량 해제한 후입니다.
 
         // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
         //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
@@ -1422,6 +1425,18 @@ impl LogisModel {
             let grid = crate::models::siglip2::vision_encoder::encode_image(siglip, &dynamic_image)
                 .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
             drop(siglip_guard);
+
+            // 🌟 비전 인코더 사용 완료 → 메모리 즉시 해제
+            {
+                let mut guard = self.siglip2_model.lock().await;
+                if let Some(m) = guard.as_mut() {
+                    m.vision = None;
+                    println!("[SigLIP2] Vision encoder unloaded after patch extraction ({}x{} patches done).",
+                        grid.grid_rows, grid.grid_cols);
+                }
+            }
+            // 텍스트 인코더 로드 (코드 분류용)
+            self.ensure_siglip2_ext(false, true).await?;
 
             // ── STEP 2.5 : 판독성 맵 ──
             //
