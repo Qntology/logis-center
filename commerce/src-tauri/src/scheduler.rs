@@ -1604,7 +1604,7 @@ pub async fn process_task(
         }
     }
 
-    let (mut url, mut origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
+    let (url, origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
 
     let active_task_json = json!({
         "id": task.id.clone(),
@@ -3760,41 +3760,60 @@ pub async fn process_task(
         model.deep_purge_resources().await;
 
 
-        if !final_thead_selector.is_empty() && final_thead_selector != "..." {
-            let clean_content = &clean_html_content;
-            let doc = scraper::Html::parse_document(clean_content);
-            if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
-                if let Some(first_match) = doc.select(&tsel).next() {
-                    
-                    let mut target_node = first_match;
-                    let mut current = target_node.parent();
-                    
-                    while let Some(parent) = current {
-                        if let Some(el) = parent.value().as_element() {
-                            let tag = el.name().to_lowercase();
-                            if tag == "thead" || tag == "tr" {
-                                if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
-                                    target_node = wrapped;
+        // 🌟 [HEADER GRID v3] 결과를 블록 밖에서도 쓸 수 있도록 사전 선언합니다.
+        let mut trade_headers: Vec<Vec<String>> = Vec::new();
+        let mut row_contract = String::new();
 
-                                    if tag == "thead" { break; } 
+        if !final_thead_selector.is_empty() && final_thead_selector != "..." {
+            // 🌟 [SCOPE FIX] doc 이 .await 경계를 넘지 않도록
+            //    DOM 순회 전체를 소유형 반환 블록으로 감쌉니다.
+            let (sync_grid, sync_pending) = {
+                let clean_content = &clean_html_content;
+                let doc = scraper::Html::parse_document(clean_content);
+                if let Ok(tsel) = scraper::Selector::parse(&final_thead_selector) {
+                    if let Some(first_match) = doc.select(&tsel).next() {
+                        let mut target_node = first_match;
+                        let mut current = target_node.parent();
+                        while let Some(parent) = current {
+                            if let Some(el) = parent.value().as_element() {
+                                let tag = el.name().to_lowercase();
+                                if tag == "thead" || tag == "tr" {
+                                    if let Some(wrapped) = scraper::ElementRef::wrap(parent) {
+                                        target_node = wrapped;
+                                        if tag == "thead" { break; }
+                                    }
                                 }
                             }
+                            current = parent.parent();
                         }
-                        current = parent.parent();
-                    }
-                    
-                    let mut tpug = String::new();
-                    
-                    crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::TheadMode, &mut None);
-                    thead_pug = tpug.trim().to_string();
-
-                    if !thead_pug.is_empty() {
-                        println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
+                        let mut tpug = String::new();
+                        crate::parsing::generate_pug_lines((*target_node).into(), 0, &mut tpug, &PugMode::TheadMode, &mut None);
+                        thead_pug = tpug.trim().to_string();
+                        if !thead_pug.is_empty() {
+                            println!("[Scheduler] 🎉 thead_pug extraction successful ({} bytes)", thead_pug.len());
+                        }
                     }
                 }
+                // 동기 DOM 추출 완료 → 소유형 데이터만 반환
+                crate::parsing::extract_doc_table_headers_sync(
+                    &doc, &final_thead_selector, &doc_lang
+                )
+            }; // ← doc 이 여기서 드롭됨
+
+            // .await 시점에 doc 은 이미 소멸. Send 안전.
+            trade_headers = crate::parsing::extract_doc_table_headers_async(
+                sync_grid, sync_pending, &doc_lang, &model
+            ).await;
+            row_contract = crate::parsing::build_table_row_contract(&trade_headers, &doc_lang);
+            if !trade_headers.is_empty() {
+                emit_term(&format!(
+                    "  📐 [HEADER GRID] {}행 x {}열 헤더 격자 확보 | row_contract {}바이트",
+                    trade_headers.len(),
+                    trade_headers.first().map(|r| r.len()).unwrap_or(0),
+                    row_contract.len()
+                ));
             }
         }
-
 
         if !skip_ai_analysis || cache_updated {
             let store = {
@@ -7891,7 +7910,7 @@ pub async fn process_task(
                                         found_existing_tracking = true;
                                         let existing_tracking_id = &tracking_cross[0].id;
                                         // 기존 tracking 문서에 order index만 매핑
-                                        if let Ok(Some(mut existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
+                                        if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
                                             if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
                                                 if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
                                                     if let Some(order_index) = extracted_data.get("index") {
@@ -8587,7 +8606,7 @@ pub async fn process_task(
                                             if !tracking_cross.is_empty() {
                                                 found_existing_tracking = true;
                                                 let existing_tracking_id = &tracking_cross[0].id;
-                                                if let Ok(Some(mut existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
+                                                if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
                                                     if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
                                                         if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
                                                             if let Some(order_index) = single_item.get("index") {

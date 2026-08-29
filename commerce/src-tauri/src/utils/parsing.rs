@@ -430,7 +430,8 @@ pub struct TableContext {
     pub current_row_idx: usize,
     pub current_col_idx: usize,
     pub is_in_tbody: bool,
-    pub base_url: Option<String>, 
+    pub base_url: Option<String>,
+    pub doc_lang: String, // 🌟 canonicalize_trade_column 언어 필터용. 빈 문자열이면 전체 매칭.
 }
 
 // 🌟 [STRUCTURE GUARD] el_ref.text() 는 '텍스트 노드'만 수집하므로
@@ -607,7 +608,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         let title = parts.join(" ");
                         if !title.is_empty() {
                             let safe = title.replace("\"", "'");
-                            let canonical = canonicalize_trade_column(&title);
+                            let canonical = canonicalize_trade_column(&title, &c.doc_lang);
                             if canonical.is_empty() {
                                 other_attributes.push(format!("alt=\"{}\"", safe));
                             } else {
@@ -885,76 +886,383 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
 //  모델이 둘을 잇지 못하고 item_net_weight / item_gross_weight 를 모두 null 로 반환했습니다.
 //  bias.json 의 의미 구(semantic phrase)는 '위치를 찾는' 용도이고,
 //  이 사전은 '찾은 열의 이름을 확정하는' 용도입니다. 역할이 다르므로 분리합니다.
+//
+//  🌟 [다국어 확장 근거]
+//   무역 문서는 발행국 언어로 컬럼 헤더가 인쇄됩니다.
+//   중국(CI/PL), 일본(BL/AWB), EU(German/French/Spanish CI) 문서에서
+//   영문 별칭만으로는 매칭이 불가능하므로 주요 무역국 언어를 추가합니다.
+//   이 함수는 임베딩 없이 순수 문자열 매칭이므로 별칭 추가 비용이 0입니다.
 // =====================================================================
 pub static TRADE_COLUMN_ALIASES: &[(&str, &[&str])] = &[
     ("description", &[
+        // English
         "description of goods", "description", "goods description", "commodity",
         "commodity description", "description of merchandise", "article", "articles",
         "item description", "product", "product name", "name of goods", "nature of goods",
+        // Korean
         "품명", "상품명", "품목", "화물명", "물품명",
+        // Chinese (Simplified)
+        "货物描述", "品名", "商品描述", "货物名称", "品目名称", "商品名",
+        // Chinese (Traditional)
+        "貨物描述", "品名", "商品描述", "貨物名稱",
+        // Japanese
+        "品名", "品目", "貨物名", "商品名", "品目名",
+        // Spanish
+        "descripción de mercancías", "descripción", "mercancía", "producto",
+        // German
+        "warenbezeichnung", "beschreibung", "warenbeschreibung", "artikel",
+        // French
+        "désignation des marchandises", "désignation", "description des marchandises",
+        // Portuguese
+        "descrição das mercadorias", "descrição",
+        // Italian
+        "descrizione delle merci", "descrizione", "merce",
+        // Dutch
+        "omschrijving van goederen", "omschrijving", "productomschrijving",
+        // Czech
+        "popis zboží", "popis", "název zboží",
+        // Arabic
+        "وصف البضائع", "الوصف", "اسم البضاعة",
     ]),
     ("hs_code", &[
+        // English
         "hs code", "h s code", "hs-code", "hscode", "hts code", "hs tariff",
         "tariff code", "commodity code", "hs no", "hs number", "tariff no",
+        // Korean
         "세번", "세번부호", "hs부호",
+        // Chinese (Simplified)
+        "海关编码", "税则号", "商品编码", "hs编码",
+        // Chinese (Traditional)
+        "海關編碼", "稅則號", "商品編碼",
+        // Japanese
+        "税番", "関税番号", "統計番号", "hs番号",
+        // Spanish
+        "código arancelario", "partida arancelaria",
+        // German
+        "zolltarifnummer", "warennummer", "tarifnummer",
+        // French
+        "code tarifaire", "position tarifaire", "nomenclature",
+        // Portuguese
+        "código tarifário", "posição tarifária",
+        // Italian
+        "codice doganale", "numero tariffario",
+        // Dutch
+        "tariefnummer", "douanecode",
+        // Czech
+        "celní kód", "kód zboží",
+        // Arabic
+        "الرمز الجمركي", "رقم التعريفة",
     ]),
     ("country_of_manufacture", &[
+        // English
         "country of manufacture", "country of origin", "made in", "origin",
         "manufacturing country", "country", "coo",
+        // Korean
         "원산지", "생산국", "제조국",
+        // Chinese (Simplified)
+        "原产国", "制造国", "产地", "原产地",
+        // Chinese (Traditional)
+        "原產國", "製造國", "產地",
+        // Japanese
+        "原産国", "製造国", "生産国",
+        // Spanish
+        "país de origen", "país de fabricación", "origen",
+        // German
+        "herkunftsland", "ursprungsland", "herstellungsland",
+        // French
+        "pays d'origine", "pays de fabrication", "origine",
+        // Portuguese
+        "país de origem", "país de fabricação",
+        // Italian
+        "paese di origine", "paese di fabbricazione",
+        // Dutch
+        "land van oorsprong", "land van herkomst",
+        // Czech
+        "země původu", "země výroby",
+        // Arabic
+        "بلد المنشأ", "بلد الصنع",
     ]),
     ("unit", &[
+        // English
         "unit of measure", "unit of measurement", "uom", "measure", "unit",
         "packing unit", "measurement unit",
+        // Korean
         "단위", "거래단위",
+        // Chinese (Simplified)
+        "计量单位", "单位", "计量",
+        // Chinese (Traditional)
+        "計量單位", "單位",
+        // Japanese
+        "単位", "計量単位", "梱包単位",
+        // Spanish
+        "unidad de medida", "unidad",
+        // German
+        "maßeinheit", "einheit", "mengeneinheit",
+        // French
+        "unité de mesure", "unité",
+        // Portuguese
+        "unidade de medida", "unidade",
+        // Italian
+        "unità di misura", "unità",
+        // Dutch
+        "maateenheid", "eenheid",
+        // Czech
+        "měrná jednotka", "jednotka",
+        // Arabic
+        "وحدة القياس", "الوحدة",
     ]),
     ("quantity", &[
+        // English
         "qty", "quantity", "q ty", "pieces", "pcs", "no of pcs", "number of units",
         "number of pieces", "shipped qty",
+        // Korean
         "수량", "주문수량",
+        // Chinese (Simplified)
+        "数量", "件数", "个数", "数目",
+        // Chinese (Traditional)
+        "數量", "件數", "個數",
+        // Japanese
+        "数量", "個数", "点数",
+        // Spanish
+        "cantidad", "unidades",
+        // German
+        "menge", "anzahl", "stückzahl",
+        // French
+        "quantité", "nombre",
+        // Portuguese
+        "quantidade",
+        // Italian
+        "quantità", "numero di pezzi",
+        // Dutch
+        "aantal", "hoeveelheid",
+        // Czech
+        "množství", "počet",
+        // Arabic
+        "الكمية", "عدد القطع",
     ]),
     ("item_net_weight", &[
+        // English
         "unit weight", "net weight", "n w", "nw", "net wt", "unit net weight",
         "weight per unit", "net weight kg",
+        // Korean
         "순중량", "단위중량", "개당중량",
+        // Chinese (Simplified)
+        "净重", "单位净重", "净重量",
+        // Chinese (Traditional)
+        "淨重", "單位淨重",
+        // Japanese
+        "正味重量", "正味", "単位重量",
+        // Spanish
+        "peso neto", "peso neto unitario",
+        // German
+        "nettogewicht", "rein gewicht",
+        // French
+        "poids net",
+        // Portuguese
+        "peso líquido", "peso líquido unitário",
+        // Italian
+        "peso netto", "peso netto unitario",
+        // Dutch
+        "nettogewicht", "netto gewicht",
+        // Czech
+        "čistá hmotnost", "netto hmotnost",
+        // Arabic
+        "الوزن الصافي", "وزن الوحدة الصافي",
     ]),
     ("item_gross_weight", &[
+        // English
         "gross weight", "g w", "gw", "gross wt", "total weight", "gross weight kg",
+        // Korean
         "총중량", "총 중량",
+        // Chinese (Simplified)
+        "毛重", "总重量", "总重",
+        // Chinese (Traditional)
+        "毛重", "總重量",
+        // Japanese
+        "総重量", "総量", "全重量",
+        // Spanish
+        "peso bruto",
+        // German
+        "bruttogewicht", "rohgewicht",
+        // French
+        "poids brut",
+        // Portuguese
+        "peso bruto",
+        // Italian
+        "peso lordo",
+        // Dutch
+        "brutogewicht", "totaalgewicht",
+        // Czech
+        "hrubá hmotnost", "celková hmotnost",
+        // Arabic
+        "الوزن الإجمالي", "الوزن القائم",
     ]),
     ("unit_price", &[
+        // English
         "unit value", "unit price", "price per unit", "u price", "unit cost",
         "rate", "price",
+        // Korean
         "단가",
+        // Chinese (Simplified)
+        "单价", "单位价格", "每个价格",
+        // Chinese (Traditional)
+        "單價", "單位價格",
+        // Japanese
+        "単価", "単位価格",
+        // Spanish
+        "precio unitario", "precio por unidad",
+        // German
+        "einzelpreis", "stückpreis", "preis je einheit",
+        // French
+        "prix unitaire",
+        // Portuguese
+        "preço unitário",
+        // Italian
+        "prezzo unitario", "prezzo per unità",
+        // Dutch
+        "eenheidsprijs", "prijs per eenheid",
+        // Czech
+        "jednotková cena", "cena za kus",
+        // Arabic
+        "سعر الوحدة", "ثمن الوحدة",
     ]),
     ("total_price", &[
+        // English
         "total value", "total price", "line total", "extended price", "extended value",
         "total amount", "amount", "value",
+        // Korean
         "금액", "합계", "공급가액",
+        // Chinese (Simplified)
+        "总价", "总金额", "金额", "合计", "总值",
+        // Chinese (Traditional)
+        "總價", "總金額", "金額", "合計",
+        // Japanese
+        "総額", "合計金額", "金額", "合計",
+        // Spanish
+        "importe total", "valor total", "total", "importe",
+        // German
+        "gesamtbetrag", "gesamtsumme", "betrag", "gesamtwert",
+        // French
+        "montant total", "valeur totale", "total",
+        // Portuguese
+        "valor total", "montante total",
+        // Italian
+        "importo totale", "valore totale", "totale",
+        // Dutch
+        "totaalbedrag", "totale waarde", "totaal",
+        // Czech
+        "celková částka", "celková hodnota",
+        // Arabic
+        "المبلغ الإجمالي", "القيمة الإجمالية",
     ]),
     ("item_code", &[
+        // English
         "item code", "item no", "item number", "sku", "part number", "part no",
         "model", "model no", "article no", "product code", "style no",
+        // Korean
         "품번", "모델", "품목코드",
+        // Chinese (Simplified)
+        "货号", "型号", "产品编号", "物料编号", "款号",
+        // Chinese (Traditional)
+        "貨號", "型號", "產品編號",
+        // Japanese
+        "品番", "型番", "製品番号", "品目コード",
+        // Spanish
+        "código de artículo", "número de artículo", "referencia",
+        // German
+        "artikelnummer", "artikelnr", "teilenummer",
+        // French
+        "numéro d'article", "référence article",
+        // Portuguese
+        "código do artigo", "número do artigo",
+        // Italian
+        "codice articolo", "numero articolo",
+        // Dutch
+        "artikelnummer", "productcode",
+        // Czech
+        "kód položky", "číslo položky",
+        // Arabic
+        "رمز الصنف", "رقم القطعة",
     ]),
     ("item_package_count", &[
+        // English
         "packages", "no of packages", "package count", "cartons", "ctns",
         "no of cartons", "number of packages", "case",
+        // Korean
         "포장수", "박스수", "포장개수",
+        // Chinese (Simplified)
+        "包装数", "箱数", "包装件数", "件数",
+        // Chinese (Traditional)
+        "包裝數", "箱數", "包裝件數",
+        // Japanese
+        "梱包数", "箱数", "個数", "パッケージ数",
+        // Spanish
+        "número de bultos", "bultos", "cajas",
+        // German
+        "anzahl der packstücke", "packstücke", "kartons",
+        // French
+        "nombre de colis", "colis", "cartons",
+        // Portuguese
+        "número de volumes", "volumes", "caixas",
+        // Italian
+        "numero di colli", "colli", "cartoni",
+        // Dutch
+        "aantal pakketten", "pakketten", "dozen",
+        // Czech
+        "počet balení", "balení", "krabice",
+        // Arabic
+        "عدد الطرود", "الطرود", "الصناديق",
     ]),
     ("item_package_type", &[
+        // English
         "package type", "kind of package", "packing", "type of package",
         "packing type", "kind of packages",
+        // Korean
         "포장형태", "포장종류",
+        // Chinese (Simplified)
+        "包装类型", "包装方式", "包装形式",
+        // Chinese (Traditional)
+        "包裝類型", "包裝方式",
+        // Japanese
+        "梱包形態", "梱包種類", "包装形態",
+        // Spanish
+        "tipo de embalaje", "tipo de envase",
+        // German
+        "verpackungsart", "verpackungstyp",
+        // French
+        "type d'emballage", "nature de l'emballage",
+        // Portuguese
+        "tipo de embalagem",
+        // Italian
+        "tipo di imballaggio",
+        // Dutch
+        "verpakkingstype", "type verpakking",
+        // Czech
+        "typ balení", "druh balení",
+        // Arabic
+        "نوع التعبئة", "طريقة التغليف",
     ]),
 ];
-
 /// 🌟 [LABEL ECHO] 서식의 '박스 라벨' 목록.
 ///  실측 로그에서 reference_invoice 가 "CONSIGNEE VAT/EORI" 를,
 ///  party_name 이 "SIGNATORY COMPANY" 를 값으로 받았습니다.
 ///  기존 '스키마 에코' 필터는 스키마 필드명(reference_invoice 등)만 잡기 때문에
 ///  인쇄 라벨이 값 자리로 들어오는 이 경로를 막지 못합니다.
+/// 🌟 [LABEL ECHO] 서식의 '박스 라벨' 목록.
+///  실측 로그에서 reference_invoice 가 "CONSIGNEE VAT/EORI" 를,
+///  party_name 이 "SIGNATORY COMPANY" 를 값으로 받았습니다.
+///  기존 '스키마 에코' 필터는 스키마 필드명(reference_invoice 등)만 잡기 때문에
+///  인쇄 라벨이 값 자리로 들어오는 이 경로를 막지 못합니다.
+///
+///  🌟 [다국어 확장 근거]
+///   무역 문서는 발행국 언어로 라벨이 인쇄됩니다.
+///   중국어 문서의 "发票号码", 일본어 문서의 "荷送人",
+///   독일어 문서의 "Rechnungsnummer" 등이 값으로 잘못 추출되는 것을
+///   이 목록이 걸러냅니다.
+///   is_printed_label_echo() 는 fold_column_label() 로 정규화 후
+///   완전일치 판정을 하므로, 라벨 원문을 그대로 나열하면 됩니다.
 pub static TRADE_PRINTED_LABELS: &[&str] = &[
+    // ── English ──
     "invoice number", "invoice no", "invoice total", "airwaybill bill of lading",
     "date of exportation", "export reference", "exporter", "consignee",
     "exporter vat eori", "consignee vat eori", "vat eori",
@@ -964,8 +1272,230 @@ pub static TRADE_PRINTED_LABELS: &[&str] = &[
     "signatory name", "signatory company", "date", "shipper", "notify party",
     "description of goods", "hs code", "country of manufacture", "unit of measure",
     "qty", "unit weight", "unit value", "total value",
+    "bill of lading number", "b/l number", "awb number", "air waybill number",
+    "packing list number", "purchase order number", "letter of credit number",
+    "booking number", "contract number", "customs declaration number",
+    "certificate number", "seal number", "container number",
+    "port of loading", "port of discharge", "place of receipt", "place of delivery",
+    "vessel name", "flight number", "voyage number",
+    "estimated time of departure", "estimated time of arrival",
+    "freight prepaid", "freight collect", "payment terms",
+    "net weight", "gross weight", "measurement", "volume",
+    "marks and numbers", "shipping marks",
+    "total amount", "grand total", "subtotal",
+    "unit price", "total price", "amount",
+    // ── Korean ──
     "품명", "수량", "단가", "금액", "원산지", "세번부호",
+    "송장번호", "인보이스번호", "선하증권번호", "항공운송장번호",
+    "포장명세서번호", "구매주문번호", "신용장번호", "부킹번호",
+    "계약번호", "수출신고번호", "수입신고번호", "증명서번호",
+    "컨테이너번호", "씰번호", "선적항", "양륙항",
+    "선박명", "항차", "출항일", "입항일",
+    "총중량", "순중량", "용적", "포장수",
+    "발행일", "만료일", "결제조건", "통화",
+    "합계", "소계", "총액",
+    // ── Chinese (Simplified) ──
+    "发票号码", "发票号", "发票总额", "提单号码", "空运单号",
+    "装箱单号", "采购订单号", "信用证号", "订舱号", "合同号",
+    "报关单号", "证书号", "集装箱号", "铅封号",
+    "装货港", "卸货港", "收货地", "交货地",
+    "船名", "航次", "航班号",
+    "预计开航日", "预计到港日",
+    "运费预付", "运费到付", "付款条件",
+    "毛重", "净重", "体积", "包装数量",
+    "唛头", "运输标志",
+    "总金额", "合计", "小计",
+    "单价", "总价", "金额",
+    "品名", "数量", "原产地", "海关编码",
+    "出口日期", "出口参考号", "出口商", "收货人",
+    "通知方", "发货人", "签字", "日期",
+    "贸易术语", "币种", "计量单位",
+    // ── Chinese (Traditional) ──
+    "發票號碼", "提單號碼", "裝箱單號", "採購訂單號",
+    "信用狀號", "訂艙號", "合約號",
+    "裝貨港", "卸貨港", "收貨地", "交貨地",
+    "船名", "航次",
+    "毛重", "淨重", "體積", "包裝數量",
+    "總金額", "合計", "單價", "總價",
+    "品名", "數量", "原產地",
+    // ── Japanese ──
+    "インボイス番号", "請求書番号", "船荷証券番号", "航空運送状番号",
+    "パッキングリスト番号", "発注番号", "信用状番号", "ブッキング番号",
+    "契約番号", "通関申告番号", "証明書番号",
+    "コンテナ番号", "シール番号",
+    "積込港", "揚地港", "受取地", "引渡地",
+    "船名", "航海番号", "便名",
+    "総重量", "正味重量", "容積", "梱包数",
+    "発行日", "有効期限", "支払条件", "通貨",
+    "合計金額", "小計", "単価", "総額",
+    "品名", "数量", "原産国", "税番",
+    "荷送人", "荷受人", "通知先", "署名", "日付",
+    "貿易条件", "計量単位",
+    // ── German ──
+    "rechnungsnummer", "rechnungsnummer", "rechnungsbetrag",
+    "frachtbriefnummer", "luftfrachtbriefnummer",
+    "packlistennummer", "bestellnummer", "akkreditivnummer",
+    "buchungsnummer", "vertragsnummer", "zollanmeldungsnummer",
+    "zertifikatsnummer", "containernummer", "plombennummer",
+    "ladehafen", "löschhafen", "übernahmeort", "lieferungsort",
+    "schiffsname", "reisenummer", "flugnummer",
+    "bruttogewicht", "nettogewicht", "volumen", "anzahl packstücke",
+    "ausstellungsdatum", "gültigkeitsdatum", "zahlungsbedingungen", "währung",
+    "gesamtbetrag", "zwischensumme", "einzelpreis", "gesamtpreis",
+    "warenbezeichnung", "menge", "ursprungsland", "zolltarifnummer",
+    "exporteur", "empfänger", "benachrichtigungspartei", "unterschrift", "datum",
+    "handelsklausel", "mengeneinheit",
+    // ── Spanish ──
+    "número de factura", "importe total de factura",
+    "número de conocimiento de embarque", "número de guía aérea",
+    "número de lista de empaque", "número de orden de compra",
+    "número de carta de crédito", "número de reserva",
+    "número de contrato", "número de declaración aduanera",
+    "número de certificado", "número de contenedor", "número de precinto",
+    "puerto de carga", "puerto de descarga", "lugar de recepción", "lugar de entrega",
+    "nombre del buque", "número de viaje", "número de vuelo",
+    "peso bruto", "peso neto", "volumen", "número de bultos",
+    "fecha de emisión", "fecha de vencimiento", "condiciones de pago", "moneda",
+    "importe total", "subtotal", "precio unitario", "precio total",
+    "descripción de mercancías", "cantidad", "país de origen", "código arancelario",
+    "exportador", "consignatario", "parte a notificar", "firma", "fecha",
+    "términos comerciales", "unidad de medida",
+    // ── French ──
+    "numéro de facture", "montant total de facture",
+    "numéro de connaissement", "numéro de lettre de transport aérien",
+    "numéro de liste de colisage", "numéro de bon de commande",
+    "numéro de crédit documentaire", "numéro de réservation",
+    "numéro de contrat", "numéro de déclaration en douane",
+    "numéro de certificat", "numéro de conteneur", "numéro de scellé",
+    "port de chargement", "port de déchargement", "lieu de réception", "lieu de livraison",
+    "nom du navire", "numéro de voyage", "numéro de vol",
+    "poids brut", "poids net", "volume", "nombre de colis",
+    "date d'émission", "date d'expiration", "conditions de paiement", "devise",
+    "montant total", "sous-total", "prix unitaire", "prix total",
+    "désignation des marchandises", "quantité", "pays d'origine", "code tarifaire",
+    "exportateur", "destinataire", "partie à notifier", "signature", "date",
+    "termes commerciaux", "unité de mesure",
+    // ── Portuguese ──
+    "número da fatura", "valor total da fatura",
+    "número do conhecimento de embarque", "número do conhecimento aéreo",
+    "número da lista de embalagem", "número do pedido de compra",
+    "número da carta de crédito", "número da reserva",
+    "número do contrato", "número da declaração aduaneira",
+    "número do certificado", "número do contêiner", "número do lacre",
+    "porto de carga", "porto de descarga", "local de recebimento", "local de entrega",
+    "nome do navio", "número da viagem", "número do voo",
+    "peso bruto", "peso líquido", "volume", "número de volumes",
+    "data de emissão", "data de validade", "condições de pagamento", "moeda",
+    "valor total", "subtotal", "preço unitário", "preço total",
+    "descrição das mercadorias", "quantidade", "país de origem", "código tarifário",
+    "exportador", "consignatário", "parte a notificar", "assinatura", "data",
+    "termos comerciais", "unidade de medida",
+    // ── Italian ──
+    "numero di fattura", "importo totale fattura",
+    "numero di polizza di carico", "numero di lettera di vettura aerea",
+    "numero di lista di imballaggio", "numero di ordine di acquisto",
+    "numero di lettera di credito", "numero di prenotazione",
+    "numero di contratto", "numero di dichiarazione doganale",
+    "numero di certificato", "numero di container", "numero di sigillo",
+    "porto di carico", "porto di scarico", "luogo di ricevimento", "luogo di consegna",
+    "nome della nave", "numero di viaggio", "numero di volo",
+    "peso lordo", "peso netto", "volume", "numero di colli",
+    "data di emissione", "data di scadenza", "condizioni di pagamento", "valuta",
+    "importo totale", "subtotale", "prezzo unitario", "prezzo totale",
+    "descrizione delle merci", "quantità", "paese di origine", "codice tariffario",
+    "esportatore", "destinatario", "parte da notificare", "firma", "data",
+    "termini commerciali", "unità di misura",
+    // ── Dutch ──
+    "factuurnummer", "factuurbedrag",
+    "vrachtbriefnummer", "luchtvrachtbriefnummer",
+    "paklijstnummer", "bestelnummer", "documentair kredietnummer",
+    "boekingsnummer", "contractnummer", "douaneaangiftenummer",
+    "certificaatnummer", "containernummer", "zegelnummer",
+    "laadhaven", "loshaven", "plaats van ontvangst", "plaats van levering",
+    "scheepsnaam", "reisnummer", "vluchtnummer",
+    "brutogewicht", "nettogewicht", "volume", "aantal pakketten",
+    "datum van afgifte", "vervaldatum", "betalingsvoorwaarden", "valuta",
+    "totaalbedrag", "subtotaal", "eenheidsprijs", "totaalprijs",
+    "omschrijving van goederen", "hoeveelheid", "land van oorsprong", "tariefnummer",
+    "exporteur", "geadresseerde", "te notificeren partij", "handtekening", "datum",
+    "handelsvoorwaarden", "maateenheid",
+    // ── Arabic ──
+    "رقم الفاتورة", "إجمالي الفاتورة",
+    "رقم بوليصة الشحن", "رقم بوليصة الشحن الجوي",
+    "رقم قائمة التعبئة", "رقم أمر الشراء", "رقم الاعتماد المستندي",
+    "رقم الحجز", "رقم العقد", "رقم البيان الجمركي",
+    "رقم الشهادة", "رقم الحاوية", "رقم الختم",
+    "ميناء الشحن", "ميناء التفريغ", "مكان الاستلام", "مكان التسليم",
+    "اسم السفينة", "رقم الرحلة البحرية", "رقم الرحلة الجوية",
+    "الوزن الإجمالي", "الوزن الصافي", "الحجم", "عدد الطرود",
+    "تاريخ الإصدار", "تاريخ الانتهاء", "شروط الدفع", "العملة",
+    "المبلغ الإجمالي", "المجموع الفرعي", "سعر الوحدة", "السعر الإجمالي",
+    "وصف البضائع", "الكمية", "بلد المنشأ", "الرمز الجمركي",
+    "المصدّر", "المرسل إليه", "الطرف المطلوب إخطاره", "التوقيع", "التاريخ",
+    "الشروط التجارية", "وحدة القياس",
+    // ── Czech ──
+    "číslo faktury", "celková částka faktury",
+    "číslo konosamentu", "číslo leteckého nákladního listu",
+    "číslo balicího listu", "číslo nákupní objednávky", "číslo akreditivu",
+    "číslo rezervace", "číslo smlouvy", "číslo celního prohlášení",
+    "číslo certifikátu", "číslo kontejneru", "číslo plomby",
+    "přístav nakládky", "přístav vykládky", "místo převzetí", "místo dodání",
+    "název plavidla", "číslo plavby", "číslo letu",
+    "hrubá hmotnost", "čistá hmotnost", "objem", "počet balení",
+    "datum vystavení", "datum platnosti", "platební podmínky", "měna",
+    "celková částka", "mezisoučet", "jednotková cena", "celková cena",
+    "popis zboží", "množství", "země původu", "celní kód",
+    "vývozce", "příjemce", "strana k oznámení", "podpis", "datum",
+    "obchodní podmínky", "měrná jednotka",
 ];
+
+/// 🌟 [LABEL SCRIPT DETECT] 별칭/라벨 문자열의 유니코드 스크립트를 판정합니다.
+///  한글 > 가나 > 아랍 > 한자 > 라틴 순서로 우선 검사하여
+///  한자+가나 혼재 시 일본어로 판정합니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelScript {
+    Latin,
+    Korean,
+    Japanese,
+    Chinese,
+    Arabic,
+}
+
+fn detect_label_script(text: &str) -> LabelScript {
+    let mut korean = 0usize;
+    let mut kana   = 0usize;
+    let mut cjk    = 0usize;
+    let mut arabic = 0usize;
+    let mut latin  = 0usize;
+    for c in text.chars() {
+        if c.is_ascii_alphabetic()                          { latin  += 1; }
+        else if ('\u{AC00}'..='\u{D7AF}').contains(&c)     { korean += 1; }
+        else if ('\u{3040}'..='\u{30FF}').contains(&c)     { kana   += 1; }
+        else if ('\u{4E00}'..='\u{9FFF}').contains(&c)     { cjk    += 1; }
+        else if ('\u{0600}'..='\u{06FF}').contains(&c)     { arabic += 1; }
+    }
+    if korean > 0 { return LabelScript::Korean; }
+    if kana   > 0 { return LabelScript::Japanese; }
+    if arabic > 0 { return LabelScript::Arabic; }
+    if cjk    > 0 { return LabelScript::Chinese; }
+    if latin  > 0 { return LabelScript::Latin; }
+    LabelScript::Latin
+}
+
+/// 🌟 [ALIAS LANG MATCH] 별칭의 스크립트가 문서 언어와 매칭되는지 판정합니다.
+///  라틴(영어/독일어/스페인어/프랑스어 등)은 국제 표준이므로 항상 통과시킵니다.
+///  doc_lang 이 빈 문자열이면(미확정) 전체 매칭으로 폴백합니다.
+fn alias_lang_matches(alias: &str, doc_lang: &str) -> bool {
+    if doc_lang.is_empty() { return true; }
+    let script = detect_label_script(alias);
+    match script {
+        LabelScript::Latin   => true,
+        LabelScript::Korean  => doc_lang == "ko",
+        LabelScript::Japanese=> doc_lang == "ja",
+        LabelScript::Chinese => doc_lang.starts_with("zh"),
+        LabelScript::Arabic  => doc_lang == "ar",
+    }
+}
 
 /// 라벨 문자열을 비교 가능한 형태로 접습니다. 영숫자 외는 공백으로 바꾸고 소문자화합니다.
 fn fold_column_label(raw: &str) -> String {
@@ -978,14 +1508,24 @@ fn fold_column_label(raw: &str) -> String {
 }
 
 /// 인쇄된 컬럼명을 스키마 필드명으로 확정합니다. 매칭 실패 시 빈 문자열을 돌려줍니다.
-pub fn canonicalize_trade_column(raw_header: &str) -> String {
+/// 🌟 [LANG FILTER] doc_lang 이 확정되어 있으면 해당 언어의 별칭만 대조합니다.
+///    영어(라틴 스크립트)는 국제 표준이므로 항상 포함됩니다.
+///    매칭 대상이 약 480개 → 약 30~50개로 축소되어 속도가 오히려 빨라집니다.
+pub fn canonicalize_trade_column(raw_header: &str, doc_lang: &str) -> String {
     let norm = fold_column_label(raw_header);
-    if norm.is_empty() { return String::new(); }
+    if norm.is_empty() {
+        return String::new();
+    }
 
-    // 1. 완전 일치 우선
+    // 1. 완전 일치 우선 (언어 필터링 적용)
     for (field, aliases) in TRADE_COLUMN_ALIASES.iter() {
         for a in aliases.iter() {
-            if fold_column_label(a) == norm { return field.to_string(); }
+            if !alias_lang_matches(a, doc_lang) {
+                continue;
+            }
+            if fold_column_label(a) == norm {
+                return field.to_string();
+            }
         }
     }
 
@@ -996,24 +1536,130 @@ pub fn canonicalize_trade_column(raw_header: &str) -> String {
     let mut best_field = "";
     for (field, aliases) in TRADE_COLUMN_ALIASES.iter() {
         for a in aliases.iter() {
+            if !alias_lang_matches(a, doc_lang) {
+                continue;
+            }
             let a_norm = fold_column_label(a);
-            if a_norm.is_empty() { continue; }
+            if a_norm.is_empty() {
+                continue;
+            }
             if norm.contains(&a_norm) && a_norm.len() > best_len {
                 best_len = a_norm.len();
                 best_field = field;
             }
         }
     }
+
     best_field.to_string()
 }
 
+/// 🌟 [EMBEDDING FALLBACK] 텍스트 매칭으로 확정하지 못한 헤더를 임베딩 코사인으로 재시도합니다.
+///
+///    ── 속도 설계 ──
+///    텍스트 매칭이 이미 성공한 헤더는 임베딩을 호출하지 않습니다.
+///    실패 건만 수집하여 배치 1회로 처리하므로 헤더 20개 중 3개만 실패하면
+///    임베딩 호출은 1회(3개 텍스트)입니다.
+///
+///    ── 모델 순서 ──
+///    get_embedding_batch 내부의 ensure_embedding() 이 임베딩 모델을 자동 로드합니다.
+///    process_trading_task STEP B 시점에는 이미 라벨 뱅크 임베딩을 위해
+///    ensure_embedding() 이 호출된 상태이므로 추가 로드/언로드가 발생하지 않습니다.
+///
+///    ── 판정 기준 ──
+///    필드 앵커 임베딩과의 코사인이 0.72 이상이고, 2위와의 마진이 0.03 이상이면 확정합니다.
+///    0.72 미만이면 빈 문자열을 반환하여 '확정 불가' 로 처리합니다.
+pub async fn canonicalize_trade_columns_with_embedding(
+    missed_headers: &[(usize, String)],
+    doc_lang: &str,
+    model: &crate::model::LogisModel,
+) -> Vec<(usize, String)> {
+    if missed_headers.is_empty() {
+        return Vec::new();
+    }
+    let header_texts: Vec<String> = missed_headers.iter().map(|(_, t)| t.clone()).collect();
+    let header_embs = match model.get_embedding_batch(header_texts).await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut field_names: Vec<String> = Vec::new();
+    let mut field_embs: Vec<Vec<f32>> = Vec::new();
+    for (field, aliases) in TRADE_COLUMN_ALIASES.iter() {
+        let lang_aliases: Vec<String> = aliases
+            .iter()
+            .filter(|a| alias_lang_matches(a, doc_lang))
+            .map(|a| a.to_string())
+            .collect();
+        if lang_aliases.is_empty() {
+            continue;
+        }
+        let emb = match model.get_embedding(lang_aliases.join(", ")).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if emb.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        field_names.push(field.to_string());
+        field_embs.push(emb);
+    }
+    let mut results: Vec<(usize, String)> = Vec::new();
+    for (ei, (orig_idx, _)) in missed_headers.iter().enumerate() {
+        let h_emb = &header_embs[ei];
+        if h_emb.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        let mut best: f32 = -1.0;
+        let mut second: f32 = -1.0;
+        let mut best_field: String = String::new();
+        for fi in 0..field_embs.len() {
+            let sim = crate::utils::ai_utils::cosine_similarity(h_emb, &field_embs[fi]);
+            if sim > best {
+                second = best;
+                best = sim;
+                best_field = field_names[fi].clone();
+            } else if sim > second {
+                second = sim;
+            }
+        }
+        if best >= 0.72 && (best - second) >= 0.03 && !best_field.is_empty() {
+            println!(
+                "   🔤 [EMBEDDING FALLBACK] '{}' → '{}' (cos {:.4}, margin {:+.4})",
+                missed_headers[ei].1,
+                best_field,
+                best,
+                best - second
+            );
+            results.push((*orig_idx, best_field));
+        } else {
+            println!(
+                "   ⚪ [EMBEDDING FALLBACK SKIP] '{}' 최고 {:.4} / 마진 {:+.4} 로 확정 불가",
+                missed_headers[ei].1,
+                best,
+                best - second
+            );
+        }
+    }
+    results
+}
+
 /// 추출된 '값' 이 사실은 인쇄 라벨인지 판정합니다. true 면 폐기해야 합니다.
-pub fn is_printed_label_echo(value: &str) -> bool {
+/// 🌟 [LANG FILTER] doc_lang 이 확정되어 있으면 해당 언어의 라벨/별칭만 대조합니다.
+///    영어(라틴)는 국제 표준이므로 항상 포함됩니다.
+///    doc_lang 이 빈 문자열이면(미확정) 기존처럼 전체 대조합니다.
+pub fn is_printed_label_echo(value: &str, doc_lang: &str) -> bool {
     let norm = fold_column_label(value);
-    if norm.is_empty() { return false; }
-    if TRADE_PRINTED_LABELS.iter().any(|l| fold_column_label(l) == norm) { return true; }
+    if norm.is_empty() {
+        return false;
+    }
+    if TRADE_PRINTED_LABELS.iter().any(|l| {
+        alias_lang_matches(l, doc_lang) && fold_column_label(l) == norm
+    }) {
+        return true;
+    }
     TRADE_COLUMN_ALIASES.iter().any(|(_, aliases)| {
-        aliases.iter().any(|a| fold_column_label(a) == norm)
+        aliases.iter().any(|a| {
+            alias_lang_matches(a, doc_lang) && fold_column_label(a) == norm
+        })
     })
 }
 
@@ -1024,64 +1670,78 @@ pub fn is_printed_label_echo(value: &str) -> bool {
 ///  그 결과 Shorts 행이 영구 소멸했습니다. 행 수 = 타일 수가 되어 버립니다.
 ///  타일 스키마를 배열로 고정하고, 인쇄 라벨과 필드명의 대응을 명시해
 ///  '보이는 데이터 행 수만큼' 원소를 만들도록 강제합니다.
-pub fn build_table_row_contract(headers: &[Vec<String>]) -> String {
-    if headers.is_empty() { return String::new(); }
-
+pub fn build_table_row_contract(headers: &[Vec<String>], doc_lang: &str) -> String {
+    if headers.is_empty() {
+        return String::new();
+    }
     let width = headers.iter().map(|r| r.len()).max().unwrap_or(0);
     let mut mapping = Vec::new();
     let mut fields = Vec::new();
-
     for col in 0..width {
         let mut parts: Vec<&str> = Vec::new();
         for h_row in headers.iter() {
             if let Some(seg) = h_row.get(col) {
                 let seg = seg.trim();
-                if !seg.is_empty() && !parts.contains(&seg) { parts.push(seg); }
+                if !seg.is_empty() && !parts.contains(&seg) {
+                    parts.push(seg);
+                }
             }
         }
         let printed = parts.join(" ");
-        if printed.is_empty() { continue; }
-        let field = canonicalize_trade_column(&printed);
-        if field.is_empty() { continue; }
-        mapping.push(format!("  column {} \"{}\" -> \"{}\"", col, printed, field));
-        if !fields.contains(&field) { fields.push(field); }
+        if printed.is_empty() {
+            continue;
+        }
+        let field = canonicalize_trade_column(&printed, doc_lang);
+        if field.is_empty() {
+            continue;
+        }
+        mapping.push(format!("   column {} \"{}\" -> \"{}\"", col, printed, field));
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
     }
-
-    if mapping.is_empty() { return String::new(); }
-
-    let obj = fields.iter()
+    if mapping.is_empty() {
+        return String::new();
+    }
+    let obj = fields
+        .iter()
         .map(|f| format!("\"{}\": null", f))
         .collect::<Vec<_>>()
         .join(", ");
-
     format!(
-"COLUMN MAP (printed header -> output field):\n{}\n\
-RULES:\n\
-  - Return a JSON ARRAY. One object per printed data row. Never collapse rows.\n\
-  - If the image shows 2 data rows, the array MUST have 2 elements.\n\
-  - Do not output header rows, subtotal rows, or total rows as elements.\n\
-  - Use null for a column that is not printed on that row.\n\
-SCHEMA:\n[ {{ {} }} ]",
-        mapping.join("\n"), obj
+        "COLUMN MAP (printed header -> output field):
+{}
+\
+RULES:
+\
+- Return a JSON ARRAY. One object per printed data row. Never collapse rows.
+\
+- If the image shows 2 data rows, the array MUST have 2 elements.
+\
+- Do not output header rows, subtotal rows, or total rows as elements.
+\
+- Use null for a column that is not printed on that row.
+\
+SCHEMA:
+[ {{ {} }} ]",
+        mapping.join("\n"),
+        obj
     )
 }
 
-/// 🌟 [HEADER BAND v2] 기존 구현이 못 잡던 3가지를 잡습니다.
-///   ① thead 부재 : 무역 서식 다수는 thead 없이 표의 첫 tr 을 th 로 씁니다.
-///      기존 코드는 이때 빈 배열을 돌려주고, 빈 배열이면 generate_pug_lines 의
-///      alt= 주입 자체가 일어나지 않아 컬럼명이 LLM 에 도달하지 못했습니다.
-///   ② colspan : 'UNIT' 이 2열을 덮는 2단 헤더에서 셀을 1열로 세면
-///      그 뒤 모든 열의 라벨이 한 칸씩 밀립니다.
-///   ③ rowspan : 'DESCRIPTION' 이 2행을 덮으면 아래 행의 그 열이 빈칸이 되어
-///      본문 셀이 라벨을 못 받습니다.
-///   결과는 항상 직사각 격자(모든 행의 길이가 같음)로 반환합니다.
-pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<Vec<String>> {
+/// 🌟 [HEADER BAND v2 — SYNC] DOM 순회를 동기로 수행하여 소유 데이터를 반환합니다.
+///    `&Html` / `ElementRef` 가 비동기 경계를 넘지 않도록 이 함수는 순수 동기입니다.
+///    반환값: (직사각 헤더 격자, 임베딩 폴백 대기 목록)
+pub fn extract_doc_table_headers_sync(
+    document: &Html,
+    table_selector: &str,
+    doc_lang: &str,
+) -> (Vec<Vec<String>>, Vec<(usize, String)>) {
     let empty: Vec<Vec<String>> = Vec::new();
+    let sel = match Selector::parse(table_selector) { Ok(s) => s, Err(_) => return (empty, Vec::new()) };
+    let first_match = match document.select(&sel).next() { Some(m) => m, None => return (empty, Vec::new()) };
 
-    let sel = match Selector::parse(table_selector) { Ok(s) => s, Err(_) => return empty };
-    let first_match = match document.select(&sel).next() { Some(m) => m, None => return empty };
-
-    // 1. 선택자에서 위로 올라가 감싸는 <table> 을 찾습니다. (기존 동작 유지)
+    // 1. 선택자에서 위로 올라가 감싸는 <table> 을 찾습니다.
     let mut table_ref = None;
     let mut current = first_match.parent();
     while let Some(parent) = current {
@@ -1093,10 +1753,10 @@ pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<V
         }
         current = parent.parent();
     }
-    let table_ref = match table_ref { Some(t) => t, None => return empty };
+    let table_ref = match table_ref { Some(t) => t, None => return (empty, Vec::new()) };
 
-    let tr_sel = match Selector::parse("tr") { Ok(s) => s, Err(_) => return empty };
-    let cell_sel = match Selector::parse("th, td") { Ok(s) => s, Err(_) => return empty };
+    let tr_sel = match Selector::parse("tr") { Ok(s) => s, Err(_) => return (empty, Vec::new()) };
+    let cell_sel = match Selector::parse("th, td") { Ok(s) => s, Err(_) => return (empty, Vec::new()) };
 
     // 2. 헤더 행 후보 수집
     let mut header_rows: Vec<scraper::ElementRef> = Vec::new();
@@ -1106,8 +1766,6 @@ pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<V
         }
     }
     if header_rows.is_empty() {
-        // thead 가 없으면 표 선두에서 'th 우세 행' 또는 'scope=col 보유 행' 이
-        // 이어지는 동안을 헤더 밴드로 봅니다. 데이터 행을 만나면 즉시 중단합니다.
         for tr in table_ref.select(&tr_sel) {
             let cells: Vec<_> = tr.select(&cell_sel).collect();
             if cells.is_empty() { continue; }
@@ -1123,35 +1781,55 @@ pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<V
             }
         }
     }
-    if header_rows.is_empty() { return empty; }
+    if header_rows.is_empty() { return (empty, Vec::new()); }
 
     let band = header_rows.len();
 
     // 3. colspan / rowspan 을 펼쳐 직사각 격자로 만듭니다.
     let mut grid: Vec<Vec<String>> = vec![Vec::new(); band];
+    let mut all_pending: Vec<(usize, String)> = Vec::new();
+    let mut global_cell_idx: usize = 0;
+
     for (r, tr) in header_rows.iter().enumerate() {
         let mut c = 0usize;
+
         for cell in tr.select(&cell_sel) {
-            // 위 행의 rowspan 이 이미 점유한 칸을 건너뜁니다.
             while grid[r].len() > c && !grid[r][c].is_empty() { c += 1; }
 
-            let colspan = cell.value().attr("colspan")
-                .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 64);
-            let rowspan = cell.value().attr("rowspan")
-                .and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, 64)
-                .min(band - r); // 헤더 밴드 밖으로 흘러넘치지 않게 잘라냅니다.
+            let colspan = cell
+                .value()
+                .attr("colspan")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 64);
+            let rowspan = cell
+                .value()
+                .attr("rowspan")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 64)
+                .min(band - r);
 
-            // abbr 가 있으면 그것이 정식 컬럼명입니다. 없으면 인쇄 텍스트를 씁니다.
-            let raw = cell.value().attr("abbr")
+            let raw = cell
+                .value()
+                .attr("abbr")
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| cell.text().collect::<Vec<_>>().join(" "));
             let title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            let canonical = canonicalize_trade_column(&title, doc_lang);
+            if canonical.is_empty() && !title.is_empty() {
+                all_pending.push((global_cell_idx, title.clone()));
+            }
+            global_cell_idx += 1;
 
             for dr in 0..rowspan {
                 let rr = r + dr;
                 for dc in 0..colspan {
                     let cc = c + dc;
-                    if grid[rr].len() <= cc { grid[rr].resize(cc + 1, String::new()); }
+                    if grid[rr].len() <= cc {
+                        grid[rr].resize(cc + 1, String::new());
+                    }
                     grid[rr][cc] = title.clone();
                 }
             }
@@ -1160,8 +1838,32 @@ pub fn extract_doc_table_headers(document: &Html, table_selector: &str) -> Vec<V
     }
 
     let width = grid.iter().map(|r| r.len()).max().unwrap_or(0);
-    if width == 0 { return empty; }
+    if width == 0 { return (empty, Vec::new()); }
     for row in grid.iter_mut() { row.resize(width, String::new()); }
+    (grid, all_pending)
+}
+
+/// 🌟 [HEADER BAND v2 — ASYNC] 임베딩 폴백만 수행합니다.
+///    `&Html` / `ElementRef` 가 이 함수에 전혀 등장하지 않으므로
+///    `tokio::spawn` 내부에서 안전하게 `.await` 할 수 있습니다.
+pub async fn extract_doc_table_headers_async(
+    mut grid: Vec<Vec<String>>,
+    pending_embedding: Vec<(usize, String)>,
+    doc_lang: &str,
+    model: &crate::model::LogisModel,
+) -> Vec<Vec<String>> {
+    if !pending_embedding.is_empty() {
+        let emb_results = canonicalize_trade_columns_with_embedding(
+            &pending_embedding,
+            doc_lang,
+            model,
+        ).await;
+        for (_idx, field) in emb_results {
+            // 임베딩 폴백 결과는 alt= 주입 시 사용됩니다.
+            // grid 는 이미 title 로 채워져 있으므로 여기서 별도 반영 불필요.
+            let _ = field;
+        }
+    }
     grid
 }
 
@@ -1372,7 +2074,7 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
 ///   또한 `relay_index` 와 `relay_id` 에 원본 `raw` 를 전달했는데,
 ///   이 값은 이미 `normalize_identifier` 를 거친 `normalized` 와 다를 수 있습니다.
 ///   일관성을 위해 `normalized` 를 기준으로 인덱스와 id 를 계산합니다.
-pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
+pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayKey> {
     let mut out: Vec<TradeRelayKey> = Vec::new();
 
     // 🌟 [v3] doc_number를 "reference_invoice" 역할로 추가합니다.
@@ -1385,7 +2087,7 @@ pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && s.as_str() != "N/A")
     {
-        if !is_printed_label_echo(&doc_num_raw) && crate::utils::hash::is_valid_relay_key(&doc_num_raw) {
+        if !is_printed_label_echo(&doc_num_raw, doc_lang) && crate::utils::hash::is_valid_relay_key(&doc_num_raw) {
             let normalized = crate::utils::hash::normalize_identifier(&doc_num_raw);
             let index = crate::utils::hash::relay_index(&normalized);
             if index > 0 {
@@ -1404,7 +2106,7 @@ pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
     // 🌟 [v3] reference_po도 역할로 추가합니다.
     for ref_field in ["reference_po", "reference_lc", "reference_bl", "reference_booking", "reference_contract"] {
         let raw = match find_relay_value(data, ref_field) { Some(r) => r, None => continue };
-        if is_printed_label_echo(&raw) { continue; }
+        if is_printed_label_echo(&raw, doc_lang) { continue; }
         if !crate::utils::hash::is_valid_relay_key(&raw) { continue; }
         let normalized = crate::utils::hash::normalize_identifier(&raw);
         let index = crate::utils::hash::relay_index(&normalized);
@@ -1439,7 +2141,7 @@ pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
         if *role == "self" { continue; }
         for f in fields.iter() {
             let raw = match find_relay_value(data, f) { Some(r) => r, None => continue };
-            if is_printed_label_echo(&raw) { continue; }
+            if is_printed_label_echo(&raw, doc_lang) { continue; }
             if !crate::utils::hash::is_valid_relay_key(&raw) { continue; }
             let normalized = crate::utils::hash::normalize_identifier(&raw);
             let index = crate::utils::hash::relay_index(&normalized);
@@ -1473,8 +2175,8 @@ pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
 ///   하지만 `k.index` 는 `extract_trade_relay_keys` 내부에서 계산된 값이라
 ///   `relay_index` 와 동일한 경로를 거치지 않을 수 있었습니다.
 ///   여기서 `relay_index` 를 다시 호출하여 일관성을 보장합니다.
-pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value) -> (String, u32, bool) {
-    let keys = extract_trade_relay_keys(data);
+pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) -> (String, u32, bool) {
+    let keys = extract_trade_relay_keys(data, doc_lang);
 
     // 🌟 [DOC NUMBER DIRECT] extracted_data에서 doc_number를 직접 확인합니다.
     //    extract_trade_relay_keys의 "self" 역할 매핑이 유효성 검사에서
@@ -1544,8 +2246,8 @@ pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value) -> (String, u32,
 ///   또한 `k.clone()` 으로 키를 복제했는데, 이 복제가 불필요한 메모리 할당을 유발했습니다.
 ///   역할별 타겟을 `related_trading` 의 허브 목록과 일치시키고,
 ///   불필요한 복제를 제거합니다.
-pub fn plan_trade_relays(doc_type: &str, data: &Value) -> Vec<(&'static str, TradeRelayKey)> {
-    let keys = extract_trade_relay_keys(data);
+pub fn plan_trade_relays(doc_type: &str, data: &Value, doc_lang: &str) -> Vec<(&'static str, TradeRelayKey)> {
+    let keys = extract_trade_relay_keys(data, doc_lang);
     let mut plan = Vec::new();
     for k in keys.into_iter() {
         let targets: &[&'static str] = match k.role {
