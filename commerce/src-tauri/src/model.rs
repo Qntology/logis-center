@@ -2266,7 +2266,12 @@ impl LogisModel {
                         ));
                     }
                     for (target_type, relay_key) in &relay_plan {
-                        let target_field = &relay_key.source_field;
+                        // 🌟 [SEARCH FIELD FIX v5] source_field와 search_field를 분리합니다.
+                        //    - source_field: 내 문서에서 값을 가져온 필드 (진단용)
+                        //    - search_field: 상대 문서에서 검색할 필드명
+                        //    기존에는 둘 다 source_field로 동일하여 자기 자신의 필드에서 검색하여
+                        //    항상 SELF-SKIP 되었습니다.
+                        let search_field = &relay_key.search_field;
                         let source_field = &relay_key.source_field;
                         let link_value = relay_key.raw.clone();
                         if link_value.is_empty() || link_value == "N/A" {
@@ -2283,65 +2288,73 @@ impl LogisModel {
                         }
                         emit_term(&format!(
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
-                            doc_type, target_type, target_field, link_value
+                            doc_type, target_type, search_field, link_value
                         ));
-                        let relay_result = db.find_item_by_property("items", target_field, &json!(link_value)).await;
-                        match relay_result {
-                            Ok(Some((existing_id, mut ej))) => {
-                                // 🌟 [SELF-SEARCH GUARD] 방금 저장한 자기 자신을 검색에서 찾은 경우
-                                //    릴레이 대상이 될 수 없습니다. 자기 자신과의 릴레이는 무의미합니다.
-                                if existing_id == hashed_id {
-                                    emit_term(&format!(
-                                        "  🚫 [RELAY SELF-SKIP] 검색 결과 '{}' 가 자기 자신입니다. 릴레이를 건너뜁니다.",
-                                        existing_id
-                                    ));
-                                    continue;
-                                }
-                                // 🌟 [TYPE GUARD] 검색된 문서의 타입이 목표 타입과 일치해야 합니다.
-                                //    다른 타입의 문서가 같은 참조 값을 가질 수 있으므로,
-                                //    타입 불일치 시 이 결과를 무시하고 draft 경로로 가야 합니다.
-                                let found_type = ej.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if !found_type.is_empty() && found_type != *target_type {
-                                    emit_term(&format!(
-                                        "  🚫 [RELAY TYPE MISMATCH] 검색된 문서 '{}' 의 type='{}' 이 목표 '{}' 와 불일치. 무시합니다.",
-                                        existing_id, found_type, target_type
-                                    ));
-                                    // 타입 불일치 시 draft 생성 경로로 폴백합니다.
-                                    let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
-                                        crate::utils::hash::relay_id(&link_value)
-                                    } else {
-                                        crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
-                                    };
-                                    let mut draft_data = json!({});
-                                    if let Some(obj) = draft_data.as_object_mut() {
-                                        obj.insert("id".to_string(), json!(draft_id.clone()));
-                                        obj.insert("type".to_string(), json!(target_type));
-                                        let fi = if crate::utils::hash::is_valid_relay_key(&link_value) {
-                                            crate::utils::hash::relay_index(&link_value)
-                                        } else {
-                                            0u32
-                                        };
-                                        obj.insert("index".to_string(), json!(fi));
-                                        obj.insert(target_field.to_string(), json!(link_value.clone()));
-                                        obj.insert("doc_type".to_string(), json!(target_type));
-                                        obj.insert("updated_at".to_string(), json!(0));
-                                        obj.insert("mode".to_string(), json!("shipping"));
-                                        obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, target_field, link_value)));
+                        // 🌟 [RELAY SEARCH v5] get_all_items로 여러 결과를 가져온 후,
+                        //    자기 자신 제외 + 타입 검증으로 유효한 상대 문서를 찾습니다.
+                        //    find_item_by_property는 첫 번째 결과만 반환하므로,
+                        //    자기 자신이 먼저 나오면 무조건 SELF-SKIP 되는 문제를 해결합니다.
+                        let filter = format!("data LIKE '%\"{}\":\"{}\"%'", search_field, link_value.replace('\'', "''"));
+                        let relay_search = db.get_all_items("items", 10, 0, Some(filter)).await;
+                        let mut found_target: Option<(String, Value)> = None;
+                        match relay_search {
+                            Ok(docs) => {
+                                for doc in docs {
+                                    // 🌟 [SELF-SEARCH GUARD] 자기 자신 제외
+                                    if doc.id == hashed_id {
+                                        continue;
                                     }
-                                    let _ = db.upsert_item(
-                                        "items", &draft_id, target_type, draft_data, None,
-                                        None,
-                                        Some(from_addr), Some(&team_id), Some(&hashed_cc),
-                                        Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
-                                        Some(&ref_val), None
-                                    ).await;
-                                    emit_term(&format!(
-                                        "  📝 [TRADE RELAY DRAFT] {} draft '{}' 생성 ({}='{}').",
-                                        target_type, draft_id, target_field, link_value
-                                    ));
-                                    continue;
+                                    // 🌟 [TYPE GUARD] 검색된 문서의 타입이 목표 타입과 일치해야 합니다.
+                                    //    저장 시 type_은 전체 이름(예: "COMMERCIAL INVOICE")으로 설정되지만,
+                                    //    릴레이 검색 시 target_type은 코드(예: "BL", "PL")입니다.
+                                    //    따라서 전체 이름을 코드로 변환하여 비교합니다.
+                                    let found_doc_type = doc.r#type.clone();
+                                    let found_code = crate::logic::doc_type_to_code(&found_doc_type);
+                                    // data JSON에서도 doc_type 확인
+                                    let parsed: Value = match serde_json::from_str(&doc.json_data) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    let data_doc_type = parsed.get("doc_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let data_code = crate::logic::doc_type_to_code(data_doc_type);
+                                    // 타입 검증: 전체 이름 또는 코드 모두 매칭 시도
+                                    let type_matches = if found_code == *target_type {
+                                        true
+                                    } else if data_code == *target_type {
+                                        true
+                                    } else if found_doc_type == *target_type {
+                                        true
+                                    } else if data_doc_type == *target_type {
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if !type_matches {
+                                        continue;
+                                    }
+                                    // 🌟 [FIELD VALUE VERIFY] search_field 값이 정확히 일치하는지 확인
+                                    let field_val = parsed.get(search_field)
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if field_val != link_value {
+                                        continue;
+                                    }
+                                    found_target = Some((doc.id, parsed));
+                                    break;
                                 }
-                                
+                            },
+                            Err(e) => {
+                                emit_term(&format!(
+                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
+                                    target_type, e
+                                ));
+                                continue;
+                            }
+                        }
+                        match found_target {
+                            Some((existing_id, mut ej)) => {
                                 let mut needs_update = false;
                                 // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
                                 //    역할 기반으로 역참조 필드명을 결정합니다.
@@ -2437,7 +2450,7 @@ impl LogisModel {
                                     ));
                                 }
                             },
-                            Ok(None) => {
+                            None => {
                                 // 🌟 [DRAFT v4] 미발견 시 draft 생성.
                                 //    기존은 `hash_id(team_id + target_type + link_value)` 였는데,
                                 //    이 경로는 전각 영숫자를 반각과 다르게 취급합니다.
@@ -2451,11 +2464,13 @@ impl LogisModel {
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
                                     obj.insert("type".to_string(), json!(target_type));
-                                    obj.insert(target_field.to_string(), json!(link_value.clone()));
+                                    // 🌟 [SEARCH FIELD FIX] draft에는 search_field(상대 문서의 검색 대상 필드)에 값을 넣습니다.
+                                    //    기존에는 target_field(=source_field)로 넣어 방향이 뒤집혔습니다.
+                                    obj.insert(search_field.to_string(), json!(link_value.clone()));
                                     obj.insert("doc_type".to_string(), json!(target_type));
                                     obj.insert("updated_at".to_string(), json!(0));
                                     obj.insert("mode".to_string(), json!("shipping"));
-                                    obj.insert("text".to_string(), json!(format!("{} {}", target_type, link_value)));
+                                    obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, search_field, link_value)));
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
@@ -2466,15 +2481,9 @@ impl LogisModel {
                                 ).await;
                                 emit_term(&format!(
                                     "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
-                                    target_type, draft_id, target_field, link_value
+                                    target_type, draft_id, search_field, link_value
                                 ));
                             },
-                            Err(e) => {
-                                emit_term(&format!(
-                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
-                                    target_type, e
-                                ));
-                            }
                         }
                     }
                 }

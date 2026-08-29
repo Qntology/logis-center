@@ -2006,7 +2006,14 @@ pub fn get_trade_doc_categories(doc_type: &str) -> Vec<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeRelayKey {
     pub role: &'static str,   // "self" | "transport" | "booking" | "order" | "contract" | "credit" | "container"
-    pub source_field: String, // 어느 필드에서 나왔는지 (진단용)
+    pub source_field: String, // 내 문서에서 값을 가져온 필드 (진단용)
+    /// 🌟 [SEARCH FIELD] 상대 문서에서 검색할 필드명입니다.
+    /// - "내가 참조하는 값"을 찾는 역할(transport/booking/order/contract/credit/container):
+    ///   상대 문서의 고유 식별 필드(`doc_number` 또는 `container_number`)에서 검색합니다.
+    /// - "나를 참조하는 값"을 찾는 역할(reference_invoice/reference_po/reference_lc):
+    ///   상대 문서의 참조 필드(`reference_invoice` 등)에서 검색합니다.
+    /// 이 구분이 없으면 자기 자신의 필드에서 검색하여 항상 SELF-SKIP 됩니다.
+    pub search_field: String,
     pub raw: String,          // 인쇄된 원문
     pub normalized: String,   // normalize_identifier 통과값
     pub index: u32,           // crc32(normalized) — commerce 의 tracking index 와 같은 축
@@ -2076,7 +2083,6 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
 ///   일관성을 위해 `normalized` 를 기준으로 인덱스와 id 를 계산합니다.
 pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayKey> {
     let mut out: Vec<TradeRelayKey> = Vec::new();
-
     // 🌟 [v3] doc_number를 "reference_invoice" 역할로 추가합니다.
     //    기존에는 "self" 역할로 분류되어 자기 자신을 릴레이 대상으로 만들었습니다.
     //    "reference_invoice" 역할은 '내 문서번호를 참조하는 문서'를 찾는 데 사용됩니다.
@@ -2094,6 +2100,10 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
                 out.push(TradeRelayKey {
                     role: "reference_invoice",
                     source_field: "doc_number".to_string(),
+                    // 🌟 [SEARCH FIELD FIX] 상대 문서의 "reference_invoice" 필드에서 검색합니다.
+                    //    내 문서번호를 "reference_invoice"에 담고 있는 다른 문서를 찾아야 합니다.
+                    //    기존에는 "doc_number"로 검색하여 자기 자신을 찾아 항상 SELF-SKIP 되었습니다.
+                    search_field: "reference_invoice".to_string(),
                     raw: doc_num_raw.clone(),
                     normalized: normalized.clone(),
                     index,
@@ -2102,7 +2112,6 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
             }
         }
     }
-
     // 🌟 [v3] reference_po도 역할로 추가합니다.
     for ref_field in ["reference_po", "reference_lc", "reference_bl", "reference_booking", "reference_contract"] {
         let raw = match find_relay_value(data, ref_field) { Some(r) => r, None => continue };
@@ -2123,16 +2132,25 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
             _ => continue,
         };
         if out.iter().any(|k| k.role == role && k.index == index) { continue; }
+        // 🌟 [SEARCH FIELD FIX] 역할별 검색 필드 결정:
+        //    - "내가 참조하는 값"을 찾는 역할(transport/booking/order/contract/credit):
+        //      상대 문서의 고유 식별 필드 "doc_number"에서 검색합니다.
+        //    - "나를 참조하는 값"을 찾는 역할은 이 블록에 없습니다.
+        let search_field = match role {
+            "transport" | "booking" | "order" | "contract" | "credit" => "doc_number".to_string(),
+            "container" => "container_number".to_string(),
+            _ => "doc_number".to_string(),
+        };
         out.push(TradeRelayKey {
             role,
             source_field: ref_field.to_string(),
+            search_field,
             raw: raw.clone(),
             normalized: normalized.clone(),
             index,
             id: crate::utils::hash::relay_id(&normalized),
         });
     }
-
     // 🌟 [v3] 기존 TRADE_RELAY_FIELDS 순회도 유지하되,
     //    "self" 역할이 이미 제거되었으므로 중복 생성되지 않습니다.
     //    단, container_number 등 기존 역할은 그대로 유지합니다.
@@ -2147,9 +2165,21 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
             let index = crate::utils::hash::relay_index(&normalized);
             if index == 0 { continue; }
             if out.iter().any(|k| k.role == *role && k.index == index) { continue; }
+            // 🌟 [SEARCH FIELD FIX] 역할별 검색 필드 결정:
+            //    - "내가 참조하는 값"을 찾는 역할: 상대 문서의 고유 식별 필드에서 검색
+            //    - "나를 참조하는 값"을 찾는 역할: 상대 문서의 참조 필드에서 검색
+            let search_field = match *role {
+                "transport" | "booking" | "order" | "contract" | "credit" => "doc_number".to_string(),
+                "container" => "container_number".to_string(),
+                "reference_invoice" => "reference_invoice".to_string(),
+                "reference_po" => "reference_po".to_string(),
+                "reference_lc" => "reference_lc".to_string(),
+                _ => "doc_number".to_string(),
+            };
             out.push(TradeRelayKey {
                 role,
                 source_field: f.to_string(),
+                search_field,
                 raw: raw.clone(),
                 normalized: normalized.clone(),
                 index,

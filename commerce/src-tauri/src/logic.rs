@@ -353,6 +353,76 @@ pub fn trade_reference_field_of(doc_type: &str) -> Option<&'static str> {
     Some(f)
 }
 
+/// 🌟 [DOC TYPE TO CODE] 문서 전체 이름을 코드로 변환합니다.
+///  저장 시 `type_`은 전체 이름(예: "COMMERCIAL INVOICE")으로 설정되지만,
+///  릴레이 검색 시 `target_type`은 코드(예: "CI", "BL")입니다.
+///  타입 검증 시 이 둘을 매칭하기 위해 이 함수가 필요합니다.
+pub fn doc_type_to_code(doc_type: &str) -> &'static str {
+    match doc_type.to_uppercase().as_str() {
+        "COMMERCIAL INVOICE" => "CI",
+        "PROFORMA INVOICE" => "PI",
+        "PACKING LIST" => "PL",
+        "BILL OF LADING" => "BL",
+        "HOUSE BILL OF LADING" => "HBL",
+        "SEA WAYBILL" => "SWB",
+        "AIR WAYBILL" => "AWB",
+        "SHIPPING ADVICE" => "SA",
+        "DELIVERY ORDER" => "DO",
+        "ARRIVAL NOTICE" => "AN",
+        "BOOKING CONFIRMATION" => "BC",
+        "BOOKING NOTE" => "BK",
+        "SHIPPING REQUEST" => "SR",
+        "FREIGHT INVOICE" => "FI",
+        "FORWARDER CERTIFICATE OF RECEIPT" => "FCR",
+        "PROOF OF DELIVERY" => "POD",
+        "CARGO MANIFEST" => "CM",
+        "WAREHOUSE RECEIPT" => "WR",
+        "EXPORT DECLARATION" => "ED",
+        "IMPORT DECLARATION" => "ID",
+        "CUSTOMS INVOICE" => "CINV",
+        "CERTIFICATE OF ORIGIN" => "CO",
+        "CUSTOMS CLEARANCE CERTIFICATE" => "CCC",
+        "CERTIFICATE OF NON-MANIPULATION" => "CNM",
+        "CONSIGNMENT SUMMARY INVOICE" => "CSI",
+        "INSPECTION CERTIFICATE" => "IC",
+        "WEIGHT CERTIFICATE" => "WC",
+        "CERTIFICATE OF ANALYSIS" => "CA",
+        "PHYTOSANITARY CERTIFICATE" => "PHYTO",
+        "HEALTH CERTIFICATE" => "HC",
+        "BENEFICIARY CERTIFICATE" => "BEN_CERT",
+        "FUMIGATION CERTIFICATE" => "FC",
+        "CARGO DAMAGE SURVEY REPORT" => "CDR",
+        "DANGEROUS GOODS DECLARATION" => "DGD",
+        "MATERIAL SAFETY DATA SHEET" => "MSDS",
+        "POWER OF ATTORNEY" => "POA",
+        "BUSINESS LICENSE" => "BIZ_LIC",
+        "INSURANCE POLICY" => "INS",
+        "INSURANCE CLAIM FORM" => "ICF",
+        "PURCHASE ORDER" => "PO",
+        "SALES CONTRACT" => "SC",
+        "LETTER OF CREDIT" => "LC",
+        "LOCAL LETTER OF CREDIT" => "LLC",
+        "CONFIRMATION OF PURCHASE" => "CP",
+        "BILL OF EXCHANGE" => "BE",
+        "TRUST RECEIPT" => "TR",
+        "LETTER OF GUARANTEE" => "LG",
+        "EXPORT LICENSE" => "EL",
+        "STATEMENT OF ACCOUNT" => "SOA",
+        "DEBIT NOTE" => "DN",
+        "CREDIT NOTE" => "CN",
+        "TAX INVOICE" => "TI",
+        // 코드가 이미 코드인 경우 그대로 반환
+        "CI" | "PI" | "SC" | "LC" | "LLC" | "CP" | "BE" | "TR" | "LG" | "EL"
+        | "PL" | "BL" | "HBL" | "SWB" | "AWB" | "SA" | "DO" | "AN"
+        | "BC" | "BK" | "SR" | "FCR" | "POD" | "CM" | "FI" | "WR"
+        | "ED" | "ID" | "CINV" | "CO" | "CCC" | "CNM" | "CSI"
+        | "IC" | "WC" | "CA" | "COA" | "PHYTO" | "PC" | "HC" | "BEN_CERT" | "FC" | "CDR"
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" | "IP" | "ICF"
+        | "SOA" | "DN" | "CN" | "TI" => doc_type,
+        _ => doc_type,
+    }
+}
+
 /// 🌟 [ALL REFERENCE FIELDS] 무역 문서가 가질 수 있는 모든 참조 축 목록입니다.
 ///  STEP C 정규화(FLATTEN)와 검색 조건 화이트리스트가 같은 목록을 공유해야
 ///  저장(정방향)과 조회(역방향)가 같은 이름 공간에서 만납니다.
