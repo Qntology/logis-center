@@ -419,7 +419,36 @@ pub fn doc_type_to_code(doc_type: &str) -> String {
         | "IC" | "WC" | "CA" | "COA" | "PHYTO" | "PC" | "HC" | "BEN_CERT" | "FC" | "CDR"
         | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" | "IP" | "ICF"
         | "SOA" | "DN" | "CN" | "TI" => doc_type.to_uppercase(),
-        _ => doc_type.to_uppercase(),
+        // 🌟 [TITLE REVERSE LOOKUP] 위 match 에 없는 전문은 TRADE_DOC_TITLES 로 역조회합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   같은 '코드 ↔ 전문' 사전이 이 함수와 TRADE_DOC_TITLES 두 벌로 존재해
+        //   실제로 어긋나 있었습니다. 아래는 TRADE_DOC_TITLES 에는 있는데
+        //   위 match 에는 없어 코드로 접히지 않던 전문입니다.
+        //     "fumigation certificate"   → FC
+        //     "purchase confirmation"    → CP   (match 는 "CONFIRMATION OF PURCHASE" 만 보유)
+        //     "consignment summary invoice" 표기 불일치 계열
+        //   코드로 접히지 않으면 entity_index / entity_bcc 가 전문으로 만들어져
+        //   목록 필터와 릴레이가 통째로 어긋납니다.
+        //   TITLE GATE 가 쓰는 사전과 저장이 쓰는 사전은 반드시 같아야 합니다.
+        _ => {
+            let upper = doc_type.to_uppercase();
+            let norm = |s: &str| -> String {
+                s.chars()
+                    .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { ' ' })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let key = norm(&upper);
+            for (code, title) in TRADE_DOC_TITLES.iter() {
+                if norm(title) == key {
+                    return code.to_string();
+                }
+            }
+            upper
+        }
     }
 }
 

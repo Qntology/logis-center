@@ -1289,6 +1289,124 @@ pub fn plan_crops(
     //    "어떤 크롭에도 안 담긴 잉크" 는 회수 불가능한 손실입니다.
     rescue_uncovered_bands(&mut plans, heatmaps, &content, content_gate, grid, emit);
 
+    // ── ⑦-B 동일 카테고리 겹침 크롭 병합 ──
+    //
+    //  ── 실측 사고 ──
+    //   header 크롭이 두 개 생성되었습니다.
+    //     [A] grid(r2~4, c4~13) → px(114,57)-(800,344)   ← 좌측 c0~c3 이 잘려 있음
+    //     [B] IDENTITY BAND     → px(0,114)-(800,516)    ← 좌측 포함, 정답이 여기 있음
+    //   순서를 바꿔도 두 크롭이 각각 LLM 을 타면서
+    //   먼저 발언한 쪽이 [ALREADY CLAIMED] 로 뒤쪽을 막습니다.
+    //   실측 로그:
+    //     [A] → doc_number "93763111837" (AIRWAYBILL 번호)  ← 먼저 확정
+    //     [B] → doc_number "CI-43726"    (정답)            ← '기존 유지' 로 폐기
+    //   그 잘못된 번호가 그대로 entity_index 와 릴레이 25건의 키가 되었습니다.
+    //
+    //  ── 왜 순서가 아니라 병합인가 ──
+    //   두 크롭은 같은 논리 블록(문서 식별 밴드)의 좌·우 조각입니다.
+    //   조각을 순서대로 보여주면 각 조각이 자기 안에서만 답을 찾으므로,
+    //   좌측 조각만 본 호출은 INVOICE NUMBER 를 볼 기회 자체가 없습니다.
+    //   합집합으로 한 번에 보여주면 두 열이 같은 시야에 들어와
+    //   모델이 라벨과 값을 좌우로 대조할 수 있습니다. LLM 호출도 하나 줄어듭니다.
+    //
+    //  ── 면적 상한 ──
+    //   무제한 병합은 카테고리 하나가 페이지를 삼키는 역효과를 냅니다.
+    //   합집합이 페이지의 60% 를 넘으면 병합하지 않고 원래대로 둡니다.
+    //   (60% 는 '한 카테고리가 문서 과반을 넘게 차지할 수 없다' 는 구조적 상한이며,
+    //    plan_crops 앞부분의 area_cap 과 같은 성격의 판정입니다)
+    {
+        let page_area = (grid.orig_width as f32) * (grid.orig_height as f32);
+        let mut i = 0usize;
+        while i < plans.len() {
+            let mut j = i + 1;
+            while j < plans.len() {
+                if plans[i].category != plans[j].category {
+                    j += 1;
+                    continue;
+                }
+                let a = plans[i].bbox;
+                let b = plans[j].bbox;
+                let overlaps = a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
+                if !overlaps {
+                    j += 1;
+                    continue;
+                }
+                let merged = (
+                    a.0.min(b.0),
+                    a.1.min(b.1),
+                    a.2.max(b.2),
+                    a.3.max(b.3),
+                );
+                let area = ((merged.2 - merged.0) as f32) * ((merged.3 - merged.1) as f32);
+                if area > page_area * 0.6 {
+                    emit(&format!(
+                        "    ⚪ [MERGE SKIP] '{}' 의 두 크롭을 합치면 페이지의 {:.0}% 를 차지해 병합하지 않습니다.",
+                        plans[i].category,
+                        area / page_area * 100.0
+                    ));
+                    j += 1;
+                    continue;
+                }
+                emit(&format!(
+                    "    🔗 [CROP MERGE] '{}' 의 겹치는 크롭 2개를 합칩니다. px({},{})-({},{}) + px({},{})-({},{}) → px({},{})-({},{})",
+                    plans[i].category,
+                    a.0, a.1, a.2, a.3,
+                    b.0, b.1, b.2, b.3,
+                    merged.0, merged.1, merged.2, merged.3
+                ));
+                plans[i].bbox = merged;
+                plans[i].patch_count += plans[j].patch_count;
+                if plans[j].score > plans[i].score {
+                    plans[i].score = plans[j].score;
+                    plans[i].top_field = plans[j].top_field.clone();
+                }
+                plans.remove(j);
+            }
+            i += 1;
+        }
+    }
+
+    // ── ⑧ 식별 크롭 우선 정렬 ──
+    //
+    //  ── 실측 사고 ──
+    //   header 크롭이 두 개 생성되었습니다.
+    //     [1] grid(r2~4, c4~13) → px(114,57)-(800,344)   ← 좌측 c0~c3 이 잘려 있음
+    //     [2] IDENTITY BAND     → px(0,114)-(800,516)    ← 좌측 포함, 정답이 여기 있음
+    //   그런데 [2] 는 ⑥ 단계에서 벡터 맨 뒤에 push 되어 10번째로 처리되었습니다.
+    //   STAGE-5 는 plans 순서대로 돌면서 [ALREADY CLAIMED] 로 앞선 확정값을 보호하므로,
+    //     [1] 이 우측 AIRWAYBILL 번호 93763111837 을 doc_number 로 먼저 확정했고
+    //     [2] 가 뒤늦게 읽어낸 정답 CI-43726 은 '기존 유지' 로 폐기되었습니다.
+    //   그 잘못된 번호가 그대로 entity_index / 릴레이 25건의 키가 되었습니다.
+    //
+    //  ── 왜 순서만 바꾸면 되는가 ──
+    //   두 크롭 모두 이미 계획에 들어 있고 둘 다 LLM 을 탑니다. 비용은 동일합니다.
+    //   달라지는 것은 '누가 먼저 기본키를 확정하는가' 뿐입니다.
+    //   문서 기본키는 되돌릴 수 없는 축이므로, 그것을 담당하는 크롭이 먼저 발언해야 합니다.
+    //
+    //  ── 판정 근거 ──
+    //   top_field 가 "doc_number" 인 header 크롭이 식별 크롭입니다.
+    //   ensure_identity_band_crop 이 그 값을 명시적으로 심어 두므로 어휘 판정이 아닙니다.
+    //   sort_by_key 는 안정 정렬이라 나머지 크롭의 상대 순서는 그대로 보존됩니다.
+    {
+        let before: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
+        plans.sort_by_key(|p| {
+            if p.category == "header" && p.top_field == "doc_number" {
+                0u8
+            } else if p.category == "header" {
+                1u8
+            } else {
+                2u8
+            }
+        });
+        let after: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
+        if before != after {
+            emit(&format!(
+                "    🥇 [IDENTITY FIRST ORDER] 문서 기본키 크롭을 선두로 재정렬했습니다. {:?} → {:?}",
+                before, after
+            ));
+        }
+    }
+
     plans
 }
 

@@ -1668,7 +1668,21 @@ impl LogisModel {
                     final_data_map.insert("conditions".to_string(), json!({}));
                     final_data_map.insert("financials".to_string(), json!({}));
                     final_data_map.insert("cargo".to_string(), json!({}));
-                    final_data_map.insert("line_items".to_string(), json!([]));
+                    // 🌟 [ARRAY KEY UNIFY] 초기화 키를 카테고리명과 일치시킵니다.
+                    //
+                    //  ── 실측 사고 ──
+                    //   merge_extracted 는 `merged.entry(category)` 로 배열을 넣으므로
+                    //   items 카테고리의 결과는 "items" 키에 쌓입니다.
+                    //   그런데 여기서 "line_items" 를 만들어 두어 두 키가 공존했고,
+                    //   저장 결과가 items 3행 / line_items 빈 배열로 갈렸습니다.
+                    //   STEP C 의 FLATTEN 도 "line_items" 를 훑기 때문에
+                    //   hs_code 루트 승격이 한 번도 성립하지 않았습니다.
+                    //   containers 는 카테고리명과 키가 우연히 같아 정상 동작했습니다.
+                    //
+                    //  ── 하위 호환 ──
+                    //   generate_rich_summary 등 기존 소비처가 line_items 를 읽으므로
+                    //   저장 직전 STEP C 에서 items → line_items 로 미러합니다.
+                    final_data_map.insert("items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
                     // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
@@ -2173,10 +2187,10 @@ impl LogisModel {
                     }
 
                     // ── 배열 축 : 첫 원소만 대표 축으로 승격 ──
-                    //    (전체 목록은 data.containers / data.line_items 배열에 그대로 남습니다)
+                    //    (전체 목록은 data.containers / data.items 배열에 그대로 남습니다)
                     for (arr_key, promote) in [
                         ("containers", vec!["container_number", "seal_number"]),
-                        ("line_items", vec!["hs_code"]),
+                        ("items", vec!["hs_code"]),
                     ] {
                         let arr = match extracted_data.get(arr_key).and_then(|v| v.as_array()) {
                             Some(a) => a.clone(),
@@ -2188,6 +2202,22 @@ impl LogisModel {
                             if let Some(v) = arr.iter().find_map(|it| it.get(field)) {
                                 obj.insert(field.to_string(), v.clone());
                                 hoisted.push(field.to_string());
+                            }
+                        }
+                    }
+
+                    // 🌟 [LEGACY MIRROR] 기존 소비처가 line_items 를 읽으므로 items 를 그대로 복사합니다.
+                    //    generate_rich_summary / merge_json_manual 등 텍스트 경로가
+                    //    line_items 키를 전제하고 있어, 키를 통일하면서 그쪽이 끊기지 않게 합니다.
+                    //    원본은 items 이고 line_items 는 읽기 전용 사본입니다.
+                    {
+                        let items_arr = final_data.get("items").cloned()
+                            .or_else(|| extracted_data.get("items").cloned());
+                        if let Some(v) = items_arr {
+                            if v.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                                final_data.as_object_mut().unwrap()
+                                    .insert("line_items".to_string(), v);
+                                emit_term("[TRADING FLATTEN v3] 🔁 items 배열을 line_items 로 미러했습니다. (레거시 소비처 호환)");
                             }
                         }
                     }
@@ -9518,11 +9548,48 @@ fn merge_extracted(
                     parts.join("|")
                 };
 
+                // 🌟 [ROW IDENTITY GATE] 표의 '데이터 행' 은 반드시 자기 정체를 갖습니다.
+                //
+                //  ── 실측 사고 ──
+                //   items 배열에 3행이 저장되었는데 실제 품목은 1행뿐이었습니다.
+                //     { description: null, item_package_count: 4, total_price: 2000 }  ← 합계 행
+                //     { description: null, item_code: "360 Footwear" }                 ← 회사명
+                //   합계 행은 품명이 없고, 회사명은 품목 코드 자리에 들어간 서명란 텍스트입니다.
+                //   프롬프트의 [TABLE RULES] 가 이미 합계 행 제외를 지시하지만
+                //   2B 모델은 타일 경계에서 그 지시를 지키지 못합니다.
+                //
+                //  ── 판정 근거 (어휘 사전 아님) ──
+                //   무역 품목표에서 '품명 없는 데이터 행' 은 정의상 존재하지 않습니다.
+                //   합계 행 · 소계 행 · 서명란 텍스트는 전부 품명 칸이 비어 있습니다.
+                //   컨테이너 표도 같은 원리로 '번호 없는 컨테이너 행' 은 성립하지 않습니다.
+                //   값이 있는지만 보므로 언어와 무관합니다.
+                let row_has_identity = |v: &Value| -> bool {
+                    let o = match v.as_object() { Some(o) => o, None => return false };
+                    let filled = |k: &str| -> bool {
+                        match o.get(k) {
+                            Some(Value::String(s)) => !s.trim().is_empty() && !is_schema_echo(s),
+                            Some(Value::Number(_)) => true,
+                            _ => false,
+                        }
+                    };
+                    match category {
+                        "items" => filled("description"),
+                        "containers" => {
+                            filled("container_number") || filled("seal_number") || filled("type_size")
+                        }
+                        _ => true,
+                    }
+                };
                 let mut added = 0usize;
                 let mut dup = 0usize;
+                let mut ghost = 0usize;
                 if let Some(existing) = slot.as_array_mut() {
                     let mut keys: Vec<String> = existing.iter().map(row_key).collect();
                     for e in arr {
+                        if !row_has_identity(e) {
+                            ghost += 1;
+                            continue;
+                        }
                         let k = row_key(e);
                         if k.is_empty() { continue; }
                         if keys.iter().any(|x| x == &k) { dup += 1; continue; }
@@ -9532,10 +9599,11 @@ fn merge_extracted(
                     }
                 }
                 emit(&format!(
-                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 (누적 {}건)",
+                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 | 정체 없는 행 {}건 폐기 (누적 {}건)",
                     category,
                     added,
                     dup,
+                    ghost,
                     merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
                 ));
             }
