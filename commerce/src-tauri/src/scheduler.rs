@@ -7654,7 +7654,7 @@ pub async fn process_task(
         for foreign_type in related_types {
             if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
                 for q in queries {
-                    match store.find_item_by_property(&q.table, &q.column, &q.value).await {
+                    match store.find_item_by_property("items", "index", &json!(foreign_index)).await {
                         Ok(Some((foreign_id, mut foreign_data))) => {
                             let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                             let mut needs_update = false;
@@ -7726,27 +7726,26 @@ pub async fn process_task(
                             }
                         },
                         Ok(None) => {
-                            // 🌟 [DEDUP FIX v5 / KEY-SCOPED]
-                            //    v4 는 `data LIKE '%값%'` 로만 좁혔습니다.
-                            //    값이 짧으면(index "18") 무관한 문서의 다른 키(`"quantity":118`)에 걸려
-                            //    "이미 있다" 고 오판하고 draft 생성을 건너뛰었습니다.
-                            //    그 결과 relay 대상 문서가 영원히 만들어지지 않는 경로가 존재했습니다.
-                            //    쿼리한 컬럼(q.column)까지 needle 에 포함시켜 오탐을 구조적으로 제거합니다.
+                            // ── ③ 상대 문서 조회 (인덱스 숫자 기반) ──
+                            //    🌟 [INDEX-BASED RELAY LOOKUP]
+                            //    commerce 의 릴레이가 `order.data.goods === goods.data.index` 로
+                            //    숫자 매칭하는 것과 동일하게,
+                            //    `data.index` = `foreign_index` 숫자로 조회합니다.
+                            //    기존 `doc_number` 문자열 LIKE 검색은:
+                            //      · 대소문자/하이픈 표기 흔들림에 취약
+                            //      · LIKE '%...%' 전체 스캔
+                            //      · 프론트엔드 Dexie 인덱스(.equals())와 타입 불일치
+                            //    였습니다.
+                            //    `find_item_by_property("items", "index", 숫자)` 는 내부에서
+                            //    `data LIKE '%"index":3029041598%'` 형태로 검색하며,
+                            //    상대 문서의 `data.index` 가 같은 숫자면 매칭됩니다.
                             let mut found_existing = false;
-                            let val_str_for_search = match &q.value {
-                                serde_json::Value::String(s) => s.clone(),
-                                serde_json::Value::Number(n) => n.to_string(),
-                                _ => q.value.to_string(),
-                            };
-                            if !val_str_for_search.is_empty() {
-                                // canonicalize_data 가 식별자류를 String 으로 확정했으므로 `"key":"값"` 형태입니다.
-                                let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
-                                let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
-                                    if !cross_results.is_empty() {
-                                        found_existing = true;
-                                        emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
-                                    }
+                            if let Ok(cross_results) = store.get_all_items("items", 1, 0,
+                                Some(format!("type = '{}' AND data LIKE '%\"index\":{}%'", foreign_type, foreign_index))
+                            ).await {
+                                if !cross_results.is_empty() {
+                                    found_existing = true;
+                                    emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (index={}). 새 draft 생성을 건너뜁니다.", foreign_type, foreign_index));
                                 }
                             }
 
@@ -8386,10 +8385,9 @@ pub async fn process_task(
                 for foreign_type in related_types {
                     if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
                         for q in queries {
-                            match store.find_item_by_property(&q.table, &q.column, &q.value).await {
+                            match store.find_item_by_property("items", "index", &json!(foreign_index)).await {
                                 Ok(Some((foreign_id, mut foreign_data))) => {
                                     let mut needs_update = false;
-
 
                                     if let Some(update) = &merge_rule.update {
                                         for field in &update.includes {
@@ -8433,7 +8431,6 @@ pub async fn process_task(
                                             }
                                         }
                                     }
-
 
                                     if needs_update {
                                         let merged_text = parsing::json_to_natural_language(&foreign_data);
@@ -10801,34 +10798,94 @@ async fn process_trading_task(
 
         // 🌟 rel_* 는 문자열로 저장합니다. (수치 통계 축 오염 차단)
         extracted_data.as_object_mut().unwrap()
-            .insert(foreign_col.clone(), json!(foreign_index.to_string()));
+            .insert(foreign_col.clone(), json!(foreign_index));
         emit_term(&format!(
             "  🔑 [TRADING INDEX] {}.{} = {} (근거 {}='{}' → 정규화 '{}')",
             doc_type, foreign_col, foreign_index, mine_field, ref_display, clean_ref
         ));
 
-        // ── ③ 상대 문서 조회 ──
-        //    index 는 canonicalize 가 String 으로 확정하므로 문자열로 질의합니다.
+        // ── ③ 상대 문서 조회 (타입 필터 포함) ──
+        //    commerce 릴레이가 인덱스 값으로 정확히 상대를 찾듯이,
+        //    trading 릴레이도 '상대의 타입 + 상대의 참조 필드' 로 조회해야 합니다.
+        //    find_item_by_property 는 타입 컬럼을 필터링하지 않으므로,
+        //    get_all_items 의 SQL 필터로 타입 + 참조 필드를 동시 조건으로 걸어야 합니다.
+        //
+        //    조회 우선순위:
+        //      1순위: 상대의 인덱스 값 (타입별 고유) + 타입 필터
+        //      2순위: 상대가 나를 가리키는 참조 필드 + 타입 필터
+        //      3순위: 상대의 doc_number + 타입 필터 (최후 폴백)
         let mut hit: Option<(String, Value)> = None;
-        if let Ok(Some(v)) = store
-            .find_item_by_property("items", "index", &json!(foreign_index.to_string()))
-            .await
+        // ── 1순위: 상대의 data.index 로 역참조 (KEY-SCOPED) ──
+        //    commerce 의 Relay("tracking","order") 가
+        //    data.order === order.data.index 로 O(log n) 조회하는 것과 동일한 원리.
+        //    find_item_by_property 가 이미 "property":"값" KEY-SCOPED prefilter 를 사용하므로
+        //    오탐 없이 1회 조회로 확정합니다.
+        //
+        //    ⚠️ 추가 개선: 타입 필터를 함께 걸어 다른 서식의 같은 값 충돌을 방지합니다.
         {
-            hit = Some(v);
+            let idx_filter = format!(
+                "type = '{}' AND data LIKE '%\"index\":{}%'",
+                foreign_type,
+                foreign_index
+            );
+            // 🌟 [INDEX PARITY] store.rs 의 canonicalize_data 가 index 를 Integer 로 확정하므로
+            //    "index":1234567890 형태로 매칭합니다. (문자열 "1234567890" 아님)
+            if let Ok(results) = store.get_all_items("items", 1, 0, Some(idx_filter)).await {
+                if let Some(doc) = results.into_iter().next() {
+                    if let Ok(data) = serde_json::from_str::<Value>(&doc.json_data) {
+                        hit = Some((doc.id, data));
+                        emit_term(&format!(
+                            "  🔍 [RELAY LOOKUP 1st] index={} 로 '{}' 문서 발견: '{}'",
+                            foreign_index, foreign_type, &hit.as_ref().unwrap().0
+                        ));
+                    }
+                }
+            }
         }
-        // 폴백은 '상대의 doc_number' 로만 합니다.
-        // v2 처럼 foreign_field(= 상대가 나를 가리키는 필드)로 조회하면
-        // 방금 만든 draft 를 자기가 다시 잡아 타입을 변조합니다.
+        // ── 2순위: 상대의 참조 필드로 역참조 (KEY-SCOPED via find_item_by_property) ──
+        //    find_item_by_property 는 내부에서
+        //    data LIKE '%"reference_invoice":"CI-2026-08001"%' 형태로
+        //    키까지 포함한 needle 을 사용하므로 오탐이 없습니다.
         if hit.is_none() {
-            if let Ok(Some(v)) = store
-                .find_item_by_property("items", "doc_number", &json!(ref_display.clone()))
-                .await
-            {
-                hit = Some(v);
+            if let Ok(Some((foreign_id, foreign_data))) = store.find_item_by_property("items", foreign_field, &json!(doc_number)).await {
+                // 🌟 [TYPE GUARD] 같은 참조 값을 다른 서식이 갖고 있을 수 있으므로 타입을 검증합니다.
+                let found_type = foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if found_type == foreign_type {
+                    hit = Some((foreign_id.clone(), foreign_data));
+                    emit_term(&format!(
+                        "  🔍 [RELAY LOOKUP 2nd] find_item_by_property('{}', '{}') 로 '{}' 문서 발견: '{}'",
+                        foreign_field, doc_number, foreign_type, &foreign_id
+                    ));
+                } else {
+                    emit_term(&format!(
+                        "  ⚠️ [RELAY TYPE GUARD] '{}' 필드 매칭 문서의 type='{}' 이 기대 '{}' 와 불일치하여 스킵.",
+                        foreign_field, found_type, foreign_type
+                    ));
+                }
+            }
+        }
+        // ── 3순위: 상대의 doc_number 로 역참조 (KEY-SCOPED via find_item_by_property) ──
+        if hit.is_none() {
+            if let Ok(Some((foreign_id, foreign_data))) = store.find_item_by_property("items", "doc_number", &json!(ref_display)).await {
+                let found_type = foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if found_type == foreign_type {
+                    hit = Some((foreign_id.clone(), foreign_data));
+                    emit_term(&format!(
+                        "  🔍 [RELAY LOOKUP 3rd] find_item_by_property('doc_number', '{}') 로 '{}' 문서 발견: '{}'",
+                        ref_display, foreign_type, &foreign_id
+                    ));
+                } else {
+                    emit_term(&format!(
+                        "  ⚠️ [RELAY TYPE GUARD] doc_number 매칭 문서의 type='{}' 이 기대 '{}' 와 불일치하여 스킵.",
+                        found_type, foreign_type
+                    ));
+                }
             }
         }
 
-        // 🌟 [TYPE GUARD] 찾은 문서의 타입이 기대와 다르면 절대 덮어쓰지 않습니다.
+        // 🌟 [TYPE GUARD v2] 모든 조회 경로에 타입 필터가 포함되었지만,
+        //    이중 방어막으로 한 번 더 검증합니다.
+        //    특히 3순위 폴백에서 doc_number가 우연히 일치하는 경우를 차단합니다.
         if let Some((fid, fdata)) = hit.clone() {
             let found_type = fdata.get("type")
                 .or_else(|| fdata.get("doc_type"))
@@ -10836,7 +10893,7 @@ async fn process_trading_task(
                 .unwrap_or("");
             if !found_type.is_empty() && found_type != foreign_type {
                 emit_term(&format!(
-                    "  🚫 [RELAY TYPE GUARD] '{}' 는 type='{}' 인데 '{}' 로 갱신하려 했습니다. 문서 변조를 막기 위해 이 릴레이를 폐기합니다.",
+                    "  🚫 [RELAY TYPE GUARD v2] '{}' 는 type='{}' 인데 '{}' 로 갱신하려 했습니다. 문서 변조를 막기 위해 이 릴레이를 폐기합니다.",
                     fid, found_type, foreign_type
                 ));
                 hit = None;
@@ -10853,8 +10910,14 @@ async fn process_trading_task(
 
                 {
                     let o = foreign_data.as_object_mut().unwrap();
-                    // 상대 문서에 내 index 를 꽂습니다. (양방향, 문자열)
-                    o.insert(mine_col.clone(), json!(index_val.to_string()));
+                    // 상대 문서에 내 index 를 꽂습니다. (양방향, 숫자)
+                    // 🌟 [TYPE CONSISTENCY] json!(index_val.to_string()) 은
+                    //    canonicalize_data 가 rel_* 를 Numeric 으로 확정하기 전에
+                    //    문자열 "12345" 로 들어갑니다. 결국 숫자로 변환되긴 하지만,
+                    //    같은 함수 안에서 내 문서 쪽은 json!(foreign_index) 로
+                    //    숫자로 넣고 있어 일관성이 없습니다.
+                    //    양쪽 모두 숫자로 통일합니다.
+                    o.insert(mine_col.clone(), json!(index_val));
                     // 🌟 문자열 참조는 '나를 가리키는 필드' 에 '내 doc_number' 를 넣습니다.
                     //    v2 는 여기에 clean_ref(= 상대 번호)를 넣어 방향이 뒤집혀 있었습니다.
                     o.insert(foreign_field.to_string(), json!(doc_number.clone()));
@@ -10887,32 +10950,51 @@ async fn process_trading_task(
                 ));
             },
             None => {
-                // 🌟 [DRAFT] 상대 문서가 아직 없으면 미리 만들어 둡니다.
+                // 🌟 [DRAFT v3] 상대 문서가 아직 없으면 미리 만들어 둡니다.
                 //    상대가 실제로 들어오면 같은 index 를 갖게 되어 자동으로 이어집니다.
+                //
+                //    ── v3 변경 사항 ──
+                //    1. doc_number 에 '상대의 고유 문서번호'가 아닌 빈 문자열을 넣습니다.
+                //       (상대 문서는 자기 자신의 문서번호를 갖습니다)
+                //    2. '나를 가리키는 참조 필드'에 '내 문서번호'를 넣습니다.
+                //       (예: PL draft의 reference_invoice = CI의 doc_number)
+                //    3. index 는 '상대 타입 + 참조값'으로 계산합니다.
+                //       (상대가 실제로 들어왔을 때 같은 index가 됩니다)
                 let draft_id = entity_id(&team_id, foreign_index);
                 let mut draft_data = json!({});
-                if let Some(o) = draft_data.as_object_mut() {
-                    o.insert("id".to_string(), json!(draft_id.clone()));
-                    o.insert("type".to_string(), json!(foreign_type));
-                    o.insert("doc_type".to_string(), json!(foreign_type));
-                    o.insert("index".to_string(), json!(foreign_index));
-                    // 🌟 draft 는 '상대 문서' 이므로 doc_number 에 상대 번호가 들어갑니다.
-                    o.insert("doc_number".to_string(), json!(ref_display.clone()));
-                    o.insert("no".to_string(), json!(ref_display.clone()));
-                    // 🌟 나를 가리키는 필드에는 '내 doc_number' 를 넣습니다.
-                    o.insert(foreign_field.to_string(), json!(doc_number.clone()));
-                    o.insert(mine_col.clone(), json!(index_val.to_string()));
-                    o.insert("updated_at".to_string(), json!(0));
-                    o.insert("mode".to_string(), json!("shipping"));
-                    o.insert("text".to_string(), json!(format!("{} {} {}", foreign_type, ref_display, doc_number)));
+                if let Some(obj) = draft_data.as_object_mut() {
+                    obj.insert("id".to_string(), json!(draft_id.clone()));
+                    obj.insert("type".to_string(), json!(foreign_type));
+                    obj.insert("index".to_string(), json!(foreign_index));
+                    // 🌟 [v3 FIX] doc_number 에 '상대의 고유 문서번호'가 아닌 빈 문자열을 넣습니다.
+                    //    상대 문서는 자기 자신의 문서번호를 갖습니다.
+                    //    기존 코드는 여기에 '참조값(=내 문서번호)'을 넣어서,
+                    //    자기 자신을 찾는 원인이 되었습니다.
+                    obj.insert("doc_number".to_string(), json!(""));
+                    obj.insert("no".to_string(), json!(""));
+                    // 🌟 나를 가리키는 필드에는 '내 문서번호'를 넣습니다.
+                    //    예: PL 문서의 reference_invoice = "CI-2026-08001"
+                    obj.insert(foreign_field.to_string(), json!(doc_number.clone()));
+                    // 🌟 [INDEX PARITY] 내 인덱스도 숫자로 역참조.
+                    //    commerce 의 order.data.tracking = tracking.data.index 패턴.
+                    //    기존 .to_string() 은 프론트엔드 Dexie 인덱스 매칭에서
+                    //    타입 불일치를 일으켰습니다.
+                    obj.insert(mine_col.clone(), json!(index_val));
+                    // 🌟 [INDEX PARITY] 상대의 인덱스도 숫자로.
+                    //    기존 .to_string() → 숫자로 변경.
+                    obj.insert(foreign_col.clone(), json!(foreign_index));
+                    obj.insert("updated_at".to_string(), json!(0));
+                    obj.insert("mode".to_string(), json!("shipping"));
+                    // 🌟 text 에도 참조 관계만 기록합니다.
+                    obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", foreign_type, foreign_field, doc_number)));
                 }
                 let foreign_bcc = entity_bcc(foreign_type, &cc_val);
                 save_item(&store, "items", &draft_id, foreign_type, draft_data, None,
                     &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
                 relay_drafted += 1;
                 emit_term(&format!(
-                    "  📝 [TRADING RELAY DRAFT] {} draft '{}' 생성 (doc_number='{}', {}='{}', index={}).",
-                    foreign_type, draft_id, ref_display, foreign_field, doc_number, foreign_index
+                    "  📝 [TRADING RELAY DRAFT v3] {} draft '{}' 생성 ({}='{}', index={}).",
+                    foreign_type, draft_id, foreign_field, doc_number, foreign_index
                 ));
             }
         }

@@ -1374,25 +1374,77 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
 ///   일관성을 위해 `normalized` 를 기준으로 인덱스와 id 를 계산합니다.
 pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
     let mut out: Vec<TradeRelayKey> = Vec::new();
+
+    // 🌟 [v3] doc_number를 "reference_invoice" 역할로 추가합니다.
+    //    기존에는 "self" 역할로 분류되어 자기 자신을 릴레이 대상으로 만들었습니다.
+    //    "reference_invoice" 역할은 '내 문서번호를 참조하는 문서'를 찾는 데 사용됩니다.
+    //    예: CI 문서를 참조하는 PL 문서의 reference_invoice = CI의 doc_number
+    if let Some(doc_num_raw) = data.get("doc_number")
+        .or_else(|| data.get("document_number"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+    {
+        if !is_printed_label_echo(&doc_num_raw) && crate::utils::hash::is_valid_relay_key(&doc_num_raw) {
+            let normalized = crate::utils::hash::normalize_identifier(&doc_num_raw);
+            let index = crate::utils::hash::relay_index(&normalized);
+            if index > 0 {
+                out.push(TradeRelayKey {
+                    role: "reference_invoice",
+                    source_field: "doc_number".to_string(),
+                    raw: doc_num_raw.clone(),
+                    normalized: normalized.clone(),
+                    index,
+                    id: crate::utils::hash::relay_id(&normalized),
+                });
+            }
+        }
+    }
+
+    // 🌟 [v3] reference_po도 역할로 추가합니다.
+    for ref_field in ["reference_po", "reference_lc", "reference_bl", "reference_booking", "reference_contract"] {
+        let raw = match find_relay_value(data, ref_field) { Some(r) => r, None => continue };
+        if is_printed_label_echo(&raw) { continue; }
+        if !crate::utils::hash::is_valid_relay_key(&raw) { continue; }
+        let normalized = crate::utils::hash::normalize_identifier(&raw);
+        let index = crate::utils::hash::relay_index(&normalized);
+        if index == 0 { continue; }
+        // role은 참조 필드명에서 "reference_" 접두를 제거한 것으로 매핑하지 않고,
+        // 참조 필드명을 그대로 역할로 사용합니다.
+        // 이렇게 하면 plan_trade_relays에서 역할별 타겟을 정확히 매핑할 수 있습니다.
+        let role = match ref_field {
+            "reference_po" => "order",
+            "reference_lc" => "credit",
+            "reference_bl" => "transport",
+            "reference_booking" => "booking",
+            "reference_contract" => "contract",
+            _ => continue,
+        };
+        if out.iter().any(|k| k.role == role && k.index == index) { continue; }
+        out.push(TradeRelayKey {
+            role,
+            source_field: ref_field.to_string(),
+            raw: raw.clone(),
+            normalized: normalized.clone(),
+            index,
+            id: crate::utils::hash::relay_id(&normalized),
+        });
+    }
+
+    // 🌟 [v3] 기존 TRADE_RELAY_FIELDS 순회도 유지하되,
+    //    "self" 역할이 이미 제거되었으므로 중복 생성되지 않습니다.
+    //    단, container_number 등 기존 역할은 그대로 유지합니다.
     for (role, fields) in TRADE_RELAY_FIELDS.iter() {
+        // "self" 역할은 더 이상 사용하지 않습니다 (위에서 "reference_invoice"으로 대체)
+        if *role == "self" { continue; }
         for f in fields.iter() {
             let raw = match find_relay_value(data, f) { Some(r) => r, None => continue };
-            
-            // 🌟 인쇄 라벨이 값 자리로 들어온 경우를 여기서 차단합니다.
             if is_printed_label_echo(&raw) { continue; }
-            
-            // 🌟 유효성 검증을 먼저 수행합니다.
-            //    is_valid_relay_key 가 내부에서 전각 접기를 수행하므로
-            //    여기서 한 번만 수행됩니다.
             if !crate::utils::hash::is_valid_relay_key(&raw) { continue; }
-            
             let normalized = crate::utils::hash::normalize_identifier(&raw);
-            
-            // 🌟 normalized 기준으로 인덱스와 id 를 계산하여 일관성 보장
             let index = crate::utils::hash::relay_index(&normalized);
             if index == 0 { continue; }
             if out.iter().any(|k| k.role == *role && k.index == index) { continue; }
-            
             out.push(TradeRelayKey {
                 role,
                 source_field: f.to_string(),
@@ -1423,15 +1475,35 @@ pub fn extract_trade_relay_keys(data: &Value) -> Vec<TradeRelayKey> {
 ///   여기서 `relay_index` 를 다시 호출하여 일관성을 보장합니다.
 pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value) -> (String, u32, bool) {
     let keys = extract_trade_relay_keys(data);
-    
-    // 1순위: 이 문서 자신의 번호
+
+    // 🌟 [DOC NUMBER DIRECT] extracted_data에서 doc_number를 직접 확인합니다.
+    //    extract_trade_relay_keys의 "self" 역할 매핑이 유효성 검사에서
+    //    떨어지는 경우(예: "26" 같은 부분 캡처)를 방지합니다.
+    //    2자 이상이면 문서번호로 인정합니다.
+    let direct_doc_number = data
+        .get("doc_number")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.chars().count() >= 2 && s != "null" && s != "N/A");
+
+    if let Some(dn) = &direct_doc_number {
+        let idx = crate::utils::hash::relay_index(dn);
+        if idx > 0 {
+            return (dn.clone(), idx, false);
+        }
+    }
+
+    // 1순위: 이 문서 자신의 번호 (기존 경로 유지)
     if let Some(k) = keys.iter().find(|k| k.role == "self") {
-        // 🌟 relay_index 를 다시 호출하여 일관성 보장
         let idx = crate::utils::hash::relay_index(&k.normalized);
         return (k.normalized.clone(), idx, false);
     }
-    
-    // 2순위: 운송증권 번호 (CI 에도 인쇄됩니다 — 이 서식의 93763111837)
+
+    // 2순위: 운송증권 번호
+    // 🌟 [TRANSPORT FALLBACK GUARD] transport 번호를 문서 식별자로 쓸 때
+    //    반드시 "서식코드:번호" 형식으로 합성합니다.
+    //    이렇게 해야 서로 다른 서식이 같은 운송번호를 공유해도
+    //    각각 다른 식별자를 갖게 됩니다.
     if let Some(k) = keys.iter().find(|k| k.role == "transport") {
         let composed = format!("{}:{}", doc_type, k.normalized);
         let idx = crate::utils::hash::relay_index(&composed);
@@ -1475,23 +1547,33 @@ pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value) -> (String, u32,
 pub fn plan_trade_relays(doc_type: &str, data: &Value) -> Vec<(&'static str, TradeRelayKey)> {
     let keys = extract_trade_relay_keys(data);
     let mut plan = Vec::new();
-    
     for k in keys.into_iter() {
-        // 🌟 역할별 타겟을 `logic.rs` 의 `related_trading` 허브와 일치시킵니다.
         let targets: &[&'static str] = match k.role {
-            // 같은 인보이스 번호를 인쇄하는 문서들
-            "self"      => &["PL", "CINV", "TI", "SOA", "DN", "CN"],
-            // 운송증권 번호를 공유하는 문서들.
-            // 🌟 [MISSING] CSI, BK, SR, WR, BE, IP, DN, CN, FC 추가
+            // 🌟 [v3 FIX] "self" 역할은 자기 자신의 문서번호입니다.
+            //    이 값으로 '상대 문서'를 찾는 것은 불가능합니다.
+            //    상대 문서는 '자기 자신의 고유한 문서번호'를 갖고 있으므로,
+            //    릴레이는 '상대가 나를 가리키는 참조 필드'로 조회해야 합니다.
+            //    "self" 역할은 더 이상 릴레이 대상을 생성하지 않습니다.
+            //    대신, 내 문서번호를 참조하는 문서들은
+            //    "transport", "booking", "order" 등 다른 역할로 연결됩니다.
+            //
+            //    예: CI → BL 은 BL 문서의 reference_invoice = CI의 doc_number 로 연결
+            //    예: CI → PL 은 PL 문서의 reference_invoice = CI의 doc_number 로 연결
+            "self"      => &[],  // 🌟 v3: self 역할은 릴레이 대상이 아닙니다.
             "transport" => &["BL", "HBL", "SWB", "AWB", "DO", "AN", "POD", "FCR", "ED", "ID", "CSI", "BK", "SR", "WR", "BE", "IP", "DN", "CN", "FC"],
-            "booking"   => &["BK", "SR", "BC"],
+            "booking"   => &["BK", "FI"],
             "order"     => &["PO", "PI", "SC"],
             "contract"  => &["SC", "PI", "CP"],
             "credit"    => &["LC", "LLC", "BE"],
             "container" => &["PL", "BL", "DO", "CM"],
+            // 🌟 [v3 추가] "reference_invoice" 역할:
+            //    내 문서번호를 참조하는 문서들을 연결합니다.
+            //    예: CI 문서를 참조하는 PL, CINV, TI, SOA, DN, CN
+            "reference_invoice" => &["PL", "CINV", "TI", "SOA", "DN", "CN"],
+            "reference_po"      => &["PO", "PI", "SC"],
+            "reference_lc"      => &["LC", "LLC"],
             _ => &[],
         };
-        
         for t in targets.iter() {
             if *t == doc_type { continue; }
             plan.push((*t, k.clone()));

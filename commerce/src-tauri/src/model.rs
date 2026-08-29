@@ -1453,6 +1453,12 @@ impl LogisModel {
             let mut grounding_claims:
                 Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
 
+            // 🌟 [SCOPE FIX] relay_plan 은 if is_trade_doc 블록 내부에서 할당되고,
+            //    블록 외부(STEP 6 이후 저장 구간)에서 참조되므로
+            //    양쪽 분기보다 바깥에서 미리 선언해야 합니다.
+            //    (커머스 경로에서는 빈 Vec 으로 남아 요약 출력이 자동 억제됩니다)
+            let mut relay_plan: Vec<(&'static str, crate::parsing::TradeRelayKey)> = Vec::new();
+
             // 🌟 [MODE REROUTE] mode="commerce" 로 들어왔더라도,
             //    상단 밴드에 무역 서식 전문이 인쇄되어 TITLE GATE 가 확정한 경우에만
             //    trading 파이프라인으로 전환합니다.
@@ -2222,19 +2228,18 @@ impl LogisModel {
 
                 // 🌟 relay_plan 을 if is_trade_doc 블록 외부에서 선언하여
                 //    블록 내부와 외부 모두에서 접근 가능하게 합니다.
-                let mut relay_plan: Vec<(&'static str, crate::parsing::TradeRelayKey)> = Vec::new();
+                
 
                 if is_trade_doc {
                     // 🌟 [RELAY v4] parsing.rs 의 plan_trade_relays 를 사용합니다.
                     //    기존은 logic.rs 의 trade_relay_rules 가 하드코딩한
-                    //    (target_type, target_field, source_field) 튜플을 순회했는데,
+                    //    (target, target_field, source_field) 튜플을 순회했는데,
                     //    필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
                     //    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
                     //
                     //    plan_trade_relays 는 extract_trade_relay_keys 가 확정한
                     //    역할별 키를 기반으로 릴레이 대상을 계산합니다.
                     //    역할이 같으면 서식 코드가 달라도 연결됩니다.
-
                     relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data);
                     if relay_plan.is_empty() {
                         emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");
@@ -2258,31 +2263,21 @@ impl LogisModel {
                             .trim()
                             .to_string();
                         if link_value.is_empty() || link_value == "N/A" {
-                            // 🌟 [RELAY STARVATION LOG] 침묵 스킵이면 원인을 못 봅니다.
-                            //    어떤 규칙이 어떤 빈 키 때문에 굶었는지 집계합니다.
                             relay_starved.push(format!("{}←{}(빈 키)", target_type, source_field));
                             continue;
                         }
-
                         emit_term(&format!(
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
                             doc_type, target_type, target_field, link_value
                         ));
-
-                        // 🌟 [RELAY v4 SEARCH] 대상 문서를 검색합니다.
-                        //    기존은 `data LIKE '%key:value%'` 였는데,
-                        //    값이 짧으면 무관한 문서의 다른 키에 걸려 오탐이 발생했습니다.
-                        //    v4 는 find_item_by_property v5 의 KEY-SCOPED PREFILTER 를 재사용합니다.
                         let relay_result = db.find_item_by_property("items", target_field, &json!(link_value)).await;
                         match relay_result {
                             Ok(Some((existing_id, mut ej))) => {
                                 let mut needs_update = false;
-                                
                                 // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
                                 //    역할 기반으로 역참조 필드명을 결정합니다.
                                 let reverse_field = crate::logic::trade_reference_field_of(&doc_type)
                                     .unwrap_or("");
-                                
                                 if !reverse_field.is_empty() {
                                     if let Some(my_doc_number) = extracted_data.get("doc_number").and_then(|v| v.as_str()) {
                                         if !my_doc_number.is_empty() && my_doc_number != "N/A" {
@@ -2294,7 +2289,6 @@ impl LogisModel {
                                         }
                                     }
                                 }
-                                
                                 // 🌟 [RELAY INDEX CROSS-LINK] relay_index 를 타겟 문서의 봉투에 주입합니다.
                                 //    이렇게 하면 두 문서가 같은 릴레이 축에서 서로를 찾을 수 있습니다.
                                 let my_relay_idx = if crate::utils::hash::is_valid_relay_key(raw_no) {
@@ -2302,7 +2296,6 @@ impl LogisModel {
                                 } else {
                                     0
                                 };
-                                
                                 if my_relay_idx > 0 {
                                     let relay_col = crate::logic::trading_index_column(&doc_type);
                                     let their_relay = ej.get(&relay_col).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2311,7 +2304,6 @@ impl LogisModel {
                                         needs_update = true;
                                     }
                                 }
-                                
                                 // 물류 정보 상호 보완 (vessel, pol, pod, etd, eta)
                                 for field in ["vessel", "voyage_number", "pol", "pod", "etd", "eta"] {
                                     let my_val = extracted_data.get("logistics")
@@ -2319,7 +2311,6 @@ impl LogisModel {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     if my_val.is_empty() || my_val == "N/A" { continue; }
-                                    
                                     let their_val = ej.get("logistics")
                                         .and_then(|l| l.get(field))
                                         .and_then(|v| v.as_str())
@@ -2331,7 +2322,6 @@ impl LogisModel {
                                         }
                                     }
                                 }
-                                
                                 // 화물 정보 상호 보완 (container_number, seal_number)
                                 for field in ["container_number", "seal_number"] {
                                     let my_val = extracted_data.get("containers")
@@ -2341,12 +2331,10 @@ impl LogisModel {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     if my_val.is_empty() || my_val == "N/A" { continue; }
-                                    
                                     let their_containers = ej.get("containers").and_then(|c| c.as_array());
                                     let their_has = their_containers.map_or(false, |arr| {
                                         arr.iter().any(|c| c.get(field).and_then(|v| v.as_str()).map_or(false, |v| v == my_val))
                                     });
-                                    
                                     if !their_has {
                                         if let Some(containers_arr) = ej.get_mut("containers").and_then(|c| c.as_array_mut()) {
                                             if containers_arr.is_empty() {
@@ -2362,13 +2350,11 @@ impl LogisModel {
                                         }
                                     }
                                 }
-                                
                                 if needs_update {
                                     ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                                     let merged_text = crate::parsing::json_to_natural_language(&ej);
                                     ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                     ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                    
                                     let _ = db.upsert_item(
                                         "items", &existing_id, target_type, ej, None,
                                         None,
@@ -2392,7 +2378,6 @@ impl LogisModel {
                                 } else {
                                     crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
                                 };
-                                
                                 let mut draft_data = json!({});
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
@@ -2403,7 +2388,6 @@ impl LogisModel {
                                     obj.insert("mode".to_string(), json!("shipping"));
                                     obj.insert("text".to_string(), json!(format!("{} {}", target_type, link_value)));
                                 }
-                                
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
                                     None,
@@ -2411,7 +2395,6 @@ impl LogisModel {
                                     Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
                                     Some(&ref_val), None
                                 ).await;
-                                
                                 emit_term(&format!(
                                     "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
                                     target_type, draft_id, target_field, link_value

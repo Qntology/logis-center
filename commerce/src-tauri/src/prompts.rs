@@ -456,6 +456,306 @@ fn extract_example_tokens(desc: &str) -> Vec<String> {
     out
 }
 
+/// 🌟 [DOC-SPECIFIC IDENTITY RULES] doc_type 이 확정된 상태에서
+///    이 서식에 실제로 인쇄되는 라벨과 참조 축만 알려줍니다.
+///
+///  ── 왜 범용 접두어 매칭을 버리는가 ──
+///   45종 × 7개 접두어 = 315개 조합을 매번 나열하면
+///   2B 모델의 주의력이 분산되어 순수 숫자("93763111837")가
+///   reference_bl 로 흘러가는 사고가 발생합니다.
+///   이 서식에 실제로 있는 라벨만 알려주면 물리적으로 오배정이 불가능합니다.
+///
+///  ── 반환 형식 ──
+///   (doc_number 라벨 목록, [(필드명, 인쇄 라벨 목록)], 자기참조 필드명)
+fn trade_doc_identity_context(doc_type: &str) -> (Vec<&'static str>, Vec<(&'static str, Vec<&'static str>)>, &'static str) {
+    // 자기참조 필드 (이 서식이 절대 참조하지 않는 축)
+    let self_ref = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
+
+    // 이 서식의 doc_number 에 붙는 실제 인쇄 라벨
+    let doc_labels: Vec<&'static str> = match doc_type {
+        "CI"       => vec!["INVOICE NUMBER", "Invoice No.", "INV NO.", "COMMERCIAL INVOICE NO"],
+        "CINV"     => vec!["CUSTOMS INVOICE NO", "INVOICE NO."],
+        "CSI"      => vec!["CONSULAR INVOICE NO", "INVOICE NO."],
+        "TI"       => vec!["TAX INVOICE NO", "세금계산서 번호"],
+        "FI"       => vec!["FREIGHT INVOICE NO", "INVOICE NO."],
+        "PL"       => vec!["PACKING LIST NO.", "P/L NO.", "PACKING LIST NUMBER"],
+        "BL"       => vec!["B/L NO.", "BILL OF LADING NO.", "B/L NUMBER", "OCEAN B/L NO."],
+        "HBL"      => vec!["HOUSE B/L NO.", "HBL NO.", "HOUSE BILL OF LADING NO."],
+        "SWB"      => vec!["SEA WAYBILL NO.", "WAYBILL NO.", "SWB NO."],
+        "AWB"      => vec!["AIR WAYBILL NO.", "AWB NO.", "AIRWAYBILL NUMBER"],
+        "PO"       => vec!["P/O NO.", "PURCHASE ORDER NO.", "ORDER NO.", "PO NUMBER"],
+        "PI"       => vec!["PROFORMA INVOICE NO.", "PI NO.", "PROFORMA NO."],
+        "SC"       => vec!["CONTRACT NO.", "SALES CONTRACT NO.", "S/C NO."],
+        "LC"       => vec!["L/C NO.", "LETTER OF CREDIT NO.", "CREDIT NO.", "DOCUMENTARY CREDIT NO."],
+        "LLC"      => vec!["LOCAL L/C NO.", "LOCAL LETTER OF CREDIT NO."],
+        "CP"       => vec!["CONFIRMATION NO.", "PURCHASE CONFIRMATION NO."],
+        "BE"       => vec!["DRAFT NO.", "BILL OF EXCHANGE NO.", "EXCHANGE NO."],
+        "TR"       => vec!["TRUST RECEIPT NO.", "TR NO."],
+        "LG"       => vec!["GUARANTEE NO.", "LETTER OF GUARANTEE NO.", "L/G NO."],
+        "EL"       => vec!["LICENSE NO.", "EXPORT LICENSE NO.", "LICENCE NO."],
+        "SA"       => vec!["ADVICE NO.", "SHIPPING ADVICE NO."],
+        "DO"       => vec!["DELIVERY ORDER NO.", "D/O NO."],
+        "AN"       => vec!["NOTICE NO.", "ARRIVAL NOTICE NO."],
+        "BC" | "BK"=> vec!["BOOKING NO.", "BOOKING CONFIRMATION NO.", "BKG NO."],
+        "SR"       => vec!["SHIPPING REQUEST NO.", "S/R NO."],
+        "FCR"      => vec!["FCR NO.", "FORWARDER CERTIFICATE OF RECEIPT NO."],
+        "POD"      => vec!["POD NO.", "PROOF OF DELIVERY NO."],
+        "CM"       => vec!["MANIFEST NO.", "CARGO MANIFEST NO."],
+        "WR"       => vec!["WAREHOUSE RECEIPT NO.", "W/R NO."],
+        "ED"       => vec!["DECLARATION NO.", "EXPORT DECLARATION NO."],
+        "ID"       => vec!["DECLARATION NO.", "IMPORT DECLARATION NO."],
+        "CO"       => vec!["CERTIFICATE NO.", "CERTIFICATE OF ORIGIN NO."],
+        "CNM"      => vec!["CERTIFICATE NO.", "NON-MANIPULATION CERTIFICATE NO."],
+        "CCC"      => vec!["CERTIFICATE NO.", "CUSTOMS CLEARANCE CERTIFICATE NO."],
+        "IC"       => vec!["CERTIFICATE NO.", "INSPECTION CERTIFICATE NO."],
+        "COA" | "CA" => vec!["CERTIFICATE NO.", "CERTIFICATE OF ANALYSIS NO."],
+        "WC"       => vec!["CERTIFICATE NO.", "WEIGHT CERTIFICATE NO."],
+        "PHYTO" | "PC" => vec!["CERTIFICATE NO.", "PHYTOSANITARY CERTIFICATE NO."],
+        "FC"       => vec!["CERTIFICATE NO.", "FUMIGATION CERTIFICATE NO."],
+        "HC"       => vec!["CERTIFICATE NO.", "HEALTH CERTIFICATE NO."],
+        "BEN_CERT" => vec!["CERTIFICATE NO.", "BENEFICIARY CERTIFICATE NO."],
+        "CDR"      => vec!["REPORT NO.", "SURVEY REPORT NO."],
+        "DGD"      => vec!["DECLARATION NO.", "DANGEROUS GOODS DECLARATION NO."],
+        "MSDS"     => vec!["MSDS NO.", "SDS NO."],
+        "POA"      => vec!["POWER OF ATTORNEY NO.", "POA NO."],
+        "BIZ_LIC"  => vec!["LICENSE NO.", "BUSINESS LICENSE NO.", "REGISTRATION NO."],
+        "INS" | "IP" => vec!["POLICY NO.", "INSURANCE POLICY NO."],
+        "ICF"      => vec!["CLAIM NO.", "INSURANCE CLAIM NO."],
+        "SOA"      => vec!["STATEMENT NO.", "STATEMENT OF ACCOUNT NO."],
+        "DN"       => vec!["DEBIT NOTE NO.", "D/N NO."],
+        "CN"       => vec!["CREDIT NOTE NO.", "C/N NO."],
+        _          => vec!["DOCUMENT NO.", "NO.", "NUMBER"],
+    };
+
+    // 이 서식에 실제로 인쇄되는 참조 축과 그 인쇄 라벨
+    // (자기참조 필드는 제외 — 이미 위에서 파악)
+    let mut refs: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+
+    let mut try_add = |field: &'static str, labels: Vec<&'static str>| {
+        if field == self_ref { return; }
+        refs.push((field, labels));
+    };
+
+    match doc_type {
+        "CI" => {
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO.", "PURCHASE ORDER NO.", "YOUR ORDER"]);
+            try_add("reference_bl", vec!["B/L NO.", "AIRWAYBILL / BILL OF LADING", "BILL OF LADING NO."]);
+            try_add("reference_lc", vec!["L/C NO.", "LETTER OF CREDIT NO.", "CREDIT NO."]);
+        },
+        "CINV" | "CSI" => {
+            try_add("reference_invoice", vec!["INVOICE NO.", "COMMERCIAL INVOICE NO."]);
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "PL" => {
+            try_add("reference_invoice", vec!["INVOICE NO.", "INV NO."]);
+            try_add("reference_bl", vec!["B/L NO.", "BILL OF LADING NO."]);
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+        },
+        "BL" => {
+            try_add("reference_invoice", vec!["INVOICE NO.", "COMMERCIAL INVOICE NO."]);
+            try_add("reference_booking", vec!["BOOKING NO.", "BKG NO."]);
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+            try_add("reference_lc", vec!["L/C NO."]);
+        },
+        "HBL" => {
+            try_add("reference_master_bl", vec!["MASTER B/L NO.", "MBL NO.", "OCEAN B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_booking", vec!["BOOKING NO."]);
+        },
+        "SWB" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_lc", vec!["L/C NO."]);
+        },
+        "AWB" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+            try_add("reference_lc", vec!["L/C NO."]);
+        },
+        "PO" => {
+            try_add("reference_lc", vec!["L/C NO.", "LETTER OF CREDIT NO."]);
+            try_add("reference_proforma", vec!["PROFORMA INVOICE NO.", "PI NO."]);
+        },
+        "PI" => {
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+        },
+        "SC" => {
+            try_add("reference_proforma", vec!["PROFORMA INVOICE NO.", "PI NO."]);
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+        },
+        "LC" => {
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO.", "PURCHASE ORDER NO."]);
+        },
+        "LLC" => {
+            try_add("reference_lc", vec!["MASTER L/C NO.", "L/C NO."]);
+            try_add("reference_purchase_confirm", vec!["CONFIRMATION NO.", "CP NO."]);
+        },
+        "CP" => {
+            try_add("reference_export_decl", vec!["EXPORT DECLARATION NO.", "ED NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+        },
+        "BE" => {
+            try_add("reference_lc", vec!["L/C NO.", "DRAWN UNDER L/C NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "TR" => {
+            try_add("reference_lg", vec!["GUARANTEE NO.", "L/G NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "LG" => {
+            try_add("reference_bl", vec!["B/L NO.", "ORIGINAL B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "EL" => {
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+            try_add("reference_contract", vec!["CONTRACT NO.", "S/C NO."]);
+        },
+        "SA" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "DO" => {
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_arrival_notice", vec!["ARRIVAL NOTICE NO.", "A/N NO."]);
+        },
+        "AN" => {
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "BC" | "BK" => {
+            try_add("reference_sr", vec!["SHIPPING REQUEST NO.", "S/R NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+        },
+        "SR" => {
+            try_add("reference_booking", vec!["BOOKING NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+        },
+        "FCR" => {
+            try_add("reference_hbl", vec!["HOUSE B/L NO.", "HBL NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "POD" => {
+            try_add("reference_do", vec!["DELIVERY ORDER NO.", "D/O NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "CM" => {
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_export_decl", vec!["EXPORT DECLARATION NO."]);
+        },
+        "WR" => {
+            try_add("reference_do", vec!["DELIVERY ORDER NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+        },
+        "FI" => {
+            try_add("reference_booking", vec!["BOOKING NO.", "BKG NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "ED" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+            try_add("reference_lc", vec!["L/C NO."]);
+        },
+        "ID" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_origin", vec!["CERTIFICATE OF ORIGIN NO.", "C/O NO."]);
+        },
+        "CO" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "CNM" => {
+            try_add("reference_origin", vec!["CERTIFICATE OF ORIGIN NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "CCC" => {
+            try_add("reference_import_decl", vec!["IMPORT DECLARATION NO."]);
+            try_add("reference_origin", vec!["CERTIFICATE OF ORIGIN NO."]);
+        },
+        "IC" => {
+            try_add("reference_po", vec!["P/O NO.", "ORDER NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "COA" | "CA" => {
+            try_add("reference_po", vec!["P/O NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_inspection", vec!["INSPECTION CERTIFICATE NO.", "IC NO."]);
+        },
+        "WC" => {
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "PHYTO" | "PC" => {
+            try_add("reference_fumigation", vec!["FUMIGATION CERTIFICATE NO.", "FC NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "FC" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "HC" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "BEN_CERT" => {
+            try_add("reference_lc", vec!["L/C NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "CDR" => {
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_policy", vec!["INSURANCE POLICY NO.", "POLICY NO."]);
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "DGD" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "MSDS" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "POA" => {
+            try_add("reference_biz_license", vec!["BUSINESS LICENSE NO."]);
+        },
+        "BIZ_LIC" => {},
+        "INS" | "IP" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "ICF" => {
+            try_add("reference_policy", vec!["INSURANCE POLICY NO.", "POLICY NO."]);
+            try_add("reference_survey", vec!["SURVEY REPORT NO.", "CDR NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "SOA" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_debit_note", vec!["DEBIT NOTE NO.", "D/N NO."]);
+            try_add("reference_credit_note", vec!["CREDIT NOTE NO.", "C/N NO."]);
+        },
+        "DN" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+        },
+        "CN" => {
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+        },
+        "TI" => {
+            try_add("reference_purchase_confirm", vec!["CONFIRMATION NO.", "CP NO."]);
+            try_add("reference_local_lc", vec!["LOCAL L/C NO."]);
+        },
+        _ => {
+            // 폴백: 범용 참조 라벨
+            try_add("reference_invoice", vec!["INVOICE NO."]);
+            try_add("reference_bl", vec!["B/L NO."]);
+            try_add("reference_po", vec!["P/O NO."]);
+        },
+    }
+
+    (doc_labels, refs, self_ref)
+}
+
 pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     use serde_json::Value;
 
@@ -695,21 +995,74 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     //    문서 자신의 번호는 제목 바로 아래 식별 블록에 인쇄된다는 레이아웃 사실은
     //    run_title_gate 가 상단 30% 를 제목 밴드로 보는 것과 같은 근거입니다.
     let reference_rule = if category == "header" {
+        let (doc_labels, refs, self_ref) = trade_doc_identity_context(doc_type);
+
+        // ── doc_number 라벨 목록 ──
+        let doc_label_str = doc_labels.join(" / ");
+
+        // ── 이 서식에 실제로 있는 참조 축과 그 인쇄 라벨 ──
+        let mut ref_lines = String::new();
+        for (field, labels) in refs.iter() {
+            let label_str = labels.join(" / ");
+            ref_lines.push_str(&format!(
+                "   - \"{}\" — printed under label: {}\n",
+                field, label_str
+            ));
+        }
+        if ref_lines.is_empty() {
+            ref_lines.push_str(
+                "   - (This document type has no reference_* fields. Omit all reference_* keys.)\n",
+            );
+        }
+
+        // ── 자기참조 경고 ──
+        let self_ref_warning = if self_ref.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "   - WARNING: \"{}\" is THIS document's own number. It is NEVER printed on this page as a reference. \
+    If you see a number that looks like this document's own ID, it belongs in \"doc_number\", NOT in \"{}\".\n",
+                self_ref, self_ref
+            )
+        };
+
         format!(
-            "\nIDENTITY RULE (read this before anything else):\n\
-             0. This page is a {doc}. \"doc_number\" is the number printed in the identity block at the TOP of the page, \
-             directly under or beside the printed document title. Read that block first and fill \"doc_number\" before any other field. \
-             A {doc} never references itself, so its own number is NEVER a reference_* value.\n\
-             \nREFERENCE RULES:\n\
-             1. \"doc_number\" is the identifier OF THIS DOCUMENT ITSELF. Never put another document's number there.\n\
-             2. A number printed under a label such as 'Ref', 'Our Ref', 'Your Ref', 'Against', 'Covering', 'Relating to', \
-             'P/O No', 'Invoice No', 'B/L No', 'L/C No', 'Booking No', 'Contract No' belongs to the matching reference_* field, NOT to doc_number.\n\
-             3. Copy each reference number EXACTLY as printed, including its prefix and hyphens. Never re-type it from memory.\n\
-             4. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".\n\
-             5. Omit any reference_* field that is not printed. An omitted field is correct data; a guessed one corrupts the document graph.\n\
-             6. A caption printed on the page (for example text ending in 'NUMBER', 'NO.', 'REFERENCE', 'VAT/EORI', 'DATE') is a LABEL. \
-             Return the value printed next to it, never the label text itself.",
-            doc = doc_type
+            "
+        IDENTITY RULE (read this before anything else):
+        \
+        0. This page is a {doc}. \"doc_number\" is the number printed in the identity block at the TOP of the page, \
+        directly under or beside the printed document title. Read that block first and fill \"doc_number\" before any other field. \
+        The label for doc_number on THIS document is: {doc_labels}.
+        \
+        1. \"doc_number\" MUST contain the FULL number including its prefix. \
+        Copy it character-for-character. Never strip the prefix, never drop hyphens, never re-type from memory.
+        \
+        REFERENCE RULES (only these reference fields exist on THIS document type):
+        \
+        {ref_lines}\
+        {self_ref_warning}\
+        2. Any number printed NEXT TO or BELOW a reference label belongs to the matching reference_* field, NOT to doc_number. \
+        The reference labels available on this document are listed above. Use ONLY those.
+        \
+        3. Match the reference number to the CORRECT field by the LABEL printed above or beside it. \
+        If the label is not listed above, use \"reference_number\". \
+        NEVER guess a reference_* field from the number's prefix alone — use the printed LABEL.
+        \
+        4. Copy each reference number EXACTLY as printed, including its prefix and hyphens. Never re-type it from memory.
+        \
+        5. Never copy the same number into two different fields. If unsure which reference_* field fits, use \"reference_number\".
+        \
+        6. Omit any reference_* field that is not printed on this page. An omitted field is correct data; a guessed one corrupts the document graph.
+        \
+        7. A caption or heading printed on the page is a LABEL, not a value. \
+        Return the value printed NEXT TO it, never the label text itself.
+        \
+        8. Pure digit strings with no alphabetic prefix are NOT reference numbers unless they appear \
+        directly under one of the reference labels listed above. Match them to the label they are printed under.",
+            doc = doc_type,
+            doc_labels = doc_label_str,
+            ref_lines = ref_lines,
+            self_ref_warning = self_ref_warning,
         )
     } else {
         String::new()
