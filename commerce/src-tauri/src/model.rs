@@ -2026,7 +2026,7 @@ impl LogisModel {
                     //    doc_number = "" → task_id 폴백 → 재스캔마다 다른 index 가 되어
                     //    같은 문서가 누적되었습니다.
                     let (resolved_no, _resolved_idx, _is_fallback) =
-                        crate::parsing::resolve_trade_doc_identity(&doc_type, &extracted_data);
+                        crate::parsing::resolve_trade_doc_identity(&doc_type, &extracted_data, &language);
                     
                     emit_term(&format!(
                         "  🔑 [DOC IDENTITY] resolve_trade_doc_identity 결과: '{}' (폴백: {})",
@@ -2255,7 +2255,7 @@ impl LogisModel {
                     //    plan_trade_relays 는 extract_trade_relay_keys 가 확정한
                     //    역할별 키를 기반으로 릴레이 대상을 계산합니다.
                     //    역할이 같으면 서식 코드가 달라도 연결됩니다.
-                    relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data);
+                    relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data, &language);
                     if relay_plan.is_empty() {
                         emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");
                     } else {
@@ -4016,7 +4016,7 @@ impl LogisModel {
                 let _ = app_handle.emit("extraction-progress", &payload);
                 crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
-                let mut current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 
                 // 🌟 [2차 분기] 세부 속성 매칭: 해당 도메인 타입의 Schema Field(Property Bias/Prej) 로드
@@ -5616,7 +5616,7 @@ impl LogisModel {
                                 let mut best_cmp_score = f32::MIN;
                                 // 구 단위 Max-Pool 경로
                                 let mut cmp_pool_score = 0.0f32;
-                                let mut cmp_pool_key = String::new();
+                                let cmp_pool_key = String::new();
                                 if !op_phrase_embs.is_empty() {
                                     let mut rank_pool = 0.0f32;
                                     for (oi, oe) in op_phrase_embs.iter().enumerate() {
