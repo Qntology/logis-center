@@ -918,7 +918,6 @@ impl LogisModel {
                 }
             }
         }
-
         let needs_load = {
             let guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_ref() {
@@ -928,10 +927,8 @@ impl LogisModel {
                 true
             }
         };
-
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
-            
             // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
             // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
             let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
@@ -961,32 +958,51 @@ impl LogisModel {
                 // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
                 self.deep_purge_resources().await;
             }
-            
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
                 *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
             }
-            
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
-            
-            let gen = tokio::task::spawn_blocking(move || {
-                let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
-                let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
-                
-                // 🌟 [수정]
-                let mmproj_gguf = if needs_vision {
-                    gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
-                } else {
-                    None
-                };
-                
-                Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
-            }).await??;
-            
+            // 🌟 [TIMEOUT ADD] 180초 타임아웃으로 무한 로딩 방지
+            let load_result = tokio::time::timeout(
+                std::time::Duration::from_secs(180),
+                tokio::task::spawn_blocking(move || {
+                    let gguf_files = crate::utils::find_type_files(&path, "gguf").unwrap_or_default();
+                    let model_gguf = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned().ok_or_else(|| anyhow::anyhow!("No model GGUF found"))?;
+                    let mmproj_gguf = if needs_vision {
+                        gguf_files.iter().find(|f| f.contains("mmproj")).cloned()
+                    } else {
+                        None
+                    };
+                    Qwen3_5GenerateModel::init_from_gguf(&model_gguf, mmproj_gguf.as_deref(), Some(&dev))
+                })
+            ).await;
+            let gen = match load_result {
+                Ok(Ok(Ok(g))) => g,
+                Ok(Ok(Err(e))) => {
+                    // 로드 실패 시 현재 사이즈 등록을 되돌리고 에러 전파
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 GGUF load failed: {}", e));
+                },
+                Ok(Err(join_err)) => {
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 load task join error: {}", join_err));
+                },
+                Err(_) => {
+                    // 타임아웃
+                    {
+                        *self.current_size.lock().await = None;
+                    }
+                    return Err(anyhow::anyhow!("Qwen 3.5 load timeout (180s). GPU may be out of memory or driver stalled."));
+                }
+            };
             let mut q35_gen_guard = self.qwen3_5_generator.lock().await;
             *q35_gen_guard = Some(gen);
-            
             // 🌟 [CRITICAL FIX] 시스템 장부에 Qwen3.5가 켜졌음을 명시하여 스냅샷 미아 발생 방지!
             let mut current_size_guard = self.current_size.lock().await;
             *current_size_guard = Some(ModelSize::Qwen3_5);
@@ -1216,6 +1232,12 @@ impl LogisModel {
             // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
             println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
+
+            // 🌟 [VRAM SETTLE AFTER RELEASE] SigLIP2 해제 후 실제 여유 메모리 확인
+            if let Some(token) = None::<Arc<AtomicBool>> {
+                let _ = token;
+            }
+            let _ = self.wait_for_vram_settle(1200, 10, None).await;
         }
         #[cfg(target_os = "windows")]
         unsafe {
@@ -1370,12 +1392,22 @@ impl LogisModel {
         // 🌟 SigLIP2 비전 인코더 + 텍스트 인코더 로드
         self.check_siglip2_downloaded().await?;
         self.ensure_siglip2(true).await?;
+
+        // 🌟 [VRAM SETTLE BEFORE QWEN3.5] SigLIP2 로드 후 실제 여유 메모리 확인
+        if !self.is_cpu_mode {
+            self.wait_for_vram_settle(1200, 10, cancel_token.clone()).await.ok();
+        }
+
+        // 🌟 [QWEN3.5 VISION PRELOAD] 이미지 추출에서는 2B 비전 모델이 반드시 필요합니다.
+        //    STEP 5 에서 동적으로 로드하면 시점이 불명확해지므로,
+        //    여기서 명시적으로 로드하여 이후 행동을 결정론적으로 만듭니다.
+        self.ensure_qwen3_5(true).await?;
+
         // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
         //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
         //    SigLIP2(~2.2GB) + Qwen3.5(~2GB) 동시 상주를 피합니다.
         //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
         //    ensure_qwen3_5 가 필요 시점에 자동 로드합니다.
-
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
 
