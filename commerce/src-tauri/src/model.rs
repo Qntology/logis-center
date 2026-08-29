@@ -2288,6 +2288,60 @@ impl LogisModel {
                         let relay_result = db.find_item_by_property("items", target_field, &json!(link_value)).await;
                         match relay_result {
                             Ok(Some((existing_id, mut ej))) => {
+                                // 🌟 [SELF-SEARCH GUARD] 방금 저장한 자기 자신을 검색에서 찾은 경우
+                                //    릴레이 대상이 될 수 없습니다. 자기 자신과의 릴레이는 무의미합니다.
+                                if existing_id == hashed_id {
+                                    emit_term(&format!(
+                                        "  🚫 [RELAY SELF-SKIP] 검색 결과 '{}' 가 자기 자신입니다. 릴레이를 건너뜁니다.",
+                                        existing_id
+                                    ));
+                                    continue;
+                                }
+                                // 🌟 [TYPE GUARD] 검색된 문서의 타입이 목표 타입과 일치해야 합니다.
+                                //    다른 타입의 문서가 같은 참조 값을 가질 수 있으므로,
+                                //    타입 불일치 시 이 결과를 무시하고 draft 경로로 가야 합니다.
+                                let found_type = ej.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if !found_type.is_empty() && found_type != *target_type {
+                                    emit_term(&format!(
+                                        "  🚫 [RELAY TYPE MISMATCH] 검색된 문서 '{}' 의 type='{}' 이 목표 '{}' 와 불일치. 무시합니다.",
+                                        existing_id, found_type, target_type
+                                    ));
+                                    // 타입 불일치 시 draft 생성 경로로 폴백합니다.
+                                    let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
+                                        crate::utils::hash::relay_id(&link_value)
+                                    } else {
+                                        crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
+                                    };
+                                    let mut draft_data = json!({});
+                                    if let Some(obj) = draft_data.as_object_mut() {
+                                        obj.insert("id".to_string(), json!(draft_id.clone()));
+                                        obj.insert("type".to_string(), json!(target_type));
+                                        let fi = if crate::utils::hash::is_valid_relay_key(&link_value) {
+                                            crate::utils::hash::relay_index(&link_value)
+                                        } else {
+                                            0u32
+                                        };
+                                        obj.insert("index".to_string(), json!(fi));
+                                        obj.insert(target_field.to_string(), json!(link_value.clone()));
+                                        obj.insert("doc_type".to_string(), json!(target_type));
+                                        obj.insert("updated_at".to_string(), json!(0));
+                                        obj.insert("mode".to_string(), json!("shipping"));
+                                        obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, target_field, link_value)));
+                                    }
+                                    let _ = db.upsert_item(
+                                        "items", &draft_id, target_type, draft_data, None,
+                                        None,
+                                        Some(from_addr), Some(&team_id), Some(&hashed_cc),
+                                        Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                        Some(&ref_val), None
+                                    ).await;
+                                    emit_term(&format!(
+                                        "  📝 [TRADE RELAY DRAFT] {} draft '{}' 생성 ({}='{}').",
+                                        target_type, draft_id, target_field, link_value
+                                    ));
+                                    continue;
+                                }
+                                
                                 let mut needs_update = false;
                                 // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
                                 //    역할 기반으로 역참조 필드명을 결정합니다.
