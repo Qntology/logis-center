@@ -2451,12 +2451,12 @@ impl LogisModel {
                                 }
                             },
                             None => {
-                                // 🌟 [DRAFT v4] 미발견 시 draft 생성.
-                                //    기존은 `hash_id(team_id + target_type + link_value)` 였는데,
-                                //    이 경로는 전각 영숫자를 반각과 다르게 취급합니다.
-                                //    `relay_id` 를 사용하면 전각/반각/대소문자 무관 동일 id 가 됩니다.
+                                // 🌟 [DRAFT v5] 미발견 시 draft 생성.
+                                //    기존은 `relay_id(&link_value)` 로 타입 미반영 해시를 사용했습니다.
+                                //    25건 릴레이가 전부 같은 `draft_id` 로 서로를 덮어쓰는 사고가 발생했습니다.
+                                //    `relay_id` 에 `target_type` 을 전달하여 릴레이 대상마다 고유한 `draft_id` 를 부여합니다.
                                 let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
-                                    crate::utils::hash::relay_id(&link_value)
+                                    crate::utils::hash::relay_id(&link_value, target_type)
                                 } else {
                                     crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
                                 };

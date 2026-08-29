@@ -2100,14 +2100,11 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
                 out.push(TradeRelayKey {
                     role: "reference_invoice",
                     source_field: "doc_number".to_string(),
-                    // 🌟 [SEARCH FIELD FIX] 상대 문서의 "reference_invoice" 필드에서 검색합니다.
-                    //    내 문서번호를 "reference_invoice"에 담고 있는 다른 문서를 찾아야 합니다.
-                    //    기존에는 "doc_number"로 검색하여 자기 자신을 찾아 항상 SELF-SKIP 되었습니다.
                     search_field: "reference_invoice".to_string(),
                     raw: doc_num_raw.clone(),
                     normalized: normalized.clone(),
                     index,
-                    id: crate::utils::hash::relay_id(&normalized),
+                    id: crate::utils::hash::relay_id(&normalized, "reference_invoice"),
                 });
             }
         }
@@ -2148,7 +2145,7 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
             raw: raw.clone(),
             normalized: normalized.clone(),
             index,
-            id: crate::utils::hash::relay_id(&normalized),
+            id: crate::utils::hash::relay_id(&normalized, role),
         });
     }
     // 🌟 [v3] 기존 TRADE_RELAY_FIELDS 순회도 유지하되,
@@ -2183,7 +2180,7 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
                 raw: raw.clone(),
                 normalized: normalized.clone(),
                 index,
-                id: crate::utils::hash::relay_id(&normalized),
+                id: crate::utils::hash::relay_id(&normalized, role),
             });
         }
     }

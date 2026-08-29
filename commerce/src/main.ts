@@ -294,7 +294,7 @@ const COMMERCE_TYPE_SET = new Set<string>([
 
 // ── analytics 행동 로그 / 관리자 Q&A ──
 const ANALYTIC_TYPE_SET = new Set<string>([
-    'click', 'hover', 'change', 'report', 'question', 'answer'
+    'click', 'hover', 'change', 'report', 'touch', 'question', 'answer'
 ]);
 
 /**
@@ -326,7 +326,9 @@ const TYPE_SETS: Record<string, string[]> = {
     //    기존에는 syncAnalyticsData 가 아예 버렸고 이 목록에도 없어
     //    앱 어디에서도 확인할 수 없었습니다. 이제 저장하므로 목록에도 노출합니다.
     //    (검색 스코프에서는 parse_analytic_query 가 별도로 제외하므로 충돌하지 않습니다)
-    analytic: ['click', 'hover', 'change', 'report', 'question', 'answer'],
+    // 🌟 [TOUCH VISIBLE] bias.json analytic_event_filters 에 정의된 touch 를
+    //    목록에 포함합니다. 이 목록에서 빠지면 목록 조회에서 통째로 탈락합니다.
+    analytic: ['click', 'hover', 'change', 'report', 'touch', 'question', 'answer'],
     // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
     //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
     //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
@@ -334,7 +336,7 @@ const TYPE_SETS: Record<string, string[]> = {
     //    결과적으로 두 탭 어디에서도 보이지 않는 고아 문서가 되었습니다.
     //    (mode 컬럼이 트랙을 이미 격리하므로 읽기 목록 중첩은 무해합니다)
     commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
-               'receiving', 'shipping']
+        'receiving', 'shipping']
 };
 
 /**

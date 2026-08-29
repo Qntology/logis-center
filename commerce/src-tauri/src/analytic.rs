@@ -33,8 +33,15 @@ use crate::parsing::PugMode;
 /// 구조화 대상 이벤트 타입. content.js 가 실제로 발행하는 3종입니다.
 pub const ANALYTIC_EVENT_TYPES: [&str; 3] = ["click", "hover", "change"];
 
-/// 검색 스코프에 포함되는 타입. 합성 문서(report)까지 포함합니다.
-pub const ANALYTIC_SEARCH_TYPES: [&str; 4] = ["click", "hover", "change", "report"];
+// 🌟 analytics 검색 스코프. question / answer 는 검색 대상이 아닙니다.
+//    (그것들은 채팅 말풍선이며, 검색 스코프에 넣으면 모든 질의에 끼어듭니다)
+//    이 배열은 parse_analytic_search_query 가 스코프 컨텍스트의
+//    types 로 보내므로, lib.rs 의 STAGE-3 이 이 목록을 그대로
+//    LanceDB 스코프 SQL 로 사용합니다.
+// 🌟 [TOUCH] bias.json analytic_event_filters 에 touch 가 정의되어 있으므로
+//    검색 스코프에도 포함해야 합니다. 빠지면 touch 이벤트는 검색에서
+//    통째로 탈락합니다.
+pub const ANALYTIC_SEARCH_TYPES: [&str; 5] = ["click", "hover", "change", "report", "touch"];
 
 // =====================================================================
 // 🌟 [EVENT TYPE ANCHOR BANK]

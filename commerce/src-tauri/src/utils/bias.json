@@ -1,5 +1,24 @@
 {
   "analytic_event_filters": {
+    "touch": {
+    "semantic": "the user interacted with the element via a touch screen, including starting a touch, moving, or releasing",
+      "bias": "touch, touched, swipe, swiped, touchstart, touchend, touchmove, touchcancel, drag, dragged, 터치, 스와이프, 문지르기, 터치시작, 터치종료, 터치이동, タッチ, スワイプ, 触摸, 滑动, 触控, toucher, berühren, tocar",
+      "prejudice": "hover, mouse over, hovered, typed, entered, input, summary, report, right click",
+      "exact_match": [
+        "touch", "touched", "touchstart", "touchend", "touchmove", "touchcancel", "swipe", "swiped",
+        "터치", "터치한", "스와이프", 
+        "タッチ", "スワイプ", 
+        "触摸", "滑动", "触控",
+        "berühren", "berührt", "wischen",
+        "tocar", "tocado", "deslizar",
+        "toucher", "touché", "balayage",
+        "tocar", "tocado", "deslizar",
+        "لمس", "ملموس", "تمرير",
+        "dotyk", "dotknutí", "přejetí",
+        "tocco", "toccato", "scorrere",
+        "aanraken", "aangeraakt", "vegen"
+      ]
+    },
     "click": {
       "semantic": "the user pressed or selected a specific element",
       "bias": "click, clicked, press, pressed, tap, tapped, select, selected, choose, chose, pick, picked, open, opened, 클릭, 눌렀, 선택, 골랐, 터치, クリック, 押した, 点击, 选择, cliquer, klicken, hacer clic",

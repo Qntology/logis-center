@@ -1230,7 +1230,19 @@ pub async fn start_background_worker(
                     println!("[Scheduler] ⏸️ Extraction stop signal active. Waiting for resume...");
                     stopped_logged = true;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // 🌟 [STOP-WAIT WITH SIGNAL] 정지 대기 중에도 새 태스크 신호를 감지합니다.
+                //    기존 500ms sleep 은 TASK_QUEUED_SIGNAL 을 확인할 기회를 주지 않아
+                //    팩토리 리셋 후 새 태스크가 영원히 처리되지 않았습니다.
+                //    ①번(정지 체크)에서 ③번(AUTO-RESUME)까지 도달할 수 없는 구조적 사각지대를
+                //    정지 대기 블록 안에서 직접 해소합니다.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = crate::utils::sync_utils::TASK_QUEUED_SIGNAL.notified() => {
+                        println!("[Scheduler] ▶️ New task signal while stop signal active. Auto-resuming extraction.");
+                        crate::utils::set_extraction_stop_signal(false);
+                        cancellation_token.store(false, Ordering::SeqCst);
+                    }
+                }
                 continue;
             }
             stopped_logged = false;

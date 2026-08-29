@@ -131,6 +131,22 @@ async fn stop_current_extraction(
         *w = None;
     }
 
+    // 🌟 [STOP-THEN-RESUME]
+    // stop_current_extraction 은 "현재 작업 중단"이지 "이후 작업 영구 차단"이 아닙니다.
+    // 여기서 정지 신호를 해제하지 않으면, 특히 btn-reset-db(전체 초기화) 이후
+    // 전처리/추출 작업 시 스케줄러 루프가
+    // "⏸️ Extraction stop signal active. Waiting for resume..." 에서
+    // 영원히 벗어나지 못합니다.
+    // (window.location.reload() 는 프론트엔드만 리로드하고 백엔드 프로세스는
+    //  리로드되지 않으므로, 정지 신호가 백엔드에 영구 잔존합니다)
+    //
+    // 현재 태스크는 이미 위쪽에서:
+    //   · cancellation_token = true 로 체크되어 중단되거나
+    //   · deep_purge_resources / 모델 언로드 로 사실상 중단되었으므로,
+    // 여기서 즉시 해제해도 안전합니다.
+    state.cancellation_token.store(false, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(false);
+
     Ok("Stop signal sent and resources cleaned.".to_string())
 }
 
@@ -170,7 +186,12 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     }
 
     state.cancellation_token.store(false, Ordering::SeqCst);
-
+    // 🌟 [UNLOAD RESET]
+    // stop_current_extraction 이 남긴 파일 기반 정지 신호까지 반드시 해제합니다.
+    // 이 줄이 없으면 리로드 후 스케줄러가
+    //   "⏸️ Extraction stop signal active. Waiting for resume..."
+    // 에서 영원히 빠져나오지 못합니다.
+    crate::utils::set_extraction_stop_signal(false);
     println!("[UNLOAD] Model, Store and Cancellation flag cleared.");
     Ok("Memory cleared.".to_string())
 }
