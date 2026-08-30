@@ -1222,6 +1222,23 @@ pub async fn start_background_worker(
         crate::utils::set_extraction_stop_signal(false);
         cancellation_token.store(false, Ordering::SeqCst);
         let mut stopped_logged = false;
+        // 🌟 [SILENT PATH INSTRUMENT] 워커 루프에서 로그를 남기지 않는 구간을 전부 계측합니다.
+        //
+        //  ── 실측 사고 ──
+        //   팩토리 리셋 직후 이미지 태스크가 PENDING 에서 영원히 멈췄는데,
+        //   스케줄러 로그가 단 한 줄도 남지 않아 원인 추적이 불가능했습니다.
+        //   루프 전체에서 무음인 곳은 아래 세 곳뿐입니다.
+        //     A. store 가 None      → `if let Some(db)` 이 else 없이 통과
+        //     B. store.lock() 영구 대기 → 다른 태스크가 가드를 쥐고 놓지 않음
+        //     C. 낡은 커넥션이 Ok(빈 배열) 반환 → 정상처럼 보이며 계속 슬립
+        //   셋 다 증상이 동일하므로 로그로 구분하지 못하면 고칠 수도 없습니다.
+        //
+        //  ── 왜 플래그로 1회만 찍는가 ──
+        //   루프는 1~10초마다 돌므로 매 회 출력하면 터미널이 로그로 뒤덮입니다.
+        //   상태가 바뀔 때만 찍고, 복구되면 복구 사실도 한 번 찍습니다.
+        let mut store_missing_logged = false;
+        let mut lock_starved_logged = false;
+        let mut idle_cycles: u32 = 0;
         loop {
             if crate::utils::is_extraction_stopped() {
                 // 🌟 [HEARTBEAT] 의도적 정지 상태임을 로그에 1회 남겨
@@ -1245,23 +1262,75 @@ pub async fn start_background_worker(
                 }
                 continue;
             }
-            stopped_logged = false;
-
+                        stopped_logged = false;
             let mut pending_tasks = Vec::new();
             {
-                let store_opt = store.lock().await;
-                if let Some(db) = store_opt.as_ref() {
-                    match db.get_pending_tasks(5).await {
-                        Ok(tasks) => {
-                            
-                            pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect();
-                        },
-                        Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
+                // 🌟 [LOCK TIMEOUT] store.lock().await 는 대기 중 아무 것도 출력하지 않습니다.
+                //    리셋 명령이 가드를 쥔 채 끝나지 않으면 워커는 영구 정지하면서
+                //    로그상으로는 '아무 일도 없는' 것처럼 보입니다.
+                //    3초 상한을 두고 초과하면 그 사실을 알립니다.
+                //    타임아웃 시 lock 퓨처는 드롭되며, tokio Mutex 는 대기 취소가 안전합니다.
+                match tokio::time::timeout(Duration::from_secs(3), store.lock()).await {
+                    Ok(store_opt) => {
+                        if lock_starved_logged {
+                            println!("[Scheduler] ✅ [STORE LOCK RECOVERED] Store 뮤텍스를 다시 획득했습니다. 폴링을 재개합니다.");
+                            lock_starved_logged = false;
+                        }
+                        match store_opt.as_ref() {
+                            Some(db) => {
+                                if store_missing_logged {
+                                    println!("[Scheduler] ✅ [STORE RESTORED] Store 가 다시 주입되었습니다. 태스크 폴링을 재개합니다.");
+                                    store_missing_logged = false;
+                                }
+                                match db.get_pending_tasks(5).await {
+                                    Ok(tasks) => {
+                                        let raw = tasks.len();
+                                        pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect::<Vec<_>>();
+                                        // 🌟 [POLL TRACE] '조회는 성공했는데 0건' 인 상태를 명시적으로 남깁니다.
+                                        //    낡은 커넥션이 새로 들어온 행을 보지 못하는 경우가 여기 해당합니다.
+                                        //    idle_cycles 로 게이팅하여 평상시에는 조용합니다.
+                                        if raw == 0 && idle_cycles > 0 && idle_cycles % 6 == 0 {
+                                            println!(
+                                                "[Scheduler] 💤 [POLL HEARTBEAT] Store 정상 · 조회 성공 · PENDING 0건 (연속 {}회). 태스크가 다른 커넥션에 저장되었을 수 있습니다.",
+                                                idle_cycles
+                                            );
+                                        }
+                                        if raw > 0 && pending_tasks.is_empty() {
+                                            println!(
+                                                "[Scheduler] ⚪ [POLL FILTERED] PENDING {}건을 조회했으나 전부 ai_search 라 처리 대상이 없습니다.",
+                                                raw
+                                            );
+                                        }
+                                    },
+                                    Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
+                                }
+                            }
+                            None => {
+                                // 🌟 [STORE MISSING] 팩토리 리셋이 store 를 비운 뒤 재주입하지 않은 상태입니다.
+                                //    이 경로가 기존 코드에서 완전히 무음이었고, 리셋 후 태스크가
+                                //    PENDING 에서 멈추는 증상의 유력한 원인입니다.
+                                if !store_missing_logged {
+                                    println!("[Scheduler] 🚨 [STORE MISSING] 스케줄러가 들고 있는 VectorStore 가 None 입니다. 팩토리 리셋이 새 커넥션을 워커의 store 핸들에 다시 주입하지 않았습니다. 이 상태에서는 어떤 태스크도 처리되지 않습니다.");
+                                    store_missing_logged = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 🌟 [LOCK STARVED] 다른 태스크가 store 가드를 쥐고 놓지 않는 상태입니다.
+                        //    리셋 명령이 가드를 잡은 채 .await 를 하거나 조기 반환하면 발생합니다.
+                        if !lock_starved_logged {
+                            println!("[Scheduler] 🔒 [STORE LOCK STARVED] Store 뮤텍스를 3초 이상 획득하지 못했습니다. 다른 작업(팩토리 리셋 등)이 가드를 점유한 채 놓지 않고 있습니다.");
+                            lock_starved_logged = true;
+                        }
                     }
                 }
             }
 
             if pending_tasks.is_empty() {
+                // 🌟 [IDLE COUNTER] 위 POLL HEARTBEAT 의 게이팅 축입니다.
+                //    처리할 태스크가 생기면 아래 else 에서 0 으로 되돌립니다.
+                idle_cycles = idle_cycles.saturating_add(1);
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay_secs)) => {
                         delay_secs = (delay_secs + 1).min(10);
@@ -1281,6 +1350,7 @@ pub async fn start_background_worker(
                 continue;
             } else {
                 delay_secs = 1;
+                idle_cycles = 0;
             }
 
             for task in pending_tasks {

@@ -9358,6 +9358,11 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             console.log("[RESET] All frontend polling and scheduling timers cleared.");
 
             // 3. 프론트엔드 전역 상태 초기화
+            // 🌟 [RESET DEDUP] forceReset 내부에 reset_lancedb 호출이 이미 있습니다.
+            //    여기서 한 번 더 호출하면 두 번 다 store=None → else 분기 → 새 커넥션 생성 →
+            //    (수정 전에는 주입 안 함 → 드롭) 이 반복됩니다.
+            //    수정 후에도 첫 번째 호출이 주입을 완료하면 두 번째는 불필요한 재리셋이 됩니다.
+            //    forceReset 하나에서만 수행하고 여기서는 제거합니다.
             await GlobalTaskManager.forceReset();
             isExtracting = false;
             isSearching = false;
@@ -9370,9 +9375,10 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             activeContext = { cc: "", bcc: "", ref: "" };
             if (docListContainer) docListContainer.innerHTML = "";
             if (chatTalks) chatTalks.innerHTML = "";
-            // 4. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
-            await invoke("reset_lancedb");
-            console.log("[RESET] LanceDB backend reset complete.");
+            // 🌟 [REMOVED] 아래 invoke("reset_lancedb") 를 제거합니다.
+            //    forceReset() 내부에서 이미 호출하며, 수정된 reset_lancedb 가
+            //    새 커넥션을 스케줄러에 주입합니다.
+            console.log("[RESET] LanceDB backend reset delegated to forceReset().");
             // 5. 프론트엔드 Dexie DB 완전 삭제 후 재생성
             await appDb.delete();
             await appDb.open();
