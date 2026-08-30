@@ -100,7 +100,7 @@ pub fn pre_clean_html(html: &str) -> String {
     //              그 분기가 도달 불가능한 죽은 코드가 되어 있었습니다.
     //    뒤쪽 (?=[\s/>]|$) 는 format= 안의 for, formaction= 안의 for 처럼
     //    접두사만 걸리는 오검출을 차단합니다.
-    let re_attr = Regex::new(r#"(?i)\b(data-[a-z0-9\-]+|placeholder|rowspan|colspan|disabled|readonly|selected|summary|headers|checked|class|scope|title|value|abbr|href|type|name|rows|cols|alt|for|src|id)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?(?=[\s/>]|$)"#).unwrap();
+    let re_attr = Regex::new(r#"(?i)\b(data-[a-z0-9\-]+|placeholder|rowspan|colspan|disabled|readonly|selected|summary|headers|checked|class|scope|title|value|abbr|href|type|name|rows|cols|alt|for|src|id)\b(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#).unwrap();
     
     let clean = re_tag.replace_all(&clean, |caps: &regex::Captures| {
         let tag_name = &caps[1];
