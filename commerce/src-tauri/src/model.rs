@@ -379,10 +379,28 @@ impl LogisModel {
             last_free = current_free;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+
         Ok(())
     }
 
-    // --- [NEW] SSD Bridge Operations ---
+    // --- [NEW] VRAM 자유 메모리 조회 헬퍼 ---
+    /// 현재 디바이스의 자유 VRAM을 MB 단위로 반환합니다.
+    /// CPU 모드면 항상 충분하다는 의미로 u64::MAX를 돌려줍니다.
+    /// nvml 초기화 실패 시 보수적으로 0을 반환합니다.
+    pub fn get_free_vram_mb(&self) -> u64 {
+        if self.is_cpu_mode { return u64::MAX; }
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    return mem.free / (1024 * 1024);
+                }
+            }
+        }
+        0
+    }
+
+    // --- [NEW] SSD Bridge Operations ---    
     pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let current_size = *self.current_size.lock().await;
         let is_q35 = current_size == Some(ModelSize::Qwen3_5);
@@ -1027,22 +1045,44 @@ impl LogisModel {
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         // 실제 메모리에 올리기 직전에 파일 존재 여부를 다시 한 번 방어합니다.
-        self.check_embedding_downloaded().await?; 
-        
+        self.check_embedding_downloaded().await?;
+
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
+            // 🌟 [VRAM GATE] 임베딩을 올리기 전에 자유 메모리를 체크합니다.
+            //    다른 모델이 상주 중인데 메모리가 부족하면,
+            //    동시 상주 대신 순차 모드(다른 모델 언로드 → 임베딩 로드)로 진입합니다.
+            //    이후 다른 모델이 다시 필요해지면 각 모델의
+            //    ensure_qwen3() / ensure_qwen3_5() / secure_vram_relay() 가
+            //    기존처럼 자동으로 재로드합니다.
+            if !self.is_cpu_mode {
+                let free_mb = self.get_free_vram_mb();
+                // granite-embedding-97m-multilingual 은 대략 300MB 내외를 사용합니다.
+                let needed_mb: u64 = 350;
+                if free_mb < needed_mb {
+                    println!(
+                        "[MODEL] ⚠️ [VRAM GATE] 자유 {}MB < 필요 {}MB. 순차 모드 진입을 위해 기존 모델을 언로드합니다.",
+                        free_mb, needed_mb
+                    );
+                    // 락을 해제하지 않으면 deep_purge_resources 내부에서
+                    // 같은 뮤텍스를 다시 잡아 데드락이 됩니다.
+                    drop(emb_guard);
+                    self.deep_purge_resources().await;
+                    emb_guard = self.embedding_model.lock().await;
+                    println!("[MODEL] ✅ [VRAM GATE] 순차 모드 준비 완료. 기존 모델 언로드됨.");
+                }
+            }
+
             let self_clone = self.embedding_path.clone();
-            
             // 🌟 CPU 강제 할당을 제거하고 시스템 설정(GPU)을 그대로 사용하여 초고속 VRAM 연산을 수행합니다.
-            let target_device = self.device_config.device.clone(); 
-            
+            let target_device = self.device_config.device.clone();
             println!("[MODEL] Loading Embedding Model on {:?}...", target_device);
-            
+
             let target_device_clone = target_device.clone();
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new_with_device(&self_clone, &target_device_clone)
             }).await??;
-            
+
             *emb_guard = Some(emb);
         }
         Ok(())

@@ -7534,12 +7534,40 @@ pub async fn process_task(
     //    이 비용은 크로스링구얼 리콜을 얻기 위해 의도적으로 감수하는 것입니다.
     //    0.6B 대비 2B 모델은 음차 정확도가 현저히 높습니다.
     {
-        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding together for synonym expansion...");
+        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding for synonym expansion...");
         emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading Qwen3.5 transliteration engine...", "spinner": "🔤" }));
-        model.ensure_qwen3_5(false).await?;
-        model.ensure_embedding().await?;
-        emit_term("[Scheduler] ✅ Qwen3.5(2B) Transliteration engine + Embedding model are resident together (no model ping-pong).");
+
+        // 🌟 [VRAM CONCURRENT GATE] 동시 상주에 필요한 메모리를 확보할 수 있는지 체크합니다.
+        //    Qwen3.5 2B(Q8) ≈ 2000MB + granite-97m 임베딩 ≈ 300MB + 여유분
+        //    → 임계값 2600MB. 부족하면 순차 모드로 진입합니다.
+        let free_mb = model.get_free_vram_mb();
+        let concurrent_threshold: u64 = 2600;
+
+        if free_mb >= concurrent_threshold {
+            // ── 동시 상주 모드 : 메모리 충분 ──
+            //    음차 생성과 임베딩을 번갈아 사용하므로 같이 올리는 편이 빠릅니다.
+            model.ensure_qwen3_5(false).await?;
+            model.ensure_embedding().await?;
+            emit_term(&format!(
+                "[Scheduler] ✅ [CONCURRENT] 자유 {}MB >= {}MB. Qwen3.5(2B) + Embedding 동시 상주 (no ping-pong).",
+                free_mb, concurrent_threshold
+            ));
+        } else {
+            // ── 순차 모드 : 메모리 부족 ──
+            //    1) 임베딩 먼저 로드 → 필드 은행·청크 벡터 생성에 사용
+            //    2) 임베딩 언로드 → VRAM 반환
+            //    3) Qwen3.5 로드 → 음차 생성
+            //    generate_transliteration_aliases 내부에서 임베딩이 다시 필요해지면
+            //    ensure_embedding() 의 변경 3 메모리 게이트가 순차 언로드를 자동으로 처리합니다.
+            emit_term(&format!(
+                "[Scheduler] ⚠️ [SEQUENTIAL] 자유 {}MB < {}MB. 순차 모드로 진입합니다.",
+                free_mb, concurrent_threshold
+            ));
+            model.ensure_qwen3_5(false).await?;
+            emit_term("[Scheduler] ✅ [SEQUENTIAL] Qwen3.5(2B) 로드 완료. 임베딩은 필요 시점에만 올립니다.");
+        }
     }
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
