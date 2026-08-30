@@ -1846,20 +1846,44 @@ pub fn decide_tile_count(
     let (lg, _il, _bl) =
         legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
     let total_in = (0..n).filter(|&i| inside(i)).count().max(1);
-    // 판독 가능 패치가 크롭의 1/4 미만이면 실제 글자가 크롭 면적에 비해 너무 작습니다.
     let t3 = lg * 4 < total_in;
 
     if !t1 && !t2 && !t3 {
         return (1, String::new());
     }
 
-    // 타일 수는 근거가 되는 구조에서 유도합니다.
-    //  · 표 행이 k 줄이면 두 줄씩 겹쳐 읽도록 ceil(k/2) 타일
-    //  · 그 외에는 2 타일 (상/하)
+    // ── [FIX-A] 표 카테고리: 판독가능 패치가 극소면 분할 무의미 ──
+    //   표 행은 감지되었지만 읽을 텍스트가 거의 없으면
+    //   타일을 나눠도 각 타일이 빈 영역만 받아 전부 null을 반환합니다.
+    //   (실측: containers 판독가능 64/182 → 4타일 전부 null)
+    //   판독가능 비율이 10% 미만이면 1타일로 축소합니다.
+    if t2 && lg * 10 < total_in {
+        emit(&format!(
+            "    ⚪ [TILE SKIP / SPARSE TABLE] '{}' 표행 {}개 감지되었으나 \
+             판독가능 패치 {}/{} ({:.0}%) 로 분할 무의미. 1타일로 축소합니다.",
+            plan.category, table_rows, lg, total_in,
+            lg as f32 / total_in as f32 * 100.0
+        ));
+        return (1, "표행감지_판독불가".to_string());
+    }
+
+    // ── [FIX-B] 비표 카테고리: 잘림위험도 내용희소도 아니면 1타일 ──
+    //   기존: 사유 하나만 걸려도 무조건 2타일
+    //   변경: T1(잘림) 또는 T3(희소) 중 실제 분할이 필요한 경우만 2타일
+    //         내용희소(T3)만 걸린 경우: 크롭이 이미 좁아서
+    //         나눠도 각 타일이 더 좁아질 뿐 → 1타일이 오히려 정확
     let count = if t2 {
-        ((table_rows + 1) / 2).clamp(2, 4)
-    } else {
+        // ── [FIX-C] 표 상한 4 → 3 ──
+        //   행 7개 이상이어도 3타일이면 타일당 ~2.3행으로 충분합니다.
+        //   4타일이면 타일당 ~1.75행으로 겹침 영역만 늘어납니다.
+        ((table_rows + 1) / 2).clamp(2, 3)
+    } else if t1 {
+        // 잘림 위험: 크롭 밖에 근거가 있으므로 2타일로 상/하 분리
         2
+    } else {
+        // T3(내용희소)만 남은 경우: 1타일
+        // 크롭 자체가 좁으므로 분할하면 오히려 컨텍스트가 끊어집니다.
+        1
     };
 
     let mut why: Vec<&str> = Vec::new();
@@ -1872,5 +1896,6 @@ pub fn decide_tile_count(
         "    🧱 [TILE PLAN] '{}' → {}타일 (겹침 25%) | 사유: {} | 표행 {} | 판독가능 {}/{}",
         plan.category, count, reason, table_rows, lg, total_in
     ));
+
     (count, reason)
 }
