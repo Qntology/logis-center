@@ -559,7 +559,7 @@ pub async fn run_analytic_structuring(
         let translit_native;
         let translit_roman;
         if !action.is_empty() {
-            let (tn, tr) = crate::scheduler::transliterate_cross_language(
+            let (tn, tr) = crate::scheduler::translit::transliterate_cross_language(
                 model, &action, &doc_lang, cancel, app_handle, task_id,
             ).await;
             translit_native = tn;
