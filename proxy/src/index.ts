@@ -1367,12 +1367,10 @@ const parseStatus = function(status){
 	return step
 }
 
-const Relay = async function(foreign, primary){
-	var query = []
-
-	var merge = {}
-
-	if(foreign == "goods" && primary.type == "order"){
+const Relay = function(foreign, primary){
+    var query = []
+    var merge = {}
+    if(foreign == "goods" && primary.type == "order"){
 		if(primary.tracking){
 			query.push({
 				type : primary.type,
@@ -2391,15 +2389,29 @@ export default {
 
 				// console.log('json',JSON.stringify(json));
 
-				var fallback = ''
-
-				var statements = {}
-					statements[CenterRegion] = []
-					statements[region] = []
-
-				if(!statements[logisRegion]){
-					statements[logisRegion] = []
-				}
+                var fallback = ''
+                var statements = {}
+                    statements[CenterRegion] = []
+                    statements[region] = []
+                // 🌟 [HOIST FIX] 여기서 logisRegion 을 참조하면 안 됩니다.
+                //
+                //  ── 무엇이 문제였나 ──
+                //   logisRegion 은 아래 for 루프 안에서
+                //     var logisRegion = LogisRegion[task.flag]
+                //   로 선언됩니다. var 호이스팅 때문에 이 시점의 값은 undefined 이고,
+                //   statements["undefined"] = [] 라는 쓸모없는 키만 만들어집니다.
+                //
+                //  ── 피해 ──
+                //   루프 말미의
+                //     statements[logisRegion].push(env[logisRegion].prepare(`UPDATE users ...`))
+                //   가 json.region !== LogisRegion[task.flag] 인 경우 undefined.push 로
+                //   TypeError 를 던지고, 바깥 catch 가 조용히 삼킵니다.
+                //   그 결과 team.data.base.pages 통계 갱신은 물론,
+                //   같은 회차에 쌓아 둔 items/sales/tracking 배치까지 통째로 유실됩니다.
+                //
+                //  ── 해결 ──
+                //   지역 키 초기화는 logisRegion 이 확정된 '루프 안' 에서 수행합니다.
+                //   (아래 zoneRegion 테이블 초기화 블록과 같은 위치)
 
 				
 
@@ -2432,13 +2444,15 @@ export default {
 								updated_at : now
 							}
 
-							var logisRegion = LogisRegion[task.flag]
-
-							var zoneRegion = task.zone
-
-							var vectorRegion = 'commerce-logis-'+zoneRegion
-
-							var language = languageCode[task.flag]
+                            var logisRegion = LogisRegion[task.flag]
+                            var zoneRegion = task.zone
+                            var vectorRegion = 'commerce-logis-'+zoneRegion
+                            var language = languageCode[task.flag]
+                            // 🌟 [REGION SLOT] logisRegion 이 확정된 이 시점에 배치 슬롯을 만듭니다.
+                            //    (위쪽 선언부에서 만들면 호이스팅으로 undefined 키가 생깁니다)
+                            if(!statements[logisRegion]){
+                                statements[logisRegion] = []
+                            }
 
 							if(!models[task.cc]){
 								models[task.cc] = task.rpm
@@ -2453,15 +2467,15 @@ export default {
 							}
 
 
-							if(!statements[`commerce_logis_${zoneRegion}-${tables[0]}`]){
-								for(var t = 0; t < tables.length; t++){
-									var table = tables[t]
-
-									if(!statements[`commerce_logis_${zoneRegion}_${table}`]){
-										statements[`commerce_logis_${zoneRegion}_${table}`] = []
-									}
-								}
-							}
+                            // 🌟 [DEAD GUARD 제거] 바깥 가드는 `-items`(하이픈), 실제 생성 키는
+                            //    `_items`(언더스코어)라 그 조건이 절대 참이 아니었습니다.
+                            //    내부에 이미 존재 검사가 있으므로 바깥 가드를 없앱니다.
+                            for(var t = 0; t < tables.length; t++){
+                                var table = tables[t]
+                                if(!statements[`commerce_logis_${zoneRegion}_${table}`]){
+                                    statements[`commerce_logis_${zoneRegion}_${table}`] = []
+                                }
+                            }
 
 							if(!limits[task.from]){
 								limits[task.from] = task.rpm
@@ -2830,16 +2844,20 @@ export default {
 
 										item.data = arr.buffer
 
-										var metadata = {
-											id: item.id,
-											no: item.no ? item.no : "",
-											type: item.type,
-											from: task.from,
-											to: task.to,
-											cc: task.cc,
-											bcc: task.bcc,
-											ref:pageId
-										}
+                                        var metadata = {
+                                            id: item.id,
+                                            no: item.no ? item.no : "",
+                                            type: item.type,
+                                            from: task.from,
+                                            to: task.to,
+                                            cc: task.cc,
+                                            bcc: task.bcc,
+                                            // 🌟 [HOIST FIX] pageId 는 아래 else if(task.scan) 분기에서
+                                            //    var 로 선언되므로 이 시점에는 undefined 입니다.
+                                            //    CLIENT_EMBEDDING 이 켜진 지금은 이 metadata 가 쓰이지 않아
+                                            //    무해하지만, 서버 임베딩을 되살리는 순간 잘못된 ref 가 실립니다.
+                                            ref: task.ref ? task.ref : ""
+                                        }
 
 										// 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않습니다.
 										if(CLIENT_EMBEDDING){

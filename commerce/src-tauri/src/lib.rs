@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
 
-static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
+// 🌟 [PUB] analytic.rs 의 구조화 루프가 전경 작업 여부를 확인해야 합니다.
+//    (스케줄러 태스크 / AI 검색이 시작되면 2B 모델을 반환하고 양보)
+pub static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 // 브라우저가 실행되는 도중 상태를 방어하기 위한 락 추가
 pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 
@@ -331,22 +333,33 @@ async fn reindex_pending_embeddings(
     //   501번째 이후의 미처리 문서는 영원히 처리되지 않았습니다.
     //   문서가 500건을 넘는 순간 로컬 임베딩이 조용히 멈춥니다.
     //   scan_limit 만큼 채울 때까지 오프셋을 밀며 순회합니다.
-    const SCAN_PAGE: usize = 500;
-    const SCAN_MAX_PAGES: usize = 40; // 최대 20,000건까지 탐색
-    let mut docs: Vec<TradeDocument> = Vec::new();
-    for page in 0..SCAN_MAX_PAGES {
-        if state.cancellation_token.load(Ordering::Relaxed) { break; }
-        let batch = store
-            .get_all_items("items", SCAN_PAGE, page * SCAN_PAGE, Some(mode_filter.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
-        let fetched = batch.len();
-        docs.extend(batch);
-        if fetched < SCAN_PAGE { break; }
-        // 이번 페이지까지의 후보로 scan_limit 을 채울 수 있으면 더 읽지 않습니다.
-        let rough_pending = docs.iter().filter(|d| !d.id.is_empty()).count();
-        if rough_pending >= scan_limit * 20 { break; }
-    }
+    // 🌟 [SINGLE SCAN]
+    //
+    //  ── 무엇이 문제였나 ──
+    //   get_all_items 는 limit/offset 을 SQL 로 내리지 않습니다.
+    //   전량을 읽어 batch_to_docs 로 행당 String 14개를 복사하고,
+    //   전량 정렬한 뒤에야 슬라이스합니다.
+    //   그런데 기존 루프는 이 함수를 '페이지마다' 호출했으므로
+    //   페이지 수만큼 전체 테이블을 다시 읽고 다시 정렬했습니다.
+    //   (문서 10,000건 × 40페이지 = 400,000행 파싱)
+    //   실측 로그에서 인덱싱 20건이 도는 사이 RAM 이 3414MB → 1172MB 로
+    //   2.2GB 증발한 것이 이 반복 스캔입니다.
+    //
+    //  ── 조기 종료 조건도 틀려 있었습니다 ──
+    //   rough_pending 은 사실상 docs.len() 이고 임계치는 scan_limit*20 = 400 입니다.
+    //   첫 페이지 500건에서 즉시 break 하므로 SCAN_MAX_PAGES 40 은 도달 불가능한
+    //   죽은 상수였고, 'SCAN STARVATION FIX' 가 해결했다고 적은 문제
+    //   (최신 500건 밖의 문서가 영원히 처리되지 않음)가 그대로 남아 있었습니다.
+    //
+    //  ── 해결 ──
+    //   호출을 1회로 줄이고 limit 을 크게 잡습니다. 어차피 함수 내부가
+    //   전량을 읽으므로, 여러 번 부르는 것은 순수한 반복 낭비입니다.
+    //   상한은 '한 번에 메모리에 올릴 문서 수' 이며 페이징 의미가 아닙니다.
+    const SCAN_CEILING: usize = 20_000;
+    let docs: Vec<TradeDocument> = store
+        .get_all_items("items", SCAN_CEILING, 0, Some(mode_filter.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
 
     // 🌟 [LAZY MODEL LOAD] 대상 선별을 '모델 로드 이전' 으로 끌어올립니다.
     //    기존 구조는 LogisModel::new → ensure_embedding 을 먼저 수행한 뒤 스캔했기 때문에,
@@ -384,14 +397,44 @@ async fn reindex_pending_embeddings(
         if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
             continue;
         }
-        // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
-        //    가장 먼저 탈락시킵니다. chunk_count는 물리적 사실이라
-        //    embed 플래그(소프트 마커)보다 신뢰도가 높습니다.
-        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
-        if chunk_count > 0 { continue; }
-        // 🌟 [EMBED FLAG CHECK] data 내부의 embed 플래그를 보조 확인합니다.
-        //    chunk_count가 0이지만 embed가 1인 경우(청크 삭제 후 재인덱싱 대기 등)
-        //    불필요한 재처리를 방지합니다.
+        // 🌟 [MODE INTEGRITY RECHECK] SQL 필터를 신뢰하지 않고 한 번 더 봅니다.
+        //
+        //  ── 왜 SQL 만으로 부족한가 ──
+        //   mode_filter = "mode = 'commerce'" 로 정확히 걸었는데도
+        //   무역 서식 20건이 잡혔습니다. 필터가 틀린 게 아니라
+        //   그 문서들의 mode 물리 컬럼 자체가 'commerce' 로 잘못 저장되어 있었습니다.
+        //   (뿌리는 upsert_items 의 mode 태깅 결손 — 위에서 수정)
+        //   이미 잘못 저장된 기존 문서는 그 수정으로 고쳐지지 않으므로,
+        //   소비 지점에서 타입 기준으로 재검사해 격리합니다.
+        //
+        //  ── 판정 근거 ──
+        //   canonical_bias_type() 이 'shipping_doc' 으로 접는지만 봅니다.
+        //   서식 목록을 여기에 복제하지 않습니다.
+        {
+            let is_shipping_doc =
+                crate::utils::bias_schema::canonical_bias_type(&doc.r#type) == "shipping_doc";
+            if is_shipping_doc && target_mode != "shipping" {
+                println!(
+                    "[EMBED-LOCAL] 🚢 [MODE MISMATCH] '{}' (type='{}') 은 무역 서식인데 mode='{}' 스캔에 잡혔습니다. 잘못 태깅된 문서이므로 이 트랙에서는 건너뜁니다.",
+                    doc.id, doc.r#type, target_mode
+                );
+                continue;
+            }
+        }
+        // 🌟 [ORDER SWAP / N+1 제거]
+        //
+        //  ── 무엇이 문제였나 ──
+        //   count_chunks_by_item 을 '가장 먼저' 호출하여 후보 문서 수만큼
+        //   LanceDB 쿼리를 날렸습니다. 500건이면 500회이고,
+        //   item_chunks 에 item_id 인덱스가 없어 각각 full scan 입니다.
+        //   이것이 백그라운드가 CPU 를 붙들고 있던 두 번째 원인입니다.
+        //
+        //  ── 왜 순서를 바꿔도 되는가 ──
+        //   embed 플래그는 메모리에 이미 올라온 json_data 파싱만으로 판정되며
+        //   비용이 0 에 가깝습니다. 대부분의 문서는 여기서 탈락합니다.
+        //   물리적 사실(chunk_count)이 더 신뢰도가 높다는 기존 판단은 옳지만,
+        //   그 검사는 '싼 검사를 통과한 소수' 에만 적용하면 충분합니다.
+        //   두 검사의 결론은 동일하고 순서만 바뀌므로 판정 결과가 달라지지 않습니다.
         if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
             // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 type 이 도메인 타입(tracking/goods/...)
             //    이라서 EMBED_EXCLUDE_TYPES 문자열 목록으로는 절대 잡히지 않습니다.
@@ -418,6 +461,12 @@ async fn reindex_pending_embeddings(
                 continue; // 이미 임베딩 완료된 아이템
             }
         }
+        // 🌟 [CHUNK COUNT — 싼 검사 통과분에만] 물리적 사실로 최종 확인합니다.
+        //    embed 마커가 없는데 청크가 존재하는 경우(마커 유실 등)를 잡습니다.
+        //    여기 도달하는 문서 수는 embed 게이트를 통과한 소수이므로
+        //    쿼리 횟수가 후보 전체가 아니라 실제 미처리분으로 줄어듭니다.
+        let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
+        if chunk_count > 0 { continue; }
         pending.push(doc);
     }
 
@@ -453,8 +502,44 @@ async fn reindex_pending_embeddings(
     model.ensure_embedding().await.map_err(|e| e.to_string())?;
 
     let mut processed = 0usize;
+    let mut yielded_to_task = false;
     for doc in pending {
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        // 🌟 [BUSY RECHECK / 매 반복]
+        //
+        //  ── 무엇이 문제였나 ──
+        //   함수 상단의 ACTIVE_TASK_MEM / IS_SEARCHING 가드는 '진입 시 1회' 입니다.
+        //   실측 로그 순서가 정확히 그 사각지대를 보여줍니다.
+        //     [EMBED-LOCAL] 20 pending item(s) detected.   ← 가드 통과 (태스크 없음)
+        //     [Scheduler] New task signal received.        ← 그 다음에 태스크 시작
+        //     [Scheduler] ✅ Model Lock acquired.
+        //   가드는 이미 통과한 뒤이므로 20건 루프가 태스크와 끝까지 병렬로 돕니다.
+        //
+        //  ── Model Lock 이 왜 못 막는가 ──
+        //   위쪽에서 model_guard 를 블록 스코프로 잡았다 clone 후 즉시 놓습니다.
+        //   이 for 루프는 락 없이 clone 만 들고 돕니다.
+        //   LogisModel 내부는 전부 Arc 슬롯이므로 clone 은 같은 VRAM 자원을 만집니다.
+        //
+        //  ── 피해 ──
+        //   스케줄러의 secure_vram_relay 가 퍼지 → VRAM 확보 → 로드 하는 사이
+        //   이 루프의 get_embedding 이 ensure_embedding 을 호출해 임베딩을 되올립니다.
+        //   그 결과 4GB 를 확보하고도 Qwen3 로드 시점엔 756MB 만 남아
+        //   KV 가 RAM 으로 밀려나고([KV-PLAN] → Ram), 전환에 47초가 걸렸습니다.
+        //
+        //  ── 왜 break 인가 ──
+        //   이 작업은 폴링으로 재호출되는 백그라운드 인덱싱입니다.
+        //   남은 문서는 다음 폴링에서 처리되므로 유실이 없습니다.
+        //   반면 태스크는 사용자가 기다리는 전경 작업이라 양보가 옳습니다.
+        if IS_SEARCHING.load(Ordering::SeqCst)
+            || crate::ACTIVE_TASK_MEM.read().map(|m| m.is_some()).unwrap_or(false)
+        {
+            yielded_to_task = true;
+            println!(
+                "[EMBED-LOCAL] ⏸️ 전경 작업(태스크/검색)이 시작되어 로컬 인덱싱을 중단하고 VRAM 을 양보합니다. (이번 회차 {}건 처리 후 중단, 잔여분은 다음 폴링에서 재개)",
+                processed
+            );
+            break;
+        }
         let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
         // 🌟 [BLOB DECODE GUARD] json_data 내부의 "data" 키가 아직
         //    base64(gzip) 문자열로 남아 있으면 해제합니다.
@@ -587,7 +672,7 @@ async fn reindex_pending_embeddings(
         //    ① Qwen3.5 를 재로딩하거나 상주시켜야 하고
         //    ② 이미 확정된 문장을 다시 음차하여 결과를 오염시킵니다.
         let skip_translit = doc.mode == "analytic";
-        let _ = crate::scheduler::index_item_chunks(
+        let _ = crate::scheduler::indexing::index_item_chunks(
             &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
             &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
             skip_translit,
@@ -599,9 +684,18 @@ async fn reindex_pending_embeddings(
     if processed > 0 {
         println!("[EMBED-LOCAL] Cloud-synced items embedded locally: {} item(s). (mode: {})", processed, target_mode);
     }
-
+    // 🌟 [IMMEDIATE RELEASE] 양보로 중단했다면 VRAM 반환이 이 함수의 유일한 목적입니다.
+    //    unload_embedding 은 임베딩 슬롯 + 캐시 + CUDA 풀을 정리하므로
+    //    스케줄러의 wait_for_vram_settle 이 곧바로 목표치를 확보할 수 있습니다.
     model.unload_embedding().await;
-
+    if yielded_to_task {
+        println!("[EMBED-LOCAL] ✅ 임베딩 모델을 즉시 반환했습니다. 전경 작업이 VRAM 을 온전히 사용할 수 있습니다.");
+        return Ok(json!({
+            "processed": processed,
+            "mode": target_mode,
+            "skipped": "yielded_to_foreground"
+        }));
+    }
     Ok(json!({ "processed": processed, "mode": target_mode }))
 }
 
@@ -714,17 +808,21 @@ async fn structure_pending_analytics(
         model_guard.as_ref().unwrap().clone()
     };
 
-    let processed = crate::analytic::run_analytic_structuring(
+    // 🌟 [PURGE ON ANY EXIT] 기존 코드는 `?` 로 조기 반환되면
+    //    deep_purge_resources 에 도달하지 못해 Qwen3.5(2B) 가 VRAM 에 상주한 채
+    //    남았습니다. 그 상태로 스케줄러 태스크가 들어오면 secure_vram_relay 가
+    //    2GB 를 다시 내리느라 통째로 낭비합니다.
+    //    결과를 먼저 받아 두고, 성공/실패와 무관하게 정리한 뒤 판정합니다.
+    let structuring_result = crate::analytic::run_analytic_structuring(
         &store,
         &model,
         &state.cancellation_token,
         &app_handle,
         "analytic_sync",
         limit.unwrap_or(20),
-    ).await.map_err(|e| e.to_string())?;
-
+    ).await;
     model.deep_purge_resources().await;
-
+    let processed = structuring_result.map_err(|e| e.to_string())?;
     Ok(json!({ "processed": processed }))
 }
 
@@ -1860,48 +1958,23 @@ async fn ai_search_complex(
                     synthesized
                 };
 
-                // 🌟 [TABLE ROUTING v4] users / pages 만 물리 분리, 나머지는 전부 items.
-                //    scheduler 저장 매핑과 lib 조회 매핑이 어긋나 'review 는 items 에 저장되는데
-                //    event 에서 조회' 같은 구조적 0건 버그를 만들던 match 문을 제거했습니다.
                 let target_table = match ctx_type {
                     "member" | "team" | "user" => "users",
                     "page" | "pages" => "pages",
                     _ => "items",
                 };
 
-                // 🌟 [SCOPE / PLAN 분리]
-                //    LanceDB 에는 봉투 컬럼만 내려보내고,
-                //    도메인 조건은 하나도 버리지 않고 dexie_plan 으로 프론트에 전달합니다.
                 let mut scope_ctx = ctx.clone();
                 if let Some(o) = scope_ctx.as_object_mut() {
                     // 폴백 접미사가 붙은 type 이 SQL 에 그대로 나가면 `type = 'review_items'` 가 되어
                     // 항상 0건이 됩니다. 정규화된 이름으로 교체합니다.
                     o.insert("type".to_string(), json!(ctx_type));
-                    // 🌟 [TENANT SCOPE] build_scope_filter 는 cc / bcc / ref 를 읽도록 되어 있는데
-                    //    STAGE-3 / parse_shipping_query / parse_analytic_query 가 만드는 컨텍스트에는
-                    //    그 키가 하나도 없어 해당 블록이 통째로 죽어 있었습니다.
-                    //    그 결과 AI 검색이 전 팀·전 사이트 문서를 무차별로 반환했습니다.
-                    //    ai_search_complex 가 인자로 이미 받고 있으므로 여기서 주입합니다.
-                    //
-                    //    ⚠️ bcc / ref 는 넣지 않습니다.
-                    //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
-                    //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
-                    // 🌟 [LOCAL EXTRACTION SCOPE] 로컬 이미지/문서 추출물은
-                    //    cc = hash_id("local.shipping") / hash_id("local.commerce") 로 저장됩니다.
-                    //    (model.rs 의 extract_from_image 참조)
-                    //    반면 검색의 cc 는 프론트엔드가 넘긴 '웹 도메인 해시' 입니다.
-                    //    (main.ts: hashId(getRootDomain(hostname)))
-                    //    두 값이 구조적으로 일치할 수 없으므로, cc 를 그대로 걸면
-                    //    로컬 추출 문서가 검색에서 100% 탈락합니다.
-                    //
-                    //    shipping 트랙은 애초에 로컬 추출이 주 경로이므로 cc 스코프를 걸지 않습니다.
-                    //    (mode = 'shipping' 만으로도 트랙 격리가 성립합니다)
-                    //    commerce/analytic 은 웹 페이지 추출이 주 경로이므로 기존대로 cc 를 유지합니다.
+
                     if !cc.trim().is_empty() && search_mode != "shipping" {
                         o.insert("cc".to_string(), json!(cc.clone()));
                     }
                 }
-                let scope_filter = build_scope_filter(&scope_ctx, &search_mode);
+                let scope_filter = sanitize_scope_filter(build_scope_filter(&scope_ctx, &search_mode));
                 let dexie_plan = build_dexie_plan(&scope_ctx, &search_mode);
 
                 println!(
@@ -3105,8 +3178,35 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         .or_else(|| item.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()))
                         .unwrap_or("").to_string();
             
-            
-            let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_lowercase();
+            let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
+
+            const COMMERCE_RESERVED: [&str; 19] = [
+                "sales", "goods", "order", "tracking", "event", "coupon", "review",
+                "receiving", "shipping", "member", "team", "user", "users",
+                "pages", "page", "talk", "prompt", "ai_search", "unknown",
+            ];
+            const ANALYTIC_RESERVED: [&str; 7] = [
+                "click", "hover", "change", "touch", "report", "question", "answer",
+            ];
+            let lower = raw_type.to_lowercase();
+            let is_reserved = COMMERCE_RESERVED.iter().any(|t| *t == lower)
+                || ANALYTIC_RESERVED.iter().any(|t| *t == lower);
+            let type_str = if is_reserved {
+                lower
+            } else {
+                match crate::utils::bias_schema::canonical_trade_doc_code(&raw_type) {
+                    Some(canon) => {
+                        if raw_type != canon {
+                            println!(
+                                "[SYNC] 🚢 [TYPE NORMALIZE] id='{}' type='{}' → '{}' (무역 서식 표준형)",
+                                id, raw_type, canon
+                            );
+                        }
+                        canon.to_string()
+                    }
+                    None => lower,
+                }
+            };
 
             
             println!("[DEBUG] Syncing item - ID: {}, Type: {}", id, type_str);
@@ -3115,28 +3215,27 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str.clone()));
-                // 🌟 [v4] 루트 호이스팅 복원 블록을 제거했습니다.
-                //    프론트엔드(normalizeEnvelope)가 이미 봉투/확장을 분리해서 보내고,
-                //    Rust 쪽 canonicalize_data 가 타입까지 확정하므로
-                //    여기서 status / amount / is_masked 를 다시 끌어올릴 이유가 없습니다.
-                //
-                //    다만 봉투 값 중 data 안에 반드시 있어야 하는 것들(mode / 시간)은
-                //    상위 페이로드에만 있을 수 있으므로 결손일 때만 보충합니다.
+
                 if obj.get("mode").is_none() {
                     if let Some(mode) = item.get("mode") {
                         obj.insert("mode".to_string(), mode.clone());
                     } else {
-                        // 🌟 [ANALYTICS MODE AUTO-TAG] 서버(D1)에서 내려온
-                        //    analytics 트랙 항목은 mode 컬럼이 없습니다.
-                        //    reindex_pending_embeddings 가 mode = 'analytic' 으로
-                        //    필터링하므로, 여기서 자동 주입하지 않으면
-                        //    동기화되어도 임베딩 대상에서 전량 탈락합니다.
                         let is_analytic_type = matches!(
                             type_str.as_str(),
                             "click" | "hover" | "change" | "report" | "question" | "answer"
                         );
+
+                        let is_shipping_doc_type =
+                            crate::utils::bias_schema::canonical_bias_type(type_str.as_str())
+                                == "shipping_doc";
                         if is_analytic_type {
                             obj.insert("mode".to_string(), serde_json::json!("analytic"));
+                        } else if is_shipping_doc_type {
+                            println!(
+                                "[SYNC] 🚢 [MODE AUTO-TAG] id='{}' type='{}' 은 무역 서식이므로 mode='shipping' 으로 태깅합니다.",
+                                id, type_str
+                            );
+                            obj.insert("mode".to_string(), serde_json::json!("shipping"));
                         }
                     }
                 }
@@ -3147,9 +3246,6 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     if let Some(v) = item.get("updated_at") {
                         obj.insert("updated_at".to_string(), v.clone());
                     } else {
-                        // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 루트에도 data 에도 없으면
-                        //    0(draft) 을 시딩합니다. 이 처리가 없으면 store.rs upsert_item 이
-                        //    '키 없음 → 현재 시각' 경로를 타 draft → count 가 됩니다.
                         obj.insert("updated_at".to_string(), serde_json::json!(0));
                     }
                 }
@@ -3881,6 +3977,10 @@ pub fn run() {
                     
                     
                     let _ = s.cleanup_unfinished_tasks_on_startup().await;
+                    // 🌟 [MODE MIGRATION] type 과 mode 가 어긋난 기존 문서를 1회 교정합니다.
+                    //    대상이 0건이면 조회 1회로 끝나므로 매 시작마다 돌아도 부담이 없고,
+                    //    교정된 문서는 embed 마커가 제거되어 reindex 가 자동으로 재인덱싱합니다.
+                    let _ = s.migrate_mode_by_type().await;
                     
                     let error_status = crate::logic::parse_status("error");
                     

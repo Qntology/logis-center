@@ -16,6 +16,22 @@ pub struct Siglip2TextModel {
     head: Linear,
     hidden_size: usize,
     max_seq_len: usize,
+    // 🌟 [CPU EMBEDDING] token_embedding 이 호스트 메모리에 있는지.
+    //
+    //  ── 왜 분리하는가 ──
+    //   token_embedding 은 [256000, 1152] = 294.9M 파라미터로
+    //   텍스트 인코더 전체(708M)의 41.7%, BF16 기준 590MB 를 차지합니다.
+    //   그런데 이 층의 연산은 index_select, 즉 '행 복사' 하나뿐입니다.
+    //   배치 32 × 64토큰이면 실제로 읽는 행은 2,048개(중복 포함)이고
+    //   결과 텐서는 32 × 64 × 1152 × 2B = 4.7MB 에 불과합니다.
+    //   590MB 를 VRAM 에 올려 두고 4.7MB 만 꺼내 쓰는 셈입니다.
+    //
+    //  ── 정밀도 ──
+    //   gather 에는 부동소수 연산이 없습니다. CPU 에서 행을 복사해 GPU 로 올려도
+    //   결과가 비트 단위로 동일합니다. 근사도 양자화도 아닙니다.
+    embed_on_cpu: bool,
+    device: candle_core::Device,
+    dtype: candle_core::DType,
 }
 
 /// 텍스트 인코더의 단일 층 (비전과 구조 동일)
@@ -41,15 +57,38 @@ pub struct TextMLP {
 }
 
 impl Siglip2TextModel {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    /// `embed_vb` 가 Some 이면 token_embedding 만 그 VarBuilder(보통 CPU)에서 로드합니다.
+    /// None 이면 종전대로 `vb` 와 같은 디바이스에 올립니다.
+    pub fn new(
+        config: &Siglip2Config,
+        vb: VarBuilder,
+        embed_vb: Option<VarBuilder>,
+    ) -> Result<Self> {
         let hidden = config.text_hidden_size;
+        let device = vb.device().clone();
+        let dtype = vb.dtype();
 
-        // 토큰 임베딩: (256000, 1152)
-        let token_embedding = candle_nn::embedding(
-            config.text_vocab_size,
-            hidden,
-            vb.pp("embeddings").pp("token_embedding"),
-        )?;
+        // 🌟 토큰 임베딩: (256000, 1152) = 590MB(BF16).
+        //    embed_vb 가 주어지면 그 디바이스(호스트)로 보내고, VRAM 에서는 뺍니다.
+        let (token_embedding, embed_on_cpu) = match embed_vb {
+            Some(evb) => {
+                let on_cpu = evb.device().is_cpu();
+                let e = candle_nn::embedding(
+                    config.text_vocab_size,
+                    hidden,
+                    evb.pp("embeddings").pp("token_embedding"),
+                )?;
+                (e, on_cpu)
+            }
+            None => {
+                let e = candle_nn::embedding(
+                    config.text_vocab_size,
+                    hidden,
+                    vb.pp("embeddings").pp("token_embedding"),
+                )?;
+                (e, false)
+            }
+        };
 
         // 27층 인코더
         let mut layers = Vec::with_capacity(config.text_num_layers);
@@ -77,6 +116,15 @@ impl Siglip2TextModel {
         // text_model.head.weight [1152,1152] / head.bias [1152] — 실제 Linear 입니다.
         let head = candle_nn::linear(hidden, hidden, vb.pp("head"))?;
 
+        if embed_on_cpu {
+            println!(
+                "[SigLIP2] token_embedding({}x{}) 을 호스트 메모리에 배치했습니다. VRAM 약 {:.0}MB 절감.",
+                config.text_vocab_size,
+                hidden,
+                (config.text_vocab_size * hidden * 2) as f64 / 1e6
+            );
+        }
+
         Ok(Self {
             token_embedding,
             position_embedding,
@@ -85,6 +133,9 @@ impl Siglip2TextModel {
             head,
             hidden_size: hidden,
             max_seq_len: config.text_max_positions,
+            embed_on_cpu,
+            device,
+            dtype,
         })
     }
 
@@ -111,11 +162,24 @@ impl Siglip2TextModel {
         let (b, seq_len) = token_ids.dims2()?;
 
         // 1. 토큰 임베딩
-        let mut x = self.token_embedding.forward(token_ids)?;
+        //
+        // 🌟 [CPU GATHER] 임베딩 테이블이 호스트에 있으면 gather 도 호스트에서 합니다.
+        //    옮기는 것은 (b, seq, 1152) 결과 하나뿐입니다.
+        //    배치 32 기준 32 × 64 × 1152 × 2B = 4.7MB — PCIe 로 1ms 미만입니다.
+        //    반대로 테이블 자체를 VRAM 에 두면 590MB 가 인코딩 내내 묶입니다.
+        let mut x = if self.embed_on_cpu {
+            let ids_cpu = token_ids.to_device(&candle_core::Device::Cpu)?;
+            let gathered = self.token_embedding.forward(&ids_cpu)?;
+            gathered.to_device(&self.device)?.to_dtype(self.dtype)?
+        } else {
+            self.token_embedding.forward(token_ids)?
+        };
 
         // 2. 위치 임베딩
+        //    🌟 위치 임베딩은 [64, 1152] = 0.15MB 라 VRAM 에 두는 편이 유리합니다.
+        //       인덱스 텐서는 x 의 디바이스에 맞춥니다(token_ids 가 CPU 일 수 있으므로).
         let pos_ids: Vec<u32> = (0..seq_len as u32).collect();
-        let pos_ids_tensor = Tensor::new(&pos_ids[..], token_ids.device())?;
+        let pos_ids_tensor = Tensor::new(&pos_ids[..], x.device())?;
         let pos_emb = self.position_embedding.forward(&pos_ids_tensor)?; // (seq, D)
         let pos_emb = pos_emb.unsqueeze(0)?;
         x = x.broadcast_add(&pos_emb)?;

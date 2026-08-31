@@ -299,7 +299,7 @@
           "reference_lg": "Referenced Letter of Guarantee number (e.g. LG-SFO-20260909) {String}"
         },
         "financials": {
-          "maturity_date": "Maturity date of this trust receipt {Number}"
+          "maturity_date": "Maturity date of this trust receipt {String}"
         },
         "conditions": {
           "ownership_clause": "Ownership clause as printed {String}",
@@ -904,6 +904,27 @@
     }
   },
   "search_bridge": {
+    "path_alias": {
+      "amount": ["amount_total", "total_amount", "grand_total_amount", "price", "total_price_sum"],
+      "amount_subtotal": ["subtotal", "sub_total", "net_amount", "total_supply_amount"],
+      "amount_tax": ["tax_amount", "vat_amount", "total_vat_amount"],
+      "doc_number": ["document_number", "bl_number", "awb_number", "po_number", "invoice_number", "certificate_number", "declaration_number", "policy_number", "claim_number", "statement_number", "no"],
+      "sender_name": ["supplier_name", "shipper_name", "exporter_name", "consignor_name", "seller_name", "vendor_name"],
+      "recipient_name": ["buyer_name", "consignee_name", "importer_name", "receiver_name"],
+      "vessel": ["vessel_name", "vehicle_name", "ocean_vessel", "mother_vessel"],
+      "flight_number": ["flight_no", "carrier_flight"],
+      "pol": ["port_of_loading", "location_port_of_loading", "loading_port", "airport_of_departure"],
+      "pod": ["port_of_discharge", "location_port_of_discharge", "discharge_port", "airport_of_destination"],
+      "incoterms": ["incoterms_code", "trade_terms", "price_terms"],
+      "container_number": ["container_no", "cntr_no"],
+      "seal_number": ["seal_no"],
+      "weight_gross": ["gross_weight", "total_gross_weight", "verified_gross_mass"],
+      "weight_net": ["net_weight", "total_net_weight"],
+      "volume": ["volume_measurement", "measurement", "cbm"],
+      "package_count": ["number_of_packages", "total_packages", "number_of_pieces"],
+      "sale_price": ["price", "selling_price", "final_price"],
+      "tracking_number": ["tracking_no", "waybill_number", "invoice_number_parcel"]
+    },
     "sales_to_order": {
       "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",
       "target_domain": "order",

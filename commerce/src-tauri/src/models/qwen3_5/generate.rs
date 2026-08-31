@@ -158,38 +158,53 @@ impl Qwen3_5GenerateModel {
         
         // 외부에서 명시적으로 비전 가중치 경로를 지정했을 때만 로드하도록 제한하여 텍스트 전용 모드 최적화
         let target_mmproj = mmproj_file.map(|f| f.to_string());
-
-        // 🌟 [VISION-JIT] 경로 문자열은 이후 set_mmproj_path 등록에 재사용해야 하므로 clone 으로 소유권을 보존합니다.
-        let (pre_processor, mut mmproj_gguf) = if let Some(mmproj_f) = target_mmproj.clone() {
-            let mut reader = std::fs::File::open(&mmproj_f)?;
-            let content = gguf_file::Content::read(&mut reader)?;
-            let mmproj_gguf = Gguf::new(content, reader, device.clone());
-            let processor = Qwen3VLProcessor::new_qwen3_5_default(&device, DType::F32)?;
-            (Some(processor), Some(mmproj_gguf))
+        // 🌟 [VISION-SKELETON] 전처리기만 만들고 mmproj Gguf 는 만들지 않습니다.
+        //
+        //  ── 구버전이 무엇을 했나 ──
+        //   ① 여기서 mmproj Content 를 파싱해 Gguf 를 만들고
+        //   ② new_from_gguf 가 그 Gguf 로 24블록 1.44GB 를 VRAM 에 적재하고
+        //   ③ set_mmproj_path 가 같은 파일을 '또' 열어 Content 를 재파싱하고
+        //   ④ set_block_streaming(true) 로 플래그만 켰습니다.
+        //   ②가 이미 끝난 뒤라 ④는 첫 forward 전까지 아무 효과가 없었고,
+        //   그래서 첫 이미지 전처리 시점 free VRAM 이 586MB 까지 떨어졌습니다.
+        //
+        //  ── 새 흐름 ──
+        //   ① 전처리기만 생성 (VRAM 0)
+        //   ② new_from_gguf 에 비전을 넘기지 않음 → 언어 모델만 구성
+        //   ③ attach_vision_skeleton 이 메타데이터만 읽어 구조를 붙임 (VRAM 0, Content 1회 파싱)
+        //   ④ 실제 가중치는 forward 가 캐시 MISS 를 확인한 뒤 블록 단위로 읽음
+        let pre_processor = if target_mmproj.is_some() {
+            Some(Qwen3VLProcessor::new_qwen3_5_default(&device, DType::F32)?)
         } else {
-            (None, None)
+            None
         };
-
         let eos_token_id = model_gguf
             .get_matedata("tokenizer.ggml.eos_token_id")?
             .to_u32()?;
-            
-        // 밥줄(Mmap, Ct)을 쥐여준 채로 모델 생성
+
+        // 밥줄(Mmap, Ct)을 쥐여준 채로 모델 생성 (비전 제외)
         let mut qwen3_5 = Qwen3_5Model::new_from_gguf(
-            &mut model_gguf, 
-            mmproj_gguf.as_mut(), 
+            &mut model_gguf,
+            None::<&mut Gguf<std::fs::File>>,
             &device,
-            Some(mmap_arc.clone()), 
+            Some(mmap_arc.clone()),
             Some(ct_arc)
         )?;
 
-        // 🌟 [VISION-JIT] mmproj 재로드 소스를 등록합니다.
-        //    등록되지 않으면(순수 텍스트 모드) unload/reload 는 전부 no-op 으로 동작합니다.
-        qwen3_5.set_mmproj_path(target_mmproj);
-
-        // 🌟 [VISION-STREAM] 비전 27블록 스트리밍 활성화.
-        //    337MB 전체 상주 → 1블록(약 12MB)만 상주. 피크 VRAM 약 325MB 절감.
-        //    mmproj 미등록(텍스트 전용) 시 내부에서 안전하게 무시됩니다.
+        // 🌟 [VISION-SKELETON] 가중치 0바이트로 비전 구조만 붙입니다.
+        //    실패하면 순수 텍스트 모드로 안전하게 강등됩니다.
+        if let Some(mmproj_f) = target_mmproj.as_deref() {
+            match qwen3_5.attach_vision_skeleton(mmproj_f, &device) {
+                Ok(_) => {
+                    println!("[VISION-SKELETON] mmproj attached without loading weights. Init peak reduced by the full vision tower.");
+                }
+                Err(e) => {
+                    println!("[VISION-SKELETON] Failed to attach mmproj skeleton ({}). Falling back to text-only.", e);
+                }
+            }
+        }
+        // 🌟 [VISION-STREAM] 스켈레톤은 이미 스트리밍 상태로 태어나지만,
+        //    명시적으로 한 번 더 확정해 의도를 코드에 남깁니다.
         qwen3_5.set_block_streaming(true);
 
         let stem = std::path::Path::new(model_file)
@@ -342,15 +357,42 @@ impl Qwen3_5GenerateModel {
                         let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
                         let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
                         
-                        let all_embs = self.qwen3_5.get_embed_tokens().to_dtype(DType::F32)?;
+                        // 🌟 [VOCAB CHUNK] 어휘 전체를 F32 로 승격하면 즉사합니다.
+                        //
+                        //  ── 실측 규모 ──
+                        //   token_embd = 248,320 × 2,048.
+                        //     all_embs(F32)        = 2,034MB
+                        //     all_normalized(F32)  = 2,034MB
+                        //   두 텐서가 동시에 살아 4GB 이상을 요구합니다.
+                        //   이 환경의 가용 VRAM 은 로드 후 약 1.8~2.0GB 이므로
+                        //   이 경로가 발화하는 순간(TRACKING fast-track 등) OOM 입니다.
+                        //
+                        //  ── 왜 청크로 나눠도 결과가 같은가 ──
+                        //   코사인 유사도는 어휘 행마다 완전히 독립입니다.
+                        //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
+                        //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
+                        //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
+                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
+
+                        const VOCAB_CHUNK: usize = 16_384;
+                        let vocab = all_embs.dim(0)?;
+                        let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
+                        let mut off = 0usize;
+                        while off < vocab {
+                            let take = (vocab - off).min(VOCAB_CHUNK);
+                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
+                            let blk_normalized = blk.broadcast_div(&blk_norm)?;
+                            sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
+                            drop(blk_normalized);
+                            drop(blk);
+                            off += take;
+                        }
+                        let sim = Tensor::cat(&sim_parts, 0)?;
+                        drop(sim_parts);
                         // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
                         let threshold = Tensor::new(0.65f32, &self.device)?;
                         let one = Tensor::new(1.0f32, &self.device)?;
@@ -740,15 +782,42 @@ impl Qwen3_5GenerateModel {
                         let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
                         let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
                         
-                        let all_embs = self.qwen3_5.get_embed_tokens().to_dtype(DType::F32)?;
+                        // 🌟 [VOCAB CHUNK] 어휘 전체를 F32 로 승격하면 즉사합니다.
+                        //
+                        //  ── 실측 규모 ──
+                        //   token_embd = 248,320 × 2,048.
+                        //     all_embs(F32)        = 2,034MB
+                        //     all_normalized(F32)  = 2,034MB
+                        //   두 텐서가 동시에 살아 4GB 이상을 요구합니다.
+                        //   이 환경의 가용 VRAM 은 로드 후 약 1.8~2.0GB 이므로
+                        //   이 경로가 발화하는 순간(TRACKING fast-track 등) OOM 입니다.
+                        //
+                        //  ── 왜 청크로 나눠도 결과가 같은가 ──
+                        //   코사인 유사도는 어휘 행마다 완전히 독립입니다.
+                        //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
+                        //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
+                        //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
+                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+                        let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
+
+                        const VOCAB_CHUNK: usize = 16_384;
+                        let vocab = all_embs.dim(0)?;
+                        let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
+                        let mut off = 0usize;
+                        while off < vocab {
+                            let take = (vocab - off).min(VOCAB_CHUNK);
+                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
+                            let blk_normalized = blk.broadcast_div(&blk_norm)?;
+                            sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
+                            drop(blk_normalized);
+                            drop(blk);
+                            off += take;
+                        }
+                        let sim = Tensor::cat(&sim_parts, 0)?;
+                        drop(sim_parts);
                         // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
                         let threshold = Tensor::new(0.65f32, &self.device)?;
                         let one = Tensor::new(1.0f32, &self.device)?;

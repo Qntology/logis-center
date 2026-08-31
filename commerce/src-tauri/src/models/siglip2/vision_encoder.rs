@@ -36,6 +36,24 @@ use super::{Siglip2Config, Siglip2Model};
 use crate::logic::TRADE_DOC_TITLES;
 use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
+/// 🌟 [LAZY TEXT CONTRACT] "이 작업에는 텍스트 인코더가 실제로 필요하다" 는 신호.
+///
+///  ── 왜 에러로 신호하는가 ──
+///   앵커 구 목록은 doc_type 과 bias.json 에 따라 결정되므로,
+///   호출부가 '무엇이 필요한지' 를 미리 알려면 build_column_heatmaps 의
+///   구 수집 로직을 통째로 복제해야 합니다. 그 복제본이 원본과 어긋나는 순간
+///   게이트가 거짓말을 하고 파이프라인이 하드 에러로 죽습니다.
+///
+///   대신 '해 보고, 정말 못 하면 그때 올린다' 로 뒤집습니다.
+///   encode_phrases_shared 는 캐시 미스가 있을 때만 이 접두어를 붙여 실패하고,
+///   model.rs 의 with_siglip_text 가 그 신호를 받아 텍스트를 부착한 뒤 1회 재시도합니다.
+///   구 목록이 어떻게 바뀌어도 게이트가 어긋날 수 없습니다.
+///
+///  ── 실패 시점 ──
+///   build_anchor_bank 는 뱅크를 만들기 '전에' encode_phrases_shared 를 부르므로,
+///   미스가 있으면 순전파를 한 번도 돌리지 않고 즉시 반환합니다. 낭비가 없습니다.
+pub const ERR_TEXT_ENCODER_REQUIRED: &str = "SIGLIP2_TEXT_ENCODER_REQUIRED";
+
 // =====================================================================
 // 텍스트 앵커 뱅크
 // =====================================================================
@@ -68,44 +86,115 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-/// SigLIP2 텍스트 인코더로 구 목록을 벡터화합니다.
+/// 🌟 [CACHED ENCODE] 앵커 구 목록을 벡터화합니다. 캐시 히트분은 인코더를 타지 않습니다.
 ///
-/// 반환값은 L2 정규화된 f32 벡터입니다.
-/// (`ai_utils::cosine_similarity` 가 내부에서 다시 정규화하지만,
-///  히트맵 계산에서 직접 dot product 를 쓰므로 여기서 확정합니다)
-pub fn encode_phrases(
+///  ── 왜 Arc 로 돌려주는가 ──
+///   build_anchor_bank 가 곧바로 Arc::new 로 감싸므로, 캐시에서 이미 Arc 인 것을
+///   벡터로 풀었다가 다시 감싸면 345 × 1152 × 4B 의 복사가 문서마다 발생합니다.
+///   캐시의 Arc 를 그대로 흘려보내면 복사가 0 이 됩니다.
+///
+///  ── 인코더 요구 조건 ──
+///   전부 캐시 히트면 model.text 가 None 이어도 성공합니다.
+///   즉 두 번째 실행부터는 1.4GB 텍스트 인코더를 올리지 않고도 뱅크를 만들 수 있습니다.
+pub fn encode_phrases_shared(
     model: &Siglip2Model,
     phrases: &[String],
-) -> anyhow::Result<Vec<Vec<f32>>> {
+) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
+    use crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE as CACHE;
+
     if phrases.is_empty() {
         return Ok(Vec::new());
     }
-    let text = model
-        .text
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("SigLIP2 text encoder is not loaded"))?;
+
+    // ── ① 캐시 조회 ──
+    let mut slots: Vec<Option<std::sync::Arc<Vec<f32>>>> = Vec::with_capacity(phrases.len());
+    let mut miss_idx: Vec<usize> = Vec::new();
+    for (i, p) in phrases.iter().enumerate() {
+        match CACHE.get(p) {
+            Some(v) => slots.push(Some(v)),
+            None => {
+                slots.push(None);
+                miss_idx.push(i);
+            }
+        }
+    }
+
+    if miss_idx.is_empty() {
+        println!(
+            "    ⚡ [PHRASE CACHE] 구 {}개 전량 히트 — 텍스트 인코더 순전파를 생략합니다. (약 {:.1} TFLOP 절감)",
+            phrases.len(),
+            phrases.len() as f64 * 26.0 / 1000.0
+        );
+        return Ok(slots.into_iter().map(|s| s.unwrap()).collect());
+    }
+
+    // ── ② 미스분만 인코딩 ──
+    //    🌟 텍스트 인코더가 없고 캐시 미스가 있으면 ERR_TEXT_ENCODER_REQUIRED 로 신호합니다.
+    //       호출부(model.rs::with_siglip_text)가 이 접두어를 보고 인코더를 부착한 뒤 재시도합니다.
+    let text = model.text.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: text encoder is not loaded, and {} of {} anchor phrases are not cached.",
+            ERR_TEXT_ENCODER_REQUIRED,
+            miss_idx.len(),
+            phrases.len()
+        )
+    })?;
     let tok = model
         .tokenizer
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("SigLIP2 tokenizer is not loaded"))?;
 
-    let mut out: Vec<Vec<f32>> = Vec::with_capacity(phrases.len());
+    println!(
+        "    🔤 [PHRASE CACHE] 구 {}개 중 {}개 히트 / {}개 신규 인코딩",
+        phrases.len(),
+        phrases.len() - miss_idx.len(),
+        miss_idx.len()
+    );
+
+    let mut fresh: Vec<(String, std::sync::Arc<Vec<f32>>)> = Vec::with_capacity(miss_idx.len());
 
     // 배치 크기는 VRAM 상한을 고려해 32 로 고정합니다.
     // (64토큰 × 1152차원 × 27층이므로 32가 안전선입니다)
-    for chunk in phrases.chunks(32) {
-        let owned: Vec<String> = chunk.to_vec();
+    for chunk in miss_idx.chunks(32) {
+        let owned: Vec<String> = chunk.iter().map(|&i| phrases[i].clone()).collect();
         let batch = tok.encode_batch(&owned)?;
         let t = text.encode_batch(&batch, &model.device)?; // (b, D)
         let t = t.to_dtype(DType::F32)?;
         let rows: Vec<Vec<f32>> = t.to_vec2::<f32>()?;
-        for mut r in rows {
+        for (bi, mut r) in rows.into_iter().enumerate() {
             l2_normalize(&mut r);
-            out.push(r);
+            let arc = std::sync::Arc::new(r);
+            let gi = chunk[bi];
+            slots[gi] = Some(arc.clone());
+            fresh.push((phrases[gi].clone(), arc));
         }
     }
 
-    Ok(out)
+    // ── ③ 캐시 적재 (메모리 + 디스크 append) ──
+    CACHE.put_batch(&fresh);
+
+    Ok(slots
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| std::sync::Arc::new(vec![0.0f32; model.config.text_hidden_size])))
+        .collect())
+}
+
+/// 레거시 호환 래퍼. 소유 벡터가 필요한 호출부(encode_query_text)용입니다.
+pub fn encode_phrases(
+    model: &Siglip2Model,
+    phrases: &[String],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    Ok(encode_phrases_shared(model, phrases)?
+        .into_iter()
+        .map(|a| (*a).clone())
+        .collect())
+}
+
+/// 🌟 [LOAD GATE] 이 구 목록이 전부 캐시에 있는지 확인합니다.
+///    model.rs 의 ensure_siglip2 가 needs_text 를 판정할 때 사용하면,
+///    캐시가 채워진 상태에서 1.4GB 인코더 로드를 건너뛸 수 있습니다.
+pub fn phrases_all_cached(phrases: &[String]) -> bool {
+    crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE.all_cached(phrases)
 }
 
 /// (category, key, phrase) 정의 목록을 뱅크로 변환합니다.
@@ -131,14 +220,10 @@ pub fn build_anchor_bank(
             uniq.push(p.clone());
         }
     }
-    let embs = encode_phrases(model, &uniq)?;
-
-    // 🌟 [CLONE 제거] 구버전은 lookup 이 호출될 때마다 1152차원 f32 벡터를 복사했습니다.
-    //    13,943회 × 1152 × 4B ≈ 64MB 힙 할당이 매 문서마다 발생했고,
-    //    그 압박이 [VISION-ADAPTIVE] Free VRAM 669MB 직전 상황에 기여했습니다.
-    //    Arc 로 공유하면 같은 구를 몇 번 참조해도 복사가 일어나지 않습니다.
-    let shared: Vec<std::sync::Arc<Vec<f32>>> =
-        embs.into_iter().map(std::sync::Arc::new).collect();
+    // 🌟 [CACHE + ZERO-COPY] encode_phrases_shared 는 캐시의 Arc 를 그대로 흘려보냅니다.
+    //    구버전은 Vec<Vec<f32>> 를 받아 다시 Arc::new 로 감쌌기 때문에
+    //    캐시 히트분까지 345 × 1152 × 4B 의 복사가 문서마다 발생했습니다.
+    let shared: Vec<std::sync::Arc<Vec<f32>>> = encode_phrases_shared(model, &uniq)?;
     let zero = std::sync::Arc::new(vec![0.0f32; model.config.text_hidden_size]);
 
     let lookup = |p: &str| -> std::sync::Arc<Vec<f32>> {
@@ -207,7 +292,6 @@ pub fn encode_image(
         ))?;
 
     let pre: PreprocessedImage = preprocess_image(image, &model.config, &model.device)?;
-
     let px = pre.pixel_values.to_dtype(model.dtype)?;
     let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
 
@@ -220,6 +304,16 @@ pub fn encode_image(
     let pooled_t = out.pooled.to_dtype(DType::F32)?; // (1, D)
     let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
     l2_normalize(&mut pooled);
+
+    // 🌟 [EARLY DROP] 필요한 값은 전부 호스트 Vec 으로 복사가 끝났습니다.
+    //    VisionForward.patch_hidden 은 이 경로의 어떤 호출부도 읽지 않는데
+    //    (1, 252, 1152) GPU 텐서를 계속 살려 둡니다.
+    //    px / shared / pooled_t 와 함께 여기서 명시적으로 떨어뜨려,
+    //    이어지는 텍스트 인코딩이 시작되기 전에 CUDA 풀에 반환되게 합니다.
+    drop(out);
+    drop(shared);
+    drop(pooled_t);
+    drop(px);
 
     Ok(PatchGrid {
         patches,
@@ -235,6 +329,12 @@ pub fn encode_image(
 }
 
 /// 이미지 전체 풀링 벡터만 필요할 때 (LanceDB 비전 인덱싱 / 검색 쿼리).
+///
+/// 🌟 [POOLED-ONLY] 구버전은 vision.forward 를 호출해 patch_shared 까지 계산한 뒤
+///    그 결과를 통째로 버렸습니다. project_patches 는
+///      proj(v) 252×1152² + out_proj 252×1152² + mlp 252×1152×4304×2
+///    ≈ 3.2 GFLOP 이고, 중간 텐서 252×4304×4B = 4.3MB 를 순간적으로 잡습니다.
+///    풀링 벡터만 필요한 경로에서는 전부 순수 낭비입니다.
 pub fn encode_image_pooled(
     model: &Siglip2Model,
     image: &DynamicImage,
@@ -248,11 +348,39 @@ pub fn encode_image_pooled(
 
     let pre = preprocess_image(image, &model.config, &model.device)?;
     let px = pre.pixel_values.to_dtype(model.dtype)?;
-    let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
-    let pooled_t = out.pooled.to_dtype(DType::F32)?;
+    let pooled_t = vision
+        .forward_pooled(&px, pre.grid_rows, pre.grid_cols)?
+        .to_dtype(DType::F32)?;
+
     let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
     l2_normalize(&mut pooled);
     Ok(pooled)
+}
+
+/// 🌟 [ENCODE + RELEASE] 패치를 뽑고 그 자리에서 비전 가중치를 반납합니다.
+///
+///  ── 왜 별도 진입점인가 ──
+///   encode_image 는 &Siglip2Model 을 받으므로 반납을 할 수 없습니다.
+///   호출부(STEP 1)가 이 함수를 쓰면 '패치 확보 → 즉시 856MB 반납' 이
+///   한 문장으로 보장됩니다. 이후 STEP 1 Depth1/2 와 STEP 2 는
+///   grid.patches(호스트) + 텍스트 인코더만으로 동작합니다.
+///
+///  ⚠️ [CALL SITE] model.rs 의 extract_from_image 에서
+///     `encode_image(&sig, &img)?`  →  `encode_image_and_release(&mut sig, &img)?`
+///     로 바꾸면 됩니다. sig 가 MutexGuard 라면 `let sig = &mut *guard;` 로 가변 참조를 얻습니다.
+pub fn encode_image_and_release(
+    model: &mut Siglip2Model,
+    image: &DynamicImage,
+) -> anyhow::Result<PatchGrid> {
+    let grid = encode_image(model, image)?;
+    println!(
+        "    ♻️ [VISION RELEASE] 패치 {}개({}x{}) 를 호스트로 확보했습니다. 비전 가중치를 즉시 반납합니다.",
+        grid.len(),
+        grid.grid_rows,
+        grid.grid_cols
+    );
+    model.detach_vision();
+    Ok(grid)
 }
 
 /// 텍스트 한 줄을 SigLIP2 공유공간 벡터로 (검색 쿼리용).
@@ -1242,44 +1370,58 @@ pub fn build_column_heatmaps(
         v
     };
 
-    // 카테고리별 구 집합을 미리 색인해 둡니다. (O(N) 1회 순회)
-    let mut cat_phrases: HashMap<String, Vec<String>> = HashMap::new();
-    for (c, _, p) in bias_defs.iter() {
-        let e = cat_phrases.entry(c.clone()).or_insert_with(Vec::new);
-        if !e.iter().any(|x| x == p) {
-            e.push(p.clone());
-        }
-    }
-
-    // 🌟 편견은 카테고리당 1세트. key 에도 카테고리명을 넣어 그룹을 만듭니다.
+    // =====================================================================
+    // 🌟 [PREJUDICE SCOPE v3] 교차 카테고리 편견을 폐기하고 크롬 + 제목만 남깁니다.
+    // ---------------------------------------------------------------------
+    //  ── 구버전이 실제로는 아무 일도 하지 않았습니다 ──
+    //   bias_defs 의 key 는 '필드명', prej_defs 의 key 는 '카테고리명' 이었습니다.
+    //   score_patches_bank_neutral 은 prej_idx.get(key) 로 조회하는데
+    //   key 가 필드명이므로 이 조회는 항상 None 이었고, zp = 0.0,
+    //   즉 편견 감산이 단 한 번도 일어나지 않았습니다.
+    //   구버전 주석의 "apply_category_prejudice() 로 감산을 직접 수행합니다" 는
+    //   실제로 작성된 적이 없는 함수를 가리키고 있었습니다.
+    //   결과적으로
+    //     · VISION_CHROME_ANCHOR (로고/스탬프/괘선/여백) 억제  → 0
+    //     · TITLE PREJUDICE (문서 전문) 억제                    → 0
+    //   이 상태로 약 2,100구를 27층에 통과시켜 인코딩만 하고 버렸습니다.
+    //
+    //  ── 왜 교차 카테고리 편견은 되살리지 않는가 ──
+    //   ⑤ 열 센터링이 net[k][i] -= mean_k(net[·][i]) 로 이미 수행합니다.
+    //   그 위에 다른 카테고리 max-pool 을 또 빼면 같은 경쟁을 두 번 벌하는 셈입니다.
+    //   반면 크롬/제목 구는 bias 뱅크에 아예 없으므로 열 센터링으로는 잡히지 않습니다.
+    //   로고 패치는 전 필드에서 낮은 점수를 받아 센터링 후 0 근처에 남고 살아남습니다.
+    //   그 축만 복구하는 것이 정확히 필요한 만큼입니다.
+    //
+    //  ── 부수 효과 ──
+    //   편견 구 약 2,100 → 카테고리수 × (크롬 21 + 제목 n) ≈ 380개.
+    //   cat_phrases HashMap(345 String 클론)과 O(N²) dedup 도 함께 사라집니다.
+    // =====================================================================
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
-    for cat in cats.iter() {
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for (other_cat, phrases) in cat_phrases.iter() {
-            if other_cat == cat {
-                continue;
-            }
-            for p in phrases.iter() {
-                if seen.insert(p.as_str()) {
-                    prej_defs.push((cat.clone(), cat.clone(), p.clone()));
-                }
-            }
-        }
+    {
+        let mut global: Vec<String> = Vec::new();
         for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
-            if seen.contains(p.as_str()) {
-                continue;
+            if !global.iter().any(|e| e == &p) {
+                global.push(p);
             }
-            prej_defs.push((cat.clone(), cat.clone(), p));
         }
-        // 🌟 [TITLE PREJUDICE] 문서 전문은 모든 카테고리의 공통 편견입니다.
-        //    제목 행 패치가 히트맵 봉우리가 되어 header 크롭이 제목/로고 행으로
-        //    착지하던 문제(로그: header 커버리지 6%, doc_number 소실)를 차단합니다.
         for p in title_prejudice.iter() {
-            if seen.contains(p.as_str()) {
-                continue;
+            if !global.iter().any(|e| e == p) {
+                global.push(p.clone());
             }
-            prej_defs.push((cat.clone(), cat.clone(), p.clone()));
         }
+        for cat in cats.iter() {
+            for p in global.iter() {
+                prej_defs.push((cat.clone(), cat.clone(), p.clone()));
+            }
+        }
+        emit(&format!(
+            "  🧹 [PREJUDICE SCOPE v3] 교차 카테고리 편견 폐기(열 센터링이 이미 수행) | 크롬 {}구 + 제목 {}구 = 공통 편견 {}구 × 카테고리 {}개 = {}항목",
+            global.len().saturating_sub(title_prejudice.len()),
+            title_prejudice.len(),
+            global.len(),
+            cats.len(),
+            prej_defs.len()
+        ));
     }
 
     // 🌟 [LOG] 카테고리별 필드 구 개수 상세
@@ -1372,13 +1514,9 @@ pub fn build_column_heatmaps(
     // ── 3) 패치별 채점 → 카테고리 히트맵 ──
     //    surprisal_dual_scores 의 key 는 '필드명' 이므로,
     //    같은 카테고리에 속한 필드들의 최댓값을 그 카테고리 점수로 씁니다.
-    let empty_names: Vec<String> = Vec::new();
-    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
-    let empty_skip: Vec<bool> = Vec::new();
-    // 🌟 편견 뱅크를 bias 자리에 넣어 채점할 때 쓰는 빈 편견 축입니다.
-    //    (편견의 편견은 없으므로 비어 있어야 합니다)
-    let empty_prej: Vec<(String, String, std::sync::Arc<Vec<f32>>)> = Vec::new();
-
+    // 🌟 [DEAD LOCAL 제거] empty_names / empty_banks / empty_skip / empty_prej 는
+    //    surprisal_dual_scores 를 직접 호출하던 구버전의 잔재입니다.
+    //    현재 채점은 score_patches_bank_neutral 하나로 끝나므로 어디에서도 쓰이지 않습니다.
     let n = grid.len();
     let mut cat_scores: HashMap<String, Vec<f32>> = HashMap::new();
     let mut cat_top: HashMap<String, (String, f32)> = HashMap::new();
@@ -1387,23 +1525,24 @@ pub fn build_column_heatmaps(
         cat_top.insert(c.clone(), (String::new(), f32::MIN));
     }
 
-    // 🌟 [LOG] 패치 채점 추적 카운터
-    let mut patch_scored_count = 0usize;
-    let mut patch_positive_field_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut patch_prej_override_count = 0usize;
-
     // 🌟 [BANK-NEUTRAL] 필드별 √(2 ln N) 차감을 폐기하고
     //    행/열 이중 센터링으로 뱅크 크기·응집도 편향을 제거합니다.
     //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
+    let mut mapped_keys = 0usize;
+    let mut positive_by_cat: HashMap<String, usize> = HashMap::new();
     for (ki, fname) in keys.iter().enumerate() {
         let cat = match field_to_cat.get(fname) {
             Some(c) => c.clone(),
             None => continue,
         };
+        mapped_keys += 1;
         for i in 0..n {
             let v = matrix[ki][i];
             if v == f32::MIN { continue; }
+            if v > 0.0 {
+                *positive_by_cat.entry(cat.clone()).or_insert(0) += 1;
+            }
             if let Some(slot) = cat_scores.get_mut(&cat) {
                 if v > slot[i] { slot[i] = v; }
             }
@@ -1414,18 +1553,21 @@ pub fn build_column_heatmaps(
     }
 
     // 🌟 [LOG] 히트맵 채점 요약
+    //    구버전의 patch_scored_count / patch_prej_override_count /
+    //    patch_positive_field_counts 는 BANK-NEUTRAL 전환 이후 한 번도 증가하지 않아
+    //    항상 0 을 출력하고 있었습니다. 실제 산출물(matrix)에서 다시 세도록 바꿉니다.
     emit(&format!(
-        "    📊 [HEATMAP SCORING SUMMARY] 채점 패치 {} | 편견 상쇄 발생 {}회",
-        patch_scored_count, patch_prej_override_count
+        "    📊 [HEATMAP SCORING SUMMARY] 채점 키 {}개 (카테고리 매핑 성공 {}) | 패치 {}개",
+        keys.len(), mapped_keys, n
     ));
     {
         let mut pf_detail: Vec<String> = Vec::new();
-        for (cat, cnt) in patch_positive_field_counts.iter() {
+        for (cat, cnt) in positive_by_cat.iter() {
             pf_detail.push(format!("{}({})", cat, cnt));
         }
         pf_detail.sort();
         emit(&format!(
-            "    📊 [HEATMAP POSITIVE FIELDS] 카테고리별 양수 패치 수: {}",
+            "    📊 [HEATMAP POSITIVE PATCHES] 카테고리별 양수 (필드×패치) 수: {}",
             pf_detail.join(" | ")
         ));
     }
@@ -1611,18 +1753,63 @@ pub fn score_patches_bank_neutral(
         prej_idx.entry(k.clone()).or_default().push(i);
     }
 
+    // 🌟 [PREJUDICE KEY RESOLUTION] bias 와 prejudice 의 key 축이 다를 수 있습니다.
+    //
+    //  ── 실측 사고 ──
+    //   build_column_heatmaps 는 bias 를 (category, 필드명), prejudice 를
+    //   (category, 카테고리명) 으로 넣습니다. 그런데 조회는 필드명으로 했기 때문에
+    //   prej_idx.get(key) 가 항상 None 이었고, 크롬/제목 억제가 전혀 동작하지 않았습니다.
+    //   (classify_doc_type / run_title_gate 는 양쪽 key 가 같아 정상이었습니다)
+    //
+    //  ── 해결 ──
+    //   bank.bias 의 0번 원소가 곧 그 key 의 category 이므로,
+    //   필드명으로 못 찾으면 그 필드의 category 로 한 번 더 조회합니다.
+    //   구조 변경 없이 두 축을 잇는 최소 수정입니다.
+    let mut key_cat: HashMap<String, String> = HashMap::new();
+    for (c, k, _) in bank.bias.iter() {
+        key_cat.entry(k.clone()).or_insert_with(|| c.clone());
+    }
+
     let dot = |a: &[f32], b: &[f32]| -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     };
+
+    // 🌟 [PREJUDICE POOL] 편견 max-pool 을 '그룹당 1회' 만 계산합니다.
+    //
+    //  ── 왜 미리 뽑는가 ──
+    //   열 히트맵에서 필드는 44개인데 편견 그룹(카테고리)은 8~16개뿐입니다.
+    //   키 루프 안에서 계산하면 같은 그룹을 평균 3~5회 중복 계산합니다.
+    //   그룹당 1회로 접으면 n × Σ(그룹 편견 구수) × D 가 최소값이 됩니다.
+    //   실측 기준 252 × 380 × 1152 ≈ 110 MFLOP — 수십 ms 수준입니다.
+    let mut prej_pool: HashMap<String, Vec<f32>> = HashMap::new();
+    for (gname, list) in prej_idx.iter() {
+        let mut v = vec![f32::MIN; n];
+        for i in 0..n {
+            let p = &grid.patches[i];
+            if p.iter().all(|&x| x == 0.0) { continue; }
+            let mut mp = f32::MIN;
+            for &j in list {
+                let s = dot(p, &bank.prejudice[j].2);
+                if s > mp { mp = s; }
+            }
+            v[i] = mp;
+        }
+        prej_pool.insert(gname.clone(), v);
+    }
 
     // ── ② 원시 Max-Pool 행렬 ──
     let m = order.len();
     let mut raw_b = vec![vec![f32::MIN; n]; m];
     let mut raw_p = vec![vec![f32::MIN; n]; m];
+    let mut resolved = 0usize;
 
     for (ki, key) in order.iter().enumerate() {
         let bi = &bias_idx[key];
-        let pi = prej_idx.get(key);
+        // 필드명 → 실패 시 카테고리명 순으로 편견 그룹을 찾습니다.
+        let pv: Option<&Vec<f32>> = prej_pool
+            .get(key)
+            .or_else(|| key_cat.get(key).and_then(|c| prej_pool.get(c)));
+        if pv.is_some() { resolved += 1; }
         for i in 0..n {
             let p = &grid.patches[i];
             if p.iter().all(|&v| v == 0.0) { continue; }
@@ -1632,13 +1819,8 @@ pub fn score_patches_bank_neutral(
                 if s > mb { mb = s; }
             }
             raw_b[ki][i] = mb;
-            if let Some(pl) = pi {
-                let mut mp = f32::MIN;
-                for &j in pl {
-                    let s = dot(p, &bank.prejudice[j].2);
-                    if s > mp { mp = s; }
-                }
-                raw_p[ki][i] = mp;
+            if let Some(pv) = pv {
+                raw_p[ki][i] = pv[i];
             }
         }
     }
@@ -1718,9 +1900,17 @@ pub fn score_patches_bank_neutral(
     }
 
     println!(
-        "    📐 [BANK-NEUTRAL] 키 {}개 | 기준선 패치 {}개 | pooled σ {:.5} | √(2 ln N) 차감 폐기",
-        m, base.len(), sd
+        "    📐 [BANK-NEUTRAL] 키 {}개 | 편견 해석 성공 {}/{} | 편견 그룹 {}개 | 기준선 패치 {}개 | pooled σ {:.5} | √(2 ln N) 차감 폐기",
+        m, resolved, m, prej_pool.len(), base.len(), sd
     );
+    if resolved == 0 && !bank.prejudice.is_empty() {
+        // 편견 뱅크가 있는데 한 건도 매칭되지 않으면 조용히 무력화된 상태입니다.
+        // 구버전에서 실제로 이 상태였고, 로그가 없어 발견이 늦었습니다.
+        println!(
+            "    🚨 [PREJUDICE ORPHAN] 편견 구 {}개가 어떤 키와도 연결되지 않았습니다. key 축이 어긋났는지 확인하십시오.",
+            bank.prejudice.len()
+        );
+    }
 
     (order, net)
 }

@@ -380,6 +380,23 @@ pub struct TwoLinearMLPGguf {
 }
 
 impl TwoLinearMLPGguf {
+    /// 🌟 [VISION-SKELETON] 가중치 없이 구조만 만듭니다. VRAM 점유 0 바이트.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   Qwen3VLVisionBlock 을 '빈 껍데기' 로 먼저 만든 뒤 mmap 에서 하나씩
+    ///   읽어 쓰려면 mlp 도 껍데기로 태어날 수 있어야 합니다.
+    ///   그런데 linear1 / linear2 는 이 모듈 밖에서 접근할 수 없어
+    ///   호출부가 구조체 리터럴로 만들 방법이 없습니다.
+    ///   GateUpDownMLPGguf 에는 이미 new_dummy 가 있는데 이쪽에만 없었습니다.
+    pub fn new_dummy(device: &Device, act: Activation) -> Self {
+        let dummy = dummy_proj(device);
+        Self {
+            linear1: dummy.clone(),
+            linear2: dummy,
+            act,
+        }
+    }
+
     pub fn new(
         vb: VarBuilder,
         // embedding_dim: usize,

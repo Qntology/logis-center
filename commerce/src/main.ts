@@ -1,34 +1,15 @@
-console.log("%c[WIDGET] MAIN.TS LOADED", "color: #00ff00; font-weight: bold; font-size: 1.2rem;");
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
-// Imports for Rendering & Shim
-// 🌟 isAlmostEqual : 낙관적 로컬 talk 행 ↔ 서버 발급 talk 행 승계 판정에 사용합니다.
-//    (render.ts 에 존재하지만 그동안 한 번도 호출되지 않던 죽은 함수였습니다)
 import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
-// 🌟 [CANONICALIZE] data 안의 값 타입을 확정합니다.
-//  IndexedDB 인덱스는 타입이 혼재하면(123 vs "123") equals 가 절반을 놓치고,
-//  boolean / undefined 는 아예 인덱스에서 조용히 빠집니다.
-//  따라서 '쓰기 시점'에 딱 한 번 정규화해서 저장합니다.
-//  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
-// 🌟 [CANONICAL CONTRACT / TS]
-//  ⚠️ 이 파일의 판정은 store.rs 가 쓰는 utils/canonical.rs 의 kind_of() 와
-//     '비트 단위로 동일' 해야 합니다. 한쪽만 바뀌면 같은 값이
-//     LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
-//     where('data.xxx').equals(...) 가 절반을 놓칩니다.
-//
-//  ── 왜 이름 목록을 없앴나 ──
-//   기존에는 ID/NUM/BOOL 배열에 필드명을 일일이 등록해야 했습니다.
-//   이제 접미사/부분일치 규칙으로 자동 판정하므로,
-//   Dexie 에 새 필드를 추가해도 이 목록을 건드릴 필요가 없습니다.
+
 type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
 
-// ── ① 명시 예외 : 규칙만으로 판정 불가능한 이름 (새 필드로 커지지 않습니다) ──
 const FORCE_ID = new Set(['id', 'no', 'digest']);
 const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
 const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
@@ -39,24 +20,13 @@ const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'con
 const NUM_SUFFIX = [
     '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
     '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges',
-    // 🌟 [UNIT / CURRENCY SUFFIX] 무역 서식은 값 이름에 단위를 붙이는 관례가 있습니다.
-    //    total_gross_weight_kg / measurement_cbm / entered_value_usd / amount_krw
-    //    이 넷은 기존 어느 규칙에도 걸리지 않아 'free' 로 떨어졌고,
-    //    LanceDB 에는 Number, Dexie 에는 String 으로 갈라져
-    //    where('data.xxx').between(...) 이 통째로 실패했습니다.
-    //    ⚠️ canonical.rs 의 NUM_SUFFIX 와 반드시 같은 집합이어야 합니다.
     '_kg', '_cbm', '_m3', '_usd', '_krw', '_eur', '_jpy', '_cny', '_gbp'
 ];
 const NUM_CONTAINS = [
     'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
     'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
     'local_charges', 'number_of_',
-    // 🌟 [PACKAGE FAMILY] total_packages / packages_delivered / packages_received /
-    //    total_pieces / number_of_pieces 는 전부 개수입니다.
-    //    'package_count' 완전일치만 있어서 나머지가 전부 새고 있었습니다.
     'packages', 'pieces',
-    // 🌟 [MEASUREMENT / VALUE] measurement / premium / duty / dutiable / balance /
-    //    flash_point 는 값이 항상 수치입니다.
     'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
     'tare_weight', 'chargeable'
 ];
@@ -66,14 +36,7 @@ const NUM_EXACT = new Set([
     'premium', 'rate', 'debit', 'credit', 'dosage'
 ]);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
-// 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
-//    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
 const NUM_PREFIX = ['rel_'];
-// 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
-//    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
-//    bool 변환식이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
-//    bias_schema.rs 도 add("bundle_shipping", "String", ...) 로 선언하므로
-//    문자열로 두는 것이 Rust 쪽과도 일치합니다.
 const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match'];
 
 function kindOf(key: string): CanonKind {
@@ -85,22 +48,14 @@ function kindOf(key: string): CanonKind {
     if (FORCE_NUM.has(k)) return 'num';
     if (FORCE_BOOL.has(k)) return 'bool';
 
-    // 🌟 [TRADING INDEX] 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
-    //    ID_CONTAINS 의 'reference_' 보다 먼저 검사해야
-    //    'rel_' 이 id(String)로 오분류되지 않습니다.
     if (NUM_PREFIX.some(p => k.startsWith(p))) return 'num';
 
-    // 🌟 Boolean 을 수치보다 먼저 검사합니다.
-    //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
     if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
     if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
 
     if (NUM_EXACT.has(k)) return 'num';
     if (NUM_SUFFIX.some(s => k.endsWith(s))) return 'num';
 
-    // 🌟 식별자를 수치보다 먼저 봅니다.
-    //    'doc_number' 는 '_number' 로 수치에도 걸리지만
-    //    실제로는 'ABCD1234567' 영숫자 혼합이므로 String 이어야 합니다.
     if (ID_SUFFIX.some(s => k.endsWith(s))) return 'id';
     if (ID_CONTAINS.some(c => k.includes(c))) return 'id';
 
@@ -109,8 +64,6 @@ function kindOf(key: string): CanonKind {
     return 'free';
 }
 
-// 🌟 [SEED KEYS] Dexie stores() 의 data.* 인덱스 중 기본값이 필요한 키만 나열합니다.
-//    store.rs 의 SEED_KEYS 와 동일해야 합니다.
 const SEED_KEYS: Array<[string, CanonKind]> = [
     ['id', 'id'], ['no', 'id'], ['code', 'id'],
     ['tracking_number', 'id'], ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
@@ -120,28 +73,17 @@ const SEED_KEYS: Array<[string, CanonKind]> = [
     ['tags', 'tags']
 ];
 
-// 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
-//    두 표가 어긋나면 같은 문서가 LanceDB 에서는 9, Dexie 에서는 0 으로 저장되어
-//    data.status 인덱스 조회가 절반을 놓칩니다.
 const STATUS_CODE: Record<string, number> = {
     progress: 1, stop: 2, cancel: 3, refund: 4, return: 5,
     error: 6, expire: 7, exchange: 8, complete: 9,
     draft: 10, show: 11, hide: 12
 };
 
-// 🌟 기본값 시딩을 하지 않는 타입. store.rs 의 `matches!(target, "users" | "pages")` 와 대응합니다.
-//    🌟 [ANALYTICS] click / hover / change / report 는 행동 로그이므로
-//       commerce 도메인 필드(sale_price / tracking_number ...)를 가질 이유가 전혀 없습니다.
-//       시딩하면 문서당 48개의 무의미한 키가 붙어 저장 용량과 인덱스를 낭비합니다.
-//       Dexie 는 없는 키를 인덱스에서 조용히 제외할 뿐 에러를 내지 않으므로 시딩이 불필요합니다.
 const NON_SEED_TYPES = new Set([
     'team', 'user', 'member', 'users', 'pages', 'page',
     'click', 'hover', 'change', 'report', 'question', 'answer'
 ]);
 
-// 🌟 [ISO DATE] Rust 의 iso_to_epoch_ms 와 동일 규칙.
-//    scheduler 가 started_at / expired_at 을 "2024-01-01T12:00:00" 으로 만듭니다.
-//    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
 function isoToEpochMs(t: string): number | null {
     if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) return null;
     let ms: number;
@@ -150,7 +92,7 @@ function isoToEpochMs(t: string): number | null {
     } else {
         const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
         const norm = t.includes('T') ? t : t.replace(' ', 'T');
-        // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
+
         ms = Date.parse(hasTz ? norm : norm + 'Z');
     }
     return isNaN(ms) ? null : ms;
@@ -160,8 +102,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     if (!parsed || typeof parsed !== 'object') return {};
     const out: any = { ...parsed };
 
-    // ── ① 기존 키 전량 정규화 (규칙 기반) ──
-    //    새 필드도 여기서 자동 처리되므로 이 함수는 확장 시 수정할 필요가 없습니다.
     for (const k of Object.keys(out)) {
         const kind = kindOf(k);
         if (kind === 'free') continue;
@@ -181,26 +121,48 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
             if (typeof v === 'object') continue;
             if (typeof v === 'number') { out[k] = v; continue; }
             if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
-
             const s = String(v).trim();
-            // 🌟 [STATUS PARITY] status 는 'complete' 같은 상태 문자열로 들어올 수 있습니다.
+            // 🌟 [MISSING PARITY] store.rs 의 Numeric 분기와 동일하게
+            //    '숫자로 환원 불가능한 값' 은 0 이 아니라 '없음' 입니다.
+            //
+            //  ── 무엇이 문제였나 ──
+            //   "N/A".replace(/[^\d.\-]/g,'') 는 "" 가 되고 Number("") 는 NaN 이 아니라 0 입니다.
+            //   그래서 LLM 이 '못 찾음' 으로 내려보낸 값이 전부 0 으로 확정되었고,
+            //   matchCondition 의 MISSING VALUE GUARD 가 raw === 0 을 '값 있음' 으로 읽어
+            //   'sale_price lte 5000' 이 가격 축을 아예 갖지 않는 문서를 전부 통과시켰습니다.
+            //   store.rs 가 SEED_KEYS 에서 수치 시딩을 제거한 목적이 여기서 원위치됩니다.
+            //
+            //  ── store.rs 대응 코드 ──
+            //   if t.is_empty() || t == "null" || t == "N/A" { continue; }
+            //   match cleaned.parse::<f64>() { Ok(v) => v, Err(_) => continue }
+            if (s === "null" || s === "N/A") continue;
             if (k === 'status') {
                 const mapped = STATUS_CODE[s.toLowerCase()];
                 if (mapped !== undefined) { out[k] = mapped; continue; }
             }
             const ms = isoToEpochMs(s);
             if (ms !== null) { out[k] = ms; continue; }
-
-            const n = Number(s.replace(/[^\d.\-]/g, ''));
-            out[k] = isNaN(n) ? 0 : n;
+            const cleaned = s.replace(/[^\d.\-]/g, '');
+            if (cleaned === "" || cleaned === "-" || cleaned === ".") continue;
+            const n = Number(cleaned);
+            if (isNaN(n)) continue;
+            out[k] = n;
             continue;
         }
 
         if (kind === 'bool') {
             if (v === undefined || v === null) continue;
             if (typeof v === 'object') continue;
-            // 🌟 boolean 은 IDB 키가 아니므로 반드시 0|1 로 내립니다.
-            out[k] = (v === true || v === 1 || v === "1" || v === "true") ? 1 : 0;
+            // 🌟 [BOOL PARITY] store.rs 의 Boolean 분기와 세 곳이 갈려 있었습니다.
+            //    ① 빈 문자열  : Rust 는 continue, JS 는 0 으로 확정
+            //    ② "True"     : Rust 는 eq_ignore_ascii_case, JS 는 대소문자 구분
+            //    ③ 숫자 2     : Rust 는 (n != 0) → 1, JS 는 0
+            //    boolean 은 IDB 키가 아니므로 값이 있을 때만 0|1 로 내립니다.
+            if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
+            if (typeof v === 'number') { out[k] = v !== 0 ? 1 : 0; continue; }
+            const t = String(v).trim();
+            if (t === "") continue;
+            out[k] = (t === "1" || t.toLowerCase() === "true") ? 1 : 0;
             continue;
         }
 
@@ -228,39 +190,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     return out;
 }
 
-// =====================================================================
-// 🌟 [MODE CONTRACT v1] 모드 ↔ 타입 매핑 단일 진실 공급원
-// ---------------------------------------------------------------------
-//  ── 왜 단일화하는가 ──
-//   기존에는 syncData 의 TRADING_TYPES 와 loadMoreDocs 의 TYPE_SETS 가
-//   각자 하드코딩되어 있었고, 두 목록 모두 'tracking' 을 포함했습니다.
-//   그 결과 proxy/index.ts 의 Relay("tracking","order") 가 만든
-//   'commerce 주문 배송추적' 문서가 mode='shipping' 으로 오염되어
-//   commerce 목록에서 통째로 사라졌습니다.
-//
-//  ── 두 목록의 역할이 다르다 ──
-//   MODE_OF_TYPE  : "이 문서를 어느 트랙에 소속시킬 것인가" (쓰기 시점, 배타적)
-//   TYPE_SETS     : "이 모드에서 어떤 타입을 보여줄 것인가" (읽기 시점, 중첩 허용)
-//   tracking 은 소속은 commerce 이지만, shipping 모드에서도 조회 대상입니다.
-//   (mode 컬럼이 이미 걸러 주므로 조회 목록에 중복 등재해도 무해합니다)
-//
-//  ⚠️ D1(commerce / analytics) 어디에도 mode 컬럼이 없습니다.
-//     따라서 mode 는 '동기화 시점에 클라이언트가 확정하는 값' 입니다.
-// =====================================================================
-
-// ── 무역 서식 코드 : app-logis-center 의 get_slice_config 분류 전량 ──
-//    ① 계약·결제 ② 선적·운송 ③ 통관·신고 ④ 검사·증명 ⑤ 특수·법무
-// 🌟 [TRADING DOC CODES v2] 27종 → 55종
-//
-//  ── 무엇이 문제였나 ──
-//   modeOfType() 은 이 목록에 없는 타입을 `return 'commerce'` 로 떨굽니다.
-//   그래서 HBL / SOA / TI / CDR / ICF / LLC 등 28종의 무역 서식이
-//   mode='commerce' 로 태깅되어 Trading 탭에서 통째로 사라졌습니다.
-//   TYPE_SETS.shipping 도 이 배열에서 파생되므로 타입 필터에서도 탈락하여
-//   두 탭 어디에서도 보이지 않는 고아 문서가 됩니다.
-//
-//  ⚠️ src-tauri/src/logic.rs 의 TRADE_GROUP_CODES 및
-//     bias_schema.rs 의 canonical_bias_type 매치 목록과 같은 집합이어야 합니다.
 const TRADING_DOC_CODES = [
     // 계약 · 결제
     'PO', 'PI', 'SC', 'LC', 'LLC', 'CP', 'BE', 'TR', 'LG', 'EL',
@@ -297,12 +226,6 @@ const ANALYTIC_TYPE_SET = new Set<string>([
     'click', 'hover', 'change', 'report', 'touch', 'question', 'answer'
 ]);
 
-/**
- * 🌟 [MODE TAGGING] D1 응답 행의 type 만 보고 소속 트랙을 확정합니다.
- *  commerce 를 먼저 판정해야 'tracking' 이 shipping 으로 새어 나가지 않습니다.
- *  (TRADING_DOC_TYPE_SET 에는 소문자 'tracking' 이 없으므로 충돌하지 않지만,
- *   순서를 고정해 두면 이후 코드가 추가되어도 안전합니다)
- */
 function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
     const s = String(t || '');
     if (ANALYTIC_TYPE_SET.has(s)) return 'analytic';
@@ -311,10 +234,6 @@ function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
     return 'commerce';
 }
 
-/**
- * 🌟 [READ SCOPE] 각 모드에서 목록/검색에 노출할 타입 목록입니다.
- *  mode 컬럼이 이미 트랙을 격리하므로 여기서는 중첩을 허용합니다.
- */
 const TYPE_SETS: Record<string, string[]> = {
     shipping: [
         'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
@@ -322,28 +241,11 @@ const TYPE_SETS: Record<string, string[]> = {
         ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
         'Unknown', 'unknown'
     ],
-    // 🌟 [Q&A VISIBLE] question / answer 는 콘솔에서 오간 관리자 Q&A 입니다.
-    //    기존에는 syncAnalyticsData 가 아예 버렸고 이 목록에도 없어
-    //    앱 어디에서도 확인할 수 없었습니다. 이제 저장하므로 목록에도 노출합니다.
-    //    (검색 스코프에서는 parse_analytic_query 가 별도로 제외하므로 충돌하지 않습니다)
-    // 🌟 [TOUCH VISIBLE] bias.json analytic_event_filters 에 정의된 touch 를
-    //    목록에 포함합니다. 이 목록에서 빠지면 목록 조회에서 통째로 탈락합니다.
     analytic: ['click', 'hover', 'change', 'report', 'touch', 'question', 'answer'],
-    // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
-    //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
-    //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
-    //    shipping 탭에는 타입은 있으나 mode 가 달라 역시 탈락 →
-    //    결과적으로 두 탭 어디에서도 보이지 않는 고아 문서가 되었습니다.
-    //    (mode 컬럼이 트랙을 이미 격리하므로 읽기 목록 중첩은 무해합니다)
     commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
         'receiving', 'shipping']
 };
 
-/**
- * 🌟 [MODE LABEL] 내부 코드값과 사용자 표기를 분리합니다.
- *  저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB · Rust 변경이 없습니다.
- *  ⚠️ 이 표가 유일한 정의입니다. applySearchModeUI 와 검색 결과 헤더가 공유합니다.
- */
 const MODE_LABEL: Record<string, string> = {
     commerce: 'Commerce',
     shipping: 'Trading',
@@ -354,12 +256,6 @@ function modeLabel(m: string): string {
     return MODE_LABEL[m] || (m.charAt(0).toUpperCase() + m.slice(1));
 }
 
-// 🌟 [NORMALIZE ENVELOPE] Rust(TradeDocument) / Cloudflare(D1 row) / 로컬 생성 객체를
-//  하나의 봉투 형태로 통일합니다. 루트에는 봉투 12개만 남기고, 나머지는 전부 data 로 내립니다.
-//  → 값이 2벌 저장되던 문제(enrichForIndex 호이스팅)가 사라집니다.
-//  → 새 도메인 필드가 생겨도 이 함수는 영원히 그대로입니다.
-// 🌟 [ENVELOPE KEYS] 루트에 남겨 둘 봉투 12개.
-//    이 집합에 없는 루트 키는 전부 '확장 필드' 로 간주해 data 로 하강시킵니다.
 const ENVELOPE_ROOT_KEYS = new Set([
     'id', 'uuid', 'type', 'doc_type', 'flag', 'from', 'to', 'cc', 'bcc',
     'ref', 'ref_val', 'mode', 'created_at', 'updated_at',
@@ -382,14 +278,6 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         parsed = {};
     }
 
-    // 🌟 [ROOT ABSORB] Cloudflare D1 의 sales / tracking / event 테이블은
-    //    확장 필드를 gzip data 가 아니라 '물리 컬럼' 으로만 저장합니다.
-    //    (proxy/index.ts 의 INSERT INTO sales(... sale_price, quantity, weight ...) 참고)
-    //    그래서 GET 응답에서는 그 값들이 행 최상위에 실려 옵니다.
-    //    이 루프가 없으면 봉투 12개만 취하고 나머지를 통째로 버려서
-    //    Dexie 의 data.sale_price / data.weight 조건이 전부 오판합니다.
-    //    로컬 추출 경로(scheduler → upsert_item)는 이미 data 에 전부 넣으므로
-    //    parsed 에 값이 있으면 그쪽을 우선하고, 없을 때만 루트에서 끌어옵니다.
     for (const k in d) {
         if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
         if (ENVELOPE_ROOT_KEYS.has(k)) continue;
@@ -405,19 +293,21 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     // 검색/표시용 텍스트도 data 안으로 통일합니다.
     if (parsed.text === undefined) parsed.text = d.text ?? "";
     if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
-    if (parsed.mode === undefined) parsed.mode = d.mode ?? 'commerce';
+
+    const inferredType = String(d.type ?? d.doc_type ?? parsed.type ?? "");
+    if (parsed.mode === undefined) parsed.mode = d.mode ?? modeOfType(inferredType);
     if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
     const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
-    // 🌟 [DRAFT PRESERVE] updated_at 폴백 체인에서 created_at 으로 빠지는 경로를 제거합니다.
-    //    기존에는 updated_at 이 없으면 created_at(현재 시각) 으로 폴백되어
-    //    draft(updated_at=0) 가 count 로 승격되었습니다.
-    //    updated_at 이 어디에도 없으면 0(draft) 으로 남겨야
-    //    renderNavigation 의 Dexie 카운트가 올바릅니다.
+
     const updatedRaw = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at;
     const updated = updatedRaw !== undefined && updatedRaw !== null ? updatedRaw : 0;
     parsed.created_at = Number(created) || 0;
     parsed.updated_at = Number(updated) || 0;
-
+    // 🌟 [PAGE CACHE DETECT] store.rs 의 target == "pages" 와 등가인 판정입니다.
+    const isPageCacheRow = d.table === 'pages' || d.table === 'page'
+        || !!parsed.node || !!parsed.item;
+    const seedDefaults = !isPageCacheRow
+        && !NON_SEED_TYPES.has(inferredType);
     return {
         // ── 봉투 12개. 이 목록은 앞으로 절대 늘어나지 않습니다 ──
         id: String(d.id ?? d.uuid ?? parsed.id ?? ""),
@@ -428,12 +318,10 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         cc: String(d.cc ?? parsed.cc ?? ""),
         bcc: String(d.bcc ?? parsed.bcc ?? ""),
         ref: String(d.ref ?? d.ref_val ?? parsed.ref ?? ""),
-        mode: String(d.mode ?? parsed.mode ?? 'commerce'),
+        mode: String(d.mode ?? parsed.mode ?? modeOfType(inferredType)),
         created_at: Number(created) || 0,
         updated_at: Number(updated) || 0,
-        // ── 확장 영역. 여기에 뭘 넣든 스키마 변경 없음 ──
-        //    users / team / pages 는 시딩을 끕니다. (통계 문서 오염 방지)
-        data: canonicalizeData(parsed, !NON_SEED_TYPES.has(String(d.type ?? parsed.type ?? "")))
+        data: canonicalizeData(parsed, seedDefaults)
     };
 });
 
@@ -475,8 +363,6 @@ interface ChatSession {
     name?: string;
     cc?: string;
     sender?: string;
-    // 🌟 [FLAG] Client Worker 가 GeoIP 로 확정해 내려주는 국가 코드입니다.
-    //    commerce D1 items 테이블에 flag 컬럼이 없어, 동기화 시 이 값으로 보강합니다.
     flag?: string;
 }
 
@@ -490,39 +376,8 @@ let isCurrentShop = false;
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
-// 🌟 [추가] 누락된 전역 상태 변수 선언
-// =====================================================================
-// 🌟 [OAUTH-NETWORK REGISTRATION] api.oauth.network 사이트 등록 기능
-// ---------------------------------------------------------------------
-//  www/docs/index.html 의 <form name="api.oauth.network"> 기능을
-//  Tauri proxy_fetch 경유로 이식합니다.
-//
-//  통신 대상: https://api.oauth.network (Vercel, api/index.js)
-//  목적: mode=analytic 에서 특정 도메인의 데이터를 조회하기 위한
-//        Client 등록 절차 (client_id / client_secret 발급)
-//
-//  CORS: proxy_fetch 는 Rust 백엔드(reqwest) 에서 요청을 보내므로
-//        브라우저 CORS 정책이 적용되지 않습니다. 별도 대응 불필요.
-//
-//  응답 파싱: api/index.js 는 HTML+postMessage 형식으로 응답합니다.
-//        proxy_fetch 가 JSON 파싱 실패 시 { text: "..." } 로 래핑하므로
-//        프론트엔드에서 <script> 내부 JSON 을 추출합니다.
-// =====================================================================
-
 const OAUTH_API_HOST = "https://api.oauth.network";
 
-/**
- * 🌟 [HOST NORMALIZE] 등록 사이트 식별자를 `https://{host}` 하나로 통일합니다.
- *
- *  ── 왜 필요한가 ──
- *   서버 메타데이터는 "client_id:client_secret@example.com" 처럼 '스킴 없는 host' 로 저장하고,
- *   사용자는 등록 폼에 "https://example.com" 을 입력합니다.
- *   두 표기를 그대로 두면 중복 판정(s.host === hostUrl)이 항상 실패해
- *   같은 사이트가 두 줄로 쌓입니다. (이슈 2 의 직접 원인)
- *
- *  www/docs 의 레퍼런스 구현이 `host : "https://"+url.host` 로 정규화하므로
- *  같은 규칙을 그대로 따릅니다.
- */
 function normalizeOAuthHost(raw: any): string {
     if (!raw || typeof raw !== "string") return "";
     let s = raw.trim().toLowerCase();
@@ -537,12 +392,6 @@ function normalizeOAuthHost(raw: any): string {
     }
 }
 
-/**
- * 🌟 [BALANCED EXTRACT] `parent.postMessage(JSON.stringify({...}), "...")` 에서
- *  첫 번째 JSON 객체를 '괄호 균형' 으로 잘라냅니다.
- *  기존 정규식 /(\{[\s\S]*?\})\)/ 은 비탐욕 매칭이라 rows 값 안에 '})' 조합이
- *  먼저 등장하면 잘린 조각을 파싱해 조용히 실패했습니다.
- */
 function extractBalancedJson(text: string, fromIndex: number): string {
     const start = text.indexOf("{", fromIndex);
     if (start === -1) return "";
@@ -617,24 +466,6 @@ function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: nu
     }
 }
 
-/**
- * 🌟 [BRANCH CONTRACT] api/index.js 의 GET 분기는 아래 순서로 '배타적' 입니다.
- *
- *    ① isAddress(to/from)                 → 지갑 주소 기반 조회
- *    ② req.query.hash && req.query.token  → 등록 사이트 목록 (cookies.#0, #1 ...)
- *    ③ req.query.referer                  → rows / count 조회
- *
- *  즉 referer 계열(경로 목록·접속량 통계)에 hash·token 을 실으면
- *  ②에 먼저 걸려 ③에 '영원히' 도달하지 못합니다. (통계가 항상 0 이던 원인)
- *
- *  그런데 Rust proxy_fetch 는 session_params 가 있으면
- *  hash / token / href 를 쿼리에 무조건 덧붙입니다(lib.rs DETAIL 1 블록).
- *  따라서 이 헬퍼는 session_params 를 '항상 null' 로 고정하고,
- *  필요한 파라미터만 호출부가 직접 명시하도록 강제합니다.
- *
- *  값이 배열이면 같은 키를 반복 append 합니다.
- *  (index.js 의 `typeof req.query.date == "object"` 기간 필터가 반복 파라미터를 요구합니다)
- */
 async function oauthApiFetch(
     query: Record<string, any>,
     opts: { method?: "GET" | "POST"; body?: any } = {}
@@ -655,8 +486,6 @@ async function oauthApiFetch(
     const qs = sp.toString();
     const url = qs ? `${OAUTH_API_HOST}/?${qs}` : `${OAUTH_API_HOST}/`;
 
-    // ⚠️ index.js 최상단 게이트: `if(req.referer){ ... } else { res.status(500) }`
-    //    Referer 헤더가 없으면 무조건 500 입니다.
     const headers: Record<string, string> = {
         "Content-Type": method === "POST"
             ? "application/x-www-form-urlencoded"
@@ -676,21 +505,6 @@ async function oauthApiFetch(
     return parseOAuthApiResponse(response);
 }
 
-/**
- * 🌟 api.oauth.network 에 POST 를 보냅니다. 서버 계약상 이 한 경로가 3가지 동작을 겸합니다.
- *
- *    body { host }                                  → 신규 발급
- *    body { host } (이미 등록된 host)                → 재발급
- *    body { host, client_id, client_secret }        → 삭제 (index.js 의 trim 경로)
- *
- *  ⚠️ DELETE 메서드는 쓸 수 없습니다.
- *     index.js 의 DELETE 블록은 `ethers.hashMessage(uri.host)` 에서
- *     uri(= req.query.referer 로만 생성)가 undefined 라 무조건 500 이며,
- *     로직 자체도 '사이트 1건 삭제' 가 아니라 '계정 탈퇴' 입니다.
- *
- *  ⚠️ 삭제 역시 서버가 사이트 <head> 의 oauth-network-verification 메타 태그를
- *     다시 검증한 뒤에야 수행합니다. 태그를 먼저 지우면 서버 삭제가 실패합니다.
- */
 async function submitOAuthRegistration(
     hostUrl: string,
     credentials?: { client_id: string; client_secret: string }
@@ -730,10 +544,6 @@ async function submitOAuthRegistration(
         if (parsed.rows.length > 0) {
             const row = parsed.rows[0];
             if (row.client_id && row.client_secret) {
-                // 🌟 [SERVER TRUTH] 로컬 배열에 push 하지 않습니다.
-                //    www/docs 레퍼런스가 성공 시 reload 로 목록을 다시 읽는 것과 동일하게,
-                //    서버 목록을 통째로 다시 당겨와 kv_store 를 교체합니다.
-                //    → 같은 주소를 두 번 등록해도 절대 중복되지 않습니다.
                 await fetchOAuthRegisteredSites();
 
                 return {
@@ -746,8 +556,6 @@ async function submitOAuthRegistration(
             }
         }
 
-        // 🌟 [DETAIL ERROR] 서버 응답에 rows 가 비어 있으면 소유 확인 실패입니다.
-        //    사용자가 대조할 수 있도록 '서버가 기대하는 주소' 를 함께 안내합니다.
         const email = currentSession.email || "";
         let expectedAddr = String(parsed.cookies?.client_id || "");
         if (!expectedAddr && email && typeof ethers !== "undefined") {
@@ -770,15 +578,6 @@ async function submitOAuthRegistration(
     }
 }
 
-/**
- * 🌟 api.oauth.network 에서 로그인된 사용자의 등록 사이트 목록을 조회합니다.
- *
- *  ⚠️ 이 호출만 hash / token 을 실어야 합니다. (index.js 의 2번 분기)
- *     referer 를 함께 보내면 안 됩니다. 보내도 2번 분기가 먼저 잡아먹습니다.
- *
- *  응답의 cookies["#0"], cookies["#1"] ... 은 "client_id:client_secret@host" 이며,
- *  레퍼런스 구현과 동일하게 `new URL("https://" + entry)` 의 자격증명 파싱으로 읽습니다.
- */
 async function fetchOAuthRegisteredSites(): Promise<void> {
     if (!currentSession.hash || !currentSession.token) return;
     try {
@@ -789,14 +588,8 @@ async function fetchOAuthRegisteredSites(): Promise<void> {
 
         const cookies = parsed.cookies || {};
 
-        // 🌟 [TRUST GATE] index.js 세션 블록이 예외로 빠지면 req.cookies = {} 가 되어
-        //    빈 응답이 옵니다. 그 상태로 교체하면 멀쩡한 로컬 목록이 지워지므로,
-        //    '세션이 실제로 성립한 응답' 일 때만 교체합니다.
         const authed = !!(cookies.email || cookies.client_id || cookies["#length"] !== undefined);
         if (!authed) {
-            // 🌟 [DIAGNOSTIC] 소멸 버그의 원인 추적용 상세 로그를 추가합니다.
-            //    cookies 가 완전히 비어 있으면 세션 블록 자체가 예외로 빠진 것이고,
-            //    일부만 비어 있으면 hash/token 쌍 불일치입니다.
             const cookieKeys = Object.keys(cookies || {});
             console.warn(
                 "[OAUTH] ⚠️ 서버 세션이 성립하지 않아 목록을 갱신하지 않습니다. " +
@@ -845,10 +638,6 @@ async function fetchOAuthRegisteredSites(): Promise<void> {
     }
 }
 
-/**
- * 🌟 api.oauth.network 에서 등록된 사이트의 Cc(경로) 목록을 조회합니다.
- *  ⚠️ hash / token 을 절대 싣지 않습니다. (index.js 의 3번 분기로 가야 합니다)
- */
 async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
     const host = normalizeOAuthHost(referer);
     if (!host) return [];
@@ -866,11 +655,6 @@ async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
     }
 }
 
-/**
- * 🌟 api.oauth.network 에서 시간별 접속량 통계를 조회합니다.
- *  ⚠️ hash / token 을 절대 싣지 않습니다.
- *  ⚠️ date 는 '같은 키를 두 번' 보내야 index.js 가 배열로 인식해 기간 필터를 겁니다.
- */
 async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<number> {
     const host = normalizeOAuthHost(referer);
     if (!host) return 0;
@@ -890,8 +674,6 @@ async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<
     }
 }
 
-// 🌟 [OAUTH RENDER LOCK] 비동기 양보 구간에서 두 번째 renderNavigation()이
-//    끼어들어 insertAdjacentHTML 이 중복 실행되는 것을 차단합니다.
 let isOAuthSitesRendering = false;
 
 async function renderOAuthSitesUI(pageList: HTMLElement) {
@@ -899,20 +681,10 @@ async function renderOAuthSitesUI(pageList: HTMLElement) {
     if (currentSearchMode !== "analytic") return;
     if (!currentSession.email) return;
 
-    // 🌟 [CONCURRENT GUARD] 이미 렌더링 중이면 중복 진입을 즉시 차단합니다.
-    //    폴링(3초) + browser-match-found + syncAnalyticsData 가 동시에
-    //    renderNavigation() 을 발동하는 레이스 컨디션에서
-    //    insertAdjacentHTML 이 2회 실행되어 아이템이 복제되던 직접 원인입니다.
     if (isOAuthSitesRendering) return;
     isOAuthSitesRendering = true;
 
     try {
-        // 🌟 [IDEMPOTENT CLEANUP] 기존 .oauth-site-item 노드를 전부 제거합니다.
-        //    기존 코드는 insertAdjacentHTML("beforeend") 만 있어서
-        //    renderNavigation() 이 여러 번 호출될 때마다 노드가 누적되었습니다.
-        //    renderAccordion(tree) 가 pageList.innerHTML 을 교체하더라도,
-        //    그 '이후' 에 이 함수가 비동기로 실행되므로
-        //    이전 라운드의 노드가 남아 있을 수 있습니다.
         const existingItems = pageList.querySelectorAll(".oauth-site-item");
         if (existingItems.length > 0) {
             existingItems.forEach((el: Element) => el.remove());
@@ -1038,10 +810,6 @@ async function renderOAuthSitesUI(pageList: HTMLElement) {
             };
         });
 
-        // 🌟 [DELETE] 서버에 host + client_id + client_secret 을 함께 POST 해야
-        //    index.js 의 trim 경로(#length--, 테이블 row delete)가 실행됩니다.
-        //    기존 구현은 kv_store 에서 splice 만 해서 서버에는 그대로 남아 있었고,
-        //    다음 fetchOAuthRegisteredSites 에서 그대로 되살아났습니다.
         pageList.querySelectorAll(".btn-oauth-delete").forEach((btn: any) => {
             btn.onclick = async (e: Event) => {
                 e.preventDefault();
@@ -1170,15 +938,6 @@ function renderOAuthRegistrationForm() {
     document.getElementById("oauth-modal-close")!.addEventListener("click", () => modal.remove());
     modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
 
-    // 🌟 [META TAG GENERATION] 도메인 입력 시 즉시 메타 태그를 생성합니다.
-    //    api/index.js 의 검증 로직:
-    //      clientAddress = ethers.computeAddress(ethers.hashMessage(email))
-    //    즉, 현재 로그인한 사용자의 email 기반으로 해시를 만들어
-    //    사이트 <head> 에 메타 태그로 삽입해야 소유 증명이 됩니다.
-    //
-    //    그러나 Tauri 앱에서는 currentSession.email 이 있으므로
-    //    사전에 태그를 만들어 보여줄 수 있습니다.
-    //    (api/index.js 는 서버에서 같은 값으로 검증합니다)
     const hostInput = document.getElementById("oauth-reg-host") as HTMLInputElement;
     const metaDiv = document.getElementById("oauth-reg-meta") as HTMLDivElement;
     const metaTextarea = document.getElementById("oauth-reg-meta-tag") as HTMLTextAreaElement;
@@ -1194,14 +953,8 @@ function renderOAuthRegistrationForm() {
                 return;
             }
             try {
-                // api/index.js 검증 로직과 동일한 해시 생성:
-                //   clientAddress = ethers.computeAddress(ethers.hashMessage(email))
-                // Tauri 에서는 currentSession.email 이 있으므로 사전 계산 가능
                 const email = currentSession.email || "";
 
-                // 🌟 [EMAIL GUARD] 이메일이 없으면 메타 태그를 생성하지 않습니다.
-                //    빈 문자열로 계산된 주소는 서버 검증과 절대 일치하지 않으므로
-                //    잘못된 태그를 붙여넣게 되는 것을 사전에 차단합니다.
                 if (!email) {
                     metaDiv.style.display = "none";
                     return;
@@ -1293,11 +1046,6 @@ function renderOAuthRegistrationForm() {
             (document.getElementById("oauth-reg-client-id") as HTMLInputElement).value = res.client_id;
             (document.getElementById("oauth-reg-client-secret") as HTMLInputElement).value = res.client_secret;
 
-            // 🌟 [NO LOCAL PUSH] submitOAuthRegistration 이 성공 직후
-            //    fetchOAuthRegisteredSites() 로 서버 목록을 통째로 다시 읽어
-            //    kv_store 를 교체합니다. 같은 주소로 다시 눌러도 절대 중복되지 않습니다.
-            //    (기존에는 여기서 로컬 배열에 push 했고, 서버 목록은 스킴 없는 host 라
-            //     중복 판정이 항상 실패했습니다)
             hostInput.value = "";
 
             // 네비게이션 갱신 (Pages 섹션에 등록된 사이트가 즉시 반영됩니다)
@@ -1329,16 +1077,10 @@ const TARGET_MODELS = [
     'stanza_hebrew', 'stanza_vietnamese'
 ];
 export let lastSearchedQuery = "";
-// 🌟 [CRITICAL FIX] 프론트엔드 상태 토글 및 중복 전송 방어용 락
+
 let isBrowserRunning = false;
 let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
 
-/*
-    🌟 [CLOUD AI TRACK]
-    - Cloud 모드로 보낸 작업은 로컬 GPU 큐를 점유하지 않습니다. (락 미사용)
-    - 서버 tasks 테이블에서 해당 task 가 사라지면 = 처리 완료로 간주하여 말풍선을 Done 처리합니다.
-    - 임베딩은 GPU 유무와 무관하게 항상 로컬(Client App)에서 수행합니다.
-*/
 interface CloudPendingMeta {
     serverId: string;
     kind: "extract" | "search";
@@ -1352,8 +1094,6 @@ let isReindexing = false;
 let reindexScheduled = false;
 let reindexDebounceTimer: number | null = null;
 
-// 🌟 클라우드에서 내려온(벡터 없는) 아이템을 로컬 임베딩 모델로 벡터화 + 청크 인덱싱합니다.
-//    디바운스(2초)를 적용하여 initSession + syncData에서 연속 호출되어도 1회만 실행됩니다.
 async function runLocalEmbeddingSync() {
     if (isReindexing || reindexScheduled) return;
     if (isSearching || isExtracting || GlobalTaskManager.isBusy) return;
@@ -1363,24 +1103,10 @@ async function runLocalEmbeddingSync() {
     reindexDebounceTimer = window.setTimeout(async () => {
         reindexScheduled = false;
         reindexDebounceTimer = null;
-        // 디바운스 후에도 여전히 바쁘면 스킵
+        
         if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
         isReindexing = true;
         try {
-            // 🌟 [ALL-TRACK EMBEDDING]
-            //  ── 무엇이 문제였나 ──
-            //   기존에는 currentSearchMode 하나만 넘겼습니다.
-            //   그래서 사용자가 Trading 탭을 한 번도 열지 않으면
-            //   무역 문서가 영원히 벡터화되지 않았고,
-            //   syncAnalyticsData 직후 호출도 현재 탭이 commerce 면
-            //   analytic 문서를 건너뛰었습니다.
-            //   벡터가 없으면 search_items 는 0벡터와 비교하고
-            //   search_chunks 는 청크가 없어 검색이 구조적으로 0건이 됩니다.
-            //  ── 비용 ──
-            //   백엔드는 대상이 0건이면 임베딩 모델을 올리기 전에
-            //   'no_pending' 으로 즉시 반환하므로(LanceDB 조회 1회),
-            //   세 트랙을 순회해도 유휴 시 부담이 사실상 없습니다.
-            //   현재 탭을 먼저 처리해 체감 지연을 최소화합니다.
             const trackOrder = [currentSearchMode,
                 ...["commerce", "shipping", "analytic"].filter(m => m !== currentSearchMode)];
 
@@ -1416,22 +1142,6 @@ async function runLocalEmbeddingSync() {
     }, 2000);
 }
 
-/**
- * 🌟 [ANALYTIC BUBBLE DONE] 구조화 완료 후 채팅 화면에 남아 있는
- *    analytic_sync 관련 말풍선들을 전부 Done(9) 상태로 전환합니다.
- *
- *  ── 무엇이 문제였나 ──
- *   구조화 진행 중에는 renderProgressToUI 가 "Extracting data (100%)..."
- *   같은 중간 상태로 말풍선을 갱신합니다. 그런데 구조화가 끝나면
- *   더 이상 해당 task_id 로 이벤트가 오지 않아
- *   data-status="1" (PROCESSING) + 스피너가 영원히 멈춰 있습니다.
- *
- *  ── 처리 대상 ──
- *   · analytic_sync_sem_*  (개별 이벤트 구조화)
- *   · analytic_sync         (흐름 리포트 합성)
- *   · analytic_sync_flow    (cross_action_flow)
- *   이 세 접두사로 시작하는 모든 .task-bubble 을 잡습니다.
- */
 async function finalizeAnalyticBubbles(processedCount: number): Promise<void> {
     if (!chatTalks) return;
     const bubbles = chatTalks.querySelectorAll('.chat-talk.task-bubble') as NodeListOf<HTMLElement>;
@@ -1464,14 +1174,6 @@ async function finalizeAnalyticBubbles(processedCount: number): Promise<void> {
     }
 }
 
-// =====================================================================
-// 🌟 [ANALYTIC STRUCTURING] 원시 행동 로그(HTML) → 시맨틱 문장 확정
-// ---------------------------------------------------------------------
-//  순서가 중요합니다.
-//    ① structure_pending_analytics : HTML → PUG → 속성 제거 → Qwen3.5 2B 요약
-//    ② reindex_pending_embeddings  : 확정된 문장을 임베딩 + item_chunks 인덱싱
-//  ①을 건너뛰면 text 가 비어 있어 ②의 RAW GUARD 가 그 문서를 통째로 보류합니다.
-// =====================================================================
 let isAnalyticStructuring = false;
 
 async function runAnalyticStructuring(): Promise<number> {
@@ -1493,14 +1195,6 @@ async function runAnalyticStructuring(): Promise<number> {
                 `[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`
             );
 
-            // 🌟 [DEXIE SYNC] 구조화 후 프론트엔드 Dexie의 updated_at을 갱신합니다.
-            //    기존에는 Rust LanceDB만 updated_at = now_ts로 갱신하고,
-            //    프론트엔드 Dexie는 갱신하지 않아 다음 폴링에서
-            //    '로컬 0 < 서버 updated_at'이 성립하여 구조화 데이터를
-            //    서버 원시 데이터로 덮어쓰는 무한 루프가 발생했습니다.
-            //    이제 Dexie에서 summary가 있는(=구조화 완료) 항목의
-            //    updated_at을 현재 시각으로 갱신하여
-            //    다음 폴링에서 '이미 처리 완료'로 판단되게 합니다.
             if (appDb) {
                 try {
                     const nowTs = Date.now();
@@ -1554,66 +1248,21 @@ async function runAnalyticStructuring(): Promise<number> {
     }
 }
 
-// =====================================================================
-// 🌟 [ANALYTICS TRACK v2] console.logis.center(Client Worker) ↔ 로컬 동기화
-// ---------------------------------------------------------------------
-//  ── Worker 계약 (console-logis-center/src/index.ts 실측) ──
-//    cookies.href = decodeURIComponent(req.query.href).toLowerCase()
-//    var url      = new URL(cookies.href)
-//    cookies.cc   = hashId(url.host)            ← req.query.cc 는 '전혀' 읽지 않음
-//    GET(JSON)    = SELECT * FROM items
-//                   WHERE "cc" = <cookies.cc>
-//                     AND "updated_at" > 0
-//                     AND "created_at" < <req.query.created_at>
-//                   ORDER BY created_at DESC LIMIT 1000
-//
-//  ── 그래서 무엇이 바뀌었나 ──
-//   ① [TDZ 사망] 기존 코드는 `const params` 선언 '이전' 에 params.append() 를 호출해
-//      매 호출마다 ReferenceError 로 즉사했고, 바깥 catch 가 조용히 삼켰습니다.
-//      HTTP 요청이 단 한 번도 나가지 않았습니다.
-//   ② [cc 불일치] Worker 는 cc 파라미터를 무시하고 href 의 host 로 cc 를 만듭니다.
-//      브라우저가 꺼져 있으면 href 가 "https://console.logis.center/" 로 폴백되어
-//      cc = hashId("console.logis.center") 를 조회 → 영원히 0건이었습니다.
-//      이제 '추적 대상 사이트의 origin' 을 해석해 사이트마다 1회씩 조회합니다.
-//   ③ [풀 호스트] Worker 는 hashId(url.host) 즉 'abc.cafe24.com' 을 씁니다.
-//      getRootDomain() 이 만드는 hashId('cafe24.com') 과 애초에 다른 값이므로
-//      로컬 계산 규칙도 Worker 와 동일하게 풀 호스트로 통일합니다.
-//   ④ [시간대] created_at 은 '상한 커서' 입니다. now - timezoneOffset 은
-//      UTC- 지역(예: EST, offset=+300)에서 now-5h 가 되어 최근 5시간 이벤트를
-//      통째로 잘라냈습니다. 반드시 미래 시각이어야 합니다.
-//   ⑤ [question/answer] 버리지 않고 analytic 아이템으로 보존합니다.
-// =====================================================================
-
 let isAnalyticsSyncRunning = false;
 let lastAnalyticsSyncAt = 0;
 
-// =====================================================================
-// 🌟 [ADAPTIVE POLLING / BACKOFF] 동일 데이터 반복 동기화 방지
-// ---------------------------------------------------------------------
-//  연속으로 '변경 없음' 이 감지되면 폴링 간격을 1.5배씩 늘립니다.
-//  실제 변경이 오면 즉시 기본 간격(3초)으로 리셋합니다.
-//  최대 30초를 넘기지 않습니다.
-// =====================================================================
 const SYNC_BASE_INTERVAL_MS = 3_000;   // 기본 폴링 간격
 const SYNC_BACKOFF_FACTOR = 1.5;       // 증가 배수
 const SYNC_MAX_INTERVAL_MS = 30_000;   // 최대 간격
 let syncConsecutiveNoChange = 0;       // 연속 '변경 없음' 카운터
 let syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS; // 현재 적용 중인 간격
 
-/**
- * 🌟 폴링 간격을 계산합니다.
- *  변경 없음 카운터가 올라갈수록 1.5배씩 증가, 최대 30초.
- */
 function computeSyncInterval(): number {
     if (syncConsecutiveNoChange === 0) return SYNC_BASE_INTERVAL_MS;
     const interval = SYNC_BASE_INTERVAL_MS * Math.pow(SYNC_BACKOFF_FACTOR, syncConsecutiveNoChange);
     return Math.min(interval, SYNC_MAX_INTERVAL_MS);
 }
 
-/**
- * 🌟 동기화 결과에 따라 백오프 상태를 갱신합니다.
- * @param hasChange 실제 데이터 변경이 있었는지 여부
- */
 function updateSyncBackoff(hasChange: boolean): void {
     if (hasChange) {
         if (syncConsecutiveNoChange > 0) {
@@ -1633,19 +1282,6 @@ function updateSyncBackoff(hasChange: boolean): void {
     }
 }
 
-/**
- * 🌟 [ORIGIN RESOLUTION] 이벤트를 조회할 '추적 대상 사이트' 목록을 확정합니다.
- *  Worker 가 cc 를 href 의 host 로 만들기 때문에, 조회 단위는 곧 origin 입니다.
- *
- *  수집 소스 (우선순위 무관, 중복 제거)
- *   ① kv_store 의 oauth_registered_sites  : 사용자가 명시적으로 등록한 사이트
- *   ② currentDetectedUrl                  : 지금 브라우저가 보고 있는 사이트
- *   ③ Dexie 의 기존 analytic 문서 data.origin : 과거에 한 번이라도 받아온 사이트
- *
- *  ⚠️ origin(스킴+호스트)만 사용합니다. 경로/쿼리를 붙이면 Worker 의
- *     decodeURIComponent(req.query.href) 가 2중 디코딩되어 '%' 가 들어간 경로에서
- *     URIError 로 418 을 맞습니다. (cc 는 host 로만 결정되므로 경로는 불필요)
- */
 async function resolveAnalyticsOrigins(): Promise<string[]> {
     const origins = new Set<string>();
 
@@ -1653,16 +1289,11 @@ async function resolveAnalyticsOrigins(): Promise<string[]> {
         if (!raw || typeof raw !== "string") return;
         let s = raw.trim().toLowerCase();
         if (!s) return;
-        // 🌟 [SCHEME TOLERANCE] api.oauth.network 메타데이터는 'example.com' 처럼
-        //    스킴 없이 저장됩니다. 기존 startsWith("http") 검사는 그 항목을 전부 버려
-        //    '등록된 사이트' 가 조회 대상에서 통째로 빠졌습니다.
         if (!/^https?:\/\//.test(s)) s = "https://" + s;
         try {
             const u = new URL(s);
             if (!u.hostname) return;
             if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return;
-            // logis.center 계열은 content.js 의 isShop 게이트에서 애초에 제외되므로
-            // 이벤트가 존재할 수 없습니다. 조회해 봐야 0건이라 왕복만 낭비합니다.
             if (u.hostname.endsWith("logis.center")) return;
             origins.add(u.origin);
         } catch (e) {}
@@ -1687,11 +1318,6 @@ async function resolveAnalyticsOrigins(): Promise<string[]> {
     return Array.from(origins);
 }
 
-/**
- * 🌟 [TEXT EXTRACT] Cron Worker 가 구조화한 문장을 골라냅니다.
- *  원시 이벤트의 action 은 [outerHTML] '배열' 이므로 문자열일 때만 채택합니다.
- *  (배열을 그대로 text 로 쓰면 HTML 덩어리가 FTS/임베딩에 들어갑니다)
- */
 function extractAnalyticText(parsed: any): string {
     const pick = (v: any): string => (typeof v === "string" ? v.trim() : "");
     return pick(parsed?.action)
@@ -1701,7 +1327,6 @@ function extractAnalyticText(parsed: any): string {
         || pick(parsed?.text);
 }
 
-/** 🌟 D1 BLOB(number[] / ArrayBuffer / base64) → JSON 객체로 복원합니다. */
 function decodeAnalyticBlob(rawData: any): any {
     const pako = (window as any).pako;
     try {
@@ -1748,17 +1373,6 @@ function decodeAnalyticBlob(rawData: any): any {
     return {};
 }
 
-/**
- * 🌟 [API KEY LOOKUP] origin 에 대응하는 client_id / client_secret 을 kv_store 에서 찾습니다.
- *
- *  ── 왜 필요한가 ──
- *   console.logis.center 의 로그 조회는 이제 '그 사이트에 발급된 API 키' 를 요구합니다.
- *   키가 없으면 서버가 0건을 돌려주므로, 아예 왕복하지 않고 건너뛰는 편이 낫습니다.
- *
- *  ── 호스트 표기 흔들림 ──
- *   kv_store 의 host 는 등록 경로에 따라 'https://example.com' 또는 'example.com' 으로
- *   섞여 저장될 수 있습니다. 양쪽 모두 URL 로 정규화한 뒤 host(도메인+포트)로 비교합니다.
- */
 async function getOAuthCredentialForOrigin(origin: string): Promise<{ client_id: string; client_secret: string } | null> {
     const toHost = (raw: any): string => {
         if (!raw || typeof raw !== "string") return "";
@@ -1795,16 +1409,12 @@ async function getOAuthCredentialForOrigin(origin: string): Promise<{ client_id:
     return null;
 }
 
-/** 🌟 origin 하나에 대해 GET 1회를 수행하고 저장한 건수를 돌려줍니다. */
 async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<number> {
-    // Worker 와 '동일한 규칙' 으로 cc 를 계산합니다. (풀 호스트, 루트 도메인 아님)
     let expectedCc = "";
     try {
         expectedCc = await hashId(new URL(origin).host);
     } catch (e) {}
 
-    // 🌟 [API KEY GATE] Worker 가 이제 client_id 로 사이트 소유를 검증합니다.
-    //    키가 없으면 서버가 0건을 돌려주므로 왕복 자체를 생략합니다.
     const cred = await getOAuthCredentialForOrigin(origin);
 
     if (!cred) {
@@ -1821,12 +1431,10 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
         created_at: cursor.toString(),
         hash: currentSession.hash,
         token: currentSession.token || "",
-        // ⚠️ 경로 없는 origin + '/' 만 보냅니다. Worker 의 2중 디코딩 대비.
         href: origin + "/"
     });
     if (expectedCc) params.append("cc", expectedCc);
 
-    // 🌟 client_id 는 필수, client_secret 은 있으면 쌍까지 대조합니다.
     params.append("client_id", cred.client_id);
     if (cred.client_secret) params.append("client_secret", cred.client_secret);
 
@@ -1845,8 +1453,6 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
 
     stepQrSpinner();
 
-    // 🌟 [VERIFY ECHO] Worker 가 session.verified / session.verify_reason 을 실어 보냅니다.
-    //    실패 원인이 클라이언트에서 바로 보이도록 표면화합니다.
     const verifySession = (response && response.session) ? response.session : {};
     if (verifySession.verify_reason && verifySession.verified === false) {
         console.warn(
@@ -1909,16 +1515,10 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
 
         const parsed: any = decodeAnalyticBlob(row.data) || {};
 
-        // 🌟 [ORIGIN SEED] question / answer 의 data 에는 origin 이 없습니다.
-        //    다음 라운드의 resolveAnalyticsOrigins() 가 이 사이트를 계속 발견하려면
-        //    반드시 채워 두어야 합니다.
         if (!parsed.origin) parsed.origin = origin;
 
         const textVal = extractAnalyticText(parsed);
 
-        // 🌟 [BCC RECONSTRUCT] analytics D1 스키마에는 bcc 컬럼이 없습니다.
-        //    (id/type/flag/from/to/cc/ref/data/created_at/updated_at 뿐)
-        //    commerce 와 동일한 규칙 bcc = hashId(type + cc) 로 클라이언트가 재구성합니다.
         const rowType = String(row.type || "click");
         const rowCc = String(row.cc || expectedCc || "");
         let rowBcc = String(row.bcc || "");
@@ -1929,15 +1529,11 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
         // 🌟 [MODE TAGGING] modeOfType() 단일 판정 경로를 그대로 사용합니다.
         const rowMode = modeOfType(rowType);
 
-        // 🌟 [RAW MARKER] 아직 구조화되지 않은 원시 이벤트인지 판정합니다.
-        //    content.js 는 action / relate 를 outerHTML '배열' 로 올리므로
-        //    배열이면 곧 '구조화 전' 이라는 구조적 사실입니다.
         const isRawEvent = Array.isArray(parsed?.action) || Array.isArray(parsed?.relate);
 
         items.push({
             id: row.id,
             type: rowType,
-            // 🌟 [FLAG] analytics D1 은 flag 를 실제로 채워 보냅니다. 비었을 때만 세션 flag 로 보강.
             flag: row.flag || String((currentSession as any).flag || ""),
             from: row.from || "",
             to: row.to || "",
@@ -1947,13 +1543,6 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
             status: 9,
             mode: rowMode,
             created_at: Number(row.created_at || now),
-            // ⚠️ updated_at 은 draft/count 계약이자 '구조화 대기' 마커입니다.
-            //    ── 왜 now 로 덮으면 안 되는가 ──
-            //     Rust 의 structure_pending_analytics 는
-            //       mode = 'analytic' AND updated_at = 0
-            //     로 구조화 대상을 찾습니다. 여기서 now 를 넣으면
-            //     원시 outerHTML 이 영원히 요약되지 않아
-            //     text 가 빈 채로 남고, 검색이 구조적으로 0건이 됩니다.
             updated_at: isRawEvent ? 0 : serverUpdated,
             text: textVal,
             masked_text: textVal,
@@ -2009,8 +1598,6 @@ async function syncAnalyticsData() {
             return;
         }
 
-        // 🌟 [CURSOR] created_at 은 상한 커서입니다. 반드시 '현재보다 미래' 여야
-        //    UTC- 지역에서 최근 이벤트가 잘려 나가지 않습니다.
         const now = Date.now();
         const cursor = Math.max(now, now - timezoneOffset) + 60_000;
 
@@ -2028,21 +1615,14 @@ async function syncAnalyticsData() {
                     await loadMoreDocs(false, true);
                 }
             }
-            // 🌟 [STRUCTURE FIRST] 원시 outerHTML 을 먼저 시맨틱 문장으로 확정합니다.
-            //    이 단계가 끝나야 text 가 채워지고, 그때서야 임베딩이 의미를 갖습니다.
+
             const structuredCount = await runAnalyticStructuring();
-            // 🌟 [STRUCTURE BUBBLE DONE] 구조화 말풍선들을 완료 처리합니다.
-            //    analytic_sync_sem_* / analytic_sync / analytic_sync_flow 가
-            //    status=1(PROCESSING) 에서 영원히 멈춰 있는 것을 방지합니다.
             if (structuredCount > 0) {
                 await finalizeAnalyticBubbles(structuredCount);
             }
-            // 🌟 [CLIENT-SIDE EMBEDDING] 서버는 벡터를 만들지 않으므로 로컬에서 즉시 임베딩합니다.
+            
             runLocalEmbeddingSync();
         } else {
-            // 🌟 새로 받은 건이 없어도, 이전 라운드에서 구조화하지 못하고 남은
-            //    원시 이벤트가 있으면 이어서 처리합니다.
-            //    (LLM 로드 비용은 대상 0건일 때 백엔드가 probe 단계에서 차단합니다)
             const structured = await runAnalyticStructuring();
             if (structured > 0) {
                 await finalizeAnalyticBubbles(structured);
@@ -2070,24 +1650,242 @@ async function syncAnalyticsData() {
     }
 }
 
-// 🌟 [ANALYTICS BACKGROUND SYNC] commerce / shipping 탭에 있어도 analytics 이벤트가
-//    계속 흘러 들어오도록 하는 역방향 경로입니다.
-//    (기존에는 syncCommerceInBackground 만 있고 이 방향이 없어서,
-//     Analytic 탭 + 채팅 화면 + 위젯 확장 3조건이 동시에 성립할 때만 동기화되었습니다)
-//    폴링 주기(3초)마다 N개 사이트를 왕복하면 과하므로 30초 스로틀을 겁니다.
 async function syncAnalyticsInBackground() {
     if (!currentSession.hash) return;
     if (isAnalyticsSyncRunning) return;
-    // 🌟 [ADAPTIVE THROTTLE] 기존 고정 30초 대신 백오프 간격을 적용합니다.
-    //    기본 3초에서 시작해 변경 없음이 연속되면 1.5배씩 증가, 최대 30초.
+
     const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
     if (Date.now() - lastAnalyticsSyncAt < throttleMs) return;
     await syncAnalyticsData();
 }
 
-// 🌟 [COMMERCE BACKGROUND SYNC] analytic 모드에서도 commerce.logis.center D1 과
-//    양방향 동기화를 수행합니다. syncData() 의 commerce 경로를 재사용하되,
-//    UI 갱신(renderNavigation / loadMoreDocs)은 현재 탭이 commerce 일 때만 수행합니다.
+const TRADING_API_HOST = "https://trading.logis.center";
+let isTradingSyncRunning = false;
+let lastTradingSyncAt = 0;
+
+async function tradingApiFetch(
+    query: Record<string, any>,
+    opts: { method?: "GET" | "POST" | "DELETE"; body?: any; gzip?: boolean } = {}
+): Promise<any> {
+    if (!currentSession.hash || !currentSession.token) return null;
+    const method = opts.method || "GET";
+    const sp = new URLSearchParams();
+    sp.append("hash", currentSession.hash);
+    sp.append("token", currentSession.token);
+    if (currentSession.team) sp.append("to", currentSession.team);
+    for (const k of Object.keys(query)) {
+        const v = query[k];
+        if (v === undefined || v === null || v === "") continue;
+        sp.append(k, String(v));
+    }
+    const url = `${TRADING_API_HOST}/?${sp.toString()}`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (opts.gzip) headers["Content-Encoding"] = "gzip";
+    const args: any = { url, method, headers, session_params: null };
+    if (opts.body !== undefined) args.body = opts.body;
+    try {
+        return await invoke<any>("proxy_fetch", args);
+    } catch (e) {
+        console.warn(`[SYNC-TRADING] ${method} 실패:`, e);
+        return null;
+    }
+}
+
+/** 서버 → 로컬. 델타 커서는 서버가 확정해 준 cursor 를 그대로 씁니다. */
+async function pullTradingData(): Promise<number> {
+    const since = Number((await kvGet("trading_sync_cursor")) || 0);
+    const now = Date.now();
+    // 🌟 [CURSOR] created_at 은 '상한' 입니다. now - timezoneOffset 을 쓰면
+    //    UTC- 지역에서 최근 문서가 통째로 잘립니다. 반드시 미래여야 합니다.
+    const upper = Math.max(now, now - timezoneOffset) + 60_000;
+    const res = await tradingApiFetch({ since: since, created_at: upper, limit: 1000 });
+    if (!res || !Array.isArray(res.results)) return 0;
+    if (res.results.length === 0) {
+        if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
+        return 0;
+    }
+    const tombs = await loadItemTombstones();
+    let tombBlocked = 0;
+    const items: any[] = [];
+    for (const row of res.results) {
+        if (!row || !row.id) continue;
+        if (tombs.has(String(row.id))) { tombBlocked++; continue; }
+        const parsed: any = decodeAnalyticBlob(row.data) || {};
+        // 서버 봉투가 진실의 원천입니다. data 안의 값보다 우선합니다.
+        parsed.id = row.id;
+        parsed.type = row.type;
+        parsed.mode = row.mode || "shipping";
+        parsed.flag = row.flag || "";
+        parsed.cc = row.cc || "";
+        parsed.bcc = row.bcc || "";
+        parsed.ref = row.ref || "";
+        parsed.digest = row.digest || "";
+        parsed.created_at = Number(row.created_at || 0);
+        parsed.updated_at = Number(row.updated_at || 0);
+        const textVal =
+            (typeof parsed.text === "string" ? parsed.text.trim() : "")
+            || (typeof parsed.summary === "string" ? parsed.summary.trim() : "");
+        items.push({
+            id: row.id,
+            table: "items",
+            type: row.type,
+            flag: row.flag || "",
+            from: row.from || "",
+            to: row.to || "",
+            cc: row.cc || "",
+            bcc: row.bcc || "",
+            ref: row.ref || "",
+            mode: row.mode || "shipping",
+            digest: row.digest || "",
+            status: 9,
+            created_at: Number(row.created_at || 0),
+            updated_at: Number(row.updated_at || 0),
+            text: textVal,
+            masked_text: textVal,
+            data: parsed
+        });
+    }
+    if (tombBlocked > 0) {
+        console.log(`[SYNC-TRADING] 🪦 삭제된 문서 ${tombBlocked}건의 재삽입을 차단했습니다.`);
+    }
+    if (items.length > 0) {
+        await invoke("upsert_items", { items });
+        if (appDb) {
+            await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
+        }
+        const brief: Record<string, number> = {};
+        for (const it of items) brief[it.type] = (brief[it.type] || 0) + 1;
+        console.log(`[SYNC-TRADING] ⬇️ 수신 ${res.results.length}건 / 저장 ${items.length}건 ${JSON.stringify(brief)}`);
+    }
+    if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
+    return items.length;
+}
+
+async function pushTradingData(): Promise<number> {
+    if (!appDb) return 0;
+    const pushedCursor = Number((await kvGet("trading_push_cursor")) || 0);
+    let rows: any[] = [];
+    try {
+        rows = await appDb.table("items").where("mode").equals("shipping").toArray();
+    } catch (e) {
+        console.warn("[SYNC-TRADING] 로컬 조회 실패:", e);
+        return 0;
+    }
+    const stampOf = (r: any) => Math.max(Number(r.updated_at || 0), Number(r.created_at || 0));
+    const candidates = rows
+        .filter((r: any) => r && r.id && stampOf(r) > pushedCursor)
+        .sort((a: any, b: any) => stampOf(a) - stampOf(b));
+    if (candidates.length === 0) return 0;
+    const batch = candidates.slice(0, 200);
+    const payload = {
+        items: batch.map((r: any) => ({
+            id: r.id,
+            type: r.type,
+            flag: r.flag || "",
+            digest: r.digest || (r.data && r.data.digest) || "",
+            created_at: Number(r.created_at || 0),
+            updated_at: Number(r.updated_at || 0),
+            data: r.data || {}
+        }))
+    };
+    const res = await tradingApiFetch({}, { method: "POST", body: payload, gzip: true });
+    if (!res) return 0;
+    const accepted = Number(res.accepted || 0);
+    const skipped = Number(res.skipped || 0);
+    const rejected = Number(res.rejected || 0);
+
+    if (accepted + skipped >= batch.length) {
+        const maxStamp = batch.reduce((m: number, r: any) => Math.max(m, stampOf(r)), pushedCursor);
+        await kvSet("trading_push_cursor", String(maxStamp));
+    }
+
+    if (Array.isArray(res.results) && res.results.length > 0) {
+        const byId = new Map<string, any>();
+        for (const r of batch) byId.set(String(r.id), r);
+        const adopted: any[] = [];
+        for (const srv of res.results) {
+            const local = byId.get(String(srv.id));
+            if (!local) continue;
+            if (local.ref === srv.ref && local.bcc === srv.bcc && local.cc === srv.cc) continue;
+            const data = { ...(local.data || {}) };
+            data.cc = srv.cc;
+            data.bcc = srv.bcc;
+            data.ref = srv.ref;
+            data.mode = srv.mode;
+            data.flag = srv.flag;
+            adopted.push({
+                id: srv.id,
+                table: "items",
+                type: srv.type,
+                flag: srv.flag,
+                from: srv.from,
+                to: srv.to,
+                cc: srv.cc,
+                bcc: srv.bcc,
+                ref: srv.ref,
+                mode: srv.mode,
+                digest: srv.digest,
+                created_at: srv.created_at,
+                updated_at: srv.updated_at,
+                text: local.data?.text || "",
+                masked_text: local.data?.masked_text || local.data?.text || "",
+                data
+            });
+        }
+        if (adopted.length > 0) {
+            await invoke("upsert_items", { items: adopted });
+            if (appDb) await appDb.table("items").bulkPut(normalizeEnvelope(adopted)).catch(() => null);
+            console.log(`[SYNC-TRADING] 🔗 서버 확정 봉투(ref/bcc) ${adopted.length}건을 로컬에 반영했습니다.`);
+        }
+    }
+    console.log(`[SYNC-TRADING] ⬆️ 후보 ${candidates.length}건 중 ${batch.length}건 전송 → 저장 ${accepted} / 스킵 ${skipped} / 거부 ${rejected}`);
+    return accepted;
+}
+
+async function syncTradingData() {
+    if (!currentSession.hash || !currentSession.token) return;
+    if (isTradingSyncRunning) return;
+    isTradingSyncRunning = true;
+    try {
+        const pushedCount = await pushTradingData();
+        const pulledCount = await pullTradingData();
+        if (pushedCount > 0 || pulledCount > 0) {
+            updateSyncBackoff(true);
+            if (currentSearchMode === "shipping") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+            runLocalEmbeddingSync();
+        } else {
+            updateSyncBackoff(false);
+        }
+    } catch (e) {
+        console.warn("[SYNC-TRADING] Failed:", e);
+    } finally {
+        isTradingSyncRunning = false;
+        lastTradingSyncAt = Date.now();
+        if (!isExtracting && !isSearching) stopSpinner();
+        if (btnSubmit) {
+            const currentVal = searchInput?.value.trim() || "";
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
+    }
+}
+
+async function syncTradingInBackground() {
+    if (!currentSession.hash || !currentSession.token) return;
+    if (isTradingSyncRunning) return;
+    const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
+    if (Date.now() - lastTradingSyncAt < throttleMs) return;
+    await syncTradingData();
+}
+
 let isCommerceSyncRunning = false;
 async function syncCommerceInBackground() {
     if (isCommerceSyncRunning) return;
@@ -2271,9 +2069,6 @@ async function syncCommerceInBackground() {
         console.warn("[SYNC-BG] Commerce background sync failed:", e);
     } finally {
         isCommerceSyncRunning = false;
-        // 🌟 [BACKOFF] 백그라운드 commerce 동기화에서 변경이 없었으면
-        //    syncData 의 백오프 카운터가 이미 갱신되어 있으므로 여기서는 추가 처리 불필요.
-        //    (syncData 가 filteredResults 판정으로 updateSyncBackoff 를 호출합니다)
     }
 }
 
@@ -2286,26 +2081,6 @@ const DexieLocal = (window as any).Dexie;
 
 const appDb = new DexieLocal("LogisAppDB");
 
-// 🌟 [v8 / TRADING INDEXES]
-//  무역(shipping/trading) 트랙 전용 조회 축을 추가합니다.
-//  스토어 구조는 v7 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
-//  → upgrade 콜백이 필요 없습니다.
-//
-//  ── 왜 봉투를 안 늘리는가 ──
-//   app-logis-center 의 TradeDocument 는 vessel/pol/pod/incoterms 등 55개를
-//   Rust 구조체에 못 박아 두어, 새 무역 서식이 추가될 때마다
-//   구조체 → LanceDB 스키마 → 프론트엔드 3곳을 동시에 고쳐야 했습니다.
-//   v4 봉투 구조에서는 값이 전부 data 안에 있으므로,
-//   '자주 eq/range 로 조회하는 경로' 만 여기에 한 줄씩 추가하면 끝입니다.
-//
-//  ⚠️ 여기 없는 무역 필드(marks_numbers, notify_party_name, place_receipt 등)는
-//     executeDexiePlan 이 .filter() 풀스캔으로 처리합니다.
-//     로컬 수천~수만 건 기준 수 ms 이므로 인덱스가 없어도 동작에 지장이 없습니다.
-// 🌟 [SCHEMA CONTRACT]
-//  Dexie 는 version(N).stores() 에 '선언되지 않은' object store 를 업그레이드 시점에 삭제합니다.
-//  v8 이 items 하나만 선언한 탓에 kv_store / ts_queue / talks / users / pages 5개가
-//  물리적으로 소멸했고, 그 결과 세션(kv_store)까지 함께 날아가 로그인이 풀렸습니다.
-//  → 앞으로 stores() 에는 '앱이 쓰는 전 테이블' 을 항상 함께 적어야 합니다.
 const ITEMS_SCHEMA = [
     // ── 봉투 (v7 그대로 유지) ──
     'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
@@ -2331,18 +2106,10 @@ const ITEMS_SCHEMA = [
     //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
     'data.incoterms', 'data.payment_terms', 'data.currency',
     //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
-    'data.container_number', 'data.seal_number',
+    '*data.container_number', '*data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
-    //  ⑤-1 🌟 [TRADING INDEX RELAY] commerce 의 data.order / data.tracking 과 동일한 역할입니다.
-    //     logic::trading_index_column() 이 만드는 crc32 숫자 인덱스 컬럼으로,
-    //     'BL 하나로 연결된 CI/PL 전부 조회' 를 O(log n) 으로 처리합니다.
-    //     문자열 doc_number 를 그대로 쓰면 표기 흔들림(대소문자/하이픈)에 매번 어긋납니다.
-    //  ⑤-1 🌟 [TRADING INDEX RELAY] ...
-    //     ⚠️ logic.rs 의 trading_index_column() 은 'rel_{소문자}' 를 45종 전부에 대해
-    //        생성합니다. 여기 없는 축은 인덱스 없이 .filter() 풀스캔으로 떨어집니다.
-    //        (동작은 하지만 문서가 늘수록 느려집니다)
     'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
     'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
     'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
@@ -2354,7 +2121,6 @@ const ITEMS_SCHEMA = [
     'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
     'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
     'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
-    //  ⑤-2 🌟 [BASE v2 신규 축] bias.json trade_schema.base v2 에서 추가된 조회 축입니다.
     'data.reference_bl', 'data.reference_po', 'data.reference_contract',
     'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
     'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
@@ -2362,39 +2128,26 @@ const ITEMS_SCHEMA = [
     'data.transport_mode', 'data.freight_payment_term',
     'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
     'data.due_date', 'data.payment_status',
-    'data.package_unit', 'data.type_size', 'data.hs_code',
-    //  ⑥ 복합 : 무역 문서는 '문서종류(type) + 발행일' 로 스캔하는 빈도가 압도적입니다.
-    //     doc_type 은 data.* 경로라 복합 인덱스의 구성 요소로 쓸 수 없으므로,
-    //     봉투 type 컬럼(BL/AWB/CI/PI/...)과 발행일을 묶습니다.
+    // 🌟 [MULTI-ENTRY] trading.rs 의 hoist_array_identifiers 가
+    //    컨테이너 2개 이상 / 품목 2개 이상인 문서에서 이 축들을 배열로 승격합니다.
+    //    스칼라 인덱스는 배열 값 전체를 하나의 키로 색인하므로
+    //    equals('8543.70') 이 ['8543.70','8544.00'] 을 영원히 찾지 못합니다.
+    //    '*' 를 붙이면 원소마다 키가 생기고, 스칼라 값도 그대로 색인되어
+    //    1개짜리 문서와 다건 문서를 같은 쿼리로 조회할 수 있습니다.
+    'data.package_unit', '*data.type_size', '*data.hs_code',
+    '*data.item_code', '*data.charge_code',
+    // 🌟 [MISSING RELAY] related_trading 이 실제로 반환하는데 인덱스가 없던 5종입니다.
+    //    PHYTO↔FC / MSDS↔DGD / POA↔BIZ_LIC / BEN_CERT 관계가
+    //    loadRelatedData 의 try/catch 에 조용히 삼켜져 영원히 연결되지 않았습니다.
+    'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
+    'data.rel_biz_lic', 'data.rel_ben_cert',
     '[type+created_at]'
 ].join(', ');
 
-
-// 🌟 v13 : talk_tombstones 추가 — 삭제한 채팅의 '묘비'
-//  ── 왜 필요한가 ──
-//   Client Worker(index.ts)에는 talk 개별 삭제 엔드포인트가 없습니다.
-//     DELETE 핸들러 = { type=crons → tasks 삭제 } | { 그 외 → S3 인증 해시 삭제(로그아웃) }
-//   PUT 은 talk.id 를 hashId() 난수로 새로 발급하므로 기존 행을 지목할 수도 없습니다.
-//   따라서 서버 행은 살아남고, 로컬에서만 지우면 다음 syncData 폴링(3초)이
-//   `!existingEl && !localMap.has(id)` 조건을 통과시켜 그대로 부활시킵니다.
-//   '이 id 는 내가 의도적으로 지웠다' 는 사실을 로컬에 영구 기록해야
-//   재삽입을 구조적으로 차단할 수 있습니다.
-//
-//  ── 왜 GC 를 하지 않는가 ──
-//   서버 행이 살아 있는 한 묘비를 지우는 순간 메시지가 되살아납니다.
-//   서버 행의 소멸 여부를 클라이언트가 확인할 방법이 없으므로 만료를 두지 않습니다.
-//   행 하나는 (42자 id + 타임스탬프) 이므로 1만 건 삭제해도 1MB 미만입니다.
-//   전체 초기화(btn-reset-db)는 Dexie DB 자체를 삭제하므로 함께 정리됩니다.
-//
-//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
-//     업그레이드 시점에 삭제합니다. 아래에는 v12 의 전 테이블이 그대로 포함되어 있습니다.
-// 🌟 v14 : trading 인덱스 축 확장 (rel_* 45종 + base v2 신규 축)
-//  스토어 구조는 v13 과 동일하고 인덱스만 추가하므로 Dexie 가 자동 백필합니다.
-//  → upgrade 콜백이 필요 없습니다.
-//
-//  ⚠️ [SCHEMA CONTRACT] Dexie 는 stores() 에 선언되지 않은 object store 를
-//     업그레이드 시점에 삭제합니다. 아래에는 v13 의 전 테이블이 그대로 포함되어 있습니다.
-appDb.version(14).stores({
+// 🌟 v15 : hs_code / type_size / item_code / charge_code 멀티엔트리 전환 +
+//          rel_phyto / rel_msds / rel_poa / rel_biz_lic / rel_ben_cert 추가.
+//          (Dexie 는 인덱스 선언이 바뀌면 반드시 버전을 올려야 재색인합니다)
+appDb.version(15).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
     ts_queue: 'taskId, type',
@@ -2405,12 +2158,8 @@ appDb.version(14).stores({
     talk_tombstones: 'id, deleted_at, ref'
 });
 
-(window as any).appDb = appDb; // db.ts 등 외부 스크립트에서 참조하기 위해 전역 노출
+(window as any).appDb = appDb;
 
-// --- kv 헬퍼 (반드시 appDb 선언 바로 아래, 모든 호출부보다 위에 위치) ---
-// 🌟 [FAIL-SOFT] 스토어가 없거나 업그레이드 중이면 예외 대신 null / no-op 으로 흡수합니다.
-//    kvGet 이 throw 하면 initSession 첫 줄에서 전체 초기화가 중단되어
-//    updateAuthUI() 조차 실행되지 않고 Sign Out 버튼이 그대로 노출됩니다.
 async function kvGet(key: string): Promise<any> {
     try {
         const record = await appDb.table("kv_store").get(key);
@@ -2435,22 +2184,7 @@ async function kvRemove(key: string) {
     }
 }
 
-// =====================================================================
-// 🌟 [TALK TOMBSTONE] 삭제한 채팅의 묘비
-// ---------------------------------------------------------------------
-//  삭제 범위 계약:
-//    ① 내 PC   : LanceDB messages + Dexie talks + DOM 에서 완전 제거
-//    ② 내 PC   : 묘비를 남겨 서버 폴링의 재삽입을 영구 차단
-//    ③ 서버    : 행은 그대로 남습니다 (워커에 talk 삭제 엔드포인트 없음)
-//    ④ 타 사용자: 각자의 로컬 원장에 그대로 남아 계속 노출됩니다
-//                 (syncData 는 가산 전용이라 서버에서 사라져도 지우지 않습니다)
-// =====================================================================
 let talkTombstoneCache: Set<string> | null = null;
-
-// 🌟 [ITEM TOMBSTONE] 삭제한 문서의 묘비.
-//    서버 D1 에 행이 남아 있으면 syncData 폴링(3초)이 재삽입하므로,
-//    '이 id 는 내가 의도적으로 지웠다' 는 사실을 로컬에 영구 기록합니다.
-//    talk_tombstones 와 동일한 원리이나 대상이 items 테이블입니다.
 let itemTombstoneCache: Set<string> | null = null;
 
 async function loadItemTombstones(): Promise<Set<string>> {
@@ -2521,20 +2255,6 @@ async function addTalkTombstone(id: string, refVal: string = "") {
     }
 }
 
-/**
- * 🌟 [DELETE CHAT MESSAGE] 채팅 한 건을 내 기기에서 삭제합니다.
- *
- *  순서가 중요합니다. 묘비를 '가장 먼저' 세워야
- *  삭제 도중에 폴링이 끼어들어도 재삽입되지 않습니다.
- *    ① 묘비 기록          → 재삽입 영구 차단
- *    ② LanceDB messages   → get_chat_messages 조회 결과에서 제거
- *    ③ Dexie talks 캐시   → syncData 의 localMap 잔재 제거
- *    ④ DOM                → 화면 즉시 반영
- *
- *  ⚠️ 서버 호출은 하지 않습니다. index.ts 의 DELETE 는
- *     `type=crons` 가 아니면 S3 인증 해시(/hash/{hash})를 지워
- *     사용자를 강제 로그아웃시키기 때문입니다.
- */
 async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } = {}): Promise<boolean> {
     if (!msgId) return false;
 
@@ -2554,9 +2274,6 @@ async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } 
     // ① 묘비 (가장 먼저)
     await addTalkTombstone(msgId, refVal);
 
-    // ② LanceDB messages
-    //    upsert_items 의 talk 분기가 task_id 에 자기 id 를 각인하므로
-    //    delete_message(taskId) 가 정확히 이 한 행만 지웁니다.
     try {
         await invoke("delete_message", { taskId: msgId });
     } catch (e) {
@@ -2638,6 +2355,12 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
     'data.etd', 'data.eta',
     'data.incoterms', 'data.payment_terms', 'data.currency',
+    // 🌟 [MULTI-ENTRY 표기] '*' 는 stores() 선언 전용 접두사입니다.
+    //    where() 에는 별표 없는 키 경로를 넘겨야 하고,
+    //    Rust build_dexie_plan 도 별표 없는 path 를 내려줍니다.
+    //    여기에 별표를 붙여 두면 has() 가 영원히 false 가 되어
+    //    선언한 멀티엔트리 인덱스가 단 한 번도 쓰이지 않고
+    //    컨테이너/씰 번호 조회가 전부 .filter() 풀스캔으로 떨어집니다.
     'data.container_number', 'data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
@@ -2656,6 +2379,10 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
     'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
     'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    // 🌟 [MISSING RELAY] ITEMS_SCHEMA 와 1:1 로 맞춥니다.
+    'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
+    'data.rel_biz_lic', 'data.rel_ben_cert',
+    'data.item_code', 'data.charge_code',
     // 🌟 [BASE v2 신규 축]
     'data.reference_bl', 'data.reference_po', 'data.reference_contract',
     'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
@@ -2734,6 +2461,21 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
         }
     }
 
+    // 🌟 [MULTI-ENTRY VALUE] 멀티엔트리 축은 값이 배열로 들어옵니다.
+    //    String(['A','B']) 는 'A,B' 가 되어 eq 가 영원히 실패하고
+    //    contains 는 우연히 통과하는 비대칭이 생깁니다.
+    //    Dexie 멀티엔트리 인덱스가 '원소 중 하나라도 일치' 로 동작하므로
+    //    메모리 검증도 같은 규칙을 따라야 인덱스 결과와 갈리지 않습니다.
+    if (Array.isArray(raw)) {
+        const t0 = (cond.value === null || cond.value === undefined) ? '' : String(cond.value).toLowerCase();
+        if (!t0) return true;
+        const hit = raw.some(el => {
+            const s = (el === null || el === undefined) ? '' : String(el).toLowerCase();
+            return cond.op === 'contains' ? s.includes(t0) : s === t0;
+        });
+        if (cond.op === 'not_contains' || cond.op === 'neq') return !hit;
+        return hit;
+    }
     // 문자열 계열
     const actualStr = (raw === null || raw === undefined) ? '' : String(raw);
     const targetStr = (cond.value === null || cond.value === undefined) ? '' : String(cond.value);
@@ -3869,9 +3611,6 @@ async function updateExtractButtonVisibility() {
         return; 
     }
 
-    // 5. 더블 클릭 및 비동기 작업(Lock 확인 및 태스크 상태 질의) 처리 후 최종 가시성 결정
-    // 🌟 [CRITICAL FIX] 즉시 렌더링(flex) 후 비동기로 숨기는(none) 로직 때문에 깜빡임이 발생했습니다. 
-    // 비동기 검증을 먼저 await로 대기한 뒤 최종적으로 한 번만 렌더링하여 깜빡임을 원천 차단합니다.
     if (extractClickLock) {
         btnExtract.style.display = "none";
         return;
@@ -3882,8 +3621,6 @@ async function updateExtractButtonVisibility() {
     if (currentLock) {
         const lockEl = document.getElementById(currentLock);
         if (!lockEl) {
-            // 🌟 [CRITICAL FIX] 5000ms라는 불확실한 시간 기반 땜질 로직을 전면 폐기하고,
-            // 실제 프론트엔드/백엔드 큐(대기열)에 존재하는지 명확한 상태 기반으로 교차 검증하여 유령 락을 즉각 해제합니다.
             const isFrontendActive = GlobalTaskManager.currentTaskId === currentLock || GlobalTaskManager.queue.some(q => q.taskId === currentLock);
             const isBackendActive = GlobalTaskManager.backendQueued.some(p => p.id === currentLock || p.taskId === currentLock);
             
@@ -5033,6 +4770,26 @@ async function syncData() {
         if (currentSession.hash && currentSession.email) {
             syncCommerceInBackground();
         }
+        if (currentSession.hash) {
+            syncTradingInBackground();
+        }
+        return;
+    }
+    // 🌟 [TRADING TRACK] shipping 모드는 trading.logis.center 전용 Worker 와 동기화합니다.
+    //
+    //  ── 왜 별도 Worker 인가 ──
+    //   commerce D1 의 items 에는 mode / flag 컬럼이 없어 클라이언트가
+    //   MODE TAGGING / FLAG RECOVERY 로 사후 보강해 왔고, 그 보강 누락이
+    //   무역 서식 19종이 mode='commerce' 로 굳은 직접 원인이었습니다.
+    //   trading D1 은 두 컬럼을 물리 컬럼으로 갖고 있어 그 해킹이 필요 없습니다.
+    if (currentSearchMode === "shipping") {
+        await syncTradingData();
+        if (currentSession.hash) {
+            syncAnalyticsInBackground();
+        }
+        if (currentSession.hash && currentSession.email) {
+            syncCommerceInBackground();
+        }
         return;
     }
     // 🌟 [ANALYTICS BACKGROUND] commerce / shipping 탭에 있어도 analytics 이벤트를 계속 받습니다.
@@ -5043,6 +4800,10 @@ async function syncData() {
     //     30초 스로틀이 걸려 있어 폴링 부하는 사실상 없습니다.
     if (currentSession.hash) {
         syncAnalyticsInBackground();
+    }
+    // 🌟 [TRADING BACKGROUND] 같은 이유로 무역 문서도 탭과 무관하게 흘러야 합니다.
+    if (currentSession.hash) {
+        syncTradingInBackground();
     }
     if (!currentSession.hash || !currentSession.email) return;
     
@@ -5415,7 +5176,7 @@ async function syncData() {
 }
 
 // --- 기존 State 영역 어딘가에 추가 ---
-let currentSearchMode = "commerce"; // 값은 initSession에서 Dexie 비동기로 덮어씌워집니다.
+let currentSearchMode = "commerce";
 
 // 🌟 앱 시작 시 탭 UI 초기화 함수
 function applySearchModeUI() {
@@ -5431,8 +5192,7 @@ function applySearchModeUI() {
             el.classList.remove('active');
         }
     });
-    // 🌟 [MODE LABEL] 파일 상단의 modeLabel() 단일 정의를 씁니다.
-    //    저장/쿼리 계약은 여전히 mode='shipping' 이므로 DB 나 Rust 쪽 변경이 전혀 없습니다.
+
     if (searchInput) {
         searchInput.placeholder = `${modeLabel(currentSearchMode)} Search or Ask`;
     }
@@ -5447,20 +5207,11 @@ function applySearchModeUI() {
         }
     }
 
-    // 🌟 [OAUTH REGISTER BUTTON GATE] analytic 모드가 아니면 사이트 등록 버튼을 제거합니다.
-    //    renderNavigation() 이 호출되지 않는 탭 전환 경로(applySearchModeUI)에서
-    //    이전 analytic 모드에서 생성된 버튼이 commerce/shipping 에 잔존하는 것을 차단합니다.
     const existingOAuthBtn = document.getElementById("btn-oauth-register");
     if (existingOAuthBtn && currentSearchMode !== "analytic") {
         existingOAuthBtn.remove();
     }
 
-    // 🌟 [OAUTH SITE NODE CLEANUP] 모드 전환 시점에 페이지 목록에 남아 있는
-    //    .oauth-site-item 노드를 즉시 제거합니다.
-    //    기존에는 renderNavigation() 의 pageList.innerHTML 교체 시점까지
-    //    노드가 잔존하다가, renderOAuthSitesUI 가 조기 탈락하면
-    //    다음 renderAccordion 에서 삭제되어 '갑자기 사라짐' 이 발생했습니다.
-    //    여기서 명시적으로 지우면 모드 전환 직후 화면이 깨끗하게 정리됩니다.
     if (currentSearchMode !== "analytic") {
         const pageListEl = document.getElementById("nav-list-pages");
         if (pageListEl) {
@@ -5468,15 +5219,6 @@ function applySearchModeUI() {
         }
     }
 
-    // 🌟 [OAUTH REGISTER BUTTON RESTORE] analytic 모드로 재전환 시 버튼이 없으면 재생성합니다.
-    //    모드 탭 클릭 경로는 applySearchModeUI() + refreshList() 만 호출하고
-    //    renderNavigation() 을 호출하지 않으므로, 여기서 버튼을 복원해야 합니다.
-    //    생성 조건은 renderNavigation() 내부와 완전히 동일합니다.
-    //      · currentSearchMode === "analytic"
-    //      · 세팅 패널이 닫혀 있어야 함 (!isSettingsOpen)
-    //      · 로그인 상태 (currentSession.email)
-    //    ⚠️ existingOAuthBtn 은 remove() 후에도 변수 참조가 남아 있으므로,
-    //       반드시 document.getElementById() 로 DOM 존재 여부를 다시 확인합니다.
     if (currentSearchMode === "analytic" && !document.getElementById("btn-oauth-register") && !isSettingsOpen && currentSession.email) {
         if (pagesSection) {
             const h3 = pagesSection.querySelector("h3");
@@ -5544,6 +5286,13 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         if (currentSearchMode === "analytic" && currentSession.hash) {
             lastAnalyticsSyncAt = 0; // 스로틀 해제
             syncAnalyticsData();
+        }
+        // 🌟 [IMMEDIATE PULL / TRADING] shipping 으로 전환한 직후도 동일합니다.
+        //    무역 트랙은 문서 수가 적고 폴링 간격이 최대 30초까지 늘어나므로,
+        //    탭을 눌렀는데 30초간 빈 화면이 유지되는 체감을 없앱니다.
+        if (currentSearchMode === "shipping" && currentSession.hash) {
+            lastTradingSyncAt = 0; // 스로틀 해제
+            syncTradingData();
         }
 
         const _isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
@@ -5969,16 +5718,12 @@ btnExtract?.addEventListener("click", async () => {
 
                 renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
 
-                // 클라우드 작업은 로컬 GPU 큐를 점유하지 않으므로 즉시 락을 해제합니다.
                 isExtracting = false;
                 stopSpinner();
                 await GlobalTaskManager.release(taskId, taskId);
                 await updateExtractButtonVisibility();
                 
             } else {
-                // ==========================================
-                // 💻 [LOCAL MODE]
-                // ==========================================
                 if (currentImage) {
                     const ext = currentImage.split('.').pop()?.toLowerCase() || '';
                     const isDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(ext);
@@ -6001,8 +5746,6 @@ btnExtract?.addEventListener("click", async () => {
                     console.log("[WIDGET] Queuing LOCAL HTML/ANALYTIC task...");
                     const html = await invoke<string>("extract_html_from_current_tab");
                     
-                    // 🌟 [CRITICAL FIX] 브라우저가 유휴 상태(Idle/Background)로 전환되어 currentDetectedUrl이 
-                    // 빈 값이거나 about:blank로 날아갔을 경우, localhost로 엉뚱하게 매칭되는 것을 방어합니다!
                     let validUrl = currentDetectedUrl;
                     if (!validUrl || validUrl === "" || validUrl === "about:blank") {
                         const pageList = document.getElementById("nav-list-pages");
@@ -6021,17 +5764,17 @@ btnExtract?.addEventListener("click", async () => {
                     const teamId = currentSession.team || "";
                     const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
                     
-                    // 🌟 [추가] 사용자의 모드 선택에 따라 전처리 파이프라인(Task Type) 분기
                     const extractType = currentSearchMode === "analytic" ? "analytic_extraction" : "html_extraction";
                     
                     // 🚀 큐에 등록
                     await GlobalTaskManager.addToQueue(taskId, extractType, { 
                         id: taskId, type: extractType, html: html, link: rawPath, 
-                        origin: urlObj.origin, // 🌟 [핵심] Rust 스케줄러가 localhost로 오판하지 않도록 origin(도메인)을 명시적으로 전달!
+                        origin: urlObj.origin,
                         cc: activeContext.cc || cc, 
                         ref: activeContext.ref || hashedRefId, 
                         bcc: activeContext.bcc || "", 
                         from: currentSession.address, to: currentSession.team,
+                        flag: String((currentSession as any).flag || ""),
                         device_preference: getDevicePref(), search_mode: currentSearchMode
                     });
                 }
@@ -9267,13 +9010,6 @@ async function initSession() {
             console.warn("[SCHEMA] Generation check skipped:", e);
         }
 
-        // 🌟 [CRITICAL FIX] 렌더링 오염(pages 타입 노출) 해결: 필터링 없이 raw DB 아이템을 무작정 렌더링하던 코드를 삭제합니다.
-        // 리스트 렌더링은 하단의 syncData -> loadMoreDocs(false, true) 파이프라인에서
-        // Dexie 스코프 체이닝을 거쳐 100% 안전하게 수행됩니다.
-
-        // 🌟 [CRITICAL FIX] Rust(LanceDB)에서 로드한 초기 데이터를 다시 Rust로 덮어쓰는(역동기화) 치명적인 병목 루프를 제거합니다.
-
-        // 🌟 [CRITICAL FIX] 로그인 여부(네트워크 상태)와 무관하게 로컬 DB의 최신 데이터로 화면을 즉시 그려냅니다! (병목 및 렌더링 유격 해소)
         await renderNavigation();
 
         // 🌟 화면이 렌더링된 후 백그라운드에서 조용히 서버와 통신하여 최신 데이터를 반영합니다.
@@ -9282,10 +9018,7 @@ async function initSession() {
             syncData(); // await를 제거하여 UI 블로킹 방지
         }
 
-         // 🌟 [CLIENT-SIDE EMBEDDING] 이전 세션에서 클라우드로 받아왔지만 로컬 임베딩이 안 된 아이템을 복구합니다.
-         //    runLocalEmbeddingSync 내부에 2초 디바운스가 있으므로 syncData 완료 후 호출과
-         //    이 4초 타이머 호출이 겹쳐도 1회만 실행됩니다.
-         setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
+        setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
 
     } catch (e) { 
         console.error("[WIDGET] Handshake failed:", e); 
@@ -9296,24 +9029,16 @@ document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth)
 
 document.getElementById("btn-logout")?.addEventListener("click", async () => {
     if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) {
-        // 1. 메모리상의 세션 데이터 초기화
         currentSession = { hash: "", cc: "logis.center" };
-        // 2. Dexie DB 내 저장된 세션 및 터미널 로그 영구 삭제
         await kvRemove("chat_session");
-        // 🌟 [LOGOUT CLEANUP] 이전 계정 기반 검색 모드 / 숨김 페이지 / 음차 캐시 정리
         await kvRemove("search_mode");
         await kvRemove("hidden_pages");
-        // 🌟 [LOGOUT EMBED RESET] 이전 계정 문서의 embed 플래그를 리셋하지 않습니다.
-        //    LanceDB 는 계정 무관 로컬 저장소이므로, 재로그인 시
-        //    initialize_hub 의 migrate_team_identity 가 to 필드만 갱신합니다.
-        //    embed/청크는 그대로 유지하여 재임베딩 비용을 방지합니다.
-        // 3. sessionStorage 및 기타 상태 초기화
+        await kvRemove("trading_sync_cursor");
+        await kvRemove("trading_push_cursor");
         sessionStorage.clear();
-        // 🌟 [LOGOUT BACKEND RESET] 백엔드 모델 메모리 해제
         try {
             await invoke("unload_model");
         } catch (_e) { /* 이미 해제된 경우 무시 */ }
-        // 4. 앱 강제 새로고침하여 초기 상태(새 해시 생성 등)로 복귀
         window.location.reload();
     }
 });
@@ -9322,27 +9047,12 @@ document.getElementById("btn-logout")?.addEventListener("click", async () => {
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
-            // 🌟 [RESET STEP 0] 백엔드 활성 태스크 및 스케줄러 중단
-            //    reset_lancedb 전에 반드시 호출해야 합니다.
-            //    스케줄러 백그라운드 워커가 이미 픽업한 태스크가
-            //    테이블 drop 이후에도 upsert_item 을 시도하거나,
-            //    reindex_pending_embeddings 가 빈 테이블에 임베딩을
-            //    계속 쓰는 것을 방지합니다.
-            //    taskId: null → 전체 정리 모드 (모든 pending 태스크 폐기)
             await invoke("stop_current_extraction", { taskId: null }).catch(() => null);
             console.log("[RESET] Backend extraction stopped and cancellation token set.");
 
-            // 🌟 [RESET STEP 1] 백엔드 모델 및 스토어 완전 언로드
-            //    모델이 로드된 상태에서 reset 하면
-            //    deep_purge_resources 가 미호출되어 VRAM 이 잔존하고,
-            //    재시작 후 모델 재로드 시 이전 KV 캐시 참조 오류가 발생할 수 있습니다.
             await invoke("unload_model").catch(() => null);
             console.log("[RESET] Backend model and store unloaded.");
 
-            // 🌟 [RESET STEP 2] 프론트엔드 폴링 / 스케줄링 타이머 정리
-            //    syncData 폴링(3초)이 reset 직후에도 upsert_items 를 호출하면
-            //    방금 비운 테이블에 데이터가 다시 채워집니다.
-            //    reindex 디바운스 타이머(2초)도 동일하게 임베딩을 재실행합니다.
             if (chatPollInterval) {
                 clearTimeout(chatPollInterval);
                 chatPollInterval = null;
@@ -9945,7 +9655,6 @@ async function initDevicePreference() {
     // 1. Check GPU Availability
     try {
         const gpuInfo = await invoke<any>("check_gpu_availability");
-        // 호환성을 위해 boolean이 반환될 경우와 객체가 반환될 경우를 모두 처리
         const hasGpu = typeof gpuInfo === "boolean" ? gpuInfo : gpuInfo.has_gpu;
         const vendor = typeof gpuInfo === "object" ? gpuInfo.vendor : "none";
 
@@ -9986,8 +9695,6 @@ async function initDevicePreference() {
     // 3. Save on change
     forceCpuToggle.addEventListener("change", async () => {
         await kvSet("force_cpu_mode", forceCpuToggle.checked.toString());
-        // [NOTE] The preference will be applied on the next model initialization.
-        // Users can click "Free Memory" to force a reload if they want immediate effect.
     });
 }
 
@@ -10223,44 +9930,12 @@ interface ChatMessage {
     status: number;
     task_id?: string;
     content?: string | any;
-    // 🌟 [OWNERSHIP] 삭제 버튼 노출 판정에 사용합니다.
-    //    upsertChatMessages 는 from === currentSession.address 일 때 role 을 'user' 로 재계산하므로
-    //    실제 판정은 role 로 하되, DOM 에 원본 from 을 남겨 두면 이후 감사·디버깅이 쉬워집니다.
     from?: string;
     ref?: string;
 }
 
-// 🌟 [LOCAL ECHO] 낙관적 로컬 저장 행의 id 접두사입니다.
-//    서버(index.ts)는 talk.id 를 `hashId()` 로 발급하므로 반드시 '0x' 로 시작합니다.
-//      var talk = { id : hashId(), ... }   // 인자 없음 = 완전 난수 지갑 주소
-//    두 접두사가 절대 겹치지 않는다는 '구조적 사실' 이 승계 판정의 유일한 근거입니다.
 const LOCAL_ECHO_PREFIX = "talk_";
 
-/**
- * 🌟 [LOCAL ECHO RECONCILE]
- *  ── 무엇이 문제였나 ──
- *   채팅 전송 시 화면 반응을 위해 로컬 행을 먼저 만들어 그립니다(낙관적 저장).
- *   그런데 서버는 talk.id 를 난수로 발급하므로 클라이언트가 그 값을 미리 알 수 없고,
- *   결과적으로 같은 문장이 서로 다른 id 두 개로 존재하게 됩니다.
- *     talk_1787456151873_ll0pqw  (로컬)
- *     0x9568fca1abca47333aa634fbe42e354f74464135  (서버)
- *   upsertChatMessages 의 중복 제거는 id 일치를 전제로 하므로 둘 다 렌더링됩니다.
- *
- *  ── 해결 ──
- *   render.ts 의 isAlmostEqual 을 사용해 { role, text, id } 중 id 하나만 다른 쌍을
- *   '동일 메시지' 로 판정하고, 로컬 행을 서버 행에 승계시킵니다.
- *   승계 처리는 세 곳을 동시에 정리해야 재발하지 않습니다.
- *     ① DOM 노드 제거          → 화면 즉시 정리
- *     ② LanceDB messages 삭제  → 앱 재시작 후 부활 방지
- *     ③ Dexie talks 삭제       → 로컬 캐시 잔재 제거
- *
- *  ── 1:1 소비 ──
- *   같은 문장을 연속으로 두 번 보내면 로컬 에코도 2개, 서버 행도 2개입니다.
- *   서버 행을 created_at 오름차순으로 순회하며 '아직 승계되지 않은 가장 오래된 에코'
- *   하나만 소비하므로 개수가 어긋나지 않습니다.
- *
- *  @returns 승계 처리되어 이번 렌더링에서 제외해야 할 로컬 행 id 집합
- */
 async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string>> {
     const superseded = new Set<string>();
     if (!chatTalks) return superseded;
@@ -10273,9 +9948,6 @@ async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string
         .sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
     if (serverRows.length === 0) return superseded;
 
-    // ── 로컬 에코 후보 수집 : ① 이미 그려진 DOM 노드 ② 이번 배치에 함께 실려 온 DB 행 ──
-    //    ②가 필요한 이유 : 앱을 껐다 켜면 로컬 행과 서버 행이 같은 조회 결과에 동시에 담겨
-    //    옵니다. DOM 만 보면 그 경우를 잡지 못해 재시작마다 중복이 되살아납니다.
     type Echo = { id: string; role: string; text: string; createdAt: number; node: HTMLElement | null };
     const echoes: Echo[] = [];
 
@@ -10604,14 +10276,6 @@ function createMessageHTML(msg: ChatMessage) {
     // 🌟 핵심: msg.text가 비어있지 않도록 보장하여 새로고침 시에도 내용 표시
     const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
 
-    // 🌟 [DELETE AFFORDANCE] 삭제 버튼은 '내가 쓴 순수 채팅' 에만 노출합니다.
-    //  · 태스크 말풍선(검색/추출 진행 상태)은 제외
-    //    → delete_message(task_id) 가 그 태스크의 질문 말풍선까지 함께 지우고,
-    //      중단은 이미 btn-stop-task 가 담당합니다.
-    //  · 상대방 메시지는 제외
-    //    → 삭제는 어차피 내 기기 로컬에만 적용되므로 남의 글을 지우는 것은
-    //      권한 행사가 아니라 '내 화면 숨김' 에 불과해 오해를 부릅니다.
-    //  role 은 upsertChatMessages 가 from === currentSession.address 로 재계산한 값입니다.
     const canDelete = !isTaskBubble && msg.role === 'user' && !!msg.id;
     const deleteBtn = canDelete
         ? `<button class="btn-delete-talk" data-talk-id="${domId}" title="Delete for me"
@@ -10650,7 +10314,6 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
     isChatLoading = true;
 
     try {
-        // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버에는 정상적으로 채팅 내역이 저장되었지만, 로컬 DB에서 꺼내올 때 URL 필터가 누락되어 빈 화면이 노출되는 버그를 해결합니다.
         let effectiveCc = activeContext.cc;
         let effectiveBcc = activeContext.bcc;
         let effectiveRef = activeContext.ref;
@@ -10709,16 +10372,10 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
 
         let messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
         
-        // 🌟 [추가] 좀비 상태 보정 및 정렬 안정화 데이터 세탁
         messages = messages.map(m => {
-            // 1. 유령 데이터 STOPPED 처리 강화: 
-            // 현재 앱이 '초기화(Handshake) 완료 전'이거나, 백엔드 DB에서도 명시적으로 2인 경우만 중단 처리합니다.
             if ((m.status === 1 || m.status === 10) && !isSearching && !isExtracting) {
-                // 단순히 검색/추출 중이 아니라고 해서 2로 바꾸지 않고, 
-                // DB에서 넘어온 원본 status가 이미 2이거나 terminal state일 때만 UI를 고정합니다.
                 return m; 
             }
-            // 2. 사용자 질문의 경우 시스템 메시지와의 정렬 간격을 벌리기 위해 시간값 강제 보정
             if (m.role === "user" && m.id.endsWith("_query")) {
                 return { ...m, created_at: Number(m.created_at) - 50 };
             }
@@ -10868,11 +10525,6 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 chatTalks.insertAdjacentHTML('afterbegin', endHtml);
             }
 
-            // 🌟 [QR RE-RENDER GUARD] 이 호출은 채팅이 갱신될 때마다 발생합니다.
-            //    performQrAuth 내부에 renderedQrHash 멱등성 검사가 들어갔으므로
-            //    이미 같은 hash 로 그려져 있으면 즉시 반환하고 노드를 건드리지 않습니다.
-            //    다만 이미 그려져 있고 hash 도 동일하다면 함수 호출 자체를 생략해
-            //    불필요한 DOM 조회조차 하지 않도록 여기서 한 번 더 걸러 냅니다.
             if (!currentSession.email && currentTab === "settings") {
                 const qrExists = !!document.getElementById("qr-code-target");
                 if (!qrExists || renderedQrHash !== currentSession.hash) {
@@ -10894,35 +10546,11 @@ async function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: 
     await upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
 }
 
-// --- Initialize ---
 initSession();
 setWindowSize(false);
 syncBrowserStatus();
 initDevicePreference();
 
-// =====================================================================
-// 🌟 [TRANSLIT CACHE / DEXIE] Rust 스케줄러 ↔ 프론트엔드 Dexie 음차 캐시 통신
-// ---------------------------------------------------------------------
-//  Rust(scheduler.rs) 가 음차 생성 전에 캐시를 조회하거나,
-//  생성 후에 캐시를 저장할 때 emit 하는 이벤트를 여기서 수신합니다.
-//
-//  조회 흐름:
-//    Rust emit("translit-cache-query", {request_id, word, lang})
-//    → 프론트 listen → Dexie 조회 → 코사인 계산(복수 후보)
-//    → invoke("translit_cache_respond", {request_id, results})
-//    → Rust oneshot receiver 에서 await
-//
-//  저장 흐름:
-//    Rust emit("translit-cache-save", {word, lang, native, roman})
-//    → 프론트 listen → Dexie upsert
-// =====================================================================
-
-// ── 캐시 조회 리스너 ──
-//  응답 계약 (Rust query_translit_cache 와 1:1):
-//    []                     → 캐시 미스 (레코드 자체가 없음)
-//    [[native, roman]]      → 캐시 히트
-//    [["", ""]]             → 네거티브 캐시 히트 ('음차 불가' 로 확정된 값)
-//  ⚠️ 빈 문자열 레코드도 반드시 반환해야 Rust 가 LLM 재호출을 생략합니다.
 listen("translit-cache-query", async (event: any) => {
     const { request_id, word, lang } = event.payload;
 
@@ -10941,10 +10569,6 @@ listen("translit-cache-query", async (event: any) => {
             .toArray();
 
         if (!candidates || candidates.length === 0) {
-            // 🌟 [LANG AXIS DIAGNOSTIC] 같은 원문이 '다른 언어 키' 로 저장돼 있는지 확인합니다.
-            //    이 경고가 뜨면 캐시가 깨진 게 아니라 doc_lang 이 흔들린 것입니다.
-            //    (실측 사례: 페이지 셀렉터 캐시 히트 시 doc_lang 이 'en' 으로 고정되어
-            //     'ko' 로 저장된 레코드를 영원히 찾지 못했습니다)
             try {
                 const others = await appDb.table("translit_cache")
                     .where("source_word").equals(word).toArray();
@@ -10956,15 +10580,12 @@ listen("translit-cache-query", async (event: any) => {
                     );
                 }
             } catch (_e) {
-                // v12 미적용 세대에서는 source_word 단독 인덱스가 없어 실패할 수 있습니다.
-                // 진단 전용 경로이므로 조용히 흡수합니다.
             }
             console.log(`[TRANSLIT CACHE] MISS word='${word}' lang='${lang}'`);
             await respond([]);
             return;
         }
 
-        // 단일 후보(정상 경로): upsert 정책상 대부분 여기에 해당합니다.
         if (candidates.length === 1) {
             const c = candidates[0];
             const nv = c.native || "";
@@ -11018,9 +10639,6 @@ listen("translit-cache-query", async (event: any) => {
     }
 });
 
-// ── 캐시 저장 리스너 ──
-//  native / roman 이 모두 빈 문자열이어도 반드시 저장합니다(네거티브 캐시).
-//  '이 원문은 이 언어에서 음차가 성립하지 않는다' 는 판정 자체가 재사용 가치가 있습니다.
 listen("translit-cache-save", async (event: any) => {
     const { word, lang, native, roman } = event.payload;
     const nv = native || "";
@@ -11045,8 +10663,6 @@ listen("translit-cache-save", async (event: any) => {
             `→ native='${nv}' roman='${rm}' (replaced ${removed})`
         );
     } catch (e) {
-        // 🌟 저장 실패는 '다음 태스크에서 LLM 재호출' 로 직결되므로 반드시 표면화합니다.
-        //    (기존에는 warn 만 찍혀 원인 추적이 불가능했습니다)
         console.error(
             `[TRANSLIT CACHE] ❌ SAVE FAILED word='${word}' lang='${lang}'. ` +
             `이 값은 다음 태스크에서 다시 LLM 으로 생성됩니다.`, e
