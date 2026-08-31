@@ -1581,14 +1581,40 @@ impl Qwen3_5TextModel {
         let rms_norm_eps = gguf.get_matedata("qwen35.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let hidden_size = gguf.get_matedata("qwen35.embedding_length")?.to_u32()? as usize;
         
-        let embed_tensor = gguf.tensor("token_embd.weight")?;
-        
-        
+        // 🌟 [EMBED SCOPE] 양자화 원본과 역양자화본이 동시에 사는 구간을 최소화합니다.
+        //
+        //  ── 실측 사고 ──
+        //   구버전은 embed_tensor(quantized, GPU 약 540MB)를 함수 스코프 끝까지
+        //   붙들고 있었습니다. 그래서 그 뒤의 레이어 스켈레톤 생성과
+        //   output_norm 로드가 전부 540MB + 1,017MB = 1,557MB 를 깔고 진행됐습니다.
+        //   블록으로 감싸 역양자화 직후 원본을 떨어뜨리면
+        //   이후 구간의 기준선이 1,017MB 로 내려갑니다.
+        //
+        //  ⚠️ CPU 역양자화로 바꾸지 않은 이유:
+        //     이 환경의 실측 free RAM 은 592MB~1.3GB 입니다(로그 KV-PLAN 참조).
+        //     CPU 경로는 호스트에 540MB + 1,017MB 를 동시에 요구하므로
+        //     VRAM 을 아끼려다 시스템 RAM 을 터뜨립니다. GPU 역양자화가 옳습니다.
         let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
-        let embed_tokens = Embedding::new(
-            embed_tensor.dequantize_f16(device).or_else(|_| embed_tensor.dequantize(device))?.to_dtype(embed_dtype)?, 
-            hidden_size
+        let embed_weight = {
+            let embed_tensor = gguf.tensor("token_embd.weight")?;
+            let w = embed_tensor
+                .dequantize_f16(device)
+                .or_else(|_| embed_tensor.dequantize(device))?
+                .to_dtype(embed_dtype)?;
+            drop(embed_tensor);
+            w
+        };
+        if device.is_cuda() {
+            // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
+            let _ = device.synchronize();
+        }
+        println!(
+            "[MODEL] embed_tokens materialized: {:?} {:?} ({:.0}MB). Quantized source released.",
+            embed_weight.shape().dims(),
+            embed_weight.dtype(),
+            (embed_weight.elem_count() as f64) * 2.0 / 1e6
         );
+        let embed_tokens = Embedding::new(embed_weight, hidden_size);
         
         
         #[cfg(target_os = "windows")]
@@ -2281,26 +2307,58 @@ impl Qwen3_5Model {
         let image_token_id = 248056u32;
         let video_token_id = 248057u32;
         let vision_start_token_id = 248053u32;
+
+        // 🌟 [LOAD ORDER] 언어 모델을 먼저 세웁니다.
+        //    레이어는 new_skeleton 이라 VRAM 을 쓰지 않고, 여기서 올라가는 것은
+        //    embed_tokens(F16 1,017MB) 와 output_norm 뿐입니다.
+        //    비전을 먼저 세우던 구버전은 비전 1.44GB 위에 이 1GB 를 얹어
+        //    피크를 그대로 합산시켰습니다.
+        let language_model = Qwen3_5TextModel::new_from_gguf(gguf, device, mmap_handle, ct_handle)?;
+
+        // 🌟 [TIED LM HEAD] output.weight 가 없으면 embed_tokens 와 '같은 가중치' 입니다.
+        //
+        //  ── 실측 사고 ──
+        //   구버전은 output.weight 가 없을 때 token_embd.weight 를 한 번 더 읽었습니다.
+        //     · embed_tokens : F16 역양자화본  248,320 × 2,048 × 2B = 1,017MB
+        //     · lm_head      : 같은 텐서의 quantized 본           ≈   540MB
+        //   즉 동일 가중치가 VRAM 에 두 벌 존재했고, 정상 구간 소비 1.81GB 중
+        //   540MB 가 순수 중복이었습니다.
+        //
+        //  ── 왜 TensorF16 으로 공유해도 되는가 ──
+        //   candle 의 QMatMul::TensorF16 은 forward 에서 입력을 F16 으로 캐스팅하고
+        //   matmul 후 원래 dtype 으로 되돌립니다. 아래 forward 는 hidden 을
+        //   F32 로 넘기므로(hidden_state_aligned) 이 경로가 정확히 맞습니다.
+        //   Tensor::clone 은 스토리지 Arc 참조 복사라 새 할당이 없습니다.
+        let lm_head = match gguf.tensor("output.weight") {
+            Ok(tensor) => {
+                println!("[MODEL] lm_head: dedicated 'output.weight' loaded (untied).");
+                ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(tensor)?, None))
+            }
+            Err(_) => {
+                let shared = language_model.embed_tokens.embeddings().clone();
+                let qm = if shared.dtype() == DType::F16 {
+                    QMatMul::TensorF16(shared)
+                } else {
+                    QMatMul::Tensor(shared)
+                };
+                println!(
+                    "[MODEL] lm_head: 'output.weight' absent → tied to embed_tokens. Duplicate {:.0}MB avoided.",
+                    (language_model.embed_tokens.embeddings().elem_count() as f64) * 2.0 / 1e6
+                );
+                ProjKind::QuantizedProj(QuantizedLinear::new(qm, None))
+            }
+        };
+
+        // 🌟 [VISION-SKELETON] 여기서는 비전을 만들지 않습니다.
+        //    호출부가 attach_vision_skeleton() 으로 '가중치 0바이트' 구조만 붙입니다.
+        //    (하위 호환: mmproj_gguf 가 주어지면 구버전대로 전량 적재합니다)
         let visual = if let Some(mmproj) = mmproj_gguf {
-            let visual = Qwen3VLVisionModel::new_from_gguf(mmproj)?;
-            Some(visual)
+            println!("[MODEL] ⚠️ Vision tower loaded EAGERLY (legacy path). Peak VRAM will include full mmproj.");
+            Some(Qwen3VLVisionModel::new_from_gguf(mmproj)?)
         } else {
             None
         };
 
-        let language_model = Qwen3_5TextModel::new_from_gguf(gguf, device, mmap_handle, ct_handle)?;
-        
-        let lm_head_tensor = match gguf.tensor("output.weight") {
-            Ok(tensor) => tensor,
-            Err(_) => gguf.tensor("token_embd.weight")?,
-        };
-        
-        
-        // 기존처럼 15만 개짜리 매트릭스를 F32로 압축 해제하지 않습니다!
-        // Quantized(압축된) 상태 그대로 QMatMul에 물려주어 RAM 피크를 완벽히 제거합니다.
-        let qmatmul = QMatMul::from_qtensor(lm_head_tensor)?;
-        let lm_head = QuantizedLinear::new(qmatmul, None);
-        
         Ok(Self {
             spatial_merge_size,
             image_token_id,
@@ -2308,11 +2366,19 @@ impl Qwen3_5Model {
             vision_start_token_id,
             visual,
             language_model,
-            
-            lm_head: ProjKind::QuantizedProj(lm_head),
+
+            lm_head,
             rope_deltas: None,
             rope_deltas_cpu: None,
         })
+    }
+
+    /// 🌟 [VISION-SKELETON] mmproj 의 메타데이터만 읽어 비전 구조를 붙입니다.
+    ///    이 시점의 VRAM 증가는 0 이며, 실제 가중치는
+    ///    forward 가 캐시 MISS 를 확인한 뒤 블록 단위로 읽어 옵니다.
+    pub fn attach_vision_skeleton(&mut self, mmproj_path: &str, device: &Device) -> Result<()> {
+        self.visual = Some(Qwen3VLVisionModel::new_skeleton_from_mmproj(mmproj_path, device)?);
+        Ok(())
     }
 
     
@@ -2336,10 +2402,32 @@ impl Qwen3_5Model {
 
     /// 🌟 [VISION-JIT] 비전 가중치만 붙였다 뗍니다. 텍스트 모델은 그대로 상주합니다.
     /// active=false 는 텍스트 전용 추론 진입 시, true 는 이미지/비디오 입력 감지 시 호출합니다.
+    ///
+    /// 🌟 [LAZY ATTACH] active=true 는 더 이상 즉시 로드하지 않습니다.
+    ///
+    ///  ── 실측 사고 ──
+    ///   ensure_qwen3_5(true) → set_vision_active(true) → reload_weights() 가
+    ///   '비전 캐시 조회보다 먼저' 실행됐습니다. 로그가 그대로 보여줍니다.
+    ///     [VISION-JIT] mmproj weights reloaded (streaming: true) ...
+    ///     [VISION-CACHE] HIT key=... ViT 27-block attention skipped.
+    ///     [VISION-JIT] mmproj weights unloaded.
+    ///   스트리밍이라 블록은 안 올라가지만 load_shared_weights()
+    ///   (patch_embed + pos_embed + merger fc1/fc2 ≈ 75MB) 는 매번 왕복했습니다.
+    ///   크롭 9개 기준 약 1.4GB 의 무의미한 PCIe 전송입니다.
+    ///
+    ///  ── 왜 지연해도 안전한가 ──
+    ///   Qwen3_5Model::forward 는 캐시 MISS 를 확인한 직후
+    ///     if !visual.is_weights_loaded && visual.is_jit_capable() { visual.reload_weights()?; }
+    ///   를 스스로 수행합니다. 비디오 경로도 동일한 가드를 갖고 있습니다.
+    ///   JIT 불가(safetensors 경로)인 인스턴스는 is_weights_loaded 가 true 로 고정이라
+    ///   unload 도 no-op 이므로 가중치가 사라지지 않습니다.
     pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
         if let Some(v) = self.visual.as_mut() {
             if active {
-                v.reload_weights()?;
+                // 로드하지 않습니다. forward 가 실제 필요 시점에 읽습니다.
+                if !v.is_weights_loaded && v.is_jit_capable() {
+                    println!("[VISION-JIT] Attach requested — deferred until a cache MISS actually needs the ViT.");
+                }
             } else {
                 v.unload_weights();
             }

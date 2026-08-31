@@ -177,6 +177,38 @@ pub struct Qwen3VLVisionPatchMerger {
 }
 
 impl Qwen3VLVisionPatchMerger {
+    /// 🌟 [VISION-SKELETON] 가중치 0 바이트로 구조만 만듭니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   new_skeleton_from_mmproj 는 mmproj 의 메타데이터만 읽어 비전 타워의
+    ///   '뼈대' 를 세웁니다. merger 와 deepstack_merger_list 도 그 뼈대의 일부이므로
+    ///   가중치 없이 태어날 수 있어야 합니다.
+    ///   norm / linear_fc1 / linear_fc2 는 이 구조체의 비공개 필드라
+    ///   호출부가 구조체 리터럴로 만들 방법이 없어 여기에 생성자를 둡니다.
+    ///
+    ///  ── 계약 ──
+    ///   hidden_size 는 new_from_gguf 와 동일하게 merge² 를 곱한 값을 보관합니다.
+    ///   (forward 의 reshape(((), self.hidden_size)) 가 그 값을 전제합니다)
+    ///   실제 가중치는 load_weights_inplace 또는 load_shared_weights 가
+    ///   동일한 prefix 규약("v.post_ln" / "mm.0" / "mm.2",
+    ///   "v.deepstack.{i}.norm" / ".fc1" / ".fc2")으로 나중에 채웁니다.
+    pub fn new_skeleton(
+        hidden_size: usize,
+        spatial_merge_size: usize,
+        eps: f64,
+        use_postshuffle_norm: bool,
+    ) -> Result<Self> {
+        let dummy = Tensor::zeros((1,), DType::F32, &Device::Cpu)?;
+        Ok(Self {
+            hidden_size: hidden_size * spatial_merge_size.pow(2),
+            use_postshuffle_norm,
+            norm: LayerNorm::new(dummy.clone(), dummy, eps),
+            linear_fc1: crate::models::common::gguf::dummy_proj(&Device::Cpu),
+            act_fn: Activation::Gelu,
+            linear_fc2: crate::models::common::gguf::dummy_proj(&Device::Cpu),
+        })
+    }
+
     pub fn new(
         config: &Qwen3VLVisionConfig,
         vb: VarBuilder,
@@ -388,6 +420,16 @@ impl Qwen3VLVisionAttention {
         Ok(self.proj.forward(&attn_output)?)
     }
 
+    /// 🌟 [VISION-SKELETON] qkv / proj 없이 헤드 수와 스케일만 확정합니다.
+    pub fn new_skeleton(num_heads: usize, head_dim: usize) -> Self {
+        Self {
+            num_heads,
+            qkv: crate::models::common::gguf::dummy_proj(&Device::Cpu),
+            proj: crate::models::common::gguf::dummy_proj(&Device::Cpu),
+            scaling: 1.0 / (head_dim as f64).sqrt(),
+        }
+    }
+
     pub fn to_device(&mut self, _device: &Device) -> Result<()> {
         // GGUF 양자화된 텐서(ProjKind)는 자체 장치를 사용하므로 이동 생략
         Ok(())
@@ -502,15 +544,30 @@ impl Qwen3VLVisionBlock {
         Ok(xs)
     }
 
+    /// 🌟 [VISION-SKELETON] 블록 하나를 가중치 없이 만듭니다.
+    ///
+    ///  ── 실측 근거 ──
+    ///   이 모델의 mmproj 는 BF16 이고 블록 하나가 약 60MB 입니다.
+    ///   (측정: 첫 이미지 처리 후 반환된 1.44GB ÷ 24블록 = 60MB)
+    ///   생성자에서 24개를 전부 올리면 그것만으로 1.44GB 가 선점됩니다.
+    ///   껍데기로 태어나면 그 1.44GB 가 애초에 할당되지 않습니다.
+    pub fn new_skeleton(num_heads: usize, head_dim: usize, eps: f64) -> Result<Self> {
+        let dummy = Tensor::zeros((1,), DType::F32, &Device::Cpu)?;
+        Ok(Self {
+            norm1: LayerNorm::new(dummy.clone(), dummy.clone(), eps),
+            norm2: LayerNorm::new(dummy.clone(), dummy, eps),
+            attn: Qwen3VLVisionAttention::new_skeleton(num_heads, head_dim),
+            mlp: TwoLinearMLPGguf::new_dummy(&Device::Cpu, Activation::GeluPytorchTanh),
+        })
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         let n1_w = self.norm1.weight().to_device(device)?;
         let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
         self.norm1 = LayerNorm::new(n1_w, n1_b, 1e-6);
-
         let n2_w = self.norm2.weight().to_device(device)?;
         let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
         self.norm2 = LayerNorm::new(n2_w, n2_b, 1e-6);
-
         self.attn.to_device(device)?;
         Ok(())
     }
@@ -720,6 +777,130 @@ impl Qwen3VLVisionModel {
         self.merger.to_device(device)?;
         for merger in self.deepstack_merger_list.iter_mut() { merger.to_device(device)?; }
         Ok(())
+    }
+
+    /// 🌟 [VISION-SKELETON] mmproj 의 '메타데이터만' 읽어 구조를 세우고,
+    ///    가중치는 단 1바이트도 올리지 않습니다.
+    ///
+    ///  ── 왜 필요한가 (실측 사고) ──
+    ///   기존 흐름은 이렇습니다.
+    ///     ① Qwen3VLVisionModel::new_from_gguf → 24블록 전량 VRAM 적재 (1.44GB)
+    ///     ② set_mmproj_path → 재로드 소스 등록
+    ///     ③ set_block_streaming(true) → 플래그만 켜짐
+    ///   stream_blocks 는 forward / reload_weights 에만 영향을 주므로
+    ///   ①에서 이미 올라간 1.44GB 를 되돌리지 못합니다.
+    ///   그 결과 첫 이미지 전처리 시점의 free VRAM 이 586MB 까지 떨어지고
+    ///     [VISION-ADAPTIVE] Free VRAM 586MB is below reserve. Forcing minimum 1048576px².
+    ///   첫 크롭(= 문서 기본키를 읽는 header 크롭)만 해상도 상한이 강제됩니다.
+    ///   첫 forward 의 스트리밍 루프가 블록을 하나씩 clear 한 뒤에야
+    ///   free VRAM 이 2024MB 로 회복됩니다.
+    ///
+    ///  ── 이 함수가 하는 일 ──
+    ///   metadata 만 읽어 (spatial_merge_size / hidden_size / patch_size /
+    ///   image_size / head_count / block_count / eps / is_deepstack_layers)
+    ///   구조를 확정하고, 모든 가중치는 1바이트 더미로 둡니다.
+    ///   is_weights_loaded = false 이므로 reload_weights() / forward() 가
+    ///   기존 JIT·스트리밍 경로 그대로 필요한 만큼만 읽어 옵니다.
+    ///
+    ///  ── 부수 효과 ──
+    ///   init_from_gguf 가 mmproj 를 위해 Gguf 를 따로 만들 필요가 없어지고,
+    ///   set_mmproj_source 의 두 번째 Content::read 도 사라집니다.
+    ///   (mmproj Content 를 파일당 1회만 파싱)
+    pub fn new_skeleton_from_mmproj(path: &str, device: &Device) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+        let ct = gguf_file::Content::read(&mut reader)?;
+
+        let get_u32 = |k: &str| -> Result<u32> {
+            ct.metadata
+                .get(k)
+                .ok_or_else(|| anyhow!("mmproj metadata missing: {}", k))?
+                .to_u32()
+                .map_err(|e| anyhow!("mmproj metadata '{}' is not u32: {}", k, e))
+        };
+
+        let spatial_merge_size = get_u32("clip.vision.spatial_merge_size")? as usize;
+        let hidden_size = get_u32("clip.vision.embedding_length")? as usize;
+        let patch_size = get_u32("clip.vision.patch_size")? as usize;
+        let image_size = get_u32("clip.vision.image_size")? as usize;
+        let num_heads = get_u32("clip.vision.attention.head_count")? as usize;
+        let num_block = get_u32("clip.vision.block_count")? as usize;
+        let rms_norm_eps = ct
+            .metadata
+            .get("clip.vision.attention.layer_norm_epsilon")
+            .and_then(|v| v.to_f32().ok())
+            .unwrap_or(1e-6) as f64;
+
+        let head_dim = hidden_size / num_heads.max(1);
+        let num_grid_per_side = (image_size / patch_size.max(1)) as u32;
+
+        // deepstack 은 없는 mmproj 도 있으므로 실패를 허용합니다.
+        let deepstack_visual_indexes: Vec<usize> = ct
+            .metadata
+            .get("clip.vision.is_deepstack_layers")
+            .and_then(|v| v.to_vec().ok())
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| match b.to_bool() {
+                        Ok(true) => Some(i),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let dummy_f16 = Tensor::zeros((1, 1), DType::F16, &Device::Cpu)?;
+        let patch_embed = Qwen3VLVisionPatchEmbed {
+            conv3d_weight: dummy_f16.clone(),
+            conv3d_bias: dummy_f16,
+        };
+        let pos_embed = Embedding::new(Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?, 1);
+        let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
+
+        let mut blocks = Vec::with_capacity(num_block);
+        for _ in 0..num_block {
+            blocks.push(Qwen3VLVisionBlock::new_skeleton(num_heads, head_dim, rms_norm_eps)?);
+        }
+
+        let merger = Qwen3VLVisionPatchMerger::new_skeleton(
+            hidden_size, spatial_merge_size, rms_norm_eps, false,
+        )?;
+        let mut deepstack_merger_list = Vec::with_capacity(deepstack_visual_indexes.len());
+        for _ in deepstack_visual_indexes.iter() {
+            deepstack_merger_list.push(Qwen3VLVisionPatchMerger::new_skeleton(
+                hidden_size, spatial_merge_size, rms_norm_eps, true,
+            )?);
+        }
+
+        println!(
+            "[VISION-SKELETON] mmproj structure built from metadata only (blocks={}, hidden={}, heads={}, deepstack={}). 0 bytes of weights loaded.",
+            num_block, hidden_size, num_heads, deepstack_visual_indexes.len()
+        );
+
+        Ok(Self {
+            spatial_merge_size,
+            patch_embed,
+            pos_embed,
+            num_grid_per_side,
+            rotary_pos_emb,
+            blocks,
+            merger,
+            deepstack_visual_indexes,
+            deepstack_merger_list,
+            dtype: DType::F32,
+            // 🌟 핵심: 태어날 때부터 '미상주' 입니다.
+            is_weights_loaded: false,
+            mmproj_path: Some(path.to_string()),
+            mmproj_mmap: Some(mmap),
+            mmproj_ct: Some(Arc::new(ct)),
+            // 블록 스트리밍을 기본으로 켭니다. 필요하면 set_block_streaming(false) 로 끕니다.
+            stream_blocks: true,
+            rms_norm_eps,
+            hidden_size,
+            device: device.clone(),
+        })
     }
 
     /// 🌟 [VISION-JIT] mmproj GGUF 경로를 등록해야 unload/reload가 활성화됩니다.
