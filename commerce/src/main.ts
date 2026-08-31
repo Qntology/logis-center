@@ -2,10 +2,54 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
-
 import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
+// 🌟 [MODE SPLIT] 모드 분류 단일 소스 (구 main.ts 상단 TRADING_DOC_CODES ~ modeLabel 블록)
+//    Part 2 기준으로 main.ts 가 실제 사용하는 심볼만 남깁니다.
+//    (TRADING_DOC_CODES / *_TYPE_SET / MODE_LABEL 은 modes/* 내부에서만 쓰입니다)
+import {
+    modeOfType,
+    TYPE_SETS,
+    modeLabel
+} from "./modes/types";
+// 🌟 [MODE SPLIT] main.ts ↔ modes/* 브리지 + 공용 백오프 + 공용 헬퍼
+//    updateSyncBackoff / getSyncIntervalMs / decodeAnalyticBlob / SYNC_BASE_INTERVAL_MS 는
+//    Part 2 에서 호출부가 전부 modes/* 로 옮겨졌으므로 여기서는 import 하지 않습니다.
+import {
+    bindModeRuntime,
+    computeSyncInterval,
+    resetSyncBackoff,
+    getRootDomain,
+    ENVELOPE_ROOT_KEYS
+} from "./modes/runtime";
+// 🌟 [MODE SPLIT] shipping(무역) 트랙
+import {
+    syncTradingData,
+    syncTradingInBackground,
+    resetTradingThrottle
+} from "./modes/trading";
+// 🌟 [MODE SPLIT] commerce 트랙
+//    COMMERCE_API_HOST 를 기존 이름 API_HOST 로 별칭 지정하여
+//    checkAuthStatus · handleTeamInvite · 채팅 PUT · 클라우드 검색/추출 등
+//    main.ts 내부의 모든 호출부를 그대로 유지합니다.
+import {
+    COMMERCE_API_HOST as API_HOST,
+    syncCommerceData,
+    syncCommerceInBackground
+} from "./modes/commerce";
+// 🌟 [MODE SPLIT] analytic 트랙
+import {
+    syncAnalyticsData,
+    syncAnalyticsInBackground,
+    resetAnalyticThrottle
+} from "./modes/analytic";
+// 🌟 [MODE SPLIT] analytic 전용 OAuth 사이트 등록/통계 (api.oauth.network)
+import {
+    fetchOAuthRegisteredSites,
+    renderOAuthSitesUI,
+    renderOAuthRegistrationForm
+} from "./modes/oauth";
 
 
 type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
@@ -190,81 +234,10 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     return out;
 }
 
-const TRADING_DOC_CODES = [
-    // 계약 · 결제
-    'PO', 'PI', 'SC', 'LC', 'LLC', 'CP', 'BE', 'TR', 'LG', 'EL',
-    // 선적 · 운송
-    'CI', 'PL', 'BL', 'HBL', 'SWB', 'AWB', 'SA', 'DO', 'AN',
-    'BC', 'BK', 'SR', 'FCR', 'POD', 'CM', 'FI', 'WR',
-    // 통관 · 신고
-    'ED', 'ID', 'CINV', 'CO', 'CCC', 'CNM', 'CSI',
-    // 검사 · 증명
-    'IC', 'WC', 'CA', 'COA', 'PHYTO', 'PC', 'HC', 'BEN_CERT', 'FC', 'CDR',
-    // 특수 · 법무 · 보험
-    'DGD', 'MSDS', 'POA', 'BIZ_LIC', 'INS', 'IP', 'ICF',
-    // 정산
-    'SOA', 'DN', 'CN', 'TI'
-];
-
-// 🌟 LLM 분류기는 대문자('BL')로, scheduler 의 page_type 은 소문자('tracking')로
-//    뱉는 두 경로가 공존하므로 양쪽을 모두 등재합니다.
-const TRADING_DOC_TYPE_SET = new Set<string>([
-    ...TRADING_DOC_CODES,
-    ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
-    'shipping_doc', 'TRACKING', 'Unknown', 'unknown'
-]);
-
-// ── commerce 도메인 타입 : proxy/index.ts 의 Relay 대상 전량 ──
-const COMMERCE_TYPE_SET = new Set<string>([
-    'sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
-    'receiving', 'shipping',
-    'member', 'team', 'user', 'users', 'pages', 'page', 'talk', 'prompt', 'ai_search'
-]);
-
-// ── analytics 행동 로그 / 관리자 Q&A ──
-const ANALYTIC_TYPE_SET = new Set<string>([
-    'click', 'hover', 'change', 'report', 'touch', 'question', 'answer'
-]);
-
-function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
-    const s = String(t || '');
-    if (ANALYTIC_TYPE_SET.has(s)) return 'analytic';
-    if (COMMERCE_TYPE_SET.has(s)) return 'commerce';
-    if (TRADING_DOC_TYPE_SET.has(s)) return 'shipping';
-    return 'commerce';
-}
-
-const TYPE_SETS: Record<string, string[]> = {
-    shipping: [
-        'tracking', 'receiving', 'shipping', 'shipping_doc', 'TRACKING',
-        ...TRADING_DOC_CODES,
-        ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
-        'Unknown', 'unknown'
-    ],
-    analytic: ['click', 'hover', 'change', 'report', 'touch', 'question', 'answer'],
-    commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
-        'receiving', 'shipping']
-};
-
-const MODE_LABEL: Record<string, string> = {
-    commerce: 'Commerce',
-    shipping: 'Trading',
-    analytic: 'Analytic'
-};
-
-function modeLabel(m: string): string {
-    return MODE_LABEL[m] || (m.charAt(0).toUpperCase() + m.slice(1));
-}
-
-const ENVELOPE_ROOT_KEYS = new Set([
-    'id', 'uuid', 'type', 'doc_type', 'flag', 'from', 'to', 'cc', 'bcc',
-    'ref', 'ref_val', 'mode', 'created_at', 'updated_at',
-    'created_at_ts', 'updated_at_ts',
-    // 아래 4개는 data 안으로 별도 승격되므로 하강 루프에서 제외합니다.
-    'data', 'json_data', 'text', 'masked_text',
-    // 클라우드 응답 전용 라우팅 힌트 (도메인 값이 아님)
-    'table', 'digest', 'current', 'score', 'name'
-]);
+// 🌟 [ENVELOPE CONTRACT MOVED → src/modes/runtime.ts]
+//    normalizeEnvelope(ROOT ABSORB)와 commerce 트랙의 ROOT ABSORB / RUST 보강 루프가
+//    반드시 같은 집합을 봐야 하므로 runtime.ts 로 승격했습니다.
+//    최상단 import 가 같은 이름을 제공하므로 normalizeEnvelope 본문은 변경되지 않습니다.
 
 const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     let parsed: any = {};
@@ -334,25 +307,19 @@ const ethers = (window as any).ethers;
 const blockies = (window as any).blockies;
 
 // --- Config ---
-const API_HOST = "https://commerce.logis.center"; 
-// 🌟 [ANALYTICS TRACK] 관리자(Console) 기능 및 사용자 행동 로그 동기화 전용 Client Worker
-const ANALYTICS_API_HOST = "https://console.logis.center";
+// 🌟 [MODE SPLIT] API_HOST 는 modes/commerce.ts 의 COMMERCE_API_HOST 로,
+//    ANALYTICS_API_HOST 는 modes/analytic.ts 의 ANALYTIC_API_HOST 로 이동했습니다.
+//    API_HOST 는 최상단 import 에서 같은 이름으로 별칭을 받으므로 호출부가 그대로이고,
+//    ANALYTICS_API_HOST 는 fetchAnalyticsOrigin 이 유일한 사용처였으므로
+//    main.ts 에서는 더 이상 참조하지 않습니다.
 const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
 const EXPANDED_HEIGHT = 600;
-
-// 🌟 [CRITICAL FIX] chrome.js와 완벽히 동일한 루트 도메인 추출 로직 추가 (필터 엇갈림 원천 차단)
-const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id","com.my","com.sg","com.ph","com.vn"];
-function getRootDomain(hostname: string) {
-    const host = hostname.split('.');
-    const isTwoPart = twoPartDomains.some(domain => hostname.endsWith(domain));
-    if (isTwoPart && host.length >= 3) {
-        return host[host.length - 3] + "." + host[host.length - 2] + "." + host[host.length - 1];
-    } else if (host.length >= 2) {
-        return host[host.length - 2] + "." + host[host.length - 1];
-    }
-    return hostname;
-}
+// 🌟 [ROOT DOMAIN MOVED → src/modes/runtime.ts]
+//    twoPartDomains / getRootDomain 은 commerce 트랙과 main.ts 의 버튼 가시성 판정이
+//    같은 규칙을 써야 하므로 runtime.ts 로 승격했습니다. (로직 변경 없음)
+//    최상단 import 가 getRootDomain 을 같은 이름으로 제공하므로
+//    updateExtractButtonVisibility / 채팅 폼 / btnExtract / loadMoreChat 호출부는 그대로입니다.
 
 interface ChatSession {
     hash: string;
@@ -376,692 +343,18 @@ let isCurrentShop = false;
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
-const OAUTH_API_HOST = "https://api.oauth.network";
-
-function normalizeOAuthHost(raw: any): string {
-    if (!raw || typeof raw !== "string") return "";
-    let s = raw.trim().toLowerCase();
-    if (!s) return "";
-    if (!/^https?:\/\//.test(s)) s = "https://" + s;
-    try {
-        const u = new URL(s);
-        if (!u.hostname) return "";
-        return "https://" + u.host;
-    } catch (_e) {
-        return "";
-    }
-}
-
-function extractBalancedJson(text: string, fromIndex: number): string {
-    const start = text.indexOf("{", fromIndex);
-    if (start === -1) return "";
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-    for (let i = start; i < text.length; i++) {
-        const ch = text[i];
-        if (inStr) {
-            if (esc) { esc = false; }
-            else if (ch === "\\") { esc = true; }
-            else if (ch === '"') { inStr = false; }
-            continue;
-        }
-        if (ch === '"') { inStr = true; continue; }
-        if (ch === "{") depth++;
-        else if (ch === "}") {
-            depth--;
-            if (depth === 0) return text.substring(start, i + 1);
-        }
-    }
-    return "";
-}
-
-/** api/index.js 의 HTML 응답에서 JSON 페이로드를 추출합니다. */
-function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: number; query: any } {
-    let text = "";
-    if (typeof raw === "string") {
-        text = raw;
-    } else if (raw && typeof raw === "object") {
-        if (raw.text) {
-            text = raw.text;
-        } else if (raw.rows) {
-            // 이미 JSON 으로 파싱된 경우 (향후 api/index.js 수정 시)
-            return { rows: raw.rows || [], cookies: raw.cookies || {}, count: raw.count || 0, query: raw.query || {} };
-        }
-    }
-    if (!text) {
-        return { rows: [], cookies: {}, count: 0, query: {} };
-    }
-
-    // <script> 내부의 parent.postMessage(JSON.stringify({...}), ...) 에서 JSON 추출
-    const anchor = text.indexOf("JSON.stringify(");
-    const jsonText = anchor === -1
-        ? extractBalancedJson(text, 0)
-        : extractBalancedJson(text, anchor + "JSON.stringify(".length);
-
-    if (!jsonText) {
-        console.warn("[OAUTH] 응답에서 postMessage 페이로드를 찾지 못했습니다.");
-        return { rows: [], cookies: {}, count: 0, query: {} };
-    }
-
-    try {
-        const parsed = JSON.parse(jsonText);
-        // ⚠️ index.js 는 cookies 를 '이중 stringify' 해서 내려줍니다.
-        //    JSON.stringify(JSON.stringify(req.cookies)) → 문자열 리터럴이므로 한 번 더 파싱합니다.
-        let cookies: any = {};
-        if (typeof parsed.cookies === "string") {
-            try { cookies = JSON.parse(parsed.cookies); } catch (_e) { cookies = {}; }
-        } else if (parsed.cookies && typeof parsed.cookies === "object") {
-            cookies = parsed.cookies;
-        }
-        return {
-            rows: Array.isArray(parsed.rows) ? parsed.rows : [],
-            cookies,
-            count: parsed.count || 0,
-            query: parsed.query || {}
-        };
-    } catch (e) {
-        console.warn("[OAUTH] postMessage 페이로드 JSON 파싱 실패:", e);
-        return { rows: [], cookies: {}, count: 0, query: {} };
-    }
-}
-
-async function oauthApiFetch(
-    query: Record<string, any>,
-    opts: { method?: "GET" | "POST"; body?: any } = {}
-): Promise<{ rows: any[]; cookies: any; count: number; query: any }> {
-    const method = opts.method || "GET";
-
-    const sp = new URLSearchParams();
-    for (const k of Object.keys(query)) {
-        const v = query[k];
-        if (v === undefined || v === null || v === "") continue;
-        if (Array.isArray(v)) {
-            for (const item of v) sp.append(k, String(item));
-        } else {
-            sp.append(k, String(v));
-        }
-    }
-
-    const qs = sp.toString();
-    const url = qs ? `${OAUTH_API_HOST}/?${qs}` : `${OAUTH_API_HOST}/`;
-
-    const headers: Record<string, string> = {
-        "Content-Type": method === "POST"
-            ? "application/x-www-form-urlencoded"
-            : "application/json",
-        "Referer": "https://oauth.network/"
-    };
-
-    const args: any = {
-        url,
-        method,
-        headers,
-        session_params: null
-    };
-    if (opts.body) args.body = opts.body;
-
-    const response = await invoke<any>("proxy_fetch", args);
-    return parseOAuthApiResponse(response);
-}
-
-async function submitOAuthRegistration(
-    hostUrl: string,
-    credentials?: { client_id: string; client_secret: string }
-): Promise<{
-    success: boolean;
-    client_id: string;
-    client_secret: string;
-    error: string;
-    removed: boolean;
-}> {
-    const isRemove = !!(credentials && credentials.client_id && credentials.client_secret);
-
-    if (!currentSession.hash || !currentSession.token) {
-        return { success: false, client_id: "", client_secret: "", error: "로그인이 필요합니다.", removed: false };
-    }
-
-    const host = normalizeOAuthHost(hostUrl);
-    if (!host) {
-        return { success: false, client_id: "", client_secret: "", error: "도메인 형식이 올바르지 않습니다. (예: https://example.com)", removed: false };
-    }
-
-    try {
-        const body: any = {
-            host: host,
-            hash: currentSession.hash,
-            token: currentSession.token
-        };
-        if (isRemove) {
-            body.client_id = credentials!.client_id;
-            body.client_secret = credentials!.client_secret;
-        }
-
-        console.log(`[OAUTH] POST ${isRemove ? "삭제" : "등록/재발급"} 요청: host='${host}'`);
-
-        const parsed = await oauthApiFetch({}, { method: "POST", body });
-
-        if (parsed.rows.length > 0) {
-            const row = parsed.rows[0];
-            if (row.client_id && row.client_secret) {
-                await fetchOAuthRegisteredSites();
-
-                return {
-                    success: true,
-                    client_id: String(row.client_id),
-                    client_secret: String(row.client_secret),
-                    error: "",
-                    removed: isRemove
-                };
-            }
-        }
-
-        const email = currentSession.email || "";
-        let expectedAddr = String(parsed.cookies?.client_id || "");
-        if (!expectedAddr && email && typeof ethers !== "undefined") {
-            try {
-                expectedAddr = ethers.computeAddress(ethers.hashMessage(email)).toLowerCase();
-            } catch (_e) { /* ignore */ }
-        }
-
-        const head = isRemove
-            ? "서버 삭제 실패. 삭제도 사이트 소유 확인을 통과해야 합니다."
-            : "사이트 소유 확인 실패.";
-
-        const errMsg = expectedAddr
-            ? `${head}\n사이트 <head>에 아래 세 태그가 그대로 있는지 확인하세요:\n<meta name="oauth-network-verification" content="${expectedAddr}" />\n<meta name="privacy" content="..." />\n<meta name="terms" content="..." />`
-            : `${head}\n메타 태그를 사이트 <head>에 추가하세요.`;
-
-        return { success: false, client_id: "", client_secret: "", error: errMsg, removed: isRemove };
-    } catch (e: any) {
-        return { success: false, client_id: "", client_secret: "", error: String(e), removed: isRemove };
-    }
-}
-
-async function fetchOAuthRegisteredSites(): Promise<void> {
-    if (!currentSession.hash || !currentSession.token) return;
-    try {
-        const parsed = await oauthApiFetch({
-            hash: currentSession.hash,
-            token: currentSession.token
-        });
-
-        const cookies = parsed.cookies || {};
-
-        const authed = !!(cookies.email || cookies.client_id || cookies["#length"] !== undefined);
-        if (!authed) {
-            const cookieKeys = Object.keys(cookies || {});
-            console.warn(
-                "[OAUTH] ⚠️ 서버 세션이 성립하지 않아 목록을 갱신하지 않습니다. " +
-                `(hash='${(currentSession.hash || "").slice(0, 8)}...', ` +
-                `token 유무=${!!currentSession.token}, ` +
-                `응답 cookies 키=[${cookieKeys.join(", ")}]). ` +
-                "로컬 kv_store 목록은 그대로 유지합니다."
-            );
-            return;
-        }
-
-        const len = parseInt(cookies["#length"] || "0", 10) || 0;
-
-        const sites: any[] = [];
-        for (let i = 0; i < len; i++) {
-            const raw = cookies[`#${i}`];
-            if (!raw || typeof raw !== "string") continue;
-            try {
-                // 형식: "0x주소:프라이빗키@호스트"
-                const u = new URL("https://" + raw);
-                if (!u.username || !u.hostname) continue;
-                sites.push({
-                    host: "https://" + u.host,
-                    client_id: decodeURIComponent(u.username),
-                    client_secret: decodeURIComponent(u.password),
-                    registered_at: Date.now()
-                });
-            } catch (_e) {
-                continue;
-            }
-        }
-
-        if (cookies.client_id) {
-            await kvSet("oauth_client_address", String(cookies.client_id));
-        }
-
-        // 서버가 유일한 진실 공급원입니다. 병합하지 않고 통째로 교체합니다.
-        await kvSet("oauth_registered_sites", sites);
-
-        console.log(
-            `[OAUTH] 서버 조회 완료. 등록된 사이트 ${sites.length}건 → kv_store 교체. ` +
-            `${sites.map((s: any) => s.host).join(", ")}`
-        );
-    } catch (e) {
-        console.warn("[OAUTH] fetchOAuthRegisteredSites failed:", e);
-    }
-}
-
-async function fetchOAuthSitePaths(referer: string): Promise<string[]> {
-    const host = normalizeOAuthHost(referer);
-    if (!host) return [];
-    try {
-        const parsed = await oauthApiFetch({
-            referer: host,
-            distinct: "Cc",
-            id: "#LOG"
-        });
-        return parsed.rows
-            .map((r: any) => r.Cc)
-            .filter((c: string) => !!c);
-    } catch (_e) {
-        return [];
-    }
-}
-
-async function fetchOAuthSiteCount(referer: string, hoursBack: number): Promise<number> {
-    const host = normalizeOAuthHost(referer);
-    if (!host) return 0;
-    try {
-        const now = Date.now();
-        const from = new Date(now - hoursBack * 3600 * 1000).toISOString();
-        const to = new Date(now).toISOString();
-        const parsed = await oauthApiFetch({
-            referer: host,
-            id: "#LOG",
-            cnt: "true",
-            date: [from, to]
-        });
-        return parsed.count || 0;
-    } catch (_e) {
-        return 0;
-    }
-}
-
-let isOAuthSitesRendering = false;
-
-async function renderOAuthSitesUI(pageList: HTMLElement) {
-    if (!pageList) return;
-    if (currentSearchMode !== "analytic") return;
-    if (!currentSession.email) return;
-
-    if (isOAuthSitesRendering) return;
-    isOAuthSitesRendering = true;
-
-    try {
-        const existingItems = pageList.querySelectorAll(".oauth-site-item");
-        if (existingItems.length > 0) {
-            existingItems.forEach((el: Element) => el.remove());
-        }
-
-        // 🌟 [OAUTH SYNC] 렌더링 전 서버에서 최신 목록을 조회합니다.
-        //    다른 기기에서 등록/삭제한 내역도 이 시점에 반영됩니다.
-        await fetchOAuthRegisteredSites();
-        const registeredSites = await kvGet("oauth_registered_sites") || [];
-        if (!Array.isArray(registeredSites) || registeredSites.length === 0) return;
-
-        let oauthHtml = '';
-        for (let si = 0; si < registeredSites.length; si++) {
-            const site = registeredSites[si];
-            const siteHost = site.host || "";
-            const clientId = site.client_id || "";
-            const clientSecret = site.client_secret || "";
-            const siteId = `oauth_site_${si}`;
-
-            let displayHost = siteHost;
-            try {
-                displayHost = new URL(siteHost).hostname;
-            } catch (_e) {}
-
-            oauthHtml += `
-<div class="oauth-site-item" id="${siteId}" style="position:relative; padding:6px 0; border-bottom:1px solid #f0f0f0;">
-    <div style="display:flex; align-items:center; gap:6px;">
-        <span style="font-size:0.8rem; font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${displayHost}</span>
-        <button class="btn-oauth-more" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; font-style:italic; text-decoration:underline; color:#6366f1; padding:0 4px;">more</button>
-        <button class="btn-oauth-hide" data-site-idx="${si}" style="background:none; border:none; cursor:pointer; font-size:10px; text-decoration:underline; color:#888; padding:0 4px;">hide</button>
-    </div>
-    <div class="oauth-site-tokens" data-site-idx="${si}" style="display:none; margin-top:6px; padding:8px; background:#f8f9fa; border-radius:4px; font-size:0.68rem; line-height:1.6; word-break:break-all;">
-        <div><strong>Client Id:</strong> ${clientId}</div>
-        <div style="margin-top:4px;"><strong>Client Secret:</strong> ${clientSecret}</div>
-        <div style="margin-top:8px; text-align:right; display:flex; gap:6px; justify-content:flex-end;">
-            <button class="btn-oauth-reissue" data-site-idx="${si}" style="background:none; border:1px solid #6366f1; color:#6366f1; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">재발급</button>
-            <button class="btn-oauth-delete" data-site-idx="${si}" style="background:none; border:1px solid #ef4444; color:#ef4444; border-radius:4px; padding:3px 10px; font-size:0.65rem; cursor:pointer;">Delete</button>
-        </div>
-    </div>
-    <div class="oauth-site-stats" data-site-host="${siteHost}" style="margin-top:15px; border:1px solid #ddd; border-radius:8px; position:relative;">
-        <span style="position:absolute; left: 8px; top: -5px; font-size:0.6rem; color:#999; font-weight:100; background:#fff; padding:0 4px;">시간별 접속량</span>
-        <table style="width:100%; border-collapse:collapse;">
-            <tbody>
-                <tr>
-                    <td class="stat-hour" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">hour</span></cnt>
-                    </td>
-                    <td class="stat-day" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">day</span></cnt>
-                    </td>
-                    <td class="stat-week" style="padding:8px; width:25%; text-align:center; border-right:1px solid #ddd;">
-                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">week</span></cnt>
-                    </td>
-                    <td class="stat-month" style="padding:8px; width:25%; text-align:center;">
-                        <cnt><span style="font-size:1em; font-weight:bold; text-decoration:underline;">0</span><span style="display:block; margin-top:3px; font-size:10px; font-weight:100;">month</span></cnt>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-</div>`;
-        }
-
-        pageList.insertAdjacentHTML("beforeend", oauthHtml);
-
-        // "more" 버튼: 토큰 정보 + 재발급/삭제 버튼 토글
-        pageList.querySelectorAll(".btn-oauth-more").forEach((btn: any) => {
-            btn.onclick = (e: Event) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const idx = btn.dataset.siteIdx;
-                const tokenDiv = pageList.querySelector(`.oauth-site-tokens[data-site-idx="${idx}"]`) as HTMLElement;
-                if (tokenDiv) {
-                    const isVisible = tokenDiv.style.display !== "none";
-                    tokenDiv.style.display = isVisible ? "none" : "block";
-                    btn.textContent = isVisible ? "more" : "fold";
-                }
-            };
-        });
-
-        // "hide" 버튼: 사이트 항목 숨김 (화면 전용, 서버 영향 없음)
-        pageList.querySelectorAll(".btn-oauth-hide").forEach((btn: any) => {
-            btn.onclick = async (e: Event) => {
-                e.preventDefault();
-                e.stopPropagation();
-                const idx = btn.dataset.siteIdx;
-                const siteItem = document.getElementById(`oauth_site_${idx}`);
-                if (siteItem) {
-                    siteItem.style.display = "none";
-                }
-            };
-        });
-
-        // 🌟 [REISSUE] host 만 보내면 index.js 가 재발급 분기로 진입합니다.
-        pageList.querySelectorAll(".btn-oauth-reissue").forEach((btn: any) => {
-            btn.onclick = async (e: Event) => {
-                e.preventDefault();
-                e.stopPropagation();
-
-                const idx = parseInt(btn.dataset.siteIdx, 10);
-                const sites = (await kvGet("oauth_registered_sites")) || [];
-                if (!Array.isArray(sites) || idx >= sites.length) return;
-
-                const site = sites[idx];
-                const confirmed = await ask(
-                    `'${site.host}' 의 client_id / client_secret 을 재발급하시겠습니까?\n기존 키는 즉시 무효화됩니다.`,
-                    { title: "재발급 확인", kind: "warning" }
-                );
-                if (!confirmed) return;
-
-                btn.textContent = "처리 중...";
-                btn.disabled = true;
-
-                const res = await submitOAuthRegistration(site.host);
-
-                if (res.success) {
-                    await renderNavigation();
-                } else {
-                    btn.textContent = "재발급";
-                    btn.disabled = false;
-                    alert(res.error);
-                }
-            };
-        });
-
-        pageList.querySelectorAll(".btn-oauth-delete").forEach((btn: any) => {
-            btn.onclick = async (e: Event) => {
-                e.preventDefault();
-                e.stopPropagation();
-
-                const idx = parseInt(btn.dataset.siteIdx, 10);
-                const sites = (await kvGet("oauth_registered_sites")) || [];
-                if (!Array.isArray(sites) || idx >= sites.length) return;
-
-                const site = sites[idx];
-
-                const confirmed = await ask(
-                    `'${site.host}' 등록을 삭제하시겠습니까?\n\n` +
-                    "· api.oauth.network 서버에서 client_id / client_secret 이 영구 삭제됩니다.\n" +
-                    "· 서버가 삭제 시에도 소유 확인을 하므로, 사이트 <head> 의 메타 태그는 아직 남아 있어야 합니다.",
-                    { title: "사이트 삭제 확인", kind: "warning" }
-                );
-                if (!confirmed) return;
-
-                btn.textContent = "삭제 중...";
-                btn.disabled = true;
-
-                const res = await submitOAuthRegistration(site.host, {
-                    client_id: site.client_id,
-                    client_secret: site.client_secret
-                });
-
-                if (res.success) {
-                    console.log(`[OAUTH] 🗑️ 서버에서 '${site.host}' 등록을 삭제했습니다.`);
-                    await renderNavigation();
-                } else {
-                    btn.textContent = "Delete";
-                    btn.disabled = false;
-                    alert(res.error);
-                }
-            };
-        });
-
-        // 🌟 [STATS] 각 사이트의 시간별 접속량을 비동기로 조회합니다.
-        //    hash / token 을 싣지 않으므로 index.js 의 referer 분기가 실제로 실행됩니다.
-        for (let si = 0; si < registeredSites.length; si++) {
-            const site = registeredSites[si];
-            const siteHost = site.host || "";
-            if (!siteHost) continue;
-            const statsDiv = pageList.querySelector(`.oauth-site-stats[data-site-host="${siteHost}"]`) as HTMLElement;
-            if (!statsDiv) continue;
-
-            // hour: 최근 1시간
-            fetchOAuthSiteCount(siteHost, 1).then(cnt => {
-                const el = statsDiv.querySelector(".stat-hour cnt span") as HTMLElement;
-                if (el) el.textContent = String(cnt);
-            });
-            // day: 최근 24시간
-            fetchOAuthSiteCount(siteHost, 24).then(cnt => {
-                const el = statsDiv.querySelector(".stat-day cnt span") as HTMLElement;
-                if (el) el.textContent = String(cnt);
-            });
-            // week: 최근 7일 (168시간)
-            fetchOAuthSiteCount(siteHost, 168).then(cnt => {
-                const el = statsDiv.querySelector(".stat-week cnt span") as HTMLElement;
-                if (el) el.textContent = String(cnt);
-            });
-            // month: 최근 30일 (720시간)
-            fetchOAuthSiteCount(siteHost, 720).then(cnt => {
-                const el = statsDiv.querySelector(".stat-month cnt span") as HTMLElement;
-                if (el) el.textContent = String(cnt);
-            });
-        }
-    } catch (oauthErr) {
-        console.warn("[NAV] OAuth registered sites render failed:", oauthErr);
-    } finally {
-        // 🌟 [LOCK RELEASE] 예외 여부과 무관하게 락을 해제해야
-        //    다음 renderNavigation() 에서 재렌더링이 가능해집니다.
-        isOAuthSitesRendering = false;
-    }
-}
-
-function renderOAuthRegistrationForm() {
-    const existing = document.getElementById("oauth-registration-modal");
-    if (existing) existing.remove();
-
-    const modal = document.createElement("div");
-    modal.id = "oauth-registration-modal";
-    modal.style.cssText = "position: fixed; inset: 121px 11px 11px; border-bottom-left-radius: 1em; border-bottom-right-radius: 1em; z-index: 99999; display: flex; align-items: center; justify-content: center; background: rgba(255, 255, 255, 0.88); pointer-events: initial;";
-    modal.innerHTML = `
-<div style="background:#fff;border-radius:12px;padding:24px;width:90%;max-width:480px;max-height:85vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,0.3);">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-        <h3 style="margin:0;font-size:1.1rem;font-weight:700;">사이트 등록 (Analytic)</h3>
-        <button id="oauth-modal-close" style="background:none;border:none;font-size:1.2rem;cursor:pointer;color:#666;">✕</button>
-    </div>
-
-    <!-- Step 1: 도메인 입력 -->
-    <div style="margin-bottom:16px;">
-        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 도메인</label>
-        <input id="oauth-reg-host" type="url" placeholder="https://example.com" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.9rem;">
-        <p style="margin:4px 0 0;font-size:0.75rem;color:#888;">예시: (O) https://example.com (X) https://www.example.com</p>
-    </div>
-
-    <!-- Step 2: 소유 확인 메타 태그 (도메인 입력 시 즉시 생성) -->
-    <div id="oauth-reg-meta" style="display:none;margin-bottom:16px;">
-        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">사이트 소유 확인 메타 태그</label>
-        <p style="margin:0 0 6px;font-size:0.75rem;color:#666;">
-            아래 메타 태그를 복사하여 사이트 홈페이지의 <code>&lt;head&gt;</code> 섹션에 붙여넣으세요.<br>
-            등록 버튼 클릭 시 서버가 이 태그의 존재 여부를 검증합니다.
-        </p>
-        <textarea id="oauth-reg-meta-tag" readonly style="width:100%;min-height:100px;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:0.72rem;resize:none;box-sizing:border-box;background:#f8f9fa;line-height:1.6;"></textarea>
-        <button id="oauth-meta-copy" style="margin-top:6px;padding:6px 14px;border:1px solid #6366f1;border-radius:4px;background:#fff;color:#6366f1;font-size:0.78rem;cursor:pointer;">태그 복사</button>
-    </div>
-
-    <!-- 결과 메시지 -->
-    <div id="oauth-reg-result" style="display:none;margin-bottom:12px;padding:12px;border-radius:6px;font-size:0.85rem;"></div>
-
-    <!-- 등록 성공 후 Client 정보 -->
-    <div id="oauth-reg-credentials" style="display:none;margin-bottom:16px;">
-        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Id (Address)</label>
-        <input id="oauth-reg-client-id" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;margin-bottom:8px;">
-        <label style="display:block;margin-bottom:6px;font-size:0.85rem;font-weight:600;">Client Secret (Private Key)</label>
-        <input id="oauth-reg-client-secret" readonly style="width:100%;padding:8px 12px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:0.8rem;">
-    </div>
-
-    <button id="oauth-reg-submit" style="width:100%;padding:12px;border:none;border-radius:8px;background:#eee;color:#000;font-size:0.95rem;font-weight:700;cursor:pointer;">추가</button>
-</div>`;
-    document.body.appendChild(modal);
-
-    // 닫기
-    document.getElementById("oauth-modal-close")!.addEventListener("click", () => modal.remove());
-    modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
-
-    const hostInput = document.getElementById("oauth-reg-host") as HTMLInputElement;
-    const metaDiv = document.getElementById("oauth-reg-meta") as HTMLDivElement;
-    const metaTextarea = document.getElementById("oauth-reg-meta-tag") as HTMLTextAreaElement;
-    const metaCopyBtn = document.getElementById("oauth-meta-copy") as HTMLButtonElement;
-
-    let metaDebounce: number | null = null;
-    hostInput.addEventListener("input", () => {
-        if (metaDebounce) clearTimeout(metaDebounce);
-        metaDebounce = window.setTimeout(() => {
-            const url = hostInput.value.trim();
-            if (!url || !url.startsWith("http")) {
-                metaDiv.style.display = "none";
-                return;
-            }
-            try {
-                const email = currentSession.email || "";
-
-                if (!email) {
-                    metaDiv.style.display = "none";
-                    return;
-                }
-
-                const hashMessage = ethers.hashMessage(email);
-                const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
-
-                // 🌟 [DEBUG] 생성된 주소를 콘솔에 출력하여 사이트 태그와 대조 가능하게 합니다.
-                console.log(`[OAUTH] Meta tag generated for email='${email}' → content="${clientAddress}"`);
-
-                const tags = `<meta name="oauth-network-verification" content="${clientAddress}" />
-    <meta name="privacy" content="/개인정보약관 경로/" />
-    <meta name="terms" content="/이용약관 경로/" />`;
-
-                metaTextarea.value = tags;
-                metaDiv.style.display = "block";
-            } catch (e) {
-                metaDiv.style.display = "none";
-            }
-        }, 300);
-    });
-
-    // 태그 복사 버튼
-    metaCopyBtn.addEventListener("click", () => {
-        const text = metaTextarea.value;
-        if (!text) return;
-        navigator.clipboard.writeText(text).then(() => {
-            metaCopyBtn.textContent = "복사됨 ✓";
-            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
-        }).catch(() => {
-            // clipboard API 실패 시 textarea 선택 방식
-            metaTextarea.focus();
-            metaTextarea.select();
-            document.execCommand("copy");
-            metaCopyBtn.textContent = "복사됨 ✓";
-            setTimeout(() => { metaCopyBtn.textContent = "태그 복사"; }, 2000);
-        });
-    });
-
-    // 제출
-    document.getElementById("oauth-reg-submit")!.addEventListener("click", async () => {
-        const resultDiv = document.getElementById("oauth-reg-result") as HTMLDivElement;
-        const credDiv = document.getElementById("oauth-reg-credentials") as HTMLDivElement;
-        const submitBtn = document.getElementById("oauth-reg-submit") as HTMLButtonElement;
-
-        const hostUrl = hostInput.value.trim();
-        if (!hostUrl) {
-            resultDiv.style.display = "block";
-            resultDiv.style.background = "#fef2f2";
-            resultDiv.style.color = "#dc2626";
-            resultDiv.textContent = "도메인을 입력하세요.";
-            return;
-        }
-
-        // 메타 태그가 아직 생성되지 않은 경우 생성 유도
-        if (metaDiv.style.display === "none") {
-            const email = currentSession.email || "";
-            const hashMessage = ethers.hashMessage(email);
-            const clientAddress = ethers.computeAddress(hashMessage).toLowerCase();
-            metaTextarea.value = `<meta name="oauth-network-verification" content="${clientAddress}" />
-<meta name="privacy" content="/개인정보약관 경로/" />
-<meta name="terms" content="/이용약관 경로/" />`;
-            metaDiv.style.display = "block";
-            resultDiv.style.display = "block";
-            resultDiv.style.background = "#fffbeb";
-            resultDiv.style.color = "#d97706";
-            resultDiv.textContent = "위 메타 태그를 사이트 <head>에 추가한 후 다시 등록하세요.";
-            return;
-        }
-
-        submitBtn.disabled = true;
-        submitBtn.textContent = "등록 중...";
-        resultDiv.style.display = "none";
-
-        const res = await submitOAuthRegistration(hostUrl);
-
-        submitBtn.disabled = false;
-        submitBtn.textContent = "추가";
-
-        if (res.success) {
-            resultDiv.style.display = "block";
-            resultDiv.style.background = "#f0fdf4";
-            resultDiv.style.color = "#16a34a";
-            resultDiv.textContent = "등록 완료!";
-
-            metaDiv.style.display = "none";
-            credDiv.style.display = "block";
-            (document.getElementById("oauth-reg-client-id") as HTMLInputElement).value = res.client_id;
-            (document.getElementById("oauth-reg-client-secret") as HTMLInputElement).value = res.client_secret;
-
-            hostInput.value = "";
-
-            // 네비게이션 갱신 (Pages 섹션에 등록된 사이트가 즉시 반영됩니다)
-            await renderNavigation();
-        } else {
-            resultDiv.style.display = "block";
-            resultDiv.style.background = "#fef2f2";
-            resultDiv.style.color = "#dc2626";
-            resultDiv.textContent = res.error;
-            // 소유 확인 실패 시 메타 태그를 다시 강조 표시
-            metaDiv.style.display = "block";
-            metaTextarea.style.border = "2px solid #ef4444";
-            setTimeout(() => { metaTextarea.style.border = "1px solid #ddd"; }, 3000);
-        }
-    });
-}
+// 🌟 [OAUTH REGISTRY MOVED → src/modes/oauth.ts]
+//    OAUTH_API_HOST / normalizeOAuthHost / extractBalancedJson / parseOAuthApiResponse /
+//    oauthApiFetch / submitOAuthRegistration / fetchOAuthRegisteredSites /
+//    fetchOAuthSitePaths / fetchOAuthSiteCount / isOAuthSitesRendering /
+//    renderOAuthSitesUI / renderOAuthRegistrationForm 전량이 modes/oauth.ts 로 이동했습니다.
+//
+//    또한 analytic 트랙이 쓰던 getOAuthCredentialForOrigin 도 같은 파일로 합쳤습니다.
+//    (자격증명 저장소와 조회기가 한 파일에 있어야 등록/조회 규칙이 갈리지 않습니다)
+//
+//    · main.ts 가 계속 호출하는 3개(fetchOAuthRegisteredSites / renderOAuthSitesUI /
+//      renderOAuthRegistrationForm)는 최상단 import 로 같은 이름을 제공하므로
+//      checkAuthStatus · renderNavigation · applySearchModeUI 호출부는 그대로입니다.
 
 let isSearching = false;
 let isExtracting = false;
@@ -1142,935 +435,42 @@ async function runLocalEmbeddingSync() {
     }, 2000);
 }
 
-async function finalizeAnalyticBubbles(processedCount: number): Promise<void> {
-    if (!chatTalks) return;
-    const bubbles = chatTalks.querySelectorAll('.chat-talk.task-bubble') as NodeListOf<HTMLElement>;
-    let finalized = 0;
-    for (const el of Array.from(bubbles)) {
-        const taskId = el.dataset.taskId || el.id || "";
-        // analytic_sync 로 시작하는 말풍선만 대상
-        if (!taskId.startsWith("analytic_sync")) continue;
-        const status = parseInt(el.dataset.status || "0");
-        // 이미 완료/에러/정지된 것은 건드리지 않음
-        if ([2, 3, 6, 9].includes(status)) continue;
-        // status → 9 (Done)
-        el.dataset.status = "9";
-        const contentEl = el.querySelector('.content') as HTMLElement;
-        if (contentEl) {
-            contentEl.textContent = `Analytic structuring complete (${processedCount} event(s)).`;
-        }
-        const statusBar = el.querySelector('.status-bar') as HTMLElement;
-        if (statusBar) {
-            statusBar.style.color = "#22c55e";
-            statusBar.innerHTML = `<span>✅</span> DONE`;
-        }
-        // active-spinner 클래스 제거
-        const spinner = el.querySelector('.active-spinner') as HTMLElement;
-        if (spinner) spinner.classList.remove('active-spinner');
-        finalized++;
-    }
-    if (finalized > 0) {
-        console.log(`[ANALYTIC] ✅ ${finalized}개의 구조화 말풍선을 Done 상태로 전환했습니다.`);
-    }
-}
-
-let isAnalyticStructuring = false;
-
-async function runAnalyticStructuring(): Promise<number> {
-    if (isAnalyticStructuring) return 0;
-    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return 0;
-
-    isAnalyticStructuring = true;
-
-    try {
-        const res = await invoke<any>("structure_pending_analytics", {
-            limit: 20,
-            devicePreference: getDevicePref(),
-        });
-
-        const processed = res && res.processed ? res.processed : 0;
-
-        if (processed > 0) {
-            console.log(
-                `[ANALYTIC] 🧠 ${processed}건의 행동 로그를 시맨틱 문장으로 구조화했습니다.`
-            );
-
-            if (appDb) {
-                try {
-                    const nowTs = Date.now();
-                    const rows = await appDb
-                        .table("items")
-                        .where("mode")
-                        .equals("analytic")
-                        .filter((r: any) => Number(r.updated_at || 0) === 0)
-                        .toArray();
-
-                    for (const r of rows) {
-                        if (
-                            r.data &&
-                            (r.data.summary ||
-                                (typeof r.data.action === "string" && r.data.action))
-                        ) {
-                            await appDb
-                                .table("items")
-                                .where("id")
-                                .equals(r.id)
-                                .modify({
-                                    updated_at: nowTs,
-                                    "data.updated_at": nowTs,
-                                });
-                        }
-                    }
-                    console.log(
-                        `[ANALYTIC] Dexie updated_at 갱신 완료 (후보 ${rows.length}건)`
-                    );
-                } catch (e) {
-                    console.warn("[ANALYTIC] Dexie updated_at sync failed:", e);
-                }
-            }
-
-            if (currentSearchMode === "analytic") {
-                await renderNavigation();
-                if (currentTab === "list") {
-                    await loadMoreDocs(false, true);
-                }
-            }
-        } else if (res && res.skipped) {
-            console.log(`[ANALYTIC] 구조화 스킵: 사유=${res.skipped}`);
-        }
-
-        return processed;
-    } catch (e) {
-        console.warn("[ANALYTIC] structure_pending_analytics failed:", e);
-        return 0;
-    } finally {
-        isAnalyticStructuring = false;
-    }
-}
-
-let isAnalyticsSyncRunning = false;
-let lastAnalyticsSyncAt = 0;
-
-const SYNC_BASE_INTERVAL_MS = 3_000;   // 기본 폴링 간격
-const SYNC_BACKOFF_FACTOR = 1.5;       // 증가 배수
-const SYNC_MAX_INTERVAL_MS = 30_000;   // 최대 간격
-let syncConsecutiveNoChange = 0;       // 연속 '변경 없음' 카운터
-let syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS; // 현재 적용 중인 간격
-
-function computeSyncInterval(): number {
-    if (syncConsecutiveNoChange === 0) return SYNC_BASE_INTERVAL_MS;
-    const interval = SYNC_BASE_INTERVAL_MS * Math.pow(SYNC_BACKOFF_FACTOR, syncConsecutiveNoChange);
-    return Math.min(interval, SYNC_MAX_INTERVAL_MS);
-}
-
-function updateSyncBackoff(hasChange: boolean): void {
-    if (hasChange) {
-        if (syncConsecutiveNoChange > 0) {
-            console.log(
-                `[SYNC-BACKOFF] 🔄 변경 감지. 폴링 간격을 ${syncCurrentIntervalMs}ms → ${SYNC_BASE_INTERVAL_MS}ms 로 리셋합니다.`
-            );
-        }
-        syncConsecutiveNoChange = 0;
-        syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS;
-    } else {
-        syncConsecutiveNoChange++;
-        syncCurrentIntervalMs = computeSyncInterval();
-        console.log(
-            `[SYNC-BACKOFF] ⏳ 변경 없음 (${syncConsecutiveNoChange}회 연속). ` +
-            `다음 폴링까지 ${syncCurrentIntervalMs}ms 대기합니다.`
-        );
-    }
-}
-
-async function resolveAnalyticsOrigins(): Promise<string[]> {
-    const origins = new Set<string>();
-
-    const push = (raw: any) => {
-        if (!raw || typeof raw !== "string") return;
-        let s = raw.trim().toLowerCase();
-        if (!s) return;
-        if (!/^https?:\/\//.test(s)) s = "https://" + s;
-        try {
-            const u = new URL(s);
-            if (!u.hostname) return;
-            if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return;
-            if (u.hostname.endsWith("logis.center")) return;
-            origins.add(u.origin);
-        } catch (e) {}
-    };
-
-    try {
-        const sites = await kvGet("oauth_registered_sites");
-        if (Array.isArray(sites)) {
-            for (const s of sites) push(s && s.host);
-        }
-    } catch (e) {}
-
-    push(currentDetectedUrl);
-
-    try {
-        if (appDb) {
-            const rows = await appDb.table("items").where("mode").equals("analytic").limit(2000).toArray();
-            for (const r of rows) push(r && r.data && r.data.origin);
-        }
-    } catch (e) {}
-
-    return Array.from(origins);
-}
-
-function extractAnalyticText(parsed: any): string {
-    const pick = (v: any): string => (typeof v === "string" ? v.trim() : "");
-    return pick(parsed?.action)
-        || pick(parsed?.summary)
-        || pick(parsed?.cross_action_flow)
-        || pick(parsed?.intent_evolution)
-        || pick(parsed?.text);
-}
-
-function decodeAnalyticBlob(rawData: any): any {
-    const pako = (window as any).pako;
-    try {
-        if (rawData && typeof rawData === "object") {
-            const raw = rawData.data || rawData;
-            let arr: Uint8Array | null = null;
-
-            if (Array.isArray(raw)) {
-                arr = new Uint8Array(raw);
-            } else if (raw.buffer) {
-                arr = new Uint8Array(raw.buffer);
-            } else if (Object.keys(raw).length > 0 && !isNaN(Number(Object.keys(raw)[0]))) {
-                arr = new Uint8Array(Object.values(raw) as number[]);
-            }
-
-            if (arr) {
-                try {
-                    return JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : new TextDecoder('utf-8').decode(arr));
-                } catch (e) {
-                    return JSON.parse(new TextDecoder('utf-8').decode(arr));
-                }
-            }
-            return raw;
-        }
-
-        if (typeof rawData === "string") {
-            // 🌟 [BASE64 GZIP PATH] Worker 가 BLOB 을 base64 로 직렬화했거나
-            //    구버전 Rust upsert_items 가 base64(gzip) 로 저장한 경우를 처리합니다.
-            try {
-                return JSON.parse(rawData);
-            } catch (_jsonErr) {
-                try {
-                    const rawBytes = Uint8Array.from(atob(rawData), c => c.charCodeAt(0));
-                    if (rawBytes.length > 50 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
-                        return JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
-                    }
-                    return JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
-                } catch (_b64Err) {
-                    return {};
-                }
-            }
-        }
-    } catch (e) {}
-    return {};
-}
-
-async function getOAuthCredentialForOrigin(origin: string): Promise<{ client_id: string; client_secret: string } | null> {
-    const toHost = (raw: any): string => {
-        if (!raw || typeof raw !== "string") return "";
-        let s = raw.trim().toLowerCase();
-        if (!s) return "";
-        if (!/^https?:\/\//.test(s)) s = "https://" + s;
-        try {
-            return new URL(s).host;
-        } catch (_e) {
-            return "";
-        }
-    };
-
-    const targetHost = toHost(origin);
-    if (!targetHost) return null;
-
-    try {
-        const sites = await kvGet("oauth_registered_sites");
-        if (!Array.isArray(sites)) return null;
-
-        for (const s of sites) {
-            if (!s) continue;
-            if (toHost(s.host) !== targetHost) continue;
-            if (!s.client_id) continue;
-            return {
-                client_id: String(s.client_id),
-                client_secret: String(s.client_secret || "")
-            };
-        }
-    } catch (e) {
-        console.warn("[OAUTH] getOAuthCredentialForOrigin failed:", e);
-    }
-
-    return null;
-}
-
-async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<number> {
-    let expectedCc = "";
-    try {
-        expectedCc = await hashId(new URL(origin).host);
-    } catch (e) {}
-
-    const cred = await getOAuthCredentialForOrigin(origin);
-
-    if (!cred) {
-        console.warn(
-            `[SYNC-ANALYTIC] ⏭️ '${origin}' 은 등록된 API 키가 없어 건너뜁니다. ` +
-            `Analytic 탭의 '+ 사이트 등록' 으로 먼저 등록하세요. ` +
-            `(console.logis.center 는 client_id 검증을 통과한 요청에만 로그를 반환합니다)`
-        );
-        return 0;
-    }
-
-    const params = new URLSearchParams({
-        origin: "https://console.logis.center",
-        created_at: cursor.toString(),
-        hash: currentSession.hash,
-        token: currentSession.token || "",
-        href: origin + "/"
-    });
-    if (expectedCc) params.append("cc", expectedCc);
-
-    params.append("client_id", cred.client_id);
-    if (cred.client_secret) params.append("client_secret", cred.client_secret);
-
-    let response: any = null;
-    try {
-        response = await invoke<any>("proxy_fetch", {
-            url: `${ANALYTICS_API_HOST}/?${params.toString()}`,
-            method: "GET",
-            headers: { "Content-Type": "application/json" },
-            session_params: { hash: currentSession.hash, token: currentSession.token, cc: expectedCc }
-        });
-    } catch (e) {
-        console.warn(`[SYNC-ANALYTIC] ❌ '${origin}' 조회 실패 (cc=${expectedCc}):`, e);
-        return 0;
-    }
-
-    stepQrSpinner();
-
-    const verifySession = (response && response.session) ? response.session : {};
-    if (verifySession.verify_reason && verifySession.verified === false) {
-        console.warn(
-            `[SYNC-ANALYTIC] 🔐 '${origin}' API 키 검증 실패: reason='${verifySession.verify_reason}' ` +
-            `(client_id='${cred.client_id}'). Analytic 탭에서 '재발급' 후 다시 시도하거나, ` +
-            `사이트 <head> 의 oauth-network-verification 메타 태그를 확인하세요.`
-        );
-    }
-
-    if (!response || !response.results || !Array.isArray(response.results)) {
-        console.log(`[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 응답에 results 없음`);
-        return 0;
-    }
-
-    if (response.results.length === 0) {
-        console.log(
-            `[SYNC-ANALYTIC] '${origin}' (cc=${expectedCc}) → 0건. ` +
-            `Worker 조회 조건은 cc = hashId('${(() => { try { return new URL(origin).host; } catch (e) { return "?"; } })()}') ` +
-            `AND created_at < ${cursor} 이며, client_id 검증을 통과해야 합니다. ` +
-            `(verify='${verifySession.verify_reason || "unknown"}')`
-        );
-        return 0;
-    }
-
-    const now = Date.now();
-    const items: any[] = [];
-
-    // 🌟 [DELTA GUARD] 이미 같은 updated_at 으로 로컬에 있는 행은 쓰기를 생략합니다.
-    const localMap = new Map<string, number>();
-    try {
-        if (appDb) {
-            const ids = response.results.map((r: any) => r && r.id).filter(Boolean);
-            if (ids.length > 0) {
-                const rows = await appDb.table("items").where("id").anyOf(ids).toArray();
-                for (const r of rows) localMap.set(String(r.id), Number(r.updated_at || 0));
-            }
-        }
-    } catch (e) {}
-
-    let skipped = 0;
-    for (let i = 0; i < response.results.length; i++) {
-        const row = response.results[i];
-        if (!row || !row.id) continue;
-
-        const serverUpdated = Number(row.updated_at || 0);
-        const localUpdated = localMap.get(String(row.id));
-
-        if (localUpdated !== undefined && serverUpdated <= localUpdated) {
-            skipped++;
-            continue;
-        }
-
-        if (localUpdated !== undefined && localUpdated > 0) {
-            skipped++;
-            console.log(
-                `[SYNC-ANALYTIC] ⚪ '${row.id}' 는 이미 구조화 완료되어 서버 원시 데이터로 덮어쓰지 않습니다.`
-            );
-            continue;
-        }
-
-        const parsed: any = decodeAnalyticBlob(row.data) || {};
-
-        if (!parsed.origin) parsed.origin = origin;
-
-        const textVal = extractAnalyticText(parsed);
-
-        const rowType = String(row.type || "click");
-        const rowCc = String(row.cc || expectedCc || "");
-        let rowBcc = String(row.bcc || "");
-        if (!rowBcc && rowCc) {
-            rowBcc = await hashId(rowType + rowCc);
-        }
-
-        // 🌟 [MODE TAGGING] modeOfType() 단일 판정 경로를 그대로 사용합니다.
-        const rowMode = modeOfType(rowType);
-
-        const isRawEvent = Array.isArray(parsed?.action) || Array.isArray(parsed?.relate);
-
-        items.push({
-            id: row.id,
-            type: rowType,
-            flag: row.flag || String((currentSession as any).flag || ""),
-            from: row.from || "",
-            to: row.to || "",
-            cc: rowCc,
-            bcc: rowBcc,
-            ref: row.ref || "",
-            status: 9,
-            mode: rowMode,
-            created_at: Number(row.created_at || now),
-            updated_at: isRawEvent ? 0 : serverUpdated,
-            text: textVal,
-            masked_text: textVal,
-            data: {
-                ...parsed,
-                id: row.id,
-                type: rowType,
-                mode: rowMode,
-                updated_at: isRawEvent ? 0 : serverUpdated,
-                text: textVal,
-                masked_text: textVal
-            }
-        });
-    }
-
-    if (items.length === 0) {
-        console.log(`[SYNC-ANALYTIC] '${origin}' 수신 ${response.results.length}건 → 전부 최신 상태(스킵 ${skipped}건)`);
-        return 0;
-    }
-
-    await invoke("upsert_items", { items });
-    if (appDb) {
-        await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
-    }
-
-    const typeBrief: Record<string, number> = {};
-    for (const it of items) typeBrief[it.type] = (typeBrief[it.type] || 0) + 1;
-
-    console.log(
-        `[SYNC-ANALYTIC] ✅ '${origin}' (cc=${expectedCc}) → 수신 ${response.results.length}건 / ` +
-        `저장 ${items.length}건 / 스킵 ${skipped}건 ${JSON.stringify(typeBrief)}`
-    );
-
-    return items.length;
-}
-
-async function syncAnalyticsData() {
-    if (!currentSession.hash) return;
-    if (isAnalyticsSyncRunning) return;
-
-    isAnalyticsSyncRunning = true;
-
-    try {
-        const origins = await resolveAnalyticsOrigins();
-
-        if (origins.length === 0) {
-            console.warn(
-                "[SYNC-ANALYTIC] 조회할 추적 대상 사이트가 없습니다. " +
-                "Analytic 탭의 '+ 사이트 등록' 으로 도메인을 등록하거나, " +
-                "브라우저로 추적 대상 사이트를 열어 두세요. " +
-                "(Worker 는 cc 파라미터가 아니라 href 의 host 로 조회 대상을 결정합니다)"
-            );
-            return;
-        }
-
-        const now = Date.now();
-        const cursor = Math.max(now, now - timezoneOffset) + 60_000;
-
-        console.log(`[SYNC-ANALYTIC] 대상 사이트 ${origins.length}곳 조회 시작: ${JSON.stringify(origins)} | cursor=${cursor}`);
-
-        let totalStored = 0;
-        for (const origin of origins) {
-            totalStored += await fetchAnalyticsOrigin(origin, cursor);
-        }
-
-        if (totalStored > 0) {
-            if (currentSearchMode === "analytic") {
-                await renderNavigation();
-                if (currentTab === "list") {
-                    await loadMoreDocs(false, true);
-                }
-            }
-
-            const structuredCount = await runAnalyticStructuring();
-            if (structuredCount > 0) {
-                await finalizeAnalyticBubbles(structuredCount);
-            }
-            
-            runLocalEmbeddingSync();
-        } else {
-            const structured = await runAnalyticStructuring();
-            if (structured > 0) {
-                await finalizeAnalyticBubbles(structured);
-                runLocalEmbeddingSync();
-            }
-        }
-
-        console.log(`[SYNC-ANALYTIC] 완료. 총 저장 ${totalStored}건.`);
-
-    } catch (e) {
-        console.warn("[SYNC-ANALYTIC] Failed:", e);
-    } finally {
-        isAnalyticsSyncRunning = false;
-        lastAnalyticsSyncAt = Date.now();
-        if (!isExtracting && !isSearching) stopSpinner();
-        // 🌟 [SYNC DONE → SUBMIT RESTORE] syncData 와 동일하게 검색 버튼 상태를 복원합니다.
-        if (btnSubmit) {
-            const currentVal = searchInput?.value.trim() || "";
-            if (currentVal !== "" && !isQueryActive(currentVal)) {
-                btnSubmit.style.display = "flex";
-            } else {
-                btnSubmit.style.display = "none";
-            }
-        }
-    }
-}
-
-async function syncAnalyticsInBackground() {
-    if (!currentSession.hash) return;
-    if (isAnalyticsSyncRunning) return;
-
-    const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
-    if (Date.now() - lastAnalyticsSyncAt < throttleMs) return;
-    await syncAnalyticsData();
-}
-
-const TRADING_API_HOST = "https://trading.logis.center";
-let isTradingSyncRunning = false;
-let lastTradingSyncAt = 0;
-
-async function tradingApiFetch(
-    query: Record<string, any>,
-    opts: { method?: "GET" | "POST" | "DELETE"; body?: any; gzip?: boolean } = {}
-): Promise<any> {
-    if (!currentSession.hash || !currentSession.token) return null;
-    const method = opts.method || "GET";
-    const sp = new URLSearchParams();
-    sp.append("hash", currentSession.hash);
-    sp.append("token", currentSession.token);
-    if (currentSession.team) sp.append("to", currentSession.team);
-    for (const k of Object.keys(query)) {
-        const v = query[k];
-        if (v === undefined || v === null || v === "") continue;
-        sp.append(k, String(v));
-    }
-    const url = `${TRADING_API_HOST}/?${sp.toString()}`;
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (opts.gzip) headers["Content-Encoding"] = "gzip";
-    const args: any = { url, method, headers, session_params: null };
-    if (opts.body !== undefined) args.body = opts.body;
-    try {
-        return await invoke<any>("proxy_fetch", args);
-    } catch (e) {
-        console.warn(`[SYNC-TRADING] ${method} 실패:`, e);
-        return null;
-    }
-}
-
-/** 서버 → 로컬. 델타 커서는 서버가 확정해 준 cursor 를 그대로 씁니다. */
-async function pullTradingData(): Promise<number> {
-    const since = Number((await kvGet("trading_sync_cursor")) || 0);
-    const now = Date.now();
-    // 🌟 [CURSOR] created_at 은 '상한' 입니다. now - timezoneOffset 을 쓰면
-    //    UTC- 지역에서 최근 문서가 통째로 잘립니다. 반드시 미래여야 합니다.
-    const upper = Math.max(now, now - timezoneOffset) + 60_000;
-    const res = await tradingApiFetch({ since: since, created_at: upper, limit: 1000 });
-    if (!res || !Array.isArray(res.results)) return 0;
-    if (res.results.length === 0) {
-        if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
-        return 0;
-    }
-    const tombs = await loadItemTombstones();
-    let tombBlocked = 0;
-    const items: any[] = [];
-    for (const row of res.results) {
-        if (!row || !row.id) continue;
-        if (tombs.has(String(row.id))) { tombBlocked++; continue; }
-        const parsed: any = decodeAnalyticBlob(row.data) || {};
-        // 서버 봉투가 진실의 원천입니다. data 안의 값보다 우선합니다.
-        parsed.id = row.id;
-        parsed.type = row.type;
-        parsed.mode = row.mode || "shipping";
-        parsed.flag = row.flag || "";
-        parsed.cc = row.cc || "";
-        parsed.bcc = row.bcc || "";
-        parsed.ref = row.ref || "";
-        parsed.digest = row.digest || "";
-        parsed.created_at = Number(row.created_at || 0);
-        parsed.updated_at = Number(row.updated_at || 0);
-        const textVal =
-            (typeof parsed.text === "string" ? parsed.text.trim() : "")
-            || (typeof parsed.summary === "string" ? parsed.summary.trim() : "");
-        items.push({
-            id: row.id,
-            table: "items",
-            type: row.type,
-            flag: row.flag || "",
-            from: row.from || "",
-            to: row.to || "",
-            cc: row.cc || "",
-            bcc: row.bcc || "",
-            ref: row.ref || "",
-            mode: row.mode || "shipping",
-            digest: row.digest || "",
-            status: 9,
-            created_at: Number(row.created_at || 0),
-            updated_at: Number(row.updated_at || 0),
-            text: textVal,
-            masked_text: textVal,
-            data: parsed
-        });
-    }
-    if (tombBlocked > 0) {
-        console.log(`[SYNC-TRADING] 🪦 삭제된 문서 ${tombBlocked}건의 재삽입을 차단했습니다.`);
-    }
-    if (items.length > 0) {
-        await invoke("upsert_items", { items });
-        if (appDb) {
-            await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
-        }
-        const brief: Record<string, number> = {};
-        for (const it of items) brief[it.type] = (brief[it.type] || 0) + 1;
-        console.log(`[SYNC-TRADING] ⬇️ 수신 ${res.results.length}건 / 저장 ${items.length}건 ${JSON.stringify(brief)}`);
-    }
-    if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
-    return items.length;
-}
-
-async function pushTradingData(): Promise<number> {
-    if (!appDb) return 0;
-    const pushedCursor = Number((await kvGet("trading_push_cursor")) || 0);
-    let rows: any[] = [];
-    try {
-        rows = await appDb.table("items").where("mode").equals("shipping").toArray();
-    } catch (e) {
-        console.warn("[SYNC-TRADING] 로컬 조회 실패:", e);
-        return 0;
-    }
-    const stampOf = (r: any) => Math.max(Number(r.updated_at || 0), Number(r.created_at || 0));
-    const candidates = rows
-        .filter((r: any) => r && r.id && stampOf(r) > pushedCursor)
-        .sort((a: any, b: any) => stampOf(a) - stampOf(b));
-    if (candidates.length === 0) return 0;
-    const batch = candidates.slice(0, 200);
-    const payload = {
-        items: batch.map((r: any) => ({
-            id: r.id,
-            type: r.type,
-            flag: r.flag || "",
-            digest: r.digest || (r.data && r.data.digest) || "",
-            created_at: Number(r.created_at || 0),
-            updated_at: Number(r.updated_at || 0),
-            data: r.data || {}
-        }))
-    };
-    const res = await tradingApiFetch({}, { method: "POST", body: payload, gzip: true });
-    if (!res) return 0;
-    const accepted = Number(res.accepted || 0);
-    const skipped = Number(res.skipped || 0);
-    const rejected = Number(res.rejected || 0);
-
-    if (accepted + skipped >= batch.length) {
-        const maxStamp = batch.reduce((m: number, r: any) => Math.max(m, stampOf(r)), pushedCursor);
-        await kvSet("trading_push_cursor", String(maxStamp));
-    }
-
-    if (Array.isArray(res.results) && res.results.length > 0) {
-        const byId = new Map<string, any>();
-        for (const r of batch) byId.set(String(r.id), r);
-        const adopted: any[] = [];
-        for (const srv of res.results) {
-            const local = byId.get(String(srv.id));
-            if (!local) continue;
-            if (local.ref === srv.ref && local.bcc === srv.bcc && local.cc === srv.cc) continue;
-            const data = { ...(local.data || {}) };
-            data.cc = srv.cc;
-            data.bcc = srv.bcc;
-            data.ref = srv.ref;
-            data.mode = srv.mode;
-            data.flag = srv.flag;
-            adopted.push({
-                id: srv.id,
-                table: "items",
-                type: srv.type,
-                flag: srv.flag,
-                from: srv.from,
-                to: srv.to,
-                cc: srv.cc,
-                bcc: srv.bcc,
-                ref: srv.ref,
-                mode: srv.mode,
-                digest: srv.digest,
-                created_at: srv.created_at,
-                updated_at: srv.updated_at,
-                text: local.data?.text || "",
-                masked_text: local.data?.masked_text || local.data?.text || "",
-                data
-            });
-        }
-        if (adopted.length > 0) {
-            await invoke("upsert_items", { items: adopted });
-            if (appDb) await appDb.table("items").bulkPut(normalizeEnvelope(adopted)).catch(() => null);
-            console.log(`[SYNC-TRADING] 🔗 서버 확정 봉투(ref/bcc) ${adopted.length}건을 로컬에 반영했습니다.`);
-        }
-    }
-    console.log(`[SYNC-TRADING] ⬆️ 후보 ${candidates.length}건 중 ${batch.length}건 전송 → 저장 ${accepted} / 스킵 ${skipped} / 거부 ${rejected}`);
-    return accepted;
-}
-
-async function syncTradingData() {
-    if (!currentSession.hash || !currentSession.token) return;
-    if (isTradingSyncRunning) return;
-    isTradingSyncRunning = true;
-    try {
-        const pushedCount = await pushTradingData();
-        const pulledCount = await pullTradingData();
-        if (pushedCount > 0 || pulledCount > 0) {
-            updateSyncBackoff(true);
-            if (currentSearchMode === "shipping") {
-                await renderNavigation();
-                if (currentTab === "list") {
-                    await loadMoreDocs(false, true);
-                }
-            }
-            runLocalEmbeddingSync();
-        } else {
-            updateSyncBackoff(false);
-        }
-    } catch (e) {
-        console.warn("[SYNC-TRADING] Failed:", e);
-    } finally {
-        isTradingSyncRunning = false;
-        lastTradingSyncAt = Date.now();
-        if (!isExtracting && !isSearching) stopSpinner();
-        if (btnSubmit) {
-            const currentVal = searchInput?.value.trim() || "";
-            if (currentVal !== "" && !isQueryActive(currentVal)) {
-                btnSubmit.style.display = "flex";
-            } else {
-                btnSubmit.style.display = "none";
-            }
-        }
-    }
-}
-
-async function syncTradingInBackground() {
-    if (!currentSession.hash || !currentSession.token) return;
-    if (isTradingSyncRunning) return;
-    const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
-    if (Date.now() - lastTradingSyncAt < throttleMs) return;
-    await syncTradingData();
-}
-
-let isCommerceSyncRunning = false;
-async function syncCommerceInBackground() {
-    if (isCommerceSyncRunning) return;
-    if (!currentSession.hash || !currentSession.email) return;
-    isCommerceSyncRunning = true;
-    try {
-        const origin = "https://commerce.logis.center";
-        const now = Date.now();
-        const createdAt = now - timezoneOffset;
-        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
-        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
-            targetHref = "https://commerce.logis.center/tracking";
-        }
-        const queryParams: any = {
-            origin: origin,
-            created_at: createdAt.toString(),
-            hash: currentSession.hash,
-            token: currentSession.token || "",
-            href: targetHref
-        };
-        let syncEffectiveCc = activeContext.cc;
-        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
-        if (!syncEffectiveCc || (!isDefaultForced && activeTags.length === 0)) {
-            try {
-                const urlObj = new URL(targetHref.toLowerCase());
-                const rootDomain = getRootDomain(urlObj.hostname);
-                syncEffectiveCc = await hashId(rootDomain);
-            } catch(e) {}
-        }
-        if (syncEffectiveCc) queryParams.cc = syncEffectiveCc;
-        const params = new URLSearchParams(queryParams);
-        const url = `${API_HOST}/?${params.toString()}`;
-        const response = await invoke<any>("proxy_fetch", {
-            url: url,
-            method: "GET",
-            headers: { "Content-Type": "application/json" },
-            session_params: { hash: currentSession.hash, token: currentSession.token, cc: activeContext.cc || "" }
-        });
-        if (response.results && Array.isArray(response.results)) {
-            try {
-                const pako = (window as any).pako;
-                for (let i = 0; i < response.results.length; i++) {
-                    let item = response.results[i];
-                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
-                        let arrData = item.data.data || item.data;
-                        let arr: Uint8Array | null = null;
-                        if (Array.isArray(arrData)) {
-                            arr = new Uint8Array(arrData);
-                        } else if (arrData.buffer) {
-                            arr = new Uint8Array(arrData.buffer);
-                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
-                            arr = new Uint8Array(Object.values(arrData) as number[]);
-                        }
-                        if (arr) {
-                            try {
-                                if (pako) {
-                                    const decompressed = pako.ungzip(arr, { to: 'string' });
-                                    item.data = JSON.parse(decompressed);
-                                } else {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                }
-                            } catch (e) {
-                                try {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                } catch (err) {}
-                            }
-                        }
-                    } else if (typeof item.data === 'string' && item.data.length > 50) {
-                        // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
-                        //    data 가 base64(gzip) 문자열로 내려오는 경우를 커버합니다.
-                        try {
-                            const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
-                            if (rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
-                                item.data = JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
-                            } else {
-                                item.data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
-                            }
-                        } catch (_strErr) {
-                            // JSON 도 base64 도 아니면 원본 문자열을 그대로 둡니다.
-                        }
-                    }
-                }
-            } catch (err) {
-                console.warn("[SYNC-BG] pako decompression failed:", err);
-            }
-            // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
-            //    syncData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
-            const bgTombstones = await loadTalkTombstones();
-            const bgItemTombs = await loadItemTombstones();
-            let bgTombBlocked = 0;
-            let bgItemTombBlocked = 0;
-            const filteredResults = response.results.filter((newItem: any) => {
-                if (bgTombstones.has(String(newItem.id))) {
-                    bgTombBlocked++;
-                    return false;
-                }
-                // 🌟 [ITEM TOMBSTONE CHECK] 문서 삭제도 백그라운드 재삽입을 차단합니다.
-                if (bgItemTombs.has(String(newItem.id))) {
-                    bgItemTombBlocked++;
-                    return false;
-                }
-                const existingEl = document.getElementById(newItem.id);
-                if (!existingEl) return true;
-                let localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
-                const serverUpdated = newItem.updated_at || newItem.created_at || 0;
-                return serverUpdated > localUpdated;
-            });
-            if (bgTombBlocked > 0) {
-                console.log(`[TOMBSTONE] 🪦 [BG] 삭제된 메시지 ${bgTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
-            }
-            if (bgItemTombBlocked > 0) {
-                console.log(`[ITEM-TOMBSTONE] 🪦 [BG] 삭제된 문서 ${bgItemTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
-            }
-            if (filteredResults.length > 0) {
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (r.mode) continue;
-                    r.mode = modeOfType(String(r.type || ""));
-                }
-                const sessionFlag = String((currentSession as any).flag || "");
-                if (sessionFlag) {
-                    for (const r of filteredResults) {
-                        if (!r) continue;
-                        if (r.flag) continue;
-                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
-                        if (inner) { r.flag = inner; continue; }
-                        r.flag = sessionFlag;
-                    }
-                }
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (!r.data || typeof r.data !== 'object') continue;
-                    for (const k in r) {
-                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
-                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
-                        const v = r[k];
-                        if (v === undefined || v === null) continue;
-                        if (typeof v === 'function') continue;
-                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
-                            r.data[k] = v;
-                        }
-                    }
-                }
-                // 🌟 [BACKOFF RESET] 백그라운드 commerce 동기화에서 변경이 있었으므로 리셋합니다.
-                updateSyncBackoff(true);
-                console.log(`[SYNC-BG] Commerce D1 background sync: ${filteredResults.length} item(s)`);
-                await invoke("upsert_items", { items: filteredResults });
-                // 🌟 [PAGE CACHE GUARD] syncData 와 동일한 규칙으로 페이지 셀렉터 캐시를 분리합니다.
-                //    기존에는 node / item 체크 없이 type 만으로 필터링하여
-                //    { table:'pages', type:'tracking', node:1, item:true } 문서를
-                //    items 테이블에 잘못 저장했습니다.
-                //    (로그: "[DEBUG] Syncing item - ID: , Type: tracking" 의 직접 원인)
-                const bgNewPages = filteredResults.filter((r: any) => {
-                    if (r.table === "pages" || r.table === "page") return true;
-                    if (r.type === "pages" || r.type === "page") return true;
-                    const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
-                    return !!d.node || !!d.item;
-                });
-                if (bgNewPages.length > 0 && appDb) {
-                    await appDb.table("pages").bulkPut(normalizeEnvelope(bgNewPages)).catch(() => null);
-                }
-                const newItems = filteredResults.filter((r: any) =>
-                    r.type !== "team" && r.type !== "user" && r.type !== "member"
-                    && r.type !== "pages" && r.type !== "page"
-                    && r.type !== "talk" && r.table !== "talks"
-                    && !bgNewPages.includes(r)
-                );
-                if (newItems.length > 0 && appDb) {
-                    await appDb.table("items").bulkPut(normalizeEnvelope(newItems)).catch(() => null);
-                }
-                // 현재 탭이 commerce/list 일 때만 UI 갱신
-                if (currentSearchMode === "commerce" && currentTab === "list") {
-                    await loadMoreDocs(false, true);
-                }
-                runLocalEmbeddingSync();
-            }
-        }
-    } catch (e) {
-        console.warn("[SYNC-BG] Commerce background sync failed:", e);
-    } finally {
-        isCommerceSyncRunning = false;
-    }
-}
+// 🌟 [ANALYTIC BUBBLE FINALIZER MOVED → src/modes/analytic.ts]
+//    유일한 호출부가 syncAnalyticsData 이므로 함께 이동했습니다.
+//    chatTalks 는 모듈 스코프 변수가 아니라 DOM 조회이므로
+//    이동 후에도 document.querySelector('.chat-talks') 로 동일하게 접근합니다.
+
+// 🌟 [ANALYTIC STRUCTURING MOVED → src/modes/analytic.ts]
+//    isAnalyticStructuring 락과 runAnalyticStructuring() 전량이 이동했습니다.
+//    · `isSearching || isExtracting || GlobalTaskManager.isBusy` 가드는
+//      runtime 의 isBusy() 게터가 그대로 계산합니다.
+//    · getDevicePref() 는 forceCpuToggle DOM 참조라 runtime 게터로 주입합니다.
+
+// 🌟 [ANALYTIC SYNC LOCK MOVED → src/modes/analytic.ts]
+//    isAnalyticsSyncRunning / lastAnalyticsSyncAt 는 analytic 트랙 내부 상태입니다.
+//    main.ts 에 선언만 남겨 두면 '아무도 읽지 않는 죽은 락' 이 되어
+//    (실제 락은 modes/analytic.ts 안에 별도로 존재) 원인 추적을 방해합니다.
+//    스로틀 강제 해제는 resetAnalyticThrottle() 로만 수행합니다.
+// 🌟 [ANALYTIC HELPERS MOVED → src/modes/analytic.ts]
+//    resolveAnalyticsOrigins / extractAnalyticText 는 analytic 트랙 전용 헬퍼이며
+//    외부 호출부가 없으므로 그대로 이동했습니다.
+
+// 🌟 [ANALYTIC SYNC MOVED]
+//    · getOAuthCredentialForOrigin → src/modes/oauth.ts
+//      (자격증명 저장소와 조회기를 한 파일에 두어 등록/조회 규칙이 갈리지 않게 합니다)
+//    · fetchAnalyticsOrigin / syncAnalyticsData → src/modes/analytic.ts
+//
+//    syncAnalyticsData 는 최상단 import 로 같은 이름이 제공되므로
+//    syncData() 라우터와 모드 탭 IMMEDIATE PULL 호출부는 그대로입니다.
+
+// 🌟 [ANALYTIC BACKGROUND SYNC MOVED → src/modes/analytic.ts]
+//    isAnalyticsSyncRunning / lastAnalyticsSyncAt 가 그 파일로 옮겨졌으므로
+//    스로틀 판정도 같은 파일 안에 있어야 합니다.
+//    이름이 동일하게 export 되어 syncData() 라우터 호출부는 그대로입니다.
+
+// 🌟 [COMMERCE BACKGROUND SYNC MOVED → src/modes/commerce.ts]
+//    isCommerceSyncRunning 락과 syncCommerceInBackground() 전량이 이동했습니다.
+//    이름이 동일하게 export 되므로 syncData() 라우터의 세 호출부는 그대로입니다.
 
 
 // [통합 락 매니저 & 프론트엔드 큐 관리자]
@@ -3421,17 +1821,26 @@ function stopSpinner() {
     });
 
     // 🌟 [수정] 스피너 정지 시, 진행 중이지 않은 유효한 텍스트 입력값이 존재할 때만 검색 버튼 노출
-    if (btnSubmit) {
-        const currentVal = searchInput?.value.trim() || "";
-        // 스피너가 멈췄다는 건 작업이 끝났다는 의미이므로, isQueryActive(currentVal)가 false가 되어 버튼이 살아납니다.
-        if (currentVal !== "" && !isQueryActive(currentVal)) {
-            btnSubmit.style.display = "flex";
-        } else {
-            btnSubmit.style.display = "none";
-        }
-    }
-
+    //    🌟 [MODE SPLIT] 동일 코드가 syncData / syncAnalyticsData / syncTradingData 에도
+    //       복사돼 있었습니다. 모드 파일이 분리되면 btnSubmit / searchInput / isQueryActive 에
+    //       접근할 수 없으므로 단일 함수로 뽑아 runtime 으로 주입합니다.
+    restoreSubmitButton();
     updateExtractButtonVisibility();
+}
+
+// 🌟 [SUBMIT RESTORE] 검색 버튼 노출 판정의 단일 진입점입니다.
+//  ── 계약 ──
+//   · 입력값이 비어 있으면 숨김
+//   · 입력값이 이미 진행/대기 중인 질의와 같으면 숨김 (중복 큐잉 방지)
+//   · 그 외에는 노출
+function restoreSubmitButton() {
+    if (!btnSubmit) return;
+    const currentVal = searchInput?.value.trim() || "";
+    if (currentVal !== "" && !isQueryActive(currentVal)) {
+        btnSubmit.style.display = "flex";
+    } else {
+        btnSubmit.style.display = "none";
+    }
 }
 
 // --- Layout & Window Logic ---
@@ -4762,7 +3171,16 @@ function showInviteQr(hook: string, email: string) {
 }
 
 // --- Sync Logic ---
-// main.ts 내부
+// 🌟 [MODE ROUTER]
+//  syncData() 는 이제 '어느 트랙을 전면(foreground)으로 돌릴 것인가' 만 결정합니다.
+//  실제 동기화 본문은 전부 modes/*.ts 안에 있습니다.
+//
+//  ── 라우팅 계약 ──
+//   ① 현재 모드의 트랙을 await 로 먼저 완주시킵니다. (사용자가 보고 있는 화면이 최우선)
+//   ② 나머지 두 트랙은 await 없이 백그라운드로 흘립니다.
+//      각 트랙 내부의 30초 스로틀이 폴링 부하를 억제하므로 사실상 무료입니다.
+//      이 백그라운드 흐름이 없으면 탭을 열기 전까지 이벤트가 로컬에 존재하지 않고,
+//      Worker 의 LIMIT 1000 창 밖으로 밀려나면 영구히 유실됩니다.
 async function syncData() {
     // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
     if (currentSearchMode === "analytic") {
@@ -4792,12 +3210,7 @@ async function syncData() {
         }
         return;
     }
-    // 🌟 [ANALYTICS BACKGROUND] commerce / shipping 탭에 있어도 analytics 이벤트를 계속 받습니다.
-    //    ── 왜 필요한가 ──
-    //     기존 구조는 analytic 탭을 열어야만 D1 이벤트를 가져왔습니다.
-    //     그 사이 쌓인 이벤트는 탭을 열기 전까지 로컬에 존재하지 않았고,
-    //     Worker 의 LIMIT 1000 창 밖으로 밀려나면 영구히 유실됩니다.
-    //     30초 스로틀이 걸려 있어 폴링 부하는 사실상 없습니다.
+    // 🌟 [ANALYTICS BACKGROUND] commerce 탭에 있어도 analytics 이벤트를 계속 받습니다.
     if (currentSession.hash) {
         syncAnalyticsInBackground();
     }
@@ -4806,373 +3219,12 @@ async function syncData() {
         syncTradingInBackground();
     }
     if (!currentSession.hash || !currentSession.email) return;
-    
-    console.log("[SYNC] 1. 서버에 최신 데이터 요청 중...");
-    try {
-        const origin = "https://commerce.logis.center";
-        const now = Date.now();
-        const createdAt = now - timezoneOffset;
-        
-        // 🌟 [CRITICAL FIX] front.js 패리티: 서버가 나를 정확히 인지하도록 cc, type, 실제 href 파라미터를 추가합니다.
-        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
-        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
-            targetHref = "https://commerce.logis.center/tracking";
-        }
 
-        const queryParams: any = {
-            origin: origin,
-            created_at: createdAt.toString(),
-            hash: currentSession.hash,
-            token: currentSession.token || "",
-            href: targetHref
-        };
-
-        // 🌟 [SENDER IMPRINT] checkAuthStatus 와 동일한 이유입니다.
-        //    syncData 는 currentSession.email 이 확정된 뒤에만 실행되므로
-        //    (함수 상단의 `if (!currentSession.hash || !currentSession.email) return;`)
-        //    여기서 보내는 sender 는 반드시 서버 user.data 에 각인됩니다.
-        //    이 값이 있어야 PUT(talks) / POST(tasks) 가 cookies.sender 게이트를 통과합니다.
-        const syncSender = currentSession.email || currentSession.name || "";
-        if (syncSender) queryParams.sender = syncSender;
-
-        // 🌟 [CRITICAL FIX] chrome.js 패리티: 서버 동기화 시, 강제 지정된 사이드바 메뉴가 없다면 현재 URL의 도메인(CC)을 최우선으로 서버에 전달합니다.
-        let syncEffectiveCc = activeContext.cc;
-        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
-        if (!syncEffectiveCc || (!isDefaultForced && activeTags.length === 0)) {
-            try {
-                const urlObj = new URL(targetHref.toLowerCase());
-                const rootDomain = getRootDomain(urlObj.hostname);
-                syncEffectiveCc = await hashId(rootDomain);
-            } catch(e) {}
-        }
-
-        if (syncEffectiveCc) queryParams.cc = syncEffectiveCc;
-        if (currentSearchMode && currentSearchMode !== "commerce") queryParams.type = currentSearchMode;
-
-        const params = new URLSearchParams(queryParams);
-        const url = `${API_HOST}/?${params.toString()}`;
-        
-        // 1. 서버 요청
-        const response = await invoke<any>("proxy_fetch", {
-            url: url,
-            method: "GET",
-            headers: { "Content-Type": "application/json" },
-            // 🌟 서버가 cc를 헤더나 쿠키처럼 파싱할 수 있게 proxy_fetch 파라미터에도 주입합니다.
-            session_params: { hash: currentSession.hash, token: currentSession.token, cc: activeContext.cc || "" }
-        });
-
-        stepQrSpinner();
-
-        console.log('response',response);
-
-        if (response.results && Array.isArray(response.results)) {
-            // 🌟 [추가] 서버에서 압축된 gzip 데이터를 그대로 보낼 경우, chrome.js와 동일하게 pako로 압축 해제
-            try {
-                const pako = (window as any).pako;
-                for (let i = 0; i < response.results.length; i++) {
-                    let item = response.results[i];
-                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
-                        let arrData = item.data.data || item.data;
-                        let arr: Uint8Array | null = null;
-                        
-                        if (Array.isArray(arrData)) {
-                            arr = new Uint8Array(arrData);
-                        } else if (arrData.buffer) {
-                            arr = new Uint8Array(arrData.buffer);
-                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
-                            arr = new Uint8Array(Object.values(arrData) as number[]);
-                        }
-
-                        if (arr) {
-                            try {
-                                if (pako) {
-                                    const decompressed = pako.ungzip(arr, { to: 'string' });
-                                    item.data = JSON.parse(decompressed);
-                                } else {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                }
-                            } catch (e) {
-                                try {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                } catch (err) {}
-                            }
-                        }
-                    }
-                }
-            } catch (err) {
-                console.warn("[SYNC] pako decompression failed:", err);
-            }
-
-            // 🌟 [버그 수정] DOM에 렌더링된 요소뿐만 아니라, Dexie DB에 있는 백그라운드 통계(team) 객체의 최신 시간도 대조해야 합니다.
-            const localUsers = await Select["users"]({});
-            const localPages = await Select["pages"]({});
-            const localTalks = await appDb.table("talks").toArray(); // 🌟 채팅(talks) 데이터도 로컬 맵에 반드시 포함
-            const localMap = new Map();
-            [...localUsers, ...localPages, ...localTalks].forEach((item: any) => {
-                // 🌟 updated_at이 0인 레거시 데이터를 대비해 created_at을 백업으로 사용
-                localMap.set(item.id, item.updated_at_ts || item.updated_at || item.created_at_ts || item.created_at || 0);
-            });
-
-            // 🌟 [TOMBSTONE GUARD] 내가 삭제한 메시지는 서버에 행이 남아 있으므로
-            //    매 폴링마다 다시 내려옵니다. 그때 로컬에는 DOM 도 Dexie 도 없으니
-            //    바로 아래 `!existingEl && !localMap.has(id)` 조건을 통과해 재삽입됩니다.
-            //    묘비 조회는 메모리 Set 이라 폴링 비용이 사실상 0 입니다.
-            const tombstones = await loadTalkTombstones();
-            // 🌟 [ITEM TOMBSTONE] 문서(items) 삭제도 동일하게 서버 재삽입을 차단합니다.
-            const itemTombs = await loadItemTombstones();
-            let tombBlocked = 0;
-            let itemTombBlocked = 0;
-            const filteredResults = response.results.filter((newItem: any) => {
-                // 🌟 삭제 의사가 기록된 id 는 어떤 조건보다 먼저, 무조건 차단합니다.
-                if (tombstones.has(String(newItem.id))) {
-                    tombBlocked++;
-                    return false;
-                }
-                // 🌟 [ITEM TOMBSTONE CHECK] talk 이 아닌 일반 문서도 차단합니다.
-                if (itemTombs.has(String(newItem.id))) {
-                    itemTombBlocked++;
-                    return false;
-                }
-                const existingEl = document.getElementById(newItem.id);
-                // 🌟 완전 신규 데이터 (DOM에도 없고 로컬 DB 캐시에도 없는 경우)는 조건 없이 즉시 통과
-                if (!existingEl && !localMap.has(newItem.id)) {
-                    return true;
-                }
-                let localUpdated = 0;
-                if (existingEl) {
-                    localUpdated = parseInt(existingEl.dataset.updatedAt || existingEl.dataset.createdAt || "0");
-                } else if (localMap.has(newItem.id)) {
-                    localUpdated = parseInt(localMap.get(newItem.id) || "0");
-                }
-                // 🌟 서버의 updated_at이 0일 수 있으므로(기존 index.ts 특성), created_at을 백업 비교값으로 활용
-                const serverUpdated = newItem.updated_at || newItem.created_at || 0;
-                return serverUpdated > localUpdated; // 서버 데이터가 더 최신인 경우만 포함
-            });
-            if (tombBlocked > 0) {
-                console.log(`[TOMBSTONE] 🪦 삭제된 메시지 ${tombBlocked}건의 서버 재삽입을 차단했습니다.`);
-            }
-            if (itemTombBlocked > 0) {
-                console.log(`[ITEM-TOMBSTONE] 🪦 삭제된 문서 ${itemTombBlocked}건의 서버 재삽입을 차단했습니다.`);
-            }
-
-            if (filteredResults.length > 0) {
-                updateSyncBackoff(true);
-                // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
-                //    mode 는 '동기화 시점에 클라이언트가 확정하는 값' 이며,
-                //    판정은 파일 상단의 modeOfType() 단일 함수가 전담합니다.
-                //
-                //    ── v1 의 결함 ──
-                //     TRADING_TYPES 에 소문자 'tracking' 이 들어 있어
-                //     proxy 의 Relay("tracking","order") 가 만든 commerce 배송추적 문서가
-                //     전부 mode='shipping' 으로 오염되었고,
-                //     loadMoreDocs 의 mode 필터에서 commerce 목록이 통째로 비었습니다.
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (r.mode) continue;
-                    r.mode = modeOfType(String(r.type || ""));
-                }
-                // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 없으면
-                //    Rust upsert_item 이 현재 시각을 부여해 draft → count 가 됩니다.
-                //    data 내부에도 없으면 여기서 0 을 명시해 draft 계약을 보존합니다.
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    const hasRoot = r.updated_at !== undefined && r.updated_at !== null;
-                    const inner = (r.data && typeof r.data === 'object') ? r.data.updated_at : undefined;
-                    const hasInner = inner !== undefined && inner !== null;
-                    if (!hasRoot && !hasInner) {
-                        r.updated_at = 0;
-                    }
-                }
-
-                // 🌟 [FLAG RECOVERY] commerce D1 의 items 테이블에는 flag 컬럼이 없습니다.
-                //    (analytics D1 · LanceDB · Dexie 에는 모두 존재)
-                //    그대로 두면 commerce 트랙 전 문서의 flag 가 영구 공백이 되어
-                //    지역 스코프 조회가 성립하지 않습니다.
-                //    세션 flag(= Client Worker 가 GeoIP 로 확정한 국가 코드)로 보강합니다.
-                const sessionFlag = String((currentSession as any).flag || "");
-                if (sessionFlag) {
-                    let flagFilled = 0;
-                    for (const r of filteredResults) {
-                        if (!r) continue;
-                        if (r.flag) continue;
-                        // data 안에 이미 flag 가 있으면(users/team 문서) 그쪽을 신뢰합니다.
-                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
-                        if (inner) { r.flag = inner; continue; }
-                        r.flag = sessionFlag;
-                        flagFilled++;
-                    }
-                    if (flagFilled > 0) {
-                        console.log(`[SYNC] flag 컬럼 부재 문서 ${flagFilled}건을 세션 flag('${sessionFlag}')로 보강했습니다.`);
-                    }
-                }
-
-                // 🌟 [ROOT ABSORB / RUST] Rust 의 upsert_items 는 item.data 객체의 알맹이를
-                //    루트로 끌어올리는 방향만 처리합니다. 반대로 '루트에만 있는 물리 컬럼' 은
-                //    data 로 내려 주지 않으므로, 여기서 미리 합쳐 보냅니다.
-                //    (normalizeEnvelope 의 ROOT ABSORB 와 동일 규칙이어야 두 저장소가 일치합니다)
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (!r.data || typeof r.data !== 'object') continue;
-                    for (const k in r) {
-                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
-                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
-                        const v = r[k];
-                        if (v === undefined || v === null) continue;
-                        if (typeof v === 'function') continue;
-                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
-                            r.data[k] = v;
-                        }
-                    }
-                }
-
-                console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
-                await invoke("upsert_items", { items: filteredResults });
-                
-                // 🌟 [누락 복구] 서버 통계를 LanceDB에 덮어썼다면, 반드시 프론트엔드 Dexie DB 에도 동기화해줘야 화면이 바뀝니다!
-                const newUsers = filteredResults.filter((r: any) => r.type === "team" || r.type === "user" || r.type === "member");
-                
-                // 🌟 [ROUTING FIX] 서버(Client Worker)는 페이지 캐시 행에 table:'pages' 를 실어 보냅니다.
-                //    기존처럼 data.node / data.item 의 '존재 여부' 로 추정하면
-                //    canonicalize_data 가 node / detail 을 0 으로 시딩하는 순간 전 아이템이 참이 되어
-                //    일반 상품/주문까지 Dexie pages 테이블로 오분류됩니다.
-                //    따라서 서버가 명시한 table 을 1순위로 신뢰하고,
-                //    없을 때만 셀렉터 마커의 '값이 truthy 인지' 를 봅니다.
-                const newPages = filteredResults.filter((r: any) => {
-                    if (r.table === "pages" || r.table === "page") return true;
-                    if (r.type === "pages" || r.type === "page") return true;
-                    const d = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || r);
-                    return !!d.node || !!d.item;
-                });
-                
-                // chrome.js 형태의 talks(채팅) 메시지 추출
-                const newTalks = filteredResults.filter((r: any) => r.type === "talk" || r.table === "talks");
-
-                const newItems = filteredResults.filter((r: any) => !newUsers.includes(r) && !newPages.includes(r) && !newTalks.includes(r));
-
-                // 🌟 v4 : users / pages 도 봉투 정규화를 거칩니다.
-                //  talks 는 스키마가 다르므로(role/task_id/status) 그대로 넣습니다.
-                if (newUsers.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(newUsers));
-                if (newPages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(newPages));
-                if (newTalks.length > 0) await appDb.table("talks").bulkPut(newTalks);
-                if (newItems.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(newItems));
-
-                // 🌟 [CRITICAL FIX] 서버에서 가져온 데이터는 이미 윗줄에서 invoke("upsert_items")를 통해 Rust(LanceDB)에 
-                // 일괄 저장되었습니다. 프론트엔드가 이를 다시 백엔드로 밀어넣는 병목 루프를 삭제합니다.
-            } else {
-                updateSyncBackoff(false);
-                
-                console.log(`[SYNC] 2. 변경된 데이터가 없어 DB 쓰기를 건너뜁니다.`);
-            }
-
-            // 🌟 [추가] '대기 중' 멤버 정화(Cleanup) 로직
-            // 서버에서 받은 결과 중 정식 멤버(member/user)가 있는지 확인합니다.
-            const realMembers = response.results.filter((item: any) => item.type === "member" || item.type === "user");
-            if (realMembers.length > 0) {
-                const localUsers = await Select["users"]({});
-                // 로컬에 저장된 'pending_invite_'로 시작하는 가짜 데이터들을 찾습니다.
-                const pendingInvites = localUsers.filter(u => u.id && u.id.startsWith("pending_invite_"));
-
-                for (const pending of pendingInvites) {
-                    const pendingEmail = pending.data?.email;
-                    // 서버에서 온 정식 멤버 중 이메일(혹은 이름)이 일치하는 사람이 있는지 대조
-                    const isNowMember = realMembers.some((m: any) => {
-                        // 서버 데이터(m) 내부에 이메일 정보가 있거나, 이름이 이메일 아이디와 같은지 확인
-                        return m.to === pending.from || (m.data && m.data.email === pendingEmail);
-                    });
-
-                    if (isNowMember) {
-                        // 정식 멤버가 확인되었으므로 가짜(Pending) 데이터를 로컬 DB에서 삭제합니다.
-                        await invoke("delete_document", { uuid: pending.id });
-                        console.log(`[SYNC] Pending invite for ${pendingEmail} is now a real member. Placeholder removed.`);
-                    }
-                }
-            }
-            
-            // 🌟 [CLOUD TASK LIFECYCLE] 서버 tasks 목록과 대조하여 클라우드 작업 완료 여부를 판정합니다.
-            if (cloudPendingTasks.size > 0) {
-                const serverTaskIds = new Set<string>();
-                for (const r of response.results) {
-                    if (!r) continue;
-                    if (r.table === "tasks" && r.id) {
-                        serverTaskIds.add(r.id);
-                    }
-                }
-
-                for (const [localTid, meta] of Array.from(cloudPendingTasks.entries())) {
-                    const stillRunning = meta.serverId ? serverTaskIds.has(meta.serverId) : false;
-
-                    if (stillRunning) {
-                        await renderProgressToUI({
-                            task_id: localTid,
-                            category: "Cloud Queue",
-                            summary: "Processing on Logis Center...",
-                            spinner: "☁️"
-                        });
-                        continue;
-                    }
-
-                    // 서버 등록 직후의 레이스 컨디션 방어(최소 5초 유예)
-                    if (Date.now() - meta.createdAt < 5000) continue;
-
-                    cloudPendingTasks.delete(localTid);
-
-                    await renderProgressToUI({
-                        task_id: localTid,
-                        category: "Done",
-                        summary: meta.kind === "search"
-                            ? "Cloud AI search complete."
-                            : "Cloud AI extraction complete.",
-                        spinner: "✅"
-                    });
-
-                    console.log(`[CLOUD] Task ${localTid} (server: ${meta.serverId}) finished on Logis Center.`);
-                }
-            }
-
-            console.log("[SYNC] 3. 로컬 DB에서 데이터 불러와 메뉴 렌더링...");
-            // 🌟 [RENDER GATE] 변경된 데이터가 없으면 네비게이션/리스트 재렌더링을 건너뜁니다.
-            //    기존에는 매 폴링마다 renderNavigation + loadMoreDocs 가 돌아
-            //    동일 데이터를 반복 적재하고 콘솔 로그를 낭비했습니다.
-            if (filteredResults.length > 0) {
-                // 3. LanceDB 불러오기
-                await renderNavigation();
-
-                // 🌟 [CRITICAL FIX] 서버 데이터를 로컬 DB에 밀어넣었으니, 현재 보고 있는 탭에 맞춰 UI를 갱신합니다!
-                if (currentTab === "list") {
-                    await loadMoreDocs(false, true);
-                } else if (currentTab === "settings") {
-                    await fetchChatHistory(false, true);
-                }
-            } else {
-                console.log("[SYNC] 3. 변경 없음 → 네비게이션/리스트 재렌더링을 건너뜁니다.");
-            }
-
-            // 🌟 [CLIENT-SIDE EMBEDDING] 클라우드는 구조화만 했으므로 임베딩은 여기서 로컬로 수행합니다.
-            //    runLocalEmbeddingSync 내부의 2초 디바운스가 initSession의 4초 타이머와
-            //    겹치는 중복 호출을 자동으로 병합하여 1회만 실행합니다.
-            console.log("[SYNC] 4. 로컬 임베딩 파이프라인 스케줄링 (2초 디바운스 적용)...");
-            runLocalEmbeddingSync();
-        }
-        
-    } catch (e) {
-        console.error("[SYNC] 동기화 실패:", e);
-    } finally {
-        if (!isExtracting && !isSearching) stopSpinner();
-        // 🌟 [SYNC DONE → SUBMIT RESTORE] 동기화가 끝나면 검색 입력 상태를 재평가합니다.
-        //    기존에는 stopSpinner() 내부에서만 조건부로 노출했지만,
-        //    syncData 가 백그라운드에서 돌 때 btnSubmit 이 숨겨진 채
-        //    복귀하지 않는 경로가 있었습니다.
-        if (btnSubmit) {
-            const currentVal = searchInput?.value.trim() || "";
-            if (currentVal !== "" && !isQueryActive(currentVal)) {
-                btnSubmit.style.display = "flex";
-            } else {
-                btnSubmit.style.display = "none";
-            }
-        }
-    }
+    // 🌟 [COMMERCE TRACK] 본문 전량은 modes/commerce.ts 의 syncCommerceData() 로 이동했습니다.
+    //    (D1 gzip 해제 / TOMBSTONE GUARD / MODE TAGGING / DRAFT PRESERVE /
+    //     FLAG RECOVERY / ROOT ABSORB / Dexie 라우팅 / Pending 멤버 정화 /
+    //     CLOUD TASK LIFECYCLE / RENDER GATE / 로컬 임베딩 스케줄링)
+    await syncCommerceData();
 }
 
 // --- 기존 State 영역 어딘가에 추가 ---
@@ -5276,28 +3328,40 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
         // 🌟 [BACKOFF RESET] 사용자가 탭을 전환하면 즉시 폴링을 기본 간격으로 리셋합니다.
-        syncConsecutiveNoChange = 0;
-        syncCurrentIntervalMs = SYNC_BASE_INTERVAL_MS;
+        //    🌟 [MODE SPLIT] 카운터가 modes/runtime.ts 로 이동해 직접 대입이 불가능하므로
+        //       전용 리셋 함수를 호출합니다. (동작은 완전히 동일합니다)
+        resetSyncBackoff();
         await refreshList();
-
         await refreshList();
 
         // 🌟 [IMMEDIATE PULL] analytic 으로 전환했으면 폴링 주기를 기다리지 않고 즉시 1회 당겨옵니다.
         if (currentSearchMode === "analytic" && currentSession.hash) {
-            lastAnalyticsSyncAt = 0; // 스로틀 해제
+            resetAnalyticThrottle(); // 🌟 [MODE SPLIT] 구 `lastAnalyticsSyncAt = 0;` 스로틀 해제
             syncAnalyticsData();
         }
         // 🌟 [IMMEDIATE PULL / TRADING] shipping 으로 전환한 직후도 동일합니다.
         //    무역 트랙은 문서 수가 적고 폴링 간격이 최대 30초까지 늘어나므로,
         //    탭을 눌렀는데 30초간 빈 화면이 유지되는 체감을 없앱니다.
         if (currentSearchMode === "shipping" && currentSession.hash) {
-            lastTradingSyncAt = 0; // 스로틀 해제
+            resetTradingThrottle(); // 🌟 [MODE SPLIT] 구 `lastTradingSyncAt = 0;` 스로틀 해제
             syncTradingData();
         }
 
         const _isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
         if (currentSearchMode === "analytic" && currentSession.email && !_isSettingsOpen) {
             await renderNavigation();
+        }
+
+        // 🌟 [REMOTE MODE BROADCAST] 페어링된 모바일에 모드 변경을 즉시 통지합니다.
+        //  ── 왜 필요한가 ──
+        //   모바일은 자체 DB 가 없어 목록 스코프를 전적으로 PC 에 의존합니다.
+        //   PC 가 Trading 으로 바꿨는데 모바일이 모르면, 모바일은 계속 commerce
+        //   스코프로 요청을 보내 두 화면이 서로 다른 집합을 보여 줍니다.
+        if (dataChannel && dataChannel.readyState === "open") {
+            dataChannel.send(JSON.stringify({
+                type: "sync_mode",
+                mode: currentSearchMode
+            }));
         }
     });
 });
@@ -7016,15 +5080,38 @@ let desktopStream: MediaStream | null = null;
 let qrRotationInterval: number | null = null;
 
 // 🌟 [추가] 양측의 인증(검증)이 완료된 후 실제 데이터 동기화를 시작하는 헬퍼 함수
+// 🌟 [IDEMPOTENT GUARD] 아래 함수의 중복 진입을 막는 플래그입니다.
+//    채널이 끊길 때 setupDataChannel 의 onclose 가 반드시 내려 줍니다.
+let isWebRtcFinalized = false;
 function finalizeWebRtcConnection(guestSession: any) {
+    // 🌟 [IDEMPOTENT FINALIZE]
+    //  ── 무엇이 문제였나 ──
+    //   양쪽 모두 채널 open 직후 서로에게 auth_request 를 보내므로,
+    //   PC 는 두 경로로 이 함수에 진입합니다.
+    //     ① 자기 승인 팝업(ask)이 통과했을 때 → finalizeWebRtcConnection(guest)
+    //     ② 모바일이 보낸 auth_success 를 받았을 때 → finalizeWebRtcConnection(null)
+    //   그때마다 `mobile_${Date.now()}` 로 서로 다른 id 를 만들어 upsert 하므로
+    //   Local Members 에 같은 기기가 두 줄 생기고, 앱을 껐다 켜도 남습니다.
+    if (isWebRtcFinalized) {
+        console.log("[WebRTC] Already finalized. Skipping duplicate device registration.");
+        return;
+    }
+    isWebRtcFinalized = true;
     const profileName = document.getElementById("nav-profile-name");
     if (profileName) {
         profileName.textContent = "✅ Mobile Linked (P2P)";
         profileName.style.color = "#4ade80";
     }
     document.getElementById("nav-qr-container")?.classList.add("hidden");
-    syncDataToMobile();
-
+    // 🌟 [PROTOCOL FIX] syncDataToMobile() 호출을 제거했습니다.
+    //  ── 왜 ──
+    //   이 함수는 DOM 카드에서 긁어낸 축약 배열을 `{ type:"sync_list", data }` 로 보냅니다.
+    //   그런데 새 원격 프로토콜의 sync_list 는 reset / total 필드를 함께 요구하며,
+    //   모바일은 reset 이 없으면 '다음 페이지' 로 해석해 remotePage 를 올리고
+    //   목록을 append 합니다. 즉 개통 직후 화면에 잘못된 1페이지가 끼어들고
+    //   이후 진짜 페이지네이션이 한 칸씩 밀립니다.
+    //   모바일은 개통 직후 bootstrapRemoteState() 로 정식 목록을 요청하므로
+    //   여기서 밀어 줄 필요가 전혀 없습니다.
     try {
         const guestName = (guestSession && guestSession.email) ? guestSession.email.split('@')[0] : "📱 Linked Device";
         const guestAddr = (guestSession && guestSession.address) ? guestSession.address : "0x0000000000000000000000000000000000000000";
@@ -7054,6 +5141,19 @@ function setupDataChannel(channel: RTCDataChannel) {
             type: "auth_request", 
             session: currentSession 
         }));
+    };
+    // 🌟 [FINALIZE RESET] 채널이 끊기면 다음 페어링에서 기기 등록·프로필 갱신이
+    //    다시 이뤄져야 하므로 idempotent 가드를 반드시 내려 줍니다.
+    //    내리지 않으면 재연결 후 finalizeWebRtcConnection 이 통째로 조기 반환되어
+    //    "✅ Mobile Linked" 표시도, Local Members 등록도 영원히 갱신되지 않습니다.
+    channel.onclose = () => {
+        console.log("[WebRTC] Channel CLOSED. Resetting pairing state.");
+        isWebRtcFinalized = false;
+        const profileName = document.getElementById("nav-profile-name");
+        if (profileName && profileName.textContent === "✅ Mobile Linked (P2P)") {
+            profileName.textContent = currentSession.email ? currentSession.email.split('@')[0] : "";
+            profileName.style.color = "";
+        }
     };
 
     channel.onmessage = async (e) => {
@@ -7136,9 +5236,8 @@ function setupDataChannel(channel: RTCDataChannel) {
             else if (msg.type === "auth_reject") {
                 alert(`WebRTC Connection blocked: ${msg.reason}`);
                 peerConn?.close();
-            }
             // --- 기존 통신 로직 유지 ---
-            else if (msg.type === "get_detail") {
+            } else if (msg.type === "get_detail") {
                 const doc = await invoke<any>("get_document", { uuid: msg.uuid });
                 if (doc && dataChannel?.readyState === "open") {
                     dataChannel.send(JSON.stringify({
@@ -7153,6 +5252,16 @@ function setupDataChannel(channel: RTCDataChannel) {
                     dataChannel.send(JSON.stringify({ 
                         type: "sync_session", 
                         data: currentSession 
+                    }));
+                }
+            } else if (msg.type === "get_mode") {
+                // 🌟 [REMOTE MODE] 모바일에 현재 데스크톱의 모드를 알려줍니다.
+                //    Part 1~2 에서 모드를 3분할한 이후, 모바일이 이 값을 모르면
+                //    항상 전체를 조회하게 되어 목록 스코프가 데스크톱과 어긋납니다.
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_mode",
+                        mode: currentSearchMode
                     }));
                 }
             } else if (msg.type === "get_navigation") {
@@ -7175,23 +5284,267 @@ function setupDataChannel(channel: RTCDataChannel) {
                         messages: messages
                     }));
                 }
+            } else if (msg.type === "get_queue_status") {
+                // 🌟 [QUEUE STATUS] 모바일이 '지금 PC 가 바쁜지' 를 알 수 있게 합니다.
+                //    ── 왜 필요한가 ──
+                //     모바일은 자체 연산 자원이 없어 모든 무거운 작업을 PC 큐에 위임합니다.
+                //     그런데 큐 상태를 모르면 사용자는 요청이 씹혔는지 대기 중인지 구분할 수 없고,
+                //     같은 작업을 반복 전송해 큐를 오염시킵니다.
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_queue_status",
+                        busy: GlobalTaskManager.isBusy,
+                        currentTaskId: GlobalTaskManager.currentTaskId,
+                        pending: GlobalTaskManager.queue.length + GlobalTaskManager.backendQueued.length
+                    }));
+                }
+            } else if (msg.type === "cancel_task") {
+                // 🌟 [REMOTE CANCEL] 모바일에서 진행 중인 작업을 취소합니다.
+                const targetTaskId = msg.taskId || GlobalTaskManager.currentTaskId;
+                if (targetTaskId) {
+                    console.log(`[WebRTC] Remote cancel requested: ${targetTaskId}`);
+                    GlobalTaskManager.cancelledTasks.add(targetTaskId);
+                    try {
+                        await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
+                        await GlobalTaskManager.release(targetTaskId, targetTaskId);
+                    } catch (e) {
+                        console.error("[WebRTC] Remote cancel failed:", e);
+                    }
+                    isSearching = false;
+                    isExtracting = false;
+                    stopSpinner();
+                    await updateExtractButtonVisibility();
+                }
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_queue_status",
+                        busy: GlobalTaskManager.isBusy,
+                        currentTaskId: GlobalTaskManager.currentTaskId,
+                        pending: GlobalTaskManager.queue.length + GlobalTaskManager.backendQueued.length
+                    }));
+                }
             } else if (msg.type === "search") {
-                // Perform local search for mobile
-                console.log("[WebRTC] Remote Search Query:", msg.query);
-                const docs = await Select["items"]({ 
-                    value: msg.query || "", 
-                    limit: 20, 
-                    offset: 0 
+                // 🌟 [REMOTE LIST v2] Dexie 인덱스를 직접 사용하는 목록 조회입니다.
+                //  ── v1 의 결함 ──
+                //   Select["items"]({value, limit, offset}) 만 호출해
+                //   ① 모드 스코프(mode / TYPE_SETS)가 전혀 적용되지 않고
+                //   ② activeContext(cc/bcc/ref)도 무시되어
+                //   데스크톱 화면과 모바일 화면이 서로 다른 집합을 보여 주었습니다.
+                //   ③ offset 고정(0)이라 페이지네이션이 불가능했습니다.
+                //
+                //  여기서는 loadMoreDocs 와 동일한 스코프 규칙을 그대로 적용합니다.
+                const remoteMode = msg.mode || currentSearchMode;
+                const remoteLimit = Number(msg.limit || 20);
+                const remoteOffset = Number(msg.offset || 0);
+                const remoteQuery = String(msg.query || "").trim();
+                console.log(`[WebRTC] Remote list: mode=${remoteMode} q='${remoteQuery}' offset=${remoteOffset}`);
+
+                const allowedTypes = TYPE_SETS[remoteMode] || TYPE_SETS.commerce;
+                // 🌟 [SCOPE GUARD] activeContext(cc/ref)는 '현재 데스크톱 모드' 의 네임스페이스입니다.
+                //    commerce 는 hashId(getRootDomain(host)), analytic 은 hashId(url.host) 로
+                //    해시 규칙 자체가 달라, 모드가 어긋난 상태에서 그대로 드라이버 인덱스로 쓰면
+                //    반드시 0건이 됩니다. (데스크톱 모드 탭 핸들러가 activeContext 를
+                //    비우는 것과 정확히 같은 이유입니다)
+                //    모바일이 요청한 모드와 데스크톱 모드가 같을 때만 스코프를 적용합니다.
+                const scopeUsable = (remoteMode === currentSearchMode);
+                const scopeRef = scopeUsable ? activeContext.ref : "";
+                const scopeCc = scopeUsable ? activeContext.cc : "";
+                if (!scopeUsable && (activeContext.ref || activeContext.cc)) {
+                    console.log(`[WebRTC] 모드 불일치(desktop='${currentSearchMode}' / mobile='${remoteMode}')로 activeContext 스코프를 무시합니다.`);
+                }
+                let rows: any[] = [];
+                try {
+                    if (appDb) {
+                        if (scopeRef) {
+                            rows = await appDb.table('items').where('ref').equals(scopeRef).toArray();
+                            rows = rows.filter((r: any) => (r.mode || 'commerce') === remoteMode);
+                            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+                        } else if (scopeCc) {
+                            rows = await appDb.table('items').where('cc').equals(scopeCc).toArray();
+                            rows = rows.filter((r: any) => (r.mode || 'commerce') === remoteMode);
+                            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+                        } else {
+                            // 🌟 '[mode+type]' 복합 인덱스를 anyOf 로 펼칩니다. (loadMoreDocs 와 동일)
+                            const pairs = allowedTypes.map(t => [remoteMode, t]);
+                            rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
+                        }
+                        // 🌟 텍스트 질의가 있으면 인메모리 부분일치로 좁힙니다.
+                        //    (AI 검색은 별도 ai_search 경로가 담당합니다)
+                        if (remoteQuery) {
+                            const q = remoteQuery.toLowerCase();
+                            rows = rows.filter((r: any) => {
+                                const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.name ?? ''} ${r.data?.no ?? ''} ${r.data?.tracking_number ?? ''}`.toLowerCase();
+                                return hay.includes(q);
+                            });
+                        }
+                        rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+                    }
+                } catch (e) {
+                    console.warn("[WebRTC] Remote list query failed:", e);
+                }
+                const total = rows.length;
+                const page = rows.slice(remoteOffset, remoteOffset + remoteLimit);
+                // 🌟 [PAYLOAD TRIM] SDP 템플릿의 a=max-message-size 는 262144(256KB)입니다.
+                //  ── 왜 잘라야 하는가 ──
+                //   Dexie 봉투 행의 data 에는 원문 텍스트·태그·무역 필드 수십 개가 통째로 들어 있어
+                //   20건만 모아도 256KB 를 넘길 수 있습니다. 한계를 넘기면 send() 가 예외를 던지거나
+                //   SCTP 가 조용히 끊겨 모바일 목록이 영원히 비어 보입니다.
+                //   카드 렌더링에 실제로 필요한 필드만 투영해 보내고,
+                //   상세는 카드를 눌렀을 때 get_detail 로 따로 가져옵니다.
+                const REMOTE_CARD_KEYS = [
+                    'id', 'no', 'code', 'index', 'title', 'name', 'text', 'summary',
+                    'status', 'type', 'mode', 'link', 'origin', 'image', 'thumbnail',
+                    'tracking_number', 'sale_price', 'amount', 'quantity',
+                    'doc_type', 'doc_number', 'vessel', 'pol', 'pod', 'etd', 'eta',
+                    'created_at', 'updated_at', 'search_badge', 'relation'
+                ];
+                const slim = page.map((r: any) => {
+                    const d: any = {};
+                    for (const k of REMOTE_CARD_KEYS) {
+                        const v = r.data ? r.data[k] : undefined;
+                        if (v === undefined || v === null || v === "") continue;
+                        // 긴 본문은 카드에서 어차피 잘리므로 500자에서 절단합니다.
+                        d[k] = (typeof v === 'string' && v.length > 500) ? v.slice(0, 500) : v;
+                    }
+                    return {
+                        id: r.id,
+                        uuid: r.id,
+                        type: r.type,
+                        mode: r.mode,
+                        cc: r.cc,
+                        ref: r.ref,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        data: d
+                    };
                 });
                 if (dataChannel?.readyState === "open") {
-                    dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
+                    const payload = JSON.stringify({
+                        type: "sync_list",
+                        data: slim,
+                        total: total,
+                        reset: !!msg.reset
+                    });
+                    if (payload.length > 240_000) {
+                        console.warn(`[WebRTC] ⚠️ sync_list 페이로드가 ${payload.length}바이트로 SCTP 한계에 근접합니다. REMOTE_CARD_KEYS 를 더 줄이거나 limit 을 낮추세요.`);
+                    }
+                    dataChannel.send(payload);
+                }
+            } else if (msg.type === "ai_search") {
+                // 🌟 [REMOTE AI SEARCH] LanceDB + LLM 이 도는 무거운 작업이므로
+                //    반드시 GlobalTaskManager 큐를 경유합니다.
+                //    ── 큐를 우회하면 안 되는 이유 ──
+                //     PC 가 이미 추출 중일 때 모델이 두 번 로드되어 VRAM 이 터지고,
+                //     sys_lock 이 어긋나 이후 모든 작업이 좀비 상태가 됩니다.
+                const remoteQ = String(msg.query || "").trim();
+                if (remoteQ) {
+                    const taskId = `search_${Date.now()}`;
+                    console.log(`[WebRTC] Remote AI search queued: '${remoteQ}' (${taskId})`);
+                    openWidget("settings");
+                    await GlobalTaskManager.addToQueue(taskId, "ai_search", {
+                        taskId: taskId,
+                        query: remoteQ,
+                        language: "korean",
+                        devicePreference: getDevicePref(),
+                        searchMode: msg.mode || currentSearchMode,
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        refId: activeContext.ref || ""
+                    });
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "task_queued",
+                            taskId: taskId,
+                            summary: `AI Search: ${remoteQ}`
+                        }));
+                    }
                 }
             } else if (msg.type === "chat_message") {
-                // Echo for now, or could integrate with actual AI chat logic
-                dataChannel?.send(JSON.stringify({ 
-                    type: "sync_chat", 
-                    data: { role: "system", content: "Hub: Received '" + msg.content + "'" } 
-                }));
+                // 🌟 [REMOTE CHAT v2] 기존에는 단순 에코만 돌려주어
+                //    메시지가 LanceDB 에도, 서버 D1 에도 저장되지 않았습니다.
+                //    (모바일에서 보낸 대화가 PC 를 껐다 켜면 전부 사라졌습니다)
+                //    데스크톱 채팅 폼과 동일한 낙관적 로컬 쓰기 경로를 태웁니다.
+                const remoteText = String(msg.content || "").trim();
+                if (remoteText) {
+                    const now = Date.now();
+                    // 🌟 [ID RESTORE] 직전 리팩터링에서 이 선언이 유실되어
+                    //    아래 upsert_items / renderMessage 가 미선언 변수를 참조했습니다. (TS2304)
+                    //    데스크톱 chatForm 과 완전히 동일한 규칙으로 로컬 에코 id 를 만듭니다.
+                    //    (reconcileLocalEchoes 가 'talk_' 접두사로 서버 행과 승계 매칭을 하므로
+                    //     접두사가 달라지면 중복 말풍선이 영구히 남습니다)
+                    const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
+                    let localLink = "/tracking";
+                    let localOrigin = "https://commerce.logis.center";
+                    let hrefForLink = currentDetectedUrl || "https://commerce.logis.center/tracking";
+                    if (hrefForLink.includes("localhost") || hrefForLink.includes("127.0.0.1") || hrefForLink === "about:blank") {
+                        hrefForLink = "https://commerce.logis.center/tracking";
+                    }
+                    try {
+                        const u = new URL(hrefForLink.toLowerCase());
+                        localLink = (u.pathname + u.search).toLowerCase();
+                        localOrigin = u.origin;
+                    } catch (e) {}
+                    // 🌟 [CHAT SCOPE PARITY] 데스크톱 chatForm 은 activeContext 가 비어 있거나
+                    //    태그가 없을 때 URL 기반으로 cc/ref 를 다시 계산합니다.
+                    //    (chatForm submit 핸들러의 effectiveCc / effectiveRef 블록)
+                    //    반면 여기서는 activeContext 를 그대로 썼기 때문에,
+                    //    PC 가 analytic 모드라 cc 가 hashId(url.host) 로 잡혀 있으면
+                    //    loadMoreChat 이 계산하는 commerce 해시(hashId(getRootDomain(host)))와
+                    //    어긋나 저장은 되지만 화면 조회에서 통째로 누락됩니다.
+                    //    데스크톱 채팅과 완전히 동일한 규칙으로 맞춥니다.
+                    let chatCc = activeContext.cc;
+                    let chatBcc = activeContext.bcc;
+                    let chatRef = activeContext.ref;
+                    const chatDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+                    if (!chatCc || (!chatDefaultForced && activeTags.length === 0)) {
+                        try {
+                            const urlObj = new URL(hrefForLink.toLowerCase());
+                            const rootDomain = getRootDomain(urlObj.hostname);
+                            chatCc = await hashId(rootDomain);
+                            const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                            chatRef = await hashId((currentSession.team || "") + chatCc + link);
+                        } catch (err) {}
+                    }
+                    try {
+                        await invoke("upsert_items", {
+                            items: [{
+                                id: localTalkId,
+                                table: "talks",
+                                type: "talk",
+                                from: currentSession.address || "",
+                                to: currentSession.team || "",
+                                cc: chatCc || "",
+                                bcc: chatBcc || "",
+                                ref: chatRef || "",
+                                status: 9,
+                                created_at: now,
+                                updated_at: now,
+                                data: {
+                                    text: remoteText,
+                                    link: localLink,
+                                    origin: localOrigin
+                                }
+                            }]
+                        });
+                        console.log(`[WebRTC] Remote chat stored locally '${localTalkId}' (cc=${chatCc}, ref=${chatRef})`);
+                    } catch (e) {
+                        console.warn("[WebRTC] Remote chat local write failed:", e);
+                    }
+                    await renderMessage({
+                        id: localTalkId,
+                        role: "user",
+                        text: remoteText,
+                        status: 9,
+                        created_at: now,
+                        updated_at: now
+                    });
+                    // 🌟 [NO ECHO] 보낸 쪽(모바일)은 chatForm submit 시점에
+                    //    renderChat({role:'user'}) 로 이미 자기 말풍선을 그렸습니다.
+                    //    여기서 sync_chat 을 되돌려 주면 동일 문장이 두 번 렌더링됩니다.
+                    //    (모바일 renderChat 은 중복 제거 로직이 없는 단순 append 입니다)
+                    //    재접속 후 히스토리 복원은 get_chat_history → sync_chat_history 가
+                    //    담당하므로 이 자리에서 회신할 이유가 없습니다.
+                }
             } else if (msg.type === "mobile_upload") {
                 console.log("[WebRTC] Receiving file from mobile:", msg.name);
                 try {
@@ -7211,23 +5564,64 @@ function setupDataChannel(channel: RTCDataChannel) {
                     });
 
                     console.log("[WebRTC] Saved mobile upload to:", fullPath);
-
                     // 3. Trigger Desktop's existing Extraction Logic
+                    // 🌟 [QUEUE BYPASS FIX]
+                    //  ── 무엇이 문제였나 ──
+                    //   기존 코드는 emit("new-task-from-browser") 를 '직접' 쏘아
+                    //   GlobalTaskManager.addToQueue() 를 통째로 우회했습니다.
+                    //   그 결과
+                    //    ① PC 가 이미 추출/검색 중이어도 즉시 백엔드로 진입해
+                    //       모델이 이중 로드되고 sys_lock 이 어긋났습니다.
+                    //    ② ts_queue(Dexie)에 기록되지 않아 앱을 껐다 켜면
+                    //       '강제 종료된 작업' 으로도 집계되지 않고 조용히 증발했습니다.
+                    //    ③ 대기열 말풍선(status 10)이 그려지지 않아
+                    //       사용자는 요청이 접수됐는지 알 수 없었습니다.
+                    //  ── 해결 ──
+                    //   데스크톱 btnExtract 와 완전히 동일하게 큐에 등록합니다.
+                    //   addToQueue 가 대기열 말풍선 렌더링 → Dexie 저장 → processNext()
+                    //   까지 전부 처리하므로, 바쁠 때는 자동으로 순번을 기다립니다.
                     const taskId = `task_mobile_${Date.now()}`;
-                    await emit("new-task-from-browser", { 
-                        id: taskId, 
-                        type: "image_extraction", 
-                        image_path: fullPath, 
-                        ref: fullPath, 
-                        link: "Mobile Upload",
-                        device_preference: getDevicePref()
+                    const mobileExt = String(msg.name || "").split('.').pop()?.toLowerCase() || '';
+                    const isMobileDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(mobileExt);
+                    const mobileTaskType = isMobileDocument ? "document_extraction" : "image_extraction";
+                    const mobileRefHash = await hashId(fullPath);
+
+                    openWidget("settings");
+                    await GlobalTaskManager.addToQueue(taskId, mobileTaskType, {
+                        id: taskId,
+                        type: mobileTaskType,
+                        image_path: fullPath,
+                        document_ext: mobileExt,
+                        ref: mobileRefHash,
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        link: `Mobile Upload: ${msg.name || "file"}`,
+                        device_preference: getDevicePref(),
+                        search_mode: currentSearchMode
                     });
 
-                    // 4. Relay progress to mobile
-                    // (We'll handle this in the global progress listener below)
-
+                    // 4. 모바일에 '큐 등록 완료' 를 즉시 알립니다.
+                    //    진행률은 아래 extraction-progress 릴레이 리스너가 계속 중계합니다.
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "task_queued",
+                            taskId: taskId,
+                            summary: `Uploading: ${msg.name || "file"}`
+                        }));
+                    }
+                    await updateExtractButtonVisibility();
                 } catch (err) {
                     console.error("[WebRTC] Mobile upload failed:", err);
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "extraction_progress",
+                            payload: {
+                                task_id: `task_mobile_err_${Date.now()}`,
+                                category: "Error",
+                                summary: `Upload failed: ${err}`
+                            }
+                        }));
+                    }
                 }
             }
         } catch (err) {
@@ -7247,21 +5641,14 @@ listen("extraction-progress", (event: any) => {
 });
 
 
-const syncDataToMobile = () => {
-    if (!dataChannel || dataChannel.readyState !== "open") return;
-    console.log("[WebRTC] Syncing list to mobile...");
-    const docs = Array.from(document.querySelectorAll('.logis-result')).map(el => {
-        const card = el as HTMLElement;
-        return {
-            id: card.id, uuid: card.id,
-            doc_type: card.dataset.type || "General",
-            text: card.querySelector('.logis-info .value')?.textContent || "",
-            created_at: parseInt(card.dataset.createdAt || "0"),
-            updated_at: parseInt(card.dataset.updatedAt || "0")
-        };
-    });
-    dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
-};
+// 🌟 [REMOVED] syncDataToMobile 정의를 삭제했습니다.
+//  ── 왜 정의까지 지우는가 ──
+//   호출부는 finalizeWebRtcConnection 에서 이미 제거했지만, 정의가 남아 있으면
+//   ① noUnusedLocals 를 켠 순간 빌드가 실패하고
+//   ② 나중에 누군가 "목록을 밀어 주는 함수가 있네" 하고 다시 호출할 위험이 있습니다.
+//   이 함수가 보내는 축약 배열은 새 프로토콜의 sync_list 계약(reset / total 필수)을
+//   위반하므로, 되살아나면 모바일 페이지네이션이 즉시 깨집니다.
+//   목록 전송은 오직 msg.type === "search" 핸들러 한 곳에서만 수행합니다.
 
 listen("app_error_alert", async (event: any) => {
     const payload = event.payload as any;
@@ -9058,7 +7445,15 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
                 chatPollInterval = null;
             }
             stopAuthPolling();
-            isCommerceSyncRunning = false;
+            // 🌟 [MODE SPLIT] isCommerceSyncRunning 은 modes/commerce.ts 의 모듈 스코프로
+            //    이동해 main.ts 에서는 참조할 수 없습니다. (TS2304 컴파일 실패 원인)
+            //
+            //  ── 제거해도 안전한 이유 ──
+            //   이 줄의 목적은 '초기화 직후 백그라운드 동기화 재진입 차단' 이었는데,
+            //   같은 핸들러 마지막에서 window.location.reload() 가 실행되어
+            //   모듈이 통째로 재평가되므로 그 락은 자동으로 false 로 되돌아갑니다.
+            //   또한 reload 이전 구간에서는 chatPollInterval 이 이미 해제되어
+            //   syncData() → syncCommerceInBackground() 경로 자체가 호출되지 않습니다.
             if (reindexDebounceTimer) {
                 clearTimeout(reindexDebounceTimer);
                 reindexDebounceTimer = null;
@@ -10545,6 +8940,53 @@ async function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: 
     // Single message upsert (Real-time is always append/newest in Slack style)
     await upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
 }
+
+// 🌟 [MODE RUNTIME BIND]
+//  modes/*.ts 가 main.ts 의 전역 상태를 순환 import 없이 사용하도록
+//  부팅 직전에 참조를 단 한 번 주입합니다.
+//
+//  ── 위치가 최하단이어야 하는 이유 ──
+//   appDb / timezoneOffset 은 const, GlobalTaskManager 는 class 선언이라
+//   파일 중·하단에 도달하기 전에는 TDZ(Temporal Dead Zone) 상태입니다.
+//   또한 currentSearchMode / activeContext / isSearching 은 런타임에 계속 바뀌므로
+//   '값' 이 아니라 반드시 '게터' 로 넘겨야 최신값이 반영됩니다.
+bindModeRuntime({
+    // ── 저장소 ──
+    appDb: appDb,
+    timezoneOffset: timezoneOffset,
+    kvGet: kvGet,
+    kvSet: kvSet,
+    normalizeEnvelope: normalizeEnvelope,
+    loadItemTombstones: loadItemTombstones,
+    // 🌟 [PART 2] commerce 트랙의 TOMBSTONE GUARD 가 talk 묘비도 검사합니다.
+    loadTalkTombstones: loadTalkTombstones,
+
+    // ── 상태 게터 (지연 평가) ──
+    getSession: () => currentSession as any,
+    getContext: () => activeContext,
+    getSearchMode: () => currentSearchMode,
+    getDetectedUrl: () => currentDetectedUrl,
+    getActiveTags: () => activeTags as any,
+    getCurrentTab: () => currentTab,
+    isBusy: () => isSearching || isExtracting || GlobalTaskManager.isBusy,
+    // 🌟 [PART 2] forceCpuToggle 은 DOM 참조이므로 반드시 게터여야 합니다.
+    getDevicePref: () => getDevicePref(),
+    // 🌟 [PART 2] Map 인스턴스 자체는 main.ts 가 계속 소유합니다.
+    //    modes/commerce.ts 는 delete() 만 수행하고 set() 은 하지 않습니다.
+    //    (등록은 클라우드 검색/추출 핸들러가 담당)
+    getCloudPendingTasks: () => cloudPendingTasks as any,
+
+    // ── UI 콜백 ──
+    renderNavigation: renderNavigation,
+    loadMoreDocs: loadMoreDocs,
+    renderMessage: (msg: any) => renderMessage(msg),
+    renderProgressToUI: (payload: any) => renderProgressToUI(payload),
+    fetchChatHistory: (reset?: boolean, silent?: boolean) => fetchChatHistory(reset, silent),
+    runLocalEmbeddingSync: runLocalEmbeddingSync,
+    stopSpinner: stopSpinner,
+    stepQrSpinner: stepQrSpinner,
+    restoreSubmitButton: restoreSubmitButton
+});
 
 initSession();
 setWindowSize(false);
