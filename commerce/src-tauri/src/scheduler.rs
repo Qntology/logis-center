@@ -1222,6 +1222,23 @@ pub async fn start_background_worker(
         crate::utils::set_extraction_stop_signal(false);
         cancellation_token.store(false, Ordering::SeqCst);
         let mut stopped_logged = false;
+        // 🌟 [SILENT PATH INSTRUMENT] 워커 루프에서 로그를 남기지 않는 구간을 전부 계측합니다.
+        //
+        //  ── 실측 사고 ──
+        //   팩토리 리셋 직후 이미지 태스크가 PENDING 에서 영원히 멈췄는데,
+        //   스케줄러 로그가 단 한 줄도 남지 않아 원인 추적이 불가능했습니다.
+        //   루프 전체에서 무음인 곳은 아래 세 곳뿐입니다.
+        //     A. store 가 None      → `if let Some(db)` 이 else 없이 통과
+        //     B. store.lock() 영구 대기 → 다른 태스크가 가드를 쥐고 놓지 않음
+        //     C. 낡은 커넥션이 Ok(빈 배열) 반환 → 정상처럼 보이며 계속 슬립
+        //   셋 다 증상이 동일하므로 로그로 구분하지 못하면 고칠 수도 없습니다.
+        //
+        //  ── 왜 플래그로 1회만 찍는가 ──
+        //   루프는 1~10초마다 돌므로 매 회 출력하면 터미널이 로그로 뒤덮입니다.
+        //   상태가 바뀔 때만 찍고, 복구되면 복구 사실도 한 번 찍습니다.
+        let mut store_missing_logged = false;
+        let mut lock_starved_logged = false;
+        let mut idle_cycles: u32 = 0;
         loop {
             if crate::utils::is_extraction_stopped() {
                 // 🌟 [HEARTBEAT] 의도적 정지 상태임을 로그에 1회 남겨
@@ -1230,26 +1247,90 @@ pub async fn start_background_worker(
                     println!("[Scheduler] ⏸️ Extraction stop signal active. Waiting for resume...");
                     stopped_logged = true;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // 🌟 [STOP-WAIT WITH SIGNAL] 정지 대기 중에도 새 태스크 신호를 감지합니다.
+                //    기존 500ms sleep 은 TASK_QUEUED_SIGNAL 을 확인할 기회를 주지 않아
+                //    팩토리 리셋 후 새 태스크가 영원히 처리되지 않았습니다.
+                //    ①번(정지 체크)에서 ③번(AUTO-RESUME)까지 도달할 수 없는 구조적 사각지대를
+                //    정지 대기 블록 안에서 직접 해소합니다.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = crate::utils::sync_utils::TASK_QUEUED_SIGNAL.notified() => {
+                        println!("[Scheduler] ▶️ New task signal while stop signal active. Auto-resuming extraction.");
+                        crate::utils::set_extraction_stop_signal(false);
+                        cancellation_token.store(false, Ordering::SeqCst);
+                    }
+                }
                 continue;
             }
-            stopped_logged = false;
-
+                        stopped_logged = false;
             let mut pending_tasks = Vec::new();
             {
-                let store_opt = store.lock().await;
-                if let Some(db) = store_opt.as_ref() {
-                    match db.get_pending_tasks(5).await {
-                        Ok(tasks) => {
-                            
-                            pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect();
-                        },
-                        Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
+                // 🌟 [LOCK TIMEOUT] store.lock().await 는 대기 중 아무 것도 출력하지 않습니다.
+                //    리셋 명령이 가드를 쥔 채 끝나지 않으면 워커는 영구 정지하면서
+                //    로그상으로는 '아무 일도 없는' 것처럼 보입니다.
+                //    3초 상한을 두고 초과하면 그 사실을 알립니다.
+                //    타임아웃 시 lock 퓨처는 드롭되며, tokio Mutex 는 대기 취소가 안전합니다.
+                match tokio::time::timeout(Duration::from_secs(3), store.lock()).await {
+                    Ok(store_opt) => {
+                        if lock_starved_logged {
+                            println!("[Scheduler] ✅ [STORE LOCK RECOVERED] Store 뮤텍스를 다시 획득했습니다. 폴링을 재개합니다.");
+                            lock_starved_logged = false;
+                        }
+                        match store_opt.as_ref() {
+                            Some(db) => {
+                                if store_missing_logged {
+                                    println!("[Scheduler] ✅ [STORE RESTORED] Store 가 다시 주입되었습니다. 태스크 폴링을 재개합니다.");
+                                    store_missing_logged = false;
+                                }
+                                match db.get_pending_tasks(5).await {
+                                    Ok(tasks) => {
+                                        let raw = tasks.len();
+                                        pending_tasks = tasks.into_iter().filter(|t| t.r#type != "ai_search").collect::<Vec<_>>();
+                                        // 🌟 [POLL TRACE] '조회는 성공했는데 0건' 인 상태를 명시적으로 남깁니다.
+                                        //    낡은 커넥션이 새로 들어온 행을 보지 못하는 경우가 여기 해당합니다.
+                                        //    idle_cycles 로 게이팅하여 평상시에는 조용합니다.
+                                        if raw == 0 && idle_cycles > 0 && idle_cycles % 6 == 0 {
+                                            println!(
+                                                "[Scheduler] 💤 [POLL HEARTBEAT] Store 정상 · 조회 성공 · PENDING 0건 (연속 {}회). 태스크가 다른 커넥션에 저장되었을 수 있습니다.",
+                                                idle_cycles
+                                            );
+                                        }
+                                        if raw > 0 && pending_tasks.is_empty() {
+                                            println!(
+                                                "[Scheduler] ⚪ [POLL FILTERED] PENDING {}건을 조회했으나 전부 ai_search 라 처리 대상이 없습니다.",
+                                                raw
+                                            );
+                                        }
+                                    },
+                                    Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
+                                }
+                            }
+                            None => {
+                                // 🌟 [STORE MISSING] 팩토리 리셋이 store 를 비운 뒤 재주입하지 않은 상태입니다.
+                                //    이 경로가 기존 코드에서 완전히 무음이었고, 리셋 후 태스크가
+                                //    PENDING 에서 멈추는 증상의 유력한 원인입니다.
+                                if !store_missing_logged {
+                                    println!("[Scheduler] 🚨 [STORE MISSING] 스케줄러가 들고 있는 VectorStore 가 None 입니다. 팩토리 리셋이 새 커넥션을 워커의 store 핸들에 다시 주입하지 않았습니다. 이 상태에서는 어떤 태스크도 처리되지 않습니다.");
+                                    store_missing_logged = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // 🌟 [LOCK STARVED] 다른 태스크가 store 가드를 쥐고 놓지 않는 상태입니다.
+                        //    리셋 명령이 가드를 잡은 채 .await 를 하거나 조기 반환하면 발생합니다.
+                        if !lock_starved_logged {
+                            println!("[Scheduler] 🔒 [STORE LOCK STARVED] Store 뮤텍스를 3초 이상 획득하지 못했습니다. 다른 작업(팩토리 리셋 등)이 가드를 점유한 채 놓지 않고 있습니다.");
+                            lock_starved_logged = true;
+                        }
                     }
                 }
             }
 
             if pending_tasks.is_empty() {
+                // 🌟 [IDLE COUNTER] 위 POLL HEARTBEAT 의 게이팅 축입니다.
+                //    처리할 태스크가 생기면 아래 else 에서 0 으로 되돌립니다.
+                idle_cycles = idle_cycles.saturating_add(1);
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay_secs)) => {
                         delay_secs = (delay_secs + 1).min(10);
@@ -1269,6 +1350,7 @@ pub async fn start_background_worker(
                 continue;
             } else {
                 delay_secs = 1;
+                idle_cycles = 0;
             }
 
             for task in pending_tasks {
@@ -2418,9 +2500,127 @@ pub async fn process_task(
                 ));
             }
             doc_lang = refined_lang;
-
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
-
+            // =====================================================================
+            // 🌟 [EVIDENCE DEDUP / COSINE] 같은 문구가 N번 반복되어도 '증거는 1개' 입니다.
+            // ---------------------------------------------------------------------
+            //  ── 실측 사고 ──
+            //   이 문서에는 행마다 붙는 '수정' 버튼이 13개 있습니다.
+            //     <a href="./goods.php?code=form&w=u&gs_id=13...">수정</a>
+            //   그 13개 라인은 데이터 추출을 위해 LINK PROTECT 로 보호되어 살아남았고,
+            //   bias.json 의 ko.order.layout_form.bias 에 있는 '주문내역 수정' 이
+            //   공백 분해로 '수정' 이라는 단독 구를 만들어
+            //     🗳️ [BODY CONSENSUS] order | Top10Mean: 1.0000
+            //   상위 10개를 통째로 독점하게 만들었습니다.
+            //
+            //  ── 판정 근거 (언어 무관 / 순수 코사인) ──
+            //   ① 문서 자신의 라인쌍 코사인 분포에서 μ, σ 를 구합니다.
+            //   ② dedup_floor = μ + 3σ. "우연히 이만큼 닮을 확률이 사실상 0" 이라는
+            //      극값 기준이며, 이 코드베이스가 surprisal 에서 쓰는 논리와 같은 계열입니다.
+            //   ③ 그 이상으로 닮은 라인은 같은 UI 클러스터로 접고, 라인당 가중 1/N 을 줍니다.
+            //   ④ BODY CONSENSUS 풀에는 클러스터 대표 1개만 넣습니다.
+            //
+            //  ── 왜 타이틀 선정보다 '앞' 인가 ──
+            //   dedup_floor 는 "이 문서에서 두 문자열이 사실상 같다" 를 판정하는 기준입니다.
+            //   그 기준이 있어야 타이틀 후보가 본문에서 몇 번 재등장하는지(본문 반향)를
+            //   셀 수 있고, 그 반향이 '사이트 껍데기 제목' 과 '이 페이지의 제목' 을 가릅니다.
+            //   (실측: '상품관리' 3회 / '전체 상품관리' 2회 / '관리자 페이지' 1회)
+            //
+            //  ⚠️ 이 가중은 '페이지 타입 분류' 에만 적용됩니다.
+            //     라인 자체를 지우지 않으므로 STAGE-3 의 데이터 추출은 전혀 영향받지 않습니다.
+            // =====================================================================
+            let dedup_idxs: Vec<usize> = {
+                let mut v: Vec<usize> = Vec::new();
+                for i in 0..line_embeddings.len() {
+                    if wiped_indices[i] { continue; }
+                    let t = if let Some(p) = pug_lines[i].find('|') { pug_lines[i][p + 1..].trim() } else { "" };
+                    if t.is_empty() { continue; }
+                    if line_embeddings[i].iter().all(|&x| x == 0.0) { continue; }
+                    v.push(i);
+                }
+                v
+            };
+            let dedup_floor: f32 = {
+                if dedup_idxs.len() < 8 {
+                    0.995
+                } else {
+                    let total_pairs = dedup_idxs.len() * (dedup_idxs.len().saturating_sub(1)) / 2;
+                    let step = (total_pairs / 4000).max(1);
+                    let mut sum = 0.0f64;
+                    let mut sq = 0.0f64;
+                    let mut cnt = 0usize;
+                    let mut k = 0usize;
+                    'outer_dd: for a in 0..dedup_idxs.len() {
+                        for b in (a + 1)..dedup_idxs.len() {
+                            k += 1;
+                            if k % step != 0 { continue; }
+                            let s = cosine_similarity(&line_embeddings[dedup_idxs[a]], &line_embeddings[dedup_idxs[b]]) as f64;
+                            sum += s;
+                            sq += s * s;
+                            cnt += 1;
+                            if cnt >= 4000 { break 'outer_dd; }
+                        }
+                    }
+                    if cnt < 8 {
+                        0.995
+                    } else {
+                        let mu = sum / (cnt as f64);
+                        let var = (sq / (cnt as f64) - mu * mu).max(0.0);
+                        let sd = var.sqrt();
+                        ((mu + 3.0 * sd) as f32).clamp(0.90, 0.995)
+                    }
+                }
+            };
+            let mut evidence_weight: Vec<f32> = vec![1.0; pug_lines.len()];
+            let mut is_cluster_rep: Vec<bool> = vec![false; pug_lines.len()];
+            {
+                let mut reps: Vec<usize> = Vec::new();
+                let mut members: Vec<Vec<usize>> = Vec::new();
+                for &i in dedup_idxs.iter() {
+                    let mut hit: Option<usize> = None;
+                    for (ri, rep) in reps.iter().enumerate() {
+                        if cosine_similarity(&line_embeddings[i], &line_embeddings[*rep]) >= dedup_floor {
+                            hit = Some(ri);
+                            break;
+                        }
+                    }
+                    match hit {
+                        Some(ri) => members[ri].push(i),
+                        None => {
+                            if reps.len() >= 600 {
+                                // 고유 클러스터가 과도하게 많은 문서에서는 비교 비용이 커지므로
+                                // 이후 라인은 중복 없음(가중 1.0)으로 간주하고 대표로만 취급합니다.
+                                is_cluster_rep[i] = true;
+                                continue;
+                            }
+                            reps.push(i);
+                            members.push(vec![i]);
+                        }
+                    }
+                }
+                let mut collapsed = 0usize;
+                for (ri, rep) in reps.iter().enumerate() {
+                    is_cluster_rep[*rep] = true;
+                    let n = members[ri].len();
+                    if n <= 1 { continue; }
+                    let w = 1.0f32 / (n as f32);
+                    for m in members[ri].iter() { evidence_weight[*m] = w; }
+                    collapsed += n - 1;
+                    let sample = if let Some(p) = pug_lines[*rep].find('|') {
+                        pug_lines[*rep][p + 1..].trim().chars().take(40).collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    emit_term(&format!(
+                        "  ♻️ [EVIDENCE DEDUP] '{}' 유형 라인 {}개를 증거 1개로 접습니다. (라인당 가중 {:.3})",
+                        sample, n, w
+                    ));
+                }
+                emit_term(&format!(
+                    "  ♻️ [EVIDENCE DEDUP] 임계치 μ+3σ = {:.4} | 판정 대상 {}라인 | 고유 증거 {}개 | 접힌 중복 {}라인",
+                    dedup_floor, dedup_idxs.len(), reps.len(), collapsed
+                ));
+            }
             let title_candidates: Vec<String> = {
                 let doc = scraper::Html::parse_document(&clean_html_content);
                 let norm = |s: String| -> String {
@@ -2433,14 +2633,55 @@ pub async fn process_task(
                         if !t.is_empty() { cands.push(t); }
                     }
                 }
+                // 🌟 [LANDMARK HEADING GATE] nav / aside / header / footer 안의 heading 은
+                //    '이 페이지가 무엇인가' 가 아니라 '사이트 전체가 무엇인가' 를 말합니다.
+                //
+                //  ── 실측 사고 ──
+                //   <nav id="gnb"><h2>관리자 주메뉴</h2> 가 타이틀 앵커로 뽑혀
+                //   '주메뉴' 가 '주문' 계열과 부분 매칭되면서 order 0.8976 / goods 0.7363 이 되었고,
+                //   그 결과 상품 목록 페이지가 order 로 확정되었습니다.
+                //   실제 제목은 <div class="s_wrap"><h1>전체 상품관리</h1> 였습니다.
+                //
+                //  ── 왜 언어 하드코딩이 아닌가 ──
+                //   'nav' / 'aside' / 'header' / 'footer' 는 어떤 언어의 어휘도 아니라
+                //   HTML5 가 정의한 랜드마크 요소입니다.
+                //   이 코드베이스가 이미 th/td/tr 태그 역할로 값-라벨을 가르는 것과 같은 계열의
+                //   '구조 판정' 이며, 벡터 판정 이전에 후보 집합을 물리적으로 좁히는 역할만 합니다.
+                //   본문(div/section) 안의 heading 은 그대로 통과하므로
+                //   <div id="snb"><h2>상품관리</h2> 같은 도메인 신호는 손실되지 않습니다.
+                let mut dropped_landmark: Vec<String> = Vec::new();
                 for tag in ["h1", "h2", "h3", "legend", "caption"] {
                     if let Ok(sel_h) = scraper::Selector::parse(tag) {
                         for el in doc.select(&sel_h) {
                             let t = norm(el.text().collect::<Vec<_>>().join(" "));
                             if t.is_empty() || t.chars().count() > 60 { continue; }
+                            let mut in_landmark = false;
+                            let mut cur = el.parent();
+                            while let Some(node) = cur {
+                                if let Some(e) = node.value().as_element() {
+                                    let name = e.name().to_lowercase();
+                                    if name == "nav" || name == "aside" || name == "header" || name == "footer" {
+                                        in_landmark = true;
+                                        break;
+                                    }
+                                    if name == "body" || name == "html" { break; }
+                                }
+                                cur = node.parent();
+                            }
+                            if in_landmark {
+                                if !dropped_landmark.contains(&t) { dropped_landmark.push(t); }
+                                continue;
+                            }
                             if !cands.contains(&t) { cands.push(t); }
                         }
                     }
+                }
+                if !dropped_landmark.is_empty() {
+                    emit_term(&format!(
+                        "  🚫 [LANDMARK HEADING GATE] nav/aside/header/footer 내부 헤딩 {}개를 타이틀 후보에서 제외했습니다: {:?}",
+                        dropped_landmark.len(),
+                        dropped_landmark.iter().take(8).collect::<Vec<_>>()
+                    ));
                 }
                 if cands.len() > 24 { cands.truncate(24); }
                 cands
@@ -2452,9 +2693,16 @@ pub async fn process_task(
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
-            let mut category_scores: Vec<(String, f32, f32, usize)> = Vec::new();
+            // 🌟 [WEIGHTED EVIDENCE COUNT] 네 번째 원소는 '라인 개수' 가 아니라
+            //    EVIDENCE DEDUP 가중을 반영한 '고유 증거량' 입니다.
+            //    같은 UI 문구 13개는 13 이 아니라 1.0 으로 집계됩니다.
+            let mut category_scores: Vec<(String, f32, f32, f32)> = Vec::new();
             let mut category_phrase_embs: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
             let mut category_title_only_embs: Vec<(String, Vec<f32>)> = Vec::new();
+            // 🌟 [ANCHOR AUDIT] 어떤 구가 어떤 이유로 제거되었는지 추적하기 위해
+            //    구 문자열과 '보호 여부' 를 함께 보관합니다.
+            let mut category_phrase_texts: Vec<Vec<String>> = Vec::new();
+            let mut category_protected: Vec<Vec<bool>> = Vec::new();
             for cat in &categories {
                 let anchor_text = crate::parsing::get_page_type_classification_bias(cat, &doc_lang);
                 let localized_type = crate::parsing::get_localized_page_type(cat, &doc_lang);
@@ -2470,16 +2718,117 @@ pub async fn process_task(
                 let mut seen_phrase = std::collections::HashSet::new();
                 phrases.retain(|p| seen_phrase.insert(p.clone()));
                 if phrases.len() > 64 { phrases.truncate(64); }
-
+                // 🌟 [IDENTITY PROTECT] 카테고리 이름 / 현지어 이름 / 그 결합은
+                //    이 카테고리의 정체 그 자체이므로 어떤 마스크로도 제거하지 않습니다.
+                let identity: [String; 3] = [
+                    cat.to_string(),
+                    localized_type.clone(),
+                    format!("{} {}", cat, localized_type),
+                ];
+                let protected: Vec<bool> = phrases
+                    .iter()
+                    .map(|p| identity.iter().any(|i| i == p))
+                    .collect();
                 let phrase_embs = model
                     .get_embedding_batch(phrases.clone())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()]);
                 category_phrase_embs.push((cat.to_string(), phrase_embs));
-
+                category_phrase_texts.push(phrases);
+                category_protected.push(protected);
                 let title_only_bias = format!("{} {}", cat, localized_type);
                 let title_only_emb = model.get_embedding(title_only_bias).await.unwrap_or(vec![0.0; 384]);
                 category_title_only_embs.push((cat.to_string(), title_only_emb));
+            }
+            // =====================================================================
+            // 🌟 [CROSS-CATEGORY AMBIGUITY MASK] 앵커 차원의 '불필요한 요소 제거'
+            // ---------------------------------------------------------------------
+            //  ── 실측 사고 ──
+            //   ko.order.layout_form.bias 의 끝에 '관리자메모' 가 있습니다.
+            //   그래서 사이트 껍데기 제목인 '관리자 페이지' 가
+            //     order 0.8534 / goods 0.7048
+            //   을 기록해 order 를 지목했고, 상품 목록 페이지가 order 로 확정되었습니다.
+            //   '주문내역 수정' 이 공백 분해로 만든 '수정' 도 같은 계열의 오염입니다.
+            //   이 구들은 어느 것도 '주문' 이라는 개념의 표지가 아닙니다.
+            //
+            //  ── 판정 근거 (임계 상수 없음 / 순수 코사인) ──
+            //   구 p 가 카테고리 C 의 표지라면, p 는 C 의 다른 형제 구들과
+            //   가장 가까워야 합니다. 그런데 p 가 경쟁 카테고리의 어휘와
+            //   더(또는 같은 정도로) 가깝다면, p 는 C 를 대표할 자격이 없습니다.
+            //     own_best  = max sim(p, q)   for q in bank(C), q != p
+            //     rival_best= max sim(p, q)   for q in bank(C'), C' != C
+            //     rival_best >= own_best  →  실격
+            //   이는 ai_utils::self_poisoned_prejudice_mask 가 편견 구를 박탈하는
+            //   논리를 '앵커 구' 쪽으로 그대로 뒤집어 적용한 것입니다.
+            //
+            //  ── 왜 다국어에서 안전한가 ──
+            //   어휘 목록도, 불용어 사전도, 언어 분기도 없습니다.
+            //   판정에 쓰이는 것은 같은 임베딩 공간 안의 상대 비교뿐이므로
+            //   en / ko / ja / zh 어느 뱅크에도 같은 규칙이 그대로 적용됩니다.
+            //   (영어 뱅크의 'list' / 'form' / 'edit' 도 동일하게 걸러집니다)
+            // =====================================================================
+            {
+                let mut rebuilt: Vec<(String, Vec<Vec<f32>>)> = Vec::with_capacity(categories.len());
+                let mut total_dropped = 0usize;
+                for ci in 0..categories.len() {
+                    let bank = &category_phrase_embs[ci].1;
+                    let mut kept: Vec<Vec<f32>> = Vec::new();
+                    let mut dropped: Vec<String> = Vec::new();
+                    for pi in 0..bank.len() {
+                        let pe = &bank[pi];
+                        if pe.iter().all(|&v| v == 0.0) { continue; }
+                        if category_protected[ci][pi] {
+                            kept.push(pe.clone());
+                            continue;
+                        }
+                        let mut own_best = 0.0f32;
+                        for pj in 0..bank.len() {
+                            if pj == pi { continue; }
+                            if bank[pj].iter().all(|&v| v == 0.0) { continue; }
+                            let s = cosine_similarity(pe, &bank[pj]);
+                            if s > own_best { own_best = s; }
+                        }
+                        let mut rival_best = 0.0f32;
+                        for cj in 0..categories.len() {
+                            if cj == ci { continue; }
+                            let s = max_pool_sim(pe, &category_phrase_embs[cj].1);
+                            if s > rival_best { rival_best = s; }
+                        }
+                        if rival_best >= own_best {
+                            dropped.push(format!(
+                                "{}(own {:.3} <= rival {:.3})",
+                                category_phrase_texts[ci][pi], own_best, rival_best
+                            ));
+                            continue;
+                        }
+                        kept.push(pe.clone());
+                    }
+                    if kept.is_empty() {
+                        // 전량 실격은 뱅크 자체가 무의미해지므로 원본을 유지합니다.
+                        emit_term(&format!(
+                            "  ⚠️ [AMBIGUITY MASK] '{}' 뱅크의 모든 구가 실격되어 마스크를 적용하지 않습니다.",
+                            categories[ci]
+                        ));
+                        rebuilt.push(category_phrase_embs[ci].clone());
+                        continue;
+                    }
+                    if !dropped.is_empty() {
+                        total_dropped += dropped.len();
+                        emit_term(&format!(
+                            "  🧹 [AMBIGUITY MASK] '{}' 앵커에서 경쟁 카테고리를 더 잘 설명하는 구 {}개 제거 (잔존 {}개): {:?}",
+                            categories[ci],
+                            dropped.len(),
+                            kept.len(),
+                            dropped.iter().take(10).collect::<Vec<_>>()
+                        ));
+                    }
+                    rebuilt.push((categories[ci].to_string(), kept));
+                }
+                emit_term(&format!(
+                    "  🧹 [AMBIGUITY MASK] 총 {}개 모호구를 앵커에서 제거했습니다. (max-pool 오염 차단)",
+                    total_dropped
+                ));
+                category_phrase_embs = rebuilt;
             }
 
             let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
@@ -2491,10 +2840,45 @@ pub async fn process_task(
                         .get_embedding_batch(title_candidates.clone())
                         .await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; title_candidates.len()]);
-
-                    let mut best_idx = 0usize;
-                    let mut best_score = f32::MIN;
-                    for (idx, cand) in title_candidates.iter().enumerate() {
+                    // =====================================================================
+                    // 🌟 [TITLE SELECTION v3 / Z-SCORE + BODY ECHO]
+                    // ---------------------------------------------------------------------
+                    //  ── v2 가 왜 틀렸나 (실측) ──
+                    //   v2 는 score = domain_contrast + chrome_gap + cat_margin 이었습니다.
+                    //     '관리자 페이지' | Contrast +0.1667 | ChromeGap +0.1315 | CatMargin +0.1486 → +0.4468 ← 선택
+                    //     '상품관리'      | Contrast +0.1257 | ChromeGap +0.2693 | CatMargin +0.0017 → +0.3967
+                    //   cat_margin 은 "이 문자열이 한 카테고리를 얼마나 또렷이 지목하는가" 인데,
+                    //   '관리자 페이지' 가 order 를 또렷이 지목한 이유는 주문 페이지여서가 아니라
+                    //   order 앵커에 '관리자메모' 라는 우연한 어휘가 있었기 때문입니다.
+                    //   즉 cat_margin 은 '우연한 어휘 충돌' 에 상을 주는 축이었습니다. 폐기합니다.
+                    //   (그 어휘 자체는 위의 AMBIGUITY MASK 가 이미 제거합니다)
+                    //
+                    //  ── v3 의 세 축 ──
+                    //   ① contrast : 이 문자열이 도메인 어휘와 얼마나 가까운가
+                    //   ② chrome   : 이 문자열이 사이트 껍데기 어휘와 얼마나 가까운가 (낮을수록 좋음)
+                    //   ③ echo     : 이 문자열이 '본문에서' 몇 번 재등장하는가  ← 새 축
+                    //
+                    //  ── ③ 이 결정적인 이유 (소급 검증) ──
+                    //   <title>관리자 페이지</title> 는 이 사이트의 모든 페이지에 동일하게 붙는
+                    //   전역 문자열이라 본문에 반향이 없습니다(반향 1 = 자기 자신뿐).
+                    //   반면 <h2>상품관리</h2> 는 snb 헤딩 + dt 2개로 본문에 3회,
+                    //   <h1>전체 상품관리</h1> 는 h1 + 활성 링크로 2회 재등장합니다.
+                    //   "이 페이지가 무엇인가" 를 말하는 제목은 본문이 스스로 반복합니다.
+                    //   판정 임계치는 위에서 문서 자신의 라인쌍 분포로 구한 dedup_floor(μ+3σ)를
+                    //   그대로 재사용하므로 새 상수가 하나도 추가되지 않습니다.
+                    //
+                    //  ── 왜 z-score 인가 ──
+                    //   세 축은 스케일이 다릅니다(대비 ~0.1대, chrome ~0.7대, 반향은 카운트).
+                    //   그대로 더하면 스케일이 큰 축이 지배합니다.
+                    //   후보 집합 안에서 각 축을 (x-μ)/σ 로 정규화하면 세 축이 동등해지고,
+                    //   문서마다 스케일이 자동으로 맞춰지며 임계 상수도 사라집니다.
+                    // =====================================================================
+                    let mut raw_contrast: Vec<f32> = vec![0.0; title_candidates.len()];
+                    let mut raw_chrome: Vec<f32> = vec![0.0; title_candidates.len()];
+                    let mut raw_echo: Vec<f32> = vec![0.0; title_candidates.len()];
+                    let mut raw_domain_max: Vec<f32> = vec![0.0; title_candidates.len()];
+                    let mut echo_count: Vec<usize> = vec![0; title_candidates.len()];
+                    for idx in 0..title_candidates.len() {
                         let emb = &cand_embs[idx];
                         if emb.iter().all(|&v| v == 0.0) { continue; }
                         let mut sims: Vec<f32> = Vec::with_capacity(categories.len());
@@ -2503,24 +2887,55 @@ pub async fn process_task(
                         }
                         let mean_s: f32 = sims.iter().sum::<f32>() / (sims.len() as f32);
                         let max_s: f32 = sims.iter().cloned().fold(0.0f32, f32::max);
-                        let domain_contrast = max_s - mean_s;
-                        let chrome_sim = cosine_similarity(&chrome_prej_emb, emb);
-
-                        let chrome_penalty = (chrome_sim - max_s * 0.85).max(0.0);
-                        let cand_score = domain_contrast - chrome_penalty * 0.5;
+                        raw_domain_max[idx] = max_s;
+                        raw_contrast[idx] = max_s - mean_s;
+                        raw_chrome[idx] = cosine_similarity(&chrome_prej_emb, emb);
+                        let mut c = 0usize;
+                        for (li, le) in line_embeddings.iter().enumerate() {
+                            if wiped_indices[li] { continue; }
+                            if le.iter().all(|&v| v == 0.0) { continue; }
+                            if cosine_similarity(emb, le) >= dedup_floor { c += 1; }
+                        }
+                        echo_count[idx] = c;
+                        raw_echo[idx] = ((c as f32) + 1.0).ln();
+                    }
+                    let zscore = |v: &Vec<f32>| -> Vec<f32> {
+                        let n = v.len() as f32;
+                        if n < 2.0 { return vec![0.0f32; v.len()]; }
+                        let mu = v.iter().sum::<f32>() / n;
+                        let var = v.iter().map(|x| (x - mu) * (x - mu)).sum::<f32>() / n;
+                        let sd = var.sqrt();
+                        if sd < 1e-6 { return vec![0.0f32; v.len()]; }
+                        v.iter().map(|x| (x - mu) / sd).collect()
+                    };
+                    let z_contrast = zscore(&raw_contrast);
+                    let z_chrome = zscore(&raw_chrome);
+                    let z_echo = zscore(&raw_echo);
+                    let mut best_idx = 0usize;
+                    let mut best_score = f32::MIN;
+                    for (idx, cand) in title_candidates.iter().enumerate() {
+                        if cand_embs[idx].iter().all(|&v| v == 0.0) { continue; }
+                        let cand_score = z_contrast[idx] - z_chrome[idx] + z_echo[idx];
                         emit_term(&format!(
-                            "  🏷️ [TITLE CANDIDATE] '{}' | DomainMax: {:.4} | Contrast: {:+.4} | ChromeSim: {:.4} | Score: {:+.4}",
-                            cand, max_s, domain_contrast, chrome_sim, cand_score
+                            "  🏷️ [TITLE CANDIDATE] '{}' | DomainMax: {:.4} | Contrast: {:.4}(z{:+.3}) | Chrome: {:.4}(z{:+.3}) | BodyEcho: {}회(z{:+.3}) | Score: {:+.4}",
+                            cand,
+                            raw_domain_max[idx],
+                            raw_contrast[idx], z_contrast[idx],
+                            raw_chrome[idx], z_chrome[idx],
+                            echo_count[idx], z_echo[idx],
+                            cand_score
                         ));
                         if cand_score > best_score {
                             best_score = cand_score;
                             best_idx = idx;
                         }
                     }
-
                     doc_title = title_candidates[best_idx].clone();
                     title_emb = cand_embs[best_idx].clone();
-                    emit_term(&format!("  👑 [TITLE ANCHOR SELECTED] '{}' (Score: {:+.4})", doc_title, best_score));
+                    emit_term(&format!(
+                        "  👑 [TITLE ANCHOR SELECTED] '{}' (Score: {:+.4} | BodyEcho: {}회)",
+                        doc_title, best_score, echo_count[best_idx]
+                    ));
                 }
             }
 
@@ -2544,62 +2959,59 @@ pub async fn process_task(
                 }
             }
 
-            let mut category_line_scores: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
+            // 🌟 [EVIDENCE DEDUP 이동] 이 블록은 타이틀 선정보다 앞으로 옮겼습니다.
+            //    타이틀 후보의 '본문 반향 카운트' 가 dedup_floor 를 필요로 하기 때문입니다.
+            //    (dedup_floor / evidence_weight / is_cluster_rep 는 같은 STEP A 블록 스코프에
+            //     이미 선언되어 있으므로 여기서 그대로 참조할 수 있습니다)
+            let mut category_line_scores: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
             for cat in &categories {
-                category_line_scores.insert(cat.to_string(), (0.0, 0));
+                category_line_scores.insert(cat.to_string(), (0.0, 0.0));
             }
             let mut ambiguous_lines = 0usize;
             let mut body_sim_pool: Vec<Vec<f32>> = vec![Vec::new(); categories.len()];
-
             for (i, emb) in line_embeddings.iter().enumerate() {
-
                 if wiped_indices[i] { continue; }
                 let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
                 if emb.iter().all(|&v| v == 0.0) { continue; }
-
                 let trimmed_line = pug_lines[i].trim();
                 let tag_part = trimmed_line.split('|').next().unwrap_or("").trim().to_lowercase();
                 let is_table_cell = tag_part.starts_with("td") || tag_part.starts_with("th");
-                let weight = if is_table_cell { 1.5 } else { 1.0 };
-
-
+                let ev_w = evidence_weight[i];
+                let weight = (if is_table_cell { 1.5f32 } else { 1.0f32 }) * ev_w;
                 let sim_threshold = if is_table_cell { 0.30 } else { 0.38 };
                 let margin_threshold = if is_table_cell { 0.015 } else { 0.030 };
-
                 let mut sims: Vec<(usize, f32)> = Vec::with_capacity(categories.len());
                 for (ci, (_, phrase_embs)) in category_phrase_embs.iter().enumerate() {
                     sims.push((ci, max_pool_sim(emb, phrase_embs)));
                 }
-
-                for (ci, s) in &sims {
-                    body_sim_pool[*ci].push(*s);
+                // 🌟 [BODY POOL DEDUP] Top-K 평균은 중복 라인에 그대로 지배당하므로
+                //    가중치가 아니라 '풀 진입 자체' 를 클러스터 대표로 제한합니다.
+                if is_cluster_rep[i] {
+                    for (ci, s) in &sims {
+                        body_sim_pool[*ci].push(*s);
+                    }
                 }
                 let mean_sim: f32 = sims.iter().map(|(_, s)| *s).sum::<f32>() / (sims.len() as f32);
-
                 let mut ordered = sims.clone();
                 ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let (best_ci, best_sim) = ordered[0];
                 let second_sim = ordered.get(1).map(|(_, s)| *s).unwrap_or(0.0);
                 let margin = best_sim - second_sim;
-
                 if best_sim < sim_threshold { continue; }
                 if margin < margin_threshold {
                     ambiguous_lines += 1;
                     continue;
                 }
-
                 let contrast = best_sim - mean_sim;
                 if contrast <= 0.0 { continue; }
-
                 let entry = category_line_scores.get_mut(categories[best_ci]).unwrap();
                 entry.0 += contrast * weight;
-                entry.1 += 1;
+                entry.1 += ev_w;
             }
             if ambiguous_lines > 0 {
                 emit_term(&format!("  ⚖️ [AMBIGUITY GATE] 카테고리 간 마진 부족으로 배제된 범용 라인: {}개", ambiguous_lines));
             }
-
             let body_consensus: Vec<f32> = {
                 let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
@@ -2611,7 +3023,10 @@ pub async fn process_task(
                 }
                 let mean_b: f32 = if raw.is_empty() { 0.0 } else { raw.iter().sum::<f32>() / (raw.len() as f32) };
                 for (ci, cat) in categories.iter().enumerate() {
-                    emit_term(&format!("  🗳️ [BODY CONSENSUS] {} | Top10Mean: {:.4} | Contrast: {:+.4}", cat, raw[ci], raw[ci] - mean_b));
+                    emit_term(&format!(
+                        "  🗳️ [BODY CONSENSUS] {} | UniqueEvidence: {} | Top10Mean: {:.4} | Contrast: {:+.4}",
+                        cat, body_sim_pool[ci].len(), raw[ci], raw[ci] - mean_b
+                    ));
                 }
                 raw.iter().map(|v| v - mean_b).collect()
             };
@@ -2691,73 +3106,264 @@ pub async fn process_task(
             };
 
             let title_trust: f32 = {
-                let mut dom_max = 0.0f32;
+                // 🌟 [DIRECT MARGIN] 타이틀 '전체' 가 어느 카테고리를 얼마나 또렷이 지목하는가.
+                //
+                //  ── 왜 필요한가 ──
+                //   구식은 신뢰도를 title_window_contrast(2~4글자 n-gram 윈도우)의
+                //   1위-2위 마진 하나로만 계산했습니다.
+                //   실측 로그에서 '관리자 주메뉴' 를 쪼갠 윈도우
+                //   (관리자 / 주메뉴 / 관리 / 리자 / 자주 / 주메 / 메뉴 …)는
+                //   어느 카테고리도 변별하지 못해 PeakMargin 이 0.0038 로 붕괴했고,
+                //     MarginTrust = ((0.0038 - 0.02) / 0.08).clamp(0,1) = 0.000
+                //   → Trust 0 → TitleSig 0.000 / Prior 1.00x / boost 1.00x
+                //   즉 타이틀 축이 통째로 사라져 반복 UI 가 만든 BodySig 만 남았습니다.
+                //
+                //  ── 새 축 ──
+                //   윈도우 마진은 '부분 문자열이 도메인어를 품고 있는가' 를 봅니다.
+                //   직접 마진은 '타이틀 문장 자체가 한 카테고리로 기우는가' 를 봅니다.
+                //   둘은 서로 다른 증거이므로 큰 쪽을 채택합니다.
+                //   (한쪽이 0 이라고 해서 나머지 증거까지 버릴 이유가 없습니다)
+                let mut sims_t: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
-                    let s = max_pool_sim(&title_emb, &category_phrase_embs[ci].1);
-                    if s > dom_max { dom_max = s; }
+                    sims_t.push(max_pool_sim(&title_emb, &category_phrase_embs[ci].1));
                 }
+                let dom_max = sims_t.iter().cloned().fold(0.0f32, f32::max);
+                let mut ord_t = sims_t.clone();
+                ord_t.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let direct_margin = (ord_t.get(0).copied().unwrap_or(0.0)
+                    - ord_t.get(1).copied().unwrap_or(0.0)).max(0.0);
+                let direct_trust = ((direct_margin - 0.02) / 0.08).clamp(0.0, 1.0);
                 let chrome_s = cosine_similarity(&chrome_prej_emb, &title_emb);
-
                 let chrome_trust = ((dom_max - chrome_s) / 0.15).clamp(0.0, 1.0);
-
                 let mut wc = title_window_contrast.clone();
                 wc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 let peak_margin = (wc.get(0).copied().unwrap_or(0.0) - wc.get(1).copied().unwrap_or(0.0)).max(0.0);
-                let margin_trust = ((peak_margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                let window_trust = ((peak_margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                let margin_trust = window_trust.max(direct_trust);
                 let t = chrome_trust.min(margin_trust);
                 emit_term(&format!(
-                    "  🔒 [TITLE TRUST] DomainMax: {:.4} | ChromeSim: {:.4} | ChromeTrust: {:.3} | PeakMargin: {:.4} | MarginTrust: {:.3} → Trust: {:.3}",
-                    dom_max, chrome_s, chrome_trust, peak_margin, margin_trust, t
+                    "  🔒 [TITLE TRUST] DomainMax: {:.4} | ChromeSim: {:.4} | ChromeTrust: {:.3} | PeakMargin: {:.4} | WindowTrust: {:.3} | DirectMargin: {:.4} | DirectTrust: {:.3} → MarginTrust: {:.3} → Trust: {:.3}",
+                    dom_max, chrome_s, chrome_trust, peak_margin, window_trust, direct_margin, direct_trust, margin_trust, t
                 ));
                 t
             };
 
+            // =====================================================================
+            // 🌟 [URL TOKEN AXIS] 타이틀과 완전히 독립적인 제4의 증거 축
+            // ---------------------------------------------------------------------
+            //  ── 왜 필요한가 ──
+            //   실측 문서의 주소는 /admin/goods.php?code=list 입니다.
+            //   본문 증거 3축이 전부 goods 를 가리켰는데도 타이틀 하나가 뒤집었습니다.
+            //   타이틀과 본문 어느 쪽에도 의존하지 않는 독립 축이 하나 더 있으면,
+            //   한 축이 오염되어도 다수결이 성립합니다.
+            //
+            //  ── 왜 하드코딩이 아닌가 ──
+            //   'goods' / 'order' 같은 문자열을 코드가 비교하지 않습니다.
+            //   URL 토큰을 임베딩해 카테고리 앵커 뱅크와 코사인 max-pool 할 뿐이며,
+            //   이는 이 코드베이스가 이미 셀렉터를 자연어화해
+            //   nav 편견 벡터와 비교하는 것(sel_naturalized)과 같은 기법입니다.
+            //   문서 언어가 무엇이든 URL 경로는 라틴 토큰이므로 다국어에서 동일하게 동작합니다.
+            //
+            //  ── 자기 규제 (이 축이 위험할 때 스스로 꺼집니다) ──
+            //   같은 사이트의 /admin/goods.php?code=review 는 '상품 후기관리' 페이지입니다.
+            //   이때 토큰 'goods' 와 'review' 가 각각 자기 뱅크에 1.0 으로 적중해
+            //   1위-2위 마진이 0 에 수렴하고 url_trust 가 0 이 되어 축이 무효화됩니다.
+            //   /admin/list.php 처럼 의미 없는 경로도 전 카테고리가 평평해져 마진이 사라집니다.
+            //   즉 URL 이 확실한 신호일 때만 개입하고, 애매하면 스스로 침묵합니다.
+            // =====================================================================
+            let (url_contrast, url_trust): (Vec<f32>, f32) = {
+                let path_query = match url::Url::parse(&url) {
+                    Ok(u) => format!(
+                        "{} {}",
+                        u.path(),
+                        u.query().unwrap_or("")
+                    ),
+                    Err(_) => url.clone(),
+                };
+                let mut tokens: Vec<String> = Vec::new();
+                for raw in path_query.split(|c: char| !c.is_alphanumeric()) {
+                    let t = raw.trim().to_lowercase();
+                    if t.is_empty() { continue; }
+                    if t.chars().count() < 2 { continue; }
+                    if t.chars().all(|c| c.is_ascii_digit()) { continue; }
+                    if tokens.iter().any(|e| e == &t) { continue; }
+                    tokens.push(t);
+                }
+                if tokens.len() > 16 { tokens.truncate(16); }
+                if tokens.is_empty() {
+                    emit_term("  🔗 [URL AXIS] 경로에서 판정 가능한 토큰을 얻지 못해 URL 축을 사용하지 않습니다.");
+                    (vec![0.0f32; categories.len()], 0.0f32)
+                } else {
+                    let tok_embs = model
+                        .get_embedding_batch(tokens.clone())
+                        .await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; tokens.len()]);
+                    let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
+                    let mut winner_tok: Vec<String> = Vec::with_capacity(categories.len());
+                    for ci in 0..categories.len() {
+                        let mut m = 0.0f32;
+                        let mut w = String::new();
+                        for (ti, te) in tok_embs.iter().enumerate() {
+                            if te.iter().all(|&v| v == 0.0) { continue; }
+                            let s = max_pool_sim(te, &category_phrase_embs[ci].1);
+                            if s > m { m = s; w = tokens[ti].clone(); }
+                        }
+                        raw.push(m);
+                        winner_tok.push(w);
+                    }
+                    let mean_u: f32 = raw.iter().sum::<f32>() / (raw.len() as f32);
+                    let mut ord = raw.clone();
+                    ord.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let margin = (ord.get(0).copied().unwrap_or(0.0) - ord.get(1).copied().unwrap_or(0.0)).max(0.0);
+                    let trust = ((margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                    emit_term(&format!(
+                        "  🔗 [URL AXIS] tokens: {:?} | Margin: {:.4} → Trust: {:.3}",
+                        tokens, margin, trust
+                    ));
+                    for ci in 0..categories.len() {
+                        emit_term(&format!(
+                            "    🔗 [URL] {} | MaxPool: {:.4} (token '{}') | Contrast: {:+.4}",
+                            categories[ci], raw[ci], winner_tok[ci], raw[ci] - mean_u
+                        ));
+                    }
+                    (raw.iter().map(|v| v - mean_u).collect(), trust)
+                }
+            };
+            // =====================================================================
+            // 🌟 [PASS 1 / TITLE-FREE EVIDENCE] 타이틀에 의존하지 않는 축만 먼저 계산합니다.
+            // ---------------------------------------------------------------------
+            //  ── 왜 2패스로 쪼개는가 ──
+            //   구식은 한 루프 안에서 타이틀 신호와 본문 신호를 동시에 계산하고
+            //   곱셈으로 합쳤습니다. 그래서 '타이틀이 본문과 어긋나는가' 를
+            //   판정할 시점 자체가 존재하지 않았습니다.
+            //   본문·URL 증거를 먼저 확정해 두면, 그것을 근거로 타이틀 신뢰도를
+            //   소급 재조정할 수 있습니다. (ID/LINK RETRY PASS 와 같은 구조)
+            // =====================================================================
+            let mut ev_line: Vec<f32> = vec![0.0; categories.len()];
+            let mut ev_body: Vec<f32> = vec![0.0; categories.len()];
+            let mut ev_url: Vec<f32> = vec![0.0; categories.len()];
+            let mut ev_mean_line: Vec<f32> = vec![0.0; categories.len()];
+            let mut ev_coverage: Vec<f32> = vec![0.0; categories.len()];
+            let mut ev_count: Vec<f32> = vec![0.0; categories.len()];
             for (ci, cat) in categories.iter().enumerate() {
-                let (title_contrast, title_only_contrast) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
-                let title_raw = category_title_raw.get(*cat).copied().unwrap_or(0.0);
-                let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
-
-                let title_signal = ((title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0)) * title_trust;
-
-                let mean_line_contrast = if contributing_lines > 0 {
-                    line_total / (contributing_lines as f32)
+                // 🌟 contributing_lines 는 '라인 개수' 가 아니라 EVIDENCE DEDUP 가중 합입니다.
+                //    반복 UI 13줄은 13 이 아니라 1.0 으로 계산되므로,
+                //    coverage / evidence_factor 가 중복에 부풀려지지 않습니다.
+                let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
+                let mean_line_contrast = if contributing_lines > 0.0 {
+                    line_total / contributing_lines
                 } else {
                     0.0
                 };
-                let coverage = if contributing_lines > 0 {
-                    (((contributing_lines as f32) + 1.0).ln() / 4.0).min(1.2)
+                let coverage = if contributing_lines > 0.0 {
+                    ((contributing_lines + 1.0).ln() / 4.0).min(1.2)
                 } else {
                     0.0
                 };
-
-                let evidence_factor = if contributing_lines < 3 {
-                    (contributing_lines as f32) / 3.0
+                let evidence_factor = if contributing_lines < 3.0 {
+                    contributing_lines / 3.0
                 } else {
                     1.0
                 };
-                let line_signal = mean_line_contrast * 10.0 * coverage * evidence_factor;
-
+                ev_line[ci] = mean_line_contrast * 10.0 * coverage * evidence_factor;
+                ev_body[ci] = body_consensus.get(ci).copied().unwrap_or(0.0).max(0.0) * 12.0;
+                ev_url[ci] = url_contrast.get(ci).copied().unwrap_or(0.0).max(0.0) * 8.0 * url_trust;
+                ev_mean_line[ci] = mean_line_contrast;
+                ev_coverage[ci] = coverage;
+                ev_count[ci] = contributing_lines;
+            }
+            let evidence_total: Vec<f32> = (0..categories.len())
+                .map(|ci| ev_line[ci] + ev_body[ci] + ev_url[ci])
+                .collect();
+            // =====================================================================
+            // 🌟 [TITLE CORROBORATION / 소급 재판정]
+            // ---------------------------------------------------------------------
+            //  ── 실측 사고 ──
+            //   본문 증거 3축이 모두 goods 를 가리켰습니다.
+            //     LineSig  goods 1.187 > order 0.746
+            //     BodySig  goods 1.183 > order 0.352
+            //     Evidence goods 30.00 > order 23.58
+            //   그런데 타이틀 하나가 Prior 3.09x / 0.59x 라는 5.2배 곱셈 스윙을 만들어
+            //   최종 점수를 17.10 대 2.36 으로 뒤집었습니다.
+            //   즉 '한 축이 다른 모든 축을 거부(veto)' 하는 구조였습니다.
+            //
+            //  ── 규칙 ──
+            //   타이틀이 지목한 카테고리가 본문·URL 증거 1위가 아니라면,
+            //   그 격차만큼 타이틀의 발언권을 깎습니다.
+            //   격차는 증거 점수의 '문서 내 상대 위치' 로 계산하므로 상수가 없습니다.
+            //     gap = (증거1위 - 타이틀지목) / (증거1위 - 증거최하위)
+            //     TitleTrust *= (1 - gap)
+            //   타이틀과 증거가 일치하면 전혀 깎지 않습니다.
+            //   타이틀이 증거 최하위를 지목하면 gap=1 이 되어 발언권이 0 이 됩니다.
+            // =====================================================================
+            let mut title_trust_eff = title_trust;
+            {
+                let mut t_pick = 0usize;
+                let mut t_best = f32::MIN;
+                for ci in 0..categories.len() {
+                    if title_probs[ci] > t_best { t_best = title_probs[ci]; t_pick = ci; }
+                }
+                let mut e_pick = 0usize;
+                let mut e_best = f32::MIN;
+                let mut e_min = f32::MAX;
+                for ci in 0..categories.len() {
+                    if evidence_total[ci] > e_best { e_best = evidence_total[ci]; e_pick = ci; }
+                    if evidence_total[ci] < e_min { e_min = evidence_total[ci]; }
+                }
+                if t_pick != e_pick {
+                    let span = (e_best - e_min).max(1e-6);
+                    let gap = ((e_best - evidence_total[t_pick]) / span).clamp(0.0, 1.0);
+                    title_trust_eff = title_trust * (1.0 - gap);
+                    emit_term(&format!(
+                        "  🧪 [TITLE CORROBORATION] 타이틀은 '{}' 를 지목했지만 본문·URL 증거 1위는 '{}' 입니다. (증거 {:.3} vs {:.3} | 상대 격차 {:.3}) → TitleTrust {:.3} → {:.3}",
+                        categories[t_pick], categories[e_pick],
+                        evidence_total[e_pick], evidence_total[t_pick], gap,
+                        title_trust, title_trust_eff
+                    ));
+                } else {
+                    emit_term(&format!(
+                        "  🧪 [TITLE CORROBORATION] 타이틀과 본문·URL 증거가 모두 '{}' 를 지목했습니다. TitleTrust {:.3} 유지.",
+                        categories[e_pick], title_trust
+                    ));
+                }
+            }
+            // ── PASS 2 : 조정된 신뢰도로 최종 점수를 계산합니다 ──
+            for (ci, cat) in categories.iter().enumerate() {
+                let (title_contrast, title_only_contrast) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
+                let title_raw = category_title_raw.get(*cat).copied().unwrap_or(0.0);
+                let title_signal = ((title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0)) * title_trust_eff;
+                let line_signal = ev_line[ci];
+                let body_signal = ev_body[ci];
+                let url_signal = ev_url[ci];
+                let mean_line_contrast = ev_mean_line[ci];
+                let coverage = ev_coverage[ci];
+                let contributing_lines = ev_count[ci];
                 let body_contrast = body_consensus.get(ci).copied().unwrap_or(0.0);
-                let body_signal = body_contrast.max(0.0) * 12.0;
-
-                let title_prior_raw = 0.5 + 3.0 * title_probs[ci];
-                let title_prior = 1.0 + (title_prior_raw - 1.0) * title_trust;
-
+                // 🌟 [BOOST-ONLY PRIOR] 타이틀은 '가산점' 만 줄 수 있고 '감점' 은 줄 수 없습니다.
+                //
+                //  ── 왜 바꾸는가 ──
+                //   구식은 title_prior_raw = 0.5 + 3.0 * p 였습니다.
+                //   p ≈ 0 이면 0.5, 즉 타이틀이 지목하지 않은 카테고리는
+                //   본문 증거가 아무리 강해도 절반으로 깎였습니다.
+                //   실측 로그의 Prior 0.59x 가 정확히 그 결과이며,
+                //   goods 의 본문 증거 2.370 이 2.126 으로 눌렸습니다.
+                //   타이틀은 여러 증거 중 하나일 뿐 다른 증거를 거부할 권한이 없습니다.
+                //   범위를 [1.0, 3.5] 로 바꿔 '지목받으면 가산, 아니면 중립' 으로 만듭니다.
+                let title_prior_raw = 1.0 + 2.5 * title_probs[ci];
+                let title_prior = 1.0 + (title_prior_raw - 1.0) * title_trust_eff;
                 let win_contrast = title_window_contrast.get(ci).copied().unwrap_or(0.0);
                 let boost_raw = (1.0 + 6.0 * win_contrast.max(0.0)).min(2.5);
-                let title_keyword_boost = 1.0 + (boost_raw - 1.0) * title_trust;
-                emit_term(&format!("  🔤 [TITLE SOFT-CONTAINS] {} | WindowContrast: {:+.4} → raw {:.2}x × trust {:.3} → boost {:.2}x", cat, win_contrast, boost_raw, title_trust, title_keyword_boost));
-
-                let normalized_score = (title_signal + line_signal + body_signal) * title_prior * title_keyword_boost;
+                let title_keyword_boost = 1.0 + (boost_raw - 1.0) * title_trust_eff;
+                emit_term(&format!("  🔤 [TITLE SOFT-CONTAINS] {} | WindowContrast: {:+.4} → raw {:.2}x × trust {:.3} → boost {:.2}x", cat, win_contrast, boost_raw, title_trust_eff, title_keyword_boost));
+                let normalized_score = (title_signal + line_signal + body_signal + url_signal) * title_prior * title_keyword_boost;
                 category_scores.push((cat.to_string(), normalized_score, title_raw, contributing_lines));
                 if normalized_score > max_total_score {
                     max_total_score = normalized_score;
                     best_type = cat.to_string();
                 }
-
                 emit_term(&format!(
-                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Lines: {} | Coverage: {:.3} | BodyContrast: {:+.4} | TitleSig: {:.3} | LineSig: {:.3} | BodySig: {:.3}",
-                    cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, body_contrast, title_signal, line_signal, body_signal
+                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Evidence: {:.2} | Coverage: {:.3} | BodyContrast: {:+.4} | TitleSig: {:.3} | LineSig: {:.3} | BodySig: {:.3} | UrlSig: {:.3}",
+                    cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, body_contrast, title_signal, line_signal, body_signal, url_signal
                 ));
             }
 
@@ -2767,7 +3373,7 @@ pub async fn process_task(
             sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (cat, score, t_sim, line_cnt) in &sorted_scores {
                 let marker = if *cat == best_type { "👑" } else { "  " };
-                emit_term(&format!("  {} [{}] Normalized: {:.4} | TitleMaxPool: {:.4} | ContributingLines: {}", marker, cat, score, t_sim, line_cnt));
+                emit_term(&format!("  {} [{}] Normalized: {:.4} | TitleMaxPool: {:.4} | UniqueEvidence: {:.2}", marker, cat, score, t_sim, line_cnt));
             }
             emit_term(&format!("  Anchor Bias Sample (winner '{}'): '{}'...", best_type, crate::parsing::get_page_type_classification_bias(&best_type, &doc_lang).chars().take(120).collect::<String>()));
             emit_term("[PAGE-TYPE CLASSIFICATION] ====================================\n");
@@ -7452,12 +8058,40 @@ pub async fn process_task(
     //    이 비용은 크로스링구얼 리콜을 얻기 위해 의도적으로 감수하는 것입니다.
     //    0.6B 대비 2B 모델은 음차 정확도가 현저히 높습니다.
     {
-        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding together for synonym expansion...");
+        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding for synonym expansion...");
         emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading Qwen3.5 transliteration engine...", "spinner": "🔤" }));
-        model.ensure_qwen3_5(false).await?;
-        model.ensure_embedding().await?;
-        emit_term("[Scheduler] ✅ Qwen3.5(2B) Transliteration engine + Embedding model are resident together (no model ping-pong).");
+
+        // 🌟 [VRAM CONCURRENT GATE] 동시 상주에 필요한 메모리를 확보할 수 있는지 체크합니다.
+        //    Qwen3.5 2B(Q8) ≈ 2000MB + granite-97m 임베딩 ≈ 300MB + 여유분
+        //    → 임계값 2600MB. 부족하면 순차 모드로 진입합니다.
+        let free_mb = model.get_free_vram_mb();
+        let concurrent_threshold: u64 = 2600;
+
+        if free_mb >= concurrent_threshold {
+            // ── 동시 상주 모드 : 메모리 충분 ──
+            //    음차 생성과 임베딩을 번갈아 사용하므로 같이 올리는 편이 빠릅니다.
+            model.ensure_qwen3_5(false).await?;
+            model.ensure_embedding().await?;
+            emit_term(&format!(
+                "[Scheduler] ✅ [CONCURRENT] 자유 {}MB >= {}MB. Qwen3.5(2B) + Embedding 동시 상주 (no ping-pong).",
+                free_mb, concurrent_threshold
+            ));
+        } else {
+            // ── 순차 모드 : 메모리 부족 ──
+            //    1) 임베딩 먼저 로드 → 필드 은행·청크 벡터 생성에 사용
+            //    2) 임베딩 언로드 → VRAM 반환
+            //    3) Qwen3.5 로드 → 음차 생성
+            //    generate_transliteration_aliases 내부에서 임베딩이 다시 필요해지면
+            //    ensure_embedding() 의 변경 3 메모리 게이트가 순차 언로드를 자동으로 처리합니다.
+            emit_term(&format!(
+                "[Scheduler] ⚠️ [SEQUENTIAL] 자유 {}MB < {}MB. 순차 모드로 진입합니다.",
+                free_mb, concurrent_threshold
+            ));
+            model.ensure_qwen3_5(false).await?;
+            emit_term("[Scheduler] ✅ [SEQUENTIAL] Qwen3.5(2B) 로드 완료. 임베딩은 필요 시점에만 올립니다.");
+        }
     }
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))

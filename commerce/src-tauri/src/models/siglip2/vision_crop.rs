@@ -1289,6 +1289,124 @@ pub fn plan_crops(
     //    "어떤 크롭에도 안 담긴 잉크" 는 회수 불가능한 손실입니다.
     rescue_uncovered_bands(&mut plans, heatmaps, &content, content_gate, grid, emit);
 
+    // ── ⑦-B 동일 카테고리 겹침 크롭 병합 ──
+    //
+    //  ── 실측 사고 ──
+    //   header 크롭이 두 개 생성되었습니다.
+    //     [A] grid(r2~4, c4~13) → px(114,57)-(800,344)   ← 좌측 c0~c3 이 잘려 있음
+    //     [B] IDENTITY BAND     → px(0,114)-(800,516)    ← 좌측 포함, 정답이 여기 있음
+    //   순서를 바꿔도 두 크롭이 각각 LLM 을 타면서
+    //   먼저 발언한 쪽이 [ALREADY CLAIMED] 로 뒤쪽을 막습니다.
+    //   실측 로그:
+    //     [A] → doc_number "93763111837" (AIRWAYBILL 번호)  ← 먼저 확정
+    //     [B] → doc_number "CI-43726"    (정답)            ← '기존 유지' 로 폐기
+    //   그 잘못된 번호가 그대로 entity_index 와 릴레이 25건의 키가 되었습니다.
+    //
+    //  ── 왜 순서가 아니라 병합인가 ──
+    //   두 크롭은 같은 논리 블록(문서 식별 밴드)의 좌·우 조각입니다.
+    //   조각을 순서대로 보여주면 각 조각이 자기 안에서만 답을 찾으므로,
+    //   좌측 조각만 본 호출은 INVOICE NUMBER 를 볼 기회 자체가 없습니다.
+    //   합집합으로 한 번에 보여주면 두 열이 같은 시야에 들어와
+    //   모델이 라벨과 값을 좌우로 대조할 수 있습니다. LLM 호출도 하나 줄어듭니다.
+    //
+    //  ── 면적 상한 ──
+    //   무제한 병합은 카테고리 하나가 페이지를 삼키는 역효과를 냅니다.
+    //   합집합이 페이지의 60% 를 넘으면 병합하지 않고 원래대로 둡니다.
+    //   (60% 는 '한 카테고리가 문서 과반을 넘게 차지할 수 없다' 는 구조적 상한이며,
+    //    plan_crops 앞부분의 area_cap 과 같은 성격의 판정입니다)
+    {
+        let page_area = (grid.orig_width as f32) * (grid.orig_height as f32);
+        let mut i = 0usize;
+        while i < plans.len() {
+            let mut j = i + 1;
+            while j < plans.len() {
+                if plans[i].category != plans[j].category {
+                    j += 1;
+                    continue;
+                }
+                let a = plans[i].bbox;
+                let b = plans[j].bbox;
+                let overlaps = a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
+                if !overlaps {
+                    j += 1;
+                    continue;
+                }
+                let merged = (
+                    a.0.min(b.0),
+                    a.1.min(b.1),
+                    a.2.max(b.2),
+                    a.3.max(b.3),
+                );
+                let area = ((merged.2 - merged.0) as f32) * ((merged.3 - merged.1) as f32);
+                if area > page_area * 0.6 {
+                    emit(&format!(
+                        "    ⚪ [MERGE SKIP] '{}' 의 두 크롭을 합치면 페이지의 {:.0}% 를 차지해 병합하지 않습니다.",
+                        plans[i].category,
+                        area / page_area * 100.0
+                    ));
+                    j += 1;
+                    continue;
+                }
+                emit(&format!(
+                    "    🔗 [CROP MERGE] '{}' 의 겹치는 크롭 2개를 합칩니다. px({},{})-({},{}) + px({},{})-({},{}) → px({},{})-({},{})",
+                    plans[i].category,
+                    a.0, a.1, a.2, a.3,
+                    b.0, b.1, b.2, b.3,
+                    merged.0, merged.1, merged.2, merged.3
+                ));
+                plans[i].bbox = merged;
+                plans[i].patch_count += plans[j].patch_count;
+                if plans[j].score > plans[i].score {
+                    plans[i].score = plans[j].score;
+                    plans[i].top_field = plans[j].top_field.clone();
+                }
+                plans.remove(j);
+            }
+            i += 1;
+        }
+    }
+
+    // ── ⑧ 식별 크롭 우선 정렬 ──
+    //
+    //  ── 실측 사고 ──
+    //   header 크롭이 두 개 생성되었습니다.
+    //     [1] grid(r2~4, c4~13) → px(114,57)-(800,344)   ← 좌측 c0~c3 이 잘려 있음
+    //     [2] IDENTITY BAND     → px(0,114)-(800,516)    ← 좌측 포함, 정답이 여기 있음
+    //   그런데 [2] 는 ⑥ 단계에서 벡터 맨 뒤에 push 되어 10번째로 처리되었습니다.
+    //   STAGE-5 는 plans 순서대로 돌면서 [ALREADY CLAIMED] 로 앞선 확정값을 보호하므로,
+    //     [1] 이 우측 AIRWAYBILL 번호 93763111837 을 doc_number 로 먼저 확정했고
+    //     [2] 가 뒤늦게 읽어낸 정답 CI-43726 은 '기존 유지' 로 폐기되었습니다.
+    //   그 잘못된 번호가 그대로 entity_index / 릴레이 25건의 키가 되었습니다.
+    //
+    //  ── 왜 순서만 바꾸면 되는가 ──
+    //   두 크롭 모두 이미 계획에 들어 있고 둘 다 LLM 을 탑니다. 비용은 동일합니다.
+    //   달라지는 것은 '누가 먼저 기본키를 확정하는가' 뿐입니다.
+    //   문서 기본키는 되돌릴 수 없는 축이므로, 그것을 담당하는 크롭이 먼저 발언해야 합니다.
+    //
+    //  ── 판정 근거 ──
+    //   top_field 가 "doc_number" 인 header 크롭이 식별 크롭입니다.
+    //   ensure_identity_band_crop 이 그 값을 명시적으로 심어 두므로 어휘 판정이 아닙니다.
+    //   sort_by_key 는 안정 정렬이라 나머지 크롭의 상대 순서는 그대로 보존됩니다.
+    {
+        let before: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
+        plans.sort_by_key(|p| {
+            if p.category == "header" && p.top_field == "doc_number" {
+                0u8
+            } else if p.category == "header" {
+                1u8
+            } else {
+                2u8
+            }
+        });
+        let after: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
+        if before != after {
+            emit(&format!(
+                "    🥇 [IDENTITY FIRST ORDER] 문서 기본키 크롭을 선두로 재정렬했습니다. {:?} → {:?}",
+                before, after
+            ));
+        }
+    }
+
     plans
 }
 
@@ -1728,20 +1846,44 @@ pub fn decide_tile_count(
     let (lg, _il, _bl) =
         legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
     let total_in = (0..n).filter(|&i| inside(i)).count().max(1);
-    // 판독 가능 패치가 크롭의 1/4 미만이면 실제 글자가 크롭 면적에 비해 너무 작습니다.
     let t3 = lg * 4 < total_in;
 
     if !t1 && !t2 && !t3 {
         return (1, String::new());
     }
 
-    // 타일 수는 근거가 되는 구조에서 유도합니다.
-    //  · 표 행이 k 줄이면 두 줄씩 겹쳐 읽도록 ceil(k/2) 타일
-    //  · 그 외에는 2 타일 (상/하)
+    // ── [FIX-A] 표 카테고리: 판독가능 패치가 극소면 분할 무의미 ──
+    //   표 행은 감지되었지만 읽을 텍스트가 거의 없으면
+    //   타일을 나눠도 각 타일이 빈 영역만 받아 전부 null을 반환합니다.
+    //   (실측: containers 판독가능 64/182 → 4타일 전부 null)
+    //   판독가능 비율이 10% 미만이면 1타일로 축소합니다.
+    if t2 && lg * 10 < total_in {
+        emit(&format!(
+            "    ⚪ [TILE SKIP / SPARSE TABLE] '{}' 표행 {}개 감지되었으나 \
+             판독가능 패치 {}/{} ({:.0}%) 로 분할 무의미. 1타일로 축소합니다.",
+            plan.category, table_rows, lg, total_in,
+            lg as f32 / total_in as f32 * 100.0
+        ));
+        return (1, "표행감지_판독불가".to_string());
+    }
+
+    // ── [FIX-B] 비표 카테고리: 잘림위험도 내용희소도 아니면 1타일 ──
+    //   기존: 사유 하나만 걸려도 무조건 2타일
+    //   변경: T1(잘림) 또는 T3(희소) 중 실제 분할이 필요한 경우만 2타일
+    //         내용희소(T3)만 걸린 경우: 크롭이 이미 좁아서
+    //         나눠도 각 타일이 더 좁아질 뿐 → 1타일이 오히려 정확
     let count = if t2 {
-        ((table_rows + 1) / 2).clamp(2, 4)
-    } else {
+        // ── [FIX-C] 표 상한 4 → 3 ──
+        //   행 7개 이상이어도 3타일이면 타일당 ~2.3행으로 충분합니다.
+        //   4타일이면 타일당 ~1.75행으로 겹침 영역만 늘어납니다.
+        ((table_rows + 1) / 2).clamp(2, 3)
+    } else if t1 {
+        // 잘림 위험: 크롭 밖에 근거가 있으므로 2타일로 상/하 분리
         2
+    } else {
+        // T3(내용희소)만 남은 경우: 1타일
+        // 크롭 자체가 좁으므로 분할하면 오히려 컨텍스트가 끊어집니다.
+        1
     };
 
     let mut why: Vec<&str> = Vec::new();
@@ -1754,5 +1896,6 @@ pub fn decide_tile_count(
         "    🧱 [TILE PLAN] '{}' → {}타일 (겹침 25%) | 사유: {} | 표행 {} | 판독가능 {}/{}",
         plan.category, count, reason, table_rows, lg, total_in
     ));
+
     (count, reason)
 }

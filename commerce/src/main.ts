@@ -294,7 +294,7 @@ const COMMERCE_TYPE_SET = new Set<string>([
 
 // ── analytics 행동 로그 / 관리자 Q&A ──
 const ANALYTIC_TYPE_SET = new Set<string>([
-    'click', 'hover', 'change', 'report', 'question', 'answer'
+    'click', 'hover', 'change', 'report', 'touch', 'question', 'answer'
 ]);
 
 /**
@@ -326,7 +326,9 @@ const TYPE_SETS: Record<string, string[]> = {
     //    기존에는 syncAnalyticsData 가 아예 버렸고 이 목록에도 없어
     //    앱 어디에서도 확인할 수 없었습니다. 이제 저장하므로 목록에도 노출합니다.
     //    (검색 스코프에서는 parse_analytic_query 가 별도로 제외하므로 충돌하지 않습니다)
-    analytic: ['click', 'hover', 'change', 'report', 'question', 'answer'],
+    // 🌟 [TOUCH VISIBLE] bias.json analytic_event_filters 에 정의된 touch 를
+    //    목록에 포함합니다. 이 목록에서 빠지면 목록 조회에서 통째로 탈락합니다.
+    analytic: ['click', 'hover', 'change', 'report', 'touch', 'question', 'answer'],
     // 🌟 [ORPHAN TYPE FIX] proxy/index.ts 가 택배 라벨에 붙이는 'receiving' / 'shipping' 은
     //    COMMERCE_TYPE_SET 에 있어 modeOfType 이 mode='commerce' 로 태깅하는데,
     //    이 읽기 목록에는 없어서 commerce 탭에서 조회되지 않았습니다.
@@ -334,7 +336,7 @@ const TYPE_SETS: Record<string, string[]> = {
     //    결과적으로 두 탭 어디에서도 보이지 않는 고아 문서가 되었습니다.
     //    (mode 컬럼이 트랙을 이미 격리하므로 읽기 목록 중첩은 무해합니다)
     commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
-               'receiving', 'shipping']
+        'receiving', 'shipping']
 };
 
 /**
@@ -9356,6 +9358,11 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             console.log("[RESET] All frontend polling and scheduling timers cleared.");
 
             // 3. 프론트엔드 전역 상태 초기화
+            // 🌟 [RESET DEDUP] forceReset 내부에 reset_lancedb 호출이 이미 있습니다.
+            //    여기서 한 번 더 호출하면 두 번 다 store=None → else 분기 → 새 커넥션 생성 →
+            //    (수정 전에는 주입 안 함 → 드롭) 이 반복됩니다.
+            //    수정 후에도 첫 번째 호출이 주입을 완료하면 두 번째는 불필요한 재리셋이 됩니다.
+            //    forceReset 하나에서만 수행하고 여기서는 제거합니다.
             await GlobalTaskManager.forceReset();
             isExtracting = false;
             isSearching = false;
@@ -9368,9 +9375,10 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             activeContext = { cc: "", bcc: "", ref: "" };
             if (docListContainer) docListContainer.innerHTML = "";
             if (chatTalks) chatTalks.innerHTML = "";
-            // 4. 백엔드 LanceDB 완전 초기화 (tasks, talks, items, sales, tracking, event, users, pages 전부 drop & recreate)
-            await invoke("reset_lancedb");
-            console.log("[RESET] LanceDB backend reset complete.");
+            // 🌟 [REMOVED] 아래 invoke("reset_lancedb") 를 제거합니다.
+            //    forceReset() 내부에서 이미 호출하며, 수정된 reset_lancedb 가
+            //    새 커넥션을 스케줄러에 주입합니다.
+            console.log("[RESET] LanceDB backend reset delegated to forceReset().");
             // 5. 프론트엔드 Dexie DB 완전 삭제 후 재생성
             await appDb.delete();
             await appDb.open();

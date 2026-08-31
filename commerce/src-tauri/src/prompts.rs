@@ -878,6 +878,28 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
         fields.retain(|(n, _)| n != self_ref);
     }
 
+    // 🌟 [DOC TYPE FIELD DROP] doc_type 은 LLM 이 답할 축이 아닙니다.
+    //
+    //  ── 실측 사고 ──
+    //   STEP 1 의 비전 NMS + TITLE GATE 가 이미 'CI' 를 margin +2.0804 로 확정했는데,
+    //   header 스키마에 doc_type 이 남아 있어 2B 모델에게 다시 물었습니다.
+    //   모델은 페이지에 인쇄된 제목 전문을 그대로 복사했습니다.
+    //     [Qwen3.5-DECODING]  ",L INVOICE      ← "doc_type": "COMMERCIAL INVOICE"
+    //   그 값이 확정값 'CI' 를 덮어썼고, 저장 시
+    //     entity_index("COMMERCIAL INVOICE", team, no)
+    //     entity_bcc  ("COMMERCIAL INVOICE", cc)
+    //   가 되어 코드('CI')로 조회하는 목록 필터와 릴레이가 전부 어긋났습니다.
+    //   본인 문서만 화면에서 사라지고 draft 25건만 남는 정확한 원인입니다.
+    //
+    //  ── 왜 값이 아니라 필드 자체를 제거하는가 ──
+    //   프롬프트에 null 로만 남겨두어도 모델은 눈에 보이는 제목을 채워 넣습니다.
+    //   [SCHEMA ECHO] 게이트는 '설명문 복사' 만 막지 '화면 복사' 는 막지 못합니다.
+    //   호출부가 확정값을 다시 주입하더라도, 그 사이 [ALREADY CLAIMED] 목록을 오염시켜
+    //   다른 필드의 판정까지 흔듭니다. 물어보지 않는 것이 유일하게 안전합니다.
+    if category == "header" {
+        fields.retain(|(n, _)| n != "doc_type");
+    }
+
     // 🌟 [IDENTITY FIRST] doc_number 를 항상 첫 필드로 올립니다.
     //   2B 모델은 [FIELD DEFINITIONS] 앞쪽 항목에 더 강하게 반응합니다.
     //   문서 기본키가 되는 축은 14개 중 아무 자리가 아니라 첫 줄에 있어야 합니다.

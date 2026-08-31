@@ -379,10 +379,28 @@ impl LogisModel {
             last_free = current_free;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+
         Ok(())
     }
 
-    // --- [NEW] SSD Bridge Operations ---
+    // --- [NEW] VRAM 자유 메모리 조회 헬퍼 ---
+    /// 현재 디바이스의 자유 VRAM을 MB 단위로 반환합니다.
+    /// CPU 모드면 항상 충분하다는 의미로 u64::MAX를 돌려줍니다.
+    /// nvml 초기화 실패 시 보수적으로 0을 반환합니다.
+    pub fn get_free_vram_mb(&self) -> u64 {
+        if self.is_cpu_mode { return u64::MAX; }
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    return mem.free / (1024 * 1024);
+                }
+            }
+        }
+        0
+    }
+
+    // --- [NEW] SSD Bridge Operations ---    
     pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let current_size = *self.current_size.lock().await;
         let is_q35 = current_size == Some(ModelSize::Qwen3_5);
@@ -1027,22 +1045,44 @@ impl LogisModel {
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         // 실제 메모리에 올리기 직전에 파일 존재 여부를 다시 한 번 방어합니다.
-        self.check_embedding_downloaded().await?; 
-        
+        self.check_embedding_downloaded().await?;
+
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
+            // 🌟 [VRAM GATE] 임베딩을 올리기 전에 자유 메모리를 체크합니다.
+            //    다른 모델이 상주 중인데 메모리가 부족하면,
+            //    동시 상주 대신 순차 모드(다른 모델 언로드 → 임베딩 로드)로 진입합니다.
+            //    이후 다른 모델이 다시 필요해지면 각 모델의
+            //    ensure_qwen3() / ensure_qwen3_5() / secure_vram_relay() 가
+            //    기존처럼 자동으로 재로드합니다.
+            if !self.is_cpu_mode {
+                let free_mb = self.get_free_vram_mb();
+                // granite-embedding-97m-multilingual 은 대략 300MB 내외를 사용합니다.
+                let needed_mb: u64 = 350;
+                if free_mb < needed_mb {
+                    println!(
+                        "[MODEL] ⚠️ [VRAM GATE] 자유 {}MB < 필요 {}MB. 순차 모드 진입을 위해 기존 모델을 언로드합니다.",
+                        free_mb, needed_mb
+                    );
+                    // 락을 해제하지 않으면 deep_purge_resources 내부에서
+                    // 같은 뮤텍스를 다시 잡아 데드락이 됩니다.
+                    drop(emb_guard);
+                    self.deep_purge_resources().await;
+                    emb_guard = self.embedding_model.lock().await;
+                    println!("[MODEL] ✅ [VRAM GATE] 순차 모드 준비 완료. 기존 모델 언로드됨.");
+                }
+            }
+
             let self_clone = self.embedding_path.clone();
-            
             // 🌟 CPU 강제 할당을 제거하고 시스템 설정(GPU)을 그대로 사용하여 초고속 VRAM 연산을 수행합니다.
-            let target_device = self.device_config.device.clone(); 
-            
+            let target_device = self.device_config.device.clone();
             println!("[MODEL] Loading Embedding Model on {:?}...", target_device);
-            
+
             let target_device_clone = target_device.clone();
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new_with_device(&self_clone, &target_device_clone)
             }).await??;
-            
+
             *emb_guard = Some(emb);
         }
         Ok(())
@@ -1668,7 +1708,21 @@ impl LogisModel {
                     final_data_map.insert("conditions".to_string(), json!({}));
                     final_data_map.insert("financials".to_string(), json!({}));
                     final_data_map.insert("cargo".to_string(), json!({}));
-                    final_data_map.insert("line_items".to_string(), json!([]));
+                    // 🌟 [ARRAY KEY UNIFY] 초기화 키를 카테고리명과 일치시킵니다.
+                    //
+                    //  ── 실측 사고 ──
+                    //   merge_extracted 는 `merged.entry(category)` 로 배열을 넣으므로
+                    //   items 카테고리의 결과는 "items" 키에 쌓입니다.
+                    //   그런데 여기서 "line_items" 를 만들어 두어 두 키가 공존했고,
+                    //   저장 결과가 items 3행 / line_items 빈 배열로 갈렸습니다.
+                    //   STEP C 의 FLATTEN 도 "line_items" 를 훑기 때문에
+                    //   hs_code 루트 승격이 한 번도 성립하지 않았습니다.
+                    //   containers 는 카테고리명과 키가 우연히 같아 정상 동작했습니다.
+                    //
+                    //  ── 하위 호환 ──
+                    //   generate_rich_summary 등 기존 소비처가 line_items 를 읽으므로
+                    //   저장 직전 STEP C 에서 items → line_items 로 미러합니다.
+                    final_data_map.insert("items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
                     // 🌟 grounding_claims 는 바깥 스코프에 선언되어 있습니다. (STEP 6 이 소비)
@@ -2173,10 +2227,10 @@ impl LogisModel {
                     }
 
                     // ── 배열 축 : 첫 원소만 대표 축으로 승격 ──
-                    //    (전체 목록은 data.containers / data.line_items 배열에 그대로 남습니다)
+                    //    (전체 목록은 data.containers / data.items 배열에 그대로 남습니다)
                     for (arr_key, promote) in [
                         ("containers", vec!["container_number", "seal_number"]),
-                        ("line_items", vec!["hs_code"]),
+                        ("items", vec!["hs_code"]),
                     ] {
                         let arr = match extracted_data.get(arr_key).and_then(|v| v.as_array()) {
                             Some(a) => a.clone(),
@@ -2188,6 +2242,22 @@ impl LogisModel {
                             if let Some(v) = arr.iter().find_map(|it| it.get(field)) {
                                 obj.insert(field.to_string(), v.clone());
                                 hoisted.push(field.to_string());
+                            }
+                        }
+                    }
+
+                    // 🌟 [LEGACY MIRROR] 기존 소비처가 line_items 를 읽으므로 items 를 그대로 복사합니다.
+                    //    generate_rich_summary / merge_json_manual 등 텍스트 경로가
+                    //    line_items 키를 전제하고 있어, 키를 통일하면서 그쪽이 끊기지 않게 합니다.
+                    //    원본은 items 이고 line_items 는 읽기 전용 사본입니다.
+                    {
+                        let items_arr = final_data.get("items").cloned()
+                            .or_else(|| extracted_data.get("items").cloned());
+                        if let Some(v) = items_arr {
+                            if v.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                                final_data.as_object_mut().unwrap()
+                                    .insert("line_items".to_string(), v);
+                                emit_term("[TRADING FLATTEN v3] 🔁 items 배열을 line_items 로 미러했습니다. (레거시 소비처 호환)");
                             }
                         }
                     }
@@ -2266,7 +2336,12 @@ impl LogisModel {
                         ));
                     }
                     for (target_type, relay_key) in &relay_plan {
-                        let target_field = &relay_key.source_field;
+                        // 🌟 [SEARCH FIELD FIX v5] source_field와 search_field를 분리합니다.
+                        //    - source_field: 내 문서에서 값을 가져온 필드 (진단용)
+                        //    - search_field: 상대 문서에서 검색할 필드명
+                        //    기존에는 둘 다 source_field로 동일하여 자기 자신의 필드에서 검색하여
+                        //    항상 SELF-SKIP 되었습니다.
+                        let search_field = &relay_key.search_field;
                         let source_field = &relay_key.source_field;
                         let link_value = relay_key.raw.clone();
                         if link_value.is_empty() || link_value == "N/A" {
@@ -2283,11 +2358,73 @@ impl LogisModel {
                         }
                         emit_term(&format!(
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
-                            doc_type, target_type, target_field, link_value
+                            doc_type, target_type, search_field, link_value
                         ));
-                        let relay_result = db.find_item_by_property("items", target_field, &json!(link_value)).await;
-                        match relay_result {
-                            Ok(Some((existing_id, mut ej))) => {
+                        // 🌟 [RELAY SEARCH v5] get_all_items로 여러 결과를 가져온 후,
+                        //    자기 자신 제외 + 타입 검증으로 유효한 상대 문서를 찾습니다.
+                        //    find_item_by_property는 첫 번째 결과만 반환하므로,
+                        //    자기 자신이 먼저 나오면 무조건 SELF-SKIP 되는 문제를 해결합니다.
+                        let filter = format!("data LIKE '%\"{}\":\"{}\"%'", search_field, link_value.replace('\'', "''"));
+                        let relay_search = db.get_all_items("items", 10, 0, Some(filter)).await;
+                        let mut found_target: Option<(String, Value)> = None;
+                        match relay_search {
+                            Ok(docs) => {
+                                for doc in docs {
+                                    // 🌟 [SELF-SEARCH GUARD] 자기 자신 제외
+                                    if doc.id == hashed_id {
+                                        continue;
+                                    }
+                                    // 🌟 [TYPE GUARD] 검색된 문서의 타입이 목표 타입과 일치해야 합니다.
+                                    //    저장 시 type_은 전체 이름(예: "COMMERCIAL INVOICE")으로 설정되지만,
+                                    //    릴레이 검색 시 target_type은 코드(예: "BL", "PL")입니다.
+                                    //    따라서 전체 이름을 코드로 변환하여 비교합니다.
+                                    let found_doc_type = doc.r#type.clone();
+                                    let found_code = crate::logic::doc_type_to_code(&found_doc_type);
+                                    // data JSON에서도 doc_type 확인
+                                    let parsed: Value = match serde_json::from_str(&doc.json_data) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                    let data_doc_type = parsed.get("doc_type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let data_code = crate::logic::doc_type_to_code(data_doc_type);
+                                    // 타입 검증: 전체 이름 또는 코드 모두 매칭 시도
+                                    let type_matches = if found_code == *target_type {
+                                        true
+                                    } else if data_code == *target_type {
+                                        true
+                                    } else if found_doc_type == *target_type {
+                                        true
+                                    } else if data_doc_type == *target_type {
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if !type_matches {
+                                        continue;
+                                    }
+                                    // 🌟 [FIELD VALUE VERIFY] search_field 값이 정확히 일치하는지 확인
+                                    let field_val = parsed.get(search_field)
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if field_val != link_value {
+                                        continue;
+                                    }
+                                    found_target = Some((doc.id, parsed));
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                emit_term(&format!(
+                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
+                                    target_type, e
+                                ));
+                                continue;
+                            }
+                        }
+                        match found_target {
+                            Some((existing_id, mut ej)) => {
                                 let mut needs_update = false;
                                 // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
                                 //    역할 기반으로 역참조 필드명을 결정합니다.
@@ -2383,13 +2520,13 @@ impl LogisModel {
                                     ));
                                 }
                             },
-                            Ok(None) => {
-                                // 🌟 [DRAFT v4] 미발견 시 draft 생성.
-                                //    기존은 `hash_id(team_id + target_type + link_value)` 였는데,
-                                //    이 경로는 전각 영숫자를 반각과 다르게 취급합니다.
-                                //    `relay_id` 를 사용하면 전각/반각/대소문자 무관 동일 id 가 됩니다.
+                            None => {
+                                // 🌟 [DRAFT v5] 미발견 시 draft 생성.
+                                //    기존은 `relay_id(&link_value)` 로 타입 미반영 해시를 사용했습니다.
+                                //    25건 릴레이가 전부 같은 `draft_id` 로 서로를 덮어쓰는 사고가 발생했습니다.
+                                //    `relay_id` 에 `target_type` 을 전달하여 릴레이 대상마다 고유한 `draft_id` 를 부여합니다.
                                 let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
-                                    crate::utils::hash::relay_id(&link_value)
+                                    crate::utils::hash::relay_id(&link_value, target_type)
                                 } else {
                                     crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
                                 };
@@ -2397,11 +2534,13 @@ impl LogisModel {
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
                                     obj.insert("type".to_string(), json!(target_type));
-                                    obj.insert(target_field.to_string(), json!(link_value.clone()));
+                                    // 🌟 [SEARCH FIELD FIX] draft에는 search_field(상대 문서의 검색 대상 필드)에 값을 넣습니다.
+                                    //    기존에는 target_field(=source_field)로 넣어 방향이 뒤집혔습니다.
+                                    obj.insert(search_field.to_string(), json!(link_value.clone()));
                                     obj.insert("doc_type".to_string(), json!(target_type));
                                     obj.insert("updated_at".to_string(), json!(0));
                                     obj.insert("mode".to_string(), json!("shipping"));
-                                    obj.insert("text".to_string(), json!(format!("{} {}", target_type, link_value)));
+                                    obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, search_field, link_value)));
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
@@ -2412,15 +2551,9 @@ impl LogisModel {
                                 ).await;
                                 emit_term(&format!(
                                     "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
-                                    target_type, draft_id, target_field, link_value
+                                    target_type, draft_id, search_field, link_value
                                 ));
                             },
-                            Err(e) => {
-                                emit_term(&format!(
-                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
-                                    target_type, e
-                                ));
-                            }
                         }
                     }
                 }
@@ -9455,11 +9588,48 @@ fn merge_extracted(
                     parts.join("|")
                 };
 
+                // 🌟 [ROW IDENTITY GATE] 표의 '데이터 행' 은 반드시 자기 정체를 갖습니다.
+                //
+                //  ── 실측 사고 ──
+                //   items 배열에 3행이 저장되었는데 실제 품목은 1행뿐이었습니다.
+                //     { description: null, item_package_count: 4, total_price: 2000 }  ← 합계 행
+                //     { description: null, item_code: "360 Footwear" }                 ← 회사명
+                //   합계 행은 품명이 없고, 회사명은 품목 코드 자리에 들어간 서명란 텍스트입니다.
+                //   프롬프트의 [TABLE RULES] 가 이미 합계 행 제외를 지시하지만
+                //   2B 모델은 타일 경계에서 그 지시를 지키지 못합니다.
+                //
+                //  ── 판정 근거 (어휘 사전 아님) ──
+                //   무역 품목표에서 '품명 없는 데이터 행' 은 정의상 존재하지 않습니다.
+                //   합계 행 · 소계 행 · 서명란 텍스트는 전부 품명 칸이 비어 있습니다.
+                //   컨테이너 표도 같은 원리로 '번호 없는 컨테이너 행' 은 성립하지 않습니다.
+                //   값이 있는지만 보므로 언어와 무관합니다.
+                let row_has_identity = |v: &Value| -> bool {
+                    let o = match v.as_object() { Some(o) => o, None => return false };
+                    let filled = |k: &str| -> bool {
+                        match o.get(k) {
+                            Some(Value::String(s)) => !s.trim().is_empty() && !is_schema_echo(s),
+                            Some(Value::Number(_)) => true,
+                            _ => false,
+                        }
+                    };
+                    match category {
+                        "items" => filled("description"),
+                        "containers" => {
+                            filled("container_number") || filled("seal_number") || filled("type_size")
+                        }
+                        _ => true,
+                    }
+                };
                 let mut added = 0usize;
                 let mut dup = 0usize;
+                let mut ghost = 0usize;
                 if let Some(existing) = slot.as_array_mut() {
                     let mut keys: Vec<String> = existing.iter().map(row_key).collect();
                     for e in arr {
+                        if !row_has_identity(e) {
+                            ghost += 1;
+                            continue;
+                        }
                         let k = row_key(e);
                         if k.is_empty() { continue; }
                         if keys.iter().any(|x| x == &k) { dup += 1; continue; }
@@ -9469,10 +9639,11 @@ fn merge_extracted(
                     }
                 }
                 emit(&format!(
-                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 (누적 {}건)",
+                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 | 정체 없는 행 {}건 폐기 (누적 {}건)",
                     category,
                     added,
                     dup,
+                    ghost,
                     merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
                 ));
             }

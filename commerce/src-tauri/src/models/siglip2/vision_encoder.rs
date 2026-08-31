@@ -1060,7 +1060,6 @@ pub fn build_column_heatmaps(
     //   그 시점에는 이미 크롭이 잘못 착지한 뒤라 되돌릴 수 없습니다.
     //   같은 판정을 히트맵 단계로 앞당깁니다. 사전은 logic.rs 것을 그대로 씁니다.
     let self_ref_field = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
-
     for (fname, _, bias_target, _) in schema_fields.iter() {
         let cat = crate::logic::trade_field_category(fname);
         if cat.is_empty() {
@@ -1070,6 +1069,26 @@ pub fn build_column_heatmaps(
             emit(&format!(
                 "  🧹 [SELF-REFERENCE ANCHOR DROP] '{}' 는 '{}' 문서가 자기 자신을 가리키는 축입니다. doc_number 와 라벨이 완전히 겹쳐 정체성 축을 잠식하므로 히트맵 경쟁에서 제외합니다.",
                 fname, doc_type
+            ));
+            continue;
+        }
+        // 🌟 [DOC TYPE ANCHOR DROP] doc_type 은 STEP 1 이 이미 확정한 축입니다.
+        //
+        //  ── 왜 히트맵에서도 빼야 하는가 ──
+        //   doc_type 의 앵커 구는 "commercial invoice" / "document kind code" 처럼
+        //   문서 제목 그 자체입니다. 그래서 제목 행 패치에 가장 강하게 반응하고,
+        //   header 카테고리의 봉우리를 제목 쪽으로 끌어당깁니다.
+        //   실측에서 header 크롭이 grid(r2~4, c4~13) 로 잡혀 좌측 식별 블록(c0~c3)을
+        //   통째로 잘라먹었고, 그 결과 doc_number 가 INVOICE NUMBER 가 아니라
+        //   우측의 AIRWAYBILL 번호(93763111837)로 확정되었습니다.
+        //
+        //   TITLE ROW SUPPRESSION 이 상단 2행을 억제하지만, doc_type 앵커는
+        //   그 아래 행까지 제목 어휘로 반응하므로 억제만으로는 부족합니다.
+        //   물어보지 않는 축이면 위치도 찾을 필요가 없습니다.
+        if fname == "doc_type" {
+            emit(&format!(
+                "  🧹 [DOC TYPE ANCHOR DROP] 'doc_type' 은 STEP 1 비전 판정이 '{}' 로 이미 확정한 축입니다. 앵커 구가 제목 행에 반응해 header 봉우리를 제목 쪽으로 끌어당기므로 히트맵 경쟁에서 제외합니다.",
+                doc_type
             ));
             continue;
         }

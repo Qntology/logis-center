@@ -116,18 +116,20 @@ pub fn relay_index(raw: &str) -> u32 {
     crc32(&normalize_identifier(raw))
 }
 
-/// 🌟 [RELAY ID v4]
+/// 🌟 [RELAY ID v5]
 ///  ── 무엇이 바뀌었나 ──
-///   기존은 `normalize_identifier` 통과값이 비어 있으면 빈 문자열을 반환했는데,
-///   호출부가 빈 문자열을 그대로 `hash_id("")` 로 전달할 수 있었습니다.
-///   유효성 검사를 내장하여 잘못된 키로 인한 빈 id 생성을 원천 차단합니다.
-pub fn relay_id(raw: &str) -> String {
+///   기존은 `normalize_identifier` 통과값만으로 해시를 계산하여,
+///   같은 `link_value` 를 참조하는 모든 릴레이가 동일한 `draft_id` 를 가졌습니다.
+///   25건 릴레이가 전부 같은 `draft_id` 로 `upsert_item` 을 호출하여
+///   서로를 덮어쓰고 마지막 릴레이만 남는 사고가 발생했습니다.
+///   `target_type` 을 해시에 포함시켜 릴레이 대상마다 고유한 `draft_id` 를 부여합니다.
+pub fn relay_id(raw: &str, target_type: &str) -> String {
     if !is_valid_relay_key(raw) {
         return String::new();
     }
     let n = normalize_identifier(raw);
     if n.is_empty() { return String::new(); }
-    hash_id(&n)
+    hash_id(&format!("{}{}", target_type, n))
 }
 
 /// 릴레이 키로 쓸 자격이 있는지 판정합니다.

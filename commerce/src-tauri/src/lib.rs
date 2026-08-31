@@ -131,6 +131,22 @@ async fn stop_current_extraction(
         *w = None;
     }
 
+    // 🌟 [STOP-THEN-RESUME]
+    // stop_current_extraction 은 "현재 작업 중단"이지 "이후 작업 영구 차단"이 아닙니다.
+    // 여기서 정지 신호를 해제하지 않으면, 특히 btn-reset-db(전체 초기화) 이후
+    // 전처리/추출 작업 시 스케줄러 루프가
+    // "⏸️ Extraction stop signal active. Waiting for resume..." 에서
+    // 영원히 벗어나지 못합니다.
+    // (window.location.reload() 는 프론트엔드만 리로드하고 백엔드 프로세스는
+    //  리로드되지 않으므로, 정지 신호가 백엔드에 영구 잔존합니다)
+    //
+    // 현재 태스크는 이미 위쪽에서:
+    //   · cancellation_token = true 로 체크되어 중단되거나
+    //   · deep_purge_resources / 모델 언로드 로 사실상 중단되었으므로,
+    // 여기서 즉시 해제해도 안전합니다.
+    state.cancellation_token.store(false, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(false);
+
     Ok("Stop signal sent and resources cleaned.".to_string())
 }
 
@@ -170,7 +186,12 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     }
 
     state.cancellation_token.store(false, Ordering::SeqCst);
-
+    // 🌟 [UNLOAD RESET]
+    // stop_current_extraction 이 남긴 파일 기반 정지 신호까지 반드시 해제합니다.
+    // 이 줄이 없으면 리로드 후 스케줄러가
+    //   "⏸️ Extraction stop signal active. Waiting for resume..."
+    // 에서 영원히 빠져나오지 못합니다.
+    crate::utils::set_extraction_stop_signal(false);
     println!("[UNLOAD] Model, Store and Cancellation flag cleared.");
     Ok("Memory cleared.".to_string())
 }
@@ -3583,18 +3604,28 @@ async fn delete_all_models() -> Result<String, String> {
 async fn reset_lancedb(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let store_guard = state.store.lock().await;
+    let mut store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         db.reset_database().await.map_err(|e| e.to_string())?;
         println!("[RESET] LanceDB fully reset completed.");
         Ok("LanceDB reset complete.".to_string())
     } else {
-        // Store가 아직 초기화되지 않은 경우 직접 생성해서 리셋
+        // 🌟 Store 가 비어 있는 상태 (예: unload_model 직후) 입니다.
+        //    새 커넥션을 만들고 반드시 주입해야 스케줄러가 태스크를 볼 수 있습니다.
         let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
+        let _ = std::fs::create_dir_all(&db_path);
         match VectorStore::new(&db_path).await {
             Ok(s) => {
                 s.reset_database().await.map_err(|e| e.to_string())?;
-                println!("[RESET] LanceDB fully reset completed (fresh connection).");
+                // 🌟 [TABLE RE-CREATE] reset_database 는 전 테이블을 드롭합니다.
+                //    직후 초기화하지 않으면 add_task / add_message 가 실패합니다.
+                let _ = s.init_task_table().await;
+                let _ = s.init_all_tables().await;
+                let _ = s.cleanup_unfinished_tasks_on_startup().await;
+                // 🌟 [RE-INJECT] 스케줄러가 들고 있는 Arc 에 주입합니다.
+                //    이 줄이 없으면 스케줄러는 영원히 store = None 입니다.
+                *store_guard = Some(s);
+                println!("[RESET] LanceDB fully reset completed (fresh connection). Store re-injected into scheduler.");
                 Ok("LanceDB reset complete.".to_string())
             },
             Err(e) => Err(format!("Failed to connect to LanceDB for reset: {}", e)),
@@ -3950,18 +3981,14 @@ pub fn run() {
                         let store_guard = store_clone.lock().await;
                         if let Some(db) = store_guard.as_ref() {
                             let now = chrono::Utc::now().timestamp_millis();
-                            
-                            
                             let zero_addr = "0x0000000000000000000000000000000000000000";
                             let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or(zero_addr).to_string();
-                            
                             let raw_to = payload_val.get("to").and_then(|v| v.as_str()).unwrap_or("");
                             let team_id = if raw_to.is_empty() || raw_to == zero_addr {
                                 crate::utils::hash::hash_id(&from_addr)
                             } else {
                                 raw_to.to_string()
                             };
-
                             let task = crate::store::Task {
                                 id: payload_val.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
@@ -3972,16 +3999,12 @@ pub fn run() {
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
                             let msg_text = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
-                            
                             let _ = db.add_message(
                                 &task.id, "system_task", &msg_text, Some(&task.id), Some(10),
                                 Some(&task.cc), Some(&task.bcc), Some(&task.r#ref),
                                 Some(&task.from), Some(&task.to), Some("talk"), None
                             ).await;
-                            
                             let _ = db.add_task(task.clone()).await;
-                            
-                            
                             let _ = app_handle.emit("task-db-registered", json!({
                                 "task_id": task.id,
                                 "status": task.status,
@@ -3989,6 +4012,21 @@ pub fn run() {
                                 "text": msg_text
                             }));
                             crate::utils::sync_utils::notify_new_task();
+                        } else {
+                            // 🌟 [TASK DROP DIAGNOSTIC]
+                            //  ── 무엇이 문제였나 ──
+                            //   store 가 None 일 때 이 리스너는 로그 없이 태스크를 버렸습니다.
+                            //   사용자는 이미지가 큐에 들어간 것처럼 보이지만,
+                            //   실제로는 DB 에 아무것도 저장되지 않은 상태였습니다.
+                            //   이 로그가 찍히면 reset_lancedb 의 재주입이 실패했다는 증거입니다.
+                            let task_id = payload_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let task_type = payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            println!(
+                                "[TASK DROP] 🚨 new-task-from-browser 가 수신했으나 Store 가 None 입니다. \
+                                 태스크 '{}' (type='{}') 가 DB 에 저장되지 않았습니다. \
+                                 팩토리 리셋 후 reset_lancedb 가 Store 를 재주입했는지 확인하세요.",
+                                task_id, task_type
+                            );
                         }
                     });
                 }

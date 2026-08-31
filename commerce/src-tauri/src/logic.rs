@@ -353,6 +353,105 @@ pub fn trade_reference_field_of(doc_type: &str) -> Option<&'static str> {
     Some(f)
 }
 
+/// 🌟 [DOC TYPE TO CODE] 문서 전체 이름을 코드로 변환합니다.
+///  저장 시 `type_`은 전체 이름(예: "COMMERCIAL INVOICE")으로 설정되지만,
+///  릴레이 검색 시 `target_type`은 코드(예: "CI", "BL")입니다.
+///  타입 검증 시 이 둘을 매칭하기 위해 이 함수가 필요합니다.
+pub fn doc_type_to_code(doc_type: &str) -> String {
+    match doc_type.to_uppercase().as_str() {
+        "COMMERCIAL INVOICE" => "CI".to_string(),
+        "PROFORMA INVOICE" => "PI".to_string(),
+        "PACKING LIST" => "PL".to_string(),
+        "BILL OF LADING" => "BL".to_string(),
+        "HOUSE BILL OF LADING" => "HBL".to_string(),
+        "SEA WAYBILL" => "SWB".to_string(),
+        "AIR WAYBILL" => "AWB".to_string(),
+        "SHIPPING ADVICE" => "SA".to_string(),
+        "DELIVERY ORDER" => "DO".to_string(),
+        "ARRIVAL NOTICE" => "AN".to_string(),
+        "BOOKING CONFIRMATION" => "BC".to_string(),
+        "BOOKING NOTE" => "BK".to_string(),
+        "SHIPPING REQUEST" => "SR".to_string(),
+        "FREIGHT INVOICE" => "FI".to_string(),
+        "FORWARDER CERTIFICATE OF RECEIPT" => "FCR".to_string(),
+        "PROOF OF DELIVERY" => "POD".to_string(),
+        "CARGO MANIFEST" => "CM".to_string(),
+        "WAREHOUSE RECEIPT" => "WR".to_string(),
+        "EXPORT DECLARATION" => "ED".to_string(),
+        "IMPORT DECLARATION" => "ID".to_string(),
+        "CUSTOMS INVOICE" => "CINV".to_string(),
+        "CERTIFICATE OF ORIGIN" => "CO".to_string(),
+        "CUSTOMS CLEARANCE CERTIFICATE" => "CCC".to_string(),
+        "CERTIFICATE OF NON-MANIPULATION" => "CNM".to_string(),
+        "CONSIGNMENT SUMMARY INVOICE" => "CSI".to_string(),
+        "INSPECTION CERTIFICATE" => "IC".to_string(),
+        "WEIGHT CERTIFICATE" => "WC".to_string(),
+        "CERTIFICATE OF ANALYSIS" => "CA".to_string(),
+        "PHYTOSANITARY CERTIFICATE" => "PHYTO".to_string(),
+        "HEALTH CERTIFICATE" => "HC".to_string(),
+        "BENEFICIARY CERTIFICATE" => "BEN_CERT".to_string(),
+        "FUMIGATION CERTIFICATE" => "FC".to_string(),
+        "CARGO DAMAGE SURVEY REPORT" => "CDR".to_string(),
+        "DANGEROUS GOODS DECLARATION" => "DGD".to_string(),
+        "MATERIAL SAFETY DATA SHEET" => "MSDS".to_string(),
+        "POWER OF ATTORNEY" => "POA".to_string(),
+        "BUSINESS LICENSE" => "BIZ_LIC".to_string(),
+        "INSURANCE POLICY" => "INS".to_string(),
+        "INSURANCE CLAIM FORM" => "ICF".to_string(),
+        "PURCHASE ORDER" => "PO".to_string(),
+        "SALES CONTRACT" => "SC".to_string(),
+        "LETTER OF CREDIT" => "LC".to_string(),
+        "LOCAL LETTER OF CREDIT" => "LLC".to_string(),
+        "CONFIRMATION OF PURCHASE" => "CP".to_string(),
+        "BILL OF EXCHANGE" => "BE".to_string(),
+        "TRUST RECEIPT" => "TR".to_string(),
+        "LETTER OF GUARANTEE" => "LG".to_string(),
+        "EXPORT LICENSE" => "EL".to_string(),
+        "STATEMENT OF ACCOUNT" => "SOA".to_string(),
+        "DEBIT NOTE" => "DN".to_string(),
+        "CREDIT NOTE" => "CN".to_string(),
+        "TAX INVOICE" => "TI".to_string(),
+        // 코드가 이미 코드인 경우 대문자화하여 그대로 반환
+        "CI" | "PI" | "SC" | "LC" | "LLC" | "CP" | "BE" | "TR" | "LG" | "EL"
+        | "PL" | "BL" | "HBL" | "SWB" | "AWB" | "SA" | "DO" | "AN"
+        | "BC" | "BK" | "SR" | "FCR" | "POD" | "CM" | "FI" | "WR"
+        | "ED" | "ID" | "CINV" | "CO" | "CCC" | "CNM" | "CSI"
+        | "IC" | "WC" | "CA" | "COA" | "PHYTO" | "PC" | "HC" | "BEN_CERT" | "FC" | "CDR"
+        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS" | "IP" | "ICF"
+        | "SOA" | "DN" | "CN" | "TI" => doc_type.to_uppercase(),
+        // 🌟 [TITLE REVERSE LOOKUP] 위 match 에 없는 전문은 TRADE_DOC_TITLES 로 역조회합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   같은 '코드 ↔ 전문' 사전이 이 함수와 TRADE_DOC_TITLES 두 벌로 존재해
+        //   실제로 어긋나 있었습니다. 아래는 TRADE_DOC_TITLES 에는 있는데
+        //   위 match 에는 없어 코드로 접히지 않던 전문입니다.
+        //     "fumigation certificate"   → FC
+        //     "purchase confirmation"    → CP   (match 는 "CONFIRMATION OF PURCHASE" 만 보유)
+        //     "consignment summary invoice" 표기 불일치 계열
+        //   코드로 접히지 않으면 entity_index / entity_bcc 가 전문으로 만들어져
+        //   목록 필터와 릴레이가 통째로 어긋납니다.
+        //   TITLE GATE 가 쓰는 사전과 저장이 쓰는 사전은 반드시 같아야 합니다.
+        _ => {
+            let upper = doc_type.to_uppercase();
+            let norm = |s: &str| -> String {
+                s.chars()
+                    .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { ' ' })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let key = norm(&upper);
+            for (code, title) in TRADE_DOC_TITLES.iter() {
+                if norm(title) == key {
+                    return code.to_string();
+                }
+            }
+            upper
+        }
+    }
+}
+
 /// 🌟 [ALL REFERENCE FIELDS] 무역 문서가 가질 수 있는 모든 참조 축 목록입니다.
 ///  STEP C 정규화(FLATTEN)와 검색 조건 화이트리스트가 같은 목록을 공유해야
 ///  저장(정방향)과 조회(역방향)가 같은 이름 공간에서 만납니다.
