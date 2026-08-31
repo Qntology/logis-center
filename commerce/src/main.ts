@@ -2055,6 +2055,271 @@ async function syncAnalyticsInBackground() {
     await syncAnalyticsData();
 }
 
+// =====================================================================
+// 🌟 [TRADING TRACK] trading.logis.center 전용 동기화 (mode='shipping')
+// ---------------------------------------------------------------------
+//  ── commerce / analytic 과 다른 점 ──
+//   ① cc 가 고정 합성 도메인입니다. 무역 서식(B/L PDF · 스캔 이미지)에는
+//      출처 사이트가 없어서, 브라우저 URL 로 cc 를 만들면 '그때 열려 있던 탭' 이
+//      스코프가 되어 같은 선적 서류가 탭마다 다른 버킷으로 흩어집니다.
+//   ② ref 가 '페이지' 가 아니라 '거래 건(hub)' 입니다.
+//      PO → CI → BL → LC 순으로 허브 번호를 찾아 그것으로 묶습니다.
+//      WHERE ref = ? 한 번에 그 거래의 전 서류가 나옵니다.
+//   ③ 서버가 mode / flag 를 물리 컬럼으로 내려줍니다.
+//      commerce D1 에 그 두 컬럼이 없어 클라이언트가 modeOfType 으로 사후 추론하던 것이
+//      무역 서식 mode 오태깅의 근본 원인이었습니다.
+//   ④ data 가 base64(gzip) 문자열로 고정됩니다.
+//      {0:31,1:139,...} / ArrayBuffer / number[] 를 추측하던 세 갈래 분기가 사라집니다.
+// =====================================================================
+const TRADING_API_HOST = "https://trading.logis.center";
+let isTradingSyncRunning = false;
+let lastTradingSyncAt = 0;
+
+/**
+ * 🌟 trading Worker 호출기.
+ *  ⚠️ session_params 는 항상 null 입니다.
+ *     Rust proxy_fetch 는 session_params 가 있으면 hash/token/href 를 쿼리에 덧붙이는데,
+ *     href 가 붙으면 이 Worker 가 '무역 트랙은 href 를 받지 않는다' 는 계약을 깨는 것처럼
+ *     보이게 됩니다. 필요한 파라미터는 여기서 전부 명시합니다.
+ */
+async function tradingApiFetch(
+    query: Record<string, any>,
+    opts: { method?: "GET" | "POST" | "DELETE"; body?: any; gzip?: boolean } = {}
+): Promise<any> {
+    if (!currentSession.hash || !currentSession.token) return null;
+    const method = opts.method || "GET";
+    const sp = new URLSearchParams();
+    sp.append("hash", currentSession.hash);
+    sp.append("token", currentSession.token);
+    if (currentSession.team) sp.append("to", currentSession.team);
+    for (const k of Object.keys(query)) {
+        const v = query[k];
+        if (v === undefined || v === null || v === "") continue;
+        sp.append(k, String(v));
+    }
+    const url = `${TRADING_API_HOST}/?${sp.toString()}`;
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (opts.gzip) headers["Content-Encoding"] = "gzip";
+    const args: any = { url, method, headers, session_params: null };
+    if (opts.body !== undefined) args.body = opts.body;
+    try {
+        return await invoke<any>("proxy_fetch", args);
+    } catch (e) {
+        console.warn(`[SYNC-TRADING] ${method} 실패:`, e);
+        return null;
+    }
+}
+
+/** 서버 → 로컬. 델타 커서는 서버가 확정해 준 cursor 를 그대로 씁니다. */
+async function pullTradingData(): Promise<number> {
+    const since = Number((await kvGet("trading_sync_cursor")) || 0);
+    const now = Date.now();
+    // 🌟 [CURSOR] created_at 은 '상한' 입니다. now - timezoneOffset 을 쓰면
+    //    UTC- 지역에서 최근 문서가 통째로 잘립니다. 반드시 미래여야 합니다.
+    const upper = Math.max(now, now - timezoneOffset) + 60_000;
+    const res = await tradingApiFetch({ since: since, created_at: upper, limit: 1000 });
+    if (!res || !Array.isArray(res.results)) return 0;
+    if (res.results.length === 0) {
+        if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
+        return 0;
+    }
+    const tombs = await loadItemTombstones();
+    let tombBlocked = 0;
+    const items: any[] = [];
+    for (const row of res.results) {
+        if (!row || !row.id) continue;
+        if (tombs.has(String(row.id))) { tombBlocked++; continue; }
+        const parsed: any = decodeAnalyticBlob(row.data) || {};
+        // 서버 봉투가 진실의 원천입니다. data 안의 값보다 우선합니다.
+        parsed.id = row.id;
+        parsed.type = row.type;
+        parsed.mode = row.mode || "shipping";
+        parsed.flag = row.flag || "";
+        parsed.cc = row.cc || "";
+        parsed.bcc = row.bcc || "";
+        parsed.ref = row.ref || "";
+        parsed.digest = row.digest || "";
+        parsed.created_at = Number(row.created_at || 0);
+        parsed.updated_at = Number(row.updated_at || 0);
+        const textVal =
+            (typeof parsed.text === "string" ? parsed.text.trim() : "")
+            || (typeof parsed.summary === "string" ? parsed.summary.trim() : "");
+        items.push({
+            id: row.id,
+            table: "items",
+            type: row.type,
+            flag: row.flag || "",
+            from: row.from || "",
+            to: row.to || "",
+            cc: row.cc || "",
+            bcc: row.bcc || "",
+            ref: row.ref || "",
+            mode: row.mode || "shipping",
+            digest: row.digest || "",
+            status: 9,
+            created_at: Number(row.created_at || 0),
+            updated_at: Number(row.updated_at || 0),
+            text: textVal,
+            masked_text: textVal,
+            data: parsed
+        });
+    }
+    if (tombBlocked > 0) {
+        console.log(`[SYNC-TRADING] 🪦 삭제된 문서 ${tombBlocked}건의 재삽입을 차단했습니다.`);
+    }
+    if (items.length > 0) {
+        await invoke("upsert_items", { items });
+        if (appDb) {
+            await appDb.table("items").bulkPut(normalizeEnvelope(items)).catch(() => null);
+        }
+        const brief: Record<string, number> = {};
+        for (const it of items) brief[it.type] = (brief[it.type] || 0) + 1;
+        console.log(`[SYNC-TRADING] ⬇️ 수신 ${res.results.length}건 / 저장 ${items.length}건 ${JSON.stringify(brief)}`);
+    }
+    if (res.cursor) await kvSet("trading_sync_cursor", String(res.cursor));
+    return items.length;
+}
+
+/**
+ * 로컬 → 서버.
+ *  ── 대상 선별 ──
+ *   Dexie 의 mode='shipping' 행 중 max(updated_at, created_at) 가
+ *   마지막 푸시 커서보다 큰 것만 보냅니다.
+ *   서버에서 내려온 문서가 그대로 되돌아가는 에코는 서버의 digest SKIP GUARD 가
+ *   전량 흡수하므로(쓰기 0회) 비용이 사실상 없습니다.
+ */
+async function pushTradingData(): Promise<number> {
+    if (!appDb) return 0;
+    const pushedCursor = Number((await kvGet("trading_push_cursor")) || 0);
+    let rows: any[] = [];
+    try {
+        rows = await appDb.table("items").where("mode").equals("shipping").toArray();
+    } catch (e) {
+        console.warn("[SYNC-TRADING] 로컬 조회 실패:", e);
+        return 0;
+    }
+    const stampOf = (r: any) => Math.max(Number(r.updated_at || 0), Number(r.created_at || 0));
+    const candidates = rows
+        .filter((r: any) => r && r.id && stampOf(r) > pushedCursor)
+        .sort((a: any, b: any) => stampOf(a) - stampOf(b));
+    if (candidates.length === 0) return 0;
+    const batch = candidates.slice(0, 200);
+    const payload = {
+        items: batch.map((r: any) => ({
+            id: r.id,
+            type: r.type,
+            flag: r.flag || "",
+            digest: r.digest || (r.data && r.data.digest) || "",
+            created_at: Number(r.created_at || 0),
+            updated_at: Number(r.updated_at || 0),
+            data: r.data || {}
+        }))
+    };
+    const res = await tradingApiFetch({}, { method: "POST", body: payload, gzip: true });
+    if (!res) return 0;
+    const accepted = Number(res.accepted || 0);
+    const skipped = Number(res.skipped || 0);
+    const rejected = Number(res.rejected || 0);
+    // 🌟 [CURSOR ADVANCE] 서버가 accepted + skipped 로 배치 전량을 소화했을 때만
+    //    커서를 전진시킵니다. 거부분이 남아 있으면 그대로 두어 다음 회차에 재시도합니다.
+    if (accepted + skipped >= batch.length) {
+        const maxStamp = batch.reduce((m: number, r: any) => Math.max(m, stampOf(r)), pushedCursor);
+        await kvSet("trading_push_cursor", String(maxStamp));
+    }
+    // 🌟 [ENVELOPE ADOPT] 서버가 확정한 ref/bcc/cc 를 즉시 로컬에 반영합니다.
+    //    다음 폴링을 기다리면 그 사이 로컬 ref 로 조회된 화면이 어긋납니다.
+    if (Array.isArray(res.results) && res.results.length > 0) {
+        const byId = new Map<string, any>();
+        for (const r of batch) byId.set(String(r.id), r);
+        const adopted: any[] = [];
+        for (const srv of res.results) {
+            const local = byId.get(String(srv.id));
+            if (!local) continue;
+            if (local.ref === srv.ref && local.bcc === srv.bcc && local.cc === srv.cc) continue;
+            const data = { ...(local.data || {}) };
+            data.cc = srv.cc;
+            data.bcc = srv.bcc;
+            data.ref = srv.ref;
+            data.mode = srv.mode;
+            data.flag = srv.flag;
+            adopted.push({
+                id: srv.id,
+                table: "items",
+                type: srv.type,
+                flag: srv.flag,
+                from: srv.from,
+                to: srv.to,
+                cc: srv.cc,
+                bcc: srv.bcc,
+                ref: srv.ref,
+                mode: srv.mode,
+                digest: srv.digest,
+                created_at: srv.created_at,
+                updated_at: srv.updated_at,
+                text: local.data?.text || "",
+                masked_text: local.data?.masked_text || local.data?.text || "",
+                data
+            });
+        }
+        if (adopted.length > 0) {
+            await invoke("upsert_items", { items: adopted });
+            if (appDb) await appDb.table("items").bulkPut(normalizeEnvelope(adopted)).catch(() => null);
+            console.log(`[SYNC-TRADING] 🔗 서버 확정 봉투(ref/bcc) ${adopted.length}건을 로컬에 반영했습니다.`);
+        }
+    }
+    console.log(`[SYNC-TRADING] ⬆️ 후보 ${candidates.length}건 중 ${batch.length}건 전송 → 저장 ${accepted} / 스킵 ${skipped} / 거부 ${rejected}`);
+    return accepted;
+}
+
+async function syncTradingData() {
+    if (!currentSession.hash || !currentSession.token) return;
+    if (isTradingSyncRunning) return;
+    isTradingSyncRunning = true;
+    try {
+        // 🌟 push 를 먼저 합니다. pull 이 먼저면 방금 로컬에서 추출한 문서가
+        //    서버 봉투로 덮이기 전에 화면에 노출되어 ref 가 두 번 바뀝니다.
+        const pushedCount = await pushTradingData();
+        const pulledCount = await pullTradingData();
+        if (pushedCount > 0 || pulledCount > 0) {
+            updateSyncBackoff(true);
+            if (currentSearchMode === "shipping") {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+            runLocalEmbeddingSync();
+        } else {
+            updateSyncBackoff(false);
+        }
+    } catch (e) {
+        console.warn("[SYNC-TRADING] Failed:", e);
+    } finally {
+        isTradingSyncRunning = false;
+        lastTradingSyncAt = Date.now();
+        if (!isExtracting && !isSearching) stopSpinner();
+        if (btnSubmit) {
+            const currentVal = searchInput?.value.trim() || "";
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
+    }
+}
+
+// 🌟 [TRADING BACKGROUND] commerce / analytic 탭에 있어도 무역 문서가 계속 흘러야 합니다.
+//    (analytic 백그라운드와 같은 이유 — 탭을 열어야만 받는 구조는 유실을 만듭니다)
+//    30초 스로틀이 걸려 폴링 부하는 사실상 없습니다.
+async function syncTradingInBackground() {
+    if (!currentSession.hash || !currentSession.token) return;
+    if (isTradingSyncRunning) return;
+    const throttleMs = Math.max(30_000, syncCurrentIntervalMs);
+    if (Date.now() - lastTradingSyncAt < throttleMs) return;
+    await syncTradingData();
+}
+
 // 🌟 [COMMERCE BACKGROUND SYNC] analytic 모드에서도 commerce.logis.center D1 과
 //    양방향 동기화를 수행합니다. syncData() 의 commerce 경로를 재사용하되,
 //    UI 갱신(renderNavigation / loadMoreDocs)은 현재 탭이 commerce 일 때만 수행합니다.
@@ -5003,6 +5268,26 @@ async function syncData() {
         if (currentSession.hash && currentSession.email) {
             syncCommerceInBackground();
         }
+        if (currentSession.hash) {
+            syncTradingInBackground();
+        }
+        return;
+    }
+    // 🌟 [TRADING TRACK] shipping 모드는 trading.logis.center 전용 Worker 와 동기화합니다.
+    //
+    //  ── 왜 별도 Worker 인가 ──
+    //   commerce D1 의 items 에는 mode / flag 컬럼이 없어 클라이언트가
+    //   MODE TAGGING / FLAG RECOVERY 로 사후 보강해 왔고, 그 보강 누락이
+    //   무역 서식 19종이 mode='commerce' 로 굳은 직접 원인이었습니다.
+    //   trading D1 은 두 컬럼을 물리 컬럼으로 갖고 있어 그 해킹이 필요 없습니다.
+    if (currentSearchMode === "shipping") {
+        await syncTradingData();
+        if (currentSession.hash) {
+            syncAnalyticsInBackground();
+        }
+        if (currentSession.hash && currentSession.email) {
+            syncCommerceInBackground();
+        }
         return;
     }
     // 🌟 [ANALYTICS BACKGROUND] commerce / shipping 탭에 있어도 analytics 이벤트를 계속 받습니다.
@@ -5013,6 +5298,10 @@ async function syncData() {
     //     30초 스로틀이 걸려 있어 폴링 부하는 사실상 없습니다.
     if (currentSession.hash) {
         syncAnalyticsInBackground();
+    }
+    // 🌟 [TRADING BACKGROUND] 같은 이유로 무역 문서도 탭과 무관하게 흘러야 합니다.
+    if (currentSession.hash) {
+        syncTradingInBackground();
     }
     if (!currentSession.hash || !currentSession.email) return;
     
@@ -5514,6 +5803,13 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         if (currentSearchMode === "analytic" && currentSession.hash) {
             lastAnalyticsSyncAt = 0; // 스로틀 해제
             syncAnalyticsData();
+        }
+        // 🌟 [IMMEDIATE PULL / TRADING] shipping 으로 전환한 직후도 동일합니다.
+        //    무역 트랙은 문서 수가 적고 폴링 간격이 최대 30초까지 늘어나므로,
+        //    탭을 눌렀는데 30초간 빈 화면이 유지되는 체감을 없앱니다.
+        if (currentSearchMode === "shipping" && currentSession.hash) {
+            lastTradingSyncAt = 0; // 스로틀 해제
+            syncTradingData();
         }
 
         const _isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
@@ -9280,6 +9576,11 @@ document.getElementById("btn-logout")?.addEventListener("click", async () => {
         // 🌟 [LOGOUT CLEANUP] 이전 계정 기반 검색 모드 / 숨김 페이지 / 음차 캐시 정리
         await kvRemove("search_mode");
         await kvRemove("hidden_pages");
+        // 🌟 [TRADING CURSOR] 델타 커서는 계정(팀) 단위 상태입니다.
+        //    남겨 두면 다른 계정으로 로그인했을 때 그 팀의 과거 문서를
+        //    '이미 받았다' 고 오판해 초기 동기화가 통째로 비게 됩니다.
+        await kvRemove("trading_sync_cursor");
+        await kvRemove("trading_push_cursor");
         // 🌟 [LOGOUT EMBED RESET] 이전 계정 문서의 embed 플래그를 리셋하지 않습니다.
         //    LanceDB 는 계정 무관 로컬 저장소이므로, 재로그인 시
         //    initialize_hub 의 migrate_team_identity 가 to 필드만 갱신합니다.

@@ -44,37 +44,21 @@ pub struct ForeignInfo {
 #[allow(dead_code)]
 
 pub fn parse_status(status: &str) -> i32 {
-
     match status {
-
         "progress" => 1,
-
         "stop" => 2,
-
         "cancel" => 3,
-
         "refund" => 4,
-
         "return" => 5,
-
         "error" => 6,
-
         "expire" => 7,
-
         "exchange" => 8,
-
         "complete" => 9,
-
         "draft" => 10,
-
         "show" => 11,
-
         "hide" => 12,
-
         _ => 0,
-
     }
-
 }
 
 

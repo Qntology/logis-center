@@ -2204,3 +2204,105 @@ pub fn plan_trade_relays(doc_type: &str, data: &Value, doc_lang: &str) -> Vec<(&
     }
     plan
 }
+
+// =====================================================================
+// 🌟 [TRADING SCOPE] 무역 트랙의 cc / ref 축
+// ---------------------------------------------------------------------
+//  ── 왜 별도 축이 필요한가 ──
+//   commerce 의 cc 는 '어느 쇼핑몰에서 왔는가' 이고 ref 는 '어느 페이지인가' 입니다.
+//   무역 서식(B/L PDF · 스캔 이미지)에는 출처 사이트도 페이지도 없습니다.
+//   브라우저 URL 로 두 축을 만들면 '그때 열려 있던 탭' 이 스코프가 되어,
+//   같은 선적 서류가 탭에 따라 다른 버킷으로 흩어집니다.
+//
+//  ── 대체 정의 ──
+//   cc  = hash_id(TRADING_HOST)                  고정 합성 도메인
+//   ref = hash_id(team + cc + '#' + hub_key)     '거래 건' 단위
+//   commerce 의 ref 가 '페이지' 였던 자리에 '선적/거래 건' 이 들어갑니다.
+//
+//  ⚠️ trading Worker(src/index.ts)의 tradingRef / resolveHubKey 와
+//     '문자 단위로 동일' 해야 합니다. 한쪽만 바꾸면 같은 문서에
+//     서버 ref / 로컬 ref 두 벌이 생겨 스코프가 갈립니다.
+// =====================================================================
+
+/// 무역 트랙의 합성 도메인. commerce Worker 가 홈 화면에 'logis.center' 를
+/// 쓰는 것과 같은 계보이며, 실제 사이트가 없는 트랙 자체를 하나의 도메인으로 봅니다.
+pub const TRADING_HOST: &str = "trading.logis.center";
+
+/// 🌟 무역 트랙의 cc. 요청/URL 로 바뀌지 않는 상수입니다.
+pub fn trading_cc() -> String {
+    crate::utils::hash::hash_id(TRADING_HOST)
+}
+
+/// 🌟 허브 우선순위. logic.rs 의 TRADE_HUB_TYPES 와 같은 순서입니다.
+///    PO(거래 시작) → CI(물품 명세) → BL(운송) → LC(결제 보증)
+const TRADE_HUB_FIELDS: &[(&str, &str)] = &[
+    ("PO", "reference_po"),
+    ("CI", "reference_invoice"),
+    ("BL", "reference_bl"),
+    ("LC", "reference_lc"),
+];
+
+/// 🌟 [HUB KEY] 이 문서가 속한 '거래 건' 의 씨앗을 고릅니다.
+///
+///  ── 순서와 근거 ──
+///   ① 허브 참조(PO → CI → BL → LC)가 있으면 그것이 이 거래의 뿌리입니다.
+///   ② 없고 자기 자신이 허브 타입이면 자기 doc_number 가 뿌리입니다.
+///      (PO 문서에는 reference_po 가 없습니다. 자기가 시작점이기 때문입니다)
+///   ③ 그래도 없으면 TRADE_RELAY_FIELDS 의 아무 참조라도 잡아 최소 묶음을 만듭니다.
+///   ④ 전부 실패하면 자기 doc_number, 그것도 없으면 id 로 고립시킵니다.
+///
+///  ④ 로 떨어져도 손해가 없습니다. ref 가 자기 자신만 담는 1건짜리 거래가 될 뿐,
+///  다른 거래에 섞이지 않습니다. '틀린 묶음' 보다 '고립' 이 항상 안전합니다.
+///
+///  ⚠️ 값 탐색은 find_relay_value(루트 → 카테고리 객체 → 배열 원소)를 그대로 씁니다.
+///     루트만 보면 header/logistics/containers 안의 참조를 통째로 놓칩니다.
+pub fn resolve_trade_hub_key(doc_type: &str, data: &Value, fallback_id: &str) -> String {
+    let norm = |s: &str| crate::utils::hash::normalize_identifier(s);
+    // ① 허브 참조
+    for (_, field) in TRADE_HUB_FIELDS.iter() {
+        if let Some(v) = find_relay_value(data, field) {
+            let n = norm(&v);
+            if !n.is_empty() { return n; }
+        }
+    }
+    // ② 자기 자신이 허브 타입
+    let code = doc_type.trim().to_uppercase();
+    let self_no = find_relay_value(data, "doc_number")
+        .map(|v| norm(&v))
+        .unwrap_or_default();
+    if TRADE_HUB_FIELDS.iter().any(|(c, _)| *c == code) && !self_no.is_empty() {
+        return self_no;
+    }
+    // ③ 아무 참조라도
+    for (_, fields) in TRADE_RELAY_FIELDS.iter() {
+        for f in fields.iter() {
+            if *f == "doc_number" { continue; }
+            if let Some(v) = find_relay_value(data, f) {
+                let n = norm(&v);
+                if !n.is_empty() { return n; }
+            }
+        }
+    }
+    // ④ 최후
+    if !self_no.is_empty() { return self_no; }
+    norm(fallback_id)
+}
+
+/// 🌟 [TRADING REF] commerce 의 hash_id(team + cc + link) 자리에 hub_key 가 들어갑니다.
+///    이 한 값으로 그 거래의 전 서류(PI / CI / BL / SOA ...)가 한 스코프에 묶입니다.
+pub fn trading_ref(team: &str, cc: &str, hub_key: &str) -> String {
+    crate::utils::hash::hash_id(&format!("{}{}#{}", team, cc, hub_key))
+}
+
+/// 🌟 [TRADING ENVELOPE] doc_type + data 로 (cc, bcc, ref) 를 한 번에 확정합니다.
+///    호출부가 세 축을 따로 계산하면 그중 하나만 어긋나는 사고가 반복됩니다.
+///    bcc 는 entity_bcc 와 동일한 hash_id(type + cc) 이며 평문 cc 를 씁니다.
+pub fn trading_envelope(team: &str, doc_type: &str, data: &Value, fallback_id: &str)
+    -> (String, String, String)
+{
+    let cc = trading_cc();
+    let bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, cc));
+    let hub = resolve_trade_hub_key(doc_type, data, fallback_id);
+    let r = trading_ref(team, &cc, &hub);
+    (cc, bcc, r)
+}
