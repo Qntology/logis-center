@@ -455,17 +455,14 @@ impl Siglip2VisionModel {
         Tensor::from_vec(out, (1, rows * cols, d), &self.device)?.to_dtype(self.dtype)
     }
 
-    /// 핵심 순전파.
-    ///
-    /// 입력:  pixel_values (1, 3, H, W) — 정규화된 이미지
-    ///        grid_rows / grid_cols     — 전처리기가 확정한 패치 격자
-    /// 출력:  VisionForward { patch_hidden, patch_shared, pooled }
-    pub fn forward(
+    /// 🌟 [TRUNK] 패치 임베딩 → 위치 보간 → 27층 → post LayerNorm.
+    ///    forward 와 forward_pooled 가 공유하는 공통 경로입니다.
+    fn trunk(
         &self,
         pixel_values: &Tensor,
         grid_rows: usize,
         grid_cols: usize,
-    ) -> Result<VisionForward> {
+    ) -> Result<Tensor> {
         // 1. 패치 임베딩 (Linear)
         let mut x = self.patch_embedding.forward(pixel_values)?;
 
@@ -479,7 +476,21 @@ impl Siglip2VisionModel {
         }
 
         // 4. post LayerNorm
-        let patch_hidden = self.post_layernorm.forward(&x)?;
+        self.post_layernorm.forward(&x)
+    }
+
+    /// 핵심 순전파.
+    ///
+    /// 입력:  pixel_values (1, 3, H, W) — 정규화된 이미지
+    ///        grid_rows / grid_cols     — 전처리기가 확정한 패치 격자
+    /// 출력:  VisionForward { patch_hidden, patch_shared, pooled }
+    pub fn forward(
+        &self,
+        pixel_values: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<VisionForward> {
+        let patch_hidden = self.trunk(pixel_values, grid_rows, grid_cols)?;
 
         // 5. 헤드: 풀링 벡터 + 패치별 공유공간 투영
         let pooled = self.head.pool(&patch_hidden)?;
@@ -490,6 +501,26 @@ impl Siglip2VisionModel {
             patch_shared,
             pooled,
         })
+    }
+
+    /// 🌟 [POOLED ONLY] 이미지 전체 벡터만 필요할 때의 경로.
+    ///
+    ///  ── 무엇을 건너뛰는가 ──
+    ///   project_patches 는 패치 252개에 대해
+    ///     proj(v)  : 252 × 1152 × 1152
+    ///     out_proj : 252 × 1152 × 1152
+    ///     mlp fc1  : 252 × 1152 × 4304
+    ///     mlp fc2  : 252 × 4304 × 1152
+    ///   총 약 3.2 GFLOP 이며, 중간 텐서 252 × 4304 × 4B = 4.3MB 가 순간 잡힙니다.
+    ///   LanceDB 인덱싱 / 검색 질의에서는 이 결과를 한 번도 읽지 않습니다.
+    pub fn forward_pooled(
+        &self,
+        pixel_values: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<Tensor> {
+        let patch_hidden = self.trunk(pixel_values, grid_rows, grid_cols)?;
+        self.head.pool(&patch_hidden)
     }
 
     /// 편의 메서드: 공유공간 패치 임베딩만 (num_patches, D) 로 반환합니다.

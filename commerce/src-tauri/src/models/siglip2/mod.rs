@@ -8,6 +8,11 @@ pub mod legibility;
 // 🌟 [STEP 6] 추출값이 크롭 안에 실제로 인쇄되어 있는지 검증
 pub mod value_grounding;
 pub mod tokenizer;
+// 🌟 [ANCHOR CACHE] 정적 앵커 구 임베딩의 메모리 + 디스크 2단 영구 캐시.
+//    구 하나가 27층 × 64토큰 ≈ 26 GFLOP 이고 문서당 345구가 필요하지만,
+//    그 문자열은 logic.rs 상수와 bias.json 에서 나오므로 불변입니다.
+//    캐시가 채워지면 1.4GB 짜리 텍스트 인코더를 아예 올리지 않아도 됩니다.
+pub mod phrase_cache;
 
 
 use candle_core::{DType, Device};
@@ -180,8 +185,26 @@ impl Siglip2Model {
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)?
         };
-
-        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"))?;
+        // 🌟 [CPU EMBEDDING] token_embedding(256000×1152 = 590MB BF16) 만 호스트로 보냅니다.
+        //    index_select 는 산술이 아니라 행 복사이므로 결과가 비트 단위로 같습니다.
+        //    CPU VarBuilder 생성이 실패하면(예: dtype 변환 불가) 종전 경로로 안전하게 폴백합니다.
+        let embed_vb = if device.is_cpu() {
+            None
+        } else {
+            match unsafe {
+                VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &Device::Cpu)
+            } {
+                Ok(v) => Some(v.pp("text_model")),
+                Err(e) => {
+                    println!(
+                        "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"), embed_vb)?;
 
         let logit_scale = vb
             .get(1, "logit_scale")
@@ -251,7 +274,24 @@ impl Siglip2Model {
             VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &self.device)?
         };
 
-        let text_model = text::Siglip2TextModel::new(&self.config, vb.pp("text_model"))?;
+        // 🌟 [CPU EMBEDDING] load_text_only 와 동일 정책. 590MB 를 VRAM 에서 뺍니다.
+        let embed_vb = if self.device.is_cpu() {
+            None
+        } else {
+            match unsafe {
+                VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &Device::Cpu)
+            } {
+                Ok(v) => Some(v.pp("text_model")),
+                Err(e) => {
+                    println!(
+                        "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        let text_model = text::Siglip2TextModel::new(&self.config, vb.pp("text_model"), embed_vb)?;
         self.text = Some(text_model);
 
         let tok = tokenizer::Siglip2Tokenizer::from_dir(
@@ -279,5 +319,44 @@ impl Siglip2Model {
     ///    ensure_siglip2 가 '요구 사양과 현재 상태' 를 비교할 때 씁니다.
     pub fn has_vision(&self) -> bool {
         self.vision.is_some()
+    }
+
+    /// 🌟 [DETACH VISION] 비전 인코더 가중치를 즉시 반납합니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   파이프라인 단계별 실제 요구는 다음과 같습니다.
+    ///     STEP 1 encode_image          : 비전 ✅ / 텍스트 ✗
+    ///     STEP 1 classify_doc_type     : 비전 ✗ / 텍스트 ✅   ← patches 는 이미 호스트
+    ///     STEP 2 build_column_heatmaps : 비전 ✗ / 텍스트 ✅
+    ///     STEP 3 plan_crops / legibility: 둘 다 ✗ (순수 CPU)
+    ///     STEP 5 Qwen 추출              : 둘 다 ✗
+    ///     STEP 6 verify_claims_v2       : 둘 다 ✗ (픽셀 판정)
+    ///   즉 encode_image 가 끝나는 순간 비전 856MB 는 완전한 사표입니다.
+    ///   PatchGrid.patches 는 Vec<Vec<f32>> 로 이미 호스트에 있습니다
+    ///   (252 × 1152 × 4B = 1.16MB).
+    ///
+    ///   구버전에는 load_vision_encoder(부착)만 있고 해제 경로가 없어서,
+    ///   345구를 인코딩하는 가장 무거운 구간에 856MB + 1,416MB = 2.27GB 가
+    ///   동시에 묶여 있었습니다.
+    pub fn detach_vision(&mut self) -> bool {
+        if self.vision.is_none() {
+            return false;
+        }
+        self.vision = None;
+        println!("[SigLIP2] Vision encoder DETACHED (약 856MB VRAM 반납).");
+        true
+    }
+
+    /// 🌟 [DETACH TEXT] 텍스트 인코더 + 토크나이저를 반납합니다.
+    ///    앵커 캐시가 채워진 뒤 STEP 3 로 넘어갈 때 호출하면
+    ///    Qwen3.5 를 올리기 전에 1,416MB(또는 CPU 임베딩 적용 시 826MB)를 비웁니다.
+    pub fn detach_text(&mut self) -> bool {
+        if self.text.is_none() && self.tokenizer.is_none() {
+            return false;
+        }
+        self.text = None;
+        self.tokenizer = None;
+        println!("[SigLIP2] Text encoder DETACHED.");
+        true
     }
 }

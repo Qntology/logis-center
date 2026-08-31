@@ -1172,6 +1172,20 @@ impl LogisModel {
             dtype, needs_vision, needs_text
         );
 
+        // 🌟 [NO-OP GUARD] 둘 다 필요 없다고 요청하면 아무것도 올리지 않습니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   아래 신규 로드 분기는 `!needs_vision && needs_text` 만 텍스트 전용으로 보내고,
+        //   나머지를 전부 load_vision_only 로 흘려보냅니다.
+        //   그래서 (false, false) 조합이 들어오면 "아무것도 필요 없다" 는 요청에
+        //   비전 856MB 를 올려 주는 정반대 동작을 합니다.
+        //   현재 호출부에는 이 조합이 없지만, LAZY TEXT 도입 후 슬롯이 비어 있는 상태에서
+        //   도달할 여지가 생기므로 진입 지점에서 차단합니다.
+        if !needs_vision && !needs_text {
+            println!("[MODEL] SigLIP2 ensure requested with no encoder. Nothing to load.");
+            return Ok(());
+        }
+
         let model = tokio::task::spawn_blocking(move || {
             let dir = std::path::Path::new(&path);
             let config_path = dir.join("config.json");
@@ -1289,6 +1303,59 @@ impl LogisModel {
         unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
         #[cfg(target_os = "macos")]
         unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+    }
+
+    /// 🌟 [LAZY TEXT] SigLIP2 텍스트 인코더를 '캐시 미스가 실제로 발생했을 때만' 올립니다.
+    ///
+    ///  ── 왜 이 구조인가 ──
+    ///   "필요한 앵커 구 목록을 미리 만들어 캐시 적중 여부를 검사" 하는 방식은
+    ///   build_column_heatmaps 의 구 수집 로직(자기참조 드롭 / doc_type 드롭 /
+    ///   LABEL+VALUE 이중축 / 표 구조 앵커 편입)을 통째로 복제해야 합니다.
+    ///   그 복제본이 원본과 한 줄이라도 어긋나면 게이트가 거짓말을 하고
+    ///   파이프라인이 하드 에러로 죽습니다. 유지보수 비용이 이득보다 큽니다.
+    ///
+    ///   대신 '해 보고, 정말 못 하면 그때 올린다' 로 뒤집습니다.
+    ///   encode_phrases_shared 는 캐시 미스가 있을 때만
+    ///   ERR_TEXT_ENCODER_REQUIRED 접두어를 붙여 실패하고, 그 실패는
+    ///   build_anchor_bank 가 순전파를 시작하기 '전' 에 발생하므로 낭비가 0 입니다.
+    ///
+    ///  ── 락 안전성 ──
+    ///   1차 시도의 가드는 스코프 블록으로 수명을 고정해 .await 이전에 반드시 해제됩니다.
+    ///   tokio Mutex 는 재진입이 불가능하므로(이 파일의 [SCOPED LOCK] 주석과 같은 이유)
+    ///   ensure_siglip2_ext 가 같은 락을 기다리다 셀프 데드록되는 경로를 만들지 않습니다.
+    async fn with_siglip_text<T, F>(&self, what: &str, f: F) -> anyhow::Result<T>
+    where
+        F: Fn(&crate::models::siglip2::Siglip2Model) -> anyhow::Result<T> + Send,
+        T: Send,
+    {
+        use crate::models::siglip2::vision_encoder::ERR_TEXT_ENCODER_REQUIRED;
+
+        // ── 1차 : 현재 상태 그대로 시도합니다. 앵커가 전부 캐시에 있으면 여기서 끝납니다. ──
+        {
+            let guard = self.siglip2_model.lock().await;
+            if let Some(m) = guard.as_ref() {
+                match f(m) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        if !e.to_string().contains(ERR_TEXT_ENCODER_REQUIRED) {
+                            return Err(e);
+                        }
+                        println!(
+                            "[SigLIP2] '{}' 에 필요한 앵커 구 일부가 캐시에 없습니다. 텍스트 인코더를 지금 부착합니다.",
+                            what
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── 2차 : 텍스트 인코더를 부착한 뒤 1회 재시도합니다. ──
+        self.ensure_siglip2_ext(false, true).await?;
+        let guard = self.siglip2_model.lock().await;
+        let m = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded for '{}'", what))?;
+        f(m)
     }
 
     // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
@@ -1458,25 +1525,45 @@ impl LogisModel {
             let mut extracted_data = json!({});
 
             // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
-            let siglip_guard = self.siglip2_model.lock().await;
-            let siglip = siglip_guard.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+            //
+            // 🌟 [SINGLE LOCK + IMMEDIATE RELEASE]
+            //  구버전은 같은 뮤텍스를 두 번 잡았습니다.
+            //    ① lock → encode_image → drop
+            //    ② lock → m.vision = None
+            //  encode_image_and_release 는 패치를 호스트 Vec 으로 확보한 직후
+            //  같은 가변 참조로 비전 가중치를 반납하므로,
+            //  "패치 확보 = 856MB 반납" 이 한 문장으로 원자화됩니다.
+            //  PatchGrid.patches 는 252 × 1152 × 4B = 1.16MB 로 이미 호스트에 있으므로
+            //  이후 STEP 1 Depth1/2 · STEP 2 · STEP 3 은 비전 없이 동작합니다.
+            let grid = {
+                let mut siglip_guard = self.siglip2_model.lock().await;
+                let siglip = siglip_guard.as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
+                crate::models::siglip2::vision_encoder::encode_image_and_release(
+                    siglip, &dynamic_image
+                ).map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?
+            };
 
-            let grid = crate::models::siglip2::vision_encoder::encode_image(siglip, &dynamic_image)
-                .map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?;
-            drop(siglip_guard);
-
-            // 🌟 비전 인코더 사용 완료 → 메모리 즉시 해제
-            {
-                let mut guard = self.siglip2_model.lock().await;
-                if let Some(m) = guard.as_mut() {
-                    m.vision = None;
-                    println!("[SigLIP2] Vision encoder unloaded after patch extraction ({}x{} patches done).",
-                        grid.grid_rows, grid.grid_cols);
-                }
-            }
-            // 텍스트 인코더 로드 (코드 분류용)
-            self.ensure_siglip2_ext(false, true).await?;
+            // 🌟 [LAZY TEXT] 텍스트 인코더를 여기서 무조건 올리지 않습니다.
+            //
+            //  ── 왜 바꾸는가 ──
+            //   구버전은 ensure_siglip2_ext(false, true) 로 1,416MB 를 즉시 올렸습니다.
+            //   그런데 STEP 1/2 가 텍스트 인코더에 요구하는 것은
+            //   '정적 앵커 구를 벡터로 바꿔 달라' 뿐이고, 그 구는 전부
+            //   logic.rs 상수와 bias.json 에서 나오는 불변 문자열입니다.
+            //   phrase_cache 가 채워진 두 번째 실행부터는 인코더 자체가 불필요합니다.
+            //
+            //  ── 어떻게 안전한가 ──
+            //   아래 모든 텍스트 작업은 with_siglip_text 로 감쌉니다.
+            //   캐시 미스가 실제로 발생하면 ERR_TEXT_ENCODER_REQUIRED 신호를 받아
+            //   그 자리에서 인코더를 부착하고 1회 재시도합니다.
+            //   '무엇이 필요한지 미리 아는' 게이트가 아니라 '해 보고 필요하면 올리는'
+            //   구조라 앵커 사전이 바뀌어도 게이트가 어긋날 수 없습니다.
+            emit_term(&format!(
+                "  🧬 [PATCH GRID READY] {}x{} = {} patches (host {:.2}MB) | 비전 반납 완료, 텍스트는 캐시 미스 시에만 로드",
+                grid.grid_rows, grid.grid_cols, grid.len(),
+                (grid.len() * 1152 * 4) as f64 / 1e6
+            ));
 
             // ── STEP 2.5 : 판독성 맵 ──
             //
@@ -1522,30 +1609,48 @@ impl LogisModel {
             //    · 인보이스/B/L 등 → title_confirmed=true && code != TRACKING → trading 전환
             //    본문 코사인(그룹 점수)은 settlement 이 CI 를 이기는 등 신뢰도가 낮으므로
             //    리라우트 근거로 쓰지 않습니다. (로그: [VISION GROUP] settlement +4.5884 1위)
+            // 🌟 [VERDICT REUSE] 리라우트 프로브의 판정 결과를 보관합니다.
+            //
+            //  ── 실측 낭비 ──
+            //   classify_doc_type 은 (model, grid) 의 순수 함수입니다.
+            //   그런데 커머스→트레이딩 리라우트 경로에서는
+            //     ① 여기(L1528 프로브)  ② STEP 2(L1567 본판정)
+            //   두 번 호출되고, 그 사이 model 도 grid 도 바뀌지 않으므로
+            //   두 번째 호출은 첫 번째와 비트 단위로 같은 값을 다시 계산합니다.
+            //   이 함수는 그룹/전문/코드 3개 앵커 뱅크를 만들며
+            //   uniq 약 345구 × 26 GFLOP ≈ 9 TFLOP 이 듭니다. 두 번이면 18 TFLOP 입니다.
+            //   인보이스 이미지를 커머스 모드로 드롭하는 것은 상시 패턴이므로
+            //   이 중복은 예외가 아니라 기본 동작이었습니다.
+            let mut cached_verdict:
+                Option<crate::models::siglip2::vision_encoder::DocTypeVerdict> = None;
+
             if !is_trade_doc {
-                let sg = self.siglip2_model.lock().await;
-                if let Some(siglip) = sg.as_ref() {
-                    match crate::models::siglip2::vision_encoder::classify_doc_type(siglip, &grid, &emit_term) {
-                        Ok(v) => {
-                            if v.title_confirmed && v.code != "TRACKING" && v.code != "Unknown" {
-                                emit_term(&format!(
-                                    "  🔀 [MODE REROUTE] mode='commerce' 이지만 서식 전문 '{}' 이 인쇄 확인되었습니다. trading 파이프라인으로 전환합니다. (code='{}', margin {:+.4})",
-                                    v.title_text, v.code, v.code_margin
-                                ));
-                                is_trade_doc = true;
-                            } else {
-                                emit_term(&format!(
-                                    "  🛒 [MODE KEEP] mode='commerce' 유지 (title_confirmed={}, code='{}')",
-                                    v.title_confirmed, v.code
-                                ));
-                            }
+                // 🌟 [LAZY TEXT] 앵커가 전부 캐시에 있으면 텍스트 인코더 없이 판정됩니다.
+                match self
+                    .with_siglip_text("doc type classification (reroute probe)", |m| {
+                        crate::models::siglip2::vision_encoder::classify_doc_type(m, &grid, &emit_term)
+                    })
+                    .await
+                {
+                    Ok(v) => {
+                        if v.title_confirmed && v.code != "TRACKING" && v.code != "Unknown" {
+                            emit_term(&format!(
+                                "  🔀 [MODE REROUTE] mode='commerce' 이지만 서식 전문 '{}' 이 인쇄 확인되었습니다. trading 파이프라인으로 전환합니다. (code='{}', margin {:+.4})",
+                                v.title_text, v.code, v.code_margin
+                            ));
+                            is_trade_doc = true;
+                        } else {
+                            emit_term(&format!(
+                                "  🛒 [MODE KEEP] mode='commerce' 유지 (title_confirmed={}, code='{}')",
+                                v.title_confirmed, v.code
+                            ));
                         }
-                        Err(e) => {
-                            emit_term(&format!("  ⚠️ [MODE REROUTE SKIP] 사전 분류 실패로 커머스 경로를 유지합니다: {}", e));
-                        }
+                        cached_verdict = Some(v);
+                    }
+                    Err(e) => {
+                        emit_term(&format!("  ⚠️ [MODE REROUTE SKIP] 사전 분류 실패로 커머스 경로를 유지합니다: {}", e));
                     }
                 }
-                drop(sg);
             }
 
             if is_trade_doc {
@@ -1560,14 +1665,27 @@ impl LogisModel {
                 //    800x1032 픽셀 스캔 2회의 순수 낭비였습니다.
 
                 // ── STEP 2 : Doc Type NMS Battle ──
-                let siglip_guard2 = self.siglip2_model.lock().await;
-                let siglip2 = siglip_guard2.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
-
-                let verdict = crate::models::siglip2::vision_encoder::classify_doc_type(
-                    siglip2, &grid, &emit_term
-                ).map_err(|e| anyhow::anyhow!("SigLIP2 classify failed: {}", e))?;
-                drop(siglip_guard2);
+                //
+                // 🌟 [VERDICT REUSE] 리라우트 프로브가 이미 판정했다면 그 결과를 그대로 씁니다.
+                //    classify_doc_type 은 (model, grid) 의 순수 함수이고 둘 다 그대로이므로
+                //    재호출은 같은 값을 다시 계산할 뿐입니다.
+                //    처음부터 mode='shipping' 으로 들어온 경로에서는 프로브가 없었으므로
+                //    여기서 최초 1회 판정합니다.
+                let verdict = match cached_verdict.take() {
+                    Some(v) => {
+                        emit_term(&format!(
+                            "  ♻️ [VERDICT REUSE] 리라우트 프로브의 판정을 재사용합니다. (code='{}', group='{}', margin {:+.4}) — 앵커 뱅크 3종 재구축을 생략합니다.",
+                            v.code, v.group, v.code_margin
+                        ));
+                        v
+                    }
+                    None => self
+                        .with_siglip_text("doc type classification (step 2)", |m| {
+                            crate::models::siglip2::vision_encoder::classify_doc_type(m, &grid, &emit_term)
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("SigLIP2 classify failed: {}", e))?,
+                };
 
                 let mut detected_type = verdict.code.clone();
 
@@ -1640,14 +1758,17 @@ impl LogisModel {
                     //    가드가 생존한 채 release_siglip2 가 같은 태스크에서 락을 기다리면
                     //    영구 정지(셀프 데드록)합니다. 명시적 drop 에 의존하지 않고
                     //    스코프 블록으로 락 수명을 고정합니다.
-                    let mut heatmaps = {
-                        let siglip_guard3 = self.siglip2_model.lock().await;
-                        let siglip3 = siglip_guard3.as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
-                        crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                            siglip3, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
-                        ).map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?
-                    };
+                    // 🌟 [LAZY TEXT] with_siglip_text 가 락 수명을 스코프로 고정하므로
+                    //    기존 [SCOPED LOCK] 의 셀프 데드록 방어가 그대로 유지됩니다.
+                    //    앵커가 전부 캐시에 있으면 텍스트 인코더 1,416MB 를 올리지 않습니다.
+                    let mut heatmaps = self
+                        .with_siglip_text("column heatmaps (trade)", |m| {
+                            crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                                m, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
+                            )
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
 
                     // 🌟 [TITLE ROW SUPPRESSION] 제목 행은 어떤 필드의 값도 될 수 없습니다.
                     //    실측에서 header 봉우리가 제목/로고 행(r0)에 착지해 doc_number 가 전멸했습니다.
@@ -1844,15 +1965,16 @@ impl LogisModel {
                 emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
 
                 let commerce_page_type = "goods";
-                // 🌟 [SCOPED LOCK] trade 분기와 동일한 셀프 데드락 방지 블록화.
-                let heatmaps = {
-                    let siglip_guard4 = self.siglip2_model.lock().await;
-                    let siglip4 = siglip_guard4.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded"))?;
-                    crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                        siglip4, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
-                    ).map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?
-                };
+                // 🌟 [SCOPED LOCK + LAZY TEXT] trade 분기와 동일한 셀프 데드락 방지 구조를
+                //    with_siglip_text 가 그대로 제공하며, 캐시 미스가 없으면 인코더를 올리지 않습니다.
+                let heatmaps = self
+                    .with_siglip_text("column heatmaps (commerce)", |m| {
+                        crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                            m, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
 
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
                     &heatmaps, &grid, &emit_term
@@ -1970,8 +2092,25 @@ impl LogisModel {
                     grounding_claims.len()
                 ));
 
-                // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
-                self.deep_purge_resources().await;
+                // 🌟 [PURGE 제거] 이 자리의 deep_purge_resources() 는 GROUNDING v1 의 잔재입니다.
+                //
+                //  ── v1 에서는 왜 필요했나 ──
+                //   v1 은 값 텍스트를 SigLIP2 텍스트 인코더로 임베딩해 패치와 코사인을 쟀습니다.
+                //   그래서 Qwen3.5(2GB)를 내리고 SigLIP2 를 다시 올릴 공간이 필요했습니다.
+                //
+                //  ── v2 는 아무 모델도 쓰지 않습니다 ──
+                //   verify_claims_v2 의 인자는 grid 치수 / 원본 크기 / legibility 뿐이고,
+                //   legibility 는 휘도 기울기 기반 순수 CPU 산출물입니다.
+                //   바로 아래 v2 주석이 "SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다" 라고
+                //   명시하고 있는데 purge 호출만 남아 있었습니다.
+                //
+                //  ── 남겨 두면 무엇이 나쁜가 ──
+                //   ① Qwen3.5 2GB 를 파기하므로 다음 이미지 태스크가 GGUF 를 처음부터 다시 읽습니다.
+                //   ② 이 purge 이후 아래 [VISION-JIT] 블록은 qwen3_5_generator == None 이라
+                //      도달해도 아무 일도 하지 않는 죽은 코드가 됩니다.
+                //   ③ scheduler.rs 의 process_task 는 태스크 종료 후 이미
+                //      deep_purge_resources() 를 호출하므로 완전한 중복입니다.
+                //   ④ STEP 6 이후 남은 작업(자연어 변환 / DB 동기화)은 GPU 를 쓰지 않습니다.
 
                 // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
                 //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
