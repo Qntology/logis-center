@@ -384,6 +384,30 @@ async fn reindex_pending_embeddings(
         if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
             continue;
         }
+        // 🌟 [MODE INTEGRITY RECHECK] SQL 필터를 신뢰하지 않고 한 번 더 봅니다.
+        //
+        //  ── 왜 SQL 만으로 부족한가 ──
+        //   mode_filter = "mode = 'commerce'" 로 정확히 걸었는데도
+        //   무역 서식 20건이 잡혔습니다. 필터가 틀린 게 아니라
+        //   그 문서들의 mode 물리 컬럼 자체가 'commerce' 로 잘못 저장되어 있었습니다.
+        //   (뿌리는 upsert_items 의 mode 태깅 결손 — 위에서 수정)
+        //   이미 잘못 저장된 기존 문서는 그 수정으로 고쳐지지 않으므로,
+        //   소비 지점에서 타입 기준으로 재검사해 격리합니다.
+        //
+        //  ── 판정 근거 ──
+        //   canonical_bias_type() 이 'shipping_doc' 으로 접는지만 봅니다.
+        //   서식 목록을 여기에 복제하지 않습니다.
+        {
+            let is_shipping_doc =
+                crate::utils::bias_schema::canonical_bias_type(&doc.r#type) == "shipping_doc";
+            if is_shipping_doc && target_mode != "shipping" {
+                println!(
+                    "[EMBED-LOCAL] 🚢 [MODE MISMATCH] '{}' (type='{}') 은 무역 서식인데 mode='{}' 스캔에 잡혔습니다. 잘못 태깅된 문서이므로 이 트랙에서는 건너뜁니다.",
+                    doc.id, doc.r#type, target_mode
+                );
+                continue;
+            }
+        }
         // 🌟 [CHUNK COUNT FIRST] 청크가 이미 존재하면 로컬 임베딩이 완료된 것이므로
         //    가장 먼저 탈락시킵니다. chunk_count는 물리적 사실이라
         //    embed 플래그(소프트 마커)보다 신뢰도가 높습니다.
@@ -453,8 +477,44 @@ async fn reindex_pending_embeddings(
     model.ensure_embedding().await.map_err(|e| e.to_string())?;
 
     let mut processed = 0usize;
+    let mut yielded_to_task = false;
     for doc in pending {
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
+        // 🌟 [BUSY RECHECK / 매 반복]
+        //
+        //  ── 무엇이 문제였나 ──
+        //   함수 상단의 ACTIVE_TASK_MEM / IS_SEARCHING 가드는 '진입 시 1회' 입니다.
+        //   실측 로그 순서가 정확히 그 사각지대를 보여줍니다.
+        //     [EMBED-LOCAL] 20 pending item(s) detected.   ← 가드 통과 (태스크 없음)
+        //     [Scheduler] New task signal received.        ← 그 다음에 태스크 시작
+        //     [Scheduler] ✅ Model Lock acquired.
+        //   가드는 이미 통과한 뒤이므로 20건 루프가 태스크와 끝까지 병렬로 돕니다.
+        //
+        //  ── Model Lock 이 왜 못 막는가 ──
+        //   위쪽에서 model_guard 를 블록 스코프로 잡았다 clone 후 즉시 놓습니다.
+        //   이 for 루프는 락 없이 clone 만 들고 돕니다.
+        //   LogisModel 내부는 전부 Arc 슬롯이므로 clone 은 같은 VRAM 자원을 만집니다.
+        //
+        //  ── 피해 ──
+        //   스케줄러의 secure_vram_relay 가 퍼지 → VRAM 확보 → 로드 하는 사이
+        //   이 루프의 get_embedding 이 ensure_embedding 을 호출해 임베딩을 되올립니다.
+        //   그 결과 4GB 를 확보하고도 Qwen3 로드 시점엔 756MB 만 남아
+        //   KV 가 RAM 으로 밀려나고([KV-PLAN] → Ram), 전환에 47초가 걸렸습니다.
+        //
+        //  ── 왜 break 인가 ──
+        //   이 작업은 폴링으로 재호출되는 백그라운드 인덱싱입니다.
+        //   남은 문서는 다음 폴링에서 처리되므로 유실이 없습니다.
+        //   반면 태스크는 사용자가 기다리는 전경 작업이라 양보가 옳습니다.
+        if IS_SEARCHING.load(Ordering::SeqCst)
+            || crate::ACTIVE_TASK_MEM.read().map(|m| m.is_some()).unwrap_or(false)
+        {
+            yielded_to_task = true;
+            println!(
+                "[EMBED-LOCAL] ⏸️ 전경 작업(태스크/검색)이 시작되어 로컬 인덱싱을 중단하고 VRAM 을 양보합니다. (이번 회차 {}건 처리 후 중단, 잔여분은 다음 폴링에서 재개)",
+                processed
+            );
+            break;
+        }
         let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
         // 🌟 [BLOB DECODE GUARD] json_data 내부의 "data" 키가 아직
         //    base64(gzip) 문자열로 남아 있으면 해제합니다.
@@ -599,9 +659,18 @@ async fn reindex_pending_embeddings(
     if processed > 0 {
         println!("[EMBED-LOCAL] Cloud-synced items embedded locally: {} item(s). (mode: {})", processed, target_mode);
     }
-
+    // 🌟 [IMMEDIATE RELEASE] 양보로 중단했다면 VRAM 반환이 이 함수의 유일한 목적입니다.
+    //    unload_embedding 은 임베딩 슬롯 + 캐시 + CUDA 풀을 정리하므로
+    //    스케줄러의 wait_for_vram_settle 이 곧바로 목표치를 확보할 수 있습니다.
     model.unload_embedding().await;
-
+    if yielded_to_task {
+        println!("[EMBED-LOCAL] ✅ 임베딩 모델을 즉시 반환했습니다. 전경 작업이 VRAM 을 온전히 사용할 수 있습니다.");
+        return Ok(json!({
+            "processed": processed,
+            "mode": target_mode,
+            "skipped": "yielded_to_foreground"
+        }));
+    }
     Ok(json!({ "processed": processed, "mode": target_mode }))
 }
 
@@ -714,17 +783,21 @@ async fn structure_pending_analytics(
         model_guard.as_ref().unwrap().clone()
     };
 
-    let processed = crate::analytic::run_analytic_structuring(
+    // 🌟 [PURGE ON ANY EXIT] 기존 코드는 `?` 로 조기 반환되면
+    //    deep_purge_resources 에 도달하지 못해 Qwen3.5(2B) 가 VRAM 에 상주한 채
+    //    남았습니다. 그 상태로 스케줄러 태스크가 들어오면 secure_vram_relay 가
+    //    2GB 를 다시 내리느라 통째로 낭비합니다.
+    //    결과를 먼저 받아 두고, 성공/실패와 무관하게 정리한 뒤 판정합니다.
+    let structuring_result = crate::analytic::run_analytic_structuring(
         &store,
         &model,
         &state.cancellation_token,
         &app_handle,
         "analytic_sync",
         limit.unwrap_or(20),
-    ).await.map_err(|e| e.to_string())?;
-
+    ).await;
     model.deep_purge_resources().await;
-
+    let processed = structuring_result.map_err(|e| e.to_string())?;
     Ok(json!({ "processed": processed }))
 }
 
@@ -3135,8 +3208,40 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                             type_str.as_str(),
                             "click" | "hover" | "change" | "report" | "question" | "answer"
                         );
+                        // 🌟 [SHIPPING MODE AUTO-TAG]
+                        //
+                        //  ── 무엇이 문제였나 ──
+                        //   analytics 만 자동 태깅하고 무역 서식(BL/CI/AWB/FC/CN/...)은
+                        //   아무 처리도 하지 않았습니다. mode 가 빈 채로 저장되면
+                        //   하류의 두 폴백이 전부 'commerce' 를 시딩합니다.
+                        //     · indexing.rs   MODE GUARD  → unwrap_or("commerce")
+                        //     · lib.rs        reindex mode → unwrap_or("commerce")
+                        //   그 결과 무역 문서가 commerce 트랙에 굳어버립니다.
+                        //
+                        //  ── 실측 피해 ──
+                        //   reindex_pending_embeddings 는 mode = 'commerce' 로 정확히
+                        //   필터링하는데도 FC/CN/DN/IP/BE/WR/SR/BK/CSI/ID/ED/FCR/POD/
+                        //   AN/DO/AWB/SWB/HBL/BL 20건이 잡혔습니다.
+                        //   필터가 틀린 게 아니라 데이터의 mode 가 틀렸던 것입니다.
+                        //   이 문서들은 commerce 검색(mode = 'commerce')에서 검색되고,
+                        //   정작 shipping 검색(mode = 'shipping')에서는 0건이 됩니다.
+                        //
+                        //  ── 판정 근거 ──
+                        //   서식 코드 55종을 여기에 나열하지 않습니다.
+                        //   canonical_bias_type() 이 이미 그 목록의 단일 소유자이며,
+                        //   'shipping_doc' 으로 접히는지만 확인합니다.
+                        //   bias_schema.rs 에 서식이 추가되어도 이 코드는 그대로입니다.
+                        let is_shipping_doc_type =
+                            crate::utils::bias_schema::canonical_bias_type(type_str.as_str())
+                                == "shipping_doc";
                         if is_analytic_type {
                             obj.insert("mode".to_string(), serde_json::json!("analytic"));
+                        } else if is_shipping_doc_type {
+                            println!(
+                                "[SYNC] 🚢 [MODE AUTO-TAG] id='{}' type='{}' 은 무역 서식이므로 mode='shipping' 으로 태깅합니다.",
+                                id, type_str
+                            );
+                            obj.insert("mode".to_string(), serde_json::json!("shipping"));
                         }
                     }
                 }

@@ -40,6 +40,18 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     //    (log.txt 실측: 21개 청크 중 14개가 masked_text 블롭의 잔재)
                     //    또한 updated_at / created_at / digest 등 시스템 타임스탬프는
                     //    "Its updated at is 0" 이라는 전 아이템 공통 쓰레기 청크를 만들므로 함께 배제합니다.
+                    // 🌟 [SYSTEM COLUMN SKIP] canonical.rs 가 FORCE_NUM / FORCE_BOOL 로
+                    //    선언한 '릴레이 인덱스 · 시스템 플래그' 축은 값이 crc32 숫자이거나
+                    //    0/1 이라 자연어 문장이 될 수 없습니다.
+                    //    (log.txt 실측: 8개 청크 중 6개가
+                    //     'Its goods is 0' / 'Its order is 0' / 'Its tracking is 0' /
+                    //     'Its embed is 1' / 'Its doc type is FC' / 해시 id 였고,
+                    //     전부 origin score 0.0000 으로 argmax 가 description·doc_number
+                    //     같은 완전 무관 필드를 가리켰습니다)
+                    //    이 축들을 여기서 끊지 않으면 청크가 만들어진 뒤
+                    //    134개 필드 뱅크와 코사인을 재고, 저장되면 검색을 오염시킵니다.
+                    //    ⚠️ 목록의 소유자는 canonical.rs 입니다. 새 릴레이 축을 추가하면
+                    //       canonical.rs 의 FORCE_NUM / FORCE_BOOL 과 여기를 함께 봐야 합니다.
                     if [
                         "title", "name", "type", "currency", "text", "masked_text",
                         "json_data", "data", "id", "index", "no", "link", "path",
@@ -47,6 +59,17 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "updated_at", "created_at", "updated_at_ts", "created_at_ts",
                         "digest", "vector", "vision_vec", "from", "to", "cc", "bcc", "ref",
                         "is_masked", "tier", "score",
+                        // 🌟 [RELAY INDEX] canonical.rs FORCE_NUM 의 릴레이 축.
+                        //    값은 crc32(normalize_identifier(...)) 결과 숫자입니다.
+                        "goods", "order", "tracking", "views",
+                        // 🌟 [SYSTEM FLAG] canonical.rs FORCE_BOOL 의 0|1 플래그.
+                        "embed", "node", "item",
+                        // 🌟 [TABLE ROUTING] store.rs 의 물리 테이블 라우팅 키.
+                        "table",
+                        // 🌟 [DOC TYPE ECHO] type 과 동일 개념인데 별도 키로 저장되어
+                        //    'Its doc type is FC' 라는 서식 코드 청크를 만듭니다.
+                        //    서식 코드는 item 의 type 컬럼으로 이미 검색 가능합니다.
+                        "doc_type",
                     ].contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
 
@@ -2077,19 +2100,24 @@ where
     //   context_intro      : "Regarding {context}," — 값이 없는 도입부
     //   json_data          : 직렬화 원문 덩어리
     //   updated_at 계열    : "Its updated at is 0" — 전 아이템 공통 시스템 타임스탬프
+    // 🌟 [SYSTEM COLUMN 2차 방어] json_to_natural_language 가 이미 끊지만,
+    //    이 함수는 다른 호출부(전처리 외 경로)에서도 직접 진입할 수 있습니다.
+    //    property 이름 기준의 동일 목록을 여기서 한 번 더 적용해,
+    //    상류 어디서 들어오든 릴레이 인덱스가 뱅크 대조에 도달하지 못하게 합니다.
+    const SYSTEM_PROPERTIES: [&str; 20] = [
+        "masked_text", "text", "unclassified", "context_intro", "json_data",
+        "updated_at", "created_at", "digest", "index",
+        // 릴레이 인덱스 (canonical.rs FORCE_NUM)
+        "goods", "order", "tracking", "views",
+        // 시스템 플래그 (canonical.rs FORCE_BOOL)
+        "embed", "node", "item", "detail",
+        // 라우팅 / 서식 코드 에코
+        "table", "doc_type", "mode",
+    ];
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
         .filter(|(_, property, _)| {
-            let p = property.as_str();
-            p != "masked_text"
-                && p != "text"
-                && p != "unclassified"
-                && p != "context_intro"
-                && p != "json_data"
-                && p != "updated_at"
-                && p != "created_at"
-                && p != "digest"
-                && p != "index"
+            !SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str())
         })
         .collect();
 

@@ -164,12 +164,56 @@ pub async fn index_item_chunks(
         search_mode
     };
 
+    // 🌟 [DOMAIN CONSISTENCY GATE] search_mode 와 page_type 의 도메인이 어긋나면
+    //    스키마를 '로드하기 전에' 차단합니다.
+    //  ── 판정 근거 ──
+    //   서식 코드 목록을 여기에 다시 적지 않습니다.
+    //   canonical_bias_type() 이 무역 서식 코드 55종을 'shipping_doc' 으로
+    //   접는다는 사실 하나만 사용하므로, 서식이 늘어도 이 코드는 수정 대상이 아닙니다.
+    // 🌟 [DOMAIN CONSISTENCY GATE / 단방향]
+    //
+    //  ── mode 값의 실제 집합 ──
+    //   lib.rs 의 ai_search_complex 가 진실의 원천입니다.
+    //     match search_mode.as_str() { "shipping" => .., "analytic" => .., _ => commerce }
+    //   즉 mode 는 commerce / shipping / analytic 3종이며 "trading" 은 존재하지 않습니다.
+    //   ("trading" 은 scheduler/trading.rs 라는 파이프라인 이름일 뿐입니다)
+    //
+    //  ── 왜 단방향인가 ──
+    //   shipping 모드에서 commerce 스키마(tracking/배송 축)가 등장하는 것은 정상입니다.
+    //   배송 축은 두 도메인에 걸쳐 있기 때문입니다.
+    //   막아야 하는 것은 그 반대, 즉 commerce·analytic 모드에서
+    //   무역 서식 87필드 스키마가 로드되는 경우뿐입니다.
+    //
+    //  ── 실측 사고 (log.txt) ──
+    //   [DB-FETCH] Filter: Some("mode = 'commerce'")
+    //   [EMBED-LOCAL] 20 pending item(s) detected.
+    //   [SCHEMA] 🚢 'FC' 조건부 로드: 카테고리 10개 | 필드 87개
+    //   commerce 로 스캔했는데 무역 서식 20건(FC/CN/DN/IP/BE/WR/SR/BK/CSI/
+    //   ID/ED/FCR/POD/AN/DO/AWB/SWB/HBL/BL)이 잡혔습니다.
+    //   이는 그 문서들의 mode 물리 컬럼이 'commerce' 로 잘못 태깅되어 있다는 뜻입니다.
+    //   (뿌리는 lib.rs 의 upsert_items — Part 2 에서 함께 고칩니다)
+    //
+    //  ── 판정 근거 ──
+    //   서식 코드 목록을 여기에 다시 적지 않습니다.
+    //   canonical_bias_type() 이 무역 서식 55종을 'shipping_doc' 으로 접는다는
+    //   사실 하나만 사용하므로, 서식이 늘어도 이 코드는 수정 대상이 아닙니다.
+    {
+        let declared_mode = if search_mode.trim().is_empty() { "commerce" } else { search_mode.trim() };
+        let is_trade_schema =
+            crate::utils::bias_schema::canonical_bias_type(page_type) == "shipping_doc";
+        if is_trade_schema && declared_mode != "shipping" {
+            emit(&format!(
+                "  ⏭️ [DOMAIN MISMATCH] item_id='{}' type='{}' 은 무역 서식(shipping_doc)인데 mode='{}' 로 요청되었습니다. 무역 스키마 로드 없이 청크 인덱싱을 건너뜁니다.",
+                item_id, page_type, declared_mode
+            ));
+            return Ok(0);
+        }
+    }
     let natural_text = crate::nl_convert::json_to_natural_language(item_json);
     let raw_chunks = crate::nl_convert::split_natural_language_to_chunks(&natural_text);
     if raw_chunks.is_empty() {
         return Ok(0);
     }
-
     let fields = if is_detail {
         crate::parsing::get_detail_schema_fields(page_type, url, doc_lang)
     } else {
@@ -224,28 +268,68 @@ pub async fn index_item_chunks(
         return Ok(0);
     }
 
+    // 🌟 [DISCOVERY-GATED BANK] 필드 뱅크 임베딩을 '실제로 쓰일 때만' 만듭니다.
+    //
+    //  ── 근거 ──
+    //   run_phase_b_pipeline 은 confirmed = true 청크의 property 를 절대
+    //   덮어쓰지 않습니다(CONFIRMED PROTECT). 따라서 발견 모드 청크가 0개면
+    //   필드 뱅크는 CONFIRM FLAG 진단 로그를 찍는 것 외에 결과에 기여가 없습니다.
+    //
+    //  ── 실측 (log.txt) ──
+    //   "[PLINKO MODE] 확인 모드: 8개 청크 | 발견 모드: 0개 청크" 가
+    //   아이템 20건 전부에서 동일하게 나왔습니다.
+    //   그런데 그때마다 shipping_doc 필드 뱅크(중복 포함 약 134개 × 각 수십~수백 구)를
+    //   통째로 임베딩했습니다. 이것이 백그라운드 인덱싱이 임베딩 모델을
+    //   장시간 붙들고 있던 이유이며, 생성 모델 전환과 VRAM 이 겹친 원인입니다.
+    //
+    //  ── 무엇을 남기는가 ──
+    //   idx_field_names 는 항상 전부 채웁니다. run_phase_b_pipeline 의
+    //   SCHEMA CANONICALIZE (id → id,link) 가 이 목록을 진실의 원천으로 쓰기 때문에
+    //   비우면 property 정규화가 깨집니다.
+    //   비우는 것은 뱅크(phrase_embs)뿐이며, plinko_game_for_indexing 은
+    //   is_empty() 를 이미 검사하므로 추가 분기 없이 안전하게 건너뜁니다.
+    let needs_discovery_bank = raw_chunks.iter().any(|(_, _, confirmed)| !*confirmed);
+    if !needs_discovery_bank {
+        emit(&format!(
+            "  ⚡ [BANK SKIP] 발견 모드 청크 0개 → 필드 뱅크 {}개 임베딩을 생략합니다. (확정 property 유지)",
+            fields.len()
+        ));
+    }
     let mut idx_field_names: Vec<String> = Vec::new();
     let mut idx_field_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::new();
     let mut idx_field_phrase_weights: Vec<Vec<f32>> = Vec::new();
     let mut idx_field_formats: Vec<String> = Vec::new();
-
+    // 🌟 [DEDUP GUARD] bias_schema 가 같은 필드를 두 번 등록해도 열이 겹치지 않게 합니다.
+    //    exclusive_assign_for_indexing 의 position() 은 첫 인덱스만 찾으므로
+    //    중복 열은 배정 불가능한 '유령 열' 이 되어 행렬만 부풀립니다.
+    let mut seen_field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (fname, _, bias_target, _) in &fields {
-        let (mut phrases, mut weights) =
-            crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
-
-        let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
-        for p in bridge_ph {
-            if phrases.iter().any(|e| e == &p) { continue; }
-            phrases.push(p);
-            weights.push(1.0);
+        if !seen_field_names.insert(fname.clone()) {
+            continue;
         }
-
-        let phrase_embs = if phrases.is_empty() {
-            vec![vec![0.0f32; 384]]
+        let phrase_embs = if !needs_discovery_bank {
+            Vec::new()
         } else {
-            model.get_embedding_batch(phrases.clone()).await
-                .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+            let (mut phrases, mut weights_inner) =
+                crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+            let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+            for p in bridge_ph {
+                if phrases.iter().any(|e| e == &p) { continue; }
+                phrases.push(p);
+                weights_inner.push(1.0);
+            }
+            let embs = if phrases.is_empty() {
+                vec![vec![0.0f32; 384]]
+            } else {
+                model.get_embedding_batch(phrases.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+            };
+            idx_field_phrase_weights.push(weights_inner);
+            embs
         };
+        if !needs_discovery_bank {
+            idx_field_phrase_weights.push(Vec::new());
+        }
 
         let fmt_str = {
             let lower = fname.to_lowercase();
@@ -288,7 +372,9 @@ pub async fn index_item_chunks(
 
         idx_field_names.push(fname.clone());
         idx_field_phrase_embs.push(phrase_embs);
-        idx_field_phrase_weights.push(weights);
+        // 🌟 weights 는 위 분기에서 이미 push 되었습니다. 여기서 다시 push 하면
+        //    names 와 weights 의 인덱스가 어긋나 weighted_max_pool_sim 이
+        //    다른 필드의 가중치를 읽게 됩니다.
         idx_field_formats.push(fmt_str);
     }
 

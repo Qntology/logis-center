@@ -949,108 +949,49 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                     let field_type = trade_desc_to_type(desc);
                     add(field, field_type, &en_anchor, "");
                 }
-                println!(
+                                println!(
                     "[SCHEMA] 🚢 '{}' 조건부 로드: 카테고리 {}개 | 필드 {}개 (base + overlay)",
                     page_type,
                     loaded_cats.len(),
                     triples.len()
                 );
             }
+            // 🌟 [DUPLICATE BLOCK REMOVED — 진실의 원천 단일화]
             //
-            //  ── 실측 피해 ──
-            //   · ⓑ에만 있고 ⓐ에 없던 13개(package_unit / description / quantity / unit /
-            //     unit_price / total_price / type_size / reference_po / reference_bl /
-            //     reference_contract / reference_number / amount_subtotal / amount_tax)는
-            //     비전 앵커가 아예 없어 크롭이 그 영역을 겨냥한 적이 없는데
-            //     프롬프트는 값을 요구했습니다.
-            //     → package_unit 이 문서에 없는데 "CTN" 을 뱉은 직접 원인입니다.
-            //     → items 카테고리 앵커가 hs_code 하나뿐이라 히트맵 최하위(+1.3126)로 밀려
-            //       상품 표(y 550~634)를 통째로 놓쳤습니다.
-            //   · ⓐ에만 있던 9개(id,link / no / status / expiry_date / place_receipt /
-            //     place_delivery / freight_amount / insurance_amount / local_charges)는
-            //     히트맵 질량만 가져가고 결과에는 기여하지 않았습니다.
-            //     특히 place_receipt / place_delivery 는 logistics 앵커를 부풀려
-            //     POL/POD 가 인쇄되지 않은 인보이스에서 서명 블록으로 크롭을 끌고 갔습니다.
+            //  ── 무엇이 있었나 ──
+            //   이 자리에 조건부 로드와 '같은 필드를 다시 add() 하는' 옛 하드코딩 목록
+            //   약 45줄이 남아 있었습니다. 리팩터링에서 지우지 않은 잔재이며,
+            //   같은 match arm 안이라 매번 실행되었습니다.
             //
-            //  ── 처방 ──
-            //   trade_schema 를 진실의 원천으로 삼아 이 목록을 정합화합니다.
-            //   아래 주석의 [B] 표시는 bias.json trade_schema 대응 카테고리입니다.
-
-            // ── 봉투/시스템 축 (프롬프트에는 없지만 저장 파이프라인이 요구) ──
-            add("id,link", "", "id link document", "");
-            add("status", "String", "status state", "");
-
-            // ── [B] header ──
-            add("doc_type", "String", "document type kind form", "");
-            add("doc_number", "String", "document number identifier", "");
-            add("issue_date", "String", "issue date", "");
-            add("reference_po", "String", "referenced purchase order number", "");
-            add("reference_invoice", "String", "referenced invoice number", "");
-            add("reference_bl", "String", "referenced bill of lading number", "");
-            add("reference_lc", "String", "referenced letter of credit number", "");
-            add("reference_booking", "String", "referenced booking number", "");
-            add("reference_contract", "String", "referenced sales contract number", "");
-            add("reference_number", "String", "other reference number", "");
-
-            // ── [B] parties ──
-            add("sender_name", "String", "shipper seller exporter name", "");
-            add("sender_address", "String", "shipper address", "");
-            add("recipient_name", "String", "consignee buyer importer name", "");
-            add("recipient_address", "String", "consignee address", "");
-            add("notify_party_name", "String", "notify party name", "");
-
-            // ── [B] logistics ──
-            add("vessel", "String", "vessel flight carrier", "");
-            add("voyage_number", "String", "voyage flight leg number", "");
-            add("pol", "String", "port of loading origin departure", "");
-            add("pod", "String", "port of discharge destination arrival", "");
-            add("etd", "String", "estimated time of departure", "");
-            add("eta", "String", "estimated time of arrival", "");
-            add("transport_mode", "String", "sea air road rail", "");
-
-            // ── [B] conditions ──
-            add("incoterms", "String", "incoterms fob cif exw ddp dap", "");
-            add("payment_terms", "String", "payment terms", "");
-            add("freight_payment_term", "String", "freight prepaid collect", "");
-
-            // ── [B] financials ──
-            add("currency", "String", "currency", "");
-            add("amount", "Number", "total amount", "");
-            add("amount_subtotal", "Number", "subtotal before tax and charges", "");
-            add("amount_tax", "Number", "tax vat amount", "");
-
-            // ── [B] cargo ──
-            add("package_count", "Number", "package carton count", "");
-            add("package_unit", "String", "package unit carton pallet", "");
-            add("weight_gross", "Number", "gross weight", "");
-            add("weight_net", "Number", "net weight", "");
-            add("volume", "Number", "volume cbm measurement", "");
-            add("marks_numbers", "String", "shipping marks and numbers", "");
-
-            // ── [B] items (배열 스키마) ──
-            //  🌟 이 6개가 ⓐ에 없어서 items 히트맵이 hs_code 단일 앵커로 붕괴했습니다.
-            //     'description of goods' / 'unit of measure' / 'unit price' 는
-            //     전 세계 무역 표의 컬럼 헤더 표준 명칭이므로 표 위치 신호로 직접 작동합니다.
-            add("description", "String", "description of goods commodity description", "");
-            add("quantity", "Number", "line item quantity qty pcs", "");
-            add("unit", "String", "unit of measure uom", "");
-            add("hs_code", "String", "hs code tariff number", "");
-            add("unit_price", "Number", "unit price unit value", "");
-            add("total_price", "Number", "line total total value amount", "");
-
-            // ── [B] containers ──
-            add("container_number", "String", "container number", "");
-            add("seal_number", "String", "seal number", "");
-            add("type_size", "String", "container size and type", "");
-
-            // ── overlay 축 (LC / INS / DGD 등 서식별 확장) ──
-            //  🌟 trade_schema.overlay 는 서식별로만 활성화되지만, 비전 앵커는
-            //     doc_type 확정 이전(STEP 3)에 만들어지므로 전 서식 공통으로 올려 둡니다.
-            //     실제 추출 여부는 STEP 5 의 카테고리 스키마가 결정합니다.
-            add("expiry_date", "String", "expiry date validity", "");
-            add("freight_amount", "Number", "freight charges", "");
-            add("insurance_amount", "Number", "insurance charges", "");
-            add("local_charges", "Number", "local handling charges", "");
+            //  ── 실측 피해 (log.txt) ──
+            //   · alts=[... id,link(0.7268), id,link(0.7268) ...]
+            //       완전 동일 점수 → 완전 동일 뱅크가 두 번 등록된 결정적 증거.
+            //   · alts=[doc_number(0.7816) ... doc_number(0.7130)]
+            //       trade_schema 설명문 앵커와 하드코딩 영어 앵커가 별개 열로 공존.
+            //   · "[SCHEMA] 🚢 필드 87개" 는 triples.len() 일 뿐이고
+            //     실제 fields 길이는 약 134 였습니다. indexing.rs 가 이 134개의
+            //     bias 구를 전부 임베딩하므로 배치 비용이 그대로 2배였습니다.
+            //   · exclusive_assign_for_indexing 의
+            //       field_names.iter().position(|f| f == &pr.property)
+            //     은 항상 첫 번째 인덱스만 찾습니다. 두 번째 등록분은 행렬 열만
+            //     차지하고 영구히 배정되지 못하는 '유령 열' 이었습니다.
+            //
+            //  ── 왜 그냥 지워도 되는가 ──
+            //   제거된 필드는 하나도 빠짐없이 bias.json 의 trade_schema.base 에
+            //   존재합니다.
+            //     expiry_date                              → base.header
+            //     freight_amount / insurance_amount /
+            //     local_charges / amount_subtotal / amount_tax → base.financials
+            //     description / quantity / unit / hs_code /
+            //     unit_price / total_price                 → base.items
+            //     container_number / seal_number / type_size → base.containers
+            //     pol / pod / etd / eta / vessel / voyage_number 등 → base.logistics
+            //   따라서 canonical_trade_triples() 가 이미 전부 등록합니다.
+            //   id,link 와 status 도 이 arm 상단에서 이미 add() 되어 있습니다.
+            //
+            //  ── 앞으로 필드를 추가할 곳 ──
+            //   여기가 아니라 bias.json 의 trade_schema 입니다. 이 파일은 수정 대상이
+            //   아니며, 그래야 목록이 두 벌로 갈라지는 사고가 재발하지 않습니다.
         },
         _ => {
             add("id,link", "", "id link", "");

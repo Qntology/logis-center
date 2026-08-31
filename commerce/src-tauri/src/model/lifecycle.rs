@@ -54,9 +54,25 @@ impl LogisModel {
 
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
+        // 🌟 [GENERATION HOLD] 퍼지 자체도 전환 구간입니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   Step 2 는 embedding_model 락을 블록 스코프로 잡았다 놓습니다.
+        //   그 직후 Step 3 의 spawn_blocking CUDA 동기화가 최대 10초 블로킹되는데,
+        //   그 창에서 ensure_embedding() 이 락을 잡고 방금 내린 모델을 다시 올립니다.
+        //   실측 로그가 이를 그대로 보여줍니다:
+        //     [DIAG-PURGE] Step 3: Synchronizing CUDA Context...
+        //     [MODEL] Loading Embedding Model on Cuda(...)      ← 퍼지 종료 전 재로드
+        //     [DIAG-PURGE] Step 4: Flushing OS Memory...
+        //   그 결과 Step 4 의 워킹셋 반환이 방금 올라온 모델을 대상으로 헛돌고,
+        //   퍼지가 사실상 무효화됩니다.
+        //
+        //  ── 중첩 안전성 ──
+        //   secure_vram_relay / ensure_qwen3 / ensure_qwen3_5 가 이미 홀드를 걸고
+        //   들어오는 경우 카운터가 2가 되지만, 각 가드가 Drop 되며 정확히 되돌아갑니다.
+        let _purge_hold = self.hold_generation();
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
         crate::models::qwen::generate::wait_for_global_io().await; // [cite: 254]
-
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
         
         {
@@ -455,6 +471,19 @@ impl LogisModel {
         }
         
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        // 🌟 [GENERATION HOLD] 퍼지 시작부터 로드 완료까지를 하나의 전환 구간으로 묶습니다.
+        //
+        //  ── 왜 deep_purge 안이 아니라 여기인가 ──
+        //   deep_purge 안에만 걸면 퍼지가 끝난 직후 wait_for_vram_settle(최대 5초)
+        //   구간이 무방비로 열립니다. 실측 로그가 정확히 그 창에서
+        //   "[VRAM-WATCH] Reclaiming... (0.00 GB -> 4.04 GB)" 를 반복한 이유입니다.
+        //   4GB 를 확보하고도 로드 시점엔 756MB 만 남아 KV 가 RAM 으로 밀려났습니다.
+        //
+        //  ── 해제 시점 ──
+        //   _relay_hold 는 이 함수가 반환될 때(정상/에러/조기반환 모두) Drop 됩니다.
+        //   즉 로드가 끝나는 순간 임베딩이 다시 올라올 수 있고,
+        //   STAGE-3 의 [VECTORIZING] 경로는 종전과 동일하게 동작합니다.
+        let _relay_hold = self.hold_generation();
         
         // 🌟 [CRITICAL FIX] size 상태값도 초기화하여 락 꼬임 방지
         {
@@ -547,10 +576,40 @@ impl LogisModel {
             }
 
             println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
+            // 🌟 [GENERATION HOLD] 이 함수는 secure_vram_relay 를 거치지 않고
+            //    단독 호출되는 경로도 있으므로 자체적으로 전환 구간을 선언합니다.
+            //    (holds 는 카운터이므로 relay 경유 시 2중으로 잡혀도 안전합니다)
+            let _load_hold = self.hold_generation();
             
-            // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
-            // 바로 deep_purge_resources만 단독 호출하여 VRAM을 100% 안전하게 날려줍니다.
-            self.deep_purge_resources().await;
+            // 🌟 [DOUBLE PURGE ELIMINATED] 퍼지를 '무조건' 이 아니라 '필요할 때만' 수행합니다.
+            //
+            //  ── 실측 사고 (log.txt) ──
+            //   [RELAY] Performing Deep Purge before loading Qwen3 ...
+            //   [DIAG-PURGE] ... Aggressive Purge Complete.     ← secure_vram_relay 가 이미 수행
+            //   [VRAM-WATCH] Success! VRAM Secured: 4.04 GB
+            //   [MODEL] Loading Qwen3 Text Model ...
+            //   [DIAG-PURGE] ... Aggressive Purge Complete.     ← 여기서 또 수행 (완전 중복)
+            //   퍼지 1회는 CUDA 동기화에만 최대 10초를 쓰며, 그 창이 곧
+            //   백그라운드 임베딩 재로드가 끼어드는 창이었습니다.
+            //   실측 [RELAY] Transition to Qwen3 complete in 47.40s 의 대부분이 이 낭비입니다.
+            //
+            //  ── 판정 근거 ──
+            //   '방금 퍼지했는가' 를 시간으로 재면 매직 상수가 됩니다.
+            //   대신 '내릴 것이 실제로 남아 있는가' 라는 상태를 봅니다.
+            //   내릴 것이 하나도 없으면 퍼지는 정의상 무의미한 연산입니다.
+            let purge_needed = {
+                self.generator.lock().await.is_some()
+                    || self.qwen3_5_generator.lock().await.is_some()
+                    || self.embedding_model.lock().await.is_some()
+                    || self.siglip2_model.lock().await.is_some()
+            };
+            if purge_needed {
+                // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
+                // 바로 deep_purge_resources만 단독 호출하여 VRAM을 100% 안전하게 날려줍니다.
+                self.deep_purge_resources().await;
+            } else {
+                println!("[MODEL] ⚡ [PURGE SKIP] 해제 대상 슬롯이 하나도 없어 중복 퍼지를 생략합니다.");
+            }
             
             {
                 *self.current_size.lock().await = Some(ModelSize::Qwen3);
@@ -817,6 +876,10 @@ impl LogisModel {
         };
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
+            // 🌟 [GENERATION HOLD] ensure_qwen3 와 같은 이유로 자체 홀드를 선언합니다.
+            //    이 함수는 secure_vram_relay 경유 외에 ensure_generator_ext 에서도
+            //    직접 호출되므로, 진입점마다 홀드가 있어야 창이 남지 않습니다.
+            let _load_hold = self.hold_generation();
             // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
             // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
             let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
@@ -843,8 +906,21 @@ impl LogisModel {
                     cache.clear();
                 }
             } else {
-                // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
-                self.deep_purge_resources().await;
+                // 🌟 [DOUBLE PURGE ELIMINATED] ensure_qwen3 와 동일한 상태 판정입니다.
+                //    secure_vram_relay 가 이미 퍼지한 뒤 이 함수로 내려오면
+                //    내릴 것이 하나도 없는데도 CUDA 동기화 10초를 다시 씁니다.
+                let purge_needed = {
+                    self.generator.lock().await.is_some()
+                        || self.qwen3_generator.lock().await.is_some()
+                        || self.qwen3_5_generator.lock().await.is_some()
+                        || self.embedding_model.lock().await.is_some()
+                };
+                if purge_needed {
+                    // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
+                    self.deep_purge_resources().await;
+                } else {
+                    println!("[MODEL] ⚡ [PURGE SKIP] 해제 대상 슬롯이 하나도 없어 중복 퍼지를 생략합니다.");
+                }
             }
             // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
@@ -916,7 +992,37 @@ impl LogisModel {
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         // 실제 메모리에 올리기 직전에 파일 존재 여부를 다시 한 번 방어합니다.
         self.check_embedding_downloaded().await?;
-
+        // 🌟 [GENERATION HOLD YIELD] 생성 모델 전환 구간이면 로드를 양보합니다.
+        //
+        //  ── 왜 락 '밖' 에서 대기하는가 ──
+        //   embedding_model 뮤텍스를 쥔 채 대기하면 deep_purge_resources 의
+        //   Step 2 가 같은 뮤텍스를 못 잡아 즉시 데드락입니다.
+        //   반드시 락을 잡기 전에 대기를 끝내야 합니다.
+        //
+        //  ── 상한의 성격 ──
+        //   아래 반복 상한은 '판정 기준' 이 아니라 데드락 방지 안전핀입니다.
+        //   홀드를 푸는 주체(GenerationHold::drop)가 패닉 등으로 사라지는
+        //   상상 가능한 최악의 경우에도 앱이 영구히 멈추지 않게 합니다.
+        //   정상 경로에서는 첫 폴에서 바로 통과하거나 전환이 끝나는 즉시 풀립니다.
+        if !self.is_cpu_mode && self.is_generation_held() {
+            println!("[MODEL] ⏸️ [EMBED YIELD] 생성 모델 전환 구간입니다. 임베딩 로드를 양보하고 대기합니다.");
+            let yield_started = Instant::now();
+            let mut polls = 0u32;
+            while self.is_generation_held() {
+                // 대기 중 다른 주체가 이미 올려 두었다면 즉시 종료합니다.
+                if self.embedding_model.lock().await.is_some() {
+                    println!("[MODEL] ▶️ [EMBED YIELD] 대기 중 임베딩이 이미 상주하게 되어 로드를 생략합니다.");
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                polls += 1;
+                if polls > 500 {
+                    println!("[MODEL] ⚠️ [EMBED YIELD] 안전핀 도달({:.1}s). 홀드가 해제되지 않아 로드를 강행합니다.", yield_started.elapsed().as_secs_f32());
+                    break;
+                }
+            }
+            println!("[MODEL] ▶️ [EMBED YIELD] 전환 완료({:.2}s 대기). 임베딩 로드를 재개합니다.", yield_started.elapsed().as_secs_f32());
+        }
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             // 🌟 [VRAM GATE] 임베딩을 올리기 전에 자유 메모리를 체크합니다.
@@ -925,6 +1031,10 @@ impl LogisModel {
             //    이후 다른 모델이 다시 필요해지면 각 모델의
             //    ensure_qwen3() / ensure_qwen3_5() / secure_vram_relay() 가
             //    기존처럼 자동으로 재로드합니다.
+            //
+            //    ⚠️ 이 게이트는 '자유 메모리 부족' 만 봅니다. 퍼지 직후에는
+            //       4GB 가 비어 있어 통과하므로, 퍼지-재로드 레이스는
+            //       위의 GENERATION HOLD YIELD 가 담당합니다. 두 장치는 역할이 다릅니다.
             if !self.is_cpu_mode {
                 let free_mb = self.get_free_vram_mb();
                 // granite-embedding-97m-multilingual 은 대략 300MB 내외를 사용합니다.
@@ -942,17 +1052,14 @@ impl LogisModel {
                     println!("[MODEL] ✅ [VRAM GATE] 순차 모드 준비 완료. 기존 모델 언로드됨.");
                 }
             }
-
             let self_clone = self.embedding_path.clone();
             // 🌟 CPU 강제 할당을 제거하고 시스템 설정(GPU)을 그대로 사용하여 초고속 VRAM 연산을 수행합니다.
             let target_device = self.device_config.device.clone();
             println!("[MODEL] Loading Embedding Model on {:?}...", target_device);
-
             let target_device_clone = target_device.clone();
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new_with_device(&self_clone, &target_device_clone)
             }).await??;
-
             *emb_guard = Some(emb);
         }
         Ok(())
@@ -1314,6 +1421,8 @@ impl LogisModel {
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
+            // 🌟 [GENERATION HOLD] 0 = 전환 구간 아님 = 임베딩 자유 로드 가능
+            generation_hold: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
             dual_mode_enabled: true, 
