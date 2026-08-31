@@ -1055,7 +1055,57 @@ impl VectorStore {
 
         // 🌟 봉투 값들을 data 안에도 동봉합니다.
         //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
-        let mode_str = data_val.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce").to_string();
+        //
+        // 🌟 [MODE FINAL GUARD] mode 가 비면 type 으로 트랙을 추론합니다.
+        //
+        //  ── 무엇이 문제였나 ──
+        //   기존은 `unwrap_or("commerce")` 였습니다. mode 를 넣지 않은 저장 경로가
+        //   하나라도 있으면 그 문서는 무조건 commerce 로 굳습니다.
+        //
+        //  ── 실측 사고 (log.txt) ──
+        //   무역 서식 19종(FC/CN/DN/IP/BE/WR/SR/BK/CSI/ID/ED/FCR/POD/AN/DO/
+        //   AWB/SWB/HBL/BL)이 mode='commerce' 스캔에 잡혔습니다.
+        //   19종의 doc_number 가 전부 '93763111837' 로 동일한데, 이는
+        //   parsing.rs 의 plan_trade_relays 가 "transport" 역할에 나열한
+        //   정확히 그 19종이며, 하나의 AWB 문서에서 파생된 릴레이 draft 입니다.
+        //   즉 서버 동기화가 아니라 로컬 trading 파이프라인이 만든 문서이고,
+        //   그 경로가 mode 를 넣지 않아 여기서 commerce 로 확정되었습니다.
+        //
+        //  ── 왜 이 지점인가 ──
+        //   upsert_item 은 모든 저장 경로가 반드시 통과하는 유일한 함수입니다.
+        //     lib.rs upsert_items / reindex / scheduler save_item /
+        //     trading.rs 릴레이 / analytic.rs 구조화 / migrate_team_identity
+        //   호출부를 하나씩 고치면 새 경로가 생길 때마다 같은 사고가 재발합니다.
+        //
+        //  ── 판정 근거 ──
+        //   서식 목록을 여기에 복제하지 않습니다. bias_schema::is_trade_doc_type 이
+        //   TRADE_DOC_TYPES 상수 하나만 참조하므로 서식이 늘어도 이 코드는 그대로입니다.
+        //
+        //  ── 부작용 ──
+        //   mode 를 명시한 문서는 그 값을 그대로 존중하므로 기존 동작이 바뀌지 않습니다.
+        //   추론이 발동하는 것은 '아무도 mode 를 넣지 않은' 경우뿐입니다.
+        let mode_str = match data_val.get("mode").and_then(|v| v.as_str()) {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => {
+                let inferred = if crate::utils::bias_schema::is_trade_doc_type(type_) {
+                    "shipping"
+                } else if matches!(
+                    type_,
+                    "click" | "hover" | "change" | "touch" | "report" | "question" | "answer"
+                ) {
+                    "analytic"
+                } else {
+                    "commerce"
+                };
+                if inferred != "commerce" {
+                    println!(
+                        "[STORE] 🧭 [MODE INFER] id='{}' type='{}' 에 mode 가 없어 '{}' 로 확정합니다.",
+                        final_id, type_, inferred
+                    );
+                }
+                inferred.to_string()
+            }
+        };
 
         // 🌟 [DRAFT MARKER PRESERVE] updated_at = 0 은 '값 없음' 이 아니라
         //    '리스트 스캔으로 껍데기만 만들어진 draft' 라는 3개 저장소 공통 계약입니다.
@@ -1263,15 +1313,35 @@ impl VectorStore {
                     obj.insert("to".to_string(), json!(new_to));
                     obj.insert("from".to_string(), json!(new_from));
                 }
-                // 기존 vector 를 재사용합니다 (임베딩 재생성 불필요)
-                let vec = if doc.vector.len() == 384 { Some(doc.vector.clone()) } else { None };
+                // 🌟 [VECTOR LOSS FIX]
+                //
+                //  ── 무엇이 문제였나 ──
+                //   기존 주석은 "기존 vector 를 재사용합니다" 였지만,
+                //   batch_to_docs 가 vector / vision_vec 을 항상 Vec::new() 로 비웁니다.
+                //   따라서 doc.vector.len() 은 언제나 0 이고 None 이 넘어가,
+                //   upsert_item 이 vec![0.0; 384] 로 덮어썼습니다.
+                //   비전 벡터도 None 이므로 함께 0 이 됩니다.
+                //   그런데 data.embed 는 1 로 남아 reindex 가 재생성하지도 않아,
+                //   로그인 한 번에 그 팀의 벡터 검색이 영구히 죽는 경로였습니다.
+                //
+                //  ── 왜 벡터를 읽어오지 않고 재생성을 택하는가 ──
+                //   batch_to_docs 가 벡터를 채우게 하면 get_all_items 의 모든 호출부가
+                //   행당 384+1152 float 를 복사합니다. 5000건이면 30MB 가
+                //   목록 조회 한 번마다 왕복합니다. 마이그레이션은 로그인 1회뿐이므로
+                //   그 비용을 상시 경로에 지우는 것은 균형이 맞지 않습니다.
+                //   대신 embed 마커를 제거해 다음 reindex 폴링이 정상 재생성하게 합니다.
+                //   (청크도 함께 지워야 count_chunks_by_item 가드에 걸리지 않습니다)
+                if let Some(obj) = data.as_object_mut() {
+                    obj.remove("embed");
+                }
+                let _ = self.delete_chunks_by_item(&doc.id).await;
                 let _ = self.upsert_item(
                     table,
                     &doc.id,
                     &doc.r#type,
                     data,
-                    vec,
-                    None, // 🌟 마이그레이션은 비전 벡터를 건드리지 않음
+                    None, // 벡터는 reindex 가 재생성합니다 (embed 마커 제거로 후보 복귀)
+                    None,
                     Some(new_from),
                     Some(new_to),
                     Some(&doc.cc),
@@ -1287,6 +1357,109 @@ impl VectorStore {
         }
         Ok(migrated)
     }
+
+
+    /// 🌟 [MODE MIGRATION] type 과 mode 가 어긋난 기존 문서를 일괄 교정합니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   upsert_item 의 MODE FINAL GUARD 는 '앞으로 저장될' 문서만 고칩니다.
+    ///   이미 mode='commerce' 로 굳어 있는 무역 서식은 그대로 남아,
+    ///     · commerce 검색(mode='commerce')에 무역 문서가 섞여 나오고
+    ///     · shipping 검색(mode='shipping')에서는 0건이 되며
+    ///     · has_vision=1 로 비전 벡터를 갖고도 Track V 에 잡히지 않습니다
+    ///       (ai_search_complex 의 비전 트랙은 search_mode=="shipping" 일 때만 활성)
+    ///
+    ///  ── 왜 물리 컬럼만 바꾸면 안 되는가 ──
+    ///   mode 는 물리 컬럼과 data JSON 양쪽에 존재합니다(upsert_item 이 동시에 기록).
+    ///   물리 컬럼만 update() 로 바꾸면 data.mode 는 commerce 로 남아,
+    ///   index_item_chunks 의 MODE GUARD(item_json.get("mode"))와
+    ///   프론트엔드 Dexie 판정이 어긋납니다. 반드시 둘 다 갱신해야 합니다.
+    ///
+    ///  ── 재인덱싱이 필수인 이유 ──
+    ///   mode 가 바뀌면 청크의 mode 컬럼도 바뀌어야 하고
+    ///   (STAGE-4 의 chunk_type_filter 가 mode 로 필터링),
+    ///   무역 스키마로 다시 청크를 만들어야 property 가 맞습니다.
+    ///   embed 마커 제거 + 청크 삭제로 reindex 폴링에 후보로 되돌립니다.
+    ///
+    ///  ── 반환 ──
+    ///   교정된 문서 수. 0 이면 대상이 없다는 뜻입니다.
+    pub async fn migrate_mode_by_type(&self) -> Result<usize> {
+        use crate::utils::bias_schema::TRADE_DOC_TYPES;
+        // 🌟 서식 목록을 여기에 복제하지 않습니다. 상수 하나를 SQL 로 펼칩니다.
+        // 🌟 [CASE-AWARE SCAN] 기존 데이터에는 'BL'(로컬 추출)과 'bl'(서버 동기화)이
+        //    섞여 있습니다. IN 절에 두 형태를 모두 넣어야 전량이 조회됩니다.
+        let type_in = TRADE_DOC_TYPES
+            .iter()
+            .flat_map(|t| [t.to_uppercase(), t.to_lowercase()])
+            .collect::<std::collections::BTreeSet<_>>()   // 대소문자 동일 코드 중복 제거
+            .into_iter()
+            .map(|t| format!("'{}'", t.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // 🌟 mode 조건을 SQL 에서 빼고 Rust 에서 판정합니다.
+        //    type 대소문자 교정 대상(mode 는 맞지만 type 이 소문자인 행)까지
+        //    같은 순회로 처리하기 위함입니다.
+        let filter = format!("type IN ({})", type_in);
+        let docs = match self.get_all_items("items", 5000, 0, Some(filter)).await {
+            Ok(d) => d,
+            Err(e) => {
+                println!("[MIGRATE] ⚠️ mode 마이그레이션 조회 실패(무시하고 진행): {}", e);
+                return Ok(0);
+            }
+        };
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        println!(
+            "[MIGRATE] 🚢 mode 오태깅 무역 문서 {}건 발견. 'shipping' 으로 교정하고 재인덱싱 대상으로 되돌립니다.",
+            docs.len()
+        );
+                let mut migrated = 0usize;
+        for doc in docs {
+            // 🌟 표준형(대문자)과 다르면 type 도 함께 교정합니다.
+            let canon_type = crate::utils::bias_schema::canonical_trade_doc_code(&doc.r#type)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| doc.r#type.clone());
+            let mode_wrong = doc.mode != "shipping";
+            let type_wrong = doc.r#type != canon_type;
+            if !mode_wrong && !type_wrong { continue; }
+            let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("mode".to_string(), json!("shipping"));
+                obj.insert("type".to_string(), json!(canon_type.clone()));
+                // 벡터·청크를 다시 만들어야 하므로 완료 마커를 지웁니다.
+                obj.remove("embed");
+            }
+            if type_wrong {
+                println!(
+                    "[MIGRATE] 🚢 type 표준형 교정: id='{}' '{}' → '{}'",
+                    doc.id, doc.r#type, canon_type
+                );
+            }
+            let _ = self.delete_chunks_by_item(&doc.id).await;
+            let _ = self.upsert_item(
+                "items",
+                &doc.id,
+                &canon_type,
+                data,
+                None,
+                None,
+                Some(&doc.from),
+                Some(&doc.to),
+                Some(&doc.cc),
+                Some(&doc.bcc),
+                Some(&doc.r#ref),
+                None,
+            ).await;
+            migrated += 1;
+        }
+        if migrated == 0 {
+            return Ok(0);
+        }
+        println!("[MIGRATE] ✅ mode 교정 완료: {}건. 다음 reindex 폴링에서 shipping 트랙으로 재인덱싱됩니다.", migrated);
+        Ok(migrated)
+    }
+
 
     // 🌟 [ROW READER] RecordBatch → TradeDocument 변환을 한 곳으로 모읍니다.
     //  기존에는 get_all_items / get_item_by_id 가 컬럼 인덱스를 각자 하드코딩해서
@@ -2143,6 +2316,40 @@ impl VectorStore {
             count += batch.num_rows();
         }
         Ok(count)
+    }
+}
+
+/// 🌟 [JSON NEEDLE / SINGLE SOURCE]
+///  data 컬럼 LIKE 프리필터에 쓸 `"key":value` 패턴을 만듭니다.
+///
+///  ── 왜 필요한가 ──
+///   canonicalize_data 가 키의 종류에 따라 직렬화 형태를 바꿉니다.
+///     Identifier → "code":"P0001"      (따옴표 있음)
+///     Numeric    → "order":3029041598  (따옴표 없음)
+///     Boolean    → "embed":1           (따옴표 없음)
+///   그런데 scheduler.rs 의 릴레이 DEDUP 은 이 규칙을 복제하면서
+///   수치 컬럼에도 따옴표를 붙여 LIKE 가 영구히 0건이 되었습니다.
+///     needle: "order":"3029041598"  /  저장:  "order":3029041598
+///   그 결과 릴레이 draft 가 매 스캔마다 새로 생성되었습니다.
+///
+///  ── 계약 ──
+///   앞으로 data LIKE 패턴은 이 함수로만 만듭니다.
+///   kind_of 규칙이 바뀌어도 호출부는 수정할 필요가 없습니다.
+pub fn json_property_needle(property: &str, value: &Value) -> String {
+    use crate::utils::canonical::{kind_of, CanonKind};
+    let raw = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
+        _ => value.to_string().trim_matches('"').to_string(),
+    };
+    let ep = property.replace('\'', "''");
+    let ev = raw.replace('\'', "''");
+    match kind_of(property) {
+        CanonKind::Identifier => format!("\"{}\":\"{}\"", ep, ev),
+        CanonKind::Numeric | CanonKind::Boolean => format!("\"{}\":{}", ep, ev),
+        // 배열/미분류는 형태를 확신할 수 없으므로 값만으로 좁히고 호출부가 정확 비교합니다.
+        _ => ev,
     }
 }
 

@@ -4,31 +4,13 @@ import { open, ask } from '@tauri-apps/plugin-dialog';
 import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
-// Imports for Rendering & Shim
-// 🌟 isAlmostEqual : 낙관적 로컬 talk 행 ↔ 서버 발급 talk 행 승계 판정에 사용합니다.
-//    (render.ts 에 존재하지만 그동안 한 번도 호출되지 않던 죽은 함수였습니다)
 import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
 
-// 🌟 [CANONICALIZE] data 안의 값 타입을 확정합니다.
-//  IndexedDB 인덱스는 타입이 혼재하면(123 vs "123") equals 가 절반을 놓치고,
-//  boolean / undefined 는 아예 인덱스에서 조용히 빠집니다.
-//  따라서 '쓰기 시점'에 딱 한 번 정규화해서 저장합니다.
-//  (Rust upsert_item 도 동일 규칙을 적용해야 양쪽 결과가 일치합니다 — Part 2 참조)
-// 🌟 [CANONICAL CONTRACT / TS]
-//  ⚠️ 이 파일의 판정은 store.rs 가 쓰는 utils/canonical.rs 의 kind_of() 와
-//     '비트 단위로 동일' 해야 합니다. 한쪽만 바뀌면 같은 값이
-//     LanceDB 에는 Number, Dexie 에는 String 으로 저장되어
-//     where('data.xxx').equals(...) 가 절반을 놓칩니다.
-//
-//  ── 왜 이름 목록을 없앴나 ──
-//   기존에는 ID/NUM/BOOL 배열에 필드명을 일일이 등록해야 했습니다.
-//   이제 접미사/부분일치 규칙으로 자동 판정하므로,
-//   Dexie 에 새 필드를 추가해도 이 목록을 건드릴 필요가 없습니다.
+
 type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
 
-// ── ① 명시 예외 : 규칙만으로 판정 불가능한 이름 (새 필드로 커지지 않습니다) ──
 const FORCE_ID = new Set(['id', 'no', 'digest']);
 const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
 const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
@@ -39,24 +21,13 @@ const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'con
 const NUM_SUFFIX = [
     '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
     '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges',
-    // 🌟 [UNIT / CURRENCY SUFFIX] 무역 서식은 값 이름에 단위를 붙이는 관례가 있습니다.
-    //    total_gross_weight_kg / measurement_cbm / entered_value_usd / amount_krw
-    //    이 넷은 기존 어느 규칙에도 걸리지 않아 'free' 로 떨어졌고,
-    //    LanceDB 에는 Number, Dexie 에는 String 으로 갈라져
-    //    where('data.xxx').between(...) 이 통째로 실패했습니다.
-    //    ⚠️ canonical.rs 의 NUM_SUFFIX 와 반드시 같은 집합이어야 합니다.
     '_kg', '_cbm', '_m3', '_usd', '_krw', '_eur', '_jpy', '_cny', '_gbp'
 ];
 const NUM_CONTAINS = [
     'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
     'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
     'local_charges', 'number_of_',
-    // 🌟 [PACKAGE FAMILY] total_packages / packages_delivered / packages_received /
-    //    total_pieces / number_of_pieces 는 전부 개수입니다.
-    //    'package_count' 완전일치만 있어서 나머지가 전부 새고 있었습니다.
     'packages', 'pieces',
-    // 🌟 [MEASUREMENT / VALUE] measurement / premium / duty / dutiable / balance /
-    //    flash_point 는 값이 항상 수치입니다.
     'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
     'tare_weight', 'chargeable'
 ];
@@ -66,14 +37,7 @@ const NUM_EXACT = new Set([
     'premium', 'rate', 'debit', 'credit', 'dosage'
 ]);
 const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
-// 🌟 [TRADING INDEX PREFIX] canonical.rs 의 NUM_PREFIX 와 반드시 동일해야 합니다.
-//    trading_index_column() 이 만드는 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
 const NUM_PREFIX = ['rel_'];
-// 🌟 [_shipping 제거] 이 접미사에 걸리는 실제 필드는 bundle_shipping 하나뿐인데,
-//    추출값이 "묶음배송가능" / "불가" 같은 자연어 문자열이라
-//    bool 변환식이 두 값을 모두 0 으로 만들어 구분을 통째로 없앴습니다.
-//    bias_schema.rs 도 add("bundle_shipping", "String", ...) 로 선언하므로
-//    문자열로 두는 것이 Rust 쪽과도 일치합니다.
 const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match'];
 
 function kindOf(key: string): CanonKind {
@@ -85,22 +49,14 @@ function kindOf(key: string): CanonKind {
     if (FORCE_NUM.has(k)) return 'num';
     if (FORCE_BOOL.has(k)) return 'bool';
 
-    // 🌟 [TRADING INDEX] 'rel_ci' / 'rel_bl' 은 crc32 숫자 인덱스입니다.
-    //    ID_CONTAINS 의 'reference_' 보다 먼저 검사해야
-    //    'rel_' 이 id(String)로 오분류되지 않습니다.
     if (NUM_PREFIX.some(p => k.startsWith(p))) return 'num';
 
-    // 🌟 Boolean 을 수치보다 먼저 검사합니다.
-    //    ('recipient_match' 처럼 실제 참/거짓인 필드만 여기에 걸립니다)
     if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
     if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
 
     if (NUM_EXACT.has(k)) return 'num';
     if (NUM_SUFFIX.some(s => k.endsWith(s))) return 'num';
 
-    // 🌟 식별자를 수치보다 먼저 봅니다.
-    //    'doc_number' 는 '_number' 로 수치에도 걸리지만
-    //    실제로는 'ABCD1234567' 영숫자 혼합이므로 String 이어야 합니다.
     if (ID_SUFFIX.some(s => k.endsWith(s))) return 'id';
     if (ID_CONTAINS.some(c => k.includes(c))) return 'id';
 
@@ -120,28 +76,17 @@ const SEED_KEYS: Array<[string, CanonKind]> = [
     ['tags', 'tags']
 ];
 
-// 🌟 [STATUS PARITY] store.rs 의 crate::logic::parse_status 와 1:1 로 동일한 표입니다.
-//    두 표가 어긋나면 같은 문서가 LanceDB 에서는 9, Dexie 에서는 0 으로 저장되어
-//    data.status 인덱스 조회가 절반을 놓칩니다.
 const STATUS_CODE: Record<string, number> = {
     progress: 1, stop: 2, cancel: 3, refund: 4, return: 5,
     error: 6, expire: 7, exchange: 8, complete: 9,
     draft: 10, show: 11, hide: 12
 };
 
-// 🌟 기본값 시딩을 하지 않는 타입. store.rs 의 `matches!(target, "users" | "pages")` 와 대응합니다.
-//    🌟 [ANALYTICS] click / hover / change / report 는 행동 로그이므로
-//       commerce 도메인 필드(sale_price / tracking_number ...)를 가질 이유가 전혀 없습니다.
-//       시딩하면 문서당 48개의 무의미한 키가 붙어 저장 용량과 인덱스를 낭비합니다.
-//       Dexie 는 없는 키를 인덱스에서 조용히 제외할 뿐 에러를 내지 않으므로 시딩이 불필요합니다.
 const NON_SEED_TYPES = new Set([
     'team', 'user', 'member', 'users', 'pages', 'page',
     'click', 'hover', 'change', 'report', 'question', 'answer'
 ]);
 
-// 🌟 [ISO DATE] Rust 의 iso_to_epoch_ms 와 동일 규칙.
-//    scheduler 가 started_at / expired_at 을 "2024-01-01T12:00:00" 으로 만듭니다.
-//    Number("2024-01-01120000") = NaN → 0 이 되어 기간 조건이 통째로 죽었습니다.
 function isoToEpochMs(t: string): number | null {
     if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) return null;
     let ms: number;
@@ -150,7 +95,7 @@ function isoToEpochMs(t: string): number | null {
     } else {
         const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
         const norm = t.includes('T') ? t : t.replace(' ', 'T');
-        // 타임존이 없으면 UTC 로 강제해야 Rust(and_utc) 결과와 1ms 도 어긋나지 않습니다.
+
         ms = Date.parse(hasTz ? norm : norm + 'Z');
     }
     return isNaN(ms) ? null : ms;
@@ -160,8 +105,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
     if (!parsed || typeof parsed !== 'object') return {};
     const out: any = { ...parsed };
 
-    // ── ① 기존 키 전량 정규화 (규칙 기반) ──
-    //    새 필드도 여기서 자동 처리되므로 이 함수는 확장 시 수정할 필요가 없습니다.
     for (const k of Object.keys(out)) {
         const kind = kindOf(k);
         if (kind === 'free') continue;
@@ -405,7 +348,13 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     // 검색/표시용 텍스트도 data 안으로 통일합니다.
     if (parsed.text === undefined) parsed.text = d.text ?? "";
     if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
-    if (parsed.mode === undefined) parsed.mode = d.mode ?? 'commerce';
+    // 🌟 [MODE INFER PARITY] store.rs 의 MODE FINAL GUARD 와 같은 규칙을 씁니다.
+    //    기존 'commerce' 하드코딩은 무역 서식·analytic 문서를 commerce 로 굳혀
+    //    LanceDB(shipping) ↔ Dexie(commerce) 가 갈리고,
+    //    executeDexiePlan 의 mode 검증에서 그 문서가 전량 탈락했습니다.
+    //    modeOfType 은 이 파일의 단일 판정 함수이므로 규칙이 하나로 유지됩니다.
+    const inferredType = String(d.type ?? d.doc_type ?? parsed.type ?? "");
+    if (parsed.mode === undefined) parsed.mode = d.mode ?? modeOfType(inferredType);
     if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
     const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
     // 🌟 [DRAFT PRESERVE] updated_at 폴백 체인에서 created_at 으로 빠지는 경로를 제거합니다.
@@ -417,7 +366,11 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     const updated = updatedRaw !== undefined && updatedRaw !== null ? updatedRaw : 0;
     parsed.created_at = Number(created) || 0;
     parsed.updated_at = Number(updated) || 0;
-
+    // 🌟 [PAGE CACHE DETECT] store.rs 의 target == "pages" 와 등가인 판정입니다.
+    const isPageCacheRow = d.table === 'pages' || d.table === 'page'
+        || !!parsed.node || !!parsed.item;
+    const seedDefaults = !isPageCacheRow
+        && !NON_SEED_TYPES.has(inferredType);
     return {
         // ── 봉투 12개. 이 목록은 앞으로 절대 늘어나지 않습니다 ──
         id: String(d.id ?? d.uuid ?? parsed.id ?? ""),
@@ -428,12 +381,29 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         cc: String(d.cc ?? parsed.cc ?? ""),
         bcc: String(d.bcc ?? parsed.bcc ?? ""),
         ref: String(d.ref ?? d.ref_val ?? parsed.ref ?? ""),
-        mode: String(d.mode ?? parsed.mode ?? 'commerce'),
+        mode: String(d.mode ?? parsed.mode ?? modeOfType(inferredType)),
         created_at: Number(created) || 0,
         updated_at: Number(updated) || 0,
         // ── 확장 영역. 여기에 뭘 넣든 스키마 변경 없음 ──
         //    users / team / pages 는 시딩을 끕니다. (통계 문서 오염 방지)
-        data: canonicalizeData(parsed, !NON_SEED_TYPES.has(String(d.type ?? parsed.type ?? "")))
+        //
+        // 🌟 [PAGE SEED PARITY]
+        //  ── 무엇이 문제였나 ──
+        //   store.rs 는 '테이블'로 판정합니다.
+        //     seed_defaults = !matches!(target, "users" | "pages") && !non_seed_type
+        //   반면 여기는 'type' 으로만 판정했습니다.
+        //   그런데 scheduler.rs 는 pages 행에 "pages" 가 아니라
+        //   실제 도메인 타입('goods' 등)을 넣습니다.
+        //     save_item(&store, "pages", &page_id, &page_type, ...)
+        //   그래서 NON_SEED_TYPES 에 걸리지 않아 Dexie 쪽만 16개 키를 시딩했고,
+        //   같은 페이지 캐시 문서가 두 저장소에서 서로 다른 내용이 되었습니다.
+        //
+        //  ── 판정 근거 ──
+        //   서버가 명시한 table 힌트를 1순위로 신뢰하고,
+        //   없으면 셀렉터 캐시의 구조 마커(node / item)를 봅니다.
+        //   이 판정은 lib.rs 의 PAGE CACHE GUARD 및 syncData 의 newPages 필터와
+        //   같은 규칙이므로 세 곳이 동시에 일치합니다.
+        data: canonicalizeData(parsed, seedDefaults)
     };
 });
 
@@ -2331,7 +2301,7 @@ const ITEMS_SCHEMA = [
     //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
     'data.incoterms', 'data.payment_terms', 'data.currency',
     //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
-    'data.container_number', 'data.seal_number',
+    '*data.container_number', '*data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
@@ -2638,7 +2608,7 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
     'data.etd', 'data.eta',
     'data.incoterms', 'data.payment_terms', 'data.currency',
-    'data.container_number', 'data.seal_number',
+    '*data.container_number', '*data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
     // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
@@ -6027,11 +5997,18 @@ btnExtract?.addEventListener("click", async () => {
                     // 🚀 큐에 등록
                     await GlobalTaskManager.addToQueue(taskId, extractType, { 
                         id: taskId, type: extractType, html: html, link: rawPath, 
-                        origin: urlObj.origin, // 🌟 [핵심] Rust 스케줄러가 localhost로 오판하지 않도록 origin(도메인)을 명시적으로 전달!
+                        origin: urlObj.origin,
                         cc: activeContext.cc || cc, 
                         ref: activeContext.ref || hashedRefId, 
                         bcc: activeContext.bcc || "", 
                         from: currentSession.address, to: currentSession.team,
+                        // 🌟 [FLAG PARITY] commerce D1 에는 flag 컬럼이 없어 syncData 가
+                        //    세션 flag 로 보강합니다. 그런데 로컬 추출 경로에는 그 보강이
+                        //    아예 없어서, 같은 도메인의 문서가 출처에 따라
+                        //    flag='kr' / flag='' 로 갈렸습니다.
+                        //    flag 는 봉투 12개 중 하나이고 양쪽 저장소가 인덱스를 갖고 있으므로
+                        //    태스크 페이로드에 실어 스케줄러가 각인하게 합니다.
+                        flag: String((currentSession as any).flag || ""),
                         device_preference: getDevicePref(), search_mode: currentSearchMode
                     });
                 }

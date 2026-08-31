@@ -2989,8 +2989,24 @@ pub async fn process_task(
             let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
             let page_id = crate::utils::hash::hash_id(&format!("{}{}", cc_for_hash, raw_path)); 
             
-            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            let bcc = entity_bcc(&page_type, &cc_for_bcc);
+            // 🌟 [BCC PLAIN CC]
+            //
+            //  ── 대문자 cc 의 원래 목적 ──
+            //   바로 위 page_id 계산에서 '같은 URL 의 리스트 캐시 / 상세 캐시' 를
+            //   물리적으로 분리하기 위한 네임스페이스 트릭입니다. 그건 유지합니다.
+            //
+            //  ── 왜 bcc 에는 쓰면 안 되는가 ──
+            //   bcc 는 '문서 종류 + 도메인' 단위 버킷입니다.
+            //   상세 추출에서만 대문자 cc 를 쓰면 같은 문서가
+            //     목록 스캔 draft  → hash(type + cc)
+            //     상세 추출 완료   → hash(type + CC)
+            //   로 버킷을 갈아탑니다. upsert_item 은 delete + add 이므로
+            //   그 순간 renderAccordion 의 최근 항목 조회(bcc = ...)와
+            //   loadMoreChat 의 bcc 스코프에서 통째로 사라집니다.
+            //
+            //   서버(Client Worker)와 analytic 경로는 둘 다 평문 cc 로
+            //   hashId(type + cc) 를 만들므로, 평문이 유일한 표준입니다.
+            let bcc = entity_bcc(&page_type, &task.cc);
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
             
@@ -3017,8 +3033,10 @@ pub async fn process_task(
                 println!("[Scheduler] Page cache updated in DB (including head selector).");
 
 
+                // 🌟 page_id 는 리스트/상세 분리를 위해 대문자 cc 를 유지합니다.
+                //    bcc 는 아이템 버킷이므로 평문 cc 로 통일합니다.
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
-                let detail_bcc = entity_bcc(&page_type, &task.cc.to_uppercase());
+                let detail_bcc = entity_bcc(&page_type, &task.cc);
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
@@ -3032,8 +3050,10 @@ pub async fn process_task(
                     &task.from, &team_id, &task.cc, &detail_bcc, ref_for_page, None).await;
 
             } else {
+                // 🌟 [BCC PLAIN CC] page_id 는 리스트/상세 네임스페이스 분리를 위해 대문자 cc 를 유지하고,
+                //    bcc 는 아이템 버킷이므로 평문 cc 로 통일합니다. (위 분기와 동일 규칙)
                 let detail_page_id = crate::utils::hash::hash_id(&format!("{}{}{}", page_type, task.cc.to_uppercase(), raw_path));
-                let detail_bcc = entity_bcc(&page_type, &task.cc.to_uppercase());
+                let detail_bcc = entity_bcc(&page_type, &task.cc);
                 let detail_page_data = json!({
                     "origin": format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or("")),
                     "link": url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str(),
@@ -6386,11 +6406,22 @@ pub async fn process_task(
     
     let search_mode_str = search_mode.clone();
     let doc_lang_str = doc_lang.clone();
+    // 🌟 [FLAG PARITY] 프론트엔드가 태스크 페이로드에 실어 보낸 세션 flag 입니다.
+    //    로컬 추출 문서에도 서버 동기화 문서와 동일한 지역 코드를 각인해
+    //    flag 스코프 조회가 출처에 따라 갈리지 않게 합니다.
+    let task_flag = task_data.get("flag")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let normalize_data = |item: &mut serde_json::Value| {
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
             
             if obj.get("mode").is_none() { obj.insert("mode".to_string(), json!(search_mode_str.clone())); }
+            if obj.get("flag").is_none() && !task_flag.is_empty() {
+                obj.insert("flag".to_string(), json!(task_flag.clone()));
+            }
             
 
             let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -6706,7 +6737,9 @@ pub async fn process_task(
         _ => "items",
     }.to_string();
 
-    let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+    // 🌟 [BCC PLAIN CC] 아이템 버킷은 리스트/상세와 무관하게 하나여야 합니다.
+    //    (자세한 경위는 위 페이지 저장부의 동일 주석 참조)
+    let cc_val = task.cc.clone();
     let bcc = entity_bcc(&page_type, &cc_val);
     let ref_val = task.r#ref.clone();
     let mut items_to_process = Vec::new();
@@ -6931,20 +6964,21 @@ pub async fn process_task(
                             // index.ts의 relay가 column: primary.type, value: primary.index로 쿼리하는 동작과 동일합니다.
                             if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                 if let Some(order_idx) = extracted_data.get("index") {
-                                    // 🌟 canonicalize_data 가 index / order 를 모두 String 으로 확정했으므로
-                                    //    숫자로 들어와도 문자열로 정규화한 뒤 needle 을 만듭니다.
-                                    //    (Number 로 온 값을 그대로 쓰면 `"order":123` 을 찾아 0건이 됩니다)
-                                    let order_idx_str = match order_idx {
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        serde_json::Value::String(s) => s.clone(),
-                                        _ => order_idx.to_string().trim_matches('"').to_string(),
-                                    };
-                                    let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                    // 🌟 [NEEDLE FIX] 기존 주석의 전제가 사실과 달랐습니다.
+                                    //    kind_of("order") 는 FORCE_NUM 이므로 Numeric 이고,
+                                    //    canonicalize_data 는 `json!(n as i64)` 로 정수를 저장합니다.
+                                    //    직렬화 결과는 `"order":3029041598` (따옴표 없음)인데
+                                    //    needle 은 `"order":"3029041598"` 이라 영구 0건이었습니다.
+                                    //    → 릴레이 draft 가 매 스캔마다 새로 생성되었습니다.
+                                    //    store.rs 의 단일 생성기로 교체합니다.
+                                    let needle = crate::store::json_property_needle("order", order_idx);
                                     let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                     if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                         if !fallback_results.is_empty() {
                                             found_existing = true;
-                                            emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] order index {}로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", order_idx_str, foreign_type));
+                                            // 🌟 needle 자체를 찍습니다. 문자열/숫자 직렬화 형태까지 로그에 남아
+                                            //    다음에 같은 사고가 나면 원인이 한 줄로 드러납니다.
+                                            emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
                                         }
                                     }
                                 }
@@ -7634,7 +7668,10 @@ pub async fn process_task(
                                         _ => q.value.to_string(),
                                     };
                                     if !val_str_for_search.is_empty() {
-                                        let needle = format!("\"{}\":\"{}\"", q.column.replace('\'', "''"), val_str_for_search.replace('\'', "''"));
+                                        // 🌟 [NEEDLE FIX] q.column 은 goods / order / tracking 같은
+                                        //    수치 컬럼일 수도, code / no 같은 식별자일 수도 있습니다.
+                                        //    형태를 호출부가 추측하지 않고 kind_of 규칙에 위임합니다.
+                                        let needle = crate::store::json_property_needle(&q.column, &q.value);
                                         let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                         if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
                                             if !cross_results.is_empty() {
@@ -7648,17 +7685,13 @@ pub async fn process_task(
                                     if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
                                         if let Some(order_idx) = single_item.get("index") {
                                             // 🌟 상세 경로와 동일하게 String 확정 규칙을 따릅니다.
-                                            let order_idx_str = match order_idx {
-                                                serde_json::Value::Number(n) => n.to_string(),
-                                                serde_json::Value::String(s) => s.clone(),
-                                                _ => order_idx.to_string().trim_matches('"').to_string(),
-                                            };
-                                            let needle = format!("\"order\":\"{}\"", order_idx_str.replace('\'', "''"));
+                                            // 🌟 [NEEDLE FIX] 상세 경로와 동일한 교정입니다.
+                                            let needle = crate::store::json_property_needle("order", order_idx);
                                             let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
                                             if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
                                                 if !fallback_results.is_empty() {
                                                     found_existing = true;
-                                                    emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] order index {}로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", order_idx_str, foreign_type));
+                                                    emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
                                                 }
                                             }
                                         }

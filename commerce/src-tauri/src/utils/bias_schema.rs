@@ -15,62 +15,85 @@ pub fn lang_code_of(lang: &str) -> String {
     if code.chars().count() >= 2 { code } else { "en".to_string() }
 }
 
-/// 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드 27종을 공용 bias 노드로 접습니다.
-///  ── 무엇이 문제였나 ──
-///   get_detail_schema_fields("BL", ...) 의 add() 는 bias.json 에서
-///     BIAS_DICT["ko"]["BL"][field]  → 없음
-///     BIAS_DICT["ko"]["default"][field] → layout_list/layout_form/id,link/title/status 뿐
-///   순서로 찾다가 실패하고, 결국 영어 en_bias 3~4구만 남았습니다.
-///   commerce 의 goods.title 이 200구+ 인 것과 비교하면 뱅크가 사실상 비어 있어
-///   PLINKO / 헤더 코사인 / 청크 인덱싱이 전부 저품질로 떨어집니다.
-///  ── 해결 ──
-///   27종을 'shipping_doc' 하나로 접어 bias.json 에 사전을 한 벌만 두면 됩니다.
-///   서식마다 필드 의미가 갈리지 않으므로(B/L 의 pol 과 AWB 의 pol 은 같은 개념)
-///   공용 사전이 정확도를 해치지 않습니다.
+pub const TRADE_DOC_TYPES: &[&str] = &[
+    // ── 기존 27종 ──
+    "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",
+    "SA", "DO", "AN", "BC", "ED", "ID", "CINV",
+    "IC", "WC", "CA", "PHYTO", "HC", "BEN_CERT",
+    "DGD", "MSDS", "POA", "BIZ_LIC", "INS",
+    // ── trade_schema.overlay 에는 있었으나 목록에 누락되었던 18종 ──
+    "HBL",  // House Bill of Lading
+    "FCR",  // Forwarder's Certificate of Receipt
+    "POD",  // Proof of Delivery
+    "LG",   // Letter of Guarantee
+    "TR",   // Trust Receipt
+    "LLC",  // Local Letter of Credit
+    "TI",   // Tax Invoice
+    "CP",   // Confirmation of Purchase
+    "CM",   // Cargo Manifest
+    "CCC",  // Customs Clearance Certificate
+    "CNM",  // Certificate of Non-Manipulation
+    "PC",   // Phytosanitary Certificate
+    "COA",  // Certificate of Analysis
+    "FI",   // Freight Invoice
+    "CDR",  // Cargo Damage / Survey Report
+    "ICF",  // Insurance Claim Form
+    "SOA",  // Statement of Account
+    "EL",   // Export License
+    // ── 무역 공용 사전으로 처리 가능한 10종 ──
+    //    개념이 갈리지 않으므로(SWB 의 pol 과 BL 의 pol 은 같은 개념)
+    //    공용 노드를 그대로 쓰는 것이 정확도를 해치지 않습니다.
+    "BE",   // Bill of Exchange
+    "SR",   // Shipping Request
+    "BK",   // Booking Confirmation
+    "WR",   // Warehouse Receipt
+    "CSI",  // Consular Invoice
+    "SWB",  // Sea Waybill
+    "IP",   // Insurance Policy
+    "DN",   // Debit Note
+    "CN",   // Credit Note
+    "FC",   // Fumigation Certificate
+];
+
+/// 🌟 이 타입이 무역 서식인지 판정합니다.
+///
+///  ── 왜 대소문자를 무시하는가 ──
+///   같은 문서가 저장 경로에 따라 두 형태로 들어옵니다.
+///     · 로컬 추출 (scheduler/trading.rs → save_item) : 'BL'  (원형 보존)
+///     · 서버 동기화 (lib.rs upsert_items)            : 'bl'  (강제 소문자)
+///   upsert_items 의 `.trim().to_lowercase()` 가 원인이며, 그 한 줄 때문에
+///   canonical_bias_type 이 'bl' 을 무역 서식으로 인식하지 못했습니다.
+///
+///  ── 실측 피해 ──
+///   get_detail_schema_fields('bl') 이 무역 스키마를 로드하지 못해
+///   index_item_chunks 가 조기 종료되고, 서버에서 내려온 무역 문서는
+///   item_chunks 가 단 한 건도 생성되지 않았습니다.
+///   (STAGE-4 필드 레벨 검색이 그 문서에 물리적으로 도달할 수 없습니다)
+///
+///  ── 왜 여기서 흡수하는가 ──
+///   저장 경로를 통일해도(아래 수정 ②) 이미 소문자로 저장된 기존 행이 남습니다.
+///   판정 함수가 두 형태를 모두 받아 주는 편이 마이그레이션과 무관하게 안전합니다.
+pub fn is_trade_doc_type(page_type: &str) -> bool {
+    let t = page_type.trim();
+    if t.is_empty() { return false; }
+    if t.eq_ignore_ascii_case("shipping_doc") { return true; }
+    TRADE_DOC_TYPES.iter().any(|c| c.eq_ignore_ascii_case(t))
+}
+
+/// 🌟 무역 서식 코드를 저장 표준형(대문자)으로 정규화합니다.
+///    bias.json 의 trade_schema.overlay 키가 대문자이므로 그것을 표준으로 삼습니다.
+///    무역 서식이 아니면 None 을 돌려주어 호출부가 기존 소문자 규칙을 쓰게 합니다.
+pub fn canonical_trade_doc_code(page_type: &str) -> Option<&'static str> {
+    let t = page_type.trim();
+    if t.is_empty() { return None; }
+    TRADE_DOC_TYPES.iter().find(|c| c.eq_ignore_ascii_case(t)).copied()
+}
+
 pub fn canonical_bias_type(page_type: &str) -> &str {
-    match page_type {
+    if is_trade_doc_type(page_type) {
         "shipping_doc"
-        // ── 기존 27종 ──
-        | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
-        | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
-        | "IC" | "WC" | "CA" | "PHYTO" | "HC" | "BEN_CERT"
-        | "DGD" | "MSDS" | "POA" | "BIZ_LIC" | "INS"
-        // 🌟 [MISSING 18] trade_schema.overlay 에는 존재하는데 이 목록에 없어
-        //    canonical_bias_type 이 자기 자신을 반환하던 서식들입니다.
-        | "HBL"  // House Bill of Lading
-        | "FCR"  // Forwarder's Certificate of Receipt
-        | "POD"  // Proof of Delivery
-        | "LG"   // Letter of Guarantee
-        | "TR"   // Trust Receipt
-        | "LLC"  // Local Letter of Credit
-        | "TI"   // Tax Invoice
-        | "CP"   // Confirmation of Purchase
-        | "CM"   // Cargo Manifest
-        | "CCC"  // Customs Clearance Certificate
-        | "CNM"  // Certificate of Non-Manipulation
-        | "PC"   // Phytosanitary Certificate
-        | "COA"  // Certificate of Analysis
-        | "FI"   // Freight Invoice
-        | "CDR"  // Cargo Damage / Survey Report
-        | "ICF"  // Insurance Claim Form
-        | "SOA"  // Statement of Account
-        | "EL"   // Export License
-        // 🌟 [NEW 10] 사용자 지적 '미포함 서식' 중 무역 공용 사전으로 처리 가능한 것들.
-        //    개념이 갈리지 않으므로(SWB 의 pol 과 BL 의 pol 은 같은 개념)
-        //    공용 노드를 그대로 쓰는 것이 정확도를 해치지 않습니다.
-        | "BE"   // Bill of Exchange
-        | "SR"   // Shipping Request
-        | "BK"   // Booking Confirmation
-        | "WR"   // Warehouse Receipt
-        | "CSI"  // Consular Invoice
-        | "SWB"  // Sea Waybill
-        | "IP"   // Insurance Policy
-        | "DN"   // Debit Note
-        | "CN"   // Credit Note
-        | "FC"   // Fumigation Certificate
-        => "shipping_doc",
-        
-        _ => page_type,
+    } else {
+        page_type
     }
 }
 
@@ -894,29 +917,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                 "repeated preference, recurring choice, habitual attribute, favourite option",
                 "identifier, code, url, link, date, price, status");
         },
-        // 🌟 [CONDITIONAL TRADE SCHEMA]
-        //
-        //  ── 왜 하드코딩을 버리는가 ──
-        //   Part 11 에서 이 분기를 bias.json 과 손으로 맞췄지만, 손으로 맞춘 것은
-        //   다음 필드 추가에서 다시 어긋납니다. 목록의 소유자를 하나로 만듭니다.
-        //
-        //  ── 왜 조건부인가 ──
-        //   page_type 은 여기 도달할 시점에 이미 STEP 2 가 확정한 서식 코드입니다.
-        //   (로그: "Document identified as: CI" 가 STAGE-3 보다 먼저 출력됩니다)
-        //   27개 서식 공통 목록을 쓰면
-        //     · CI 인보이스에 un_number / botanical_name / weighing_date 앵커가 올라가
-        //       무관한 영역과 코사인을 만들어 히트맵을 오염시키고
-        //     · 편견 구가 O(필드수 × 전체구수) 로 폭발합니다.
-        //       (실측 44필드에서 이미 13,598구. 388필드면 약 116만 구 = 대조 연산 86배)
-        //   base + overlay[doc_type] 만 로드하면 필드 1.6배 / 연산 2.8배로 그칩니다.
-        //
-        //  ── 별칭은 필드가 아니라 앵커 ──
-        //   invoice_number / bl_number / awb_number 같은 35개 '서식별 자기 번호' 는
-        //   전부 doc_number 입니다. 별도 필드로 만들면 같은 영역을 놓고 경쟁해
-        //   근거가 갈라지고 배타 배정에서 양쪽 다 굶습니다.
-        //   그 라벨들은 bias.json 의 doc_number 앵커(overlay)로 들어갑니다.
-        //   (실측 doc_number = "" 의 원인: 이미지엔 INVOICE NUMBER 라고 적혀 있는데
-        //    앵커에는 "document number identifier" 뿐이었습니다)
+
         "shipping_doc"
         | "BL" | "AWB" | "CI" | "PI" | "PL" | "PO" | "SC" | "LC" | "CO"
         | "SA" | "DO" | "AN" | "BC" | "ED" | "ID" | "CINV"
@@ -942,9 +943,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                     if !loaded_cats.iter().any(|c| c == category) {
                         loaded_cats.push(category.clone());
                     }
-                    // 🌟 desc 는 bias.json 의 설명문입니다. 여기서 타입 마커를 떼고
-                    //    영어 앵커로 씁니다. bias.json 의 ko.shipping_doc 노드가 있으면
-                    //    add() 내부에서 한국어 앵커가 추가로 붙습니다.
                     let en_anchor = trade_desc_to_anchor(desc);
                     let field_type = trade_desc_to_type(desc);
                     add(field, field_type, &en_anchor, "");
@@ -956,42 +954,6 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
                     triples.len()
                 );
             }
-            // 🌟 [DUPLICATE BLOCK REMOVED — 진실의 원천 단일화]
-            //
-            //  ── 무엇이 있었나 ──
-            //   이 자리에 조건부 로드와 '같은 필드를 다시 add() 하는' 옛 하드코딩 목록
-            //   약 45줄이 남아 있었습니다. 리팩터링에서 지우지 않은 잔재이며,
-            //   같은 match arm 안이라 매번 실행되었습니다.
-            //
-            //  ── 실측 피해 (log.txt) ──
-            //   · alts=[... id,link(0.7268), id,link(0.7268) ...]
-            //       완전 동일 점수 → 완전 동일 뱅크가 두 번 등록된 결정적 증거.
-            //   · alts=[doc_number(0.7816) ... doc_number(0.7130)]
-            //       trade_schema 설명문 앵커와 하드코딩 영어 앵커가 별개 열로 공존.
-            //   · "[SCHEMA] 🚢 필드 87개" 는 triples.len() 일 뿐이고
-            //     실제 fields 길이는 약 134 였습니다. indexing.rs 가 이 134개의
-            //     bias 구를 전부 임베딩하므로 배치 비용이 그대로 2배였습니다.
-            //   · exclusive_assign_for_indexing 의
-            //       field_names.iter().position(|f| f == &pr.property)
-            //     은 항상 첫 번째 인덱스만 찾습니다. 두 번째 등록분은 행렬 열만
-            //     차지하고 영구히 배정되지 못하는 '유령 열' 이었습니다.
-            //
-            //  ── 왜 그냥 지워도 되는가 ──
-            //   제거된 필드는 하나도 빠짐없이 bias.json 의 trade_schema.base 에
-            //   존재합니다.
-            //     expiry_date                              → base.header
-            //     freight_amount / insurance_amount /
-            //     local_charges / amount_subtotal / amount_tax → base.financials
-            //     description / quantity / unit / hs_code /
-            //     unit_price / total_price                 → base.items
-            //     container_number / seal_number / type_size → base.containers
-            //     pol / pod / etd / eta / vessel / voyage_number 등 → base.logistics
-            //   따라서 canonical_trade_triples() 가 이미 전부 등록합니다.
-            //   id,link 와 status 도 이 arm 상단에서 이미 add() 되어 있습니다.
-            //
-            //  ── 앞으로 필드를 추가할 곳 ──
-            //   여기가 아니라 bias.json 의 trade_schema 입니다. 이 파일은 수정 대상이
-            //   아니며, 그래야 목록이 두 벌로 갈라지는 사고가 재발하지 않습니다.
         },
         _ => {
             add("id,link", "", "id link", "");

@@ -7,8 +7,6 @@ pub use crate::prompts::*; // 🌟 분리된 프롬프트 함수들을 외부에
 
 use crate::tokenizer;
 
-// 🌟 [호환성 재수출] 기존 crate::parsing:: 경로로 접근하던 코드를 위해
-// 각 전용 모듈의 함수를 이 모듈에서 그대로 재수출합니다.
 pub use crate::utils::bias_schema::{
     BIAS_DICT,
     get_localized_page_type,
@@ -42,15 +40,6 @@ pub enum PugMode {
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
-    // 🌟 [ALLOW-LIST 폐기] 기존 구현은 "ASCII + 한글만 통과" 화이트리스트였습니다.
-    //    무역 문서는 다국어가 원칙이므로 이 필터는 값을 조용히 파괴합니다.
-    //      Gaisbergstraße → Gaisbergstrae   (독일 수하인 주소, ß = U+00DF 소멸)
-    //      Köln → Kln,  中国 / 深圳 → 전소  (country_of_manufacture 의 표준 표기)
-    //      € ¥ £ ° № → 전소               (currency / 단위)
-    //    파괴된 문자열은 STAGE-6 접지 검증에서 '이미지에 없는 값' 으로 폐기되거나,
-    //    normalize_identifier 를 통과해도 원본과 다른 index 로 떨어져 릴레이가 끊깁니다.
-    //    따라서 화이트리스트를 버리고, LLM 파이프라인을 실제로 깨뜨리는 문자만
-    //    블랙리스트로 제거합니다.
     let cleaned: String = text.chars()
         .filter(|c| {
             let u = *c as u32;
@@ -878,21 +867,6 @@ pub fn split_doc_to_pug_list_advanced(document: &Html, selector_str: &str, mode:
     pug_list
 }
 
-// =====================================================================
-// 🌟 [TRADE COLUMN DICTIONARY] 인쇄된 컬럼명 ↔ 스키마 필드명 사전
-// ---------------------------------------------------------------------
-//  이 사전이 없어서 실측 로그에서 'UNIT WEIGHT' 열(값 0.1)이 통째로 버려졌습니다.
-//  스키마 필드는 item_net_weight 인데 인쇄 라벨은 'UNIT WEIGHT' 라서
-//  모델이 둘을 잇지 못하고 item_net_weight / item_gross_weight 를 모두 null 로 반환했습니다.
-//  bias.json 의 의미 구(semantic phrase)는 '위치를 찾는' 용도이고,
-//  이 사전은 '찾은 열의 이름을 확정하는' 용도입니다. 역할이 다르므로 분리합니다.
-//
-//  🌟 [다국어 확장 근거]
-//   무역 문서는 발행국 언어로 컬럼 헤더가 인쇄됩니다.
-//   중국(CI/PL), 일본(BL/AWB), EU(German/French/Spanish CI) 문서에서
-//   영문 별칭만으로는 매칭이 불가능하므로 주요 무역국 언어를 추가합니다.
-//   이 함수는 임베딩 없이 순수 문자열 매칭이므로 별칭 추가 비용이 0입니다.
-// =====================================================================
 pub static TRADE_COLUMN_ALIASES: &[(&str, &[&str])] = &[
     ("description", &[
         // English
@@ -1553,21 +1527,6 @@ pub fn canonicalize_trade_column(raw_header: &str, doc_lang: &str) -> String {
     best_field.to_string()
 }
 
-/// 🌟 [EMBEDDING FALLBACK] 텍스트 매칭으로 확정하지 못한 헤더를 임베딩 코사인으로 재시도합니다.
-///
-///    ── 속도 설계 ──
-///    텍스트 매칭이 이미 성공한 헤더는 임베딩을 호출하지 않습니다.
-///    실패 건만 수집하여 배치 1회로 처리하므로 헤더 20개 중 3개만 실패하면
-///    임베딩 호출은 1회(3개 텍스트)입니다.
-///
-///    ── 모델 순서 ──
-///    get_embedding_batch 내부의 ensure_embedding() 이 임베딩 모델을 자동 로드합니다.
-///    process_trading_task STEP B 시점에는 이미 라벨 뱅크 임베딩을 위해
-///    ensure_embedding() 이 호출된 상태이므로 추가 로드/언로드가 발생하지 않습니다.
-///
-///    ── 판정 기준 ──
-///    필드 앵커 임베딩과의 코사인이 0.72 이상이고, 2위와의 마진이 0.03 이상이면 확정합니다.
-///    0.72 미만이면 빈 문자열을 반환하여 '확정 불가' 로 처리합니다.
 pub async fn canonicalize_trade_columns_with_embedding(
     missed_headers: &[(usize, String)],
     doc_lang: &str,
@@ -1642,10 +1601,6 @@ pub async fn canonicalize_trade_columns_with_embedding(
     results
 }
 
-/// 추출된 '값' 이 사실은 인쇄 라벨인지 판정합니다. true 면 폐기해야 합니다.
-/// 🌟 [LANG FILTER] doc_lang 이 확정되어 있으면 해당 언어의 라벨/별칭만 대조합니다.
-///    영어(라틴)는 국제 표준이므로 항상 포함됩니다.
-///    doc_lang 이 빈 문자열이면(미확정) 기존처럼 전체 대조합니다.
 pub fn is_printed_label_echo(value: &str, doc_lang: &str) -> bool {
     let norm = fold_column_label(value);
     if norm.is_empty() {
@@ -1973,46 +1928,11 @@ pub fn get_trade_doc_categories(doc_type: &str) -> Vec<&'static str> {
     out
 }
 
-// =====================================================================
-// 🌟 [TRADE RELAY POINT] mode="trading" 의 문서 연결 진입점
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 ──
-//   mode="commerce" 는 type="tracking" 과 type="order" 가
-//     tracking_number → hash::normalize_identifier → crc32 → index
-//   라는 단일 경로로 만나기 때문에 릴레이가 성립합니다.
-//   반면 trading 에는 이 경로에 해당하는 함수가 코드에 존재하지 않았습니다.
-//   parsing.rs 는 '어떤 카테고리를 뽑을지'(get_trade_doc_categories)만 정하고
-//   '무엇으로 문서를 이을지'는 아무 것도 정하지 않았습니다.
-//
-//  ── 실측 실패 ──
-//   ["PL←doc_number(빈 키)", "BL←doc_number(빈 키)",
-//    "ED←doc_number(빈 키)", "AWB←flight_number(빈 키)"]
-//   ① 규칙 3개가 doc_number 하나에만 매달려 있습니다.
-//      CI↔PL 은 인보이스번호, CI↔BL 은 B/L 번호, CI↔PO 는 발주번호로 이어지는데
-//      단일 키로는 셋 중 하나만 맞아도 나머지 둘이 끊깁니다.
-//   ② AWB←flight_number 는 의미가 틀렸습니다. flight_number 는 편명(KE083)이고,
-//      AWB 를 특정하는 것은 항공운송장 번호입니다. 이 서식은 그 번호를
-//      AIRWAYBILL / BILL OF LADING 박스에 93763111837 로 인쇄하고 있습니다.
-//      즉 추출이 완벽했더라도 이 규칙표로는 AWB 릴레이가 성립하지 않습니다.
-//   ③ 키가 하나도 없을 때 task_id 로 폴백했습니다. task_id 는 실행마다 달라지므로
-//      같은 문서가 재실행될 때마다 새 id 를 받습니다. 실측 로그에서
-//      0xef44… (이전 실행) 과 0xcf1c… (이번 실행) 로 갈렸습니다.
-//
-//  좌표를 코드에 적지 않는 vision_crop 의 원칙과 같은 이유로,
-//  키 이름도 문서 종류마다 하드코딩하지 않고 '역할' 로 선언합니다.
-// =====================================================================
-
 /// 릴레이 키의 역할. 같은 역할끼리만 서로 연결됩니다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeRelayKey {
     pub role: &'static str,   // "self" | "transport" | "booking" | "order" | "contract" | "credit" | "container"
     pub source_field: String, // 내 문서에서 값을 가져온 필드 (진단용)
-    /// 🌟 [SEARCH FIELD] 상대 문서에서 검색할 필드명입니다.
-    /// - "내가 참조하는 값"을 찾는 역할(transport/booking/order/contract/credit/container):
-    ///   상대 문서의 고유 식별 필드(`doc_number` 또는 `container_number`)에서 검색합니다.
-    /// - "나를 참조하는 값"을 찾는 역할(reference_invoice/reference_po/reference_lc):
-    ///   상대 문서의 참조 필드(`reference_invoice` 등)에서 검색합니다.
-    /// 이 구분이 없으면 자기 자신의 필드에서 검색하여 항상 SELF-SKIP 됩니다.
     pub search_field: String,
     pub raw: String,          // 인쇄된 원문
     pub normalized: String,   // normalize_identifier 통과값
@@ -2070,17 +1990,6 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
     None
 }
 
-/// 🌟 추출 JSON 에서 릴레이 키를 전부 뽑습니다.
-///  commerce 의 tracking_number 한 개에 대응하는, trading 쪽의 다중 키 버전입니다.
-/// 🌟 [RELAY KEYS v4]
-///  ── 무엇이 바뀌었나 ──
-///   기존은 `find_relay_value` 로 값을 찾고 `is_printed_label_echo` 로
-///   플레이스홀더를 차단한 뒤 `is_valid_relay_key` 로 유효성을 검증했는데,
-///   이 순서에서 `is_valid_relay_key` 가 `normalize_identifier` 를
-///   내부에서 다시 호출하여 전각 접기가 두 번 수행되었습니다.
-///   또한 `relay_index` 와 `relay_id` 에 원본 `raw` 를 전달했는데,
-///   이 값은 이미 `normalize_identifier` 를 거친 `normalized` 와 다를 수 있습니다.
-///   일관성을 위해 `normalized` 를 기준으로 인덱스와 id 를 계산합니다.
 pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayKey> {
     let mut out: Vec<TradeRelayKey> = Vec::new();
     // 🌟 [v3] doc_number를 "reference_invoice" 역할로 추가합니다.
@@ -2187,21 +2096,6 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
     out
 }
 
-/// 🌟 문서 식별자를 확정합니다. task_id 폴백을 제거하는 것이 목적입니다.
-///  반환: (정규화된 키, index, 폴백 여부)
-///  폴백이 필요하면 task_id 대신 '내용 지문' 을 씁니다.
-///  내용 지문은 같은 문서를 다시 태워도 같은 값이 나오므로
-///  0xef44… / 0xcf1c… 처럼 id 가 갈리는 일이 생기지 않습니다.
-/// 🌟 [DOC IDENTITY v4]
-///  ── 무엇이 바뀌었나 ──
-///   기존은 4순위까지 순차 탐색 후 내용 지문으로 폴백했는데,
-///   내용 지문은 `crc32` 만 사용하고 `relay_index` 를 사용하지 않아
-///   전각 영숫자가 포함된 경우 다른 인덱스가 생성되었습니다.
-///   또한 1순위에서 `k.normalized` 을 반환했는데,
-///   이 값은 `normalize_identifier` 통과값이므로 이미 정규화되어 있습니다.
-///   하지만 `k.index` 는 `extract_trade_relay_keys` 내부에서 계산된 값이라
-///   `relay_index` 와 동일한 경로를 거치지 않을 수 있었습니다.
-///   여기서 `relay_index` 를 다시 호출하여 일관성을 보장합니다.
 pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) -> (String, u32, bool) {
     let keys = extract_trade_relay_keys(data, doc_lang);
 

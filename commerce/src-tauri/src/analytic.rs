@@ -30,8 +30,23 @@ use crate::parsing::PugMode;
 //   남는 신호가 '태그 구조 + 인쇄된 텍스트' 뿐이라 환각이 물리적으로 줄어듭니다.
 // =====================================================================
 
-/// 구조화 대상 이벤트 타입. content.js 가 실제로 발행하는 3종입니다.
-pub const ANALYTIC_EVENT_TYPES: [&str; 3] = ["click", "hover", "change"];
+/// 구조화 대상 이벤트 타입.
+///
+///  🌟 [TOUCH ORPHAN FIX]
+///   기존 주석은 "content.js 가 실제로 발행하는 3종" 이라고 단정했지만,
+///   bias.json 의 analytic_event_filters 에는 touch 노드가 있고
+///   ANALYTIC_SEARCH_TYPES / main.ts 의 ANALYTIC_TYPE_SET / TYPE_SETS.analytic
+///   에도 전부 touch 가 등재되어 있습니다.
+///
+///   이 목록에만 touch 가 빠져 있어서, touch 이벤트가 한 번이라도 들어오면
+///     ① structure_pending_analytics 의 type IN 절에서 탈락 → 영구 미구조화
+///     ② text 가 비어 reindex 의 RAW GUARD 가 임베딩을 영구 보류
+///     ③ 목록에는 보이는데 검색에는 절대 안 잡히는 draft 로 잔존
+///   이 됩니다.
+///
+///   touch 가 실제로 발행되지 않는다면 이 항목은 아무 비용도 발생시키지 않고
+///   (조회 결과 0건), 발행된다면 고아 상태가 사라집니다. 넣는 편이 안전합니다.
+pub const ANALYTIC_EVENT_TYPES: [&str; 4] = ["click", "hover", "change", "touch"];
 
 // 🌟 analytics 검색 스코프. question / answer 는 검색 대상이 아닙니다.
 //    (그것들은 채팅 말풍선이며, 검색 스코프에 넣으면 모든 질의에 끼어듭니다)
@@ -433,6 +448,32 @@ pub async fn run_analytic_structuring(
     for (idx, (doc, data, target_pug_pre)) in pre_checked.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             emit_term("[ANALYTIC] 🛑 사용자 취소로 구조화를 중단합니다.");
+            break;
+        }
+        // 🌟 [BUSY RECHECK / 매 반복]
+        //
+        //  ── 왜 cancel 만으로 부족한가 ──
+        //   cancel 은 '사용자가 중단 버튼을 눌렀는가' 이고,
+        //   스케줄러 태스크가 새로 시작한 것과는 무관하게 false 로 남습니다.
+        //   structure_pending_analytics 상단의 ACTIVE_TASK_MEM 가드는
+        //   함수 진입 시 1회뿐이라, 그 이후 시작된 태스크와 이 루프가 병렬로 돕니다.
+        //
+        //  ── 피해 규모 ──
+        //   이 루프는 Qwen3.5 2B 를 상주시킨 채 돕니다.
+        //   스케줄러가 secure_vram_relay 로 모델을 전환하려 할 때
+        //   2GB 가 VRAM 에 남아 있으면 wait_for_vram_settle 이 목표치를 못 채우고,
+        //   전환이 통째로 지연되거나 OOM 재시도 경로로 빠집니다.
+        //
+        //  ── 왜 break 인가 ──
+        //   구조화는 폴링으로 재호출되는 백그라운드 작업이라 잔여분이 유실되지 않습니다.
+        //   updated_at = 0 인 draft 는 다음 폴링에서 그대로 다시 잡힙니다.
+        if crate::IS_SEARCHING.load(Ordering::SeqCst)
+            || crate::ACTIVE_TASK_MEM.read().map(|m| m.is_some()).unwrap_or(false)
+        {
+            emit_term(&format!(
+                "[ANALYTIC] ⏸️ 전경 작업(태스크/검색)이 시작되어 구조화를 중단합니다. (이번 회차 {}건 처리, 잔여분은 다음 폴링에서 재개)",
+                processed
+            ));
             break;
         }
 
@@ -1350,7 +1391,8 @@ pub async fn parse_analytic_search_query(
     let mut time_intent = String::new();
     let mut time_score = f32::MIN;
     for (key, idxs) in &time_key_indices {
-        let (sur, mx) = surprisal_score(&query_emb, idxs, &time_embs);
+        // 🌟 max_cos 는 진단용이며 판정에는 surprisal 만 씁니다.
+        let (sur, _max_cos) = surprisal_score(&query_emb, idxs, &time_embs);
         if sur > time_score { time_score = sur; time_intent = key.clone(); }
     }
     // 편견 게이트: 경쟁 개념이 더 잘 설명하면 폐기
@@ -1481,16 +1523,6 @@ pub async fn parse_analytic_search_query(
         .unwrap_or_else(|| {
             if keywords.is_empty() { query.clone() } else { keywords.join(" ") }
         });
-
-    let target = parsed
-        .get("target")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if keywords.is_empty() { query.clone() } else { keywords.join(" ") }
-        });
-
     // ── ③ 기간을 Rust 가 재확정 ──
     let mut started_at: i64 = 0;
     let mut expired_at: i64 = 0;
@@ -1531,12 +1563,9 @@ pub async fn parse_analytic_search_query(
             json!({ "operator": "gte", "value": started_at })
         );
     }
-    if expired_at > 0 {
-        // 🌟 동일 키가 하나뿐이므로 상한은 updated_at 축으로 내려보내지 않고
-        //    별도 키(created_at_to)를 만들지 않습니다.
-        //    build_scope_filter 는 키 단위로 하나의 연산자만 받으므로,
-        //    상한은 Dexie 플랜이 처리하도록 unassigned 가 아닌 별도 컨텍스트로 분리합니다.
-    }
+    // 🌟 [상한 처리 위치] build_scope_filter 는 키 하나에 연산자 하나만 받으므로
+    //    created_at 의 lte 는 여기서 넣지 않고, 아래에서 별도 컨텍스트로 분리합니다.
+    //    (기존에는 이 자리에 본문 없는 if 블록만 남아 있었습니다)
 
     let mut contexts: Vec<Value> = Vec::new();
 

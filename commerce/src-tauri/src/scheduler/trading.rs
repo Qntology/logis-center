@@ -2068,3 +2068,50 @@ pub async fn process_trading_task(
     println!("[TRADING] Task {} completed. {} page(s) processed.", task.id, total_pages);
     Ok(())
 }
+
+/// 🌟 [ARRAY FLATTEN] 배열 카테고리의 '식별자 축' 을 루트로 승격합니다.
+///
+///  ── 왜 필요한가 ──
+///   is_trade_array_category 가 참인 카테고리는 data.{category} = [ {...} ] 로 저장됩니다.
+///   그런데 Dexie 인덱스(ITEMS_SCHEMA)와 DEXIE_INDEXED_PATHS 는
+///   data.container_number / data.hs_code 같은 '스칼라 경로' 로 선언되어 있습니다.
+///   두 계약이 어긋나 컨테이너 번호·HS 코드 검색이 구조적으로 0건이 됩니다.
+///
+///  ── 왜 배열째로 올리는가 ──
+///   한 문서에 컨테이너가 3개면 값도 3개입니다. 첫 원소만 올리면 나머지 2개를
+///   영원히 찾을 수 없습니다. Dexie 의 멀티엔트리 인덱스('*data.container_number')가
+///   배열 원소 각각에 키를 만들어 주므로 배열 그대로 올리는 것이 정답입니다.
+///
+///  ⚠️ ITEMS_SCHEMA 의 해당 축을 '*data.container_number' 형태(멀티엔트리)로
+///     바꿔야 인덱스가 실제로 생성됩니다. 스칼라 선언이면 배열은 인덱싱되지 않습니다.
+const ARRAY_HOIST_KEYS: &[(&str, &[&str])] = &[
+    ("containers", &["container_number", "seal_number", "type_size"]),
+    ("items",      &["hs_code", "item_code"]),
+    ("charges",    &["charge_code"]),
+];
+
+fn hoist_array_identifiers(data: &mut serde_json::Value) {
+    let obj = match data.as_object_mut() { Some(o) => o, None => return };
+    for (cat, keys) in ARRAY_HOIST_KEYS {
+        let rows = match obj.get(*cat).and_then(|v| v.as_array()) {
+            Some(r) if !r.is_empty() => r.clone(),
+            _ => continue,
+        };
+        for key in *keys {
+            let mut vals: Vec<serde_json::Value> = Vec::new();
+            for row in &rows {
+                let v = match row.get(*key) { Some(x) => x, None => continue };
+                let s = match v {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                if s.is_empty() { continue; }
+                if vals.iter().any(|e| e.as_str() == Some(s.as_str())) { continue; }
+                vals.push(serde_json::json!(s));
+            }
+            if vals.is_empty() { continue; }
+            obj.insert(key.to_string(), serde_json::json!(vals));
+        }
+    }
+}

@@ -32,26 +32,6 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                 }
 
                 for (key, v) in map {
-                    // 이미 처리된 핵심 속성 및 시스템 변수는 스킵
-                    // 🌟 [SELF-REFERENCE GUARD] scheduler.rs 는 json_to_natural_language() 호출 '직전'에
-                    //    text / masked_text 를 extracted_data 에 삽입합니다.
-                    //    masked_text 가 스킵 목록에 없어서 자연어 원문이 통째로 다시 자연어화되고,
-                    //    ". " 분할 시 link/title/code/sale_price/traffic_insight 청크가 전부 복제되었습니다.
-                    //    (log.txt 실측: 21개 청크 중 14개가 masked_text 블롭의 잔재)
-                    //    또한 updated_at / created_at / digest 등 시스템 타임스탬프는
-                    //    "Its updated at is 0" 이라는 전 아이템 공통 쓰레기 청크를 만들므로 함께 배제합니다.
-                    // 🌟 [SYSTEM COLUMN SKIP] canonical.rs 가 FORCE_NUM / FORCE_BOOL 로
-                    //    선언한 '릴레이 인덱스 · 시스템 플래그' 축은 값이 crc32 숫자이거나
-                    //    0/1 이라 자연어 문장이 될 수 없습니다.
-                    //    (log.txt 실측: 8개 청크 중 6개가
-                    //     'Its goods is 0' / 'Its order is 0' / 'Its tracking is 0' /
-                    //     'Its embed is 1' / 'Its doc type is FC' / 해시 id 였고,
-                    //     전부 origin score 0.0000 으로 argmax 가 description·doc_number
-                    //     같은 완전 무관 필드를 가리켰습니다)
-                    //    이 축들을 여기서 끊지 않으면 청크가 만들어진 뒤
-                    //    134개 필드 뱅크와 코사인을 재고, 저장되면 검색을 오염시킵니다.
-                    //    ⚠️ 목록의 소유자는 canonical.rs 입니다. 새 릴레이 축을 추가하면
-                    //       canonical.rs 의 FORCE_NUM / FORCE_BOOL 과 여기를 함께 봐야 합니다.
                     if [
                         "title", "name", "type", "currency", "text", "masked_text",
                         "json_data", "data", "id", "index", "no", "link", "path",
@@ -66,9 +46,6 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "embed", "node", "item",
                         // 🌟 [TABLE ROUTING] store.rs 의 물리 테이블 라우팅 키.
                         "table",
-                        // 🌟 [DOC TYPE ECHO] type 과 동일 개념인데 별도 키로 저장되어
-                        //    'Its doc type is FC' 라는 서식 코드 청크를 만듭니다.
-                        //    서식 코드는 item 의 type 컬럼으로 이미 검색 가능합니다.
                         "doc_type",
                     ].contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
@@ -672,43 +649,6 @@ pub fn enrich_chunks_with_metadata(
     results
 }
 
-/// [PHASE B - NMS] 인덱싱 전용 중복 제거입니다.
-///
-/// 검색 파이프라인의 NMS BATTLE 은 임베딩 코사인으로 오버랩을 판정하지만,
-/// 인덱싱 단계에서는 아직 임베딩이 생성되지 않았으므로
-/// **텍스트 구조 기반** 중복 제거를 수행합니다.
-///
-/// 제거 규칙 (코사인 없이 결정론):
-///   D1: 완전 동일 텍스트 → 하나만 보존
-///   D2: 동일 property + 동일 value_part → 하나만 보존
-///   D3: 한 청크의 텍스트가 다른 청크의 텍스트에 완전 포함(부분문자열) →
-///       짧은 쪽 폐기 (단, 식별자/URL/숫자 리터럴 포함 청크는 독립 보존)
-///
-/// 이 규칙은 contains() 기반 '의미 판정'이 아니라
-/// '동일 문자열 포함'이라는 구조적 사실만 사용하므로 설계 원칙을 위반하지 않습니다.
-///
-/// # 인자
-///   - chunks: enrich_chunks_with_metadata() 반환값
-///
-/// # 반환
-///   중복 제거 후 Vec<ChunkMetadata>
-/// [PHASE B - NMS] 인덱싱 전용 중복 제거입니다.
-///
-/// 전처리 경로에서는 Phase A 패턴 매칭으로 property 가 이미 확정된 청크가
-/// 입력되므로, 텍스트 유사도 기반이 아닌 **property 수준** 중복 제거를 우선합니다.
-///
-/// 제거 규칙 (결정론, 코사인 없음):
-///   D1: 완전 동일 텍스트 → 하나만 보존
-///   D2: 동일 property + 동일 value_part → 하나만 보존
-///   D3: 동일 property + 한쪽 value_part 가 다른 쪽에 포함 → 짧은 쪽 폐기
-///       (confirmed 청크는 비confirmed 에 의해 절대 폐기되지 않음)
-///   D4: 텍스트 부분문자열 포함 → 짧은 쪽 폐기 (기존 규칙 유지)
-///       (confirmed 청크는 비confirmed 에 의해 절대 폐기되지 않음)
-///   D5: 동일 property 내 confirmed 청크가 2개 이상이면
-///       정보량(텍스트 길이)이 큰 쪽만 생존
-///
-/// 이 규칙은 contains() 기반 '의미 판정'이 아니라
-/// '동일 문자열 포함'이라는 구조적 사실만 사용하므로 설계 원칙을 위반하지 않습니다.
 pub fn nms_battle_for_indexing(chunks: Vec<ChunkMetadata>) -> Vec<ChunkMetadata> {
     if chunks.len() <= 1 {
         return chunks;
@@ -2034,32 +1974,6 @@ pub fn log_plinko_results(results: &[PlinkoResult]) {
 }
 
 /// [PHASE B+C - 통합 진입점] PHASE A 출력을 받아 PHASE B + PHASE C 전체 파이프라인을 순차 실행합니다.
-///
-/// 호출 순서:
-///   1. enrich_chunks_with_metadata()       — 형식 + bias/prejudice + 값 추출
-///   2. nms_battle_for_indexing()           — 텍스트 레벨 중복 제거
-///   3. format_gate_for_indexing()          — 형식 검증 게이트 (배정 전)
-///   4. plinko_game_for_indexing()          — Sliding Window Cliff Detection 속성 확정
-///   5. exclusive_assign_for_indexing()     — 배타 배정 (한 청크 = 한 속성)
-///   6. log_plinko_results()                — 결과 로그 출력
-///
-/// # 인자
-///   - raw_chunks: split_natural_language_to_chunks() 반환값
-///   - doc_lang:   문서 언어 코드
-///   - page_type:  도메인 타입
-///   - field_names: 필드명 배열 (bias.json 에서 추출)
-///   - field_phrase_embs: 필드별 bias 구 임베딩 뱅크
-///   - field_phrase_weights: 필드별 구 가중치
-///   - field_formats: 필드별 형식 문자열 배열
-///   - embed_fn: 텍스트 → 임베딩 벡터 변환 클로저 (비동기)
-///
-/// # 반환
-///   Vec<ChunkMetadata> — PHASE D(임베딩) + PHASE E(LanceDB 저장) 에 전달할 최종 배열
-/// [PHASE B+C 통합 진입점] PHASE A 출력을 받아 PHASE B + PHASE C 전체 파이프라인을 순차 실행합니다.
-///
-/// 전처리 경로(scheduler)에서는 JSON 구조에서 결정론적으로 확정된 청크(`confirmed = true`)가
-/// 입력되므로, PLINKO GAME 은 "발견"이 아닌 "확인" 모드로 동작합니다.
-///
 /// 파이프라인 순서:
 ///   1. enrich_chunks_with_metadata()       — 형식 + bias/prejudice + 값 추출 (confirmed 전파)
 ///   2. nms_battle_for_indexing()           — property 기반 중복 제거 (confirmed 보호)
@@ -2094,16 +2008,6 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Vec<f32>>,
 {
-    // ── Step 0: 인덱싱 불가 청크 필터링 ──
-    //   masked_text / text : json_to_natural_language 출력 자체를 재수록한 자기참조 청크
-    //   unclassified       : 패턴 매칭 실패
-    //   context_intro      : "Regarding {context}," — 값이 없는 도입부
-    //   json_data          : 직렬화 원문 덩어리
-    //   updated_at 계열    : "Its updated at is 0" — 전 아이템 공통 시스템 타임스탬프
-    // 🌟 [SYSTEM COLUMN 2차 방어] json_to_natural_language 가 이미 끊지만,
-    //    이 함수는 다른 호출부(전처리 외 경로)에서도 직접 진입할 수 있습니다.
-    //    property 이름 기준의 동일 목록을 여기서 한 번 더 적용해,
-    //    상류 어디서 들어오든 릴레이 인덱스가 뱅크 대조에 도달하지 못하게 합니다.
     const SYSTEM_PROPERTIES: [&str; 20] = [
         "masked_text", "text", "unclassified", "context_intro", "json_data",
         "updated_at", "created_at", "digest", "index",
@@ -2129,12 +2033,6 @@ where
         );
     }
 
-    // 🌟 [SCHEMA PROPERTY CANONICALIZE]
-    //    Phase A 는 패턴에서 'id' / 'link' 를 따로 뽑지만, bias_schema 의 필드명은 콤마 결합 키
-    //    'id,link' 입니다. 이 불일치 때문에 확인 모드의 origin_score 가 항상 0.0000 이 되고
-    //    (log.txt: origin='id'(0.0000), origin='link'(0.0000)),
-    //    정방향 STAGE-4C 의 `property = 'id,link'` 타겟 검색이 저장된 'id' 청크를 못 찾습니다.
-    //    field_names 를 진실의 원천으로 삼아 구조적으로 정규화합니다.
     let canonicalize = |p: &str| -> String {
         if field_names.iter().any(|f| f == p) {
             return p.to_string();
