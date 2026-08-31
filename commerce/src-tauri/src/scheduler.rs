@@ -2515,14 +2515,55 @@ pub async fn process_task(
                         if !t.is_empty() { cands.push(t); }
                     }
                 }
+                // 🌟 [LANDMARK HEADING GATE] nav / aside / header / footer 안의 heading 은
+                //    '이 페이지가 무엇인가' 가 아니라 '사이트 전체가 무엇인가' 를 말합니다.
+                //
+                //  ── 실측 사고 ──
+                //   <nav id="gnb"><h2>관리자 주메뉴</h2> 가 타이틀 앵커로 뽑혀
+                //   '주메뉴' 가 '주문' 계열과 부분 매칭되면서 order 0.8976 / goods 0.7363 이 되었고,
+                //   그 결과 상품 목록 페이지가 order 로 확정되었습니다.
+                //   실제 제목은 <div class="s_wrap"><h1>전체 상품관리</h1> 였습니다.
+                //
+                //  ── 왜 언어 하드코딩이 아닌가 ──
+                //   'nav' / 'aside' / 'header' / 'footer' 는 어떤 언어의 어휘도 아니라
+                //   HTML5 가 정의한 랜드마크 요소입니다.
+                //   이 코드베이스가 이미 th/td/tr 태그 역할로 값-라벨을 가르는 것과 같은 계열의
+                //   '구조 판정' 이며, 벡터 판정 이전에 후보 집합을 물리적으로 좁히는 역할만 합니다.
+                //   본문(div/section) 안의 heading 은 그대로 통과하므로
+                //   <div id="snb"><h2>상품관리</h2> 같은 도메인 신호는 손실되지 않습니다.
+                let mut dropped_landmark: Vec<String> = Vec::new();
                 for tag in ["h1", "h2", "h3", "legend", "caption"] {
                     if let Ok(sel_h) = scraper::Selector::parse(tag) {
                         for el in doc.select(&sel_h) {
                             let t = norm(el.text().collect::<Vec<_>>().join(" "));
                             if t.is_empty() || t.chars().count() > 60 { continue; }
+                            let mut in_landmark = false;
+                            let mut cur = el.parent();
+                            while let Some(node) = cur {
+                                if let Some(e) = node.value().as_element() {
+                                    let name = e.name().to_lowercase();
+                                    if name == "nav" || name == "aside" || name == "header" || name == "footer" {
+                                        in_landmark = true;
+                                        break;
+                                    }
+                                    if name == "body" || name == "html" { break; }
+                                }
+                                cur = node.parent();
+                            }
+                            if in_landmark {
+                                if !dropped_landmark.contains(&t) { dropped_landmark.push(t); }
+                                continue;
+                            }
                             if !cands.contains(&t) { cands.push(t); }
                         }
                     }
+                }
+                if !dropped_landmark.is_empty() {
+                    emit_term(&format!(
+                        "  🚫 [LANDMARK HEADING GATE] nav/aside/header/footer 내부 헤딩 {}개를 타이틀 후보에서 제외했습니다: {:?}",
+                        dropped_landmark.len(),
+                        dropped_landmark.iter().take(8).collect::<Vec<_>>()
+                    ));
                 }
                 if cands.len() > 24 { cands.truncate(24); }
                 cands
@@ -2534,7 +2575,10 @@ pub async fn process_task(
             let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
             let mut best_type = "".to_string();
             let mut max_total_score = -1.0;
-            let mut category_scores: Vec<(String, f32, f32, usize)> = Vec::new();
+            // 🌟 [WEIGHTED EVIDENCE COUNT] 네 번째 원소는 '라인 개수' 가 아니라
+            //    EVIDENCE DEDUP 가중을 반영한 '고유 증거량' 입니다.
+            //    같은 UI 문구 13개는 13 이 아니라 1.0 으로 집계됩니다.
+            let mut category_scores: Vec<(String, f32, f32, f32)> = Vec::new();
             let mut category_phrase_embs: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
             let mut category_title_only_embs: Vec<(String, Vec<f32>)> = Vec::new();
             for cat in &categories {
@@ -2573,7 +2617,6 @@ pub async fn process_task(
                         .get_embedding_batch(title_candidates.clone())
                         .await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; title_candidates.len()]);
-
                     let mut best_idx = 0usize;
                     let mut best_score = f32::MIN;
                     for (idx, cand) in title_candidates.iter().enumerate() {
@@ -2587,19 +2630,37 @@ pub async fn process_task(
                         let max_s: f32 = sims.iter().cloned().fold(0.0f32, f32::max);
                         let domain_contrast = max_s - mean_s;
                         let chrome_sim = cosine_similarity(&chrome_prej_emb, emb);
-
-                        let chrome_penalty = (chrome_sim - max_s * 0.85).max(0.0);
-                        let cand_score = domain_contrast - chrome_penalty * 0.5;
+                        // 🌟 [CHROME GAP / RELATIVE] 절대 임계치 감점을 폐기하고 상대 갭을 가산합니다.
+                        //
+                        //  ── 왜 바꾸는가 ──
+                        //   구식은 chrome_penalty = max(chrome - max_s * 0.85, 0) 였습니다.
+                        //   실측 로그의 후보 6개를 대입하면
+                        //     '관리자 주메뉴' : 0.6938 - 0.8976*0.85 = -0.069 → penalty 0
+                        //     '전체 상품관리' : 0.5836 - 0.7999*0.85 = -0.096 → penalty 0
+                        //     '상품관리'      : 0.5341 - 0.8034*0.85 = -0.149 → penalty 0
+                        //   전부 0 이 되어 chrome 신호가 판정에 전혀 개입하지 못했고,
+                        //   점수는 domain_contrast 하나로 결정되었습니다.
+                        //   그 결과 '주메뉴'→'주문' 오인이 만든 큰 대비가 그대로 승리했습니다.
+                        //
+                        //  ── 새 식 ──
+                        //   chrome_gap  : 도메인 유사도가 껍데기 유사도보다 얼마나 앞서는가
+                        //   cat_margin  : 이 후보가 '어느 한 카테고리' 를 얼마나 또렷이 지목하는가
+                        //   세 축 모두 상대 대비값이라 임계치가 없고, 문서마다 스케일이 자동 조정됩니다.
+                        let chrome_gap = (max_s - chrome_sim).max(0.0);
+                        let mut ordered_c = sims.clone();
+                        ordered_c.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                        let cat_margin = (ordered_c.get(0).copied().unwrap_or(0.0)
+                            - ordered_c.get(1).copied().unwrap_or(0.0)).max(0.0);
+                        let cand_score = domain_contrast + chrome_gap + cat_margin;
                         emit_term(&format!(
-                            "  🏷️ [TITLE CANDIDATE] '{}' | DomainMax: {:.4} | Contrast: {:+.4} | ChromeSim: {:.4} | Score: {:+.4}",
-                            cand, max_s, domain_contrast, chrome_sim, cand_score
+                            "  🏷️ [TITLE CANDIDATE] '{}' | DomainMax: {:.4} | Contrast: {:+.4} | ChromeSim: {:.4} | ChromeGap: {:+.4} | CatMargin: {:+.4} | Score: {:+.4}",
+                            cand, max_s, domain_contrast, chrome_sim, chrome_gap, cat_margin, cand_score
                         ));
                         if cand_score > best_score {
                             best_score = cand_score;
                             best_idx = idx;
                         }
                     }
-
                     doc_title = title_candidates[best_idx].clone();
                     title_emb = cand_embs[best_idx].clone();
                     emit_term(&format!("  👑 [TITLE ANCHOR SELECTED] '{}' (Score: {:+.4})", doc_title, best_score));
@@ -2626,62 +2687,177 @@ pub async fn process_task(
                 }
             }
 
-            let mut category_line_scores: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
+            // =====================================================================
+            // 🌟 [EVIDENCE DEDUP / COSINE] 같은 문구가 N번 반복되어도 '증거는 1개' 입니다.
+            // ---------------------------------------------------------------------
+            //  ── 실측 사고 ──
+            //   이 문서에는 행마다 붙는 '수정' 버튼이 13개 있습니다.
+            //     <a href="./goods.php?code=form&w=u&gs_id=13...">수정</a>
+            //   그 13개 라인은 데이터 추출을 위해 LINK PROTECT 로 보호되어 살아남았습니다.
+            //     🛡️ [TABLE-SAME-COL LINK PROTECT] ... '수정' (13회)
+            //   그런데 bias.json 의 ko.order.layout_form.bias 에는
+            //     "... 주문내역수정, 주문내역 수정, 상세정보, ..."
+            //   가 있고, 앵커 구 생성이 콤마뿐 아니라 '공백' 으로도 쪼개므로
+            //   '수정' 이라는 범용 동사가 order 앵커의 단독 구가 됩니다.
+            //   (ko.goods 쪽은 '상품수정' 처럼 공백이 없어 단독 구가 생기지 않습니다)
+            //   결과적으로 13개 라인이 order 에 대해 각각 코사인 1.0000 을 기록했고,
+            //     🗳️ [BODY CONSENSUS] order | Top10Mean: 1.0000
+            //   상위 10개를 통째로 독점해 BodySig 1.823 을 만들었습니다.
+            //   MeanLineContrast 는 goods(0.1254) > order(0.1093) 였는데도
+            //   이 한 덩어리 때문에 order 가 확정되었습니다.
+            //
+            //  ── 판정 근거 (언어 무관 / 순수 코사인) ──
+            //   ① 문서 자신의 라인쌍 코사인 분포에서 μ, σ 를 구합니다.
+            //   ② dedup_floor = μ + 3σ. "우연히 이만큼 닮을 확률이 사실상 0" 이라는
+            //      극값 기준이며, 이 코드베이스가 surprisal 에서 쓰는 논리와 같은 계열입니다.
+            //   ③ 그 이상으로 닮은 라인은 같은 UI 클러스터로 접고, 라인당 가중 1/N 을 줍니다.
+            //   ④ BODY CONSENSUS 풀에는 클러스터 대표 1개만 넣습니다.
+            //      (Top-K 평균은 중복에 그대로 지배당하므로 가중치로는 막을 수 없습니다)
+            //
+            //  ⚠️ 이 가중은 '페이지 타입 분류' 에만 적용됩니다.
+            //     라인 자체를 지우지 않으므로 STAGE-3 의 데이터 추출은 전혀 영향받지 않습니다.
+            // =====================================================================
+            let dedup_idxs: Vec<usize> = {
+                let mut v: Vec<usize> = Vec::new();
+                for i in 0..line_embeddings.len() {
+                    if wiped_indices[i] { continue; }
+                    let t = if let Some(p) = pug_lines[i].find('|') { pug_lines[i][p + 1..].trim() } else { "" };
+                    if t.is_empty() { continue; }
+                    if line_embeddings[i].iter().all(|&x| x == 0.0) { continue; }
+                    v.push(i);
+                }
+                v
+            };
+            let dedup_floor: f32 = {
+                if dedup_idxs.len() < 8 {
+                    0.995
+                } else {
+                    let total_pairs = dedup_idxs.len() * (dedup_idxs.len().saturating_sub(1)) / 2;
+                    let step = (total_pairs / 4000).max(1);
+                    let mut sum = 0.0f64;
+                    let mut sq = 0.0f64;
+                    let mut cnt = 0usize;
+                    let mut k = 0usize;
+                    'outer_dd: for a in 0..dedup_idxs.len() {
+                        for b in (a + 1)..dedup_idxs.len() {
+                            k += 1;
+                            if k % step != 0 { continue; }
+                            let s = cosine_similarity(&line_embeddings[dedup_idxs[a]], &line_embeddings[dedup_idxs[b]]) as f64;
+                            sum += s;
+                            sq += s * s;
+                            cnt += 1;
+                            if cnt >= 4000 { break 'outer_dd; }
+                        }
+                    }
+                    if cnt < 8 {
+                        0.995
+                    } else {
+                        let mu = sum / (cnt as f64);
+                        let var = (sq / (cnt as f64) - mu * mu).max(0.0);
+                        let sd = var.sqrt();
+                        ((mu + 3.0 * sd) as f32).clamp(0.90, 0.995)
+                    }
+                }
+            };
+            let mut evidence_weight: Vec<f32> = vec![1.0; pug_lines.len()];
+            let mut is_cluster_rep: Vec<bool> = vec![false; pug_lines.len()];
+            {
+                let mut reps: Vec<usize> = Vec::new();
+                let mut members: Vec<Vec<usize>> = Vec::new();
+                for &i in dedup_idxs.iter() {
+                    let mut hit: Option<usize> = None;
+                    for (ri, rep) in reps.iter().enumerate() {
+                        if cosine_similarity(&line_embeddings[i], &line_embeddings[*rep]) >= dedup_floor {
+                            hit = Some(ri);
+                            break;
+                        }
+                    }
+                    match hit {
+                        Some(ri) => members[ri].push(i),
+                        None => {
+                            if reps.len() >= 600 {
+                                // 고유 클러스터가 과도하게 많은 문서에서는 비교 비용이 커지므로
+                                // 이후 라인은 중복 없음(가중 1.0)으로 간주하고 대표로만 취급합니다.
+                                is_cluster_rep[i] = true;
+                                continue;
+                            }
+                            reps.push(i);
+                            members.push(vec![i]);
+                        }
+                    }
+                }
+                let mut collapsed = 0usize;
+                for (ri, rep) in reps.iter().enumerate() {
+                    is_cluster_rep[*rep] = true;
+                    let n = members[ri].len();
+                    if n <= 1 { continue; }
+                    let w = 1.0f32 / (n as f32);
+                    for m in members[ri].iter() { evidence_weight[*m] = w; }
+                    collapsed += n - 1;
+                    let sample = if let Some(p) = pug_lines[*rep].find('|') {
+                        pug_lines[*rep][p + 1..].trim().chars().take(40).collect::<String>()
+                    } else {
+                        String::new()
+                    };
+                    emit_term(&format!(
+                        "  ♻️ [EVIDENCE DEDUP] '{}' 유형 라인 {}개를 증거 1개로 접습니다. (라인당 가중 {:.3})",
+                        sample, n, w
+                    ));
+                }
+                emit_term(&format!(
+                    "  ♻️ [EVIDENCE DEDUP] 임계치 μ+3σ = {:.4} | 판정 대상 {}라인 | 고유 증거 {}개 | 접힌 중복 {}라인",
+                    dedup_floor, dedup_idxs.len(), reps.len(), collapsed
+                ));
+            }
+            let mut category_line_scores: std::collections::HashMap<String, (f32, f32)> = std::collections::HashMap::new();
             for cat in &categories {
-                category_line_scores.insert(cat.to_string(), (0.0, 0));
+                category_line_scores.insert(cat.to_string(), (0.0, 0.0));
             }
             let mut ambiguous_lines = 0usize;
             let mut body_sim_pool: Vec<Vec<f32>> = vec![Vec::new(); categories.len()];
-
             for (i, emb) in line_embeddings.iter().enumerate() {
-
                 if wiped_indices[i] { continue; }
                 let text_part = if let Some(idx) = pug_lines[i].find('|') { pug_lines[i][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
                 if emb.iter().all(|&v| v == 0.0) { continue; }
-
                 let trimmed_line = pug_lines[i].trim();
                 let tag_part = trimmed_line.split('|').next().unwrap_or("").trim().to_lowercase();
                 let is_table_cell = tag_part.starts_with("td") || tag_part.starts_with("th");
-                let weight = if is_table_cell { 1.5 } else { 1.0 };
-
-
+                let ev_w = evidence_weight[i];
+                let weight = (if is_table_cell { 1.5f32 } else { 1.0f32 }) * ev_w;
                 let sim_threshold = if is_table_cell { 0.30 } else { 0.38 };
                 let margin_threshold = if is_table_cell { 0.015 } else { 0.030 };
-
                 let mut sims: Vec<(usize, f32)> = Vec::with_capacity(categories.len());
                 for (ci, (_, phrase_embs)) in category_phrase_embs.iter().enumerate() {
                     sims.push((ci, max_pool_sim(emb, phrase_embs)));
                 }
-
-                for (ci, s) in &sims {
-                    body_sim_pool[*ci].push(*s);
+                // 🌟 [BODY POOL DEDUP] Top-K 평균은 중복 라인에 그대로 지배당하므로
+                //    가중치가 아니라 '풀 진입 자체' 를 클러스터 대표로 제한합니다.
+                if is_cluster_rep[i] {
+                    for (ci, s) in &sims {
+                        body_sim_pool[*ci].push(*s);
+                    }
                 }
                 let mean_sim: f32 = sims.iter().map(|(_, s)| *s).sum::<f32>() / (sims.len() as f32);
-
                 let mut ordered = sims.clone();
                 ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let (best_ci, best_sim) = ordered[0];
                 let second_sim = ordered.get(1).map(|(_, s)| *s).unwrap_or(0.0);
                 let margin = best_sim - second_sim;
-
                 if best_sim < sim_threshold { continue; }
                 if margin < margin_threshold {
                     ambiguous_lines += 1;
                     continue;
                 }
-
                 let contrast = best_sim - mean_sim;
                 if contrast <= 0.0 { continue; }
-
                 let entry = category_line_scores.get_mut(categories[best_ci]).unwrap();
                 entry.0 += contrast * weight;
-                entry.1 += 1;
+                entry.1 += ev_w;
             }
             if ambiguous_lines > 0 {
                 emit_term(&format!("  ⚖️ [AMBIGUITY GATE] 카테고리 간 마진 부족으로 배제된 범용 라인: {}개", ambiguous_lines));
             }
-
             let body_consensus: Vec<f32> = {
                 let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
@@ -2693,7 +2869,10 @@ pub async fn process_task(
                 }
                 let mean_b: f32 = if raw.is_empty() { 0.0 } else { raw.iter().sum::<f32>() / (raw.len() as f32) };
                 for (ci, cat) in categories.iter().enumerate() {
-                    emit_term(&format!("  🗳️ [BODY CONSENSUS] {} | Top10Mean: {:.4} | Contrast: {:+.4}", cat, raw[ci], raw[ci] - mean_b));
+                    emit_term(&format!(
+                        "  🗳️ [BODY CONSENSUS] {} | UniqueEvidence: {} | Top10Mean: {:.4} | Contrast: {:+.4}",
+                        cat, body_sim_pool[ci].len(), raw[ci], raw[ci] - mean_b
+                    ));
                 }
                 raw.iter().map(|v| v - mean_b).collect()
             };
@@ -2773,23 +2952,44 @@ pub async fn process_task(
             };
 
             let title_trust: f32 = {
-                let mut dom_max = 0.0f32;
+                // 🌟 [DIRECT MARGIN] 타이틀 '전체' 가 어느 카테고리를 얼마나 또렷이 지목하는가.
+                //
+                //  ── 왜 필요한가 ──
+                //   구식은 신뢰도를 title_window_contrast(2~4글자 n-gram 윈도우)의
+                //   1위-2위 마진 하나로만 계산했습니다.
+                //   실측 로그에서 '관리자 주메뉴' 를 쪼갠 윈도우
+                //   (관리자 / 주메뉴 / 관리 / 리자 / 자주 / 주메 / 메뉴 …)는
+                //   어느 카테고리도 변별하지 못해 PeakMargin 이 0.0038 로 붕괴했고,
+                //     MarginTrust = ((0.0038 - 0.02) / 0.08).clamp(0,1) = 0.000
+                //   → Trust 0 → TitleSig 0.000 / Prior 1.00x / boost 1.00x
+                //   즉 타이틀 축이 통째로 사라져 반복 UI 가 만든 BodySig 만 남았습니다.
+                //
+                //  ── 새 축 ──
+                //   윈도우 마진은 '부분 문자열이 도메인어를 품고 있는가' 를 봅니다.
+                //   직접 마진은 '타이틀 문장 자체가 한 카테고리로 기우는가' 를 봅니다.
+                //   둘은 서로 다른 증거이므로 큰 쪽을 채택합니다.
+                //   (한쪽이 0 이라고 해서 나머지 증거까지 버릴 이유가 없습니다)
+                let mut sims_t: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
-                    let s = max_pool_sim(&title_emb, &category_phrase_embs[ci].1);
-                    if s > dom_max { dom_max = s; }
+                    sims_t.push(max_pool_sim(&title_emb, &category_phrase_embs[ci].1));
                 }
+                let dom_max = sims_t.iter().cloned().fold(0.0f32, f32::max);
+                let mut ord_t = sims_t.clone();
+                ord_t.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let direct_margin = (ord_t.get(0).copied().unwrap_or(0.0)
+                    - ord_t.get(1).copied().unwrap_or(0.0)).max(0.0);
+                let direct_trust = ((direct_margin - 0.02) / 0.08).clamp(0.0, 1.0);
                 let chrome_s = cosine_similarity(&chrome_prej_emb, &title_emb);
-
                 let chrome_trust = ((dom_max - chrome_s) / 0.15).clamp(0.0, 1.0);
-
                 let mut wc = title_window_contrast.clone();
                 wc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 let peak_margin = (wc.get(0).copied().unwrap_or(0.0) - wc.get(1).copied().unwrap_or(0.0)).max(0.0);
-                let margin_trust = ((peak_margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                let window_trust = ((peak_margin - 0.02) / 0.08).clamp(0.0, 1.0);
+                let margin_trust = window_trust.max(direct_trust);
                 let t = chrome_trust.min(margin_trust);
                 emit_term(&format!(
-                    "  🔒 [TITLE TRUST] DomainMax: {:.4} | ChromeSim: {:.4} | ChromeTrust: {:.3} | PeakMargin: {:.4} | MarginTrust: {:.3} → Trust: {:.3}",
-                    dom_max, chrome_s, chrome_trust, peak_margin, margin_trust, t
+                    "  🔒 [TITLE TRUST] DomainMax: {:.4} | ChromeSim: {:.4} | ChromeTrust: {:.3} | PeakMargin: {:.4} | WindowTrust: {:.3} | DirectMargin: {:.4} | DirectTrust: {:.3} → MarginTrust: {:.3} → Trust: {:.3}",
+                    dom_max, chrome_s, chrome_trust, peak_margin, window_trust, direct_margin, direct_trust, margin_trust, t
                 ));
                 t
             };
@@ -2797,48 +2997,43 @@ pub async fn process_task(
             for (ci, cat) in categories.iter().enumerate() {
                 let (title_contrast, title_only_contrast) = category_title_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
                 let title_raw = category_title_raw.get(*cat).copied().unwrap_or(0.0);
-                let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0));
-
+                // 🌟 contributing_lines 는 '라인 개수' 가 아니라 EVIDENCE DEDUP 가중 합입니다.
+                //    반복 UI 13줄은 13 이 아니라 1.0 으로 계산되므로,
+                //    coverage / evidence_factor 가 중복에 부풀려지지 않습니다.
+                let (line_total, contributing_lines) = category_line_scores.get(*cat).copied().unwrap_or((0.0, 0.0));
                 let title_signal = ((title_contrast.max(0.0) * 15.0) + (title_only_contrast.max(0.0) * 12.0)) * title_trust;
-
-                let mean_line_contrast = if contributing_lines > 0 {
-                    line_total / (contributing_lines as f32)
+                let mean_line_contrast = if contributing_lines > 0.0 {
+                    line_total / contributing_lines
                 } else {
                     0.0
                 };
-                let coverage = if contributing_lines > 0 {
-                    (((contributing_lines as f32) + 1.0).ln() / 4.0).min(1.2)
+                let coverage = if contributing_lines > 0.0 {
+                    ((contributing_lines + 1.0).ln() / 4.0).min(1.2)
                 } else {
                     0.0
                 };
-
-                let evidence_factor = if contributing_lines < 3 {
-                    (contributing_lines as f32) / 3.0
+                let evidence_factor = if contributing_lines < 3.0 {
+                    contributing_lines / 3.0
                 } else {
                     1.0
                 };
                 let line_signal = mean_line_contrast * 10.0 * coverage * evidence_factor;
-
                 let body_contrast = body_consensus.get(ci).copied().unwrap_or(0.0);
                 let body_signal = body_contrast.max(0.0) * 12.0;
-
                 let title_prior_raw = 0.5 + 3.0 * title_probs[ci];
                 let title_prior = 1.0 + (title_prior_raw - 1.0) * title_trust;
-
                 let win_contrast = title_window_contrast.get(ci).copied().unwrap_or(0.0);
                 let boost_raw = (1.0 + 6.0 * win_contrast.max(0.0)).min(2.5);
                 let title_keyword_boost = 1.0 + (boost_raw - 1.0) * title_trust;
                 emit_term(&format!("  🔤 [TITLE SOFT-CONTAINS] {} | WindowContrast: {:+.4} → raw {:.2}x × trust {:.3} → boost {:.2}x", cat, win_contrast, boost_raw, title_trust, title_keyword_boost));
-
                 let normalized_score = (title_signal + line_signal + body_signal) * title_prior * title_keyword_boost;
                 category_scores.push((cat.to_string(), normalized_score, title_raw, contributing_lines));
                 if normalized_score > max_total_score {
                     max_total_score = normalized_score;
                     best_type = cat.to_string();
                 }
-
                 emit_term(&format!(
-                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Lines: {} | Coverage: {:.3} | BodyContrast: {:+.4} | TitleSig: {:.3} | LineSig: {:.3} | BodySig: {:.3}",
+                    "  📐 [{}] TitleMaxPool: {:.4} | Contrast: {:+.4} | TitleP: {:.3} | Prior: {:.2}x | MeanLineContrast: {:.4} | Evidence: {:.2} | Coverage: {:.3} | BodyContrast: {:+.4} | TitleSig: {:.3} | LineSig: {:.3} | BodySig: {:.3}",
                     cat, title_raw, title_contrast, title_probs[ci], title_prior, mean_line_contrast, contributing_lines, coverage, body_contrast, title_signal, line_signal, body_signal
                 ));
             }
@@ -2849,7 +3044,7 @@ pub async fn process_task(
             sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (cat, score, t_sim, line_cnt) in &sorted_scores {
                 let marker = if *cat == best_type { "👑" } else { "  " };
-                emit_term(&format!("  {} [{}] Normalized: {:.4} | TitleMaxPool: {:.4} | ContributingLines: {}", marker, cat, score, t_sim, line_cnt));
+                emit_term(&format!("  {} [{}] Normalized: {:.4} | TitleMaxPool: {:.4} | UniqueEvidence: {:.2}", marker, cat, score, t_sim, line_cnt));
             }
             emit_term(&format!("  Anchor Bias Sample (winner '{}'): '{}'...", best_type, crate::parsing::get_page_type_classification_bias(&best_type, &doc_lang).chars().take(120).collect::<String>()));
             emit_term("[PAGE-TYPE CLASSIFICATION] ====================================\n");
