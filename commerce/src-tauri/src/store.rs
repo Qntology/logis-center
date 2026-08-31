@@ -593,18 +593,35 @@ impl VectorStore {
                 match self.conn.open_table(name).execute().await {
                     Ok(table) => {
                         let current_schema = table.schema().await.unwrap_or_else(|_| Arc::new(Schema::new(Vec::<Field>::new())));
-                        // 🌟 세대 각인 컬럼 하나만 확인하면 됩니다.
-                        //    (기존처럼 컬럼을 하나하나 확인하는 방식은 스키마가 바뀔 때마다
-                        //     검사 코드를 같이 고쳐야 해서 누락이 반복되었습니다)
                         let is_v4 = current_schema.field_with_name("schema_v4").is_ok();
-                        // 🌟 [비전 벡터 세대] vision_vec 컬럼이 없으면 구세대입니다.
                         let has_vision_vec = current_schema.field_with_name("vision_vec").is_ok();
+
+                        let mut version_ok = true;
+                        if is_v4 {
+                            if let Ok(res) = table.query().limit(1).execute().await {
+                                if let Ok(batches) = res.try_collect::<Vec<_>>().await {
+                                    for b in batches {
+                                        if b.num_rows() == 0 { continue; }
+                                        if let Some(col) = b.column(16).as_any().downcast_ref::<StringArray>() {
+                                            if col.value(0) != Self::SCHEMA_VERSION {
+                                                println!(
+                                                    "[Store] Schema version drift on {}: stored='{}' expected='{}'",
+                                                    name, col.value(0), Self::SCHEMA_VERSION
+                                                );
+                                                version_ok = false;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         // 🌟 도메인 컬럼 잔재가 있으면 구세대입니다.
                         let has_legacy_domain = current_schema.field_with_name("status").is_ok()
                             || current_schema.field_with_name("amount").is_ok()
                             || current_schema.field_with_name("is_masked").is_ok();
 
-                        if !is_v4 || !has_vision_vec || has_legacy_domain {
+                        if !is_v4 || !has_vision_vec || has_legacy_domain || !version_ok {
                             println!("[Store] Schema generation mismatch for {} (v4: {}, legacy_domain: {}). Recreating...", name, is_v4, has_legacy_domain);
                             let _ = self.conn.drop_table(name, &[]).await;
                             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", uri, name));
@@ -863,6 +880,42 @@ impl VectorStore {
         v
     }
 
+    /// 🌟 [VECTOR CARRY] 기존 행의 벡터 2개를 그대로 읽어옵니다.
+    ///
+    ///  ── 왜 batch_to_docs 를 쓰지 않는가 ──
+    ///   batch_to_docs 는 vector / vision_vec 을 항상 Vec::new() 로 비웁니다.
+    ///   그 함수가 get_all_items 의 상시 경로이기 때문이며,
+    ///   거기서 벡터를 채우면 목록 조회 한 번에 행당 1536 float 이 왕복합니다.
+    ///   벡터 승계는 단건 upsert 에서만 필요하므로 전용 리더를 둡니다.
+    async fn read_existing_vectors(&self, target: &str, id: &str)
+        -> (Option<Vec<f32>>, Option<Vec<f32>>)
+    {
+        let table = match self.conn.open_table(target).execute().await {
+            Ok(t) => t,
+            Err(_) => return (None, None),
+        };
+        let batches = match table.query().only_if(format!("id = '{}'", id)).limit(1).execute().await {
+            Ok(r) => r.try_collect::<Vec<_>>().await.unwrap_or_default(),
+            Err(_) => return (None, None),
+        };
+        let read_fsl = |b: &RecordBatch, col: usize, dim: usize| -> Option<Vec<f32>> {
+            let arr = b.column(col).as_any().downcast_ref::<FixedSizeListArray>()?;
+            if arr.is_null(0) { return None; }
+            let vals = arr.value(0);
+            let f = vals.as_any().downcast_ref::<Float32Array>()?;
+            if f.len() != dim { return None; }
+            let v: Vec<f32> = (0..dim).map(|i| f.value(i)).collect();
+            if v.iter().all(|&x| x == 0.0) { return None; }
+            Some(v)
+        };
+        for b in batches {
+            if b.num_rows() == 0 { continue; }
+            // 컬럼 순서: 12 = vector(384), 13 = vision_vec(1152)
+            return (read_fsl(&b, 12, 384), read_fsl(&b, 13, 1152));
+        }
+        (None, None)
+    }
+
     pub async fn upsert_item(
         &self, table_name: &str, id: &str, type_: &str, mut data_val: Value, vector: Option<Vec<f32>>,
         vision_vec: Option<Vec<f32>>,
@@ -870,6 +923,32 @@ impl VectorStore {
     ) -> Result<()> {
         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
         let table = self.conn.open_table(target).execute().await?;
+        // 🌟 [VECTOR PRESERVE]
+        //
+        //  ── 무엇이 문제였나 ──
+        //   syncData / pullTradingData 는 벡터를 들고 오지 않으므로 vector = None 입니다.
+        //   그런데 아래에서 None 은 vec![0.0; 384] 로 덮이고,
+        //   동시에 old_embedded 분기가 data.embed = 1 을 강제 주입합니다.
+        //   결과는 '0 벡터 + embed=1' 이며,
+        //   runLocalEmbeddingSync 는 embed != 1 만 후보로 삼으므로
+        //   그 문서의 벡터 검색이 영구히 죽습니다.
+        //   (migrate_team_identity 는 이 함정을 알고 embed 를 제거하는데,
+        //    3초마다 도는 상시 경로가 반대로 하고 있었습니다)
+        //
+        //  ── 왜 '승계' 인가 ──
+        //   서버 동기화는 봉투(cc/bcc/ref)와 도메인 값만 갱신합니다.
+        //   text 가 그대로면 벡터도 그대로여야 하고,
+        //   text 가 바뀌었으면 reindex 가 다시 만들어야 합니다.
+        //   어느 쪽이든 '0 으로 지우기' 가 정답인 경우는 없습니다.
+        let (carry_vec, carry_vision) = if vector.is_none() || vision_vec.is_none() {
+            self.read_existing_vectors(target, if id.is_empty() {
+                data_val.get("id").and_then(|v| v.as_str()).unwrap_or("")
+            } else { id }).await
+        } else {
+            (None, None)
+        };
+        let vector = vector.or(carry_vec);
+        let vision_vec = vision_vec.or(carry_vision);
 
         let final_id = if id.is_empty() {
             data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
@@ -1053,38 +1132,8 @@ impl VectorStore {
             }
         }
 
-        // 🌟 봉투 값들을 data 안에도 동봉합니다.
-        //    Dexie 는 data.* 만 인덱싱하므로, 프론트엔드가 봉투/확장을 구분 없이 읽을 수 있게 됩니다.
-        //
-        // 🌟 [MODE FINAL GUARD] mode 가 비면 type 으로 트랙을 추론합니다.
-        //
-        //  ── 무엇이 문제였나 ──
-        //   기존은 `unwrap_or("commerce")` 였습니다. mode 를 넣지 않은 저장 경로가
-        //   하나라도 있으면 그 문서는 무조건 commerce 로 굳습니다.
-        //
-        //  ── 실측 사고 (log.txt) ──
-        //   무역 서식 19종(FC/CN/DN/IP/BE/WR/SR/BK/CSI/ID/ED/FCR/POD/AN/DO/
-        //   AWB/SWB/HBL/BL)이 mode='commerce' 스캔에 잡혔습니다.
-        //   19종의 doc_number 가 전부 '93763111837' 로 동일한데, 이는
-        //   parsing.rs 의 plan_trade_relays 가 "transport" 역할에 나열한
-        //   정확히 그 19종이며, 하나의 AWB 문서에서 파생된 릴레이 draft 입니다.
-        //   즉 서버 동기화가 아니라 로컬 trading 파이프라인이 만든 문서이고,
-        //   그 경로가 mode 를 넣지 않아 여기서 commerce 로 확정되었습니다.
-        //
-        //  ── 왜 이 지점인가 ──
-        //   upsert_item 은 모든 저장 경로가 반드시 통과하는 유일한 함수입니다.
-        //     lib.rs upsert_items / reindex / scheduler save_item /
-        //     trading.rs 릴레이 / analytic.rs 구조화 / migrate_team_identity
-        //   호출부를 하나씩 고치면 새 경로가 생길 때마다 같은 사고가 재발합니다.
-        //
-        //  ── 판정 근거 ──
-        //   서식 목록을 여기에 복제하지 않습니다. bias_schema::is_trade_doc_type 이
-        //   TRADE_DOC_TYPES 상수 하나만 참조하므로 서식이 늘어도 이 코드는 그대로입니다.
-        //
-        //  ── 부작용 ──
-        //   mode 를 명시한 문서는 그 값을 그대로 존중하므로 기존 동작이 바뀌지 않습니다.
-        //   추론이 발동하는 것은 '아무도 mode 를 넣지 않은' 경우뿐입니다.
-        let mode_str = match data_val.get("mode").and_then(|v| v.as_str()) {
+        let src = &final_data;
+        let mode_str = match src.get("mode").and_then(|v| v.as_str()) {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
             _ => {
                 let inferred = if crate::utils::bias_schema::is_trade_doc_type(type_) {
@@ -1107,29 +1156,9 @@ impl VectorStore {
             }
         };
 
-        // 🌟 [DRAFT MARKER PRESERVE] updated_at = 0 은 '값 없음' 이 아니라
-        //    '리스트 스캔으로 껍데기만 만들어진 draft' 라는 3개 저장소 공통 계약입니다.
-        //    (proxy/src/index.ts 의 `if(updated_at){ count++ } else { draft++ }` 와 동일 규칙)
-        //
-        //    기존 코드는 `if new_updated_at > 0 { .. } else { now() }` 로 0 을 현재 시각으로
-        //    덮어써 버렸고, 그 결과 scheduler 가 넣은 draft(0) / relay draft(0) /
-        //    서버가 내려준 draft(0) 이 전부 count 로 승격되어
-        //    Pages 트리의 Draft 표기가 항상 0 이 되었습니다.
-        //
-        //    판정 기준은 '값이 0인가' 가 아니라 '키가 존재하는가' 입니다.
-        //    키가 아예 없는 경우(pages 캐시 등)에만 현재 시각을 부여합니다.
-        //
-        //    🌟 [DRAFT CONTRACT EXTENDED] data 내부의 항목 중 '목록 스캔으로 생성된
-        //    아이템'(type 이 commerce 6도메인 또는 trading 서식 코드에 해당)은
-        //    updated_at 키가 없어도 draft 로 간주합니다.
-        //    서버(Client Worker)가 items 행을 내려보낼 때 data 안에 updated_at 을
-        //    포함하지 않는 경우가 있으므로, 여기서 현재 시각을 부여하면
-        //    syncData 폴링마다 draft → count 승격이 반복됩니다.
-        let has_updated_key = data_val.get("updated_at").is_some();
+        let has_updated_key = src.get("updated_at").is_some();
+        let new_updated_at = src.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(new_updated_at);
         let wall_now = chrono::Utc::now().timestamp_millis();
-        // 🌟 items 테이블의 도메인 타입은 '목록 스캔 → 상세 추출' 2단계를 거치므로,
-        //    updated_at 키가 없으면 draft(0) 로 시딩합니다.
-        //    users / pages 는 도메인 아이템이 아니므로 기존 규칙(현재 시각)을 유지합니다.
         let is_domain_item = matches!(target, "items");
         let updated_ts = if has_updated_key {
             new_updated_at
@@ -1139,9 +1168,7 @@ impl VectorStore {
             wall_now
         };
 
-        // 🌟 created_at 은 draft 여부와 무관하게 항상 실제 시각이어야 합니다.
-        //    (기존에는 now_ts 를 폴백으로 써서 updated_at 과 결합돼 있었습니다)
-        let created_at = data_val.get("created_at")
+        let created_at = src.get("created_at")
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
             .unwrap_or(wall_now);
@@ -1358,40 +1385,22 @@ impl VectorStore {
         Ok(migrated)
     }
 
-
-    /// 🌟 [MODE MIGRATION] type 과 mode 가 어긋난 기존 문서를 일괄 교정합니다.
-    ///
-    ///  ── 왜 필요한가 ──
-    ///   upsert_item 의 MODE FINAL GUARD 는 '앞으로 저장될' 문서만 고칩니다.
-    ///   이미 mode='commerce' 로 굳어 있는 무역 서식은 그대로 남아,
-    ///     · commerce 검색(mode='commerce')에 무역 문서가 섞여 나오고
-    ///     · shipping 검색(mode='shipping')에서는 0건이 되며
-    ///     · has_vision=1 로 비전 벡터를 갖고도 Track V 에 잡히지 않습니다
-    ///       (ai_search_complex 의 비전 트랙은 search_mode=="shipping" 일 때만 활성)
-    ///
-    ///  ── 왜 물리 컬럼만 바꾸면 안 되는가 ──
-    ///   mode 는 물리 컬럼과 data JSON 양쪽에 존재합니다(upsert_item 이 동시에 기록).
-    ///   물리 컬럼만 update() 로 바꾸면 data.mode 는 commerce 로 남아,
-    ///   index_item_chunks 의 MODE GUARD(item_json.get("mode"))와
-    ///   프론트엔드 Dexie 판정이 어긋납니다. 반드시 둘 다 갱신해야 합니다.
-    ///
-    ///  ── 재인덱싱이 필수인 이유 ──
-    ///   mode 가 바뀌면 청크의 mode 컬럼도 바뀌어야 하고
-    ///   (STAGE-4 의 chunk_type_filter 가 mode 로 필터링),
-    ///   무역 스키마로 다시 청크를 만들어야 property 가 맞습니다.
-    ///   embed 마커 제거 + 청크 삭제로 reindex 폴링에 후보로 되돌립니다.
-    ///
-    ///  ── 반환 ──
-    ///   교정된 문서 수. 0 이면 대상이 없다는 뜻입니다.
     pub async fn migrate_mode_by_type(&self) -> Result<usize> {
         use crate::utils::bias_schema::TRADE_DOC_TYPES;
-        // 🌟 서식 목록을 여기에 복제하지 않습니다. 상수 하나를 SQL 로 펼칩니다.
-        // 🌟 [CASE-AWARE SCAN] 기존 데이터에는 'BL'(로컬 추출)과 'bl'(서버 동기화)이
-        //    섞여 있습니다. IN 절에 두 형태를 모두 넣어야 전량이 조회됩니다.
+
+        const LOWER_COLLIDE: [&str; 4] = ["co", "id", "ca", "pc"];
         let type_in = TRADE_DOC_TYPES
             .iter()
-            .flat_map(|t| [t.to_uppercase(), t.to_lowercase()])
-            .collect::<std::collections::BTreeSet<_>>()   // 대소문자 동일 코드 중복 제거
+            .flat_map(|t| {
+                let up = t.to_uppercase();
+                let low = t.to_lowercase();
+                if LOWER_COLLIDE.iter().any(|c| *c == low) {
+                    vec![up]
+                } else {
+                    vec![up, low]
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .map(|t| format!("'{}'", t.replace('\'', "''")))
             .collect::<Vec<_>>()
@@ -1526,8 +1535,8 @@ impl VectorStore {
             if !f.trim().is_empty() { q = q.only_if(f); }
         }
 
-        // 정렬을 위해 전량을 메모리에 올린 뒤 슬라이스합니다. (기존 동작 유지)
-        let results = q.execute().await?.try_collect::<Vec<_>>().await?;
+        let scan_cap = std::cmp::max(20_000, (offset + limit).saturating_mul(50));
+        let results = q.limit(scan_cap).execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             docs.extend(Self::batch_to_docs(&batch));

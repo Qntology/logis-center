@@ -491,6 +491,24 @@ pub fn trading_relay_pair(from_type: &str, to_type: &str) -> Option<(&'static st
     if from_type == to_type { return None; }
     let mine = trade_reference_field_of(to_type)?;    // 상대를 가리키는 내 필드
     let foreign = trade_reference_field_of(from_type)?; // 나를 가리키는 상대 필드
+    // 🌟 [ALIAS COLLAPSE GUARD]
+    //
+    //  ── 어떤 쌍이 걸리는가 ──
+    //   INS ↔ IP      → 둘 다 reference_policy
+    //   CA  ↔ COA     → 둘 다 reference_analysis
+    //   PHYTO ↔ PC    → 둘 다 reference_phyto
+    //   BC  ↔ BK      → 둘 다 reference_booking
+    //   related_trading("INS") 이 IP 를 포함하므로 이 경로는 실제로 실행됩니다.
+    //
+    //  ── 왜 위험한가 ──
+    //   mine == foreign 이면 상대 문서의 그 필드에 내 doc_number 를 덮어씁니다.
+    //   상대가 원래 그 필드로 '나' 를 가리키고 있었다면 값이 자기 자신을 향하게 되고,
+    //   다음 스캔에서 RELAY SELF-LOOP 판정으로 관계가 통째로 끊깁니다.
+    //
+    //  ── 왜 그냥 끊는가 ──
+    //   두 코드는 같은 서식의 다른 표기입니다(보험증권 / 분석성적서 / 식물검역 / 부킹).
+    //   별개의 두 문서가 아니므로 릴레이를 성립시킬 이유 자체가 없습니다.
+    if mine == foreign { return None; }
     Some((mine, foreign))
 }
 
@@ -1025,17 +1043,6 @@ pub const TRADE_GROUPS: [(&str, &str); 7] = [
     ("parcel",    "courier label, parcel waybill sticker, domestic courier service, home delivery parcel, door to door small package, delivery driver, barcode sticker label, parcel pickup, last mile delivery"),
 ];
 
-/// Depth 2 : 그룹 소속 코드 목록.
-/// 🌟 [TRADE GROUP CODES v2] 27종 → 55종.
-///
-///  ── 무엇이 문제였나 ──
-///   related_trading() 은 HBL / FCR / POD / LG / TR / LLC / TI / CP / CM /
-///   CCC / CNM / PC / COA / FI / CDR / ICF / SOA / EL / BE / SR / BK / WR /
-///   CSI / SWB / IP / DN / CN / FC 를 참조 그래프에 넣어 두었지만,
-///   이 목록에 없으면 STEP 2 의 Depth 2 후보에 오르지 못합니다.
-///   (실측 로그의 VISION CODE CANDIDATES 가 정확히 27개였습니다)
-///   그 결과 House B/L 은 BL 로, 보험증권은 INS 로 오분류되고
-///   trade_relay_rules 가 빈 vec 을 돌려줘 연결 그래프가 통째로 죽습니다.
 pub const TRADE_GROUP_CODES: [(&str, &[&str]); 7] = [
     ("contract",   &["PO", "PI", "SC", "LC", "LLC", "CP", "BE", "TR", "LG", "EL"]),
     ("shipping",   &["CI", "PL", "BL", "HBL", "SWB", "AWB", "SA", "DO", "AN",
@@ -1048,28 +1055,19 @@ pub const TRADE_GROUP_CODES: [(&str, &[&str]); 7] = [
     ("parcel",     &["TRACKING"]),
 ];
 
-/// 🌟 [VISION CHROME] 이미지에만 존재하는 시각 노이즈 앵커.
-///  텍스트(PUG) 트랙에는 없던 축입니다.
-///  로고 / 도장 / 서명 / 표 괘선 / 여백 / QR 은 문서 면적의 상당수를 차지하지만
-///  어떤 스키마 필드의 값도 아닙니다. 모든 그룹·코드·카테고리의 공통 편견입니다.
 pub const VISION_CHROME_ANCHOR: &str =
     "company logo, brand emblem, letterhead graphic, official round stamp, red seal, \
      handwritten signature, watermark, blank paper, empty margin, page border, table grid lines, \
      ruled lines, barcode stripes, QR code square, page number footer, printed form template, \
      decorative frame, background texture, scanned paper noise, staple hole, punch hole";
 
-/// 🌟 [TABLE STRUCTURE ANCHOR] 명세 표(line items / containers) 전용 시각 앵커.
-///
-///  ── 왜 필요한가 ──
-///   items 카테고리의 스키마 필드는 `hs_code` 하나뿐입니다.
-///   실측에서 items 히트맵의 최고 점수는 +1.3126 으로 7개 카테고리 중 최하위였고,
-///   상품 표(y 550~634)를 전혀 잡지 못한 채 합계 블록을 크롭했습니다.
-///   표는 '컬럼 헤더 나열 + 반복 행' 이라는 강한 시각 구조를 갖고 있으므로
-///   그 구조 자체를 앵커로 세워야 위치가 잡힙니다.
-///
-///  ── 어휘가 아니라 구조인가 ──
-///   여기 적힌 문구는 전 세계 무역 서식 표의 컬럼 헤더 표준 명칭입니다.
-///   bias.json 의 필드 semantic 과 같은 계보이며, 특정 서식에 종속되지 않습니다.
+pub const UI_ACTION_ANCHOR: &str =
+    "edit button, modify, update, delete, remove, copy, duplicate, register, add new, \
+     save, cancel, confirm, submit, apply, reset, search button, view detail, go to detail, \
+     open detail page, more, expand, manage, management, administration, row action, \
+     action column, link button, print, download, export to excel, select all checkbox, \
+     move, sort order input, quick edit, preview, share, send sms, send email";
+
 pub const TRADE_TABLE_STRUCTURE_ANCHOR: &str =
     "description of goods, description of merchandise, commodity description, item description, \
      line item table, itemized list, goods table, product table, \
@@ -1114,12 +1112,6 @@ pub fn trade_code_anchor(code: &str) -> &'static str {
         "POA"      => "power of attorney, authorization letter, attorney in fact",
         "BIZ_LIC"  => "business license, business registration certificate, company registration number",
         "INS"      => "insurance policy, marine cargo insurance, insured amount, premium, coverage all risks",
-
-        // 🌟 [NEW 28] TRADE_GROUP_CODES v2 로 후보에 오르게 된 서식들입니다.
-        //    구버전은 이 코드들이 후보 목록에 없어 판정 자체가 불가능했고,
-        //    설령 도달해도 이 함수가 기본값 "trade document" 를 돌려줘
-        //    Depth 2 채점에서 모든 코드가 동점이 되었습니다.
-        //    앵커 문구는 각 서식의 표준 표제·필수 기재사항입니다.
 
         // ── 계약 · 결제 ──
         "LLC"      => "local letter of credit, domestic letter of credit, internal L/C, applicant exporter, beneficiary supplier, local L/C amount in won",
@@ -1166,14 +1158,6 @@ pub fn trade_code_anchor(code: &str) -> &'static str {
     }
 }
 
-/// 🌟 [FIELD → CATEGORY] 스키마 필드가 어느 추출 카테고리에 속하는지 판정합니다.
-///
-///  ── 왜 logic.rs 인가 ──
-///   기존에는 scheduler.rs 의 process_trading_task 안에
-///   지역 fn trade_field_category 로 박혀 있어서
-///   비전 히트맵(카테고리 단위)이 같은 매핑을 쓸 수 없었습니다.
-///   저장 스키마(get_trade_category_schema)와 히트맵 축이 어긋나면
-///   크롭 영역과 추출 프롬프트가 서로 다른 필드를 가리키게 됩니다.
 pub fn trade_field_category(field: &str) -> &'static str {
     // ── ① 참조 축은 전부 header ──
     //    (구버전은 match 에도 "reference_number" 를 적어 두었지만
@@ -1312,11 +1296,6 @@ pub fn trade_field_category(field: &str) -> &'static str {
     }
 }
 
-// 🌟 [TRADE DOC TITLES] vision_encoder.rs 에 하드코딩되어 있던 서식 전문 사전을
-//    logic.rs 로 이관합니다. 텍스트 트랙(scheduler STEP A)과 비전 트랙이
-//    같은 사전을 쓰면 서식이 늘어도 수정 지점이 한 곳으로 고정됩니다.
-//    전문(full name)을 키로 쓰는 이유: 'CI' 같은 접두어는 다른 서식에도
-//    인쇄되지만(ED 의 reference_invoice 등), 전문은 헤더로 인쇄되는 서식 본인뿐입니다.
 pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
     ("CI", "commercial invoice"),
     ("PI", "proforma invoice"),
@@ -1373,24 +1352,9 @@ pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
     ("BE", "bill of exchange"),
     ("TR", "trust receipt"),
     ("LG", "letter of guarantee"),
-    // 🌟 [COMMERCE/PARCEL AXIS] mode 감지용 추가 축.
-    //    택배 라벨은 무역 서식과 달리 전문이 '라벨' 문구로 인쇄됩니다.
-    //    동명 마진 0 자가거부 규칙 때문에 TRACKING 은 1개 항목만 둡니다.
     ("TRACKING", "tracking label shipping label parcel waybill"),
 ];
 
-/// 🌟 [RULE FALLBACK] 명시 매핑에 없는 필드를 부분일치 규칙으로 라우팅합니다.
-///
-///  ── 왜 필요한가 ──
-///   구버전은 `_ => ""` 였습니다. 그래서 bias.json 의 trade_schema 에 필드를
-///   추가해도 이 함수를 함께 고치지 않으면 그 필드는 카테고리를 못 받고,
-///   히트맵에서 통째로 사라졌습니다.
-///   (실측: items 6필드 중 5개가 정확히 이 경로로 소멸)
-///   규칙 폴백이 있으면 bias.json 만 고쳐도 새 필드가 자동으로 라우팅됩니다.
-///
-///  ── 순서가 의미를 갖습니다 ──
-///   'duty_rate' 는 'rate'(financials) 와 'duty_'(customs) 양쪽에 걸립니다.
-///   좁은 개념(customs / insurance / hazmat)을 먼저 검사해야 올바른 축으로 갑니다.
 fn trade_field_category_by_rule(field: &str) -> &'static str {
     let f = field;
 
@@ -1406,6 +1370,10 @@ fn trade_field_category_by_rule(field: &str) -> &'static str {
     if f.contains("insur") || f.contains("polic") || f.contains("premium")
         || f.contains("claim") || f.contains("coverage") {
         return "insurance";
+    }
+    if f.contains("damage") || f.contains("finding") || f.contains("loss")
+        || f.contains("affected") || f.contains("surveyor") {
+        return "inspection";
     }
     if f.contains("inspect") || f.contains("treatment") || f.contains("certificate")
         || f.contains("survey") || f.contains("weighing") || f.contains("test_") {
@@ -1440,16 +1408,7 @@ fn trade_field_category_by_rule(field: &str) -> &'static str {
     ""
 }
 
-/// 🌟 이 카테고리가 배열(반복 행) 스키마인지 답합니다.
-///
-///  ── 왜 이 함수가 logic.rs 에 있는가 ──
-///   merge_extracted(model.rs) 의 배열 승격, get_trade_category_schema(prompts.rs) 의
-///   `[ { ... } ]` 렌더링, plan_crops(vision_crop.rs) 의 TABLE UNION 이
-///   전부 같은 판정을 필요로 합니다. 세 곳이 각자 문자열을 비교하면
-///   카테고리 하나 추가할 때마다 셋이 어긋납니다.
 pub fn is_trade_array_category(category: &str) -> bool {
-    // 🌟 parties 는 스칼라 5축이므로 배열이 아닙니다.
-    //    반복되는 당사자는 other_parties 가 받습니다. (22-7 주석 참조)
     matches!(
         category,
         "items" | "containers" | "other_parties" | "charges"
@@ -1457,37 +1416,12 @@ pub fn is_trade_array_category(category: &str) -> bool {
     )
 }
 
-/// 🌟 [EXTRACTION CATEGORIES] 비전 크롭 + LLM 추출이 순회하는 카테고리 목록.
-///
-///  parsing.rs 의 get_trade_category_schema 가 소비하는 8개와 동일합니다.
-///  items / containers 는 배열 스키마이며, 히트맵으로 위치를 찾은 뒤
-///  그 영역 전체를 크롭해 표를 통째로 읽힙니다.
-/// 🌟 [EXTRACTION CATEGORIES v2]
-///
-///  ── 왜 8개에서 16개로 늘리는가 ──
-///   45종 예시 대조에서 기존 8개 카테고리에 담을 수 없는 필드가
-///   customs(통관) / inspection(검사) / insurance(보험) / settlement(정산) /
-///   hazmat(위험물) / origin(원산지) / compliance(규제) / charges(요금명세)
-///   여덟 갈래로 나타났습니다.
-///   기존에는 이 필드들이 trade_field_category 에서 "" 를 받아 통째로 사라졌습니다.
-///
-///  ── 카테고리가 늘어도 호출 횟수는 서식마다 다릅니다 ──
-///   히트맵은 '그 서식에 실제로 로드된 필드가 있는 카테고리' 에만 생성됩니다.
-///   bias_schema 의 조건부 로드(base + overlay[doc_type])와 맞물려
-///     · CI 인보이스 → header/parties/logistics/conditions/financials/cargo/items/containers = 8
-///     · DGD        → 위 8 + hazmat = 9
-///     · COA        → 위 8 + inspection = 9
-///     · SOA        → header/parties/financials/settlement/charges = 5
-///   처럼 자동으로 좁혀집니다. 16개가 항상 전부 도는 것이 아닙니다.
-///
-///  ⚠️ 배열 여부는 is_trade_array_category() 가 단독으로 답합니다.
-///     이 배열의 순서는 크롭 추출 순서가 되므로,
-///     식별자(header)를 먼저 확정해 ALREADY CLAIMED 로 뒤 카테고리를 보호합니다.
-pub const TRADE_EXTRACTION_CATEGORIES: [&str; 17] = [
+pub const TRADE_EXTRACTION_CATEGORIES: [&str; 20] = [
     // ── base (전 서식 공통) ──
     "header", "parties", "other_parties", "logistics", "conditions",
     "financials", "cargo", "items", "containers",
     // ── overlay (서식별 조건부) ──
     "customs", "inspection", "insurance", "settlement",
     "hazmat", "origin", "compliance", "charges",
+    "test_results", "findings_and_damage", "account_ledger",
 ];

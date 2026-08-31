@@ -1958,48 +1958,23 @@ async fn ai_search_complex(
                     synthesized
                 };
 
-                // 🌟 [TABLE ROUTING v4] users / pages 만 물리 분리, 나머지는 전부 items.
-                //    scheduler 저장 매핑과 lib 조회 매핑이 어긋나 'review 는 items 에 저장되는데
-                //    event 에서 조회' 같은 구조적 0건 버그를 만들던 match 문을 제거했습니다.
                 let target_table = match ctx_type {
                     "member" | "team" | "user" => "users",
                     "page" | "pages" => "pages",
                     _ => "items",
                 };
 
-                // 🌟 [SCOPE / PLAN 분리]
-                //    LanceDB 에는 봉투 컬럼만 내려보내고,
-                //    도메인 조건은 하나도 버리지 않고 dexie_plan 으로 프론트에 전달합니다.
                 let mut scope_ctx = ctx.clone();
                 if let Some(o) = scope_ctx.as_object_mut() {
                     // 폴백 접미사가 붙은 type 이 SQL 에 그대로 나가면 `type = 'review_items'` 가 되어
                     // 항상 0건이 됩니다. 정규화된 이름으로 교체합니다.
                     o.insert("type".to_string(), json!(ctx_type));
-                    // 🌟 [TENANT SCOPE] build_scope_filter 는 cc / bcc / ref 를 읽도록 되어 있는데
-                    //    STAGE-3 / parse_shipping_query / parse_analytic_query 가 만드는 컨텍스트에는
-                    //    그 키가 하나도 없어 해당 블록이 통째로 죽어 있었습니다.
-                    //    그 결과 AI 검색이 전 팀·전 사이트 문서를 무차별로 반환했습니다.
-                    //    ai_search_complex 가 인자로 이미 받고 있으므로 여기서 주입합니다.
-                    //
-                    //    ⚠️ bcc / ref 는 넣지 않습니다.
-                    //       bcc = hash_id(doc_type + cc) 로 '문서 종류' 단위,
-                    //       ref = 문서 그룹 단위이므로 검색 스코프로 쓰면 리콜이 붕괴합니다.
-                    // 🌟 [LOCAL EXTRACTION SCOPE] 로컬 이미지/문서 추출물은
-                    //    cc = hash_id("local.shipping") / hash_id("local.commerce") 로 저장됩니다.
-                    //    (model.rs 의 extract_from_image 참조)
-                    //    반면 검색의 cc 는 프론트엔드가 넘긴 '웹 도메인 해시' 입니다.
-                    //    (main.ts: hashId(getRootDomain(hostname)))
-                    //    두 값이 구조적으로 일치할 수 없으므로, cc 를 그대로 걸면
-                    //    로컬 추출 문서가 검색에서 100% 탈락합니다.
-                    //
-                    //    shipping 트랙은 애초에 로컬 추출이 주 경로이므로 cc 스코프를 걸지 않습니다.
-                    //    (mode = 'shipping' 만으로도 트랙 격리가 성립합니다)
-                    //    commerce/analytic 은 웹 페이지 추출이 주 경로이므로 기존대로 cc 를 유지합니다.
+
                     if !cc.trim().is_empty() && search_mode != "shipping" {
                         o.insert("cc".to_string(), json!(cc.clone()));
                     }
                 }
-                let scope_filter = build_scope_filter(&scope_ctx, &search_mode);
+                let scope_filter = sanitize_scope_filter(build_scope_filter(&scope_ctx, &search_mode));
                 let dexie_plan = build_dexie_plan(&scope_ctx, &search_mode);
 
                 println!(
@@ -3203,36 +3178,34 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         .or_else(|| item.get("data").and_then(|d| d.get("id")).and_then(|v| v.as_str()))
                         .unwrap_or("").to_string();
             
-            
-            // 🌟 [TYPE CASE CONTRACT]
-            //
-            //  ── 무엇이 문제였나 ──
-            //   무조건 to_lowercase() 를 걸어 무역 서식 'BL' 이 'bl' 로 저장되었습니다.
-            //   bias.json 의 trade_schema.overlay 키는 대문자이므로
-            //   canonical_bias_type / get_detail_schema_fields 가 그 행을
-            //   무역 문서로 인식하지 못했고, 청크가 통째로 생성되지 않았습니다.
-            //
-            //  ── 왜 무역만 대문자인가 ──
-            //   commerce 도메인 타입(goods/order/tracking)은 원래 소문자가 표준이고
-            //   store.rs 의 resolve_table 매치도 소문자 기준입니다.
-            //   무역 서식 코드만 bias.json 계약상 대문자가 표준이므로,
-            //   '무역이면 대문자, 그 외는 소문자' 라는 단일 규칙으로 통일합니다.
-            //
-            //  ── 판정 근거 ──
-            //   서식 목록을 여기에 복제하지 않습니다.
-            //   canonical_trade_doc_code 가 TRADE_DOC_TYPES 상수 하나만 참조합니다.
             let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
-            let type_str = match crate::utils::bias_schema::canonical_trade_doc_code(&raw_type) {
-                Some(canon) => {
-                    if raw_type != canon {
-                        println!(
-                            "[SYNC] 🚢 [TYPE NORMALIZE] id='{}' type='{}' → '{}' (무역 서식 표준형)",
-                            id, raw_type, canon
-                        );
+
+            const COMMERCE_RESERVED: [&str; 19] = [
+                "sales", "goods", "order", "tracking", "event", "coupon", "review",
+                "receiving", "shipping", "member", "team", "user", "users",
+                "pages", "page", "talk", "prompt", "ai_search", "unknown",
+            ];
+            const ANALYTIC_RESERVED: [&str; 7] = [
+                "click", "hover", "change", "touch", "report", "question", "answer",
+            ];
+            let lower = raw_type.to_lowercase();
+            let is_reserved = COMMERCE_RESERVED.iter().any(|t| *t == lower)
+                || ANALYTIC_RESERVED.iter().any(|t| *t == lower);
+            let type_str = if is_reserved {
+                lower
+            } else {
+                match crate::utils::bias_schema::canonical_trade_doc_code(&raw_type) {
+                    Some(canon) => {
+                        if raw_type != canon {
+                            println!(
+                                "[SYNC] 🚢 [TYPE NORMALIZE] id='{}' type='{}' → '{}' (무역 서식 표준형)",
+                                id, raw_type, canon
+                            );
+                        }
+                        canon.to_string()
                     }
-                    canon.to_string()
+                    None => lower,
                 }
-                None => raw_type.to_lowercase(),
             };
 
             
@@ -3242,49 +3215,16 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let mut clean_item = item.clone();
             if let Some(obj) = clean_item.as_object_mut() {
                 obj.insert("type".to_string(), serde_json::json!(type_str.clone()));
-                // 🌟 [v4] 루트 호이스팅 복원 블록을 제거했습니다.
-                //    프론트엔드(normalizeEnvelope)가 이미 봉투/확장을 분리해서 보내고,
-                //    Rust 쪽 canonicalize_data 가 타입까지 확정하므로
-                //    여기서 status / amount / is_masked 를 다시 끌어올릴 이유가 없습니다.
-                //
-                //    다만 봉투 값 중 data 안에 반드시 있어야 하는 것들(mode / 시간)은
-                //    상위 페이로드에만 있을 수 있으므로 결손일 때만 보충합니다.
+
                 if obj.get("mode").is_none() {
                     if let Some(mode) = item.get("mode") {
                         obj.insert("mode".to_string(), mode.clone());
                     } else {
-                        // 🌟 [ANALYTICS MODE AUTO-TAG] 서버(D1)에서 내려온
-                        //    analytics 트랙 항목은 mode 컬럼이 없습니다.
-                        //    reindex_pending_embeddings 가 mode = 'analytic' 으로
-                        //    필터링하므로, 여기서 자동 주입하지 않으면
-                        //    동기화되어도 임베딩 대상에서 전량 탈락합니다.
                         let is_analytic_type = matches!(
                             type_str.as_str(),
                             "click" | "hover" | "change" | "report" | "question" | "answer"
                         );
-                        // 🌟 [SHIPPING MODE AUTO-TAG]
-                        //
-                        //  ── 무엇이 문제였나 ──
-                        //   analytics 만 자동 태깅하고 무역 서식(BL/CI/AWB/FC/CN/...)은
-                        //   아무 처리도 하지 않았습니다. mode 가 빈 채로 저장되면
-                        //   하류의 두 폴백이 전부 'commerce' 를 시딩합니다.
-                        //     · indexing.rs   MODE GUARD  → unwrap_or("commerce")
-                        //     · lib.rs        reindex mode → unwrap_or("commerce")
-                        //   그 결과 무역 문서가 commerce 트랙에 굳어버립니다.
-                        //
-                        //  ── 실측 피해 ──
-                        //   reindex_pending_embeddings 는 mode = 'commerce' 로 정확히
-                        //   필터링하는데도 FC/CN/DN/IP/BE/WR/SR/BK/CSI/ID/ED/FCR/POD/
-                        //   AN/DO/AWB/SWB/HBL/BL 20건이 잡혔습니다.
-                        //   필터가 틀린 게 아니라 데이터의 mode 가 틀렸던 것입니다.
-                        //   이 문서들은 commerce 검색(mode = 'commerce')에서 검색되고,
-                        //   정작 shipping 검색(mode = 'shipping')에서는 0건이 됩니다.
-                        //
-                        //  ── 판정 근거 ──
-                        //   서식 코드 55종을 여기에 나열하지 않습니다.
-                        //   canonical_bias_type() 이 이미 그 목록의 단일 소유자이며,
-                        //   'shipping_doc' 으로 접히는지만 확인합니다.
-                        //   bias_schema.rs 에 서식이 추가되어도 이 코드는 그대로입니다.
+
                         let is_shipping_doc_type =
                             crate::utils::bias_schema::canonical_bias_type(type_str.as_str())
                                 == "shipping_doc";
@@ -3306,9 +3246,6 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     if let Some(v) = item.get("updated_at") {
                         obj.insert("updated_at".to_string(), v.clone());
                     } else {
-                        // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 루트에도 data 에도 없으면
-                        //    0(draft) 을 시딩합니다. 이 처리가 없으면 store.rs upsert_item 이
-                        //    '키 없음 → 현재 시각' 경로를 타 draft → count 가 됩니다.
                         obj.insert("updated_at".to_string(), serde_json::json!(0));
                     }
                 }
