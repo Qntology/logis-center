@@ -22,15 +22,13 @@ const TRADE_ITEM_ATTRIBUTE_ANCHOR: &str = "line item attribute, attribute of one
      item code, stock keeping unit, article number, product description, \
      quantity, unit of measure, unit price, line total, amount of this row, \
      table column header, row number in a list, subtotal, discount, total quantity";
-/// 🌟 [ROW MARKER ANCHOR] 표 행 구분자 / 그룹 키 등 '표제가 될 수 없는' 라인.
-///    실측에서 "[ Item 2 ]" 와 "metadata:" 가 표제 후보로 올라왔습니다.
+
 const TRADE_ROW_MARKER_ANCHOR: &str = "row separator, table row marker, line item index, \
      item number in a list, section key, group key, metadata key, \
      continued from previous page, page break marker, list bullet";
-/// 🌟 [TITLE CANDIDATE] 상단 밴드에서 '표제(전문)일 수 있는 값' 을 수집합니다.
+
 #[derive(Debug, Clone)]
 struct TitleCandidate {
-    /// 라벨이 있으면 그 라벨. 표제 헤딩(라벨 없음)이면 빈 문자열.
     label: String,
     value: String,
     line: usize,
@@ -317,7 +315,6 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
         }
     }
 
-    
     if upper.contains("B/L") {
         found.push("bl_label".to_string());
     }
@@ -1511,42 +1508,8 @@ pub async fn process_trading_task(
 
     
     let mut detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
-    // =====================================================================
-    // 🌟 [SECTION RECOVERY] 섹션이 비면 상위 들여쓰기 라벨로 복원합니다.
-    // ---------------------------------------------------------------------
-    //  ── 실측 사고 ──
-    //   로그의 페어 22개가 전부 Section: '' 였습니다.
-    //     Line 34 | Section: '' | Label: 'name'    | Value: 'Nova Importers LLC'
-    //     Line 45 | Section: '' | Label: 'name'    | Value: 'Global Tech Logistics KR'
-    //     Line 37 | Section: '' | Label: 'address' | Value: '456 Market St, ...'
-    //     Line 48 | Section: '' | Label: 'address' | Value: '123 Teheran-ro, ...'
-    //   buyer / seller 라는 결정적 구분 정보가 통째로 사라졌고,
-    //   is_multi_value_field('party_address') 가 참이라 두 주소가 한 값으로 접합되어
-    //   sender_address / recipient_address 가 둘 다 비었습니다.
-    //
-    //  ── 복원 근거 (구조 사실) ──
-    //   YAML/PUG 는 들여쓰기로 소속을 표현합니다.
-    //   자기보다 얕은 들여쓰기의 가장 가까운 앞 라인이 곧 소속 섹션입니다.
-    //   어휘 사전이 아니라 공백 개수만 보므로 언어와 무관합니다.
-    // =====================================================================
+
     {
-        // 🌟 [SECTION RECOVERY v2] 들여쓰기가 아니라 '직전 미소비 텍스트 행' 으로 복원합니다.
-        //
-        //  ── v1 이 왜 실패했나 (실측: [SECTION RECOVERY] 로그 0건) ──
-        //   collect_detail_label_value_pairs 의 섹션은 heading 태그(h1~h6/legend/caption)
-        //   에서만 나옵니다. 그런데 pdf_page_to_structured_html 은
-        //     <table><tr><th>라벨</th><td>값</td></tr>
-        //     <tr><td colspan="2">parties:</td></tr>
-        //   만 만들고 heading 을 하나도 만들지 않습니다.
-        //   게다가 표 행이 전부 같은 깊이라 들여쓰기 비교도 성립하지 않습니다.
-        //
-        //  ── 올바른 구조 근거 ──
-        //   그룹 제목은 '라벨-값 페어가 되지 못한 단독 텍스트 행' 으로 나타납니다.
-        //   실측 라인 간격이 이를 뒷받침합니다.
-        //     27(related_lc_number) → 34(name)  : 7칸 (parties: / buyer: 두 행)
-        //     40(contact_number)    → 45(name)  : 5칸 (seller: 한 행)
-        //   따라서 label_line 에서 뒤로 걸어 가장 가까운 '미소비 텍스트 행' 이 곧 섹션입니다.
-        //   태그명·어휘를 보지 않고 소비 여부만 보므로 언어와 무관합니다.
         let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for p in detail_pairs.iter() {
             consumed.insert(p.primary_line);
@@ -1752,9 +1715,6 @@ pub async fn process_trading_task(
                     | crate::utils::ai_utils::FieldFormat::Text
             );
 
-            // 🌟 [BANK COHESION] 이 필드 라벨 뱅크의 내부 응집도를 1회만 계산합니다.
-            //    응집도가 높은 필드(동의어가 촘촘한 필드)는 편견 뱅크와도
-            //    구조적으로 가깝게 나오므로 그만큼 관대한 기준이 필요합니다.
             let f_cohesion = crate::utils::ai_utils::bank_internal_cohesion(&t_label_embs[f]);
             for h in 0..unique_labels.len() {
                 if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
@@ -1767,31 +1727,14 @@ pub async fn process_trading_task(
                 } else {
                     crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &t_prej_embs[f])
                 };
-                // 🌟 [RELATIVE PREJUDICE GATE]
-                //  ── 실측 사고 ──
-                //   🚫 'address' → 'recipient_address' | Label: 0.8061 <= Prej: 0.8374
-                //   전 조합 중 최고 점수가 삭제되어, 편견이 약한 party_address 만 남았고
-                //   buyer 주소와 seller 주소가 한 값으로 접합되었습니다.
-                //   ("456 Market St, ... USA 123 Teheran-ro, ... South Korea")
-                //  ── 왜 상대 비교인가 ──
-                //   "이 라벨이 어느 필드에 속하는가" 는 배타 배정이 이미 판정합니다.
-                //   편견의 역할은 '정반대 개념 차단' 이므로, 자기 점수를 뱅크 응집도만큼의
-                //   여유 이상으로 앞설 때만 폐기합니다. 새 매직 상수가 없습니다.
+
                 if crate::utils::ai_utils::prejudice_dominates(own, prej, f_cohesion) {
                     emit_term(&format!("    🚫 [TRADING PREJUDICE GATE] '{}' → '{}' | Label: {:.4} | Prej: {:.4} | Cohesion: {:.4} (상대 우위 초과)",
                         unique_labels[h], t_field_names[f], own, prej, f_cohesion));
                     continue;
                 }
                 let pair_val = if f_multi { &phrase_multi[h] } else { &phrase_single[h] };
-                // 🌟 [FORMAT GATE ALWAYS] f_strict 분기를 제거합니다.
-                //
-                //  ── 왜 제거하는가 ──
-                //   f_strict 는 Identifier / Link / Enum / Synthesis 를 게이트에서 뺐습니다.
-                //   그런데 value_matches_format 은 그 포맷들에 대해서도 명확한 판정을 갖고
-                //   있으므로 예외를 둘 이유가 없습니다.
-                //   오히려 예외 때문에 Enum 필드(incoterms 등)에 수치가 들어가는 것을
-                //   별도 게이트(TRADING ENUM NUMERIC GATE)로 따로 막아야 했습니다.
-                //   그 별도 게이트는 아래에 그대로 남겨 두어 이중 방어를 유지합니다.
+
                 if pair_val.trim().is_empty()
                     || !crate::utils::ai_utils::value_matches_format(f_fmt, pair_val) {
                     emit_term(&format!("    🚫 [TRADING VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 형식 불일치",
@@ -1859,7 +1802,7 @@ pub async fn process_trading_task(
             } else if let Some(slot) = final_data_map.get_mut(cat).and_then(|v| v.as_object_mut()) {
                 slot.insert(fname.clone(), json!(val.clone()));
             } else {
-                let arr_key = match *cat {
+                let arr_key = match cat {
                     "items" => Some("line_items"),
                     "containers" => Some("containers"),
                     _ => None,
