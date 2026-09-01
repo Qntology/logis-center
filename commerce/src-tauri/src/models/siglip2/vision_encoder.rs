@@ -1,33 +1,3 @@
-// =====================================================================
-// 🌟 [SigLIP2 VISION ENCODER PIPELINE]
-// ---------------------------------------------------------------------
-//  이 파일은 기획서의 STEP 1 / STEP 2 를 담당합니다.
-//
-//   STEP 1 : Doc Type NMS Battle
-//            원본 이미지 패치 임베딩  ×  서식 그룹/코드 앵커 뱅크
-//            → SURPRISAL 채점 → 그룹 확정 → 코드 확정
-//
-//   STEP 2 : Column Cosine Matching
-//            패치 임베딩  ×  스키마 컬럼 앵커 뱅크
-//            → 카테고리별 2D 히트맵 생성
-//
-//  ── 왜 텍스트 NMS 와 같은 함수를 쓰는가 ──
-//   scheduler.rs STEP A 는 27종 서식을 '그룹 → 코드' 2뎁스로 좁히면서
-//   ai_utils::surprisal_dual_scores 로 채점합니다.
-//   비전도 정확히 같은 함수를 씁니다. 판정 대상이
-//   'PUG 라인 임베딩' 에서 '이미지 패치 임베딩' 으로 바뀔 뿐입니다.
-//   그래야 새 서식이 추가돼도 logic.rs 의 사전 한 곳만 고치면 되고,
-//   텍스트 트랙과 비전 트랙의 판정 근거가 갈라지지 않습니다.
-//
-//  ── 왜 parsing.rs 의 get_trade_doc_slice_config 를 대체하는가 ──
-//   그 함수는 서식마다 (카테고리, top, bottom) 비율을 손으로 적어 둔 표입니다.
-//   실제 문서는 레이아웃이 제각각이라 고정 비율 크롭은
-//   ① 다른 카테고리 영역을 통째로 삼키고
-//   ② 정작 필요한 필드는 절반이 잘려 나갑니다.
-//   여기서는 '컬럼 이름 텍스트' 와 '이미지 패치' 의 코사인으로
-//   그 카테고리가 실제로 인쇄된 위치를 찾아냅니다.
-// =====================================================================
-
 use candle_core::{DType, Device, Tensor};
 use image::DynamicImage;
 
@@ -36,33 +6,8 @@ use super::{Siglip2Config, Siglip2Model};
 use crate::logic::TRADE_DOC_TITLES;
 use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
-/// 🌟 [LAZY TEXT CONTRACT] "이 작업에는 텍스트 인코더가 실제로 필요하다" 는 신호.
-///
-///  ── 왜 에러로 신호하는가 ──
-///   앵커 구 목록은 doc_type 과 bias.json 에 따라 결정되므로,
-///   호출부가 '무엇이 필요한지' 를 미리 알려면 build_column_heatmaps 의
-///   구 수집 로직을 통째로 복제해야 합니다. 그 복제본이 원본과 어긋나는 순간
-///   게이트가 거짓말을 하고 파이프라인이 하드 에러로 죽습니다.
-///
-///   대신 '해 보고, 정말 못 하면 그때 올린다' 로 뒤집습니다.
-///   encode_phrases_shared 는 캐시 미스가 있을 때만 이 접두어를 붙여 실패하고,
-///   model.rs 의 with_siglip_text 가 그 신호를 받아 텍스트를 부착한 뒤 1회 재시도합니다.
-///   구 목록이 어떻게 바뀌어도 게이트가 어긋날 수 없습니다.
-///
-///  ── 실패 시점 ──
-///   build_anchor_bank 는 뱅크를 만들기 '전에' encode_phrases_shared 를 부르므로,
-///   미스가 있으면 순전파를 한 번도 돌리지 않고 즉시 반환합니다. 낭비가 없습니다.
 pub const ERR_TEXT_ENCODER_REQUIRED: &str = "SIGLIP2_TEXT_ENCODER_REQUIRED";
 
-// =====================================================================
-// 텍스트 앵커 뱅크
-// =====================================================================
-
-/// (category, key, phrase) 트리플을 SigLIP2 텍스트 공간으로 인코딩한 결과.
-///
-/// 🌟 [Arc 공유] 같은 구가 여러 (category, key) 에 반복 등장하므로
-///    벡터 실체는 한 벌만 두고 참조만 나눠 갖습니다.
-///    (구버전은 13,943회 복사로 문서당 64MB 를 힙에 쏟아부었습니다)
 pub struct AnchorBank {
     /// bias 축: 이 개념을 설명하는 구
     pub bias: Vec<(String, String, std::sync::Arc<Vec<f32>>)>,
@@ -86,16 +31,6 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-/// 🌟 [CACHED ENCODE] 앵커 구 목록을 벡터화합니다. 캐시 히트분은 인코더를 타지 않습니다.
-///
-///  ── 왜 Arc 로 돌려주는가 ──
-///   build_anchor_bank 가 곧바로 Arc::new 로 감싸므로, 캐시에서 이미 Arc 인 것을
-///   벡터로 풀었다가 다시 감싸면 345 × 1152 × 4B 의 복사가 문서마다 발생합니다.
-///   캐시의 Arc 를 그대로 흘려보내면 복사가 0 이 됩니다.
-///
-///  ── 인코더 요구 조건 ──
-///   전부 캐시 히트면 model.text 가 None 이어도 성공합니다.
-///   즉 두 번째 실행부터는 1.4GB 텍스트 인코더를 올리지 않고도 뱅크를 만들 수 있습니다.
 pub fn encode_phrases_shared(
     model: &Siglip2Model,
     phrases: &[String],
@@ -128,9 +63,6 @@ pub fn encode_phrases_shared(
         return Ok(slots.into_iter().map(|s| s.unwrap()).collect());
     }
 
-    // ── ② 미스분만 인코딩 ──
-    //    🌟 텍스트 인코더가 없고 캐시 미스가 있으면 ERR_TEXT_ENCODER_REQUIRED 로 신호합니다.
-    //       호출부(model.rs::with_siglip_text)가 이 접두어를 보고 인코더를 부착한 뒤 재시도합니다.
     let text = model.text.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "{}: text encoder is not loaded, and {} of {} anchor phrases are not cached.",
@@ -190,15 +122,10 @@ pub fn encode_phrases(
         .collect())
 }
 
-/// 🌟 [LOAD GATE] 이 구 목록이 전부 캐시에 있는지 확인합니다.
-///    model.rs 의 ensure_siglip2 가 needs_text 를 판정할 때 사용하면,
-///    캐시가 채워진 상태에서 1.4GB 인코더 로드를 건너뛸 수 있습니다.
 pub fn phrases_all_cached(phrases: &[String]) -> bool {
     crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE.all_cached(phrases)
 }
 
-/// (category, key, phrase) 정의 목록을 뱅크로 변환합니다.
-/// 동일 문자열 구는 1회만 임베딩하고 재사용합니다.
 pub fn build_anchor_bank(
     model: &Siglip2Model,
     bias_defs: &[(String, String, String)],
@@ -206,12 +133,6 @@ pub fn build_anchor_bank(
 ) -> anyhow::Result<AnchorBank> {
     use std::collections::HashMap;
 
-    // 🌟 [O(N²) → O(N)] 구버전은 uniq 구축과 lookup 을 둘 다 선형 탐색으로 했습니다.
-    //    실측 뱅크(bias 345 + prej 13,598 = 13,943구, uniq 345)에서
-    //      uniq 구축 : 13,943 × 345/2 ≈ 240만 문자열 비교
-    //      lookup    : 13,943 × 345/2 ≈ 240만 문자열 비교
-    //    필드가 늘면 이 둘이 제곱으로 커져 STEP 3 이 CPU 에서 먼저 죽습니다.
-    //    HashMap 색인으로 둘 다 O(1) 조회가 됩니다.
     let mut index: HashMap<&str, usize> = HashMap::new();
     let mut uniq: Vec<String> = Vec::new();
     for (_, _, p) in bias_defs.iter().chain(prej_defs.iter()) {
@@ -220,9 +141,7 @@ pub fn build_anchor_bank(
             uniq.push(p.clone());
         }
     }
-    // 🌟 [CACHE + ZERO-COPY] encode_phrases_shared 는 캐시의 Arc 를 그대로 흘려보냅니다.
-    //    구버전은 Vec<Vec<f32>> 를 받아 다시 Arc::new 로 감쌌기 때문에
-    //    캐시 히트분까지 345 × 1152 × 4B 의 복사가 문서마다 발생했습니다.
+
     let shared: Vec<std::sync::Arc<Vec<f32>>> = encode_phrases_shared(model, &uniq)?;
     let zero = std::sync::Arc::new(vec![0.0f32; model.config.text_hidden_size]);
 
@@ -245,15 +164,8 @@ pub fn build_anchor_bank(
     })
 }
 
-// =====================================================================
-// 패치 임베딩 산출
-// =====================================================================
-
-/// 이미지 1장의 비전 산출물. STEP 1~4 가 모두 이 구조체를 소비합니다.
 pub struct PatchGrid {
-    /// 각 패치의 공유공간 임베딩 (L2 정규화 완료). len = rows * cols
     pub patches: Vec<Vec<f32>>,
-    /// 이미지 전체 풀링 벡터 (L2 정규화 완료). LanceDB 비전 검색용.
     pub pooled: Vec<f32>,
     pub grid_rows: usize,
     pub grid_cols: usize,
@@ -282,8 +194,6 @@ pub fn encode_image(
     model: &Siglip2Model,
     image: &DynamicImage,
 ) -> anyhow::Result<PatchGrid> {
-    // 🌟 [OPTIONAL VISION] 텍스트 전용으로 로드된 인스턴스에서는 이미지 처리가 불가능합니다.
-    //    조용히 0 벡터를 돌려주면 히트맵이 전부 무의미해지므로 명시적으로 실패시킵니다.
     let vision = model
         .vision
         .as_ref()
@@ -305,11 +215,6 @@ pub fn encode_image(
     let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
     l2_normalize(&mut pooled);
 
-    // 🌟 [EARLY DROP] 필요한 값은 전부 호스트 Vec 으로 복사가 끝났습니다.
-    //    VisionForward.patch_hidden 은 이 경로의 어떤 호출부도 읽지 않는데
-    //    (1, 252, 1152) GPU 텐서를 계속 살려 둡니다.
-    //    px / shared / pooled_t 와 함께 여기서 명시적으로 떨어뜨려,
-    //    이어지는 텍스트 인코딩이 시작되기 전에 CUDA 풀에 반환되게 합니다.
     drop(out);
     drop(shared);
     drop(pooled_t);
@@ -328,13 +233,6 @@ pub fn encode_image(
     })
 }
 
-/// 이미지 전체 풀링 벡터만 필요할 때 (LanceDB 비전 인덱싱 / 검색 쿼리).
-///
-/// 🌟 [POOLED-ONLY] 구버전은 vision.forward 를 호출해 patch_shared 까지 계산한 뒤
-///    그 결과를 통째로 버렸습니다. project_patches 는
-///      proj(v) 252×1152² + out_proj 252×1152² + mlp 252×1152×4304×2
-///    ≈ 3.2 GFLOP 이고, 중간 텐서 252×4304×4B = 4.3MB 를 순간적으로 잡습니다.
-///    풀링 벡터만 필요한 경로에서는 전부 순수 낭비입니다.
 pub fn encode_image_pooled(
     model: &Siglip2Model,
     image: &DynamicImage,
@@ -357,17 +255,6 @@ pub fn encode_image_pooled(
     Ok(pooled)
 }
 
-/// 🌟 [ENCODE + RELEASE] 패치를 뽑고 그 자리에서 비전 가중치를 반납합니다.
-///
-///  ── 왜 별도 진입점인가 ──
-///   encode_image 는 &Siglip2Model 을 받으므로 반납을 할 수 없습니다.
-///   호출부(STEP 1)가 이 함수를 쓰면 '패치 확보 → 즉시 856MB 반납' 이
-///   한 문장으로 보장됩니다. 이후 STEP 1 Depth1/2 와 STEP 2 는
-///   grid.patches(호스트) + 텍스트 인코더만으로 동작합니다.
-///
-///  ⚠️ [CALL SITE] model.rs 의 extract_from_image 에서
-///     `encode_image(&sig, &img)?`  →  `encode_image_and_release(&mut sig, &img)?`
-///     로 바꾸면 됩니다. sig 가 MutexGuard 라면 `let sig = &mut *guard;` 로 가변 참조를 얻습니다.
 pub fn encode_image_and_release(
     model: &mut Siglip2Model,
     image: &DynamicImage,
@@ -391,10 +278,6 @@ pub fn encode_query_text(model: &Siglip2Model, text: &str) -> anyhow::Result<Vec
         .ok_or_else(|| anyhow::anyhow!("SigLIP2 text encoding returned nothing"))
 }
 
-// =====================================================================
-// 🌟 [STEP 1] Doc Type NMS Battle
-// =====================================================================
-
 #[derive(Debug, Clone)]
 pub struct DocTypeVerdict {
     pub group: String,
@@ -403,21 +286,12 @@ pub struct DocTypeVerdict {
     pub code: String,
     pub code_score: f32,
     pub code_margin: f32,
-    /// 그룹 판정에서 편견 우세로 탈락한 패치 비율. 진단용.
     pub prejudice_dropped: usize,
-    /// 코드 후보와 각 점수. LLM 재판정 프롬프트에 그대로 실립니다.
     pub code_candidates: Vec<(String, f32)>,
-    /// 🌟 [MODE GATE] 상단 밴드에서 서식 전문이 인쇄되어 확정되었는가.
-    ///    mode 리라우트(commerce→trading)는 이 플래그가 true 일 때만 허용됩니다.
-    ///    본문 코사인만으로는 상품 사진과 무역 문서를 안전히 가를 수 없습니다.
     pub title_confirmed: bool,
-    /// 🌟 확정된 서식 전문 문자열. 컬럼 히트맵의 TITLE PREJUDICE 로 재사용됩니다.
     pub title_text: String,
 }
 
-/// 🌟 [BANK-NEUTRAL KEY SCORES] score_patches_bank_neutral 출력을 (key → 패치 최댓값) 으로 축소합니다.
-///    √(2 ln N) 차감이 없으므로 앵커 구 수에 무관한 공정한 경쟁이 됩니다.
-///    반환: (정렬된 (key, score) 목록, 활성 패치 수)
 fn bank_neutral_key_scores(
     grid: &PatchGrid,
     bank: &AnchorBank,
@@ -437,12 +311,6 @@ fn bank_neutral_key_scores(
     (out, active)
 }
 
-/// 패치 임베딩 전체를 뱅크에 채점하여 (key → 최고 surprisal) 맵을 만듭니다.
-///
-/// 🌟 [PREJUDICE DROP] scheduler.rs 의 [FRONT-CLEAN] / [NAV PRE-FILTER] 와 같은 역할입니다.
-///    어떤 패치의 최고 편견 점수가 최고 bias 점수보다 높으면
-///    그 패치는 UI 껍데기(로고 / 워터마크 / 여백)로 보고 판정에서 제외합니다.
-///    좌표를 손으로 적지 않고, 편견 사전만으로 노이즈를 걷어냅니다.
 fn score_patches(
     grid: &PatchGrid,
     bank: &AnchorBank,
@@ -485,8 +353,6 @@ fn score_patches(
 
         total_scored += 1;
 
-        // 🌟 [LOG] 패치별 코사인 상세 — 상위 3개 키의 원시 코사인 + surprisal
-        //    전체 252패치를 출력하면 과다하므로, 채점 카운터로 조절합니다.
         let patch_idx_for_log = {
             let mut cnt = 0usize;
             for pp in grid.patches.iter() {
@@ -567,32 +433,6 @@ fn score_patches(
     (best, dropped)
 }
 
-// =====================================================================
-// 🌟 [DOC TITLE GATE] 무역 서식 '전문(풀 네임)' 에 의한 결정론 게이트
-// ---------------------------------------------------------------------
-//   ── 왜 접두어(code prefix)가 아니라 전문인가 ──
-//    'CI' 같은 짧은 코드는 이 서식_own 번호 접두어일 뿐 아니라
-//    다른 서식에도 인쇄됩니다. ED 는 reference_invoice 셀에 'CI-43726' 을
-//    그대로 찍고, BL / PL 도 인보이스 번호를 인쇄합니다.
-//    접두어 매칭은 그 서식들에서 결정론적으로 오발화합니다.
-//    반면 전문 'COMMERCIAL INVOICE' 는 이 서식의 헤더(제목)이며,
-//    다른 서식은 이 문구를 헤더로 인쇄하지 않습니다.
-//    따라서 게이트의 키는 전문, 값은 코드입니다.
-//
-//   ── 왜 상단 밴드만 보는가 ──
-//    헤더는 문서 상단에 인쇄됩니다. PL 이 본문에 "as per commercial invoice"
-//    라고 적는 경우가 있으므로 상단 30% 행만 제목 밴드로 봅니다.
-//    이것은 레이아웃의 구조적 사실이며 매직 상수가 아닙니다.
-//
-//   ── 왜 surprisal 0 게이트인가 ──
-//    score_patches 와 동일한 극값 기준선을 재사용합니다.
-//    0 = N개를 무작위로 뽑은 기대 최댓값. 전문이 그 기대치를 넘을 때만
-//    '인쇄되어 있다' 고 인정합니다. LLM 을 부르지 않으므로 동일 입력은
-//    항상 동일 출력을 냅니다.
-//    동명 서식(BC/BK, PC/PHYTO, INS/IP)은 마진이 0 이 되어 게이트가
-//    스스로 거부하고 벡터 판정에 위임합니다.
-
-/// 🌟 [TITLE GATE] 산출물. code/group 은 전문에서 역引き한 확정값입니다.
 struct TitleGateVerdict {
     code: String,
     group: String,
@@ -601,9 +441,6 @@ struct TitleGateVerdict {
     margin: f32,
 }
 
-/// 🌟 [TITLE GATE] 상단 밴드 패치만을 서식 전문 뱅크에 채점합니다.
-///    일부 패치라도 전문의 surprisal 이 0 을 넘고, 1·2위 마진이 양수일 때만
-///    확정값을 돌려줍니다. 아니면 None(벡터 판정 유지) 입니다.
 fn run_title_gate(
     model: &Siglip2Model,
     grid: &PatchGrid,
@@ -947,22 +784,6 @@ pub fn classify_doc_type(
     }
     emit(&format!("  🎯 [VISION CODE CANDIDATES] {:?}", codes));
 
-    // 🌟 [SPLIT 1회 캐시 + 편견 축약]
-    //
-    //  ── 구버전의 두 가지 낭비 ──
-    //   ① split_bias_phrases_full 이 후보수² 회 호출됩니다.
-    //      27개 후보면 729회, Part 20 확장 후 56개면 3,136회입니다.
-    //   ② c_prej 크기가 후보수 × (후보수-1) × 평균구수 로 폭발합니다.
-    //      56개 후보 × 55 × 평균 12구 ≈ 37,000구. dedup 도 없습니다.
-    //
-    //  ── 왜 축약해도 결과가 같은가 ──
-    //   surprisal_dual_scores 는 (category, key) 그룹의 편견 최댓값 하나만 감산합니다.
-    //   'CI' 의 편견은 "CI 를 제외한 나머지 전부" 인데,
-    //   그 최댓값은 곧 "전체 코드 앵커 중 CI 것을 뺀 최댓값" 입니다.
-    //   따라서 전체 코드 앵커를 한 벌만 두고, 채점 시 자기 코드 구를 제외하면
-    //   같은 값을 얻으면서 저장량이 후보수 배 줄어듭니다.
-    //   여기서는 구조 변경 범위를 좁히기 위해 '중복 구 제거' 만 적용합니다.
-    //   (코드 앵커는 서식마다 문구가 거의 겹치지 않아 실질 절감은 split 호출 쪽이 큽니다)
     let code_phrases: Vec<(&str, Vec<String>)> = codes
         .iter()
         .map(|c| (*c, split_bias_phrases_full(crate::logic::trade_code_anchor(c))))
@@ -1511,12 +1332,6 @@ pub fn build_column_heatmaps(
 
     let bank = build_anchor_bank(model, &bias_defs, &prej_defs)?;
 
-    // ── 3) 패치별 채점 → 카테고리 히트맵 ──
-    //    surprisal_dual_scores 의 key 는 '필드명' 이므로,
-    //    같은 카테고리에 속한 필드들의 최댓값을 그 카테고리 점수로 씁니다.
-    // 🌟 [DEAD LOCAL 제거] empty_names / empty_banks / empty_skip / empty_prej 는
-    //    surprisal_dual_scores 를 직접 호출하던 구버전의 잔재입니다.
-    //    현재 채점은 score_patches_bank_neutral 하나로 끝나므로 어디에서도 쓰이지 않습니다.
     let n = grid.len();
     let mut cat_scores: HashMap<String, Vec<f32>> = HashMap::new();
     let mut cat_top: HashMap<String, (String, f32)> = HashMap::new();
@@ -1552,10 +1367,6 @@ pub fn build_column_heatmaps(
         }
     }
 
-    // 🌟 [LOG] 히트맵 채점 요약
-    //    구버전의 patch_scored_count / patch_prej_override_count /
-    //    patch_positive_field_counts 는 BANK-NEUTRAL 전환 이후 한 번도 증가하지 않아
-    //    항상 0 을 출력하고 있었습니다. 실제 산출물(matrix)에서 다시 세도록 바꿉니다.
     emit(&format!(
         "    📊 [HEATMAP SCORING SUMMARY] 채점 키 {}개 (카테고리 매핑 성공 {}) | 패치 {}개",
         keys.len(), mapped_keys, n
@@ -1697,36 +1508,6 @@ pub fn render_heatmap_ascii(hm: &CategoryHeatmap, grid: &PatchGrid) -> String {
 #[allow(dead_code)]
 fn _unused_marker(_d: &Device, _t: DType, _c: &Siglip2Config, _x: &Tensor) {}
 
-/// 🌟 [BANK-NEUTRAL SCORING] 뱅크 크기 편향을 구조적으로 제거한 패치 채점.
-///
-///  ── 왜 √(2 ln N) 을 버리는가 ──
-///   극값이론의 E[max] ≈ √(2 ln N) 은 '뱅크 구가 서로 독립' 일 때만 성립합니다.
-///   그런데 한 필드의 앵커 구는 "Shipper / exporter / consignor" 처럼 동의어 나열이라
-///   실효 표본 수가 N 보다 훨씬 작습니다. 큰 뱅크를 과잉 처벌합니다.
-///
-///   실측(로그 대조):
-///     reference_sr(1구) 차감 ≈ 0     vs  status(19구) 차감 2.427
-///     → 'reference sr' 이라는 무의미 구가 header 를 대표하고
-///       header 크롭이 문서 하단으로 착지 → doc_number 소실 → task_id 폴백
-///
-///  ── 대체 원리 ──
-///   각 뱅크의 '자기 기준선' 을 패치 축으로 실측해 뺍니다.
-///     centered[k][i] = (raw[k][i] - μ_k) / σ_pooled
-///   μ_k 는 그 뱅크가 이 문서에서 보이는 평균 반응이므로,
-///   뱅크가 크든 작든 응집되든 자동으로 상쇄됩니다.
-///   σ 는 뱅크마다 쓰지 않고 전역 pooled 를 씁니다.
-///   (1구 뱅크는 σ_k 가 0 에 가까워 z 가 무한히 부풀기 때문입니다)
-///
-///   그 다음 패치 축으로 한 번 더 센터링합니다.
-///     final[k][i] = centered[k][i] - mean_k(centered[·][i])
-///   '잉크가 빽빽해서 전 개념에 반응하는 패치' 의 공통 성분이 제거됩니다.
-///   이것은 scheduler.rs 의 double_center_matrix 와 동일한 도구입니다.
-///
-///  ── 판독성 ──
-///   μ_k / σ 는 '판독 가능 패치' 로만 계산합니다.
-///   여백 141개가 통계를 끌어내리면 모든 뱅크가 동시에 부풀어 변별력이 사라집니다.
-///
-///  반환: (keys, matrix[key][patch])
 pub fn score_patches_bank_neutral(
     grid: &PatchGrid,
     bank: &AnchorBank,
@@ -1753,18 +1534,6 @@ pub fn score_patches_bank_neutral(
         prej_idx.entry(k.clone()).or_default().push(i);
     }
 
-    // 🌟 [PREJUDICE KEY RESOLUTION] bias 와 prejudice 의 key 축이 다를 수 있습니다.
-    //
-    //  ── 실측 사고 ──
-    //   build_column_heatmaps 는 bias 를 (category, 필드명), prejudice 를
-    //   (category, 카테고리명) 으로 넣습니다. 그런데 조회는 필드명으로 했기 때문에
-    //   prej_idx.get(key) 가 항상 None 이었고, 크롬/제목 억제가 전혀 동작하지 않았습니다.
-    //   (classify_doc_type / run_title_gate 는 양쪽 key 가 같아 정상이었습니다)
-    //
-    //  ── 해결 ──
-    //   bank.bias 의 0번 원소가 곧 그 key 의 category 이므로,
-    //   필드명으로 못 찾으면 그 필드의 category 로 한 번 더 조회합니다.
-    //   구조 변경 없이 두 축을 잇는 최소 수정입니다.
     let mut key_cat: HashMap<String, String> = HashMap::new();
     for (c, k, _) in bank.bias.iter() {
         key_cat.entry(k.clone()).or_insert_with(|| c.clone());
@@ -1774,13 +1543,6 @@ pub fn score_patches_bank_neutral(
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     };
 
-    // 🌟 [PREJUDICE POOL] 편견 max-pool 을 '그룹당 1회' 만 계산합니다.
-    //
-    //  ── 왜 미리 뽑는가 ──
-    //   열 히트맵에서 필드는 44개인데 편견 그룹(카테고리)은 8~16개뿐입니다.
-    //   키 루프 안에서 계산하면 같은 그룹을 평균 3~5회 중복 계산합니다.
-    //   그룹당 1회로 접으면 n × Σ(그룹 편견 구수) × D 가 최소값이 됩니다.
-    //   실측 기준 252 × 380 × 1152 ≈ 110 MFLOP — 수십 ms 수준입니다.
     let mut prej_pool: HashMap<String, Vec<f32>> = HashMap::new();
     for (gname, list) in prej_idx.iter() {
         let mut v = vec![f32::MIN; n];
@@ -1915,16 +1677,6 @@ pub fn score_patches_bank_neutral(
     (order, net)
 }
 
-/// 🌟 [ROW RUN POOLING] 판독 가능 패치의 가로 연속 구간을 하나의 '텍스트 라인' 으로 봅니다.
-///
-///  ── 왜 필요한가 ──
-///   16×16 패치는 원본 57×57px 입니다. 글자 2~3개밖에 안 들어갑니다.
-///   "customs export filing" 같은 문서 단위 개념을 그 조각과 코사인 비교하는 것은
-///   성립하지 않습니다. scheduler.rs STEP A 가 PUG '라인' 을 단위로 삼는 이유와 같습니다.
-///
-///  ── 반환 ──
-///   (pooled_embeddings, member_patch_indices)
-///   런 점수를 소속 패치에 되돌려 칠하면 위치 해상도를 잃지 않습니다.
 pub fn pool_row_runs(
     grid: &PatchGrid,
     legible: &crate::models::siglip2::legibility::LegibilityMap,

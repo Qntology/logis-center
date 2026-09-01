@@ -5,16 +5,6 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use once_cell::sync::Lazy;
 
-/// 🌟 [VISION CACHE] ViT 는 상태 없는 결정론적 feed-forward 입니다.
-/// 동일한 pixel_values + grid_thw 조합은 항상 동일한 image_embeds 를 만들어냅니다.
-/// 따라서 27개 비전 블록의 어텐션 연산을 디스크 캐시로 완전히 건너뛸 수 있습니다.
-///
-/// 캐시 키를 image_embeds 의 입력인 pixel_values 로 잡는 이유:
-///   Part 6 의 적응형 해상도 때문에 같은 원본 이미지도 가용 VRAM 에 따라
-///   1210x1210 / 768x768 등으로 다르게 리사이즈됩니다.
-///   원본 바이트를 해싱하면 grid_thw 가 달라져 n_image_token 불일치 패닉이 납니다.
-///   이미 리사이즈/정규화가 끝난 pixel_values 를 해싱하면 해상도가 자동 반영됩니다.
-
 const CACHE_VERSION: u32 = 1;
 /// 캐시 디렉터리 총량 상한 (기본 2GB)
 const DEFAULT_MAX_BYTES: u64 = 2_000_000_000;

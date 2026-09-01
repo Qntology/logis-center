@@ -3,11 +3,6 @@ use candle_nn::{Embedding, Linear, Module, VarBuilder};
 
 use super::Siglip2Config;
 
-// =====================================================================
-// 텍스트 인코더 (텍스트 앵커 인코딩용)
-// =====================================================================
-/// 텍스트 앵커(예: "상품명", "가격", "주문번호")를 1152차원 벡터로 변환합니다.
-/// 비전 패치 임베딩과 동일한 차원(1152)이므로 코사인 비교가 가능합니다.
 pub struct Siglip2TextModel {
     token_embedding: Embedding,
     position_embedding: Embedding,
@@ -16,19 +11,6 @@ pub struct Siglip2TextModel {
     head: Linear,
     hidden_size: usize,
     max_seq_len: usize,
-    // 🌟 [CPU EMBEDDING] token_embedding 이 호스트 메모리에 있는지.
-    //
-    //  ── 왜 분리하는가 ──
-    //   token_embedding 은 [256000, 1152] = 294.9M 파라미터로
-    //   텍스트 인코더 전체(708M)의 41.7%, BF16 기준 590MB 를 차지합니다.
-    //   그런데 이 층의 연산은 index_select, 즉 '행 복사' 하나뿐입니다.
-    //   배치 32 × 64토큰이면 실제로 읽는 행은 2,048개(중복 포함)이고
-    //   결과 텐서는 32 × 64 × 1152 × 2B = 4.7MB 에 불과합니다.
-    //   590MB 를 VRAM 에 올려 두고 4.7MB 만 꺼내 쓰는 셈입니다.
-    //
-    //  ── 정밀도 ──
-    //   gather 에는 부동소수 연산이 없습니다. CPU 에서 행을 복사해 GPU 로 올려도
-    //   결과가 비트 단위로 동일합니다. 근사도 양자화도 아닙니다.
     embed_on_cpu: bool,
     device: candle_core::Device,
     dtype: candle_core::DType,
@@ -143,30 +125,8 @@ impl Siglip2TextModel {
         self.max_seq_len
     }
 
-    /// 텍스트 토큰 시퀀스 → 텍스트 임베딩
-    ///
-    /// 입력:
-    ///   token_ids (b, seq_len)  — seq_len 은 반드시 max_seq_len(64) 고정
-    ///   attn_mask (b, seq_len)  — 1 = 실토큰, 0 = 패딩 (없으면 전부 유효로 간주)
-    /// 출력:
-    ///   (b, 1152)
-    ///
-    /// 🌟 [POOLING] SigLIP 계열은 평균 풀링이 아니라 **마지막 토큰** 풀링입니다.
-    ///    HF SiglipTextTransformer:  pooled = last_hidden_state[:, -1, :]  → head(pooled)
-    ///    평균 풀링을 쓰면 학습 공간과 좌표계가 달라져 비전 패치와의 코사인이
-    ///    구조적으로 의미를 잃습니다.
-    ///
-    /// 🌟 [MASK] 패딩 위치를 key 로 참여시키지 않기 위해 가산 마스크를 만듭니다.
-    ///    (SigLIP 텍스트 인코더에는 causal mask 가 없습니다. 양방향입니다.)
     pub fn forward(&self, token_ids: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, seq_len) = token_ids.dims2()?;
-
-        // 1. 토큰 임베딩
-        //
-        // 🌟 [CPU GATHER] 임베딩 테이블이 호스트에 있으면 gather 도 호스트에서 합니다.
-        //    옮기는 것은 (b, seq, 1152) 결과 하나뿐입니다.
-        //    배치 32 기준 32 × 64 × 1152 × 2B = 4.7MB — PCIe 로 1ms 미만입니다.
-        //    반대로 테이블 자체를 VRAM 에 두면 590MB 가 인코딩 내내 묶입니다.
         let mut x = if self.embed_on_cpu {
             let ids_cpu = token_ids.to_device(&candle_core::Device::Cpu)?;
             let gathered = self.token_embedding.forward(&ids_cpu)?;

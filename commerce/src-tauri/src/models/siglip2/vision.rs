@@ -3,19 +3,6 @@ use candle_nn::{Linear, Module, VarBuilder};
 
 use super::Siglip2Config;
 
-// =====================================================================
-// Patch Embedding (NaFlex)
-// ---------------------------------------------------------------------
-// 🌟 [TENSOR CONTRACT] vision_model.embeddings.patch_embedding.weight 는
-//    [1152, 768] 즉 Linear 입니다. 768 = 16 * 16 * 3.
-//    Conv2d 로 로드하면 candle 이 [1152, 3, 16, 16] 을 요구해 즉시 실패합니다.
-//
-//    flatten 순서는 HF image_processing_siglip2.convert_image_to_patches 와
-//    반드시 동일해야 합니다.
-//      (nh, p, nw, p, C) -> transpose(0,2,1,3,4) -> (nh, nw, p, p, C)
-//    즉 패치 내부 인덱스는 (patch_row, patch_col, channel) 순서이며
-//    채널이 가장 빠르게 변합니다.
-// =====================================================================
 pub struct Siglip2PatchEmbedding {
     projection: Linear,
     patch_size: usize,
@@ -50,9 +37,6 @@ impl Siglip2PatchEmbedding {
     }
 }
 
-// =====================================================================
-// Multi-Head Self-Attention
-// =====================================================================
 pub struct Siglip2Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -144,11 +128,7 @@ impl Siglip2MLP {
         Ok(Self { fc1, fc2 })
     }
 
-    /// 입력: (1, seq, hidden) → 출력: (1, seq, hidden)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // 🌟 [ACT] config 의 hidden_act 는 "gelu_pytorch_tanh" 입니다.
-        //    candle 의 gelu() 가 tanh 근사, gelu_erf() 가 정확한 erf 구현이므로
-        //    학습 시점과 동일한 tanh 근사를 사용해야 층마다 오차가 누적되지 않습니다.
         let x = self.fc1.forward(x)?;
         let x = x.gelu()?;
         self.fc2.forward(&x)
