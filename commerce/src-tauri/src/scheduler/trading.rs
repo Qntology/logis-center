@@ -8,6 +8,7 @@ use crate::scheduler::indexing::save_item;
 use crate::utils::logger::log_task_progress;
 use crate::parsing;
 use tauri::Emitter;
+use crate::logic::TRADE_DOC_TITLES;
 // =====================================================================
 // 🌟 [TITLE AXIS ANCHOR] 제목 축 판정에 쓰는 두 개의 개념 앵커
 // ---------------------------------------------------------------------
@@ -141,7 +142,7 @@ pub(crate) async fn resolve_title_values(
     model: &LogisModel,
     light_pug: &str,
     band_ratio: f32,
-    emit_term: &dyn Fn(&str),
+    emit_term: &(dyn Fn(&str) + Send + Sync),
     verbose: bool,
 ) -> Vec<String> {
     let cands = collect_title_candidates(light_pug, band_ratio);
@@ -298,7 +299,7 @@ pub async fn probe_trade_document(
     model: &LogisModel,
     light_pug: &str,
     doc_lang: &str,
-    emit_term: &dyn Fn(&str),
+    emit_term: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<TradeRerouteVerdict> {
     let values = resolve_title_values(model, light_pug, 0.30, emit_term, true).await;
     if values.is_empty() {
