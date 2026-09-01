@@ -308,12 +308,69 @@ pub async fn process_task(
         light_pug = model.truncate_pug_context(&raw_pug, true, 2000, None).await;
     }    
     
-    doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
+    // 🌟 [DOC LANG SOURCE FIX] 언어 판정에 PUG 구조 문자가 섞이면 언어가 흔들립니다.
+    //
+    //  ── 실측 사고 ──
+    //   영문 YAML 문서인데 커머스 트랙은 'fr', 트레이딩 트랙은 'en' 으로 판정했습니다.
+    //   트레이딩은 '|' 뒤 본문 텍스트만 넣고, 커머스는 light_pug 전체(태그·들여쓰기 포함)를
+    //   넣기 때문입니다. doc_lang 은 label_phrase_bank / prejudice_phrase_bank 의
+    //   locale 키라, 틀리면 커머스 필드 뱅크가 통째로 열화됩니다.
+    //
+    //  ── 수정 ──
+    //   판정 입력을 '본문 텍스트만' 으로 통일합니다. 어휘 사전이 아니라 입력 정제입니다.
+    let lang_probe_text: String = {
+        let mut out = String::new();
+        for line in light_pug.lines() {
+            let t = match line.find('|') { Some(p) => line[p + 1..].trim(), None => continue };
+            if t.chars().count() < 2 { continue; }
+            out.push_str(t);
+            out.push('\n');
+            if out.len() > 8000 { break; }
+        }
+        if out.trim().is_empty() { light_pug.clone() } else { out }
+    };
+    doc_lang = crate::utils::lang_utils::detect_document_language(&lang_probe_text);
     println!(
         "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
         doc_lang
     );
-
+    // =====================================================================
+    // 🌟 [MODE REROUTE] mode 가 commerce 여도 문서가 무역 서식이면 shipping 으로 넘깁니다.
+    // ---------------------------------------------------------------------
+    //  ── 왜 여기인가 ──
+    //   위 search_mode 분기는 UI 플래그 하나만 봅니다. 문서 내용은 여기서 처음 확보됩니다.
+    //   커머스 분류(STEP A)가 시작되면 order/goods/tracking/review/coupon/event 6개 중
+    //   하나로 강제 분류되므로, 그 전에 갈라야 합니다.
+    //
+    //  ── mode 값의 실제 집합 ──
+    //   lib.rs 의 ai_search_complex 기준으로 mode 는 commerce / shipping / analytic 3종입니다.
+    //   "trading" 은 파이프라인 이름일 뿐 mode 값이 아니므로, 리라우트 대상 mode 는 shipping 입니다.
+    //   process_trading_task 가 저장 시 data.mode 를 'shipping' 으로 확정하므로
+    //   여기서는 파이프라인만 바꾸면 됩니다.
+    //
+    //  ── 비용 ──
+    //   자기선언 라벨이 없는 페이지(커머스 목록/상세)는 라벨 임베딩 몇 개만 쓰고 즉시 빠집니다.
+    // =====================================================================
+    if search_mode != "shipping"
+        && (task.r#type == "html_extraction" || task.r#type == "document_extraction")
+    {
+        model.check_embedding_downloaded().await?;
+        model.ensure_embedding().await?;
+        let probe = crate::scheduler::trading::probe_trade_document(
+            &model, &light_pug, &doc_lang, &emit_term,
+        ).await;
+        if let Some(v) = probe {
+            emit_term(&format!(
+                "🚢 [MODE REROUTE] mode='{}' 로 들어왔지만 표제 축이 무역 서식 '{}'({})를 지목했습니다. \
+                 Score {:+.4} > 커머스 최상위 '{}'({:+.4}). 트레이딩 파이프라인(mode='shipping')으로 전환합니다.",
+                search_mode, v.code, v.title, v.score, v.rival, v.rival_score
+            ));
+            let reroute_pref = task_device_pref.clone().or_else(|| device_preference.clone());
+            return process_trading_task(
+                task, store_mutex, model_mutex, cancellation_token, app_handle, reroute_pref
+            ).await;
+        }
+    }
     let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
     } else {

@@ -1319,6 +1319,60 @@ pub fn bank_neutral_key_scores<V: AsRef<Vec<f32>>>(
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
+// =====================================================================
+// 🌟 [RELATIVE PREJUDICE GATE] 절대 대소 비교를 상대 우위 비교로 교체합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측) ──
+//   기존 게이트는 `if prej >= own { skip }` 입니다.
+//   그런데 편견 뱅크는 '다른 필드의 라벨' 이므로,
+//     recipient_address 의 편견에 sender_address 라벨이 들어 있고
+//     라벨 'address' 는 두 필드 모두와 0.8+ 로 공명합니다.
+//   결과:
+//     🚫 'address' → 'recipient_address' | Label: 0.8061 <= Prej: 0.8374
+//   전 조합 중 최고 점수(0.8061)가 삭제되고,
+//   편견이 약한 party_address 만 살아남아 두 회사 주소가 한 값으로 접합되었습니다.
+//
+//  ── 대체 원리 ──
+//   "이 라벨이 이 필드보다 다른 필드를 더 잘 설명하는가" 는
+//   배타 배정(exclusive_assign_by_score)이 이미 판정합니다.
+//   편견의 진짜 역할은 '이 라벨이 이 필드의 개념과 정반대인가' 이므로,
+//   자기 라벨 뱅크와의 유사도를 기준선으로 삼아 상대 비교합니다.
+//
+//     drop  ⟺  prej > own * (1 + relief)
+//     relief = 이 필드 라벨 뱅크의 내부 응집도로부터 유도
+//
+//   응집도가 높은 뱅크(동의어가 촘촘한 필드)는 편견과도 가깝게 나오므로
+//   그만큼 관대해야 공정합니다. 새 매직 상수가 없습니다.
+// =====================================================================
+/// 라벨 뱅크의 내부 응집도. 구끼리의 평균 코사인입니다.
+/// 뱅크가 1구면 응집도를 정의할 수 없으므로 0을 돌려줍니다.
+pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
+    let valid: Vec<&Vec<f32>> = bank.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).collect();
+    if valid.len() < 2 {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    let mut cnt = 0usize;
+    for i in 0..valid.len() {
+        for j in (i + 1)..valid.len() {
+            sum += cosine_similarity(valid[i], valid[j]);
+            cnt += 1;
+        }
+    }
+    if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
+}
+/// 🌟 [RELATIVE PREJUDICE] 편견이 자기 점수를 '응집도만큼의 여유' 이상으로
+///    앞설 때만 후보 자격을 박탈합니다.
+///
+///  반환 true = 폐기 대상
+pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
+    if own <= 0.0 {
+        return true;
+    }
+    // 응집도가 높을수록 편견과의 근접이 구조적으로 불가피하므로 여유를 넓힙니다.
+    let relief = cohesion.clamp(0.0, 0.5);
+    prej > own * (1.0 + relief)
+}
 /// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
 /// filter_category_phrases 의 prejudice 판입니다.
 pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
@@ -2357,17 +2411,80 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
     if is_bare_markup_token(v) { return false; }
     match fmt {
         FieldFormat::Synthesis => true,
-        FieldFormat::Enum => true,
+        // 🌟 [DATE EXCLUSION / ENUM] 날짜는 열거형 멤버가 될 수 없습니다.
+        //
+        //  ── 왜 여기서 막는가 ──
+        //   기존에는 ENUM NUMERIC GATE 가 is_pure_numeric_value 로 날짜를 막고 있었습니다.
+        //   (로그: 'issue_date' → 'status' | 값 "2026-08-10" 은 순수 수치)
+        //   그런데 그 판정은 '날짜를 수치로 오인한 것' 이라 우연히 맞은 결과였습니다.
+        //   판정 근거를 올바른 축(날짜 구조)으로 옮겨, 우연한 방어를 명시적 방어로 바꿉니다.
+        FieldFormat::Enum => !has_date_literal(v),
         // 이름·상품명·제목은 문자가 반드시 있어야 합니다. "수량 | 1" 의 "1" 을 여기서 차단합니다.
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
-        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
-        // "번호 | 9", "배송비 | 0" 을 여기서 차단합니다.
-        FieldFormat::Date => has_date_literal(v),
+        FieldFormat::Numeric => {
+            // 🌟 [DATE EXCLUSION] 날짜 리터럴은 수치가 아닙니다.
+            //
+            //  ── 실측 사고 ──
+            //   'expected_delivery_date' → 'amount_subtotal' 에 "2026-09-15" 가 배정되었고
+            //   normalize_trading_data 의 to_number 가 앞자리만 잘라 2026.0 으로 저장했습니다.
+            //   팀 통계까지 오염되었습니다. ("amount_subtotal": { "max": 2026.0 })
+            //
+            //  ── 판정 근거 (어휘 사전 아님) ──
+            //   '숫자가 하나라도 있으면 수치' 라는 기존 규칙은 날짜/코드/전화번호를
+            //   전부 통과시킵니다. 날짜는 has_date_literal 이 구조로 판정하므로
+            //   그 판정이 참이면 수치 자격을 박탈합니다. 언어와 무관합니다.
+            if has_date_literal(v) {
+                return false;
+            }
+            // 구분자를 제거했을 때 '숫자와 소수점만' 남아야 수치입니다.
+            let core: String = v
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',' && *c != '%')
+                .collect();
+            if core.is_empty() {
+                return false;
+            }
+            // 통화 기호와 부호는 허용합니다. (₩ 12,500 / -350.00 / $78,500)
+            let stripped: String = core
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect();
+            let symbols = core.chars().count().saturating_sub(stripped.chars().count());
+            // 기호가 숫자보다 많으면 수치가 아닙니다. (예: "FOB Busan")
+            if symbols * 2 > core.chars().count() {
+                return false;
+            }
+            stripped.chars().any(|c| c.is_ascii_digit())
+        },
+        FieldFormat::Date => {
+            // 🌟 [REGRESSION FIX] is_pure_numeric_value 가드를 폐기합니다.
+            //
+            //  ── 무엇이 문제였나 (실측) ──
+            //   is_pure_numeric_value 의 판정식은 `letters <= 1` 입니다.
+            //   "2026-08-10" 은 digits=8 / letters=0 이므로 '순수 수치' 로 판정됩니다.
+            //   그래서 이 가드가 모든 날짜를 거부했고, 로그에
+            //     🚫 'issue_date' → 'issue_date' (Date) | 값 "2026-08-10" 형식 불일치
+            //   처럼 자기 자신에게조차 형식 불일치가 났습니다.
+            //   issue_date / etd / eta / due_date / expiry_date / latest_shipment_date /
+            //   arrival_date / departure_date 가 전부 PLINKO 에서 사라졌습니다.
+            //
+            //  ── 원래 가드가 불필요했던 이유 ──
+            //   has_date_literal 은 '숫자 4~2~2 가 같은 구분자로 이어질 때' 만 참입니다.
+            //   "78500.0" 은 세 번째 그룹이 없어 이미 거짓이었습니다.
+            //   1차 로그의 `'sub_total' → 'due_date' (Date) | 값 "78500.0" 형식 불일치` 가 그 증거입니다.
+            has_date_literal(v)
+        },
         FieldFormat::Link => v.contains('/') || v.to_lowercase().starts_with("http"),
-        // "번호 | 11" 을 여기서 차단합니다. 운송장은 최소 8자입니다.
-        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
-        // Identifier 는 url_pool 대조가 본판정이므로 여기서는 최소 길이만 봅니다.
-        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
+        // 🌟 [DATE EXCLUSION / CODE] 날짜 리터럴은 식별자도 운송장도 아닙니다.
+        //
+        //  ── 실측 사고 ──
+        //   ✨ Label 'expected_delivery_date' → Field 'hs_code' (cat: items) | Value: "2026-09-15"
+        //   "2026-09-15" 는 토큰 2026/09/15 로 쪼개져 최장 4자를 만족하므로
+        //   Identifier 게이트를 그대로 통과했습니다.
+        //   Numeric 에만 날짜 배제를 넣고 코드 계열에 넣지 않은 누락입니다.
+        //   판정은 has_date_literal 의 구조 규칙이며 언어 리터럴이 없습니다.
+        FieldFormat::TrackingCode => !has_date_literal(v) && longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => !has_date_literal(v) && longest_code_token_len(v) >= 4,
         // 🌟 [PHONE] 숫자 7자리 이상 + 전화번호에 물리적으로 허용되는 문자만.
         //    'test3@gmail.com'(문자·@ 포함) / '주문결제 내역'(숫자 0개) 이 여기서 전멸합니다.
         FieldFormat::Phone => {

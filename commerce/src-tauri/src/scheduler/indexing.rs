@@ -393,11 +393,37 @@ pub async fn index_item_chunks(
         },
     ).await;
 
+    // 🌟 [SCHEMA WHITELIST] 스키마에 없는 property 는 검색 축이 아닙니다.
+    //
+    //  ── 실측 사고 ──
+    //   [13]✓ property='rel_lc'     | score=0.0000 | text='Its rel lc is 3209045268'
+    //   [14]✓ property='started_at' | score=0.0000 | text='Its started at is 2026-08-28T00:00:00'
+    //   score=0.0000 은 '필드 뱅크에 그 property 가 아예 없다' 는 뜻입니다.
+    //   rel_lc 는 릴레이 내부 인덱스, started_at 은 정규화 파생 축이라
+    //   사용자가 검색할 대상이 아닙니다. confirmed 보호를 타고 들어와
+    //   의미 없는 벡터 2건이 저장되었습니다.
+    //
+    //  ── 판정 근거 ──
+    //   idx_field_names 는 이 doc_type 의 스키마가 소유한 필드 목록입니다.
+    //   그 밖의 property 는 정의상 검색 축이 될 수 없습니다.
+    //   어휘 사전이 아니라 '스키마 소속 여부' 라는 구조 사실입니다.
     let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
         .enumerate()
-        .filter(|(_, c)| c.property != "unclassified")
+        .filter(|(_, c)| {
+            if c.property == "unclassified" { return false; }
+            let in_schema = idx_field_names.iter().any(|f| {
+                f == &c.property
+                    || f.split(',').any(|k| k.trim() == c.property.as_str())
+            });
+            if !in_schema {
+                println!(
+                    "  🚫 [SCHEMA WHITELIST] property='{}' 는 '{}' 스키마에 없는 축이라 청크 인덱싱에서 제외합니다. (text=\"{}\")",
+                    c.property, page_type, c.chunk_text
+                );
+            }
+            in_schema
+        })
         .collect();
-
     if indexable_chunks.is_empty() {
         return Ok(0);
     }

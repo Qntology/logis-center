@@ -498,16 +498,30 @@ impl crate::model::LogisModel {
             let mut f_descs: Vec<String> = Vec::new();
             let mut f_banks: Vec<Vec<Vec<f32>>> = Vec::new();
             let mut f_weights: Vec<Vec<f32>> = Vec::new();
+            // 🌟 [QUERY PREJUDICE] 저장 측(scheduler/trading.rs)은 편견 뱅크를 쓰는데
+            //    질의 측은 쓰지 않아 비대칭이었습니다.
+            //    저장은 편견으로 과잉 차단, 질의는 편견 없이 과잉 허용이라
+            //    같은 값이 두 방향에서 서로 다른 필드로 굳습니다.
+            //    저장 측과 동일한 prejudice_phrase_bank 를 사용해 대칭을 맞춥니다.
+            let mut f_prejs: Vec<Vec<Vec<f32>>> = Vec::new();
             for (fname, fdesc, anchor) in fields.iter() {
                 if claimed_fields.contains(*fname) { continue; }
                 let (ph, wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
                 if ph.is_empty() { continue; }
                 let embs = self.get_embedding_batch(ph.clone()).await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
+                let pp = crate::utils::ai_utils::prejudice_phrase_bank(language, "shipping_doc", fname);
+                let pe = if pp.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(pp.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
+                };
                 f_names.push(fname.to_string());
                 f_descs.push(fdesc.to_string());
                 f_banks.push(embs);
                 f_weights.push(wt);
+                f_prejs.push(pe);
             }
             if f_names.is_empty() { continue; }
 
@@ -529,24 +543,43 @@ impl crate::model::LogisModel {
                 for (si, wi) in span_idxs.iter().enumerate() {
                     let e = &span_embs[si];
                     if e.iter().all(|&v| v == 0.0) { continue; }
-
-                    // 🌟 [FORMAT GATE] 배정 '전' 에 값 생김새부터 검증합니다.
+                    // 🌟 [FORMAT GATE / UNIFIED] 저장 측과 동일한 판정기를 씁니다.
+                    //
+                    //  ── 무엇이 문제였나 ──
+                    //   기존 게이트는 Numeric/Date 둘 다 '숫자가 하나라도 있으면 통과' 였습니다.
+                    //   저장 측(scheduler/trading.rs)에서 이 규칙이
+                    //     'expected_delivery_date' → 'amount_subtotal' | 값 "2026-09-15"
+                    //   를 통과시켜 2026.0 으로 저장되는 사고를 냈습니다.
+                    //   질의 측도 같은 규칙이라 "2026-09-15 이후 주문" 이
+                    //   amount_subtotal 조건으로 굳을 수 있었습니다.
+                    //
+                    //  ── 통일 ──
+                    //   value_matches_format 하나로 모읍니다. 저장(역방향)과 질의(정방향)가
+                    //   같은 형식 판정을 쓰므로 조건이 어긋날 수 없습니다.
                     let raw_val = winners[*wi].text.trim();
-                    let ok = match fmt {
-                        crate::utils::ai_utils::FieldFormat::Numeric =>
-                            raw_val.chars().any(|c| c.is_ascii_digit()),
-                        crate::utils::ai_utils::FieldFormat::Date =>
-                            raw_val.chars().any(|c| c.is_ascii_digit()),
-                        _ => true,
-                    };
-                    if !ok { continue; }
-
-                    matrix[fi][si] = crate::utils::ai_utils::weighted_max_pool_sim(
+                    if !crate::utils::ai_utils::value_matches_format(fmt, raw_val) {
+                        continue;
+                    }
+                    let own = crate::utils::ai_utils::weighted_max_pool_sim(
                         e, &f_banks[fi], &f_weights[fi],
                     );
+                    // 🌟 [RELATIVE PREJUDICE / QUERY] 저장 측과 동일한 상대 우위 게이트.
+                    //    절대 대소 비교를 쓰면 저장 측에서 발생한
+                    //    "'address' 최고 점수가 편견에 밀려 삭제" 사고가 질의에서도 재현됩니다.
+                    if !f_prejs[fi].is_empty() {
+                        let prej = crate::utils::ai_utils::max_pool_sim(e, &f_prejs[fi]);
+                        let coh = crate::utils::ai_utils::bank_internal_cohesion(&f_banks[fi]);
+                        if crate::utils::ai_utils::prejudice_dominates(own, prej, coh) {
+                            emit_term(&format!(
+                                "      🚫 [D2 PREJUDICE] \"{}\" → {} | Own: {:.4} | Prej: {:.4} | Cohesion: {:.4}",
+                                winners[*wi].text, f_names[fi], own, prej, coh
+                            ));
+                            continue;
+                        }
+                    }
+                    matrix[fi][si] = own;
                 }
             }
-
             let centered = crate::utils::ai_utils::double_center_matrix(&matrix);
             let assign = crate::utils::ai_utils::exclusive_assign_by_score(&centered, 0.0, 0.0);
 
