@@ -523,7 +523,18 @@ pub async fn process_task(
                 println!("[Scheduler] Baking Base PUG Context to SSD...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));
                 
-                model.secure_vram_relay(crate::model::ModelSize::Qwen, None, Some(cancellation_token.clone()), true, kv_name.clone()).await?;
+                // 🌟 [CROSSOVER] 프리필은 KV 를 크게 잡으므로 여유 판정이 특히 중요합니다.
+                //    임베딩이 남아 있으면 이 시점에 반환시켜 프리필 KV 공간을 확보합니다.
+                model
+                    .enter_generation_phase(
+                        crate::model::ModelSize::Qwen,
+                        None,
+                        Some(cancellation_token.clone()),
+                        true,
+                        kv_name.clone(),
+                        "base pug prefill",
+                    )
+                    .await?;
                 
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -821,15 +832,15 @@ pub async fn process_task(
         }
 
         if !texts_to_embed.is_empty() {
-
-            for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
-                let start_idx = chunk_idx * 100;
-                if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
-                    for (i, vector) in vectors.into_iter().enumerate() {
-                        let original_idx = text_indices[start_idx + i];
-                        line_embeddings[original_idx] = vector;
-                    }
-                }
+            // 🌟 [CROSSOVER] STEP A 는 순수 임베딩 구간입니다.
+            //    페이즈를 선언해 두면 이후 Qwen 프리필까지 생성 모델이 개입하지 않습니다.
+            model.enter_embedding_phase("step A line vectorization").await?;
+            let vectors = model.get_embedding_batch(texts_to_embed.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; texts_to_embed.len()]);
+            for (i, vector) in vectors.into_iter().enumerate() {
+                if i >= text_indices.len() { break; }
+                let original_idx = text_indices[i];
+                line_embeddings[original_idx] = vector;
             }
         }
 
@@ -2106,6 +2117,9 @@ pub async fn process_task(
                 }
 
                 if is_list_track {
+                    // 🌟 [CROSSOVER] sel 은 위쪽 NAV 판정에서 이미 임베딩된 문자열입니다.
+                    //    get_embedding 의 메모리 캐시가 재계산을 차단하므로
+                    //    이 호출은 GPU 연산 없이 즉시 반환됩니다. (구조 변경 없음)
                     let sel_emb = model.get_embedding(sel.to_lowercase()).await.unwrap_or(vec![0.0f32; 384]);
                     let sel_list_sim = cosine_similarity(&list_bias_emb, &sel_emb);
                     if sel_list_sim > 0.30 {
@@ -2382,8 +2396,11 @@ pub async fn process_task(
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
     model.deep_purge_resources().await;
+    // 🌟 [CROSSOVER] 직접 퍼지한 경로는 페이즈 상태를 되돌려야 합니다.
+    //    이 줄이 없으면 다음 enter_*_phase 가 '아직 상주 중' 으로 오판해
+    //    불필요한 스왑을 하거나, 반대로 로드를 생략해 버립니다.
+    model.mark_crossover_idle();
  
     {
         let q3_clear_arc = model.qwen3_generator.clone();
@@ -2449,11 +2466,21 @@ pub async fn process_task(
                     };
 
                     let res = if base_model_size == crate::model::ModelSize::Qwen {
-                        model.secure_vram_relay(crate::model::ModelSize::Qwen, Some(&base_session_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                        // 🌟 [CROSSOVER] STEP A 에서 임베딩을 대량으로 썼으므로
+                        //    여기서 임베딩이 남아 있을 수 있습니다. 예산에 따라 정리합니다.
+                        model
+                            .enter_generation_phase(
+                                crate::model::ModelSize::Qwen,
+                                Some(&base_session_id),
+                                Some(cancellation_token.clone()),
+                                false,
+                                kv_name.clone(),
+                                "title extraction (Qwen 0.6B)",
+                            )
+                            .await?;
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
                             
-
                             let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
                             gen.generate(
                                 params, 
@@ -2466,7 +2493,14 @@ pub async fn process_task(
                             return Err(anyhow::anyhow!("Qwen generator missing"));
                         }
                     } else {
-                        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, None).await?;
+                        model
+                            .switch_to_generation(
+                                crate::model::ModelSize::Qwen3,
+                                Some(cancellation_token.clone()),
+                                None,
+                                "title extraction (Qwen3)",
+                            )
+                            .await?;
                         let q3_gen_arc = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
                         let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
@@ -2670,35 +2704,19 @@ pub async fn process_task(
                         ..Default::default()
                     };
 
-                    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
-
+                    // 🌟 [CROSSOVER] Qwen3.5(2B)는 임베딩과 동시 상주가 어려운 크기입니다.
+                    //    예산 판정이 SWAP 으로 떨어지면 임베딩을 먼저 반환합니다.
+                    model
+                        .switch_to_generation(
+                            crate::model::ModelSize::Qwen3_5,
+                            Some(cancellation_token.clone()),
+                            kv_name.clone(),
+                            "thead structure analysis",
+                        )
+                        .await?;
                     if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                         if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_step_thead", task.id)), kv_name.clone(), None, None).await {
                             let thead_json = crate::parsing::parse_json_from_llm(&res);
-                            
-
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            //
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
                             
                             fn harvest_selector_strings(v: &serde_json::Value, out: &mut Vec<String>) {
                                 match v {
@@ -3308,8 +3326,21 @@ pub async fn process_task(
                 t_val
             };
 
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
-
+            // 🌟 [CROSSOVER / ORDER FIX] Qwen3 로드를 여기서 제거합니다.
+            //
+            //  ── 무엇이 문제였나 ──
+            //   이 자리에서 Qwen3(0.6B)를 올려 두고, 그 뒤로
+            //     field_embeddings 루프 → header_embs → label bank → idlink bank
+            //     → 아이템 루프의 라인 임베딩
+            //   까지 임베딩만 수백 회 돌렸습니다.
+            //   Qwen3 의 첫 실사용은 아이템 루프 안의 generate 이므로,
+            //   그 전 구간 내내 두 가중치가 아무 이유 없이 겹쳐 있었습니다.
+            //
+            //  ── 해결 ──
+            //   여기서는 임베딩 페이즈만 선언하고,
+            //   Qwen3 는 아이템 루프 진입 직전에 올립니다(아래 참조).
+            //   코드 이동만으로 이 구간의 피크가 통째로 사라집니다.
+            model.enter_embedding_phase("list schema field bank").await?;
             let mut field_embeddings = Vec::new();
             
             
@@ -3548,6 +3579,27 @@ pub async fn process_task(
             let mut all_item_raw_lines: Vec<Vec<String>> = Vec::new();
             let mut all_item_labeled_lines: Vec<Vec<String>> = Vec::new();
 
+            // 🌟 [CROSSOVER] 여기서부터 임베딩과 Qwen3 가 진짜로 교차합니다.
+            //
+            //  아이템마다 라인 임베딩 → 필드별 generate 를 반복하므로
+            //  '매번 스왑' 은 아이템 수만큼 왕복이 되어 재앙입니다.
+            //  enter_generation_phase 는 예산을 보고
+            //    · 여유가 있으면 임베딩을 유지한 채 Qwen3 를 얹고 (스왑 0회)
+            //    · 여유가 없으면 임베딩만 반환시킨 뒤 Qwen3 를 올립니다.
+            //  Qwen3 는 0.6B 라 임베딩과 함께 있어도 대부분 여유가 남습니다.
+            //  이 판정이 하드코딩이 아니라 실측이므로 GPU 가 바뀌어도 유효합니다.
+            model
+                .enter_generation_phase(
+                    crate::model::ModelSize::Qwen3,
+                    None,
+                    Some(cancellation_token.clone()),
+                    false,
+                    Some("inference".to_string()),
+                    "list item extraction loop",
+                )
+                .await?;
+            emit_term(&format!("  {}", model.crossover_report()));
+
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
@@ -3662,40 +3714,44 @@ pub async fn process_task(
                 }
                 
                 if !texts_to_embed.is_empty() {
-                    for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
-                        let start_idx = chunk_idx * 100;
-                        if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
-                            for (i, vector) in vectors.into_iter().enumerate() {
-                                let original_idx = text_indices[start_idx + i];
-                                let emb = vector.clone();
-                                let noise_score = cosine_similarity(&layout_prej_emb, &emb);
-                                
-                                let original_text = text_chunk[i].trim();
-                                let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
-                                let is_short = original_text.len() <= 3;
-                                
+                    // 🌟 [CROSSOVER] 고정 100개 청킹을 제거하고 한 번에 넘깁니다.
+                    //
+                    //  ── 왜 100 을 없애는가 ──
+                    //   이 값은 activation 여유와 무관하게 고정되어 있어,
+                    //   Qwen3 와 동시 상주 중일 때도 100건씩 밀어 넣습니다.
+                    //   그 순간 점유가 곧 피크의 두 번째 축입니다.
+                    //   get_embedding_batch 가 adaptive_embed_batch 로 여유에 맞춰
+                    //   쪼개므로, 여유가 넉넉하면 오히려 100보다 크게 묶어 더 빠릅니다.
+                    //   캐시 적중분은 아예 연산되지 않아 실연산량 자체가 줄어듭니다.
+                    let vectors = model.get_embedding_batch(texts_to_embed.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; texts_to_embed.len()]);
+                    for (i, vector) in vectors.into_iter().enumerate() {
+                        if i >= text_indices.len() { break; }
+                        let original_idx = text_indices[i];
+                        let emb = vector.clone();
+                        let noise_score = cosine_similarity(&layout_prej_emb, &emb);
 
-                                let is_structure_tag = original_text.starts_with("th") 
-                                    || original_text.starts_with("td") 
-                                    || original_text.starts_with("tr") 
-                                    || original_text.starts_with("input")
-                                    || original_text.starts_with("div");
-                                
+                        let original_text = texts_to_embed[i].trim();
+                        let has_digit = original_text.chars().any(|c| c.is_ascii_digit());
+                        let is_short = original_text.len() <= 3;
 
-                                let is_header_owned = line_owner_field[original_idx].is_some();
+                        let is_structure_tag = original_text.starts_with("th")
+                            || original_text.starts_with("td")
+                            || original_text.starts_with("tr")
+                            || original_text.starts_with("input")
+                            || original_text.starts_with("div");
 
-                                if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag && !is_header_owned {
-                                    emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
-                                    item_lines[original_idx] = String::new(); 
-                                } else {
-                                    if noise_score > 0.6 && is_header_owned {
-                                        emit_term(&format!("    🛡️ [HEADER OWNED PROTECT] Item Line {}/{} : {} (NoiseScore {:.4} 이지만 '{}' 컬럼으로 코사인 확정됨)", original_idx + 1, item_lines.len(), original_text, noise_score, line_owner_field[original_idx].clone().unwrap_or_default()));
-                                    } else {
-                                        emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), original_text));
-                                    }
-                                    item_embeddings[original_idx] = emb;
-                                }
+                        let is_header_owned = line_owner_field[original_idx].is_some();
+                        if noise_score > 0.6 && !has_digit && !is_short && !is_structure_tag && !is_header_owned {
+                            emit_term(&format!("    🚫 [NOISE FILTERED] Item Line {}/{} : {} (Score: {:.4})", original_idx + 1, item_lines.len(), original_text, noise_score));
+                            item_lines[original_idx] = String::new(); 
+                        } else {
+                            if noise_score > 0.6 && is_header_owned {
+                                emit_term(&format!("    🛡️ [HEADER OWNED PROTECT] Item Line {}/{} : {} (NoiseScore {:.4} 이지만 '{}' 컬럼으로 코사인 확정됨)", original_idx + 1, item_lines.len(), original_text, noise_score, line_owner_field[original_idx].clone().unwrap_or_default()));
+                            } else {
+                                emit_term(&format!("    [VECTORIZING] Item Line {}/{} : {}", original_idx + 1, item_lines.len(), original_text));
                             }
+                            item_embeddings[original_idx] = emb;
                         }
                     }
                 }
@@ -4864,15 +4920,19 @@ pub async fn process_task(
         };
 
         if !content_pug.trim().is_empty() {
-
-            model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
-
+            // 🌟 [CROSSOVER / ORDER FIX] 리스트 경로와 같은 이유로 Qwen3 로드를 미룹니다.
+            //
+            //  이 아래로 이어지는 구간은 전부 임베딩입니다.
+            //    layout_prej_emb → line_embeddings → boa 블록 임베딩
+            //    → field_phrase_embs / prejudice bank
+            //    → detail_pairs 라벨·섹션 임베딩
+            //    → ENUM SELECT 옵션 임베딩
+            //  Qwen3 의 첫 실사용은 한참 뒤 '필드 추출 루프' 입니다.
+            //  그 전까지 두 가중치를 겹쳐 둘 이유가 없습니다.
+            model.enter_embedding_phase("detail vectorization").await?;
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-
             let (_, layout_prejudice) = crate::parsing::get_layout_bias(&page_type, &doc_lang);
             let layout_prej_emb = model.get_embedding(layout_prejudice.clone()).await.unwrap_or(vec![0.0; 384]);
-
 
             let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
@@ -4928,15 +4988,15 @@ pub async fn process_task(
             }
             
             if !texts_to_embed.is_empty() {
-                for (chunk_idx, text_chunk) in texts_to_embed.chunks(100).enumerate() {
-                    let start_idx = chunk_idx * 100;
-                    if let Ok(vectors) = model.get_embedding_batch(text_chunk.to_vec()).await {
-                        for (i, vector) in vectors.into_iter().enumerate() {
-                            let original_idx = text_indices[start_idx + i];
-                            emit_term(&format!("  [VECTORIZING] Stage-3 Line {}/{} : {}", original_idx + 1, pug_lines.len(), text_chunk[i].trim()));
-                            line_embeddings[original_idx] = vector;
-                        }
-                    }
+                // 🌟 [CROSSOVER] 리스트 경로와 같은 이유로 고정 청킹을 제거합니다.
+                //    여유 판정과 캐시는 get_embedding_batch 가 담당합니다.
+                let vectors = model.get_embedding_batch(texts_to_embed.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; texts_to_embed.len()]);
+                for (i, vector) in vectors.into_iter().enumerate() {
+                    if i >= text_indices.len() { break; }
+                    let original_idx = text_indices[i];
+                    emit_term(&format!("  [VECTORIZING] Stage-3 Line {}/{} : {}", original_idx + 1, pug_lines.len(), texts_to_embed[i].trim()));
+                    line_embeddings[original_idx] = vector;
                 }
             }
 
@@ -5774,7 +5834,17 @@ pub async fn process_task(
                             ..Default::default()
                         };
 
-                        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, kv_name.clone()).await?;
+                        // 🌟 [CROSSOVER] 임베딩 페이즈 한복판의 유일한 생성 호출입니다.
+                        //    Qwen3.5(2B)는 임베딩과 동시 상주가 어려운 크기이므로
+                        //    예산 판정이 대부분 SWAP 으로 떨어집니다. 정상 동작입니다.
+                        model
+                            .switch_to_generation(
+                                crate::model::ModelSize::Qwen3_5,
+                                Some(cancellation_token.clone()),
+                                kv_name.clone(),
+                                "enum select fallback",
+                            )
+                            .await?;
                         let mut picked = String::new();
                         if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
                             if let Ok(res) = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_status_selector", task.id)), kv_name.clone(), None, None).await {
@@ -5783,7 +5853,17 @@ pub async fn process_task(
                             }
                         }
                         model.deep_purge_resources().await;
-                        model.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancellation_token.clone()), false, Some("inference".to_string())).await?;
+                        model.mark_crossover_idle();
+                        // 🌟 이 뒤로는 다시 임베딩(vector_assignment 재료)이 아니라
+                        //    필드 추출 루프로 이어지므로 생성 페이즈를 유지합니다.
+                        model
+                            .switch_to_generation(
+                                crate::model::ModelSize::Qwen3,
+                                Some(cancellation_token.clone()),
+                                Some("inference".to_string()),
+                                "detail field extraction (after enum fallback)",
+                            )
+                            .await?;
 
                         if !picked.is_empty() && picked != "null" {
                             if let Some(pos) = select_groups.iter().position(|g| g.selector == picked) {
@@ -5981,12 +6061,25 @@ pub async fn process_task(
             }
 
 
+            // 🌟 [CROSSOVER] 벡터 배정이 끝났습니다. 이 아래는 전부 Qwen3 generate 입니다.
+            //    ENUM SELECT 폴백이 발동한 경우 이미 생성 페이즈이므로
+            //    enter_generation_phase 는 no-op 에 가깝고,
+            //    발동하지 않은 경우에만 실제 전환이 일어납니다.
+            model
+                .enter_generation_phase(
+                    crate::model::ModelSize::Qwen3,
+                    None,
+                    Some(cancellation_token.clone()),
+                    false,
+                    Some("inference".to_string()),
+                    "detail field extraction loop",
+                )
+                .await?;
+            emit_term(&format!("  {}", model.crossover_report()));
+
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-                
-                
-                
                 if let Some(canon) = enum_resolved.get(&field_name).cloned() {
                     extracted_data.as_object_mut().unwrap().insert(field_name.clone(), json!(canon.clone()));
                     if !global_ignore_list.contains(&canon) {
@@ -6681,64 +6774,57 @@ pub async fn process_task(
         
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
         
-
         model.deep_purge_resources().await;
+        // 🌟 [CROSSOVER] 퍼지 사실을 페이즈 원장에 반영합니다.
+        model.mark_crossover_idle();
         
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         
-
         crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+        emit_term(&format!("[Scheduler] {}", model.crossover_report()));
     }
 
-    
-    //
-    
-    
-    //
-    
-    
-    
-    
-    
-    //
-    
-    
-    
     {
-        emit_term("[Scheduler] 🔤 Loading Qwen3.5(2B) + Embedding for synonym expansion...");
+        emit_term("[Scheduler] 🔤 Preparing crossover for synonym expansion...");
         emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Planning VRAM crossover...", "spinner": "🔤" }));
 
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Loading Qwen3.5 transliteration engine...", "spinner": "🔤" }));
-
-        
-        
-        
+        // 🌟 [CROSSOVER / BUDGET] 하드코딩 임계치(2600MB)를 제거합니다.
+        //
+        //  ── 무엇이 문제였나 ──
+        //   2600 이라는 숫자는 임베딩 실제 상주 비용과도, Qwen3.5 실제 비용과도
+        //   무관한 값이었습니다. GPU 를 바꾸거나 모델을 교체하면 즉시 틀립니다.
+        //   게다가 CONCURRENT 분기는 두 모델을 '무조건' 함께 올리므로
+        //   판정이 낙관적이면 그 순간이 곧 피크가 됩니다.
+        //
+        //  ── 무엇으로 바꾸는가 ──
+        //   embedding_budget_mb() / generation_budget_mb() 는
+        //   ① 디스크 가중치 크기로 시작하고
+        //   ② 첫 로드 전후의 free VRAM 차이로 실측값으로 교체되며
+        //   ③ 대량 배치에서 관측한 activation 여유를 더해 돌려줍니다.
+        //   판정 근거가 전부 실측이므로 상수를 손댈 이유가 없습니다.
+        //
+        //  ── 여기서 미리 올리지 않는 이유 ──
+        //   음차는 캐시 히트가 대부분입니다. 이 시점에 Qwen3.5 를 올리면
+        //   캐시로만 끝나는 아이템에서 2GB 를 헛돌립니다.
+        //   실제 전환은 translit.rs 의 첫 캐시 미스 시점에서 일어납니다.
         let free_mb = model.get_free_vram_mb();
-        let concurrent_threshold: u64 = 2600;
-
-        if free_mb >= concurrent_threshold {
-            
-            
-            model.ensure_qwen3_5(false).await?;
-            model.ensure_embedding().await?;
+        let embed_need = model.embedding_budget_mb();
+        let gen_need = model.generation_budget_mb(crate::model::ModelSize::Qwen3_5);
+        if free_mb >= embed_need + gen_need {
             emit_term(&format!(
-                "[Scheduler] ✅ [CONCURRENT] 자유 {}MB >= {}MB. Qwen3.5(2B) + Embedding 동시 상주 (no ping-pong).",
-                free_mb, concurrent_threshold
+                "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + Qwen3.5 {}MB. 스왑 없이 진행할 수 있습니다.",
+                free_mb, embed_need, gen_need
             ));
         } else {
-            
-            
-            
-            
-            
-            
             emit_term(&format!(
-                "[Scheduler] ⚠️ [SEQUENTIAL] 자유 {}MB < {}MB. 순차 모드로 진입합니다.",
-                free_mb, concurrent_threshold
+                "[Scheduler] 🔁 [CROSSOVER/SWAP 예상] 자유 {}MB < 임베딩 {}MB + Qwen3.5 {}MB. 페이즈별 교차 상주로 진행합니다.",
+                free_mb, embed_need, gen_need
             ));
-            model.ensure_qwen3_5(false).await?;
-            emit_term("[Scheduler] ✅ [SEQUENTIAL] Qwen3.5(2B) 로드 완료. 임베딩은 필요 시점에만 올립니다.");
         }
+        // 임베딩 가중치 파일 존재만 확인하고, 로드는 실제 사용 시점으로 미룹니다.
+        model.check_embedding_downloaded().await?;
+        emit_term("[Scheduler] ✅ [CROSSOVER] 지연 로드 계획 확정. 각 페이즈 진입 시점에 필요한 모델만 올립니다.");
     }
     let id_val_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))

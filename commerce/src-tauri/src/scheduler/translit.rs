@@ -270,16 +270,43 @@ pub async fn generate_transliteration_aliases(
     let mut reused = 0usize;
     let mut skipped = 0usize;
 
+    // 🌟 [CROSSOVER / LAZY SWITCH] Qwen3.5(2B) 를 '실제로 부를 때' 만 올립니다.
+    //
+    //  ── 왜 지연시키는가 ──
+    //   이 함수는 캐시 히트가 대부분입니다. (메모리 → Dexie 2단 캐시)
+    //   함수 진입부에서 무조건 생성 페이즈로 전환하면,
+    //   LLM 을 한 번도 부르지 않는 아이템에서도 임베딩을 내리고
+    //   2GB 를 올렸다 내리는 순수 낭비가 발생합니다.
+    //   첫 캐시 미스 시점에 단 한 번만 전환하고, 이후 미스는 재사용합니다.
+    let mut generation_ready = false;
+    macro_rules! ensure_generation {
+        () => {
+            if !generation_ready {
+                if let Err(e) = model
+                    .switch_to_generation(
+                        crate::model::ModelSize::Qwen3_5,
+                        Some(cancel.clone()),
+                        None,
+                        "transliteration (first cache miss)",
+                    )
+                    .await
+                {
+                    println!("  ⚠️ [CROSSOVER] 음차용 Qwen3.5 전환 실패: {}. 이번 값은 건너뜁니다.", e);
+                } else {
+                    generation_ready = true;
+                }
+            }
+        };
+    }
+
     for (i, cm) in chunks.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-
         if !crate::nl_convert::needs_transliteration(cm) {
             skipped += 1;
             continue;
         }
-
         let src = cm.value_part.trim().to_string();
         if src.is_empty() {
             skipped += 1;
@@ -341,6 +368,12 @@ pub async fn generate_transliteration_aliases(
 
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
         println!("    SOURCE = '{}'", src);
+
+        // 🌟 [CROSSOVER] 여기서부터 Qwen3.5 를 부를 수 있습니다.
+        //    any_ascii 로만 끝나는 경로도 있지만, 그 판정이 트랙별로 흩어져 있어
+        //    호출 직전마다 개별 판정하면 분기가 폭발합니다.
+        //    캐시를 통과한 값은 대부분 LLM 을 필요로 하므로 여기서 한 번 전환합니다.
+        ensure_generation!();
 
         // 🌟 [LANGUAGE TRACK SPLIT] 표기 체계별로 단어를 분리하여 트랙별 처리합니다.
         // 비라틴 단어(한글 등) → target "english" (로마자 전사)
@@ -692,6 +725,18 @@ pub async fn generate_transliteration_aliases(
             "  🔤 [SYNONYM EXPANSION / Qwen3.5-2B] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
             made, reused, skipped
         ));
+    }
+
+    // 🌟 [CROSSOVER] LLM 을 한 번도 부르지 않았다면 전환 자체가 없었습니다.
+    //    부른 경우에만 진단을 남겨, '캐시만으로 끝난 아이템' 과 구분합니다.
+    if generation_ready {
+        emit(&format!(
+            "  🔁 [CROSSOVER] 음차 구간에서 Qwen3.5 를 1회 올려 {}건을 처리했습니다. {}",
+            made,
+            model.crossover_report()
+        ));
+    } else {
+        emit("  ⚡ [CROSSOVER] 음차가 전부 캐시로 해결되어 Qwen3.5 를 올리지 않았습니다. (전환 0회)");
     }
 
     out

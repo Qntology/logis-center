@@ -358,6 +358,37 @@ impl crate::model::LogisModel {
         Ok(extracted_data)
     }
 
+    // =====================================================================
+    // 🌟 [CROSSOVER] 임베딩 캐시 RAM 상한
+    // ---------------------------------------------------------------------
+    //  ── 왜 필요해졌나 ──
+    //   get_embedding_batch 가 캐시를 쓰게 되면서 적재량이 크게 늘어납니다.
+    //   기존에는 단건 호출만 캐시했기에 사실상 자라지 않았고,
+    //   그래서 상한이 없어도 문제가 드러나지 않았습니다.
+    //
+    //  ── 이 값의 성격 ──
+    //   판정 임계치가 아니라 'RAM 사용 상한' 입니다. 정확도에 전혀 영향이 없고,
+    //   초과 시 캐시를 비워도 결과가 달라지지 않습니다(다시 계산할 뿐입니다).
+    //   기존 코드가 이미 unload_embedding / deep_purge 에서 cache.clear() 를
+    //   수행하므로, 전체 비우기는 이 코드베이스의 기존 정리 방식과 동일합니다.
+    const EMBED_CACHE_RAM_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+    /// 캐시 엔트리 하나의 대략적 RAM 점유(바이트).
+    ///   벡터 384 × f32 = 1536B + 키 문자열/해시 오버헤드 ≈ 96B
+    const EMBED_CACHE_ENTRY_BYTES: usize = 384 * 4 + 96;
+
+    fn guard_embedding_cache(cache: &mut std::collections::HashMap<String, Vec<f32>>) {
+        let cap = Self::EMBED_CACHE_RAM_BUDGET_BYTES / Self::EMBED_CACHE_ENTRY_BYTES;
+        if cache.len() > cap {
+            println!(
+                "[MODEL] 🧹 [EMBED CACHE] 엔트리 {}개가 RAM 예산({}MB)을 초과하여 캐시를 비웁니다. (정확도 영향 없음)",
+                cache.len(),
+                Self::EMBED_CACHE_RAM_BUDGET_BYTES / (1024 * 1024)
+            );
+            cache.clear();
+        }
+    }
+
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
         // 🌟 1. 메모리 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산 원천 차단)
         {
@@ -366,10 +397,12 @@ impl crate::model::LogisModel {
                 return Ok(vector.clone());
             }
         }
-
         // Ensure embedding model is loaded (and generator is unloaded)
         self.ensure_embedding().await?;
-
+        // 🌟 [CROSSOVER] 이 호출이 실제로 쓴 순간 점유를 학습합니다.
+        //    가중치가 아니라 activation 축이며, embedding_budget_mb() 에 더해져
+        //    다음 예산 판정이 '연산 중 여유' 까지 포함하게 만듭니다.
+        let free_before = self.get_free_vram_mb();
         let embedding_model_arc = self.embedding_model.clone();
         let text_clone = text.clone();
         
@@ -382,29 +415,137 @@ impl crate::model::LogisModel {
                 Ok(vec![0.0; 384])
             }
         }).await??;
-
+        self.observe_activation_headroom(free_before);
         // 🌟 2. 새로 연산된 벡터를 해시맵 캐시에 저장하여 다음 루프 때 재사용합니다.
         {
             let mut cache = self.embedding_cache.lock().await;
+            Self::guard_embedding_cache(&mut cache);
             cache.insert(text, vector.clone());
         }
-
         Ok(vector)
     }
 
+    // =====================================================================
+    // 🌟 [CROSSOVER] 배치 임베딩 — 캐시 · 중복 제거 · 적응 청킹
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 문제였나 ──
+    //   ① 캐시 부재
+    //      get_embedding 은 캐시를 읽고 쓰는데 이 함수는 둘 다 하지 않았습니다.
+    //      indexing.rs 의 anchor_texts 는 property 가 같으면 문자열이 완전히
+    //      동일하고, upsert_alias_chunks 는 한 배치 안에서 같은 anchor 를
+    //      변종 수만큼 중복해서 넣습니다. 전부 재계산되고 있었습니다.
+    //      연산하지 않아도 되는 것을 연산하면 그만큼 activation 이 커지고,
+    //      그것이 곧 '가중치 합' 과 별개인 두 번째 피크 축입니다.
+    //
+    //   ② 청킹 계층 오류
+    //      호출부(index_item_chunks)에서 직접 쪼개면 scheduler.rs 의 수십 개
+    //      다른 호출부는 보호받지 못합니다. 여기가 올바른 계층입니다.
+    //
+    //   ③ 락 재획득 위험
+    //      청크마다 spawn_blocking 을 새로 하면 그 틈에 unload_embedding 이
+    //      끼어들어 모델이 사라질 수 있고, 이후 청크는 조용히 0벡터를 반환합니다.
+    //      틀린 벡터가 그대로 저장되는 무증상 손상입니다.
+    //      spawn_blocking 하나 안에서 락을 쥔 채 청크를 순회하면
+    //      activation 축소라는 목적은 그대로 달성하면서 이 위험이 사라집니다.
+    // =====================================================================
     pub async fn get_embedding_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.ensure_embedding().await?;
-        let embedding_model_arc = self.embedding_model.clone();
-        
-        let vectors = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Vec<f32>>> {
-            let guard = embedding_model_arc.blocking_lock();
-            if let Some(model) = guard.as_ref() {
-                model.embed_batch(&texts).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
-            } else {
-                Ok(vec![vec![0.0; 384]; texts.len()])
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ── ① 캐시 조회 + 배치 내 중복 제거 ──
+        //    miss_texts[i] 를 계산하면 miss_slots[i] 의 모든 자리에 채워 넣습니다.
+        let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut miss_texts: Vec<String> = Vec::new();
+        let mut miss_slots: Vec<Vec<usize>> = Vec::new();
+        {
+            let cache = self.embedding_cache.lock().await;
+            let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for (i, t) in texts.iter().enumerate() {
+                if let Some(v) = cache.get(t) {
+                    out[i] = Some(v.clone());
+                    continue;
+                }
+                match seen.get(t.as_str()) {
+                    Some(&mi) => miss_slots[mi].push(i),
+                    None => {
+                        seen.insert(t.as_str(), miss_texts.len());
+                        miss_texts.push(t.clone());
+                        miss_slots.push(vec![i]);
+                    }
+                }
             }
+        }
+
+        let dup_folded: usize = miss_slots.iter().map(|s| s.len() - 1).sum();
+        let hit_count = out.iter().filter(|v| v.is_some()).count();
+
+        // ── ② 전부 캐시 적중이면 모델을 건드리지 않습니다 ──
+        //    ensure_embedding 조차 부르지 않으므로, 생성 모델이 상주 중이어도
+        //    임베딩이 되올라오는 일이 없습니다. 피크가 물리적으로 발생하지 않습니다.
+        if miss_texts.is_empty() {
+            if hit_count > 0 {
+                println!(
+                    "[MODEL] ⚡ [EMBED CACHE] {}건 전부 캐시 적중. 모델 로드 없이 반환합니다.",
+                    hit_count
+                );
+            }
+            return Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; 384])).collect());
+        }
+
+        self.ensure_embedding().await?;
+
+        // ── ③ 여유에 맞춘 청크 크기 결정 ──
+        //    가중치가 아니라 '연산 중 순간 점유' 를 깎는 축입니다.
+        //    동시 상주 중이거나 여유가 얇으면 잘게 나눕니다.
+        let batch = self.adaptive_embed_batch(miss_texts.len());
+        if hit_count > 0 || dup_folded > 0 {
+            println!(
+                "[MODEL] 🧮 [EMBED BATCH] 요청 {}건 | 캐시 적중 {}건 | 배치 내 중복 {}건 접음 | 실연산 {}건 | 청크 {}",
+                texts.len(), hit_count, dup_folded, miss_texts.len(), batch
+            );
+        }
+
+        let free_before = self.get_free_vram_mb();
+        let embedding_model_arc = self.embedding_model.clone();
+        let miss_for_compute = miss_texts.clone();
+
+        let computed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Vec<f32>>> {
+            // 🌟 락을 '한 번만' 잡고 청크를 순회합니다.
+            //    이 스코프가 끝날 때까지 모델이 파기될 수 없으므로
+            //    중간 청크가 0벡터로 대체되는 무증상 손상이 원천 차단됩니다.
+            let guard = embedding_model_arc.blocking_lock();
+            let model = match guard.as_ref() {
+                Some(m) => m,
+                None => return Ok(vec![vec![0.0; 384]; miss_for_compute.len()]),
+            };
+            let mut acc: Vec<Vec<f32>> = Vec::with_capacity(miss_for_compute.len());
+            for part in miss_for_compute.chunks(batch) {
+                let v = model
+                    .embed_batch(part)
+                    .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                acc.extend(v);
+            }
+            Ok(acc)
         }).await??;
 
-        Ok(vectors)
+        self.observe_activation_headroom(free_before);
+
+        // ── ④ 결과 흩뿌리기 + 캐시 적재 ──
+        {
+            let mut cache = self.embedding_cache.lock().await;
+            Self::guard_embedding_cache(&mut cache);
+            for (mi, vec) in computed.into_iter().enumerate() {
+                if mi >= miss_slots.len() { break; }
+                for &slot in &miss_slots[mi] {
+                    out[slot] = Some(vec.clone());
+                }
+                cache.insert(miss_texts[mi].clone(), vec);
+            }
+        }
+
+        // 모델이 사라졌거나 embed_batch 가 짧게 반환한 자리는 0벡터로 채웁니다.
+        // (호출부는 전부 이 길이를 전제로 인덱싱하므로 길이 보존이 계약입니다)
+        Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; 384])).collect())
     }
 }
