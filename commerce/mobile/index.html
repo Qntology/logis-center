@@ -13,7 +13,7 @@
     <script src="./marked.js"></script>
 
     <!-- Main Styles -->
-    <link rel="stylesheet" href="./styles.css?v=137">
+    <link rel="stylesheet" href="./styles.css?v=147">
     
     <style>
         /* Build Tag */
@@ -24,7 +24,7 @@
     </style>
 </head>
 <body>
-    <div id="build-tag">V137</div>
+    <div id="build-tag">V147</div>
 
     <div class="widget-wrapper">
       <!-- 1. The Pill Nav (Always Visible) -->
@@ -44,7 +44,10 @@
       <section id="content-panel" class="content-panel open">
         
         <!-- Disconnected / Intro View (Inside Panel) -->
-        <div id="tab-intro" class="tab-content active" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; flex:1; height:100%;">
+        <!-- 🌟 정렬/여백은 styles.css 의 #tab-intro 가 담당합니다.
+             display 는 JS(finalizeConnectionUI / handleDisconnect)가 직접 토글하므로
+             초기값만 인라인으로 남깁니다. -->
+        <div id="tab-intro" class="tab-content active" style="display:flex;">
             <p style="font-size:3rem; margin:0;">📡</p>
             <h3 style="margin:10px 0;">Disconnected</h3>
             <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR or connect manually</p>
@@ -75,8 +78,13 @@
                     <h2>Results</h2>
                     <button id="list-refresh-btn" class="nav-btn">🔄</button>
                </div>
-               <div id="list-scroll-container" class="chat-container" style="flex:1;">
-                 <div id="list-scroll" class="chat-scroll">
+               <!-- 🌟 [SCROLL] 스크롤 규칙은 styles.css 의 .chat-container / #list-scroll 이
+                    전부 담당합니다. (overflow-y:auto + transform:none)
+                    인라인과 CSS 에 같은 규칙을 이중으로 두면
+                    나중에 한쪽만 고쳤을 때 무한스크롤이 조용히 죽으므로 인라인을 제거했습니다.
+                    initRemoteInfiniteScroll() 이 이 요소의 scroll 이벤트를 듣습니다. -->
+               <div id="list-scroll-container" class="chat-container">
+                 <div id="list-scroll">
                     <!-- Navigation Categories Overlay -->
                     <div id="nav-categories" class="nav-categories hidden" style="padding: 10px; background: #fff; border-bottom: 1px solid #eee;">
                         <div class="nav-section">
@@ -109,7 +117,13 @@
              <button id="btn-settings-back" class="nav-btn">⬅︎</button>
              <h2>Remote Hub</h2>
            </div>
-           <div class="chat-container">
+           <!-- 🌟 [CHAT SCROLL] main.ts 의 chatScroll.scrollTop 대입이 효과를 가지려면
+                #chat-scroll 자체가 overflow 요소여야 합니다.
+                그 규칙은 styles.css 의 .chat-scroll 에 정의되어 있습니다.
+                ⚠️ 여기서는 .chat-container 가 스크롤을 갖지 않도록
+                   overflow:hidden 을 명시해 이중 스크롤을 차단합니다.
+                   (목록 탭과 달리 채팅은 안쪽 .chat-scroll 이 스크롤 주체입니다) -->
+           <div class="chat-container" style="overflow:hidden;">
                 <div class="chat-scroll" id="chat-scroll">
                     <div class="chat-talks"></div>
                 </div>
@@ -136,7 +150,11 @@
     <div id="log-panel" style="position:fixed; bottom:0; left:0; right:0; height:80px; background:rgba(0,0,0,0.8); color:#0f0; font-size:10px; z-index:100001; pointer-events:none; overflow-y:auto; padding:5px;">Initializing...</div>
 
     <!-- Hidden File Input for Mobile Upload -->
-    <input type="file" id="mobile-file-input" style="display:none" accept="image/*">
+    <!-- 🌟 [ACCEPT WIDEN] PC 의 mobile_upload 핸들러는 확장자로
+         document_extraction / image_extraction 큐 타입을 가릅니다.
+         image/* 만 허용하면 문서 분기(pdf·docx·xlsx·hwpx·csv)가 영원히 죽습니다. -->
+    <input type="file" id="mobile-file-input" style="display:none"
+           accept="image/*,application/pdf,.pdf,.doc,.docx,.xls,.xlsx,.hwpx,.txt,.csv">
 
     <script type="module" src="./src/main.ts"></script>
     <script>

@@ -69,8 +69,31 @@
                     <!-- Navigation Categories (Users + Pages Tree) -->
                     <div id="nav-categories" class="nav-categories hidden">
                         <!-- Profile Section -->
-                        <div class="nav-profile"></div>
-
+                        <!-- 🌟 [MARKUP RESTORE] main.ts 가 아래 6개 id 를 참조하는데
+                             마크업이 비어 있어 전부 null 이었습니다.
+                             그 결과
+                              ① renderNavigation() 의 프로필/블로키 렌더링이 통째로 무동작
+                              ② finalizeWebRtcConnection() 의 "✅ Mobile Linked (P2P)" 표시가
+                                 화면에 절대 나타나지 않아, 페어링 성공 여부를 알 수 없었습니다
+                              ③ setupDataChannel 의 onclose 복구 표기도 무동작
+                              ④ startMobileScanning 의 "Scanning N/M" 진행 표기도 무동작
+                             (전부 `if (profileName)` 가드에 걸려 예외 없이 조용히 사라졌습니다) -->
+                        <div class="nav-profile">
+                            <div class="profile-card">
+                                <div id="nav-profile-favicon" class="profile-favicon"></div>
+                                <div class="profile-info">
+                                    <div class="profile-name-group">
+                                        <span id="nav-profile-name"></span>
+                                        <span id="auth-status-text" class="link-btn" style="cursor:default;">Waiting for Auth...</span>
+                                    </div>
+                                    <div class="profile-menu">
+                                        <button id="nav-signin" class="nav-menu-btn" style="color:#fff;">Sign In</button>
+                                        <button id="nav-signout" class="nav-menu-btn hidden" style="color:#fff;">Sign Out</button>
+                                        <button id="btn-qr-auth" class="nav-menu-btn" style="color:#fff;">QR Auth</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                         <div class="settings-toggle">
                             <input type="checkbox" id="settings-toggle" style="display: none;" />
                             <label for="settings-toggle">Settings</label>

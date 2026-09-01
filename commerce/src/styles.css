@@ -484,13 +484,23 @@ tr:hover { background: rgba(0,0,0,0.05); }
 }
 
 /* System Message Toggle Logic */
+/* 🌟 [CLIP FIX] top:-82px 는 .chat-container(= .aside.right 상단) 기준으로
+   헤더 행보다도 위, 즉 #tab-settings 의 바깥입니다.
+   #tab-settings { overflow:hidden } 과 .content-panel { overflow:hidden } 에
+   이중으로 잘려 라벨이 영구히 보이지 않았고, 그래서 사용자는
+   시스템 로그 말풍선을 숨길 방법이 아예 없었습니다.
+   (#system-toggle 이 HTML 에서 checked 라 로그는 계속 보이는 상태로 고정)
+   헤더 행 안쪽(-32px)으로 끌어올려 클리핑 영역 밖으로 나가지 않게 합니다. */
 .system-label {
     position: absolute;
-    top: -82px;
+    top: -32px;
     right: 1em;
+    z-index: 2;
     opacity: 0.5;
     cursor: pointer;
     font-size: 0.8rem;
+    line-height: 1.2;
+    user-select: none;
 }
 .system-label:before {
     content: "✅";
@@ -767,7 +777,11 @@ tr:hover { background: rgba(0,0,0,0.05); }
 .logis-info .value {
     color: #000;
     font-weight: 500;
-    text-align: right;
+    /* 🌟 [REMOVED] text-align:right 제거.
+       .logis-info 가 display:block 이고 .value 는 인라인 span 이라
+       text-align 이 자기 자신에게는 아무 영향도 주지 않는 죽은 선언이었습니다.
+       (예전 display:flex 세대의 잔재이며, 모바일에도 그대로 복사되어
+        같은 카드가 두 앱에서 다르게 보이는 원인이었습니다) */
     word-break: break-all;
 }
 
