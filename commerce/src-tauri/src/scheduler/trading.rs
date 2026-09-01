@@ -418,6 +418,46 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     (!found.is_empty(), found)
 }
 
+/// 🌟 [PRESENCE PRUNE] 이 문서에 존재하지 않는 필드 키를 LLM 결과에서 제거합니다.
+///
+///  ── 왜 재귀인가 ──
+///   카테고리 결과는 평면 객체일 때도 있고 { "items": [ {...}, {...} ] } 처럼
+///   배열을 품을 때도 있습니다. 실측 로그의 ITEMS 응답은 평면이었지만,
+///   서식에 따라 배열이 오므로 깊이에 무관하게 지웁니다.
+///
+///  ── 왜 프롬프트 차단만으로 부족한가 ──
+///   2B 모델은 지시를 어깁니다. 실측에서 [SCHEMA ECHO] 가드가
+///   "N/A" 를 반복해서 걷어내야 했던 것과 같은 이유입니다.
+///   프롬프트 차단은 토큰 절감, 이 함수는 결과 보장입니다.
+fn prune_absent_keys(
+    v: &mut Value,
+    absent: &std::collections::HashSet<String>,
+    dropped: &mut Vec<String>,
+) {
+    match v {
+        Value::Object(map) => {
+            let ks: Vec<String> = map.keys().cloned().collect();
+            for k in ks {
+                if absent.contains(&k) {
+                    map.remove(&k);
+                    if !dropped.iter().any(|e| e == &k) { dropped.push(k); }
+                    continue;
+                }
+                if let Some(child) = map.get_mut(&k) {
+                    if child.is_object() || child.is_array() {
+                        prune_absent_keys(child, absent, dropped);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for it in arr.iter_mut() {
+                prune_absent_keys(it, absent, dropped);
+            }
+        }
+        _ => {}
+    }
+}
 fn merge_trading_page_map(
     target: &mut serde_json::Map<String, Value>,
     source: &serde_json::Map<String, Value>,
@@ -1947,10 +1987,162 @@ pub async fn process_trading_task(
 
         emit_term(&format!("  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료.", assigned_fields.len()));
     }
+    // =====================================================================
+    // 🌟 [FIELD PRESENCE GATE] 이 문서에 인쇄되지 않은 필드는 LLM 에게 묻지 않습니다.
+    // ---------------------------------------------------------------------
+    //  ── 실측 사고 ──
+    //   PO 문서에는 항구·선박이 한 글자도 없는데 LOGISTICS 카테고리가
+    //     place_delivery = "San Francisco, CA"   (당사자 주소에서 절취)
+    //     place_receipt  = "Seoul, South Korea"  (당사자 주소에서 절취)
+    //     pod            = "Busan"               (incoterms "FOB Busan" 에서 절취)
+    //     pol            = "Gangnam-gu, Seoul"   (당사자 주소에서 절취)
+    //     transport_mode = "Sea"                 (순수 창작)
+    //   를 반환했고 그대로 저장·인덱싱되었습니다.
+    //   기존 게이트는 '서식이 그 필드를 가질 수 있는가' 만 묻고
+    //   '이 문서에 실제로 있는가' 는 묻지 않습니다.
+    //
+    //  ── 판정 원리 (vision_crop.rs::presence_gate 의 텍스트판) ──
+    //   ① 카테고리 : 증거 하나라도 그 카테고리가 argmax 인가
+    //   ② 필드     : 승리 카테고리 안에서 그 증거의 카테고리 평균 이상인가
+    //   ②가 형제 필드를 함께 살립니다. argmax 하나만 남기면
+    //   'name' 증거에서 sender_name / recipient_name 을 잃어 오히려 나빠집니다.
+    //
+    //  ── 왜 매직 상수가 없는가 ──
+    //   bank_neutral_key_matrix 가 행/열 이중 센터링을 수행하므로 0 은
+    //   '이 증거에서 평균적인 필드' 라는 유도된 기준선입니다.
+    //   카테고리 평균도 그 문서 자신의 분포에서 나옵니다.
+    //
+    //  ── 다국어 ──
+    //   입력은 다국어 임베딩 벡터뿐이며 언어 리터럴이 없습니다.
+    // =====================================================================
+    let mut absent_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        // ── 증거 수집 : 라벨 + 페어가 되지 못한 자유 텍스트 행 ──
+        //    자유 텍스트를 넣는 이유는 선언문·비고에 정보가 실리는 서식(LG/DGD/CNM 등)에서
+        //    라벨만 보면 실제로 있는 축을 없다고 오판하기 때문입니다.
+        //    증거가 늘면 판정이 관대해지는 방향이라 안전합니다.
+        let mut evidence: Vec<String> = Vec::new();
+        for l in unique_leaf.iter() {
+            let t = l.trim();
+            if t.chars().count() < 2 { continue; }
+            if !evidence.iter().any(|e| e == t) { evidence.push(t.to_string()); }
+        }
+        {
+            let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for p in detail_pairs.iter() {
+                consumed.insert(p.primary_line);
+                consumed.insert(p.label_line);
+            }
+            for (i, line) in pug_lines.iter().enumerate() {
+                if consumed.contains(&i) { continue; }
+                let (_, _, _, txt) = crate::utils::ai_utils::pug_line_parts(line);
+                let t = txt.trim();
+                if t.chars().count() < 3 { continue; }
+                if evidence.iter().any(|e| e == t) { continue; }
+                evidence.push(t.to_string());
+                if evidence.len() >= 200 { break; }
+            }
+        }
+        if evidence.is_empty() || t_field_names.is_empty() {
+            emit_term("  ⚪ [PRESENCE GATE] 증거 라인 또는 라벨 뱅크가 없어 전 필드를 존재로 간주합니다. (fail-open)");
+        } else {
+            let ev_embs = model.get_embedding_batch(evidence.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; evidence.len()]);
+            // 🌟 라벨 뱅크는 PLINKO 가 이미 임베딩해 두었으므로 재사용합니다.
+            //    (가중치는 쓰지 않습니다. 존재 판정은 순위만 필요하고,
+            //     STEP A 그룹/코드 채점도 같은 무가중 max-pool 을 씁니다)
+            let mut bias_bank: Vec<(String, String, Vec<f32>)> = Vec::new();
+            for f in 0..t_field_names.len() {
+                let c = crate::logic::trade_field_category(&t_field_names[f]);
+                let c = if c.is_empty() { "-".to_string() } else { c.to_string() };
+                for e in t_label_embs[f].iter() {
+                    if e.iter().all(|&v| v == 0.0) { continue; }
+                    bias_bank.push((c.clone(), t_field_names[f].clone(), e.clone()));
+                }
+            }
+            let no_prej: Vec<(String, String, Vec<f32>)> = Vec::new();
+            let (keys, net, _) = crate::utils::ai_utils::bank_neutral_key_matrix(
+                &ev_embs, &bias_bank, &no_prej,
+            );
+            let key_cat: Vec<String> = keys.iter().map(|k| {
+                let c = crate::logic::trade_field_category(k);
+                if c.is_empty() { "-".to_string() } else { c.to_string() }
+            }).collect();
+            let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut cat_hits: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for ei in 0..evidence.len() {
+                // ① 카테고리 argmax
+                let mut best_cat = String::new();
+                let mut best_score = f32::MIN;
+                for ki in 0..keys.len() {
+                    let v = net[ki][ei];
+                    if v == f32::MIN { continue; }
+                    if v > best_score { best_score = v; best_cat = key_cat[ki].clone(); }
+                }
+                if best_cat.is_empty() || best_score <= 0.0 { continue; }
+                *cat_hits.entry(best_cat.clone()).or_insert(0) += 1;
+                // ② 승리 카테고리 내부 평균 이상 필드만 존재로 인정
+                let mut sum = 0.0f32;
+                let mut cnt = 0usize;
+                for ki in 0..keys.len() {
+                    if key_cat[ki] != best_cat { continue; }
+                    let v = net[ki][ei];
+                    if v == f32::MIN { continue; }
+                    sum += v;
+                    cnt += 1;
+                }
+                if cnt == 0 { continue; }
+                let mean = sum / cnt as f32;
+                for ki in 0..keys.len() {
+                    if key_cat[ki] != best_cat { continue; }
+                    let v = net[ki][ei];
+                    if v == f32::MIN { continue; }
+                    if v >= mean { present.insert(keys[ki].clone()); }
+                }
+            }
+            // ③ 면제
+            //    · PLINKO 확정 필드 : 이미 증거로 확정된 값이므로 정의상 존재
+            //    · doc_number / doc_type : 문서 기본키. 잃으면 릴레이가 영구히 끊깁니다.
+            //      (vision_crop.rs 의 HEADER EXEMPT 와 같은 근거)
+            for k in assigned_fields.keys() { present.insert(k.clone()); }
+            present.insert("doc_number".to_string());
+            present.insert("doc_type".to_string());
+            for f in t_field_names.iter() {
+                if !present.contains(f) { absent_fields.insert(f.clone()); }
+            }
+            let mut hit_summary: Vec<String> = cat_hits.iter()
+                .map(|(c, n)| format!("{}({})", c, n)).collect();
+            hit_summary.sort();
+            emit_term(&format!(
+                "  🧭 [PRESENCE GATE] 증거 {}개 | 카테고리 argmax 분포: {} | 존재 {}필드 / 부재 {}필드",
+                evidence.len(),
+                if hit_summary.is_empty() { "-".to_string() } else { hit_summary.join(" ") },
+                t_field_names.len().saturating_sub(absent_fields.len()),
+                absent_fields.len()
+            ));
+            {
+                let mut by_cat: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for f in absent_fields.iter() {
+                    let c = crate::logic::trade_field_category(f);
+                    let c = if c.is_empty() { "-".to_string() } else { c.to_string() };
+                    by_cat.entry(c).or_default().push(f.clone());
+                }
+                let mut cats: Vec<&String> = by_cat.keys().collect();
+                cats.sort();
+                for c in cats {
+                    let mut fs = by_cat.get(c).cloned().unwrap_or_default();
+                    fs.sort();
+                    emit_term(&format!(
+                        "    ⚪ [NOT PRESENT / {}] {}개: {:?}",
+                        c, fs.len(), fs.iter().take(12).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
 
-    
     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
-
     for cat in &categories {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -1961,6 +2153,29 @@ pub async fn process_trading_task(
             continue;
         }
 
+        // 🌟 [CATEGORY PRESENCE SKIP] 이 카테고리의 필드가 하나도 존재하지 않으면
+        //    LLM 을 부르지 않습니다. 빈 슬롯을 2B 모델에게 주면 반드시 채웁니다.
+        //
+        //  ── 실측 근거 ──
+        //   PO 문서에서 CARGO / CONTAINERS 는 전 필드 null 을 반환하는 데
+        //   각각 한 번씩 프리필+디코딩을 소모했습니다.
+        //   (CARGO 1467토큰 / CONTAINERS 1628토큰 프리필)
+        //   존재하지 않는 카테고리를 묻지 않으면 그만큼 그대로 절약됩니다.
+        let cat_schema_fields: Vec<String> = trade_fields.iter()
+            .map(|(f, _, _, _)| f.clone())
+            .filter(|f| crate::logic::trade_field_category(f) == *cat)
+            .collect();
+        let absent_in_cat: Vec<String> = cat_schema_fields.iter()
+            .filter(|f| absent_fields.contains(*f))
+            .cloned()
+            .collect();
+        if !cat_schema_fields.is_empty() && absent_in_cat.len() == cat_schema_fields.len() {
+            emit_term(&format!(
+                "  ⚪ [PRESENCE SKIP] Category '{}' 의 필드 {}개가 이 문서에 하나도 인쇄되어 있지 않습니다. LLM 호출을 생략합니다. (빈 슬롯 창작 차단)",
+                cat.to_uppercase(), cat_schema_fields.len()
+            ));
+            continue;
+        }
         if *cat != "items" && *cat != "containers" {
             let filled = final_data_map.get(*cat)
                 .and_then(|v| v.as_object())
@@ -1975,6 +2190,16 @@ pub async fn process_trading_task(
                     cat.to_uppercase(), filled, schema_field_count));
                 continue;
             }
+            // 🌟 [PRESENCE-AWARE LLM SKIP] '존재하는 필드' 만을 분모로 다시 봅니다.
+            //    부재 필드를 분모에 포함하면 영원히 채워지지 않아 매번 LLM 을 부릅니다.
+            let present_cnt = cat_schema_fields.len().saturating_sub(absent_in_cat.len());
+            if present_cnt > 0 && filled >= present_cnt {
+                emit_term(&format!(
+                    "  ⚡ [PRESENCE LLM SKIP] Category '{}' 는 존재 필드 {}개를 PLINKO 가 전부 확정했습니다. (부재 {}개 제외) LLM 호출을 생략합니다.",
+                    cat.to_uppercase(), present_cnt, absent_in_cat.len()
+                ));
+                continue;
+            }
         }
 
         
@@ -1986,6 +2211,22 @@ pub async fn process_trading_task(
                 .collect();
             format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
                 serde_json::to_string_pretty(&list).unwrap_or_default())
+        };
+        // 🌟 [ABSENT FIELD DIRECTIVE] 부재 필드를 명시적으로 알려 토큰과 오답을 함께 줄입니다.
+        //    ⚠️ 이것만으로는 보장이 되지 않습니다. 2B 모델은 지시를 어깁니다.
+        //       실제 보장은 아래 [PRESENCE DROP] 이 담당하고, 이 블록은 비용 절감용입니다.
+        let absent_ctx = if absent_in_cat.is_empty() {
+            String::new()
+        } else {
+            emit_term(&format!(
+                "  🚧 [PRESENCE FILTER] Category '{}' | 존재 {}필드 / 부재 {}필드 {:?}",
+                cat.to_uppercase(),
+                cat_schema_fields.len().saturating_sub(absent_in_cat.len()),
+                absent_in_cat.len(),
+                absent_in_cat.iter().take(10).collect::<Vec<_>>()
+            ));
+            format!("\n\n[FIELDS NOT PRESENT IN THIS DOCUMENT]\nThe deterministic label engine scanned every line of this document and found NO evidence for the fields below. You MUST return null for every one of them. Do NOT infer, guess, or derive them from addresses, incoterms, party names, or any other field:\n{}",
+                serde_json::to_string_pretty(&absent_in_cat).unwrap_or_default())
         };
 
         emit_term(&format!("[TRADING STEP B] Extracting category '{}' for {}...", cat.to_uppercase(), doc_type));
@@ -2003,7 +2244,7 @@ pub async fn process_trading_task(
                 messages: vec![
                     crate::openai_types::ChatCompletionRequestMessage::System(
                         crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}", content_pug, claimed_ctx),
+                            content: format!("[PUG CONTENT — attribute-stripped]\n{}{}{}", content_pug, claimed_ctx, absent_ctx),
                             name: None,
                         },
                     ),
@@ -2030,7 +2271,6 @@ pub async fn process_trading_task(
                 None, None, None
             ).await?;
             let mut tile_json = crate::parsing::parse_json_from_llm(&res);
-
             
             if let Some(obj) = tile_json.as_object_mut() {
                 let ks: Vec<String> = obj.keys().cloned().collect();
@@ -2041,7 +2281,23 @@ pub async fn process_trading_task(
                     }
                 }
             }
-
+            // 🌟 [PRESENCE DROP] 프롬프트 지시를 어기고 채워 온 부재 필드를 폐기합니다.
+            //
+            //  ── 왜 결과 단계에서도 막는가 ──
+            //   실측에서 LOGISTICS 는 [ALREADY CLAIMED VALUES] 지시를 받고도
+            //   당사자 주소를 잘라 pol/pod/place_receipt/place_delivery 를 채웠습니다.
+            //   프롬프트는 확률적이고 이 게이트는 결정론입니다.
+            //   [SCHEMA ECHO GUARD] 가 "N/A" 를 결과 단계에서 걷어내는 것과 같은 계보입니다.
+            if !absent_fields.is_empty() {
+                let mut dropped: Vec<String> = Vec::new();
+                prune_absent_keys(&mut tile_json, &absent_fields, &mut dropped);
+                if !dropped.is_empty() {
+                    emit_term(&format!(
+                        "    🚫 [PRESENCE DROP] Category '{}' | LLM 이 부재 필드 {}개를 채웠으나 폐기합니다: {:?}",
+                        cat.to_uppercase(), dropped.len(), dropped.iter().take(12).collect::<Vec<_>>()
+                    ));
+                }
+            }
             crate::model::merge_json_manual(&mut final_data_map, cat, tile_json);
         }
     }
