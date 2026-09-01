@@ -8,7 +8,97 @@ use crate::scheduler::indexing::save_item;
 use crate::utils::logger::log_task_progress;
 use crate::parsing;
 use tauri::Emitter;
-
+// =====================================================================
+// 🌟 [TITLE AXIS ANCHOR] 제목 축 판정에 쓰는 두 개의 개념 앵커
+// ---------------------------------------------------------------------
+//  ── 왜 영어 한 벌인가 (단일 언어 하드코딩이 아닌 이유) ──
+//   bias.json 의 search_bridge.abstract_bridge 가 영어 브릿지 구만 두고
+//   교차언어 매칭을 다국어 임베딩에 맡기는 것과 같은 계보입니다.
+//   언어별 사전을 만들면 언어가 늘 때마다 코드를 고쳐야 하지만,
+//   granite-embedding-97m-multilingual-r2 가 이미 그 일을 합니다.
+//   ('문서유형' / '書類種別' / 'tipo de documento' 는 전부 아래 앵커와 공명합니다)
+//
+//  ── 왜 두 축인가 ──
+//   Purchase_Order 문서에는 'Letter of Credit (L/C)' 가 payment_terms 값으로
+//   인쇄되어 있습니다. 제목 축만 세우면 PO 가 LC 로 뒤집힙니다.
+//   '이 라벨이 자기 종류를 선언하는가' vs '다른 문서를 참조하는가' 를
+//   상대 코사인으로 먼저 가르면 그 경로가 물리적으로 사라집니다.
+//   절대 임계치 없이 두 앵커의 대소 비교만 사용하므로 매직 상수가 없습니다.
+// =====================================================================
+const TRADE_TITLE_LABEL_ANCHOR: &str = "document type, kind of document, type of form, \
+     name of this document, title of this document, document name, form name, \
+     document code, form code, classification of this document";
+const TRADE_REFERENCE_LABEL_ANCHOR: &str = "referenced document number, related document number, \
+     reference number of another document, master document number, associated document, \
+     payment terms, terms of payment, drawn under credit, issued under, \
+     attached documents, required documents, enclosed documents, remark, note";
+/// 🌟 [TITLE CANDIDATE] 상단 밴드에서 '표제(전문)일 수 있는 값' 을 수집합니다.
+#[derive(Debug, Clone)]
+struct TitleCandidate {
+    /// 라벨이 있으면 그 라벨. 표제 헤딩(라벨 없음)이면 빈 문자열.
+    label: String,
+    value: String,
+    line: usize,
+}
+/// 🌟 [TITLE BAND] 상단 밴드에서 표제 후보를 뽑습니다.
+///
+///  ── 밴드 근거 ──
+///   vision_encoder.rs::run_title_gate 가 상단 30% 를 제목 밴드로 보는 것과
+///   같은 레이아웃 구조 사실입니다. 서식 전문은 문서 최상단에 인쇄되고,
+///   본문의 'as per commercial invoice' 같은 언급은 그 아래에 나옵니다.
+///
+///  ── 두 경로 ──
+///   ① 라벨-값 페어 : 'document_type | Purchase Order' 처럼 라벨이 붙은 값
+///   ② 라벨 없는 라인 : 'COMMERCIAL INVOICE' 처럼 단독 헤딩
+///   실제 스캔 서식은 ②, YAML/폼 기반 문서는 ① 로 들어옵니다. 둘 다 받습니다.
+fn collect_title_candidates(pug: &str, band_ratio: f32) -> Vec<TitleCandidate> {
+    let all: Vec<&str> = pug.lines().collect();
+    if all.is_empty() { return Vec::new(); }
+    // 거대 문서에서 O(n²) 페어 수집이 폭주하지 않도록 스캔 상한을 둡니다.
+    let scan_cap = all.len().min(2000);
+    let scan: Vec<&str> = all[..scan_cap].to_vec();
+    let band = (((scan_cap as f32) * band_ratio).ceil() as usize)
+        .max(1)
+        .min(scan_cap);
+    let pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&scan);
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for p in pairs.iter() {
+        consumed.insert(p.primary_line);
+        consumed.insert(p.label_line);
+    }
+    let mut out: Vec<TitleCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ① 라벨-값 페어
+    for p in pairs.iter() {
+        if p.label_line >= band && p.primary_line >= band { continue; }
+        let v = p.value.trim().to_string();
+        if v.chars().count() < 2 { continue; }
+        if !seen.insert(v.clone()) { continue; }
+        out.push(TitleCandidate {
+            label: p.label.trim().to_string(),
+            value: v,
+            line: p.primary_line,
+        });
+    }
+    // ② 라벨 없는 헤딩 라인
+    for i in 0..band {
+        if consumed.contains(&i) { continue; }
+        let (_, tag, _, value) = crate::utils::ai_utils::pug_line_parts(scan[i]);
+        if matches!(
+            tag.as_str(),
+            "tr" | "table" | "thead" | "tbody" | "tfoot" | "colgroup" | "col" | "form" | "button"
+        ) {
+            continue;
+        }
+        let v = value.trim().to_string();
+        if v.chars().count() < 2 { continue; }
+        if !seen.insert(v.clone()) { continue; }
+        out.push(TitleCandidate { label: String::new(), value: v, line: i });
+    }
+    out.sort_by_key(|c| c.line);
+    if out.len() > 24 { out.truncate(24); }
+    out
+}
 fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     let upper = pug.to_uppercase();
     let mut found: Vec<String> = Vec::new();
@@ -507,7 +597,7 @@ pub async fn process_trading_task(
     model.check_embedding_downloaded().await?;
     model.ensure_embedding().await?;
     
-    use crate::logic::{TRADE_GROUPS, TRADE_GROUP_CODES as GROUP_CODES, trade_code_anchor};
+    use crate::logic::{TRADE_GROUPS, TRADE_GROUP_CODES as GROUP_CODES, TRADE_DOC_TITLES, trade_code_anchor};
 
     let doc_lines: Vec<String> = {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -573,30 +663,19 @@ pub async fn process_trading_task(
         .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
     let g_prej_bank: Vec<(String, String, Vec<f32>)> = g_prej_defs.iter()
         .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
-
-    let empty_names: Vec<String> = Vec::new();
-    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
-    let empty_skip: Vec<bool> = Vec::new();
-
-    let mut group_best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    for le in line_embs.iter() {
-        if le.iter().all(|&v| v == 0.0) { continue; }
-        let (fs, _) = crate::utils::ai_utils::surprisal_dual_scores(
-            le, &g_bias_bank, &g_prej_bank, &empty_names, &empty_banks, &empty_skip,
-        );
-        for s in fs {
-            let e = group_best.entry(s.key.clone()).or_insert(f32::MIN);
-            if s.surprisal > *e { *e = s.surprisal; }
-        }
-    }
-
-    let mut group_scores: Vec<(String, f32)> = group_best.into_iter().collect();
-    group_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 🌟 [BANK-NEUTRAL GROUP SCORING] √(2 ln N) 차감을 폐기합니다.
+    //    그룹마다 앵커 구 수가 다르면(shipping 33구 vs customs 17구)
+    //    구 수가 적은 그룹이 구조적으로 유리해집니다.
+    //    vision_encoder.rs 가 이미 폐기한 편향이라 텍스트 트랙도 동일하게 맞춥니다.
+    let group_scores_raw = crate::utils::ai_utils::bank_neutral_key_scores(
+        &line_embs, &g_bias_bank, &g_prej_bank,
+    );
+    let mut group_scores: Vec<(String, f32)> = group_scores_raw;
     if group_scores.is_empty() {
         group_scores.push(("shipping".to_string(), 0.0));
     }
     for (g, s) in group_scores.iter() {
-        emit_term(&format!("  📐 [TRADE GROUP] {} | Surprisal(max over lines): {:+.4}", g, s));
+        emit_term(&format!("  📐 [TRADE GROUP] {} | Score(bank-neutral): {:+.4}", g, s));
     }
 
     let mut best_group = group_scores[0].0.clone();
@@ -619,17 +698,45 @@ pub async fn process_trading_task(
     emit_term(&format!("  👑 [TRADE GROUP SELECTED] '{}' | Top: {:+.4} | Margin: {:+.4}",
         best_group, group_scores[0].1, group_margin));
 
-    
-    
-    
-    
     let mut codes: Vec<&str> = GROUP_CODES.iter()
         .find(|(g, _)| *g == best_group)
         .map(|(_, c)| c.to_vec())
         .unwrap_or_else(|| vec!["Unknown"]);
+    // 🌟 [GROUP EXPANSION GATE]
+    //  ── 무엇이 문제였나 (실측) ──
+    //   기존 게이트는 `*s <= 0.0` 이었습니다. 그런데 점수는 48개 라인의 최댓값이라
+    //   라인이 조금만 많아지면 7개 그룹이 전부 양수가 됩니다.
+    //   로그에서 후보가 55개 전부 열려 Depth-1 승리('contract')가 무의미해졌고,
+    //   contract 에 없는 CI 가 후보로 들어와 PO 를 이겼습니다.
+    //
+    //  ── 대체 기준 (매직 상수 아님) ──
+    //   '이 문서에서 관측된 양수 그룹 점수 분포의 (평균 + 표준편차)'.
+    //   models/siglip2/vision_crop.rs::core_threshold 가 쓰는 것과 같은 도구이며,
+    //   문서 자신의 분포에서 유도되므로 문서/언어에 따라 자동으로 조정됩니다.
+    let expand_gate = {
+        let pos: Vec<f32> = group_scores.iter().map(|(_, s)| *s).filter(|s| *s > 0.0).collect();
+        if pos.len() < 4 {
+            0.0f32
+        } else {
+            let n = pos.len() as f32;
+            let mean = pos.iter().sum::<f32>() / n;
+            let var = pos.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n;
+            mean + var.sqrt()
+        }
+    };
+    emit_term(&format!(
+        "  🚧 [GROUP EXPANSION GATE] 확장 임계 = 양수 그룹 점수의 (평균 + 표준편차) = {:+.4}",
+        expand_gate
+    ));
     for (g, s) in group_scores.iter() {
         if g == &best_group { continue; }
-        if *s <= 0.0 { continue; }
+        if *s <= expand_gate {
+            emit_term(&format!(
+                "    ⚪ [GROUP EXPANSION SKIP] '{}' ({:+.4}) 는 임계 이하라 코드 후보를 열지 않습니다.",
+                g, s
+            ));
+            continue;
+        }
         if g == "parcel" && has_trade_marker { continue; }
         if let Some((_, extra)) = GROUP_CODES.iter().find(|(gn, _)| gn == g) {
             for c in extra.iter() {
@@ -637,7 +744,131 @@ pub async fn process_trading_task(
             }
         }
     }
-    emit_term(&format!("  🎯 [TRADE CODE CANDIDATES] {:?}", codes));
+    // =====================================================================
+    // 🌟 [TITLE AXIS — 텍스트 트랙]
+    // ---------------------------------------------------------------------
+    //  vision_encoder.rs 의 run_title_gate + TITLE AXIS NMS INTEGRATION 을
+    //  텍스트 트랙에 이식합니다. 같은 문서를 스캔 이미지로 넣든 PDF 로 넣든
+    //  같은 코드가 나와야 하므로 두 트랙의 판정 근거를 통일합니다.
+    //
+    //  ① 라벨 축 : '자기 종류 선언' vs '타 문서 참조' 상대 코사인
+    //  ② 값 축   : 살아남은 값 ↔ TRADE_DOC_TITLES 전문 뱅크 (뱅크 중립 채점)
+    // =====================================================================
+    let mut title_scores: Vec<(String, f32)> = Vec::new();
+    {
+        let cands = collect_title_candidates(&light_pug, 0.30);
+        emit_term(&format!("  🪪 [TITLE CANDIDATES] 상단 밴드 표제 후보 {}개 수집", cands.len()));
+        if !cands.is_empty() {
+            let humanize = |raw: &str| -> String {
+                let h = crate::utils::ai_utils::humanize_url_token(raw);
+                if h.trim().is_empty() { raw.trim().to_string() } else { h }
+            };
+            let mut label_texts: Vec<String> = Vec::new();
+            for c in cands.iter() {
+                if c.label.trim().is_empty() { continue; }
+                let t = humanize(&c.label);
+                if !label_texts.iter().any(|e| e == &t) { label_texts.push(t); }
+            }
+            let anchor_embs = model
+                .get_embedding_batch(vec![
+                    TRADE_TITLE_LABEL_ANCHOR.to_string(),
+                    TRADE_REFERENCE_LABEL_ANCHOR.to_string(),
+                ])
+                .await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; 2]);
+            let label_embs = if label_texts.is_empty() {
+                Vec::new()
+            } else {
+                model.get_embedding_batch(label_texts.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; label_texts.len()])
+            };
+            let mut label_is_title: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            for (li, lt) in label_texts.iter().enumerate() {
+                let ts = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchor_embs[0]);
+                let rs = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchor_embs[1]);
+                let keep = ts > rs;
+                label_is_title.insert(lt.clone(), keep);
+                emit_term(&format!(
+                    "     🏷️ [TITLE LABEL GATE] '{}' | 자기선언 {:.4} vs 타문서참조 {:.4} → {}",
+                    lt, ts, rs,
+                    if keep { "표제 후보 유지" } else { "참조 라벨 → 제외" }
+                ));
+            }
+            let mut value_texts: Vec<String> = Vec::new();
+            for c in cands.iter() {
+                let keep = if c.label.trim().is_empty() {
+                    true
+                } else {
+                    label_is_title.get(&humanize(&c.label)).copied().unwrap_or(false)
+                };
+                if !keep { continue; }
+                if !value_texts.iter().any(|e| e == &c.value) {
+                    value_texts.push(c.value.clone());
+                }
+            }
+            if value_texts.is_empty() {
+                emit_term("  ⚪ [TITLE AXIS] 표제 후보가 전부 참조 라벨로 판정되어 제목 축을 사용하지 않습니다.");
+            } else {
+                emit_term(&format!(
+                    "  🪪 [TITLE AXIS] 표제 후보 값 {}개: {:?}",
+                    value_texts.len(),
+                    value_texts.iter().take(8).collect::<Vec<_>>()
+                ));
+                let val_embs = model.get_embedding_batch(value_texts.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; value_texts.len()]);
+                let mut t_bias: Vec<(String, String, String)> = Vec::new();
+                let mut t_prej: Vec<(String, String, String)> = Vec::new();
+                for (code, title) in TRADE_DOC_TITLES.iter() {
+                    t_bias.push(("title".to_string(), code.to_string(), title.to_string()));
+                    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                    for (other, other_title) in TRADE_DOC_TITLES.iter() {
+                        if other == code { continue; }
+                        if seen.insert(other_title) {
+                            t_prej.push(("title".to_string(), code.to_string(), other_title.to_string()));
+                        }
+                    }
+                }
+                let mut uniq_t: Vec<String> = Vec::new();
+                for (_, _, p) in t_bias.iter().chain(t_prej.iter()) {
+                    if !uniq_t.iter().any(|e| e == p) { uniq_t.push(p.clone()); }
+                }
+                let uniq_t_embs = model.get_embedding_batch(uniq_t.clone()).await
+                    .unwrap_or_else(|_| vec![vec![0.0; 384]; uniq_t.len()]);
+                let t_emb = |p: &str| -> Vec<f32> {
+                    match uniq_t.iter().position(|e| e == p) {
+                        Some(i) => uniq_t_embs[i].clone(),
+                        None => vec![0.0f32; 384],
+                    }
+                };
+                let t_bias_bank: Vec<(String, String, Vec<f32>)> = t_bias.iter()
+                    .map(|(c, k, p)| (c.clone(), k.clone(), t_emb(p))).collect();
+                let t_prej_bank: Vec<(String, String, Vec<f32>)> = t_prej.iter()
+                    .map(|(c, k, p)| (c.clone(), k.clone(), t_emb(p))).collect();
+                title_scores = crate::utils::ai_utils::bank_neutral_key_scores(
+                    &val_embs, &t_bias_bank, &t_prej_bank,
+                );
+                for (c, s) in title_scores.iter().take(6) {
+                    emit_term(&format!("     📐 [TITLE AXIS] {} | Score: {:+.4}", c, s));
+                }
+            }
+        }
+    }
+    // 🌟 [TITLE RESCUE] 제목 축 승자가 그룹 후보 밖이면 후보로 편입합니다.
+    //    그룹 판정이 틀렸을 때의 유일한 복구 경로입니다.
+    if let Some((tc, ts)) = title_scores.first().cloned() {
+        let second = title_scores.get(1).map(|x| x.1).unwrap_or(ts);
+        if ts > 0.0 && ts > second && !codes.iter().any(|x| *x == tc.as_str()) {
+            if let Some(entry) = TRADE_DOC_TITLES.iter().find(|(c, _)| *c == tc.as_str()) {
+                emit_term(&format!(
+                    "  🛟 [TITLE RESCUE] 제목 축 승자 '{}' ({:+.4}, 2위 대비 {:+.4}) 가 그룹 후보에 없어 편입합니다.",
+                    tc, ts, ts - second
+                ));
+                codes.push(entry.0);
+            }
+        }
+    }
+    emit_term(&format!("  🎯 [TRADE CODE CANDIDATES] {}개 {:?}", codes.len(), codes));
 
     
     let mut c_bias_defs: Vec<(String, String, String)> = Vec::new();
@@ -672,25 +903,39 @@ pub async fn process_trading_task(
     let c_prej_bank: Vec<(String, String, Vec<f32>)> = c_prej_defs.iter()
         .map(|(c, k, p)| (c.clone(), k.clone(), code_phrase_emb(p))).collect();
 
-    let mut code_best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    for le in line_embs.iter() {
-        if le.iter().all(|&v| v == 0.0) { continue; }
-        let (fs, _) = crate::utils::ai_utils::surprisal_dual_scores(
-            le, &c_bias_bank, &c_prej_bank, &empty_names, &empty_banks, &empty_skip,
-        );
-        for s in fs {
-            let e = code_best.entry(s.key.clone()).or_insert(f32::MIN);
-            if s.surprisal > *e { *e = s.surprisal; }
-        }
-    }
-
-    let mut code_scores: Vec<(String, f32)> = code_best.into_iter().collect();
-    code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 🌟 [BANK-NEUTRAL CODE SCORING]
+    //  ── 왜 바꾸는가 ──
+    //   후보가 55개일 때 각 코드의 편견 뱅크 N 이 54배로 폭발해
+    //   √(2 ln N) ≈ 3.4 가 차감되고, surprisal_dual_scores 의
+    //   `if ps > 0.0 { sc -= ps; }` 가 거의 항상 거짓이 되었습니다.
+    //   즉 CI 의 편견 안에 'purchase order' 가 있어도 한 번도 깎지 못했습니다.
+    //   행/열 이중 센터링은 뱅크 크기와 무관하므로 이 역설이 사라집니다.
+    let mut code_scores: Vec<(String, f32)> = crate::utils::ai_utils::bank_neutral_key_scores(
+        &line_embs, &c_bias_bank, &c_prej_bank,
+    );
     if code_scores.is_empty() {
         code_scores.push((codes[0].to_string(), 0.0));
     }
+    // 🌟 [TITLE AXIS INTEGRATION] 제목 축을 본문 축과 같은 점수 공간에 합산합니다.
+    //    가중치 2.0 은 vision_encoder.rs 의 TITLE AXIS NMS INTEGRATION 과 동일하며,
+    //    두 트랙이 같은 문서에서 같은 코드를 내도록 맞춘 값입니다.
+    //    사후 오버라이드가 아니라 단일 점수 축 편입이므로 NMS 가 결정론적으로 판정합니다.
+    if !title_scores.is_empty() {
+        let mut merged = 0usize;
+        for (cname, cs) in code_scores.iter_mut() {
+            if let Some((_, ts)) = title_scores.iter().find(|(t, _)| t == cname) {
+                *cs += 2.0 * ts;
+                merged += 1;
+            }
+        }
+        code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        emit_term(&format!(
+            "  🪪 [TITLE AXIS MERGE] 본문 축에 제목 축(가중치 2.0)을 합산했습니다. (코드 {}개)",
+            merged
+        ));
+    }
     for (c, s) in code_scores.iter() {
-        emit_term(&format!("    📐 [TRADE CODE] {} | Surprisal: {:+.4}", c, s));
+        emit_term(&format!("    📐 [TRADE CODE] {} | Score(bank-neutral + title): {:+.4}", c, s));
     }
 
     

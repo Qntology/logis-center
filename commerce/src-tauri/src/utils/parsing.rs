@@ -1991,11 +1991,26 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
 }
 
 pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayKey> {
+    // 🌟 [BACK-COMPAT] doc_type 을 모르는 레거시 호출부용. 기존 동작을 그대로 유지합니다.
+    extract_trade_relay_keys_for(data, doc_lang, "")
+}
+/// 🌟 [REVERSE ROLE v4] 자기 문서번호를 '남이 나를 부르는 이름' 으로 등록합니다.
+///
+///  ── 무엇이 문제였나 ──
+///   기존 v3 는 문서 종류와 무관하게 role/search_field 를 "reference_invoice" 로
+///   고정했습니다. PO 문서가 저장되면
+///     "reference_invoice == PO-99281A 인 문서를 찾아라"
+///   라는 성립 불가능한 릴레이가 나갑니다. 정답은 reference_po 입니다.
+///   실측 데이터셋 45종 중 CI 를 제외한 44종이 전부 이 경로로 빗나갑니다.
+///
+///  ── 수정 근거 ──
+///   '이 서식을 남이 어떤 참조 축으로 부르는가' 는 logic.rs 의
+///   trade_reference_field_of 가 이미 소유한 사실입니다. 코드에 사전을
+///   다시 적지 않고 그 함수 하나에 위임합니다.
+pub fn extract_trade_relay_keys_for(data: &Value, doc_lang: &str, doc_type: &str) -> Vec<TradeRelayKey> {
     let mut out: Vec<TradeRelayKey> = Vec::new();
-    // 🌟 [v3] doc_number를 "reference_invoice" 역할로 추가합니다.
-    //    기존에는 "self" 역할로 분류되어 자기 자신을 릴레이 대상으로 만들었습니다.
-    //    "reference_invoice" 역할은 '내 문서번호를 참조하는 문서'를 찾는 데 사용됩니다.
-    //    예: CI 문서를 참조하는 PL 문서의 reference_invoice = CI의 doc_number
+    let reverse_field: &'static str =
+        crate::logic::trade_reference_field_of(doc_type).unwrap_or("reference_invoice");
     if let Some(doc_num_raw) = data.get("doc_number")
         .or_else(|| data.get("document_number"))
         .and_then(|v| v.as_str())
@@ -2006,14 +2021,18 @@ pub fn extract_trade_relay_keys(data: &Value, doc_lang: &str) -> Vec<TradeRelayK
             let normalized = crate::utils::hash::normalize_identifier(&doc_num_raw);
             let index = crate::utils::hash::relay_index(&normalized);
             if index > 0 {
+                println!(
+                    "[RELAY] 🔁 [REVERSE ROLE] doc_type='{}' 의 역방향 참조 축을 '{}' 로 확정했습니다. (값 '{}')",
+                    doc_type, reverse_field, doc_num_raw
+                );
                 out.push(TradeRelayKey {
-                    role: "reference_invoice",
+                    role: reverse_field,
                     source_field: "doc_number".to_string(),
-                    search_field: "reference_invoice".to_string(),
+                    search_field: reverse_field.to_string(),
                     raw: doc_num_raw.clone(),
                     normalized: normalized.clone(),
                     index,
-                    id: crate::utils::hash::relay_id(&normalized, "reference_invoice"),
+                    id: crate::utils::hash::relay_id(&normalized, reverse_field),
                 });
             }
         }
@@ -2168,9 +2187,21 @@ pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) 
 ///   역할별 타겟을 `related_trading` 의 허브 목록과 일치시키고,
 ///   불필요한 복제를 제거합니다.
 pub fn plan_trade_relays(doc_type: &str, data: &Value, doc_lang: &str) -> Vec<(&'static str, TradeRelayKey)> {
-    let keys = extract_trade_relay_keys(data, doc_lang);
+    let keys = extract_trade_relay_keys_for(data, doc_lang, doc_type);
+    let reverse_field: &'static str =
+        crate::logic::trade_reference_field_of(doc_type).unwrap_or("reference_invoice");
     let mut plan = Vec::new();
     for k in keys.into_iter() {
+        // 🌟 [REVERSE ROLE v4] '남이 나를 부르는 축' 의 대상 목록은
+        //    logic.rs 의 related_trading 이 이미 소유합니다.
+        //    여기에 서식별 목록을 다시 적으면 두 사전이 어긋나는 통로가 됩니다.
+        if k.role == reverse_field {
+            for t in crate::logic::related_trading(doc_type) {
+                if t == doc_type { continue; }
+                plan.push((t, k.clone()));
+            }
+            continue;
+        }
         let targets: &[&'static str] = match k.role {
             // 🌟 [v3 FIX] "self" 역할은 자기 자신의 문서번호입니다.
             //    이 값으로 '상대 문서'를 찾는 것은 불가능합니다.

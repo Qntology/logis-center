@@ -1143,10 +1143,182 @@ pub fn surprisal_dual_scores<V: AsRef<Vec<f32>>>(
         sout.push(SurprisalScore { category: "schema".to_string(), key: name.clone(), max_cos: m, n, surprisal: sc });
     }
     sout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
-
     (fout, sout)
 }
-
+// =====================================================================
+// 🌟 [BANK-NEUTRAL TEXT SCORING] 뱅크 크기 편향을 제거한 텍스트 채점기
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   surprisal_dual_scores 는 √(2 ln N) 을 차감합니다.
+//   그런데 한 코드의 앵커 구는 "purchase order / order form / buyer order" 처럼
+//   동의어 나열이라 실효 표본 수가 N 보다 훨씬 작습니다.
+//   앵커가 적은 코드(CI)가 앵커가 많은 코드(PO)를 구조적으로 이깁니다.
+//   models/siglip2/vision_encoder.rs 의 score_patches_bank_neutral 이
+//   이미 같은 문제를 행/열 이중 센터링으로 해결했으므로 그 도구를 그대로 이식합니다.
+//
+//  ── 왜 다국어가 성립하는가 ──
+//   이 함수는 문자열을 전혀 보지 않습니다. 입력은 이미 다국어 임베딩 모델
+//   (granite-embedding-97m-multilingual-r2)이 만든 벡터뿐이므로,
+//   앵커가 영어 한 벌이어도 문서 언어와 무관하게 동작합니다.
+//
+//  ── 반환 ──
+//   (keys, net[key][query], raw_cos[key][query])
+//   net  : 행/열 이중 센터링 후 순위 점수 (뱅크 크기 무관)
+//   raw_cos : 원시 Max-Pool 코사인 (진단 / 구조 게이트용)
+// =====================================================================
+pub fn bank_neutral_key_matrix<V: AsRef<Vec<f32>>>(
+    queries: &[Vec<f32>],
+    bias: &[(String, String, V)],
+    prejudice: &[(String, String, V)],
+) -> (Vec<String>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    use std::collections::HashMap;
+    let n = queries.len();
+    if n == 0 || bias.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    // ── ① (category, key) 그룹 색인 ──
+    let mut order: Vec<String> = Vec::new();
+    let mut bias_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut key_cat: HashMap<String, String> = HashMap::new();
+    for (i, (c, k, _)) in bias.iter().enumerate() {
+        if !bias_idx.contains_key(k) { order.push(k.clone()); }
+        bias_idx.entry(k.clone()).or_default().push(i);
+        key_cat.entry(k.clone()).or_insert_with(|| c.clone());
+    }
+    let mut prej_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, k, _)) in prejudice.iter().enumerate() {
+        prej_idx.entry(k.clone()).or_default().push(i);
+    }
+    // ── ② 편견 Max-Pool 은 그룹당 1회만 ──
+    //    (bias 의 key 가 필드명, prejudice 의 key 가 카테고리명인 호출부가 있으므로
+    //     조회는 key → 실패 시 category 순으로 해석합니다)
+    let mut prej_pool: HashMap<String, Vec<f32>> = HashMap::new();
+    for (gname, list) in prej_idx.iter() {
+        let mut v = vec![f32::MIN; n];
+        for i in 0..n {
+            let q = &queries[i];
+            if q.iter().all(|&x| x == 0.0) { continue; }
+            let mut mp = f32::MIN;
+            for &j in list {
+                let e = prejudice[j].2.as_ref();
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(q, e);
+                if s > mp { mp = s; }
+            }
+            v[i] = mp;
+        }
+        prej_pool.insert(gname.clone(), v);
+    }
+    // ── ③ 원시 Max-Pool 행렬 ──
+    let m = order.len();
+    let mut raw_b = vec![vec![f32::MIN; n]; m];
+    let mut raw_p = vec![vec![f32::MIN; n]; m];
+    for (ki, key) in order.iter().enumerate() {
+        let bi = &bias_idx[key];
+        let pv: Option<&Vec<f32>> = prej_pool
+            .get(key)
+            .or_else(|| key_cat.get(key).and_then(|c| prej_pool.get(c)));
+        for i in 0..n {
+            let q = &queries[i];
+            if q.iter().all(|&x| x == 0.0) { continue; }
+            let mut mb = f32::MIN;
+            for &j in bi {
+                let e = bias[j].2.as_ref();
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(q, e);
+                if s > mb { mb = s; }
+            }
+            raw_b[ki][i] = mb;
+            if let Some(pv) = pv { raw_p[ki][i] = pv[i]; }
+        }
+    }
+    // ── ④ 행 기준선 + 전역 pooled σ ──
+    //    뱅크마다 σ 를 쓰면 1구 뱅크의 z 가 무한히 부풀기 때문에 pooled 를 씁니다.
+    let single = n < 2;
+    let mut pooled_var = 0.0f32;
+    let mut pooled_cnt = 0usize;
+    let mut mu_b = vec![0.0f32; m];
+    let mut mu_p = vec![0.0f32; m];
+    for ki in 0..m {
+        let (mut sb, mut sp, mut c) = (0.0f32, 0.0f32, 0usize);
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            sb += raw_b[ki][i];
+            if raw_p[ki][i] != f32::MIN { sp += raw_p[ki][i]; }
+            c += 1;
+        }
+        if c == 0 { continue; }
+        mu_b[ki] = sb / c as f32;
+        mu_p[ki] = sp / c as f32;
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            let d = raw_b[ki][i] - mu_b[ki];
+            pooled_var += d * d;
+            pooled_cnt += 1;
+        }
+    }
+    let sd = if pooled_cnt > 1 {
+        (pooled_var / pooled_cnt as f32).sqrt().max(1e-6)
+    } else {
+        1.0
+    };
+    // ── ⑤ 행 센터링 + 편견 상쇄 ──
+    //    🌟 [SINGLE QUERY GUARD] 질의가 1개뿐이면 행 센터링이 자기 자신을 소거해
+    //       전부 0 이 됩니다. 그 경우 원시 코사인 차를 그대로 씁니다.
+    let mut net = vec![vec![f32::MIN; n]; m];
+    for ki in 0..m {
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            if single {
+                let p = if raw_p[ki][i] == f32::MIN { 0.0 } else { raw_p[ki][i].max(0.0) };
+                net[ki][i] = raw_b[ki][i] - p;
+            } else {
+                let zb = (raw_b[ki][i] - mu_b[ki]) / sd;
+                let zp = if raw_p[ki][i] == f32::MIN {
+                    0.0
+                } else {
+                    ((raw_p[ki][i] - mu_p[ki]) / sd).max(0.0)
+                };
+                net[ki][i] = zb - zp;
+            }
+        }
+    }
+    // ── ⑥ 열 센터링 : '전 개념에 반응하는 잡음 라인' 공통 성분 제거 ──
+    for i in 0..n {
+        let (mut s, mut c) = (0.0f32, 0usize);
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            s += net[ki][i];
+            c += 1;
+        }
+        if c < 2 { continue; }
+        let mean = s / c as f32;
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            net[ki][i] -= mean;
+        }
+    }
+    (order, net, raw_b)
+}
+/// 🌟 [BANK-NEUTRAL KEY SCORES] 위 행렬을 (key → 질의 전체 최댓값) 으로 축소합니다.
+///    √(2 ln N) 차감이 없으므로 앵커 구 수에 무관한 공정한 경쟁이 됩니다.
+pub fn bank_neutral_key_scores<V: AsRef<Vec<f32>>>(
+    queries: &[Vec<f32>],
+    bias: &[(String, String, V)],
+    prejudice: &[(String, String, V)],
+) -> Vec<(String, f32)> {
+    let (keys, net, _) = bank_neutral_key_matrix(queries, bias, prejudice);
+    let mut out: Vec<(String, f32)> = keys
+        .iter()
+        .enumerate()
+        .map(|(ki, k)| {
+            let mx = net[ki].iter().cloned().fold(f32::MIN, f32::max);
+            (k.clone(), if mx == f32::MIN { 0.0 } else { mx })
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
 /// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
 /// filter_category_phrases 의 prejudice 판입니다.
 pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
