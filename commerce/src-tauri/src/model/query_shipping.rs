@@ -50,30 +50,38 @@ impl crate::model::LogisModel {
         let mut consumed_words: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for raw_word in query.split_whitespace() {
-            // 조사/따옴표를 떼어낸 코어 토큰
-            let core: String = raw_word
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .collect();
-            if core.chars().count() < 4 { continue; }
-            if !core.contains('-') && !core.contains('_') { continue; }
-            if !core.chars().any(|c| c.is_ascii_digit()) { continue; }
-
-            let prefix: String = core
-                .chars()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .collect::<String>()
-                .to_uppercase();
-            if prefix.is_empty() { continue; }
-
-            if let Some(field) = crate::logic::trade_reference_field_of(&prefix) {
-                if deterministic_refs.iter().any(|(f, _)| f == field) { continue; }
-                emit_term(&format!(
-                    "   ⚡ [PREFIX EXACT MATCH] '{}' → 접두어 '{}' 로 '{}' 축 확정 (벡터·LLM 생략)",
-                    core, prefix, field
-                ));
-                deterministic_refs.push((field.to_string(), core.clone()));
-                consumed_words.insert(raw_word.to_string());
+            let mut runs: Vec<String> = Vec::new();
+            {
+                let mut cur = String::new();
+                for ch in raw_word.chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        cur.push(ch);
+                    } else {
+                        if !cur.is_empty() { runs.push(std::mem::take(&mut cur)); }
+                    }
+                }
+                if !cur.is_empty() { runs.push(cur); }
+            }
+            for core in runs {
+                let core = core.trim_matches(|c| c == '-' || c == '_').to_string();
+                if core.chars().count() < 4 { continue; }
+                if !core.contains('-') && !core.contains('_') { continue; }
+                if !core.chars().any(|c| c.is_ascii_digit()) { continue; }
+                let prefix: String = core
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect::<String>()
+                    .to_uppercase();
+                if prefix.is_empty() { continue; }
+                if let Some(field) = crate::logic::trade_reference_field_of(&prefix) {
+                    if deterministic_refs.iter().any(|(f, _)| f == field) { continue; }
+                    emit_term(&format!(
+                        "   ⚡ [PREFIX EXACT MATCH] '{}' → 접두어 '{}' 로 '{}' 축 확정 (벡터·LLM 생략)",
+                        core, prefix, field
+                    ));
+                    deterministic_refs.push((field.to_string(), core.clone()));
+                    consumed_words.insert(raw_word.to_string());
+                }
             }
         }
 

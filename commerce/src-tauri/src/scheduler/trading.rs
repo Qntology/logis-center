@@ -9,23 +9,7 @@ use crate::utils::logger::log_task_progress;
 use crate::parsing;
 use tauri::Emitter;
 use crate::logic::TRADE_DOC_TITLES;
-// =====================================================================
-// 🌟 [TITLE AXIS ANCHOR] 제목 축 판정에 쓰는 두 개의 개념 앵커
-// ---------------------------------------------------------------------
-//  ── 왜 영어 한 벌인가 (단일 언어 하드코딩이 아닌 이유) ──
-//   bias.json 의 search_bridge.abstract_bridge 가 영어 브릿지 구만 두고
-//   교차언어 매칭을 다국어 임베딩에 맡기는 것과 같은 계보입니다.
-//   언어별 사전을 만들면 언어가 늘 때마다 코드를 고쳐야 하지만,
-//   granite-embedding-97m-multilingual-r2 가 이미 그 일을 합니다.
-//   ('문서유형' / '書類種別' / 'tipo de documento' 는 전부 아래 앵커와 공명합니다)
-//
-//  ── 왜 두 축인가 ──
-//   Purchase_Order 문서에는 'Letter of Credit (L/C)' 가 payment_terms 값으로
-//   인쇄되어 있습니다. 제목 축만 세우면 PO 가 LC 로 뒤집힙니다.
-//   '이 라벨이 자기 종류를 선언하는가' vs '다른 문서를 참조하는가' 를
-//   상대 코사인으로 먼저 가르면 그 경로가 물리적으로 사라집니다.
-//   절대 임계치 없이 두 앵커의 대소 비교만 사용하므로 매직 상수가 없습니다.
-// =====================================================================
+
 const TRADE_TITLE_LABEL_ANCHOR: &str = "document type, kind of document, type of form, \
      name of this document, title of this document, document name, form name, \
      document code, form code, classification of this document";
@@ -33,19 +17,7 @@ const TRADE_REFERENCE_LABEL_ANCHOR: &str = "referenced document number, related 
      reference number of another document, master document number, associated document, \
      payment terms, terms of payment, drawn under credit, issued under, \
      attached documents, required documents, enclosed documents, remark, note";
-/// 🌟 [ITEM ATTRIBUTE ANCHOR] '한 줄짜리 품목의 속성' 개념 축.
-///
-///  ── 왜 세 번째 축이 필요한가 (실측) ──
-///   기존 게이트는 '자기선언 vs 타문서참조' 2지 선택이라 '둘 다 아님'을 표현할 수 없습니다.
-///   그래서 2페이지의 라벨이 이렇게 오통과했습니다.
-///     🏷️ [TITLE LABEL GATE] 'item code'   | 자기선언 0.6187 vs 타문서참조 0.5412 → 표제 후보 유지
-///     🏷️ [TITLE LABEL GATE] 'description' | 자기선언 0.6000 vs 타문서참조 0.5295 → 표제 후보 유지
-///   'item code' 는 타 문서 참조가 아니므로 참조 축에 지고, 자연히 표제 축이 이깁니다.
-///   품목 속성이라는 제3의 선택지를 주면 그 경로가 물리적으로 사라집니다.
-///
-///  ── 왜 영어 한 벌인가 ──
-///   위 두 앵커와 같은 계보입니다. 판정은 다국어 임베딩 코사인으로만 이뤄지므로
-///   '품목코드' / '品目コード' / 'código de artículo' 도 같은 축과 공명합니다.
+
 const TRADE_ITEM_ATTRIBUTE_ANCHOR: &str = "line item attribute, attribute of one product row, \
      item code, stock keeping unit, article number, product description, \
      quantity, unit of measure, unit price, line total, amount of this row, \
@@ -63,17 +35,7 @@ struct TitleCandidate {
     value: String,
     line: usize,
 }
-/// 🌟 [TITLE BAND] 상단 밴드에서 표제 후보를 뽑습니다.
-///
-///  ── 밴드 근거 ──
-///   vision_encoder.rs::run_title_gate 가 상단 30% 를 제목 밴드로 보는 것과
-///   같은 레이아웃 구조 사실입니다. 서식 전문은 문서 최상단에 인쇄되고,
-///   본문의 'as per commercial invoice' 같은 언급은 그 아래에 나옵니다.
-///
-///  ── 두 경로 ──
-///   ① 라벨-값 페어 : 'document_type | Purchase Order' 처럼 라벨이 붙은 값
-///   ② 라벨 없는 라인 : 'COMMERCIAL INVOICE' 처럼 단독 헤딩
-///   실제 스캔 서식은 ②, YAML/폼 기반 문서는 ① 로 들어옵니다. 둘 다 받습니다.
+
 fn collect_title_candidates(pug: &str, band_ratio: f32) -> Vec<TitleCandidate> {
     let all: Vec<&str> = pug.lines().collect();
     if all.is_empty() { return Vec::new(); }
@@ -122,22 +84,7 @@ fn collect_title_candidates(pug: &str, band_ratio: f32) -> Vec<TitleCandidate> {
     if out.len() > 24 { out.truncate(24); }
     out
 }
-// =====================================================================
-// 🌟 [TITLE VALUE RESOLVER] '표제로 인정할 값' 을 한 곳에서 결정합니다.
-// ---------------------------------------------------------------------
-//  ── 왜 공용 함수인가 ──
-//   같은 판정을 세 곳이 필요로 합니다.
-//     ① STEP A 제목 축
-//     ② PAGE CONTINUITY (연속 페이지 판정)
-//     ③ MODE REROUTE 프로브 (커머스 진입 시 무역 문서 감지)
-//   각자 인라인으로 두면 세 판정이 서로 어긋납니다. 실제로 ②가 ①과 달라
-//   "[ Item 2 ]" 를 표제로 인정해 2페이지를 독립 문서로 만들었습니다.
-//
-//  ── 4축 상대 비교 (절대 임계치 없음) ──
-//   라벨이 있으면 : 자기선언 / 타문서참조 / 품목속성 중 자기선언이 최대일 때만 통과
-//   라벨이 없으면 : 값 자체를 자기선언 / 행구분자 / 품목속성 과 비교, 자기선언 최대일 때만 통과
-//   전부 대소 비교이므로 매직 상수가 없고 언어 리터럴도 없습니다.
-// =====================================================================
+
 pub(crate) async fn resolve_title_values(
     model: &LogisModel,
     light_pug: &str,
@@ -230,25 +177,7 @@ pub(crate) async fn resolve_title_values(
     }
     kept
 }
-// =====================================================================
-// 🌟 [PAGE CONTINUITY] 이 페이지가 '새 문서' 인가 '앞 문서의 연속' 인가
-// ---------------------------------------------------------------------
-//  ── 실측 사고 ──
-//   Purchase_Order_Part4.pdf 는 단일 PO 문서인데 2페이지로 분할되었고,
-//   2페이지(품목 2행 꼬리 + summary)가 독립 문서로 재분류되어
-//     👑 [TRADE CODE COSINE] 'ID' | Top: +5.6726
-//   가 되었습니다. 그 결과 존재하지 않는 수입신고(ID) 문서가 저장되고
-//   doc_number='DECL-2026-0815' / due_date=2024-12-31 / payment_status=PAID
-//   가 전부 창작되었습니다. PO 는 품목 1행과 합계 62500 만 남았습니다.
-//
-//  ── 판정 근거 (어휘 사전 아님, 다국어 코사인) ──
-//   서식은 정의상 '자기 종류를 선언하는 표제' 를 1회 인쇄합니다.
-//   표제가 없는 페이지는 그 자체로 독립 문서가 될 수 없습니다.
-//   ① 표제 축 : 이 페이지의 표제 후보가 TRADE_DOC_TITLES 와 공명하는가
-//   ② 정체 축 : 이 페이지에 '자기 문서번호' 라벨이 있는가
-//   두 축이 모두 없으면 앞 페이지의 연속으로 봅니다.
-//   판정은 전부 임베딩 코사인이며 언어 리터럴이 없습니다.
-// =====================================================================
+
 struct PageIdentityVerdict {
     /// 표제 축 최고 점수 (없으면 f32::MIN)
     title_top: f32,
@@ -264,29 +193,7 @@ const TRADE_SELF_ID_LABEL_ANCHOR: &str = "document number of this document, \
      invoice number, order number, certificate number, declaration number, \
      bill of lading number, waybill number, policy number, claim number, \
      statement number, receipt number, licence number, booking number";
-// =====================================================================
-// 🌟 [MODE REROUTE PROBE] 커머스로 들어온 문서가 실은 무역 서식인지 판정합니다.
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 (실측 사고) ──
-//   process_task 의 분기는 `search_mode == "shipping"` 하나뿐입니다.
-//   사용자가 커머스 탭에서 Purchase Order PDF 를 올리면 mode='commerce' 이므로
-//   커머스 파이프라인으로 들어가고, 거기에는 무역 서식이라는 선택지가 없어
-//     [Scheduler] Deterministic Classified Page Type: order
-//   로 강제 분류됩니다. 무역 스키마·릴레이·팀 통계가 전부 소실됩니다.
-//
-//  ── 왜 본문 축으로는 못 가르는가 ──
-//   커머스 'order' 앵커에 "purchase order management" 가 들어 있습니다.
-//   즉 본문 코사인은 원리적으로 두 개념을 분리할 수 없습니다.
-//   가를 수 있는 축은 '자기 종류를 선언하는 표제' 뿐이며,
-//   커머스 목록 페이지에는 그 라벨이 애초에 존재하지 않습니다.
-//
-//  ── 판정 (다국어 코사인 / 임계치 없음) ──
-//   ① resolve_title_values 로 자기선언 값만 남깁니다. 0개면 즉시 커머스 유지.
-//   ② 무역 서식 전문 55개 + 커머스 페이지 타입 6개를 하나의 뱅크로 세우고
-//      bank_neutral_key_scores 로 채점합니다. (행/열 이중 센터링)
-//   ③ argmax 가 무역 코드일 때만 리라우트합니다.
-//   커머스 앵커가 같은 경쟁판에 있으므로 '무역이 커머스를 이겼다' 는 사실 자체가 근거입니다.
-// =====================================================================
+
 #[derive(Debug, Clone)]
 pub struct TradeRerouteVerdict {
     pub code: String,
@@ -418,17 +325,6 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     (!found.is_empty(), found)
 }
 
-/// 🌟 [PRESENCE PRUNE] 이 문서에 존재하지 않는 필드 키를 LLM 결과에서 제거합니다.
-///
-///  ── 왜 재귀인가 ──
-///   카테고리 결과는 평면 객체일 때도 있고 { "items": [ {...}, {...} ] } 처럼
-///   배열을 품을 때도 있습니다. 실측 로그의 ITEMS 응답은 평면이었지만,
-///   서식에 따라 배열이 오므로 깊이에 무관하게 지웁니다.
-///
-///  ── 왜 프롬프트 차단만으로 부족한가 ──
-///   2B 모델은 지시를 어깁니다. 실측에서 [SCHEMA ECHO] 가드가
-///   "N/A" 를 반복해서 걷어내야 했던 것과 같은 이유입니다.
-///   프롬프트 차단은 토큰 절감, 이 함수는 결과 보장입니다.
 fn prune_absent_keys(
     v: &mut Value,
     absent: &std::collections::HashSet<String>,
@@ -744,13 +640,6 @@ fn pdf_page_to_structured_html(page_text: &str) -> (String, usize) {
     (format!("<table>\n{}</table>", rows), pair_cnt)
 }
 
-/// 🌟 [CONTINUATION EXTRACT] 표제 없는 연속 페이지를 앞 문서의 스키마로 추출합니다.
-///
-///  ── 왜 별도 경로인가 ──
-///   STEP A(문서분류)를 건너뛰는 대신, 앞 페이지가 확정한 doc_type 의 스키마로
-///   PLINKO 만 수행합니다. 문서 종류를 다시 묻지 않으므로 오분류가 원천 차단됩니다.
-///   LLM 도 호출하지 않습니다. 연속 페이지는 대부분 표 행의 꼬리이고,
-///   그 값들은 구조적 라벨-값 페어로 전부 회수되기 때문입니다.
 async fn extract_continuation_page(
     model: &LogisModel,
     clean_html: &str,
@@ -1303,16 +1192,7 @@ pub async fn process_trading_task(
             }
         }
     }
-    // =====================================================================
-    // 🌟 [TITLE AXIS — 텍스트 트랙]
-    // ---------------------------------------------------------------------
-    //  vision_encoder.rs 의 run_title_gate + TITLE AXIS NMS INTEGRATION 을
-    //  텍스트 트랙에 이식합니다. 같은 문서를 스캔 이미지로 넣든 PDF 로 넣든
-    //  같은 코드가 나와야 하므로 두 트랙의 판정 근거를 통일합니다.
-    //
-    //  ① 라벨 축 : '자기 종류 선언' vs '타 문서 참조' 상대 코사인
-    //  ② 값 축   : 살아남은 값 ↔ TRADE_DOC_TITLES 전문 뱅크 (뱅크 중립 채점)
-    // =====================================================================
+
     let mut title_scores: Vec<(String, f32)> = Vec::new();
     {
         let cands = collect_title_candidates(&light_pug, 0.30);
@@ -1978,8 +1858,31 @@ pub async fn process_trading_task(
                 emit_term(&format!("    ⚪ [TRADING CATEGORY UNMAPPED] '{}' 는 8개 카테고리에 매핑되지 않아 루트에만 주입합니다.", fname));
             } else if let Some(slot) = final_data_map.get_mut(cat).and_then(|v| v.as_object_mut()) {
                 slot.insert(fname.clone(), json!(val.clone()));
+            } else {
+                let arr_key = match *cat {
+                    "items" => Some("line_items"),
+                    "containers" => Some("containers"),
+                    _ => None,
+                };
+                if let Some(ak) = arr_key {
+                    let slot = final_data_map
+                        .entry(ak.to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()));
+                    if let Some(arr) = slot.as_array_mut() {
+                        if arr.is_empty() {
+                            arr.push(Value::Object(serde_json::Map::new()));
+                        }
+                        if let Some(row) = arr[0].as_object_mut() {
+                            row.insert(fname.clone(), json!(val.clone()));
+                        }
+                    }
+                } else {
+                    emit_term(&format!(
+                        "    ⚠️ [PLINKO WRITE MISS] '{}' (cat: '{}') 를 기록할 루트 슬롯을 찾지 못했습니다.",
+                        fname, cat
+                    ));
+                }
             }
-
             assigned_fields.insert(fname.clone(), val.clone());
             emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
                 unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
@@ -1987,40 +1890,9 @@ pub async fn process_trading_task(
 
         emit_term(&format!("  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료.", assigned_fields.len()));
     }
-    // =====================================================================
-    // 🌟 [FIELD PRESENCE GATE] 이 문서에 인쇄되지 않은 필드는 LLM 에게 묻지 않습니다.
-    // ---------------------------------------------------------------------
-    //  ── 실측 사고 ──
-    //   PO 문서에는 항구·선박이 한 글자도 없는데 LOGISTICS 카테고리가
-    //     place_delivery = "San Francisco, CA"   (당사자 주소에서 절취)
-    //     place_receipt  = "Seoul, South Korea"  (당사자 주소에서 절취)
-    //     pod            = "Busan"               (incoterms "FOB Busan" 에서 절취)
-    //     pol            = "Gangnam-gu, Seoul"   (당사자 주소에서 절취)
-    //     transport_mode = "Sea"                 (순수 창작)
-    //   를 반환했고 그대로 저장·인덱싱되었습니다.
-    //   기존 게이트는 '서식이 그 필드를 가질 수 있는가' 만 묻고
-    //   '이 문서에 실제로 있는가' 는 묻지 않습니다.
-    //
-    //  ── 판정 원리 (vision_crop.rs::presence_gate 의 텍스트판) ──
-    //   ① 카테고리 : 증거 하나라도 그 카테고리가 argmax 인가
-    //   ② 필드     : 승리 카테고리 안에서 그 증거의 카테고리 평균 이상인가
-    //   ②가 형제 필드를 함께 살립니다. argmax 하나만 남기면
-    //   'name' 증거에서 sender_name / recipient_name 을 잃어 오히려 나빠집니다.
-    //
-    //  ── 왜 매직 상수가 없는가 ──
-    //   bank_neutral_key_matrix 가 행/열 이중 센터링을 수행하므로 0 은
-    //   '이 증거에서 평균적인 필드' 라는 유도된 기준선입니다.
-    //   카테고리 평균도 그 문서 자신의 분포에서 나옵니다.
-    //
-    //  ── 다국어 ──
-    //   입력은 다국어 임베딩 벡터뿐이며 언어 리터럴이 없습니다.
-    // =====================================================================
+
     let mut absent_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
     {
-        // ── 증거 수집 : 라벨 + 페어가 되지 못한 자유 텍스트 행 ──
-        //    자유 텍스트를 넣는 이유는 선언문·비고에 정보가 실리는 서식(LG/DGD/CNM 등)에서
-        //    라벨만 보면 실제로 있는 축을 없다고 오판하기 때문입니다.
-        //    증거가 늘면 판정이 관대해지는 방향이라 안전합니다.
         let mut evidence: Vec<String> = Vec::new();
         for l in unique_leaf.iter() {
             let t = l.trim();
@@ -2048,9 +1920,7 @@ pub async fn process_trading_task(
         } else {
             let ev_embs = model.get_embedding_batch(evidence.clone()).await
                 .unwrap_or_else(|_| vec![vec![0.0; 384]; evidence.len()]);
-            // 🌟 라벨 뱅크는 PLINKO 가 이미 임베딩해 두었으므로 재사용합니다.
-            //    (가중치는 쓰지 않습니다. 존재 판정은 순위만 필요하고,
-            //     STEP A 그룹/코드 채점도 같은 무가중 max-pool 을 씁니다)
+
             let mut bias_bank: Vec<(String, String, Vec<f32>)> = Vec::new();
             for f in 0..t_field_names.len() {
                 let c = crate::logic::trade_field_category(&t_field_names[f]);
@@ -2100,10 +1970,7 @@ pub async fn process_trading_task(
                     if v >= mean { present.insert(keys[ki].clone()); }
                 }
             }
-            // ③ 면제
-            //    · PLINKO 확정 필드 : 이미 증거로 확정된 값이므로 정의상 존재
-            //    · doc_number / doc_type : 문서 기본키. 잃으면 릴레이가 영구히 끊깁니다.
-            //      (vision_crop.rs 의 HEADER EXEMPT 와 같은 근거)
+
             for k in assigned_fields.keys() { present.insert(k.clone()); }
             present.insert("doc_number".to_string());
             present.insert("doc_type".to_string());
@@ -2153,14 +2020,6 @@ pub async fn process_trading_task(
             continue;
         }
 
-        // 🌟 [CATEGORY PRESENCE SKIP] 이 카테고리의 필드가 하나도 존재하지 않으면
-        //    LLM 을 부르지 않습니다. 빈 슬롯을 2B 모델에게 주면 반드시 채웁니다.
-        //
-        //  ── 실측 근거 ──
-        //   PO 문서에서 CARGO / CONTAINERS 는 전 필드 null 을 반환하는 데
-        //   각각 한 번씩 프리필+디코딩을 소모했습니다.
-        //   (CARGO 1467토큰 / CONTAINERS 1628토큰 프리필)
-        //   존재하지 않는 카테고리를 묻지 않으면 그만큼 그대로 절약됩니다.
         let cat_schema_fields: Vec<String> = trade_fields.iter()
             .map(|(f, _, _, _)| f.clone())
             .filter(|f| crate::logic::trade_field_category(f) == *cat)
@@ -2190,8 +2049,7 @@ pub async fn process_trading_task(
                     cat.to_uppercase(), filled, schema_field_count));
                 continue;
             }
-            // 🌟 [PRESENCE-AWARE LLM SKIP] '존재하는 필드' 만을 분모로 다시 봅니다.
-            //    부재 필드를 분모에 포함하면 영원히 채워지지 않아 매번 LLM 을 부릅니다.
+
             let present_cnt = cat_schema_fields.len().saturating_sub(absent_in_cat.len());
             if present_cnt > 0 && filled >= present_cnt {
                 emit_term(&format!(
@@ -2212,9 +2070,7 @@ pub async fn process_trading_task(
             format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
                 serde_json::to_string_pretty(&list).unwrap_or_default())
         };
-        // 🌟 [ABSENT FIELD DIRECTIVE] 부재 필드를 명시적으로 알려 토큰과 오답을 함께 줄입니다.
-        //    ⚠️ 이것만으로는 보장이 되지 않습니다. 2B 모델은 지시를 어깁니다.
-        //       실제 보장은 아래 [PRESENCE DROP] 이 담당하고, 이 블록은 비용 절감용입니다.
+
         let absent_ctx = if absent_in_cat.is_empty() {
             String::new()
         } else {
@@ -2630,33 +2486,16 @@ pub async fn process_trading_task(
             "  🔑 [TRADING INDEX] {}.{} = {} (근거 {}='{}' → 정규화 '{}')",
             doc_type, foreign_col, foreign_index, mine_field, ref_display, clean_ref
         ));
-
-        
-        
-        
-        
-        
-        //
-        
-        
-        
         
         let mut hit: Option<(String, Value)> = None;
-        
-        
-        
-        
-        
-        //
-        
+
         {
             let idx_filter = format!(
                 "type = '{}' AND data LIKE '%\"index\":{}%'",
                 foreign_type,
                 foreign_index
             );
-            
-            
+                        
             if let Ok(results) = store.get_all_items("items", 1, 0, Some(idx_filter)).await {
                 if let Some(doc) = results.into_iter().next() {
                     if let Ok(data) = serde_json::from_str::<Value>(&doc.json_data) {
@@ -2669,10 +2508,7 @@ pub async fn process_trading_task(
                 }
             }
         }
-        
-        
-        
-        
+
         if hit.is_none() {
             if let Ok(Some((foreign_id, foreign_data))) = store.find_item_by_property("items", foreign_field, &json!(doc_number)).await {
                 
@@ -2710,9 +2546,6 @@ pub async fn process_trading_task(
             }
         }
 
-        
-        
-        
         if let Some((fid, fdata)) = hit.clone() {
             let found_type = fdata.get("type")
                 .or_else(|| fdata.get("doc_type"))
@@ -2737,17 +2570,10 @@ pub async fn process_trading_task(
 
                 {
                     let o = foreign_data.as_object_mut().unwrap();
-                    
-                    
-                    
-                    
-                    
-                    
-                    
-                    o.insert(mine_col.clone(), json!(index_val));
-                    
-                    
+
+                    o.insert(mine_col.clone(), json!(index_val));                    
                     o.insert(foreign_field.to_string(), json!(doc_number.clone()));
+
                     if was_draft {
                         o.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
                     }

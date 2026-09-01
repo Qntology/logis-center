@@ -995,12 +995,6 @@ async fn summarize_image(
     }
 }
 
-// 🌟 [SCOPE SANITIZE] 프론트엔드가 넘긴 필터에서 봉투 컬럼 술어만 남깁니다.
-//  v4 이전 프론트엔드는 status / amount 같은 도메인 컬럼을 SQL 로 보냈는데,
-//  그 컬럼들이 물리적으로 사라졌으므로 그대로 내려보내면 DataFusion 이 통째로 실패합니다.
-//  (실패 시 필터가 초기화되어 타 팀 데이터가 새어 나오는 보안 문제로 이어집니다)
-//  따라서 여기서 화이트리스트로 걸러 '스코프만' 남기고, 도메인 술어는 조용히 버립니다.
-//  버려진 조건은 프론트엔드 Dexie 가 data.* 로 다시 적용합니다.
 fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
     const ENVELOPE_COLS: [&str; 9] = [
         "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
@@ -1014,9 +1008,23 @@ fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
 
     let mut kept: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
-
     for clause in raw.split(" AND ") {
-        let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let mut c = clause.trim();
+        loop {
+            if !(c.starts_with('(') && c.ends_with(')')) { break; }
+            let mut depth = 0i32;
+            let mut wraps = true;
+            let chars: Vec<char> = c.chars().collect();
+            for (i, ch) in chars.iter().enumerate() {
+                if *ch == '(' { depth += 1; }
+                else if *ch == ')' {
+                    depth -= 1;
+                    if depth == 0 && i + 1 != chars.len() { wraps = false; break; }
+                }
+            }
+            if !wraps || depth != 0 { break; }
+            c = c[1..c.len() - 1].trim();
+        }
         if c.is_empty() { continue; }
 
         // 술어의 좌변 컬럼명을 추출합니다. (백틱/공백/연산자 제거)
