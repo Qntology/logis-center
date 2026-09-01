@@ -231,13 +231,21 @@ impl crate::model::LogisModel {
             alts: Vec<(String, f32)>,
         }
 
-        let empty_names: Vec<String> = Vec::new();
-        let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
-        let empty_skip: Vec<bool> = Vec::new();
-
         let mut candidates: Vec<TradeSpan> = Vec::new();
         let mut rescue_pool: Vec<TradeSpan> = Vec::new();
-
+        // 🌟 [BANK-NEUTRAL D1] 저장(역방향)과 같은 채점기를 씁니다.
+        //  ── 왜 필요한가 ──
+        //   TRADE_CONDITION_CATEGORIES 는 카테고리별 구 수가 크게 다릅니다.
+        //   (reference 계열은 참조 필드 44개 기준으로 뱅크가 크고 parties 는 3~5구)
+        //   √(2 ln N) 차감은 큰 뱅크를 과잉 처벌하므로,
+        //   '참조번호 질의' 가 구조적으로 parties 로 흘러가는 편향이 생깁니다.
+        //   행/열 이중 센터링은 뱅크 크기에 무관하므로 이 편향이 사라집니다.
+        //  ── 다국어 ──
+        //   입력은 다국어 임베딩 벡터뿐이라 앵커가 영어 한 벌이어도
+        //   한국어/일본어/중국어 질의가 동일한 척도로 채점됩니다.
+        let (d1_keys, d1_net, d1_cos) = crate::utils::ai_utils::bank_neutral_key_matrix(
+            &chunk_embs, &d1_bias_bank, &d1_prej_bank,
+        );
         for (ci, (s, e)) in chunk_spans.iter().enumerate() {
             if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
                 emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
@@ -245,30 +253,32 @@ impl crate::model::LogisModel {
             }
             let q = match chunk_embs.get(ci) { Some(v) => v, None => continue };
             if q.iter().all(|&v| v == 0.0) { continue; }
-
-            let (f_scores, _) = crate::utils::ai_utils::surprisal_dual_scores(
-                q, &d1_bias_bank, &d1_prej_bank, &empty_names, &empty_banks, &empty_skip,
-            );
-            if f_scores.is_empty() { continue; }
-
-            let top = &f_scores[0];
-            let alts: Vec<(String, f32)> = f_scores.iter().skip(1).take(3)
-                .map(|x| (x.key.clone(), x.surprisal)).collect();
-
+            if d1_keys.is_empty() { continue; }
+            // 이 청크(열 ci)에 대한 카테고리 점수를 내림차순으로 정리합니다.
+            let mut col: Vec<(String, f32, f32)> = Vec::with_capacity(d1_keys.len());
+            for (ki, k) in d1_keys.iter().enumerate() {
+                let v = d1_net[ki][ci];
+                if v == f32::MIN { continue; }
+                let c = if d1_cos[ki][ci] == f32::MIN { 0.0 } else { d1_cos[ki][ci] };
+                col.push((k.clone(), v, c));
+            }
+            if col.is_empty() { continue; }
+            col.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let alts: Vec<(String, f32)> = col.iter().skip(1).take(3)
+                .map(|x| (x.0.clone(), x.1)).collect();
             let span = TradeSpan {
                 start: *s,
                 end: *e,
                 text: chunk_texts[ci].clone(),
-                category: top.key.clone(),
-                score: top.surprisal,
-                max_cos: top.max_cos,
+                category: col[0].0.clone(),
+                score: col[0].1,
+                max_cos: col[0].2,
                 alts,
             };
-
-            if top.surprisal > 0.0 {
+            if col[0].1 > 0.0 {
                 emit_term(&format!(
-                    "   🎯 [D1 CANDIDATE] \"{}\" → {} | Surprisal: {:+.4} | MaxCos: {:.4} | N={}",
-                    chunk_texts[ci], top.key, top.surprisal, top.max_cos, top.n
+                    "   🎯 [D1 CANDIDATE] \"{}\" → {} | Score(bank-neutral): {:+.4} | MaxCos: {:.4}",
+                    chunk_texts[ci], col[0].0, col[0].1, col[0].2
                 ));
                 candidates.push(span);
             } else {
