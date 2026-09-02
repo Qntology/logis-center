@@ -351,7 +351,22 @@ pub async fn process_task(
     //  ── 비용 ──
     //   자기선언 라벨이 없는 페이지(커머스 목록/상세)는 라벨 임베딩 몇 개만 쓰고 즉시 빠집니다.
     // =====================================================================
+    // 🌟 [ANALYTIC GUARD] analytic 은 코사인 mode 판정 대상이 아닙니다.
+    //
+    //  ── 근거 ──
+    //   analytic 은 이 함수 최상단에서 task.r#type == "analytic_extraction" 로
+    //   결정론 분기되며, 이후 type(click / hover / change / touch / report)은
+    //   Worker 가 내려준 D1 row 의 type 컬럼에서 옵니다. 코사인이 개입하지 않습니다.
+    //
+    //  ── 그래도 가드가 필요한 이유 ──
+    //   main.ts 의 WebRTC mobile_upload 경로는 document_extraction 을 만들면서
+    //   search_mode: currentSearchMode 를 그대로 실어 보냅니다.
+    //   즉 search_mode='analytic' + type='document_extraction' 조합이 성립하고,
+    //   그 경우 무역 프로브를 타서 mode='shipping' 으로 저장될 수 있습니다.
+    //   index_item_chunks 의 DOMAIN CONSISTENCY GATE 가 청크는 막아 주지만
+    //   아이템 자체는 이미 잘못된 mode 로 기록된 뒤입니다.
     if search_mode != "shipping"
+        && search_mode != "analytic"
         && (task.r#type == "html_extraction" || task.r#type == "document_extraction")
     {
         model.check_embedding_downloaded().await?;
@@ -360,10 +375,15 @@ pub async fn process_task(
             &model, &light_pug, &doc_lang, &emit_term,
         ).await;
         if let Some(v) = probe {
+            // 🌟 [AUDIT] 파이프라인 자체가 바뀌는 되돌릴 수 없는 분기이므로
+            //    '무엇을 근거로' 넘어갔는지 한 줄에 전부 남깁니다.
+            //    Score 는 Gumbel 보정 후 값이며, 전문/껍데기는 센터링 이전 원시 코사인입니다.
             emit_term(&format!(
                 "🚢 [MODE REROUTE] mode='{}' 로 들어왔지만 표제 축이 무역 서식 '{}'({})를 지목했습니다. \
-                 Score {:+.4} > 커머스 최상위 '{}'({:+.4}). 트레이딩 파이프라인(mode='shipping')으로 전환합니다.",
-                search_mode, v.code, v.title, v.score, v.rival, v.rival_score
+                 보정 Score {:+.4} > 커머스 최상위 '{}'({:+.4}) | 근거 표제 \"{}\" (서식 전문 {:.4} > 사이트 껍데기 {:.4}) | 구조 증거 {:?}. \
+                 트레이딩 파이프라인(mode='shipping')으로 전환합니다.",
+                search_mode, v.code, v.title, v.score, v.rival, v.rival_score,
+                v.evidence_value, v.title_cos, v.chrome_cos, v.markers
             ));
             let reroute_pref = task_device_pref.clone().or_else(|| device_preference.clone());
             return process_trading_task(

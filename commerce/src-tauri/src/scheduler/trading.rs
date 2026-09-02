@@ -26,6 +26,33 @@ const TRADE_ITEM_ATTRIBUTE_ANCHOR: &str = "line item attribute, attribute of one
 const TRADE_ROW_MARKER_ANCHOR: &str = "row separator, table row marker, line item index, \
      item number in a list, section key, group key, metadata key, \
      continued from previous page, page break marker, list bullet";
+// 🌟 [SITE CHROME ANCHOR] '문서의 내용' 이 아니라 '사이트/앱의 껍데기' 를 뜻하는 개념 축.
+//
+//  ── 왜 새 축이 필요한가 (실측) ──
+//   기존 4축(자기선언 / 타문서참조 / 품목속성 / 행구분자)은 전부 '문서 내부' 개념입니다.
+//   관리자 화면의 '관리자 페이지 / 로그아웃 / 회원관리 / 오늘:61, 어제:182' 는
+//   네 축 어디에도 속하지 않아 네 값이 0.02 이내로 붙어 나오고,
+//   그 잡음의 부호로 통과·탈락이 갈렸습니다.
+//   실측: 후보 24개 중 15개 통과, 그 15개가 전부 껍데기.
+//
+//  ── 왜 다국어가 성립하는가 ──
+//   TRADE_SELF_ID_LABEL_ANCHOR 와 동일한 계보입니다.
+//   문자열은 영어 한 벌뿐이고 판정은 granite-embedding-97m-multilingual-r2 가
+//   만든 벡터의 코사인으로만 이루어지므로, 문서 언어와 무관하게 동작합니다.
+//   한국어 사전을 추가하는 것이 아니라 '없던 축' 을 세우는 수정입니다.
+//
+//  ── 액션 축은 왜 새로 안 만드는가 ──
+//   crate::logic::UI_ACTION_ANCHOR 가 이미 '수정/삭제/등록/검색/엑셀저장' 개념을
+//   갖고 있습니다. 같은 사전을 두 벌로 두면 반드시 어긋나므로 재사용합니다.
+const SITE_CHROME_ANCHOR: &str = "site name, shopping mall name, brand slogan, \
+     administrator page, admin home, admin main menu, management menu, \
+     dashboard, control panel, back office, console, \
+     global navigation bar, breadcrumb, sidebar menu, footer, copyright notice, banner, \
+     login, logout, sign in, sign out, my page, member management, \
+     settings, configuration, preferences, \
+     visitor counter, today visitors, yesterday visitors, total visitors, \
+     software version number, welcome message, home, index page, \
+     search form, filter form, page navigation, pagination";
 
 #[derive(Debug, Clone)]
 struct TitleCandidate {
@@ -99,15 +126,20 @@ pub(crate) async fn resolve_title_values(
         let h = crate::utils::ai_utils::humanize_url_token(raw);
         if h.trim().is_empty() { raw.trim().to_string() } else { h }
     };
+    // 🌟 [AXIS 6] 기존 4축에 '사이트 껍데기' 와 'UI 액션' 을 추가합니다.
+    //    문서 내부 개념끼리만 비교하던 3지선다는, 문서 내부 개념이 하나도 없는
+    //    관리자 화면에서 잡음의 부호로 판정이 갈렸습니다.
     let anchors = model
         .get_embedding_batch(vec![
-            TRADE_TITLE_LABEL_ANCHOR.to_string(),
-            TRADE_REFERENCE_LABEL_ANCHOR.to_string(),
-            TRADE_ITEM_ATTRIBUTE_ANCHOR.to_string(),
-            TRADE_ROW_MARKER_ANCHOR.to_string(),
+            TRADE_TITLE_LABEL_ANCHOR.to_string(),        // 0 자기선언
+            TRADE_REFERENCE_LABEL_ANCHOR.to_string(),    // 1 타문서참조
+            TRADE_ITEM_ATTRIBUTE_ANCHOR.to_string(),     // 2 품목속성
+            TRADE_ROW_MARKER_ANCHOR.to_string(),         // 3 행구분자
+            SITE_CHROME_ANCHOR.to_string(),              // 4 사이트 껍데기
+            crate::logic::UI_ACTION_ANCHOR.to_string(),  // 5 UI 액션
         ])
         .await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; 4]);
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; 6]);
     // ── 라벨 축 ──
     let mut label_texts: Vec<String> = Vec::new();
     for c in cands.iter() {
@@ -127,13 +159,27 @@ pub(crate) async fn resolve_title_values(
         let ts = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchors[0]);
         let rs = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchors[1]);
         let is = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchors[2]);
-        let keep = ts > rs && ts > is;
+        let ch = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchors[4]);
+        let ac = crate::utils::ai_utils::cosine_similarity(&label_embs[li], &anchors[5]);
+        // 🌟 [ALL-AXIS RIVAL] 2지선다가 아니라 '나머지 전 축의 최댓값' 과 겨룹니다.
+        let rival = rs.max(is).max(ch).max(ac);
+        let keep = ts > rival;
         label_is_title.insert(lt.clone(), keep);
         if verbose {
+            let why = if keep {
+                "표제 후보 유지"
+            } else if ch >= ts && ch >= rs && ch >= is && ch >= ac {
+                "사이트 껍데기 → 제외"
+            } else if ac >= ts && ac >= rs && ac >= is {
+                "UI 액션 → 제외"
+            } else if is >= ts {
+                "품목 속성 → 제외"
+            } else {
+                "참조 라벨 → 제외"
+            };
             emit_term(&format!(
-                "     🏷️ [TITLE LABEL GATE] '{}' | 자기선언 {:.4} vs 타문서참조 {:.4} vs 품목속성 {:.4} → {}",
-                lt, ts, rs, is,
-                if keep { "표제 후보 유지" } else if is >= ts { "품목 속성 → 제외" } else { "참조 라벨 → 제외" }
+                "     🏷️ [TITLE LABEL GATE] '{}' | 자기선언 {:.4} vs 타문서참조 {:.4} vs 품목속성 {:.4} vs 껍데기 {:.4} vs 액션 {:.4} → {}",
+                lt, ts, rs, is, ch, ac, why
             ));
         }
     }
@@ -152,17 +198,70 @@ pub(crate) async fn resolve_title_values(
     if !headless.is_empty() {
         let he = model.get_embedding_batch(headless.clone()).await
             .unwrap_or_else(|_| vec![vec![0.0; 384]; headless.len()]);
+        // ── ① 자기선언 점수 분포를 먼저 수집 ──
+        let mut ts_all: Vec<f32> = Vec::with_capacity(headless.len());
+        for i in 0..headless.len() {
+            if he[i].iter().all(|&x| x == 0.0) {
+                ts_all.push(f32::MIN);
+            } else {
+                ts_all.push(crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[0]));
+            }
+        }
+        // ── ② [TITLE FLOOR v2] 문서 자신의 분포에서 절대 바닥을 유도합니다 ──
+        //
+        //  ── v1(평균+표준편차)이 왜 틀렸나 (실측) ──
+        //   📏 바닥 0.6329 | 'document_type: Purchase Order' 자기선언 0.6142 → 바닥 미달
+        //   이 값은 나머지 5축을 전부 이겼습니다(액션 0.5409 / 품목 0.4982 /
+        //   껍데기 0.4917 / 행구분자 0.3666). 즉 판정은 옳았는데 바닥이 0.019 차이로 잘랐고,
+        //   표제 후보가 11개 → 1개로 줄어 프로브가 질의 1개로 동작했습니다.
+        //
+        //  ── 왜 평균이 옳은가 ──
+        //   평균+표준편차는 vision_crop::core_threshold 의 계보인데,
+        //   그것은 '연결 성분의 씨앗' 을 잡는 용도라 상위 소수만 남기는 것이 목적입니다.
+        //   표제 후보 선별은 정반대로 리콜이 생명입니다.
+        //   bank_neutral_key_scores 는 max over queries 이므로 후보가 많아도
+        //   정답 하나만 살아 있으면 잡히고, 껍데기가 섞여도 프로브의
+        //   chrome 편견 축과 EVT 보정이 2차로 걸러냅니다.
+        //   따라서 여기서는 '평균 이상의 자기선언성' 만 요구합니다.
+        let floor = {
+            let v: Vec<f32> = ts_all.iter().cloned().filter(|s| *s > f32::MIN).collect();
+            if v.len() < 4 {
+                0.0f32
+            } else {
+                v.iter().sum::<f32>() / (v.len() as f32)
+            }
+        };
+        if verbose {
+            emit_term(&format!(
+                "     📏 [TITLE FLOOR] 라벨 없는 후보 {}개의 자기선언 분포에서 유도한 바닥 = 평균 = {:.4} (리콜 우선: 상대 5축 비교가 주 판정, 바닥은 하한선)",
+                ts_all.iter().filter(|s| **s > f32::MIN).count(), floor
+            ));
+        }
         for (i, v) in headless.iter().enumerate() {
-            if he[i].iter().all(|&x| x == 0.0) { continue; }
-            let ts = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[0]);
+            if ts_all[i] == f32::MIN { continue; }
+            let ts = ts_all[i];
             let rw = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[3]);
             let is = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[2]);
-            if ts > rw && ts > is {
+            let ch = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[4]);
+            let ac = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[5]);
+            let rival = rw.max(is).max(ch).max(ac);
+            if ts > rival && ts >= floor {
                 if !kept.iter().any(|e| e == v) { kept.push(v.clone()); }
             } else if verbose {
+                let why = if ts <= ch {
+                    "사이트 껍데기"
+                } else if ts <= ac {
+                    "UI 액션"
+                } else if ts <= is {
+                    "품목 속성"
+                } else if ts <= rw {
+                    "행 구분자"
+                } else {
+                    "바닥 미달"
+                };
                 emit_term(&format!(
-                    "     🧹 [HEADLESS DROP] '{}' | 자기선언 {:.4} vs 행구분자 {:.4} vs 품목속성 {:.4} → 표제 아님",
-                    v, ts, rw, is
+                    "     🧹 [HEADLESS DROP] '{}' | 자기선언 {:.4} vs 행구분자 {:.4} vs 품목속성 {:.4} vs 껍데기 {:.4} vs 액션 {:.4} | 바닥 {:.4} → {} (표제 아님)",
+                    v, ts, rw, is, ch, ac, floor, why
                 ));
             }
         }
@@ -196,9 +295,18 @@ const TRADE_SELF_ID_LABEL_ANCHOR: &str = "document number of this document, \
 pub struct TradeRerouteVerdict {
     pub code: String,
     pub title: String,
+    /// 🌟 Gumbel 보정 후 점수입니다. (경쟁 키 개수 편향 제거됨)
     pub score: f32,
     pub rival: String,
     pub rival_score: f32,
+    /// 🌟 이 코드를 지목한 실제 표제 값. 리라우트 감사 로그의 근거입니다.
+    pub evidence_value: String,
+    /// 🌟 그 값의 '서식 전문' 원시 코사인 (센터링 이전, 레벨 보존)
+    pub title_cos: f32,
+    /// 🌟 그 값의 '사이트 껍데기' 원시 코사인
+    pub chrome_cos: f32,
+    /// 🌟 trade_structural_evidence 가 찾은 국제 표준 포맷 증거
+    pub markers: Vec<String>,
 }
 pub async fn probe_trade_document(
     model: &LogisModel,
@@ -206,6 +314,27 @@ pub async fn probe_trade_document(
     doc_lang: &str,
     emit_term: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<TradeRerouteVerdict> {
+    // ── ⓪ [DEPTH 0 / 결정론] 코사인보다 먼저, 국제 표준 포맷 증거를 봅니다 ──
+    //
+    //  ── 왜 순서를 바꾸는가 (실측) ──
+    //   PO 문서는 incoterms:FOB / doccode:PO / doccode:LC 를 갖고 있었는데,
+    //   구 코드는 이 증거를 '진영 승부에서 이긴 뒤 마진이 얇을 때만' 참조했습니다.
+    //   진영 승부에서 먼저 져버려 증거에 도달조차 못 했습니다.
+    //   커머스 웹페이지에 Incoterms / HS / 컨테이너번호 / 서식코드 문서번호가
+    //   나오는 일은 사실상 없으므로, 이것은 코사인보다 신뢰도가 높은 축입니다.
+    let (has_marker, markers) = trade_structural_evidence(light_pug);
+    // 서식 코드 접두어(PO- / LC- / BL-)는 단독으로도 결정적입니다.
+    // 그 외 증거는 2종 이상 겹칠 때만 강한 증거로 인정합니다.
+    let code_marker = markers.iter().any(|m| m.starts_with("doccode:"));
+    let strong_structure = code_marker || markers.len() >= 2;
+    if has_marker {
+        emit_term(&format!(
+            "  🔩 [TRADE STRUCTURE] 국제 표준 포맷 증거 {}건 {:?} | 강한 증거: {}",
+            markers.len(), markers, if strong_structure { "예(코드 접두어 또는 2종 이상)" } else { "아니오(1종)" }
+        ));
+    } else {
+        emit_term("  ⚪ [TRADE STRUCTURE] 국제 표준 포맷 증거가 없습니다. (Incoterms / HS / 컨테이너 / AWB / B-L / 서식코드 문서번호)");
+    }
     let values = resolve_title_values(model, light_pug, 0.30, emit_term, true).await;
     if values.is_empty() {
         emit_term("  ⚪ [MODE PROBE] 자기 종류를 선언하는 표제가 없습니다. 커머스 판정을 유지합니다.");
@@ -213,20 +342,52 @@ pub async fn probe_trade_document(
     }
     let val_embs = model.get_embedding_batch(values.clone()).await
         .unwrap_or_else(|_| vec![vec![0.0; 384]; values.len()]);
-    // ── 무역 서식 전문 + 커머스 페이지 타입을 한 판에 올립니다 ──
+    // ── ① 무역 서식 전문 + 커머스 페이지 타입을 한 판에 올립니다 ──
     let mut bias_defs: Vec<(String, String, String)> = Vec::new();
     for (code, title) in TRADE_DOC_TITLES.iter() {
         bias_defs.push(("trade".to_string(), code.to_string(), title.to_string()));
     }
     const COMMERCE_TYPES: [&str; 6] = ["order", "goods", "tracking", "review", "coupon", "event"];
+    // 🌟 [BILINGUAL COMMERCE BANK] 커머스 앵커를 doc_lang 과 'en' 두 벌로 만듭니다.
+    //
+    //  ── 왜 필요한가 (실측) ──
+    //   [DOC LANG] Early detection: 'fr' — 영어 YAML 을 프랑스어로 오판했습니다.
+    //   그 순간 무역 뱅크는 영어(TRADE_DOC_TITLES 고정), 커머스 뱅크는 프랑스어가 되어
+    //   두 진영이 서로 다른 언어장에서 겨루게 됩니다. 비교 자체가 성립하지 않습니다.
+    //   언어 판정기를 고치는 것과 별개로, 프로브는 언어 오판에 강건해야 합니다.
+    let mut commerce_langs: Vec<String> = vec![doc_lang.to_string()];
+    if doc_lang != "en" { commerce_langs.push("en".to_string()); }
     for c in COMMERCE_TYPES.iter() {
-        let anchor = crate::parsing::get_page_type_classification_bias(c, doc_lang);
-        for p in crate::utils::ai_utils::split_bias_phrases_full(&anchor) {
-            bias_defs.push(("commerce".to_string(), c.to_string(), p));
+        for lg in commerce_langs.iter() {
+            let anchor = crate::parsing::get_page_type_classification_bias(c, lg);
+            for p in crate::utils::ai_utils::split_bias_phrases_full(&anchor) {
+                if bias_defs.iter().any(|(_, k, e)| k == *c && e == &p) { continue; }
+                bias_defs.push(("commerce".to_string(), c.to_string(), p));
+            }
+        }
+    }
+    // ── ② [CHROME PREJUDICE] 전 키 공통 편견 축 ──
+    let chrome_phrases: Vec<String> = {
+        let mut v = crate::utils::ai_utils::split_bias_phrases_full(SITE_CHROME_ANCHOR);
+        for p in crate::utils::ai_utils::split_bias_phrases_full(crate::logic::UI_ACTION_ANCHOR) {
+            if !v.iter().any(|e| e == &p) { v.push(p); }
+        }
+        v
+    };
+    let mut key_order: Vec<(String, String)> = Vec::new();
+    for (c, k, _) in bias_defs.iter() {
+        if !key_order.iter().any(|(_, kk)| kk == k) {
+            key_order.push((c.clone(), k.clone()));
+        }
+    }
+    let mut prej_defs: Vec<(String, String, String)> = Vec::new();
+    for (c, k) in key_order.iter() {
+        for p in chrome_phrases.iter() {
+            prej_defs.push((c.clone(), k.clone(), p.clone()));
         }
     }
     let mut uniq: Vec<String> = Vec::new();
-    for (_, _, p) in bias_defs.iter() {
+    for (_, _, p) in bias_defs.iter().chain(prej_defs.iter()) {
         if !uniq.iter().any(|e| e == p) { uniq.push(p.clone()); }
     }
     let uniq_embs = model.get_embedding_batch(uniq.clone()).await
@@ -237,75 +398,307 @@ pub async fn probe_trade_document(
             None => vec![0.0f32; 384],
         }
     };
+    // ── ②-2 [CROSS-MODE AMBIGUITY MASK] 두 mode 가 공유하는 구를 커머스 뱅크에서 뺍니다 ──
+    //
+    //  ── 무엇이 문제였나 (실측) ──
+    //   get_page_type_classification_bias 의 첫 줄은 `String::from(page_type)` 이라
+    //   커머스 'order' 앵커에 문자열 "order" 가 그대로 들어갑니다.
+    //   무역 'PO' 의 전문은 "purchase order" 입니다. 두 개념은 임베딩 공간에서
+    //   사실상 같은 지점이라, 'document_code: PO' 같은 질의가 커머스 order 를
+    //   무역 PO 보다 높게 만듭니다. 이것이 mode 간 유사도 충돌의 실체입니다.
+    //
+    //  ── 판정 규칙 (scheduler.rs STEP A 의 AMBIGUITY MASK 와 동일 계보) ──
+    //   own   = 같은 커머스 키의 '다른' 구들과의 최고 유사도 (자기 뱅크 응집도)
+    //   rival = 무역 전문 뱅크 전체와의 최고 유사도
+    //   rival >= own 이면 그 구는 자기 진영보다 상대 진영을 더 잘 설명하므로 제거합니다.
+    //   무역 뱅크는 키당 구가 1개라 own 을 정의할 수 없으므로 마스크 대상이 아닙니다.
+    //   전량 실격되면 마스크를 적용하지 않습니다(뱅크 소멸 방지).
+    {
+        let trade_embs: Vec<Vec<f32>> = bias_defs.iter()
+            .filter(|(c, _, _)| c == "trade")
+            .map(|(_, _, p)| emb_of(p))
+            .collect();
+        let mut rebuilt: Vec<(String, String, String)> = Vec::new();
+        let mut dropped_total = 0usize;
+        for c in COMMERCE_TYPES.iter() {
+            let own_phrases: Vec<String> = bias_defs.iter()
+                .filter(|(cat, k, _)| cat == "commerce" && k == *c)
+                .map(|(_, _, p)| p.clone())
+                .collect();
+            if own_phrases.is_empty() { continue; }
+            let own_embs: Vec<Vec<f32>> = own_phrases.iter().map(|p| emb_of(p)).collect();
+            let mut kept: Vec<String> = Vec::new();
+            let mut dropped: Vec<String> = Vec::new();
+            for (pi, p) in own_phrases.iter().enumerate() {
+                if own_embs[pi].iter().all(|&v| v == 0.0) { continue; }
+                let mut own = 0.0f32;
+                for pj in 0..own_phrases.len() {
+                    if pj == pi { continue; }
+                    if own_embs[pj].iter().all(|&v| v == 0.0) { continue; }
+                    let s = crate::utils::ai_utils::cosine_similarity(&own_embs[pi], &own_embs[pj]);
+                    if s > own { own = s; }
+                }
+                let mut rival = 0.0f32;
+                for te in trade_embs.iter() {
+                    if te.iter().all(|&v| v == 0.0) { continue; }
+                    let s = crate::utils::ai_utils::cosine_similarity(&own_embs[pi], te);
+                    if s > rival { rival = s; }
+                }
+                if rival >= own {
+                    dropped.push(format!("{}(own {:.3} <= trade {:.3})", p, own, rival));
+                } else {
+                    kept.push(p.clone());
+                }
+            }
+            if kept.is_empty() {
+                emit_term(&format!(
+                    "     ⚠️ [CROSS-MODE MASK] '{}' 뱅크의 모든 구가 실격되어 마스크를 적용하지 않습니다.",
+                    c
+                ));
+                for p in own_phrases { rebuilt.push(("commerce".to_string(), c.to_string(), p)); }
+                continue;
+            }
+            if !dropped.is_empty() {
+                dropped_total += dropped.len();
+                emit_term(&format!(
+                    "     🧹 [CROSS-MODE MASK] 커머스 '{}' 에서 무역 전문을 더 잘 설명하는 구 {}개 제거 (잔존 {}개): {:?}",
+                    c, dropped.len(), kept.len(), dropped.iter().take(6).collect::<Vec<_>>()
+                ));
+            }
+            for p in kept { rebuilt.push(("commerce".to_string(), c.to_string(), p)); }
+        }
+        if dropped_total > 0 {
+            let mut merged: Vec<(String, String, String)> = bias_defs.iter()
+                .filter(|(c, _, _)| c == "trade").cloned().collect();
+            merged.extend(rebuilt);
+            bias_defs = merged;
+            emit_term(&format!(
+                "     🧹 [CROSS-MODE MASK] 총 {}개 공유 개념구를 커머스 뱅크에서 제거했습니다. (mode 간 유사도 충돌 차단)",
+                dropped_total
+            ));
+        }
+    }
     let bank: Vec<(String, String, Vec<f32>)> = bias_defs.iter()
         .map(|(c, k, p)| (c.clone(), k.clone(), emb_of(p))).collect();
-    let no_prej: Vec<(String, String, Vec<f32>)> = Vec::new();
-    let scores = crate::utils::ai_utils::bank_neutral_key_scores(&val_embs, &bank, &no_prej);
-    if scores.is_empty() { return None; }
+    let prej_bank: Vec<(String, String, Vec<f32>)> = prej_defs.iter()
+        .map(|(c, k, p)| (c.clone(), k.clone(), emb_of(p))).collect();
+    let chrome_embs: Vec<Vec<f32>> = chrome_phrases.iter().map(|p| emb_of(p)).collect();
+    let (keys, net, raw) = crate::utils::ai_utils::bank_neutral_key_matrix(
+        &val_embs, &bank, &prej_bank,
+    );
+    if keys.is_empty() { return None; }
     let is_commerce = |k: &str| COMMERCE_TYPES.iter().any(|c| *c == k);
-    for (k, s) in scores.iter().take(6) {
-        emit_term(&format!(
-            "     📐 [MODE PROBE] {} {} | Score: {:+.4}",
-            if is_commerce(k) { "🛒" } else { "🚢" }, k, s
-        ));
+    let q = val_embs.len();
+    // ── ③ [UNIT NORMALIZE] net 을 이 문서 안에서 다시 z 로 통일합니다 ★ ──
+    //
+    //  ── 무엇이 문제였나 (실측) ──
+    //   bank_neutral_key_matrix 의 ⑤단계에는 SINGLE QUERY GUARD 가 있습니다.
+    //       let single = n < 2;
+    //       if single { net = raw_b - prej }     ← 코사인 차이 (z 아님)
+    //       else      { net = z_b - z_p }        ← z
+    //   질의가 1개면 net 은 z 가 아닌데, 여기에 z 공간의 √(2 ln N) 을 빼면
+    //   반드시 큰 음수가 나옵니다.
+    //     🚢 DGD  raw +0.0940 → 보정 -2.7433
+    //     🛒 order raw +0.1482 → 보정 -1.7448
+    //   두 값 모두 음수인 것은 판정이 아니라 '단위가 깨졌다' 는 신호입니다.
+    //   게다가 무역 draw(56) > 커머스 draw(6) 이므로 무역만 더 깎여
+    //   보정이 정확히 반대 방향으로 작동했습니다.
+    //
+    //   질의가 3개여도 안전하지 않습니다. 행 센터링 자유도가 2뿐이라
+    //   max 가 구조적으로 작아지는데(관측 +1.6954) √(2 ln 168)=3.2012 은
+    //   i.i.d. 표준정규 가정값이라 여전히 과대합니다.
+    //
+    //  ── 해결 ──
+    //   보정을 빼기 '전에' net 값 전체의 표준편차로 나눠 단위를 z 로 통일합니다.
+    //   (열 센터링 때문에 평균은 이미 0 근처이므로 척도만 맞추면 됩니다)
+    //   이러면 single 분기든 아니든, 질의가 1개든 15개든 같은 척도가 됩니다.
+    let net_sd = {
+        let mut sum = 0.0f64;
+        let mut sq = 0.0f64;
+        let mut cnt = 0usize;
+        for ki in 0..keys.len() {
+            for qi in 0..q {
+                let v = net[ki][qi];
+                if v == f32::MIN { continue; }
+                sum += v as f64;
+                sq += (v as f64) * (v as f64);
+                cnt += 1;
+            }
+        }
+        if cnt < 2 {
+            1.0f32
+        } else {
+            let mu = sum / cnt as f64;
+            let var = (sq / cnt as f64 - mu * mu).max(0.0);
+            (var.sqrt() as f32).max(1e-6)
+        }
+    };
+    let mut trade_keys = 0usize;
+    let mut commerce_keys = 0usize;
+    for k in keys.iter() {
+        if is_commerce(k) { commerce_keys += 1; } else { trade_keys += 1; }
     }
-    let (top_key, top_score) = scores[0].clone();
-    let rival = scores.iter()
-        .find(|(k, _)| is_commerce(k) != is_commerce(&top_key))
-        .cloned()
-        .unwrap_or_else(|| (String::new(), 0.0));
-    if is_commerce(&top_key) {
+    let trade_draws = trade_keys.saturating_mul(q);
+    let commerce_draws = commerce_keys.saturating_mul(q);
+    let trade_base = crate::utils::ai_utils::gumbel_expected_z(trade_draws);
+    let commerce_base = crate::utils::ai_utils::gumbel_expected_z(commerce_draws);
+    let mut best_trade: (String, f32, usize) = (String::new(), f32::MIN, 0);
+    let mut best_commerce: (String, f32, usize) = (String::new(), f32::MIN, 0);
+    for (ki, k) in keys.iter().enumerate() {
+        for qi in 0..q {
+            let v = net[ki][qi];
+            if v == f32::MIN { continue; }
+            if is_commerce(k) {
+                if v > best_commerce.1 { best_commerce = (k.clone(), v, qi); }
+            } else if v > best_trade.1 {
+                best_trade = (k.clone(), v, qi);
+            }
+        }
+    }
+    let trade_score = if best_trade.1 == f32::MIN { f32::MIN } else { best_trade.1 / net_sd - trade_base };
+    let commerce_score = if best_commerce.1 == f32::MIN { f32::MIN } else { best_commerce.1 / net_sd - commerce_base };
+    emit_term(&format!(
+        "     📐 [MODE PROBE / EVT] 질의 {}개 | net 표준편차 {:.4} (단위 통일 척도) | 무역 키 {}개(draw {} → 기대 최댓값 {:.4}) | 커머스 키 {}개(draw {} → {:.4})",
+        q, net_sd, trade_keys, trade_draws, trade_base, commerce_keys, commerce_draws, commerce_base
+    ));
+    emit_term(&format!(
+        "     📐 [MODE PROBE] 🚢 {} | net {:+.4} → z {:+.4} → 보정 {:+.4}  |  🛒 {} | net {:+.4} → z {:+.4} → 보정 {:+.4}",
+        if best_trade.0.is_empty() { "-" } else { best_trade.0.as_str() },
+        if best_trade.1 == f32::MIN { 0.0 } else { best_trade.1 },
+        if best_trade.1 == f32::MIN { 0.0 } else { best_trade.1 / net_sd },
+        if trade_score == f32::MIN { 0.0 } else { trade_score },
+        if best_commerce.0.is_empty() { "-" } else { best_commerce.0.as_str() },
+        if best_commerce.1 == f32::MIN { 0.0 } else { best_commerce.1 },
+        if best_commerce.1 == f32::MIN { 0.0 } else { best_commerce.1 / net_sd },
+        if commerce_score == f32::MIN { 0.0 } else { commerce_score }
+    ));
+    if trade_score == f32::MIN {
+        emit_term("  🛒 [MODE KEEP] 무역 코드가 하나도 점수를 얻지 못했습니다. 커머스 판정을 유지합니다.");
+        return None;
+    }
+    // ── ④ 게이트 1 : 진영 승패 ──
+    //
+    //  🌟 [STRUCTURE OVERRIDE] 강한 구조 증거가 있으면 진영 승부를 건너뜁니다.
+    //     그 경우 코사인의 역할은 '무역인가' 가 아니라 '무역 중 어느 코드인가' 로 축소됩니다.
+    //     커머스 웹페이지가 Incoterms 나 서식코드 문서번호를 갖는 일은 사실상 없습니다.
+    if commerce_score >= trade_score {
+        if strong_structure {
+            emit_term(&format!(
+                "  🔩 [STRUCTURE OVERRIDE] 코사인은 커머스 '{}'({:+.4}) 가 무역 '{}'({:+.4}) 이상이지만, 국제 표준 포맷 강한 증거 {:?} 가 있어 무역으로 확정합니다. (커머스 화면에는 이 포맷이 인쇄되지 않습니다)",
+                best_commerce.0, commerce_score, best_trade.0, trade_score, markers
+            ));
+        } else {
+            emit_term(&format!(
+                "  🛒 [MODE KEEP] 보정 후 커머스 '{}'({:+.4}) 가 무역 '{}'({:+.4}) 이상이고 강한 구조 증거도 없습니다. 무역 리라우트를 하지 않습니다.",
+                best_commerce.0, commerce_score, best_trade.0, trade_score
+            ));
+            return None;
+        }
+    }
+    if trade_score <= 0.0 && !strong_structure {
         emit_term(&format!(
-            "  🛒 [MODE KEEP] 표제 축 승자가 커머스 '{}' ({:+.4}) 입니다. 무역 리라우트를 하지 않습니다.",
-            top_key, top_score
+            "  ⚪ [MODE PROBE] 무역 코드 '{}' 의 보정 점수 {:+.4} 는 '무작위로 {}개를 뽑았을 때의 기대 최댓값' 이하이고 강한 구조 증거도 없습니다. 리라우트하지 않습니다.",
+            best_trade.0, trade_score, trade_draws
         ));
         return None;
     }
-    if top_score <= 0.0 {
+    // ── ⑤ 게이트 2 : [TITLE CONFIRM] 원시 코사인으로 레벨을 되살려 확인 ──
+    let win_ki = keys.iter().position(|k| k == &best_trade.0).unwrap_or(0);
+    let title_cos = {
+        let v = raw[win_ki][best_trade.2];
+        if v == f32::MIN { 0.0 } else { v }
+    };
+    let chrome_cos = {
+        let mut m = 0.0f32;
+        for e in chrome_embs.iter() {
+            if e.iter().all(|&x| x == 0.0) { continue; }
+            let s = crate::utils::ai_utils::cosine_similarity(&val_embs[best_trade.2], e);
+            if s > m { m = s; }
+        }
+        m
+    };
+    let evidence_value = values.get(best_trade.2).cloned().unwrap_or_default();
+    if title_cos <= chrome_cos && !strong_structure {
         emit_term(&format!(
-            "  ⚪ [MODE PROBE] 무역 코드 '{}' 가 1위지만 점수 {:+.4} 로 평균 이하입니다. 리라우트하지 않습니다.",
-            top_key, top_score
+            "  🛒 [TITLE NOT CONFIRMED] 무역 1위 '{}' 를 지목한 표제 값 \"{}\" 은 서식 전문({:.4})보다 사이트 껍데기({:.4})에 더 가깝고 강한 구조 증거도 없습니다. 리라우트하지 않습니다.",
+            best_trade.0, evidence_value, title_cos, chrome_cos
+        ));
+        return None;
+    }
+    // ── ⑥ 게이트 3 : 마진이 극값 잡음대 안이면 구조 증거를 요구 ──
+    let margin = trade_score - commerce_score;
+    let evt_sd = |n: usize| -> f32 {
+        let z = crate::utils::ai_utils::gumbel_expected_z(n);
+        if z <= 0.0 { 0.0 } else { (std::f32::consts::PI / 6.0f32.sqrt()) / z }
+    };
+    let noise_band = evt_sd(trade_draws).max(evt_sd(commerce_draws));
+    if margin < noise_band && !has_marker {
+        emit_term(&format!(
+            "  🛒 [THIN MARGIN] 진영 마진 {:+.4} 가 극값 잡음대 {:.4} 미만이고 국제 표준 포맷 증거도 없습니다. 리라우트하지 않습니다.",
+            margin, noise_band
         ));
         return None;
     }
     let title = TRADE_DOC_TITLES.iter()
-        .find(|(c, _)| *c == top_key.as_str())
+        .find(|(c, _)| *c == best_trade.0.as_str())
         .map(|(_, t)| t.to_string())
         .unwrap_or_default();
+    emit_term(&format!(
+        "  ✅ [MODE PROBE CONFIRMED] '{}' | 보정 {:+.4} | 마진 {:+.4} (잡음대 {:.4}) | 근거 표제 \"{}\" (전문 {:.4} vs 껍데기 {:.4}) | 구조 증거 {:?}",
+        best_trade.0, trade_score, margin, noise_band, evidence_value, title_cos, chrome_cos, markers
+    ));
     Some(TradeRerouteVerdict {
-        code: top_key,
+        code: best_trade.0,
         title,
-        score: top_score,
-        rival: rival.0,
-        rival_score: rival.1,
+        score: trade_score,
+        rival: best_commerce.0,
+        rival_score: if commerce_score == f32::MIN { 0.0 } else { commerce_score },
+        evidence_value,
+        title_cos,
+        chrome_cos,
+        markers,
     })
 }
+
 fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     let upper = pug.to_uppercase();
     let mut found: Vec<String> = Vec::new();
-
     if let Ok(re) = regex::Regex::new(r"\b[A-Z]{4}\s?\d{7}\b") {
         if let Some(m) = re.find(&upper) {
             found.push(format!("container:{}", m.as_str().trim()));
         }
     }
-
     if let Ok(re) = regex::Regex::new(r"\b\d{3}-\d{8}\b") {
         if let Some(m) = re.find(&upper) {
             found.push(format!("awb:{}", m.as_str()));
         }
     }
-
-    if let Ok(re) = regex::Regex::new(r"\b\d{4}[.\-]\d{2}[.\-]\d{2,4}\b") {
-        if let Some(m) = re.find(&upper) {
-            found.push(format!("hs:{}", m.as_str()));
+    // 🌟 [HS FALSE POSITIVE FIX] 기존 정규식은 ISO 날짜를 HS 코드로 오인했습니다.
+    //
+    //  ── 실측 사고 ──
+    //   'issue_date: 2026-08-10' → \d{4}-\d{2}-\d{2} 에 정확히 매칭되어
+    //   hs:2026-08-10 이라는 거짓 증거가 만들어집니다.
+    //   구조 증거를 판정의 1급 근거로 승격하는 순간 이 오탐은 치명적이 됩니다.
+    //
+    //  ── 구분 근거 (사전이 아니라 형식 사실) ──
+    //   HS 코드의 2~3번째 자리는 '류(chapter) 내 호(heading)' 라 12 를 넘을 수 있고,
+    //   날짜의 월은 1~12, 일은 1~31 을 벗어날 수 없습니다.
+    //   두 번째 그룹이 12 이하이고 세 번째 그룹이 31 이하이면 날짜로 보고 폐기합니다.
+    //   (8542.31 처럼 점 구분이면 날짜가 아니므로 그대로 통과합니다)
+    if let Ok(re) = regex::Regex::new(r"\b(\d{4})([.\-])(\d{2})[.\-](\d{2,4})\b") {
+        for cap in re.captures_iter(&upper) {
+            let sep = cap.get(2).map(|m| m.as_str()).unwrap_or("-");
+            let g2: u32 = cap.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(99);
+            let g3: u32 = cap.get(4).and_then(|m| m.as_str().parse().ok()).unwrap_or(99);
+            let looks_like_date = sep == "-" && (1..=12).contains(&g2) && (1..=31).contains(&g3);
+            if looks_like_date { continue; }
+            found.push(format!("hs:{}", cap.get(0).map(|m| m.as_str()).unwrap_or("")));
+            break;
         }
     }
-
     const INCOTERMS: [&str; 11] = [
         "EXW", "FCA", "FAS", "FOB", "CFR", "CIF", "CPT", "CIP", "DAP", "DPU", "DDP",
     ];
-
     'inco: for t in INCOTERMS.iter() {
         for tok in upper.split(|c: char| !c.is_ascii_alphanumeric()) {
             if tok == *t {
@@ -314,11 +707,33 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
             }
         }
     }
-
     if upper.contains("B/L") {
         found.push("bl_label".to_string());
     }
-
+    // 🌟 [DOC CODE PREFIX] '{서식코드}-{일련번호}' 형태의 문서번호를 찾습니다.
+    //
+    //  ── 왜 강력한가 ──
+    //   PO-99281A / LC-88492011 / BL-55432219 / CI-2026-08001 처럼
+    //   무역 서식은 자기 코드를 접두어로 갖는 번호를 반드시 인쇄합니다.
+    //   반대로 커머스 관리자 화면에는 이 패턴이 사실상 존재하지 않습니다.
+    //   사전은 새로 만들지 않고 TRADE_DOC_TITLES 의 코드 목록을 그대로 조회하므로
+    //   서식이 늘어나도 이 코드는 수정 대상이 아닙니다.
+    //
+    //  ── 왜 다국어 무관인가 ──
+    //   서식 코드는 어느 나라 서식이든 라틴 대문자 약어로 인쇄됩니다.
+    //   임베딩도 언어 사전도 쓰지 않는 순수 형식 판정입니다.
+    if let Ok(re) = regex::Regex::new(r"\b([A-Z]{2,8})-[A-Z0-9]{3,}\b") {
+        let mut seen: Vec<String> = Vec::new();
+        for cap in re.captures_iter(&upper) {
+            let prefix = match cap.get(1) { Some(m) => m.as_str().to_string(), None => continue };
+            if seen.iter().any(|e| e == &prefix) { continue; }
+            let known = TRADE_DOC_TITLES.iter().any(|(c, _)| *c == prefix.as_str());
+            if !known { continue; }
+            seen.push(prefix.clone());
+            found.push(format!("doccode:{}", prefix));
+            if seen.len() >= 4 { break; }
+        }
+    }
     (!found.is_empty(), found)
 }
 
