@@ -1319,6 +1319,60 @@ pub fn bank_neutral_key_scores<V: AsRef<Vec<f32>>>(
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
+// =====================================================================
+// 🌟 [RELATIVE PREJUDICE GATE] 절대 대소 비교를 상대 우위 비교로 교체합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측) ──
+//   기존 게이트는 `if prej >= own { skip }` 입니다.
+//   그런데 편견 뱅크는 '다른 필드의 라벨' 이므로,
+//     recipient_address 의 편견에 sender_address 라벨이 들어 있고
+//     라벨 'address' 는 두 필드 모두와 0.8+ 로 공명합니다.
+//   결과:
+//     🚫 'address' → 'recipient_address' | Label: 0.8061 <= Prej: 0.8374
+//   전 조합 중 최고 점수(0.8061)가 삭제되고,
+//   편견이 약한 party_address 만 살아남아 두 회사 주소가 한 값으로 접합되었습니다.
+//
+//  ── 대체 원리 ──
+//   "이 라벨이 이 필드보다 다른 필드를 더 잘 설명하는가" 는
+//   배타 배정(exclusive_assign_by_score)이 이미 판정합니다.
+//   편견의 진짜 역할은 '이 라벨이 이 필드의 개념과 정반대인가' 이므로,
+//   자기 라벨 뱅크와의 유사도를 기준선으로 삼아 상대 비교합니다.
+//
+//     drop  ⟺  prej > own * (1 + relief)
+//     relief = 이 필드 라벨 뱅크의 내부 응집도로부터 유도
+//
+//   응집도가 높은 뱅크(동의어가 촘촘한 필드)는 편견과도 가깝게 나오므로
+//   그만큼 관대해야 공정합니다. 새 매직 상수가 없습니다.
+// =====================================================================
+/// 라벨 뱅크의 내부 응집도. 구끼리의 평균 코사인입니다.
+/// 뱅크가 1구면 응집도를 정의할 수 없으므로 0을 돌려줍니다.
+pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
+    let valid: Vec<&Vec<f32>> = bank.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).collect();
+    if valid.len() < 2 {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    let mut cnt = 0usize;
+    for i in 0..valid.len() {
+        for j in (i + 1)..valid.len() {
+            sum += cosine_similarity(valid[i], valid[j]);
+            cnt += 1;
+        }
+    }
+    if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
+}
+/// 🌟 [RELATIVE PREJUDICE] 편견이 자기 점수를 '응집도만큼의 여유' 이상으로
+///    앞설 때만 후보 자격을 박탈합니다.
+///
+///  반환 true = 폐기 대상
+pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
+    if own <= 0.0 {
+        return true;
+    }
+    // 응집도가 높을수록 편견과의 근접이 구조적으로 불가피하므로 여유를 넓힙니다.
+    let relief = cohesion.clamp(0.0, 0.5);
+    prej > own * (1.0 + relief)
+}
 /// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
 /// filter_category_phrases 의 prejudice 판입니다.
 pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
@@ -2357,26 +2411,43 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
     if is_bare_markup_token(v) { return false; }
     match fmt {
         FieldFormat::Synthesis => true,
-        FieldFormat::Enum => true,
-        // 이름·상품명·제목은 문자가 반드시 있어야 합니다. "수량 | 1" 의 "1" 을 여기서 차단합니다.
+        FieldFormat::Enum => !has_date_literal(v),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
-        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
-        // "번호 | 9", "배송비 | 0" 을 여기서 차단합니다.
-        FieldFormat::Date => has_date_literal(v),
+        FieldFormat::Numeric => {
+            if has_date_literal(v) {
+                return false;
+            }
+
+            let core: String = v
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',' && *c != '%')
+                .collect();
+            if core.is_empty() {
+                return false;
+            }
+            // 통화 기호와 부호는 허용합니다. (₩ 12,500 / -350.00 / $78,500)
+            let stripped: String = core
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect();
+            let symbols = core.chars().count().saturating_sub(stripped.chars().count());
+            // 기호가 숫자보다 많으면 수치가 아닙니다. (예: "FOB Busan")
+            if symbols * 2 > core.chars().count() {
+                return false;
+            }
+            stripped.chars().any(|c| c.is_ascii_digit())
+        },
+        FieldFormat::Date => {
+            has_date_literal(v)
+        },
         FieldFormat::Link => v.contains('/') || v.to_lowercase().starts_with("http"),
-        // "번호 | 11" 을 여기서 차단합니다. 운송장은 최소 8자입니다.
-        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
-        // Identifier 는 url_pool 대조가 본판정이므로 여기서는 최소 길이만 봅니다.
-        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
-        // 🌟 [PHONE] 숫자 7자리 이상 + 전화번호에 물리적으로 허용되는 문자만.
-        //    'test3@gmail.com'(문자·@ 포함) / '주문결제 내역'(숫자 0개) 이 여기서 전멸합니다.
+        FieldFormat::TrackingCode => !has_date_literal(v) && longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => !has_date_literal(v) && longest_code_token_len(v) >= 4,
         FieldFormat::Phone => {
             let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
             if digits < 7 { return false; }
             v.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || "+-().,".contains(c))
         },
-        // 🌟 [ADDRESS] 주소는 최소 2토큰 이상입니다.
-        //    '우체국' / 'https://m.epost.go.kr/…' 같은 단일 토큰이 여기서 전멸합니다.
         FieldFormat::Address => {
             if v.split_whitespace().count() < 2 { return false; }
             if v.chars().count() < 6 { return false; }
@@ -2393,9 +2464,6 @@ pub fn is_id_link_field(field_name: &str) -> bool {
     keys.contains(&"id") && keys.contains(&"link")
 }
 
-// 🌟 [DOUBLE CENTERING] (필드 × 라인) 원시 유사도에서 라인 고유 베이스라인과 필드 고유 베이스라인을 동시에 제거합니다.
-// 원시값이 0.50~0.74 처럼 좁은 구간에 뭉쳐 있어도 상대적 우위가 선명하게 드러나
-// 절대 임계치가 비로소 의미를 갖게 됩니다. -1.0 셀은 형식 게이트 탈락(무효)을 의미합니다.
 pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     let field_count = raw.len();
     if field_count == 0 { return Vec::new(); }
@@ -2434,14 +2502,6 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
         for l in 0..raw[f].len() {
             let v = raw[f][l];
             if v < 0.0 { continue; }
-            // 🌟 [SPARSE GUARD] 형식 게이트 통과 후 행렬 밀도는 실측 약 5% 입니다.
-            //    이 라인의 유효 후보가 하나뿐이면 line_mean[l] == v 이므로
-            //        centered = v - v - field_mean[f] + global_mean = global_mean - field_mean[f]
-            //    가 되어 own(v) 이 식에서 완전히 소거됩니다.
-            //    즉 '증거가 압도적인 라인'과 '겨우 통과한 라인'의 점수가 비트 단위로 같아지고,
-            //    이후 배타 배정은 사실상 필드 인덱스 순서로 결정됩니다.
-            //    라인 경쟁이 실제로 존재할 때만 라인 베이스라인을 제거합니다.
-            //    (경쟁이 없으면 라인 베이스라인은 전역 평균과 같다고 보는 것이 정의상 자연스럽습니다)
             let lm = if line_cnt[l] > 1 { line_mean[l] } else { global_mean };
             out[f][l] = v - lm - field_mean[f] + global_mean;
         }
@@ -2449,9 +2509,6 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     out
 }
 
-// 🌟 [URL SPLIT] href 를 (host, path, query) 로 분해합니다.
-//    상대경로/프로토콜생략(//) 형태까지 그대로 받아냅니다.
-//    이 분해가 있어야 "도메인 조각(cafe24)" 과 "쿼리값(18)" 을 구조적으로 구분할 수 있습니다.
 pub fn split_href_parts(href: &str) -> (String, String, String) {
     let mut rest: &str = href.trim();
     let mut host = String::new();
@@ -2475,8 +2532,6 @@ pub fn split_href_parts(href: &str) -> (String, String, String) {
     }
 }
 
-// 🌟 [HOST REGION] link 문자열에서 호스트 구간이 끝나는 바이트 인덱스를 돌려줍니다.
-//    이 인덱스 이전에서 매칭된 조각으로는 절대 URL 패턴을 만들지 않습니다.
 pub fn host_region_end(link: &str) -> usize {
     let total = link.len();
     if let Some(p) = link.find("://") {
@@ -2491,8 +2546,6 @@ pub fn host_region_end(link: &str) -> usize {
     0
 }
 
-// 🌟 [URL TOKEN HUMANIZE] "product_no" → "product no", "ProductRegister" → "product register".
-//    임베딩 모델이 이해할 수 있는 자연어 구로 바꿔야 코사인 비교가 의미를 갖습니다.
 pub fn humanize_url_token(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
@@ -2517,9 +2570,6 @@ pub fn humanize_url_token(raw: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-// 🌟 [ID/LINK CANDIDATE] href 안에서 식별자로 쓸 수 있는 토큰을,
-//    "그 토큰이 URL 상에서 맡은 역할 문구" 와 함께 수집합니다.
-//    role_phrase 가 코사인 채점 대상이며, token 은 문자열 포함검사가 아니라 구조 파싱으로 뽑힙니다.
 #[derive(Debug, Clone)]
 pub struct IdLinkCandidate {
     pub token: String,
@@ -2529,9 +2579,6 @@ pub struct IdLinkCandidate {
     pub prior: f32,
 }
 
-// 🌟 [HREF → CANDIDATE] 단일 href 를 (host / path / query) 로 분해해 식별자 후보를 뽑습니다.
-//    collect_id_link_candidates(문서 내부 href) 와
-//    collect_id_link_candidates_from_url(현재 추출 중인 페이지 주소) 가 공유합니다.
 fn push_candidates_from_href(
     href: &str,
     out: &mut Vec<IdLinkCandidate>,
@@ -2652,10 +2699,6 @@ pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
     out
 }
 
-// 🌟 [PAGE-URL ID PRIORITY] "지금 추출 중인 주소(link)" 자체에서 먼저 식별자를 찾습니다.
-//    상세페이지의 주문번호/상품번호는 대부분 문서 안의 a[href] 가 아니라
-//    현재 URL 의 쿼리(od_id=24120419364235)에 실려 있습니다.
-//    이걸 1순위로 두어야 외부 배송조회 URL(우체국) 쿼리가 id 로 승격되는 사고가 사라집니다.
 pub fn collect_id_link_candidates_from_url(page_url: &str) -> Vec<IdLinkCandidate> {
     let mut out: Vec<IdLinkCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2667,9 +2710,6 @@ pub fn collect_id_link_candidates_from_url(page_url: &str) -> Vec<IdLinkCandidat
     out
 }
 
-// 🌟 [LABELED TOKEN CANDIDATE] href 가 아예 없는 아이템의 소급 복구용 후보입니다.
-//    핵심은 "값" 이 아니라 "그 값이 달린 컬럼 라벨" 을 코사인 채점 대상으로 삼는다는 점입니다.
-//    ("상품코드 | P000000P" → 라벨 '상품코드' 를 id,link 라벨 뱅크와 비교)
 #[derive(Debug, Clone)]
 pub struct LabeledTokenCandidate {
     pub token: String,
@@ -2714,9 +2754,6 @@ pub fn collect_labeled_token_candidates(labeled_lines: &[String]) -> Vec<Labeled
     out
 }
 
-// 🌟 [ID SHAPE] 확정된 식별자의 '생김새'(자릿수, 숫자전용 여부)를 학습해 둡니다.
-//    goods 목록의 id 가 전부 '18','17','16' 처럼 2자리 숫자였다면
-//    'P000000P' 를 URL 패턴에 대입하는 순간 링크가 깨지므로 아예 거부해야 합니다.
 pub fn id_shape_signature(token: &str) -> (usize, bool) {
     let n = token.chars().count();
     let digits_only = !token.is_empty() && token.chars().all(|c| c.is_ascii_digit());
@@ -2745,8 +2782,6 @@ pub fn id_shape_allowed(token: &str, learned: &[(usize, bool)]) -> bool {
     n >= lo && n <= hi
 }
 
-// 🌟 [HOST GUARD] 재구성된 링크가 기준 링크와 같은 호스트인지 검증합니다.
-//    'https://breakbot.P000000P.com/...' 같은 도메인 변조를 여기서 최종 차단합니다.
 pub fn same_host(a: &str, b: &str) -> bool {
     let (ha, _, _) = split_href_parts(a);
     let (hb, _, _) = split_href_parts(b);
@@ -2754,8 +2789,6 @@ pub fn same_host(a: &str, b: &str) -> bool {
     ha.eq_ignore_ascii_case(&hb)
 }
 
-// 🌟 [DETERMINISTIC ID/LINK - LEGACY FALLBACK] 코사인 후보가 전부 탈락했을 때만 쓰이는 최후 보루입니다.
-//    기존과 달리 '호스트 구간' 매칭은 무조건 무시하므로, 도메인 조각(cafe24)이 id 로 승격되는 경로가 사라집니다.
 pub fn resolve_id_link_from_lines(lines: &[&str]) -> Option<(String, String)> {
     let href_re = regex::Regex::new(r#"href=["']([^"']+)["']"#).ok()?;
 
@@ -2804,11 +2837,6 @@ pub fn resolve_id_link_from_lines(lines: &[&str]) -> Option<(String, String)> {
     best
 }
 
-// 🌟 [URL PATTERN EXTRACT] 성공적으로 확정된 id/link 쌍에서 URL 구조 패턴을 추출합니다.
-// 예: id="18", link="https://host/disp/admin/shop1/product/ProductRegister?product_no=18"
-//   → prefix="https://host/disp/admin/shop1/product/ProductRegister?product_no=", suffix=""
-// [CRITICAL] 호스트(도메인) 구간에서 매칭된 조각으로는 절대 패턴을 만들지 않습니다.
-//            이 가드가 없으면 prefix="https://breakbot." / suffix=".com/..." 같은 도메인 변조 패턴이 만들어집니다.
 pub fn extract_url_pattern(id: &str, link: &str) -> Option<(String, String)> {
     if id.is_empty() || link.is_empty() { return None; }
     if !id.is_ascii() { return None; }
@@ -2848,10 +2876,6 @@ pub fn apply_url_pattern(prefix: &str, suffix: &str, new_id: &str) -> String {
     format!("{}{}{}", prefix, new_id, suffix)
 }
 
-// 🌟 [IDENTIFIER TOKEN SEARCH] PUG 라인 배열에서 식별자 후보 토큰을 탐색합니다.
-// 조건: 파이프 뒤(value)에 위치, 8자 이상, 숫자 포함, 영숫자 토큰.
-// 이제는 코사인 게이트가 모두 실패했을 때의 최후 폴백으로만 호출되며,
-// 호출부에서 id_shape_allowed() 생김새 게이트를 반드시 통과해야 실제로 사용됩니다.
 pub fn find_identifier_token_in_lines(lines: &[String]) -> Option<String> {
     for line in lines {
         let value = match line.find('|') {
@@ -2870,9 +2894,6 @@ pub fn find_identifier_token_in_lines(lines: &[String]) -> Option<String> {
     None
 }
 
-// 🌟 [DEAD HREF] href 가 실제 페이지 이동이 아니라 자바스크립트 훅/레이어 토글인지 판정합니다.
-//    '#', '#none', '#layerSnsShare', 'javascript:...' 는 전부 UI 액션이며 실데이터 링크가 아닙니다.
-//    이 구분이 없으면 "a[href=\"#none\"] | SMS발송" 이 '링크 데이터'로 보호되어 컬럼을 오염시킵니다.
 pub fn is_dead_href(href: &str) -> bool {
     let h = href.trim().to_ascii_lowercase();
     if h.is_empty() { return true; }
@@ -2882,10 +2903,6 @@ pub fn is_dead_href(href: &str) -> bool {
     false
 }
 
-// 🌟 [REAL HREF] PUG 라인이 실제 상세 페이지로 이동하는 href 를 갖고 있으면 그 값을 돌려줍니다.
-//    "a[href=\"/disp/.../ProductRegister?product_no=18\"] | 테스트상품" → Some(...)  ← 실데이터
-//    "a[href=\"#none\"] | SMS발송"                                    → None        ← UI 액션
-//    "li | 상품 상세보기"                                              → None        ← UI 액션(속성 유실)
 pub fn line_real_href(line: &str) -> Option<String> {
     let re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
         Ok(r) => r,
@@ -2900,11 +2917,6 @@ pub fn line_real_href(line: &str) -> Option<String> {
     None
 }
 
-// 🌟 [MULTI VALUE FIELD] 값이 여러 개 이어붙어야 정상인 배열 성격의 필드인지 판정합니다.
-//    옵션/태그/구성상품만 공백 병합을 허용하고, title/name 같은 단일 값 필드는
-//    반드시 대표값 1개만 채택해야 합니다. (기존 무조건 Join 이 title 오염의 직접 원인)
-//    🌟 address 는 우편번호/기본주소/상세주소/참고항목이 서로 다른 input 으로 쪼개져 있으므로
-//    반드시 셀 전체를 병합해야 완전한 주소가 됩니다.
 pub fn is_multi_value_field(field_name: &str) -> bool {
     let lower = field_name.to_lowercase();
     ["options", "tags", "goods", "additional_goods", "additional_image", "region_restrictions", "address"]
@@ -2912,10 +2924,6 @@ pub fn is_multi_value_field(field_name: &str) -> bool {
         .any(|k| lower.contains(k))
 }
 
-// 🌟 [PUG LINE ANATOMY] PUG 한 줄을 (들여쓰기, 태그명, 속성부, 값) 으로 안전 분해합니다.
-//    line.find('|') 는 속성값 내부의 파이프를 먼저 잡아버립니다.
-//    (예: option[selected value="우체국|https://m.epost.go.kr/..."] | 우체국)
-//    → payment_origin 이 우체국 URL 을 뱉은 직접 원인이며, 여기서 원천 차단합니다.
 pub fn pug_line_parts(line: &str) -> (usize, String, String, String) {
     let indent = line.chars().take_while(|c| c.is_whitespace()).count();
     let trimmed = line.trim();
@@ -3024,15 +3032,6 @@ fn detail_cell_label_text(
     String::new()
 }
 
-// 🌟 셀 하나의 값을 뽑습니다.
-//    [DEPTH GATE] 같은 td 안이라도 '값을 지닌 라인 중 가장 얕은 깊이'에 있는 라인만
-//    그 셀의 대표값/병합 대상입니다.
-//      <td><a>상품명</a><div class="frm_info"><select>우체국</select><input 123456789><a>배송조회</a></div></td>
-//    구조에서 기존 무조건 병합은 "상품명 우체국 123456789 배송조회" 라는 오염값을 만들었습니다.
-//    반대로 주소 셀은 우편번호/기본주소/상세주소 input 이 전부 td 직속(동일 깊이)이라
-//    병합이 그대로 유지됩니다.
-//    rank 3 = 실제 이동 href, 2 = 폼 컨트롤 값(input/option), 1 = 일반 텍스트, 0 = 죽은 href.
-//    동일 rank 면 더 긴 텍스트가 대표값이 됩니다. (리스트 경로의 REPRESENTATIVE 규칙과 동일)
 fn detail_cell_value_text(
     lines: &[&str],
     parts: &[(usize, String, String, String)],
@@ -3092,11 +3091,6 @@ fn detail_cell_value_text(
     (best_text, joined.join(" "), best_line)
 }
 
-// 🌟 [DETAIL PAIR EXTRACTOR]
-//    (a) th[scope="row"] → 같은 tr 의 다음 td   : 폼형 key-value
-//    (b) 전부 th 인 행    → 컬럼 헤더로 등록 후 후속 행의 같은 컬럼 td 에 부여
-//    (c) input[placeholder] → placeholder 자체가 라벨
-//    기존의 "직전 라벨 라인" 휴리스틱은 thead 의 th 끼리도 라벨-값으로 오인했기에 폐기합니다.
 pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
     let n = lines.len();
     if n == 0 { return Vec::new(); }
@@ -3207,13 +3201,6 @@ pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
         }
     }
 
-    // (c) placeholder 기반 보조 페어 : "개별 운송장번호" 처럼 th 가 없는 값의 유일한 라벨입니다.
-    //     🌟 [PLACEHOLDER DEDUPE] 단, 그 라인을 이미 th 기반 라벨이 소유하고 있다면
-    //     placeholder 는 '보조 안내문'일 뿐 라벨이 아닙니다.
-    //     Line 165 는 th '가맹점 ID' 가 있는데 placeholder '없음' 이 중복 생성되어
-    //     payment_origin ← '없음' → 값 'test1' 오염을 만들었고,
-    //     Line 178 도 th '입금자명' 위에 '실 입금자명' 이 겹쳤습니다.
-    //     반대로 Line 75 는 th 페어가 없으므로 placeholder 가 유일한 라벨이라 반드시 보존됩니다.
     let structural_lines: std::collections::HashSet<usize> =
         pairs.iter().map(|p| p.primary_line).collect();
 

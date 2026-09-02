@@ -50,6 +50,15 @@ pub async fn upsert_alias_chunks(
     //    반응하도록 만들어 별칭 행이 리콜 보험 역할을 하게 합니다.
     let origin_value = chunk_meta.value_part.trim().to_string();
 
+    // 🌟 [CROSSOVER / BATCH-AHEAD] 이 청크의 별칭에 필요한 텍스트를 먼저 전부 모읍니다.
+    //
+    //  ── 무엇이 문제였나 ──
+    //   변종(native / roman)마다 get_embedding_batch(vec![3개]) 를 개별 호출해
+    //   청크 20개 × 변종 2개 = 최대 40회 왕복이 발생했습니다.
+    //   그 사이사이에 생성 모델이 올라와 있으면 왕복마다 피크가 재현됩니다.
+    //   텍스트를 먼저 모아 '한 번' 만 호출하면 왕복이 1회로 줄고,
+    //   호출 시점도 한 곳으로 모여 페이즈 판정이 가능해집니다.
+    let mut pending_alias: Vec<(&str, String, String)> = Vec::new(); // (suffix, alias, localized)
     for (suffix, alias) in variants.iter() {
         let a = alias.trim();
         if a.is_empty() { continue; }
@@ -67,12 +76,32 @@ pub async fn upsert_alias_chunks(
             }
             s
         };
+        pending_alias.push((suffix, a.to_string(), localized));
+    }
+    if pending_alias.is_empty() { return 0; }
 
-        let embs = model
-            .get_embedding_batch(vec![a.to_string(), anchor_text.clone(), localized.clone()])
-            .await
-            .unwrap_or_else(|_| vec![vec![0.0; 384]; 3]);
-        if embs.len() < 3 { continue; }
+    // 🌟 [CROSSOVER] 임베딩을 부르기 직전에 페이즈를 선언합니다.
+    //    생성 모델이 상주 중이면 예산을 보고 유지하거나 양보시킵니다.
+    let _ = model.enter_embedding_phase("alias chunk embedding").await;
+
+    let mut batch_texts: Vec<String> = Vec::with_capacity(pending_alias.len() * 3);
+    for (_, a, localized) in pending_alias.iter() {
+        batch_texts.push(a.clone());
+        batch_texts.push(anchor_text.clone());
+        batch_texts.push(localized.clone());
+    }
+    // 🌟 [CROSSOVER] 청킹 · activation 관측 · 캐시는 get_embedding_batch 내부가 담당합니다.
+    //    여기서 anchor_text 를 변종 수만큼 중복해 넣어도 배치 내 중복 제거가
+    //    한 벌로 접어 주므로 실연산은 늘지 않습니다.
+    let batch_embs = model
+        .get_embedding_batch(batch_texts.clone())
+        .await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; batch_texts.len()]);
+    if batch_embs.len() < pending_alias.len() * 3 { return 0; }
+
+    for (vi, (suffix, alias_owned, localized)) in pending_alias.iter().enumerate() {
+        let a = alias_owned.as_str();
+        let embs = &batch_embs[vi * 3..vi * 3 + 3];
 
         let (w_chunk, w_anchor, w_local) = match chunk_meta.property_format.as_str() {
             "Text" | "Address" | "Synthesis" => (0.25f32, 0.10f32, 0.65f32),
@@ -393,31 +422,64 @@ pub async fn index_item_chunks(
         },
     ).await;
 
+    // 🌟 [SCHEMA WHITELIST] 스키마에 없는 property 는 검색 축이 아닙니다.
+    //
+    //  ── 실측 사고 ──
+    //   [13]✓ property='rel_lc'     | score=0.0000 | text='Its rel lc is 3209045268'
+    //   [14]✓ property='started_at' | score=0.0000 | text='Its started at is 2026-08-28T00:00:00'
+    //   score=0.0000 은 '필드 뱅크에 그 property 가 아예 없다' 는 뜻입니다.
+    //   rel_lc 는 릴레이 내부 인덱스, started_at 은 정규화 파생 축이라
+    //   사용자가 검색할 대상이 아닙니다. confirmed 보호를 타고 들어와
+    //   의미 없는 벡터 2건이 저장되었습니다.
+    //
+    //  ── 판정 근거 ──
+    //   idx_field_names 는 이 doc_type 의 스키마가 소유한 필드 목록입니다.
+    //   그 밖의 property 는 정의상 검색 축이 될 수 없습니다.
+    //   어휘 사전이 아니라 '스키마 소속 여부' 라는 구조 사실입니다.
     let indexable_chunks: Vec<(usize, &crate::nl_convert::ChunkMetadata)> = enriched_chunks.iter()
         .enumerate()
-        .filter(|(_, c)| c.property != "unclassified")
+        .filter(|(_, c)| {
+            if c.property == "unclassified" { return false; }
+            let in_schema = idx_field_names.iter().any(|f| {
+                f == &c.property
+                    || f.split(',').any(|k| k.trim() == c.property.as_str())
+            });
+            if !in_schema {
+                println!(
+                    "  🚫 [SCHEMA WHITELIST] property='{}' 는 '{}' 스키마에 없는 축이라 청크 인덱싱에서 제외합니다. (text=\"{}\")",
+                    c.property, page_type, c.chunk_text
+                );
+            }
+            in_schema
+        })
         .collect();
-
     if indexable_chunks.is_empty() {
         return Ok(0);
     }
 
+    // =====================================================================
+    // 🌟 [CROSSOVER / PHASE SEPARATION] 임베딩을 음차 '앞' 으로 전부 끌어옵니다.
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 문제였나 ──
+    //   기존 순서는
+    //     ① chunk 임베딩 → ② 음차(Qwen3.5 2B) → ③ anchor 임베딩
+    //     → ④ localized 임베딩 → ⑤ 별칭 임베딩(청크마다)
+    //   이었습니다. ②를 사이에 두고 임베딩이 앞뒤로 갈라져 있어
+    //   Qwen3.5(약 2GB)와 임베딩이 최소 두 번 교차 상주합니다.
+    //
+    //  ── 왜 순서를 바꿔도 되는가 ──
+    //   anchor_texts / localized_texts 는 chunk_meta 의 property 와
+    //   value_part 만으로 만들어지며, 음차 결과에 전혀 의존하지 않습니다.
+    //   즉 ②보다 먼저 계산할 수 있는데 뒤에 있었을 뿐입니다.
+    //   ⑤만 음차 결과가 필요하므로 그것만 뒤에 남깁니다.
+    //
+    //  ── 효과 ──
+    //   임베딩 페이즈 1회 → 생성 페이즈 1회 → 임베딩 페이즈 1회 로
+    //   교차 횟수가 고정되고, 각 페이즈 안에서는 스왑이 발생하지 않습니다.
+    // =====================================================================
+    let _ = model.enter_embedding_phase("index_item_chunks / pre-compute").await;
+
     let chunk_texts: Vec<String> = indexable_chunks.iter().map(|(_, c)| c.chunk_text.clone()).collect();
-    let chunk_embs = model.get_embedding_batch(chunk_texts.clone()).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk_texts.len()]);
-
-    let metas: Vec<&crate::nl_convert::ChunkMetadata> =
-        indexable_chunks.iter().map(|(_, c)| *c).collect();
-    // 🌟 [ANALYTIC TRANSLIT SKIP] 전처리에서 이미 음차를 완료한 경우 건너뜁니다.
-    let alias_pairs = if skip_transliteration {
-        vec![(String::new(), String::new()); metas.len()]
-    } else {
-        generate_transliteration_aliases(
-            model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
-        ).await
-    };
-
-    let _ = store.delete_chunks_by_item(item_id).await;
 
     let mut anchor_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
     let mut localized_texts: Vec<String> = Vec::with_capacity(indexable_chunks.len());
@@ -429,10 +491,60 @@ pub async fn index_item_chunks(
         anchor_texts.push(a);
         localized_texts.push(l);
     }
-    let anchor_embs = model.get_embedding_batch(anchor_texts.clone()).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; anchor_texts.len()]);
-    let localized_embs = model.get_embedding_batch(localized_texts.clone()).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; localized_texts.len()]);
+
+    // 🌟 [SINGLE BATCH] 세 종류를 한 번에 넣어 왕복을 3회 → 1회로 줄입니다.
+    //
+    //  ── 왜 한 번에 넘겨도 안전한가 ──
+    //   embed_batch 는 내부적으로 1건씩 순전파하므로 순간 점유가
+    //   '넘긴 건수' 에 비례하지 않습니다. 실제 activation 축인
+    //   동시 순전파 스레드 수는 embedding.rs 의 adaptive_thread_count 가
+    //   여유를 보고 3 → 2 → 1 로 줄입니다.
+    //   여기서 쪼개면 왕복만 늘고 피크는 그대로입니다.
+    //
+    //  ── 캐시 이득 ──
+    //   anchor_texts 는 property 가 같으면 문자열이 완전히 동일합니다.
+    //   get_embedding_batch 의 배치 내 중복 제거가 한 벌로 접어 주므로,
+    //   세 종류를 함께 넘길수록 실연산이 오히려 줄어듭니다.
+    //
+    //  ── 길이 보존 ──
+    //   get_embedding_batch 는 입력과 같은 길이를 반환하는 것이 계약이므로
+    //   아래 슬라이싱이 항상 안전합니다.
+    let total_n = indexable_chunks.len();
+    let mut combined: Vec<String> = Vec::with_capacity(total_n * 3);
+    combined.extend(chunk_texts.iter().cloned());
+    combined.extend(anchor_texts.iter().cloned());
+    combined.extend(localized_texts.iter().cloned());
+
+    let mut combined_embs = model.get_embedding_batch(combined.clone()).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; combined.len()]);
+    if combined_embs.len() < combined.len() {
+        combined_embs.resize(combined.len(), vec![0.0; 384]);
+    }
+    emit(&format!(
+        "  🧬 [CROSSOVER] 임베딩 선계산 완료: 텍스트 {}건 | 자유 VRAM {}MB",
+        combined.len(), model.get_free_vram_mb()
+    ));
+
+    let chunk_embs: Vec<Vec<f32>> = combined_embs[0..total_n].to_vec();
+    let anchor_embs: Vec<Vec<f32>> = combined_embs[total_n..total_n * 2].to_vec();
+    let localized_embs: Vec<Vec<f32>> = combined_embs[total_n * 2..total_n * 3].to_vec();
+
+    let metas: Vec<&crate::nl_convert::ChunkMetadata> =
+        indexable_chunks.iter().map(|(_, c)| *c).collect();
+
+    // 🌟 [ANALYTIC TRANSLIT SKIP] 전처리에서 이미 음차를 완료한 경우 건너뜁니다.
+    //    이제 이 호출 시점에는 임베딩이 필요한 계산이 전부 끝나 있으므로,
+    //    generate_transliteration_aliases 가 임베딩을 반환시키고
+    //    Qwen3.5 를 올려도 두 가중치가 겹치지 않습니다.
+    let alias_pairs = if skip_transliteration {
+        vec![(String::new(), String::new()); metas.len()]
+    } else {
+        generate_transliteration_aliases(
+            model, &metas, doc_lang, page_type, cancel, app_handle, task_id,
+        ).await
+    };
+
+    let _ = store.delete_chunks_by_item(item_id).await;
 
     let mut saved = 0usize;
 

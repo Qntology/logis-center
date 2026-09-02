@@ -177,7 +177,12 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     {
         let mut model_guard = state.model.lock().await;
         if let Some(m) = model_guard.as_ref() {
+            println!("[UNLOAD] {}", m.crossover_report());
             m.deep_purge_resources().await;
+            // 🌟 [CROSSOVER] 모델 슬롯을 통째로 비우므로 원장도 IDLE 로 되돌립니다.
+            //    이 줄이 없으면 다음 LogisModel::new 이후에도
+            //    전역 페이즈가 GENERATION 으로 남아 첫 임베딩 로드가 오판됩니다.
+            m.mark_crossover_idle();
         }
         *model_guard = None;
     }
@@ -476,30 +481,31 @@ async fn reindex_pending_embeddings(
     }
 
     println!("[EMBED-LOCAL] {} pending item(s) detected. Loading embedding model...", pending.len());
-
     let model = {
         let mut model_guard = state.model.lock().await;
-
         if let Some(m) = model_guard.as_ref() {
             let wants_cpu = device_preference.as_deref() == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
                 m.deep_purge_resources().await;
+                m.mark_crossover_idle();
                 *model_guard = None;
             }
         }
-
         if model_guard.is_none() {
             match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
         }
-
         model_guard.as_ref().unwrap().clone()
     };
-
     model.check_embedding_downloaded().await.map_err(|e| e.to_string())?;
-    model.ensure_embedding().await.map_err(|e| e.to_string())?;
+    // 🌟 [CROSSOVER] 백그라운드 인덱싱은 순수 임베딩 페이즈입니다.
+    //    전경 태스크가 남긴 생성 모델이 아직 상주 중일 수 있으므로,
+    //    ensure_embedding 대신 페이즈 진입으로 예산 판정을 거칩니다.
+    //    여유가 있으면 생성 모델을 그대로 두고(다음 전경 작업이 빨라집니다),
+    //    없으면 먼저 반환시킵니다.
+    model.enter_embedding_phase("background reindex").await.map_err(|e| e.to_string())?;
 
     let mut processed = 0usize;
     let mut yielded_to_task = false;
@@ -688,8 +694,14 @@ async fn reindex_pending_embeddings(
     //    unload_embedding 은 임베딩 슬롯 + 캐시 + CUDA 풀을 정리하므로
     //    스케줄러의 wait_for_vram_settle 이 곧바로 목표치를 확보할 수 있습니다.
     model.unload_embedding().await;
+    // 🌟 [CROSSOVER] unload_embedding 이 내부에서 sync_crossover_phase 를 호출하므로
+    //    여기서 IDLE 로 뭉뚱그릴 필요가 없어졌습니다.
+    //    생성 모델이 함께 상주 중이었다면 PHASE_GENERATION 이 정확한 상태이고,
+    //    IDLE 로 덮어쓰면 다음 enter_generation_phase 가 이미 올라와 있는 모델을
+    //    '없다' 고 판단해 불필요한 relay 를 태웁니다.
     if yielded_to_task {
         println!("[EMBED-LOCAL] ✅ 임베딩 모델을 즉시 반환했습니다. 전경 작업이 VRAM 을 온전히 사용할 수 있습니다.");
+        println!("[EMBED-LOCAL] {}", model.crossover_report());
         return Ok(json!({
             "processed": processed,
             "mode": target_mode,
@@ -995,12 +1007,6 @@ async fn summarize_image(
     }
 }
 
-// 🌟 [SCOPE SANITIZE] 프론트엔드가 넘긴 필터에서 봉투 컬럼 술어만 남깁니다.
-//  v4 이전 프론트엔드는 status / amount 같은 도메인 컬럼을 SQL 로 보냈는데,
-//  그 컬럼들이 물리적으로 사라졌으므로 그대로 내려보내면 DataFusion 이 통째로 실패합니다.
-//  (실패 시 필터가 초기화되어 타 팀 데이터가 새어 나오는 보안 문제로 이어집니다)
-//  따라서 여기서 화이트리스트로 걸러 '스코프만' 남기고, 도메인 술어는 조용히 버립니다.
-//  버려진 조건은 프론트엔드 Dexie 가 data.* 로 다시 적용합니다.
 fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
     const ENVELOPE_COLS: [&str; 9] = [
         "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
@@ -1014,9 +1020,23 @@ fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
 
     let mut kept: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
-
     for clause in raw.split(" AND ") {
-        let c = clause.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let mut c = clause.trim();
+        loop {
+            if !(c.starts_with('(') && c.ends_with(')')) { break; }
+            let mut depth = 0i32;
+            let mut wraps = true;
+            let chars: Vec<char> = c.chars().collect();
+            for (i, ch) in chars.iter().enumerate() {
+                if *ch == '(' { depth += 1; }
+                else if *ch == ')' {
+                    depth -= 1;
+                    if depth == 0 && i + 1 != chars.len() { wraps = false; break; }
+                }
+            }
+            if !wraps || depth != 0 { break; }
+            c = c[1..c.len() - 1].trim();
+        }
         if c.is_empty() { continue; }
 
         // 술어의 좌변 컬럼명을 추출합니다. (백틱/공백/연산자 제거)
@@ -2686,7 +2706,9 @@ async fn ai_search_complex(
     
     // 🌟 [PURGE FIRST] 자원 파기를 먼저 끝낸 뒤에 가드를 내립니다.
     //    순서가 뒤집히면 파기 도중에 다른 커맨드가 모델을 올려 컨텍스트가 충돌합니다.
+    println!("[AI-SEARCH] {}", model.crossover_report());
     model.deep_purge_resources().await;
+    model.mark_crossover_idle();
     drop(model_guard);
 
     {

@@ -670,6 +670,16 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
                       else if let Some(inner) = data.get(cat) { inner.clone() } 
                       else { data };
 
+    let actual_data = if root.get(target_key).map(|t| t.is_array()).unwrap_or(false)
+        && actual_data.is_object()
+    {
+        let has_value = actual_data.as_object()
+            .map(|o| o.values().any(|v| !v.is_null()))
+            .unwrap_or(false);
+        if has_value { Value::Array(vec![actual_data]) } else { Value::Array(Vec::new()) }
+    } else {
+        actual_data
+    };
     if let Some(target) = root.get_mut(target_key) {
         if target.is_array() {
             let target_arr = target.as_array_mut().unwrap();

@@ -326,6 +326,70 @@ impl EmbeddingModel {
         Ok(accumulated_vector)
     }
 
+    // =====================================================================
+    // 🌟 [CROSSOVER] 동시 순전파 스레드 수를 여유에 맞춰 조절합니다.
+    // ---------------------------------------------------------------------
+    //  ── 왜 여기인가 ──
+    //   embed_batch 는 이름과 달리 '배치 연산' 이 아닙니다.
+    //   내부에서 self.embed(text) 를 1건씩 순회하므로,
+    //   texts.len() 을 100 으로 주든 1000 으로 주든 순전파는 항상 1건 단위입니다.
+    //   시퀀스 길이도 embed() 내부에서 512 로 이미 고정되어 있습니다.
+    //   즉 activation 의 유일한 변수는 '동시에 순전파하는 스레드 수' 입니다.
+    //
+    //  ── 3 이 왜 위험한가 ──
+    //   Attention::forward 는 .contiguous() 를 12회 호출하며 매번 새 텐서를
+    //   할당합니다. 그 순간 점유가 스레드 수만큼 배가됩니다.
+    //   생성 모델(Qwen3 0.6B / Qwen3.5 2B)이 함께 상주 중일 때
+    //   이 3배가 곧 OOM 경계선을 넘는 지점입니다.
+    //
+    //  ── 판정 근거 ──
+    //   '한 스레드가 쓰는 순간 점유' 를 알면 몇 개를 띄울 수 있는지 나옵니다.
+    //   그 값은 관측으로 학습되며(embed_activation_unit_mb), 관측 전에는
+    //   기존 동작(3)을 그대로 유지해 회귀가 없습니다.
+    //   3 은 여전히 상한이고, 줄이는 방향으로만 작동합니다.
+    // =====================================================================
+    /// 한 스레드가 순전파 중 쓰는 VRAM(MB) 관측치. 0 이면 미관측.
+    fn observed_unit_mb() -> u64 {
+        EMBED_UNIT_ACTIVATION_MB.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn free_vram_mb(&self) -> u64 {
+        if self.device.is_cpu() { return u64::MAX; }
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    return mem.free / (1024 * 1024);
+                }
+            }
+        }
+        0
+    }
+
+    /// 지금 띄워도 되는 동시 순전파 스레드 수. 상한은 기존과 같은 3 입니다.
+    fn adaptive_thread_count(&self, len: usize) -> usize {
+        const MAX_THREADS: usize = 3;
+        if self.device.is_cpu() { return 1; }
+        let cap = MAX_THREADS.min(len).max(1);
+        let unit = Self::observed_unit_mb();
+        if unit == 0 {
+            // 미관측 : 기존 동작을 그대로 유지합니다.
+            return cap;
+        }
+        let free = self.free_vram_mb();
+        // 관측 단위의 2배를 안전 계수로 둡니다.
+        // (관측은 '피크 이후 잔여' 라 과소평가 방향이므로 여유를 둡니다)
+        let affordable = (free / unit.max(1) / 2).max(1) as usize;
+        let picked = affordable.min(cap);
+        if picked < cap {
+            println!(
+                "[EmbeddingModel] 🧵 [CROSSOVER] 자유 {}MB / 스레드당 관측 {}MB → 동시 순전파 {} → {} 로 축소합니다.",
+                free, unit, cap, picked
+            );
+        }
+        picked
+    }
+
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() { return Ok(Vec::new()); }
         
@@ -334,11 +398,11 @@ impl EmbeddingModel {
         // 🌟 [CRITICAL FIX] 장치(Device) 타입에 따른 스레드 동적 분기 및 VRAM 최적화
         // GPU(CUDA)일 경우 워프 스케줄링 한계와 PCIe 대역폭 병목을 방지하기 위해 가장 이상적인 3개로 제한합니다.
         // CPU일 경우 스레드 경합(Thread Contention)과 L3 캐시 오염을 막기 위해 무조건 1개(직렬)로 강제 고정합니다.
-        let num_threads = if self.device.is_cpu() {
-            1
-        } else {
-            3.min(texts.len())
-        }.max(1); 
+        //
+        // 🌟 [CROSSOVER] 상한 3 은 유지하되, 생성 모델과 동시 상주 중이라
+        //    여유가 얇으면 1~2 로 줄입니다. activation 이 스레드 수에 비례하므로
+        //    이것이 이 코드베이스에서 순간 피크를 줄이는 유일한 실효 축입니다.
+        let num_threads = self.adaptive_thread_count(texts.len());
         
         let chunk_size = (texts.len() + num_threads - 1) / num_threads; 
         
@@ -374,4 +438,47 @@ impl EmbeddingModel {
         
         Ok(results)
     }
+
+    /// 🌟 [CROSSOVER] 스레드 하나가 쓰는 순간 점유를 관측해 기록합니다.
+    ///
+    ///  ── 왜 embed_batch 안에서 재지 않는가 ──
+    ///   std::thread::scope 안에서는 모든 스레드가 동시에 돌고 있어
+    ///   '한 스레드분' 을 분리해 잴 수 없습니다.
+    ///   호출부가 (연산 전 free, 연산 후 free, 사용한 스레드 수)를 넘겨 주면
+    ///   총 점유를 스레드 수로 나눠 단위값을 얻습니다.
+    ///
+    ///  ── 누적 최대값을 쓰는 이유 ──
+    ///   짧은 텍스트만 들어온 배치는 과소평가됩니다. 그 값으로 스레드 수를
+    ///   정하면 다음에 긴 텍스트가 들어올 때 OOM 이 납니다.
+    ///   최대값을 유지하면 판정이 항상 보수적인 방향입니다.
+    pub fn record_unit_activation(free_before_mb: u64, free_after_mb: u64, threads: usize) {
+        if threads == 0 { return; }
+        if free_before_mb <= free_after_mb { return; }
+        let total = free_before_mb - free_after_mb;
+        let unit = (total / threads as u64).max(1);
+        let prev = EMBED_UNIT_ACTIVATION_MB.load(std::sync::atomic::Ordering::SeqCst);
+        if unit > prev {
+            EMBED_UNIT_ACTIVATION_MB.store(unit, std::sync::atomic::Ordering::SeqCst);
+            println!(
+                "[EmbeddingModel] 📏 [CROSSOVER] 스레드당 순간 점유 관측 갱신: {}MB (총 {}MB / {}스레드)",
+                unit, total, threads
+            );
+        }
+    }
+
+    /// 마지막 배치가 실제로 사용한 스레드 수. 호출부의 관측에 필요합니다.
+    pub fn last_thread_count(&self, len: usize) -> usize {
+        self.adaptive_thread_count(len)
+    }
 }
+
+/// 🌟 [CROSSOVER] 스레드 하나가 순전파 중 쓰는 VRAM(MB) 누적 최대 관측치.
+///
+///  ── 왜 전역 static 인가 ──
+///   EmbeddingModel 은 unload/reload 로 인스턴스가 계속 교체됩니다.
+///   구조체 필드에 두면 재로드마다 관측이 초기화되어
+///   매번 처음부터 3스레드로 시작하는 위험한 상태로 되돌아갑니다.
+///   프로세스 전역에 임베딩 모델은 하나뿐이므로 static 이 적절하며,
+///   model.rs 의 크로스오버 원장이 이미 같은 선례입니다.
+static EMBED_UNIT_ACTIVATION_MB: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);

@@ -1,31 +1,3 @@
-// =====================================================================
-// 🌟 [SIGLIP2 PHRASE CACHE] 앵커 구 임베딩 2단 영구 캐시
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 ──
-//   SigLIP2 텍스트 인코더는 27층 × 64토큰 × 1152차원입니다.
-//   구 하나를 벡터로 만드는 데 약 26 GFLOP 이 듭니다.
-//   그런데 우리가 인코딩하는 문자열은 전부 정적입니다.
-//     · logic.rs 의 TRADE_GROUPS / TRADE_GROUP_CODES / TRADE_DOC_TITLES
-//     · logic.rs 의 VISION_CHROME_ANCHOR
-//     · bias.json 의 trade_schema 필드 semantic / bias
-//   실측 문서 하나가 uniq 345구를 인코딩하므로 약 9 TFLOP,
-//   그리고 그 계산을 위해 1.4GB 짜리 텍스트 인코더를 VRAM 에 올려야 합니다.
-//   같은 문자열을 두 번째 문서에서 또 계산하는 것은 순수 낭비입니다.
-//
-//  ── 왜 디스크까지 가는가 ──
-//   scheduler.rs 의 음차 캐시가 (메모리 → Dexie) 2단인 것과 같은 이유입니다.
-//   앱을 재시작해도 앵커 사전은 바뀌지 않으므로, 프로세스 경계를 넘어 살아남아야
-//   '두 번째 실행부터는 텍스트 인코더를 아예 올리지 않는' 상태가 됩니다.
-//   vision_cache.rs 가 Qwen ViT 결과를 디스크에 굽는 것과 같은 계열입니다.
-//
-//  ── 정밀도 ──
-//   저장하는 값은 encode_phrases 가 만든 L2 정규화 f32 벡터 원본 그대로입니다.
-//   양자화도 차원 축소도 하지 않으므로 캐시 히트와 재계산의 결과가 비트 단위로 같습니다.
-//
-//  ── 용량 ──
-//   구 하나 = 8B(키) + 1152 × 4B = 4,616B.
-//   실측 345구 = 1.6MB. 상한 50,000구를 잡아도 231MB 입니다.
-// =====================================================================
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -60,8 +32,6 @@ impl PhraseCache {
         }
     }
 
-    /// 🌟 캐시 키. 토크나이저의 canonicalize 는 결정론이므로 원문만 해싱해도 안전합니다.
-    ///    dim / version 을 함께 넣어 모델 교체 시 자동 무효화됩니다.
     pub fn key_of(phrase: &str) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();

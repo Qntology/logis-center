@@ -1,9 +1,3 @@
-#![allow(unused_imports)]
-// 🌟 [SPLIT] 원본 model.rs 157~1405 행에서 이동.
-//    LogisModel 의 비공개 필드(current_size / qwen*_model_path / embedding_path /
-//    max_tokens_limit)를 만지므로, 반드시 model 의 '자식' 모듈이어야 합니다.
-//    형제 모듈(src/model_lifecycle.rs)로 두면 privacy 위반으로 컴파일이 깨집니다.
-
 use super::{LogisModel, ModelSize};   // ← 부모의 타입을 끌어옵니다
 use crate::utils;
 use anyhow::anyhow;
@@ -50,26 +44,105 @@ impl LogisModel {
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
             println!("[MODEL] CUDA Context synchronized and memory pool flushed.");
         }
+
+        // 🌟 [CROSSOVER] 임베딩만 내렸으므로 IDLE 이 아니라 '남은 슬롯 기준' 으로 맞춥니다.
+        //    생성 모델이 함께 상주 중이었다면 PHASE_GENERATION 이 되어야 하는데,
+        //    mark_crossover_idle 로 뭉뚱그리면 다음 enter_generation_phase 가
+        //    이미 올라와 있는 모델을 다시 올리려 합니다.
+        self.sync_crossover_phase().await;
+    }
+
+    // =====================================================================
+    // 🌟 [CROSSOVER] 생성 슬롯 전용 부분 반환
+    // ---------------------------------------------------------------------
+    //  ── 왜 deep_purge_resources 로 충분하지 않은가 ──
+    //   deep_purge 는 '공장 초기화' 성격입니다. 임베딩·SigLIP2·KV 스토리지까지
+    //   전부 파기하고 CUDA 동기화에 최대 10초를 씁니다.
+    //   그런데 크로스오버가 필요로 하는 것은 '생성 모델이 쥔 VRAM' 뿐입니다.
+    //   전체 퍼지를 쓰면 임베딩을 곧바로 다시 올려야 하므로
+    //   스왑 1회가 실질적으로 2회분 비용이 됩니다.
+    //
+    //  ── 무엇을 건드리지 않는가 ──
+    //   · embedding_model  : 반환 대상이 아닙니다. 그것이 이 함수의 존재 이유입니다.
+    //   · siglip2_model    : 비전 파이프라인이 별도로 release_siglip2 로 관리합니다.
+    //                        ensure_qwen3_5 의 SigLIP2 보호 분기와 충돌하지 않도록
+    //                        여기서는 손대지 않습니다.
+    //
+    //  ── 동기화 상한 ──
+    //   release_siglip2 와 같은 이유로 5초 상한을 둡니다. 동기화는 정확성이 아니라
+    //   반환 시점에만 영향을 주므로, 드라이버 스톨 시 영구 대기하는 편이 더 위험합니다.
+    // =====================================================================
+    pub async fn unload_generation_slots(&self, reason: &str) {
+        let _hold = self.hold_generation();
+
+        let had = {
+            self.generator.lock().await.is_some()
+                || self.qwen3_generator.lock().await.is_some()
+                || self.qwen3_5_generator.lock().await.is_some()
+        };
+        if !had {
+            println!("[CROSSOVER] ⚡ [GEN UNLOAD SKIP] 반환할 생성 슬롯이 없습니다. ({})", reason);
+            self.sync_crossover_phase().await;
+            return;
+        }
+
+        println!("[CROSSOVER] 🔻 [GEN UNLOAD] 생성 슬롯만 반환합니다. ({})", reason);
+        crate::models::qwen::generate::wait_for_global_io().await;
+
+        {
+            let mut gen = self.generator.lock().await;
+            if let Some(mut g) = gen.take() {
+                println!("[CROSSOVER] Dropping Qwen(0.6B) generator...");
+                let _ = g.clear_kv_cache();
+                let _ = g.qwen.drop_kv_storage();
+                drop(g);
+            }
+        }
+        {
+            let mut q3 = self.qwen3_generator.lock().await;
+            if let Some(mut g) = q3.take() {
+                println!("[CROSSOVER] Dropping Qwen3 generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+        }
+        {
+            let mut q35 = self.qwen3_5_generator.lock().await;
+            if let Some(mut g) = q35.take() {
+                println!("[CROSSOVER] Dropping Qwen3.5 generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+        }
+        {
+            *self.current_size.lock().await = None;
+        }
+
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let sync = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() {
+                        let _ = dev.synchronize();
+                    }
+                }),
+            ).await;
+            match sync {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => println!("[CROSSOVER] CUDA sync join error: {:?}", e),
+                Err(_) => println!("[CROSSOVER] ⚠️ CUDA sync 5s 상한 도달. 동기화 없이 진행합니다."),
+            }
+            // caching allocator 가 붙들고 있는 풀을 OS 로 밀어냅니다.
+            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+        }
+
+        self.sync_crossover_phase().await;
+        println!("[CROSSOVER] ✅ [GEN UNLOAD] 완료. 자유 {}MB", self.get_free_vram_mb());
     }
 
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
-        // 🌟 [GENERATION HOLD] 퍼지 자체도 전환 구간입니다.
-        //
-        //  ── 왜 필요한가 ──
-        //   Step 2 는 embedding_model 락을 블록 스코프로 잡았다 놓습니다.
-        //   그 직후 Step 3 의 spawn_blocking CUDA 동기화가 최대 10초 블로킹되는데,
-        //   그 창에서 ensure_embedding() 이 락을 잡고 방금 내린 모델을 다시 올립니다.
-        //   실측 로그가 이를 그대로 보여줍니다:
-        //     [DIAG-PURGE] Step 3: Synchronizing CUDA Context...
-        //     [MODEL] Loading Embedding Model on Cuda(...)      ← 퍼지 종료 전 재로드
-        //     [DIAG-PURGE] Step 4: Flushing OS Memory...
-        //   그 결과 Step 4 의 워킹셋 반환이 방금 올라온 모델을 대상으로 헛돌고,
-        //   퍼지가 사실상 무효화됩니다.
-        //
-        //  ── 중첩 안전성 ──
-        //   secure_vram_relay / ensure_qwen3 / ensure_qwen3_5 가 이미 홀드를 걸고
-        //   들어오는 경우 카운터가 2가 되지만, 각 가드가 Drop 되며 정확히 되돌아갑니다.
         let _purge_hold = self.hold_generation();
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
         crate::models::qwen::generate::wait_for_global_io().await; // [cite: 254]
@@ -179,6 +252,10 @@ impl LogisModel {
         }
 
         println!("[DIAG-PURGE] Aggressive Purge Complete.");
+        // 🌟 [CROSSOVER] 퍼지 후 모든 슬롯이 비었으므로 원장을 사실에 맞춥니다.
+        //    이 한 줄 덕분에 호출부마다 mark_crossover_idle 을 흩뿌릴 필요가 없습니다.
+        //    (이미 호출부에 남아 있는 mark_crossover_idle 은 멱등이라 무해합니다)
+        self.sync_crossover_phase().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -454,6 +531,11 @@ impl LogisModel {
                 };
                 if is_loaded {
                     println!("[RELAY] {:?} is already loaded. Skipping purge/reload.", target_size);
+                    // 🌟 [CROSSOVER] fast-path 는 아무것도 내리지 않습니다.
+                    //    임베딩이 함께 상주 중일 수 있으므로 실제 슬롯을 읽어 원장을 맞춥니다.
+                    //    (current_size 가드를 먼저 놓아야 뒤이은 조회가 막히지 않습니다)
+                    drop(current);
+                    self.sync_crossover_phase().await;
                     return Ok(());
                 } else {
                     // 🌟 [CRITICAL FIX] Background에서 로딩 중이라 객체(is_some)는 없지만, current_size는 target_size로 등록된 상태!
@@ -526,6 +608,9 @@ impl LogisModel {
         }
 
         println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
+        // 🌟 [CROSSOVER] 이 경로는 deep_purge 를 거쳤으므로 임베딩이 파기된 상태입니다.
+        //    그 사실을 추측하지 않고 슬롯에서 직접 읽어 원장에 반영합니다.
+        self.sync_crossover_phase().await;
         Ok(())
     }
 
@@ -597,16 +682,46 @@ impl LogisModel {
             //   '방금 퍼지했는가' 를 시간으로 재면 매직 상수가 됩니다.
             //   대신 '내릴 것이 실제로 남아 있는가' 라는 상태를 봅니다.
             //   내릴 것이 하나도 없으면 퍼지는 정의상 무의미한 연산입니다.
-            let purge_needed = {
+            // 🌟 [CROSSOVER] 임베딩을 '퍼지 트리거' 에서 분리합니다.
+            //
+            //  ── 무엇이 문제였나 ──
+            //   기존 purge_needed 는 embedding_model.is_some() 을 포함했습니다.
+            //   그래서 임베딩이 상주하기만 하면 예산과 무관하게 전체 퍼지가 돌고,
+            //   deep_purge Step 2 가 그 임베딩을 함께 파기했습니다.
+            //   크로스오버의 '동시 상주' 경로가 이 한 줄 때문에
+            //   구조적으로 도달 불가능했습니다.
+            //
+            //  ── 판정 근거 ──
+            //   임베딩은 이미 VRAM 을 점유한 상태이므로, 지금 측정한 자유 메모리는
+            //   '임베딩을 남긴 채 쓸 수 있는 양' 그 자체입니다.
+            //   그 값이 Qwen3 예산을 넘으면 임베딩을 내릴 이유가 없습니다.
+            //   예산은 디스크 가중치 크기에서 출발해 실측으로 교체되므로 상수가 아닙니다.
+            //
+            //  ── 무엇을 보수적으로 남겼는가 ──
+            //   다른 생성 슬롯이나 SigLIP2 가 살아 있으면 기존과 동일하게 전체 퍼지합니다.
+            //   그 경우는 어차피 무언가를 반드시 내려야 하고, 부분 반환으로 얻는 이득보다
+            //   기존 동작을 보존하는 쪽이 안전합니다.
+            let embed_resident = { self.embedding_model.lock().await.is_some() };
+            let other_resident = {
                 self.generator.lock().await.is_some()
                     || self.qwen3_5_generator.lock().await.is_some()
-                    || self.embedding_model.lock().await.is_some()
-                    || self.siglip2_model.lock().await.is_some()
             };
-            if purge_needed {
+            let vision_resident = { self.siglip2_model.lock().await.is_some() };
+            let keep_embedding = embed_resident
+                && !other_resident
+                && !vision_resident
+                && self.embedding_coexist_ok(ModelSize::Qwen3);
+
+            if other_resident || vision_resident || (embed_resident && !keep_embedding) {
                 // 🌟 [CRITICAL FIX] unload_generator가 소유권을 훔쳐가 KV 캐시 클리어를 방해하는 버그 해결!
                 // 바로 deep_purge_resources만 단독 호출하여 VRAM을 100% 안전하게 날려줍니다.
                 self.deep_purge_resources().await;
+            } else if keep_embedding {
+                println!(
+                    "[MODEL] 🤝 [CROSSOVER/COEXIST] 자유 {}MB >= Qwen3 예산 {}MB. 임베딩을 상주시킨 채 로드합니다. (퍼지 생략)",
+                    self.get_free_vram_mb(),
+                    self.generation_budget_mb(ModelSize::Qwen3)
+                );
             } else {
                 println!("[MODEL] ⚡ [PURGE SKIP] 해제 대상 슬롯이 하나도 없어 중복 퍼지를 생략합니다.");
             }
@@ -909,15 +1024,33 @@ impl LogisModel {
                 // 🌟 [DOUBLE PURGE ELIMINATED] ensure_qwen3 와 동일한 상태 판정입니다.
                 //    secure_vram_relay 가 이미 퍼지한 뒤 이 함수로 내려오면
                 //    내릴 것이 하나도 없는데도 CUDA 동기화 10초를 다시 씁니다.
-                let purge_needed = {
+                //
+                // 🌟 [CROSSOVER] ensure_qwen3 와 같은 이유로 임베딩을 트리거에서 뺍니다.
+                //    이 분기는 is_vision_pipeline_active == false 인 경우만 도달하므로
+                //    SigLIP2 는 여기서 이미 None 임이 보장됩니다.
+                //
+                //  ── Qwen3.5 는 2B 라 대부분 SWAP 으로 떨어집니다 ──
+                //   그것이 오판이 아니라 정확한 판정입니다. 2GB 를 임베딩 위에
+                //   얹을 수 있는 여유가 실제로 있을 때만 COEXIST 로 갑니다.
+                let embed_resident = { self.embedding_model.lock().await.is_some() };
+                let other_resident = {
                     self.generator.lock().await.is_some()
                         || self.qwen3_generator.lock().await.is_some()
                         || self.qwen3_5_generator.lock().await.is_some()
-                        || self.embedding_model.lock().await.is_some()
                 };
-                if purge_needed {
+                let keep_embedding = embed_resident
+                    && !other_resident
+                    && self.embedding_coexist_ok(ModelSize::Qwen3_5);
+
+                if other_resident || (embed_resident && !keep_embedding) {
                     // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
                     self.deep_purge_resources().await;
+                } else if keep_embedding {
+                    println!(
+                        "[MODEL] 🤝 [CROSSOVER/COEXIST] 자유 {}MB >= Qwen3.5 예산 {}MB. 임베딩을 상주시킨 채 로드합니다. (퍼지 생략)",
+                        self.get_free_vram_mb(),
+                        self.generation_budget_mb(ModelSize::Qwen3_5)
+                    );
                 } else {
                     println!("[MODEL] ⚡ [PURGE SKIP] 해제 대상 슬롯이 하나도 없어 중복 퍼지를 생략합니다.");
                 }
@@ -1037,19 +1170,40 @@ impl LogisModel {
             //       위의 GENERATION HOLD YIELD 가 담당합니다. 두 장치는 역할이 다릅니다.
             if !self.is_cpu_mode {
                 let free_mb = self.get_free_vram_mb();
-                // granite-embedding-97m-multilingual 은 대략 300MB 내외를 사용합니다.
-                let needed_mb: u64 = 350;
+                // 🌟 [CROSSOVER] 하드코딩 350MB 를 실측 기반 예산으로 교체합니다.
+                //
+                //  ── 왜 상수가 위험했나 ──
+                //   350 은 granite-97m 을 눈대중한 값이며, dtype·GPU·드라이버가 바뀌면
+                //   즉시 틀립니다. 과소평가되면 게이트를 통과한 뒤 로드에서 OOM 이 나고,
+                //   과대평가되면 여유가 있는데도 매번 전체 퍼지를 유발합니다.
+                //   embedding_budget_mb() 는 디스크 가중치 크기에서 출발해
+                //   첫 로드 전후의 free VRAM 차이로 실측값이 되며,
+                //   대량 배치에서 관측한 activation 여유까지 더해 돌려줍니다.
+                let needed_mb = self.embedding_budget_mb();
                 if free_mb < needed_mb {
                     println!(
-                        "[MODEL] ⚠️ [VRAM GATE] 자유 {}MB < 필요 {}MB. 순차 모드 진입을 위해 기존 모델을 언로드합니다.",
+                        "[MODEL] ⚠️ [VRAM GATE] 자유 {}MB < 예산 {}MB. 생성 슬롯을 먼저 반환합니다.",
                         free_mb, needed_mb
                     );
-                    // 락을 해제하지 않으면 deep_purge_resources 내부에서
+                    // 락을 해제하지 않으면 아래 반환 로직 내부에서
                     // 같은 뮤텍스를 다시 잡아 데드락이 됩니다.
                     drop(emb_guard);
-                    self.deep_purge_resources().await;
+
+                    // 🌟 [LADDER] ① 생성 슬롯만 반환 → ② 그래도 모자라면 전체 퍼지
+                    //   전체 퍼지는 SigLIP2 파기 + CUDA 동기화 최대 10초를 쓰므로
+                    //   정말 필요할 때만 도달하도록 단을 나눕니다.
+                    //   대부분의 경우 ①에서 끝나며, 그만큼 왕복 비용이 줄어듭니다.
+                    self.unload_generation_slots("embedding vram gate").await;
+                    if self.get_free_vram_mb() < needed_mb {
+                        println!(
+                            "[MODEL] ⚠️ [VRAM GATE] 생성 슬롯 반환 후에도 자유 {}MB < 예산 {}MB. 전체 퍼지로 승격합니다.",
+                            self.get_free_vram_mb(), needed_mb
+                        );
+                        self.deep_purge_resources().await;
+                    }
+
                     emb_guard = self.embedding_model.lock().await;
-                    println!("[MODEL] ✅ [VRAM GATE] 순차 모드 준비 완료. 기존 모델 언로드됨.");
+                    println!("[MODEL] ✅ [VRAM GATE] 순차 모드 준비 완료. 자유 {}MB", self.get_free_vram_mb());
                 }
             }
             let self_clone = self.embedding_path.clone();
