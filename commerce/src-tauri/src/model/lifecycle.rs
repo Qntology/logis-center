@@ -164,6 +164,7 @@ impl LogisModel {
             if let Some(mut g) = q3_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen3 Generator...");
                 g.clear_kv_cache(); // Qwen3 구조체에 구현된 캐시 클리어 호출
+                // 🌟 [VOCAB CHUNK] 편견 벡터는 상주분이 없으므로 별도 해제가 불필요합니다.
                 drop(g);
             }
         }
