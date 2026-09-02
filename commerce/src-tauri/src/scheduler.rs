@@ -3620,6 +3620,12 @@ pub async fn process_task(
                 .await?;
             emit_term(&format!("  {}", model.crossover_report()));
 
+            // 🌟 [PEAK SAMPLER] 아이템 루프 전 구간의 순간 점유를 추적합니다.
+            //    KV-PLAN 의 free 값은 generate '전' 스냅샷이라 연산 도중의
+            //    전이를 잡지 못합니다. 50ms 폴링이 그 사각지대를 메웁니다.
+            //    루프가 끝나면 Drop 이 자동으로 결과를 출력합니다.
+            let vram_probe = model.spawn_vram_sampler("list item extraction loop");
+
             for (idx, item_pug) in pug_list.iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
@@ -4431,6 +4437,8 @@ pub async fn process_task(
                     
                     let mut ignore_list: Vec<String> = global_ignore_list.clone();
                     let mut miss_counter = 0;
+                    // 🌟 [PEAK SAMPLER] 최저점이 어느 필드에서 나왔는지 귀속시킵니다.
+                    vram_probe.phase(format!("item {}/{} · field '{}'", idx + 1, total_items, field_name));
                     
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -4470,21 +4478,38 @@ pub async fn process_task(
                                 Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                             }
                         }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
-
-
+                        // 🌟 [PEAK SAMPLER] 재시도 회차를 라벨에 반영합니다.
+                        //    'color' 처럼 3회 재시도하는 필드가 피크의 주범인지
+                        //    이 라벨 하나로 판별됩니다.
+                        if miss_counter > 0 {
+                            vram_probe.phase(format!(
+                                "item {}/{} · field '{}' · retry {}",
+                                idx + 1, total_items, field_name, miss_counter
+                            ));
+                        }
+                        // 🌟 [MERGED CLEANUP] clear_kv_cache 와 synchronize 를 한 번의
+                        //    spawn_blocking 으로 합칩니다.
+                        //
+                        //  ── 왜 합치는가 ──
+                        //   기존에는 필드마다 스레드 홉이 2회 발생했습니다.
+                        //   13아이템 × 10필드 × 2 = 260회입니다.
+                        //   더 중요한 것은 '해제와 동기화 사이의 창' 이 사라진다는 점입니다.
+                        //   그 사이에 다른 태스크가 끼어들면 동기화가 해제분을
+                        //   반영하지 못한 채 지나갑니다.
                         let q3_clear_arc = model.qwen3_generator.clone();
+                        let dev_for_sync = if model.is_cpu_mode {
+                            None
+                        } else {
+                            Some(model.device_config.device.clone())
+                        };
                         let _ = tokio::task::spawn_blocking(move || {
                             if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
                                 gen.clear_kv_cache();
                             }
-                        }).await;
-
-                        if !model.is_cpu_mode {
-                            let dev = model.device_config.device.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
+                            if let Some(dev) = dev_for_sync {
                                 if dev.is_cuda() { let _ = dev.synchronize(); }
-                            }).await;
-                        }
+                            }
+                        }).await;
 
                         match res {
                             Ok(res_text) => {
@@ -4779,15 +4804,20 @@ pub async fn process_task(
                 }
                 
                 crate::models::qwen::generate::wait_for_global_io().await;
-            }
 
-            
-            
-            
-            
-            
-            
-            
+                // 🌟 [PEAK SAMPLER] 아이템 경계마다 누적 최저점을 보고합니다.
+                //    값이 아이템마다 계단식으로 내려가면 '누적',
+                //    특정 아이템에서만 한 번 크게 내려가면 '전이' 입니다.
+                //    이 한 줄로 두 가설이 갈립니다.
+                {
+                    let (base, low, worst) = vram_probe.snapshot();
+                    emit_term(&format!(
+                        "  📉 [VRAM TRACE] item {}/{} 종료 | 진입 {}MB → 누적 최저 {}MB (-{}MB) | 최저 단계 '{}' | 현재 {}MB",
+                        idx + 1, total_items, base, low, base.saturating_sub(low), worst,
+                        model.get_free_vram_mb()
+                    ));
+                }
+            }
             
             {
                 let total_extracted_items = all_extracted_items.len();

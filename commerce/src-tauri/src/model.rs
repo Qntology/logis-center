@@ -1,3 +1,4 @@
+use std::time::Duration;
 use crate::utils;
 use crate::models::qwen::generate::QwenVLGenerateModel;
 use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
@@ -90,6 +91,55 @@ pub struct GenerationHold(Arc<std::sync::atomic::AtomicU32>);
 impl Drop for GenerationHold {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 🌟 [PEAK SAMPLER] 구간 동안의 최저 free VRAM 과 그때의 단계 라벨을 잡습니다.
+///
+///  Drop 시 자동으로 정지하고 결과를 출력하므로, `?` 조기 반환이나
+///  패닉이 나도 백그라운드 태스크가 남지 않습니다.
+pub struct VramSampler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    min_free: Arc<std::sync::atomic::AtomicU64>,
+    phase: Arc<std::sync::Mutex<String>>,
+    worst_phase: Arc<std::sync::Mutex<String>>,
+    label: String,
+    baseline: u64,
+}
+
+impl VramSampler {
+    /// 지금부터의 단계 이름을 갱신합니다. 최저점 갱신 시 이 이름이 함께 기록됩니다.
+    pub fn phase(&self, name: impl Into<String>) {
+        if let Ok(mut p) = self.phase.lock() {
+            *p = name.into();
+        }
+    }
+
+    /// 중간 보고. 루프 안에서 주기적으로 찍어 추이를 볼 때 씁니다.
+    pub fn snapshot(&self) -> (u64, u64, String) {
+        let lo = self.min_free.load(std::sync::atomic::Ordering::SeqCst);
+        let w = self.worst_phase.lock().map(|s| s.clone()).unwrap_or_default();
+        (self.baseline, lo, w)
+    }
+}
+
+impl Drop for VramSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let lo = self.min_free.load(std::sync::atomic::Ordering::SeqCst);
+        if lo == u64::MAX { return; }
+        let w = self.worst_phase.lock().map(|s| s.clone()).unwrap_or_default();
+        if self.baseline > lo {
+            println!(
+                "[VRAM-PEAK] 🔺 {} | 진입 {}MB → 최저 {}MB | 순간 점유 +{}MB | 최저 시점 단계: '{}'",
+                self.label, self.baseline, lo, self.baseline - lo, w
+            );
+        } else {
+            println!(
+                "[VRAM-PEAK] ✅ {} | 진입 {}MB → 최저 {}MB | 순간 증가 없음",
+                self.label, self.baseline, lo
+            );
+        }
     }
 }
 
@@ -215,6 +265,16 @@ impl LogisModel {
     }
 
     /// 생성 모델을 올리는 데 필요한 VRAM(MB).
+    ///
+    ///  ── 정규화 임베딩 상주분 반영 ──
+    ///   qwen3/generate.rs 가 편견 계산을 위해 정규화 임베딩 행렬을
+    ///   1회 계산해 상주시킵니다. Qwen3-0.6B 기준
+    ///     vocab 151,936 × hidden 1,024 × 4바이트(F32) ≈ 594MB
+    ///   이 값을 예산에 더하지 않으면 COEXIST 판정이 낙관적이 되어
+    ///   임베딩과 함께 올린 직후 여유가 예상보다 600MB 적어집니다.
+    ///
+    ///   실측(GEN_RESIDENT_MB)이 들어오면 그 값에 이미 포함되므로
+    ///   디스크 추정치를 쓸 때만 더합니다. 이중 계산을 피하는 조건입니다.
     pub fn generation_budget_mb(&self, size: ModelSize) -> u64 {
         let dir = match size {
             ModelSize::Qwen => self.qwen_model_path.clone(),
@@ -223,10 +283,20 @@ impl LogisModel {
         };
         let disk = Self::path_footprint_mb(std::path::Path::new(&dir));
         let observed = GEN_RESIDENT_MB.load(XOrder::SeqCst);
-        // 실측은 '마지막에 올린 모델' 기준이라 크기가 다른 모델에는 부정확합니다.
-        // 두 값 중 큰 쪽을 택해 보수적으로 판정합니다.
-        disk.max(observed).max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
+        let base = if observed > 0 {
+            // 실측에는 정규화 행렬이 이미 포함되어 있습니다.
+            disk.max(observed)
+        } else {
+            // 디스크 추정치만 있을 때는 정규화 행렬 몫을 더합니다.
+            disk + Self::NORMALIZED_EMBED_MB
+        };
+        base.max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
     }
+
+    /// 정규화 임베딩 행렬(F32)의 대략적 상주 비용(MB).
+    ///   Qwen3-0.6B: 151,936 × 1,024 × 4B ≈ 594MB
+    /// 정확한 값은 첫 로드 후 GEN_RESIDENT_MB 실측이 대체합니다.
+    const NORMALIZED_EMBED_MB: u64 = 600;
 
     // ── 페이즈 상태 ────────────────────────────────────────────────
     pub fn crossover_phase(&self) -> u8 {
@@ -298,6 +368,64 @@ impl LogisModel {
     pub fn embedding_coexist_ok(&self, size: ModelSize) -> bool {
         if self.is_cpu_mode { return true; }
         self.get_free_vram_mb() >= self.generation_budget_mb(size)
+    }
+
+    // =====================================================================
+    // 🌟 [PEAK SAMPLER] 순간 점유를 잡아내는 백그라운드 표본기
+    // ---------------------------------------------------------------------
+    //  ── 왜 동기 측정으로는 안 되는가 ──
+    //   generate 앞뒤에서 get_free_vram_mb() 를 재면 '연산 전' 과 '연산 후' 만
+    //   보입니다. 문제의 1.5GB 는 연산 '도중' 에만 존재하고 반환되므로
+    //   앞뒤 값은 둘 다 평평하게 나옵니다.
+    //   로그의 KV-PLAN free 가 2308~2375 로 붙박이인 이유가 정확히 이것입니다.
+    //
+    //  ── 왜 별도 태스크인가 ──
+    //   generate 는 spawn_blocking 안에서 돕니다. 그 사이 tokio 런타임은
+    //   비어 있으므로 50ms 폴링이 실제 연산을 방해하지 않습니다.
+    //
+    //  ── 왜 NVML 을 태스크 안에서 1회만 여는가 ──
+    //   get_free_vram_mb() 는 호출마다 Nvml::init() 을 수행합니다.
+    //   50ms 폴링에 그대로 쓰면 측정 자체가 부하가 됩니다.
+    //
+    //  ── phase 라벨 ──
+    //   최저점을 갱신한 순간의 라벨을 함께 기록하므로,
+    //   "어느 필드의 어느 단계에서 튀었는가" 가 한 줄로 확정됩니다.
+    // =====================================================================
+    pub fn spawn_vram_sampler(&self, label: impl Into<String>) -> VramSampler {
+        let label = label.into();
+        let baseline = self.get_free_vram_mb();
+        let stop = Arc::new(AtomicBool::new(false));
+        let min_free = Arc::new(AtomicU64::new(u64::MAX));
+        let phase = Arc::new(std::sync::Mutex::new(String::from("(start)")));
+        let worst_phase = Arc::new(std::sync::Mutex::new(String::new()));
+
+        if !self.is_cpu_mode {
+            let gpu = self.device_config.gpu_id as u32;
+            let s = stop.clone();
+            let m = min_free.clone();
+            let p = phase.clone();
+            let w = worst_phase.clone();
+            tokio::spawn(async move {
+                use nvml_wrapper::Nvml;
+                let nvml = match Nvml::init() { Ok(n) => n, Err(_) => return };
+                while !s.load(XOrder::SeqCst) {
+                    if let Ok(dev) = nvml.device_by_index(gpu) {
+                        if let Ok(mem) = dev.memory_info() {
+                            let f = mem.free / (1024 * 1024);
+                            if f < m.load(XOrder::SeqCst) {
+                                m.store(f, XOrder::SeqCst);
+                                if let (Ok(cur), Ok(mut dst)) = (p.lock(), w.lock()) {
+                                    *dst = cur.clone();
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        }
+
+        VramSampler { stop, min_free, phase, worst_phase, label, baseline }
     }
 
     fn observe_embedding_cost(&self, free_before: u64) {

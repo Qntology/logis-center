@@ -22,7 +22,13 @@ pub struct Qwen3GenerateModel {
     eos_token_id2: u32,
     generation_config: Qwen3GenerationConfig,
     model_name: String,
+    normalized_embed_cache: Option<Tensor>,
+    prejudice_cache: std::collections::HashMap<String, Tensor>,
 }
+
+/// prejudice 캐시 엔트리 상한. 초과 시 전체를 비웁니다.
+/// 정확도가 아니라 VRAM 사용량에만 영향을 주므로 판정 임계치가 아닙니다.
+const PREJUDICE_CACHE_MAX: usize = 32;
 
 impl Qwen3GenerateModel {
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
@@ -49,9 +55,11 @@ impl Qwen3GenerateModel {
             eos_token_id2: generation_config.eos_token_id[1] as u32,
             generation_config,
             model_name: "qwen3".to_string(),
+            // 🌟 [PREJUDICE CACHE] 첫 요청 시 지연 생성됩니다.
+            normalized_embed_cache: None,
+            prejudice_cache: std::collections::HashMap::new(),
         })
     }
-
     pub fn init_from_gguf(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
@@ -122,7 +130,118 @@ impl Qwen3GenerateModel {
             eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
             generation_config,
             model_name: "qwen3".to_string(),
+            // 🌟 [PREJUDICE CACHE] 첫 요청 시 지연 생성됩니다.
+            normalized_embed_cache: None,
+            prejudice_cache: std::collections::HashMap::new(),
         })
+    }
+
+    // =====================================================================
+    // 🌟 [PREJUDICE CACHE] 공용 계산기
+    // ---------------------------------------------------------------------
+    //  기존에는 generate 와 generate_part 가 같은 클로저를 각각 복제해
+    //  갖고 있었습니다. 한쪽만 고치면 다른 쪽이 조용히 옛 동작을 유지하므로
+    //  단일 메서드로 통합합니다. 수식은 한 줄도 바꾸지 않았습니다.
+    // =====================================================================
+
+    /// 정규화된 임베딩 행렬을 확보합니다. 최초 1회만 계산하고 이후 재사용합니다.
+    ///
+    ///  ── 왜 이것만 따로 캐시하는가 ──
+    ///   all_normalized 는 target 과 무관한 '모델 가중치만의 함수' 입니다.
+    ///   그런데 기존 코드는 target 이 바뀔 때마다 622MB 텐서 3개를
+    ///   새로 만들었습니다. 한 번 만들어 두면 이후 순간 점유가 0 이 됩니다.
+    ///
+    ///  ── 왜 상주가 이득인가 ──
+    ///   상주 622MB vs 순간 1866MB. 게다가 순간 점유는 '지금 당장' 필요하지만
+    ///   상주분은 다른 할당과 경합하지 않습니다. VRAM 파편화도 줄어듭니다.
+    fn normalized_embeddings(&mut self) -> Result<Tensor> {
+        if let Some(t) = &self.normalized_embed_cache {
+            return Ok(t.clone());
+        }
+        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
+        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+        let all_norm = all_sqr.sqrt()?;
+        let all_normalized = all_embs.broadcast_div(&all_norm)?;
+        // 중간 텐서를 명시적으로 떨어뜨려 캐시 저장 시점의 겹침을 줄입니다.
+        drop(all_embs);
+        drop(all_sqr);
+        drop(all_norm);
+        if self.device.is_cuda() {
+            let _ = self.device.synchronize();
+        }
+        println!(
+            "[SEMANTIC-PREJUDICE] 🧊 정규화 임베딩 행렬을 1회 계산하여 캐시했습니다. (이후 재계산 없음)"
+        );
+        self.normalized_embed_cache = Some(all_normalized.clone());
+        Ok(all_normalized)
+    }
+
+    /// target 문자열에 대한 편견 벡터를 얻습니다. 같은 문자열이면 재계산하지 않습니다.
+    ///
+    ///  ── 캐시 키가 문자열인 이유 ──
+    ///   scheduler 가 만드는 dynamic_prej_str 은 필드마다 고정된 문자열이며
+    ///   아이템이 바뀌어도 달라지지 않습니다. 실측 로그에서 item 1 과
+    ///   item 13 의 general_insight 프롬프트가 바이트 단위로 동일합니다.
+    ///   따라서 문자열 자체가 정확한 캐시 키입니다.
+    ///
+    ///  ── 재시도가 공짜가 되는 이유 ──
+    ///   'color' 3회 재시도는 전부 같은 target 이므로 2·3회차가 캐시 적중입니다.
+    ///   실측에서 전부 실패로 끝난 9회 재시도의 VRAM 비용이 0 이 됩니다.
+    fn prejudice_vector(&mut self, target_text: &str) -> Result<Tensor> {
+        if let Some(t) = self.prejudice_cache.get(target_text) {
+            return Ok(t.clone());
+        }
+
+        let target_ids = self.tokenizer.text_encode_vec(target_text.to_string(), false)?;
+        if target_ids.is_empty() {
+            return Err(anyhow::anyhow!("empty target tokens"));
+        }
+
+        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+        let target_emb_sum = target_emb.sum_keepdim(1)?;
+        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
+        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
+
+        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
+        let target_normalized = target_vec.broadcast_div(&target_norm)?;
+
+        // 🌟 622MB × 3 이 여기서 사라집니다. 캐시된 행렬을 그대로 씁니다.
+        let all_normalized = self.normalized_embeddings()?;
+
+        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
+        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
+        //    수식은 원본 그대로입니다. 계산 결과가 달라지지 않습니다.
+        let threshold = Tensor::new(0.65f32, &self.device)?;
+        let one = Tensor::new(1.0f32, &self.device)?;
+        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
+        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
+
+        if self.prejudice_cache.len() >= PREJUDICE_CACHE_MAX {
+            println!(
+                "[SEMANTIC-PREJUDICE] 🧹 편견 캐시 {}개가 상한에 도달하여 비웁니다. (정확도 영향 없음)",
+                self.prejudice_cache.len()
+            );
+            self.prejudice_cache.clear();
+        }
+        self.prejudice_cache
+            .insert(target_text.to_string(), prejudice.clone());
+
+        // 로그를 짧게 바꿉니다. 기존에는 수천 자 target 전문을 130회 출력해
+        // 터미널이 그것만으로 가득 찼고, 정작 필요한 진단이 묻혔습니다.
+        println!(
+            "[SEMANTIC-PREJUDICE] 🆕 편견 벡터 신규 계산 (target {}자 | 캐시 {}개)",
+            target_text.chars().count(),
+            self.prejudice_cache.len()
+        );
+        Ok(prejudice)
+    }
+
+    /// 모델을 내리기 전에 캐시를 비웁니다. deep_purge 경로가 호출합니다.
+    pub fn clear_prejudice_cache(&mut self) {
+        self.normalized_embed_cache = None;
+        self.prejudice_cache.clear();
     }
 
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
@@ -276,47 +395,22 @@ impl Qwen3GenerateModel {
         let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         
         let mut gen_text = String::new();
-
         // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
+        //
+        //  ── 인라인 클로저를 제거한 이유 ──
+        //   기존 클로저는 호출 때마다 vocab 전체(151,936 × 1,024)의 F32 사본을
+        //   3개 만들어 순간 1.6GB 를 점유했습니다.
+        //   [VRAM TRACE] 가 item 1 에서 -1632MB 를 기록한 뒤 item 11 까지
+        //   갱신되지 않은 것이 '누적이 아니라 반복되는 순간 전이' 라는 증거입니다.
+        //   prejudice_vector() 가 정규화 행렬과 결과 벡터를 모두 캐시하므로
+        //   같은 target 은 두 번째부터 순간 점유가 0 이 됩니다.
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
         if let Some(target_text) = semantic_prejudice {
-            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
-                if !target_ids.is_empty() {
-                    let calc_prej = || -> Result<Tensor> {
-                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
-                        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
-                        let target_emb_sum = target_emb.sum_keepdim(1)?;
-                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
-                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
-                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.device)?;
-                        let one = Tensor::new(1.0f32, &self.device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(prejudice)
-                    };
-                    match calc_prej() {
-                        Ok(prej) => {
-                            semantic_prejudice_tensor = Some(prej);
-                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
-                        }
-                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
-                    }
-                }
+            match self.prejudice_vector(target_text) {
+                Ok(prej) => semantic_prejudice_tensor = Some(prej),
+                Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
-
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
         let chunk_size = 256;
         let mut next_token = 0;
@@ -610,47 +704,19 @@ impl Qwen3GenerateModel {
         let space_double_slash_id = self.tokenizer.text_encode_vec(" //".to_string(), false).unwrap_or_default().into_iter().next().unwrap_or(999999);
         
         let mut gen_text = String::new();
-
         // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
+        //
+        //  generate_part 와 동일한 이유로 인라인 클로저를 제거합니다.
+        //  두 함수가 같은 계산을 복제해 갖고 있으면 한쪽만 고쳤을 때
+        //  다른 쪽이 조용히 옛 동작(1.6GB 순간 점유)을 유지합니다.
+        //  실측 로그의 130회 [SEMANTIC-PREJUDICE] 는 전부 이 generate 경로입니다.
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
         if let Some(target_text) = semantic_prejudice {
-            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
-                if !target_ids.is_empty() {
-                    let calc_prej = || -> Result<Tensor> {
-                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
-                        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
-                        let target_emb_sum = target_emb.sum_keepdim(1)?;
-                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
-                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
-                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        let all_embs = self.qwen3.get_embed_tokens().to_dtype(DType::F32)?;
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.device)?;
-                        let one = Tensor::new(1.0f32, &self.device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(prejudice)
-                    };
-                    match calc_prej() {
-                        Ok(prej) => {
-                            semantic_prejudice_tensor = Some(prej);
-                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
-                        }
-                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
-                    }
-                }
+            match self.prejudice_vector(target_text) {
+                Ok(prej) => semantic_prejudice_tensor = Some(prej),
+                Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
-
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
         let chunk_size = 256;
         let mut next_token = 0;

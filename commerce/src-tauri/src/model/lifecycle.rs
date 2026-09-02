@@ -103,6 +103,8 @@ impl LogisModel {
             if let Some(mut g) = q3.take() {
                 println!("[CROSSOVER] Dropping Qwen3 generator...");
                 g.clear_kv_cache();
+                // 🌟 [PREJUDICE CACHE] 부분 반환 경로도 정규화 행렬을 함께 놓습니다.
+                g.clear_prejudice_cache();
                 drop(g);
             }
         }
@@ -164,6 +166,10 @@ impl LogisModel {
             if let Some(mut g) = q3_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen3 Generator...");
                 g.clear_kv_cache(); // Qwen3 구조체에 구현된 캐시 클리어 호출
+                // 🌟 [PREJUDICE CACHE] 정규화 임베딩(622MB)과 편견 벡터를 반환합니다.
+                //    clear_kv_cache 는 의도적으로 이것을 건드리지 않으므로
+                //    모델을 실제로 내리는 이 지점에서만 명시적으로 비웁니다.
+                g.clear_prejudice_cache();
                 drop(g);
             }
         }
