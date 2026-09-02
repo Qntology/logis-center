@@ -509,26 +509,33 @@ impl LogisModel {
         self.enter_generation_phase(size, None, cancel, false, kv_name, reason).await
     }
 
-    /// 🌟 [BATCH ADAPTATION] 여유에 맞춰 임베딩 배치 크기를 줄입니다.
+    /// 🌟 [DEPRECATED] 배치 크기로는 activation 을 줄일 수 없습니다.
     ///
-    ///  가중치가 아니라 '연산 중 순간 점유' 를 깎는 축입니다.
-    ///  100개를 한 번에 넣으면 activation 이 그만큼 커지므로,
-    ///  동시 상주 중이거나 여유가 얇을 때는 잘게 나눕니다.
-    ///  결과는 항상 1 이상이라 호출부의 chunks() 가 패닉하지 않습니다.
+    ///  ── 왜 무력한가 ──
+    ///   models/embedding.rs 의 embed_batch 는 이름과 달리 배치 연산이 아닙니다.
+    ///     for text in chunk { local_res.push(self.embed(text)...) }
+    ///   내부는 1건씩 순회이고, 시퀀스 길이도 embed() 안에서 512 로 고정입니다.
+    ///   따라서 '한 번에 몇 건을 넘기는가' 는 순간 점유에 영향이 없습니다.
+    ///
+    ///  ── 진짜 축은 무엇인가 ──
+    ///   embed_batch 는 GPU 에서 3개 스레드를 띄워 동시에 순전파합니다.
+    ///   Attention::forward 가 .contiguous() 를 12회 호출하며 매번 새 텐서를
+    ///   할당하므로, 그 순간 점유가 스레드 수만큼 배가됩니다.
+    ///   조절 대상은 그 스레드 수이며, embedding.rs 의 adaptive_thread_count 가
+    ///   관측값을 근거로 3 → 2 → 1 로 줄입니다.
+    ///
+    ///  ── 왜 삭제하지 않는가 ──
+    ///   호출부가 남아 있으면 컴파일 경고로 즉시 드러나야 하고,
+    ///   나중에 '배치를 줄이면 되지 않나' 는 같은 판단이 재발하는 것을 막기 위해
+    ///   무력한 이유를 코드에 남깁니다. 항상 요청값을 그대로 돌려줍니다.
+    #[deprecated(
+        since = "crossover-v2",
+        note = "embed_batch 는 1건씩 순회하므로 배치 크기가 activation 에 영향이 없습니다. \
+                embedding.rs 의 adaptive_thread_count 를 사용하십시오."
+    )]
+    #[allow(dead_code)]
     pub fn adaptive_embed_batch(&self, requested: usize) -> usize {
-        if self.is_cpu_mode || requested <= 1 { return requested.max(1); }
-        let free = self.get_free_vram_mb();
-        let unit = self.embedding_budget_mb().max(1);
-        let picked = if free >= unit * 4 {
-            requested
-        } else if free >= unit * 3 {
-            (requested / 2).max(16)
-        } else if free >= unit * 2 {
-            (requested / 4).max(8)
-        } else {
-            (requested / 8).max(4)
-        };
-        picked.min(requested).max(1)
+        requested.max(1)
     }
 
     /// 🌟 크로스오버 진단 요약. 태스크 종료 시 한 줄로 남깁니다.

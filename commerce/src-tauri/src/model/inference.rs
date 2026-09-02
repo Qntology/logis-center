@@ -495,41 +495,67 @@ impl crate::model::LogisModel {
 
         self.ensure_embedding().await?;
 
-        // ── ③ 여유에 맞춘 청크 크기 결정 ──
-        //    가중치가 아니라 '연산 중 순간 점유' 를 깎는 축입니다.
-        //    동시 상주 중이거나 여유가 얇으면 잘게 나눕니다.
-        let batch = self.adaptive_embed_batch(miss_texts.len());
+        // ── ③ 실연산 규모 로깅 ──
+        //
+        //  🌟 [CROSSOVER / 정정] embedding.rs 대조 결과 embed_batch 는
+        //     이름과 달리 배치 연산이 아니라 self.embed(text) 1건씩 순회입니다.
+        //     시퀀스 길이도 embed() 내부에서 512 로 고정되어 있습니다.
+        //     따라서 '한 번에 몇 건을 넘기는가' 는 activation 에 영향이 없고,
+        //     실제 축은 embed_batch 내부의 '동시 순전파 스레드 수' 입니다.
+        //     그 조절은 embedding.rs 의 adaptive_thread_count 가 담당하며,
+        //     여기서는 청킹으로 activation 을 줄이려 하지 않습니다.
+        //
+        //  ── 그래도 청킹을 남기는 이유 ──
+        //     한 번에 수천 건을 넘기면 embed_batch 가 결과 Vec 전체를
+        //     RAM 에 한꺼번에 들고 있게 됩니다. 그것은 VRAM 이 아니라 RAM 축이며,
+        //     아래 상한은 그 목적만 갖습니다. VRAM 판정과 무관합니다.
+        const RAM_CHUNK: usize = 512;
         if hit_count > 0 || dup_folded > 0 {
             println!(
-                "[MODEL] 🧮 [EMBED BATCH] 요청 {}건 | 캐시 적중 {}건 | 배치 내 중복 {}건 접음 | 실연산 {}건 | 청크 {}",
-                texts.len(), hit_count, dup_folded, miss_texts.len(), batch
+                "[MODEL] 🧮 [EMBED BATCH] 요청 {}건 | 캐시 적중 {}건 | 배치 내 중복 {}건 접음 | 실연산 {}건",
+                texts.len(), hit_count, dup_folded, miss_texts.len()
             );
         }
 
         let free_before = self.get_free_vram_mb();
         let embedding_model_arc = self.embedding_model.clone();
         let miss_for_compute = miss_texts.clone();
+        let miss_len = miss_texts.len();
 
-        let computed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Vec<f32>>> {
-            // 🌟 락을 '한 번만' 잡고 청크를 순회합니다.
-            //    이 스코프가 끝날 때까지 모델이 파기될 수 없으므로
-            //    중간 청크가 0벡터로 대체되는 무증상 손상이 원천 차단됩니다.
-            let guard = embedding_model_arc.blocking_lock();
-            let model = match guard.as_ref() {
-                Some(m) => m,
-                None => return Ok(vec![vec![0.0; 384]; miss_for_compute.len()]),
-            };
-            let mut acc: Vec<Vec<f32>> = Vec::with_capacity(miss_for_compute.len());
-            for part in miss_for_compute.chunks(batch) {
-                let v = model
-                    .embed_batch(part)
-                    .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
-                acc.extend(v);
-            }
-            Ok(acc)
-        }).await??;
+        let (computed, used_threads) = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(Vec<Vec<f32>>, usize)> {
+                // 🌟 락을 '한 번만' 잡고 순회합니다.
+                //    이 스코프가 끝날 때까지 모델이 파기될 수 없으므로
+                //    중간에 0벡터로 대체되는 무증상 손상이 원천 차단됩니다.
+                let guard = embedding_model_arc.blocking_lock();
+                let model = match guard.as_ref() {
+                    Some(m) => m,
+                    None => return Ok((vec![vec![0.0; 384]; miss_for_compute.len()], 0)),
+                };
+                // 관측에 쓸 실제 스레드 수를 미리 확보합니다.
+                let threads = model.last_thread_count(miss_for_compute.len().min(RAM_CHUNK));
+                let mut acc: Vec<Vec<f32>> = Vec::with_capacity(miss_for_compute.len());
+                for part in miss_for_compute.chunks(RAM_CHUNK) {
+                    let v = model
+                        .embed_batch(part)
+                        .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                    acc.extend(v);
+                }
+                Ok((acc, threads))
+            },
+        ).await??;
 
+        // 🌟 [CROSSOVER] 두 축을 함께 관측합니다.
+        //    ① 총 순간 점유 → embedding_budget_mb 에 반영 (가중치 축)
+        //    ② 스레드당 점유 → adaptive_thread_count 에 반영 (activation 축)
         self.observe_activation_headroom(free_before);
+        if used_threads > 0 && miss_len > 0 {
+            crate::models::embedding::EmbeddingModel::record_unit_activation(
+                free_before,
+                self.get_free_vram_mb(),
+                used_threads,
+            );
+        }
 
         // ── ④ 결과 흩뿌리기 + 캐시 적재 ──
         {

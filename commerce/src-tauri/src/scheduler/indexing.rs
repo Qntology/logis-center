@@ -494,11 +494,17 @@ pub async fn index_item_chunks(
 
     // 🌟 [SINGLE BATCH] 세 종류를 한 번에 넣어 왕복을 3회 → 1회로 줄입니다.
     //
-    //  ── 청킹을 여기서 하지 않는 이유 ──
-    //   호출부에서 쪼개면 scheduler.rs 의 다른 수십 개 호출부는 보호받지 못합니다.
-    //   get_embedding_batch 내부가 adaptive_embed_batch 로 여유에 맞춰 쪼개고,
-    //   activation 여유 관측과 캐시 적재까지 함께 수행합니다.
-    //   여기서는 '한 번에 넘긴다' 는 사실만 남깁니다.
+    //  ── 왜 한 번에 넘겨도 안전한가 ──
+    //   embed_batch 는 내부적으로 1건씩 순전파하므로 순간 점유가
+    //   '넘긴 건수' 에 비례하지 않습니다. 실제 activation 축인
+    //   동시 순전파 스레드 수는 embedding.rs 의 adaptive_thread_count 가
+    //   여유를 보고 3 → 2 → 1 로 줄입니다.
+    //   여기서 쪼개면 왕복만 늘고 피크는 그대로입니다.
+    //
+    //  ── 캐시 이득 ──
+    //   anchor_texts 는 property 가 같으면 문자열이 완전히 동일합니다.
+    //   get_embedding_batch 의 배치 내 중복 제거가 한 벌로 접어 주므로,
+    //   세 종류를 함께 넘길수록 실연산이 오히려 줄어듭니다.
     //
     //  ── 길이 보존 ──
     //   get_embedding_batch 는 입력과 같은 길이를 반환하는 것이 계약이므로
