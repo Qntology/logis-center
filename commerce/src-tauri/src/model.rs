@@ -266,15 +266,12 @@ impl LogisModel {
 
     /// 생성 모델을 올리는 데 필요한 VRAM(MB).
     ///
-    ///  ── 정규화 임베딩 상주분 반영 ──
-    ///   qwen3/generate.rs 가 편견 계산을 위해 정규화 임베딩 행렬을
-    ///   1회 계산해 상주시킵니다. Qwen3-0.6B 기준
-    ///     vocab 151,936 × hidden 1,024 × 4바이트(F32) ≈ 594MB
-    ///   이 값을 예산에 더하지 않으면 COEXIST 판정이 낙관적이 되어
-    ///   임베딩과 함께 올린 직후 여유가 예상보다 600MB 적어집니다.
-    ///
-    ///   실측(GEN_RESIDENT_MB)이 들어오면 그 값에 이미 포함되므로
-    ///   디스크 추정치를 쓸 때만 더합니다. 이중 계산을 피하는 조건입니다.
+    ///  ── 편견 계산분을 예산에 더하지 않는 이유 ──
+    ///   qwen3/generate.rs 와 qwen3_5/generate.rs 는 편견 벡터를
+    ///   VOCAB_CHUNK 블록 루프로 계산하며, 상주하는 텐서가 없습니다.
+    ///   블록 버퍼(134MB)는 계산 중에만 존재하는 activation 이므로
+    ///   ACTIVATION_HEADROOM_MB 축이 이미 담당합니다.
+    ///   여기서 또 더하면 이중 계산이 되어 예산이 과대평가됩니다.
     pub fn generation_budget_mb(&self, size: ModelSize) -> u64 {
         let dir = match size {
             ModelSize::Qwen => self.qwen_model_path.clone(),
@@ -283,20 +280,10 @@ impl LogisModel {
         };
         let disk = Self::path_footprint_mb(std::path::Path::new(&dir));
         let observed = GEN_RESIDENT_MB.load(XOrder::SeqCst);
-        let base = if observed > 0 {
-            // 실측에는 정규화 행렬이 이미 포함되어 있습니다.
-            disk.max(observed)
-        } else {
-            // 디스크 추정치만 있을 때는 정규화 행렬 몫을 더합니다.
-            disk + Self::NORMALIZED_EMBED_MB
-        };
-        base.max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
+        // 실측은 '마지막에 올린 모델' 기준이라 크기가 다른 모델에는 부정확합니다.
+        // 두 값 중 큰 쪽을 택해 보수적으로 판정합니다.
+        disk.max(observed).max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
     }
-
-    /// 정규화 임베딩 행렬(F32)의 대략적 상주 비용(MB).
-    ///   Qwen3-0.6B: 151,936 × 1,024 × 4B ≈ 594MB
-    /// 정확한 값은 첫 로드 후 GEN_RESIDENT_MB 실측이 대체합니다.
-    const NORMALIZED_EMBED_MB: u64 = 600;
 
     // ── 페이즈 상태 ────────────────────────────────────────────────
     pub fn crossover_phase(&self) -> u8 {
