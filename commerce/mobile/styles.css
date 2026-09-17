@@ -396,6 +396,20 @@ h3 { margin: 0; font-size: 0.8rem; }
 .logis-result.sales    { border-left: 3px solid var(--primary); }
 .logis-result.tracking { border-left: 3px solid #4ade80; }
 .logis-result.event    { border-left: 3px solid #fbbf24; }
+.logis-result.shipping { border-left: 3px solid #6366f1; }
+.logis-result.analytic { border-left: 3px solid #a855f7; }
+.logis-result.unknown  { border-left: 3px solid rgba(0, 0, 0, 0.15); }
+
+.logis-relate { display: none; }
+
+.logis-info.search-badge strong { color: #6366f1; }
+.logis-info.search-badge .value { font-size: 0.7rem; color: #6366f1; }
+
+.logis-info.doc_type .value {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
 
 /* ============================================================
    5. Navigation Tree  (.logis-branch / .logis-label)
@@ -551,6 +565,22 @@ h3 { margin: 0; font-size: 0.8rem; }
   font-size: 0.75rem;
 }
 .markdown-body { line-height: 1.5; }
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  margin: 12px 0;
+}
+.markdown-body pre {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  background: #111 !important;
+  color: #e5e5e5 !important;
+  padding: 12px !important;
+  border-radius: 8px;
+  overflow-x: auto;
+}
 
 /* 🌟 모바일 진행률 로그 (renderExtractionProgress 가 생성) */
 #extraction-log-mobile { display: flex; flex-direction: column; gap: 8px; }

@@ -8,7 +8,6 @@ use std::sync::{Arc, RwLock};
 const CACHE_MAGIC: u32 = 0x5347_4C32; // "SGL2"
 const CACHE_VERSION: u32 = 1;
 const EMBED_DIM: usize = 1152;
-/// 디스크 레코드 상한. 앵커 사전은 수백 구 규모이므로 사실상 도달하지 않습니다.
 const MAX_RECORDS: usize = 50_000;
 
 pub struct PhraseCache {
@@ -66,7 +65,6 @@ impl PhraseCache {
         let ver = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
         let dim = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
         if magic != CACHE_MAGIC || ver != CACHE_VERSION || dim != self.dim {
-            // 스키마가 다르면 통째로 폐기합니다. 잘못된 벡터를 쓰는 것보다 재계산이 안전합니다.
             let _ = std::fs::remove_file(&self.path);
             println!("[SIGLIP2-PHRASE] 캐시 스키마 불일치 → 폐기 후 재생성합니다.");
             return;
@@ -119,7 +117,6 @@ impl PhraseCache {
         }
     }
 
-    /// 새로 계산한 구를 메모리에 넣고 디스크에 append 합니다.
     pub fn put_batch(&self, items: &[(String, Arc<Vec<f32>>)]) {
         if items.is_empty() {
             return;
@@ -189,7 +186,6 @@ impl PhraseCache {
         );
     }
 
-    /// 🌟 [LOAD GATE] 이 구 목록이 전부 캐시에 있으면 텍스트 인코더를 올릴 필요가 없습니다.
     pub fn all_cached(&self, phrases: &[String]) -> bool {
         self.ensure_loaded();
         let map = self.mem.read().unwrap();
@@ -211,8 +207,6 @@ impl PhraseCache {
     }
 }
 
-/// 🌟 전역 싱글턴. 모델 인스턴스가 파기/재생성되어도 캐시는 살아남아야 의미가 있습니다.
-///    (vision_cache.rs 의 VISION_CACHE 와 같은 수명 정책)
 pub static SIGLIP2_PHRASE_CACHE: Lazy<PhraseCache> = Lazy::new(|| {
     let p = crate::utils::get_app_dir()
         .join("cache")

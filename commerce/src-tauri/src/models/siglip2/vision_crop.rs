@@ -13,6 +13,8 @@ pub struct CropPlan {
     pub margin: f32,
     pub patch_count: usize,
     pub top_field: String,
+    pub owned_patches: usize,
+    pub twin_of: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,51 @@ struct Component {
     peak: f32,
     /// 이 성분 안의 점수 합
     total: f32,
+}
+
+impl Component {
+    fn area(&self) -> usize {
+        (self.r_max - self.r_min + 1) * (self.c_max - self.c_min + 1)
+    }
+}
+
+const COL_BAND_UP_ROWS: usize = 1;
+const BAND_FOREIGN_RUN: usize = 2;
+
+const CROP_SNAP_IOU: f32 = 0.85;
+const CROP_TWIN_IOU: f32 = 0.90;
+
+const RESCUE_MAX: usize = 5;
+const RESCUE_MIN_CELLS: usize = 3;
+const RESCUE_SPLIT_PASSES: usize = 4;
+const RESCUE_OWNER_MIN_SHARE: f32 = 0.20;
+
+const SPLIT_COVERAGE_FLOOR: f32 = 0.70;
+const SPLIT_CROP_LIMIT: usize = 2;
+const SPLIT_MIN_HOT: usize = 8;
+const SPLIT_MIN_GAIN: usize = 4;
+
+const CROP_MERGE_IOU: f32 = 0.25;
+const MERGE_FILL_DROP: f32 = 0.65;
+const MERGE_PAGE_RATIO: f32 = 0.55;
+
+fn px_iou(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> f32 {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = a.2.min(b.2);
+    let y1 = a.3.min(b.3);
+    if x0 >= x1 || y0 >= y1 {
+        return 0.0;
+    }
+    let inter = (x1 - x0) as f32 * (y1 - y0) as f32;
+    let aa = (a.2.saturating_sub(a.0) as f32 * a.3.saturating_sub(a.1) as f32).max(1.0);
+    let bb = (b.2.saturating_sub(b.0) as f32 * b.3.saturating_sub(b.1) as f32).max(1.0);
+    let uni = aa + bb - inter;
+    if uni <= 0.0 { 0.0 } else { inter / uni }
+}
+
+fn px_covers(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+    outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
 }
 
 fn positive_stats(scores: &[f32]) -> (f32, f32, usize) {
@@ -170,6 +217,84 @@ fn split_oversized(
     }
 }
 
+fn split_component_quantile(
+    comp: &Component,
+    field: &[f32],
+    rows: usize,
+    cols: usize,
+    area_cap: usize,
+) -> Vec<Component> {
+    let n = rows * cols;
+    let mut local = vec![-1.0f32; n];
+    let mut vals: Vec<f32> = Vec::with_capacity(comp.indices.len());
+    for &i in comp.indices.iter() {
+        if i < n && i < field.len() {
+            local[i] = field[i];
+            vals.push(field[i]);
+        }
+    }
+    if vals.len() < 2 {
+        return vec![comp.clone()];
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut best: Vec<Component> = vec![comp.clone()];
+    for k in 1..=4usize {
+        let q = (0.35 + 0.15 * k as f32).min(0.95);
+        let pos = (((vals.len() - 1) as f32) * q).round() as usize;
+        let gate = vals[pos.min(vals.len() - 1)];
+        let subs = extract_components(&local, rows, cols, gate);
+        if subs.is_empty() {
+            continue;
+        }
+        if subs.len() > best.len() {
+            best = subs.clone();
+        }
+        if subs.len() > 1 && subs.iter().all(|s| s.area() <= area_cap) {
+            return subs;
+        }
+    }
+    best
+}
+
+fn split_until_fits(
+    comps: Vec<Component>,
+    field: &[f32],
+    rows: usize,
+    cols: usize,
+    area_cap: usize,
+    passes: usize,
+) -> (Vec<Component>, usize) {
+    let mut cur = comps;
+    let mut done = 0usize;
+    for _ in 0..passes {
+        if !cur.iter().any(|c| c.area() > area_cap) {
+            break;
+        }
+        let mut next: Vec<Component> = Vec::new();
+        let mut progressed = false;
+        for c in cur.into_iter() {
+            if c.area() <= area_cap {
+                next.push(c);
+                continue;
+            }
+            let parts = split_component_quantile(&c, field, rows, cols, area_cap);
+            if parts.len() > 1 {
+                progressed = true;
+                next.extend(parts);
+            } else {
+                next.push(c);
+            }
+        }
+        cur = next;
+        done += 1;
+        if !progressed {
+            break;
+        }
+    }
+    (cur, done)
+}
+
 fn expand_row_band(
     comp: &Component,
     content: &[f32],
@@ -194,6 +319,82 @@ fn expand_row_band(
     }
 
     (comp.r_min, comp.r_max, c_min, c_max)
+}
+
+fn expand_col_band(
+    gbox: (usize, usize, usize, usize),
+    content: &[f32],
+    gate: f32,
+    rows: usize,
+    cols: usize,
+    max_height: usize,
+    owned: Option<&[bool]>,
+) -> ((usize, usize, usize, usize), String) {
+    let (mut r_min, mut r_max, c_min, c_max) = gbox;
+    let cap = if max_height == 0 { rows } else { max_height.max(1) };
+
+    let band_has = |r: usize| -> bool {
+        (c_min..=c_max).any(|c| {
+            let idx = r * cols + c;
+            idx < content.len() && content[idx] > gate
+        })
+    };
+    let band_owned = |r: usize| -> bool {
+        match owned {
+            None => true,
+            Some(map) => (c_min..=c_max).any(|c| {
+                let idx = r * cols + c;
+                idx < map.len() && map[idx]
+            }),
+        }
+    };
+
+    let mut note = String::new();
+    let mut run = 0usize;
+    while r_max + 1 < rows && (r_max - r_min + 1) < cap {
+        let nr = r_max + 1;
+        if !band_has(nr) {
+            note = format!("아래 r{} 가 밴드 여백", nr);
+            break;
+        }
+        if band_owned(nr) {
+            run = 0;
+        } else {
+            run += 1;
+            if run > BAND_FOREIGN_RUN {
+                note = format!("아래 r{} 부터 남의 영토가 {}줄 연속", nr, run);
+                break;
+            }
+        }
+        r_max = nr;
+    }
+    if note.is_empty() && (r_max - r_min + 1) >= cap {
+        note = format!("면적 상한(높이 {}행) 도달", cap);
+    }
+
+    let mut run = 0usize;
+    let mut up_left = COL_BAND_UP_ROWS;
+    while up_left > 0 && r_min > 0 && (r_max - r_min + 1) < cap {
+        let nr = r_min - 1;
+        if !band_has(nr) {
+            break;
+        }
+        if band_owned(nr) {
+            run = 0;
+        } else {
+            run += 1;
+            if run > BAND_FOREIGN_RUN {
+                break;
+            }
+        }
+        r_min = nr;
+        up_left -= 1;
+    }
+
+    if note.is_empty() {
+        note = "격자 끝".to_string();
+    }
+    ((r_min, r_max, c_min, c_max), note)
 }
 
 fn table_union(
@@ -410,38 +611,53 @@ fn ensure_min_size(
 fn presence_gate(
     heatmaps: &[CategoryHeatmap],
     n: usize,
+    identity_category: &str,
     emit: &dyn Fn(&str),
-) -> std::collections::HashSet<String> {
+) -> (std::collections::HashSet<String>, Vec<Option<usize>>) {
     use std::collections::{HashMap, HashSet};
     let mut wins: HashMap<String, usize> = HashMap::new();
+    let mut owner_of: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
         let mut best = f32::MIN;
-        let mut owner: Option<&str> = None;
-        for hm in heatmaps.iter() {
+        let mut owner: Option<usize> = None;
+        for (hi, hm) in heatmaps.iter().enumerate() {
             if i >= hm.scores.len() {
                 continue;
             }
             if hm.scores[i] > best {
                 best = hm.scores[i];
-                owner = Some(hm.category.as_str());
+                owner = Some(hi);
             }
         }
         if let Some(o) = owner {
             if best > 0.0 {
-                *wins.entry(o.to_string()).or_insert(0) += 1;
+                owner_of[i] = Some(o);
+                *wins.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
             }
         }
     }
     let mut out: HashSet<String> = HashSet::new();
     for hm in heatmaps.iter() {
         let w = wins.get(&hm.category).copied().unwrap_or(0);
-        // header 는 문서 기본키를 담당하므로 게이트를 면제합니다.
-        if w > 0 || hm.category == "header" {
+        let is_identity = !identity_category.is_empty() && hm.category == identity_category;
+        if hm.absent && !is_identity {
+            emit(&format!(
+                "    ⚪ [PRESENCE GATE] '{}' 부재 — {}",
+                hm.category,
+                if hm.absent_reason.is_empty() {
+                    "경쟁 영토 없음"
+                } else {
+                    &hm.absent_reason
+                }
+            ));
+            continue;
+        }
+        if w > 0 || is_identity {
             out.insert(hm.category.clone());
             if w == 0 {
                 emit(&format!(
-                    "    🪪 [PRESENCE GATE / HEADER EXEMPT] 'header' 는 argmax 패치가 0개지만 문서 기본키(doc_number)를 담당하므로 면제합니다. (Top: {:+.4})",
-                    hm.top_score
+                    "    🪪 [PRESENCE GATE / IDENTITY EXEMPT] '{}' 는 argmax 패치가 0개지만 문서 기본키를 담당하므로 면제합니다. (Top: {:+.4})",
+                    hm.category, hm.top_score
                 ));
             }
         } else {
@@ -451,7 +667,12 @@ fn presence_gate(
             ));
         }
     }
-    out
+    let owned_cnt = owner_of.iter().filter(|o| o.is_some()).count();
+    emit(&format!(
+        "    🧭 [TERRITORY MAP] 패치 {}개 중 {}개가 소유자를 확정했습니다. 이 맵을 세로 밴드 확장의 정지 근거와 구제 지분 계산에 재사용합니다.",
+        n, owned_cnt
+    ));
+    (out, owner_of)
 }
 
 fn ensure_identity_band_crop(
@@ -460,14 +681,17 @@ fn ensure_identity_band_crop(
     content: &[f32],
     content_gate: f32,
     grid: &PatchGrid,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    identity_category: &str,
+    identity_field: &str,
     emit: &dyn Fn(&str),
 ) {
     let rows = grid.grid_rows;
     let cols = grid.grid_cols;
-    if rows < 4 || cols == 0 {
+    if rows < 4 || cols == 0 || identity_category.is_empty() {
         return;
     }
-    let hm = match heatmaps.iter().find(|h| h.category == "header") {
+    let hm = match heatmaps.iter().find(|h| h.category == identity_category) {
         Some(h) => h,
         None => return,
     };
@@ -501,7 +725,7 @@ fn ensure_identity_band_crop(
             let cx = (c as f32 + 0.5) * cw;
             let cy = (r as f32 + 0.5) * ch;
             let hit = plans.iter().any(|p| {
-                p.category == "header"
+                p.category == identity_category
                     && cx >= p.bbox.0 as f32
                     && cx <= p.bbox.2 as f32
                     && cy >= p.bbox.1 as f32
@@ -518,8 +742,8 @@ fn ensure_identity_band_crop(
     }
     if cov * 2 >= tot {
         emit(&format!(
-            "    ✅ [IDENTITY BAND] 'header' 가 식별 밴드 r{}~{} 의 내용 {}/{} 를 이미 점유하고 있습니다.",
-            band_start, band_end, cov, tot
+            "    ✅ [IDENTITY BAND] '{}' 가 식별 밴드 r{}~{} 의 내용 {}/{} 를 이미 점유하고 있습니다.",
+            identity_category, band_start, band_end, cov, tot
         ));
         return;
     }
@@ -560,164 +784,262 @@ fn ensure_identity_band_crop(
         }
     }
 
+    let (lg, il, bl) = legibility.count_in_bbox(bbox, grid.orig_width, grid.orig_height);
+    if lg == 0 {
+        emit(&format!(
+            "    ⛔ [IDENTITY BAND SKIP] '{}' 식별 밴드 r{}~{} c{}~{} 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). 기본키가 이 밴드에 인쇄되어 있지 않으므로 빈 크롭을 추가하지 않습니다.",
+            identity_category, band_start, band_end, c0, c1, il, bl
+        ));
+        return;
+    }
+
     emit(&format!(
-        "    🪪 [IDENTITY BAND GUARANTEE] 'header' 가 식별 밴드 내용을 {}/{} 밖에 못 담아 전용 크롭을 추가합니다. r{}~{} c{}~{} → px({},{})-({},{}) | Peak: {:+.4}",
-        cov, tot, band_start, band_end, c0, c1, bbox.0, bbox.1, bbox.2, bbox.3,
-        if peak == f32::MIN { 0.0 } else { peak }
+        "    🪪 [IDENTITY BAND GUARANTEE] '{}' 가 식별 밴드 내용을 {}/{} 밖에 못 담아 전용 크롭을 추가합니다. r{}~{} c{}~{} → px({},{})-({},{}) | Peak: {:+.4} | 판독 가능 {}",
+        identity_category, cov, tot, band_start, band_end, c0, c1,
+        bbox.0, bbox.1, bbox.2, bbox.3,
+        if peak == f32::MIN { 0.0 } else { peak }, lg
     ));
     plans.push(CropPlan {
-        category: "header".to_string(),
+        category: identity_category.to_string(),
         bbox,
         score: if peak == f32::MIN { 0.0 } else { peak },
         margin: 0.0,
         patch_count: (band_end - band_start + 1) * (c1 - c0 + 1),
-        top_field: "doc_number".to_string(),
+        top_field: identity_field.to_string(),
+        owned_patches: 0,
+        twin_of: String::new(),
     });
 }
 
-fn rescue_uncovered_bands(
+fn rescue_uncovered_cells(
     plans: &mut Vec<CropPlan>,
     heatmaps: &[CategoryHeatmap],
+    owner_of: &[Option<usize>],
     content: &[f32],
     content_gate: f32,
     grid: &PatchGrid,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    area_cap: usize,
     emit: &dyn Fn(&str),
 ) {
     let rows = grid.grid_rows;
     let cols = grid.grid_cols;
-    if rows == 0 || cols == 0 || heatmaps.is_empty() {
+    let n = rows * cols;
+    if n == 0 || heatmaps.is_empty() {
         return;
     }
     let cw = grid.orig_width as f32 / cols as f32;
     let ch = grid.orig_height as f32 / rows as f32;
 
-    let mut need: Vec<bool> = vec![false; rows];
-    let mut total_lost = 0usize;
-    for r in 0..rows {
-        let mut tot = 0usize;
-        let mut cov = 0usize;
-        for c in 0..cols {
-            let i = r * cols + c;
-            if i >= content.len() || content[i] <= content_gate {
-                continue;
-            }
-            tot += 1;
-            let cx = (c as f32 + 0.5) * cw;
-            let cy = (r as f32 + 0.5) * ch;
-            let hit = plans.iter().any(|p| {
-                cx >= p.bbox.0 as f32
-                    && cx <= p.bbox.2 as f32
-                    && cy >= p.bbox.1 as f32
-                    && cy <= p.bbox.3 as f32
-            });
-            if hit {
-                cov += 1;
-            }
+    let mut hole = vec![false; n];
+    let mut holes = 0usize;
+    for i in 0..n {
+        if i >= content.len() || content[i] <= content_gate {
+            continue;
         }
-        if tot > 0 && cov * 2 < tot {
-            need[r] = true;
-            total_lost += tot - cov;
+        let r = i / cols;
+        let c = i % cols;
+        let cx = (c as f32 + 0.5) * cw;
+        let cy = (r as f32 + 0.5) * ch;
+        let covered = plans.iter().any(|p| {
+            cx >= p.bbox.0 as f32
+                && cx <= p.bbox.2 as f32
+                && cy >= p.bbox.1 as f32
+                && cy <= p.bbox.3 as f32
+        });
+        if !covered {
+            hole[i] = true;
+            holes += 1;
         }
     }
-    if total_lost == 0 {
-        emit("    ✅ [COVERAGE GUARANTEE] 모든 내용 행이 최소 하나의 크롭에 포함되어 있습니다.");
+    if holes == 0 {
+        emit("    ✅ [COVERAGE GUARANTEE] 모든 내용 칸이 최소 하나의 크롭에 포함되어 있습니다.");
         return;
     }
 
-    let mut bands: Vec<(usize, usize)> = Vec::new();
-    let mut r = 0usize;
-    while r < rows {
-        if !need[r] {
-            r += 1;
+    let mut miss_rows: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if hole[i] {
+            let r = i / cols;
+            if !miss_rows.contains(&r) {
+                miss_rows.push(r);
+            }
+        }
+    }
+    emit(&format!(
+        "    ⚠️ [COVERAGE GUARANTEE] 내용 칸 {}개가 어떤 크롭에도 없습니다 (행 {:?}). 행 단위로만 세면 같은 행의 다른 열이 통째로 빠져도 통과합니다 — 좌우로 떨어진 두 섬을 한 밴드로 묶으면 그 사이 여백까지 삼킵니다.",
+        holes,
+        miss_rows.iter().take(12).collect::<Vec<_>>()
+    ));
+
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for i in 0..n.min(content.len()) {
+        let v = content[i];
+        if v == f32::MIN || !v.is_finite() {
             continue;
         }
-        let start = r;
-        while r + 1 < rows && need[r + 1] {
-            r += 1;
-        }
-        bands.push((start, r));
-        r += 1;
+        if v < lo { lo = v; }
+        if v > hi { hi = v; }
     }
+    if lo == f32::MAX {
+        lo = 0.0;
+        hi = 1.0;
+    }
+    let span = if hi > lo { hi - lo } else { 1.0 };
+
+    let mut field = vec![-1.0f32; n];
+    for i in 0..n {
+        if !hole[i] {
+            continue;
+        }
+        let v = if i < content.len() && content[i] != f32::MIN && content[i].is_finite() {
+            content[i]
+        } else {
+            lo
+        };
+        field[i] = (v - lo) / span + 1e-3;
+    }
+
+    let blobs = extract_components(&field, rows, cols, 0.0);
+    let before_n = blobs.len();
+    let first_over = blobs.iter().filter(|c| c.area() > area_cap).count();
+    let (mut blobs, passes) =
+        split_until_fits(blobs, &field, rows, cols, area_cap, RESCUE_SPLIT_PASSES);
+    if first_over > 0 {
+        let left = blobs.iter().filter(|c| c.area() > area_cap).count();
+        emit(&format!(
+            "    ✂️ [RESCUE SPLIT] 미커버 덩이 {}개가 면적 상한 {}칸을 넘어 {}개 → {}개로 쪼갰습니다 ({}회 반복 / 잔여 초과 {}개). 한 번만 쪼개면 갈라진 조각이 다시 상한을 넘어도 그대로 버려지므로 더 갈라지지 않을 때까지 분위수 게이트를 올려 가며 반복합니다.",
+            first_over, area_cap, before_n, blobs.len(), passes, left
+        ));
+    }
+
+    blobs.sort_by(|a, b| b.indices.len().cmp(&a.indices.len()));
 
     let min_w = ((grid.orig_width as f32 * 0.12) as u32).max(64);
     let min_h = ((grid.orig_height as f32 * 0.06) as u32).max(48);
+    let blob_n = blobs.len();
+    let mut added = 0usize;
 
-    for (r0, r1) in bands {
-        let mut c0 = cols;
-        let mut c1 = 0usize;
-        for rr in r0..=r1 {
-            for c in 0..cols {
-                let i = rr * cols + c;
-                if i < content.len() && content[i] > content_gate {
-                    if c < c0 {
-                        c0 = c;
-                    }
-                    if c > c1 {
-                        c1 = c;
-                    }
-                }
-            }
+    for comp in blobs.iter() {
+        if added >= RESCUE_MAX {
+            break;
         }
-        if c0 > c1 {
-            c0 = 0;
-            c1 = cols.saturating_sub(1);
+        if comp.indices.len() < RESCUE_MIN_CELLS {
+            continue;
         }
-
-        let mut owner = String::new();
-        let mut owner_field = String::new();
-        let mut best = f32::MIN;
-        for hm in heatmaps.iter() {
-            let m = (rows * cols).min(hm.scores.len());
-            for rr in r0..=r1 {
-                for c in c0..=c1 {
-                    let i = rr * cols + c;
-                    if i >= m {
-                        continue;
-                    }
-                    if hm.scores[i] > best {
-                        best = hm.scores[i];
-                        owner = hm.category.clone();
-                        owner_field = hm.top_field.clone();
-                    }
-                }
-            }
-        }
-        if owner.is_empty() {
+        if comp.area() > area_cap {
+            emit(&format!(
+                "    ⛔ [RESCUE SKIP] 미커버 덩이 grid(r{}~{}, c{}~{}) 은 {}칸으로 상한 {}칸을 넘습니다. 쪼개지지 않는 큰 여백이라 크롭하지 않습니다 — 이 자리에 통 크롭을 만들면 여러 카테고리 글자가 한 축으로 몰립니다.",
+                comp.r_min, comp.r_max, comp.c_min, comp.c_max, comp.area(), area_cap
+            ));
             continue;
         }
 
-        // 이미 같은 카테고리·같은 밴드로 추가된 식별 밴드 크롭과 중복되면 건너뜁니다.
-        let raw = to_pixel_bbox((r0, r1, c0, c1), grid);
+        let mut owner_hi: Option<usize> = None;
+        let mut best_rank = f32::MIN;
+        let mut best_share = 0.0f32;
+        let mut best_score = f32::MIN;
+        let mut near = String::new();
+        let mut near_share = 0.0f32;
+
+        for (hi, hm) in heatmaps.iter().enumerate() {
+            let mut own = 0usize;
+            let mut sum = 0.0f32;
+            let mut peak = f32::MIN;
+            for &i in comp.indices.iter() {
+                if i >= hm.scores.len() || i >= owner_of.len() {
+                    continue;
+                }
+                if owner_of[i] != Some(hi) {
+                    continue;
+                }
+                own += 1;
+                sum += hm.scores[i];
+                if hm.scores[i] > peak {
+                    peak = hm.scores[i];
+                }
+            }
+            let share = own as f32 / comp.indices.len().max(1) as f32;
+            if share > near_share {
+                near_share = share;
+                near = hm.category.clone();
+            }
+            if own == 0 || share < RESCUE_OWNER_MIN_SHARE {
+                continue;
+            }
+            let rank = share * (sum / own as f32);
+            if rank > best_rank {
+                best_rank = rank;
+                best_share = share;
+                best_score = peak;
+                owner_hi = Some(hi);
+            }
+        }
+
+        let hi = match owner_hi {
+            Some(v) => v,
+            None => {
+                emit(&format!(
+                    "    ⛔ [RESCUE OWNER] 미커버 덩이 grid(r{}~{}, c{}~{}) 은 어느 카테고리도 지분이 {:.0}% 를 넘지 못합니다 (최고 '{}' {:.0}%). 지분에 평균 점수를 곱한 값을 지분 임계와 비교하면 한 칸짜리 봉우리가 점수만으로 문턱을 넘으므로, 문턱은 지분만 / 순위는 지분×평균으로 나눕니다.",
+                    comp.r_min, comp.r_max, comp.c_min, comp.c_max,
+                    RESCUE_OWNER_MIN_SHARE * 100.0,
+                    if near.is_empty() { "-" } else { &near },
+                    near_share * 100.0
+                ));
+                continue;
+            }
+        };
+
+        let gbox = (comp.r_min, comp.r_max, comp.c_min, comp.c_max);
+        let raw = to_pixel_bbox(gbox, grid);
         let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
-        let dup = plans.iter().any(|p| {
-            p.category == owner
-                && p.bbox.1 <= bbox.1
-                && p.bbox.3 >= bbox.3
-                && p.bbox.0 <= bbox.0
-                && p.bbox.2 >= bbox.2
-        });
-        if dup {
+
+        let (lg, il, bl) = legibility.count_in_bbox(bbox, grid.orig_width, grid.orig_height);
+        if lg == 0 {
+            emit(&format!(
+                "    ⛔ [COVERAGE SKIP] 미커버 덩이 grid(r{}~{}, c{}~{}) 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). 로고 테두리나 도장이 내용 마스크를 통과한 자리이며, STEP 5 의 EMPTY CROP SKIP 이 같은 기준으로 거부하므로 크롭을 만들지 않습니다.",
+                comp.r_min, comp.r_max, comp.c_min, comp.c_max, il, bl
+            ));
+            continue;
+        }
+
+        if plans.iter().any(|p| px_iou(p.bbox, bbox) >= CROP_SNAP_IOU) {
             continue;
         }
 
         emit(&format!(
-            "    🩹 [COVERAGE RESCUE] 미커버 행 밴드 r{}~{} (c{}~{}) 를 '{}' 소유로 추가 크롭합니다. → px({},{})-({},{}) | Peak: {:+.4}",
-            r0, r1, c0, c1, owner, bbox.0, bbox.1, bbox.2, bbox.3, best
+            "    🩹 [COVERAGE RESCUE] 미커버 덩이 r{}~{} c{}~{} ({}칸) 를 '{}' 소유(지분 {:.0}%)로 전용 크롭합니다. → px({},{})-({},{}) | Peak: {:+.4} | 판독 가능 {} — 기존 크롭을 넓히지 않습니다.",
+            comp.r_min, comp.r_max, comp.c_min, comp.c_max, comp.indices.len(),
+            heatmaps[hi].category, best_share * 100.0,
+            bbox.0, bbox.1, bbox.2, bbox.3,
+            if best_score == f32::MIN { 0.0 } else { best_score }, lg
         ));
         plans.push(CropPlan {
-            category: owner,
+            category: heatmaps[hi].category.clone(),
             bbox,
-            score: best,
+            score: if best_score == f32::MIN { 0.0 } else { best_score },
             margin: 0.0,
-            patch_count: (r1 - r0 + 1) * (c1 - c0 + 1),
-            top_field: owner_field,
+            patch_count: comp.indices.len(),
+            top_field: heatmaps[hi].top_field.clone(),
+            owned_patches: (best_share * comp.indices.len() as f32).round() as usize,
+            twin_of: String::new(),
         });
+        added += 1;
     }
+
+    emit(&format!(
+        "    🩹 [COVERAGE RESCUE] 미커버 칸 {}개를 덩이 {}개로 묶어 큰 것부터 {}건만 전용 크롭했습니다 (상한 {}건 — 크롭이 늘면 VLM 호출과 업스케일 버퍼가 함께 늘어납니다).",
+        holes, blob_n, added, RESCUE_MAX
+    ));
 }
 
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    table_categories: &[&str],
+    identity_category: &str,
+    identity_field: &str,
     emit: &dyn Fn(&str),
 ) -> Vec<CropPlan> {
     if heatmaps.is_empty() || grid.len() == 0 {
@@ -735,9 +1057,21 @@ pub fn plan_crops(
         content_cnt, n, content_gate
     ));
 
-    let present = presence_gate(heatmaps, n, emit);
+    let legible_cnt = (0..n).filter(|&i| legibility.is_legible(i)).count();
+    emit(&format!(
+        "    🔎 [BLANK GATE] 판독 가능 패치 {}/{} | 교차 판독 가능 패치가 0개인 후보 영역은 크롭하지 않습니다. STEP 5 의 EMPTY CROP SKIP 이 정확히 같은 기준(count_in_bbox)으로 호출을 거부하므로, 계획만 무르게 두면 업스케일 버퍼를 잡았다가 한 글자도 못 읽고 버립니다.",
+        legible_cnt, n
+    ));
+
+    let (present, owner_of) = presence_gate(heatmaps, n, identity_category, emit);
 
     let area_cap = (n / present.len().max(1)).max(4);
+
+    let region_blank = |bbox: (u32, u32, u32, u32)| -> (bool, usize, usize, usize) {
+        let (lg, il, bl) =
+            legibility.count_in_bbox(bbox, grid.orig_width, grid.orig_height);
+        (lg == 0, lg, il, bl)
+    };
 
     // 🌟 [LOG] 히트맵 → 크롭 전환 전 전체 상태 요약
     emit(&format!(
@@ -768,7 +1102,7 @@ pub fn plan_crops(
     let mut per_cat: Vec<(String, String, Vec<(usize, usize, usize, usize)>, Vec<f32>, Vec<usize>)> =
         Vec::new();
 
-    for hm in heatmaps.iter() {
+    for (hi, hm) in heatmaps.iter().enumerate() {
         // 🌟 [PRESENCE GATE] 이 문서에 인쇄되지 않은 축은 크롭 경쟁 자체에 넣지 않습니다.
         //    빈 영역을 2B 모델에게 보내면 반드시 무언가를 창작합니다.
         if !present.contains(&hm.category) {
@@ -812,22 +1146,38 @@ pub fn plan_crops(
         }
 
         // ③ 표 전용 카테고리는 행 밴드를 union 해 표 전체를 잡습니다.
-        let is_table_cat = hm.category == "items" || hm.category == "containers";
+        let is_table_cat = table_categories.iter().any(|c| *c == hm.category.as_str());
+
+        let owned_mask: Vec<bool> = owner_of
+            .iter()
+            .map(|o| matches!(o, Some(x) if *x == hi))
+            .collect();
 
         let mut gboxes: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut peaks: Vec<f32> = Vec::new();
         let mut counts: Vec<usize> = Vec::new();
+        let mut blank_skipped = 0usize;
 
         if is_table_cat {
             if let Some(tb) = table_union(&comps, &content, content_gate, rows, cols) {
                 let area = (tb.1 - tb.0 + 1) * (tb.3 - tb.2 + 1);
-                emit(&format!(
-                    "    🧾 [TABLE UNION] '{}' | 표 밴드 r{}~{}, c{}~{} ({}패치) 로 통합",
-                    hm.category, tb.0, tb.1, tb.2, tb.3, area
-                ));
-                gboxes.push(tb);
-                peaks.push(comps[0].peak);
-                counts.push(area);
+                let px = to_pixel_bbox(tb, grid);
+                let (blank, lg, il, bl) = region_blank(px);
+                if blank {
+                    blank_skipped += 1;
+                    emit(&format!(
+                        "    ⛔ [EMPTY REGION SKIP] '{}' 표 밴드 r{}~{}, c{}~{} 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). 히트맵 봉우리가 표 괘선이나 얼룩에 찍힌 것이므로 성분 단위 크롭으로 넘어갑니다.",
+                        hm.category, tb.0, tb.1, tb.2, tb.3, il, bl
+                    ));
+                } else {
+                    emit(&format!(
+                        "    🧾 [TABLE UNION] '{}' | 표 밴드 r{}~{}, c{}~{} ({}패치 / 판독 가능 {}) 로 통합",
+                        hm.category, tb.0, tb.1, tb.2, tb.3, area, lg
+                    ));
+                    gboxes.push(tb);
+                    peaks.push(comps[0].peak);
+                    counts.push(area);
+                }
             }
         }
 
@@ -841,16 +1191,55 @@ pub fn plan_crops(
                         hm.category, comp.c_min, comp.c_max, expanded.2, expanded.3
                     ));
                 }
-                gboxes.push(expanded);
+
+                let width = (expanded.3 - expanded.2 + 1).max(1);
+                let cap_h = (area_cap / width).max(2);
+                let (grown, stop) = expand_col_band(
+                    expanded,
+                    &content,
+                    content_gate,
+                    rows,
+                    cols,
+                    cap_h,
+                    Some(&owned_mask),
+                );
+                if grown.0 != expanded.0 || grown.1 != expanded.1 {
+                    emit(&format!(
+                        "    ↕️ [COL BAND] '{}' | r{}~{} → r{}~{} (같은 열 밴드의 아래 값 셀 편입 — 이 서식은 라벨이 위, 값이 아래라 가로만 넓히면 값 행이 크롭 밖에 남습니다) | 정지: {}",
+                        hm.category, expanded.0, expanded.1, grown.0, grown.1, stop
+                    ));
+                }
+
+                let px = to_pixel_bbox(grown, grid);
+                let (blank, _lg, il, bl) = region_blank(px);
+                if blank {
+                    blank_skipped += 1;
+                    emit(&format!(
+                        "    ⛔ [EMPTY REGION SKIP] '{}' 후보 grid(r{}~{}, c{}~{}) 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). 봉우리가 여백이나 판독불가 얼룩에 찍힌 것이므로 다음 후보 영역으로 넘어갑니다 — 빈 크롭을 VLM 에 보내면 없는 사실이 생성됩니다.",
+                        hm.category, grown.0, grown.1, grown.2, grown.3, il, bl
+                    ));
+                    continue;
+                }
+
+                gboxes.push(grown);
                 peaks.push(comp.peak);
                 counts.push(comp.indices.len());
             }
         }
 
+        if gboxes.is_empty() {
+            emit(&format!(
+                "    ⚪ [NO REGION] '{}' 는 후보 영역 {}개가 전부 판독 가능 패치 0개였습니다. 이 문서에 인쇄되지 않은 축으로 보고 크롭하지 않습니다.",
+                hm.category, blank_skipped
+            ));
+            continue;
+        }
+
         emit(&format!(
-            "    🧩 [COMPONENTS] '{}' | 영역 {}개 | Gate: {:+.4} | Top: {}({:+.4})",
+            "    🧩 [COMPONENTS] '{}' | 영역 {}개 (빈 영역 {}개 제외) | Gate: {:+.4} | Top: {}({:+.4})",
             hm.category,
             gboxes.len(),
+            blank_skipped,
             gate,
             if hm.top_field.is_empty() { "-" } else { &hm.top_field },
             hm.top_score
@@ -998,6 +1387,49 @@ pub fn plan_crops(
         let raw = to_pixel_bbox(gbox, grid);
         let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
 
+        {
+            let (blank, _lg, il, bl) = region_blank(bbox);
+            if blank {
+                emit(&format!(
+                    "    ⛔ [EMPTY CROP SKIP / PLAN] '{}' 최종 px({},{})-({},{}) 안에 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). ensure_min_size 가 여백 쪽으로 부풀린 결과이므로 계획 단계에서 버립니다.",
+                    per_cat[ci].0, bbox.0, bbox.1, bbox.2, bbox.3, il, bl
+                ));
+                continue;
+            }
+        }
+
+        let margin = {
+            let terr = heatmaps
+                .iter()
+                .find(|h| h.category == per_cat[ci].0)
+                .map(|h| h.mean_margin)
+                .unwrap_or(0.0);
+            if terr > margin { terr } else { margin }
+        };
+
+        let owned_patches = {
+            let cw = grid.orig_width as f32 / cols as f32;
+            let ch = grid.orig_height as f32 / rows as f32;
+            match heatmaps.iter().position(|h| h.category == per_cat[ci].0) {
+                Some(h) => (0..n)
+                    .filter(|&i| {
+                        if owner_of.get(i).copied().flatten() != Some(h) {
+                            return false;
+                        }
+                        let r = i / cols;
+                        let c = i % cols;
+                        let cx = (c as f32 + 0.5) * cw;
+                        let cy = (r as f32 + 0.5) * ch;
+                        cx >= bbox.0 as f32
+                            && cx <= bbox.2 as f32
+                            && cy >= bbox.1 as f32
+                            && cy <= bbox.3 as f32
+                    })
+                    .count(),
+                None => 0,
+            }
+        };
+
         // 🌟 [LOG] 크롭이 히트맵 활성 패치를 얼마나 커버하는지 계산
         {
             let hm_opt = heatmaps.iter().find(|h| h.category == per_cat[ci].0);
@@ -1034,6 +1466,22 @@ pub fn plan_crops(
                         per_cat[ci].0, (1.0 - coverage) * 100.0
                     ));
                 }
+                // 🌟 [SDS 계측] 커버리지 손실률을 남깁니다.
+                //
+                //  ── 실측 ──
+                //   score_dynamics.json 의 spatial[*].coverage_loss 가 전부 n=0 입니다.
+                //   Phase 0 에서 record_coverage_loss 를 정의만 하고
+                //   호출부를 넣지 않았기 때문입니다.
+                //   이 값이 없으면 V-2(크롭 재수립)의 기대 밴드를 유도할 수 없습니다.
+                //
+                //  ── 왜 경고 조건 밖인가 ──
+                //   경고(coverage < 0.70)만 기록하면 '손실이 적은 정상 케이스' 가
+                //   표본에서 빠져 분포가 한쪽으로 치우칩니다.
+                //   V-2 는 '이 서식의 통상 손실률' 을 알아야 하므로 전량 기록합니다.
+                crate::utils::score_dynamics::record_coverage_loss(
+                    &per_cat[ci].0,
+                    1.0 - coverage,
+                );
             }
         }
 
@@ -1046,6 +1494,13 @@ pub fn plan_crops(
             if per_cat[ci].1.is_empty() { "-" } else { &per_cat[ci].1 }
         ));
 
+        if owned_patches == 0 {
+            emit(&format!(
+                "    🧭 [TERRITORY TAG] '{}' 크롭은 최종 좌표 안에 자기 영토 패치를 한 칸도 담지 않았습니다. 이 크롭에서는 새 필드를 만들지 말고 명시된 라벨↔값만 읽어야 합니다.",
+                per_cat[ci].0
+            ));
+        }
+
         plans.push(CropPlan {
             category: per_cat[ci].0.clone(),
             bbox,
@@ -1053,15 +1508,189 @@ pub fn plan_crops(
             margin,
             patch_count,
             top_field: per_cat[ci].1.clone(),
+            owned_patches,
+            twin_of: String::new(),
         });
     }
 
-    ensure_identity_band_crop(&mut plans, heatmaps, &content, content_gate, grid, emit);
+    {
+        let cw = grid.orig_width as f32 / cols as f32;
+        let ch = grid.orig_height as f32 / rows as f32;
+        let inside = |b: &(u32, u32, u32, u32), cx: f32, cy: f32| -> bool {
+            cx >= b.0 as f32 && cx <= b.2 as f32 && cy >= b.1 as f32 && cy <= b.3 as f32
+        };
 
-    rescue_uncovered_bands(&mut plans, heatmaps, &content, content_gate, grid, emit);
+        let mut split_total = 0usize;
+
+        for (cat, field, gboxes, peaks, counts) in per_cat.iter() {
+            let hm = match heatmaps.iter().find(|h| &h.category == cat) {
+                Some(h) => h,
+                None => continue,
+            };
+            let cur: Vec<(u32, u32, u32, u32)> = plans
+                .iter()
+                .filter(|p| &p.category == cat)
+                .map(|p| p.bbox)
+                .collect();
+            if cur.is_empty() {
+                continue;
+            }
+
+            let m = n.min(hm.scores.len());
+            let mut hot = 0usize;
+            let mut covered = 0usize;
+            for i in 0..m {
+                if hm.scores[i] <= 0.0 {
+                    continue;
+                }
+                hot += 1;
+                let cx = ((i % cols) as f32 + 0.5) * cw;
+                let cy = ((i / cols) as f32 + 0.5) * ch;
+                if cur.iter().any(|b| inside(b, cx, cy)) {
+                    covered += 1;
+                }
+            }
+            if hot < SPLIT_MIN_HOT {
+                continue;
+            }
+            let ratio = covered as f32 / hot as f32;
+            if ratio >= SPLIT_COVERAGE_FLOOR {
+                continue;
+            }
+
+            let mut cands: Vec<(usize, usize, (u32, u32, u32, u32), usize)> = Vec::new();
+            for (gi, gb) in gboxes.iter().enumerate() {
+                let raw = to_pixel_bbox(*gb, grid);
+                let bbox = ensure_min_size(raw, grid.orig_width, grid.orig_height, min_w, min_h);
+                if plans.iter().any(|p| px_iou(p.bbox, bbox) >= CROP_SNAP_IOU) {
+                    continue;
+                }
+                let (lg, _il, _bl) =
+                    legibility.count_in_bbox(bbox, grid.orig_width, grid.orig_height);
+                if lg == 0 {
+                    continue;
+                }
+                let mut gain = 0usize;
+                for i in 0..m {
+                    if hm.scores[i] <= 0.0 {
+                        continue;
+                    }
+                    let cx = ((i % cols) as f32 + 0.5) * cw;
+                    let cy = ((i / cols) as f32 + 0.5) * ch;
+                    if !inside(&bbox, cx, cy) {
+                        continue;
+                    }
+                    if cur.iter().any(|b| inside(b, cx, cy)) {
+                        continue;
+                    }
+                    gain += 1;
+                }
+                if gain < SPLIT_MIN_GAIN {
+                    continue;
+                }
+                cands.push((gain, gi, bbox, lg));
+            }
+            cands.sort_by(|a, b| b.0.cmp(&a.0));
+
+            let mut added = 0usize;
+            let mut taken: Vec<(u32, u32, u32, u32)> = Vec::new();
+            let mut acc = covered;
+
+            for (gain, gi, bbox, lg) in cands.into_iter() {
+                if added >= SPLIT_CROP_LIMIT {
+                    break;
+                }
+                if taken.iter().any(|b| px_iou(*b, bbox) >= CROP_SNAP_IOU) {
+                    continue;
+                }
+                acc += gain;
+                emit(&format!(
+                    "    ➕ [SPLIT CROP] '{}' 커버리지 {:.0}% < {:.0}% — 배정받지 못한 자기 영역 grid(r{}~{}, c{}~{}) 를 크롭으로 하나 더 만듭니다. → px({},{})-({},{}) | 신규 커버 {}칸 | 판독 가능 {} | 누적 {:.0}%",
+                    cat,
+                    ratio * 100.0,
+                    SPLIT_COVERAGE_FLOOR * 100.0,
+                    gboxes[gi].0, gboxes[gi].1, gboxes[gi].2, gboxes[gi].3,
+                    bbox.0, bbox.1, bbox.2, bbox.3,
+                    gain, lg,
+                    acc as f32 / hot as f32 * 100.0
+                ));
+                plans.push(CropPlan {
+                    category: cat.clone(),
+                    bbox,
+                    score: peaks[gi],
+                    margin: 0.0,
+                    patch_count: counts[gi],
+                    top_field: field.clone(),
+                    owned_patches: gain,
+                    twin_of: String::new(),
+                });
+                taken.push(bbox);
+                added += 1;
+                split_total += 1;
+            }
+
+            if added == 0 {
+                emit(&format!(
+                    "    ⚪ [SPLIT SKIP] '{}' 커버리지 {:.0}% 이지만 추가할 영역이 없습니다. 남은 후보가 이미 배정된 크롭과 겹치거나 판독 가능 패치가 0개이거나 신규 커버가 {}칸 미만입니다. 히트맵이 페이지 전반에 퍼져 단일 영역으로 좁혀지지 않는 상태입니다.",
+                    cat, ratio * 100.0, SPLIT_MIN_GAIN
+                ));
+            }
+        }
+
+        if split_total > 0 {
+            emit(&format!(
+                "    ➕ [SPLIT CROP] 커버리지 미달 카테고리에 크롭 {}건을 추가했습니다 (카테고리당 상한 {}건). 배타 배정은 카테고리당 영역 하나만 주므로, 확장된 큰 박스가 다른 카테고리에 선점되면 남는 것은 1×1 조각뿐입니다.",
+                split_total, SPLIT_CROP_LIMIT
+            ));
+        }
+    }
+
+    ensure_identity_band_crop(
+        &mut plans,
+        heatmaps,
+        &content,
+        content_gate,
+        grid,
+        legibility,
+        identity_category,
+        identity_field,
+        emit,
+    );
+
+    rescue_uncovered_cells(
+        &mut plans,
+        heatmaps,
+        &owner_of,
+        &content,
+        content_gate,
+        grid,
+        legibility,
+        area_cap,
+        emit,
+    );
 
     {
         let page_area = (grid.orig_width as f32) * (grid.orig_height as f32);
+        let cw = grid.orig_width as f32 / cols as f32;
+        let ch = grid.orig_height as f32 / rows as f32;
+
+        let fill_of = |b: (u32, u32, u32, u32)| -> f32 {
+            let mut tot = 0usize;
+            let mut got = 0usize;
+            for i in 0..n {
+                let cx = ((i % cols) as f32 + 0.5) * cw;
+                let cy = ((i / cols) as f32 + 0.5) * ch;
+                if cx < b.0 as f32 || cx > b.2 as f32 || cy < b.1 as f32 || cy > b.3 as f32 {
+                    continue;
+                }
+                tot += 1;
+                if i < content.len() && content[i] > content_gate {
+                    got += 1;
+                }
+            }
+            if tot == 0 { 0.0 } else { got as f32 / tot as f32 }
+        };
+
         let mut i = 0usize;
         while i < plans.len() {
             let mut j = i + 1;
@@ -1072,8 +1701,14 @@ pub fn plan_crops(
                 }
                 let a = plans[i].bbox;
                 let b = plans[j].bbox;
-                let overlaps = a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
-                if !overlaps {
+                let iou = px_iou(a, b);
+                let contained = px_covers(a, b) || px_covers(b, a);
+                if !contained && iou < CROP_MERGE_IOU {
+                    emit(&format!(
+                        "    ⚪ [MERGE SKIP] '{}' 의 두 크롭은 IoU {:.2} < {:.2} 로 서로 다른 지면입니다. px({},{})-({},{}) 와 px({},{})-({},{}) 를 따로 읽습니다 — 한 픽셀이라도 겹치면 합치면 SPLIT CROP 이 직후에 되삼켜져 통짜 크롭이 됩니다.",
+                        plans[i].category, iou, CROP_MERGE_IOU,
+                        a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3
+                    ));
                     j += 1;
                     continue;
                 }
@@ -1084,7 +1719,7 @@ pub fn plan_crops(
                     a.3.max(b.3),
                 );
                 let area = ((merged.2 - merged.0) as f32) * ((merged.3 - merged.1) as f32);
-                if area > page_area * 0.6 {
+                if area > page_area * MERGE_PAGE_RATIO {
                     emit(&format!(
                         "    ⚪ [MERGE SKIP] '{}' 의 두 크롭을 합치면 페이지의 {:.0}% 를 차지해 병합하지 않습니다.",
                         plans[i].category,
@@ -1093,15 +1728,30 @@ pub fn plan_crops(
                     j += 1;
                     continue;
                 }
+                let base_fill = fill_of(a).max(fill_of(b));
+                let merged_fill = fill_of(merged);
+                if base_fill > 0.0 && merged_fill < base_fill * MERGE_FILL_DROP {
+                    emit(&format!(
+                        "    ⚪ [MERGE SKIP] '{}' 병합 사각형의 내용 밀도가 {:.0}% 로 원본 {:.0}% 대비 급락합니다. 두 크롭 사이가 여백이라는 뜻이므로 합치지 않습니다.",
+                        plans[i].category,
+                        merged_fill * 100.0,
+                        base_fill * 100.0
+                    ));
+                    j += 1;
+                    continue;
+                }
                 emit(&format!(
-                    "    🔗 [CROP MERGE] '{}' 의 겹치는 크롭 2개를 합칩니다. px({},{})-({},{}) + px({},{})-({},{}) → px({},{})-({},{})",
-                    plans[i].category,
+                    "    🔗 [CROP MERGE] '{}' 의 겹치는 크롭 2개를 합칩니다 (IoU {:.2}{}). px({},{})-({},{}) + px({},{})-({},{}) → px({},{})-({},{}) | 내용 밀도 {:.0}%→{:.0}%",
+                    plans[i].category, iou,
+                    if contained { " / 완전 포함" } else { "" },
                     a.0, a.1, a.2, a.3,
                     b.0, b.1, b.2, b.3,
-                    merged.0, merged.1, merged.2, merged.3
+                    merged.0, merged.1, merged.2, merged.3,
+                    base_fill * 100.0, merged_fill * 100.0
                 ));
                 plans[i].bbox = merged;
                 plans[i].patch_count += plans[j].patch_count;
+                plans[i].owned_patches += plans[j].owned_patches;
                 if plans[j].score > plans[i].score {
                     plans[i].score = plans[j].score;
                     plans[i].top_field = plans[j].top_field.clone();
@@ -1113,11 +1763,97 @@ pub fn plan_crops(
     }
 
     {
+        let mut order: Vec<usize> = (0..plans.len()).collect();
+        order.sort_by(|&a, &b| {
+            plans[b]
+                .score
+                .partial_cmp(&plans[a].score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let is_table = |c: &str| -> bool { table_categories.iter().any(|t| *t == c) };
+
+        let mut seen: Vec<((u32, u32, u32, u32), String)> = Vec::new();
+        let mut snapped = 0usize;
+        let mut twins: Vec<String> = Vec::new();
+        let mut shared_tables: Vec<String> = Vec::new();
+
+        for &pi in order.iter() {
+            let cand = plans[pi].bbox;
+            let cand_cat = plans[pi].category.clone();
+            let mut owner: Option<String> = None;
+
+            for (bx, cat) in seen.iter() {
+                let same = *bx == cand;
+                let iou = if same { 1.0 } else { px_iou(*bx, cand) };
+                if !same && iou < CROP_SNAP_IOU {
+                    continue;
+                }
+                let covers = same || px_covers(*bx, cand);
+                if !same && !covers && iou < CROP_TWIN_IOU {
+                    continue;
+                }
+
+                if is_table(&cand_cat) && is_table(cat) {
+                    shared_tables.push(format!("{}↔{}", cand_cat, cat));
+                    emit(&format!(
+                        "    🧾 [SHARED TABLE EXEMPT] '{}' 와 '{}' 는 둘 다 표 카테고리이고 table_union 이 같은 표 밴드를 배정했습니다. 좌표가 같은 것이 정상이므로 쌍둥이로 묶지 않습니다 — 묶으면 점수가 낮은 쪽 표가 통째로 읽히지 않습니다.",
+                        cand_cat, cat
+                    ));
+                    if !same {
+                        plans[pi].bbox = *bx;
+                        snapped += 1;
+                    }
+                    owner = None;
+                    break;
+                }
+
+                if !same {
+                    emit(&format!(
+                        "    🔗 [CROP SNAP] '{}' px({},{})-({},{}) 를 '{}' px({},{})-({},{}) 에 맞춥니다 (IoU {:.2}{}). 격자 박스가 같은데 픽셀 좌표가 몇십 px 어긋나면 완전 일치 검사도 판독 원장도 놓쳐 같은 지면을 두 번 읽습니다.",
+                        cand_cat, cand.0, cand.1, cand.2, cand.3,
+                        cat, bx.0, bx.1, bx.2, bx.3, iou,
+                        if covers { " / 완전 포함" } else { "" }
+                    ));
+                    plans[pi].bbox = *bx;
+                    snapped += 1;
+                }
+                owner = Some(cat.clone());
+                break;
+            }
+
+            match owner {
+                None => seen.push((plans[pi].bbox, cand_cat)),
+                Some(cat) => {
+                    twins.push(cand_cat);
+                    plans[pi].twin_of = cat;
+                }
+            }
+        }
+
+        if !shared_tables.is_empty() {
+            emit(&format!(
+                "    🧾 [SHARED TABLE EXEMPT] 표 밴드를 공유하는 쌍 {}건 ({}) 은 쌍둥이 판정에서 면제했습니다. 두 카테고리가 같은 지면을 각자의 필드 집합으로 읽습니다.",
+                shared_tables.len(), shared_tables.join(", ")
+            ));
+        }
+        if !twins.is_empty() {
+            emit(&format!(
+                "    👯 [TWIN CROP] 좌표가 같아진 크롭 {}건 ({}) — 좌표 스냅 {}건. 점수가 낮은 쪽은 배열을 만들지 않습니다.",
+                twins.len(), twins.join(", "), snapped
+            ));
+        }
+    }
+
+    {
         let before: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
         plans.sort_by_key(|p| {
-            if p.category == "header" && p.top_field == "doc_number" {
+            if !identity_category.is_empty()
+                && p.category == identity_category
+                && p.top_field == identity_field
+            {
                 0u8
-            } else if p.category == "header" {
+            } else if !identity_category.is_empty() && p.category == identity_category {
                 1u8
             } else {
                 2u8
@@ -1137,6 +1873,11 @@ pub fn plan_crops(
 
 const VISION_PATCH_PX: f32 = 28.0;
 
+const TEXT_HEIGHT_MIN_COHERENCE: f32 = 0.15;
+const TEXT_HEIGHT_FLOOR_PX: f32 = 8.0;
+const TEXT_HEIGHT_CROP_FRACTION: f32 = 40.0;
+const TEXT_HEIGHT_CEIL_FRACTION: f32 = 3.0;
+
 fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     use image::GenericImageView;
     let g = img.to_luma8();
@@ -1155,11 +1896,26 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     let mean: f32 = prof.iter().sum::<f32>() / prof.len() as f32;
     for v in prof.iter_mut() { *v -= mean; }
 
+    let var: f32 = prof.iter().map(|v| v * v).sum::<f32>() / prof.len() as f32;
+    if var <= 1e-6 {
+        println!("    📏 [TEXT HEIGHT REJECT] 행 프로파일 분산이 0 입니다. 잉크가 없는 영역이므로 추정을 기각합니다.");
+        return None;
+    }
+
     // ── 자기상관 최대 주기 = 텍스트 라인 피치 ──
     let max_lag = ((h / 2) as usize).min(120);
+    let min_lag = ((TEXT_HEIGHT_FLOOR_PX / 0.6).ceil() as usize).max(4);
+    if max_lag <= min_lag {
+        println!(
+            "    📏 [TEXT HEIGHT REJECT] 크롭 높이 {}px 로는 탐색 구간(lag {}~{})이 성립하지 않습니다. 추정을 기각합니다.",
+            h, min_lag, max_lag
+        );
+        return None;
+    }
+
     let mut best_lag = 0usize;
     let mut best = f32::MIN;
-    for lag in 4..max_lag {
+    for lag in min_lag..max_lag {
         let mut s = 0.0f32;
         for i in 0..(prof.len() - lag) {
             s += prof[i] * prof[i + lag];
@@ -1168,8 +1924,28 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
         if norm > best { best = norm; best_lag = lag; }
     }
     if best_lag == 0 || best <= 0.0 { return None; }
+
+    let coherence = best / var;
+    if coherence < TEXT_HEIGHT_MIN_COHERENCE {
+        println!(
+            "    📏 [TEXT HEIGHT REJECT] 자기상관 응집도 {:.3} < {:.2} (lag {}) — 주기가 노이즈 수준입니다. 추정을 기각하고 보수적 배율로 내려갑니다.",
+            coherence, TEXT_HEIGHT_MIN_COHERENCE, best_lag
+        );
+        return None;
+    }
+
     // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
-    Some(best_lag as f32 * 0.6)
+    let th = best_lag as f32 * 0.6;
+    let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
+    let ceil = h as f32 / TEXT_HEIGHT_CEIL_FRACTION;
+    if th < floor || th > ceil {
+        println!(
+            "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 기각합니다.",
+            th, floor, ceil, h
+        );
+        return None;
+    }
+    Some(th)
 }
 
 pub fn crop_region(
@@ -1222,6 +1998,8 @@ pub fn whole_page_fallback(categories: &[&str], grid: &PatchGrid) -> Vec<CropPla
             margin: 0.0,
             patch_count: grid.len(),
             top_field: String::new(),
+            owned_patches: 0,
+            twin_of: String::new(),
         })
         .collect()
 }
@@ -1257,23 +2035,25 @@ pub fn audit_crops(
     let score_pair = |cat: &str, bbox: (u32, u32, u32, u32)| -> (f32, f32) {
         let hm = match heatmaps.iter().find(|h| h.category == cat) {
             Some(h) => h,
-            None => return (0.0, 0.0),
+            None => return (f32::MIN, f32::MIN),
         };
         let m = n.min(hm.scores.len());
-        if m == 0 {
-            return (0.0, 0.0);
+        let live: Vec<usize> = (0..m).filter(|&i| hm.scores[i].is_finite()).collect();
+        if live.len() < 2 {
+            return (f32::MIN, f32::MIN);
         }
-        let mean: f32 = hm.scores[..m].iter().sum::<f32>() / m as f32;
-        let var: f32 = hm.scores[..m]
+        let mean: f32 =
+            live.iter().map(|&i| hm.scores[i]).sum::<f32>() / live.len() as f32;
+        let var: f32 = live
             .iter()
-            .map(|s| (s - mean) * (s - mean))
+            .map(|&i| (hm.scores[i] - mean) * (hm.scores[i] - mean))
             .sum::<f32>()
-            / m as f32;
+            / live.len() as f32;
         let std = var.sqrt().max(1e-6);
 
         let (mut mx_in, mut mx_out) = (f32::MIN, f32::MIN);
         let (mut n_in, mut n_out) = (0usize, 0usize);
-        for i in 0..m {
+        for &i in live.iter() {
             // 판독 불가 패치는 근거가 될 수 없습니다.
             if !legibility.is_legible(i) {
                 continue;
@@ -1313,6 +2093,7 @@ pub fn audit_crops(
     // ── ② 상호 교환 후보 탐색 ──
     //    A 가 B 의 bbox 에서, B 가 A 의 bbox 에서 각각 더 높은 점수를 받으면 맞바꿉니다.
     let mut swapped: Vec<bool> = vec![false; plans.len()];
+    let mut swap_blocked = 0usize;
     for ai in 0..plans.len() {
         if swapped[ai] { continue; }
         for bi in (ai + 1)..plans.len() {
@@ -1322,6 +2103,11 @@ pub fn audit_crops(
             let a_there = score_pair(&plans[ai].category, plans[bi].bbox).0;
             let b_here = score_pair(&plans[bi].category, plans[bi].bbox).0;
             let b_there = score_pair(&plans[bi].category, plans[ai].bbox).0;
+
+            if a_there == f32::MIN || b_there == f32::MIN {
+                swap_blocked += 1;
+                continue;
+            }
 
             if a_there > a_here && b_there > b_here {
                 emit(&format!(
@@ -1343,6 +2129,13 @@ pub fn audit_crops(
                 break;
             }
         }
+    }
+
+    if swap_blocked > 0 {
+        emit(&format!(
+            "    ⏭ [CROP SWAP SKIP] 교환 후보 {}쌍이 상대 영역에서 유한 점수를 갖지 못했습니다. arena 가 이미 패치를 배타 배정했으므로 교환은 구조적으로 성립하지 않습니다 — 잘못 착지한 크롭은 아래 재배정이 처리합니다.",
+            swap_blocked
+        ));
     }
 
     // ── ③ 짝이 없는 의심 크롭은 자체 최고 봉우리로 재배정 ──
@@ -1465,6 +2258,7 @@ pub fn decide_tile_count(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
     legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    table_categories: &[&str],
     emit: &dyn Fn(&str),
 ) -> (usize, String) {
     use crate::utils::ai_utils::gumbel_expected_z;
@@ -1488,13 +2282,18 @@ pub fn decide_tile_count(
     let mut t1 = false;
     if let Some(hm) = heatmaps.iter().find(|h| h.category == plan.category) {
         let m = n.min(hm.scores.len());
-        if m > 0 {
-            let mean: f32 = hm.scores[..m].iter().sum::<f32>() / m as f32;
-            let var: f32 = hm.scores[..m].iter()
-                .map(|s| (s - mean) * (s - mean)).sum::<f32>() / m as f32;
+        let live: Vec<usize> = (0..m).filter(|&i| hm.scores[i].is_finite()).collect();
+        if live.len() >= 2 {
+            let mean: f32 =
+                live.iter().map(|&i| hm.scores[i]).sum::<f32>() / live.len() as f32;
+            let var: f32 = live
+                .iter()
+                .map(|&i| (hm.scores[i] - mean) * (hm.scores[i] - mean))
+                .sum::<f32>()
+                / live.len() as f32;
             let std = var.sqrt().max(1e-6);
             let (mut mx_out, mut n_out) = (f32::MIN, 0usize);
-            for i in 0..m {
+            for &i in live.iter() {
                 if inside(i) || !legibility.is_legible(i) { continue; }
                 n_out += 1;
                 if hm.scores[i] > mx_out { mx_out = hm.scores[i]; }
@@ -1507,7 +2306,7 @@ pub fn decide_tile_count(
     }
 
     // ── T2 : 표 행 밀도 (배열 카테고리 전용) ──
-    let is_array_cat = plan.category == "items" || plan.category == "containers";
+    let is_array_cat = table_categories.iter().any(|c| *c == plan.category.as_str());
     let dense_cols = (cols / 3).max(2);
     let mut table_rows = 0usize;
     if is_array_cat {

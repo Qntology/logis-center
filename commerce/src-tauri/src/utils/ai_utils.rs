@@ -1033,26 +1033,32 @@ pub struct SurprisalScore {
     pub n: usize,
     pub surprisal: f32,
 }
-
-/// 🌟 [EXTREME VALUE BASELINE] N개를 무작위로 뽑았을 때 기대되는 최댓값의 z 점수.
-///    E[z of max of N] ≈ √(2 ln N)
-///    뱅크(또는 패치 집합) 크기가 다른 두 집단의 최댓값을 공정하게 비교하려면
-///    반드시 이 기대치를 차감해야 합니다.
-///
-///    🌟 [PUB] vision_crop 의 크롭 감사와 value_grounding 의 접지 검증이
-///       같은 기준선을 사용해야 두 판정이 같은 척도가 되므로 공개합니다.
 pub fn gumbel_expected_z(n: usize) -> f32 {
     if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
 }
+pub fn axis_snr(scores: &[f32]) -> Option<f32> {
+    let mut v: Vec<f32> = scores.iter().cloned().filter(|s| s.is_finite()).collect();
+    if v.len() < 3 { return None; }
+    v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
-/// 🌟 [GENERIC OVER VEC / Arc<Vec>] 벡터 소유 형태에 무관하게 동작합니다.
-///    vision_encoder 의 AnchorBank 가 Arc<Vec<f32>> 로 바뀌었지만,
-///    다른 호출부는 Vec<f32> 를 그대로 넘깁니다.
-///    AsRef<[f32]> 로 받으면 두 형태를 한 함수가 모두 처리합니다.
-///
-/// 🌟 [O(N²) → O(N)] order 탐색을 HashMap 색인으로 바꿉니다.
-///    편견 뱅크가 13,598구일 때 구버전은
-///    13,598 × (그룹수/2) 회 문자열 쌍 비교를 수행했습니다.
+    let tail = &v[1..];
+    let mut sorted_tail = tail.to_vec();
+    sorted_tail.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail_median = sorted_tail[sorted_tail.len() / 2];
+
+    let n = tail.len() as f32;
+    let tail_mean = tail.iter().sum::<f32>() / n;
+    let tail_var = tail.iter().map(|x| (x - tail_mean) * (x - tail_mean)).sum::<f32>() / n;
+    let tail_sd = tail_var.max(0.0).sqrt();
+
+    // 꼬리가 완전히 균일하면(표준편차 0) 잡음 추정이 불가능합니다.
+    // 이 경우 비율이 발산하므로 판정을 포기하고 호출부에 위임합니다.
+    if tail_sd <= 1e-6 { return None; }
+
+    let signal = v[0] - tail_median;
+    if !signal.is_finite() { return None; }
+    Some((signal / tail_sd).max(0.0))
+}
 fn group_sims<V: AsRef<Vec<f32>>>(
     query: &[f32],
     src: &[(String, String, V)],
@@ -1557,16 +1563,6 @@ pub fn is_sql_effective_field(field_name: &str) -> bool {
         FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode
     )
 }
-
-// 🌟 [BANK SIZE BIAS NORMALIZATION] Max-Pool 은 뱅크가 클수록 점수가 구조적으로 부풀려집니다.
-//        E[max of N draws] ≈ μ + σ·√(2 ln N)
-//    bias.json 루트 color.bias 는 50개 언어 색상명 ~700구라
-//        color(N≈700) √(2 ln 700)=3.62  vs  title(N≈11) √(2 ln 11)=2.19  → 1.65배 유리
-//    그 결과 '팔린'(0.6228) '남긴'(0.6365) '여름'(0.5433) 처럼 색상과 무관한 청크의
-//    argmax 가 전부 color 로 몰리는 '흡수 싱크' 가 됩니다.
-//    질의와 무관한 언어권 구(아랍어/힌디어/조지아어 색상명 등)를 런타임에 비활성화합니다.
-//    판정 기준은 '이 뱅크 안에서의 코사인 중앙값' 이라는 상대 통계이므로 새 상수가 아닙니다.
-//    뱅크가 작으면(중앙값 통계가 무의미) 전량 유지하여 정보 손실을 막습니다.
 pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>) -> Vec<bool> {
     let n = phrase_embs.len();
     let mut keep = vec![true; n];
@@ -1592,17 +1588,6 @@ pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>)
     }
     keep
 }
-
-// 🌟 [BANK SIZE EQUALIZATION] bank_size_normalized_mask 는 중앙값 컷을 '단 한 번'만 수행합니다.
-//    그래서 로그에서 color 뱅크가 603구 → 302구 로 절반만 줄었고,
-//    Max-Pool 의 구조적 이득 E[max of N] ≈ μ + σ·√(2 ln N) 은
-//        √(2 ln 603)=3.58 → √(2 ln 302)=3.38  (겨우 5.6% 감소)
-//    에 그쳐, title(11구, √(2 ln 11)=2.19) 대비 여전히 1.54배 유리한 상태였습니다.
-//    그 결과 색상과 무관한 '팔린'(0.5780) '남긴'(0.6365) 의 argmax 를 color 가 계속 독식했습니다.
-//    여기서는 '이 스키마에서 정상 규모의 뱅크가 실제로 몇 구인가'(호출부 실측 중앙값)를
-//    목표로 삼아 중앙값 컷을 반복 적용하여 유효 크기를 같은 규모로 수렴시킵니다.
-//    각 반복은 '살아남은 구 집합 안에서의 상대 통계'만 사용하므로 절대 임계치가 없고,
-//    target_size 도 호출부의 실측값이므로 새 매직 상수가 아닙니다.
 pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, target_size: usize) -> Vec<bool> {
     let n = phrase_embs.len();
     let mut keep = vec![true; n];
@@ -1638,21 +1623,6 @@ pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, 
 
     keep
 }
-
-// 🌟 [FUNCTIONAL WORD] 조사·접속 표현은 어떤 속성의 값도 될 수 없습니다.
-//    Stanza 는 '제품중에서'/'제품으로'/'중에서' 를 전부 NOUN 으로 태깅하므로 POS 로는 못 거릅니다.
-//    (로그: 세 청크가 각각 condition / bundle_shipping / status 에 Margin -0.0091, -0.0020, +0.0000 로 억지 배정)
-//
-//    🌟 [LEMMA-FREE FALLBACK] 직전 구현은 lemma 잔여 판정과 deprel 에만 의존했는데,
-//    로그의 Stanza 출력은 전 토큰이 'lemma:' 로 비어 있고 deprel 도 전달되지 않아
-//    항상 false 를 반환했습니다. ([FUNCTIONAL WORD DROP] 이 한 번도 출력되지 않은 이유)
-//    lemma/deprel 이 비어 있어도 동작하도록, 같은 질의 안의 '다른 토큰'을 원형 사전처럼 사용합니다.
-//    어떤 언어든 조사·접속 표현은 '실질 형태소 + 기능 형태소' 구조를 갖고,
-//    그 실질 형태소는 대개 같은 문장에 단독으로도 등장합니다.
-//      '제품중에서' = '제품'(같은 질의에 단독 존재) + '중에서'
-//      '제품으로'   = '제품'(같은 질의에 단독 존재) + '으로'
-//      '중에서'     = 위에서 추출된 잔여와 완전일치
-//    다국어 어휘 리터럴을 단 하나도 쓰지 않고, 문자열 구조 비교만으로 판정합니다.
 pub fn is_functional_word_chunk(
     chunk: &str,
     words: &[String],
@@ -1792,6 +1762,105 @@ pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, 
 
     if best_stem.is_empty() { None } else { Some((best_key, best_stem)) }
 }
+// =====================================================================
+// 🌟 [COUNT-UNIT SPLIT] '30 PLTS' 처럼 수량과 포장단위가 한 셀에 붙은 값을 분해합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측 로그) ──
+//   ✨ [PLINKO ASSIGN] 'total_packages' → 'package_unit'  ("50 PLTS")
+//   ✨ [PLINKO ASSIGN] 'packages'       → 'package_unit'  ("30 PLTS")
+//   package_unit 은 detect_field_format 상 Enum 입니다.
+//   ENUM NUMERIC GATE 는 is_pure_numeric_value 로 판정하는데
+//   "30 PLTS" 는 알파벳이 4자라 letters <= 1 이 거짓 → 게이트를 그대로 통과합니다.
+//   그 결과 수량 30 이 소실되고 단위 필드에 복합 문자열이 저장되며,
+//   SR 의 item_package_type: "30 PLTS" 오염이 여기서 확정됩니다.
+//
+//  ── 왜 split_numeric_and_comparator 로는 안 되는가 ──
+//   그 함수는 '숫자 + 비교 표현' 을 전제로 만들어졌고, 반환값 rest 에
+//   단위 제거 휴리스틱(첫 토큰 2자 이하)이 들어 있어 'PLTS'(4자)를 단위로 인정하지 않습니다.
+//   또한 호출부가 전부 검색 경로(query_chunk_matches_property_ext)라
+//   저장 경로에서 재사용하면 의미가 어긋납니다.
+//
+//  ── 판정 규칙 (전부 구조, 어휘 사전 없음) ──
+//   R1 숫자 토큰이 정확히 하나 존재해야 합니다. (2개 이상이면 표 셀 병합 사고이므로 손대지 않음)
+//   R2 그 숫자 앞뒤의 잔여가 '숫자를 포함하지 않는 짧은 토큰' 이어야 단위로 인정합니다.
+//   R3 잔여가 4단어를 넘으면 설명문이므로 분해하지 않습니다.
+//   국제 포장단위(CTN/PLT/PKG/BOX/DRUM/BALE/CASE/ROLL/BAG/BDL)는 전부 1~5자이며,
+//   한국어('팔레트')·일본어('パレット')·중국어('托盘')도 이 길이 안에 들어옵니다.
+//
+//  ── 반환 ──
+//   Some((수량 문자열, 단위 문자열)) / 분해 불가면 None
+// =====================================================================
+pub fn split_count_and_unit(value: &str) -> Option<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() { return None; }
+
+    // R1 : 숫자 덩어리를 훑되, 두 개 이상이면 즉시 포기합니다.
+    let chars: Vec<char> = v.chars().collect();
+    let mut num_start: Option<usize> = None;
+    let mut num_end: usize = 0;
+    let mut num_groups = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() { i += 1; continue; }
+        let s = i;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit()
+                || ((chars[i] == '.' || chars[i] == ',')
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()))
+        {
+            i += 1;
+        }
+        num_groups += 1;
+        if num_groups > 1 { return None; }
+        num_start = Some(s);
+        num_end = i;
+    }
+    let ns = match num_start { Some(s) => s, None => return None };
+
+    let number: String = chars[ns..num_end].iter().filter(|c| **c != ',').collect();
+    if number.is_empty() { return None; }
+
+    // R2/R3 : 숫자 앞뒤 잔여를 합쳐 단위 후보를 만듭니다.
+    let head: String = chars[..ns].iter().collect();
+    let tail: String = chars[num_end..].iter().collect();
+    let unit_raw = format!("{} {}", head.trim(), tail.trim());
+    let unit: String = unit_raw
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if unit.is_empty() { return None; }
+    if unit.chars().any(|c| c.is_ascii_digit()) { return None; }
+    let words: Vec<&str> = unit.split_whitespace().collect();
+    if words.len() > 4 { return None; }
+    if unit.chars().count() > 24 { return None; }
+
+    Some((number, unit))
+}
+
+/// 🌟 [COUNT-UNIT PAIR] 이 필드가 '수량 축' 인지 '단위 축' 인지 결정론으로 답합니다.
+///
+///  ── 왜 이름 규칙인가 ──
+///   trade_schema 는 수량과 단위를 항상 짝으로 정의합니다.
+///     package_count ↔ package_unit
+///     item_package_count ↔ item_package_type
+///     container_package_count ↔ (컨테이너 단위 없음)
+///     quantity ↔ unit
+///   접미사만으로 짝을 유도하므로 새 축이 늘어도 이 함수는 수정 대상이 아닙니다.
+///
+///  ── 반환 ──
+///   Some((수량 필드명, 단위 필드명)) — 둘 중 어느 쪽으로 들어왔든 같은 쌍을 돌려줍니다.
+pub fn count_unit_pair_of(field: &str) -> Option<(&'static str, &'static str)> {
+    match field {
+        "package_count" | "package_unit" => Some(("package_count", "package_unit")),
+        "item_package_count" | "item_package_type" => Some(("item_package_count", "item_package_type")),
+        "container_package_count" => Some(("container_package_count", "")),
+        "quantity" | "unit" => Some(("quantity", "unit")),
+        _ => None,
+    }
+}
 
 // 🌟 [NUMERIC COMPARISON SPLIT] '5000원 이하로' 처럼 숫자와 비교 표현이 붙은 청크를
 //    (숫자 / 나머지) 로 구조 분해합니다.
@@ -1925,15 +1994,6 @@ pub fn prejudice_phrase_bank(doc_lang: &str, page_type: &str, field_name: &str) 
     if phrases.len() > 64 { phrases.truncate(64); }
     phrases
 }
-
-// 🌟 [EXCLUSIVE ASSIGNMENT] (필드 × 라인) 유사도 행렬을 받아 상호 배타적 1:1 그리디 매칭을 수행합니다.
-// - own    : 해당 필드 바이어스와의 weighted max-pool 유사도
-// - rival  : 같은 라인을 노리는 다른 필드들 중 최고 유사도
-// - margin : own - rival (경쟁 필드 대비 실제 우위)
-//
-// 기존 방식(필드마다 독립 argmax)은 "본사" 같은 한 라인을 여러 필드가 중복 점유했고,
-// 절대 임계치가 없어 점수 0.0000 짜리 쓰레기 라인도 무조건 힌트로 주입되었습니다.
-// 반환값 = field_idx -> Option<(line_idx, own, margin)> / None 이면 "힌트 없음(null 유도)"
 pub fn exclusive_assign(
     matrix: &Vec<Vec<f32>>,
     abs_threshold: f32,
@@ -1958,15 +2018,6 @@ pub fn exclusive_assign(
         for l in 0..line_count {
             let own = get(f, l);
             if own < abs_threshold { continue; }
-
-            // 🌟 [RIVAL FIX] rival 초기값 0.0 은 두 가지를 동시에 배제합니다.
-            //    ① 무효 칸(-1.0)  → 의도된 배제
-            //    ② double_center_matrix 를 거쳐 '유효하지만 음수'가 된 경쟁 필드 → 의도치 않은 배제
-            //    ②가 발생하면 rival 이 0.0 으로 고정되어 margin = own 이 되고,
-            //    경쟁이 치열한 라인일수록 오히려 margin 이 과대평가되어
-            //    '경쟁자가 없는 약한 후보'가 먼저 선점하는 역전이 일어납니다.
-            //    exclusive_assign_by_score 는 이미 abs_threshold 기반으로 교정되어 있으므로
-            //    두 함수의 판정 규칙을 동일하게 통일합니다.
             let mut rival = f32::MIN;
             for other in 0..field_count {
                 if other == f { continue; }
@@ -1981,8 +2032,6 @@ pub fn exclusive_assign(
             claims.push((f, l, own, margin));
         }
     }
-
-    // 경쟁 우위(margin)가 큰 순서로, 동률이면 절대 유사도(own)가 큰 순서로 선점시킵니다.
     claims.sort_by(|a, b| {
         b.3.partial_cmp(&a.3)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1999,12 +2048,6 @@ pub fn exclusive_assign(
 
     result
 }
-
-// 🌟 [SCORE-FIRST EXCLUSIVE ASSIGN]
-// exclusive_assign 은 '경쟁 마진'이 큰 순서로 선점시키므로, 증거가 약하지만 경쟁자가 없는
-// 라벨('판매자')이 증거가 압도적인 라벨('주문하신 분 이름', own 1.0)보다 먼저 필드를 채갑니다.
-// 상세 페이지의 (라벨 → 필드) 매핑은 "가장 강한 증거부터 잠근다"가 옳으므로
-// 절대 점수(own) 우선, 동률이면 마진 우선으로 정렬합니다.
 pub fn exclusive_assign_by_score(
     matrix: &Vec<Vec<f32>>,
     abs_threshold: f32,
@@ -2054,7 +2097,6 @@ pub fn exclusive_assign_by_score(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
     });
-
     let mut claimed_lines = vec![false; line_count];
     for (f, l, own, margin) in claims {
         if result[f].is_some() { continue; }
@@ -2062,17 +2104,215 @@ pub fn exclusive_assign_by_score(
         result[f] = Some((l, own, margin));
         claimed_lines[l] = true;
     }
-
     result
 }
 
-// 🌟 [SELF-POISON GUARD]
-// bias.json 의 prejudice 는 "다른 필드 semantic 전부"로 기계 생성되어 있어서
-// recipient_address.prejudice 안에 '받는사람' 이, sender_phone.prejudice 안에 '주문자' 가
-// 들어가 있습니다. 그 결과 정답 라벨('받으시는 분 주소')이 자기 편견에 맞아 -0.1143 로 자멸합니다.
-// 판정 규칙(문자열 비교가 아니라 순수 코사인):
-//   편견 구 p 가 '자기 라벨 뱅크'를 경쟁 필드 라벨 뱅크보다 더 잘 설명하면,
-//   그 p 는 이 필드의 편견이 될 자격이 없습니다.
+// =====================================================================
+// 🌟 [T-2 / 감쇠 곡선 기반 적응형 마진]
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   실측 로그: ✨ [PLINKO ASSIGN] 'related_po_number' → 'marks_numbers' | Margin: +0.0001
+//   트레이딩 경로의 호출은 exclusive_assign_by_score(&t_matrix, 0.0, 0.0) 이므로
+//   마진 게이트가 아예 0 입니다. +0.0001 이든 +3.5 든 동일하게 확정됩니다.
+//
+//  ── 마진 절대값이 구분하지 못하는 세 상황 ──
+//   같은 '마진 0.01' 이어도 라인의 점수 분포에 따라 의미가 정반대입니다.
+//     [0.85, 0.84, 0.12, 0.09]  1·2위만 붙고 나머지는 멀리 → 두 필드의 구조적 혼동
+//     [0.60, 0.59, 0.58, 0.57]  전체가 평탄 → 변별력 없음 또는 다중 속성 값
+//   전자는 혼동 사전으로 해소해야 하고, 후자는 배정 자체를 보류해야 합니다.
+//   현재는 둘 다 무조건 확정됩니다.
+//
+//  ── 판정 기준을 어디서 얻는가 ──
+//   이 코드베이스는 이미 '마진을 분포 표준편차와 비교' 하는 패턴을 씁니다.
+//     CONTINUATION DRIFT : 격차 +0.0774 > 분포 표준편차 0.0725
+//     MODE PROBE         : margin < noise_band (EVT 표준편차)
+//     EVIDENCE DEDUP     : dedup_floor = μ + 3σ
+//   그 패턴을 배타 배정 안으로 이식하는 것이므로 새 상수가 생기지 않습니다.
+//   잡음 마진 = 그 라인 경쟁 점수의 '꼬리(2위 이하) 표준편차' 입니다.
+//   1위와 2위의 격차가 무리 자체의 흩어짐보다 작으면 우연입니다.
+//
+//  ── 왜 강화 단방향인가 ──
+//   승자독식형에서 임계를 완화할 수도 있지만, 그것은 '기존에 보류되던 것이
+//   확정됨' 이라 회귀 위험이 있습니다. 기획의 부분 게이팅 원칙에 따라
+//   Phase 1 에서는 강화만 적용합니다.
+//   표적 사고(+0.0001 확정)는 강화만으로 완전히 해결되므로 완화가 불필요합니다.
+// =====================================================================
+
+/// 라인 하나의 경쟁 분포가 어떤 형태의 동률인지 판정합니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TieKind {
+    /// 1위가 무리에서 충분히 떨어짐. 확정해도 됩니다.
+    Decisive,
+    /// 1·2위만 붙고 3위 이하는 멀리 떨어짐. 두 필드 간 구조적 혼동입니다.
+    PairConfusion,
+    /// 전체가 평탄. 변별력이 없거나 다중 속성 값입니다.
+    Flat,
+}
+
+/// 라인 `l` 의 경쟁 분포를 분석합니다.
+///
+///  ── 반환 ──
+///   (동률 종류, 1위 필드, 2위 필드, 1·2위 마진, 잡음 마진)
+///   후보가 3개 미만이면 잡음 추정이 불가능하므로 None 을 돌려주고,
+///   호출부는 기존 동작(마진 임계값만 적용)을 그대로 씁니다.
+pub fn line_tie_shape(
+    matrix: &Vec<Vec<f32>>,
+    line: usize,
+    abs_threshold: f32,
+) -> Option<(TieKind, usize, usize, f32, f32)> {
+    let mut cands: Vec<(usize, f32)> = Vec::new();
+    for (f, row) in matrix.iter().enumerate() {
+        let v = match row.get(line) { Some(x) => *x, None => continue };
+        if !v.is_finite() || v < abs_threshold { continue; }
+        cands.push((f, v));
+    }
+    if cands.len() < 3 { return None; }
+    cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let m12 = cands[0].1 - cands[1].1;
+    let m23 = cands[1].1 - cands[2].1;
+
+    // 잡음 마진 = 꼬리(2위 이하)의 표준편차.
+    // '무리 자체가 얼마나 흩어져 있는가' 이며, 1·2위 격차가 이보다 작으면
+    // 그 격차는 무리의 흔들림으로 설명됩니다.
+    let tail: Vec<f32> = cands[1..].iter().map(|(_, s)| *s).collect();
+    let n = tail.len() as f32;
+    let mean = tail.iter().sum::<f32>() / n;
+    let var = tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    let noise = var.max(0.0).sqrt();
+
+    // 꼬리가 완전히 균일하면(표준편차 0) 잡음 추정이 불가능합니다.
+    // 이 경우 마진이 조금이라도 있으면 결정적으로 봅니다.
+    if noise <= 1e-6 {
+        return Some((TieKind::Decisive, cands[0].0, cands[1].0, m12, 0.0));
+    }
+
+    let kind = if m12 >= noise {
+        TieKind::Decisive
+    } else if m23 > noise {
+        // 1위와 2위는 붙었는데 2위와 3위는 벌어짐 → 두 필드만의 문제
+        TieKind::PairConfusion
+    } else {
+        TieKind::Flat
+    };
+    Some((kind, cands[0].0, cands[1].0, m12, noise))
+}
+
+/// 배정 진단. 확정분과 보류분을 모두 담아 호출부가 로그·관측으로 소비합니다.
+#[derive(Debug, Clone)]
+pub struct AssignDiag {
+    pub field: usize,
+    pub rival: usize,
+    pub line: usize,
+    pub own: f32,
+    pub margin: f32,
+    pub noise_margin: f32,
+    pub tie: TieKind,
+    pub accepted: bool,
+}
+
+/// 🌟 [T-2] 잡음 마진 게이트를 적용한 배타 배정.
+///
+///  ── 기존 함수와의 관계 ──
+///   claims 수집·정렬·그리디 배정 로직은 exclusive_assign_by_score 와 동일합니다.
+///   달라지는 것은 '어떤 claim 이 후보 풀에 들어가는가' 뿐입니다.
+///
+///  ── allow_tie 클로저 ──
+///   Decisive 가 아닌 claim 을 통과시킬지 호출부가 결정합니다.
+///   ai_utils 는 하위 계층이라 혼동 사전(score_dynamics)을 직접 참조하면
+///   계층이 역전되므로, 판단을 호출부에 위임합니다.
+///   인자는 (승자 필드 인덱스, 경쟁 필드 인덱스, 동률 종류) 입니다.
+///   항상 false 를 돌려주면 '동률은 전부 보류' 가 됩니다.
+pub fn exclusive_assign_by_score_adaptive<R>(
+    matrix: &Vec<Vec<f32>>,
+    abs_threshold: f32,
+    margin_threshold: f32,
+    allow_tie: R,
+) -> (Vec<Option<(usize, f32, f32)>>, Vec<AssignDiag>)
+where
+    R: Fn(usize, usize, TieKind) -> bool,
+{
+    let field_count = matrix.len();
+    let mut result: Vec<Option<(usize, f32, f32)>> = vec![None; field_count];
+    let mut diags: Vec<AssignDiag> = Vec::new();
+    if field_count == 0 { return (result, diags); }
+    let mut line_count = 0usize;
+    for row in matrix.iter() {
+        if row.len() > line_count { line_count = row.len(); }
+    }
+    if line_count == 0 { return (result, diags); }
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+
+    // 라인별 동률 형상을 1회만 계산해 재사용합니다.
+    let shapes: Vec<Option<(TieKind, usize, usize, f32, f32)>> = (0..line_count)
+        .map(|l| line_tie_shape(matrix, l, abs_threshold))
+        .collect();
+
+    let mut claims: Vec<(usize, usize, f32, f32)> = Vec::new();
+    for f in 0..field_count {
+        for l in 0..line_count {
+            let own = get(f, l);
+            if own < abs_threshold { continue; }
+            let mut rival = f32::MIN;
+            for other in 0..field_count {
+                if other == f { continue; }
+                let s = get(other, l);
+                if s < abs_threshold { continue; }
+                if s > rival { rival = s; }
+            }
+            let rival_v = if rival == f32::MIN { abs_threshold } else { rival };
+            let margin = own - rival_v;
+            if margin < margin_threshold { continue; }
+
+            // 🌟 [T-2 게이트] 이 라인의 1위인 경우에만 형상 판정을 적용합니다.
+            //    1위가 아닌 claim 은 어차피 margin 이 음수라 위에서 걸러지거나
+            //    그리디 단계에서 1위에게 라인을 뺏깁니다.
+            if let Some((kind, top, second, m12, noise)) = shapes[l] {
+                if top == f && kind != TieKind::Decisive {
+                    let allowed = allow_tie(f, second, kind);
+                    diags.push(AssignDiag {
+                        field: f,
+                        rival: second,
+                        line: l,
+                        own,
+                        margin: m12,
+                        noise_margin: noise,
+                        tie: kind,
+                        accepted: allowed,
+                    });
+                    if !allowed { continue; }
+                } else if top == f {
+                    diags.push(AssignDiag {
+                        field: f,
+                        rival: second,
+                        line: l,
+                        own,
+                        margin: m12,
+                        noise_margin: noise,
+                        tie: kind,
+                        accepted: true,
+                    });
+                }
+            }
+            claims.push((f, l, own, margin));
+        }
+    }
+    claims.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut claimed_lines = vec![false; line_count];
+    for (f, l, own, margin) in claims {
+        if result[f].is_some() { continue; }
+        if claimed_lines[l] { continue; }
+        result[f] = Some((l, own, margin));
+        claimed_lines[l] = true;
+    }
+    (result, diags)
+}
 pub fn self_poisoned_prejudice_mask(
     own_label_embs: &Vec<Vec<f32>>,
     prej_embs: &Vec<Vec<f32>>,
@@ -2503,7 +2743,8 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
             let v = raw[f][l];
             if v < 0.0 { continue; }
             let lm = if line_cnt[l] > 1 { line_mean[l] } else { global_mean };
-            out[f][l] = v - lm - field_mean[f] + global_mean;
+            let fm = if field_cnt[f] > 1 { field_mean[f] } else { global_mean };
+            out[f][l] = v - lm - fm + global_mean;
         }
     }
     out

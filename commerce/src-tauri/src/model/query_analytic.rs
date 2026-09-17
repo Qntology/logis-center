@@ -33,30 +33,8 @@ impl crate::model::LogisModel {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
             return Ok(json!({ "context": [], "cancelled": true }));
         }
-
-        // 🌟 [ANALYTIC CONTEXT v4]
-        //  ── 무엇이 고쳐졌나 ──
-        //   기존 더미는 type 을 "sales" 로 고정했습니다. 그런데
-        //     · build_scope_filter 가 여기에 mode = 'analytic' 을 AND 로 붙이고
-        //     · analytic 문서의 type 은 click / hover / change / report 뿐이라
-        //   최종 SQL 이 `type = 'sales' AND mode = 'analytic'` 이 되어
-        //   analytic 로컬 검색은 구조적으로 항상 0건이었습니다.
-        //
-        //  ── 왜 LLM 을 부르지 않는가 ──
-        //   analytic 문서의 본문은 Cron Worker 가 이미 자연어 한 문장으로 구조화한
-        //   action / summary 입니다. reindex_pending_embeddings 도 그 문장을
-        //   그대로 벡터화합니다(analytic_text 우선). 질의도 문장, 저장도 문장이므로
-        //   FTS + 벡터만으로 리콜이 성립하고, 조건화할 도메인 컬럼 자체가 없습니다.
-        //   여기서 0.6B 를 부르면 VRAM 만 쓰고 얻는 것이 없습니다.
         emit_term(&format!("[STAGE-1] Building analytic context (no LLM required) for: '{}'", query));
-
-        // 🌟 analytics D1(console-logis-center)이 실제로 발행하는 전 타입입니다.
-        //    question / answer 는 채팅 말풍선 전용이라 검색 스코프에서 제외합니다.
-        //    (main.ts 의 TYPE_SETS.analytic 과 반드시 같은 집합이어야 합니다)
         let analytic_types = vec!["report", "click", "hover", "change"];
-
-        // 🌟 [UNASSIGNED] 질의 토큰을 그대로 넘겨 Dexie 가 keywords 가산점으로 씁니다.
-        //    조건이 0개인 트랙이므로 이 축이 사실상 유일한 정밀도 신호입니다.
         let keywords: Vec<String> = query
             .split_whitespace()
             .map(|s| s.to_string())
@@ -82,33 +60,6 @@ impl crate::model::LogisModel {
         emit_term("[SUCCESS] Analytic Search Pipeline Completed.");
         Ok(json!({ "context": ctx }))
     }
-
-    /// 🌟 [ANALYTIC SEARCH QUERY v3 / VECTOR-FIRST NMS]
-    ///  ── v2 의 결함 ──
-    ///   time_intent / event_types 를 Qwen3.5 2B 가 '단독으로' 골랐습니다.
-    ///   프롬프트에는 후보 목록만 있고 벡터 근거가 하나도 없었기 때문에,
-    ///   실측 로그에서
-    ///     · 질의에 기간 표현이 없는데 time_intent = "last_month" 로 창작되어
-    ///       created_at >= 1782864000000 조건이 붙고 오늘 수집한 문서가 전량 탈락
-    ///     · event_types 가 ["click"] 하나로 좁혀져
-    ///       방금 구조화한 hover 3건 + report 1건이 스코프에서 제거
-    ///   되면서 검색 결과가 구조적으로 0건이 되었습니다.
-    ///
-    ///  ── v3 구조 (commerce PLINKO 와 동일 계보) ──
-    ///   ① 완전일치        : bias.json exact_match. 벡터·LLM 없이 확정
-    ///   ② Stanza POS      : VERB/ADP/PUNCT 등 무의미 품사 판정 (NLP 모델)
-    ///   ③ 슬라이딩 윈도우 : 1~4단어 청크 생성
-    ///   ④ Max-Pool 코사인 : time / season / event 3개 뱅크와 구 단위 비교
-    ///   ⑤ SURPRISAL 게이트: 뱅크 크기 편향 제거(√(2 ln N)).
-    ///                       무작위 기대치를 못 넘으면 폐기 → '근거 없으면 조건 없음'
-    ///   ⑥ NMS 배틀        : 겹치는 스팬 중 최고 점수만 생존
-    ///   ⑦ 마진 판정        : 1위-2위가 사실상 동률일 때만 LLM 1회 재판정
-    ///   ⑧ 기간 재확정      : LLM 이 준 날짜는 신뢰하지 않고 Rust 가 epoch 로 계산
-    ///
-    ///  ── 비용 ──
-    ///   대부분의 질의에서 LLM 호출이 0회가 됩니다.
-    ///   (임베딩 배치 3회 + Stanza POS 1회로 종료)
-    ///   그리고 근거가 없으면 조건을 만들지 않으므로 스코프가 좁아지지 않습니다.
     pub async fn parse_analytic_search_query(
         &self,
         task_id: &str,

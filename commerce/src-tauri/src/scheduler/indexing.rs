@@ -445,6 +445,11 @@ pub async fn index_item_chunks(
                     || f.split(',').any(|k| k.trim() == c.property.as_str())
             });
             if !in_schema {
+                crate::utils::score_dynamics::record_field_seen(&c.property);
+                crate::utils::score_dynamics::record_field_reject(
+                    &c.property,
+                    crate::utils::score_dynamics::GateKind::SelfId,
+                );
                 println!(
                     "  🚫 [SCHEMA WHITELIST] property='{}' 는 '{}' 스키마에 없는 축이라 청크 인덱싱에서 제외합니다. (text=\"{}\")",
                     c.property, page_type, c.chunk_text
@@ -453,6 +458,22 @@ pub async fn index_item_chunks(
             in_schema
         })
         .collect();
+    crate::utils::score_dynamics::record_baseline(
+        "indexing.schema_drop",
+        (enriched_chunks.len().saturating_sub(indexable_chunks.len())) as f32,
+    );
+    crate::utils::score_dynamics::record_baseline(
+        "indexing.indexable_chunks",
+        indexable_chunks.len() as f32,
+    );
+    crate::utils::score_dynamics::record_baseline(
+        "indexing.chunk_yield",
+        if enriched_chunks.is_empty() {
+            0.0
+        } else {
+            indexable_chunks.len() as f32 / enriched_chunks.len() as f32
+        },
+    );
     if indexable_chunks.is_empty() {
         return Ok(0);
     }

@@ -1,13 +1,9 @@
-
 use image::{DynamicImage, GenericImageView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchLegibility {
-    /// 잉크가 거의 없는 여백
     Blank,
-    /// 잉크는 있으나 고주파가 소실된 영역 (블러 / 모자이크 / 마스킹)
     Illegible,
-    /// 정상 판독 가능
     Legible,
 }
 
@@ -15,14 +11,9 @@ pub enum PatchLegibility {
 pub struct LegibilityMap {
     pub rows: usize,
     pub cols: usize,
-    /// 패치별 휘도 표준편차 (잉크 존재량의 근사)
     pub ink: Vec<f32>,
-    /// 패치별 정규화 기울기 에너지 = mean|∇| / (std + eps)
-    ///  · 선명한 글자 경계는 계단 함수라 ∇ ≈ std → 비율이 1 에 가깝습니다.
-    ///  · 블러는 같은 std 를 유지한 채 ∇ 만 떨어지므로 비율이 급락합니다.
     pub sharpness: Vec<f32>,
     pub verdict: Vec<PatchLegibility>,
-    /// Otsu 가 실제로 분리에 성공했는가 (실패 시 전량 Legible 로 간주)
     pub split_applied: bool,
     pub ink_gate: f32,
     pub sharp_gate: f32,
@@ -40,7 +31,6 @@ impl LegibilityMap {
         matches!(self.verdict.get(idx), Some(PatchLegibility::Legible))
     }
 
-    /// 픽셀 bbox 안의 (판독가능, 판독불가, 여백) 패치 수
     pub fn count_in_bbox(
         &self,
         bbox: (u32, u32, u32, u32),
@@ -56,7 +46,6 @@ impl LegibilityMap {
                 let y0 = (r as f32 * ch) as u32;
                 let x1 = x0 + cw as u32;
                 let y1 = y0 + ch as u32;
-                // 패치 중심이 bbox 안에 있으면 그 bbox 소속으로 셉니다.
                 let cx = (x0 + x1) / 2;
                 let cy = (y0 + y1) / 2;
                 if cx < bbox.0 || cx > bbox.2 || cy < bbox.1 || cy > bbox.3 {
@@ -73,11 +62,6 @@ impl LegibilityMap {
     }
 }
 
-/// 🌟 [OTSU] 무모수 이분법. 클래스 간 분산이 최대가 되는 임계를 돌려줍니다.
-///
-///  반환 (threshold, separability)
-///   separability = 클래스간분산 / 전체분산 (0~1).
-///   이 값이 낮으면 분포가 단봉이라는 뜻이므로 호출부가 분리를 기각합니다.
 fn otsu_threshold(values: &[f32]) -> (f32, f32) {
     if values.len() < 8 {
         return (0.0, 0.0);
@@ -134,19 +118,6 @@ fn otsu_threshold(values: &[f32]) -> (f32, f32) {
     (best_t, best_between / total_var)
 }
 
-/// 🌟 [BUILD] 원본 이미지와 패치 격자 크기를 받아 판독성 맵을 만듭니다.
-///
-///  ── 계산 ──
-///   각 격자 셀에 대응하는 픽셀 사각형에서
-///     ink       = 휘도 표준편차
-///     grad      = 인접 픽셀 절대차의 평균 (수평 + 수직)
-///     sharpness = grad / (ink + eps)
-///
-///  ── 판정 ──
-///   ① ink 분포에 Otsu → 여백/잉크 분리. 분리 실패 시 전량 잉크로 간주.
-///   ② 잉크 셀의 sharpness 분포에 Otsu → 판독불가/판독가능 분리.
-///      분리에 성공했더라도 '판독불가' 가 잉크 셀의 절반을 넘으면 기각합니다.
-///      문서는 대부분 판독 가능하다는 구조적 사실을 어기기 때문입니다.
 pub fn build_legibility_map(
     img: &DynamicImage,
     grid_rows: usize,

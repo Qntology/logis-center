@@ -39,8 +39,6 @@ pub struct TextMLP {
 }
 
 impl Siglip2TextModel {
-    /// `embed_vb` 가 Some 이면 token_embedding 만 그 VarBuilder(보통 CPU)에서 로드합니다.
-    /// None 이면 종전대로 `vb` 와 같은 디바이스에 올립니다.
     pub fn new(
         config: &Siglip2Config,
         vb: VarBuilder,
@@ -49,9 +47,6 @@ impl Siglip2TextModel {
         let hidden = config.text_hidden_size;
         let device = vb.device().clone();
         let dtype = vb.dtype();
-
-        // 🌟 토큰 임베딩: (256000, 1152) = 590MB(BF16).
-        //    embed_vb 가 주어지면 그 디바이스(호스트)로 보내고, VRAM 에서는 뺍니다.
         let (token_embedding, embed_on_cpu) = match embed_vb {
             Some(evb) => {
                 let on_cpu = evb.device().is_cpu();
@@ -81,8 +76,6 @@ impl Siglip2TextModel {
             layers.push(layer);
         }
 
-        // 🌟 [TENSOR CONTRACT] text_model.embeddings.position_embedding.weight 는
-        //    [64, 1152] 입니다. 512 를 요구하면 shape mismatch 로 즉시 실패합니다.
         let position_embedding = candle_nn::embedding(
             config.text_max_positions,
             hidden,
@@ -95,7 +88,6 @@ impl Siglip2TextModel {
             vb.pp("final_layer_norm"),
         )?;
 
-        // text_model.head.weight [1152,1152] / head.bias [1152] — 실제 Linear 입니다.
         let head = candle_nn::linear(hidden, hidden, vb.pp("head"))?;
 
         if embed_on_cpu {
@@ -135,9 +127,6 @@ impl Siglip2TextModel {
             self.token_embedding.forward(token_ids)?
         };
 
-        // 2. 위치 임베딩
-        //    🌟 위치 임베딩은 [64, 1152] = 0.15MB 라 VRAM 에 두는 편이 유리합니다.
-        //       인덱스 텐서는 x 의 디바이스에 맞춥니다(token_ids 가 CPU 일 수 있으므로).
         let pos_ids: Vec<u32> = (0..seq_len as u32).collect();
         let pos_ids_tensor = Tensor::new(&pos_ids[..], x.device())?;
         let pos_emb = self.position_embedding.forward(&pos_ids_tensor)?; // (seq, D)
@@ -169,10 +158,6 @@ impl Siglip2TextModel {
         self.head.forward(&pooled)
     }
 
-    /// 여러 텍스트를 한 번에 인코딩합니다.
-    ///
-    /// 입력: (token_ids, attn_mask) 쌍의 목록. 모든 시퀀스 길이는 동일해야 합니다.
-    /// 출력: (n, 1152) L2 정규화 이전 원본 텐서
     pub fn encode_batch(
         &self,
         batch: &[(Vec<u32>, Vec<u32>)],
@@ -287,8 +272,6 @@ impl TextAttention {
         let attn = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
         let mut attn = (attn / scale)?;
 
-        // 🌟 [PAD MASK] 패딩 위치를 key 에서 제거합니다.
-        //    SigLIP 텍스트 인코더에는 causal mask 가 없으므로 이 가산 마스크가 전부입니다.
         if let Some(m) = additive_mask {
             attn = attn.broadcast_add(m)?;
         }

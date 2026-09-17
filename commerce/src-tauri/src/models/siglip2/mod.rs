@@ -3,15 +3,10 @@ pub mod text;
 pub mod preprocessor;
 pub mod vision_crop;
 pub mod vision_encoder;
-// 🌟 [STEP 2.5] 패치 격자 단위 판독 가능성 지도 (블러 / 마스킹 / 여백 판정)
 pub mod legibility;
-// 🌟 [STEP 6] 추출값이 크롭 안에 실제로 인쇄되어 있는지 검증
+pub mod nms_arena;
 pub mod value_grounding;
 pub mod tokenizer;
-// 🌟 [ANCHOR CACHE] 정적 앵커 구 임베딩의 메모리 + 디스크 2단 영구 캐시.
-//    구 하나가 27층 × 64토큰 ≈ 26 GFLOP 이고 문서당 345구가 필요하지만,
-//    그 문자열은 logic.rs 상수와 bias.json 에서 나오므로 불변입니다.
-//    캐시가 채워지면 1.4GB 짜리 텍스트 인코더를 아예 올리지 않아도 됩니다.
 pub mod phrase_cache;
 
 
@@ -19,31 +14,7 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use std::path::Path;
 
-/// SigLIP2 통합 모델 (비전 인코더 + 텍스트 인코더 + 토크나이저)
-///
-/// ── 텐서 계약 (print_tensors.py 실측 대조 완료) ──
-///   vision_model.embeddings.patch_embedding.weight   [1152, 768]   ← Linear (16*16*3)
-///   vision_model.embeddings.position_embedding.weight[256, 1152]   ← 16×16 격자
-///   vision_model.encoder.layers.{0..26}.*
-///   vision_model.post_layernorm.*
-///   vision_model.head.probe                          [1, 1, 1152]
-///   vision_model.head.attention.in_proj_weight       [3456, 1152]  ← q|k|v concat
-///   vision_model.head.attention.out_proj.*
-///   vision_model.head.layernorm.*  /  head.mlp.fc1,fc2
-///   text_model.embeddings.token_embedding.weight     [256000, 1152]
-///   text_model.embeddings.position_embedding.weight  [64, 1152]    ← seq len 64 고정
-///   text_model.final_layer_norm.*
-///   text_model.head.weight/bias                      [1152,1152] / [1152]
-///   logit_scale / logit_bias                         [1] / [1]
 pub struct Siglip2Model {
-    /// 🌟 [OPTIONAL VISION] 텍스트 전용 로드를 허용하기 위해 Option 으로 둡니다.
-    ///
-    ///  ── 왜 필요한가 ──
-    ///   STEP 6 값 접지 검증과 검색 질의 벡터 생성은 텍스트 인코더만 씁니다.
-    ///   패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 이미 있고,
-    ///   질의 벡터는 애초에 이미지와 무관합니다.
-    ///   구조체가 비전을 필수로 요구하면 그 두 경로가 항상 820MB 를 함께 올려야 했습니다.
-    ///   특히 검색은 질의마다 반복되므로 누적 비용이 큽니다.
     pub vision: Option<vision::Siglip2VisionModel>,
     pub text: Option<text::Siglip2TextModel>,
     pub tokenizer: Option<tokenizer::Siglip2Tokenizer>,
@@ -87,7 +58,6 @@ impl Siglip2Config {
             vision_intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(4304) as usize,
             vision_num_layers: vc["num_hidden_layers"].as_u64().unwrap_or(27) as usize,
             vision_num_heads: vc["num_attention_heads"].as_u64().unwrap_or(16) as usize,
-            // 🌟 하드코딩 폐기: config 의 patch_size / num_patches 를 실제로 읽습니다.
             patch_size: vc["patch_size"].as_u64().unwrap_or(16) as usize,
             max_num_patches: vc["num_patches"].as_u64().unwrap_or(256) as usize,
             vision_layer_norm_eps: vc["layer_norm_eps"].as_f64().unwrap_or(1e-6),
@@ -96,7 +66,6 @@ impl Siglip2Config {
             text_num_layers: tc["num_hidden_layers"].as_u64().unwrap_or(27) as usize,
             text_num_heads: tc["num_attention_heads"].as_u64().unwrap_or(16) as usize,
             text_vocab_size: tc["vocab_size"].as_u64().unwrap_or(256000) as usize,
-            // 🌟 실측 텐서가 [64, 1152] 이므로 기본값 64.
             text_max_positions: tc["max_position_embeddings"].as_u64().unwrap_or(64) as usize,
             text_pad_token_id: tc["pad_token_id"].as_u64().unwrap_or(1) as u32,
             text_layer_norm_eps: tc["layer_norm_eps"].as_f64().unwrap_or(1e-6),
@@ -111,11 +80,6 @@ impl Siglip2Config {
 }
 
 impl Siglip2Model {
-    /// 비전 인코더만 mmap 으로 로드합니다.
-    ///
-    /// 🌟 [MEMORY] 기존 `candle_core::safetensors::load()` 는 4.3GB 전체를
-    ///    HashMap 으로 올린 뒤 vision_model.* 만 골라냈습니다.
-    ///    mmap 백엔드는 요청한 텐서만 페이지 인 하므로 상주량이 실제 사용분으로 제한됩니다.
     pub fn load_vision_only(
         safetensors_path: &Path,
         config: &Siglip2Config,
@@ -165,16 +129,6 @@ impl Siglip2Model {
         })
     }
 
-    /// 🌟 텍스트 인코더 + 토크나이저만 로드합니다. 비전 가중치는 올리지 않습니다.
-    ///
-    ///  ── 언제 쓰는가 ──
-    ///   · STEP 6 값 접지 검증 : 값 텍스트만 인코딩. 패치는 STEP 1 산출물을 재사용.
-    ///   · 검색 질의 벡터 생성 : 질의는 텍스트이므로 비전이 애초에 불필요.
-    ///   두 경로 모두 load_vision_only 를 거치면 820MB 를 헛되이 점유합니다.
-    ///
-    ///  ── mmap ──
-    ///   VarBuilder::from_mmaped_safetensors 는 요청한 텐서만 페이지 인 하므로,
-    ///   같은 model.safetensors 를 열어도 text_model.* 만 실제로 상주합니다.
     pub fn load_text_only(
         model_dir: &Path,
         config: &Siglip2Config,
@@ -185,9 +139,6 @@ impl Siglip2Model {
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)?
         };
-        // 🌟 [CPU EMBEDDING] token_embedding(256000×1152 = 590MB BF16) 만 호스트로 보냅니다.
-        //    index_select 는 산술이 아니라 행 복사이므로 결과가 비트 단위로 같습니다.
-        //    CPU VarBuilder 생성이 실패하면(예: dtype 변환 불가) 종전 경로로 안전하게 폴백합니다.
         let embed_vb = if device.is_cpu() {
             None
         } else {
@@ -246,8 +197,6 @@ impl Siglip2Model {
         })
     }
 
-    /// 🌟 비전 인코더 가중치를 나중에 부착합니다.
-    ///    텍스트 전용으로 올린 인스턴스에 이미지 처리가 필요해졌을 때 사용합니다.
     pub fn load_vision_encoder(&mut self, model_dir: &Path) -> anyhow::Result<()> {
         if self.vision.is_some() {
             return Ok(());
@@ -265,9 +214,6 @@ impl Siglip2Model {
         Ok(())
     }
 
-    /// 텍스트 인코더 + 토크나이저를 추가로 로드합니다.
-    ///
-    /// `model_dir` 에는 model.safetensors 와 tokenizer.json 이 함께 있어야 합니다.
     pub fn load_text_encoder(&mut self, model_dir: &Path) -> anyhow::Result<()> {
         let safetensors_path = model_dir.join("model.safetensors");
         let vb = unsafe {
@@ -315,29 +261,10 @@ impl Siglip2Model {
         self.text.is_some() && self.tokenizer.is_some()
     }
 
-    /// 🌟 비전 인코더가 실제로 상주 중인지 확인합니다.
-    ///    ensure_siglip2 가 '요구 사양과 현재 상태' 를 비교할 때 씁니다.
     pub fn has_vision(&self) -> bool {
         self.vision.is_some()
     }
 
-    /// 🌟 [DETACH VISION] 비전 인코더 가중치를 즉시 반납합니다.
-    ///
-    ///  ── 왜 필요한가 ──
-    ///   파이프라인 단계별 실제 요구는 다음과 같습니다.
-    ///     STEP 1 encode_image          : 비전 ✅ / 텍스트 ✗
-    ///     STEP 1 classify_doc_type     : 비전 ✗ / 텍스트 ✅   ← patches 는 이미 호스트
-    ///     STEP 2 build_column_heatmaps : 비전 ✗ / 텍스트 ✅
-    ///     STEP 3 plan_crops / legibility: 둘 다 ✗ (순수 CPU)
-    ///     STEP 5 Qwen 추출              : 둘 다 ✗
-    ///     STEP 6 verify_claims_v2       : 둘 다 ✗ (픽셀 판정)
-    ///   즉 encode_image 가 끝나는 순간 비전 856MB 는 완전한 사표입니다.
-    ///   PatchGrid.patches 는 Vec<Vec<f32>> 로 이미 호스트에 있습니다
-    ///   (252 × 1152 × 4B = 1.16MB).
-    ///
-    ///   구버전에는 load_vision_encoder(부착)만 있고 해제 경로가 없어서,
-    ///   345구를 인코딩하는 가장 무거운 구간에 856MB + 1,416MB = 2.27GB 가
-    ///   동시에 묶여 있었습니다.
     pub fn detach_vision(&mut self) -> bool {
         if self.vision.is_none() {
             return false;
@@ -347,9 +274,6 @@ impl Siglip2Model {
         true
     }
 
-    /// 🌟 [DETACH TEXT] 텍스트 인코더 + 토크나이저를 반납합니다.
-    ///    앵커 캐시가 채워진 뒤 STEP 3 로 넘어갈 때 호출하면
-    ///    Qwen3.5 를 올리기 전에 1,416MB(또는 CPU 임베딩 적용 시 826MB)를 비웁니다.
     pub fn detach_text(&mut self) -> bool {
         if self.text.is_none() && self.tokenizer.is_none() {
             return false;

@@ -1,21 +1,4 @@
-#![allow(unused_imports)]
-// 🌟 [SPLIT] 원본 model.rs 27~113 + 9181~9798 행에서 이동.
-//    parse_commerce_query / parse_shipping_query 가 이 함수들을 호출하는데
-//    그쪽은 이제 형제 모듈이므로, 비공개 fn 이면 보이지 않습니다.
-//    전부 pub(crate) 로 올립니다.
 use serde_json::{Value, json, Map};
-
-// pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String { /* 27~113 */ }
-
-// pub(crate) fn trade_resolve_condition_value(field: &str, chunk: &str) -> String { /* ... */ }
-// pub(crate) fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String { /* ... */ }
-// pub(crate) fn is_schema_echo(s: &str) -> bool { /* ... */ }
-// pub(crate) fn collect_claimed(merged: &Map<String, Value>) -> Vec<(String, String)> { /* ... */ }
-// pub(crate) fn record_grounding_claims(/* ... */) { /* ... */ }
-// pub(crate) fn apply_grounding_verdicts(/* ... */) { /* ... */ }
-// pub(crate) fn merge_extracted(/* ... */) { /* ... */ }
-// pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) { /* ... */ }
-
 pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
     let type_map = json!({
         "CI": "Commercial Invoice", "PI": "Proforma Invoice", "PL": "Packing List",
@@ -291,7 +274,71 @@ pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, 
     }
     out
 }
-
+pub fn record_claim_violations(
+    claimed: &[(String, String)],
+    incoming: &Value,
+    category: &str,
+    emit: &dyn Fn(&str),
+) -> usize {
+    if claimed.is_empty() {
+        return 0;
+    }
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    fn substantial(s: &str) -> bool {
+        s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+    }
+    fn harvest(o: &serde_json::Map<String, Value>, out: &mut Vec<(String, String)>) {
+        for (k, v) in o.iter() {
+            let s = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if s.is_empty() || is_schema_echo(&s) {
+                continue;
+            }
+            out.push((k.clone(), s));
+        }
+    }
+    let mut scan: Vec<(String, String)> = Vec::new();
+    if let Some(o) = incoming.as_object() {
+        harvest(o, &mut scan);
+    } else if let Some(arr) = incoming.as_array() {
+        for e in arr {
+            if let Some(o) = e.as_object() {
+                harvest(o, &mut scan);
+            }
+        }
+    }
+    let mut hits = 0usize;
+    for (field, value) in scan.iter() {
+        if !substantial(value) {
+            continue;
+        }
+        let nv = norm(value);
+        for (owner, owned) in claimed.iter() {
+            if owner == field {
+                continue;
+            }
+            if norm(owned) != nv {
+                continue;
+            }
+            hits += 1;
+            crate::utils::score_dynamics::record_field_seen(field);
+            crate::utils::score_dynamics::record_near_miss(field);
+            crate::utils::score_dynamics::record_confusion(owner, field, 0.0);
+            emit(&format!(
+                "    ⚠️ [CLAIM VIOLATION] [{}] '{}' = \"{}\" 는 이미 '{}' 가 확정한 값입니다. 금지 목록으로 지시했으나 모델이 되돌려주었습니다.",
+                category, field, value, owner
+            ));
+            break;
+        }
+    }
+    crate::utils::score_dynamics::record_baseline("vision.claim_violation", hits as f32);
+    hits
+}
 /// 🌟 [GROUNDING CLAIM 수집] 한 타일이 주장한 (필드, 값) 을 출처 bbox 와 함께 기록합니다.
 ///
 ///  ── 왜 병합 전에 기록하는가 ──
@@ -320,6 +367,11 @@ pub fn record_grounding_claims(
             };
             if s.is_empty() || is_schema_echo(&s) {
                 continue;
+            }
+            if s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+                && out.iter().any(|c| c.field != *k && c.value == s)
+            {
+                crate::utils::score_dynamics::record_baseline("vision.value_reuse", 1.0);
             }
             // 같은 (필드, 값) 이 여러 타일에서 나오면 한 번만 검증합니다.
             if out.iter().any(|c| c.field == *k && c.value == s) {
@@ -362,6 +414,79 @@ pub fn apply_grounding_verdicts(
     verdicts: &[crate::models::siglip2::value_grounding::GroundingVerdict],
     emit: &dyn Fn(&str),
 ) {
+    // 🌟 [SDS / V-1] 분모를 먼저 세웁니다.
+    //
+    //  ── 무엇이 문제였나 (실측) ──
+    //   계측이 아래 `for r in rejected` 루프 안에만 있어서,
+    //   접지에 성공한 값은 record_field_seen 조차 되지 않았습니다.
+    //   그 결과 vision 스코프의 필드 통계가 seen == reject_format, assigned == 0 이 되어
+    //   learned_specificity(= rejected / seen) 가 항상 1.0 이라는 거짓값을 냈습니다.
+    //   (score_dynamics.json: recipient_name / party_name 이 정확히 이 모양)
+    //   게다가 폐기가 0건이면 아래 조기 반환에 걸려 관측이 통째로 사라졌습니다.
+    //   크롭 10개를 돌려 doc_number·amount·hs_code·package_count 를 채운 실행에서도
+    //   '그 필드를 시도했다' 는 사실이 한 건도 남지 않았습니다.
+    //
+    //  ── 왜 함수 맨 앞인가 ──
+    //   조기 반환보다 앞에 두어야 '전 값이 접지 성공' 인 정상 문서에서도
+    //   분모가 쌓입니다. 정상 문서만 계속 들어오면 분모만 커지는 것이 맞습니다.
+    //
+    //  ── 보류를 분자·분모 어디에도 넣지 않는 이유 ──
+    //   verify_claims 는 임베딩 생성 실패 / 대응 패치 없음일 때
+    //   accepted=true 로 두되 사유에 '검증 보류' 를 남깁니다.
+    //   이건 '통과' 가 아니라 '판정 못 함' 이므로 assigned 로 세면
+    //   특이도가 반대 방향으로 왜곡됩니다. seen 에만 남깁니다.
+    //
+    //  ── 폐기 사유를 두 종류로 가르는 이유 ──
+    //   '인쇄 라벨을 값으로 읽음' 은 라벨 어휘가 값을 이긴 사고이므로
+    //   의미상 편견 게이트입니다. 나머지(접지 실패 / 여백·블러 / 출처 공백)는
+    //   '값의 형태가 그 필드일 수 없다' 는 형식 게이트입니다.
+    //   두 축을 나눠야 기획 T-3 이 '이 서식의 이 축은 라벨과 값이 구조적으로 겹친다' 와
+    //   '이 크롭은 애초에 읽을 게 없었다' 를 구분할 수 있습니다.
+    {
+        let mut seen = 0usize;
+        let mut kept = 0usize;
+        let mut held = 0usize;
+        for v in verdicts.iter() {
+            crate::utils::score_dynamics::record_field_seen(&v.field);
+            seen += 1;
+            if !v.accepted {
+                let kind = if v.reason.contains("인쇄 라벨") {
+                    crate::utils::score_dynamics::GateKind::Prejudice
+                } else {
+                    crate::utils::score_dynamics::GateKind::Format
+                };
+                crate::utils::score_dynamics::record_field_reject(&v.field, kind);
+                continue;
+            }
+            if v.reason.contains("보류") {
+                held += 1;
+                continue;
+            }
+            // surprisal_out 은 크롭 밖 패치가 하나도 없을 때 f32::MIN 입니다.
+            // 그대로 빼면 +inf 가 되어 Welford 의 mean/m2 를 영구히 오염시킵니다.
+            let margin = if v.surprisal_out <= f32::MIN / 2.0 {
+                v.surprisal_in.max(0.0)
+            } else {
+                (v.surprisal_in - v.surprisal_out).max(0.0)
+            };
+            crate::utils::score_dynamics::record_field_assigned(&v.field, margin);
+            kept += 1;
+        }
+        if seen > 0 {
+            crate::utils::score_dynamics::record_baseline(
+                "vision.grounding_claims",
+                seen as f32,
+            );
+            crate::utils::score_dynamics::record_baseline(
+                "vision.grounding_accept_ratio",
+                kept as f32 / seen as f32,
+            );
+            emit(&format!(
+                "  📊 [SDS / GROUNDING] 주장 {}건 | 접지 확인 {} | 검증 보류 {} | 폐기 {}",
+                seen, kept, held, seen.saturating_sub(kept + held)
+            ));
+        }
+    }
     let rejected: Vec<&crate::models::siglip2::value_grounding::GroundingVerdict> =
         verdicts.iter().filter(|v| !v.accepted).collect();
     if rejected.is_empty() {
@@ -420,8 +545,20 @@ pub fn apply_grounding_verdicts(
             "  🗑️ [GROUNDING APPLY] [{}] '{}' = \"{}\" 제거 | {}",
             r.category, r.field, r.value, r.reason
         ));
+        // 🌟 [SDS 계측 이동 완료 / V-1]
+        //
+        //  ── 왜 여기서 뺐나 ──
+        //   이 루프는 '폐기된 것' 만 돌기 때문에 여기에 계측을 두면
+        //   분자만 쌓이고 분모가 없습니다. 함수 맨 앞의 선행 집계 블록이
+        //   accepted / rejected / 보류 세 갈래를 모두 한 번에 세므로,
+        //   여기서 다시 부르면 같은 필드가 두 번 seen 되고
+        //   reject_format 이 이중 가산되어 거절률이 200% 로 계산됩니다.
+        //
+        //  ── 이 루프의 책임 ──
+        //   이제 이 루프는 '병합 결과에서 실제로 값을 걷어내는' 데이터 조작만 합니다.
+        //   판정 사실의 기록과 데이터 조작을 분리해 두면
+        //   나중에 폐기 정책이 바뀌어도 통계 축이 흔들리지 않습니다.
     }
-
     emit(&format!(
         "  ✅ [GROUNDING APPLY] 폐기 {}건 | 데이터 지점 {}곳에서 제거",
         rejected.len(),
@@ -544,6 +681,12 @@ pub fn merge_extracted(
                     for e in arr {
                         if !row_has_identity(e) {
                             ghost += 1;
+                            let id_field = if category == "items" { "description" } else { "container_number" };
+                            crate::utils::score_dynamics::record_field_seen(id_field);
+                            crate::utils::score_dynamics::record_field_reject(
+                                id_field,
+                                crate::utils::score_dynamics::GateKind::SelfId,
+                            );
                             continue;
                         }
                         let k = row_key(e);
@@ -570,8 +713,46 @@ pub fn merge_extracted(
     let mut added = 0usize;
     let mut kept = 0usize;
     let mut echoed = 0usize;
+    let mut off_schema = 0usize;
+    let mut off_schema_null = 0usize;
 
     for (k, v) in obj.iter() {
+        let is_empty = v.is_null()
+            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
+
+        {
+            let owner = crate::logic::trade_field_category(k);
+            if owner != category {
+                if is_empty {
+                    off_schema_null += 1;
+                    continue;
+                }
+                off_schema += 1;
+                let shown: String = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+                    .chars()
+                    .take(40)
+                    .collect();
+                emit(&format!(
+                    "    🚫 [SCHEMA WHITELIST] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아닙니다 (소속: {}). 크롭 프롬프트는 '{}' 필드만 요청했으므로 모델이 스스로 만든 키입니다. 폐기합니다.",
+                    category, k, shown,
+                    if owner.is_empty() { "스키마 밖" } else { owner },
+                    category
+                ));
+                crate::utils::score_dynamics::record_field_seen(k);
+                crate::utils::score_dynamics::record_field_reject(
+                    k,
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
+                continue;
+            }
+        }
+
+        if is_empty { continue; }
+
         // ① 빈 값 / 스키마 에코는 덮지 않습니다.
         if let Some(s) = v.as_str() {
             if is_schema_echo(s) {
@@ -580,14 +761,14 @@ pub fn merge_extracted(
                     "    🚫 [SCHEMA ECHO] [{}] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",
                     category, k, s
                 ));
+                crate::utils::score_dynamics::record_field_seen(k);
+                crate::utils::score_dynamics::record_field_reject(
+                    k,
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
                 continue;
             }
         }
-        let is_empty = v.is_null()
-            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
-            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
-        if is_empty { continue; }
-
         // ② 배열은 이어붙입니다.
         if let Some(arr) = v.as_array() {
             let slot = merged
@@ -629,6 +810,10 @@ pub fn merge_extracted(
                 true
             }
         };
+        crate::utils::score_dynamics::record_field_seen(k);
+        if newly_added {
+            crate::utils::score_dynamics::record_field_assigned(k, 0.0);
+        }
 
         // 🌟 [CATEGORY SLOT MIRROR] 카테고리 그룹 객체에도 같은 값을 넣습니다.
         //
@@ -657,8 +842,8 @@ pub fn merge_extracted(
     }
 
     emit(&format!(
-        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건",
-        category, added, kept, echoed
+        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건 | 스키마 밖 키 폐기 {}건 (빈 값 {}건은 조용히 무시)",
+        category, added, kept, echoed, off_schema, off_schema_null
     ));
 }
 

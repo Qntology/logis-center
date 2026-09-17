@@ -2084,12 +2084,12 @@
       "sender_name": {
         "semantic": "송하인, 수출자, 판매자, 선적인 이름",
         "bias": "송하인, 수출자, 판매자, 선적인, 공급자, 발송인, shipper, exporter, seller, supplier, consignor, vendor",
-        "prejudice": "수하인, 수입자, 구매자, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+        "prejudice": "수하인, 수입자, 구매자, 통지처, 선사, 운송인, 운송회사, 포워더, 운송주선인, 국제물류주선업자, 복합운송주선인, 선박회사, 해운회사, 항공사, 대리점, 선적대리점, 창고업자, 보세창고, 관세사, 검사기관, 은행, 발행은행, 통지은행, 보험사, carrier, forwarder, freight forwarder, NVOCC, shipping line, shipping agent, agent, liner, logistics, warehouse operator, customs broker, bank, insurer, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
       },
       "recipient_name": {
         "semantic": "수하인, 수입자, 구매자 이름",
         "bias": "수하인, 수입자, 구매자, 인수인, consignee, importer, buyer, receiver, to order of",
-        "prejudice": "송하인, 수출자, 판매자, 선적인, 통지처, 선사, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
+        "prejudice": "송하인, 수출자, 판매자, 선적인, 통지처, 선사, 운송인, 운송회사, 포워더, 운송주선인, 국제물류주선업자, 복합운송주선인, 선박회사, 해운회사, 항공사, 대리점, 선적대리점, 창고업자, 보세창고, 관세사, 검사기관, 은행, 발행은행, 통지은행, 보험사, carrier, forwarder, freight forwarder, NVOCC, shipping line, shipping agent, agent, liner, logistics, warehouse operator, customs broker, bank, insurer, 항구, 서류번호, 발행일, 중량, 금액, 컨테이너번호"
       },
       "vessel": {
         "semantic": "선박명, 항공편명, 운송수단명",
@@ -3206,12 +3206,12 @@
       "sender_name": {
         "semantic": "Shipper, exporter, seller, consignor name",
         "bias": "shipper, exporter, seller, supplier, consignor, vendor",
-        "prejudice": "consignee, importer, buyer, notify party, carrier, port, document number, issue date, weight, amount, container number"
+        "prejudice": "consignee, importer, buyer, notify party, carrier, forwarder, freight forwarder, NVOCC, shipping line, shipping agent, agent, liner, ocean carrier, air carrier, logistics provider, warehouse operator, customs broker, issuing bank, advising bank, insurer, surveyor, port, document number, issue date, weight, amount, container number"
       },
       "recipient_name": {
         "semantic": "Consignee, importer, buyer name",
         "bias": "consignee, importer, buyer, receiver, to order of",
-        "prejudice": "shipper, exporter, seller, consignor, notify party, carrier, port, document number, issue date, weight, amount, container number"
+        "prejudice": "shipper, exporter, seller, consignor, notify party, carrier, forwarder, freight forwarder, NVOCC, shipping line, shipping agent, agent, liner, ocean carrier, air carrier, logistics provider, warehouse operator, customs broker, issuing bank, advising bank, insurer, surveyor, port, document number, issue date, weight, amount, container number"
       },
       "vessel": {
         "semantic": "Vessel name, flight number, transport mode name",

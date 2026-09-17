@@ -849,6 +849,8 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
             // 🌟 confirmed 청크는 형식 불일치여도 강등하지 않습니다.
             if chunk.confirmed {
                 confirmed_bypass_count += 1;
+                crate::utils::score_dynamics::record_field_seen(&chunk.property);
+                crate::utils::score_dynamics::record_baseline("indexing.format_bypass", 1.0);
                 println!(
                     "  🛡️ [FORMAT GATE BYPASS] '{}' (property='{}', format='{}') 형식 불일치이지만 JSON 구조 확정이므로 보호",
                     if chunk.chunk_text.chars().count() > 60 {
@@ -861,7 +863,11 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
                 );
                 continue;
             }
-
+            crate::utils::score_dynamics::record_field_seen(&chunk.property);
+            crate::utils::score_dynamics::record_field_reject(
+                &chunk.property,
+                crate::utils::score_dynamics::GateKind::Format,
+            );
             println!(
                 "  🚧 [FORMAT GATE / INDEXING] '{}' (property='{}', format='{}') 형식 불일치 → unclassified 강등",
                 chunk.chunk_text, chunk.property, chunk.property_format
@@ -1575,7 +1581,9 @@ where
             // ── 임베딩 계산 (1회) ──
             let chunk_emb = embed_fn(chunk_meta.chunk_text.clone()).await;
             if chunk_emb.iter().all(|&v| v == 0.0) {
-                // 임베딩 실패: 구조적 사실 우선으로 확정 유지
+                crate::utils::score_dynamics::record_field_seen(&chunk_meta.property);
+                crate::utils::score_dynamics::record_field_assigned(&chunk_meta.property, 0.0);
+                crate::utils::score_dynamics::record_baseline("indexing.embed_fail", 1.0);
                 results.push(PlinkoResult {
                     chunk_text: chunk_meta.chunk_text.clone(),
                     property: chunk_meta.property.clone(),
@@ -1623,8 +1631,24 @@ where
 
             // ── 역방향 검증 판정 ──
             let is_argmax = chunk_meta.property == argmax_prop;
-
+            crate::utils::score_dynamics::record_field_seen(&chunk_meta.property);
+            {
+                let dist: Vec<f32> = all_field_scores.iter().map(|(_, s)| *s).collect();
+                if dist.len() >= 2 {
+                    crate::utils::score_dynamics::record_decay("indexing.confirm_row", &dist);
+                }
+            }
             if !is_argmax && origin_score < argmax_score {
+                crate::utils::score_dynamics::record_near_miss(&chunk_meta.property);
+                crate::utils::score_dynamics::record_confusion(
+                    &chunk_meta.property,
+                    &argmax_prop,
+                    argmax_score - origin_score,
+                );
+                crate::utils::score_dynamics::record_baseline(
+                    "indexing.confirm_flag_gap",
+                    argmax_score - origin_score,
+                );
                 println!(
                     "  🚩 [CONFIRM FLAG] '{}' | origin='{}'({:.4}) < argmax='{}'({:.4}) | margin={:+.4}",
                     chunk_meta.chunk_text,
@@ -1634,8 +1658,13 @@ where
                     argmax_score,
                     origin_score - argmax_score
                 );
+            } else {
+                let runner = alternatives.first().map(|(_, s)| *s).unwrap_or(origin_score);
+                crate::utils::score_dynamics::record_field_assigned(
+                    &chunk_meta.property,
+                    origin_score - runner,
+                );
             }
-
             results.push(PlinkoResult {
                 chunk_text: chunk_meta.chunk_text.clone(),
                 property: chunk_meta.property.clone(), // JSON 구조 우선: 변경하지 않음
@@ -1646,10 +1675,8 @@ where
             confirm_count += 1;
             continue;
         }
-
         // ── 발견 모드: 미확정 청크에 대한 기존 PLINKO 슬라이딩 윈도우 ──
         discover_count += 1;
-
         // ── Sliding Window 상태 ──
         let mut current_window: Vec<&str> = Vec::new();
         let mut prev_max_score: f32 = -1.0;

@@ -24,7 +24,7 @@ pub mod bias_schema;
 pub mod json_parse;
 pub mod nl_convert;
 pub mod time_guide;
-
+pub mod score_dynamics;
 pub use device_utils::*;
 pub use misc_utils::*;
 pub use lang_utils::*;

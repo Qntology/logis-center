@@ -6,6 +6,10 @@ pub use utils::bias_schema;
 pub use utils::json_parse;
 pub use utils::nl_convert;
 pub use utils::time_guide;
+// 🌟 [SCORE DYNAMICS] 점수를 신호로 취급하는 관측·통계 계층.
+//    bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
+//    Phase 0 에서는 계측과 영속화만 수행하고 판정에는 개입하지 않습니다.
+pub use utils::score_dynamics;
 mod logic;
 mod scheduler;
 pub mod analytic;
@@ -186,6 +190,10 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
         }
         *model_guard = None;
     }
+    // 🌟 [SDS FLUSH] 언로드는 세션 경계이므로 관측을 디스크에 확정합니다.
+    //    dirty 플래그가 false 면 파일을 쓰지 않으므로 불필요한 I/O 가 없습니다.
+    println!("[UNLOAD] {}", crate::utils::score_dynamics::report());
+    crate::utils::score_dynamics::flush();
     
     {
         let mut store_guard = state.store.lock().await;
@@ -395,11 +403,11 @@ async fn reindex_pending_embeddings(
         //     ── 비용 ──
         //      analytics 도메인 타입은 get_detail_schema_fields 에 스키마가 없어
         //      index_item_chunks 가 조기 종료됩니다. 즉 추가 비용은 '문서 벡터 1개' 뿐입니다.
-        const EMBED_EXCLUDE_TYPES: [&str; 10] = [
-            "pages", "page", "talk", "prompt", "ai_search",
-            "question", "answer", "team", "user", "member",
-        ];
-        if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
+        // 🌟 [제외 타입 위임] 기존 EMBED_EXCLUDE_TYPES 배열은 talk / user 타입 목록의
+        //    네 번째 복제본이었습니다. store.rs::is_embed_excluded_type 하나로 통합합니다.
+        //    analytic 원시 이벤트(click/hover/change/touch)와 report 는 제외되지 않습니다.
+        //    그것들이 빠지면 D1 에서 받아온 행동 로그가 검색에 절대 잡히지 않습니다.
+        if crate::store::is_embed_excluded_type(&doc.r#type) {
             continue;
         }
         // 🌟 [MODE INTEGRITY RECHECK] SQL 필터를 신뢰하지 않고 한 번 더 봅니다.
@@ -1008,16 +1016,14 @@ async fn summarize_image(
 }
 
 fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
-    const ENVELOPE_COLS: [&str; 9] = [
-        "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
-    ];
-    const TIME_COLS: [&str; 2] = ["created_at", "updated_at"];
-
+    // 🌟 [SINGLE SOURCE] 봉투 컬럼 목록을 store.rs 의 물리 스키마 선언과 공유합니다.
+    //    기존에는 여기에 ENVELOPE_COLS[9] + TIME_COLS[2] 로 복제되어 있어,
+    //    init_all_tables 의 Field 선언이 바뀌면 조용히 어긋났습니다.
+    use crate::store::ENVELOPE_COLUMNS;
     let raw = match filter {
         Some(f) if !f.trim().is_empty() => f,
         _ => return None,
     };
-
     let mut kept: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     for clause in raw.split(" AND ") {
@@ -1048,9 +1054,7 @@ fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
             .trim()
             .to_lowercase();
 
-        let is_envelope = ENVELOPE_COLS.iter().any(|e| *e == lhs)
-            || TIME_COLS.iter().any(|e| *e == lhs);
-
+        let is_envelope = ENVELOPE_COLUMNS.iter().any(|e| *e == lhs);
         if is_envelope {
             kept.push(c.to_string());
         } else {
@@ -2403,6 +2407,102 @@ async fn ai_search_complex(
                 }
             }
 
+            // ── 5-A2: [U-3] 시간 감쇠 융합 ──
+            //
+            //  ── 왜 정규화 '직전' 인가 ──
+            //   정규화 이후에 곱하면 최댓값이 1.0 을 유지하지 못해
+            //   프론트엔드의 상대 비교가 흔들립니다.
+            //   정규화 이전에 곱하면 감쇠가 반영된 채로 다시 0~1 에 맞춰지므로
+            //   '상대 순위만 바뀌고 스케일 계약은 유지' 됩니다.
+            //
+            //  ── 왜 analytic 에만 적용하는가 ──
+            //   무역 서식은 시간이 지나도 유효합니다. B/L 은 늙지 않습니다.
+            //   커머스 상품도 마찬가지입니다.
+            //   시의성이 관련성의 일부인 것은 행동 로그뿐입니다.
+            //
+            //  ── 왜 명시적 기간이 있으면 끄는가 ──
+            //   사용자가 '지난달' 을 지정했다면 SQL 이 이미 구간을 잘랐습니다.
+            //   그 안에서 다시 감쇠를 걸면 구간 앞부분이 부당하게 눌립니다.
+            if search_mode == "analytic" && !merged_map.is_empty() {
+                let explicit_period = structured_query
+                    .get("started_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0;
+                if explicit_period {
+                    emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
+                } else if let Some(store) = store_opt.as_ref() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    // ① 회수 문서의 행동 시각을 모읍니다.
+                    //    report 문서는 U-1 이 남긴 episode_ended_at 이 실제 행동 시각이고,
+                    //    created_at 은 '합성 시각' 이라 시의성 판정에 쓰면 안 됩니다.
+                    let mut ages: Vec<(String, i64)> = Vec::new();
+                    for (id, _) in merged_map.iter() {
+                        if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
+                            let acted_at = serde_json::from_str::<Value>(&doc.json_data)
+                                .ok()
+                                .and_then(|d| {
+                                    d.get("episode_ended_at")
+                                        .and_then(|v| v.as_i64())
+                                        .or_else(|| d.get("created_at").and_then(|v| v.as_i64()))
+                                })
+                                .filter(|v| *v > 0)
+                                .unwrap_or(doc.created_at_ts);
+                            ages.push((id.clone(), (now_ms - acted_at).max(0)));
+                        }
+                    }
+                    let age_only: Vec<i64> = ages.iter().map(|(_, a)| *a).collect();
+                    match crate::analytic::derive_recency_half_life(&age_only) {
+                        Some(half_life) => {
+                            let hl_days = half_life / 86_400_000.0;
+                            emit_term(&format!(
+                                "[AI-SEARCH] ⏱️ [RECENCY DECAY] 회수 {}건의 경과 시간 중앙값에서 반감기를 유도했습니다: {:.2}일. (중앙값 시점에서 가중 0.5 → 절반은 증폭, 절반은 감쇠)",
+                                age_only.len(), hl_days
+                            ));
+                            crate::utils::score_dynamics::record_baseline(
+                                "analytic.recency_half_life_days",
+                                hl_days as f32,
+                            );
+                            let mut logged = 0usize;
+                            for (id, age) in ages.into_iter() {
+                                let w = crate::analytic::recency_weight(age, half_life);
+                                if let Some(item) = merged_map.get_mut(&id) {
+                                    let raw = item
+                                        .get("score")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0) as f32;
+                                    let decayed = raw * w;
+                                    item.as_object_mut()
+                                        .unwrap()
+                                        .insert("score".to_string(), json!(decayed));
+                                    item.as_object_mut()
+                                        .unwrap()
+                                        .insert("recency_weight".to_string(), json!(w));
+                                    item.as_object_mut().unwrap().insert(
+                                        "age_days".to_string(),
+                                        json!((age as f64 / 86_400_000.0 * 100.0).round() / 100.0),
+                                    );
+                                    if logged < 8 {
+                                        logged += 1;
+                                        emit_term(&format!(
+                                            "  ⏱️ [RECENCY] id={} | 경과 {:.2}일 | 가중 {:.4} | {:.4} → {:.4}",
+                                            id,
+                                            age as f64 / 86_400_000.0,
+                                            w,
+                                            raw,
+                                            decayed
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            emit_term("[AI-SEARCH] ⏱️ [RECENCY] 회수 건수가 부족하거나 전 기록이 사실상 동시각이라 반감기를 유도할 수 없습니다. 시간 감쇠를 적용하지 않습니다.");
+                        }
+                    }
+                }
+            }
+
             // ── 5-B: 점수 정규화 ──
             // 문서 매칭(primary)과 청크 매칭(chunk_match)의 점수 스케일이 다를 수 있으므로
             // 최대 점수 기준으로 0.0~1.0 에 정규화합니다.
@@ -2485,10 +2585,18 @@ async fn ai_search_complex(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let brief: String = matched_text.chars().take(48).collect();
-                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'",
+                // 🌟 [U-3] 시간 감쇠가 적용된 항목은 그 사실을 랭킹 로그에 함께 남깁니다.
+                //    '왜 이 결과가 위에 있는가' 를 사후에 재구성할 수 있어야 합니다.
+                let rec = item.get("recency_weight").and_then(|v| v.as_f64());
+                let age_d = item.get("age_days").and_then(|v| v.as_f64());
+                let rec_note = match (rec, age_d) {
+                    (Some(w), Some(a)) => format!(" | recency={:.4}({:.1}일)", w, a),
+                    _ => String::new(),
+                };
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'{}",
                     rank + 1, id, score, ctx,
                     if is_chunk { if is_alias { "alias" } else { "chunk" } } else { "doc" },
-                    prop, brief);
+                    prop, brief, rec_note);
             }
 
             all_results = ranked_results;
@@ -2543,10 +2651,21 @@ async fn ai_search_complex(
                                 .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
                                 .unwrap_or_default();
 
+                            // 🌟 [U-3] 경과 일수를 함께 실어 모델이 시의성을 판단할 수 있게 합니다.
+                            //
+                            //  ── 왜 ISO 시각만으로는 부족한가 ──
+                            //   2B 모델은 "2026-03-15" 와 "오늘" 사이의 간격을
+                            //   안정적으로 계산하지 못합니다. 시스템 시각이 프롬프트에 있어도
+                            //   뺄셈을 틀립니다. 계산된 일수를 직접 주는 편이 확실합니다.
+                            let age_days = {
+                                let now = chrono::Utc::now().timestamp_millis();
+                                ((now - at).max(0) as f64 / 86_400_000.0 * 10.0).round() / 10.0
+                            };
                             records.push(json!({
                                 "user": doc.from,
                                 "type": doc.r#type,
                                 "at": at_iso,
+                                "days_ago": age_days,
                                 "link": d.get("link").and_then(|v| v.as_str()).unwrap_or(""),
                                 "action": action,
                                 "summary": summary,
@@ -2559,6 +2678,23 @@ async fn ai_search_complex(
                     }
                 }
 
+                // 🌟 [U-3] 회수 기록을 최신순으로 정렬해 프롬프트에 넣습니다.
+                //
+                //  ── 왜 필요한가 ──
+                //   STAGE-5 는 점수순으로 정렬되어 있어 시간이 뒤섞입니다.
+                //   그 상태로 넣으면 모델이 "최근 흐름" 을 물어도
+                //   목록 앞쪽(=점수 높은) 오래된 기록부터 서술합니다.
+                //   시간 감쇠가 순위에 반영되었더라도, 프롬프트 안의 '읽는 순서' 는
+                //   별개의 신호이므로 함께 맞춰야 합니다.
+                //
+                //  ── 점수 순서를 버리지 않습니다 ──
+                //   records 는 이미 상위 30건으로 잘린 상태이므로,
+                //   그 안에서 시간순으로 재배열해도 '관련성 높은 집합' 이라는 사실은 유지됩니다.
+                records.sort_by(|a, b| {
+                    let ta = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
+                    let tb = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
+                    tb.cmp(ta)
+                });
                 if !records.is_empty() {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
@@ -3003,6 +3139,16 @@ async fn initialize_hub(
                 Err(e) => println!("[HUB] Migration warning: {}", e),
             }
         }
+        // 🌟 [SDS REBIND] 통계 스코프를 실제 팀으로 재바인딩합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   부팅 시점에는 로그인 전이라 ZERO_ADDRESS 기반 팀으로 로드됩니다.
+        //   그 상태로 쌓인 통계를 다른 팀에 그대로 적용하면
+        //   기획 6-4 의 스코프 격리 원칙을 위반합니다.
+        //   migrate_team_identity 가 LanceDB 문서를 이전하는 것과 같은 시점에
+        //   통계도 정리합니다. 단 문서와 달리 통계는 '이전' 이 아니라 '폐기' 입니다.
+        //   ZERO 팀에서 쌓인 분포가 실제 팀의 문서 분포와 같다는 보장이 없기 때문입니다.
+        crate::utils::score_dynamics::rebind_team(&new_team_id);
         match store.initialize_user_profiles(&address, &email, &flag).await {
             Ok(_) => Ok(format!("Hub initialized for address: {}", address)),
             Err(e) => Err(format!("Initialization failed: {}", e)),
@@ -3201,18 +3347,13 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         .unwrap_or("").to_string();
             
             let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
-
-            const COMMERCE_RESERVED: [&str; 19] = [
-                "sales", "goods", "order", "tracking", "event", "coupon", "review",
-                "receiving", "shipping", "member", "team", "user", "users",
-                "pages", "page", "talk", "prompt", "ai_search", "unknown",
-            ];
-            const ANALYTIC_RESERVED: [&str; 7] = [
-                "click", "hover", "change", "touch", "report", "question", "answer",
-            ];
+            // 🌟 [예약 타입 판정 위임] 기존 COMMERCE_RESERVED / ANALYTIC_RESERVED 두 배열은
+            //    store.rs 의 COMMERCE_TYPES / USER_TYPES / TALK_TYPES / ANALYTIC_TYPES 와
+            //    같은 집합을 세 번째로 복제한 것이었습니다.
+            //    'ID'(Import Declaration) / 'CO' / 'CA' / 'PC' 처럼 커머스 소문자 타입과
+            //    대소문자만 다른 무역 코드가 있으므로 예약 판정이 반드시 먼저 와야 합니다.
             let lower = raw_type.to_lowercase();
-            let is_reserved = COMMERCE_RESERVED.iter().any(|t| *t == lower)
-                || ANALYTIC_RESERVED.iter().any(|t| *t == lower);
+            let is_reserved = crate::store::is_reserved_type(&lower);
             let type_str = if is_reserved {
                 lower
             } else {
@@ -3242,22 +3383,17 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     if let Some(mode) = item.get("mode") {
                         obj.insert("mode".to_string(), mode.clone());
                     } else {
-                        let is_analytic_type = matches!(
-                            type_str.as_str(),
-                            "click" | "hover" | "change" | "report" | "question" | "answer"
-                        );
-
-                        let is_shipping_doc_type =
-                            crate::utils::bias_schema::canonical_bias_type(type_str.as_str())
-                                == "shipping_doc";
-                        if is_analytic_type {
-                            obj.insert("mode".to_string(), serde_json::json!("analytic"));
-                        } else if is_shipping_doc_type {
+                        // 🌟 [MODE 자동 태깅 위임] 기존 인라인 판정은 'touch' 가 빠져 있어
+                        //    touch 이벤트가 commerce 로 태깅되었습니다.
+                        //    (store.rs 의 추론이 뒤에서 덮어써 우연히 동작하고 있었을 뿐입니다)
+                        //    이제 store.rs::infer_mode 하나가 유일한 판정자입니다.
+                        let inferred = crate::store::infer_mode(type_str.as_str());
+                        if inferred != "commerce" {
                             println!(
-                                "[SYNC] 🚢 [MODE AUTO-TAG] id='{}' type='{}' 은 무역 서식이므로 mode='shipping' 으로 태깅합니다.",
-                                id, type_str
+                                "[SYNC] 🧭 [MODE AUTO-TAG] id='{}' type='{}' → mode='{}'",
+                                id, type_str, inferred
                             );
-                            obj.insert("mode".to_string(), serde_json::json!("shipping"));
+                            obj.insert("mode".to_string(), serde_json::json!(inferred));
                         }
                     }
                 }
@@ -3403,28 +3539,21 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             //      Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
             //      그 명시값을 '진짜로' 1순위에 둡니다. (추정이 아니라 계약입니다)
             let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
-            let final_table = match table_hint {
-                // ── 1순위 : 서버가 명시한 물리 테이블 ──
-                "pages" | "page" => "pages",
-                "users" => "users",
-                // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
-                "talks" => continue,
-                // ── 2순위 : 힌트가 없거나 레거시(sales/tracking/event)일 때만 type 으로 판정 ──
-                _ => match type_str.as_str() {
-                    "member" | "team" | "user" | "users" => "users",
-                    "pages" | "page" => "pages",
-                    // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
-                    "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
-                    "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
-                    | "receiving" | "shipping" => "items",
-                    // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
-                    //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
-                    //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
-                    //    방어적으로 여기서도 skip 합니다.
-                    "talk" | "prompt" | "ai_search" => continue,
-                    // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
-                    _ => "items",
-                },
+            // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
+            if table_hint == "talks" { continue; }
+            // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
+            //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
+            //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
+            //    방어적으로 여기서도 skip 합니다.
+            if crate::store::is_talk_type(type_str.as_str()) { continue; }
+            // ── 1순위 : 서버가 명시한 물리 테이블. 2순위 : type 으로 판정 ──
+            //    두 경로 모두 store.rs::resolve_table_for 를 통과하므로,
+            //    upsert 가 쓴 테이블과 get_item_by_id / delete_item 이 여는 테이블이
+            //    구조적으로 어긋날 수 없습니다.
+            let final_table = if table_hint.is_empty() {
+                crate::store::resolve_table_for(type_str.as_str())
+            } else {
+                crate::store::resolve_table_for(table_hint)
             };
 
             
@@ -3722,6 +3851,12 @@ async fn delete_all_models() -> Result<String, String> {
 async fn reset_lancedb(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // 🌟 [SDS PURGE] 팩토리 리셋은 '판정 근거를 포함한 전량 초기화' 입니다.
+    //    문서를 지우면서 그 문서들에서 유도한 통계를 남기면
+    //    존재하지 않는 데이터의 분포로 판정하게 됩니다.
+    //    또한 이 삭제가 기획 8-2 의 롤백 수단입니다.
+    //    (코드 롤백 없이 파일 삭제만으로 적응 이전 동작으로 복귀)
+    crate::utils::score_dynamics::purge();
     let mut store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         db.reset_database().await.map_err(|e| e.to_string())?;
@@ -4003,6 +4138,21 @@ pub fn run() {
                     //    대상이 0건이면 조회 1회로 끝나므로 매 시작마다 돌아도 부담이 없고,
                     //    교정된 문서는 embed 마커가 제거되어 reindex 가 자동으로 재인덱싱합니다.
                     let _ = s.migrate_mode_by_type().await;
+                    // 🌟 [SDS LOAD] 점수 동역학 통계를 세션 시작 시 1회 불러옵니다.
+                    //
+                    //  ── 왜 여기인가 ──
+                    //   VectorStore 초기화와 같은 블록이어야 '데이터 계층이 준비되는 시점'
+                    //   이라는 의미가 코드 배치로 드러납니다.
+                    //   이 시점에는 아직 로그인 전이라 팀이 ZERO_ADDRESS 기반일 수 있고,
+                    //   initialize_hub 가 실제 팀을 확정하면 rebind_team 이 재바인딩합니다.
+                    //
+                    //  ── 파일이 없으면 ──
+                    //   냉간 시작 로그만 남기고 빈 통계로 출발합니다.
+                    //   ASE 는 관측 부족으로 None 을 돌려주므로 판정은 현행 그대로입니다.
+                    let zero_team = crate::utils::hash::hash_id(
+                        "0x0000000000000000000000000000000000000000"
+                    );
+                    crate::utils::score_dynamics::load(&zero_team);
                     
                     let error_status = crate::logic::parse_status("error");
                     
@@ -4171,7 +4321,12 @@ pub fn run() {
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 println!("[APP] Application exiting. Shutting down browser...");
-
+                // 🌟 [SDS FLUSH] 종료 경로에서도 관측을 확정합니다.
+                //    언로드를 거치지 않고 창을 닫는 경로가 존재하므로
+                //    두 지점 모두에 flush 가 있어야 관측이 유실되지 않습니다.
+                //    flush 는 dirty 일 때만 파일을 쓰므로 중복 호출이 무해합니다.
+                println!("[APP] {}", crate::utils::score_dynamics::report());
+                crate::utils::score_dynamics::flush();
                 // 1. 전역 브라우저 상태를 즉시 stopped으로 고정
                 if let Ok(mut state) = crate::CURRENT_BROWSER_STATE.write() {
                     *state = "stopped".to_string();

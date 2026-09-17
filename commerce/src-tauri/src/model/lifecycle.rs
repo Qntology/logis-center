@@ -26,52 +26,20 @@ impl LogisModel {
                 println!("[MODEL] Embedding Model unloaded to free VRAM.");
             }
         }
-        
-        // 🌟 [추가] RAM 확보를 위해 임베딩 텍스트 캐시 완전 삭제
         {
             let mut cache = self.embedding_cache.lock().await;
             cache.clear();
             println!("[MODEL] Embedding Memory Cache cleared to free RAM.");
         }
-
-        // 🌟 [추가] VRAM 해제를 위해 CUDA 디바이스 동기화 및 메모리 풀 초기화
         if !self.is_cpu_mode {
-            // candle의 Device 자체에 내장된 안전한 동기화 메서드 사용 (컴파일 에러 해결)
             if self.device_config.device.is_cuda() {
                 let _ = self.device_config.device.synchronize();
             }
-            // 이전 CUDA 컨텍스트의 캐시 풀을 OS로 강제 반환시키기 위한 유도 장치
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
             println!("[MODEL] CUDA Context synchronized and memory pool flushed.");
         }
-
-        // 🌟 [CROSSOVER] 임베딩만 내렸으므로 IDLE 이 아니라 '남은 슬롯 기준' 으로 맞춥니다.
-        //    생성 모델이 함께 상주 중이었다면 PHASE_GENERATION 이 되어야 하는데,
-        //    mark_crossover_idle 로 뭉뚱그리면 다음 enter_generation_phase 가
-        //    이미 올라와 있는 모델을 다시 올리려 합니다.
         self.sync_crossover_phase().await;
     }
-
-    // =====================================================================
-    // 🌟 [CROSSOVER] 생성 슬롯 전용 부분 반환
-    // ---------------------------------------------------------------------
-    //  ── 왜 deep_purge_resources 로 충분하지 않은가 ──
-    //   deep_purge 는 '공장 초기화' 성격입니다. 임베딩·SigLIP2·KV 스토리지까지
-    //   전부 파기하고 CUDA 동기화에 최대 10초를 씁니다.
-    //   그런데 크로스오버가 필요로 하는 것은 '생성 모델이 쥔 VRAM' 뿐입니다.
-    //   전체 퍼지를 쓰면 임베딩을 곧바로 다시 올려야 하므로
-    //   스왑 1회가 실질적으로 2회분 비용이 됩니다.
-    //
-    //  ── 무엇을 건드리지 않는가 ──
-    //   · embedding_model  : 반환 대상이 아닙니다. 그것이 이 함수의 존재 이유입니다.
-    //   · siglip2_model    : 비전 파이프라인이 별도로 release_siglip2 로 관리합니다.
-    //                        ensure_qwen3_5 의 SigLIP2 보호 분기와 충돌하지 않도록
-    //                        여기서는 손대지 않습니다.
-    //
-    //  ── 동기화 상한 ──
-    //   release_siglip2 와 같은 이유로 5초 상한을 둡니다. 동기화는 정확성이 아니라
-    //   반환 시점에만 영향을 주므로, 드라이버 스톨 시 영구 대기하는 편이 더 위험합니다.
-    // =====================================================================
     pub async fn unload_generation_slots(&self, reason: &str) {
         let _hold = self.hold_generation();
 
@@ -646,7 +614,6 @@ impl LogisModel {
     pub async fn ensure_qwen3(&self) -> anyhow::Result<()> {
         let needs_load = { self.qwen3_generator.lock().await.is_none() };
         if needs_load {
-            // 🌟 [CRITICAL FIX] 백그라운드에서 이미 로딩이 시작되었는지 확인하고, 진행 중이라면 완료될 때까지 안전하게 대기합니다.
             {
                 let size_guard = self.current_size.lock().await;
                 if *size_guard == Some(ModelSize::Qwen3) {
@@ -660,48 +627,8 @@ impl LogisModel {
                     }
                 }
             }
-
             println!("[MODEL] Loading Qwen3 Text Model (0.6B GGUF) exclusively via NATIVE /qwen3/ logic...");
-            // 🌟 [GENERATION HOLD] 이 함수는 secure_vram_relay 를 거치지 않고
-            //    단독 호출되는 경로도 있으므로 자체적으로 전환 구간을 선언합니다.
-            //    (holds 는 카운터이므로 relay 경유 시 2중으로 잡혀도 안전합니다)
             let _load_hold = self.hold_generation();
-            
-            // 🌟 [DOUBLE PURGE ELIMINATED] 퍼지를 '무조건' 이 아니라 '필요할 때만' 수행합니다.
-            //
-            //  ── 실측 사고 (log.txt) ──
-            //   [RELAY] Performing Deep Purge before loading Qwen3 ...
-            //   [DIAG-PURGE] ... Aggressive Purge Complete.     ← secure_vram_relay 가 이미 수행
-            //   [VRAM-WATCH] Success! VRAM Secured: 4.04 GB
-            //   [MODEL] Loading Qwen3 Text Model ...
-            //   [DIAG-PURGE] ... Aggressive Purge Complete.     ← 여기서 또 수행 (완전 중복)
-            //   퍼지 1회는 CUDA 동기화에만 최대 10초를 쓰며, 그 창이 곧
-            //   백그라운드 임베딩 재로드가 끼어드는 창이었습니다.
-            //   실측 [RELAY] Transition to Qwen3 complete in 47.40s 의 대부분이 이 낭비입니다.
-            //
-            //  ── 판정 근거 ──
-            //   '방금 퍼지했는가' 를 시간으로 재면 매직 상수가 됩니다.
-            //   대신 '내릴 것이 실제로 남아 있는가' 라는 상태를 봅니다.
-            //   내릴 것이 하나도 없으면 퍼지는 정의상 무의미한 연산입니다.
-            // 🌟 [CROSSOVER] 임베딩을 '퍼지 트리거' 에서 분리합니다.
-            //
-            //  ── 무엇이 문제였나 ──
-            //   기존 purge_needed 는 embedding_model.is_some() 을 포함했습니다.
-            //   그래서 임베딩이 상주하기만 하면 예산과 무관하게 전체 퍼지가 돌고,
-            //   deep_purge Step 2 가 그 임베딩을 함께 파기했습니다.
-            //   크로스오버의 '동시 상주' 경로가 이 한 줄 때문에
-            //   구조적으로 도달 불가능했습니다.
-            //
-            //  ── 판정 근거 ──
-            //   임베딩은 이미 VRAM 을 점유한 상태이므로, 지금 측정한 자유 메모리는
-            //   '임베딩을 남긴 채 쓸 수 있는 양' 그 자체입니다.
-            //   그 값이 Qwen3 예산을 넘으면 임베딩을 내릴 이유가 없습니다.
-            //   예산은 디스크 가중치 크기에서 출발해 실측으로 교체되므로 상수가 아닙니다.
-            //
-            //  ── 무엇을 보수적으로 남겼는가 ──
-            //   다른 생성 슬롯이나 SigLIP2 가 살아 있으면 기존과 동일하게 전체 퍼지합니다.
-            //   그 경우는 어차피 무언가를 반드시 내려야 하고, 부분 반환으로 얻는 이득보다
-            //   기존 동작을 보존하는 쪽이 안전합니다.
             let embed_resident = { self.embedding_model.lock().await.is_some() };
             let other_resident = {
                 self.generator.lock().await.is_some()
@@ -768,8 +695,6 @@ impl LogisModel {
         if size == ModelSize::Qwen3 {
             return self.ensure_qwen3().await; 
         }
-
-        // 오직 ModelSize::Qwen 만 이 아래 로직을 탐
         let mut current_size_guard = self.current_size.lock().await; // 🌟 첫 번째 자물쇠 획득!
         let mut gen_guard = self.generator.lock().await;
 
@@ -780,9 +705,7 @@ impl LogisModel {
                     crate::models::qwen::generate::ModelVariant::QuantizedText(m) => m.language_model.baking_only,
                     _ => false,
                 };
-                // 🌟 [CRITICAL FIX] 현재 모델이 Baking(LM Head 부재) 상태인데 추론 요청이 오면 Fresh Loading 진행
                 if !baking_only && is_baking_loaded {
-                    // 통과하여 아래 리로드 로직(Fresh Loading) 실행
                 } else {
                     return Ok(());
                 }
@@ -791,9 +714,6 @@ impl LogisModel {
 
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = &self.qwen_model_path; 
-        
-        // 🌟 [CRITICAL FIX] 이중 자물쇠(Deadlock) 유발 코드 제거! 
-        // 이미 가지고 있는 current_size_guard 에 직접 값을 할당합니다.
         *current_size_guard = Some(size); 
         
         let target_device = self.device_config.device.clone();
@@ -829,15 +749,11 @@ impl LogisModel {
                 return Err(anyhow::anyhow!("Model Loading Timeout"));
             }
         };
-
         *gen_guard = Some(gen);
-        // *current_size_guard = Some(size); // 위에서 미리 등록했으므로 생략 가능
-        
         Ok(())
     }
 
     pub async fn call_qwen3_verification_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        // Qwen3 로드 보장
         self.ensure_qwen3().await?;
         
         let gen_arc = self.qwen3_generator.clone();
@@ -869,16 +785,6 @@ impl LogisModel {
         
         Ok(res)
     }
-
-    // 🌟 [SYNONYM EXPANSION] 음차(Transliteration) 전용 Qwen3 호출.
-    //    call_qwen3_verification_model 은 시스템 프롬프트가 "JSON 으로 답하라"라서
-    //    음차 결과가 JSON 껍데기에 갇힙니다. 여기서는 단어별 JSON만 받도록 분리합니다.
-    //
-    //    시스템 프롬프트에도 언어 이름이 전혀 없습니다.
-    //    목표 표기 체계는 user 프롬프트의 [TARGET LANGUAGE] 로만 전달되며,
-    //    그 값은 lang_code_to_full_name() 으로 런타임에 생성됩니다.
-    //
-    //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
     pub async fn call_qwen3_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         self.ensure_qwen3().await?;
         let gen_arc = self.qwen3_generator.clone();
@@ -906,8 +812,6 @@ impl LogisModel {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }
         }).await??;
-
-        // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
         let q3_clear_arc = self.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
@@ -917,18 +821,6 @@ impl LogisModel {
 
         Ok(res)
     }
-
-    // 🌟 [SYNONYM EXPANSION - QWEN3.5] 음차(Transliteration) 전용 Qwen3.5 2B 호출.
-    //    0.6B 모델은 음차 능력이 부족하여 원문을 그대로 반복하는 문제가 있습니다.
-    //    Qwen3.5 2B 모델은 별도의 VRAM 슬롯(qwen3_5_generator)을 사용하며,
-    //    호출 전 Qwen3 0.6B를 내리고 Qwen3.5를 올리는 분리 동작을 전제로 합니다.
-    //
-    //    시스템 프롬프트에도 언어 이름이 전혀 없습니다.
-    //    목표 표기 체계는 user 프롬프트의 [TARGET LANGUAGE] 로만 전달되며,
-    //    그 값은 lang_code_to_full_name() 으로 런타임에 생성됩니다.
-    //
-    //    temperature 0.0 : 같은 값이면 항상 같은 별칭이 나와야 재인덱싱 시 벡터가 흔들리지 않습니다.
-    //    max_tokens 256 : 단어별 JSON 구조는 기존 단일 문자열보다 토큰 수가 많으므로 상향합니다.
     pub async fn call_qwen3_5_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         self.ensure_qwen3_5(false).await?;
 
@@ -953,8 +845,6 @@ impl LogisModel {
         let res = gen.generate(params, cancel_token.clone(), None, None, None, None)
             .await
             .map_err(|e| anyhow::anyhow!("Qwen3.5 transliteration failed: {}", e))?;
-
-        // 호출마다 KV 캐시를 비워 이전 값의 음차가 다음 값에 새는 것을 차단합니다.
         let _ = gen.clear_kv_cache();
         drop(gen_guard);
 
@@ -962,10 +852,6 @@ impl LogisModel {
     }
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
-        // 🌟 [VISION-JIT] 이미 2B 가 상주 중이고 mmproj 재로드 소스가 등록되어 있다면,
-        //    2GB 텍스트 모델을 통째로 파기/재로딩하지 않고 비전 가중치(약 600MB)만 붙였다 뗍니다.
-        //    기존에는 '이미지 추출 → thead 추출' 처럼 비전/텍스트가 번갈아 올 때마다
-        //    GGUF 를 처음부터 다시 읽어야 했습니다.
         {
             let mut guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_mut() {
@@ -992,24 +878,15 @@ impl LogisModel {
         };
         if needs_load {
             println!("[MODEL] Loading Qwen 3.5 Generator (2B) (Vision: {})...", needs_vision);
-            // 🌟 [GENERATION HOLD] ensure_qwen3 와 같은 이유로 자체 홀드를 선언합니다.
-            //    이 함수는 secure_vram_relay 경유 외에 ensure_generator_ext 에서도
-            //    직접 호출되므로, 진입점마다 홀드가 있어야 창이 남지 않습니다.
             let _load_hold = self.hold_generation();
-            // 🌟 [CRITICAL FIX] SigLIP2가 로드되어 있다면(이미지 추출 파이프라인),
-            // 전체 Purge가 비전 엔진을 죽이므로 Generator만 정리합니다.
             let is_vision_pipeline_active = self.siglip2_model.lock().await.is_some();
             if is_vision_pipeline_active {
                 println!("[RELAY] 🛡️ SigLIP2 is resident. Skipping deep purge to protect vision engine.");
-                // Generator 슬롯만 클리어 (KV 캐시 및 스토리지 해제)
                 let mut gen = self.generator.lock().await;
                 if let Some(mut g) = gen.take() {
                     let _ = g.clear_kv_cache();
                     let _ = g.qwen.drop_kv_storage();
                 }
-                // 🌟 [VRAM] 이미지 추출 파이프라인(extract_from_image)에서는
-                //    임베딩 모델(384차원 97M)을 한 번도 사용하지 않습니다.
-                //    해제하여 Qwen3.5 로드 전에 VRAM 을 확보합니다.
                 {
                     let mut emb = self.embedding_model.lock().await;
                     if emb.is_some() {
@@ -1022,17 +899,6 @@ impl LogisModel {
                     cache.clear();
                 }
             } else {
-                // 🌟 [DOUBLE PURGE ELIMINATED] ensure_qwen3 와 동일한 상태 판정입니다.
-                //    secure_vram_relay 가 이미 퍼지한 뒤 이 함수로 내려오면
-                //    내릴 것이 하나도 없는데도 CUDA 동기화 10초를 다시 씁니다.
-                //
-                // 🌟 [CROSSOVER] ensure_qwen3 와 같은 이유로 임베딩을 트리거에서 뺍니다.
-                //    이 분기는 is_vision_pipeline_active == false 인 경우만 도달하므로
-                //    SigLIP2 는 여기서 이미 None 임이 보장됩니다.
-                //
-                //  ── Qwen3.5 는 2B 라 대부분 SWAP 으로 떨어집니다 ──
-                //   그것이 오판이 아니라 정확한 판정입니다. 2GB 를 임베딩 위에
-                //   얹을 수 있는 여유가 실제로 있을 때만 COEXIST 로 갑니다.
                 let embed_resident = { self.embedding_model.lock().await.is_some() };
                 let other_resident = {
                     self.generator.lock().await.is_some()
@@ -1044,7 +910,6 @@ impl LogisModel {
                     && self.embedding_coexist_ok(ModelSize::Qwen3_5);
 
                 if other_resident || (embed_resident && !keep_embedding) {
-                    // 일반 텍스트 경로에서는 기존대로 전체 Purge 수행
                     self.deep_purge_resources().await;
                 } else if keep_embedding {
                     println!(
@@ -1056,13 +921,11 @@ impl LogisModel {
                     println!("[MODEL] ⚡ [PURGE SKIP] 해제 대상 슬롯이 하나도 없어 중복 퍼지를 생략합니다.");
                 }
             }
-            // 🌟 [핵심 픽스] 여기서도 로딩 전에 미리 방주인 등록!
             {
                 *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
             }
             let path = self.qwen3_5_model_path.clone();
             let dev = self.device_config.device.clone();
-            // 🌟 [TIMEOUT ADD] 180초 타임아웃으로 무한 로딩 방지
             let load_result = tokio::time::timeout(
                 std::time::Duration::from_secs(180),
                 tokio::task::spawn_blocking(move || {
@@ -1079,7 +942,6 @@ impl LogisModel {
             let gen = match load_result {
                 Ok(Ok(Ok(g))) => g,
                 Ok(Ok(Err(e))) => {
-                    // 로드 실패 시 현재 사이즈 등록을 되돌리고 에러 전파
                     {
                         *self.current_size.lock().await = None;
                     }
@@ -1124,20 +986,7 @@ impl LogisModel {
     }
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
-        // 실제 메모리에 올리기 직전에 파일 존재 여부를 다시 한 번 방어합니다.
         self.check_embedding_downloaded().await?;
-        // 🌟 [GENERATION HOLD YIELD] 생성 모델 전환 구간이면 로드를 양보합니다.
-        //
-        //  ── 왜 락 '밖' 에서 대기하는가 ──
-        //   embedding_model 뮤텍스를 쥔 채 대기하면 deep_purge_resources 의
-        //   Step 2 가 같은 뮤텍스를 못 잡아 즉시 데드락입니다.
-        //   반드시 락을 잡기 전에 대기를 끝내야 합니다.
-        //
-        //  ── 상한의 성격 ──
-        //   아래 반복 상한은 '판정 기준' 이 아니라 데드락 방지 안전핀입니다.
-        //   홀드를 푸는 주체(GenerationHold::drop)가 패닉 등으로 사라지는
-        //   상상 가능한 최악의 경우에도 앱이 영구히 멈추지 않게 합니다.
-        //   정상 경로에서는 첫 폴에서 바로 통과하거나 전환이 끝나는 즉시 풀립니다.
         if !self.is_cpu_mode && self.is_generation_held() {
             println!("[MODEL] ⏸️ [EMBED YIELD] 생성 모델 전환 구간입니다. 임베딩 로드를 양보하고 대기합니다.");
             let yield_started = Instant::now();
@@ -1159,41 +1008,15 @@ impl LogisModel {
         }
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
-            // 🌟 [VRAM GATE] 임베딩을 올리기 전에 자유 메모리를 체크합니다.
-            //    다른 모델이 상주 중인데 메모리가 부족하면,
-            //    동시 상주 대신 순차 모드(다른 모델 언로드 → 임베딩 로드)로 진입합니다.
-            //    이후 다른 모델이 다시 필요해지면 각 모델의
-            //    ensure_qwen3() / ensure_qwen3_5() / secure_vram_relay() 가
-            //    기존처럼 자동으로 재로드합니다.
-            //
-            //    ⚠️ 이 게이트는 '자유 메모리 부족' 만 봅니다. 퍼지 직후에는
-            //       4GB 가 비어 있어 통과하므로, 퍼지-재로드 레이스는
-            //       위의 GENERATION HOLD YIELD 가 담당합니다. 두 장치는 역할이 다릅니다.
             if !self.is_cpu_mode {
                 let free_mb = self.get_free_vram_mb();
-                // 🌟 [CROSSOVER] 하드코딩 350MB 를 실측 기반 예산으로 교체합니다.
-                //
-                //  ── 왜 상수가 위험했나 ──
-                //   350 은 granite-97m 을 눈대중한 값이며, dtype·GPU·드라이버가 바뀌면
-                //   즉시 틀립니다. 과소평가되면 게이트를 통과한 뒤 로드에서 OOM 이 나고,
-                //   과대평가되면 여유가 있는데도 매번 전체 퍼지를 유발합니다.
-                //   embedding_budget_mb() 는 디스크 가중치 크기에서 출발해
-                //   첫 로드 전후의 free VRAM 차이로 실측값이 되며,
-                //   대량 배치에서 관측한 activation 여유까지 더해 돌려줍니다.
                 let needed_mb = self.embedding_budget_mb();
                 if free_mb < needed_mb {
                     println!(
                         "[MODEL] ⚠️ [VRAM GATE] 자유 {}MB < 예산 {}MB. 생성 슬롯을 먼저 반환합니다.",
                         free_mb, needed_mb
                     );
-                    // 락을 해제하지 않으면 아래 반환 로직 내부에서
-                    // 같은 뮤텍스를 다시 잡아 데드락이 됩니다.
                     drop(emb_guard);
-
-                    // 🌟 [LADDER] ① 생성 슬롯만 반환 → ② 그래도 모자라면 전체 퍼지
-                    //   전체 퍼지는 SigLIP2 파기 + CUDA 동기화 최대 10초를 쓰므로
-                    //   정말 필요할 때만 도달하도록 단을 나눕니다.
-                    //   대부분의 경우 ①에서 끝나며, 그만큼 왕복 비용이 줄어듭니다.
                     self.unload_generation_slots("embedding vram gate").await;
                     if self.get_free_vram_mb() < needed_mb {
                         println!(
@@ -1208,7 +1031,6 @@ impl LogisModel {
                 }
             }
             let self_clone = self.embedding_path.clone();
-            // 🌟 CPU 강제 할당을 제거하고 시스템 설정(GPU)을 그대로 사용하여 초고속 VRAM 연산을 수행합니다.
             let target_device = self.device_config.device.clone();
             println!("[MODEL] Loading Embedding Model on {:?}...", target_device);
             let target_device_clone = target_device.clone();
@@ -1219,10 +1041,6 @@ impl LogisModel {
         }
         Ok(())
     }
-
-    /// SigLIP2 모델 파일이 디스크에 존재하는지 확인합니다.
-    /// 존재하지 않으면 에러를 반환하며, 호출 측(scheduler)에서
-    /// app_error_alert 이벤트를 발행하여 프론트엔드에 알립니다.
     pub async fn check_siglip2_downloaded(&self) -> anyhow::Result<()> {
         let base = std::path::Path::new(&self.siglip2_model_path);
         let safetensors_path = base.join("model.safetensors");
@@ -1244,26 +1062,6 @@ impl LogisModel {
         }
         Ok(())
     }
-
-    /// 🌟 [SIGLIP2 ENSURE v2] 필요한 인코더만 정확히 올립니다.
-    ///
-    ///  ── v1 의 결함 2가지 ──
-    ///   ① needs_text 무시
-    ///      `if guard.is_some() { return Ok(()); }` 가 요구 사양을 보지 않아,
-    ///      비전만 상주한 상태에서 ensure_siglip2(true) 가 그냥 성공했습니다.
-    ///      호출부는 텍스트가 준비된 줄 알고 진행하다가
-    ///        ⚪ [GROUNDING SKIP] 텍스트 인코더가 없어 검증을 건너뜁니다.
-    ///      로 조용히 실패합니다. 로그 한 줄만 남아 원인 추적이 불가능했습니다.
-    ///
-    ///   ② 비전 강제
-    ///      load_vision_only 를 무조건 먼저 호출하므로 텍스트만 필요한 경로도
-    ///      820MB 를 함께 올렸습니다. STEP 6 과 검색 질의 벡터 생성이 여기 해당하며,
-    ///      검색은 질의마다 반복되므로 누적 비용이 큽니다.
-    ///
-    ///  ── v2 ──
-    ///   (needs_vision, needs_text) 를 받아 '부족한 쪽만' 부착합니다.
-    ///   이미 상주한 가중치는 그대로 재사용하므로 전체 파기/재로딩이 없습니다.
-    ///   (Qwen3.5 의 VISION-JIT set_vision_active 와 같은 원리)
     pub async fn ensure_siglip2_ext(&self, needs_vision: bool, needs_text: bool) -> anyhow::Result<()> {
         let dir = std::path::PathBuf::from(&self.siglip2_model_path);
 
@@ -1303,16 +1101,6 @@ impl LogisModel {
             "[MODEL] Loading SigLIP2 ({:?}) | vision: {} | text: {}",
             dtype, needs_vision, needs_text
         );
-
-        // 🌟 [NO-OP GUARD] 둘 다 필요 없다고 요청하면 아무것도 올리지 않습니다.
-        //
-        //  ── 왜 필요한가 ──
-        //   아래 신규 로드 분기는 `!needs_vision && needs_text` 만 텍스트 전용으로 보내고,
-        //   나머지를 전부 load_vision_only 로 흘려보냅니다.
-        //   그래서 (false, false) 조합이 들어오면 "아무것도 필요 없다" 는 요청에
-        //   비전 856MB 를 올려 주는 정반대 동작을 합니다.
-        //   현재 호출부에는 이 조합이 없지만, LAZY TEXT 도입 후 슬롯이 비어 있는 상태에서
-        //   도달할 여지가 생기므로 진입 지점에서 차단합니다.
         if !needs_vision && !needs_text {
             println!("[MODEL] SigLIP2 ensure requested with no encoder. Nothing to load.");
             return Ok(());
@@ -1322,8 +1110,6 @@ impl LogisModel {
             let dir = std::path::Path::new(&path);
             let config_path = dir.join("config.json");
             let config = crate::models::siglip2::Siglip2Config::from_json(&config_path)?;
-
-            // 🌟 텍스트만 필요하면 비전 가중치를 아예 읽지 않습니다. (~820MB 절약)
             if !needs_vision && needs_text {
                 return crate::models::siglip2::Siglip2Model::load_text_only(
                     dir, &config, &dev, dtype,
@@ -1348,33 +1134,15 @@ impl LogisModel {
 
         let mut guard = self.siglip2_model.lock().await;
         if guard.is_some() {
-            // 락을 놓은 사이 다른 태스크가 로드를 마쳤습니다. 방금 만든 것은 버립니다.
             return Ok(());
         }
         *guard = Some(model);
         println!("[MODEL] SigLIP2 loaded successfully.");
         Ok(())
     }
-
-    /// 🌟 [BACK-COMPAT] 기존 호출부를 살려 둡니다.
-    ///    구 시그니처는 '비전은 항상 필요' 를 전제했으므로 needs_vision=true 로 위임합니다.
     pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
         self.ensure_siglip2_ext(true, needs_text).await
     }
-
-    /// 🌟 [SigLIP2 RELEASE] 비전+텍스트 인코더를 통째로 내리고 CUDA 캐시까지 반환합니다.
-    ///
-    ///  ── 왜 별도 헬퍼인가 ──
-    ///   기존에는 `*guard = None` 만 수행했습니다. candle 의 CUDA 백엔드는
-    ///   caching allocator 를 쓰므로 그것만으로는 VRAM 이 OS 로 돌아오지 않습니다.
-    ///   `deep_purge_resources` 가 하는 것과 같은 synchronize + 컨텍스트 재생성을
-    ///   여기서도 수행해야 실제 free VRAM 이 올라갑니다.
-    ///
-    ///  ── 언제 부르는가 ──
-    ///   STEP 1~4(패치 임베딩 · 문서분류 · 히트맵 · 크롭계획)가 끝나면
-    ///   SigLIP2 는 더 이상 필요하지 않습니다.
-    ///   그 시점이 곧 Qwen3.5(2B) 를 올려야 하는 시점이므로 여기서 반드시 비웁니다.
-    ///   (실측: 해제 없이 진입 시 첫 크롭에서 free VRAM 147MB)
     pub async fn release_siglip2(&self, reason: &str) {
         println!("[VRAM] release_siglip2 ENTER ({}) — lock acquiring...", reason);
         let released = {
@@ -1396,10 +1164,6 @@ impl LogisModel {
             reason
         );
         if !self.is_cpu_mode {
-            // 🌟 [HANG FIX] 텐서 드롭이 이미 암묵 synchronize 를 수행한 상태에서
-            //    여기서 다시 무한정으로 synchronize 를 기다리면 저VRAM(3.5GB) 환경에서
-            //    드라이버 스톨 시 영구 대기됩니다. 5초 상한을 두고 초과면 그냥 진행합니다.
-            //    (동기화는 '언제' 끝나도 정확성에 영향이 없는 베스트에포트 정리입니다)
             let dev = self.device_config.device.clone();
             let sync_res = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -1415,11 +1179,8 @@ impl LogisModel {
                 Ok(Err(e)) => println!("[VRAM] CUDA synchronize join error: {:?}", e),
                 Err(_) => println!("[VRAM] ⚠️ CUDA synchronize 5s timeout — 드라이버 스톨 감지, 동기화 없이 진행합니다."),
             }
-            // caching allocator 가 붙들고 있는 풀을 OS 로 밀어내기 위한 컨텍스트 재생성
             let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
             println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
-
-            // 🌟 [VRAM SETTLE AFTER RELEASE] SigLIP2 해제 후 실제 여유 메모리 확인
             if let Some(token) = None::<Arc<AtomicBool>> {
                 let _ = token;
             }
@@ -1436,33 +1197,12 @@ impl LogisModel {
         #[cfg(target_os = "macos")]
         unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
     }
-
-    /// 🌟 [LAZY TEXT] SigLIP2 텍스트 인코더를 '캐시 미스가 실제로 발생했을 때만' 올립니다.
-    ///
-    ///  ── 왜 이 구조인가 ──
-    ///   "필요한 앵커 구 목록을 미리 만들어 캐시 적중 여부를 검사" 하는 방식은
-    ///   build_column_heatmaps 의 구 수집 로직(자기참조 드롭 / doc_type 드롭 /
-    ///   LABEL+VALUE 이중축 / 표 구조 앵커 편입)을 통째로 복제해야 합니다.
-    ///   그 복제본이 원본과 한 줄이라도 어긋나면 게이트가 거짓말을 하고
-    ///   파이프라인이 하드 에러로 죽습니다. 유지보수 비용이 이득보다 큽니다.
-    ///
-    ///   대신 '해 보고, 정말 못 하면 그때 올린다' 로 뒤집습니다.
-    ///   encode_phrases_shared 는 캐시 미스가 있을 때만
-    ///   ERR_TEXT_ENCODER_REQUIRED 접두어를 붙여 실패하고, 그 실패는
-    ///   build_anchor_bank 가 순전파를 시작하기 '전' 에 발생하므로 낭비가 0 입니다.
-    ///
-    ///  ── 락 안전성 ──
-    ///   1차 시도의 가드는 스코프 블록으로 수명을 고정해 .await 이전에 반드시 해제됩니다.
-    ///   tokio Mutex 는 재진입이 불가능하므로(이 파일의 [SCOPED LOCK] 주석과 같은 이유)
-    ///   ensure_siglip2_ext 가 같은 락을 기다리다 셀프 데드록되는 경로를 만들지 않습니다.
     pub async fn with_siglip_text<T, F>(&self, what: &str, f: F) -> anyhow::Result<T>
     where
         F: Fn(&crate::models::siglip2::Siglip2Model) -> anyhow::Result<T> + Send,
         T: Send,
     {
         use crate::models::siglip2::vision_encoder::ERR_TEXT_ENCODER_REQUIRED;
-
-        // ── 1차 : 현재 상태 그대로 시도합니다. 앵커가 전부 캐시에 있으면 여기서 끝납니다. ──
         {
             let guard = self.siglip2_model.lock().await;
             if let Some(m) = guard.as_ref() {
@@ -1489,18 +1229,10 @@ impl LogisModel {
             .ok_or_else(|| anyhow::anyhow!("SigLIP2 model not loaded for '{}'", what))?;
         f(m)
     }
-
-    // 🌟 [CRITICAL FIX] config.json의 물리적 텐서 크기와 실제 훈련된 Context Length를 완벽히 분리합니다.
     pub async fn truncate_pug_context(&self, pug: &str, is_detail: bool, margin_tokens: usize, bottom_drop_tokens: Option<usize>) -> String {
-        // 🌟 current_size 를 읽고 한 번도 쓰지 않아 불필요한 뮤텍스 획득만 발생했습니다.
-        //    아래에서 제너레이터 슬롯을 순서대로 확인하므로 이 값이 필요 없습니다.
         let max_context_length: usize = if is_detail { 60_000 } else { 9_000 };
         let tokenizer_path = &self.qwen_model_path;
-
-        // 🌟 한도(최대 토큰)를 계산하고, 버릴 하단 토큰(bottom_drop_tokens)을 파서에 함께 전달합니다.
         let final_max = max_context_length.saturating_sub(margin_tokens);
-
-        // 2. 이미 활성화된 제너레이터가 있다면 그 안에 탑재된 토크나이저를 즉시 재사용합니다.
         if let Some(gen) = self.qwen3_5_generator.lock().await.as_ref() {
             return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, bottom_drop_tokens);
         }
@@ -1510,17 +1242,13 @@ impl LogisModel {
         if let Some(gen) = self.generator.lock().await.as_ref() {
             return crate::parsing::truncate_pug_by_tokens(pug, final_max, &gen.tokenizer, bottom_drop_tokens);
         }
-
-        // 3. 모델이 VRAM에 없을 경우, 디스크에서 가볍게 토크나이저만 읽어와서 정확한 토큰 수 기반으로 절단합니다.
         if let Ok(tokenizer) = crate::tokenizer::TokenizerModel::init(tokenizer_path) {
             crate::parsing::truncate_pug_by_tokens(pug, final_max, &tokenizer, bottom_drop_tokens)
         } else {
             pug.to_string()
         }
     }
-
     pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
-        // Default to true for SSD-Swap unless user explicitly wants pure CPU
         let is_disk_swap = match device_preference {
             Some("cpu") => false,
             _ => true,
@@ -1541,8 +1269,6 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            // 🌟 [CRITICAL FIX] VRAM 즉각 해제를 위해 전역 캐싱(Singleton) 디바이스 사용을 중단하고 매번 새 컨텍스트를 생성합니다.
-            // utils::get_cuda_device는 내부에 메모리 풀(Caching Allocator)을 영구 보존하므로 작업 관리자에서 VRAM이 떨어지지 않는 주범입니다.
             let fresh_dev = candle_core::Device::new_cuda(config.gpu_id as usize).unwrap_or(candle_core::Device::Cpu);
             config.device = fresh_dev;
             println!("🚀 [MODEL] Running in default mode ({}) with Fresh CUDA Context", config.name);
@@ -1550,8 +1276,6 @@ impl LogisModel {
 
         let app_dir = crate::utils::get_app_dir();
         let base_path = app_dir.join("models");
-        
-        // [FIX] Normalize UNC paths for Windows to prevent "builder error" in model loaders
         let normalize_path = |path: std::path::PathBuf| -> String {
             let s = path.to_string_lossy().to_string();
             if s.starts_with(r"\\?\") {
@@ -1576,7 +1300,6 @@ impl LogisModel {
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
-            // 🌟 [GENERATION HOLD] 0 = 전환 구간 아님 = 임베딩 자유 로드 가능
             generation_hold: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             is_cpu_mode: config.is_cpu,
             is_disk_swap,
@@ -1589,7 +1312,6 @@ impl LogisModel {
             max_tokens_limit: max_tokens_limit as u32,
             _dtype: None, 
             current_size: Arc::new(TokioMutex::new(None)),
-
             siglip2_model: Arc::new(TokioMutex::new(None)),
             siglip2_config: None,
             siglip2_model_path,

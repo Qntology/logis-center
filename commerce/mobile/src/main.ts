@@ -1,5 +1,6 @@
 
 import { item2html } from "./lib/render";
+import { bindRemoteSender } from "./lib/db";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -209,8 +210,11 @@ const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
 const listView = document.getElementById("list-view") as HTMLElement;
 const detailView = document.getElementById("detail-view") as HTMLElement;
 const chatForm = document.querySelector('.chat-form') as HTMLFormElement;
-const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatScroll = document.getElementById("chat-scroll") as HTMLElement;
+const chatTalks = (chatScroll?.querySelector('.chat-talks')
+    || document.querySelector('#chat-scroll .chat-talks')) as HTMLElement;
+
+const REMOTE_PAGE_SIZE = 20;
 
 // --- UI Logic ---
 function switchTab(tabName: string) {
@@ -325,6 +329,7 @@ function finalizeConnectionUI() {
 //    양쪽이 채널 open 직후 동시에 auth_request 를 보내는 구조라
 //    이 플래그가 없으면 finalize / bootstrap 이 두 번 실행됩니다.
 let isAuthFinalized = false;
+let mobileSearchDebounce: any = null;
 // 🌟 [CANCEL TARGET] 현재 PC 에서 진행 중인 원격 작업 id. cancel_task 에 실어 보냅니다.
 let activeRemoteTaskId: string | null = null;
 // 🌟 [HEADER STATE] 결과 건수와 대기열 표시가 같은 h2 를 서로 덮어쓰지 않도록
@@ -369,14 +374,15 @@ function requestRemoteList(reset: boolean = false) {
     }
     if (!remoteHasMore) return;
     remoteIsLoading = true;
-    sendRemote({
+    const ok = sendRemote({
         type: "search",
         query: searchInput?.value || "",
         mode: remoteSearchMode,
-        limit: 20,
-        offset: remotePage * 20,
+        limit: REMOTE_PAGE_SIZE,
+        offset: remotePage * REMOTE_PAGE_SIZE,
         reset: reset
     });
+    if (!ok) remoteIsLoading = false;
 }
 
 /**
@@ -483,9 +489,7 @@ function setupDataChannel(channel: RTCDataChannel) {
             // ── ② 데이터 스냅샷 ──
             if (msg.type === "sync_list") {
                 remoteIsLoading = false;
-                // 🌟 [PAGINATION] PC 가 pageSize 미만을 돌려주면 마지막 페이지입니다.
                 const rows = msg.data || [];
-                remoteHasMore = rows.length >= 20;
                 if (msg.reset) {
                     remotePage = 1;
                     renderList(rows, false);
@@ -493,7 +497,12 @@ function setupDataChannel(channel: RTCDataChannel) {
                     remotePage++;
                     renderList(rows, true);
                 }
-                if (typeof msg.total === "number") updateResultCount(msg.total);
+                if (typeof msg.total === "number") {
+                    updateResultCount(msg.total);
+                    remoteHasMore = remotePage * REMOTE_PAGE_SIZE < msg.total;
+                } else {
+                    remoteHasMore = rows.length >= REMOTE_PAGE_SIZE;
+                }
                 return;
             }
             if (msg.type === "sync_detail") { renderDetail(msg.title, msg.content); return; }
@@ -524,6 +533,7 @@ function setupDataChannel(channel: RTCDataChannel) {
             }
             if (msg.type === "task_queued") {
                 log(`Task queued on desktop: ${msg.taskId}`);
+                if (msg.taskId) activeRemoteTaskId = String(msg.taskId);
                 renderExtractionProgress({
                     task_id: msg.taskId,
                     category: "Pending",
@@ -570,7 +580,8 @@ function setupDataChannel(channel: RTCDataChannel) {
     };
 }
 
-/** 🌟 인증 승인 직후 PC 의 초기 상태를 한 번에 당겨옵니다. */
+bindRemoteSender((payload: any) => sendRemote(payload));
+
 function bootstrapRemoteState() {
     sendRemote({ type: "get_session" });
     sendRemote({ type: "get_mode" });
@@ -592,6 +603,13 @@ function handleDisconnect() {
     activeRemoteTaskId = null;
     lastResultTotal = -1;
     remoteQueue = { busy: false, currentTaskId: null, pending: 0 };
+    remotePage = 0;
+    remoteHasMore = true;
+    isRemoteModeConfirmed = false;
+    remoteSearchMode = "commerce";
+    if (mobileSearchDebounce) { clearTimeout(mobileSearchDebounce); mobileSearchDebounce = null; }
+    const navWrap = document.getElementById("nav-categories");
+    if (navWrap) navWrap.classList.add("hidden");
     // 🌟 [FINALIZED LEDGER RESET] 재연결 후에는 같은 task id 라도 다시 마감 처리해야
     //    목록/대기열이 갱신됩니다. 장부를 비우지 않으면 재접속 직후 도착한 Done 이
     //    "이미 마감함" 으로 조기 반환되어 화면이 옛 상태에 머뭅니다.
@@ -663,40 +681,68 @@ function renderNavigationTree(pages: any[], users: any[]) {
     log("Rendering Nav Tree...");
     const pageList = document.getElementById("nav-list-pages");
     const userList = document.getElementById("nav-list-users");
-    
+
     if (pageList) pageList.innerHTML = renderAccordion(pages);
     if (userList) userList.innerHTML = renderAccordion(users);
-}
 
+    const wrap = document.getElementById("nav-categories");
+    if (wrap) {
+        const hasAny = (pages && pages.length > 0) || (users && users.length > 0);
+        wrap.classList.toggle("hidden", !hasAny);
+    }
+}
+function navNodeLabel(node: any, i: number): string {
+    const d = node?.data || {};
+    const raw = node?.name
+        || node?.title
+        || d.name
+        || d.title
+        || d.text
+        || d.link
+        || d.origin
+        || d.type
+        || node?.type
+        || `node-${i}`;
+    return String(raw).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function renderAccordion(nodes: any[]): string {
     if (!nodes || nodes.length === 0) return "<div style='color:#999; padding:5px; font-size:0.7rem;'>No items</div>";
     let html = `<ul class="logis-branch" style="list-style:none; padding-left:15px; margin:0;">`;
     nodes.forEach((node, i) => {
-        const id = node.id || node.uuid || `node-${i}`;
-        const name = node.name || (node.data && node.data.type) || "Page";
+        const id = String(node.id || node.uuid || `node-${i}`).replace(/"/g, "");
+        const name = navNodeLabel(node, i);
+        const link = String((node.data && node.data.link) || "").replace(/"/g, "");
         const hasChildren = node.children && node.children.length > 0;
-        
+
         html += `<li class="logis-parent" style="margin-bottom:8px;">`;
-        html += `<div class="logis-label" style="font-size:0.8rem; cursor:pointer;" onclick="console.log('Nav to: ${id}')"><span>${name}</span></div>`;
+        html += `<div class="logis-label" data-nav-id="${id}" data-nav-link="${link}" style="font-size:0.8rem; cursor:pointer;"><span>${name}</span></div>`;
         if (hasChildren) html += renderAccordion(node.children);
         html += `</li>`;
     });
     html += `</ul>`;
     return html;
 }
+document.getElementById("nav-list-pages")?.addEventListener("click", (e) => {
+    const el = (e.target as HTMLElement)?.closest(".logis-label") as HTMLElement | null;
+    if (!el) return;
+    const id = el.dataset.navId || "";
+    if (!id) return;
+    log(`Nav → get_detail ${id}`);
+    sendRemote({ type: "get_detail", uuid: id });
+});
 
 // --- Chat History ---
 function requestChatHistory() {
-    if (dataChannel?.readyState === "open") {
-        log("Fetching chat history...");
-        dataChannel.send(JSON.stringify({ type: "get_chat_history" }));
-    }
+    log("Fetching chat history...");
+    sendRemote({ type: "get_chat_history" });
 }
-
 function renderChatHistory(messages: any[]) {
     if (!chatTalks) return;
-    chatTalks.innerHTML = ""; // Clear for fresh history
-    messages.forEach(msg => renderChat(msg));
+    chatTalks.innerHTML = "";
+    const rows = Array.isArray(messages) ? messages.slice() : [];
+    rows.sort((a: any, b: any) => (Number(a?.created_at) || 0) - (Number(b?.created_at) || 0));
+    rows.forEach(msg => renderChat(msg));
+    if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
 }
 
 // --- Session ---
@@ -929,14 +975,22 @@ function renderList(items: any[], append: boolean = false) {
     }
     const html = items.map(item => item2html(item, false)).join("");
     list.insertAdjacentHTML("beforeend", html);
-    // 🌟 새로 삽입된 카드에만 리스너를 붙입니다. (data-bound 마커로 중복 방지)
     list.querySelectorAll('.logis-result:not([data-bound])').forEach(el => {
         (el as HTMLElement).dataset.bound = "1";
-        el.addEventListener("click", () => {
+        el.addEventListener("click", (ev) => {
+            const t = ev.target as HTMLElement;
+            if (t && (t.closest("label.more-label") || t.closest("a"))) return;
             sendRemote({ type: "get_detail", uuid: el.id });
         });
     });
 }
+document.addEventListener("nav-link", (e: any) => {
+    const target = e?.detail;
+    if (!target) return;
+    log(`nav-link → ${target}`);
+    if (searchInput) searchInput.value = String(target);
+    requestRemoteList(true);
+});
 
 /**
  * 🌟 [INFINITE SCROLL] 목록 끝에 닿으면 다음 페이지를 원격으로 요청합니다.
@@ -1122,7 +1176,6 @@ function showAnswerSlideQr(chunks: string[]) {
 // --- Listeners ---
 // 🌟 [DEBOUNCE] 기존에는 키 입력마다 즉시 send 하여 PC 의 Dexie 를 초당 수 회 두드렸습니다.
 //    모바일 타이핑 속도 기준 한 단어에 5~10회 왕복이 발생합니다.
-let mobileSearchDebounce: any = null;
 searchInput?.addEventListener("input", () => {
     if (mobileSearchDebounce) clearTimeout(mobileSearchDebounce);
     mobileSearchDebounce = setTimeout(() => {

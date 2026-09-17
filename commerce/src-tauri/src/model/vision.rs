@@ -8,7 +8,7 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use tauri::Emitter;
 use crate::openai_types::*;
-use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts};
+use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts, record_claim_violations};
 
 impl crate::model::LogisModel {
 
@@ -40,6 +40,29 @@ impl crate::model::LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
+        // 🌟 [SDS SCOPE / 필수] 비전 경로의 계측 스코프를 세웁니다.
+        //
+        //  ── 왜 여기여야 하는가 ──
+        //   process_task 는 resolve_absolute_url 보다 앞에서
+        //     if task.r#type == "image_extraction" { ... return Ok(()); }
+        //   로 이탈합니다. 따라서 이 경로도 enter_scope 에 도달하지 못했고,
+        //   V-1 이 남기는 record_spatial / record_baseline("vision.spread_*") 과
+        //   classify_doc_type 의 record_decay("vision.doc_code") 가 전부 버려졌습니다.
+        //
+        //  ── team 을 빈 문자열로 두는 이유 ──
+        //   이 함수 시그니처에 team_id 가 없습니다. 스코프 키는
+        //   track|primary|secondary 로만 구성되고 team 은 진단용이므로,
+        //   SDS 가 로드 시점에 바인딩한 팀이 그대로 유지됩니다.
+        //
+        //  ── 1차 키는 STAGE-2 가 확정합니다 ──
+        //   지금은 doc_type 을 모르므로 'unknown' 으로 시작하고,
+        //   비전 코드가 확정되면 refine_primary 가 교체합니다.
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Vision,
+            "unknown",
+            "",
+        );
         emit_term("[STAGE-1] Preparing SigLIP2 Vision Encoder + Qwen3.5 (2B)...");
 
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
@@ -267,7 +290,16 @@ impl crate::model::LogisModel {
                 }
 
                 emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
-
+                // 🌟 [SDS SCOPE] 확정 코드로 1차 키를 교체합니다.
+                //
+                //  ⚠️ 변수명 주의
+                //   이 시점에 존재하는 것은 detected_type 입니다.
+                //   doc_type 은 이 블록보다 한참 뒤(저장 구간)에서
+                //     let doc_type = if is_trade_doc { ... } else { "goods" };
+                //   로 처음 선언되므로, 여기서 참조하면 E0425 가 납니다.
+                //   trading.rs 의 STEP A 에는 그 위치에 doc_type 이 실제로 있어
+                //   같은 문장이 성립하지만, 이 파일에서는 성립하지 않습니다.
+                crate::utils::score_dynamics::refine_primary(&detected_type);
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
                     // 🌟 [VRAM STAGE] 이 경로는 크롭 없이 전체 이미지를 Qwen3.5 에 바로 넘깁니다.
@@ -348,10 +380,44 @@ impl crate::model::LogisModel {
                         ));
                     }
 
+                    // ── STEP 3.5 : NMS Arena ──
+                    {
+                        let mut protect: Vec<&str> =
+                            crate::logic::TRADE_ARRAY_CATEGORIES.to_vec();
+                        protect.push(crate::logic::TRADE_IDENTITY_CATEGORY);
+                        let arena = crate::models::siglip2::nms_arena::run_arena(
+                            &heatmaps, &grid, &legibility, &protect, &emit_term,
+                        );
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.arena_rounds",
+                            arena.rounds as f32,
+                        );
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.arena_margin_gate",
+                            arena.margin_gate,
+                        );
+                        for t in arena.territories.iter() {
+                            crate::utils::score_dynamics::record_baseline(
+                                &format!("vision.territory.{}", t.category),
+                                t.patches.len() as f32
+                                    / (grid.grid_rows * grid.grid_cols).max(1) as f32,
+                            );
+                        }
+                        crate::models::siglip2::nms_arena::apply_arena(
+                            &mut heatmaps, &arena, &emit_term,
+                        );
+                    }
+
                     // ── STEP 4 : Vision NMS & Cropping ──
                     emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
                     let mut plans = crate::models::siglip2::vision_crop::plan_crops(
-                        &heatmaps, &grid, &emit_term
+                        &heatmaps,
+                        &grid,
+                        &legibility,
+                        crate::logic::TRADE_ARRAY_CATEGORIES,
+                        crate::logic::TRADE_IDENTITY_CATEGORY,
+                        crate::logic::TRADE_IDENTITY_FIELD,
+                        &emit_term,
                     );
                     emit_term(&format!("  🧾 [PLAN DONE] 크롭 계획 {}건 확정. release_siglip2 진입 전...", plans.len()));
                     if plans.is_empty() {
@@ -407,24 +473,50 @@ impl crate::model::LogisModel {
                             return Ok(());
                         }
 
-                        // 🌟 [EMPTY CROP SKIP] 출처 영역에 읽을 것이 없으면 Qwen 호출 자체를 생략합니다.
-                        //    실측: insurance 타일은 판독 가능 패치 0/10 인데 2048x512 로 2회 호출되어
-                        //    "Apr-19-2022" 를 지어냈습니다. 확대는 빈 영역에 정보를 만들지 못합니다.
                         let (lg_cnt, _il_cnt, _bl_cnt) =
                             legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
-
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.crop_legible_patches",
+                            lg_cnt as f32,
+                        );
                         if lg_cnt == 0 {
                             emit_term(&format!(
                                 "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다. Qwen 호출을 생략합니다.",
                                 plan.category
                             ));
+                            crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 1.0);
+                            continue;
+                        }
+                        crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
+
+                        if !plan.twin_of.is_empty()
+                            && crate::logic::TRADE_ARRAY_CATEGORIES
+                                .iter()
+                                .any(|c| *c == plan.category.as_str())
+                        {
+                            emit_term(&format!(
+                                "    👯 [TWIN ARRAY SKIP] '{}' 는 '{}' 와 좌표가 같은 쌍둥이 크롭입니다. 같은 표에서 배열을 두 번 만들면 행이 그대로 복제되므로 이 크롭은 건너뜁니다.",
+                                plan.category, plan.twin_of
+                            ));
                             continue;
                         }
 
-                        // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
+                        if plan.owned_patches == 0 {
+                            emit_term(&format!(
+                                "    🧭 [TERRITORY TAG] '{}' 크롭 안에 자기 영토 패치가 한 칸도 없습니다. 이 크롭에서는 명시된 라벨↔값만 읽고 줄 전체를 값으로 승격하지 않아야 합니다.",
+                                plan.category
+                            ));
+                        }
+
                         let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
-                            plan, &heatmaps, &grid, &legibility, &emit_term
+                            plan,
+                            &heatmaps,
+                            &grid,
+                            &legibility,
+                            crate::logic::TRADE_ARRAY_CATEGORIES,
+                            &emit_term,
                         );
+                        crate::utils::score_dynamics::record_baseline("vision.tile_count", tile_count as f32);
                         let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
                             plan.bbox, tile_count, 0.25
                         );
@@ -452,8 +544,9 @@ impl crate::model::LogisModel {
                             //    겹침 타일에서 같은 값이 두 번 나오는 것은 정상이므로
                             //    배열 카테고리는 이 목록을 넘기지 않습니다.
                             //    (넘기면 두 번째 타일이 정당한 반복 행을 스스로 버립니다)
-                            let is_array_cat =
-                                plan.category == "items" || plan.category == "containers";
+                            let is_array_cat = crate::logic::TRADE_ARRAY_CATEGORIES
+                                .iter()
+                                .any(|c| *c == plan.category.as_str());
                             let claimed = if is_array_cat {
                                 Vec::new()
                             } else {
@@ -491,16 +584,49 @@ impl crate::model::LogisModel {
                             ).await?;
 
                             let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
-
+                            record_claim_violations(
+                                &claimed,
+                                &tile_json,
+                                &plan.category,
+                                &emit_term,
+                            );
                             // 🌟 병합 '전' 에 이 타일이 주장한 값을 출처 bbox 와 함께 기록합니다.
                             //    STEP 6 이 이 목록으로 접지 검증을 수행합니다.
+                            {
+                                let mut filled = 0usize;
+                                let mut total = 0usize;
+                                let mut count_obj = |o: &serde_json::Map<String, Value>,
+                                                     filled: &mut usize,
+                                                     total: &mut usize| {
+                                    for (_, v) in o.iter() {
+                                        *total += 1;
+                                        let empty = v.is_null()
+                                            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
+                                        if !empty { *filled += 1; }
+                                    }
+                                };
+                                if let Some(o) = tile_json.as_object() {
+                                    count_obj(o, &mut filled, &mut total);
+                                } else if let Some(a) = tile_json.as_array() {
+                                    for e in a.iter() {
+                                        if let Some(o) = e.as_object() {
+                                            count_obj(o, &mut filled, &mut total);
+                                        }
+                                    }
+                                }
+                                if total > 0 {
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.crop_yield",
+                                        filled as f32 / total as f32,
+                                    );
+                                }
+                            }
                             record_grounding_claims(
                                 &mut grounding_claims,
                                 &plan.category,
                                 &tile_json,
                                 tile.bbox,
                             );
-
                             merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                         }
                     }
@@ -513,11 +639,15 @@ impl crate::model::LogisModel {
                 // 🛒 [Commerce 모드] SigLIP2 히트맵 + 정밀 크롭
                 // ============================================================
                 emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
-
                 let commerce_page_type = "goods";
+                // 🌟 [SDS SCOPE] 커머스 경로도 1차 키를 확정합니다.
+                //    이 줄이 없으면 스코프가 'vision|unknown|' 에 머물러
+                //    상품 이미지와 무역 서식의 히트맵 확산도가 한 통계에 섞이고,
+                //    V-1 의 확산 게이트(중앙값+MAD) 기준선이 오염됩니다.
+                crate::utils::score_dynamics::refine_primary(commerce_page_type);
                 // 🌟 [SCOPED LOCK + LAZY TEXT] trade 분기와 동일한 셀프 데드락 방지 구조를
                 //    with_siglip_text 가 그대로 제공하며, 캐시 미스가 없으면 인코더를 올리지 않습니다.
-                let heatmaps = self
+                let mut heatmaps = self
                     .with_siglip_text("column heatmaps (commerce)", |m| {
                         crate::models::siglip2::vision_encoder::build_column_heatmaps(
                             m, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
@@ -526,8 +656,30 @@ impl crate::model::LogisModel {
                     .await
                     .map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
 
+                {
+                    let mut protect: Vec<&str> =
+                        crate::logic::TRADE_ARRAY_CATEGORIES.to_vec();
+                    protect.push(crate::logic::TRADE_IDENTITY_CATEGORY);
+                    let arena = crate::models::siglip2::nms_arena::run_arena(
+                        &heatmaps, &grid, &legibility, &protect, &emit_term,
+                    );
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.arena_rounds",
+                        arena.rounds as f32,
+                    );
+                    crate::models::siglip2::nms_arena::apply_arena(
+                        &mut heatmaps, &arena, &emit_term,
+                    );
+                }
+
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
-                    &heatmaps, &grid, &emit_term
+                    &heatmaps,
+                    &grid,
+                    &legibility,
+                    crate::logic::TRADE_ARRAY_CATEGORIES,
+                    crate::logic::TRADE_IDENTITY_CATEGORY,
+                    crate::logic::TRADE_IDENTITY_FIELD,
+                    &emit_term,
                 );
 
                 // 🌟 [VRAM STAGE] 커머스 경로도 여기서 SigLIP2 임무가 끝납니다.
@@ -570,6 +722,22 @@ impl crate::model::LogisModel {
 
                         if fields.is_empty() { continue; }
 
+                        let (lg_cnt, il_cnt, bl_cnt) =
+                            legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.crop_legible_patches",
+                            lg_cnt as f32,
+                        );
+                        if lg_cnt == 0 {
+                            emit_term(&format!(
+                                "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). Qwen 호출을 생략합니다.",
+                                plan.category, il_cnt, bl_cnt
+                            ));
+                            crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 1.0);
+                            continue;
+                        }
+                        crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
+
                         let crop = crate::models::siglip2::vision_crop::crop_region(
                             &dynamic_image, plan, 512
                         );
@@ -605,6 +773,12 @@ impl crate::model::LogisModel {
                         ).await?;
 
                         let parsed = crate::parsing::parse_json_from_llm(&res);
+                        record_claim_violations(
+                            &claimed,
+                            &parsed,
+                            &plan.category,
+                            &emit_term,
+                        );
                         record_grounding_claims(
                             &mut grounding_claims,
                             &plan.category,
@@ -618,59 +792,13 @@ impl crate::model::LogisModel {
                     extracted_data = Value::Object(merged);
                 }
             }
-            
-            // ── STEP 6 : 값 접지 검증 ──
-            //
-            // 🌟 [왜 필요한가 — 실측 사고 3건]
-            //  ① reference_invoice = "CI-2026-08001"
-            //     문서 어디에도 없습니다. bias.json 설명문의 (e.g. CI-2026-08001) 복사입니다.
-            //     [SCHEMA ECHO] 게이트는 {String} 같은 플레이스홀더만 잡으므로 통과했습니다.
-            //  ② voyage_number = "26"
-            //     logistics 크롭에 항차가 없는데, 같은 크롭의 CI-43726 뒤 두 자리를 뗐습니다.
-            //  ③ recipient_name = "BUYER (IF NOT CONSIGNEE)"
-            //     빈 박스의 헤더 라벨을 값으로 읽었습니다.
-            //  셋 다 '문법적으로 완벽한 답' 이라 파싱 단계에서는 절대 걸러지지 않습니다.
-            //  픽셀에 그 값이 실제로 있는지 되묻는 것만이 유일한 검증입니다.
-            //
-            // 🌟 [VRAM 순서]
-            //  Qwen3.5(2GB) 해제 → SigLIP2 재로드 → 값 인코딩 1회 → 즉시 해제.
-            //  패치 임베딩(grid.patches)은 STEP 1 산출물이 CPU 메모리에 그대로 있으므로
-            //  (252 × 1152 × 4B ≈ 1.2MB) 비전 순전파를 다시 돌리지 않습니다.
+
             if !grounding_claims.is_empty() {
                 emit_term(&format!(
                     "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
                     grounding_claims.len()
                 ));
 
-                // 🌟 [PURGE 제거] 이 자리의 deep_purge_resources() 는 GROUNDING v1 의 잔재입니다.
-                //
-                //  ── v1 에서는 왜 필요했나 ──
-                //   v1 은 값 텍스트를 SigLIP2 텍스트 인코더로 임베딩해 패치와 코사인을 쟀습니다.
-                //   그래서 Qwen3.5(2GB)를 내리고 SigLIP2 를 다시 올릴 공간이 필요했습니다.
-                //
-                //  ── v2 는 아무 모델도 쓰지 않습니다 ──
-                //   verify_claims_v2 의 인자는 grid 치수 / 원본 크기 / legibility 뿐이고,
-                //   legibility 는 휘도 기울기 기반 순수 CPU 산출물입니다.
-                //   바로 아래 v2 주석이 "SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다" 라고
-                //   명시하고 있는데 purge 호출만 남아 있었습니다.
-                //
-                //  ── 남겨 두면 무엇이 나쁜가 ──
-                //   ① Qwen3.5 2GB 를 파기하므로 다음 이미지 태스크가 GGUF 를 처음부터 다시 읽습니다.
-                //   ② 이 purge 이후 아래 [VISION-JIT] 블록은 qwen3_5_generator == None 이라
-                //      도달해도 아무 일도 하지 않는 죽은 코드가 됩니다.
-                //   ③ scheduler.rs 의 process_task 는 태스크 종료 후 이미
-                //      deep_purge_resources() 를 호출하므로 완전한 중복입니다.
-                //   ④ STEP 6 이후 남은 작업(자연어 변환 / DB 동기화)은 GPU 를 쓰지 않습니다.
-
-                // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
-                //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
-                //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
-                // 🌟 [GROUNDING v2] v1 코사인 접지는 실측 26건 중 25건을 오폐기했습니다.
-                //    (로그: 🚫 [UNGROUNDED] [items] 'description' = "T-Shirt" | in -0.6821 ≤ 0 → 폐기)
-                //    v2 는 '출처 영역에 판독 가능한 패치가 있는가' 만 봅니다.
-                //    블러/여백에서 읽어낸 값(로그의 sender_name="Michael Johnson" 등)은
-                //    legibility 맵이 이미 잡으므로 여기서도 폐기됩니다.
-                //    SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다.
                 let verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
                     &grounding_claims,
                     grid.grid_rows,
@@ -678,12 +806,11 @@ impl crate::model::LogisModel {
                     grid.orig_width,
                     grid.orig_height,
                     &legibility,
+                    // 🌟 resolve_trade_doc_identity 에 넘기고 있는 값과 동일한 언어 축입니다.
+                    &language,
                     &emit_term,
                 );
 
-                // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
-                //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
-                //    (TRACKING fast-track / commerce 경로도 같은 변수를 쓰므로 경로 하나로 통일됩니다)
                 if let Some(map) = extracted_data.as_object_mut() {
                     apply_grounding_verdicts(map, &verdicts, &emit_term);
                 } else {
@@ -699,16 +826,26 @@ impl crate::model::LogisModel {
             emit_term(&format!("[DEBUG-VISION] 🤖 AI Raw Response Extracted."));
             emit_term("=======================================\n");
 
+            if is_trade_doc {
+                let nested_cur = extracted_data
+                    .get("financials")
+                    .and_then(|f| f.get("currency"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "N/A" && s != "null");
+                if let (Some(c), Some(obj)) = (nested_cur, extracted_data.as_object_mut()) {
+                    let root_empty = obj
+                        .get("currency")
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |s| s.trim().is_empty());
+                    if root_empty {
+                        obj.insert("currency".to_string(), json!(c));
+                    }
+                }
+                crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &language);
+            }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
-            
-            // [PRIVACY] 무역 문서(BL, CI 등) 및 송장(Tracking)은 개인정보 밀집 구역이므로 반드시 마스킹을 적용합니다.
-            // 커머스 상품(goods) 이미지인 경우에만 예외적으로 우회합니다.
             let doc_type = if is_trade_doc {
-                // 🌟 [DOC TYPE RESOLVE] 두 경로가 doc_type 을 서로 다른 위치에 기록합니다.
-                //   · Slice & Merge 경로   : extracted_data["header"]["doc_type"]
-                //   · TRACKING Fast-Track : extracted_data["doc_type"] (루트)
-                //   기존에는 header 만 봤기 때문에 운송장 라벨이 전부 "shipping_doc" 으로
-                //   저장되어 index_val / hashed_id / DB type 까지 뭉개졌습니다.
                 extracted_data.get("header")
                     .and_then(|h| h.get("doc_type"))
                     .and_then(|s| s.as_str())
@@ -722,9 +859,6 @@ impl crate::model::LogisModel {
 
             let item_digest = crate::utils::hash::digest(&nl);
 
-            // 🌟 [VISION-JIT] 비전 추론이 모두 끝났습니다. 이어지는 임베딩/DB 동기화 단계가
-            //    VRAM 을 쓸 수 있도록 mmproj 가중치를 여기서 즉시 반환합니다.
-            //    (2B 텍스트 모델 본체는 그대로 상주하므로 재로딩 비용은 0 입니다)
             {
                 let mut q35_guard = self.qwen3_5_generator.lock().await;
                 if let Some(gen) = q35_guard.as_mut() {
@@ -957,22 +1091,18 @@ impl crate::model::LogisModel {
                         hoisted.iter().take(12).collect::<Vec<_>>()
                     ));
                 }
-                
-                // 🌟 [비전 벡터 저장] STEP 1 의 encode_image() 가 이미 산출해 둔
-                //    L2 정규화 pooled 벡터를 그대로 재사용합니다.
-                //
-                //  ── 무엇이 문제였나 ──
-                //   구버전은 여기서 encode_image_pooled() 를 다시 호출했습니다.
-                //   그러면 전처리 → 패치 임베딩 → 27층 순전파 → 어텐션 풀링이 통째로 재실행되고,
-                //   그 시점까지 SigLIP2 를 붙들고 있어야 하므로 820MB 를 Qwen3.5 와 동시에 점유했습니다.
-                //   (실측 로그에 [SigLIP2/NaFlex] 가 두 번 찍히는 원인)
-                //   PatchGrid.pooled 는 동일한 값이므로 재계산은 순수 낭비입니다.
+
+                if let Some(o) = final_data.as_object_mut() {
+                    o.insert(
+                        "updated_at".to_string(),
+                        json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
                 let vision_vec: Option<Vec<f32>> = if grid.pooled.len() == 1152 {
                     Some(grid.pooled.clone())
                 } else {
                     None
                 };
-
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
                     &hashed_id,
@@ -988,16 +1118,6 @@ impl crate::model::LogisModel {
                     Some(&item_digest)
                 ).await;
 
-                // =====================================================================
-                // 🌟 [TRADE RELAY] 무역 서식 간 연결고리 처리
-                // Commerce의 TRACKING RELAY와 동일한 패턴:
-                //   1. 현재 문서의 참조 필드(reference_invoice 등)에서 연결 키 추출
-                //   2. 해당 키로 타겟 서식 검색
-                //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
-                // =====================================================================
-                // 🌟 [SCOPE FIX] relay_starved 는 블록 내부(규칙 푸시)와 블록 외부(집계 출력)
-                //    양쪽에서 사용되므로, is_trade_doc 블록보다 바깥에서 선언합니다.
-                //    커머스가 아닌 경로에서는 비어 있어 출력이 자동 억제됩니다.
                 let mut relay_starved: Vec<String> = Vec::new();
 
                 // 🌟 relay_plan 을 if is_trade_doc 블록 외부에서 선언하여
@@ -1005,15 +1125,6 @@ impl crate::model::LogisModel {
                 
 
                 if is_trade_doc {
-                    // 🌟 [RELAY v4] parsing.rs 의 plan_trade_relays 를 사용합니다.
-                    //    기존은 logic.rs 의 trade_relay_rules 가 하드코딩한
-                    //    (target, target_field, source_field) 튜플을 순회했는데,
-                    //    필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
-                    //    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
-                    //
-                    //    plan_trade_relays 는 extract_trade_relay_keys 가 확정한
-                    //    역할별 키를 기반으로 릴레이 대상을 계산합니다.
-                    //    역할이 같으면 서식 코드가 달라도 연결됩니다.
                     relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data, &language);
                     if relay_plan.is_empty() {
                         emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");
@@ -1279,9 +1390,35 @@ impl crate::model::LogisModel {
             crate::utils::logger::log_task_progress(app_handle, &task_id, &payload);
             
             crate::utils::sync_utils::notify_new_task();
-            
+
+            // 🌟 [SDS] 비전 태스크 경계에서 관측을 확정합니다.
+            //
+            //  ── 왜 함수 끝이 아니라 여기인가 ──
+            //   이 함수의 본문 마지막은
+            //     if let Ok(img) = image::open(...) { ... Ok(()) } else { Ok(()) }
+            //   이고, 이 if/else 자체가 함수의 꼬리 표현식(반환값)입니다.
+            //   그 뒤에 문장을 붙이면 if/else 가 '문장' 이 되어 값 타입이 ()
+            //   이어야 하는데 실제로는 Result<()> 라 E0308 로 컴파일이 깨지고,
+            //   설령 통과해도 위 분기에서 이미 반환되므로 도달하지 못합니다.
+            //   따라서 성공 분기의 Ok(()) '직전' 이 유일하게 올바른 위치입니다.
+            //
+            //  ── 취소·에러 경로를 덮지 못하는 것은 손실이 아닙니다 ──
+            //   본문 중간에 `return Ok(())`(사용자 취소) 와 `?`(에러 전파) 가 있어
+            //   그 경로는 이 지점을 지나지 않습니다. 그러나
+            //     · enter_scope 는 다음 태스크 진입 시 스코프를 덮어쓰고
+            //     · flush 를 놓친 관측은 DIRTY=true 로 메모리에 남아
+            //       다음 태스크의 flush 또는 unload_model / 앱 종료 flush 가 기록합니다.
+            //   즉 유실이 아니라 '지연' 이며, 그래서 Drop 가드를 도입하지 않습니다.
+            emit_term(&format!("[ENGINE] {}", crate::utils::score_dynamics::report()));
+            crate::utils::score_dynamics::flush();
+            crate::utils::score_dynamics::leave_scope();
+            emit_term(&format!("[ENGINE] ✅ Image extraction pipeline complete for Task: {}", task_id));
             Ok(())
         } else {
+            // 🌟 [SDS] 이미지 파일을 열지 못한 경로입니다.
+            //    관측이 하나도 없으므로 flush 는 불필요하고 스코프만 내립니다.
+            //    (flush 는 dirty 가 false 면 어차피 파일을 쓰지 않습니다)
+            crate::utils::score_dynamics::leave_scope();
             Ok(())
         }
     }

@@ -1,7 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-import { parseItemData, hashId } from "./utils";
-
-// --- Types ---
 interface DbQuery {
     select?: string;
     upsert?: string;
@@ -16,8 +12,64 @@ interface DbQuery {
     type?: string;
 }
 
-export const Select: Record<string, (query: any) => Promise<any[]>> = {};
-export const Upsert: Record<string, (value: any) => Promise<any>> = {};
+type RemoteSender = (payload: any) => boolean;
+
+let remoteSender: RemoteSender | null = null;
+
+export function bindRemoteSender(sender: RemoteSender) {
+    remoteSender = sender;
+}
+
+function requireRemote(op: string): RemoteSender {
+    if (!remoteSender) {
+        throw new Error(
+            `[DB Shim] '${op}' 는 데스크탑 위임 전용입니다. bindRemoteSender() 로 DataChannel 을 먼저 연결하세요.`
+        );
+    }
+    return remoteSender;
+}
+
+export const Select: Record<string, (query: any) => Promise<any[]>> = {
+    items: async (query: DbQuery = {}) => {
+        const send = requireRemote("Select['items']");
+        if (query.key === "id" && query.value) {
+            send({ type: "get_detail", uuid: String(query.value) });
+        } else {
+            send({
+                type: "search",
+                query: String(query.value ?? ""),
+                mode: query.type || "commerce",
+                limit: query.limit ?? 20,
+                offset: query.offset ?? 0,
+                reset: (query.offset ?? 0) === 0
+            });
+        }
+        return [];
+    },
+    pages: async () => {
+        requireRemote("Select['pages']")({ type: "get_navigation" });
+        return [];
+    },
+    users: async () => {
+        requireRemote("Select['users']")({ type: "get_navigation" });
+        return [];
+    },
+    crons: async () => {
+        requireRemote("Select['crons']")({ type: "get_queue_status" });
+        return [];
+    }
+};
+
+export const Upsert: Record<string, (value: any) => Promise<any>> = {
+    talks: async (value: any) => {
+        requireRemote("Upsert['talks']")({
+            type: "chat_message",
+            content: String(value?.data?.text ?? value?.text ?? "")
+        });
+        return null;
+    }
+};
+
 export const Delete: Record<string, (query: any) => Promise<any>> = {};
 
 // Helper: Parse tags into SQL filter string for LanceDB

@@ -2176,61 +2176,59 @@ pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) 
     let index = crate::utils::hash::crc32(&normalized_fp);
     (fingerprint, index, true)
 }
-
-/// 🌟 릴레이 규칙 평가. 어떤 문서 종류로 이어질 수 있는지를 돌려줍니다.
-///  기존 규칙표의 "AWB←flight_number" 의미 오류를 여기서 바로잡습니다.
-/// 🌟 [RELAY PLAN v4]
-///  ── 무엇이 바뀌었나 ──
-///   기존은 역할별로 하드코딩된 타겟 목록을 사용했는데,
-///   이 목록이 `logic.rs` 의 `related_trading` 과 어긋나는 경우가 있었습니다.
-///   또한 `k.clone()` 으로 키를 복제했는데, 이 복제가 불필요한 메모리 할당을 유발했습니다.
-///   역할별 타겟을 `related_trading` 의 허브 목록과 일치시키고,
-///   불필요한 복제를 제거합니다.
 pub fn plan_trade_relays(doc_type: &str, data: &Value, doc_lang: &str) -> Vec<(&'static str, TradeRelayKey)> {
     let keys = extract_trade_relay_keys_for(data, doc_lang, doc_type);
     let reverse_field: &'static str =
         crate::logic::trade_reference_field_of(doc_type).unwrap_or("reference_invoice");
-    let mut plan = Vec::new();
-    for k in keys.into_iter() {
-        // 🌟 [REVERSE ROLE v4] '남이 나를 부르는 축' 의 대상 목록은
-        //    logic.rs 의 related_trading 이 이미 소유합니다.
-        //    여기에 서식별 목록을 다시 적으면 두 사전이 어긋나는 통로가 됩니다.
-        if k.role == reverse_field {
-            for t in crate::logic::related_trading(doc_type) {
-                if t == doc_type { continue; }
-                plan.push((t, k.clone()));
+    let targets: Vec<&'static str> = crate::logic::related_trading(doc_type);
+    let mut plan: Vec<(&'static str, TradeRelayKey)> = Vec::new();
+    let mut forward_targets: Vec<&'static str> = Vec::new();
+
+    let push = |plan: &mut Vec<(&'static str, TradeRelayKey)>,
+                t: &'static str,
+                k: &TradeRelayKey,
+                search: &str| {
+        if t == doc_type { return; }
+        if plan.iter().any(|(tt, kk)| *tt == t && kk.index == k.index) { return; }
+        let mut kk = k.clone();
+        kk.search_field = search.to_string();
+        plan.push((t, kk));
+    };
+
+    // ── ① forward : 내가 참조하는 번호로 '그 번호를 자기 문서번호로 갖는' 상대를 찾습니다 ──
+    for k in keys.iter() {
+        if k.role == reverse_field { continue; }
+        // 🌟 [CONTAINER] 컨테이너 번호는 어느 서식의 doc_number 도 아닙니다.
+        //    trading_relay_pair 는 reference_* 축만 다루므로 이 역할만 예외로 둡니다.
+        if k.role == "container" {
+            for t in ["PL", "BL", "DO", "CM"] {
+                push(&mut plan, t, k, "container_number");
+                if !forward_targets.contains(&t) { forward_targets.push(t); }
             }
             continue;
         }
-        let targets: &[&'static str] = match k.role {
-            // 🌟 [v3 FIX] "self" 역할은 자기 자신의 문서번호입니다.
-            //    이 값으로 '상대 문서'를 찾는 것은 불가능합니다.
-            //    상대 문서는 '자기 자신의 고유한 문서번호'를 갖고 있으므로,
-            //    릴레이는 '상대가 나를 가리키는 참조 필드'로 조회해야 합니다.
-            //    "self" 역할은 더 이상 릴레이 대상을 생성하지 않습니다.
-            //    대신, 내 문서번호를 참조하는 문서들은
-            //    "transport", "booking", "order" 등 다른 역할로 연결됩니다.
-            //
-            //    예: CI → BL 은 BL 문서의 reference_invoice = CI의 doc_number 로 연결
-            //    예: CI → PL 은 PL 문서의 reference_invoice = CI의 doc_number 로 연결
-            "self"      => &[],  // 🌟 v3: self 역할은 릴레이 대상이 아닙니다.
-            "transport" => &["BL", "HBL", "SWB", "AWB", "DO", "AN", "POD", "FCR", "ED", "ID", "CSI", "BK", "SR", "WR", "BE", "IP", "DN", "CN", "FC"],
-            "booking"   => &["BK", "FI"],
-            "order"     => &["PO", "PI", "SC"],
-            "contract"  => &["SC", "PI", "CP"],
-            "credit"    => &["LC", "LLC", "BE"],
-            "container" => &["PL", "BL", "DO", "CM"],
-            // 🌟 [v3 추가] "reference_invoice" 역할:
-            //    내 문서번호를 참조하는 문서들을 연결합니다.
-            //    예: CI 문서를 참조하는 PL, CINV, TI, SOA, DN, CN
-            "reference_invoice" => &["PL", "CINV", "TI", "SOA", "DN", "CN"],
-            "reference_po"      => &["PO", "PI", "SC"],
-            "reference_lc"      => &["LC", "LLC"],
-            _ => &[],
-        };
         for t in targets.iter() {
-            if *t == doc_type { continue; }
-            plan.push((*t, k.clone()));
+            let mine = match crate::logic::trading_relay_pair(doc_type, *t) {
+                Some((m, _)) => m,
+                None => continue,
+            };
+            // 이 상대를 가리키는 내 필드가 바로 이 키의 출처일 때만 성립합니다.
+            if mine != k.source_field { continue; }
+            if !forward_targets.contains(t) { forward_targets.push(*t); }
+            push(&mut plan, *t, k, "doc_number");
+        }
+    }
+
+    // ── ② reverse : 내 문서번호를 참조하고 있을 상대를 찾습니다 ──
+    for k in keys.iter() {
+        if k.role != reverse_field { continue; }
+        for t in targets.iter() {
+            if forward_targets.contains(t) { continue; }
+            let foreign = match crate::logic::trading_relay_pair(doc_type, *t) {
+                Some((_, f)) => f,
+                None => continue,
+            };
+            push(&mut plan, *t, k, foreign);
         }
     }
     plan

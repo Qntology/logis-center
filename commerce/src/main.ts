@@ -5,17 +5,11 @@ import { readFile } from '@tauri-apps/plugin-fs';
 import { item2html, selector, isAlmostEqual } from "./lib/render";
 import { Select, Upsert } from "./lib/db";
 import { hashId, time2text } from "./lib/utils";
-// 🌟 [MODE SPLIT] 모드 분류 단일 소스 (구 main.ts 상단 TRADING_DOC_CODES ~ modeLabel 블록)
-//    Part 2 기준으로 main.ts 가 실제 사용하는 심볼만 남깁니다.
-//    (TRADING_DOC_CODES / *_TYPE_SET / MODE_LABEL 은 modes/* 내부에서만 쓰입니다)
 import {
     modeOfType,
     TYPE_SETS,
     modeLabel
 } from "./modes/types";
-// 🌟 [MODE SPLIT] main.ts ↔ modes/* 브리지 + 공용 백오프 + 공용 헬퍼
-//    updateSyncBackoff / getSyncIntervalMs / decodeAnalyticBlob / SYNC_BASE_INTERVAL_MS 는
-//    Part 2 에서 호출부가 전부 modes/* 로 옮겨졌으므로 여기서는 import 하지 않습니다.
 import {
     bindModeRuntime,
     computeSyncInterval,
@@ -23,28 +17,21 @@ import {
     getRootDomain,
     ENVELOPE_ROOT_KEYS
 } from "./modes/runtime";
-// 🌟 [MODE SPLIT] shipping(무역) 트랙
 import {
     syncTradingData,
     syncTradingInBackground,
     resetTradingThrottle
 } from "./modes/trading";
-// 🌟 [MODE SPLIT] commerce 트랙
-//    COMMERCE_API_HOST 를 기존 이름 API_HOST 로 별칭 지정하여
-//    checkAuthStatus · handleTeamInvite · 채팅 PUT · 클라우드 검색/추출 등
-//    main.ts 내부의 모든 호출부를 그대로 유지합니다.
 import {
     COMMERCE_API_HOST as API_HOST,
     syncCommerceData,
     syncCommerceInBackground
 } from "./modes/commerce";
-// 🌟 [MODE SPLIT] analytic 트랙
 import {
     syncAnalyticsData,
     syncAnalyticsInBackground,
     resetAnalyticThrottle
 } from "./modes/analytic";
-// 🌟 [MODE SPLIT] analytic 전용 OAuth 사이트 등록/통계 (api.oauth.network)
 import {
     fetchOAuthRegisteredSites,
     renderOAuthSitesUI,
@@ -57,8 +44,6 @@ type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
 const FORCE_ID = new Set(['id', 'no', 'digest']);
 const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
 const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
-
-// ── ② 접미사 / 부분일치 규칙 : 새 필드는 여기에 자동으로 걸립니다 ──
 const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin', '_mpn'];
 const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
 const NUM_SUFFIX = [
@@ -74,7 +59,6 @@ const NUM_CONTAINS = [
     'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
     'tare_weight', 'chargeable'
 ];
-// 🌟 단독 명사형 수치 축. canonical.rs 의 NUM_EXACT 와 동일 집합입니다.
 const NUM_EXACT = new Set([
     'width', 'height', 'length',
     'premium', 'rate', 'debit', 'credit', 'dosage'
@@ -166,19 +150,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
             if (typeof v === 'number') { out[k] = v; continue; }
             if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
             const s = String(v).trim();
-            // 🌟 [MISSING PARITY] store.rs 의 Numeric 분기와 동일하게
-            //    '숫자로 환원 불가능한 값' 은 0 이 아니라 '없음' 입니다.
-            //
-            //  ── 무엇이 문제였나 ──
-            //   "N/A".replace(/[^\d.\-]/g,'') 는 "" 가 되고 Number("") 는 NaN 이 아니라 0 입니다.
-            //   그래서 LLM 이 '못 찾음' 으로 내려보낸 값이 전부 0 으로 확정되었고,
-            //   matchCondition 의 MISSING VALUE GUARD 가 raw === 0 을 '값 있음' 으로 읽어
-            //   'sale_price lte 5000' 이 가격 축을 아예 갖지 않는 문서를 전부 통과시켰습니다.
-            //   store.rs 가 SEED_KEYS 에서 수치 시딩을 제거한 목적이 여기서 원위치됩니다.
-            //
-            //  ── store.rs 대응 코드 ──
-            //   if t.is_empty() || t == "null" || t == "N/A" { continue; }
-            //   match cleaned.parse::<f64>() { Ok(v) => v, Err(_) => continue }
             if (s === "null" || s === "N/A") continue;
             if (k === 'status') {
                 const mapped = STATUS_CODE[s.toLowerCase()];
@@ -197,11 +168,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
         if (kind === 'bool') {
             if (v === undefined || v === null) continue;
             if (typeof v === 'object') continue;
-            // 🌟 [BOOL PARITY] store.rs 의 Boolean 분기와 세 곳이 갈려 있었습니다.
-            //    ① 빈 문자열  : Rust 는 continue, JS 는 0 으로 확정
-            //    ② "True"     : Rust 는 eq_ignore_ascii_case, JS 는 대소문자 구분
-            //    ③ 숫자 2     : Rust 는 (n != 0) → 1, JS 는 0
-            //    boolean 은 IDB 키가 아니므로 값이 있을 때만 0|1 로 내립니다.
             if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
             if (typeof v === 'number') { out[k] = v !== 0 ? 1 : 0; continue; }
             const t = String(v).trim();
@@ -222,8 +188,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
             continue;
         }
     }
-
-    // ── ② 조회 축 기본값 시딩 ──
     if (seedDefaults) {
         for (const [k, kind] of SEED_KEYS) {
             if (out[k] !== undefined && out[k] !== null) continue;
@@ -233,12 +197,6 @@ function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
 
     return out;
 }
-
-// 🌟 [ENVELOPE CONTRACT MOVED → src/modes/runtime.ts]
-//    normalizeEnvelope(ROOT ABSORB)와 commerce 트랙의 ROOT ABSORB / RUST 보강 루프가
-//    반드시 같은 집합을 봐야 하므로 runtime.ts 로 승격했습니다.
-//    최상단 import 가 같은 이름을 제공하므로 normalizeEnvelope 본문은 변경되지 않습니다.
-
 const normalizeEnvelope = (docs: any[]) => docs.map(d => {
     let parsed: any = {};
     if (typeof d.json_data === 'string') {
@@ -297,30 +255,12 @@ const normalizeEnvelope = (docs: any[]) => docs.map(d => {
         data: canonicalizeData(parsed, seedDefaults)
     };
 });
-
-// 🌟 [BACK-COMPAT] 기존 호출부(enrichForIndex(...))를 그대로 살려 둡니다.
-//  호출부 치환은 Part 3 에서 일괄 정리합니다.
 const enrichForIndex = normalizeEnvelope;
-
-// Access global libs
 const ethers = (window as any).ethers;
 const blockies = (window as any).blockies;
-
-// --- Config ---
-// 🌟 [MODE SPLIT] API_HOST 는 modes/commerce.ts 의 COMMERCE_API_HOST 로,
-//    ANALYTICS_API_HOST 는 modes/analytic.ts 의 ANALYTIC_API_HOST 로 이동했습니다.
-//    API_HOST 는 최상단 import 에서 같은 이름으로 별칭을 받으므로 호출부가 그대로이고,
-//    ANALYTICS_API_HOST 는 fetchAnalyticsOrigin 이 유일한 사용처였으므로
-//    main.ts 에서는 더 이상 참조하지 않습니다.
 const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
 const EXPANDED_HEIGHT = 600;
-// 🌟 [ROOT DOMAIN MOVED → src/modes/runtime.ts]
-//    twoPartDomains / getRootDomain 은 commerce 트랙과 main.ts 의 버튼 가시성 판정이
-//    같은 규칙을 써야 하므로 runtime.ts 로 승격했습니다. (로직 변경 없음)
-//    최상단 import 가 getRootDomain 을 같은 이름으로 제공하므로
-//    updateExtractButtonVisibility / 채팅 폼 / btnExtract / loadMoreChat 호출부는 그대로입니다.
-
 interface ChatSession {
     hash: string;
     token?: string;
@@ -332,8 +272,6 @@ interface ChatSession {
     sender?: string;
     flag?: string;
 }
-
-// --- State ---
 let currentSession: ChatSession = { hash: "", cc: "logis.center" };
 let isExpanded = false;
 let currentTab = "list";
@@ -342,24 +280,8 @@ let currentDetectedUrl = "";
 let isCurrentShop = false; 
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
-
-// 🌟 [OAUTH REGISTRY MOVED → src/modes/oauth.ts]
-//    OAUTH_API_HOST / normalizeOAuthHost / extractBalancedJson / parseOAuthApiResponse /
-//    oauthApiFetch / submitOAuthRegistration / fetchOAuthRegisteredSites /
-//    fetchOAuthSitePaths / fetchOAuthSiteCount / isOAuthSitesRendering /
-//    renderOAuthSitesUI / renderOAuthRegistrationForm 전량이 modes/oauth.ts 로 이동했습니다.
-//
-//    또한 analytic 트랙이 쓰던 getOAuthCredentialForOrigin 도 같은 파일로 합쳤습니다.
-//    (자격증명 저장소와 조회기가 한 파일에 있어야 등록/조회 규칙이 갈리지 않습니다)
-//
-//    · main.ts 가 계속 호출하는 3개(fetchOAuthRegisteredSites / renderOAuthSitesUI /
-//      renderOAuthRegistrationForm)는 최상단 import 로 같은 이름을 제공하므로
-//      checkAuthStatus · renderNavigation · applySearchModeUI 호출부는 그대로입니다.
-
 let isSearching = false;
 let isExtracting = false;
-
-// 🚀 모델 다운로드 관련 상태 관리 변수 추가
 let modelStatus: Record<string, boolean> = {};
 const TARGET_MODELS = [
     'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
@@ -434,46 +356,6 @@ async function runLocalEmbeddingSync() {
         }
     }, 2000);
 }
-
-// 🌟 [ANALYTIC BUBBLE FINALIZER MOVED → src/modes/analytic.ts]
-//    유일한 호출부가 syncAnalyticsData 이므로 함께 이동했습니다.
-//    chatTalks 는 모듈 스코프 변수가 아니라 DOM 조회이므로
-//    이동 후에도 document.querySelector('.chat-talks') 로 동일하게 접근합니다.
-
-// 🌟 [ANALYTIC STRUCTURING MOVED → src/modes/analytic.ts]
-//    isAnalyticStructuring 락과 runAnalyticStructuring() 전량이 이동했습니다.
-//    · `isSearching || isExtracting || GlobalTaskManager.isBusy` 가드는
-//      runtime 의 isBusy() 게터가 그대로 계산합니다.
-//    · getDevicePref() 는 forceCpuToggle DOM 참조라 runtime 게터로 주입합니다.
-
-// 🌟 [ANALYTIC SYNC LOCK MOVED → src/modes/analytic.ts]
-//    isAnalyticsSyncRunning / lastAnalyticsSyncAt 는 analytic 트랙 내부 상태입니다.
-//    main.ts 에 선언만 남겨 두면 '아무도 읽지 않는 죽은 락' 이 되어
-//    (실제 락은 modes/analytic.ts 안에 별도로 존재) 원인 추적을 방해합니다.
-//    스로틀 강제 해제는 resetAnalyticThrottle() 로만 수행합니다.
-// 🌟 [ANALYTIC HELPERS MOVED → src/modes/analytic.ts]
-//    resolveAnalyticsOrigins / extractAnalyticText 는 analytic 트랙 전용 헬퍼이며
-//    외부 호출부가 없으므로 그대로 이동했습니다.
-
-// 🌟 [ANALYTIC SYNC MOVED]
-//    · getOAuthCredentialForOrigin → src/modes/oauth.ts
-//      (자격증명 저장소와 조회기를 한 파일에 두어 등록/조회 규칙이 갈리지 않게 합니다)
-//    · fetchAnalyticsOrigin / syncAnalyticsData → src/modes/analytic.ts
-//
-//    syncAnalyticsData 는 최상단 import 로 같은 이름이 제공되므로
-//    syncData() 라우터와 모드 탭 IMMEDIATE PULL 호출부는 그대로입니다.
-
-// 🌟 [ANALYTIC BACKGROUND SYNC MOVED → src/modes/analytic.ts]
-//    isAnalyticsSyncRunning / lastAnalyticsSyncAt 가 그 파일로 옮겨졌으므로
-//    스로틀 판정도 같은 파일 안에 있어야 합니다.
-//    이름이 동일하게 export 되어 syncData() 라우터 호출부는 그대로입니다.
-
-// 🌟 [COMMERCE BACKGROUND SYNC MOVED → src/modes/commerce.ts]
-//    isCommerceSyncRunning 락과 syncCommerceInBackground() 전량이 이동했습니다.
-//    이름이 동일하게 export 되므로 syncData() 라우터의 세 호출부는 그대로입니다.
-
-
-// [통합 락 매니저 & 프론트엔드 큐 관리자]
 if (!(window as any).Dexie) {
     console.error("🚨 [ERROR] Dexie library is missing! public 폴더 안의 파일들은 반드시 절대경로(/)로 불러와야 합니다.");
 }
@@ -482,11 +364,9 @@ const DexieLocal = (window as any).Dexie;
 const appDb = new DexieLocal("LogisAppDB");
 
 const ITEMS_SCHEMA = [
-    // ── 봉투 (v7 그대로 유지) ──
     'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
     'created_at', 'updated_at',
     '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
-    // ── commerce 축 (v7 그대로 유지) ──
     'data.index', 'data.no', 'data.code', 'data.tracking_number',
     'data.goods', 'data.order', 'data.tracking',
     'data.stock_keeping_unit', 'data.barcode',
@@ -497,18 +377,12 @@ const ITEMS_SCHEMA = [
     'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
     'data.embed', 'data.digest',
     '*data.tags',
-    // ── 🌟 trading 축 ──
-    //  ① 문서 식별 : B/L No, AWB No, PO No, Booking No 를 하나로 흡수
     'data.doc_type', 'data.doc_number', 'data.issue_date',
-    //  ② 운송 : 선박/항공편 + 출발/도착 항구 (교차 조회 최다 축)
     'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
     'data.etd', 'data.eta',
-    //  ③ 계약 : 인코텀즈 / 결제조건 (Enum 성격, 카디널리티 낮지만 eq 조회 빈발)
     'data.incoterms', 'data.payment_terms', 'data.currency',
-    //  ④ 화물 : 컨테이너/씰 번호 (식별자, 카디널리티 최상)
     '*data.container_number', '*data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
-    //  ⑤ 참조 : 인보이스/LC 상호 참조 (N:N RELAY 축)
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
     'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
     'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
@@ -528,25 +402,12 @@ const ITEMS_SCHEMA = [
     'data.transport_mode', 'data.freight_payment_term',
     'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
     'data.due_date', 'data.payment_status',
-    // 🌟 [MULTI-ENTRY] trading.rs 의 hoist_array_identifiers 가
-    //    컨테이너 2개 이상 / 품목 2개 이상인 문서에서 이 축들을 배열로 승격합니다.
-    //    스칼라 인덱스는 배열 값 전체를 하나의 키로 색인하므로
-    //    equals('8543.70') 이 ['8543.70','8544.00'] 을 영원히 찾지 못합니다.
-    //    '*' 를 붙이면 원소마다 키가 생기고, 스칼라 값도 그대로 색인되어
-    //    1개짜리 문서와 다건 문서를 같은 쿼리로 조회할 수 있습니다.
     'data.package_unit', '*data.type_size', '*data.hs_code',
     '*data.item_code', '*data.charge_code',
-    // 🌟 [MISSING RELAY] related_trading 이 실제로 반환하는데 인덱스가 없던 5종입니다.
-    //    PHYTO↔FC / MSDS↔DGD / POA↔BIZ_LIC / BEN_CERT 관계가
-    //    loadRelatedData 의 try/catch 에 조용히 삼켜져 영원히 연결되지 않았습니다.
     'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
     'data.rel_biz_lic', 'data.rel_ben_cert',
     '[type+created_at]'
 ].join(', ');
-
-// 🌟 v15 : hs_code / type_size / item_code / charge_code 멀티엔트리 전환 +
-//          rel_phyto / rel_msds / rel_poa / rel_biz_lic / rel_ben_cert 추가.
-//          (Dexie 는 인덱스 선언이 바뀌면 반드시 버전을 올려야 재색인합니다)
 appDb.version(15).stores({
     items: ITEMS_SCHEMA,
     kv_store: 'key',
@@ -701,39 +562,8 @@ async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } 
     console.log(`[CHAT] 🗑️ [DELETED] '${msgId}' 를 내 기기에서 삭제했습니다. (서버 행 및 타 사용자 로컬 원장은 유지)`);
     return true;
 }
-
-// 🌟 v4 : 봉투 정규화 규칙을 단 하나만 유지하기 위해 db.ts 에도 같은 함수를 공유합니다.
-//  (db.ts 가 자체 enrich 복사본을 갖고 있으면 두 규칙이 어긋나 인덱스가 조용히 깨집니다)
 (window as any).normalizeEnvelope = normalizeEnvelope;
 (window as any).canonicalizeData = canonicalizeData;
-
-// =====================================================================
-// 🌟 [DEXIE PLAN ENGINE v4]
-// ---------------------------------------------------------------------
-//  Rust(build_dexie_plan)가 내려준 정밀 필터 플랜을 실제 Dexie 쿼리로 실행합니다.
-//
-//  ── 왜 이 엔진이 필요한가 ──
-//   기존에는 convert_conditions_to_sql 이 valid_cols 7개 밖의 조건을 전부 버렸고,
-//   그 손실을 메우려고 STAGE-3 이 A/FULL ~ E/TABLE-FALLBACK 5티어를 발행했습니다.
-//   v4 는 조건을 하나도 버리지 않고 여기로 넘기므로, 티어 보험이 필요 없어집니다.
-//
-//  ── 실행 전략 ──
-//   ① 인덱스가 선언된 경로  → where().equals()/.between()/.above() (O(log n))
-//   ② 인덱스가 없는 경로    → .filter() 풀스캔 (로컬 수천~수만 건 = 수 ms)
-//   ③ top / bottom          → 정렬 후 백분위 슬라이스
-//   ④ contains/not_contains → .filter() (IndexedDB 는 substring 인덱스가 없음)
-// =====================================================================
-
-// 🌟 Dexie 스키마에 실제로 선언한 인덱스 경로 목록입니다.
-//  이 집합에 없는 경로는 자동으로 .filter() 로 떨어집니다.
-//
-//  ⚠️ [계약] 이 집합은 appDb.version(N).stores() 의 items 선언과 '반드시' 일치해야 합니다.
-//     여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이 where('없는경로') 를 호출해
-//     Dexie 가 SchemaError 를 던집니다. 반대로 스키마에만 있으면 인덱스가 놀 뿐이라 안전합니다.
-//     따라서 스키마를 줄일 때는 반드시 이 집합을 먼저 줄이세요.
-//
-//  🌟 v7 : data.link / data.origin 제거 (contains 전용이라 인덱스 이득 0),
-//          data.title / data.name / data.sender_name / data.recipient_name 추가.
 const DEXIE_INDEXED_PATHS = new Set<string>([
     // ── 봉투 ──
     'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
@@ -748,26 +578,13 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.started_at', 'data.expired_at',
     'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
     'data.embed', 'data.digest',
-    // ── 🌟 trading 축 : v8 stores 선언과 1:1 로 일치해야 합니다 ──
-    //    이 21개가 빠져 있으면 선언한 인덱스가 단 한 번도 쓰이지 않고
-    //    모든 무역 조건이 .filter() 풀스캔으로 떨어집니다.
     'data.doc_type', 'data.doc_number', 'data.issue_date',
     'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
     'data.etd', 'data.eta',
     'data.incoterms', 'data.payment_terms', 'data.currency',
-    // 🌟 [MULTI-ENTRY 표기] '*' 는 stores() 선언 전용 접두사입니다.
-    //    where() 에는 별표 없는 키 경로를 넘겨야 하고,
-    //    Rust build_dexie_plan 도 별표 없는 path 를 내려줍니다.
-    //    여기에 별표를 붙여 두면 has() 가 영원히 false 가 되어
-    //    선언한 멀티엔트리 인덱스가 단 한 번도 쓰이지 않고
-    //    컨테이너/씰 번호 조회가 전부 .filter() 풀스캔으로 떨어집니다.
     'data.container_number', 'data.seal_number',
     'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
     'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
-    // 🌟 [TRADING INDEX RELAY] ITEMS_SCHEMA 의 data.rel_* 와 1:1 로 일치해야 합니다.
-    //    ⚠️ 여기에만 있고 실제 스키마에 없으면 pickDriverCondition 이
-    //       where('없는경로') 를 호출해 Dexie 가 SchemaError 를 던집니다.
-    //       (executeDexiePlan 의 INDEX FALLBACK 이 흡수하지만 매번 예외 비용이 듭니다)
     'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
     'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
     'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
@@ -779,11 +596,9 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
     'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
     'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
     'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
-    // 🌟 [MISSING RELAY] ITEMS_SCHEMA 와 1:1 로 맞춥니다.
     'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
     'data.rel_biz_lic', 'data.rel_ben_cert',
     'data.item_code', 'data.charge_code',
-    // 🌟 [BASE v2 신규 축]
     'data.reference_bl', 'data.reference_po', 'data.reference_contract',
     'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
     'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
@@ -825,10 +640,6 @@ function readPath(row: any, path: string): any {
     }
     return cur;
 }
-
-// 🌟 조건 하나를 '메모리상의 행'에 적용합니다.
-//  인덱스 경로든 아니든 최종 검증은 전부 이 함수를 통과시켜
-//  인덱스 쿼리의 오탐(타입 혼재 등)을 이중으로 막습니다.
 function matchCondition(row: any, cond: DexieCondition): boolean {
     // top / bottom 은 개별 행으로 판정 불가. 정렬 단계에서 처리합니다.
     if (cond.op === 'top' || cond.op === 'bottom') return true;
@@ -838,11 +649,6 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
     if (cond.kind === 'number') {
         const target = typeof cond.value === 'number' ? cond.value : Number(cond.value);
         if (isNaN(target)) return true; // 비교 불가 → 조건 무시(리콜 우선)
-
-        // 🌟 [MISSING VALUE GUARD] 값이 없는 것과 0 은 완전히 다른 사실입니다.
-        //    기존에는 Number('') = 0 으로 떨어져 'sale_price lte 5000' 같은 조건을
-        //    가격 필드가 아예 없는 문서까지 전부 통과시켰습니다.
-        //    neq 만 예외로 통과시킵니다. (없는 값은 target 과 같지 않은 것이 맞습니다)
         const isMissing = (raw === undefined || raw === null || raw === "");
         if (isMissing) return cond.op === 'neq';
 
@@ -860,12 +666,6 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
             default:    return actual === target;
         }
     }
-
-    // 🌟 [MULTI-ENTRY VALUE] 멀티엔트리 축은 값이 배열로 들어옵니다.
-    //    String(['A','B']) 는 'A,B' 가 되어 eq 가 영원히 실패하고
-    //    contains 는 우연히 통과하는 비대칭이 생깁니다.
-    //    Dexie 멀티엔트리 인덱스가 '원소 중 하나라도 일치' 로 동작하므로
-    //    메모리 검증도 같은 규칙을 따라야 인덱스 결과와 갈리지 않습니다.
     if (Array.isArray(raw)) {
         const t0 = (cond.value === null || cond.value === undefined) ? '' : String(cond.value).toLowerCase();
         if (!t0) return true;
@@ -895,19 +695,13 @@ function matchCondition(row: any, cond: DexieCondition): boolean {
         default:             return a === t;
     }
 }
-
-// 🌟 조건 배열 중 '인덱스 쿼리로 후보를 좁히기에 가장 유리한 것' 하나를 고릅니다.
-//  eq 가 범위보다 선택도가 높고, 식별자 경로가 상태/수치보다 선택도가 높습니다.
 function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
     const HIGH_SELECTIVITY = [
         // ── commerce 식별자 ──
         'data.tracking_number', 'data.no', 'data.code', 'data.index',
         'data.barcode', 'data.stock_keeping_unit', 'data.digest',
-        // ── 🌟 trading 식별자 : 카디널리티가 상품명/항구명보다 압도적으로 높습니다 ──
         'data.doc_number', 'data.container_number', 'data.seal_number',
         'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
-        // ── 🌟 trading 인덱스 참조 : crc32 숫자라 카디널리티가 최상입니다 ──
-        //    DEXIE_INDEXED_PATHS 의 rel_* 전량과 동일 집합입니다.
         'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
         'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
         'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
@@ -919,7 +713,6 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
         'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
         'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
         'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
-        // 🌟 [BASE v2 참조 축] 문서번호와 동급의 카디널리티를 갖습니다.
         'data.reference_bl', 'data.reference_po', 'data.reference_contract',
         'data.reference_master_bl', 'data.reference_sr'
     ];
@@ -941,10 +734,6 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
     }
     return best;
 }
-
-// 🌟 [MAIN] 플랜을 실행해 최종 문서 배열을 돌려줍니다.
-//  candidateIds 가 있으면 LanceDB 리콜 후보 안에서만 필터링하고,
-//  없으면 Dexie 전체를 대상으로 합니다(목록 조회 경로).
 async function executeDexiePlan(
     plan: DexiePlan,
     opts: { candidateIds?: string[]; limit?: number; offset?: number } = {}
@@ -956,19 +745,12 @@ async function executeDexiePlan(
     const offset = opts.offset ?? 0;
 
     let rows: any[] = [];
-
-    // ── 후보 집합이 주어진 경우 : LanceDB 리콜 결과 안에서만 정밀 필터 ──
     if (opts.candidateIds && opts.candidateIds.length > 0) {
         rows = await appDb.table('items').where('id').anyOf(opts.candidateIds).toArray();
         console.log(`[DEXIE-PLAN] 후보 ${opts.candidateIds.length}건 → Dexie 적재 ${rows.length}건`);
     } else {
-        // ── 후보가 없는 경우 : 인덱스로 최대한 좁혀서 적재 ──
         const driver = pickDriverCondition(conds);
-
         if (driver) {
-            // 🌟 [INDEX FALLBACK] DEXIE_INDEXED_PATHS 와 실제 스키마가 어긋난 세대에서는
-            //    where('없는경로') 가 SchemaError 를 던집니다. 그 경우 조용히 전량 적재로 폴백해
-            //    '검색이 통째로 실패' 하는 대신 '조금 느린 검색' 으로 흡수합니다.
             try {
                 const coll = appDb.table('items').where(driver.path);
                 if (driver.op === 'eq') {
@@ -1001,10 +783,6 @@ async function executeDexiePlan(
             console.log(`[DEXIE-PLAN] 전체 적재 ${rows.length}건`);
         }
     }
-
-    // ── 스코프 검증 (types / mode) ──
-    //  🌟 v4 : plan.type 하나만 보면 교차 후보 도메인 결과가 전부 잘립니다.
-    //     LanceDB 가 IN 절로 넓힌 만큼 Dexie 도 같은 집합을 통과시켜야 합니다.
     const allowedTypes: string[] = (plan.types && plan.types.length > 0)
         ? plan.types
         : (plan.type ? [plan.type] : []);
@@ -1037,11 +815,6 @@ async function executeDexiePlan(
     // ── top / bottom 백분위 : 정렬 후 슬라이스 ──
     for (const rc of rankConds) {
         if (rows.length === 0) break;
-
-        // 🌟 [RANK MISSING GUARD] 값이 없는 문서는 순위 자체가 성립하지 않습니다.
-        //    Number(undefined) || 0 으로 떨어지면 bottom 20% 가
-        //    '해당 축을 아예 갖지 않은 문서' 로 채워집니다.
-        //    (수치 시딩을 제거한 뒤에는 결손이 실제로 발생하므로 반드시 필요합니다)
         const ranked = rows.filter(r => {
             const v = readPath(r, rc.path);
             if (v === undefined || v === null || v === "") return false;
@@ -1064,9 +837,6 @@ async function executeDexiePlan(
         rows = sorted.slice(0, take);
         console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
     }
-
-    // ── keywords : 조건이 되지 못한 청크로 보조 스코어링 ──
-    //  버리지 않고 '가산점' 으로만 씁니다. 여기서 잘라내면 리콜이 무너집니다.
     if (plan.keywords && plan.keywords.length > 0) {
         for (const r of rows) {
             const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.masked_text ?? ''}`.toLowerCase();
@@ -1083,8 +853,6 @@ async function executeDexiePlan(
     const end = Math.min(start + limit, rows.length);
     return rows.slice(start, end);
 }
-
-// [통합 락 매니저 & 프론트엔드 큐 관리자]
 class GlobalTaskManager {
     static isBusy: boolean = false;
     static currentTaskId: string | null = null;
@@ -1093,23 +861,15 @@ class GlobalTaskManager {
     static queue: Array<{taskId: string, type: string, payload: any}> = [];
     static backendQueued: any[] = []; // 🌟 [CRITICAL FIX] 백엔드가 이미 관리 중인 대기열 추적용 배열 추가
     static cancelledTasks: Set<string> = new Set(); // 🌟 [CRITICAL FIX] 취소된 작업 ID 블랙리스트 추가
-
-    // 🌟 [추가] 큐를 Dexie(IndexedDB)에 저장하여 새로고침 시에도 증발 방지
     static async saveQueue() {
         await appDb.table("ts_queue").clear();
         if (this.queue.length > 0) {
             await appDb.table("ts_queue").bulkAdd(this.queue);
         }
     }
-
-    // 🌟 [수정] 앱 시작 시 Dexie에서 저장된 큐 복원
     static async loadQueue() {
-        // 🌟 [CRITICAL FIX] 앱을 완전히 종료 후 재시작했을 때 대기열 자동 실행 방지
-        // sessionStorage는 F5 새로고침 시에는 유지되지만, 앱 종료 시에는 초기화됩니다.
         if (!sessionStorage.getItem("app_running_session")) {
             sessionStorage.setItem("app_running_session", "true");
-            
-            // 🌟 [추가] 강제 종료 전 Dexie에 남아있던 대기열을 가져와 LanceDB에 에러(Error) 히스토리로 남깁니다.
             try {
                 const leftoverTasks = await appDb.table("ts_queue").toArray();
                 if (leftoverTasks && leftoverTasks.length > 0) {
@@ -1141,16 +901,12 @@ class GlobalTaskManager {
                             }
                         };
                     });
-                    
-                    // 백엔드 LanceDB에 에러 히스토리 일괄 삽입
                     await invoke("upsert_items", { items: errorItems });
                     console.log(`[QUEUE] Recorded ${errorItems.length} leftover tasks as ERROR in LanceDB.`);
                 }
             } catch (e) {
                 console.error("[QUEUE] Failed to log leftover tasks to LanceDB:", e);
             }
-
-            // 🌟 [FAIL-SOFT] 스토어 부재/업그레이드 중이어도 초기화 흐름을 끊지 않습니다.
             try {
                 await appDb.table("ts_queue").clear();
                 console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
@@ -1181,11 +937,7 @@ class GlobalTaskManager {
         this.queue.push({ taskId, type, payload });
         this.activeRefs.add(taskId);
         await this.saveQueue(); // 🌟 즉시 저장 (Dexie)
-        
-        // 🌟 [추가] 큐에 담기자마자 사용자에게 시각적 피드백 제공 (DB 등록 전 선행 렌더링)
         const startTime = parseInt(taskId.split('_')[1]) || Date.now();
-        
-        // 1. 사용자 질문 선행 렌더링 (검색인 경우)
         if (payload.query) {
             await renderMessage({
                 id: `${taskId}_query`,
@@ -1196,8 +948,6 @@ class GlobalTaskManager {
                 updated_at: startTime - 100
             });
         }
-
-        // 2. 시스템 대기열 말풍선 선행 렌더링
         await renderMessage({
             id: taskId,
             task_id: taskId,
@@ -1263,18 +1013,8 @@ class GlobalTaskManager {
         this.activeRefs.clear();
         this.queue = [];
         this.backendQueued = []; // 🌟 전체 초기화 반영
-        // 🌟 Dexie DB 초기화 (세션/설정 키는 보존)
         try {
             await appDb.table("ts_queue").clear();
-            // 🌟 [SESSION PRESERVE] kv_store 를 통째로 clear() 하면
-            //    chat_session(로그인 세션), search_mode, hidden_pages,
-            //    my_sync_seed, oauth_registered_sites 등 사용자 상태가
-            //    전부 소멸하여 앱 재시작 시 로그인이 풀립니다.
-            //    '작업 큐/락/터미널 로그' 관련 키만 선택적으로 삭제합니다.
-            //
-            //    ⚠️ btn-reset-db 경로는 이 함수 호출 '직후' 에
-            //       appDb.delete() 로 Dexie DB 자체를 물리 삭제하므로
-            //       여기서 보존해도 완전 초기화에는 영향이 없습니다.
             const PRESERVE_KEYS = new Set([
                 "chat_session",
                 "search_mode",
@@ -1296,7 +1036,6 @@ class GlobalTaskManager {
         } catch (e) {
             console.error("[QUEUE] Dexie DB clear error:", e);
         }
-        // 🌟 LanceDB 전면 초기화 호출 (새로고침 전에 백엔드 초기화가 완료되도록 대기)
         try {
             await invoke("reset_lancedb");
             console.log("[QUEUE] LanceDB fully reset.");
@@ -1444,8 +1183,6 @@ const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTML
 const btnSyncQr = document.getElementById("btn-sync-qr") as HTMLButtonElement;
 const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
 const headerLoading = document.getElementById("header-loading") as HTMLElement;
-
-// 🌟 기존 loadingIndicator 대신 h2 태그를 선택합니다.
 const listTitle = document.querySelector("#list-view .header-row h2") as HTMLElement;
 
 const aiResultsArea = document.getElementById("ai-search-results") as HTMLElement;
@@ -1498,10 +1235,6 @@ if (chatForm) {
             }));
             console.log("[CHAT] Message sent via WebRTC");
         }
-
-        // 🌟 [ANALYTIC LOCAL] analytic 모드에서도 로컬 LanceDB 검색(ai_search_complex)을 사용합니다.
-        //    서버 Vectorize POST 를 제거하고, commerce/shipping 과 동일한 검색 큐로 합류시킵니다.
-        //    parse_analytic_query 가 질의를 파싱하고, 로컬 item_chunks + Dexie 가 결과를 반환합니다.
         if (currentSearchMode === "analytic") {
             const taskId = `search_${Date.now()}`;
             const startTime = Date.now();
@@ -1549,21 +1282,6 @@ if (chatForm) {
 
             return;
         }
-
-        // 🌟 [OPTIMISTIC LOCAL WRITE]
-        //  ── 무엇이 문제였나 ──
-        //   기존 구조는 `if (response.results.length > 0)` 안에서만 로컬에 저장했습니다.
-        //   서버(index.ts)의 PUT 핸들러는 `if(cookies.sender)` 게이트에 막혀
-        //   talks INSERT 를 한 번도 수행하지 못했고, 빈 results 를 돌려주었습니다.
-        //   그래서 LanceDB talks 에 아무것도 안 들어가고
-        //   get_chat_messages 가 0건 → .chat-talks 에 "No messages yet." 이 남았습니다.
-        //
-        //  ── 해결 ──
-        //   이전 구현(content.js / chrome.js)과 동일하게, 사용자가 입력한 즉시
-        //   로컬 messages 테이블에 먼저 적재하고 화면을 그립니다.
-        //   서버 응답이 오면 그 행이 별도 id 로 추가되며(서버가 hashId() 로 새 id 발급),
-        //   upsertChatMessages 의 중복 제거 + 시간순 정렬이 자연스럽게 합칩니다.
-        //   서버가 실패해도 채팅 목록은 절대 사라지지 않습니다.
         const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
         {
             let localLink = "/tracking";
@@ -1625,22 +1343,6 @@ if (chatForm) {
             if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
                 targetHref = "https://commerce.logis.center/tracking";
             }
-
-            // 🌟 [SENDER GATE] index.ts 의 PUT 핸들러는 아래 게이트를 통과해야만
-            //    INSERT INTO talks 를 실행합니다.
-            //      if(cookies.sender){ if(isAddress(from) && isAddress(to)){ ... } }
-            //    cookies.sender 는 요청 최상단 세션 블록에서
-            //    req.query.sender → data.sender → cookies.sender 순으로 세팅되며,
-            //    이 블록은 method 와 무관하게 매 요청 실행됩니다.
-            //    따라서 이 PUT 요청 자체에 sender 를 실으면 그 자리에서 게이트를 통과합니다.
-            //
-            // 🌟 [TO FIX] 기존에는 to 로 effectiveRef(페이지 ref 해시)를 보냈습니다.
-            //    서버는 talk.to 에 그 값을 그대로 저장하는데,
-            //    GET 조회 쿼리 중 하나가
-            //      SELECT * FROM talks WHERE "from" = team AND "to" = address
-            //    이므로 ref 를 넣으면 대화 상대 축이 어긋납니다.
-            //    ref 는 서버가 자체적으로 hashId(team+cc+link) 로 재계산하므로
-            //    to 에는 소속 팀 주소를 보내는 것이 계약상 올바릅니다.
             const talkSender = currentSession.email || currentSession.name || "";
 
             const params = new URLSearchParams({
@@ -1664,8 +1366,6 @@ if (chatForm) {
                 headers: { "Content-Type": "application/json" },
                 session_params: { hash: currentSession.hash, token: currentSession.token }
             });
-
-            // 서버 응답 결과(결과 배열)가 온 경우 chrome.js처럼 로컬 DB에 동기화
             if (response && response.results && response.results.length > 0) {
                 await invoke("upsert_items", { items: response.results });
                 for (const item of response.results) {
@@ -1675,8 +1375,6 @@ if (chatForm) {
                 }
                 console.log(`[CHAT] Server accepted talk. rows=${response.results.length}`);
             } else {
-                // 🌟 서버가 빈 배열을 돌려주면 cookies.sender 게이트에서 탈락한 것입니다.
-                //    낙관적 로컬 저장 덕분에 화면은 유지되지만 원인을 반드시 표면화합니다.
                 console.warn(
                     "[CHAT] ⚠️ Server returned no talk rows. " +
                     "Check that `sender` reached the worker (cookies.sender gate) — " +
@@ -1706,10 +1404,6 @@ if (chatForm) {
         }, 100);
     });
 }
-
-// 🌟 [DELETE DELEGATION] 삭제 버튼은 말풍선이 재렌더링될 때마다 새로 만들어지므로
-//  개별 노드에 리스너를 붙이면 upsertChatMessages 의 replaceChild 시점에 유실됩니다.
-//  컨테이너에 위임 리스너 하나만 두면 이후 어떤 렌더링 경로에서도 그대로 동작합니다.
 if (chatTalks) {
     chatTalks.addEventListener("click", async (e) => {
         const target = e.target as HTMLElement;
@@ -1749,7 +1443,6 @@ settingsToggle?.addEventListener("change", (e) => {
     const listRefreshBtn = document.getElementById("list-refresh-btn"); // 🌟 버튼 참조 추가
     
     if (isChecked) {
-        // 설정 켜짐: 설정 패널 표시, 리스트 및 네비게이션 숨김
         if (settingsPanel) settingsPanel.style.display = "block";
         if (docList) docList.style.display = "none";
         if (listRefreshBtn) listRefreshBtn.style.display = "none"; // 🌟 새로고침 버튼 숨김
@@ -1759,7 +1452,6 @@ settingsToggle?.addEventListener("change", (e) => {
             label.classList.add("on")
         }
     } else {
-        // 설정 꺼짐: 설정 패널 숨김, 리스트 및 네비게이션 원상복구
         if (settingsPanel) settingsPanel.style.display = "none";
         if (docList) docList.style.display = ""; 
         if (listRefreshBtn) listRefreshBtn.style.display = "flex"; // 🌟 새로고침 버튼 다시 표시
@@ -1781,8 +1473,6 @@ function startSpinner() {
     
     if (settingsBtn) {
         settingsBtn.classList.add("active-spinner-mode");
-        // 🌟 [CRITICAL FIX] 글로벌 스피너가 돌 때 번개 버튼을 무조건 숨기던 코드를 제거합니다! (대기열 큐잉 허용)
-        // isSearching 변수가 Part 1에서 선언되었으므로 이제 에러가 발생하지 않습니다.
         if (isSearching && btnSubmit) btnSubmit.style.display = "none";
     }
     
@@ -1799,8 +1489,6 @@ function startSpinner() {
 }
 
 function stopSpinner() {
-    // 🌟 [CRITICAL FIX] 추출(Extracting) 중이거나 검색(Searching) 중이면, 
-    // 백그라운드 태스크가 함부로 글로벌 스피너를 끄지 못하도록 절대 방어합니다!
     if (isExtracting || isSearching) return;
 
     if (spinnerInterval) {
@@ -1819,20 +1507,9 @@ function stopSpinner() {
             (el as HTMLElement).innerText = "";
         }
     });
-
-    // 🌟 [수정] 스피너 정지 시, 진행 중이지 않은 유효한 텍스트 입력값이 존재할 때만 검색 버튼 노출
-    //    🌟 [MODE SPLIT] 동일 코드가 syncData / syncAnalyticsData / syncTradingData 에도
-    //       복사돼 있었습니다. 모드 파일이 분리되면 btnSubmit / searchInput / isQueryActive 에
-    //       접근할 수 없으므로 단일 함수로 뽑아 runtime 으로 주입합니다.
     restoreSubmitButton();
     updateExtractButtonVisibility();
 }
-
-// 🌟 [SUBMIT RESTORE] 검색 버튼 노출 판정의 단일 진입점입니다.
-//  ── 계약 ──
-//   · 입력값이 비어 있으면 숨김
-//   · 입력값이 이미 진행/대기 중인 질의와 같으면 숨김 (중복 큐잉 방지)
-//   · 그 외에는 노출
 function restoreSubmitButton() {
     if (!btnSubmit) return;
     const currentVal = searchInput?.value.trim() || "";
@@ -1858,40 +1535,25 @@ function switchTab(tabName: string) {
     
     if (tabName === "settings") {
         settingsBtn?.classList.add("active-emoji", "active");
-        
-        // 🌟 [CRITICAL FIX] Settings 버튼을 누르면 3초를 기다리지 않고 즉시 1회 서버 통신(인증/동기화)을 강제 실행합니다!
         if (!currentSession.email) {
             checkAuthStatus();
         }
-
-        // 🌟 [CRITICAL FIX] 검색 중(isSearching)이거나 추출 중(isExtracting)일 때는 
-        // 탭을 전환하더라도 억지로 히스토리를 리셋하여 방금 작성한 말풍선을 날려버리지 않도록 방어합니다!
         if (!isSearching && !isExtracting) {
             fetchChatHistory();
         } else {
-            // 🌟 진행 중인 작업 때문에 돔을 리셋(innerHTML="")할 수는 없지만,
-            // 달랑 진행 중인 말풍선 1~2개만 있고 과거 내역이 안 불러와진 상태라면 과거 내역(isHistory=true)을 끌어와서 화면을 채웁니다!
             if (chatTalks && chatTalks.children.length < 10 && chatHasMore) {
                 loadMoreChat(true, true);
             } else {
-                // 이미 화면이 채워져 있다면 최신 상태 변경점(status)만 조용히 동기화합니다.
                 loadMoreChat(false, true);
             }
         }
-        
-        // 🌟 탭이 열렸으므로 폴링 타이머를 새롭게 리셋하여 주기를 맞춥니다.
         startPolling();
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
-    
-    // 🌟 [추가] 리스트 탭으로 이동 시 검색 결과 화면이었다면 전체 리스트로 복구합니다.
     if (tabName === "list") {
         const resultH3 = document.querySelector('.nav-section.search h3');
         const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
-        
-        // 🌟 [CRITICAL FIX] 검색이 진행 중(isSearching)일 때는 절대 초기화(refreshList)를 방지하여 검색 화면 및 진행 상태(Cancel 버튼)가 날아가는 것을 막습니다!
-        // 또한 일반 리스트 상태일 때는 탭을 전환한다고 굳이 초기화하지 않아 무한스크롤 상태를 보존합니다.
         if (isShowingSearchResult && !isSearching) {
             if (searchInput) searchInput.value = "";
             if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
@@ -1923,8 +1585,6 @@ function collapseWidget() {
 const interactiveElements = ['.pill-nav', '#content-panel'];
 
 function setupMousePassthrough() {
-    // [FIX] 기본적으로 위젯은 클릭이 가능해야 합니다. 
-    // 윈도우 크기(380x80)가 이미 작기 때문에 윈도우 밖은 자동으로 클릭이 통과됩니다.
     invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
 
     interactiveElements.forEach(selector => {
@@ -1969,9 +1629,6 @@ let extractClickLock = false;
 
 async function updateExtractButtonVisibility() {
     if (!btnExtract || !btnAutoLaunch) return;
-
-    // 1. 브라우저 물리 상태 체크 (동기/즉시 실행)
-    // 이미지(currentImage)가 선택된 상태라면 브라우저 실행 여부와 무관하게 반환하지 않고 진행합니다.
     if (!isBrowserRunning && !isAutoLaunchLocked && !currentImage) {
         btnAutoLaunch.style.display = "flex";
         btnAutoLaunch.classList.remove("hidden");
@@ -2001,7 +1658,6 @@ async function updateExtractButtonVisibility() {
     if (!isAllowedDomain && currentDetectedUrl) {
         try {
             const currentHostname = new URL(currentDetectedUrl.toLowerCase()).hostname;
-            // DB를 비동기로 호출하지 않고 이미 그려진 내비게이션 요소에서 도메인 목록을 즉시 확인합니다.
             const pageList = document.getElementById("nav-list-pages");
             if (pageList) {
                 const labels = Array.from(pageList.querySelectorAll(".logis-label")) as HTMLElement[];
@@ -2059,23 +1715,11 @@ async function updateExtractButtonVisibility() {
             const rootDomain = getRootDomain(urlObj.hostname);
             const ccHash = await hashId(rootDomain);
             const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
-            // 🌟 [CRITICAL FIX v3] 현재 URL 기반 해시를 1순위로 검사합니다.
             const currentRefToCheck = hashedRefId;
             let isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
-            // 🌟 [CRITICAL FIX v3] hashedRefId로 매칭되지 않았을 때 activeContext.ref도 추가 확인합니다.
-            //    네비게이션 클릭 후 추출 시 task.ref = activeContext.ref로 저장되므로
-            //    URL 기반 해시만으로는 매칭이 안 되는 케이스를 커버합니다.
-            //    (URL 변경 시 browser-match-found에서 activeContext.ref가 ""로 초기화되므로
-            //     다른 페이지에서는 이 분기가 실행되지 않아 원래 버그가 재발하지 않습니다.)
             if (!isActive && activeContext.ref && activeContext.ref !== currentRefToCheck) {
                 isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: activeContext.ref } });
             }
-            // 🌟 [CRITICAL FIX v3] 네비게이션 렌더링이 아직 activeContext.ref를 설정하지 못한
-            //    레이스 컨디션 상태에서, 백엔드 ACTIVE_TASK_MEM에 같은 페이지의 진행 중 태스크가
-            //    있는지 get_active_task_context로 추가 교차 검증합니다.
-            //    🌟 [FIX v4] 단, 활성 태스크의 link가 현재 URL의 path와 일치할 때만 숨김 처리합니다.
-            //    아직 동기화하지 않은 새 팝업 페이지로 포커싱했을 때, 다른 페이지의 태스크 때문에
-            //    버튼이 잘못 숨겨지는 것을 방지합니다.
             if (!isActive && !activeContext.ref) {
                 try {
                     const activeCtx = await invoke<any>("get_active_task_context");
@@ -2087,7 +1731,6 @@ async function updateExtractButtonVisibility() {
                     }
                 } catch (_e2) { /* 무시 */ }
             }
-            // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
             const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link)) ||
                 GlobalTaskManager.backendQueued.some(p => p.ref === currentRefToCheck || p.link === link);
             const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload &&
@@ -2118,13 +1761,7 @@ listen("browser-match-found", async (event: any) => {
     }
     currentDetectedUrl = payload.url || "";
     isCurrentShop = payload.is_client || payload.is_admin || false;
-    // 🌟 [CRITICAL FIX] URL 변경 시 이전 페이지의 activeContext.ref를 초기화합니다.
-    //    이어서 호출되는 renderNavigation()이 새 페이지의 ref를 재설정하므로,
-    //    이전 페이지의 stale ref가 버튼 가시성 판정을 오염시키는 것을 원천 차단합니다.
     activeContext.ref = "";
-    // 🌟 [CRITICAL FIX v3] renderNavigation()이 activeContext.ref를 재설정하기 전에
-    //    updateExtractButtonVisibility()를 호출하면 ref="" 상태에서 매칭 실패 → 버튼 오노출됩니다.
-    //    따라서 renderNavigation()을 먼저 완료시킨 뒤, 설정된 ref 기반으로 최종 판정을 내립니다.
     await renderNavigation();
     await updateExtractButtonVisibility();
 });
@@ -2137,8 +1774,6 @@ listen("browser-status", async (event: any) => {
         const prevUrl = currentDetectedUrl;
         currentDetectedUrl = payload.url || "";
         isCurrentShop = payload.is_client || payload.is_admin || false;
-        // 🌟 [CRITICAL FIX v3] URL이 실제로 변경되었을 때만 버튼 가시성 재평가를 수행합니다.
-        //    800ms 주기 하트비트에서 매번 재평가하면 비동기 레이스로 버튼이 깜빡입니다.
         if (prevUrl !== currentDetectedUrl) {
             await updateExtractButtonVisibility();
         }
@@ -2151,9 +1786,6 @@ listen("browser-status", async (event: any) => {
         isBrowserRunning = false;
         isAutoLaunchLocked = false;
         currentDetectedUrl = "";
-        // 🌟 [CRITICAL FIX] 브라우저 종료 시 btnAutoLaunch를 직접 노출시킵니다.
-        //    updateExtractButtonVisibility() 내부의 extractClickLock 조기 리턴이나
-        //    isExtracting 상태에 의해 btnAutoLaunch 노출이 누락되는 것을 원천 차단합니다.
         if (btnAutoLaunch) {
             btnAutoLaunch.style.display = "flex";
             btnAutoLaunch.classList.remove("hidden");
@@ -2167,7 +1799,6 @@ listen("browser-status", async (event: any) => {
 });
 
 const handleSearchInteraction = () => {
-    // 🌟 [추가] 검색창 클릭/포커스 시 세팅 패널이 열려있다면 강제로 스위치를 끄고 닫아줍니다.
     const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
     if (settingsToggle && settingsToggle.checked) {
         settingsToggle.checked = false;
@@ -2176,35 +1807,7 @@ const handleSearchInteraction = () => {
 
     const resultH3 = document.querySelector('.nav-section.search h3');
     const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
-
-    // 🌟 [추가] 도메인(CC)이 선택되어 있지 않을 경우, 기본 홈 링크(/tracking) 도메인으로 강제 할당합니다.
-    // if (!activeContext.cc && currentSession.team) {
-    //     (async () => {
-    //         const defaultDomain = "logis.center";
-    //         const defaultPath = "/tracking";
-            
-    //         // 해시값 생성
-    //         const ccHash = await hashId(defaultDomain);
-    //         const refHash = await hashId(currentSession.team + ccHash + defaultPath);
-            
-    //         // 컨텍스트에 강제 주입
-    //         activeContext.cc = ccHash;
-    //         activeContext.ref = refHash;
-            
-    //         // UI 태그 추가 (사용자에게 시각적 피드백 제공)
-    //         addSearchTag(`@${defaultDomain}`, 'domain', defaultDomain);
-    //         addSearchTag(`#tracking`, 'type', 'tracking');
-    //         updateTagsUI();
-            
-    //         console.log(`[NAV] No domain selected. Defaulting to: ${defaultDomain} (${defaultPath})`);
-    //     })();
-    // }
-
-    // [UI-FIX] If the panel is already expanded, don't refresh the navigation or clear the list.
-    // This prevents annoying UI flickering when the user just wants to type in the search bar.
     if (isExpanded && currentTab === "list") {
-        // 🌟 [수정] 검색 결과가 표시된 상태에서 검색창을 클릭했다면 다시 전체 리스트로 복구합니다.
-        // 🌟 [CRITICAL FIX] 단, 현재 검색이 진행 중(isSearching)이라면 초기화하지 않고 그대로 둡니다.
         if (isShowingSearchResult && !isSearching) {
             if (searchInput) searchInput.value = "";
             if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
@@ -2221,8 +1824,6 @@ const handleSearchInteraction = () => {
         renderNavigation();
         if (listScrollContainer) listScrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
     }
-    
-    // 🌟 [CRITICAL FIX] 검색 진행 중일 때는 하단 초기화 로직도 타지 않도록 완벽히 방어합니다.
     if (!isSearching && (!searchInput.value || isShowingSearchResult)) {
         if (searchInput) searchInput.value = "";
         if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
@@ -2230,7 +1831,6 @@ const handleSearchInteraction = () => {
         cachedDocs = [];
         currentPage = 0;
         hasMore = true;
-        // 🌟 [CRITICAL FIX] 빈 검색창 클릭으로 위젯을 열었을 때, 목록을 지우기만 하고 다시 불러오지 않아 빈 화면이 출력되는 현상 수정
         loadMoreDocs(true);
     }
 };
@@ -2258,23 +1858,16 @@ function addSearchTag(label: string, type: 'domain' | 'type' | 'mode' | 'path', 
 function removeSearchTag(id: string) {
     const tagToRemove = activeTags.find(t => t.id === id);
     if (tagToRemove) {
-        // [FIX] Reset specific context when corresponding tags are removed
         if (tagToRemove.type === 'domain') activeContext.cc = "";
         if (tagToRemove.type === 'type') activeContext.ref = "";
         if (tagToRemove.type === 'path') activeContext.ref = "";
     }
-
     activeTags = activeTags.filter(t => t.id !== id);
-    
-    // If no more tags left, clear the entire active context
     if (activeTags.length === 0) {
         activeContext = { cc: "", bcc: "", ref: "" };
     }
-
     updateTagsUI();
     loadMoreDocs(true);
-    
-    // [FIX] Also refresh chat history to reflect cleared filters
     fetchChatHistory(true);
 }
 
@@ -2289,11 +1882,7 @@ function updateTagsUI() {
         container.appendChild(chip);
     });
 }
-
 document.addEventListener('remove-tag', (e: any) => removeSearchTag(e.detail));
-
-// --- Tree Rendering Logic (Pages & Users) ---
-// --- Original Logic Implementation from content.js ---
 let navTmp: Record<string, boolean> = {};
 
 async function renderAccordion(nodes: any[], level = 1): Promise<string> {
@@ -2309,8 +1898,6 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
         var name = '';
         var desc: string[] = [];
         var _url: URL | null = null;
-
-        // ONLY generate HTML if this node hasn't been rendered yet
         if (!navTmp[nodeId]) {
             navTmp[nodeId] = true;
 
@@ -2325,18 +1912,12 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     host = `<strong>${teamName}</strong>`;
                 } else {
                     let cancelBtn = "";
-
-                    // 🌟 [수정] 본인 계정만 (owner), 초대된 멤버나 펜딩 상태는 (member)로 표시
                     if (node.id === currentSession.address) {
                         desc.push("(owner)");
-                        // 🌟 본인(Owner 또는 Self)일 경우 삭제/취소 버튼을 노출하지 않습니다.
                     } else {
                         desc.push("(member)");
-                        // 🌟 타인(Member)일 경우에만 삭제/취소 버튼을 노출합니다.
                         cancelBtn = `<button class="btn-cancel-member" data-id="${nodeId}" data-name="${name}" style="background:none; border:none; color:#ef4444; font-size:0.85rem; cursor:pointer; padding:0 5px; margin-left:auto; display:flex; align-items:center; justify-content:center;" title="Remove / Cancel Invite">✕</button>`;
                     }
-
-                    // 🌟 [수정] 버튼이 우측 끝에 붙도록 Flex 구조 적용
                     content = `<div style="display:flex; align-items:center; width:100%; gap:8px;">
                         <span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>
                         ${cancelBtn}
@@ -2346,7 +1927,6 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
             } else if (node.data || node.type) {
                 type = 'page';
                 const data = node.data || {};
-                // 🌟 [CRITICAL FIX] DB 테이블명(pages)이 아닌 진짜 속성(goods, tracking)을 우선적으로 참조하도록 수정합니다.
                 const nodeType = data.type || node.type || 'unknown';
                 console.log("[DEBUG] renderAccordion Page Node:", { id: nodeId, type: nodeType, domain: node.domain, origin: data.origin, link: data.link });
 
@@ -2354,16 +1934,12 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                     _url = new URL(data.origin);
                     const domain = node.domain || _url.hostname;
                     if (!navTmp[domain] && data.item) {
-                        // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: CSS 파괴를 막기 위해 불필요한 div 래핑을 모두 제거하고 원본 구조 유지
                         host = `<strong>${domain}</strong>`;
                         if (API_HOST.includes(domain)) {
                             host += `<label for="membership">Edit</label>`;
                         }
                         navTmp[domain] = true;
                     }
-
-                    // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: Hash ID 기반 매칭에 실패했을 경우를 대비해, 
-                    // 현재 브라우저 URL의 파라미터를 분석하여 리스트(부모)와 상세(자식) 활성화 대상을 100% 정확히 찾아냅니다.
                     let isActive = nodeId === activeContext.ref;
 
                     if (!isActive && currentDetectedUrl && data.link) {
@@ -2404,20 +1980,6 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 }
                 var total = { draft: 0, count: 0 };
                 const cc = node.cc || data.cc;
-
-                // 🌟 [DEXIE COUNT] team.data.base.pages 증감 통계 대신 Dexie 인덱스로 직접 셉니다.
-                //    ① 증감 방식은 서버(proxy/index.ts)와 로컬(metrics.rs)이 같은 트리를 각자 갱신하므로
-                //       한쪽이 실패하면 영구히 어긋납니다.
-                //    ② relay draft / DEDUP 스킵 / ORDER-INDEX FALLBACK 처럼 분기가 늘 때마다
-                //       증감 지점을 같이 늘려야 합니다.
-                //    ③ '[cc+type]' 복합 인덱스가 이미 선언돼 있어 range 조회 1회면 끝납니다.
-                //
-                //    🌟 [DRAFT 판정 계약] proxy/index.ts 와 완전히 동일합니다.
-                //       updated_at == 0  → draft (리스트 스캔으로 껍데기만 존재)
-                //       updated_at >  0  → count (상세 추출까지 완료)
-                //    cc+type 단위 단일 통계이므로 리스트 노드와 상세 노드가 같은 total 을 공유하고,
-                //    리스트 노드는 total.draft 를, 상세 노드는 total.count 를 표시합니다.
-                //    (이 구조 자체가 base.pages[cc][type] 와 동일합니다)
                 if (
                     nodeType !== 'team' &&
                     nodeType !== 'user' &&
@@ -2432,11 +1994,7 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                             .where('[cc+type]')
                             .equals([cc, nodeType])
                             .toArray();
-
                         for (const r of rows) {
-                            // 🌟 [DRAFT COUNT v2] 봉투 루트 updated_at 과 data.updated_at 둘 다 확인합니다.
-                            //    normalizeEnvelope 가 data.* 로 내린 뒤에도 루트 updated_at 이
-                            //    별도 경로(syncData bulkPut 이전)로 갱신될 수 있으므로 이중 판정합니다.
                             const rootUp = Number(r.updated_at ?? 0);
                             const dataUp = Number(r.data?.updated_at ?? rootUp);
                             const up = dataUp;
@@ -2459,38 +2017,25 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
                 try {
                     const bcc = node.bcc || data.bcc;
                     if (bcc) {
-                        // 🌟 [CRITICAL FIX 1] AI 검색(Select)을 타격하여 무한 스피너가 도는 현상을 원천 차단합니다.
                         const _items = await invoke<any[]>("get_all_documents", { limit: 1, offset: 0, filter: `bcc = '${bcc}'` });
                         if (_items.length && _items[0].created_at) {
-                            // 🌟 bb.ts의 유저 이름 표기 로직과 동일하게 작성자 정보를 가져와 병합 표기
                             const timeStr = time2text(Number(_items[0].created_at));
                             const author = _items[0].from ? _items[0].from.substring(0,6) : "system";
                             recent = `<strong>${timeStr} - ${author}</strong>`;
                         }
                     }
                 } catch (err) {}
-
-                // 🌟 [CRITICAL FIX] bb.ts 패리티 완벽 복원: 실제 타입(nodeType)을 최우선으로 출력하여 'pages'로 노출되는 버그를 고칩니다!
-                // Draft 텍스트는 아래 count 변수 조립 시 명시적으로 통합합니다.
                 name = `<span>${nodeType}</span>`;
                 
                 var count = '';
                 if (data.item) {
-                    // 🌟 전처리 중인 리스트 페이지일 경우, Draft 수량과 정식 처리된 Count 수량을 함께 노출합니다.
                     count = `<span style="font-size: 0.9em; margin-left: 4px;"> Draft <u>(${total.draft || 0})</u></span>`;
                 } else {
-                    // 🌟 상세 페이지일 경우 기존처럼 Count만 노출합니다.
                     count = `<u>(${total.count || 0})</u>`;
                 }
-                
-                // 🌟 [추가] 숨김 처리 상태 아이콘 및 스타일 적용
                 const isHidden = hiddenPages.includes(nodeId);
                 const visibilityIcon = isHidden ? "show" : "hide";
-                
-                // 🌟 [CRITICAL FIX] 기존 CSS 레이아웃을 파괴하지 않도록 절대 위치(absolute)를 사용하여 우측 상단에 버튼을 배치합니다.
                 const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}" style="position: absolute; right: 10px; top: 1px; background: none; border: none; cursor: pointer; font-size: 10px; text-decoration: underline; color: #888; z-index: 10;">${visibilityIcon}</button>`;
-
-                // 🌟 [CRITICAL FIX] 실수로 누락했던 visibilityBtn 변수를 content 문자열 맨 끝에 다시 포함시킵니다!
                 const opacityStyle = isHidden ? 'opacity: 0.3;' : 'opacity: 1;';
                 content = `<span style="${opacityStyle}">${name}\n${count}\n</span>\n${recent}\n${visibilityBtn}`;
             }
@@ -2534,8 +2079,6 @@ async function renderNavigation() {
     const btnSignout = document.getElementById("nav-signout");
 
     if (!pageList || !userList) return;
-
-    // [FIX] Show spinner only on the very first navigation render
     if (isFirstNavRender) {
         startSpinner();
     }
@@ -2554,16 +2097,12 @@ async function renderNavigation() {
     try {
         navTmp = {}; // Reset for fresh render
         let _pagesRaw = await Select["pages"]({});
-        
-        // 🌟 [CRITICAL FIX] 백엔드(LanceDB)에서 가져온 TradeDocument는 알맹이가 json_data 문자열에 있으므로 반드시 파싱해 주어야 UI 필터링에서 증발하지 않습니다!
         let _pages = _pagesRaw.map(p => {
             if (!p.data && p.json_data && typeof p.json_data === "string") {
                 try { p.data = JSON.parse(p.json_data); } catch(e) {}
             }
             return p;
         });
-
-        // 🌟 [CRITICAL FIX] 크롬 브라우저의 현재 접속 도메인과 일치하는 페이지만 남깁니다.
         let currentDomain = "";
         console.log(`[DEBUG-NAV] 브라우저 현재 감지된 URL(currentDetectedUrl):`, currentDetectedUrl);
         
@@ -2572,9 +2111,6 @@ async function renderNavigation() {
                 const footprint = new URL(currentDetectedUrl.toLowerCase());
                 currentDomain = footprint.hostname;
                 console.log(`[DEBUG-NAV] 파싱된 현재 도메인(currentDomain):`, currentDomain);
-                
-                // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: 해시 규칙 불일치로 못 찾던 문제를, 
-                // URL 문자열 직접 대조 및 상세/리스트 파라미터 판별을 통해 활성 컨텍스트(activeContext)를 100% 완벽히 복원합니다.
                 if (!activeContext.ref) {
                     console.log(`[DEBUG-NAV] 활성 컨텍스트(activeContext.ref)가 비어있어 URL 기반 자동 복구를 시도합니다.`);
                     const currentParams = Object.fromEntries(footprint.searchParams.entries());
@@ -2631,17 +2167,9 @@ async function renderNavigation() {
         
         const navSection = pageList.closest('.nav-section') as HTMLElement;
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
-
-        // 🌟 [OAUTH REGISTER BUTTON] Pages nav-section 상단에 사이트 등록 버튼을 삽입합니다.
-        //    매 렌더링마다 중복 생성을 방지하기 위해 기존 버튼을 먼저 제거합니다.
         if (navSection) {
             const existingBtn = navSection.querySelector("#btn-oauth-register");
             if (existingBtn) existingBtn.remove();
-
-            // analytic 모드에서만 등록 버튼 노출 (이 버튼의 목적이 analytic 조회이므로)
-            // 🌟 [LOGIN GATE] 로그인(currentSession.email)이 되어 있어야만 버튼을 노출합니다.
-            //    미로그인 상태에서 등록을 시도하면 submitOAuthRegistration 내부에서
-            //    "로그인이 필요합니다." 에러가 반환되므로, 사전에 UI에서 차단합니다.
             if (currentSearchMode === "analytic" && !isSettingsOpen && currentSession.email) {
                 const h3 = navSection.querySelector("h3");
                 const registerBtn = document.createElement("button");
@@ -2653,8 +2181,6 @@ async function renderNavigation() {
                     e.stopPropagation();
                     renderOAuthRegistrationForm();
                 });
-
-                // h3 바로 아래, pageList 위에 삽입
                 if (h3 && h3.nextSibling) {
                     navSection.insertBefore(registerBtn, h3.nextSibling);
                 } else if (h3) {
@@ -2666,21 +2192,12 @@ async function renderNavigation() {
         }
 
         if (_pages.length === 0) {
-            // 🌟 [OAUTH CLEANUP] innerHTML 교체 전에 잔존 oauth 노드를 명시적으로 제거합니다.
-            //    innerHTML = "" 자체가 전부 지우지만, 비동기 레이스에서
-            //    이전 라운드의 insertAdjacentHTML 이 이 할당 '이후' 에 도착하는
-            //    윈도우를 원천 차단하기 위해 쿼리로도 한 번 제거합니다.
             pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
-            // 🌟 [CRITICAL FIX] 데이터가 없더라도 Commerce/Analytic 모드이면 "비어있음" 문구가 노출되도록 통일
             if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
         } else {
-            // 🌟 일치하는 데이터가 있으면 섹션을 화면에 표시하되, 세팅/Shipping 상태에 맞춰 제어합니다.
             if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
-            
-            // 🌟 [CRITICAL FIX] bb.ts의 페이지 트리(Branch) 조립 로직을 완벽히 복원하여 뎁스가 깨지는 현상을 해결합니다.
             const branchs: Record<string, any> = {};
-
             for (let p = 0; p < _pages.length; p++) {
                 let _page = _pages[p];
                 const data = _page.data || _page;
@@ -2704,10 +2221,7 @@ async function renderNavigation() {
 
                     if (!temp[_page.id]) {
                         temp[_page.id] = true;
-
                         let parent = branchs[`${data.origin}#${_page.type}`];
-
-                        // 🌟 [CRITICAL FIX] before.ts 패리티 완벽 복원: 모순이 발생하는 복잡한 Splice 로직을 걷어내고 가장 간결하고 정확한 트리 조립을 수행합니다.
                         if (parent) {
                             if (data.item) {
                                 let children = safeClone(parent.children);
@@ -2745,18 +2259,11 @@ async function renderNavigation() {
                     }
                 }
             }
-
-            // 🌟 [CRITICAL FIX] 네비게이션(Accordion)을 렌더링하기 직전에, 
-            // 로컬 DB(users 테이블)에 저장된 AI의 최신 추출 통계(count)를 불러와 메모리에 덮어씌웁니다!
             try {
                 const _usersForStats = await Select["users"]({});
                 const teamDoc = _usersForStats.find(u => u.type === "team" || (u.data && u.data.type === "team"));
                 if (teamDoc) {
-                    // 🌟 [CRITICAL FIX] LanceDB(TradeDocument)와 Server(JSON)의 포맷 차이 완벽 호환
-                    // TradeDocument의 경우 최신 데이터가 문자열 형태의 json_data에 들어있으므로 최우선으로 파싱합니다.
                     let teamData: any = teamDoc;
-                    
-                    // 🌟 [CRITICAL FIX] 백엔드에서 이중, 삼중으로 인코딩된 json_data(Matryoshka 버그)를 완벽하게 벗겨냅니다.
                     while (teamData && teamData.json_data && typeof teamData.json_data === "string") {
                         try {
                             const parsed = JSON.parse(teamData.json_data);
@@ -2774,8 +2281,6 @@ async function renderNavigation() {
                         teamData = typeof teamData.data === "string" ? JSON.parse(teamData.data) : teamData.data;
                     }
                     teamData = teamData || teamDoc;
-
-                    // 🌟 [로그 추가] 검색창 클릭 및 네비게이션 렌더링 시 Dexie에서 로드된 통계를 출력합니다.
                     console.log("\n=====================================");
                     console.log("[DEBUG-UI] Dexie에서 로드된 Team 데이터:", teamDoc);
                     console.log("[DEBUG-UI] 화면에 렌더링될 Base 통계:", JSON.stringify(teamData.base, null, 2));
@@ -2790,16 +2295,8 @@ async function renderNavigation() {
             }
 
             // 3. Render
-            // 🌟 [OAUTH CLEANUP] renderAccordion 이전에도 잔존 노드를 제거합니다.
             pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = await renderAccordion(tree);
-
-            // 🌟 [OAUTH SITES] 등록 사이트 렌더링은 renderOAuthSitesUI() 로 분리했습니다.
-            //    이 블록이 `else` 안에만 있어서, _pages 가 0건인 analytic 화면에서는
-            //    조회도 렌더링도 통째로 건너뛰었습니다. 아래 if/else 가 끝난 뒤에
-            //    분기와 무관하게 한 번 호출합니다.
-
-            // 🌟 [추가] Show/Hide 토글 버튼 이벤트 바인딩
             pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {
                 btn.onclick = async (e: Event) => {
                     e.preventDefault();
@@ -2817,11 +2314,9 @@ async function renderNavigation() {
                 };
             });
 
-            // 🌟 [추가] 숨겨진 항목이 있는 Host(도메인)의 Show 버튼 노출 및 일괄 해제 이벤트 바인딩
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
                 const id = label.dataset.id;
                 const domain = label.dataset.domain;
-                // 해당 도메인에 속한 아이템 중 하나라도 숨김(hidden) 상태라면 Host의 Show 버튼을 노출합니다.
                 if (hiddenPages.includes(id)) {
                     const hostShowBtn = pageList.querySelector(`.btn-show-domain-hidden[data-domain="${domain}"]`) as HTMLElement;
                     if (hostShowBtn) hostShowBtn.style.display = "inline";
@@ -2833,8 +2328,6 @@ async function renderNavigation() {
                     e.preventDefault();
                     e.stopPropagation();
                     const domain = btn.dataset.domain;
-                    
-                    // 🌟 해당 도메인을 가진 모든 라벨을 찾아 hiddenPages 배열에서 전부 제거합니다.
                     pageList.querySelectorAll(`.logis-label[data-domain="${domain}"]`).forEach((label: any) => {
                         const id = label.dataset.id;
                         if (hiddenPages.includes(id)) {
@@ -2852,22 +2345,16 @@ async function renderNavigation() {
                 label.onclick = async (e: Event) => {
                     const ds = label.dataset;
                     if (!ds.id) return;
-
-                    // 🌟 [기획 반영] 초대 패널이 열려있는지 확인
                     const inviteContainer = document.getElementById("nav-cloud-invite-container");
                     const isInviteMode = inviteContainer && !inviteContainer.classList.contains("hidden");
 
                     if (isInviteMode) {
-                        // A. 초대 모드: 클래스 토글 및 이벤트 중단
                         e.preventDefault();
                         e.stopPropagation();
                         label.classList.toggle("selected");
                         console.log(`[INVITE-MODE] Page ${ds.id} selection toggled:`, label.classList.contains("selected"));
                         return; // 필터링 로직 실행 방지
                     }
-
-                    // B. 일반 모드: 기존 필터링 및 내비게이션 로직
-                    // 1. 컨텍스트 업데이트
                     activeContext.cc = ds.cc || "";
                     activeContext.bcc = ds.bcc || "";
                     activeContext.ref = ds.ref || "";
@@ -2888,16 +2375,9 @@ async function renderNavigation() {
                 };
             });
         }
-
-        // 🌟 [OAUTH SITES] _pages 가 0건이든 아니든 analytic 모드에서는 항상 렌더링합니다.
-        //    (analytic 화면은 currentDomain 필터 때문에 _pages 가 비는 경우가 대부분입니다)
         await renderOAuthSitesUI(pageList);
-
-        // Users rendering (simplified parity)
         const localUserList = document.getElementById("nav-list-local-users");
         const usersRaw = await Select["users"]({});
-        
-        // 🌟 [CRITICAL FIX] 백엔드(LanceDB)에서 가져온 유저 데이터 역시 json_data를 파싱해 주어야 Local/Cloud 분류가 정상 작동합니다!
         const users = usersRaw.map(u => {
             if (!u.data && u.json_data && typeof u.json_data === "string") {
                 try { u.data = JSON.parse(u.json_data); } catch(e) {}
@@ -2909,21 +2389,13 @@ async function renderNavigation() {
         if (localUserList) localUserList.innerHTML = `<div class="empty">No local Members/Devices</div>`;
 
         if (users.length > 0) {
-            // 1. 꼬리표를 기준으로 로컬/클라우드 유저 분할
-            // 🌟 [BOOL PARITY] canonicalizeData 의 BOOL_KEYS 가 is_device 를 0|1 정수로 확정합니다.
-            //    (IndexedDB 는 boolean 을 유효한 키로 인정하지 않기 때문입니다)
-            //    따라서 === true 비교는 항상 false 가 되어 로컬 디바이스가 전부
-            //    Cloud Members 로 새어 나갔습니다. truthy 판정으로 통일합니다.
             const isDevice = (u: any) => {
                 const v = u?.data?.is_device;
                 return v === 1 || v === true || v === "1" || v === "true";
             };
             const localUsers = users.filter(u => isDevice(u));
             const cloudUsers = users.filter(u => !isDevice(u));
-
-            // 2. Cloud Team Members 렌더링 (중복 Row 제거 로직 추가)
             if (cloudUsers.length > 0 && userList) {
-                // 🌟 [CRITICAL FIX] bb.ts의 유저 트리(Tree) 조립 로직을 완벽히 복원하여 팀과 멤버의 구조를 맞춥니다.
                 const tempUsers: Record<string, any> = {};
                 const treeUsers: any[] = [];
 
@@ -2936,8 +2408,6 @@ async function renderNavigation() {
                     if (tempUsers.hasOwnProperty(key)) {
                         let user = tempUsers[key];
                         let parentId = user.to;
-
-                        // 클라우드 동기화 과정에서 member 타입으로도 내려올 수 있으므로 포괄 처리
                         if (user.type === "user" || user.type === "member") { 
                             if (tempUsers[parentId]) {
                                 tempUsers[parentId].children.push(tempUsers[key]);
@@ -2949,10 +2419,7 @@ async function renderNavigation() {
                         }
                     }
                 }
-                
                 userList.innerHTML = await renderAccordion(treeUsers);
-
-                // 🌟 [수정] 방장(Owner)인 경우에만 ADD 버튼 노출 (폼은 HTML에 정적으로 존재)
                 const myTeam = cloudUsers.find(u => u.type === "team" && u.from === currentSession.address && u.id === u.to);
                 const btnCloudInvite = document.getElementById("btn-cloud-invite-toggle");
                 
@@ -2961,14 +2428,10 @@ async function renderNavigation() {
                 } else {
                     if (btnCloudInvite) btnCloudInvite.style.display = "none";
                 }
-
-                // 🌟 [추가] 멤버 삭제 및 초대 취소 이벤트 위임 (Event Delegation)
                 userList.onclick = async (e: Event) => {
                     const target = e.target as HTMLElement;
                     const cancelBtn = target.closest('.btn-cancel-member') as HTMLElement;
                     if (!cancelBtn) return;
-
-                    // 라벨의 기본 클릭 이벤트(검색 컨텍스트 전환) 방지
                     e.preventDefault();
                     e.stopPropagation();
 
@@ -3007,14 +2470,10 @@ async function renderNavigation() {
     } catch (e) { 
         console.error("Nav render error:", e); 
     } finally {
-        // [FIX] Navigation rendered (or failed), stop spinner if it was the first time
         if (isFirstNavRender) {
             isFirstNavRender = false;
             stopSpinner();
         }
-        // 🌟 [CRITICAL FIX v3] 네비게이션 렌더링 완료 후 DOM을 참조하는 버튼 가시성 로직을 강제 재평가하여 버튼을 복구합니다.
-        //    단, activeContext.ref가 아직 비어있다면(매칭 실패 또는 레이스 컨디션),
-        //    caller(browser-match-found 리스너)가 renderNavigation() 직후 별도로 호출하므로 여기서는 스킵합니다.
         if (activeContext.ref) {
             await updateExtractButtonVisibility();
         }
@@ -3025,8 +2484,6 @@ async function renderNavigation() {
 async function handleTeamInvite() {
     const emailInput = document.getElementById("invite-email-input") as HTMLInputElement;
     const email = emailInput?.value.trim();
-
-    // 🌟 이메일 형식 검증을 위한 정규식 추가
     const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
     if (!email || !emailRegex.test(email)) {
@@ -3037,8 +2494,6 @@ async function handleTeamInvite() {
         }
         return;
     }
-
-    // 검증 성공 시 스타일 초기화
     if (emailInput) emailInput.style.outline = "none";
 
     const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
@@ -3050,8 +2505,6 @@ async function handleTeamInvite() {
         const origin = "https://commerce.logis.center";
         const now = Date.now();
         const createdAt = now - timezoneOffset;
-
-        // 🌟 [추가] Pages 영역에서 selected 클래스가 붙은 모든 라벨의 data-id 수집
         const selectedPages: string[] = [];
         const pageList = document.getElementById("nav-list-pages");
         if (pageList) {
@@ -3074,20 +2527,16 @@ async function handleTeamInvite() {
             from: currentSession.team || "",
             to: currentSession.address || "",
             email: email,
-            // 🌟 수집된 페이지 ID 배열을 JSON 문자열로 변환하여 전달
             ref: JSON.stringify(selectedPages)
         });
         
         const url = `${API_HOST}/?${params.toString()}`;
-        
         const response = await invoke<any>("proxy_fetch", {
             url: url,
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             session_params: { hash: currentSession.hash, token: currentSession.token }
         });
-
-        // 서버 응답에서 hook URL을 가져오거나, 기본 mailto 훅을 사용
         let hookUrl = `${currentSession.hash}.logis.center@oauth.email`;
         if (response.results && response.results.length > 0) {
             const invite = response.results[0];
@@ -3096,8 +2545,6 @@ async function handleTeamInvite() {
 
         showInviteQr(hookUrl, email);
         emailInput.value = "";
-
-        // 🌟 [추가] 클라우드 멤버 리스트에 '대기 중(Pending)' 상태로 즉시 렌더링되도록 로컬 DB에 임시 주입합니다.
         try {
             const pendingMember = {
                 id: `pending_invite_${Date.now()}`,
@@ -3126,8 +2573,6 @@ async function handleTeamInvite() {
 
 function showInviteQr(hook: string, email: string) {
     if (!chatTalks) return;
-    
-    // 기존 열려있던 네비게이션 숨기고 세팅(채팅) 탭 열기
     hideNavigation();
     openWidget("settings");
 
@@ -3169,18 +2614,6 @@ function showInviteQr(hook: string, email: string) {
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     }
 }
-
-// --- Sync Logic ---
-// 🌟 [MODE ROUTER]
-//  syncData() 는 이제 '어느 트랙을 전면(foreground)으로 돌릴 것인가' 만 결정합니다.
-//  실제 동기화 본문은 전부 modes/*.ts 안에 있습니다.
-//
-//  ── 라우팅 계약 ──
-//   ① 현재 모드의 트랙을 await 로 먼저 완주시킵니다. (사용자가 보고 있는 화면이 최우선)
-//   ② 나머지 두 트랙은 await 없이 백그라운드로 흘립니다.
-//      각 트랙 내부의 30초 스로틀이 폴링 부하를 억제하므로 사실상 무료입니다.
-//      이 백그라운드 흐름이 없으면 탭을 열기 전까지 이벤트가 로컬에 존재하지 않고,
-//      Worker 의 LIMIT 1000 창 밖으로 밀려나면 영구히 유실됩니다.
 async function syncData() {
     // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
     if (currentSearchMode === "analytic") {
@@ -3193,13 +2626,6 @@ async function syncData() {
         }
         return;
     }
-    // 🌟 [TRADING TRACK] shipping 모드는 trading.logis.center 전용 Worker 와 동기화합니다.
-    //
-    //  ── 왜 별도 Worker 인가 ──
-    //   commerce D1 의 items 에는 mode / flag 컬럼이 없어 클라이언트가
-    //   MODE TAGGING / FLAG RECOVERY 로 사후 보강해 왔고, 그 보강 누락이
-    //   무역 서식 19종이 mode='commerce' 로 굳은 직접 원인이었습니다.
-    //   trading D1 은 두 컬럼을 물리 컬럼으로 갖고 있어 그 해킹이 필요 없습니다.
     if (currentSearchMode === "shipping") {
         await syncTradingData();
         if (currentSession.hash) {
@@ -3210,20 +2636,13 @@ async function syncData() {
         }
         return;
     }
-    // 🌟 [ANALYTICS BACKGROUND] commerce 탭에 있어도 analytics 이벤트를 계속 받습니다.
     if (currentSession.hash) {
         syncAnalyticsInBackground();
     }
-    // 🌟 [TRADING BACKGROUND] 같은 이유로 무역 문서도 탭과 무관하게 흘러야 합니다.
     if (currentSession.hash) {
         syncTradingInBackground();
     }
     if (!currentSession.hash || !currentSession.email) return;
-
-    // 🌟 [COMMERCE TRACK] 본문 전량은 modes/commerce.ts 의 syncCommerceData() 로 이동했습니다.
-    //    (D1 gzip 해제 / TOMBSTONE GUARD / MODE TAGGING / DRAFT PRESERVE /
-    //     FLAG RECOVERY / ROOT ABSORB / Dexie 라우팅 / Pending 멤버 정화 /
-    //     CLOUD TASK LIFECYCLE / RENDER GATE / 로컬 임베딩 스케줄링)
     await syncCommerceData();
 }
 
@@ -3293,9 +2712,6 @@ function applySearchModeUI() {
             }
         }
     }
-
-    // 🌟 [ANALYTIC LOGO HIDE] analytic 모드에서는 logo-section 영역을 숨깁니다.
-    //    console.logis.center 기반이므로 상점 로고/브랜딩 영역이 의미가 없습니다.
     const logoSection = document.querySelector('.logo-section') as HTMLElement;
     if (logoSection) {
         logoSection.style.display = currentSearchMode === "analytic" ? "none" : "";
@@ -3308,40 +2724,23 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         const target = e.target as HTMLElement;
         const prevMode = currentSearchMode;
         currentSearchMode = target.dataset.mode || "commerce";
-
-        // 🌟 [SCOPE RESET] 트랙마다 cc 네임스페이스가 다릅니다.
-        //  ── 무엇이 문제였나 ──
-        //   commerce 는 activeContext.cc = hashId(getRootDomain(host)) 즉 'cafe24.com' 해시이고,
-        //   analytic 은 Worker 가 넣은 hashId(url.host) 즉 'abc.cafe24.com' 해시입니다.
-        //   commerce 에서 페이지를 클릭한 뒤 analytic 으로 넘어오면
-        //   loadMoreDocs 가 그 cc 를 드라이버 인덱스로 삼아 무조건 0건이 됩니다.
-        //   (검색 태그도 같은 이유로 남아 있으면 안 됩니다)
         if (prevMode !== currentSearchMode) {
             activeContext = { cc: "", bcc: "", ref: "" };
             activeTags = [];
             updateTagsUI();
         }
-
-        // 🌟 탭 클릭 시 상태 저장 및 UI 업데이트
         await kvSet("search_mode", currentSearchMode);
         applySearchModeUI();
 
         console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
-        // 🌟 [BACKOFF RESET] 사용자가 탭을 전환하면 즉시 폴링을 기본 간격으로 리셋합니다.
-        //    🌟 [MODE SPLIT] 카운터가 modes/runtime.ts 로 이동해 직접 대입이 불가능하므로
-        //       전용 리셋 함수를 호출합니다. (동작은 완전히 동일합니다)
         resetSyncBackoff();
         await refreshList();
         await refreshList();
 
-        // 🌟 [IMMEDIATE PULL] analytic 으로 전환했으면 폴링 주기를 기다리지 않고 즉시 1회 당겨옵니다.
         if (currentSearchMode === "analytic" && currentSession.hash) {
             resetAnalyticThrottle(); // 🌟 [MODE SPLIT] 구 `lastAnalyticsSyncAt = 0;` 스로틀 해제
             syncAnalyticsData();
         }
-        // 🌟 [IMMEDIATE PULL / TRADING] shipping 으로 전환한 직후도 동일합니다.
-        //    무역 트랙은 문서 수가 적고 폴링 간격이 최대 30초까지 늘어나므로,
-        //    탭을 눌렀는데 30초간 빈 화면이 유지되는 체감을 없앱니다.
         if (currentSearchMode === "shipping" && currentSession.hash) {
             resetTradingThrottle(); // 🌟 [MODE SPLIT] 구 `lastTradingSyncAt = 0;` 스로틀 해제
             syncTradingData();
@@ -3352,11 +2751,6 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
             await renderNavigation();
         }
 
-        // 🌟 [REMOTE MODE BROADCAST] 페어링된 모바일에 모드 변경을 즉시 통지합니다.
-        //  ── 왜 필요한가 ──
-        //   모바일은 자체 DB 가 없어 목록 스코프를 전적으로 PC 에 의존합니다.
-        //   PC 가 Trading 으로 바꿨는데 모바일이 모르면, 모바일은 계속 commerce
-        //   스코프로 요청을 보내 두 화면이 서로 다른 집합을 보여 줍니다.
         if (dataChannel && dataChannel.readyState === "open") {
             dataChannel.send(JSON.stringify({
                 type: "sync_mode",
@@ -3380,7 +2774,6 @@ document.addEventListener('nav-link', async (e: any) => {
     detailView.style.display = "none";
 });
 
-// 🌟 [추가] 현재 입력한 검색어가 이미 대기열(10)이나 진행 중(1)인지 확인하는 완벽한 헬퍼 함수
 function isQueryActive(text: string): boolean {
     const query = text.trim();
     // 1. 프론트엔드 큐 배열 검사 (아직 UI에 안 그려진 찰나의 순간 방어)
@@ -3393,9 +2786,6 @@ function isQueryActive(text: string): boolean {
         const el = bubbles[i] as HTMLElement;
         const status = parseInt(el.dataset.status || "0");
         const taskId = el.id;
-
-        // 🌟 [CRITICAL FIX] 이미 Cancel 버튼을 눌러 취소된 작업(블랙리스트)이라면 중복 검사에서 즉시 제외하여 
-        // 새로운 검색어가 막히는 버그를 원천 차단합니다!
         if (GlobalTaskManager.cancelledTasks.has(taskId)) {
             continue;
         }
@@ -3452,9 +2842,6 @@ searchInput?.addEventListener("keydown", (e) => {
 btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value.trim();
     if (!query) return;
-
-    // 🌟 [CRITICAL FIX] 다른 검색어가 진행 중이더라도 새로운 검색어를 큐에 추가할 수 있도록 허용하되,
-    // 완전히 동일한 검색어가 이미 진행/대기 중일 때만 중복 실행을 방어합니다!
     if (isQueryActive(query)) {
         console.warn("[SEARCH] The exact same query is already in progress or queued.");
         return; 
@@ -3465,19 +2852,12 @@ btnSubmit?.addEventListener("click", async () => {
         searchDebounceTimer = null;
     }
 
-    // 인풋창 비우기
     searchInput.value = "";
-
-    // 🌟 [CRITICAL FIX] 검색 버튼 숨김 (번개 버튼은 독립적인 추출 대기열 노출 조건을 따르도록 강제 숨김 코드를 제거합니다)
     if (btnSubmit) btnSubmit.style.display = "none";
-
-    // 🌟 [CRITICAL FIX] 버튼을 누른 직후, 전역 플래그를 참(true)으로 고정하여 탭 전환 등 기타 UI 이벤트에 의해 초기화되는 것을 즉시 차단합니다!
     isSearching = true;
 
     const taskId = `search_${Date.now()}`;
     const startTime = Date.now();
-    
-    // 🌟 [추가] 검색 진행 중 UI 변경 및 초기화
     const resultH3 = document.querySelector('.nav-section.search h3');
     if (resultH3) {
         resultH3.innerHTML = `searching<strong class="count" style="cursor:pointer; margin-left:10px; color:#ef4444;" id="cancel-search-btn">Cancel</strong>`;
@@ -3489,9 +2869,6 @@ btnSubmit?.addEventListener("click", async () => {
                     const targetTaskId = activeTaskId || taskId;
                     if (targetTaskId) {
                         GlobalTaskManager.cancelledTasks.add(targetTaskId);
-
-                        // 🌟 [CRITICAL FIX] 화면에 남아있는 취소된 태스크의 말풍선(DOM) 상태를 2(Stopped)로 변경하여
-                        // isQueryActive 검사에서 중복 진행 중으로 오인받지 않도록 시각적/구조적으로 확실히 처리합니다!
                         const el = document.getElementById(targetTaskId);
                         if (el) {
                             el.dataset.status = "2";
@@ -3530,11 +2907,8 @@ btnSubmit?.addEventListener("click", async () => {
             });
         }
     }
-    
-    // 🌟 [추가] 검색 시작 전 기존 리스트 싹 비우기 (append 방지 및 뷰 클리어)
+
     if (docListContainer) docListContainer.innerHTML = "";
-    
-    // 🌟 [수정] 검색 시 설정(채팅) 탭으로 화면을 전환합니다.
     openWidget("settings");
 
     // 3. 사용자 질문 말풍선 즉시 렌더링
@@ -3552,7 +2926,6 @@ btnSubmit?.addEventListener("click", async () => {
         const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
 
         if (isCloudMode && currentSession.hash && currentSession.email) {
-            // ☁️ [CLOUD SEARCH] LLM 은 서버에서 돌지만, 질의 임베딩은 반드시 로컬 모델로 만듭니다.
             renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
 
             let queryVector: number[] = [];
@@ -3609,7 +2982,6 @@ btnSubmit?.addEventListener("click", async () => {
             stopSpinner();
             if (btnSubmit) btnSubmit.style.display = "flex";
         } else {
-            // 🌟 큐에 추가 (스피너는 백엔드가 실제 작업을 픽업하면 renderProgressToUI가 켭니다)
             await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
                 taskId: taskId, 
                 query: query, 
@@ -3621,11 +2993,8 @@ btnSubmit?.addEventListener("click", async () => {
                 refId: activeContext.ref || ""
             });
         }
-        
-        // 🌟 [CRITICAL FIX] 검색을 대기열에 추가한 직후, 현재 주소가 전처리 중인지 여부를 재검사하여 번개 버튼을 확실히 숨깁니다.
-        updateExtractButtonVisibility();
 
-        // 🌟 [추가] 생성된 검색 테스크(질문) 말풍선 위치로 부드럽게 스크롤 이동
+        updateExtractButtonVisibility();
         setTimeout(() => {
             const taskEl = document.getElementById(`${taskId}_query`) || document.getElementById(taskId);
             const scrollEl = document.getElementById("chat-scroll");
@@ -3645,30 +3014,20 @@ btnSubmit?.addEventListener("click", async () => {
                 setTimeout(() => { scrollEl.style.transition = ""; }, 300);
             }
         }, 100);
-
-        // 🌟 [CRITICAL FIX] 여기서 isSearching = false를 하지 않습니다! 백엔드의 Done/Error 신호가 풀어줄 때까지 잠가둡니다.
     } catch(e) { 
         console.error("[SEARCH-ERROR]", e);
         if (aiResultsContent) aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
-        
-        // 에러 발생 시에만 강제 해제
         isSearching = false; 
         if (btnSubmit) btnSubmit.style.display = "flex";
         stopSpinner(); 
         updateExtractButtonVisibility();
-    } 
-    // 🌟 [CRITICAL FIX] finally 블록을 통째로 삭제하여 isSearching이 조기 해제되어 큐가 뚫리는 치명적 버그를 차단했습니다.
+    }
 });
 
 document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
 
-
-// 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 완벽 방어 로직 적용
-// 🌟 [CRITICAL FIX] 추출 버튼 더블클릭 방어 및 대기열(Queue) 다중 진입 허용
 btnExtract?.addEventListener("click", async () => {
-    // 1. 순수하게 더블클릭(extractClickLock)만 막고, 
-    // 기존 작업이 돌아가고 있더라도 주소가 다르다면 큐에 넣을 수 있도록 조건 해제
     if (extractClickLock) {
         console.warn("[LOCK] Click locked to prevent double submission.");
         if (btnExtract) btnExtract.style.display = "none";
@@ -3716,7 +3075,6 @@ btnExtract?.addEventListener("click", async () => {
                     });
                     
                     payloadBody = base64Data;
-                    // 문서일 경우 포맷 매핑 분기
                     if (isDocument) {
                         format = `application/${ext}`; // 서버에서 확장자 기반 파싱을 위해 전달
                     } else {
@@ -3891,11 +3249,8 @@ btnExtract?.addEventListener("click", async () => {
     } catch (e) {
         console.error("[WIDGET] Extraction failed:", e);
         extractClickLock = false;
-        // 다른 작업이 정상적으로 돌아가고 있을 수 있으므로 sys_lock이나 전역 스피너를 함부로 날리지 않습니다.
         updateExtractButtonVisibility();
     } finally {
-        // 🌟 [CRITICAL FIX] Rust 백엔드(DB)에 작업이 완전히 등재되도록 1.5초간 여유를 줍니다.
-        // 이 시간 동안은 버튼이 절대 부활하지 않으며, 1.5초 뒤 DB를 조회하여 정상적으로 큐에 등록되었다면 버튼은 계속 숨겨집니다.
         setTimeout(async () => {
             extractClickLock = false;
             await updateExtractButtonVisibility();
@@ -3934,10 +3289,6 @@ listen("extraction-progress", async (event: any) => {
     
     if (isTerminal && payload.task_id) {
         console.log(`[QUEUE] Terminal state reached for ${payload.task_id}. Releasing and checking next.`);
-        
-        // 🌟 [CRITICAL FIX] 검색 완료(Done) 시점에 isSearching을 미리 false로 풀면, openWidget("list") 내부에서 
-        // refreshList()가 발동하여 검색 결과를 전부 날려버리는 Race Condition이 발생합니다!
-        // 따라서 추출 상태(isExtracting)만 먼저 풀고, 검색 상태(isSearching)는 UI 렌더링이 100% 끝난 최하단에서 풉니다.
         if (payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) {
             isExtracting = false;
         } 
@@ -3987,14 +3338,8 @@ listen("extraction-progress", async (event: any) => {
              updateExtractButtonVisibility();
         }
 
-        // 🌟 [추가] 검색 작업이 완료(Done)되었을 경우, 백엔드가 보내준 데이터를 결과창에 렌더링합니다.
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
             const response = payload.data;
-
-            // 🌟 [ANALYTIC LOCAL RENDER] analytic 모드 검색 결과는 리스트 탭이 아닌
-            //    채팅 탭에 말풍선으로 렌더링합니다.
-            //    parse_analytic_query → search_items(mode='analytic') → search_chunks → Dexie Plan
-            //    순서로 로컬에서 확정된 결과를 그대로 보여줍니다.
             if (currentSearchMode === "analytic") {
                 const resultCount = response.results ? response.results.length : 0;
 
@@ -4027,9 +3372,6 @@ listen("extraction-progress", async (event: any) => {
                     updated_at: Date.now()
                 });
 
-                // 🌟 ①-1 리포트 말풍선
-                //    Rust(STAGE-6)가 회수한 시맨틱 기록만 근거로 Qwen3.5 2B 가 작성한 답변입니다.
-                //    근거가 없으면 백엔드가 빈 문자열을 돌려주므로 그때는 건너뜁니다.
                 if (response.report && String(response.report).trim().length > 0) {
                     await renderMessage({
                         id: `${payload.task_id}_report`,
@@ -4105,18 +3447,11 @@ listen("extraction-progress", async (event: any) => {
                 return;
             }
 
-            // 🌟 [CRITICAL FIX] isSearching = true 인 상태에서 탭을 전환해야 초기화(refreshList)가 방어됩니다!
             openWidget("list");
-
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
-            
-            // 🌟 [추가] 검색어와 카운트 H3에 업데이트
             const resultH3 = document.querySelector('.nav-section.search h3');
             if (resultH3) {
-                // 🌟 [CONDITION SUMMARY] dexie_plans 에서 실제 적용된 조건을 요약해 보여줍니다.
-                //  기존에는 tracking_number 만 특별 취급했지만,
-                //  v4 는 모든 조건이 동등하게 플랜에 들어 있으므로 일반화합니다.
                 const applied: string[] = [];
                 const coveredTypes = new Set<string>();
 
@@ -4169,11 +3504,6 @@ listen("extraction-progress", async (event: any) => {
             console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 리콜 후보 수: ${response.results ? response.results.length : 0}`);
             console.log(`[SEARCH-DEBUG] 수신한 Dexie 플랜 수: ${response.dexie_plans ? response.dexie_plans.length : 0}`);
 
-            // 🌟 [DEXIE PLAN EXECUTION]
-            //  LanceDB 는 조건을 적용하지 않은 '리콜 후보' 만 돌려줍니다.
-            //  실제 조건 필터링(가격/수량/송장번호/상태/기간/top·bottom)은 여기서 수행합니다.
-            //  → 기존의 trackingEqDocs 특수 분기는 plan.conditions 의
-            //    data.tracking_number eq 조건으로 일반화되어 사라집니다.
             let planFilteredIds: Set<string> | null = null;
             const planBadges = new Map<string, string>();
 
@@ -4203,15 +3533,6 @@ listen("extraction-progress", async (event: any) => {
                         }
                         console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
 
-                        // 🌟 [PLAN RECALL v2] 조건이 있는 플랜은 '항상' Dexie 전체를 한 번 더 훑습니다.
-                        //  ── 왜 조건부를 없애는가 ──
-                        //   candidateIds 는 lib.rs 가 점수 상위 N건으로 자른 배열이고,
-                        //   그 정렬 기준에는 도메인 조건이 아직 반영되어 있지 않습니다.
-                        //   기존처럼 passed.length === 0 일 때만 구출하면,
-                        //   후보 안에서 1건이라도 통과하는 순간 구출이 멈춰
-                        //   순위 밖의 정답이 그대로 사라집니다.
-                        //   조건 필터링은 Dexie 인덱스로 O(log n) 이므로
-                        //   항상 도는 편이 안전하고, 리콜이 전송 상한과 완전히 분리됩니다.
                         {
                             const rescued = await executeDexiePlan(plan, { limit: 200 });
                             let added = 0;
@@ -4301,31 +3622,17 @@ listen("extraction-progress", async (event: any) => {
                 }
 
                 console.log(`[SEARCH-DEBUG] 1차 파싱 완료. 기본 문서 수: ${docs.length}`);
-
-                // 🌟 [N:N RELAY v4] 루트 호이스팅 컬럼(index/goods/order/...) 대신
-                //  data.* 중첩 인덱스를 직접 사용합니다.
-                //  canonicalize 가 식별자를 전부 String 으로 확정했으므로
-                //  기존의 '숫자/문자 두 갈래로 쏘던 타입 방어 쿼리' 가 불필요해집니다.
-                //  (쿼리 수가 절반으로 줄고, 타입 혼재로 절반을 놓치던 문제도 사라집니다)
                 if (appDb && docs.length > 0) {
                     console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay v4) 시작...`);
                     const relayDocs = new Map<string, any>();
                     const existingIds = new Set(docs.map(d => d.id));
-                    // 연관 축으로 사용할 data.* 경로 (전부 인덱스 선언되어 있음)
                     const LINK_PATHS = [
                         'data.index', 'data.no', 'data.code', 'data.tracking_number',
                         'data.goods', 'data.order', 'data.tracking',
                         'data.stock_keeping_unit', 'data.barcode',
-                        // 🌟 [TRADE LINK PATHS] 무역 문서 간 연결 축
                         'data.doc_number', 'data.reference_invoice',
                         'data.reference_lc', 'data.reference_booking',
                         'data.container_number', 'data.seal_number',
-                        // 🌟 [TRADE INDEX LINK] commerce 의 data.order / data.tracking 과 동일한
-                        //    'index 로 서로를 가리키는' 축입니다.
-                        //    문자열 doc_number 는 표기가 흔들려도 이 숫자는 절대 흔들리지 않습니다.
-                        // 🌟 [FULL 45-CODE] ITEMS_SCHEMA 의 data.rel_* 전량과 1:1 로 일치해야 합니다.
-                        //    기존에는 15종만 있어 나머지 30종의 무역 문서 간 연결이
-                        //    N:N RELAY 교차 검색에서 통째로 누락되었습니다.
                         'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
                         'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
                         'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
@@ -4399,8 +3706,6 @@ listen("extraction-progress", async (event: any) => {
                 }
                 
                 console.log(`[SEARCH-DEBUG] 화면에 렌더링될 최종 문서 수(docs.length): ${docs.length}`);
-
-                // 🌟 [TOTAL COUNT] AI 검색은 단발성 고정 셋이므로 docs.length 가 곧 전체 건수입니다.
                 totalResultCount = docs.length;
 
                 if (docs.length > 0) {
@@ -4440,17 +3745,10 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     payload.task_id = payload.task_id || activeTaskId || (document.getElementById("extraction-log")?.dataset.activeTaskId);
     const tId = payload.task_id;
     if (!tId) return;
-
-    // 🌟 [CRITICAL FIX] 렌더링 함수 내부에서도 블랙리스트를 한 번 더 검사하여 좀비 UI 생성을 이중으로 방어합니다.
     if (GlobalTaskManager.cancelledTasks.has(tId)) return;
-
     const summary = (payload.summary || "").toLowerCase();
     const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
     const isNotification = payload.category === "Warning" || payload.category === "Info";
-
-    // 🌟 [CRITICAL FIX 1] 상태 입양(Adopt) 범위 확대: 
-    // 백엔드에서 날아오는 'Loading Model', 'Saving', 'Handover' 등 모든 활동을 
-    // '진행 중'으로 인지하여 큐가 풀리지 않도록 락을 단단히 고정합니다!
     const isPayloadRunning = payload.category && !["Pending", "Cloud Sync", "Cloud Queue"].includes(payload.category);
 
     if (!isRecovery && !isTerminal && isPayloadRunning) {
@@ -4470,8 +3768,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             }
             startSpinner();
         } else if (!spinnerInterval) {
-            // 🌟 [CRITICAL FIX] 이미 activeTaskId가 일치하여 입양(Adoption) 블록을 건너뛰었더라도,
-            // 스피너가 돌고 있지 않다면 강제로 스피너를 가동시켜 무반응(멈춤) 버그를 방지합니다.
             startSpinner();
         }
     }
@@ -4479,11 +3775,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     const baseCategory = payload.category ? payload.category.replace(/\s*\(.*?\)/g, "") : "general";
     const catId = baseCategory.replace(/[^a-zA-Z0-9]/g, "");
     const elementId = `progress-${catId}`;
-    
     let displaySummary = payload.summary || "";
-    
-    // 🌟 [CRITICAL FIX] 백엔드에서 텍스트(summary)가 없는 순수 로그 이벤트를 보냈을 때,
-    // 기존에 화면에 떠있던 텍스트를 보존하여 말풍선이 텅 비어버리는 현상을 원천 차단합니다!
     if (tId) {
         const existingEl = document.getElementById(tId) as HTMLElement;
         if (!displaySummary && existingEl) {
@@ -4495,8 +3787,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         taskSteps.set(tId, new Map());
     }
     const stepMap = taskSteps.get(tId)!;
-
-    // 🌟 [UI 심플화] 복잡한 계산식을 모두 삭제하고, 오직 'List Extraction' 단계에서만 [N/M]을 보여줍니다!
     if (!isTerminal && !isNotification) {
         let rawSummary = payload.summary || "";
         const pctMatch = rawSummary.match(/\(\d+%\)/);
@@ -4517,8 +3807,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     } else if (isNotification) {
         displaySummary = payload.summary || "";
     }
-
-    // 🌟 [CRITICAL FIX] 대기열 상태(10)와 진행 상태(1)를 엄격히 구분합니다.
     let statusCode = 1; 
         
     if (isTerminal) {
@@ -4528,8 +3816,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
     } else if (summary.includes("cancelled") || summary.includes("stopped")) {
         statusCode = 3;
     } else {
-        // 🌟 [CRITICAL FIX 2] 백엔드에서 날아오는 중간 과정들이 10번(QUEUED)으로 오해받아 
-        // 텍스트가 지워지고 스피너가 멈추는 버그를 원천 차단합니다. 오직 Pending 계열만 10번을 부여합니다!
         if (payload.category === "Pending" || payload.category === "Cloud Sync" || payload.category === "Cloud Queue") {
             statusCode = 10;
         } else {
@@ -4550,7 +3836,6 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
         await renderMessage({ 
             id: payload.task_id, 
             role: "system_task", 
-            // 🌟 [CRITICAL FIX 1] content 대신 text 속성을 명시적으로 사용하여 텍스트 증발 방지
             text: displaySummary, 
             status: statusCode, 
             created_at: originalCreatedAt, 
@@ -4558,12 +3843,7 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
             task_id: payload.task_id
         });
     }
-
-    // 🌟 [CRITICAL FIX] 1차 스피너 및 전역 상태 종료 처리 
-    // 사용자가 현재 무슨 화면을 보고 있든, 작업이 끝났다면 무조건 전역 락을 풀고 스피너를 정지시킵니다!
     if (isTerminal) {
-        // 🌟 [CRITICAL FIX] 과거의 로그(History)를 불러올 때 터미널 이벤트가 현재 진행 중인 작업을 끄는 것을 완벽 차단!
-        // 오직 현재 활성화된 작업(activeTaskId)이 종료되었을 때만 글로벌 락을 해제합니다.
         if (tId === activeTaskId || !activeTaskId) {
             const currentLock = await kvGet("sys_lock");
             if (currentLock === tId || !currentLock) {
@@ -4582,19 +3862,12 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                 if (searchInput) searchInput.disabled = false; 
                 if (btnSubmit) btnSubmit.style.display = "flex"; 
             }
-            // 🌟 [CRITICAL FIX] 작업 완료 시점에 브라우저가 이미 종료된 상태라면
-            //    isAutoLaunchLocked를 강제로 false로 리셋하여 btnAutoLaunch 노출을 보장합니다.
-            //    작업 진행 중 브라우저가 종료되면 isAutoLaunchLocked가 true로 남아있어
-            //    updateExtractButtonVisibility()의 2번 단계에서 btnAutoLaunch가 노출되지 않는 버그를 수정합니다.
             if (!isBrowserRunning) {
                 isAutoLaunchLocked = false;
             }
             updateExtractButtonVisibility(); 
         }
-
-        // 🌟 [CRITICAL FIX] 전처리가 완료되면 자동으로 메뉴 카운트와 리스트를 리프레시!
         if (payload.category === "Done") {
-            // 🌟 [버그 수정] 서버 모드이든 로컬 모드이든 무조건 로컬 LanceDB의 최신 전처리 결과를 Dexie에 먼저 덮어써야 합니다!
             Promise.all([
                 invoke<any[]>("get_known_users"),
                 invoke<any[]>("get_known_pages") 
@@ -4619,32 +3892,23 @@ async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
                         console.warn("[TRACKING-WARN] get_known_users에 'team' 문서가 포함되지 않았습니다! (Limit 제한 의심)");
                     }
                 }
-                
-                // 🌟 [CRITICAL FIX] 프론트엔드 최신화 버그 해결! 서버 동기화(네트워크 상태)와 무관하게, 백엔드 로컬 통계가 갱신되었으므로 무조건 즉시 UI를 새로고침합니다.
                 await renderNavigation();
                 if (currentTab === "list") {
-                    // 🌟 [로직 충돌 수정] AI 검색(ai_search) 완료 시에는 전용 리스너에서 직접 결과를 화면에 그려줍니다.
-                    // 여기서 refreshList()를 호출하면 전체 리스트 불러오기(10개)가 중첩되어 20개로 늘어나는 Race Condition 버그가 발생하므로 제외합니다.
                     if (!(payload.task_id && payload.task_id.startsWith("search_"))) {
                         refreshList();
                     }
                 }
-                
-                // 🌟 UI를 100% 최신 상태로 바꾼 뒤에 백그라운드에서 조용히 서버와 동기화를 진행합니다.
                 if (currentSession.email) {
                     syncData(); 
                 }
             });
         }
     }
-
-    // 🌟 이제 현재 열려있는 Detail View가 이 Task의 것인지 확인 후 내부 로그(DOM)를 업데이트합니다.
     const extractionLog = document.getElementById("extraction-log");
     const targetContainer = document.getElementById("progress-container") || extractionLog;
 
     if (extractionLog && detailView.style.display !== "none") {
         if (extractionLog.dataset.activeTaskId !== tId) {
-            // 현재 보고 있는 화면이 다른 Task면 여기서 DOM 업데이트 중지! (버블은 이미 위에서 업데이트됨)
             return;
         }
 
@@ -4747,8 +4011,6 @@ btnStopTask?.addEventListener("click", async () => {
         if (targetTaskId) {
             GlobalTaskManager.cancelledTasks.add(targetTaskId); // 🌟 [CRITICAL FIX] 취소 블랙리스트에 등록하여 지연 도착하는 이벤트를 완벽 차단
         }
-        
-        // 🌟 [CRITICAL FIX] 취소 즉시 락을 강제 해제하여 취소 후 #btn-extract 버튼이 먹통되는 현상을 완벽 방어합니다.
         activeTaskId = null;
         GlobalTaskManager.isBusy = false;
         GlobalTaskManager.currentTaskId = null;
@@ -4840,17 +4102,11 @@ listen("browser-status", async (event: any) => {
     
     if (statusStr === "running") {
         isBrowserRunning = true;
-        // 🌟 [CRITICAL FIX] 정상 실행 신호가 오더라도 락을 해제하지 않고 앱 종료 때까지 무조건 숨김을 유지합니다.
         if (btnAutoLaunch) {
             btnAutoLaunch.style.display = "none";
             btnAutoLaunch.classList.add("hidden");
         }
     } else {
-        // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
-        //    작업 진행 중(extractClickLock=true, isAutoLaunchLocked=true) 브라우저가 종료되면
-        //    이 조건 때문에 btnAutoLaunch 노출 로직이 실행되지 않는 버그를 수정합니다.
-        //    첫 번째 browser-status 리스너에서 이미 isAutoLaunchLocked=false로 설정하지만,
-        //    이벤트 리스너 실행 순서 보장이 없으므로 여기서도 무조건 리셋합니다.
         console.log("[WIDGET] Browser stopped. Resetting UI.");
         isBrowserRunning = false;
         isAutoLaunchLocked = false;
@@ -4872,7 +4128,6 @@ btnDeleteSelected?.addEventListener("click", async () => {
         try {
             const uuids = Array.from(selectedUuids);
             await invoke("delete_documents", { uuids });
-            // 🌟 [DEXIE DELETE] 다중 삭제도 Dexie 캐시에서 동기 제거합니다.
             if (appDb && uuids.length > 0) {
                 try {
                     await appDb.table("items").bulkDelete(uuids);
@@ -5042,7 +4297,6 @@ let mySyncSeed = 0;
 let isListenerStarted = false; // 🌟 [추가] 리스너 중복 실행 방지용 플래그
 
 async function initSyncUI() {
-    // 🌟 [CRITICAL FIX] 시드 번호를 기기별로 고정(Fix)하기 위해 로컬 DB에서 불러오거나 최초 1회만 생성하여 저장합니다.
     if (mySyncSeed === 0) {
         const savedSeed = await kvGet("my_sync_seed");
         if (savedSeed) {
@@ -5078,20 +4332,8 @@ let peerConn: RTCPeerConnection | null = null;
 let dataChannel: RTCDataChannel | null = null;
 let desktopStream: MediaStream | null = null;
 let qrRotationInterval: number | null = null;
-
-// 🌟 [추가] 양측의 인증(검증)이 완료된 후 실제 데이터 동기화를 시작하는 헬퍼 함수
-// 🌟 [IDEMPOTENT GUARD] 아래 함수의 중복 진입을 막는 플래그입니다.
-//    채널이 끊길 때 setupDataChannel 의 onclose 가 반드시 내려 줍니다.
 let isWebRtcFinalized = false;
 function finalizeWebRtcConnection(guestSession: any) {
-    // 🌟 [IDEMPOTENT FINALIZE]
-    //  ── 무엇이 문제였나 ──
-    //   양쪽 모두 채널 open 직후 서로에게 auth_request 를 보내므로,
-    //   PC 는 두 경로로 이 함수에 진입합니다.
-    //     ① 자기 승인 팝업(ask)이 통과했을 때 → finalizeWebRtcConnection(guest)
-    //     ② 모바일이 보낸 auth_success 를 받았을 때 → finalizeWebRtcConnection(null)
-    //   그때마다 `mobile_${Date.now()}` 로 서로 다른 id 를 만들어 upsert 하므로
-    //   Local Members 에 같은 기기가 두 줄 생기고, 앱을 껐다 켜도 남습니다.
     if (isWebRtcFinalized) {
         console.log("[WebRTC] Already finalized. Skipping duplicate device registration.");
         return;
@@ -5103,15 +4345,6 @@ function finalizeWebRtcConnection(guestSession: any) {
         profileName.style.color = "#4ade80";
     }
     document.getElementById("nav-qr-container")?.classList.add("hidden");
-    // 🌟 [PROTOCOL FIX] syncDataToMobile() 호출을 제거했습니다.
-    //  ── 왜 ──
-    //   이 함수는 DOM 카드에서 긁어낸 축약 배열을 `{ type:"sync_list", data }` 로 보냅니다.
-    //   그런데 새 원격 프로토콜의 sync_list 는 reset / total 필드를 함께 요구하며,
-    //   모바일은 reset 이 없으면 '다음 페이지' 로 해석해 remotePage 를 올리고
-    //   목록을 append 합니다. 즉 개통 직후 화면에 잘못된 1페이지가 끼어들고
-    //   이후 진짜 페이지네이션이 한 칸씩 밀립니다.
-    //   모바일은 개통 직후 bootstrapRemoteState() 로 정식 목록을 요청하므로
-    //   여기서 밀어 줄 필요가 전혀 없습니다.
     try {
         const guestName = (guestSession && guestSession.email) ? guestSession.email.split('@')[0] : "📱 Linked Device";
         const guestAddr = (guestSession && guestSession.address) ? guestSession.address : "0x0000000000000000000000000000000000000000";
@@ -5121,9 +4354,7 @@ function finalizeWebRtcConnection(guestSession: any) {
             type: "user",
             name: guestName,
             from: guestAddr, 
-            to: currentSession.team || "0x0000000000000000000000000000000000000000",    
-            // 🌟 [BOOL PARITY] IndexedDB 는 boolean 을 키로 인정하지 않습니다.
-            //    저장 시점부터 0|1 정수로 확정해야 data.is_device 인덱스가 실제로 동작합니다.
+            to: currentSession.team || "0x0000000000000000000000000000000000000000",
             data: { origin: "local", is_device: 1 } 
         };
         
@@ -5136,16 +4367,11 @@ function finalizeWebRtcConnection(guestSession: any) {
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = async () => {
         console.log("[WebRTC] Channel OPEN! Starting Zero-Trust Auth Handshake...");
-        // 🌟 [핵심 1] 채널이 열리면 데이터를 즉시 붓지 않고, 내 세션(신분증)을 보내 통성명을 시작합니다.
         channel.send(JSON.stringify({ 
             type: "auth_request", 
             session: currentSession 
         }));
     };
-    // 🌟 [FINALIZE RESET] 채널이 끊기면 다음 페어링에서 기기 등록·프로필 갱신이
-    //    다시 이뤄져야 하므로 idempotent 가드를 반드시 내려 줍니다.
-    //    내리지 않으면 재연결 후 finalizeWebRtcConnection 이 통째로 조기 반환되어
-    //    "✅ Mobile Linked" 표시도, Local Members 등록도 영원히 갱신되지 않습니다.
     channel.onclose = () => {
         console.log("[WebRTC] Channel CLOSED. Resetting pairing state.");
         isWebRtcFinalized = false;
@@ -5173,13 +4399,10 @@ function setupDataChannel(channel: RTCDataChannel) {
                 );
 
                 if (isCloudMember) {
-                    // 이미 클라우드에서 인증된 팀원이면 즉시 승인 및 동기화
                     console.log("[WebRTC] Guest is an authorized Cloud Member. Auto-approving.");
                     channel.send(JSON.stringify({ type: "auth_success" }));
                     finalizeWebRtcConnection(guest);
                 } else {
-                    // 🌟 [CRITICAL FIX] 시드 충돌 감지 및 0-멤버 자동 양보(Yield) 로직!
-                    // 상대방(Guest)의 소속 팀과 내(Host) 소속 팀이 명확히 다른데 연결이 들어왔다면, 100% 시드 중복입니다.
                     if (guest.team && currentSession.team && guest.team !== currentSession.team) {
                         const myTeamMembers = users.filter(u => u.to === currentSession.team || u.cc === currentSession.team);
                         
@@ -5240,10 +4463,23 @@ function setupDataChannel(channel: RTCDataChannel) {
             } else if (msg.type === "get_detail") {
                 const doc = await invoke<any>("get_document", { uuid: msg.uuid });
                 if (doc && dataChannel?.readyState === "open") {
+                    let parsed: any = {};
+                    try { parsed = JSON.parse(doc.json_data || "{}"); } catch (e) { parsed = {}; }
+                    const titleType = parsed.doc_type || doc.type || "Detail";
+                    const titleNo = parsed.doc_number || parsed.no || parsed.title || parsed.tracking_number || "";
+                    const esc = (s: any) => String(s ?? "")
+                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                    let pretty = "";
+                    try { pretty = JSON.stringify(parsed, null, 2); } catch (e) { pretty = String(doc.json_data || ""); }
+                    if (pretty.length > 60_000) pretty = pretty.slice(0, 60_000) + "\n… (truncated)";
                     dataChannel.send(JSON.stringify({
                         type: "sync_detail",
-                        title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
-                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.8rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                        title: `${titleType} ${titleNo}`.trim(),
+                        content:
+                            `<div style="margin-bottom:15px; font-size:0.85rem; color:#333;">` +
+                            `<strong>Summary</strong><br>${esc(doc.text)}</div>` +
+                            `<hr>` +
+                            `<pre>${esc(pretty)}</pre>`
                     }));
                 }
             } else if (msg.type === "get_session") {
@@ -5255,9 +4491,6 @@ function setupDataChannel(channel: RTCDataChannel) {
                     }));
                 }
             } else if (msg.type === "get_mode") {
-                // 🌟 [REMOTE MODE] 모바일에 현재 데스크톱의 모드를 알려줍니다.
-                //    Part 1~2 에서 모드를 3분할한 이후, 모바일이 이 값을 모르면
-                //    항상 전체를 조회하게 되어 목록 스코프가 데스크톱과 어긋납니다.
                 if (dataChannel?.readyState === "open") {
                     dataChannel.send(JSON.stringify({
                         type: "sync_mode",
@@ -5265,31 +4498,79 @@ function setupDataChannel(channel: RTCDataChannel) {
                     }));
                 }
             } else if (msg.type === "get_navigation") {
-                // Fetch pages and users for mobile tree
                 const pages = await Select["pages"]({});
                 const users = await Select["users"]({});
+                const slimPages = (pages || []).slice(0, 200).map((p: any) => ({
+                    id: p.id,
+                    uuid: p.id,
+                    type: p.type,
+                    mode: p.mode,
+                    ref: p.ref,
+                    cc: p.cc,
+                    title: p.title || p.data?.title || "",
+                    data: {
+                        type: p.data?.type || p.type || "",
+                        title: p.data?.title || p.title || "",
+                        link: p.data?.link || "",
+                        origin: p.data?.origin || "",
+                        detail: p.data?.detail ?? false
+                    }
+                }));
+                const slimUsers = (users || []).slice(0, 200).map((u: any) => ({
+                    id: u.id,
+                    uuid: u.id,
+                    type: u.type,
+                    from: u.from,
+                    to: u.to,
+                    cc: u.cc,
+                    data: {
+                        type: u.data?.type || u.type || "",
+                        name: u.data?.name || "",
+                        title: u.data?.title || "",
+                        flag: u.data?.flag || "",
+                        page_count: u.data?.page_count ?? 0
+                    }
+                }));
                 if (dataChannel?.readyState === "open") {
-                    dataChannel.send(JSON.stringify({ 
-                        type: "sync_navigation", 
-                        pages: pages,
-                        users: users
-                    }));
+                    const navPayload = JSON.stringify({
+                        type: "sync_navigation",
+                        pages: slimPages,
+                        users: slimUsers
+                    });
+                    if (navPayload.length > 240_000) {
+                        console.warn(`[WebRTC] sync_navigation 페이로드 ${navPayload.length}바이트. slice 상한을 낮추세요.`);
+                    }
+                    dataChannel.send(navPayload);
                 }
             } else if (msg.type === "get_chat_history") {
-                // Fetch last 20 messages for mobile
-                const messages = await invoke<any[]>("get_chat_messages", { limit: 20, offset: 0 });
+                const chatFilterParts: string[] = [];
+                if (activeContext.ref) chatFilterParts.push(`\`ref\` = '${activeContext.ref}'`);
+                else if (activeContext.cc) chatFilterParts.push(`cc = '${activeContext.cc}'`);
+                const chatFilter = chatFilterParts.length > 0 ? chatFilterParts.join(" AND ") : null;
+                const messages = await invoke<any[]>("get_chat_messages", {
+                    limit: 30,
+                    offset: 0,
+                    filter: chatFilter
+                });
+                const ordered = (messages || []).slice().sort(
+                    (a: any, b: any) => (Number(a?.created_at) || 0) - (Number(b?.created_at) || 0)
+                );
+                const slimMessages = ordered.map((m: any) => ({
+                    id: m.id,
+                    role: m.role,
+                    text: typeof m.text === "string" && m.text.length > 2000 ? m.text.slice(0, 2000) : m.text,
+                    status: m.status,
+                    task_id: m.task_id,
+                    created_at: m.created_at,
+                    updated_at: m.updated_at
+                }));
                 if (dataChannel?.readyState === "open") {
-                    dataChannel.send(JSON.stringify({ 
-                        type: "sync_chat_history", 
-                        messages: messages
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_chat_history",
+                        messages: slimMessages
                     }));
                 }
             } else if (msg.type === "get_queue_status") {
-                // 🌟 [QUEUE STATUS] 모바일이 '지금 PC 가 바쁜지' 를 알 수 있게 합니다.
-                //    ── 왜 필요한가 ──
-                //     모바일은 자체 연산 자원이 없어 모든 무거운 작업을 PC 큐에 위임합니다.
-                //     그런데 큐 상태를 모르면 사용자는 요청이 씹혔는지 대기 중인지 구분할 수 없고,
-                //     같은 작업을 반복 전송해 큐를 오염시킵니다.
                 if (dataChannel?.readyState === "open") {
                     dataChannel.send(JSON.stringify({
                         type: "sync_queue_status",
@@ -5324,28 +4605,12 @@ function setupDataChannel(channel: RTCDataChannel) {
                     }));
                 }
             } else if (msg.type === "search") {
-                // 🌟 [REMOTE LIST v2] Dexie 인덱스를 직접 사용하는 목록 조회입니다.
-                //  ── v1 의 결함 ──
-                //   Select["items"]({value, limit, offset}) 만 호출해
-                //   ① 모드 스코프(mode / TYPE_SETS)가 전혀 적용되지 않고
-                //   ② activeContext(cc/bcc/ref)도 무시되어
-                //   데스크톱 화면과 모바일 화면이 서로 다른 집합을 보여 주었습니다.
-                //   ③ offset 고정(0)이라 페이지네이션이 불가능했습니다.
-                //
-                //  여기서는 loadMoreDocs 와 동일한 스코프 규칙을 그대로 적용합니다.
                 const remoteMode = msg.mode || currentSearchMode;
                 const remoteLimit = Number(msg.limit || 20);
                 const remoteOffset = Number(msg.offset || 0);
                 const remoteQuery = String(msg.query || "").trim();
                 console.log(`[WebRTC] Remote list: mode=${remoteMode} q='${remoteQuery}' offset=${remoteOffset}`);
-
                 const allowedTypes = TYPE_SETS[remoteMode] || TYPE_SETS.commerce;
-                // 🌟 [SCOPE GUARD] activeContext(cc/ref)는 '현재 데스크톱 모드' 의 네임스페이스입니다.
-                //    commerce 는 hashId(getRootDomain(host)), analytic 은 hashId(url.host) 로
-                //    해시 규칙 자체가 달라, 모드가 어긋난 상태에서 그대로 드라이버 인덱스로 쓰면
-                //    반드시 0건이 됩니다. (데스크톱 모드 탭 핸들러가 activeContext 를
-                //    비우는 것과 정확히 같은 이유입니다)
-                //    모바일이 요청한 모드와 데스크톱 모드가 같을 때만 스코프를 적용합니다.
                 const scopeUsable = (remoteMode === currentSearchMode);
                 const scopeRef = scopeUsable ? activeContext.ref : "";
                 const scopeCc = scopeUsable ? activeContext.cc : "";
@@ -5373,7 +4638,15 @@ function setupDataChannel(channel: RTCDataChannel) {
                         if (remoteQuery) {
                             const q = remoteQuery.toLowerCase();
                             rows = rows.filter((r: any) => {
-                                const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.name ?? ''} ${r.data?.no ?? ''} ${r.data?.tracking_number ?? ''}`.toLowerCase();
+                                const d = r.data ?? {};
+                                const hay = [
+                                    d.text, d.title, d.name, d.no, d.code,
+                                    d.tracking_number, d.doc_number, d.doc_type,
+                                    d.vessel, d.container_number, d.seal_number,
+                                    d.sender_name, d.recipient_name,
+                                    d.pol, d.pod, d.hs_code,
+                                    d.action, d.summary
+                                ].filter(Boolean).join(' ').toLowerCase();
                                 return hay.includes(q);
                             });
                         }
@@ -5384,19 +4657,29 @@ function setupDataChannel(channel: RTCDataChannel) {
                 }
                 const total = rows.length;
                 const page = rows.slice(remoteOffset, remoteOffset + remoteLimit);
-                // 🌟 [PAYLOAD TRIM] SDP 템플릿의 a=max-message-size 는 262144(256KB)입니다.
-                //  ── 왜 잘라야 하는가 ──
-                //   Dexie 봉투 행의 data 에는 원문 텍스트·태그·무역 필드 수십 개가 통째로 들어 있어
-                //   20건만 모아도 256KB 를 넘길 수 있습니다. 한계를 넘기면 send() 가 예외를 던지거나
-                //   SCTP 가 조용히 끊겨 모바일 목록이 영원히 비어 보입니다.
-                //   카드 렌더링에 실제로 필요한 필드만 투영해 보내고,
-                //   상세는 카드를 눌렀을 때 get_detail 로 따로 가져옵니다.
                 const REMOTE_CARD_KEYS = [
                     'id', 'no', 'code', 'index', 'title', 'name', 'text', 'summary',
                     'status', 'type', 'mode', 'link', 'origin', 'image', 'thumbnail',
-                    'tracking_number', 'sale_price', 'amount', 'quantity',
-                    'doc_type', 'doc_number', 'vessel', 'pol', 'pod', 'etd', 'eta',
-                    'created_at', 'updated_at', 'search_badge', 'relation'
+                    'created_at', 'updated_at', 'search_badge', 'relation',
+                    'goods', 'event', 'tracking', 'views',
+                    'currency', 'amount', 'sale_price', 'price', 'supply_price',
+                    'discount', 'quantity', 'stock_keeping_unit', 'tax_included',
+                    'shipping_fee', 'shipping_method', 'shipping_duration', 'release_date',
+                    'carrier', 'tracking_number',
+                    'sender_name', 'sender_address', 'recipient_name', 'recipient_address',
+                    'notify_party_name',
+                    'doc_type', 'doc_number', 'vessel', 'voyage_number', 'pol', 'pod',
+                    'place_receipt', 'place_delivery', 'etd', 'eta', 'transport_mode',
+                    'incoterms', 'payment_terms', 'freight_payment_term',
+                    'freight_amount', 'insurance_amount',
+                    'container_number', 'seal_number', 'package_count', 'package_unit',
+                    'weight_gross', 'weight_net', 'volume', 'hs_code',
+                    'reference_invoice', 'reference_lc', 'reference_booking',
+                    'issue_date', 'expiry_date',
+                    'action', 'cross_action_flow', 'intent_evolution',
+                    'consistent_preferences', 'href',
+                    'usage_per', 'usage_limit', 'min_order_amount', 'max_discount_amount',
+                    'started_at', 'expired_at'
                 ];
                 const slim = page.map((r: any) => {
                     const d: any = {};
@@ -5431,11 +4714,6 @@ function setupDataChannel(channel: RTCDataChannel) {
                     dataChannel.send(payload);
                 }
             } else if (msg.type === "ai_search") {
-                // 🌟 [REMOTE AI SEARCH] LanceDB + LLM 이 도는 무거운 작업이므로
-                //    반드시 GlobalTaskManager 큐를 경유합니다.
-                //    ── 큐를 우회하면 안 되는 이유 ──
-                //     PC 가 이미 추출 중일 때 모델이 두 번 로드되어 VRAM 이 터지고,
-                //     sys_lock 이 어긋나 이후 모든 작업이 좀비 상태가 됩니다.
                 const remoteQ = String(msg.query || "").trim();
                 if (remoteQ) {
                     const taskId = `search_${Date.now()}`;
@@ -5460,18 +4738,9 @@ function setupDataChannel(channel: RTCDataChannel) {
                     }
                 }
             } else if (msg.type === "chat_message") {
-                // 🌟 [REMOTE CHAT v2] 기존에는 단순 에코만 돌려주어
-                //    메시지가 LanceDB 에도, 서버 D1 에도 저장되지 않았습니다.
-                //    (모바일에서 보낸 대화가 PC 를 껐다 켜면 전부 사라졌습니다)
-                //    데스크톱 채팅 폼과 동일한 낙관적 로컬 쓰기 경로를 태웁니다.
                 const remoteText = String(msg.content || "").trim();
                 if (remoteText) {
                     const now = Date.now();
-                    // 🌟 [ID RESTORE] 직전 리팩터링에서 이 선언이 유실되어
-                    //    아래 upsert_items / renderMessage 가 미선언 변수를 참조했습니다. (TS2304)
-                    //    데스크톱 chatForm 과 완전히 동일한 규칙으로 로컬 에코 id 를 만듭니다.
-                    //    (reconcileLocalEchoes 가 'talk_' 접두사로 서버 행과 승계 매칭을 하므로
-                    //     접두사가 달라지면 중복 말풍선이 영구히 남습니다)
                     const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
                     let localLink = "/tracking";
                     let localOrigin = "https://commerce.logis.center";
@@ -5484,14 +4753,6 @@ function setupDataChannel(channel: RTCDataChannel) {
                         localLink = (u.pathname + u.search).toLowerCase();
                         localOrigin = u.origin;
                     } catch (e) {}
-                    // 🌟 [CHAT SCOPE PARITY] 데스크톱 chatForm 은 activeContext 가 비어 있거나
-                    //    태그가 없을 때 URL 기반으로 cc/ref 를 다시 계산합니다.
-                    //    (chatForm submit 핸들러의 effectiveCc / effectiveRef 블록)
-                    //    반면 여기서는 activeContext 를 그대로 썼기 때문에,
-                    //    PC 가 analytic 모드라 cc 가 hashId(url.host) 로 잡혀 있으면
-                    //    loadMoreChat 이 계산하는 commerce 해시(hashId(getRootDomain(host)))와
-                    //    어긋나 저장은 되지만 화면 조회에서 통째로 누락됩니다.
-                    //    데스크톱 채팅과 완전히 동일한 규칙으로 맞춥니다.
                     let chatCc = activeContext.cc;
                     let chatBcc = activeContext.bcc;
                     let chatRef = activeContext.ref;
@@ -5538,48 +4799,21 @@ function setupDataChannel(channel: RTCDataChannel) {
                         created_at: now,
                         updated_at: now
                     });
-                    // 🌟 [NO ECHO] 보낸 쪽(모바일)은 chatForm submit 시점에
-                    //    renderChat({role:'user'}) 로 이미 자기 말풍선을 그렸습니다.
-                    //    여기서 sync_chat 을 되돌려 주면 동일 문장이 두 번 렌더링됩니다.
-                    //    (모바일 renderChat 은 중복 제거 로직이 없는 단순 append 입니다)
-                    //    재접속 후 히스토리 복원은 get_chat_history → sync_chat_history 가
-                    //    담당하므로 이 자리에서 회신할 이유가 없습니다.
                 }
             } else if (msg.type === "mobile_upload") {
                 console.log("[WebRTC] Receiving file from mobile:", msg.name);
                 try {
-                    // 1. Convert Base64 to Uint8Array
                     const binaryString = atob(msg.data);
                     const bytes = new Uint8Array(binaryString.length);
                     for (let i = 0; i < binaryString.length; i++) {
                         bytes[i] = binaryString.charCodeAt(i);
                     }
-
-                    // 2. Save to a temporary location using Tauri FS
-                    // We'll use a specific name to identify mobile uploads
                     const tempPath = `mobile_upload_${Date.now()}_${msg.name}`;
                     const fullPath = await invoke<string>("save_mobile_temp_file", { 
                         filename: tempPath, 
                         data: Array.from(bytes) 
                     });
-
                     console.log("[WebRTC] Saved mobile upload to:", fullPath);
-                    // 3. Trigger Desktop's existing Extraction Logic
-                    // 🌟 [QUEUE BYPASS FIX]
-                    //  ── 무엇이 문제였나 ──
-                    //   기존 코드는 emit("new-task-from-browser") 를 '직접' 쏘아
-                    //   GlobalTaskManager.addToQueue() 를 통째로 우회했습니다.
-                    //   그 결과
-                    //    ① PC 가 이미 추출/검색 중이어도 즉시 백엔드로 진입해
-                    //       모델이 이중 로드되고 sys_lock 이 어긋났습니다.
-                    //    ② ts_queue(Dexie)에 기록되지 않아 앱을 껐다 켜면
-                    //       '강제 종료된 작업' 으로도 집계되지 않고 조용히 증발했습니다.
-                    //    ③ 대기열 말풍선(status 10)이 그려지지 않아
-                    //       사용자는 요청이 접수됐는지 알 수 없었습니다.
-                    //  ── 해결 ──
-                    //   데스크톱 btnExtract 와 완전히 동일하게 큐에 등록합니다.
-                    //   addToQueue 가 대기열 말풍선 렌더링 → Dexie 저장 → processNext()
-                    //   까지 전부 처리하므로, 바쁠 때는 자동으로 순번을 기다립니다.
                     const taskId = `task_mobile_${Date.now()}`;
                     const mobileExt = String(msg.name || "").split('.').pop()?.toLowerCase() || '';
                     const isMobileDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(mobileExt);
@@ -5599,9 +4833,6 @@ function setupDataChannel(channel: RTCDataChannel) {
                         device_preference: getDevicePref(),
                         search_mode: currentSearchMode
                     });
-
-                    // 4. 모바일에 '큐 등록 완료' 를 즉시 알립니다.
-                    //    진행률은 아래 extraction-progress 릴레이 리스너가 계속 중계합니다.
                     if (dataChannel?.readyState === "open") {
                         dataChannel.send(JSON.stringify({
                             type: "task_queued",
@@ -5639,17 +4870,6 @@ listen("extraction-progress", (event: any) => {
         }));
     }
 });
-
-
-// 🌟 [REMOVED] syncDataToMobile 정의를 삭제했습니다.
-//  ── 왜 정의까지 지우는가 ──
-//   호출부는 finalizeWebRtcConnection 에서 이미 제거했지만, 정의가 남아 있으면
-//   ① noUnusedLocals 를 켠 순간 빌드가 실패하고
-//   ② 나중에 누군가 "목록을 밀어 주는 함수가 있네" 하고 다시 호출할 위험이 있습니다.
-//   이 함수가 보내는 축약 배열은 새 프로토콜의 sync_list 계약(reset / total 필수)을
-//   위반하므로, 되살아나면 모바일 페이지네이션이 즉시 깨집니다.
-//   목록 전송은 오직 msg.type === "search" 핸들러 한 곳에서만 수행합니다.
-
 listen("app_error_alert", async (event: any) => {
     const payload = event.payload as any;
     // 🌟 Settings 탭 자동 열기 + 다운로드 시작
@@ -5958,9 +5178,6 @@ btnDetailDelete?.addEventListener("click", async () => {
             console.log("[WIDGET] Deletion confirmed for:", currentDetailUuid);
             const res = await invoke<string>("delete_document", { uuid: currentDetailUuid });
             console.log("[WIDGET] Delete response:", res);
-            // 🌟 [DEXIE DELETE] LanceDB 삭제 후 프론트엔드 Dexie 캐시에서도 제거합니다.
-            //    이 처리가 없으면 refreshList() → loadMoreDocs() 가 Dexie 를 조회할 때
-            //    해당 아이템이 여전히 존재하여 화면에 다시 렌더링됩니다.
             if (appDb && currentDetailUuid) {
                 try {
                     await appDb.table("items").delete(currentDetailUuid);
@@ -5971,8 +5188,6 @@ btnDetailDelete?.addEventListener("click", async () => {
                     console.warn("[WIDGET] Dexie delete failed (non-critical):", dexieErr);
                 }
             }
-            // 🌟 [ITEM TOMBSTONE] 서버 D1 에 행이 남아 있으면 3초 폴링이 재삽입하므로
-            //    묘비를 세워 영구 차단합니다.
             await addItemTombstone(currentDetailUuid);
             detailView.style.display = "none";
             listView.style.display = "block";
@@ -5992,13 +5207,10 @@ async function refreshList() {
 }
 
 async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
-    // 🌟 [CRITICAL FIX] AI 검색 중이거나 검색 결과가 화면에 고정된 상태에서는
-    // 백그라운드 자동 동기화(isSync)나 스크롤에 의한 일반 리스트 덮어쓰기가 난입하여 카운트가 23개 등으로 뻥튀기되는 경합(Race Condition)을 완벽 차단합니다!
     const resultH3 = document.querySelector('.nav-section.search h3');
     const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
     
     if (isSearching || isShowingSearchResult) {
-        // 단, 사용자가 검색창을 지우고 강제 초기화(reset=true)를 요청한 경우는 정상 목록을 불러와야 하므로 예외 처리합니다.
         if (reset && !isSearching) {
             isLoading = false;
         } else {
@@ -6011,10 +5223,8 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (docListContainer) docListContainer.innerHTML = "";
         cachedDocs = [];
         listCurrentY = 0;
-        // 🌟 [TOTAL COUNT] 스코프가 바뀌었으므로 총계를 초기화합니다.
         totalResultCount = -1;
         updateListTransform();
-        // 🌟 [CRITICAL FIX] 검색어가 지워지는 등 새로운 초기화 요청이 들어오면, 기존에 대기 중이던 로딩 락(isLoading)을 강제로 해제하여 먹통 현상을 방지합니다.
         isLoading = false; 
     }
 
@@ -6031,22 +5241,9 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     }
     
     try {
-        // 🌟 [LIST QUERY v4] 목록 조회는 LanceDB 를 거치지 않고 Dexie 에서 직접 처리합니다.
-        //  목록에는 벡터/FTS 가 필요 없고, 필요한 건 스코프 + 타입 + 정렬 + 페이징뿐입니다.
-        //  → SQL 문자열 조립이 사라지므로 DataFusion 문법 에러 클래스가 통째로 소멸합니다.
-        //  → 텍스트 검색이 있을 때만 LanceDB(search_documents)를 후보 소스로 사용합니다.
-
-        // 🌟 [READ SCOPE] 파일 상단의 TYPE_SETS 단일 정의를 그대로 씁니다.
-        //  ── 왜 지역 정의를 없앴는가 ──
-        //   기존에는 이 목록과 syncData 의 TRADING_TYPES 가 별도로 하드코딩되어
-        //   한쪽만 고치면 '태깅한 mode' 와 '조회하는 type' 이 어긋났습니다.
-        //   이제 쓰기(modeOfType)와 읽기(TYPE_SETS)가 같은 파일 상단에서 관리됩니다.
         const allowedTypes = TYPE_SETS[currentSearchMode] || TYPE_SETS.commerce;
-
         const textQuery = searchInput?.value.trim() || "";
         const currentOffset = isSync ? 0 : currentPage * pageSize;
-
-        // [TIMESTAMPS] Scan UI for current range
         let latestUpdateTime = 0;
         const allCards = docListContainer.querySelectorAll('.logis-result');
         allCards.forEach(el => {
@@ -6060,8 +5257,6 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         let docs: any[] = [];
 
         if (textQuery) {
-            // ── 텍스트 검색 : LanceDB 로 후보를 긁고 Dexie 로 스코프 검증 ──
-            //   스코프는 봉투 컬럼만 담습니다. (sanitize_scope_filter 가 어차피 걸러냄)
             let scopeSql = `mode = '${currentSearchMode}'`;
             if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
             else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
@@ -6077,29 +5272,22 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             const ids = searchResults.map((r: any) => r[0]).filter(Boolean);
             if (ids.length > 0 && appDb) {
                 const rows = await appDb.table('items').where('id').anyOf(ids).toArray();
-                // LanceDB 점수 순서를 보존합니다.
                 const orderMap = new Map<string, number>();
                 ids.forEach((id: string, i: number) => orderMap.set(id, i));
                 rows.sort((a: any, b: any) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999));
                 docs = rows.filter((r: any) => allowedTypes.includes(r.type));
             }
-
-            // Dexie 에 아직 없는 문서는 Rust 에서 직접 가져옵니다. (최초 진입 대비)
             if (docs.length === 0 && ids.length > 0) {
                 for (const id of ids.slice(0, pageSize)) {
                     const fullDoc = await invoke<any>("get_document", { uuid: id });
                     if (fullDoc) docs.push(fullDoc);
                 }
             }
-            // 🌟 [TOTAL COUNT] slice 이전의 전체 매칭 건수를 기록합니다.
             if (!isSync) totalResultCount = docs.length;
             docs = docs.slice(currentOffset, currentOffset + pageSize);
 
         } else if (appDb) {
-            // ── 일반 목록 : Dexie 컬렉션 체이닝 ──
             let coll: any;
-
-            // 가장 좁은 스코프 인덱스를 드라이버로 선택합니다.
             if (activeContext.ref) {
                 coll = appDb.table('items').where('ref').equals(activeContext.ref);
             } else if (activeContext.bcc) {
@@ -6111,36 +5299,23 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
             }
 
             let rows: any[];
-
-            // 🌟 [COMPOUND DRIVER] 스코프(ref/bcc/cc)가 없을 때는 mode 만으로 훑지 말고
-            //    선언해 둔 '[mode+type]' 복합 인덱스를 anyOf 로 펼칩니다.
-            //    shipping 은 allowedTypes 가 15종이 넘어 mode 단독 스캔 대비 체감 차이가 큽니다.
             if (!activeContext.ref && !activeContext.bcc && !activeContext.cc) {
                 const pairs = allowedTypes.map(t => [currentSearchMode, t]);
                 rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
                 console.log(`[DEBUG-LIST] 복합 인덱스 [mode+type] anyOf ${pairs.length}쌍 → ${rows.length}건 적재`);
             } else {
                 rows = await coll.toArray();
-                // 스코프 드라이버가 mode 가 아니었다면 mode 를 추가 검증합니다.
                 rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
                 rows = rows.filter((r: any) => allowedTypes.includes(r.type));
             }
-
             if (isSync && latestUpdateTime > 0) {
                 rows = rows.filter((r: any) => (r.updated_at || 0) > latestUpdateTime);
             }
-
             rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
-
-            // 🌟 [TOTAL COUNT] slice 이전의 '스코프 전체 건수' 를 기록합니다.
-            //    isSync(상단 당김 갱신)는 최신 델타만 가져오므로 총계를 갱신하지 않습니다.
             if (!isSync) totalResultCount = rows.length;
 
             console.log(`[DEBUG-LIST] Dexie 스코프 조회: ${rows.length}건 (allowedTypes=${allowedTypes.length}종)`);
             docs = isSync ? rows.slice(0, pageSize) : rows.slice(currentOffset, currentOffset + pageSize);
-
-            // 🌟 [COLD START] Dexie 가 비어 있으면 Rust 에서 끌어와 캐시를 채웁니다.
-            //  (앱 최초 실행 / DB 초기화 직후 경로)
             if (rows.length === 0 && currentPage === 0) {
                 let scopeSql = `mode = '${currentSearchMode}'`;
                 if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
@@ -6157,19 +5332,15 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                     await appDb.table("items").bulkPut(normalizeEnvelope(fromRust)).catch(() => null);
                     const coldRows = normalizeEnvelope(fromRust)
                         .filter((r: any) => allowedTypes.includes(r.type));
-                    // 🌟 [TOTAL COUNT] Cold start 경로도 slice 이전 값을 총계로 씁니다.
                     if (!isSync) totalResultCount = coldRows.length;
                     docs = coldRows.slice(0, pageSize);
                 }
             }
         }
-
         console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
         if (docs.length === 0) {
             console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다. 스코프가 좁거나 해당 타입 데이터가 없습니다.`);
         }
-
-        // 🌟 [CACHE WARM] Rust 경유로 들어온 문서를 Dexie 봉투 형태로 정규화해 저장합니다.
         if (appDb && docs.length > 0) {
             try {
                 await appDb.table("items").bulkPut(normalizeEnvelope(docs));
@@ -6177,15 +5348,9 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
                 console.error("[Dexie] Local cache update failed:", e);
             }
         }
-
-        // 🌟 [CRITICAL FIX] 데이터를 불러오는 동안 사용자가 검색어를 변경했거나 지웠다면, 과거 데이터가 화면에 렌더링되어 혼선을 주는 것을 즉시 차단합니다.
         if (textQuery !== (searchInput?.value.trim() || "")) {
             return;
         }
-
-        // 🌟 [CRITICAL FIX] 백그라운드에서 대기하던 일반 리스트 로딩이 끝났을 때,
-        // 이미 AI 검색이 진행 중이거나 검색 결과가 화면에 렌더링된 상태(H3 태그가 Search로 변경됨)라면,
-        // 일반 문서 5개가 검색 결과 18개 밑에 강제로 들러붙어 23개로 뻥튀기되는 경합(Race Condition)을 완벽 차단합니다!
         const currentH3 = document.querySelector('.nav-section.search h3');
         const currentlyShowingSearch = currentH3 && currentH3.textContent?.toLowerCase().includes("search");
         if ((isSearching || currentlyShowingSearch) && !textQuery && !isSync) {
@@ -6198,8 +5363,6 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (docs.length > 0) {
             const mode = isSync ? 'prepend' : 'append';
             upsertListItems(docs, mode);
-            
-            // 🌟 [CRITICAL FIX] 문서가 성공적으로 추가되었으므로 페이지 카운터를 정상적으로 증가시킵니다.
             if (!isSync) {
                 if (reset) currentPage = 1;
                 else currentPage++;
@@ -6216,25 +5379,15 @@ async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
         if (reset && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
     } 
     finally { 
-        isLoading = false; 
-        
-        // 🌟 로딩 종료: Loading... 글자를 완전히 숨김 (아무것도 표시 안 됨)
+        isLoading = false;
         if (headerLoading) {
             headerLoading.style.display = "none";
         }
-        
         if (!isSync) stopSpinner();
-
-        // 🌟 [추가] 최초 로딩 및 일반 리스트 동기화 후 카운트 반영
         updateResultCount();
     }
 }
-
-// 🌟 [TOTAL COUNT] 화면에 렌더링된 카드 수가 아니라 '스코프/검색 전체 건수' 를 보관합니다.
-//    -1 = 아직 집계되지 않음(→ DOM 카운트로 폴백)
 let totalResultCount = -1;
-
-// 🌟 [추가] 리스트 결과 개수 카운트 업데이트 헬퍼 함수
 function updateResultCount() {
     const h3El = document.querySelector('.nav-section.search h3');
     if (h3El && h3El.textContent?.includes("searching")) {
@@ -6243,7 +5396,6 @@ function updateResultCount() {
     const countEl = document.querySelector('.nav-section.search h3 strong.count');
     if (countEl) {
         const rendered = document.querySelectorAll('#doc-list .logis-result').length;
-        // 🌟 페이징으로 몇 장을 그렸든 상관없이 전체 건수를 표기합니다.
         const total = totalResultCount >= 0 ? totalResultCount : rendered;
         console.log(`[COUNT] 전체 ${total}건 / 현재 렌더링 ${rendered}건`);
         countEl.textContent = total > 0 ? `(${total})` : "";
@@ -6265,14 +5417,9 @@ function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
     processBatch.forEach(doc => {
         const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
         const existingEl = docListContainer.querySelector(`[id="${docId}"]`) as HTMLElement;
-
-        // 🌟 [CRITICAL FIX] item2html은 숨겨진 checkbox와 메인 카드(div) 2개의 요소를 생성합니다.
         const html = item2html(doc, false, currentDetectedUrl);
         const temp = document.createElement('div');
         temp.innerHTML = html;
-        
-        // 🌟 클래스 이름(.logis-result)이 누락되거나 충돌하는 상황을 원천 차단하기 위해 
-        // 부여된 ID 값을 이용해 가장 확실하게 두 요소를 뜯어옵니다.
         const newCheckbox = temp.querySelector(`input#more-${docId}`) as HTMLElement || temp.querySelector('.toggle-more') as HTMLElement;
         const newCard = temp.querySelector(`div[id="${docId}"]`) as HTMLElement || temp.querySelector('.logis-result') as HTMLElement;
 
@@ -6280,8 +5427,6 @@ function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             if (doc.updated_at > cachedUpdatedAt) {
                 console.log(`[List] Updating item ${docId}`);
-                
-                // 체크박스와 카드를 각각 찾아서 안전하게 교체(Replace)합니다.
                 const oldCheckbox = docListContainer.querySelector(`#more-${docId}`);
                 if (oldCheckbox && newCheckbox) docListContainer.replaceChild(newCheckbox, oldCheckbox);
                 
@@ -6291,7 +5436,6 @@ function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
                 }
             }
         } else {
-            // 새 카드를 삽입할 때도 체크박스와 카드를 순서대로 온전히 다 넣습니다.
             if (mode === 'prepend') {
                 if (newCard) docListContainer.prepend(newCard);
                 if (newCheckbox) docListContainer.prepend(newCheckbox);
@@ -6319,44 +5463,31 @@ function bindCardEvents(el: HTMLElement, doc: any) {
     const moreContent = el.querySelector('.more-content') as HTMLElement;
     const moreLabel = el.querySelector('.more-label') as HTMLElement;
     const relateContainer = el.querySelector('.logis-relate') as HTMLElement;
-
-    // 🌟 [PARITY] 클라우드의 Relay(관계 병합) 아코디언 토글 이벤트
     if (toggleCheckbox && moreContent && moreLabel) {
         toggleCheckbox.addEventListener('change', async () => {
             if (toggleCheckbox.checked) {
-                // 아코디언 열림
                 moreContent.style.display = "block";
                 moreLabel.innerHTML = "fold ▲";
-                
-                // 🌟 열릴 때 연관된 데이터(Foreign/Primary)를 DB에서 긁어와 병합합니다!
                 if (relateContainer) {
                     await loadRelatedData(doc, relateContainer);
                 }
             } else {
-                // 아코디언 닫힘
                 moreContent.style.display = "none";
                 moreLabel.innerHTML = "more ▼";
             }
         });
     }
-
     el.addEventListener("click", (e) => {
         const target = e.target as HTMLElement;
-        
-        // 아코디언 래퍼나 내부 연관 데이터 클릭 시, 메인 상세 페이지로 넘어가지 않도록 차단
         if (target.closest('.toggle-more') || target.closest('.more-label') || target.closest('.more-content') || target.closest('.logis-relate')) {
             return;
         }
-
         const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
         if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
             if (docId) showDetail(String(docId));
         }
     });
 }
-
-// 🌟 [PARITY] 클라우드 Relay 로직의 클라이언트 사이드 이식
-// 🌟 [PARITY] 클라우드 Relay 로직의 클라이언트 사이드 이식
 async function loadRelatedData(doc: any, container: HTMLElement) {
     if (!container || container.dataset.loaded === "true") return;
     // 스피너 표시
@@ -6364,14 +5495,8 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
     try {
         const docId = doc.id || doc.uuid;
         const docRef = doc.ref;
-        // 🌟 v5 : 연관 조회를 3단계 인덱스 기반으로 처리합니다.
-        //   ① ref 인덱스        : 기존 경로 유지
-        //   ② 정방향 (정방향)   : 내 문서의 rel_* 값 = 상대 문서의 data.index
-        //   ③ 역방향 (역방향)   : 상대 문서의 rel_* 값 = 내 문서의 data.index
-        //   세 경로 모두 Dexie 인덱스 O(log n) 입니다.
         let uniqueDocs: any[] = [];
         if (appDb) {
-            // ── ① ref 인덱스 기반 (기존 경로 유지) ──
             const refTargets = [docId];
             if (docRef && docRef !== "") refTargets.push(docRef);
             const refRows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
@@ -6380,11 +5505,6 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
                     uniqueDocs.push(r);
                 }
             }
-
-            // ── ② 정방향 : 내가 참조하는 문서들 ──
-            // 내 문서의 rel_* 값 = 상대 문서의 data.index
-            // 예: CI 문서의 data.rel_bl = 1234567890
-            //     → BL 문서의 data.index = 1234567890 인 문서를 찾음
             const relKeys = Object.keys(doc.data || {}).filter(k => k.startsWith("rel_"));
             for (const relKey of relKeys) {
                 const relVal = doc.data?.[relKey];
@@ -6404,12 +5524,6 @@ async function loadRelatedData(doc: any, container: HTMLElement) {
                     }
                 } catch (_e) { /* 인덱스 없으면 무시 */ }
             }
-
-            // ── ③ 역방향 : 나를 참조하는 문서들 ──
-            // 상대 문서의 rel_* 값 = 내 문서의 data.index
-            // 예: BL 문서의 data.rel_ci = 9876543210
-            //     → 내 문서의 data.index = 9876543210 이므로
-            //     → data.rel_ci = 내 문서의 data.index 인 문서를 찾음
             const myIndex = doc.data?.index;
             if (myIndex !== undefined && myIndex !== null) {
                 const myIndexNum = Number(myIndex);
@@ -6641,40 +5755,19 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 async function checkAuthStatus() {
-    // 🌟 [BOOTSTRAP 허용] 기존에는 hash 가 없으면 즉시 return 했습니다.
-    //    이제 hash 발급을 서버에 위임하므로, hash 가 없는 상태에서도
-    //    '자격증명 없는 bootstrap 요청' 을 보내 서버가 유효한 쌍을 발급하게 합니다.
     const origin = "https://commerce.logis.center"; 
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
     try {
-        // 🌟 [CRITICAL FIX] Tauri의 window.location.href는 'localhost'이므로 서버가 도메인(cc)을 파악하지 못합니다.
-        // 브라우저에서 감지된 URL(currentDetectedUrl)이나 기본 클라우드 주소를 전달해야 완벽히 매칭됩니다!
         let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
         if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
             targetHref = "https://commerce.logis.center/tracking";
         }
-
         const queryParams: Record<string, string> = { 
             origin: origin, 
             created_at: createdAt.toString(), 
             href: targetHref 
         };
-
-        // 🌟 [PAIRED CREDENTIAL] hash 와 token 은 반드시 '함께' 보내야 합니다.
-        //  ── 근거 ──
-        //   워커의 세션 게이트는 다음 한 줄입니다.
-        //     if(cookies.hash || (req.query.hash && req.query.token))
-        //   Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를 전혀 보내지 않으므로
-        //   cookies.hash 는 항상 빈 값이고, (hash && token) 쌍이 유일한 통과 조건입니다.
-        //   게이트를 통과해야만 S3 HEAD 가 실행되어 balance 가 정의되고,
-        //   balance 가 undefined 로 남으면 아래 블록이 무조건 발동합니다.
-        //     if(typeof balance == "undefined"){ ... ethers.Wallet.createRandom() ... }
-        //   즉 hash 만 단독으로 보내는 순간 서버는 100% 새 hash 를 발급하고,
-        //   화면의 QR 주소가 바뀝니다. 이것이 '요청할 때마다 주소가 달라지는' 원인입니다.
-        //
-        //  둘 중 하나라도 없으면 아예 보내지 않고 깨끗하게 재발급받습니다.
-        //  (반쪽짜리 자격증명을 보내는 것과 결과가 같으면서, 서버 쪽 로그가 명확해집니다)
         const hasPairedCredential = !!(currentSession.hash && currentSession.token);
         if (hasPairedCredential) {
             queryParams.hash = currentSession.hash;
@@ -6682,50 +5775,20 @@ async function checkAuthStatus() {
         } else {
             console.log("[AUTH] 🔑 자격증명 쌍이 없어 bootstrap 요청을 보냅니다. 서버가 (hash, token) 을 새로 발급합니다.");
         }
-
-        // 🌟 [SENDER IMPRINT] Client Worker(index.ts)는 method 와 무관하게
-        //    매 요청의 세션 블록에서 아래를 수행합니다.
-        //      var sender = req.query.sender ? decodeURIComponent(req.query.sender) : data.sender
-        //      if(sender){ data.sender = sender }
-        //      if(data.sender){ cookies.sender = data.sender }
-        //    그런데 신규 유저 생성 시 user_arr 에는 flag/name/title/region/page_count/favicon 만
-        //    들어가고 sender 키가 아예 없어서 cookies.sender 가 영원히 undefined 였습니다.
-        //    그 결과 서버의
-        //      PUT  : if(cookies.sender){ ... INSERT INTO talks ... }
-        //      POST : if(cookies.sender && created_at){ ... INSERT INTO tasks ... }
-        //    두 경로가 통째로 죽어, 채팅이 D1 talks 에 단 한 건도 저장되지 않았습니다.
-        //    여기서 sender 를 실어 보내면 user row 에 영구 각인되어
-        //    이후 모든 요청이 자동으로 통과합니다.
         const senderName = currentSession.email || currentSession.name || "";
         if (senderName) queryParams.sender = senderName;
-
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
-
-        // 🌟 [SESSION PARAMS GUARD] proxy_fetch 는 session_params 의 hash/token 을
-        //    쿼리에 '한 번 더' append 합니다. (Rust proxy_fetch 의 DETAIL 1 블록)
-        //    쌍이 온전하지 않을 때 hash 만 append 되면 위 쿼리 조립을 무력화하므로,
-        //    쌍이 있을 때만 넘깁니다.
         const sessionParams = hasPairedCredential
             ? { hash: currentSession.hash, token: currentSession.token }
             : null;
-
         const sentHash = currentSession.hash || "";
-
         console.log('sessionParams',sessionParams);
-
         const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: sessionParams });
-        
-        // [FIX] Step the spinner frame only when result arrives
         stepQrSpinner();
-
         let session = data.session || data; 
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
-
-            // 🌟 [CREDENTIAL ROTATION DETECT] 온전한 쌍을 보냈는데도 서버가 다른 hash 를 돌려줬다면
-            //    S3 의 /hash/{hash} 객체가 사라졌거나 워커 try 블록이 예외로 빠진 것입니다.
-            //    조용히 넘어가면 원인 추적이 불가능하므로 반드시 표면화합니다.
             if (hashChanged && hasPairedCredential) {
                 console.warn(
                     `[AUTH] ⚠️ 서버가 자격증명을 거부하고 hash 를 회전시켰습니다. ` +
@@ -6733,23 +5796,13 @@ async function checkAuthStatus() {
                     `(S3 /hash/{hash} 객체 소실 또는 워커 세션 블록 예외 가능성)`
                 );
             }
-
             currentSession = { ...currentSession, ...session };
             await saveSession();
-
-            // 🌟 서버가 응답으로 돌려준 hash 이므로 이제 QR 을 그려도 되는 '살아 있는 주소' 입니다.
             isHashServerConfirmed = true;
-
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
-
             console.log('currentSession',currentSession);
-
             if (currentSession.email) {
-                // 🌟 [TEAM MIGRATION TRIGGER] initialize_hub 내부에서 ZERO_ADDRESS → 실제 address
-                //    마이그레이션이 자동으로 수행됩니다.
                 await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" });
-                // 🌟 [OAUTH SYNC] 로그인 직후 서버에서 기존 등록된 사이트 목록을 조회합니다.
-                //    등록 여부와 무관하게 호출하며, 응답을 kv_store 에 저장합니다.
                 await fetchOAuthRegisteredSites();
                 updateAuthUI(); fetchChatHistory(); syncData();
             }
@@ -6765,12 +5818,8 @@ function updateAuthUI() {
     const btnQrAuth = document.getElementById("btn-qr-auth");
     const chatForm = document.querySelector(".chat-form") as HTMLElement;
     const cloudToggle = document.getElementById("cloud-mode-toggle") as HTMLInputElement;
-    
-    // 🌟 [추가] Cloud Members 섹션을 통째로 잡습니다.
     const cloudMembersSection = document.getElementById("nav-list-users")?.closest(".nav-section") as HTMLElement;
-
     console.log('currentSession',currentSession);
-
     if (currentSession.email) {
         if (authStatus) authStatus.innerText = "Authenticated";
         if (btnLogout) btnLogout.style.display = "block";
@@ -6778,16 +5827,12 @@ function updateAuthUI() {
         if (chatForm) chatForm.classList.remove("hidden");
         const qrMsg = document.getElementById("msg-qr-auth");
         if (qrMsg) qrMsg.remove();
-        
         if (cloudToggle) {
             cloudToggle.disabled = false;
             cloudToggle.title = "Cloud AI Mode is available";
         }
-
-        // 🌟 [수정] 로그인 성공 시 Cloud Members 영역을 표시하되, 세팅 화면이 켜져있다면 숨김을 유지합니다.
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
-        if (cloudMembersSection) cloudMembersSection.style.display = isSettingsOpen ? "none" : ""; 
-        
+        if (cloudMembersSection) cloudMembersSection.style.display = isSettingsOpen ? "none" : "";
     } else {
         if (authStatus) authStatus.innerText = "Waiting for Auth...";
         if (btnLogout) btnLogout.style.display = "none";
@@ -6799,24 +5844,12 @@ function updateAuthUI() {
             cloudToggle.checked = false;
             cloudToggle.title = "Login required to use Cloud AI";
         }
-
-        // 🌟 [추가] 비로그인 시 Cloud Members 영역 완전히 숨김
         if (cloudMembersSection) cloudMembersSection.style.display = "none"; 
     }
 }
 
 let authPollInterval: number | null = null;
-
-// 🌟 [QR IDEMPOTENCY] 마지막으로 QR 캔버스를 그린 hash 값입니다.
-//  performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
-//  채팅이 갱신될 때마다 QR 노드를 파괴·재생성하고 있었습니다.
-//  같은 hash 라면 다시 그릴 이유가 없으므로 이 값으로 차단합니다.
 let renderedQrHash = "";
-
-// 🌟 [SERVER-CONFIRMED HASH] 서버가 실제로 응답으로 돌려준 hash 인지 여부입니다.
-//  클라이언트가 로컬에서 만든 임시 hash 는 S3 에 객체가 없어
-//  스캔해도 절대 인증되지 않는 '죽은 주소' 입니다.
-//  서버가 확인해 준 hash 로만 QR 을 그리기 위해 구분합니다.
 let isHashServerConfirmed = false;
 
 function stopAuthPolling() {
@@ -6829,35 +5862,22 @@ function stopAuthPolling() {
 function startAuthPolling() {
     if (authPollInterval) clearTimeout(authPollInterval);
     const poll = async () => {
-        // 인증이 완료되었으면 폴링 중단
         if (currentSession.email) {
             stopAuthPolling();
             return;
         }
-        
-        // 서버에 세션 인증 상태 확인 요청
         await checkAuthStatus();
-        
-        // 아직 인증되지 않았으면 3초 후 다시 재귀 요청
         if (!currentSession.email) {
             authPollInterval = window.setTimeout(poll, 3000);
         } else {
             stopAuthPolling();
         }
     };
-    
-    // 첫 요청은 3초 후 실행
     authPollInterval = window.setTimeout(poll, 3000);
 }
 
 async function performQrAuth() {
     if (!chatTalks) return;
-
-    // 🌟 [DEAD ADDRESS GUARD] 서버가 확인해 주지 않은 hash 로는 QR 을 그리지 않습니다.
-    //    그런 hash 는 S3 에 객체가 없어 스캔해도 인증 메일이 매칭되지 않는 죽은 주소이며,
-    //    잠시 뒤 서버가 새 hash 를 내려주면 화면의 주소가 바뀌어 사용자를 혼란시킵니다.
-    //    대신 '준비 중' 안내를 띄우고, checkAuthStatus 가 hash 를 확보하는 즉시
-    //    hashChanged 분기가 이 함수를 다시 불러 실제 QR 로 교체합니다.
     if (!currentSession.hash || !isHashServerConfirmed) {
         const placeholderId = "msg-qr-auth";
         if (!document.getElementById(placeholderId)) {
@@ -6871,23 +5891,14 @@ async function performQrAuth() {
                 </div>`
             );
         }
-        // 서버에서 hash 를 받아와야 하므로 폴링은 반드시 가동합니다.
         startAuthPolling();
         return;
     }
-
-    // 🌟 [IDEMPOTENT RENDER] 같은 hash 로 이미 QR 을 그려 두었다면 다시 그리지 않습니다.
-    //    performQrAuth 는 loadMoreChat 끝에서 조건 없이 호출되기 때문에
-    //    채팅이 갱신될 때마다 QR 노드를 remove → insert → 캔버스 재생성 하고 있었고,
-    //    함수 말미의 startAuthPolling() 이 3초 타이머를 계속 리셋해
-    //    인증 상태 확인이 지연되는 부작용까지 있었습니다.
     const alreadyRendered = document.getElementById("qr-code-target");
     if (alreadyRendered && renderedQrHash === currentSession.hash) {
-        // 폴링이 꺼져 있을 수 있으므로 그것만 보증하고 즉시 반환합니다.
         if (!authPollInterval && !currentSession.email) startAuthPolling();
         return;
     }
-
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
     const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.8rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
@@ -6897,20 +5908,13 @@ async function performQrAuth() {
         qrTarget.innerHTML = "";
         const mailtoAddr = `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`;
         new (window as any).QRCode(qrTarget, { text: mailtoAddr, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
-
-        // 🌟 이 hash 로 그렸다는 사실을 기록해 다음 호출부터 재생성을 차단합니다.
         renderedQrHash = currentSession.hash;
         console.log(`[AUTH] 🔳 QR rendered for server-confirmed hash '${currentSession.hash}'`);
-
         const scroll = document.getElementById("chat-scroll");
         if (scroll) scroll.scrollTop = scroll.scrollHeight;
     }
-    
-    // 🌟 QR 코드 노출 후 3초 간격으로 세션 인증 상태 반복 확인 시작
     startAuthPolling();
 }
-
-// 🌟 [PARITY] Window Focus/Blur 이벤트 리스너 추가
 window.addEventListener("blur", () => {
     isFocus = false;
     if (chatPollInterval) {
@@ -6919,55 +5923,36 @@ window.addEventListener("blur", () => {
         console.log("[WIDGET] Window blurred. Polling paused to save resources.");
     }
 });
-
 window.addEventListener("focus", () => {
     isFocus = true;
-    
-    // 🌟 [CRITICAL FIX] 크롬 브라우저를 끄고 앱 화면으로 돌아왔을 때 즉시 브라우저 생존 여부를 검사하여 
-    // 브라우저 런처 버튼 노출 및 번개 버튼 상태를 원상복구합니다.
     syncBrowserStatus();
-    
-    // 🌟 [CRITICAL FIX] 이메일(로그인)이 없는 상태에서도 QR 인증 대기를 위해 폴링이 무조건 재개되어야 합니다!
     if (!chatPollInterval) {
         console.log("[WIDGET] Window focused. Polling resumed.");
-        // 창을 다시 봤을 때 즉시 1회 최신화 (로그인 된 상태일 때만)
         if (currentSession.email) {
             fetchChatHistory(false, true); 
         }
         startPolling();
     }
 });
-
-// 🌟 [PARITY] startPolling 함수 업그레이드 (setInterval -> 재귀적 setTimeout)
 function startPolling() {
     if (chatPollInterval) {
         clearTimeout(chatPollInterval);
         chatPollInterval = null;
     }
     if (!isFocus) return;
-
     const poll = async () => {
         if (!isFocus) return;
-
-        // 히스토리(Settings) 창이 열려있을 때만 서버에 인증/동기화 요청을 보냅니다!
         if (currentTab === "settings" && isExpanded) {
             try {
                 if (!currentSession.email) {
                     await checkAuthStatus();
                 } else {
-                    // 🌟 [CRITICAL FIX] 로컬 DB만 조회하던 fetchChatHistory 대신,
-                    // front.js와 동일하게 실제 서버와 통신하는 syncData를 호출해야 합니다!
                     await syncData();
                 }
             } catch (e) {
                 console.error("[POLLING] Error during poll:", e);
             }
         } else {
-            // 🌟 [ANALYTICS ALWAYS-ON] 채팅 화면이 닫혀 있거나 위젯이 접혀 있어도
-            //    analytics 이벤트 수집은 계속되어야 합니다.
-            //    (Worker 의 GET 은 로그인 없이 hash 만으로도 동작하지만,
-            //     사용자 요구사항이 '로그인 이후에도' 이므로 hash 확보 시점부터 돌립니다)
-            //    syncAnalyticsInBackground 내부의 30초 스로틀이 왕복을 억제합니다.
             if (currentSession.hash) {
                 try {
                     await syncAnalyticsInBackground();
@@ -6976,16 +5961,11 @@ function startPolling() {
                 }
             }
         }
-
-        // 🌟 [ADAPTIVE POLLING] 고정 3초 대신 백오프 간격을 적용합니다.
-        //    변경이 있으면 3초, 연속 변경 없음이면 4.5초 → 6.75초 → ... → 최대 30초.
         const nextInterval = computeSyncInterval();
         if (isFocus) {
             chatPollInterval = window.setTimeout(poll, nextInterval);
         }
     };
-
-    // 첫 시작 시 현재 간격으로 대기 후 실행
     const initialInterval = computeSyncInterval();
     chatPollInterval = window.setTimeout(poll, initialInterval);
 }
@@ -6993,29 +5973,14 @@ function startPolling() {
 
 
 async function saveSession() { await kvSet("chat_session", JSON.stringify(currentSession)); }
-
-// 🌟 [추가] Pages 숨김 처리 상태를 담을 전역 배열
 let hiddenPages: string[] = [];
-
 async function initSession() {
-    // 🌟 [AUTH UI FIRST] 어떤 비동기 초기화가 실패하더라도 인증 UI 는 항상 옳은 상태여야 합니다.
-    //    currentSession.email 이 비어 있는 최초 시점에 즉시 호출하면
-    //    Sign Out 버튼이 숨겨지고 QR 인증 버튼이 노출됩니다.
-    //    (세션 복원 후 아래에서 한 번 더 호출해 최종 상태를 확정합니다)
     updateAuthUI();
-
-    // 🌟 [추가] Dexie에서 숨김 페이지 목록을 불러옵니다.
     const savedHiddenPages = await kvGet("hidden_pages");
     if (savedHiddenPages) {
         try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
     }
-
-    // 🌟 [TOMBSTONE PRELOAD] 삭제 묘비를 메모리에 먼저 올립니다.
-    //    startPolling() 이 첫 syncData 를 쏘기 전에 캐시가 채워져야
-    //    앱 재시작 직후 한 번의 폴링 동안 삭제된 메시지가 되살아나는 창이 생기지 않습니다.
     await loadTalkTombstones();
-
-    // 🌟 [CRITICAL FIX 1] 앱 최초 실행 시, Dexie에서 묵은 터미널 찌꺼기 및 30일이 지난 오래된 검색 결과를 완벽 청소합니다!
     const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
     const nowTimeMs = Date.now();
     // 30일을 밀리초 단위로 계산 (30일 * 24시간 * 60분 * 60초 * 1000)
@@ -7069,36 +6034,9 @@ async function initSession() {
     const saved = await kvGet("chat_session");
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = await kvGet("device_hash"); if (legacy) currentSession.hash = legacy; }
-
-    // 🌟 [BOOTSTRAP HASH 폐기]
-    //  ── 무엇이 문제였나 ──
-    //   기존에는 여기서 ethers.Wallet.createRandom() 으로 임시 hash 를 만들었습니다.
-    //   그런데 이 값은
-    //     ① S3 의 /hash/{hash} 객체가 존재하지 않고
-    //     ② 짝이 되는 token 이 없습니다.
-    //   Client Worker(index.ts)의 세션 게이트는
-    //     if(cookies.hash || (req.query.hash && req.query.token))
-    //   인데, Rust proxy_fetch 는 reqwest 에 쿠키 스토어가 없어 Cookie 헤더를
-    //   전혀 보내지 않으므로 워커의 cookies.hash 는 항상 빈 값입니다.
-    //   결국 (hash && token) 쌍이 유일한 통과 조건인데 임시 hash 는 token 이 없어
-    //   반드시 게이트에서 탈락하고, 그러면
-    //     if(typeof balance == "undefined"){ ... createRandom() ... }
-    //   가 발동해 서버가 새 hash 를 발급합니다.
-    //   즉 이 임시 hash 로 그린 QR 은 '스캔해도 절대 인증되지 않는 죽은 주소' 이고,
-    //   서버 응답이 오는 순간 화면의 주소가 바뀌는 원인이었습니다.
-    //
-    //  ── 해결 ──
-    //   hash 발급은 전적으로 서버에 위임합니다.
-    //   hash 가 비어 있으면 checkAuthStatus 가 자격증명 없이 bootstrap 요청을 보내고,
-    //   서버가 S3 에 PUT 까지 마친 유효한 (hash, token) 쌍을 돌려줍니다.
-    //   그 값으로만 QR 을 그리므로 주소가 흔들릴 여지가 사라집니다.
     if (currentSession.hash && currentSession.token) {
-        // 저장된 자격증명이 온전한 쌍이면 서버 확인 전까지는 잠정 신뢰합니다.
         isHashServerConfirmed = true;
     } else if (currentSession.hash && !currentSession.token) {
-        // 🌟 [ORPHAN CREDENTIAL] hash 만 남고 token 이 유실된 상태입니다.
-        //    이 hash 를 그대로 보내면 게이트에서 탈락해 서버가 매번 새 hash 를 발급합니다.
-        //    쌍을 깨뜨려 버리고 깨끗한 bootstrap 을 유도하는 편이 안전합니다.
         console.warn(`[AUTH] ⚠️ hash 는 있으나 token 이 없어 세션이 성립하지 않습니다. 폐기 후 서버에서 재발급받습니다. (orphan hash: ${currentSession.hash})`);
         currentSession.hash = "";
         currentSession.token = undefined;
@@ -7108,26 +6046,13 @@ async function initSession() {
     await saveSession(); 
     currentSession.address = currentSession.address || ZERO_ADDRESS;
     currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
-    // 🌟 [LOGOUT STATE GUARD] 로그아웃 후 reload 시 currentSession 이 초기화되어
-    //    address/team 이 ZERO 로 리셋됩니다. 이 상태에서 syncData 가 호출되면
-    //    ZERO 기반 cc 로 서버에 요청하므로, 미로그인 시 sync 를 건너뜁니다.
-    //    (initSession 하단의 syncData 호출은 currentSession.email 체크로 이미 방어됨)
     updateAuthUI(); 
     startPolling();
 
     try {
         console.log("[WIDGET] UI Ready handshake starting...");
-        
-        // 🌟 1. 새로고침 전 담아두었던 프론트엔드 대기열 먼저 복구 (Dexie 비동기 처리)
         await GlobalTaskManager.loadQueue();
-        
         const data = await invoke<any>("mark_ui_ready");
-
-        // 🌟 [Tauri Bridge -> Dexie] 초기 구동 시 백엔드 데이터를 봉투 형태로 정규화해 적재합니다.
-        //  ⚠️ 기존 코드의 결함: users / pages 가 normalizeEnvelope 를 거치지 않아
-        //     data 객체 없이 json_data 문자열만 들어갔고, 그래서 db.ts 의 Select 가
-        //     매번 parseItemData 로 다시 파싱해야 했습니다.
-        //     v4 부터 세 테이블 모두 동일하게 정규화합니다.
         try {
             if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(data.users));
             if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(data.pages));
@@ -7135,9 +6060,6 @@ async function initSession() {
         } catch(dbErr) {
             console.error("[Dexie] Initial sync failed:", dbErr);
         }
-
-        // 🌟 [CRITICAL FIX] 백엔드에서 실제로 실행 중인 작업이 있다면 프론트엔드 큐 매니저를 바쁨(Busy) 상태로 잠급니다!
-        // 이렇게 해야 대기열에 있던 검색 작업이 새로고침 즉시 백엔드로 뚫고 들어가는 것을 막을 수 있습니다.
         const runningTask = data.tasks && data.tasks.find((t: any) => t.status === 1);
         if (runningTask) {
             GlobalTaskManager.isBusy = true;
@@ -7148,15 +6070,10 @@ async function initSession() {
         const currentLockId = await kvGet("sys_lock");
         if (currentLockId) {
             const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
-            // 🌟 2. DB엔 없어도 TS Queue에 남아있는 녀석은 아직 Rust로 안 넘어간 정당한 대기열입니다.
             const isPendingInQueue = GlobalTaskManager.queue.some(q => q.taskId === currentLockId);
             if (!isTaskStillAlive && !isPendingInQueue) {
                 console.log(`[LOCK] Zombie detected: ${currentLockId} is not active in Backend or Queue. Releasing.`);
                 await kvRemove("sys_lock");
-                // 🌟 [SESSION PRESERVE] 기존에는 여기서 forceReset() 을 호출하여
-                //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
-                //    Zombie lock 해제는 락과 큐 상태만 정리하면 충분합니다.
-                //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
                 GlobalTaskManager.isBusy = false;
                 GlobalTaskManager.currentTaskId = null;
                 GlobalTaskManager.currentTaskPayload = null;
@@ -7243,14 +6160,8 @@ async function initSession() {
                             updated_at: t.updated_at
                         });
                     }
-                    
-                    // 3. 진행 중(1)이거나 대기 중(10)인 작업에 대한 전역 상태 락 설정
-                    // 🌟 [CRITICAL FIX] 검색 작업인데 프론트엔드 큐(TS Queue)에 존재하지 않는다면 실행될 가능성이 없는 유령(Ghost)입니다.
                     const isSearchGhost = t.id.startsWith("search_") && !GlobalTaskManager.queue.some(q => q.taskId === t.id);
-
                     if (!isSearchGhost) {
-                        // 🌟 [CRITICAL FIX] 상태가 10(대기)인 작업까지 스피너를 돌리고 활성 작업으로 덮어쓰는 치명적 버그 수정!
-                        // 오직 상태가 1(Processing)인 진짜 진행 중인 작업만 UI 락을 걸고 스피너를 돌립니다.
                         if (t.status === 1) {
                             await kvSet("sys_lock", t.id);
                             
@@ -7267,7 +6178,6 @@ async function initSession() {
                             GlobalTaskManager.currentTaskId = t.id;
                             GlobalTaskManager.currentTaskPayload = taskData;
                         } else if (t.status === 10) {
-                            // 대기열은 락을 걸지 않고, 오직 버튼 가림막(backendQueued) 목록에만 조용히 추가합니다.
                             taskData.taskId = t.id;
                             GlobalTaskManager.backendQueued.push(taskData);
                             GlobalTaskManager.activeRefs.add(t.id);
@@ -7285,16 +6195,9 @@ async function initSession() {
         if (btnAutoLaunch) {
             if (data.browser_status === "running") {
                 isBrowserRunning = true;
-                // 🌟 [CRITICAL FIX] isAutoLaunchLocked를 여기서 설정하지 않습니다.
-                //    try_reconnect_existing_browser가 IS_BROWSER_LAUNCHING을 일시적으로 true로 설정하면
-                //    mark_ui_ready가 "running"을 반환하고, isAutoLaunchLocked=true가 고정되어
-                //    브라우저가 실제로 없음에도 btnAutoLaunch가 영원히 숨겨지는 버그를 수정합니다.
-                //    isAutoLaunchLocked는 btnAutoLaunch 클릭 시에만 true로 설정되어야 합니다.
                 btnAutoLaunch.style.display = "none";
                 btnAutoLaunch.classList.add("hidden");
             } else {
-                // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
-                //    브라우저가 stopped이면 무조건 btnAutoLaunch를 노출합니다.
                 isBrowserRunning = false;
                 isAutoLaunchLocked = false;
                 btnAutoLaunch.style.display = "flex";
@@ -7302,29 +6205,11 @@ async function initSession() {
             }
             console.log(`[WIDGET] 🔵 [${new Date().toISOString().split('T')[1].slice(0, -1)}] UI Ready Browser Status: ${data.browser_status}`);
         }
-
-        // 🌟 [CRITICAL FIX] 앱 새로고침 시 백엔드에서 감지 중인 브라우저 현재 URL 상태를 완벽 복구합니다.
         if (data.current_url) {
             currentDetectedUrl = data.current_url;
             isCurrentShop = data.is_client || data.is_admin;
-            // 🌟 [CRITICAL FIX] URL 복구 직후 명시적으로 버튼 UI 업데이트 로직을 트리거하여 화면에 즉시 노출되도록 강제
             await updateExtractButtonVisibility();
         }
-
-        // 🌟 [SCHEMA GENERATION CHECK v4]
-        //  store.rs 의 init_all_tables 는 schema_v4 컬럼이 없으면 테이블을 통째로 drop 합니다.
-        //  구버전 사용자는 앱 실행 직후 LanceDB 가 비어 있게 되므로,
-        //  '데이터가 사라진 것처럼 보이는' 상황을 사용자에게 정확히 설명해야 합니다.
-        //  판정: Dexie 에는 데이터가 있는데 LanceDB(mark_ui_ready)가 비어 있으면 세대 전환입니다.
-        //
-        //  🌟 [MULTI-TABLE RESTORE] 기존 구현은 items 만 복구했습니다.
-        //     그런데 init_all_tables 는 items / users / pages 세 테이블을 '전부' drop 합니다.
-        //     users 가 사라지면 팀 통계(base.pages)가 통째로 날아가 네비게이션 카운트가 0이 되고,
-        //     pages 가 사라지면 셀렉터 캐시가 없어져 모든 페이지를 다시 AI 분석해야 합니다.
-        //     세 테이블을 동일한 절차로 복구합니다.
-        //
-        //  🌟 [TABLE HINT] save_item / upsert_items 는 item.table 힌트를 1순위로 신뢰하므로,
-        //     복구 페이로드에 table 을 명시해야 users / pages 가 items 로 새어 나가지 않습니다.
         try {
             const RESTORE_TABLES: Array<{ name: string; hint: string; lanceKey: string }> = [
                 { name: "items", hint: "items", lanceKey: "items" },
@@ -7344,21 +6229,13 @@ async function initSession() {
             }
 
             const alreadyNotified = await kvGet("schema_v4_notified");
-            // 🌟 [LOGIN GATE] 로그아웃 상태에서는 복원을 수행하지 않습니다.
-            //    로그아웃 후 앱 재시작 시 이전 계정 데이터가 복원되어
-            //    로그아웃의 의미가 사라지고, 미로그인 상태에서 서버 데이터가 섞입니다.
-            //    (로그 실측: 로그아웃 직후 upsert_items 3건이 SCHEMA RESTORE 에서 발생)
             if (needsRestore && !alreadyNotified && currentSession.email) {
                 await kvSet("schema_v4_notified", "true");
                 console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local index needs re-population.");
-
                 for (const t of RESTORE_TABLES) {
                     const allRows = await appDb.table(t.name).limit(5000).toArray();
                     if (allRows.length === 0) continue;
-
                     const restorePayload = allRows.map((r: any) => ({
-                        // 🌟 봉투를 루트에 펼치고 확장은 스프레드합니다.
-                        //    (upsert_items 가 루트 평탄화 페이로드를 기대합니다)
                         id: r.id,
                         table: t.hint,
                         type: r.type,
@@ -7373,7 +6250,6 @@ async function initSession() {
                         updated_at: r.updated_at,
                         ...(r.data || {})
                     }));
-
                     console.log(`[SCHEMA] Restoring ${restorePayload.length} '${t.name}' document(s) into LanceDB v4...`);
                     for (let i = 0; i < restorePayload.length; i += 100) {
                         const chunk = restorePayload.slice(i, i + 100);
@@ -7384,22 +6260,14 @@ async function initSession() {
                         }
                     }
                 }
-
                 console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
-
-                // 🌟 벡터/청크는 다시 만들어야 하므로 로컬 임베딩을 트리거합니다.
                 runLocalEmbeddingSync();
-
-                // 🌟 통계/네비게이션이 복구된 users 를 반영하도록 즉시 다시 그립니다.
                 await renderNavigation();
             }
         } catch (e) {
             console.warn("[SCHEMA] Generation check skipped:", e);
         }
-
         await renderNavigation();
-
-        // 🌟 화면이 렌더링된 후 백그라운드에서 조용히 서버와 통신하여 최신 데이터를 반영합니다.
         if (currentSession.email) {
             console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 백그라운드에서 동기화합니다...");
             syncData(); // await를 제거하여 UI 블로킹 방지
@@ -7411,9 +6279,7 @@ async function initSession() {
         console.error("[WIDGET] Handshake failed:", e); 
     }
 }
-
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
-
 document.getElementById("btn-logout")?.addEventListener("click", async () => {
     if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) {
         currentSession = { hash: "", cc: "logis.center" };
@@ -7429,8 +6295,6 @@ document.getElementById("btn-logout")?.addEventListener("click", async () => {
         window.location.reload();
     }
 });
-
-// 🌟 [추가] Dexie DB 초기화 및 앱 리셋 버튼 로직
 document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
     if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
         try {
@@ -7445,15 +6309,6 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
                 chatPollInterval = null;
             }
             stopAuthPolling();
-            // 🌟 [MODE SPLIT] isCommerceSyncRunning 은 modes/commerce.ts 의 모듈 스코프로
-            //    이동해 main.ts 에서는 참조할 수 없습니다. (TS2304 컴파일 실패 원인)
-            //
-            //  ── 제거해도 안전한 이유 ──
-            //   이 줄의 목적은 '초기화 직후 백그라운드 동기화 재진입 차단' 이었는데,
-            //   같은 핸들러 마지막에서 window.location.reload() 가 실행되어
-            //   모듈이 통째로 재평가되므로 그 락은 자동으로 false 로 되돌아갑니다.
-            //   또한 reload 이전 구간에서는 chatPollInterval 이 이미 해제되어
-            //   syncData() → syncCommerceInBackground() 경로 자체가 호출되지 않습니다.
             if (reindexDebounceTimer) {
                 clearTimeout(reindexDebounceTimer);
                 reindexDebounceTimer = null;
@@ -7461,13 +6316,6 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             reindexScheduled = false;
             isReindexing = false;
             console.log("[RESET] All frontend polling and scheduling timers cleared.");
-
-            // 3. 프론트엔드 전역 상태 초기화
-            // 🌟 [RESET DEDUP] forceReset 내부에 reset_lancedb 호출이 이미 있습니다.
-            //    여기서 한 번 더 호출하면 두 번 다 store=None → else 분기 → 새 커넥션 생성 →
-            //    (수정 전에는 주입 안 함 → 드롭) 이 반복됩니다.
-            //    수정 후에도 첫 번째 호출이 주입을 완료하면 두 번째는 불필요한 재리셋이 됩니다.
-            //    forceReset 하나에서만 수행하고 여기서는 제거합니다.
             await GlobalTaskManager.forceReset();
             isExtracting = false;
             isSearching = false;
@@ -7480,20 +6328,12 @@ document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
             activeContext = { cc: "", bcc: "", ref: "" };
             if (docListContainer) docListContainer.innerHTML = "";
             if (chatTalks) chatTalks.innerHTML = "";
-            // 🌟 [REMOVED] 아래 invoke("reset_lancedb") 를 제거합니다.
-            //    forceReset() 내부에서 이미 호출하며, 수정된 reset_lancedb 가
-            //    새 커넥션을 스케줄러에 주입합니다.
             console.log("[RESET] LanceDB backend reset delegated to forceReset().");
-            // 5. 프론트엔드 Dexie DB 완전 삭제 후 재생성
             await appDb.delete();
             await appDb.open();
             console.log("[RESET] Dexie DB deleted and reopened.");
-            // 🌟 v4 : 세대 전환 안내 플래그도 함께 초기화합니다.
-            //    (전체 초기화 후에는 복구할 원본이 없으므로 안내가 다시 뜨면 안 됩니다)
             await kvRemove("schema_v4_notified");
-            // 6. 세션 스토리지 초기화 (새로고침 후 큐 자동 재실행 방지)
             sessionStorage.clear();
-            // 7. 앱 강제 새로고침
             window.location.reload();
         } catch (e) {
             console.error("DB Initialization failed:", e);
@@ -7515,14 +6355,11 @@ async function updateModelStatusUI() {
     TARGET_MODELS.forEach(m => {
         const isDownloaded = modelStatus[m];
         const safeId = m.replace(/[\s\(\)]+/g, '-');
-        
-        // 🌟 [추가] stanza_ prefix 변환 로직
         let displayName = m;
         if (m.startsWith('stanza_')) {
             const lang = m.replace('stanza_', '');
             displayName = `Stanza ${lang.charAt(0).toUpperCase() + lang.slice(1)}`;
         }
-        
         const row = document.createElement("div");
         row.style.display = "flex";
         row.style.flexDirection = "column";
@@ -7530,18 +6367,14 @@ async function updateModelStatusUI() {
         row.style.border = "1px solid rgba(0,0,0,0.1)";
         row.style.padding = "8px";
         row.style.borderRadius = "6px";
-
         const topRow = document.createElement("div");
         topRow.style.display = "flex";
         topRow.style.justifyContent = "space-between";
         topRow.style.alignItems = "center";
-
         const nameSpan = document.createElement("span");
-        // 🌟 [수정] 모델명 뒤에 / apache 2.0 고정 노출
         nameSpan.innerText = `${displayName} / apache 2.0`;
         nameSpan.style.fontSize = "0.75rem";
         nameSpan.style.fontWeight = "bold";
-
         const btn = document.createElement("button");
         btn.id = `btn-download-${safeId}`;
         btn.style.padding = "4px 8px";
@@ -7549,7 +6382,6 @@ async function updateModelStatusUI() {
         btn.style.borderRadius = "4px";
         btn.style.border = "none";
         btn.style.cursor = "pointer";
-
         if (isDownloaded) {
             btn.innerText = "Downloaded";
             btn.style.background = "#6c757d";
@@ -7596,7 +6428,6 @@ async function updateModelStatusUI() {
         container.appendChild(row);
     });
 }
-
 listen("download_progress", (event: any) => {
     const payload = event.payload;
     const safeId = payload.model.replace(/[\s\(\)]+/g, '-');
@@ -7610,20 +6441,15 @@ listen("download_progress", (event: any) => {
         btn.innerText = `Wait (${payload.percent}%)`;
     }
 });
-
 listen("download_complete", (event: any) => {
     const payload = event.payload;
     updateModelStatusUI();
 });
-
 listen("download_error", (event: any) => {
     const payload = event.payload;
     updateModelStatusUI();
     alert(`Error downloading ${payload.model}: ${payload.error}`);
 });
-
-
-// 🌟 [MODEL STATUS UI] 모델 상태를 화면에 렌더링하는 함수
 function renderModelStatusUI(status: any) {
     const models: Array<{ key: string; label: string }> = [
         { key: "Qwen3", label: "Qwen3 (0.6B)" },
@@ -7738,18 +6564,11 @@ document.getElementById("btn-delete-all-models")?.addEventListener("click", asyn
         updateModelStatusUI();
     }
 });
-
-// 앱 렌더링 시 모델 UI 즉시 초기화
 updateModelStatusUI();
-
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 document.getElementById("unload-btn")?.addEventListener("click", async () => {
     try {
-        // 🌟 [SESSION PRESERVE] 기존에는 forceReset() 을 호출하여
-        //    kv_store.clear() → chat_session 소실 → 로그인 풀림이 발생했습니다.
-        //    메모리 해제는 모델/큐 상태만 정리하면 충분하며,
-        //    세션·설정·묘비 등 사용자 데이터는 건드리지 않습니다.
         GlobalTaskManager.isBusy = false;
         GlobalTaskManager.currentTaskId = null;
         GlobalTaskManager.currentTaskPayload = null;
@@ -7758,7 +6577,6 @@ document.getElementById("unload-btn")?.addEventListener("click", async () => {
         stopSpinner();
         await invoke("unload_model");
         alert("Memory cleared.");
-        // 버튼 상태 복구
         await updateExtractButtonVisibility();
         if (btnSubmit && searchInput) {
             const currentVal = searchInput.value.trim();
@@ -7783,7 +6601,6 @@ document.getElementById("invite-email-input")?.addEventListener("input", (e) => 
         if (btn) btn.disabled = false;
     } else if (!emailRegex.test(input.value.trim())) {
         input.style.outline = "1px solid #ef4444";
-        // 형식이 맞지 않으면 전송 버튼을 비활성화하여 오전송 방지
         if (btn) btn.style.opacity = "0.5";
     } else {
         input.style.outline = "1px solid #4ade80";
@@ -7798,30 +6615,21 @@ async function syncBrowserStatus() {
     try { 
         const res = await invoke<any>("get_browser_status"); 
         const s = res.status;
-
-        // 🌟 [CRITICAL FIX] 새 탭(빈 주소) 이동 시에도 currentDetectedUrl을 정상적으로 덮어씌워 버튼을 비활성화합니다!
         if (res.url !== undefined) {
             const urlChanged = currentDetectedUrl !== res.url;
             currentDetectedUrl = res.url;
             isCurrentShop = res.is_client || res.is_admin;
-
             if (urlChanged && !activeContext.cc && currentTab === "settings") {
                 fetchChatHistory(true, true);
             }
         }
-
         if (s === "running") {
             isBrowserRunning = true;
-            // 🌟 [CRITICAL FIX] 런칭 성공 시그널이 오더라도 락을 해제하지 않고 앱 종료 때까지 무조건 숨김을 유지합니다.
             if (btnAutoLaunch) {
                 btnAutoLaunch.style.display = "none";
                 btnAutoLaunch.classList.add("hidden");
             }
         } else {
-            // 🌟 [CRITICAL FIX] isAutoLaunchLocked 조건을 제거합니다.
-            //    window focus 시 syncBrowserStatus()가 호출되는데, 작업 진행 중 브라우저가 종료된 후
-            //    포커스가 돌아오면 isAutoLaunchLocked=true 상태로 이 분기에 진입하여
-            //    btnAutoLaunch가 영원히 노출되지 않는 버그를 수정합니다.
             console.log("[WIDGET] Browser stopped. Resetting UI.");
             isBrowserRunning = false;
             isAutoLaunchLocked = false;
@@ -8413,11 +7221,6 @@ async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string
 
 async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
-
-    // 🌟 [TOMBSTONE GATE] 렌더링 직전 최종 방어선입니다.
-    //    syncData 를 거치지 않는 경로(loadMoreChat → get_chat_messages,
-    //    renderMessage 직접 호출 등)가 새로 생겨도 삭제한 메시지가
-    //    화면에 되살아나지 않도록 여기서 한 번 더 걸러냅니다.
     if (messages && messages.length > 0) {
         const tombs = await loadTalkTombstones();
         if (tombs.size > 0) {
@@ -8429,22 +7232,12 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             if (messages.length === 0) return;
         }
     }
-
-    // 🌟 [EMPTY NOTICE SWEEP] "No messages yet." 안내는 infoNodes 로 분류되어
-    //    아래 정렬 로직에서 항상 최상단에 유지됩니다.
-    //    실제 메시지가 한 건이라도 들어오는 순간 이 문구는 거짓이 되므로 즉시 제거합니다.
     if (messages && messages.length > 0) {
         const noMsgEl = chatTalks.querySelector('.no-msg');
         if (noMsgEl) noMsgEl.remove();
     }
-
-    // 🌟 [RECONCILE FIRST] 서버 행이 도착했다면 그와 짝이 되는 로컬 에코를 먼저 승계 처리합니다.
-    //    반드시 prevScrollHeight 측정 '이전' 에 수행해야 합니다.
-    //    노드를 제거하면 scrollHeight 가 줄어드는데, 측정 이후에 지우면
-    //    아래 스크롤 보정식(heightDiff)이 음수가 되어 화면이 튑니다.
     const supersededIds = await reconcileLocalEchoes(messages);
     if (supersededIds.size > 0) {
-        // 승계된 로컬 행이 이번 배치에도 실려 있다면 렌더링 대상에서 제외합니다.
         messages = messages.filter(m => !supersededIds.has(String(m.id || "")));
         if (messages.length === 0) return;
     }
@@ -8466,8 +7259,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
                         contentObj = rawContent;
                     }
                 }
-                
-                // ArrayBuffer 또는 Gzip 배열 형태의 데이터 파싱 보완
                 if (contentObj && typeof contentObj === 'object' && !contentObj.text && !contentObj.title) {
                     if (Array.isArray(contentObj) || contentObj.buffer) {
                         try {
@@ -8487,8 +7278,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
                 if (!textContent) textContent = String(rawContent);
             }
         }
-
-        // chrome.js 형태의 from 주소 기반 유저/시스템 role 자동 교정
         let computedRole = msg.role;
         if (msg.from && currentSession.address) {
             computedRole = (msg.from.toLowerCase() === currentSession.address.toLowerCase()) ? "user" : "system";
@@ -8502,12 +7291,9 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
 
         if (existingEl) {
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
-            
-            // 🌟 [CRITICAL FIX 3] 한 번 진행 중(1)이 된 작업을 늦게 도착한 이벤트가 다시 대기(10)로 강등시키는 것을 원천 차단합니다!
             if ([1, 2, 6, 9].includes(cachedStatus) && msg.status === 10) {
                 msg.status = cachedStatus; 
             }
-            // 🌟 이미 종료 상태(2, 6, 9)인 메시지를 다시 진행(1)으로 되돌리는 것도 금지합니다.
             if ([2, 6, 9].includes(cachedStatus) && msg.status === 1) {
                 msg.status = cachedStatus; 
             }
@@ -8515,21 +7301,12 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             const isTransitionFromVirtual = cachedStatus === 10 && displayMsg.status !== 10;
             const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
             const cachedText = existingEl.querySelector('.content')?.textContent || "";
-
-            // 🌟 [CRITICAL FIX 2] msg 대신 파싱이 완료된 displayMsg의 속성을 사용하여 안전하게 비교합니다.
             if (isTransitionFromVirtual || displayMsg.updated_at > cachedUpdatedAt || displayMsg.status !== cachedStatus || (displayMsg.text && cachedText !== displayMsg.text)) {
-                
-                // 1. 텍스트 내용 업데이트 (퍼센트 및 요약글)
                 const contentEl = existingEl.querySelector('.content');
-                // 🌟 [CRITICAL FIX 3] msg.text(undefined)가 아닌 displayMsg.text를 꽂아 넣어 빈칸 버그를 해결합니다!
                 if (contentEl && contentEl.textContent !== displayMsg.text) {
                     contentEl.textContent = displayMsg.text;
                 }
-
-                // 2. 상태(Status) 및 아이콘 업데이트
                 let finalStatus = displayMsg.status;
-                
-                // 🌟 [CRITICAL FIX] 좀비 방어: 현재 활성 작업(activeTaskId)이 아니더라도 큐가 돌리고 있는(currentTaskId) 정상 작업이면 STOPPED 처리를 면제합니다.
                 if (finalStatus === 1 && !isSearching && !isExtracting && activeTaskId !== domId && GlobalTaskManager.currentTaskId !== domId) {
                     finalStatus = 2;
                 }
@@ -8552,7 +7329,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
                             2: { icon: "❌", text: "STOPPED", color: "#ef4444" }, // 🌟 아이콘을 ❌로 변경하고 색상을 빨간색으로 고정
                             6: { icon: "❌", text: "ERROR", color: "#ef4444" }
                         };
-                        // 🌟 finalStatus 변수를 참조하거나 msg.status를 직접 매핑에 사용하도록 보장합니다.
                         const s = statusMap[finalStatus] || statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
                         statusBar.style.color = s.color;
                         statusBar.innerHTML = `<span class="${(finalStatus === 1 || msg.status === 1) ? 'active-spinner' : ''}">${s.icon}</span> ${s.text}`;
@@ -8565,8 +7341,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             temp.innerHTML = createMessageHTML(displayMsg);
             const newEl = temp.firstElementChild as HTMLElement;
             if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
-            
-            // 🌟 [CRITICAL FIX] chrome.js 패리티: 신규 메시지만 append/prepend 로 처리하여 DOM 중복 생성을 원천 차단합니다.
             if (mode === 'prepend') {
                 chatTalks.prepend(newEl);
             } else {
@@ -8574,15 +7348,9 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             }
         }
     }
-
-    // 🌟 [CRITICAL FIX] DOM 정렬 로직 강화 (시간 오름차순 및 질문 우선순위 고정)
     const sortedChildren = Array.from(chatTalks.children) as HTMLElement[];
-    
-    // ".no-msg"나 ".chat-history-end" 같은 안내 문구는 정렬 및 중복 검사 대상에서 제외
     const messageNodes = sortedChildren.filter(node => !node.classList.contains('no-msg') && !node.classList.contains('chat-history-end'));
     const infoNodes = sortedChildren.filter(node => node.classList.contains('no-msg') || node.classList.contains('chat-history-end'));
-
-    // 🌟 [중복 노드 제거 헬퍼] 동일한 ID가 여러 개 있을 경우 가장 최신 노드(아래쪽)만 남기고 삭제
     const uniqueIds = new Set();
     const uniqueNodes = [];
     for (let i = messageNodes.length - 1; i >= 0; i--) {
@@ -8591,7 +7359,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
             uniqueIds.add(node.id);
             uniqueNodes.unshift(node); // 원래 순서를 유지하기 위해 앞으로 넣음
         } else {
-            // 중복된 노드는 DOM에서 즉시 파기
             node.remove();
         }
     }
@@ -8599,35 +7366,23 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
     uniqueNodes.sort((a, b) => {
         const timeA = Number(a.dataset.createdAt || 0);
         const timeB = Number(b.dataset.createdAt || 0);
-        
-        // 1. 시간이 다르면 시간순 정렬
         if (timeA !== timeB) {
             return timeA - timeB;
         }
-        
-        // 2. 시간이 동일할 경우, 질문(_query)이 작업 메시지보다 항상 앞에 오도록 배치
         const aId = a.id || "";
         const bId = b.id || "";
         const aIsQuery = aId.endsWith("_query") || aId.includes("_query");
         const bIsQuery = bId.endsWith("_query") || bId.includes("_query");
-        
         if (aIsQuery && !bIsQuery) return -1;
         if (!aIsQuery && bIsQuery) return 1;
-        
-        // 3. 그 외에는 ID 문자열 순서로 고정 정렬
         return aId.localeCompare(bId);
     });
-
-    // 🌟 [핵심 수정] 정렬된 리스트와 현재 DOM 순서를 비교하여 필요한 노드만 재배치
-    // 정보성 노드(안내 문구)는 무조건 가장 위쪽에 배치
     const finalNodes = [...infoNodes, ...uniqueNodes];
     finalNodes.forEach((node, idx) => {
         if (chatTalks.children[idx] !== node) {
             chatTalks.insertBefore(node, chatTalks.children[idx] || null);
         }
     });
-
-    // [Scroll Maintenance]
     if (mode === 'prepend' && scrollEl) {
         const newScrollHeight = scrollEl.scrollHeight;
         const heightDiff = newScrollHeight - prevScrollHeight;
@@ -8647,7 +7402,6 @@ async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'ap
 }
 
 function createMessageHTML(msg: ChatMessage) {
-    // 🌟 상태 2번에 대한 정의를 명시적으로 추가하여 'WAITING'으로 빠지는 것을 방지합니다.
     const statusMap: Record<number, { icon: string, text: string, color: string }> = {
         9: { icon: "✅", text: "DONE", color: "#22c55e" },
         0: { icon: "✅", text: "DONE", color: "#22c55e" },
@@ -8657,18 +7411,12 @@ function createMessageHTML(msg: ChatMessage) {
         10: { icon: "📥", text: "PENDING", color: "#999999" },
         3: { icon: "🛑", text: "STOPPED", color: "#ef4444" }
     };
-    
     const currentStatus = statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
-    
-    // Task Bubble 판단 로직 (ID와 Role 기준)
     const isTaskBubble = msg.role === "system_task" || (!!msg.task_id && msg.task_id.startsWith("search_") && !msg.id.endsWith("_query"));
     const roleClass = msg.role === "user" ? "user" : "system";
     const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
-    
     const timeStr = new Date(Number(msg.created_at)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const bubbleClass = isTaskBubble ? 'task-bubble' : '';
-
-    // 🌟 핵심: msg.text가 비어있지 않도록 보장하여 새로고침 시에도 내용 표시
     const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
 
     const canDelete = !isTaskBubble && msg.role === 'user' && !!msg.id;
@@ -8776,18 +7524,12 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
             }
             return m;
         });
-
-        // 🌟 [CRITICAL FIX 2] 변수 스코프(Scope) 에러 해결! 
         let activeMemContext: any = null;
         try {
             activeMemContext = await invoke<any>("get_active_task_context");
         } catch (e) {}
-
         try {
-            // 1. Rust 백엔드 DB에 저장된 활성 태스크 가져오기
             const activeTasks = await invoke<any[]>("get_active_tasks");
-            
-            // 🌟 2. [수정] 프론트엔드 큐 작업 병합 시, DB에서 이미 종료/중단된 ID는 제외합니다.
             const queuedTasks = GlobalTaskManager.queue.map(q => ({
                 id: q.taskId,
                 task_id: q.taskId,
@@ -8796,12 +7538,9 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                 data_json: q.payload,
                 ref: q.payload.link || q.payload.image_path || "Queued Task"
             }));
-
-            // 🌟 [핵심 로직] DB(activeTasks)에 있는 녀석이 10번이 아니라면(이미 2번 등으로 변했다면) 큐에서 부활시키지 않습니다.
             const combinedTasks = [...activeTasks];
             queuedTasks.forEach(qt => {
                 const dbEquivalent = activeTasks.find(t => t.id === qt.id);
-                // DB에 아예 없거나, DB에서도 여전히 Pending(10)인 경우에만 큐 정보를 신뢰합니다.
                 if (!dbEquivalent) {
                     combinedTasks.push(qt);
                 }
@@ -8813,21 +7552,17 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                     const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
                     taskQuery = taskData.query || "";
                 } catch(e) {}
-
-                // 🌟 [CRITICAL FIX] 새로고침 시 질문 복구 로직 강화
                 if (taskQuery) {
                     const userMsgId = `${t.id}_query`;
                     const userExistsInBatch = messages.some(m => m.id === userMsgId);
                     const userExistsInDom = document.getElementById(userMsgId);
-                    
                     if (!userExistsInBatch && !userExistsInDom) {
                         messages.push({
                             id: userMsgId,
                             task_id: t.id,
                             role: "user",
                             text: taskQuery,
-                            status: 9, 
-                            // 🌟 initSession과 동일하게 100ms 시간차를 주어 정렬 순서를 물리적으로 강제합니다.
+                            status: 9,
                             created_at: Number(t.created_at) - 100, 
                             updated_at: Number(t.created_at) - 100
                         });
@@ -8841,7 +7576,6 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
                         id: t.id,
                         task_id: t.id,
                         role: "system_task",
-                        // 🌟 [UI 보강] DB에 아직 안 들어간 순수 대기열(status: 10) 상태임을 직관적으로 보여줍니다.
                         text: t.id.startsWith("search_") ? "Waiting in Queue: AI Search" : ("Waiting in Queue: " + (t.ref || "Local Source")),
                         status: t.status,
                         created_at: t.created_at + 1,
@@ -8937,31 +7671,16 @@ async function loadMoreChat(isHistory: boolean = false, silent: boolean = false)
 
 async function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
     if (!chatTalks) return;
-    // Single message upsert (Real-time is always append/newest in Slack style)
     await upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
 }
-
-// 🌟 [MODE RUNTIME BIND]
-//  modes/*.ts 가 main.ts 의 전역 상태를 순환 import 없이 사용하도록
-//  부팅 직전에 참조를 단 한 번 주입합니다.
-//
-//  ── 위치가 최하단이어야 하는 이유 ──
-//   appDb / timezoneOffset 은 const, GlobalTaskManager 는 class 선언이라
-//   파일 중·하단에 도달하기 전에는 TDZ(Temporal Dead Zone) 상태입니다.
-//   또한 currentSearchMode / activeContext / isSearching 은 런타임에 계속 바뀌므로
-//   '값' 이 아니라 반드시 '게터' 로 넘겨야 최신값이 반영됩니다.
 bindModeRuntime({
-    // ── 저장소 ──
     appDb: appDb,
     timezoneOffset: timezoneOffset,
     kvGet: kvGet,
     kvSet: kvSet,
     normalizeEnvelope: normalizeEnvelope,
     loadItemTombstones: loadItemTombstones,
-    // 🌟 [PART 2] commerce 트랙의 TOMBSTONE GUARD 가 talk 묘비도 검사합니다.
     loadTalkTombstones: loadTalkTombstones,
-
-    // ── 상태 게터 (지연 평가) ──
     getSession: () => currentSession as any,
     getContext: () => activeContext,
     getSearchMode: () => currentSearchMode,
@@ -8969,11 +7688,7 @@ bindModeRuntime({
     getActiveTags: () => activeTags as any,
     getCurrentTab: () => currentTab,
     isBusy: () => isSearching || isExtracting || GlobalTaskManager.isBusy,
-    // 🌟 [PART 2] forceCpuToggle 은 DOM 참조이므로 반드시 게터여야 합니다.
     getDevicePref: () => getDevicePref(),
-    // 🌟 [PART 2] Map 인스턴스 자체는 main.ts 가 계속 소유합니다.
-    //    modes/commerce.ts 는 delete() 만 수행하고 set() 은 하지 않습니다.
-    //    (등록은 클라우드 검색/추출 핸들러가 담당)
     getCloudPendingTasks: () => cloudPendingTasks as any,
 
     // ── UI 콜백 ──

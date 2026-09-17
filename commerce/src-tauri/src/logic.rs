@@ -1212,11 +1212,24 @@ pub fn trade_field_category(field: &str) -> &'static str {
             | "special_instructions" => "conditions",
 
         // ── financials ──
+        //  🌟 [FINANCIAL ALIAS GUARD] CI overlay 의 'insurance' / 'freight_charge' /
+        //     'grand_total_amount' / 'amount_krw' / 'total_amount_krw' / 'tax_rate' /
+        //     'legalization_fee' / 'discount' 는 전부 금액 축입니다.
+        //     그런데 명시 매핑에 없으면 규칙 폴백이 다음처럼 잡습니다.
+        //       "insurance"        → f.contains("insur")   → insurance   (카테고리명과 충돌)
+        //       "freight_charge"   → f.contains("charge")  → financials  (우연히 정답)
+        //       "legalization_fee" → 어디에도 안 걸림       → ""          (전량 폐기)
+        //     'insurance' 는 실측에서 insurance 버킷을 새로 만들어
+        //     cargo 값이 그 안에 복제되는 오염을 유발했습니다.
+        //     금액 축을 명시적으로 못박아 폴백이 개입할 여지 자체를 없앱니다.
         "currency" | "amount" | "amount_subtotal" | "amount_tax"
             | "freight_amount" | "insurance_amount" | "local_charges"
             | "exchange_rate" | "bank_charges" | "usance_tenor_days" | "tenor"
             | "maturity_date" | "due_date" | "valid_until"
-            | "remittance_reference" | "swift_code" | "account_number" => "financials",
+            | "remittance_reference" | "swift_code" | "account_number"
+            | "insurance" | "freight_charge" | "grand_total_amount"
+            | "amount_krw" | "total_amount_krw" | "tax_rate"
+            | "legalization_fee" | "discount" | "storage_fee" => "financials",
 
         // ── cargo ──
         //  🌟 container_number / seal_number 를 여기서 뺐습니다.
@@ -1295,6 +1308,10 @@ pub fn trade_field_category(field: &str) -> &'static str {
         _ => trade_field_category_by_rule(field),
     }
 }
+
+pub const TRADE_ARRAY_CATEGORIES: &[&str] = &["items", "containers"];
+pub const TRADE_IDENTITY_CATEGORY: &str = "header";
+pub const TRADE_IDENTITY_FIELD: &str = "doc_number";
 
 pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
     ("CI", "commercial invoice"),
