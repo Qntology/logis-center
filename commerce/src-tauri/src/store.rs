@@ -39,70 +39,33 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
 }
 
-// =====================================================================
-// 🌟 [ENVELOPE CONTRACT v5 / SINGLE SOURCE]
-// ---------------------------------------------------------------------
-//  저장소 역할 분담을 코드 한 곳에서 선언합니다.
-//    LanceDB : 봉투(Envelope) 물리 컬럼 + 벡터/FTS 검색 부품
-//    Dexie   : data.* 중첩 인덱스로 도메인 조건 / 정렬 / 페이징
-//
-//  ── 왜 여기로 모으는가 ──
-//   이 계약이 지금까지 다음 5곳에 복제되어 있었고, 실제로 어긋나 있었습니다.
-//     lib.rs   sanitize_scope_filter  : 봉투 컬럼 화이트리스트(스키마와 별도 상수)
-//     lib.rs   upsert_items           : 예약 타입 / mode 자동 태깅 / 테이블 라우팅
-//     store.rs upsert_item            : mode 추론 / non_seed_type
-//     store.rs resolve_table          : 물리 테이블 라우팅
-//     lib.rs   reindex_pending_embeddings : EMBED_EXCLUDE_TYPES
-//   실측 결함:
-//     · lib.rs 의 is_analytic_type 에 'touch' 가 빠져 touch 이벤트가 commerce 로 태깅됨
-//     · store.rs 의 non_seed_type 에도 'touch' 가 빠져 커머스 시드 16키가 주입됨
-//   아래 상수/함수가 유일한 진실의 원천이며, 모든 호출부는 여기에 위임합니다.
-// =====================================================================
-
-/// LanceDB 물리 봉투 컬럼. sanitize_scope_filter / build_scope_filter 가 공유합니다.
-/// 이 목록 밖의 술어는 전부 Dexie 로 위임됩니다.
-/// ⚠️ init_all_tables 의 Field 선언과 반드시 같은 집합이어야 합니다.
 pub const ENVELOPE_COLUMNS: [&str; 11] = [
     "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
     "created_at", "updated_at",
 ];
 
-/// analytic 트랙 문서 타입.
-/// analytic.rs 의 ANALYTIC_EVENT_TYPES(원시 이벤트 4종) + report / question / answer.
 pub const ANALYTIC_TYPES: [&str; 7] = [
     "click", "hover", "change", "touch", "report", "question", "answer",
 ];
-
-/// 채팅 말풍선(talks 테이블) 전용 타입. items 로 유입되면 안 됩니다.
 pub const TALK_TYPES: [&str; 3] = ["talk", "prompt", "ai_search"];
-
-/// 커머스 도메인 예약 타입.
 pub const COMMERCE_TYPES: [&str; 9] = [
     "sales", "goods", "order", "tracking", "event", "coupon", "review",
     "receiving", "shipping",
 ];
-
-/// 사용자 / 팀 통계 문서 타입.
 pub const USER_TYPES: [&str; 3] = ["member", "team", "user"];
 
 pub fn is_analytic_type(type_: &str) -> bool {
     let t = type_.trim().to_lowercase();
     ANALYTIC_TYPES.iter().any(|x| *x == t)
 }
-
 pub fn is_talk_type(type_: &str) -> bool {
     let t = type_.trim().to_lowercase();
     TALK_TYPES.iter().any(|x| *x == t)
 }
-
 pub fn is_user_type(type_: &str) -> bool {
     let t = type_.trim().to_lowercase();
     USER_TYPES.iter().any(|x| *x == t)
 }
-
-/// 예약 타입 판정. 무역 서식 코드 정규화(canonical_trade_doc_code)를 태우면 안 되는 타입입니다.
-/// ⚠️ 'ID'(Import Declaration) / 'CO' / 'CA' / 'PC' 처럼 커머스 소문자 타입과
-///    대소문자만 다른 무역 코드가 존재하므로, 예약 판정이 먼저 와야 합니다.
 pub fn is_reserved_type(type_: &str) -> bool {
     let t = type_.trim().to_lowercase();
     t == "unknown"
@@ -112,9 +75,6 @@ pub fn is_reserved_type(type_: &str) -> bool {
         || is_analytic_type(&t)
         || COMMERCE_TYPES.iter().any(|x| *x == t)
 }
-
-/// 타입만으로 트랙(mode)을 확정합니다.
-/// 판정 순서는 기존 store.rs::upsert_item 과 동일합니다(무역 → analytic → commerce).
 pub fn infer_mode(type_: &str) -> &'static str {
     if crate::utils::bias_schema::is_trade_doc_type(type_) {
         "shipping"
@@ -124,9 +84,6 @@ pub fn infer_mode(type_: &str) -> &'static str {
         "commerce"
     }
 }
-
-/// 물리 테이블 라우팅. v4 부터 도메인 타입은 전부 items 로 접히고,
-/// 구분은 type 컬럼이 담당합니다.
 pub fn resolve_table_for(table_or_type: &str) -> &'static str {
     let t = if table_or_type.starts_with("commerce_") {
         &table_or_type[9..]
@@ -806,46 +763,9 @@ impl VectorStore {
 
         Ok(())
     }
-    
-// 🌟 [CANONICALIZE v5 / RULE-BASED]
-    //  ── 무엇이 바뀌었나 ──
-    //   기존은 ID_KEYS / NUM_KEYS / BOOL_KEYS 라는 '이름 화이트리스트' 였습니다.
-    //   그래서 Dexie 에 data.container_number 를 추가하면 여기 배열과
-    //   find_item_by_property 의 복제본까지 총 4곳(배열 길이 상수 포함)을 고쳐야 했습니다.
-    //
-    //   이제는 '이미 존재하는 키를 순회' 하면서 crate::utils::canonical::kind_of() 로
-    //   접미사/부분일치 규칙 판정을 받습니다.
-    //   → 새 필드를 Dexie 에 추가해도 이 함수는 영원히 수정할 필요가 없습니다.
-    //
-    //  ── seed_defaults 의 의미 ──
-    //   Dexie 의 data.* 인덱스는 undefined 값을 조용히 제외합니다.
-    //   그래서 items 문서에는 '조회 축으로 쓰는 최소 기본값' 을 시딩해야 합니다.
-    //   시딩 목록은 SEED_KEYS 하나로만 관리하며, 조회 축이 늘 때만 손댑니다.
-    //   (조회 축이 아닌 단순 저장 필드는 시딩이 전혀 필요 없습니다)
+
     fn canonicalize_data(mut v: Value, seed_defaults: bool) -> Value {
         use crate::utils::canonical::{kind_of, iso_to_epoch_ms, CanonKind};
-
-        // 🌟 [SEED KEYS] Dexie stores() 에 인덱스로 선언된 data.* 경로 중
-        //    '값이 없을 때 기본값이 있어야 조회가 성립하는' 키만 나열합니다.
-        //    이 목록은 main.ts 의 ITEMS_SCHEMA 와 대응하며,
-        //    인덱스를 추가하지 않는 단순 확장 필드는 여기 넣을 필요가 없습니다.
-        // 🌟 [NUMERIC SEED REMOVED]
-        //  ── 무엇이 문제였나 ──
-        //   amount / sale_price / supply_price / quantity / weight / discount /
-        //   started_at / expired_at 을 0 으로 시딩하면,
-        //   main.ts 의 matchCondition 이 가진 MISSING VALUE GUARD 가
-        //   raw === 0 을 '값이 있음' 으로 판정해 발화하지 못합니다.
-        //   그 결과 'sale_price lte 5000' 같은 조건이
-        //   가격 필드를 아예 갖지 않는 문서(무역 서식 등)를 전부 통과시켰습니다.
-        //   가드를 도입한 목적이 시딩에 의해 정확히 원위치된 상태였습니다.
-        //  ── 시딩을 빼도 되는 이유 ──
-        //   Dexie 는 키가 없는 레코드를 해당 인덱스에서 조용히 제외합니다.
-        //   where('data.sale_price').belowOrEqual(5000) 이
-        //   '가격을 가진 문서' 만 돌려주는데, 그것이 정확히 옳은 동작입니다.
-        //  ⚠️ status / created_at / updated_at 은 남깁니다.
-        //     status 0 은 build_dexie_plan 의 ZERO GUARD 가 조건으로 만들지 않고,
-        //     created_at / updated_at 은 봉투 필드라 항상 실제 값이 들어옵니다.
-        //  ⚠️ main.ts 의 SEED_KEYS 와 반드시 같은 집합이어야 합니다.
         const SEED_KEYS: &[(&str, CanonKind)] = &[
             // ── 식별자 ──
             ("id", CanonKind::Identifier),
@@ -873,9 +793,6 @@ impl VectorStore {
             Some(o) => o,
             None => return json!({}),
         };
-
-        // ── ① 기존 키 전량 정규화 (규칙 기반) ──
-        //    새 필드도 여기서 자동으로 처리되므로 Rust 수정이 불필요합니다.
         let existing: Vec<String> = obj.keys().cloned().collect();
         for k in existing {
             let kind = kind_of(&k);
@@ -883,11 +800,6 @@ impl VectorStore {
 
             match kind {
                 CanonKind::Identifier => {
-                    // 🌟 [MISSING PARITY] main.ts 의 canonicalizeData 는
-                    //    null / undefined 를 만나면 `continue` 로 건너뜁니다.
-                    //    여기서 String::new() 로 확정하면 같은 문서가
-                    //    LanceDB 에는 "" , Dexie 에는 null 로 저장되어
-                    //    where('data.xxx').equals(...) 결과가 갈립니다.
                     let s = match obj.get(&k) {
                         Some(Value::Null) | None => continue,
                         Some(Value::String(s)) => s.clone(),
@@ -899,16 +811,6 @@ impl VectorStore {
                     obj.insert(k, json!(s));
                 },
                 CanonKind::Numeric => {
-                    // 🌟 [MISSING PARITY / T2 완결]
-                    //  ── 무엇이 문제였나 ──
-                    //   null / "" 를 0.0 으로 확정하면, SEED_KEYS 에서 수치 시딩을 제거해도
-                    //   LLM 이 '못 찾음' 으로 내려보낸 null 이 그대로 0 이 되어
-                    //   matchCondition 의 MISSING VALUE GUARD 가 다시 무력화됩니다.
-                    //   ('sale_price lte 5000' 이 가격 없는 문서를 전부 통과)
-                    //   main.ts 는 이 세 경우를 전부 continue 로 건너뜁니다.
-                    //  ── 파싱 실패도 동일 취급 ──
-                    //   "N/A" 처럼 숫자로 환원 불가능한 값은 '0' 이 아니라 '없음' 입니다.
-                    //   0 으로 확정하면 bottom 랭킹이 그 문서를 최상위로 끌어올립니다.
                     let n: f64 = match obj.get(&k) {
                         None | Some(Value::Null) => continue,
                         Some(Value::Number(num)) => num.as_f64().unwrap_or(0.0),
@@ -916,14 +818,9 @@ impl VectorStore {
                         Some(Value::String(s)) => {
                             let t = s.trim();
                             if t.is_empty() || t == "null" || t == "N/A" { continue; }
-                            // 🌟 status 는 'complete' 같은 상태 문자열이 들어올 수 있습니다.
                             if k == "status" {
                                 crate::logic::parse_status(t) as f64
                             } else if let Some(ms) = iso_to_epoch_ms(t) {
-                                // 🌟 [ISO DATE] scheduler 의 normalize_data 가 만든
-                                //    "2024-01-01T12:00:00" 을 epoch ms 로 확정합니다.
-                                //    이 처리가 없으면 숫자만 추출해 파싱에 실패하고
-                                //    모든 기간 조건이 0 으로 뭉개집니다.
                                 ms as f64
                             } else {
                                 let cleaned: String = t.chars()
@@ -931,7 +828,6 @@ impl VectorStore {
                                     .collect();
                                 match cleaned.parse::<f64>() {
                                     Ok(v) => v,
-                                    // 숫자로 환원 불가 → '값 없음' 으로 두고 키를 건드리지 않습니다.
                                     Err(_) => continue,
                                 }
                             }
@@ -945,9 +841,6 @@ impl VectorStore {
                     }
                 },
                 CanonKind::Boolean => {
-                    // 🌟 [MISSING PARITY] main.ts 는 null / undefined 를 건너뜁니다.
-                    //    `_ => false` 로 두면 '값 없음' 이 '거짓' 으로 확정되어
-                    //    data.embed / data.is_device 인덱스 판정이 두 저장소에서 갈립니다.
                     let b = match obj.get(&k) {
                         Some(Value::Bool(x)) => *x,
                         Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
@@ -1127,10 +1020,6 @@ impl VectorStore {
                     final_id
                 );
             }
-            // 🌟 [CC-INDEPENDENT SKIP] digest 가 달라도 embed=1 이고 chunk 가 존재하면
-            //    '이미 임베딩 완료된 문서의 cc 변경' 으로 간주하여
-            //    upsert 는 수행하되 embed 플래그를 data 에 강제 주입합니다.
-            //    (upsert 자체는 막지 않습니다 — cc/bcc/ref 갱신은 필요하므로)
             let old_data = serde_json::from_str::<Value>(&doc.json_data).ok();
             let old_embedded = old_data.as_ref()
                 .and_then(|v| v.get("embed"))
@@ -1147,27 +1036,6 @@ impl VectorStore {
 
         println!("[DEBUG] store.upsert_item (v4) - Table: {}, ID: {}, Type: {}", target, final_id, type_);
 
-        // 🌟 [VISION MARKER] '이 문서가 실제 비전 벡터를 갖는가' 를 데이터에 각인합니다.
-        //
-        //  ── 왜 필요한가 ──
-        //   비전 벡터가 없는 문서는 vec![0.0; 1152] 로 저장됩니다.
-        //   LanceDB 기본 거리는 L2 제곱이고, 정규화 질의 q 에 대해
-        //     ‖q − 0‖² = ‖q‖² = 1.00
-        //     ‖q − v‖² = 2 − 2·cos(q, v)
-        //   이므로 cos < 0.5 인 모든 실제 이미지 문서가 0 벡터보다 멀리 있습니다.
-        //   SigLIP2 는 logit_scale=4.7188 (temperature ≈ 112) 로 학습되어
-        //   이미지↔텍스트 코사인이 0.05~0.15 대역입니다. 0.5 에 절대 도달하지 않습니다.
-        //   → 비전 트랙이 텍스트 전용 문서 200건으로 창을 채우고
-        //     정작 이미지 문서는 한 건도 반환하지 않습니다. 의도와 정반대입니다.
-        //
-        //  ── 왜 별도 컬럼이 아니라 data 인가 ──
-        //   v4 봉투 계약은 '도메인 값은 전부 data 로' 입니다.
-        //   물리 컬럼을 늘리면 SCHEMA_VERSION 을 올려 전 테이블을 drop 해야 합니다.
-        //   canonical.rs 의 BOOL_PREFIX("has_") 규칙이 이 키를 0|1 로 자동 확정하고,
-        //   main.ts 의 동일 규칙이 Dexie 쪽 판정을 맞추므로 양쪽 수정이 전혀 필요 없습니다.
-        //
-        //  ⚠️ 기존에 저장된 이미지 문서에는 이 키가 없습니다.
-        //     재추출 전까지 비전 트랙에 잡히지 않지만, 잘못된 결과를 내는 것보다 낫습니다.
         let has_real_vision = vision_vec
             .as_ref()
             .map(|v| v.len() == 1152 && v.iter().any(|&x| x != 0.0))
@@ -1175,10 +1043,6 @@ impl VectorStore {
 
         let _ = table.delete(&format!("id = '{}'", final_id)).await;
         let mut final_data = data_val.clone();
-        // gzip/base64 로 압축되어 온 서버 페이로드 해제 (기존 동작 유지)
-        // 🌟 [MERGE FIX] 기존에는 final_data 를 decompressed 로 '전체 교체' 하여
-        //    봉투 필드(id, type, cc, from, to, mode, created_at 등)가 전부 사라졌습니다.
-        //    이제는 내부 객체만 병합하고 "data" 키만 제거합니다.
         if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
             if blob_base64.len() > 50 {
                 use base64::prelude::BASE64_STANDARD;
@@ -1201,24 +1065,10 @@ impl VectorStore {
             }
         }
 
-        // 🌟 [CANONICALIZE — 단일 호출로 통합]
-        //
-        //  ── 무엇이 문제였나 ──
-        //   여기에 canonicalize_data 의 본문(Identifier / Numeric / Boolean / Tags 판정)이
-        //   그대로 복사되어 있었고, 함수 말미에서 Self::canonicalize_data 가 또 한 번 돌았습니다.
-        //   즉 같은 규칙이 한 문서에 두 번 적용되고, 두 벌의 코드가 따로 늙어갔습니다.
-        //   canonicalize_data 의 주석이 "SINGLE SOURCE" 라고 선언한 계약이 깨진 상태였습니다.
-        //
-        //  ── 해결 ──
-        //   여기서는 정규화하지 않습니다. 봉투 확정과 미러링만 수행하고,
-        //   실제 타입 확정은 함수 말미의 Self::canonicalize_data(final_data, seed_defaults)
-        //   한 번으로 끝냅니다. (시딩 여부까지 그 호출이 함께 결정합니다)
         let src = &final_data;
         let mode_str = match src.get("mode").and_then(|v| v.as_str()) {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
             _ => {
-                // 🌟 [MODE 추론 위임] lib.rs::upsert_items 와 같은 판정기를 씁니다.
-                //    기존에는 두 곳에 복제되어 있었고, lib.rs 쪽에 'touch' 가 빠져 있었습니다.
                 let inferred = infer_mode(type_);
                 if inferred != "commerce" {
                     println!(
@@ -1244,25 +1094,6 @@ impl VectorStore {
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
             .unwrap_or(wall_now);
-
-        // 🌟 [ENVELOPE MIRROR] 봉투 값을 물리 컬럼과 data 양쪽에 '같은 값' 으로 확정합니다.
-        //
-        //  ── 무엇이 문제였나 ──
-        //   봉투가 반반으로 흩어져 있었습니다.
-        //     from / to / cc / bcc / ref → 물리 컬럼에만 기록, data 에는 미반영
-        //     flag                       → data 에만 존재, 물리 컬럼이 그것을 읽어감
-        //   Dexie 는 json_data(= data) 를 보는데 그 안의 cc 가 비어 있거나 옛 값이었습니다.
-        //   migrate_team_identity 이후 Dexie 쪽 스코프가 어긋나는 직접 원인입니다.
-        //
-        //  ── 해결 ──
-        //   인자 → data → 빈 문자열 순으로 한 번 확정하고(resolve_envelope_field),
-        //   그 확정값을 물리 컬럼과 data 에 동시에 씁니다.
-        //   두 저장소가 구조적으로 갈라질 수 없습니다.
-        //
-        //  ⚠️ kind_of("from"/"to"/"cc"/"bcc"/"ref") 는 전부 Free 이므로
-        //     canonicalize_data 가 이 값들을 변형하지 않습니다.
-        //     json_to_natural_language 도 이 키들을 스킵 목록에 두고 있어
-        //     청크·임베딩 본문에 새어 들어가지 않습니다.
         let env_from = resolve_envelope_field(from, &final_data, "from");
         let env_to   = resolve_envelope_field(to,   &final_data, "to");
         let env_cc   = resolve_envelope_field(cc,   &final_data, "cc");
@@ -1282,7 +1113,6 @@ impl VectorStore {
             obj.insert("mode".to_string(), json!(mode_str.clone()));
             obj.insert("created_at".to_string(), json!(created_at));
             obj.insert("updated_at".to_string(), json!(updated_ts));
-            // 🌟 봉투 5축을 data 에도 그대로 각인합니다. (Dexie 가 보는 문서가 자기완결적이 됩니다)
             obj.insert("from".to_string(), json!(env_from.clone()));
             obj.insert("to".to_string(), json!(env_to.clone()));
             obj.insert("cc".to_string(), json!(env_cc.clone()));
@@ -1291,24 +1121,10 @@ impl VectorStore {
             if !new_digest.is_empty() {
                 obj.insert("digest".to_string(), json!(new_digest.clone()));
             }
-            // 🌟 참일 때만 넣습니다. 키 부재 = 비전 벡터 없음이라는 뜻이 명확해지고,
-            //    LIKE 프리필터가 그대로 성립합니다.
             if has_real_vision {
                 obj.insert("has_vision".to_string(), json!(1));
             }
         }
-        // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
-        //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
-        //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
-        //
-        //    🌟 [ANALYTICS] analytics 트랙 행동 로그(click / hover / change / report)와
-        //       관리자 Q&A(question / answer)도 commerce 도메인 필드를 갖지 않습니다.
-        //       main.ts 의 NON_SEED_TYPES 와 반드시 동일한 집합이어야 두 저장소가 일치합니다.
-        // 🌟 [SEED 판정 위임] 기존 인라인 matches! 에는 'touch' 가 빠져 있어
-        //    touch 이벤트에 커머스 시드 16키(id/no/code/tracking_number/index/goods/
-        //    order/tracking/status/embed/tags ...)가 강제 주입되었습니다.
-        //    main.ts 의 NON_SEED_TYPES 와 같은 집합이어야 한다는 계약이 깨진 상태였습니다.
-        //    이제 needs_domain_seed 하나가 유일한 판정자입니다.
         let seed_defaults = needs_domain_seed(target, type_);
         let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
@@ -1326,8 +1142,6 @@ impl VectorStore {
         let values_builder = Float32Array::from(safe_vector);
         let list_field = Field::new("item", DataType::Float32, true);
         let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 384, Arc::new(values_builder), None)?;
-
-        // 🌟 [비전 벡터] 1152차원. 이미지 미추출 문서는 0 벡터.
         let safe_vision_vec = match vision_vec {
             Some(v) if v.len() == 1152 => v,
             _ => vec![0.0; 1152],
@@ -1335,14 +1149,6 @@ impl VectorStore {
         let vision_values_builder = Float32Array::from(safe_vision_vec);
         let vision_list_field = Field::new("item", DataType::Float32, true);
         let vision_list_array = FixedSizeListArray::try_new(Arc::new(vision_list_field), 1152, Arc::new(vision_values_builder), None)?;
-
-        // 🌟 컬럼 순서는 init_all_tables 의 schema 정의와 1:1 로 일치해야 합니다.
-        //    0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
-        //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 vision_vec / 14 text / 15 masked_text / 16 schema_v4
-        //    🌟 updated_ts 가 0 이면 draft 입니다. 물리 컬럼에도 0 을 그대로 남겨야
-        //       프론트엔드(Dexie)와 서버(proxy)의 draft 판정이 일치합니다.
-        // 🌟 [ENVELOPE MIRROR] 물리 컬럼에는 반드시 위에서 확정한 env_* 를 씁니다.
-        //    인자를 직접 쓰면 data 에 각인한 값과 갈라질 수 있습니다.
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(StringArray::from(vec![final_id])),
             Arc::new(StringArray::from(vec![type_])),
@@ -1381,10 +1187,6 @@ impl VectorStore {
             }
         }
 
-        // 🌟 [ENVELOPE] flag / mode / text 를 data 안에 명시적으로 넣습니다.
-        //    canonicalize_data 가 ID/NUM/BOOL 키만 건드리므로 base 통계 트리는 그대로 보존됩니다.
-        //    text 가 비면 LanceDB text 컬럼이 빈 문자열이 되어 FTS 대상에서 제외되므로
-        //    최소한의 식별 문구를 넣어 둡니다.
         let team_data = json!({
             "flag": flag,
             "mode": "commerce",
@@ -1412,17 +1214,6 @@ impl VectorStore {
         Ok(())
     }
 
-    /// 🌟 [TEAM IDENTITY MIGRATION] 로그인 전 ZERO_ADDRESS 기반으로 생성된 문서들의
-    ///    `to` 필드를 실제 team_id 로 일괄 갱신합니다.
-    ///
-    ///  호출 시점: initialize_user_profiles 직후 (main.ts 의 initSession 에서
-    ///             currentSession.address 가 확정된 후)
-    ///
-    ///  대상: items / users / pages 3개 테이블에서
-    ///        `to = hash_id(ZERO_ADDRESS)` 인 행 전부
-    ///
-    ///  방식: get_all_items 로 스캔 → to 필드 교체 → upsert_item 재저장
-    ///        (LanceDB 는 UPDATE 가 없으므로 delete + add 패턴)
     pub async fn migrate_team_identity(
         &self,
         old_to: &str,
@@ -1441,24 +1232,6 @@ impl VectorStore {
                     obj.insert("to".to_string(), json!(new_to));
                     obj.insert("from".to_string(), json!(new_from));
                 }
-                // 🌟 [VECTOR LOSS FIX]
-                //
-                //  ── 무엇이 문제였나 ──
-                //   기존 주석은 "기존 vector 를 재사용합니다" 였지만,
-                //   batch_to_docs 가 vector / vision_vec 을 항상 Vec::new() 로 비웁니다.
-                //   따라서 doc.vector.len() 은 언제나 0 이고 None 이 넘어가,
-                //   upsert_item 이 vec![0.0; 384] 로 덮어썼습니다.
-                //   비전 벡터도 None 이므로 함께 0 이 됩니다.
-                //   그런데 data.embed 는 1 로 남아 reindex 가 재생성하지도 않아,
-                //   로그인 한 번에 그 팀의 벡터 검색이 영구히 죽는 경로였습니다.
-                //
-                //  ── 왜 벡터를 읽어오지 않고 재생성을 택하는가 ──
-                //   batch_to_docs 가 벡터를 채우게 하면 get_all_items 의 모든 호출부가
-                //   행당 384+1152 float 를 복사합니다. 5000건이면 30MB 가
-                //   목록 조회 한 번마다 왕복합니다. 마이그레이션은 로그인 1회뿐이므로
-                //   그 비용을 상시 경로에 지우는 것은 균형이 맞지 않습니다.
-                //   대신 embed 마커를 제거해 다음 reindex 폴링이 정상 재생성하게 합니다.
-                //   (청크도 함께 지워야 count_chunks_by_item 가드에 걸리지 않습니다)
                 if let Some(obj) = data.as_object_mut() {
                     obj.remove("embed");
                 }
@@ -1570,20 +1343,6 @@ impl VectorStore {
         Ok(migrated)
     }
 
-
-    // 🌟 [ROW READER] RecordBatch → TradeDocument 변환을 한 곳으로 모읍니다.
-    //  기존에는 get_all_items / get_item_by_id 가 컬럼 인덱스를 각자 하드코딩해서
-    //  스키마가 바뀔 때마다 두 곳을 동시에 고쳐야 했고, 실제로 어긋난 적이 있습니다.
-    //
-    //  ⚠️ [SCHEMA CONTRACT] 아래 인덱스는 init_all_tables 의 Field 선언 순서와 1:1 대응입니다.
-    //     0 id / 1 type / 2 flag / 3 from / 4 to / 5 cc / 6 bcc / 7 ref / 8 mode
-    //     9 data / 10 created_at / 11 updated_at
-    //     12 vector(384) / 13 vision_vec(1152) / 14 text / 15 masked_text / 16 schema_v4
-    //
-    //     봉투 컬럼을 '중간에' 추가하면 뒤 인덱스가 전부 밀려 search_items(column(9)) 등
-    //     다른 지점까지 조용히 깨집니다. 봉투를 늘려야 한다면 반드시 '끝에' 추가하고
-    //     SCHEMA_VERSION 을 올려 구세대 테이블이 drop 되도록 하세요.
-    //     그보다 먼저 'data.* 로 내릴 수 없는가' 를 검토하는 것이 v4 설계 의도입니다.
     fn batch_to_docs(batch: &RecordBatch) -> Vec<TradeDocument> {
         let ids         = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types       = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
@@ -1597,8 +1356,6 @@ impl VectorStore {
         let jsons       = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
         let createds    = batch.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
         let updateds    = batch.column(11).as_any().downcast_ref::<Int64Array>().unwrap();
-        // 🌟 12=vector, 13=vision_vec 은 구조체 매핑에서 건너뜁니다.
-        //    14=text, 15=masked_text 로 인덱스가 밀렸습니다.
         let texts       = batch.column(14).as_any().downcast_ref::<StringArray>().unwrap();
         let masked      = batch.column(15).as_any().downcast_ref::<StringArray>().unwrap();
 
@@ -1635,11 +1392,6 @@ impl VectorStore {
         if let Some(f) = filter {
             if !f.trim().is_empty() { q = q.only_if(f); }
         }
-
-        // 🌟 [SCAN CAP] 기존 `max(20_000, (offset+limit) * 50)` 은 상한이 아니라 증폭기였습니다.
-        //    migrate_team_identity 가 limit 5000 으로 부르면 250,000 행을 파싱하고 정렬했습니다.
-        //    LanceDB 는 이 버전에서 ORDER BY 푸시다운이 없으므로 '메모리에 올려 정렬' 은 불가피하지만,
-        //    올릴 양의 천장은 고정되어야 합니다. 요청량보다 적게 읽는 일은 없습니다.
         const SCAN_CEILING: usize = 20_000;
         let scan_cap = std::cmp::max(offset + limit, SCAN_CEILING);
         let results = q.limit(scan_cap).execute().await?.try_collect::<Vec<_>>().await?;
@@ -1663,41 +1415,17 @@ impl VectorStore {
         let docs = Self::batch_to_docs(&results[0]);
         Ok(docs.into_iter().next())
     }
-    
-    // 🌟 [2-TRACK RECALL SEARCH / v4]
-    //  Track 1(Column Matching) 을 완전히 제거합니다.
-    //
-    //  ── 왜 제거하는가 ──
-    //   v4 부터 filter 인자는 '스코프' 전용입니다. (type / mode / cc / bcc / ref / 시간)
-    //   도메인 조건(가격/수량/송장번호/상태)은 SQL 로 내려오지 않고 Dexie 가 처리합니다.
-    //   따라서 '조건 매칭 +3.0' 이라는 트랙이 성립할 수 없습니다.
-    //   기존 has_real_condition 가드는 이 상황을 이미 부분적으로 방어하고 있었는데,
-    //   v4 에서는 그 분기가 항상 false 가 되므로 코드째로 걷어냅니다.
-    //
-    //  ── 역할 재정의 ──
-    //   LanceDB = 리콜(넓게 긁기). 점수는 '의미 근접도' 만 표현합니다.
-    //   Dexie   = 정밀도(정확히 자르기). 조건/정렬/페이징 담당.
-    //   → 그래서 fetch_limit 을 넉넉히(요청의 4배, 최소 200) 잡습니다.
-    //     Dexie 가 뒤에서 조건으로 잘라내므로 여기서 좁히면 정답이 사라집니다.
+
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, vision_query_vec: Option<Vec<f32>>, limit: usize, offset: usize, filter: Option<String>, use_fts: bool) -> Result<Vec<(String, String, f32)>> {
          let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
          let table = self.conn.open_table(target).execute().await?;
 
          let mut combined: std::collections::HashMap<String, (String, f32)> = std::collections::HashMap::new();
-
-         // 🌟 [OVERFETCH] Dexie 정밀 필터가 뒤에 붙으므로 후보를 넓게 확보합니다.
          let fetch_limit = std::cmp::max(200, (limit + offset) * 4);
-
-         // 스코프 필터를 정리합니다. 비어 있으면 아예 걸지 않습니다.
          let scope: Option<String> = filter.as_ref().and_then(|f| {
              let t = f.trim();
              if t.is_empty() { None } else { Some(t.to_string()) }
          });
-
-         // =======================================================
-         // 🌟 [Track A] Native Full Text Search (Tantivy ngram 역인덱스)
-         //     가중치 2.0. 어휘 일치 신호.
-         // =======================================================
          if !query_text.trim().is_empty() {
              let mut q = table.query();
              let has_fts_index = target == "items"; // FTS 인덱스는 items 에만 존재
@@ -1711,7 +1439,6 @@ impl VectorStore {
                  q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));
                  if let Some(ref f) = scope { q = q.only_if(f.clone()); }
              } else {
-                 // 타이핑 중(Live Search) 미완성 단어 대응 ILIKE 폴백
                  let sql_clean = query_text.replace("'", "''");
                  let mut ilike_conditions = Vec::new();
                  for w in sql_clean.split_whitespace() {
@@ -1743,25 +1470,12 @@ impl VectorStore {
              }
          }
 
-         // =======================================================
-         // 🌟 [Track B] Vector Search (ANN)
-         //     가중치 1.0 시작, 랭크당 -0.001. 의미 근접 신호.
-         // =======================================================
          let is_empty_vec = query_vec.iter().all(|&x| x == 0.0);
 
          if !is_empty_vec {
              let mut vq = table.query();
              if let Some(ref f) = scope { vq = vq.only_if(f.clone()); }
 
-             // 🌟 [VECTOR COLUMN 명시 — 필수]
-             //  ── 무엇이 문제였나 ──
-             //   v5 스키마부터 items 테이블에는 벡터 컬럼이 두 개입니다.
-             //     vector      FixedSizeList(Float32, 384)   ← 텍스트 임베딩
-             //     vision_vec  FixedSizeList(Float32, 1152)  ← SigLIP2 비전 임베딩
-             //   LanceDB 는 벡터 컬럼이 복수인데 대상을 지정하지 않으면 모호성 에러를 냅니다.
-             //   그 에러가 `if let Ok(...)` 에 조용히 삼켜져 벡터 트랙이 통째로 0건이 되고,
-             //   FTS 트랙만 살아남아 "의미 검색이 안 되는" 상태가 됩니다.
-             //   비전 컬럼을 추가한 순간부터 텍스트 벡터 검색까지 함께 죽어 있었습니다.
              if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
                  let vq_with_vector = vq_with_vector.column("vector");
                  if let Ok(vres) = vq_with_vector.execute().await {
@@ -1784,21 +1498,6 @@ impl VectorStore {
                  }
              }
          }
-
-        // =======================================================
-        // 🌟 [Track V] Vision Vector Search (SigLIP2 1152-dim)
-        //    이미지 추출 문서의 비전 벡터와 질의 벡터의 ANN 검색입니다.
-        //    텍스트 트랙(384)과 독립적으로 동작하며,
-        //    같은 id 가 양쪽 트랙에서 잡히면 점수가 합산되어
-        //    '텍스트 + 비전' 이중 근거 문서가 상위로 올라갑니다.
-        //
-        //    가중치: 1.0 시작, 랭크당 -0.001 (Track B 와 동일 스케일)
-        //
-        //    ⚠️ lancedb 버전별 API 차이:
-        //    - 0.4+: .nearest_to_on("vision_vec", vvec)
-        //    - 0.5+: .vector_column("vision_vec").nearest_to(vvec)
-        //    현재 코드베이스의 lancedb 버전에 맞게 조정하십시오.
-        // =======================================================
         if let Some(ref vvec) = vision_query_vec {
             let is_empty_vvec = vvec.iter().all(|&x| x == 0.0);
             let dim_ok = vvec.len() == 1152;
@@ -1809,10 +1508,6 @@ impl VectorStore {
                 );
             }
             if !is_empty_vvec && dim_ok {
-                // 🌟 [ZERO-VECTOR EXCLUSION] 비전 벡터가 없는 문서를 ANN 대상에서 제외합니다.
-                //    이 필터가 없으면 0 벡터가 거리 1.00 으로 실제 이미지(≈1.80)를 전부 이깁니다.
-                //    (upsert_item 의 VISION MARKER 주석에 계산 근거가 있습니다)
-                //    serde_json 은 공백 없이 `"has_vision":1` 로 직렬화하므로 LIKE 가 정확히 맞습니다.
                 let vision_scope = match &scope {
                     Some(f) => format!("({}) AND data LIKE '%\"has_vision\":1%'", f),
                     None => "data LIKE '%\"has_vision\":1%'".to_string(),
@@ -1820,9 +1515,6 @@ impl VectorStore {
                 let mut vvq = table.query();
                 vvq = vvq.only_if(vision_scope.clone());
                 if let Ok(vvq_with_vector) = vvq.limit(fetch_limit).nearest_to(vvec.clone()) {
-                    // 🌟 [VECTOR COLUMN 명시 — 필수]
-                    //  1152차원 질의를 384차원 `vector` 컬럼에 던지면 차원 불일치로 실패합니다.
-                    //  구버전은 컬럼을 지정하지 않아 이 트랙이 한 번도 발화한 적이 없습니다.
                     let vvq_with_vector = vvq_with_vector.column("vision_vec");
                     if let Ok(vvres) = vvq_with_vector.execute().await {
                         if let Ok(vbatches) = vvres.try_collect::<Vec<_>>().await {
@@ -1841,8 +1533,6 @@ impl VectorStore {
                             if vrank > 0 {
                                 println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec' (scope: {}).", vrank, vision_scope);
                             } else {
-                                // 🌟 0건은 '비전 문서가 없다' 는 사실일 수도, 'has_vision 마커가 없는
-                                //    구세대 문서뿐' 이라는 뜻일 수도 있습니다. 둘을 구분해야 추적됩니다.
                                 println!("[STORE] ⚪ Vision track matched 0 rows. 이미지 추출 문서가 없거나, 마커 도입 이전에 저장되어 재추출이 필요합니다.");
                             }
                         }
@@ -1852,13 +1542,6 @@ impl VectorStore {
                 }
             }
         }
-
-        // =======================================================
-        // 🌟 [Track C] Scope-Only Recall
-        //  질의 텍스트도 없고 벡터도 0 이면(= 순수 목록 조회) 스코프 결과를 그대로 돌려줍니다.
-        //  기존에는 이 경우 Track 1 이 blanket +3.0 을 뿌려 목록처럼 동작했는데,
-        //  Track 1 을 없앴으므로 명시적 경로로 분리합니다.
-        // =======================================================
         if combined.is_empty() {
              let mut q = table.query();
              if let Some(ref f) = scope { q = q.only_if(f.clone()); }
@@ -1869,7 +1552,6 @@ impl VectorStore {
                          let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
                          let createds = b.column(10).as_any().downcast_ref::<Int64Array>().unwrap();
                          for i in 0..b.num_rows() {
-                             // 최신순 타이브레이커만 부여합니다. (의미 신호 없음)
                              let recency = (createds.value(i) as f64 / 1.0e13) as f32;
                              combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), recency));
                          }
@@ -1907,20 +1589,6 @@ impl VectorStore {
 
          Ok(result_slice)
     }
-
-    // 🌟 [PROPERTY LOOKUP v5 / KEY-SCOPED PREFILTER]
-    //  v4 는 `data ILIKE '%값%'` 로만 좁혔습니다. 그런데 값이 짧으면(예: index "18")
-    //  전혀 무관한 문서의 다른 키(`"quantity":118`)까지 후보로 끌려와
-    //  500건 상한 안에서 정답이 밀려나는 사고가 발생했습니다.
-    //
-    //  v5 는 canonicalize_data 가 확정한 '직렬화 형태' 를 그대로 프리필터에 씁니다.
-    //    · 식별자류(String 확정) → `"property":"값"`
-    //    · 수치류(Number 확정)   → `"property":값`
-    //  키까지 포함시키므로 오탐이 구조적으로 사라지고, 상한 500건이 실효를 갖습니다.
-    //
-    //  ⚠️ 이 함수는 scheduler 의 RELAY 경로 전용입니다.
-    //     사용자 검색/목록 조회의 도메인 조건은 전부 Dexie(executeDexiePlan)가 담당하며,
-    //     LanceDB 는 벡터/FTS/봉투 스코프만 책임집니다.
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
         let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
@@ -1932,20 +1600,12 @@ impl VectorStore {
             _ => value.to_string().trim_matches('"').to_string(),
         };
         if target_str.is_empty() { return Ok(None); }
-
-        // 🌟 [SINGLE SOURCE] canonicalize_data 와 '완전히 같은 판정 함수' 를 씁니다.
-        //    기존에는 배열이 복제되어 있어 한쪽만 고치면
-        //    needle 이 `"key":123` vs `"key":"123"` 으로 어긋나 프리필터가 0건이 됐습니다.
         use crate::utils::canonical::{kind_of, CanonKind};
-
         let escaped_prop = property.replace('\'', "''");
         let escaped_val = target_str.replace('\'', "''");
-
-        // 🌟 [KEY-SCOPED NEEDLE] serde_json 은 공백 없이 `"key":value` 로 직렬화합니다.
         let needle = match kind_of(property) {
             CanonKind::Identifier => format!("\"{}\":\"{}\"", escaped_prop, escaped_val),
             CanonKind::Numeric | CanonKind::Boolean => format!("\"{}\":{}", escaped_prop, escaped_val),
-            // 배열/미분류 키는 형태를 확신할 수 없으므로 값만으로 좁히고 아래에서 정확 비교합니다.
             _ => escaped_val.clone(),
         };
 
@@ -1986,29 +1646,18 @@ impl VectorStore {
     }
 
     pub async fn reset_database(&self) -> Result<()> {
-        // 🌟 [v4] sales / tracking / event 는 이미 폐기되었지만,
-        //    구버전에서 넘어온 사용자를 위해 drop 대상에는 남겨 둡니다.
         let tables = vec!["tasks", "talks", "items", "sales", "tracking", "event", "users", "pages", "item_chunks"];
         for name in tables {
             let _ = self.conn.drop_table(name, &[]).await;
             let _ = std::fs::remove_dir_all(format!("{}/{}.lance", self.base_path, name));
         }
         println!("[Store] LanceDB all tables dropped for factory reset.");
-
-        // 테이블 초기화 함수 재호출하여 빈 껍데기로 복구
         self.init_task_table().await?;
         self.init_all_tables().await?;
 
         Ok(())
     }
 
-    // =====================================================================
-    // 🌟 [PHASE D] item_chunks 테이블 — 청크 단위 코사인 유사도 검색용
-    // =====================================================================
-
-    /// [PHASE D-1] item_chunks 테이블 스키마를 생성합니다.
-    /// 앱 시작 시 init_all_tables() 이후에 호출됩니다.
-    /// 기존 테이블이 존재하면 스키마 호환성 검사 후 그대로 사용합니다.
     pub async fn init_chunks_table(&self) -> Result<()> {
         let uri = self.base_path.clone();
         let existing = self.conn.table_names().execute().await?;
@@ -2022,11 +1671,6 @@ impl VectorStore {
                     let has_chunk_id = current_schema.field_with_name("chunk_id").is_ok();
                     let has_vector = current_schema.field_with_name("vector").is_ok();
                     let has_property = current_schema.field_with_name("property").is_ok();
-                    // 🌟 [EMBEDDING RECIPE VERSION] 저장 벡터 합성식이 바뀌면 기존 청크는
-                    //    새 질의 벡터와 정합하지 않습니다. 스키마가 같아도 강제 재구축이 필요하므로
-                    //    레시피 버전을 컬럼으로 각인하고, 버전이 다르면 테이블을 드롭합니다.
-                    // 🌟 (v2 = chunk 0.5 + anchor 0.2 + localized 0.3 — 라벨 블롭이 값을 희석)
-                    // 🌟 (v3 = 형식 인지 가중치 + localized 를 "{leaf_label} {value}" 로 축약 + Enum 라벨 지배)
                     let has_recipe_v3 = current_schema.field_with_name("embed_recipe_v3").is_ok();
                     if !has_chunk_id || !has_vector || !has_property || !has_recipe_v3 {
                         println!("[Store] item_chunks schema mismatch. Dropping for recreation.");
@@ -2086,20 +1730,6 @@ impl VectorStore {
 
         Ok(())
     }
-
-    /// [PHASE D-2] 청크 1건을 item_chunks 테이블에 삽입합니다.
-    /// 동일 chunk_id 가 이미 존재하면 삭제 후 재삽입합니다 (upsert 시맨틱).
-    ///
-    /// # 인자
-    ///   - chunk_id:       UUID 기반 청크 고유 식별자
-    ///   - item_id:        원본 item 의 해시 ID (FK)
-    ///   - item_type:      도메인 타입 ("goods", "order", "tracking" 등)
-    ///   - chunk_text:     자연어 청크 원문
-    ///   - property:       PLINKO 확정 속성명 (snake_case)
-    ///   - property_format: 형식 문자열 ("Numeric", "Text", "Enum" 등)
-    ///   - value_part:     청크에서 추출한 실제 값 부분
-    ///   - vector:         384차원 임베딩 벡터
-    ///   - cc, bcc, ref_val, mode: 메타데이터
     pub async fn upsert_chunk(
         &self,
         chunk_id: &str,
@@ -2116,17 +1746,7 @@ impl VectorStore {
         mode: Option<&str>,
     ) -> Result<()> {
         let table = self.conn.open_table("item_chunks").execute().await?;
-
-        // 기존 동일 chunk_id 삭제 (upsert)
         let _ = table.delete(&format!("chunk_id = '{}'", chunk_id)).await;
-
-        // 🌟 [L2 NORMALIZE / DEFENSIVE]
-        //  search_chunks 는 '저장 벡터가 정규화되어 있다' 는 전제로
-        //  cos = 1 - d/2 변환을 수행합니다(L2² = 2 - 2cos).
-        //  그런데 그 정규화는 호출부(scheduler::index_item_chunks)에만 존재하는
-        //  암묵 계약이라, 새 호출 경로가 생기면 조용히 깨집니다.
-        //  정규화는 멱등이므로(이미 정규화된 벡터를 다시 정규화해도 동일)
-        //  저장 지점에서 한 번 더 확정해 계약을 코드로 강제합니다.
         let safe_vector = match vector {
             Some(v) if v.len() == 384 => {
                 let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -2169,26 +1789,6 @@ impl VectorStore {
         Ok(())
     }
 
-    /// [PHASE D-3] item_chunks 테이블에서 코사인 유사도 벡터 검색을 수행합니다.
-    /// STAGE-4 (검색 시) 에서 호출됩니다.
-    ///
-    /// # 인자
-    ///   - query_vec:  검색 질의의 임베딩 벡터 (384차원)
-    ///   - limit:      반환할 최대 청크 수
-    ///   - filter:     SQL 필터 (예: "item_type = 'goods' AND mode = 'commerce'")
-    ///
-    /// # 반환
-    ///   Vec<(chunk_id, item_id, chunk_text, property, group_score, best_cos)>
-    ///     - group_score : 그 item 이 확보한 청크 점수의 합산 (증거의 '양')
-    ///     - best_cos    : 그 item 의 최고 코사인 (0.0~1.0, 증거의 '질')
-    ///
-    /// 🌟 [반환값 분리 이유] 기존에는 합산 점수 하나만 돌려주었고, lib.rs 가 그것을
-    ///    코사인이라 가정하여 트랙 가중치(Column 3.0 / FTS 2.0 / CrossLingual 1.5)를 곱했습니다.
-    ///    (log 실측: score 3.0146 × 2.0 + × 1.5 = 10.5510)
-    ///    코사인 상한 1.0 을 전제로 설계된 가중치 체계가 무너져,
-    ///    '청크가 많이 살아남은 item' 이 '질의와 실제로 가까운 item' 을 압도했습니다.
-    ///    (Beige Wool Coat 가 '니트 가디건' 질의에서 RANK 2, Cable Knit Sweater 는 RANK 7)
-    ///    이제 두 값을 분리해 돌려주고, 가중치는 best_cos 에만 곱하도록 합니다.
     pub async fn search_chunks(
         &self,
         query_vec: &[f32],
@@ -2202,12 +1802,6 @@ impl VectorStore {
             return Ok(Vec::new());
         }
 
-        // 🌟 [PROPERTY-PINNED DETECTION] 호출부가 `property = '...'` 로 property 를
-        //    이미 하나로 고정한 타겟 검색인지 판정합니다.
-        //    이 SQL 문자열은 전부 우리 코드(lib.rs STAGE-4C / 4D)가 생성하므로
-        //    '의미 판정' 이 아니라 '우리가 만든 술어의 존재 여부' 라는 구조적 사실입니다.
-        //    고정 검색에서 property 다양성 캡을 적용하면 정확히 정반대로 작동합니다.
-        //    (log 실측: property='title' 고정 검색인데 "title(16행)" 억제 → 별칭 전멸)
         let property_pinned = filter
             .map(|f| f.contains("property = '"))
             .unwrap_or(false);
@@ -2218,10 +1812,6 @@ impl VectorStore {
                 q = q.only_if(f.to_string());
             }
         }
-
-        // 🌟 [QUERY VECTOR NORMALIZE] 저장 벡터는 upsert_chunk 직전에 L2 정규화되어 있습니다.
-        //    질의 벡터는 정규화되지 않은 채 들어와 L2 거리 스케일이 어긋났습니다.
-        //    양쪽을 정규화해야 L2² = 2 - 2cos 관계가 성립합니다.
         let normalized_query: Vec<f32> = {
             let norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
@@ -2230,14 +1820,7 @@ impl VectorStore {
                 query_vec.to_vec()
             }
         };
-
-        // 🌟 [OVERFETCH 확대] property 다양성 캡을 적용하려면 후보 창이 충분히 커야 합니다.
-        //    저변별 청크가 상한에 걸려 버려지는 만큼을 미리 확보합니다.
-        //    🌟 property 고정 검색은 캡이 없으므로 오버페치를 더 크게 잡아
-        //    원본 청크와 음차 별칭(_tn/_tr)이 함께 창에 들어오도록 보장합니다.
         let overfetch = if property_pinned { limit * 12 } else { limit * 6 };
-        // 🌟 item_chunks 는 벡터 컬럼이 하나뿐이지만, 향후 컬럼이 늘어도
-        //    조용히 죽지 않도록 대상을 명시합니다.
         let results = q
             .limit(overfetch)
             .nearest_to(normalized_query)?
@@ -2252,9 +1835,6 @@ impl VectorStore {
         for batch in results {
             let num_rows = batch.num_rows();
             if num_rows == 0 { continue; }
-
-            // 컬럼 인덱스: 0=chunk_id, 1=item_id, 2=item_type, 3=chunk_text,
-            //              4=property, 5=property_format, 6=value_part, 7=vector, ...
             let chunk_ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let item_ids = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
             let chunk_texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
@@ -2265,14 +1845,6 @@ impl VectorStore {
             let distances = batch.column(dist_idx).as_any().downcast_ref::<Float32Array>();
 
             for i in 0..num_rows {
-                // 🌟 [DISTANCE → SIMILARITY FIX]
-                //    distance_type 을 지정하지 않았으므로 LanceDB 기본값인 L2(제곱거리)가 옵니다.
-                //    정규화 벡터에서 L2² = 2 - 2cos 이므로 올바른 변환은 cos = 1 - d/2 입니다.
-                //    기존 `1.0 - d` 는 2·cos - 1 이 되어 코사인 0.5 미만이 음수가 되고,
-                //    item 별 그룹 합산이 2·Σcos - n 으로 왜곡되어
-                //    매칭 청크가 많은 아이템이 구조적으로 불리해졌습니다.
-                //    설령 백엔드가 코사인 거리(1-cos)를 돌려주더라도 이 식은 (1+cos)/2 로
-                //    단조 증가를 유지하므로 순위가 깨지지 않고 음수도 발생하지 않습니다.
                 let score = distances
                     .map(|d| (1.0f32 - d.value(i) / 2.0f32).clamp(0.0f32, 1.0f32))
                     .unwrap_or(0.0);
@@ -2286,24 +1858,7 @@ impl VectorStore {
                 ));
             }
         }
-
-        // 점수 내림차순 정렬
         chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
-
-        // 🌟 [PROPERTY DIVERSIFICATION] 저변별 청크가 후보 윈도우를 독점하는 것을 차단합니다.
-        //    status 청크는 "It is currently in 'complete' status" 로 전 아이템에서
-        //    바이트 단위로 동일하여 변별력이 0인데도, 오버페치 창을 전부 채워
-        //    정작 값이 담긴 title 청크가 후보에 진입조차 못 했습니다.
-        //
-        //    🌟 [PINNED BYPASS] 단, 호출부가 property 를 이미 하나로 고정했다면
-        //    이 캡은 존재 이유가 사라지고 오히려 정답 청크를 학살합니다.
-        //    (log 실측: property='title' 고정 검색에서 "title(16행)" 억제)
-        //    별칭(_tn/_tr)은 원본과 같은 property 를 쓰므로 캡의 1순위 희생양이었습니다.
-        //
-        //    🌟 [ALIAS GROUP SPLIT] 캡을 적용하는 전역 검색에서도, 음차 별칭은
-        //    원본 청크와 '다른 표기 체계' 를 담은 별개 증거이므로 같은 슬롯을 두고
-        //    경쟁시키면 안 됩니다. chunk_id 접미어(_tn/_tr)라는 구조적 사실만으로
-        //    별도 그룹키를 부여하여 원본과 별칭이 나란히 생존하도록 합니다.
         if property_pinned {
             println!(
                 "  🎯 [PROPERTY PINNED] property 고정 검색 감지. 다양성 캡을 적용하지 않습니다. (후보 {}행 전량 보존)",
@@ -2362,11 +1917,8 @@ impl VectorStore {
             }
         }
 
-        // item_id 기준 그룹핑: 동일 item 의 여러 청크 점수를 합산하여
-        // 최종 상위 limit 개 item 을 반환합니다.
         let mut item_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         let mut item_best_chunk: std::collections::HashMap<String, (String, String, String, f32)> = std::collections::HashMap::new();
-
         for (chunk_id, item_id, chunk_text, property, score) in &chunks {
             let entry = item_scores.entry(item_id.clone()).or_insert(0.0);
             *entry += score;
@@ -2379,10 +1931,6 @@ impl VectorStore {
             }
         }
 
-        // 🌟 [RANKING BASIS] 대표 정렬 기준을 '최고 코사인' 으로 바꿉니다.
-        //    합산(total)은 '증거의 양' 이지 '질의와의 가까움' 이 아닙니다.
-        //    합산으로 정렬하면 무관한 값이라도 청크 수가 많은 item 이 이깁니다.
-        //    합산은 동률을 깨는 보조 기준으로만 사용합니다.
         let mut final_results: Vec<(String, String, String, String, f32, f32)> = Vec::new();
         let mut sorted_items: Vec<(String, f32, f32)> = item_scores
             .into_iter()
@@ -2406,16 +1954,12 @@ impl VectorStore {
         Ok(final_results)
     }
 
-    /// [PHASE D-4] 특정 item_id 에 연관된 모든 청크를 삭제합니다.
-    /// item 삭제 또는 재추출 시 호출됩니다.
     pub async fn delete_chunks_by_item(&self, item_id: &str) -> Result<()> {
         let table = self.conn.open_table("item_chunks").execute().await?;
         table.delete(&format!("item_id = '{}'", item_id)).await?;
         Ok(())
     }
 
-    /// [PHASE D-5] 특정 item_id 의 청크 개수를 반환합니다.
-    /// 재인덱싱 여부 판정에 사용됩니다.
     pub async fn count_chunks_by_item(&self, item_id: &str) -> Result<usize> {
         let table = self.conn.open_table("item_chunks").execute().await?;
         let results = table.query()
@@ -2434,22 +1978,6 @@ impl VectorStore {
     }
 }
 
-/// 🌟 [JSON NEEDLE / SINGLE SOURCE]
-///  data 컬럼 LIKE 프리필터에 쓸 `"key":value` 패턴을 만듭니다.
-///
-///  ── 왜 필요한가 ──
-///   canonicalize_data 가 키의 종류에 따라 직렬화 형태를 바꿉니다.
-///     Identifier → "code":"P0001"      (따옴표 있음)
-///     Numeric    → "order":3029041598  (따옴표 없음)
-///     Boolean    → "embed":1           (따옴표 없음)
-///   그런데 scheduler.rs 의 릴레이 DEDUP 은 이 규칙을 복제하면서
-///   수치 컬럼에도 따옴표를 붙여 LIKE 가 영구히 0건이 되었습니다.
-///     needle: "order":"3029041598"  /  저장:  "order":3029041598
-///   그 결과 릴레이 draft 가 매 스캔마다 새로 생성되었습니다.
-///
-///  ── 계약 ──
-///   앞으로 data LIKE 패턴은 이 함수로만 만듭니다.
-///   kind_of 규칙이 바뀌어도 호출부는 수정할 필요가 없습니다.
 pub fn json_property_needle(property: &str, value: &Value) -> String {
     use crate::utils::canonical::{kind_of, CanonKind};
     let raw = match value {
@@ -2463,19 +1991,10 @@ pub fn json_property_needle(property: &str, value: &Value) -> String {
     match kind_of(property) {
         CanonKind::Identifier => format!("\"{}\":\"{}\"", ep, ev),
         CanonKind::Numeric | CanonKind::Boolean => format!("\"{}\":{}", ep, ev),
-        // 배열/미분류는 형태를 확신할 수 없으므로 값만으로 좁히고 호출부가 정확 비교합니다.
         _ => ev,
     }
 }
 
-// 🌟 [ENVELOPE v4] 도메인 필드 55개를 전부 제거합니다.
-//  기존 구조체는 무역 문서 전용 컬럼(vessel/pol/pod/incoterms/...)을 Rust 타입에 못 박아 두어
-//  새 도메인이 추가될 때마다 구조체 → LanceDB 스키마 → 프론트엔드 3곳을 동시에 고쳐야 했습니다.
-//  실제로는 대부분 채워지지도 않은 채(Default::default()) 직렬화 비용만 발생하고 있었습니다.
-//
-//  v4 부터 도메인 값은 전부 json_data(= data 컬럼) 안에 있고,
-//  프론트엔드는 Dexie 의 data.* 중첩 인덱스로 쿼리합니다.
-//  → 이 구조체는 앞으로 영원히 변경되지 않습니다.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TradeDocument {
     // ── 봉투(Envelope) ──
@@ -2500,9 +2019,6 @@ pub struct TradeDocument {
     pub text: String,
     pub masked_text: String,
     pub vector: Vec<f32>,
-    /// 🌟 [비전 벡터] SigLIP2 encode_image_pooled 산출물 (1152차원).
-    ///    이미지 추출 시에만 채워지고, 텍스트 전용 문서는 0 벡터입니다.
-    ///    trading 검색의 비전 트랙에서 ANN 질의 대상으로 사용합니다.
     #[serde(default)]
     pub vision_vec: Vec<f32>,
 }

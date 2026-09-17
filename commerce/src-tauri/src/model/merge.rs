@@ -713,8 +713,46 @@ pub fn merge_extracted(
     let mut added = 0usize;
     let mut kept = 0usize;
     let mut echoed = 0usize;
+    let mut off_schema = 0usize;
+    let mut off_schema_null = 0usize;
 
     for (k, v) in obj.iter() {
+        let is_empty = v.is_null()
+            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
+
+        {
+            let owner = crate::logic::trade_field_category(k);
+            if owner != category {
+                if is_empty {
+                    off_schema_null += 1;
+                    continue;
+                }
+                off_schema += 1;
+                let shown: String = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string())
+                    .chars()
+                    .take(40)
+                    .collect();
+                emit(&format!(
+                    "    🚫 [SCHEMA WHITELIST] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아닙니다 (소속: {}). 크롭 프롬프트는 '{}' 필드만 요청했으므로 모델이 스스로 만든 키입니다. 폐기합니다.",
+                    category, k, shown,
+                    if owner.is_empty() { "스키마 밖" } else { owner },
+                    category
+                ));
+                crate::utils::score_dynamics::record_field_seen(k);
+                crate::utils::score_dynamics::record_field_reject(
+                    k,
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
+                continue;
+            }
+        }
+
+        if is_empty { continue; }
+
         // ① 빈 값 / 스키마 에코는 덮지 않습니다.
         if let Some(s) = v.as_str() {
             if is_schema_echo(s) {
@@ -731,11 +769,6 @@ pub fn merge_extracted(
                 continue;
             }
         }
-        let is_empty = v.is_null()
-            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
-            || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
-        if is_empty { continue; }
-
         // ② 배열은 이어붙입니다.
         if let Some(arr) = v.as_array() {
             let slot = merged
@@ -809,8 +842,8 @@ pub fn merge_extracted(
     }
 
     emit(&format!(
-        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건",
-        category, added, kept, echoed
+        "    ✅ [{}] 신규 {}건 | 기존 유지 {}건 | 스키마 에코 폐기 {}건 | 스키마 밖 키 폐기 {}건 (빈 값 {}건은 조용히 무시)",
+        category, added, kept, echoed, off_schema, off_schema_null
     ));
 }
 

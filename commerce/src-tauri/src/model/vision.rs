@@ -380,10 +380,44 @@ impl crate::model::LogisModel {
                         ));
                     }
 
+                    // ── STEP 3.5 : NMS Arena ──
+                    {
+                        let mut protect: Vec<&str> =
+                            crate::logic::TRADE_ARRAY_CATEGORIES.to_vec();
+                        protect.push(crate::logic::TRADE_IDENTITY_CATEGORY);
+                        let arena = crate::models::siglip2::nms_arena::run_arena(
+                            &heatmaps, &grid, &legibility, &protect, &emit_term,
+                        );
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.arena_rounds",
+                            arena.rounds as f32,
+                        );
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.arena_margin_gate",
+                            arena.margin_gate,
+                        );
+                        for t in arena.territories.iter() {
+                            crate::utils::score_dynamics::record_baseline(
+                                &format!("vision.territory.{}", t.category),
+                                t.patches.len() as f32
+                                    / (grid.grid_rows * grid.grid_cols).max(1) as f32,
+                            );
+                        }
+                        crate::models::siglip2::nms_arena::apply_arena(
+                            &mut heatmaps, &arena, &emit_term,
+                        );
+                    }
+
                     // ── STEP 4 : Vision NMS & Cropping ──
                     emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
                     let mut plans = crate::models::siglip2::vision_crop::plan_crops(
-                        &heatmaps, &grid, &emit_term
+                        &heatmaps,
+                        &grid,
+                        &legibility,
+                        crate::logic::TRADE_ARRAY_CATEGORIES,
+                        crate::logic::TRADE_IDENTITY_CATEGORY,
+                        crate::logic::TRADE_IDENTITY_FIELD,
+                        &emit_term,
                     );
                     emit_term(&format!("  🧾 [PLAN DONE] 크롭 계획 {}건 확정. release_siglip2 진입 전...", plans.len()));
                     if plans.is_empty() {
@@ -455,8 +489,32 @@ impl crate::model::LogisModel {
                         }
                         crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
 
+                        if !plan.twin_of.is_empty()
+                            && crate::logic::TRADE_ARRAY_CATEGORIES
+                                .iter()
+                                .any(|c| *c == plan.category.as_str())
+                        {
+                            emit_term(&format!(
+                                "    👯 [TWIN ARRAY SKIP] '{}' 는 '{}' 와 좌표가 같은 쌍둥이 크롭입니다. 같은 표에서 배열을 두 번 만들면 행이 그대로 복제되므로 이 크롭은 건너뜁니다.",
+                                plan.category, plan.twin_of
+                            ));
+                            continue;
+                        }
+
+                        if plan.owned_patches == 0 {
+                            emit_term(&format!(
+                                "    🧭 [TERRITORY TAG] '{}' 크롭 안에 자기 영토 패치가 한 칸도 없습니다. 이 크롭에서는 명시된 라벨↔값만 읽고 줄 전체를 값으로 승격하지 않아야 합니다.",
+                                plan.category
+                            ));
+                        }
+
                         let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
-                            plan, &heatmaps, &grid, &legibility, &emit_term
+                            plan,
+                            &heatmaps,
+                            &grid,
+                            &legibility,
+                            crate::logic::TRADE_ARRAY_CATEGORIES,
+                            &emit_term,
                         );
                         crate::utils::score_dynamics::record_baseline("vision.tile_count", tile_count as f32);
                         let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
@@ -486,8 +544,9 @@ impl crate::model::LogisModel {
                             //    겹침 타일에서 같은 값이 두 번 나오는 것은 정상이므로
                             //    배열 카테고리는 이 목록을 넘기지 않습니다.
                             //    (넘기면 두 번째 타일이 정당한 반복 행을 스스로 버립니다)
-                            let is_array_cat =
-                                plan.category == "items" || plan.category == "containers";
+                            let is_array_cat = crate::logic::TRADE_ARRAY_CATEGORIES
+                                .iter()
+                                .any(|c| *c == plan.category.as_str());
                             let claimed = if is_array_cat {
                                 Vec::new()
                             } else {
@@ -588,7 +647,7 @@ impl crate::model::LogisModel {
                 crate::utils::score_dynamics::refine_primary(commerce_page_type);
                 // 🌟 [SCOPED LOCK + LAZY TEXT] trade 분기와 동일한 셀프 데드락 방지 구조를
                 //    with_siglip_text 가 그대로 제공하며, 캐시 미스가 없으면 인코더를 올리지 않습니다.
-                let heatmaps = self
+                let mut heatmaps = self
                     .with_siglip_text("column heatmaps (commerce)", |m| {
                         crate::models::siglip2::vision_encoder::build_column_heatmaps(
                             m, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
@@ -597,8 +656,30 @@ impl crate::model::LogisModel {
                     .await
                     .map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
 
+                {
+                    let mut protect: Vec<&str> =
+                        crate::logic::TRADE_ARRAY_CATEGORIES.to_vec();
+                    protect.push(crate::logic::TRADE_IDENTITY_CATEGORY);
+                    let arena = crate::models::siglip2::nms_arena::run_arena(
+                        &heatmaps, &grid, &legibility, &protect, &emit_term,
+                    );
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.arena_rounds",
+                        arena.rounds as f32,
+                    );
+                    crate::models::siglip2::nms_arena::apply_arena(
+                        &mut heatmaps, &arena, &emit_term,
+                    );
+                }
+
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
-                    &heatmaps, &grid, &emit_term
+                    &heatmaps,
+                    &grid,
+                    &legibility,
+                    crate::logic::TRADE_ARRAY_CATEGORIES,
+                    crate::logic::TRADE_IDENTITY_CATEGORY,
+                    crate::logic::TRADE_IDENTITY_FIELD,
+                    &emit_term,
                 );
 
                 // 🌟 [VRAM STAGE] 커머스 경로도 여기서 SigLIP2 임무가 끝납니다.
@@ -640,6 +721,22 @@ impl crate::model::LogisModel {
                             .collect();
 
                         if fields.is_empty() { continue; }
+
+                        let (lg_cnt, il_cnt, bl_cnt) =
+                            legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.crop_legible_patches",
+                            lg_cnt as f32,
+                        );
+                        if lg_cnt == 0 {
+                            emit_term(&format!(
+                                "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다 (판독불가 {} / 여백 {}). Qwen 호출을 생략합니다.",
+                                plan.category, il_cnt, bl_cnt
+                            ));
+                            crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 1.0);
+                            continue;
+                        }
+                        crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
 
                         let crop = crate::models::siglip2::vision_crop::crop_region(
                             &dynamic_image, plan, 512

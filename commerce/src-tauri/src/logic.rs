@@ -1309,6 +1309,10 @@ pub fn trade_field_category(field: &str) -> &'static str {
     }
 }
 
+pub const TRADE_ARRAY_CATEGORIES: &[&str] = &["items", "containers"];
+pub const TRADE_IDENTITY_CATEGORY: &str = "header";
+pub const TRADE_IDENTITY_FIELD: &str = "doc_number";
+
 pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
     ("CI", "commercial invoice"),
     ("PI", "proforma invoice"),

@@ -1,83 +1,15 @@
-// =====================================================================
-// 🌟 [SCORE DYNAMICS LAYER] 점수를 스칼라가 아니라 신호로 취급하는 계층
-// ---------------------------------------------------------------------
-//  ── 이 모듈이 존재하는 이유 ──
-//   현재 파이프라인의 모든 판정(비전 히트맵, 문서 type 분류, PLINKO 배정,
-//   청크 인덱싱, analytic 쿼리 파싱)은 코사인 점수 하나를 스칼라로 읽고
-//   고정 상수와 비교하는 '횡단적(cross-sectional)' 구조입니다.
-//
-//   그래서 다음 세 가지가 구조적으로 불가능합니다.
-//     L1 절대 점수의 의미가 문서마다 다른데 기준이 고정
-//        → TITLE FLOOR 0.5457 바닥 미달로 'Shipping Advice' 표제가 탈락,
-//          제목 축 정보가 0 으로 수렴
-//     L2 1위-2위 단일 마진만 보고 확신도를 판정
-//        → MODE PROBE 마진 +0.0308 (잡음대 0.5334) 코인플립,
-//          PLINKO 'related_po_number'→'marks_numbers' 마진 +0.0001
-//     L3 편향 보정 상수가 문서·사이트 간에 적응하지 않음
-//        → CATEGORY-NEUTRAL cargo(-1.973) / financials(-2.297) 고정,
-//          HEATMAP 활성 패치 249/252 과확산
-//
-//  ── 이 모듈이 하는 일 / 하지 않는 일 ──
-//   합니다   : 판정 근거를 구조화 관측으로 수집(SSR), 요약 통계로 압축해
-//              세션 간 영속화(SDS), 적응 파라미터 조회 인터페이스 제공(ASE)
-//   안 합니다: 예측. 신경망. 판정 변경.
-//              Phase 0 에서 ASE 조회 함수는 정의만 되고 호출되지 않습니다.
-//
-//  ── 왜 신경망 시계열 모델이 아닌가 ──
-//   ① 문서 추출에는 물리적 시간이 없어 순위/인덱스를 시간으로 치환해야 하고,
-//      그 계열의 길이가 3~15보라 학습형 모델은 과적합합니다.
-//   ② 온디바이스 VRAM 에서 Qwen3.5(2B) / SigLIP2(2.2GB) / granite(97M) 과
-//      경쟁해야 하므로 추가 가중치는 ROI 가 음수입니다.
-//   따라서 도구는 Welford 온라인 통계 · 분포 형상 요약 · 역분산 가중이며,
-//   전부 순수 산술이라 모델 로드가 없습니다.
-//
-//  ── 기존 철학과의 정합 ──
-//   이 코드베이스는 이미 '기준선은 데이터에서 유도' 를 채택하고 있습니다.
-//     scheduler.rs   dedup_floor = μ + 3σ
-//     trading.rs     TITLE FLOOR = 자기선언 분포 평균
-//     ai_utils.rs    pooled σ, gumbel_expected_z(N)
-//     vision_encoder score_patches_bank_neutral 의 패치별 μ_k
-//   정적 상수가 남아 있는 곳은 '문서 간 축' 뿐이며, 이 모듈은 그 축 하나를
-//   메우는 것입니다. bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
-// =====================================================================
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-// =====================================================================
-// 🌟 [세대 각인] 관측 통계는 '같은 앵커 뱅크 · 같은 임베딩 레시피' 아래에서만
-//    의미가 있습니다. bias.json 이 개정되거나 임베딩 모델이 바뀌면
-//    과거 점수 분포는 현재 판정과 무관한 숫자가 됩니다.
-//    store.rs 의 SCHEMA_VERSION / embed_recipe_v3 와 동일한 방어입니다.
-//    이 문자열이 달라지면 저장된 통계를 전량 폐기하고 새로 시작합니다.
-// =====================================================================
-// 🌟 v2: entropy_norm 스케일을 full_range → tail_sd 로 교정했습니다.
-//    척도가 달라져 v1 관측과 혼용하면 감쇠 판정이 왜곡되므로 세대를 올립니다.
 pub const SDS_RECIPE: &str = "sds-v2:welford+ring/tail-sd-entropy/granite-384/bias-json";
 
-// =====================================================================
-// 🌟 [최소 관측 수] 기획 6-2 의 냉간 시작 임계값입니다.
-//
-//  ── 왜 이것은 '매직 상수' 가 아닌가 ──
-//   이 값은 판정에 쓰이는 임계치가 아니라 '통계를 신뢰할 수 있는 표본 수'
-//   입니다. 미달이면 ASE 는 None 을 돌려주고 호출부는 기존 상수를 그대로
-//   씁니다. 즉 이 값이 틀려도 잘못된 판정이 생기지 않고,
-//   적응이 늦게 시작될 뿐입니다.
-//
-//  ── 링 버퍼 크기로도 재사용 ──
-//   최근 구간 평균과 전체 평균의 비교로 드리프트를 보려면 창이 필요한데,
-//   그 창 크기를 여기서 그대로 가져다 씁니다. 새 상수를 만들지 않기 위함입니다.
-// =====================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Track {
-    /// 이미지 문서 전처리 (SigLIP2 비전 경로)
     Vision,
-    /// 텍스트 문서 전처리 (트레이딩 경로)
     Trading,
-    /// 커머스 목록/상세 및 청크 인덱싱
     Commerce,
-    /// 웹사이트 사용자 의도 분석
     Analytic,
 }
 
@@ -105,17 +37,6 @@ impl Track {
     }
 }
 
-// =====================================================================
-// 🌟 [SCOPE] 통계 격리 단위
-// ---------------------------------------------------------------------
-//  너무 넓으면 서로 다른 레이아웃이 섞여 평균이 무의미해지고,
-//  너무 좁으면 표본이 모이지 않습니다. 그래서 2단으로 두고 폴백합니다.
-//
-//    Vision   1차 doc_type              2차 doc_type × 발행처 해시
-//    Trading  1차 mode × doc_type       2차 mode × doc_type × cc
-//    Commerce 1차 cc × page_type        2차 cc × page_type × detail
-//    Analytic 1차 cc                    2차 cc × ref
-// =====================================================================
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
     pub team: String,
@@ -139,19 +60,6 @@ impl Scope {
     }
 }
 
-// =====================================================================
-// 🌟 [ACTIVE SCOPE] 태스크 진입 시 세우는 전역 스코프
-// ---------------------------------------------------------------------
-//  ── 왜 전역인가 ──
-//   vision_encoder::classify_doc_type / build_column_heatmaps 는 순수 함수라
-//   team_id 를 갖지 않습니다. 인자로 스코프를 밀어 넣으면 시그니처가 전부
-//   바뀌고 호출부가 광범위하게 흔들립니다.
-//   태스크는 모델 락(model_mutex)으로 직렬화되므로 동시에 두 스코프가
-//   활성화되지 않으며, CROSSOVER_PHASE / TRANSLIT_MEM_CACHE 가 같은 선례입니다.
-//
-//  ── 스코프가 비어 있으면 ──
-//   모든 record_* 함수가 즉시 반환합니다. 계측 누락이지 오류가 아닙니다.
-// =====================================================================
 static ACTIVE_SCOPE: Lazy<RwLock<Scope>> = Lazy::new(|| RwLock::new(Scope::default()));
 
 pub fn enter_scope(team: &str, track: Track, primary: &str, secondary: &str) {
@@ -165,26 +73,6 @@ pub fn enter_scope(team: &str, track: Track, primary: &str, secondary: &str) {
     }
 }
 
-/// 스코프의 1차 키가 나중에 확정되는 경우(문서 type 을 판정한 직후 등)의 갱신입니다.
-///
-///  🌟 [SCOPE MIGRATION] 키만 바꾸지 않고 이전 관측을 새 키로 옮깁니다.
-///
-///  ── 실측 사고 ──
-///   score_dynamics.json 에 같은 문서의 관측이 두 스코프로 갈렸습니다.
-///     trading|shipping| → trading.title_snr / title_axis  (T-1 관측)
-///     trading|sa|       → plinko.* / field.* / confusion.* (T-2 관측)
-///   refine_primary 가 STEP A 확정 후에 호출되므로, 그보다 앞선
-///   표제 축 관측이 'shipping' 에 남습니다.
-///   다음에 CI 문서를 처리하면 CI 의 표제 축도 같은 자리에 쌓여
-///   SA 와 뒤섞이고, T-1 의 doc_type 별 격리가 무효화됩니다.
-///
-///  ── 왜 '옮기기' 인가 ──
-///   관측을 버리면 T-1 통계가 통째로 사라지고,
-///   그대로 두면 서식 간 오염이 누적됩니다.
-///   이관하면 둘 다 피할 수 있고, 같은 문서의 관측이므로 귀속이 정확합니다.
-///
-///  ── 이관하지 않는 경우 ──
-///   이전 키에 관측이 없거나(첫 호출), 키가 실제로 같으면 아무 일도 하지 않습니다.
 pub fn refine_primary(primary: &str) {
     let new_primary = primary.trim().to_lowercase();
     let (old_key, new_key, ring) = {
@@ -256,28 +144,6 @@ fn current_scope() -> Option<Scope> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-// 🌟 [UNSCOPED FALLBACK] 스코프가 없어도 관측을 버리지 않습니다.
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 (실측 사고) ──
-//   초기 설계는 스코프가 없으면 with_scope_mut 이 조용히 return 했습니다.
-//   그래서 enter_scope 배치를 한 군데라도 틀리면
-//     · 모든 record_* 가 아무 소리 없이 버려지고
-//     · DIRTY 가 false 로 남아 flush 가 파일을 쓰지 않으며
-//     · 로그에는 아무 흔적도 남지 않습니다.
-//   실제로 process_task 의 shipping/image 조기 return 을 놓쳐
-//   두 경로 모두 계측이 통째로 죽었는데 이를 알아챌 방법이 없었습니다.
-//   '실패가 보이지 않는 설계' 는 그 자체가 결함입니다.
-//
-//  ── 어떻게 고치는가 ──
-//   스코프가 없으면 'unscoped' 라는 명시적 스코프에 기록합니다.
-//   통계로서의 가치는 낮지만(서식별 격리가 안 됨),
-//     ① 파일이 생성되어 배선 성공을 즉시 확인할 수 있고
-//     ② 아래 경고 로그가 '어디서 스코프가 비었는지' 를 알려줍니다.
-//   즉 조용한 유실이 시끄러운 진단으로 바뀝니다.
-//
-//  ── 경고를 1회만 내는 이유 ──
-//   record_* 는 문서 1건에 수백 회 호출됩니다.
-//   매번 찍으면 로그가 묻히므로 프로세스당 1회만 알립니다.
 static UNSCOPED_WARNED: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 
 fn effective_scope_key() -> (String, usize) {
@@ -309,21 +175,11 @@ fn current_track() -> Option<Track> {
     })
 }
 
-// =====================================================================
-// 🌟 [WELFORD] 온라인 평균/분산
-// ---------------------------------------------------------------------
-//  ── 왜 EWMA 가 아닌가 ──
-//   EWMA 의 α 는 그 자체가 매직 상수입니다. 기획 1-5 의 '새 매직 상수 금지'
-//   원칙에 걸립니다. Welford 는 상수가 없고 수치적으로 안정하며,
-//   n·mean·m2 세 값만 저장하면 되어 파일이 커지지 않습니다.
-//   드리프트는 아래 ring 과 전체 평균의 비교로 봅니다.
-// =====================================================================
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Welford {
     pub n: u64,
     pub mean: f64,
     pub m2: f64,
-    /// 최근 K개 관측. 드리프트 판정용이며 K = Track::ring_len()
     #[serde(default)]
     pub ring: Vec<f64>,
 }
@@ -347,29 +203,15 @@ impl Welford {
     pub fn sd(&self) -> f64 {
         self.variance().max(0.0).sqrt()
     }
-    /// 최근 창 평균. 링이 비면 전체 평균으로 폴백합니다.
     pub fn recent_mean(&self) -> f64 {
         if self.ring.is_empty() { return self.mean; }
         self.ring.iter().sum::<f64>() / (self.ring.len() as f64)
     }
-    /// 드리프트 z 값. 전체 평균 대비 최근 창 평균이 몇 σ 떨어져 있는가.
     pub fn drift_z(&self) -> f64 {
         let sd = self.sd();
         if sd <= 0.0 || self.ring.is_empty() { return 0.0; }
         (self.recent_mean() - self.mean) / sd
     }
-
-    /// 🌟 [MERGE] 두 Welford 를 손실 없이 합칩니다.
-    ///
-    ///  ── 왜 필요한가 ──
-    ///   refine_primary 가 스코프를 재지정할 때, 그 이전 관측을 버리면
-    ///   T-1 의 표제 축 통계가 통째로 사라집니다.
-    ///   단순히 mean 을 평균내면 표본 수가 다른 경우 왜곡되므로,
-    ///   Chan 의 병렬 Welford 병합식을 그대로 씁니다.
-    ///     n  = nA + nB
-    ///     δ  = meanB − meanA
-    ///     mean = meanA + δ·nB/n
-    ///     M2  = M2A + M2B + δ²·nA·nB/n
     pub fn merge(&mut self, other: &Welford, ring_len: usize) {
         if other.n == 0 { return; }
         if self.n == 0 {
@@ -394,22 +236,6 @@ impl Welford {
     }
 }
 
-// =====================================================================
-// 🌟 [DECAY PROFILE] 순위 감쇠 곡선의 형상 요약
-// ---------------------------------------------------------------------
-//  ── 무엇을 해결하려는 통계인가 ──
-//   현재 판정은 1위-2위 마진만 봅니다. 그래서 다음 두 상황을 구분할 수 없습니다.
-//     승자독식형 [6.28, 2.42, 2.03, 2.02] — 낮은 마진이어도 1위가 이상치
-//     평탄형     [0.60, 0.59, 0.58, 0.57] — 높은 마진이어도 변별력 없음
-//   실측 로그 `[VISION CODE MARGIN] 마진 +0.0434 | 양수 점수 코드: 55/55` 는
-//   전형적인 평탄형이며, 마진만으로는 이 사실이 드러나지 않습니다.
-//
-//  ── 저장하는 형상 지표 ──
-//   top_gap_ratio : (1위-2위) / (1위-꼬리중앙값). 1 에 가까울수록 승자독식
-//   tail_flatness : 2위 이하의 표준편차 / 전체 범위. 0 에 가까울수록 평탄
-//   entropy_norm  : softmax 정규화 엔트로피 / ln(N). 1 에 가까울수록 무변별
-//   positive_ratio: 양수 점수 비율. 1.0 이면 전 후보가 살아남은 상태
-// =====================================================================
 #[derive(Debug, Clone, Copy)]
 pub struct DecayShape {
     pub n: usize,
@@ -422,7 +248,6 @@ pub struct DecayShape {
     pub positive_ratio: f64,
 }
 
-/// 정렬 여부와 무관하게 점수 배열에서 감쇠 형상을 산출합니다.
 pub fn decay_shape(scores: &[f32]) -> Option<DecayShape> {
     let mut v: Vec<f64> = scores
         .iter()
@@ -435,14 +260,10 @@ pub fn decay_shape(scores: &[f32]) -> Option<DecayShape> {
     let top1 = v[0];
     let top2 = v[1];
     let margin = top1 - top2;
-
-    // 꼬리 중앙값: 2위 이하의 중앙값. 1위가 얼마나 떨어져 있는지의 기준선입니다.
     let tail = &v[1..];
     let tail_median = tail[tail.len() / 2];
     let span = (top1 - tail_median).abs();
     let top_gap_ratio = if span > 1e-9 { (margin / span).clamp(0.0, 1.0) } else { 0.0 };
-
-    // 꼬리 평탄도
     let tail_mean = tail.iter().sum::<f64>() / (tail.len() as f64);
     let tail_var = tail.iter().map(|x| (x - tail_mean).powi(2)).sum::<f64>() / (tail.len() as f64);
     let full_range = (v[0] - v[n - 1]).abs();
@@ -451,28 +272,6 @@ pub fn decay_shape(scores: &[f32]) -> Option<DecayShape> {
     } else {
         1.0
     };
-
-    // 🌟 [ENTROPY SCALE FIX] 척도를 '전체 범위' 에서 '꼬리 표준편차' 로 바꿉니다.
-    //
-    //  ── 실측 사고 ──
-    //   trading|sa| 의 plinko.label_row.entropy_norm 관측 7건이
-    //   [0.994, 0.990, 0.991, 0.970, 0.994, 0.978, 0.993] 로
-    //   전부 0.97~0.996 에 갇혔습니다. 변별력이 0 입니다.
-    //
-    //  ── 원인 ──
-    //   (x − max) / full_range 는 정의상 항상 [−1, 0] 입니다.
-    //   따라서 exp() 결과가 [0.368, 1.0] 안에 갇히고,
-    //   그 분포의 정규화 엔트로피는 후보 수가 많을수록 1 에 수렴합니다.
-    //   분포가 뾰족하든 평탄하든 같은 값이 나옵니다.
-    //
-    //  ── 교정 ──
-    //   꼬리 표준편차로 나누면 z-score 가 되어 스케일이 열립니다.
-    //   1위가 꼬리에서 멀면 exp 인자가 크게 음수가 되어 엔트로피가 떨어지고,
-    //   평탄하면 1 에 가까워집니다. 이것이 원래 의도한 동작입니다.
-    //   꼬리가 균일하면(sd=0) 판정 불가이므로 1.0(무변별)로 둡니다.
-    //
-    //  ⚠️ 이 변경으로 과거 관측과 척도가 달라집니다.
-    //     SDS_RECIPE 를 올려 통계를 재수집하십시오.
     let entropy_norm = {
         let tail_sd_for_scale = tail_var.sqrt();
         if tail_sd_for_scale <= 1e-9 {
@@ -649,23 +448,6 @@ impl ScopeStat {
 
 static SDS: Lazy<RwLock<SdsFile>> = Lazy::new(|| RwLock::new(SdsFile::default()));
 static DIRTY: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
-
-// =====================================================================
-// 🌟 [영속화]
-// ---------------------------------------------------------------------
-//  ── 위치 ──
-//   앱 데이터 디렉터리 하위. bias.json 과 나란히 두면 '정적 사전 옆의
-//   동적 사전' 이라는 관계가 파일 배치로 드러납니다.
-//
-//  ── 형식 ──
-//   phrase_cache 의 anchors.bin 과 달리 JSON 입니다.
-//   이 파일은 사람이 열어 "왜 그 판정이 나왔는가" 를 검수해야 하므로
-//   가독성이 성능보다 우선합니다.
-//
-//  ── 삭제 ──
-//   reset_lancedb / delete_all_models 시 동반 삭제됩니다.
-//   삭제 = 즉시 현행(적응 이전) 동작 복귀이며, 이것이 롤백 수단입니다.
-// =====================================================================
 fn sds_path() -> std::path::PathBuf {
     crate::utils::get_app_dir().join("score_dynamics.json")
 }
@@ -720,47 +502,15 @@ pub fn load(team: &str) {
         println!("[SDS] 🆕 저장된 통계가 없습니다. 냉간 시작합니다. (현행 판정 그대로)");
     }
     if let Ok(mut w) = SDS.write() { *w = fresh; }
-    // 🌟 [SEED WRITE] 부팅 시점에 빈 파일을 즉시 만듭니다.
-    //
-    //  ── 왜 필요한가 ──
-    //   기존에는 flush 만 파일을 썼고, flush 는 dirty 일 때만 동작했습니다.
-    //   그래서 '파일이 없다' 가 다음 셋 중 무엇인지 구분할 수 없었습니다.
-    //     ① lib.rs 배선을 안 했다  ② enter_scope 를 못 탔다  ③ 아직 태스크가 안 끝났다
-    //   부팅 즉시 빈 파일을 쓰면 ①과 ②③이 즉시 갈립니다.
-    //   파일이 있는데 scopes 가 비어 있으면 ②③, 파일 자체가 없으면 ①입니다.
-    //
-    //  ── 비용 ──
-    //   수백 바이트 1회 쓰기입니다.
     if let Ok(mut d) = DIRTY.write() { *d = true; }
     flush();
     println!("[SDS] 📍 통계 파일 경로: {}", sds_path().display());
 }
 
-/// 🌟 [LOCAL TEAM] 로그인 전 로컬 작업이 귀속되는 기본 팀입니다.
-///
-///  ── 왜 상수가 아니라 함수인가 ──
-///   이 값은 model/vision.rs 와 스케줄러가 쓰는
-///     hash_id("0x0000000000000000000000000000000000000000")
-///   와 같은 규칙으로 유도됩니다. 결과 해시를 코드에 적어 두면 두 곳이 갈라지므로
-///   같은 해시 함수를 그대로 재사용합니다. 새 매직 상수가 아닙니다.
 fn local_default_team() -> String {
     crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000")
 }
 
-/// 팀 식별자가 확정된 뒤(로그인 등) 호출합니다.
-///
-///  ── 무엇이 문제였나 (실측) ──
-///   커머스·트레이딩·비전에서 쌓은 관측은 전부 로컬 기본 팀에 귀속됩니다.
-///   그 뒤 OAuth 로그인이 실제 팀을 확정하면 이 함수가 '팀 전환' 으로 보고
-///   purge() 를 불러 통계를 통째로 지웠습니다.
-///   (실측: score_dynamics.json 의 team 이 바뀌면서 scopes 가 {} 로 비었음)
-///   기획 6-4 는 이 시점을 '폐기' 가 아니라 '마이그레이션' 으로 규정합니다.
-///
-///  ── 이관과 폐기를 가르는 기준 ──
-///   이전 팀이 로컬 기본 팀이면 그 관측은 '아직 주인이 정해지지 않은 내 작업' 이므로
-///   실제 팀으로 이관합니다. 그 외의 팀↔팀 전환은 남의 통계이므로 폐기합니다.
-///   스코프 키는 track|primary|secondary 로만 구성되어 team 을 포함하지 않으므로
-///   이관 시 키를 손댈 필요가 없습니다.
 pub fn rebind_team(team: &str) {
     let prev = SDS.read().ok().map(|s| s.team.clone()).unwrap_or_default();
     if prev.is_empty() || prev == team {
@@ -875,51 +625,12 @@ fn with_scope_mut<F: FnOnce(&mut ScopeStat, usize)>(f: F) {
     bump_and_maybe_flush();
 }
 
-// 🌟 [AUTO FLUSH] 태스크 끝까지 가야만 파일이 생기는 구조를 없앱니다.
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 ──
-//   기존에는 flush 지점이 태스크 말미 한 곳뿐이라
-//     · 이미지 1장이 크롭 10개 × Qwen3.5 로 수 분이 걸리는 동안 파일이 없고
-//     · 중간에 `?` 로 에러가 전파되거나 사용자가 취소하면 관측이 통째로 사라지며
-//     · 무엇보다 '지금 동작 중인가' 를 확인할 방법이 없었습니다.
-//
-//  ── 임계치가 매직 상수 아닌가 ──
-//   이 값은 판정에 쓰이지 않습니다. '몇 번마다 디스크에 쓸 것인가' 라는
-//   I/O 정책이며, 틀려도 통계나 추출 결과가 달라지지 않습니다.
-//   파일 크기가 수십 KB 수준이라 자주 써도 부담이 없습니다.
 static WRITE_TICK: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
 static LAST_FLUSH: Lazy<RwLock<Option<std::time::Instant>>> = Lazy::new(|| RwLock::new(None));
-// 🌟 [실측 조정] 커머스 경로는 record_* 호출이 태스크당 6회 수준입니다.
-//
-//  ── 왜 바꾸는가 ──
-//   실측에서 'commerce|goods|...' 스코프가 메모리에만 남고
-//   score_dynamics.json 에 한 번도 저장되지 않았습니다.
-//   AUTO_FLUSH_EVERY=64 에 도달하지 못한 채 태스크가 길어졌고,
-//   말미의 flush 는 아이템 13개를 다 돌아야 나오기 때문입니다.
-//   트레이딩(태스크당 약 1900회)에 맞춘 값이라 커머스에서 무용지물이었습니다.
-//
-//  ── 왜 8인가 ──
-//   최소 관측 수(Track::min_obs 의 1차 임계 12) 보다 작게 두어
-//   어떤 트랙이든 '통계가 쓸모 있어지기 전에' 최소 1회는 저장되게 합니다.
-//   시간 간격 조건이 남아 있어 I/O 폭주는 여전히 막힙니다.
 const AUTO_FLUSH_EVERY: u32 = 8;
 const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 
 fn bump_and_maybe_flush() {
-    // 🌟 [DEBOUNCE v2] 호출 횟수와 경과 시간을 모두 만족할 때만 씁니다.
-    //
-    //  ── v1 의 결함 ──
-    //   v1 은 `*t % AUTO_FLUSH_EVERY == 0` 으로 판정했습니다.
-    //   그래서 8의 배수 시점에 시간 조건에 막히면 그 기회가 그대로 소멸하고,
-    //   다음 기회까지 다시 8회를 세야 했습니다. 커머스처럼 태스크당 관측이
-    //   수십 회뿐인 경로에서는 이 손실 한 번이 '태스크 내내 저장 0회' 로 이어져
-    //   스코프가 메모리에만 남습니다.
-    //
-    //  ── v2 ──
-    //   카운터를 '마지막 저장 이후 누적 관측 수' 로 바꿉니다.
-    //   시간 조건에 막히면 카운터가 유지되므로 다음 관측에서 즉시 재시도됩니다.
-    //   저장에 성공하면 flush() 안에서 0 으로 리셋합니다.
-    //   이 값은 판정에 쓰이지 않는 I/O 정책이므로 틀려도 통계가 달라지지 않습니다.
     let tick_ok = match WRITE_TICK.write() {
         Ok(mut t) => {
             *t = t.saturating_add(1);
@@ -1100,18 +811,6 @@ pub fn record_transition(from: &str, to: &str) {
     });
 }
 
-// =====================================================================
-// 🌟 [ASE] 적응 파라미터 조회 API
-// ---------------------------------------------------------------------
-//  ⚠️ Phase 0 에서는 이 함수들이 정의만 되고 판정 경로에서 호출되지 않습니다.
-//     기획 8-2 의 3단 게이팅(섀도 → 부분 → 전면) 중 섀도 이전 단계이며,
-//     이 커밋을 적용해도 추출 결과가 바이트 단위로 동일해야 합니다.
-//
-//  ── 폴백 3단 ──
-//   2차 스코프 → 1차 스코프 → 전역 → None(현행 동작)
-//   관측 수가 Track::min_obs() 미달이면 다음 단계로 내려가고,
-//   전부 미달이면 None 을 돌려줍니다. 이것이 냉간 시작 원칙의 구현입니다.
-// =====================================================================
 fn resolve<T, F>(pick: F) -> Option<T>
 where
     F: Fn(&ScopeStat) -> Option<(T, u64)>,
@@ -1187,8 +886,6 @@ pub fn learned_specificity(field: &str) -> Option<f32> {
     })
 }
 
-/// 혼동 사전. 동률에서 역사 승자를 돌려줍니다(Phase 1).
-/// 반환값은 (승자 필드명, 승률).
 pub fn confusion_winner(a: &str, b: &str) -> Option<(String, f32)> {
     if a.is_empty() || b.is_empty() || a == b { return None; }
     let (x, y) = if a <= b { (a, b) } else { (b, a) };
@@ -1207,12 +904,6 @@ pub fn confusion_winner(a: &str, b: &str) -> Option<(String, f32)> {
     })
 }
 
-/// 실효 드로잉 수. CATEGORY-NEUTRAL 의 N 을 대체합니다(Phase 2).
-///
-///  ── 역산 근거 ──
-///   Gumbel 기대 최댓값은 대략 √(2 ln N) 이므로,
-///   실현 최댓값 평균 m 에서 N_eff ≈ exp(m² / 2) 로 되돌립니다.
-///   구조가 가정한 필드 수 N 을 넘지 않도록 상한을 둡니다.
 pub fn effective_draws(category: &str) -> Option<f32> {
     resolve(|st| {
         st.category.get(category).map(|c| {

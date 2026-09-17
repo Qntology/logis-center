@@ -979,6 +979,11 @@ pub struct CategoryHeatmap {
     /// 이 카테고리에서 가장 강하게 반응한 필드명 (진단용).
     pub top_field: String,
     pub top_score: f32,
+    pub territory: usize,
+    pub mean_margin: f32,
+    pub top_rival: String,
+    pub absent: bool,
+    pub absent_reason: String,
 }
 
 /// 🌟 [STEP 2] 스키마 카테고리별 히트맵을 만듭니다.
@@ -1731,6 +1736,11 @@ pub fn build_column_heatmaps(
             scores,
             top_field,
             top_score,
+            territory: 0,
+            mean_margin: 0.0,
+            top_rival: String::new(),
+            absent: false,
+            absent_reason: String::new(),
         });
     }
 
