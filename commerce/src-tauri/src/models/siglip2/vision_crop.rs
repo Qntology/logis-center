@@ -50,7 +50,7 @@ const RESCUE_SPLIT_PASSES: usize = 4;
 const RESCUE_OWNER_MIN_SHARE: f32 = 0.20;
 
 const SPLIT_COVERAGE_FLOOR: f32 = 0.70;
-const SPLIT_CROP_LIMIT: usize = 3;
+const SPLIT_CROP_LIMIT: usize = 2;
 const SPLIT_MIN_HOT: usize = 8;
 const SPLIT_MIN_GAIN: usize = 4;
 
@@ -1627,16 +1627,6 @@ pub fn plan_crops(
                 taken.push(bbox);
                 added += 1;
                 split_total += 1;
-                if hot > 0 && acc as f32 / hot as f32 >= SPLIT_COVERAGE_FLOOR {
-                    emit(&format!(
-                        "    ✅ [SPLIT CROP DONE] '{}' 누적 커버리지 {:.0}% 로 목표 {:.0}% 를 넘겨 추가 크롭을 멈춥니다. 상한 {}건을 끝까지 쓰지 않습니다.",
-                        cat,
-                        acc as f32 / hot as f32 * 100.0,
-                        SPLIT_COVERAGE_FLOOR * 100.0,
-                        SPLIT_CROP_LIMIT
-                    ));
-                    break;
-                }
             }
 
             if added == 0 {
