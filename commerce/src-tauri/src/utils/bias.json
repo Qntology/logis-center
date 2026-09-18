@@ -2067,6 +2067,21 @@
         "bias": "서류번호, 문서번호, 선하증권번호, 항공운송장번호, 인보이스번호, 계약번호, document number, bill of lading number, air waybill number, invoice number, contract number, HBL, MBL",
         "prejudice": "컨테이너번호, 씰번호, HS코드, 부킹번호, 신용장번호, 발행일, 선적일, 중량, 금액"
       },
+      "reference_number": {
+        "semantic": "참조번호, 수출참조번호, 당사 참조번호",
+        "bias": "참조번호, 수출참조번호, 당사참조, 귀사참조, 레퍼런스번호, 주문참조번호, reference number, export reference, export ref, our reference, your reference, ref no, reference no, order reference, job number, file number, shipper reference",
+        "prejudice": "인보이스번호, 서류번호, 선하증권번호, 항공운송장번호, 구매주문번호, 발행일, 금액, 중량, 부가세번호, invoice number, document number, VAT number, EORI number"
+      },
+      "reference_po": {
+        "semantic": "구매주문번호, 발주번호",
+        "bias": "구매주문번호, 발주번호, 주문번호, 오더번호, purchase order number, PO number, order number, buyer order number, customer order number",
+        "prejudice": "인보이스번호, 서류번호, 선하증권번호, 수출참조번호, 발행일, 금액, 중량, invoice number, document number, export reference"
+      },
+      "signatory_name": {
+        "semantic": "서명자 이름, 서명인",
+        "bias": "서명자, 서명인, 서명자 성명, 권한 있는 서명자, signatory name, signed by, authorized signatory, name of signatory, signature name, signer",
+        "prejudice": "서명 회사, 회사명, 당사자 역할, 주소, 날짜, 서류번호, 금액, signatory company, company name, party role, address, date"
+      },
       "doc_type": {
         "semantic": "서식 종류, 문서 유형",
         "bias": "서식종류, 문서유형, 선하증권, 항공운송장, 상업송장, 포장명세서, 원산지증명서, 신용장, bill of lading, air waybill, commercial invoice, packing list, certificate of origin, letter of credit",
@@ -3196,7 +3211,7 @@
       },
       "reference_po": {
         "semantic": "Purchase order number referenced on this document",
-        "bias": "purchase order number, P/O number, PO number, order number, buyer order number, customer order number",
+        "bias": "purchase order number, PO number, order number, buyer order number, customer order number",
         "prejudice": "invoice number, document number, bill of lading number, export reference, issue date, amount, weight"
       },
       "signatory_name": {

@@ -472,6 +472,82 @@ pub fn plan_recovery_windows(
     out
 }
 
+pub fn reroute_closed_vocab_values(
+    merged: &mut serde_json::Map<String, Value>,
+    doc_type: &str,
+    emit: &dyn Fn(&str),
+) -> usize {
+    let mut owners: Vec<(String, String, Vec<String>)> = Vec::new();
+    if let Some(ts) = crate::parsing::BIAS_DICT.get("trade_schema") {
+        for node in [ts.get("base"), ts.get("overlay").and_then(|o| o.get(doc_type))] {
+            let cats = match node.and_then(|n| n.as_object()) {
+                Some(c) => c,
+                None => continue,
+            };
+            for (cat, fields) in cats.iter() {
+                if crate::logic::is_trade_array_category(cat) { continue; }
+                let fm = match fields.as_object() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                for (f, _) in fm.iter() {
+                    if owners.iter().any(|(_, x, _)| x == f) { continue; }
+                    let vocab = crate::parsing::trade_expected_vocab(cat, doc_type, f);
+                    if !vocab.is_empty() {
+                        owners.push((cat.clone(), f.clone(), vocab));
+                    }
+                }
+            }
+        }
+    }
+    if owners.is_empty() { return 0; }
+
+    let keys: Vec<String> = merged.keys().cloned().collect();
+    let mut moved = 0usize;
+    for k in keys.into_iter() {
+        let from_cat = crate::logic::trade_field_category(&k);
+        if from_cat.is_empty() || crate::logic::is_trade_array_category(from_cat) { continue; }
+        let v = match merged.get(&k).and_then(|x| x.as_str()) {
+            Some(s) => s.trim().to_string(),
+            None => continue,
+        };
+        if v.is_empty() { continue; }
+        let own_vocab = owners
+            .iter()
+            .any(|(_, f, voc)| *f == k && voc.iter().any(|t| same_printed_token(t, &v)));
+        if own_vocab { continue; }
+        let hits: Vec<(String, String)> = owners
+            .iter()
+            .filter(|(_, f, voc)| *f != k && voc.iter().any(|t| same_printed_token(t, &v)))
+            .map(|(c, f, _)| (c.clone(), f.clone()))
+            .collect();
+        if hits.len() != 1 { continue; }
+        let (to_cat, to_field) = hits[0].clone();
+        let target_filled = merged
+            .get(&to_field)
+            .map(|x| !(x.is_null() || x.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
+            .unwrap_or(false);
+        if target_filled { continue; }
+        merged.remove(&k);
+        if let Some(o) = merged.get_mut(from_cat).and_then(|x| x.as_object_mut()) {
+            o.remove(&k);
+        }
+        merged.insert(to_field.clone(), json!(v));
+        let slot = merged
+            .entry(to_cat.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(o) = slot.as_object_mut() {
+            o.insert(to_field.clone(), json!(v));
+        }
+        emit(&format!(
+            "  🔀 [VOCAB OWNER REROUTE] {}.{} = \"{}\" → {}.{} | 이 값은 '{}' 의 닫힌 어휘에만 속하는 토큰입니다. 비어 있던 소유 필드로 옮깁니다.",
+            from_cat, k, v, to_cat, to_field, to_field
+        ));
+        moved += 1;
+    }
+    moved
+}
+
 pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in merged.iter() {

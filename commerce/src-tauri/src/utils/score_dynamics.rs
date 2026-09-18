@@ -11,6 +11,7 @@ pub enum Track {
     Trading,
     Commerce,
     Analytic,
+    Search,
 }
 
 impl Track {
@@ -20,6 +21,7 @@ impl Track {
             Track::Trading => "trading",
             Track::Commerce => "commerce",
             Track::Analytic => "analytic",
+            Track::Search => "search",
         }
     }
     /// (2차 스코프 발동, 1차 스코프 발동, 전역 발동)
@@ -29,6 +31,7 @@ impl Track {
             Track::Trading => (30, 12, 40),
             Track::Commerce => (50, 20, 60),
             Track::Analytic => (40, 15, 0),
+            Track::Search => (20, 8, 30),
         }
     }
     /// 링 버퍼 크기 = 1차 스코프 발동 수. 새 상수를 만들지 않기 위한 재사용입니다.
@@ -103,7 +106,8 @@ pub fn refine_primary(primary: &str) {
                         || !prev.confusion.is_empty()
                         || !prev.category.is_empty()
                         || !prev.spatial.is_empty()
-                        || !prev.transition.is_empty();
+                        || !prev.transition.is_empty()
+                        || !prev.search_field.is_empty();
                     if has {
                         let cnt = prev.baseline.len()
                             + prev.decay.len()
@@ -171,6 +175,7 @@ fn current_track() -> Option<Track> {
         "trading" => Track::Trading,
         "commerce" => Track::Commerce,
         "analytic" => Track::Analytic,
+        "search" => Track::Search,
         _ => return None,
     })
 }
@@ -382,6 +387,8 @@ pub struct ScopeStat {
     /// analytic 도메인 전이 카운트 ("from>to" → 횟수)
     #[serde(default)]
     pub transition: HashMap<String, u64>,
+    #[serde(default)]
+    pub search_field: HashMap<String, SearchFieldStat>,
     pub updated_at: i64,
 }
 
@@ -441,6 +448,17 @@ impl ScopeStat {
         }
         for (k, v) in other.transition {
             *self.transition.entry(k).or_insert(0) += v;
+        }
+        for (k, v) in other.search_field {
+            let f = self.search_field.entry(k).or_insert_with(SearchFieldStat::default);
+            f.proposed += v.proposed;
+            f.hard += v.hard;
+            f.hint += v.hint;
+            f.evaluated += v.evaluated;
+            f.satisfied_any += v.satisfied_any;
+            f.killed_all += v.killed_all;
+            f.sole_blocker += v.sole_blocker;
+            f.demoted += v.demoted;
         }
         self.updated_at = chrono::Utc::now().timestamp_millis();
     }
@@ -966,9 +984,95 @@ pub fn report() -> String {
     let spatial_obs: u64 = store.scopes.values().flat_map(|s| s.spatial.values()).map(|s| s.active_ratio.n).sum();
     let transition_obs: u64 = store.scopes.values().flat_map(|s| s.transition.values()).sum();
     let axis_obs: u64 = store.scopes.values().flat_map(|s| s.axis_variance.values()).map(|w| w.n).sum();
+    let search_obs: u64 = store.scopes.values().flat_map(|s| s.search_field.values()).map(|f| f.proposed).sum();
+    let search_eval: u64 = store.scopes.values().flat_map(|s| s.search_field.values()).map(|f| f.evaluated).sum();
     format!(
-        "[SDS REPORT] 스코프 {}개 | 베이스라인 {} | 감쇠 {} | 축분산 {} | 필드 {} | 혼동 {} | 카테고리 {} | 공간 {} | 전이 {} | (Phase 0: 판정 미개입)",
+        "[SDS REPORT] 스코프 {}개 | 베이스라인 {} | 감쇠 {} | 축분산 {} | 필드 {} | 혼동 {} | 카테고리 {} | 공간 {} | 전이 {} | 검색조건 {} | 검색결과평가 {} | (Phase 0: 판정 미개입)",
         scopes, baseline_obs, decay_obs, axis_obs, field_obs, confusion_obs,
-        category_obs, spatial_obs, transition_obs
+        category_obs, spatial_obs, transition_obs, search_obs, search_eval
     )
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchFieldStat {
+    pub proposed: u64,
+    pub hard: u64,
+    pub hint: u64,
+    pub evaluated: u64,
+    pub satisfied_any: u64,
+    pub killed_all: u64,
+    pub sole_blocker: u64,
+    pub demoted: u64,
+}
+
+pub fn search_scope_key(types: &[String]) -> String {
+    let mut codes: Vec<String> = Vec::new();
+    for t in types.iter() {
+        let c = t.trim().to_lowercase();
+        if c.is_empty() { continue; }
+        if !codes.contains(&c) { codes.push(c); }
+    }
+    codes.sort();
+    if codes.is_empty() || codes.len() > Track::Search.ring_len() {
+        return "all".to_string();
+    }
+    codes.join("+")
+}
+
+pub fn record_search_proposal(field: &str, hard: bool) {
+    if field.is_empty() { return; }
+    with_scope_mut(|s, _| {
+        let e = s.search_field.entry(field.to_string()).or_insert_with(SearchFieldStat::default);
+        e.proposed += 1;
+        if hard { e.hard += 1; } else { e.hint += 1; }
+    });
+}
+
+pub fn record_search_outcome(field: &str, satisfied_any: bool, sole_blocker: bool) {
+    if field.is_empty() { return; }
+    with_scope_mut(|s, _| {
+        let e = s.search_field.entry(field.to_string()).or_insert_with(SearchFieldStat::default);
+        e.evaluated += 1;
+        if satisfied_any { e.satisfied_any += 1; } else { e.killed_all += 1; }
+        if sole_blocker { e.sole_blocker += 1; }
+    });
+}
+
+pub fn record_search_demotion(field: &str) {
+    if field.is_empty() { return; }
+    with_scope_mut(|s, _| {
+        s.search_field.entry(field.to_string()).or_insert_with(SearchFieldStat::default).demoted += 1;
+    });
+}
+
+pub fn search_kill_rate(field: &str) -> Option<f32> {
+    resolve(|st| {
+        st.search_field.get(field).map(|f| {
+            ((f.killed_all as f64 / f.evaluated.max(1) as f64) as f32, f.evaluated)
+        })
+    })
+}
+
+pub fn storage_fill_prior(doc_types: &[String], field: &str) -> Option<(f32, u64, u64)> {
+    let wanted: Vec<String> = doc_types
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if wanted.is_empty() || field.is_empty() { return None; }
+    let store = SDS.read().ok()?;
+    let mut docs = 0u64;
+    let mut assigned = 0u64;
+    for (key, st) in store.scopes.iter() {
+        let mut parts = key.splitn(3, '|');
+        let track = parts.next().unwrap_or("");
+        let primary = parts.next().unwrap_or("");
+        if track != Track::Vision.as_str() && track != Track::Trading.as_str() { continue; }
+        if !wanted.iter().any(|t| t == primary) { continue; }
+        let d = st.category.values().map(|c| c.realized_max.n).max().unwrap_or(0);
+        if d == 0 { continue; }
+        docs += d;
+        assigned += st.field.get(field).map(|f| f.assigned).unwrap_or(0).min(d);
+    }
+    if docs < Track::Vision.min_obs().1 { return None; }
+    Some((((assigned as f64 + 0.5) / (docs as f64 + 1.0)) as f32, assigned, docs))
 }

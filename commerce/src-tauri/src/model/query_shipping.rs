@@ -33,6 +33,12 @@ impl crate::model::LogisModel {
         emit_term("\n=======================================");
         emit_term("[ENGINE] 🚀 Starting Shipping Search Pipeline (v3 / Vector-First NMS)...");
         emit_term(&format!("   질의: \"{}\"", query));
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Search,
+            "all",
+            "",
+        );
 
         let payload = json!({ "task_id": task_id, "category": "Shipping", "summary": "Segmenting trade conditions...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
@@ -377,6 +383,22 @@ impl crate::model::LogisModel {
             }
         }
 
+        {
+            let scores: Vec<f32> = winners.iter().map(|w| w.score).collect();
+            crate::utils::score_dynamics::record_decay("search.d1.winners", &scores);
+            let mut cat_best: Vec<(String, f32)> = Vec::new();
+            for w in winners.iter() {
+                match cat_best.iter_mut().find(|(c, _)| *c == w.category) {
+                    Some(slot) => {
+                        if w.score > slot.1 { slot.1 = w.score; }
+                    }
+                    None => cat_best.push((w.category.clone(), w.score)),
+                }
+            }
+            for (c, m) in cat_best.iter() {
+                crate::utils::score_dynamics::record_category_max(c, crate::logic::trade_condition_fields(c).len(), *m);
+            }
+        }
         let d1_gate = crate::utils::ai_utils::gumbel_expected_z(crate::logic::TRADE_CONDITION_CATEGORIES.len());
         let mut need_d1_llm: Vec<usize> = Vec::new();
         for (wi, w) in winners.iter().enumerate() {
@@ -499,6 +521,20 @@ impl crate::model::LogisModel {
         } else {
             doc_scope.clone()
         };
+        {
+            let scope_key = crate::utils::score_dynamics::search_scope_key(&final_scope);
+            if scope_key != "all" {
+                crate::utils::score_dynamics::enter_scope(
+                    "",
+                    crate::utils::score_dynamics::Track::Search,
+                    &scope_key,
+                    "",
+                );
+                emit_term(&format!("   📈 [SDS] 검색 스코프를 'search|{}|' 로 좁혀 기록합니다.", scope_key));
+            }
+            crate::utils::score_dynamics::record_baseline("search.doc_scope", if final_scope.is_empty() { 0.0 } else { 1.0 });
+            crate::utils::score_dynamics::record_baseline("search.temporal", if layers.temporal.is_some() { 1.0 } else { 0.0 });
+        }
 
         if let Some(t) = layers.temporal.as_ref() {
             if !claimed_fields.contains(&t.field) {
@@ -671,8 +707,24 @@ impl crate::model::LogisModel {
                     g_matrix[fi][si] = own;
                 }
             }
-            let g_centered = crate::utils::ai_utils::double_center_matrix(&g_matrix);
-            let g_assign = crate::utils::ai_utils::exclusive_assign_by_score(&g_centered, 0.0, 0.0);
+            let g_assign = crate::utils::ai_utils::exclusive_assign_by_score(&g_matrix, 0.0, 0.0);
+            for (si, wi) in value_spans.iter().enumerate() {
+                let mut ranked: Vec<(usize, f32)> = (0..g_fields.len())
+                    .filter(|&k| g_matrix[k][si] >= 0.0)
+                    .map(|k| (k, g_matrix[k][si]))
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if ranked.len() < 2 { continue; }
+                let (top, second) = (ranked[0], ranked[1]);
+                let coh = crate::utils::ai_utils::bank_internal_cohesion(&g_banks[second.0]);
+                if !crate::utils::ai_utils::prejudice_dominates(second.1, top.1, coh) {
+                    crate::utils::score_dynamics::record_confusion(&g_fields[top.0].0, &g_fields[second.0].0, top.1 - second.1);
+                    emit_term(&format!(
+                        "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 원점수로 판정하고 혼동 쌍으로 기록합니다.",
+                        winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
+                    ));
+                }
+            }
             for (fi, a) in g_assign.iter().enumerate() {
                 let (si, own, margin) = match a { Some(v) => *v, None => continue };
                 let wi = value_spans[si];
@@ -966,6 +1018,24 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 10 : 벡터 근거가 전무하면 레거시 폴백 1회
         // =====================================================================
+        {
+            let hard_fields: Vec<String> = conditions.keys().cloned().collect();
+            for f in hard_fields.into_iter() {
+                if let Some(reason) = ship_sds_demotion_reason(&f, &final_scope) {
+                    if let Some(v) = conditions.remove(&f) {
+                        hints.insert(f.clone(), v);
+                    }
+                    crate::utils::score_dynamics::record_search_demotion(&f);
+                    emit_term(&format!("   🧮 [SDS DEMOTE] '{}' 하드 조건을 힌트로 내립니다 | {}", f, reason));
+                }
+            }
+            for f in conditions.keys() {
+                crate::utils::score_dynamics::record_search_proposal(f, true);
+            }
+            for f in hints.keys() {
+                crate::utils::score_dynamics::record_search_proposal(f, false);
+            }
+        }
         if conditions.is_empty() && hub_values.is_empty() && hints.is_empty() && final_scope.is_empty() && projection.is_empty() {
             emit_term("   🛟 [FALLBACK] 벡터 근거가 전무하여 레거시 단일 프롬프트를 1회 호출합니다.");
             self.secure_vram_relay(crate::model::ModelSize::Qwen3, None, Some(cancel_token.clone()), false, None).await?;
@@ -1777,6 +1847,35 @@ pub fn ship_apply_assignment(
     (kind, operator, shown)
 }
 
+pub fn ship_sds_demotion_reason(field: &str, scope: &[String]) -> Option<String> {
+    if field == "doc_number" || field == "no" || field.starts_with("reference_") || field == "hub_reference" {
+        return None;
+    }
+    if crate::logic::is_trade_array_category(crate::logic::trade_field_category(field)) {
+        return None;
+    }
+    if let Some(rate) = crate::utils::score_dynamics::search_kill_rate(field) {
+        let ceiling = 1.0 - 1.0 / crate::utils::score_dynamics::Track::Search.ring_len() as f32;
+        if rate >= ceiling {
+            return Some(format!(
+                "이 스코프에서 이 필드 하드 조건이 리콜 문서를 전부 걸러낸 비율 {:.0}% ≥ {:.0}%",
+                rate * 100.0, ceiling * 100.0
+            ));
+        }
+    }
+    if !scope.is_empty() {
+        if let Some((rate, assigned, docs)) = crate::utils::score_dynamics::storage_fill_prior(scope, field) {
+            if assigned == 0 {
+                return Some(format!(
+                    "저장 측 {:?} 문서 {}건 중 이 필드가 채워진 문서 0건 (평활 채움률 {:.3})",
+                    scope, docs, rate
+                ));
+            }
+        }
+    }
+    None
+}
+
 impl crate::model::LogisModel {
     pub async fn build_shipping_query_layers(
         &self,
@@ -2098,6 +2197,7 @@ impl crate::model::LogisModel {
         let title_top = |q: &Vec<f32>| -> f32 {
             title_embs.iter().map(|t| cosine_similarity(q, t)).fold(f32::MIN, f32::max)
         };
+        let mut title_best: Option<(String, f32, f32, f32)> = None;
         for width in (1..=3usize).rev() {
             let mut s = 0usize;
             while s + width <= n {
@@ -2124,12 +2224,24 @@ impl crate::model::LogisModel {
                     s += 1;
                     continue;
                 }
-                let z = (top - mean) / sd;
+                let z = {
+                    let mut sorted = sims.clone();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let med = sorted[sorted.len() / 2];
+                    let mut dev: Vec<f32> = sims.iter().map(|x| (x - med).abs()).collect();
+                    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mad = dev[dev.len() / 2] * 1.4826;
+                    if mad > 1e-6 { (top - med) / mad } else { (top - mean) / sd }
+                };
                 let lab = max_pool_sim(q, &label_bank);
                 let fun = max_pool_sim(q, &func_bank);
                 let opb = max_pool_sim(q, &op_all_bank);
                 let compositional = width == 1
                     || (s..e).all(|k| top > title_top(table.get(&cores[k])));
+                let dom = top - lab.max(fun).max(opb);
+                if title_best.as_ref().map_or(true, |b| z > b.1) {
+                    title_best = Some((text.clone(), z, dom, top));
+                }
                 if z > title_gate && compositional && top > lab.max(fun).max(opb) {
                     let mut codes: Vec<String> = Vec::new();
                     for (ti, v) in sims.iter().enumerate() {
@@ -2151,6 +2263,16 @@ impl crate::model::LogisModel {
                 s += 1;
             }
         }
+        if let Some((t, z, dom, top)) = title_best.as_ref() {
+            crate::utils::score_dynamics::record_baseline("search.title.robust_z", *z);
+            crate::utils::score_dynamics::record_baseline("search.title.dominance", *dom);
+            if !doc_mentions.iter().any(|m| !m.exact) {
+                logs.push(format!(
+                    "   📄 [DOC TYPE MISS] 최고 후보 \"{}\" | 서식 cos {:.4} | robust z {:+.3} (게이트 {:.3}) | 라벨·기능어·연산자 대비 우위 {:+.4}",
+                    t, top, z, title_gate, dom
+                ));
+            }
+        }
         doc_mentions.sort_by(|a, b| a.start.cmp(&b.start));
 
         for &i in pending.iter() {
@@ -2160,17 +2282,19 @@ impl crate::model::LogisModel {
             let lab = max_pool_sim(q, &label_bank);
             let fun = max_pool_sim(q, &func_bank);
             let opb = max_pool_sim(q, &op_all_bank);
+            crate::utils::score_dynamics::record_baseline("search.role.fun_margin", fun - lab);
+            crate::utils::score_dynamics::record_baseline("search.role.op_margin", opb - lab);
             if fun >= opb && crate::utils::ai_utils::prejudice_dominates(lab, fun, lab_coh) {
                 roles[i] = ShipTokenRole::Function;
                 logs.push(format!(
                     "   🗣️ [FUNCTION] \"{}\" | 기능어 cos {:.4} > 라벨 cos {:.4} × (1 + 응집도 {:.4})",
                     cores[i], fun, lab, lab_coh.clamp(0.0, 0.5)
                 ));
-            } else if opb > fun && crate::utils::ai_utils::prejudice_dominates(lab, opb, lab_coh) {
+            } else if opb > lab && opb > fun {
                 roles[i] = ShipTokenRole::Operator;
                 logs.push(format!(
-                    "   ⚖️ [OPERATOR WORD] \"{}\" | 연산자 cos {:.4} > 라벨 cos {:.4} × (1 + 응집도 {:.4})",
-                    cores[i], opb, lab, lab_coh.clamp(0.0, 0.5)
+                    "   ⚖️ [OPERATOR WORD] \"{}\" | 연산자 cos {:.4} > 라벨 cos {:.4} | 기능어 cos {:.4}",
+                    cores[i], opb, lab, fun
                 ));
             }
         }
@@ -2258,6 +2382,7 @@ impl crate::model::LogisModel {
         }
 
         let mut year_like: Vec<(usize, i32)> = Vec::new();
+        let mut conditional_time: Vec<(usize, ShipTimePart, f32, f32)> = Vec::new();
         for i in 0..n {
             if roles[i] != ShipTokenRole::Numeric { continue; }
             if numerics_raw.iter().any(|x| x.token == i) { continue; }
@@ -2286,7 +2411,7 @@ impl crate::model::LogisModel {
             let lab_r = max_pool_sim(q, &label_bank);
             let fun_r = max_pool_sim(q, &func_bank);
             let op_r = max_pool_sim(q, &op_all_bank);
-            if !(unit_top > lab_r && unit_top > fun_r && unit_top > op_r) { continue; }
+            crate::utils::score_dynamics::record_baseline("search.time.unit_margin", unit_top - lab_r.max(fun_r).max(op_r));
             let v = match int_val {
                 Some(v) => v,
                 None => continue,
@@ -2297,22 +2422,62 @@ impl crate::model::LogisModel {
                 "day" if (1..=31).contains(&v) => Some(ShipTimePart::Day(v as u32)),
                 _ => None,
             };
-            if let Some(p) = part {
-                roles[i] = ShipTokenRole::Temporal;
-                logs.push(format!(
-                    "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} > 라벨 {:.4}",
-                    cores[i], p, unit_key, unit_top, lab_r
-                ));
-                parts.push((i, p));
+            let p = match part {
+                Some(p) => p,
+                None => continue,
+            };
+            if !(unit_top > lab_r && unit_top > fun_r && unit_top > op_r) {
+                conditional_time.push((i, p, unit_top, lab_r.max(fun_r).max(op_r)));
+                continue;
             }
+            roles[i] = ShipTokenRole::Temporal;
+            logs.push(format!(
+                "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} > 라벨 {:.4}",
+                cores[i], p, unit_key, unit_top, lab_r
+            ));
+            parts.push((i, p));
         }
-        for (i, y) in year_like.into_iter() {
-            let near_time = (i > 0 && parts.iter().any(|(k, p)| *k == i - 1 && matches!(p, ShipTimePart::Month(_) | ShipTimePart::Day(_))))
-                || parts.iter().any(|(k, p)| *k == i + 1 && matches!(p, ShipTimePart::Month(_) | ShipTimePart::Day(_)));
-            if near_time {
-                roles[i] = ShipTokenRole::Temporal;
-                parts.push((i, ShipTimePart::Year(y)));
+        loop {
+            let mut promoted = false;
+            let mut rest: Vec<(usize, ShipTimePart, f32, f32)> = Vec::new();
+            for (i, p, unit_top, rival) in conditional_time.into_iter() {
+                let linked = [i.wrapping_sub(1), i + 1].iter().any(|k| {
+                    parts.iter().any(|(j, q)| {
+                        *j == *k
+                            && matches!(
+                                (q, &p),
+                                (ShipTimePart::Year(_), ShipTimePart::Month(_))
+                                    | (ShipTimePart::Month(_), ShipTimePart::Day(_))
+                            )
+                    })
+                });
+                if linked {
+                    roles[i] = ShipTokenRole::Temporal;
+                    logs.push(format!(
+                        "   🕒 [TIME UNIT / ADJACENT] \"{}\" → {:?} | 단위 cos {:.4} ≤ 경쟁 cos {:.4} 이지만 인접 시간 조각과 연→월→일 순서로 이어집니다.",
+                        cores[i], p, unit_top, rival
+                    ));
+                    parts.push((i, p));
+                    promoted = true;
+                } else {
+                    rest.push((i, p, unit_top, rival));
+                }
             }
+            conditional_time = rest;
+            let mut rest_years: Vec<(usize, i32)> = Vec::new();
+            for (i, y) in year_like.into_iter() {
+                let near_time = (i > 0 && parts.iter().any(|(k, p)| *k == i - 1 && matches!(p, ShipTimePart::Month(_) | ShipTimePart::Day(_))))
+                    || parts.iter().any(|(k, p)| *k == i + 1 && matches!(p, ShipTimePart::Month(_) | ShipTimePart::Day(_)));
+                if near_time {
+                    roles[i] = ShipTokenRole::Temporal;
+                    parts.push((i, ShipTimePart::Year(y)));
+                    promoted = true;
+                } else {
+                    rest_years.push((i, y));
+                }
+            }
+            year_like = rest_years;
+            if !promoted { break; }
         }
         parts.sort_by(|a, b| a.0.cmp(&b.0));
 

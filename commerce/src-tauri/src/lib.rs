@@ -1521,6 +1521,132 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     })
 }
 
+fn dexie_value_passes(op: &str, kind: &str, have: &Value, want: &Value) -> bool {
+    let as_num = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let t: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                t.parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    };
+    let as_text = |v: &Value| -> String {
+        match v {
+            Value::String(s) => s.trim().to_lowercase(),
+            other => other.to_string().trim_matches('"').to_lowercase(),
+        }
+    };
+    if kind == "number" {
+        let (h, w) = match (as_num(have), as_num(want)) {
+            (Some(h), Some(w)) => (h, w),
+            _ => return false,
+        };
+        return match op {
+            "gte" => h >= w,
+            "gt" => h > w,
+            "lte" => h <= w,
+            "lt" => h < w,
+            "neq" => (h - w).abs() > 1e-9,
+            _ => (h - w).abs() <= 1e-9,
+        };
+    }
+    let (h, w) = (as_text(have), as_text(want));
+    match op {
+        "contains" => h.contains(&w),
+        "not_contains" => !h.contains(&w),
+        "neq" => h != w,
+        "gte" => h >= w,
+        "gt" => h > w,
+        "lte" => h <= w,
+        "lt" => h < w,
+        _ => h == w,
+    }
+}
+
+fn dexie_condition_passes(cond: &Value, doc: &Value, alternates: &Value) -> bool {
+    let path = cond.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let field = path.strip_prefix("data.").unwrap_or(path);
+    let op = cond.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
+    if op == "top" || op == "bottom" { return true; }
+    let want = cond.get("value").cloned().unwrap_or(Value::Null);
+    let kind = cond.get("kind").and_then(|v| v.as_str()).unwrap_or("string");
+    let mut axes: Vec<String> = vec![field.to_string()];
+    if let Some(arr) = alternates.get(field).and_then(|v| v.as_array()) {
+        for a in arr.iter() {
+            if let Some(s) = a.as_str() { axes.push(s.to_string()); }
+        }
+    }
+    axes.iter().any(|f| match doc.get(f.as_str()) {
+        Some(have) if !have.is_null() => dexie_value_passes(op, kind, have, &want),
+        _ => op == "neq" || op == "not_contains",
+    })
+}
+
+fn evaluate_dexie_plan(plan: &Value, docs: &[Value]) -> (usize, usize, Vec<(String, usize, usize)>) {
+    let conds: Vec<Value> = plan
+        .get("conditions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
+    let types: Vec<String> = plan
+        .get("types")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase())).collect())
+        .unwrap_or_default();
+    let mut fields: Vec<String> = Vec::new();
+    for c in conds.iter() {
+        let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let f = path.strip_prefix("data.").unwrap_or(path).to_string();
+        if !f.is_empty() && !fields.contains(&f) { fields.push(f); }
+    }
+    let mut per: Vec<(String, usize, usize)> = fields.iter().map(|f| (f.clone(), 0usize, 0usize)).collect();
+    let mut eligible = 0usize;
+    let mut all_pass = 0usize;
+    for d in docs.iter() {
+        if !types.is_empty() {
+            let t = d
+                .get("type")
+                .or_else(|| d.get("doc_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            if !types.iter().any(|x| *x == t) { continue; }
+        }
+        eligible += 1;
+        let ok: Vec<bool> = fields
+            .iter()
+            .map(|f| {
+                conds
+                    .iter()
+                    .filter(|c| {
+                        let p = c.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        p.strip_prefix("data.").unwrap_or(p) == f.as_str()
+                    })
+                    .all(|c| dexie_condition_passes(c, d, &alternates))
+            })
+            .collect();
+        let fails = ok.iter().filter(|x| !**x).count();
+        if fails == 0 { all_pass += 1; }
+        for (i, pass) in ok.iter().enumerate() {
+            if *pass {
+                per[i].1 += 1;
+            } else if fails == 1 {
+                per[i].2 += 1;
+            }
+        }
+    }
+    (eligible, all_pass, per)
+}
+
+fn is_relay_draft(doc: &Value) -> bool {
+    doc.get("updated_at").and_then(|v| v.as_i64()) == Some(0)
+        && doc.get("digest").and_then(|v| v.as_str()).map_or(false, |s| s.is_empty())
+}
+
 #[tauri::command]
 async fn get_all_documents(
     state: State<'_, AppState>,
@@ -2643,6 +2769,67 @@ async fn ai_search_complex(
                     prop, brief, rec_note);
             }
 
+            if search_mode == "shipping" && !dexie_plans.is_empty() {
+                let docs: Vec<Value> = ranked_results
+                    .iter()
+                    .filter_map(|r| match r.get("text") {
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                        Some(v) if v.is_object() => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for plan in dexie_plans.iter() {
+                    let types: Vec<String> = plan
+                        .get("types")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
+                    let scope_key = crate::utils::score_dynamics::search_scope_key(&types);
+                    crate::utils::score_dynamics::enter_scope(
+                        "",
+                        crate::utils::score_dynamics::Track::Search,
+                        &scope_key,
+                        "",
+                    );
+                    let (eligible, all_pass, per_field) = evaluate_dexie_plan(plan, &docs);
+                    let drafts = docs.iter().filter(|d| is_relay_draft(d)).count();
+                    crate::utils::score_dynamics::record_baseline("search.recall_n", docs.len() as f32);
+                    crate::utils::score_dynamics::record_baseline("search.eligible_n", eligible as f32);
+                    crate::utils::score_dynamics::record_baseline("search.hard_n", per_field.len() as f32);
+                    if !docs.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("search.draft_share", drafts as f32 / docs.len() as f32);
+                    }
+                    if eligible > 0 {
+                        crate::utils::score_dynamics::record_baseline("search.pass_ratio", all_pass as f32 / eligible as f32);
+                    }
+                    let mut detail: Vec<String> = Vec::new();
+                    for (field, satisfied, blocked) in per_field.iter() {
+                        if eligible > 0 {
+                            crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, *blocked > 0);
+                        }
+                        detail.push(format!("{}(만족 {} / 단독 차단 {})", field, satisfied, blocked));
+                    }
+                    println!(
+                        "[AI-SEARCH] 📈 [SDS / SEARCH OUTCOME] 'search|{}|' | 리콜 {}건 · 서식 범위 안 {}건 중 하드 조건 전부 만족 {}건 | 초안 {}건 | {}",
+                        scope_key,
+                        docs.len(),
+                        eligible,
+                        all_pass,
+                        drafts,
+                        if detail.is_empty() { "하드 조건 없음".to_string() } else { detail.join(" | ") }
+                    );
+                    if all_pass == 0 && eligible > 0 && !per_field.is_empty() {
+                        println!(
+                            "[AI-SEARCH] ⚠️ [OVER-FILTER] 서식 범위 안 문서 {}건 중 하드 조건을 전부 만족하는 문서가 없습니다. 단독으로 걸러낸 필드: {:?}",
+                            eligible,
+                            per_field.iter().filter(|(_, _, b)| *b > 0).map(|(f, _, _)| f.clone()).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
+                crate::utils::score_dynamics::flush();
+                crate::utils::score_dynamics::leave_scope();
+            }
             all_results = ranked_results;
         }
         // =====================================================================
