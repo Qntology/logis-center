@@ -1,4 +1,4 @@
-use super::{LogisModel, ModelSize};   // ← 부모의 타입을 끌어옵니다
+use super::{LogisModel, ModelSize};
 use crate::utils;
 use anyhow::anyhow;
 use crate::models::qwen::generate::QwenVLGenerateModel;

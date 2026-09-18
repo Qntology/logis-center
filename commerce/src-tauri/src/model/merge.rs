@@ -129,13 +129,6 @@ pub fn trade_resolve_condition_value(field: &str, chunk: &str) -> String {
     crate::utils::ai_utils::deterministic_condition_value(&vec![c.to_string()], false)
 }
 
-/// 🌟 [TRADE CONDITION OPERATOR] 비교 표현이 명시된 경우에만 기본 연산자를 바꿉니다.
-///  ── 근거 ──
-///   split_numeric_and_comparator 가 '5000원 이하로' 를 (숫자, 비교 표현) 으로 분해하고,
-///   bias.json 의 operators 노드가 다국어 비교 표현을 이미 갖고 있습니다.
-///   여기서는 그 구조를 그대로 재사용하되, 임베딩 호출 없이
-///   bias.json 의 exact_match 계열 완전일치만으로 판정합니다.
-///   (임베딩 판정이 필요한 애매한 경우는 Depth 3 프롬프트가 담당합니다)
 pub fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
     let default_op = crate::logic::trade_default_operator(field).to_string();
 
@@ -192,31 +185,6 @@ pub fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
     }
 }
 
-/// 🌟 [MERGE POLICY] 카테고리별 추출 결과를 하나의 객체로 합칩니다.
-///
-///  ── 왜 별도 함수인가 ──
-///   기존 merge_json_manual 은 무조건 덮어썼습니다.
-///   header 크롭이 확정한 doc_number 를 parties 크롭이 null 로 덮는 사고가 납니다.
-///   크롭은 서로 다른 영역을 보므로, 값이 없다는 사실은
-///   '그 영역에 없었다' 는 뜻이지 '문서에 없다' 는 뜻이 아닙니다.
-///
-///  ── 규칙 ──
-///   ① null / 빈 문자열 / 빈 배열은 기존 값을 덮지 않습니다.
-///   ② 배열 필드(items / containers 등)는 이어붙입니다.
-///   ③ 이미 값이 있는 스칼라 필드는 유지합니다. 먼저 확정된 쪽이 이깁니다.
-///      (크롭 계획은 점수 순이므로 근거가 강한 쪽이 먼저 들어옵니다)
-/// 🌟 [SCHEMA ECHO GUARD] LLM 이 프롬프트의 스키마 플레이스홀더를 그대로 베낀 경우를 걸러냅니다.
-///
-///  ── 실측 사고 ──
-///   logistics 크롭(서명 영역)에 voyage number 가 없자 2B 모델이
-///   프롬프트의 타입 표기 `{String}` 을 값으로 그대로 반환했습니다.
-///   그대로 저장하면 data.voyage_number = "{String}" 이 되어
-///   Dexie 인덱스와 FTS 를 영구히 오염시킵니다.
-///
-///  ── 판정 근거 ──
-///   어휘 사전이 아니라 '문자 구조' 입니다.
-///   중괄호/꺾쇠로 감싼 토큰, 타입 이름 그 자체, 날짜 포맷 문자열은
-///   어느 언어의 문서에도 값으로 등장하지 않습니다.
 pub fn is_schema_echo(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -236,18 +204,6 @@ pub fn is_schema_echo(s: &str) -> bool {
     )
 }
 
-/// 🌟 [CLAIMED HARVEST] 지금까지 확정된 (필드, 값) 쌍을 뽑아 다음 크롭에 전달합니다.
-///
-///  ── 왜 필요한가 ──
-///   크롭은 카테고리별로 순차 호출되므로 뒤 크롭은 앞 크롭의 결과를 모릅니다.
-///   그래서 financials 가 이미 2000.00 을 확정했는데
-///   cargo 가 근처의 같은 숫자를 자기 필드로 다시 가져가는 사고가 납니다.
-///   scheduler.rs 의 커머스 추출이 [ALREADY CLAIMED VALUES] 로 같은 문제를 막는 것과
-///   동일한 장치를 비전 크롭 경로에도 부여합니다.
-///
-///  ── 무엇을 넘기는가 ──
-///   스칼라 값만 넘깁니다. 배열(line_items / containers)은 여러 행이 정상이므로
-///   금지 목록에 넣으면 오히려 정답을 막습니다.
 pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in merged.iter() {
@@ -366,6 +322,16 @@ pub fn record_grounding_claims(
                 _ => continue,
             };
             if s.is_empty() || is_schema_echo(&s) {
+                continue;
+            }
+            let schema_shaped = !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !schema_shaped {
+                println!(
+                    "    🚫 [CLAIM KEY SHAPE] [{}] 키 '{}' 는 스키마 필드 형식이 아닙니다. 모델이 인쇄 라벨을 키로 만든 것이므로 접지 주장에서 제외합니다.",
+                    category, k
+                );
                 continue;
             }
             if s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
@@ -545,19 +511,6 @@ pub fn apply_grounding_verdicts(
             "  🗑️ [GROUNDING APPLY] [{}] '{}' = \"{}\" 제거 | {}",
             r.category, r.field, r.value, r.reason
         ));
-        // 🌟 [SDS 계측 이동 완료 / V-1]
-        //
-        //  ── 왜 여기서 뺐나 ──
-        //   이 루프는 '폐기된 것' 만 돌기 때문에 여기에 계측을 두면
-        //   분자만 쌓이고 분모가 없습니다. 함수 맨 앞의 선행 집계 블록이
-        //   accepted / rejected / 보류 세 갈래를 모두 한 번에 세므로,
-        //   여기서 다시 부르면 같은 필드가 두 번 seen 되고
-        //   reject_format 이 이중 가산되어 거절률이 200% 로 계산됩니다.
-        //
-        //  ── 이 루프의 책임 ──
-        //   이제 이 루프는 '병합 결과에서 실제로 값을 걷어내는' 데이터 조작만 합니다.
-        //   판정 사실의 기록과 데이터 조작을 분리해 두면
-        //   나중에 폐기 정책이 바뀌어도 통계 축이 흔들리지 않습니다.
     }
     emit(&format!(
         "  ✅ [GROUNDING APPLY] 폐기 {}건 | 데이터 지점 {}곳에서 제거",
@@ -572,21 +525,6 @@ pub fn merge_extracted(
     incoming: &Value,
     emit: &dyn Fn(&str),
 ) {
-    // 🌟 [ARRAY CATEGORY COERCION]
-    //
-    //  ── 실측 사고 ──
-    //   items 크롭의 프롬프트 스키마는 `[ { ... } ]` 배열인데,
-    //   2B 모델은 행이 하나만 보이면 `{ ... }` 객체를 반환합니다.
-    //   구버전은 `incoming.as_object()` 가 Some 이면 배열 분기를 타지 않아,
-    //   description / quantity / unit / unit_price / total_price / hs_code 6개가
-    //   전부 '최상위 스칼라' 로 흘러들어갔고 line_items 는 빈 배열로 남았습니다.
-    //   (실측 결과 JSON: line_items: [] 이면서 루트에 description: "T-Shirt")
-    //   그 상태로 저장되면 Dexie 의 line_items 인덱스가 영원히 비고,
-    //   두 번째 행(Shorts)은 애초에 담을 그릇조차 없습니다.
-    //
-    //  ── 처방 ──
-    //   배열 카테고리에서 객체 하나가 오면 원소 1개짜리 배열로 승격합니다.
-    //   '스키마가 배열이면 결과도 배열' 이라는 계약을 코드가 강제합니다.
     let is_array_category = category == "items" || category == "containers";
 
     let coerced: Value;
@@ -641,21 +579,6 @@ pub fn merge_extracted(
                     parts.join("|")
                 };
 
-                // 🌟 [ROW IDENTITY GATE] 표의 '데이터 행' 은 반드시 자기 정체를 갖습니다.
-                //
-                //  ── 실측 사고 ──
-                //   items 배열에 3행이 저장되었는데 실제 품목은 1행뿐이었습니다.
-                //     { description: null, item_package_count: 4, total_price: 2000 }  ← 합계 행
-                //     { description: null, item_code: "360 Footwear" }                 ← 회사명
-                //   합계 행은 품명이 없고, 회사명은 품목 코드 자리에 들어간 서명란 텍스트입니다.
-                //   프롬프트의 [TABLE RULES] 가 이미 합계 행 제외를 지시하지만
-                //   2B 모델은 타일 경계에서 그 지시를 지키지 못합니다.
-                //
-                //  ── 판정 근거 (어휘 사전 아님) ──
-                //   무역 품목표에서 '품명 없는 데이터 행' 은 정의상 존재하지 않습니다.
-                //   합계 행 · 소계 행 · 서명란 텍스트는 전부 품명 칸이 비어 있습니다.
-                //   컨테이너 표도 같은 원리로 '번호 없는 컨테이너 행' 은 성립하지 않습니다.
-                //   값이 있는지만 보므로 언어와 무관합니다.
                 let row_has_identity = |v: &Value| -> bool {
                     let o = match v.as_object() { Some(o) => o, None => return false };
                     let filled = |k: &str| -> bool {
@@ -815,22 +738,6 @@ pub fn merge_extracted(
             crate::utils::score_dynamics::record_field_assigned(k, 0.0);
         }
 
-        // 🌟 [CATEGORY SLOT MIRROR] 카테고리 그룹 객체에도 같은 값을 넣습니다.
-        //
-        //  ── 무엇이 문제였나 ──
-        //   구버전은 category 인자를 배열 분기에서만 쓰고, 객체 분기에서는
-        //   최상위에 평평하게 삽입했습니다. 그 결과
-        //     final_data_map["header"] = {"doc_type":"CI"}   ← 초기값 그대로
-        //     final_data_map["doc_number"] = "CI-43726"      ← 루트에 평평하게
-        //   가 되어, STEP C 의 TRADING FLATTEN v3 가 header 그룹을 순회할 때
-        //   승격할 잎이 doc_type 하나뿐이었습니다.
-        //   (실측 로그: "data 루트로 승격한 축 1개: [\"doc_type\"]")
-        //   또 doc_number 탐색이 header.document_number → 루트 순서인데
-        //   header 가 비어 있어 task_id 폴백이 확정되었습니다.
-        //
-        //  ── 왜 미러인가 ──
-        //   루트 평면 배치는 Dexie 인덱스(data.*)가 소비하므로 그대로 둡니다.
-        //   그룹 슬롯은 doc_number 탐색과 FLATTEN 이 소비합니다. 둘 다 필요합니다.
         if newly_added && category != "items" && category != "containers" {
             let slot = merged
                 .entry(category.to_string())
@@ -885,15 +792,8 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
         } else if let Some(target_obj) = target.as_object_mut() {
             if let Some(source_obj) = actual_data.as_object() {
                 for (k, v) in source_obj {
-                    // 🌟 [ZERO IS DATA] 기존 `v != 0` 은 값이 실제로 0 인 축을 통째로 버렸습니다.
-                    //    freight_amount 0(Freight Prepaid), package_count 0, weight_net 0 은
-                    //    모두 '못 찾음' 이 아니라 확정된 값입니다.
                     if v.is_null() { continue; }
                     if let Some(s) = v.as_str() {
-                        // 🌟 [SCHEMA ECHO GUARD] 텍스트 경로도 get_trade_category_schema 를
-                        //    그대로 쓰므로 비전 경로와 동일한 에코가 발생합니다.
-                        //    "{String}" / "String" / "..." 같은 플레이스홀더를 값으로 저장하면
-                        //    Dexie 인덱스와 FTS 가 영구히 오염됩니다.
                         if is_schema_echo(s) {
                             println!(
                                 "[TRADING] 🚫 [SCHEMA ECHO] '{}' = \"{}\" 는 프롬프트 플레이스홀더 복사이므로 폐기합니다.",

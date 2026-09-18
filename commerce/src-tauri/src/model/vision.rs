@@ -40,23 +40,6 @@ impl crate::model::LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
-        // 🌟 [SDS SCOPE / 필수] 비전 경로의 계측 스코프를 세웁니다.
-        //
-        //  ── 왜 여기여야 하는가 ──
-        //   process_task 는 resolve_absolute_url 보다 앞에서
-        //     if task.r#type == "image_extraction" { ... return Ok(()); }
-        //   로 이탈합니다. 따라서 이 경로도 enter_scope 에 도달하지 못했고,
-        //   V-1 이 남기는 record_spatial / record_baseline("vision.spread_*") 과
-        //   classify_doc_type 의 record_decay("vision.doc_code") 가 전부 버려졌습니다.
-        //
-        //  ── team 을 빈 문자열로 두는 이유 ──
-        //   이 함수 시그니처에 team_id 가 없습니다. 스코프 키는
-        //   track|primary|secondary 로만 구성되고 team 은 진단용이므로,
-        //   SDS 가 로드 시점에 바인딩한 팀이 그대로 유지됩니다.
-        //
-        //  ── 1차 키는 STAGE-2 가 확정합니다 ──
-        //   지금은 doc_type 을 모르므로 'unknown' 으로 시작하고,
-        //   비전 코드가 확정되면 refine_primary 가 교체합니다.
         crate::utils::score_dynamics::enter_scope(
             "",
             crate::utils::score_dynamics::Track::Vision,
@@ -79,35 +62,11 @@ impl crate::model::LogisModel {
             self.wait_for_vram_settle(1200, 10, cancel_token.clone()).await.ok();
         }
 
-        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
-        //    STEP 1~4 는 SigLIP2 만 사용하므로 여기서 로드하면
-        //    SigLIP2 비전(~400MB) + Qwen3.5+mmproj(~2.6GB) = ~3.0GB 동시 상주가 발생합니다.
-        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
-        //    ensure_qwen3_5(image.is_some()) 가 필요 시점에 자동 로드하며,
-        //    그 시점에는 release_siglip2() 가 이미 SigLIP2 를 전량 해제한 후입니다.
-
-        // 🌟 [VRAM STAGE] Qwen3.5 로드를 STEP 5 직전으로 지연합니다.
-        //    STEP 1~3 은 SigLIP2 만 사용하므로 4GB VRAM 에서
-        //    SigLIP2(~2.2GB) + Qwen3.5(~2GB) 동시 상주를 피합니다.
-        //    STEP 5 의 chat_with_qwen3_5_image_spinner 내부에서
-        //    ensure_qwen3_5 가 필요 시점에 자동 로드합니다.
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
 
             let mut is_trade_doc = search_mode == "shipping";
             let mut extracted_data = json!({});
-
-            // ── STEP 1 : SigLIP2 패치 임베딩 격자 ──
-            //
-            // 🌟 [SINGLE LOCK + IMMEDIATE RELEASE]
-            //  구버전은 같은 뮤텍스를 두 번 잡았습니다.
-            //    ① lock → encode_image → drop
-            //    ② lock → m.vision = None
-            //  encode_image_and_release 는 패치를 호스트 Vec 으로 확보한 직후
-            //  같은 가변 참조로 비전 가중치를 반납하므로,
-            //  "패치 확보 = 856MB 반납" 이 한 문장으로 원자화됩니다.
-            //  PatchGrid.patches 는 252 × 1152 × 4B = 1.16MB 로 이미 호스트에 있으므로
-            //  이후 STEP 1 Depth1/2 · STEP 2 · STEP 3 은 비전 없이 동작합니다.
             let grid = {
                 let mut siglip_guard = self.siglip2_model.lock().await;
                 let siglip = siglip_guard.as_mut()
@@ -116,84 +75,20 @@ impl crate::model::LogisModel {
                     siglip, &dynamic_image
                 ).map_err(|e| anyhow::anyhow!("SigLIP2 encode failed: {}", e))?
             };
-
-            // 🌟 [LAZY TEXT] 텍스트 인코더를 여기서 무조건 올리지 않습니다.
-            //
-            //  ── 왜 바꾸는가 ──
-            //   구버전은 ensure_siglip2_ext(false, true) 로 1,416MB 를 즉시 올렸습니다.
-            //   그런데 STEP 1/2 가 텍스트 인코더에 요구하는 것은
-            //   '정적 앵커 구를 벡터로 바꿔 달라' 뿐이고, 그 구는 전부
-            //   logic.rs 상수와 bias.json 에서 나오는 불변 문자열입니다.
-            //   phrase_cache 가 채워진 두 번째 실행부터는 인코더 자체가 불필요합니다.
-            //
-            //  ── 어떻게 안전한가 ──
-            //   아래 모든 텍스트 작업은 with_siglip_text 로 감쌉니다.
-            //   캐시 미스가 실제로 발생하면 ERR_TEXT_ENCODER_REQUIRED 신호를 받아
-            //   그 자리에서 인코더를 부착하고 1회 재시도합니다.
-            //   '무엇이 필요한지 미리 아는' 게이트가 아니라 '해 보고 필요하면 올리는'
-            //   구조라 앵커 사전이 바뀌어도 게이트가 어긋날 수 없습니다.
             emit_term(&format!(
                 "  🧬 [PATCH GRID READY] {}x{} = {} patches (host {:.2}MB) | 비전 반납 완료, 텍스트는 캐시 미스 시에만 로드",
                 grid.grid_rows, grid.grid_cols, grid.len(),
                 (grid.len() * 1152 * 4) as f64 / 1e6
             ));
-
-            // ── STEP 2.5 : 판독성 맵 ──
-            //
-            // 🌟 [왜 if 블록 밖인가]
-            //  이 맵은 세 곳이 소비합니다.
-            //    · STEP 3   : 판독불가 패치를 히트맵 근거에서 제외
-            //    · STEP 4.5 : 크롭 감사에서 판독가능 패치만 근거로 인정
-            //    · STEP 6   : 값의 최고 일치 패치가 블러/여백이면 그 값을 폐기
-            //  STEP 6 은 trade / commerce 분기 '밖' 에서 실행되므로,
-            //  분기 안에 선언하면 스코프를 벗어나 컴파일되지 않습니다.
-            //  커머스 경로도 동일한 판독성 판정이 필요하므로 모드 무관하게 1회 계산합니다.
-            //
-            // 🌟 [왜 임베딩이 아니라 픽셀인가]
-            //  블러는 '의미' 가 아니라 '고주파 성분의 소실' 입니다.
-            //  패치 임베딩도 흐려지지만 그것이 '개념 부재' 인지 '해상도 부족' 인지
-            //  구분할 수 없습니다. 휘도 기울기 에너지는 블러를 직접 측정합니다.
-            //  (실측: EXPORTER/CONSIGNEE 블러 블록, 빈 BUYER 박스가 여기서 잡힙니다)
             let legibility = crate::models::siglip2::legibility::build_legibility_map(
                 &dynamic_image,
                 grid.grid_rows,
                 grid.grid_cols,
                 &emit_term,
             );
-
-            // 🌟 [GROUNDING CLAIMS] STEP 6 검증에 넘길 (값, 출처 bbox) 기록.
-            //  분기 안에서 선언하면 STEP 6 이 볼 수 없으므로 여기서 만듭니다.
-            //  TRACKING fast-track / commerce 경로도 여기에 주장을 쌓으면
-            //  같은 검증을 그대로 받게 됩니다.
             let mut grounding_claims:
                 Vec<crate::models::siglip2::value_grounding::GroundingClaim> = Vec::new();
-
-            // 🌟 [SCOPE FIX] relay_plan 은 if is_trade_doc 블록 내부에서 할당되고,
-            //    블록 외부(STEP 6 이후 저장 구간)에서 참조되므로
-            //    양쪽 분기보다 바깥에서 미리 선언해야 합니다.
-            //    (커머스 경로에서는 빈 Vec 으로 남아 요약 출력이 자동 억제됩니다)
             let mut relay_plan: Vec<(&'static str, crate::parsing::TradeRelayKey)> = Vec::new();
-
-            // 🌟 [MODE REROUTE] mode="commerce" 로 들어왔더라도,
-            //    상단 밴드에 무역 서식 전문이 인쇄되어 TITLE GATE 가 확정한 경우에만
-            //    trading 파이프라인으로 전환합니다.
-            //    · 상품 사진/스크린샷(커머스) → 전문 없음 → title_confirmed=false → 커머스 유지
-            //    · 택배 라벨 → TRACKING 확정 → 아래 분기에서 기존 커머스 트랙킹 경로 유지
-            //    · 인보이스/B/L 등 → title_confirmed=true && code != TRACKING → trading 전환
-            //    본문 코사인(그룹 점수)은 settlement 이 CI 를 이기는 등 신뢰도가 낮으므로
-            //    리라우트 근거로 쓰지 않습니다. (로그: [VISION GROUP] settlement +4.5884 1위)
-            // 🌟 [VERDICT REUSE] 리라우트 프로브의 판정 결과를 보관합니다.
-            //
-            //  ── 실측 낭비 ──
-            //   classify_doc_type 은 (model, grid) 의 순수 함수입니다.
-            //   그런데 커머스→트레이딩 리라우트 경로에서는
-            //     ① 여기(L1528 프로브)  ② STEP 2(L1567 본판정)
-            //   두 번 호출되고, 그 사이 model 도 grid 도 바뀌지 않으므로
-            //   두 번째 호출은 첫 번째와 비트 단위로 같은 값을 다시 계산합니다.
-            //   이 함수는 그룹/전문/코드 3개 앵커 뱅크를 만들며
-            //   uniq 약 345구 × 26 GFLOP ≈ 9 TFLOP 이 듭니다. 두 번이면 18 TFLOP 입니다.
-            //   인보이스 이미지를 커머스 모드로 드롭하는 것은 상시 패턴이므로
-            //   이 중복은 예외가 아니라 기본 동작이었습니다.
             let mut cached_verdict:
                 Option<crate::models::siglip2::vision_encoder::DocTypeVerdict> = None;
 
@@ -233,17 +128,6 @@ impl crate::model::LogisModel {
                 ));
 
                 emit_term("[STAGE-2] 🚢 Trade Document Mode: SigLIP2 Cosine Classification...");
-                // 🌟 [LEGIBILITY REUSE] 판독성 맵은 분기 밖 STEP 2.5 에서 1회 계산된
-                //    바인딩을 그대로 사용합니다. 기존 shadowing 재계산은 로그 2회 출력 +
-                //    800x1032 픽셀 스캔 2회의 순수 낭비였습니다.
-
-                // ── STEP 2 : Doc Type NMS Battle ──
-                //
-                // 🌟 [VERDICT REUSE] 리라우트 프로브가 이미 판정했다면 그 결과를 그대로 씁니다.
-                //    classify_doc_type 은 (model, grid) 의 순수 함수이고 둘 다 그대로이므로
-                //    재호출은 같은 값을 다시 계산할 뿐입니다.
-                //    처음부터 mode='shipping' 으로 들어온 경로에서는 프로브가 없었으므로
-                //    여기서 최초 1회 판정합니다.
                 let verdict = match cached_verdict.take() {
                     Some(v) => {
                         emit_term(&format!(
@@ -290,20 +174,9 @@ impl crate::model::LogisModel {
                 }
 
                 emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
-                // 🌟 [SDS SCOPE] 확정 코드로 1차 키를 교체합니다.
-                //
-                //  ⚠️ 변수명 주의
-                //   이 시점에 존재하는 것은 detected_type 입니다.
-                //   doc_type 은 이 블록보다 한참 뒤(저장 구간)에서
-                //     let doc_type = if is_trade_doc { ... } else { "goods" };
-                //   로 처음 선언되므로, 여기서 참조하면 E0425 가 납니다.
-                //   trading.rs 의 STEP A 에는 그 위치에 doc_type 이 실제로 있어
-                //   같은 문장이 성립하지만, 이 파일에서는 성립하지 않습니다.
                 crate::utils::score_dynamics::refine_primary(&detected_type);
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
-                    // 🌟 [VRAM STAGE] 이 경로는 크롭 없이 전체 이미지를 Qwen3.5 에 바로 넘깁니다.
-                    //    SigLIP2 는 여기서 임무가 끝났으므로 즉시 반환합니다.
                     self.release_siglip2("TRACKING fast-track, before Qwen3.5 load").await;
                     let prompt = crate::parsing::get_image_extraction_prompt("kr", &language, "tracking", "");
                     let (_track_bias, track_prej) = crate::parsing::get_vision_tracking_bias(&language);
@@ -313,10 +186,6 @@ impl crate::model::LogisModel {
                     ).await?;
 
                     extracted_data = crate::parsing::parse_json_from_llm(&result_str);
-
-                    // 🌟 [WHOLE-PAGE CLAIM] 크롭이 없으므로 출처 bbox 는 페이지 전체입니다.
-                    //    N_in = 전 패치이므로 √(2 ln 252) = 3.32 를 차감하는 엄격한 시험이 됩니다.
-                    //    그래도 '문서에 없는 운송장번호를 지어낸' 경우는 확실히 걸립니다.
                     record_grounding_claims(
                         &mut grounding_claims,
                         "tracking",
@@ -336,13 +205,6 @@ impl crate::model::LogisModel {
                     } else {
                         vec![verdict.title_text.clone()]
                     };
-                    // 🌟 [SCOPED LOCK] tokio Mutex 는 재진입이 불가능합니다.
-                    //    가드가 생존한 채 release_siglip2 가 같은 태스크에서 락을 기다리면
-                    //    영구 정지(셀프 데드록)합니다. 명시적 drop 에 의존하지 않고
-                    //    스코프 블록으로 락 수명을 고정합니다.
-                    // 🌟 [LAZY TEXT] with_siglip_text 가 락 수명을 스코프로 고정하므로
-                    //    기존 [SCOPED LOCK] 의 셀프 데드록 방어가 그대로 유지됩니다.
-                    //    앵커가 전부 캐시에 있으면 텍스트 인코더 1,416MB 를 올리지 않습니다.
                     let mut heatmaps = self
                         .with_siglip_text("column heatmaps (trade)", |m| {
                             crate::models::siglip2::vision_encoder::build_column_heatmaps(
@@ -351,16 +213,7 @@ impl crate::model::LogisModel {
                         })
                         .await
                         .map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
-
-                    // 🌟 [TITLE ROW SUPPRESSION] 제목 행은 어떤 필드의 값도 될 수 없습니다.
-                    //    실측에서 header 봉우리가 제목/로고 행(r0)에 착지해 doc_number 가 전멸했습니다.
-                    //    타이틀은 상단 1줄(≈ 격자 행수의 1/9, TITLE GATE 30% 밴드의 1/3)에 인쇄되므로
-                    //    해당 행의 점수를 억제해 header 봉우리가 값 행으로 이동하게 합니다.
                     {
-                        // 🌟 [ROW FIX v2] /9(=2) 는 0..=2 세 행을 죽여 "INVOICE NUMBER" 라벨 행(r2)까지
-                        //    함께 억제했고, doc_number 앵커가 근거를 잃어 header 봉우리가
-                        //    숫자 밀집 블록(VAT/EORI, r7~8)으로 탈주했습니다(실측: reference_invoice="CONSIGNEE VAT/EORI").
-                        //    제목 실제 인쇄 행은 r0~1 뿐이므로 /18(=1) 로 0..=1 만 억제합니다.
                         let title_row_max = (grid.grid_rows / 18).max(1).min(grid.grid_rows.saturating_sub(1));
                         let mut suppressed = 0usize;
                         for hm in heatmaps.iter_mut() {
@@ -988,18 +841,6 @@ impl crate::model::LogisModel {
                 final_data.as_object_mut().unwrap().insert("text".to_string(), json!(nl));
                 final_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_nl));
 
-                // 🌟 [TRADING FLATTEN v3 / RULE-BASED]
-                //  ── 무엇이 바뀌었나 ──
-                //   v2 는 header/parties/logistics/financials/conditions/cargo 6개 그룹의
-                //   필드 60여 개를 손으로 나열했습니다. 그래서
-                //     ① get_trade_category_schema 에 필드를 추가하면 여기도 같이 고쳐야 했고
-                //     ② 여기 없는 필드는 data 루트에 올라오지 않아,
-                //        executeDexiePlan 의 contains 판정이 false 를 돌려주며
-                //        '조건 무시' 가 아니라 '문서 탈락' 으로 이어졌습니다.
-                //   v3 는 '중첩 객체의 잎을 전부 끌어올린다' 는 구조적 규칙만 남깁니다.
-                //   별칭은 build_dexie_plan 의 normalize_path 와 동일한
-                //   bias.json search_bridge.path_alias 노드를 재사용하므로,
-                //   저장(정방향)과 조회(역방향)가 같은 이름 공간을 씁니다.
                 if is_trade_doc {
                     // 잎을 끌어올릴 중첩 그룹. 배열(line_items/containers)은 아래에서 따로 처리합니다.
                     const TRADE_GROUPS: [&str; 6] =
