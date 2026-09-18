@@ -38,17 +38,18 @@ impl LegibilityMap {
         orig_h: u32,
     ) -> (usize, usize, usize) {
         let (mut lg, mut il, mut bl) = (0usize, 0usize, 0usize);
+        if self.rows == 0 || self.cols == 0 || orig_w == 0 || orig_h == 0 {
+            return (lg, il, bl);
+        }
         let cw = orig_w as f32 / self.cols as f32;
         let ch = orig_h as f32 / self.rows as f32;
         for r in 0..self.rows {
             for c in 0..self.cols {
                 let x0 = (c as f32 * cw) as u32;
                 let y0 = (r as f32 * ch) as u32;
-                let x1 = x0 + cw as u32;
-                let y1 = y0 + ch as u32;
-                let cx = (x0 + x1) / 2;
-                let cy = (y0 + y1) / 2;
-                if cx < bbox.0 || cx > bbox.2 || cy < bbox.1 || cy > bbox.3 {
+                let x1 = ((((c + 1) as f32 * cw).ceil()) as u32).max(x0 + 1);
+                let y1 = ((((r + 1) as f32 * ch).ceil()) as u32).max(y0 + 1);
+                if x1 <= bbox.0 || x0 >= bbox.2 || y1 <= bbox.1 || y0 >= bbox.3 {
                     continue;
                 }
                 match self.at(r, c) {

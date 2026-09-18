@@ -183,7 +183,7 @@
         "country_of_manufacture": "Country of manufacture or origin for this line {String}",
         "unit_price": "Unit price {Number}",
         "total_price": "Line total {Number}",
-        "item_net_weight": "Net weight of this line {Number}",
+        "item_net_weight": "Net weight of this line, printed as UNIT WEIGHT or NET WEIGHT or N.W. {Number}",
         "item_gross_weight": "Gross weight of this line {Number}",
         "item_package_count": "Number of packages for this line {Number}",
         "item_package_type": "Package type for this line {String}"

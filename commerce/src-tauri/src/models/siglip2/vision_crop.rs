@@ -1988,6 +1988,76 @@ pub fn crop_region(
     cropped.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 
+pub fn crop_tile(
+    image: &DynamicImage,
+    plan: &CropPlan,
+    tile: &TilePlan,
+    target_short: u32,
+) -> DynamicImage {
+    let (hy0, hy1) = match tile.header_band {
+        Some(h) => h,
+        None => {
+            let mut p = plan.clone();
+            p.bbox = tile.bbox;
+            return crop_region(image, &p, target_short);
+        }
+    };
+
+    let (x0, ry0, x1, ry1) = tile.bbox;
+    let w = x1.saturating_sub(x0).max(1);
+    let hh = hy1.saturating_sub(hy0).max(1);
+    let rh = ry1.saturating_sub(ry0).max(1);
+    let total_h = hh + HEADER_STITCH_SEAM_PX + rh;
+
+    let head = image.crop_imm(x0, hy0, w, hh).to_rgb8();
+    let body = image.crop_imm(x0, ry0, w, rh).to_rgb8();
+
+    let mut canvas = image::RgbImage::new(w, total_h);
+    for px in canvas.pixels_mut() {
+        *px = image::Rgb([255u8, 255u8, 255u8]);
+    }
+    let hw = head.width().min(w);
+    let hd = head.height().min(hh);
+    for y in 0..hd {
+        for x in 0..hw {
+            canvas.put_pixel(x, y, *head.get_pixel(x, y));
+        }
+    }
+    let bw = body.width().min(w);
+    let bd = body.height().min(rh);
+    for y in 0..bd {
+        for x in 0..bw {
+            canvas.put_pixel(x, hh + HEADER_STITCH_SEAM_PX + y, *body.get_pixel(x, y));
+        }
+    }
+    let stitched = DynamicImage::ImageRgb8(canvas);
+
+    let mut factor = if tile.text_h > 0.5 {
+        (VISION_PATCH_PX / tile.text_h).clamp(1.0, 4.0)
+    } else {
+        let short = w.min(total_h) as f32;
+        (target_short as f32 / short).clamp(1.0, 2.0)
+    };
+    let cap_w = CROP_MAX_SIDE_PX as f32 / w as f32;
+    let cap_h = CROP_MAX_SIDE_PX as f32 / total_h as f32;
+    let cap = if cap_w < cap_h { cap_w } else { cap_h };
+    if cap > 1.0 && factor > cap {
+        factor = cap;
+    }
+
+    println!(
+        "    🧷 [HEADER STITCH] 표 헤더 y{}~{} ({}px) 를 데이터 행 y{}~{} ({}px) 위에 붙여 {}x{} 합성 크롭을 만들었습니다. 추정 글자 높이 {:.1}px → 배율 {:.2}x (종횡비 유지)",
+        hy0, hy1, hh, ry0, ry1, rh, w, total_h, tile.text_h, factor
+    );
+
+    if factor <= 1.01 {
+        return stitched;
+    }
+    let nw = ((w as f32 * factor).round() as u32).max(1);
+    let nh = ((total_h as f32 * factor).round() as u32).max(1);
+    stitched.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+}
+
 pub fn whole_page_fallback(categories: &[&str], grid: &PatchGrid) -> Vec<CropPlan> {
     categories
         .iter()
@@ -2203,10 +2273,266 @@ pub struct TilePlan {
     pub bbox: (u32, u32, u32, u32),
     pub index: usize,
     pub total: usize,
+    pub header_band: Option<(u32, u32)>,
+    pub text_h: f32,
 }
 
 /// 세로 방향 겹침 분할. 무역 서식의 표는 가로로 넓고 세로로 쌓이므로
 /// 세로 분할이 행 손실을 최소화합니다.
+const ROW_BAND_MIN_H: u32 = 4;
+const ROW_BAND_MERGE_GAP: u32 = 4;
+const ROW_BAND_NOISE_SIGMA: f32 = 3.0;
+const ROW_TILE_PAD_PX: u32 = 6;
+const ROW_TILE_MAX: usize = 6;
+const ROW_TILE_MIN_BANDS: usize = 2;
+const TABLE_BAND_MIN_COLS: usize = 4;
+const TABLE_BAND_CLUSTER_TOL: usize = 1;
+const COL_CLUSTER_GAP: u32 = 6;
+const COL_CLUSTER_MIN_W: u32 = 4;
+const HEADER_STITCH_SEAM_PX: u32 = 2;
+const CROP_MAX_SIDE_PX: u32 = 2048;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RowBand {
+    pub y0: u32,
+    pub y1: u32,
+    pub col_clusters: usize,
+}
+
+pub fn text_row_bands(img: &DynamicImage, bbox: (u32, u32, u32, u32)) -> Vec<RowBand> {
+    use image::GenericImageView;
+    let (x0, y0, x1, y1) = bbox;
+    let w = x1.saturating_sub(x0).max(1);
+    let h = y1.saturating_sub(y0).max(1);
+    if h < ROW_BAND_MIN_H * 2 {
+        return Vec::new();
+    }
+    let g = img.crop_imm(x0, y0, w, h).to_luma8();
+    let (gw, gh) = g.dimensions();
+
+    let mut prof: Vec<f32> = Vec::with_capacity(gh as usize);
+    for y in 0..gh {
+        let mut s = 0.0f32;
+        for x in 0..gw {
+            s += 255.0 - g.get_pixel(x, y)[0] as f32;
+        }
+        prof.push(s / gw as f32);
+    }
+
+    let mut sorted = prof.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[sorted.len() / 10];
+    let peak = sorted[sorted.len() * 9 / 10];
+    if peak - floor < 1.0 {
+        return Vec::new();
+    }
+    let span_gate = floor + (peak - floor) * 0.25;
+    let half = &sorted[..(sorted.len() / 2).max(1)];
+    let hm: f32 = half.iter().sum::<f32>() / half.len() as f32;
+    let hsd: f32 = (half.iter().map(|v| (v - hm) * (v - hm)).sum::<f32>() / half.len() as f32).sqrt();
+    let noise_gate = hm + hsd * ROW_BAND_NOISE_SIGMA;
+    let gate = if noise_gate < span_gate { noise_gate } else { span_gate };
+
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut start: Option<u32> = None;
+    for y in 0..gh {
+        if prof[y as usize] > gate {
+            if start.is_none() {
+                start = Some(y);
+            }
+        } else if let Some(s) = start.take() {
+            runs.push((s, y));
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, gh));
+    }
+
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (bs, be) in runs.into_iter() {
+        match merged.last_mut() {
+            Some(last) if bs.saturating_sub(last.1) <= ROW_BAND_MERGE_GAP => {
+                last.1 = be;
+            }
+            _ => merged.push((bs, be)),
+        }
+    }
+    merged.retain(|(bs, be)| be.saturating_sub(*bs) >= ROW_BAND_MIN_H);
+
+    merged
+        .into_iter()
+        .map(|(bs, be)| {
+            let span = (be - bs).max(1) as f32;
+            let mut colp: Vec<f32> = Vec::with_capacity(gw as usize);
+            for x in 0..gw {
+                let mut s = 0.0f32;
+                for y in bs..be {
+                    s += 255.0 - g.get_pixel(x, y)[0] as f32;
+                }
+                colp.push(s / span);
+            }
+            let mut cs = colp.clone();
+            cs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let cfloor = cs[cs.len() / 10];
+            let cpeak = cs[cs.len() * 9 / 10];
+            let cgate = cfloor + (cpeak - cfloor).max(1.0) * 0.30;
+
+            let mut cruns: Vec<(u32, u32)> = Vec::new();
+            let mut cst: Option<u32> = None;
+            for x in 0..gw {
+                if colp[x as usize] > cgate {
+                    if cst.is_none() {
+                        cst = Some(x);
+                    }
+                } else if let Some(s) = cst.take() {
+                    cruns.push((s, x));
+                }
+            }
+            if let Some(s) = cst {
+                cruns.push((s, gw));
+            }
+
+            let mut cmerged: Vec<(u32, u32)> = Vec::new();
+            for (s, e) in cruns.into_iter() {
+                match cmerged.last_mut() {
+                    Some(last) if s.saturating_sub(last.1) <= COL_CLUSTER_GAP => {
+                        last.1 = e;
+                    }
+                    _ => cmerged.push((s, e)),
+                }
+            }
+            let clusters = cmerged
+                .iter()
+                .filter(|(s, e)| e.saturating_sub(*s) >= COL_CLUSTER_MIN_W)
+                .count();
+
+            RowBand {
+                y0: y0 + bs,
+                y1: y0 + be,
+                col_clusters: clusters,
+            }
+        })
+        .collect()
+}
+
+pub fn plan_row_tiles(
+    img: &DynamicImage,
+    bbox: (u32, u32, u32, u32),
+    emit: &dyn Fn(&str),
+) -> Option<Vec<TilePlan>> {
+    let (x0, y0, x1, y1) = bbox;
+    let bands = text_row_bands(img, bbox);
+    if bands.len() < ROW_TILE_MIN_BANDS {
+        emit(&format!(
+            "    ⏭ [ROW TILE SKIP] 크롭 px({},{})-({},{}) 안에서 잉크 행 밴드를 {}개밖에 못 찾았습니다. 균등 분할로 되돌립니다.",
+            x0, y0, x1, y1, bands.len()
+        ));
+        return None;
+    }
+
+    let table: Vec<RowBand> = bands
+        .iter()
+        .copied()
+        .filter(|b| b.col_clusters >= TABLE_BAND_MIN_COLS)
+        .collect();
+
+    let diff = |a: usize, b: usize| -> usize { if a > b { a - b } else { b - a } };
+
+    let picked: Vec<RowBand> = if table.len() >= ROW_TILE_MIN_BANDS {
+        let mut mode_cols = 0usize;
+        let mut mode_hits = 0usize;
+        for b in table.iter() {
+            let hits = table
+                .iter()
+                .filter(|o| diff(o.col_clusters, b.col_clusters) <= TABLE_BAND_CLUSTER_TOL)
+                .count();
+            if hits > mode_hits || (hits == mode_hits && b.col_clusters > mode_cols) {
+                mode_hits = hits;
+                mode_cols = b.col_clusters;
+            }
+        }
+        let aligned: Vec<RowBand> = table
+            .iter()
+            .copied()
+            .filter(|b| diff(b.col_clusters, mode_cols) <= TABLE_BAND_CLUSTER_TOL)
+            .collect();
+        let dropped: Vec<(u32, u32, usize)> = table
+            .iter()
+            .filter(|b| diff(b.col_clusters, mode_cols) > TABLE_BAND_CLUSTER_TOL)
+            .map(|b| (b.y0, b.y1, b.col_clusters))
+            .collect();
+        if aligned.len() >= ROW_TILE_MIN_BANDS {
+            emit(&format!(
+                "    📏 [ROW TILE / GRID ALIGN] 잉크 행 밴드 {}개 중 열 뭉치 {}개 이상인 후보 {}개, 그중 최빈 열 수 {}±{} 로 정렬된 표 행 {}개만 남깁니다 (y {:?}). 비표 블록 {}개 제외: {:?}",
+                bands.len(), TABLE_BAND_MIN_COLS, table.len(),
+                mode_cols, TABLE_BAND_CLUSTER_TOL, aligned.len(),
+                aligned.iter().map(|b| (b.y0, b.y1)).take(8).collect::<Vec<_>>(),
+                dropped.len(),
+                dropped.iter().take(6).collect::<Vec<_>>()
+            ));
+            aligned
+        } else {
+            emit(&format!(
+                "    📏 [ROW TILE / TABLE BANDS] 최빈 열 수 {}±{} 로 정렬된 행이 {}개뿐이라 열 정렬 필터를 기각하고 후보 {}개를 그대로 씁니다.",
+                mode_cols, TABLE_BAND_CLUSTER_TOL, aligned.len(), table.len()
+            ));
+            table
+        }
+    } else {
+        emit(&format!(
+            "    📏 [ROW TILE / ALL BANDS] 열 뭉치 {}개 이상인 행이 {}개뿐이라 표 행을 특정하지 못했습니다. 전체 밴드 {}개를 그대로 씁니다.",
+            TABLE_BAND_MIN_COLS, table.len(), bands.len()
+        ));
+        bands
+    };
+
+    let header = picked[0];
+    let hy0 = header.y0.saturating_sub(ROW_TILE_PAD_PX).max(y0);
+    let hy1 = (header.y1 + ROW_TILE_PAD_PX).min(y1);
+
+    let mut out: Vec<TilePlan> = Vec::new();
+    if hy1 > hy0 + 1 {
+        out.push(TilePlan {
+            bbox: (x0, hy0, x1, hy1),
+            index: 0,
+            total: 0,
+            header_band: None,
+            text_h: (header.y1.saturating_sub(header.y0)).max(1) as f32,
+        });
+    }
+
+    for b in picked.iter().skip(1) {
+        if out.len() >= ROW_TILE_MAX {
+            break;
+        }
+        let ty0 = b.y0.saturating_sub(ROW_TILE_PAD_PX).max(y0);
+        let ty1 = (b.y1 + ROW_TILE_PAD_PX).min(y1);
+        if ty1 <= ty0 + 1 {
+            continue;
+        }
+        out.push(TilePlan {
+            bbox: (x0, ty0, x1, ty1),
+            index: out.len(),
+            total: 0,
+            header_band: Some((hy0, hy1)),
+            text_h: (b.y1.saturating_sub(b.y0)).max(1) as f32,
+        });
+    }
+
+    if out.len() < 2 {
+        return None;
+    }
+    let total = out.len();
+    for p in out.iter_mut() {
+        p.total = total;
+    }
+    emit(&format!(
+        "    📏 [ROW TILE] 크롭 px({},{})-({},{}) 를 표 행 {}개 기준으로 타일 {}개로 만들었습니다. 1번은 헤더 밴드 y{}~{} 단독, 나머지는 그 헤더를 데이터 행 위에 붙인 합성 크롭입니다. 데이터 행 단독 크롭은 열 대응 근거가 없어 2B 모델이 값을 엉뚱한 필드에 넣습니다.",
+        x0, y0, x1, y1, picked.len(), total, hy0, hy1
+    ));
+    Some(out)
+}
+
 pub fn plan_overlap_tiles(
     bbox: (u32, u32, u32, u32),
     tile_count: usize,
@@ -2214,7 +2540,7 @@ pub fn plan_overlap_tiles(
 ) -> Vec<TilePlan> {
     let (x0, y0, x1, y1) = bbox;
     if tile_count <= 1 || y1 <= y0 {
-        return vec![TilePlan { bbox, index: 0, total: 1 }];
+        return vec![TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 }];
     }
     let h = (y1 - y0) as f32;
     // t = 타일 높이. n 타일이 겹침 r 로 전체를 덮으려면
@@ -2222,7 +2548,7 @@ pub fn plan_overlap_tiles(
     let n = tile_count as f32;
     let denom = n - (n - 1.0) * overlap_ratio;
     if denom <= 0.0 {
-        return vec![TilePlan { bbox, index: 0, total: 1 }];
+        return vec![TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 }];
     }
     let t = h / denom;
     let step = t * (1.0 - overlap_ratio);
@@ -2238,10 +2564,12 @@ pub fn plan_overlap_tiles(
             bbox: (x0, ty0 as u32, x1, ty1 as u32),
             index: i,
             total: tile_count,
+            header_band: None,
+            text_h: 0.0,
         });
     }
     if out.is_empty() {
-        out.push(TilePlan { bbox, index: 0, total: 1 });
+        out.push(TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 });
     }
     let total = out.len();
     for p in out.iter_mut() {

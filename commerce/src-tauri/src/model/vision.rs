@@ -516,17 +516,30 @@ impl crate::model::LogisModel {
                             crate::logic::TRADE_ARRAY_CATEGORIES,
                             &emit_term,
                         );
-                        crate::utils::score_dynamics::record_baseline("vision.tile_count", tile_count as f32);
-                        let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
-                            plan.bbox, tile_count, 0.25
+                        let row_tile_cat = crate::logic::TRADE_ARRAY_CATEGORIES
+                            .iter()
+                            .any(|c| *c == plan.category.as_str());
+                        let tiles = if row_tile_cat && tile_count > 1 {
+                            crate::models::siglip2::vision_crop::plan_row_tiles(
+                                &dynamic_image, plan.bbox, &emit_term
+                            )
+                            .unwrap_or_else(|| {
+                                crate::models::siglip2::vision_crop::plan_overlap_tiles(
+                                    plan.bbox, tile_count, 0.25
+                                )
+                            })
+                        } else {
+                            crate::models::siglip2::vision_crop::plan_overlap_tiles(
+                                plan.bbox, tile_count, 0.25
+                            )
+                        };
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.tile_count", tiles.len() as f32
                         );
                         for tile in tiles.iter() {
                             // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
-                            let mut tile_plan = plan.clone();
-                            tile_plan.bbox = tile.bbox;
-
-                            let crop = crate::models::siglip2::vision_crop::crop_region(
-                                &dynamic_image, &tile_plan, 512
+                            let crop = crate::models::siglip2::vision_crop::crop_tile(
+                                &dynamic_image, plan, tile, 512
                             );
 
                             let tile_tag = if tile.total > 1 {

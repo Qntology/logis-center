@@ -266,6 +266,25 @@ pub fn verify_claims_v2(
             continue;
         }
         let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
+        if lg + il + bl == 0 {
+            emit(&format!(
+                "    ⏸️ [SOURCE UNRESOLVED] [{}] '{}' = \"{}\" | bbox px({},{})-({},{}) 에 대응하는 판독성 패치가 0개입니다. 출처가 비어 있다는 관측이 아니라 기하 대응 실패이므로 폐기하지 않고 값을 유지합니다.",
+                c.category, c.field, c.value,
+                c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3
+            ));
+            out.push(GroundingVerdict {
+                category: c.category.clone(),
+                field: c.field.clone(),
+                value: c.value.clone(),
+                surprisal_in: 0.0,
+                surprisal_out: 0.0,
+                top_patch: 0,
+                top_legible: true,
+                accepted: true,
+                reason: "대응 패치 없음 — 검증 보류".to_string(),
+            });
+            continue;
+        }
         let accepted = lg > 0;
         // 🌟 [SDS / V-4 입력] 출처 영역의 판독성 구성입니다.
         //
