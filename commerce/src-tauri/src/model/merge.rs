@@ -91,22 +91,31 @@ pub fn trade_resolve_condition_value(field: &str, chunk: &str) -> String {
     let c = chunk.trim();
     if c.is_empty() { return String::new(); }
 
-    // ── ① 문서번호 토큰 우선 ──
-    //    'BL-55432219' / 'HBL-55432219-01' / 'AWB-180-99281014'
-    if field == "doc_number" || field == "no" || field.starts_with("reference_") || field == "hub_reference" {
+    let identifier_axis = field == "doc_number"
+        || field == "no"
+        || field.starts_with("reference_")
+        || field == "hub_reference"
+        || matches!(
+            crate::utils::ai_utils::query_value_format(field),
+            crate::utils::ai_utils::FieldFormat::Identifier | crate::utils::ai_utils::FieldFormat::TrackingCode
+        );
+    if identifier_axis {
         for w in c.split_whitespace() {
             let core: String = w
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
                 .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '/')
-                .collect();
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '/' || *ch == '.')
+                .collect::<String>()
+                .trim_end_matches(|ch: char| ch == '-' || ch == '_' || ch == '/' || ch == '.')
+                .to_string();
             if core.chars().count() < 4 { continue; }
             if !core.chars().any(|ch| ch.is_ascii_digit()) { continue; }
-            if !core.contains('-') && !core.contains('_') && !core.contains('/') {
-                // 구분자가 없어도 6자 이상 영숫자면 코드로 인정합니다. (컨테이너/씰 번호)
+            if !core.contains('-') && !core.contains('_') && !core.contains('/') && !core.contains('.') {
                 if core.chars().count() < 6 { continue; }
             }
             return core;
         }
+        return String::new();
     }
 
     // ── ② 수치 / 날짜 ──
@@ -182,6 +191,175 @@ pub fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
         default_op
     } else {
         best_key
+    }
+}
+
+pub fn cross_field_duplicate_groups(
+    claims: &[crate::models::siglip2::value_grounding::GroundingClaim],
+    verdicts: &[crate::models::siglip2::value_grounding::GroundingVerdict],
+) -> Vec<(String, Vec<(String, String, String)>)> {
+    use crate::utils::ai_utils::FieldFormat;
+    let mut groups: Vec<(String, Vec<(String, String, String)>)> = Vec::new();
+    for c in claims.iter() {
+        if crate::logic::TRADE_ARRAY_CATEGORIES.iter().any(|a| *a == c.category.as_str()) { continue; }
+        if matches!(c.field.trim(), "party_role" | "doc_type") { continue; }
+        let fmt = crate::utils::ai_utils::detect_field_format(&c.field);
+        if !matches!(fmt, FieldFormat::Text | FieldFormat::Address) { continue; }
+        let v = c.value.trim();
+        if v.chars().filter(|ch| ch.is_alphanumeric()).count() < 2 { continue; }
+        if !v.chars().any(|ch| ch.is_alphabetic()) { continue; }
+        let rejected = verdicts.iter().any(|r| {
+            !r.accepted && r.category == c.category && r.field == c.field && r.value.trim() == v
+        });
+        if rejected { continue; }
+        let key = v.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, owners)) => {
+                if !owners.iter().any(|(cat, f, _)| *cat == c.category && *f == c.field) {
+                    owners.push((c.category.clone(), c.field.clone(), v.to_string()));
+                }
+            }
+            None => groups.push((key, vec![(c.category.clone(), c.field.clone(), v.to_string())])),
+        }
+    }
+    groups.retain(|(_, owners)| {
+        let mut cats: Vec<&str> = owners.iter().map(|(c, _, _)| c.as_str()).collect();
+        cats.sort();
+        cats.dedup();
+        cats.len() >= 2
+    });
+    groups
+}
+
+pub fn resolve_cross_field_duplicates(
+    groups: &[(String, Vec<(String, String, String)>)],
+    lookup: &std::collections::HashMap<String, Vec<f32>>,
+    doc_lang: &str,
+    bank_type: &str,
+    emit: &dyn Fn(&str),
+) -> Vec<crate::models::siglip2::value_grounding::GroundingVerdict> {
+    let mut out: Vec<crate::models::siglip2::value_grounding::GroundingVerdict> = Vec::new();
+    for (value, owners) in groups.iter() {
+        let q = match lookup.get(value) {
+            Some(v) => v,
+            None => continue,
+        };
+        if q.iter().all(|&x| x == 0.0) { continue; }
+        let mut scored: Vec<(usize, f32, f32)> = Vec::new();
+        for (oi, (_, field, _)) in owners.iter().enumerate() {
+            let (phrases, weights) = crate::utils::ai_utils::label_phrase_bank(doc_lang, bank_type, field);
+            let mut bank: Vec<Vec<f32>> = Vec::new();
+            let mut wts: Vec<f32> = Vec::new();
+            for (p, w) in phrases.iter().zip(weights.iter()) {
+                if let Some(e) = lookup.get(p) {
+                    if e.iter().all(|&x| x == 0.0) { continue; }
+                    bank.push(e.clone());
+                    wts.push(*w);
+                }
+            }
+            if bank.is_empty() { continue; }
+            let own = crate::utils::ai_utils::weighted_max_pool_sim(q, &bank, &wts);
+            let coh = crate::utils::ai_utils::bank_internal_cohesion(&bank);
+            scored.push((oi, own, coh));
+        }
+        if scored.len() < 2 { continue; }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (wi, w_own, _) = scored[0];
+        for &(li, l_own, l_coh) in scored.iter().skip(1) {
+            let (l_cat, l_field, l_raw) = &owners[li];
+            let (w_cat, w_field, _) = &owners[wi];
+            if crate::utils::ai_utils::prejudice_dominates(l_own, w_own, l_coh) {
+                emit(&format!(
+                    "    🧭 [VALUE OWNER] \"{}\" | {}.{} (cos {:.4}) 가 {}.{} (cos {:.4}, 응집도 {:.4}) 를 응집도 여유 이상으로 앞섭니다. 후자의 값을 폐기합니다.",
+                    l_raw, w_cat, w_field, w_own, l_cat, l_field, l_own, l_coh
+                ));
+                out.push(crate::models::siglip2::value_grounding::GroundingVerdict {
+                    category: l_cat.clone(),
+                    field: l_field.clone(),
+                    value: l_raw.clone(),
+                    surprisal_in: 0.0,
+                    surprisal_out: 0.0,
+                    top_patch: 0,
+                    top_legible: true,
+                    accepted: false,
+                    reason: "필드 소유권 경쟁 패배 (다른 축이 같은 값을 더 잘 설명함)".to_string(),
+                });
+            } else {
+                emit(&format!(
+                    "    🤝 [VALUE OWNER KEEP] \"{}\" | {}.{} (cos {:.4}) 와 {}.{} (cos {:.4}) 의 차이가 응집도 여유 {:.4} 안이라 둘 다 유지합니다.",
+                    l_raw, w_cat, w_field, w_own, l_cat, l_field, l_own, l_coh.clamp(0.0, 0.5)
+                ));
+            }
+        }
+    }
+    out
+}
+
+pub fn drop_row_echo_columns(merged: &mut serde_json::Map<String, Value>, emit: &dyn Fn(&str)) {
+    const ECHO_RULES: [(&str, &str, &str, &str); 1] = [
+        ("item_package_count", "quantity", "cargo", "package_count"),
+    ];
+    fn num_of(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let t: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                t.parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    }
+    for (row_field, sibling, total_cat, total_field) in ECHO_RULES.iter() {
+        let total = merged
+            .get(*total_cat)
+            .and_then(|c| c.get(*total_field))
+            .and_then(num_of)
+            .or_else(|| merged.get(*total_field).and_then(num_of));
+        let total = match total {
+            Some(t) => t,
+            None => continue,
+        };
+        for arr_key in ["items", "line_items"] {
+            let rows = match merged.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+                Some(r) => r,
+                None => continue,
+            };
+            if rows.is_empty() { continue; }
+            let mut sum = 0.0f64;
+            let mut seen = 0usize;
+            let mut all_echo = true;
+            for r in rows.iter() {
+                let a = r.get(*row_field).and_then(num_of);
+                let b = r.get(*sibling).and_then(num_of);
+                match (a, b) {
+                    (Some(x), Some(y)) => {
+                        sum += x;
+                        seen += 1;
+                        if (x - y).abs() > 1e-9 { all_echo = false; }
+                    }
+                    (Some(x), None) => {
+                        sum += x;
+                        seen += 1;
+                        all_echo = false;
+                    }
+                    _ => {}
+                }
+            }
+            if seen == 0 || !all_echo { continue; }
+            if (sum - total).abs() <= 1e-9 { continue; }
+            for r in rows.iter_mut() {
+                if let Some(o) = r.as_object_mut() {
+                    if o.contains_key(*row_field) { o.insert(row_field.to_string(), Value::Null); }
+                }
+            }
+            emit(&format!(
+                "  🧮 [ROW ECHO DROP] [{}] '{}' 가 모든 행에서 '{}' 와 같은 값이고 합계 {} 가 문서 총계 {}.{} = {} 와 어긋납니다. 인쇄되지 않은 열을 옆 열 값으로 채운 복사로 보고 비웁니다.",
+                arr_key, row_field, sibling, sum, total_cat, total_field, total
+            ));
+        }
     }
 }
 

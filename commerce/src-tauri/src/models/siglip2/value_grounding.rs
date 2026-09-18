@@ -246,7 +246,10 @@ pub fn verify_claims_v2(
         //    "SIGNATORY COMPANY" 는 이미지에 실제로 인쇄되어 있어 판독성 검사는 반드시 통과합니다.
         //    라벨인지 값인지는 픽셀이 아니라 어휘로만 판정할 수 있습니다.
         //    사전은 parsing.rs 의 TRADE_PRINTED_LABELS + TRADE_COLUMN_ALIASES 를 그대로 씁니다.
-        if !role_field(&c.field) && crate::parsing::is_printed_label_echo(&c.value, doc_lang) {
+        if !role_field(&c.field)
+            && (crate::parsing::is_printed_label_echo(&c.value, doc_lang)
+                || crate::parsing::is_printed_label_fragment(&c.value, doc_lang))
+        {
             rejected += 1;
             emit(&format!(
                 "    🚫 [LABEL ECHO] [{}] '{}' = \"{}\" | 이 문자열은 서식의 인쇄 라벨입니다. 값이 아니므로 폐기합니다.",

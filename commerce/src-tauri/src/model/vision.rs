@@ -665,20 +665,48 @@ impl crate::model::LogisModel {
                     grounding_claims.len()
                 ));
 
-                let verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
+                let mut verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
                     &grounding_claims,
                     grid.grid_rows,
                     grid.grid_cols,
                     grid.orig_width,
                     grid.orig_height,
                     &legibility,
-                    // 🌟 resolve_trade_doc_identity 에 넘기고 있는 값과 동일한 언어 축입니다.
                     &language,
                     &emit_term,
                 );
 
+                let dup_groups = crate::model::merge::cross_field_duplicate_groups(&grounding_claims, &verdicts);
+                if !dup_groups.is_empty() {
+                    let bank_type = if is_trade_doc { "shipping_doc" } else { "goods" };
+                    let mut texts: Vec<String> = Vec::new();
+                    for (value, owners) in dup_groups.iter() {
+                        if !texts.contains(value) {
+                            texts.push(value.clone());
+                        }
+                        for (_, field, _) in owners.iter() {
+                            let (phrases, _) = crate::utils::ai_utils::label_phrase_bank(&language, bank_type, field);
+                            for p in phrases {
+                                if !texts.contains(&p) {
+                                    texts.push(p);
+                                }
+                            }
+                        }
+                    }
+                    let embs = self.get_embedding_batch(texts.clone()).await.unwrap_or_default();
+                    let lookup: std::collections::HashMap<String, Vec<f32>> =
+                        texts.into_iter().zip(embs.into_iter()).collect();
+                    let owner_verdicts = crate::model::merge::resolve_cross_field_duplicates(
+                        &dup_groups, &lookup, &language, bank_type, &emit_term,
+                    );
+                    verdicts.extend(owner_verdicts);
+                }
+
                 if let Some(map) = extracted_data.as_object_mut() {
                     apply_grounding_verdicts(map, &verdicts, &emit_term);
+                    if is_trade_doc {
+                        crate::model::merge::drop_row_echo_columns(map, &emit_term);
+                    }
                 } else {
                     emit_term("  ⚪ [GROUNDING APPLY SKIP] 추출 결과가 객체가 아니라 폐기 판정을 적용할 수 없습니다.");
                 }

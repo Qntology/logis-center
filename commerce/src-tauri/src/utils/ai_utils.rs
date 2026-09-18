@@ -2525,6 +2525,16 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     FieldFormat::Text
 }
 
+pub fn query_value_format(field_name: &str) -> FieldFormat {
+    let f = detect_field_format(field_name);
+    if matches!(f, FieldFormat::Text | FieldFormat::Enum)
+        && crate::utils::canonical::kind_of(field_name) == crate::utils::canonical::CanonKind::Identifier
+    {
+        return FieldFormat::Identifier;
+    }
+    f
+}
+
 // 🌟 "a-b-c" / "a/b/c" / "a.b.c" 형태의 실제 날짜 리터럴이 있는지 판정합니다.
 // "615600", "9", "26031514155635" 같은 순수 숫자 덩어리는 날짜로 인정하지 않습니다.
 pub fn has_date_literal(s: &str) -> bool {

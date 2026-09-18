@@ -1378,6 +1378,41 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
             let op_raw = val_obj.get("operator").and_then(|v| v.as_str()).unwrap_or("eq");
             // 🌟 LLM 이 "lt [Alts: lte, gte]" 같은 쓰레기를 붙여 보내는 사례가 있어 앞부분만 취합니다.
             let op_clean = op_raw.trim().to_lowercase();
+            if op_clean.starts_with("between") {
+                for (bound, key) in [("gte", "value"), ("lte", "value_to")] {
+                    let raw = match val_obj.get(key) {
+                        Some(v) => v.clone(),
+                        None => continue,
+                    };
+                    let empty = match &raw {
+                        Value::Null => true,
+                        Value::String(s) => s.trim().is_empty() || s == "null",
+                        _ => false,
+                    };
+                    if empty { continue; }
+                    let kind = value_kind(&path, &raw);
+                    let final_val = if kind == "number" {
+                        let n = match &raw {
+                            Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                            Value::String(s) => {
+                                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+                                cleaned.parse::<f64>().unwrap_or(0.0)
+                            },
+                            _ => 0.0,
+                        };
+                        if n.fract() == 0.0 && n.abs() < 9e15 { json!(n as i64) } else { json!(n) }
+                    } else {
+                        json!(raw.as_str().unwrap_or("").trim())
+                    };
+                    conditions.push(json!({
+                        "path": path,
+                        "op": bound,
+                        "value": final_val,
+                        "kind": kind
+                    }));
+                }
+                continue;
+            }
             let op = if op_clean.starts_with("gte") { "gte" }
                 else if op_clean.starts_with("gt") { "gt" }
                 else if op_clean.starts_with("lte") { "lte" }
@@ -1480,7 +1515,9 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         "keywords": keywords,
         "alternates": ctx.get("alternates").cloned().unwrap_or(json!({})),
         "substantial": ctx.get("substantial").cloned().unwrap_or(json!("")),
-        "find": ctx.get("find").cloned().unwrap_or(json!(""))
+        "find": ctx.get("find").cloned().unwrap_or(json!("")),
+        "hints": ctx.get("hint").cloned().unwrap_or(json!({})),
+        "projection": ctx.get("projection").cloned().unwrap_or(json!([]))
     })
 }
 
@@ -2115,6 +2152,13 @@ async fn ai_search_complex(
                         .and_then(|v| v.as_object())
                         .map(|obj| obj.keys().cloned().collect())
                         .unwrap_or_default();
+                    if let Some(hint_obj) = ctx.get("hint").and_then(|v| v.as_object()) {
+                        for k in hint_obj.keys() {
+                            if !condition_props.iter().any(|p| p == k) {
+                                condition_props.push(k.clone());
+                            }
+                        }
+                    }
 
                     let substantial_prop = ctx.get("substantial")
                         .and_then(|v| v.as_str())
