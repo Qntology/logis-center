@@ -124,7 +124,8 @@
         "party_role": "The role printed above this party block, exactly as printed (Carrier, Insurer, Issuing Bank, Customs Broker, Drawer, Drawee, Payee, Warehouse Operator, Surveying Agency, Applicant, Claimant, Shipping Agent) {String}",
         "party_name": "Company or person name of this party {String}",
         "party_address": "Address of this party {String}",
-        "party_contact": "Phone, fax or email of this party {String}"
+        "party_contact": "Phone, fax or email of this party {String}",
+        "signatory_name": "Name of the person who signed this document, printed next to SIGNATORY NAME or SIGNED BY {String}"
       },
       "logistics": {
         "vessel": "Vessel name or Flight number {String}",
@@ -3187,6 +3188,21 @@
         "semantic": "Document number, primary identifier number",
         "bias": "document number, bill of lading number, air waybill number, invoice number, contract number, HBL, MBL",
         "prejudice": "container number, seal number, HS code, booking number, letter of credit number, issue date, shipping date, weight, amount"
+      },
+      "reference_number": {
+        "semantic": "Reference number, export reference, our reference",
+        "bias": "reference number, export reference, export ref, our reference, your reference, ref no, reference no, order reference, job number, file number, shipper reference",
+        "prejudice": "invoice number, document number, bill of lading number, air waybill number, purchase order number, issue date, amount, weight, VAT number, EORI number"
+      },
+      "reference_po": {
+        "semantic": "Purchase order number referenced on this document",
+        "bias": "purchase order number, P/O number, PO number, order number, buyer order number, customer order number",
+        "prejudice": "invoice number, document number, bill of lading number, export reference, issue date, amount, weight"
+      },
+      "signatory_name": {
+        "semantic": "Signatory name, name of the person who signed the document",
+        "bias": "signatory name, signed by, authorized signatory, name of signatory, signature name, signer",
+        "prejudice": "signatory company, company name, party role, address, date, document number, amount"
       },
       "doc_type": {
         "semantic": "Document type, document category",

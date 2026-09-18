@@ -382,6 +382,96 @@ pub fn is_schema_echo(s: &str) -> bool {
     )
 }
 
+pub fn same_printed_token(a: &str, b: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_uppercase())
+            .collect()
+    };
+    let (x, y) = (norm(a), norm(b));
+    if x.is_empty() || y.is_empty() { return false; }
+    if x == y { return true; }
+    let (short, long) = if x.chars().count() <= y.chars().count() { (&x, &y) } else { (&y, &x) };
+    long.starts_with(short.as_str())
+        && long.chars().count() == short.chars().count() + 1
+        && long.ends_with('S')
+}
+
+pub fn recovery_label_gate(
+    label_emb: &[f32],
+    target: &str,
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> (bool, f32, f32, String) {
+    if label_emb.is_empty() || label_emb.iter().all(|&x| x == 0.0) {
+        return (false, 0.0, 0.0, String::new());
+    }
+    let mut own = 0.0f32;
+    let mut own_coh = 0.0f32;
+    let mut have_own = false;
+    let mut rival = 0.0f32;
+    let mut rival_field = String::new();
+    for (f, bank, w) in banks.iter() {
+        if bank.is_empty() { continue; }
+        let s = crate::utils::ai_utils::weighted_max_pool_sim(label_emb, bank, w);
+        if f == target {
+            own = s;
+            own_coh = crate::utils::ai_utils::bank_internal_cohesion(bank);
+            have_own = true;
+        } else if s > rival {
+            rival = s;
+            rival_field = f.clone();
+        }
+    }
+    if !have_own || own <= 0.0 {
+        return (false, own, rival, rival_field);
+    }
+    let ok = !crate::utils::ai_utils::prejudice_dominates(own, rival, own_coh);
+    (ok, own, rival, rival_field)
+}
+
+pub fn plan_recovery_windows(
+    cands: &[(String, String, usize, f32)],
+    rows: usize,
+    cols: usize,
+    orig_w: u32,
+    orig_h: u32,
+    budget: usize,
+) -> Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let cw = orig_w as f32 / cols as f32;
+    let ch = orig_h as f32 / rows as f32;
+    let mut sorted: Vec<&(String, String, usize, f32)> = cands.iter().collect();
+    sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = Vec::new();
+    for c in sorted.into_iter() {
+        let (cat, field, patch, z) = (&c.0, &c.1, c.2, c.3);
+        let r = patch / cols;
+        let col = patch % cols;
+        if r >= rows { continue; }
+        let r0 = r.saturating_sub(1);
+        let r1 = (r + 1).min(rows - 1);
+        let c0 = col.saturating_sub(1);
+        let c1 = (col + 2).min(cols - 1);
+        let bbox = (
+            (c0 as f32 * cw).floor() as u32,
+            (r0 as f32 * ch).floor() as u32,
+            (((c1 + 1) as f32 * cw).ceil() as u32).min(orig_w),
+            (((r1 + 1) as f32 * ch).ceil() as u32).min(orig_h),
+        );
+        if let Some(slot) = out.iter_mut().find(|(b, _)| *b == bbox) {
+            if !slot.1.iter().any(|(_, f, _)| f == field) {
+                slot.1.push((cat.clone(), field.clone(), z));
+            }
+            continue;
+        }
+        if out.len() >= budget { continue; }
+        out.push((bbox, vec![(cat.clone(), field.clone(), z)]));
+    }
+    out
+}
+
 pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for (k, v) in merged.iter() {

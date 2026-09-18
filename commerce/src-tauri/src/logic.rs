@@ -787,6 +787,8 @@ pub fn trade_condition_fields(category: &str) -> Vec<(&'static str, &'static str
              "consignee, importer, buyer, receiver, applicant, to order of"),
             ("notify_party_name", "Notify Party name",
              "notify party, notify, also notify"),
+            ("signatory_name",    "Person who signed the document",
+             "signatory name, signed by, authorized signatory, signer"),
         ],
         "terms" => vec![
             ("incoterms",            "Incoterms code",
@@ -1210,7 +1212,7 @@ pub fn trade_field_category(field: &str) -> &'static str {
         //     role 을 원소 필드로 두면 한 영역에서 여러 역할을 순서대로 읽어내고,
         //     우리가 예상하지 못한 역할까지 스키마 변경 없이 수용합니다.
         "party_role" | "party_name" | "party_address"
-            | "party_contact" => "other_parties",
+            | "party_contact" | "signatory_name" => "other_parties",
 
         // ── logistics ──
         //  🌟 place_receipt / place_delivery 를 되살렸습니다.

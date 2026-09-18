@@ -984,6 +984,7 @@ pub struct CategoryHeatmap {
     pub top_rival: String,
     pub absent: bool,
     pub absent_reason: String,
+    pub field_peaks: Vec<(String, usize, f32)>,
 }
 
 /// 🌟 [STEP 2] 스키마 카테고리별 히트맵을 만듭니다.
@@ -1307,6 +1308,40 @@ pub fn build_column_heatmaps(
     //    행/열 이중 센터링으로 뱅크 크기·응집도 편향을 제거합니다.
     //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
+    let mut field_peaks_by_cat: HashMap<String, Vec<(String, usize, f32)>> = HashMap::new();
+    for (ki, fname) in keys.iter().enumerate() {
+        if fname.starts_with("__") { continue; }
+        let cat = match field_to_cat.get(fname) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+        let row = match matrix.get(ki) {
+            Some(r) => r,
+            None => continue,
+        };
+        let vals: Vec<(usize, f32)> = row
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != f32::MIN)
+            .map(|(i, v)| (i, *v))
+            .collect();
+        if vals.len() < 3 { continue; }
+        let cnt = vals.len() as f32;
+        let mean = vals.iter().map(|(_, v)| *v).sum::<f32>() / cnt;
+        let sd = (vals.iter().map(|(_, v)| (*v - mean) * (*v - mean)).sum::<f32>() / cnt).sqrt();
+        if sd <= 1e-6 { continue; }
+        let (pi, pv) = vals
+            .iter()
+            .fold((usize::MAX, f32::MIN), |acc, (i, v)| if *v > acc.1 { (*i, *v) } else { acc });
+        let z = (pv - mean) / sd;
+        if z <= crate::utils::ai_utils::gumbel_expected_z(vals.len()) { continue; }
+        field_peaks_by_cat.entry(cat).or_default().push((fname.clone(), pi, z));
+    }
+    emit(&format!(
+        "    📍 [FIELD PEAKS] 자기 분포에서 √(2lnN) 을 넘는 필드 봉우리 {}개 (카테고리 {}개) — 빈 필드 복구의 위치 근거로 넘깁니다.",
+        field_peaks_by_cat.values().map(|v| v.len()).sum::<usize>(),
+        field_peaks_by_cat.len()
+    ));
 
     const FIELD_COUNT_NEUTRAL_WEIGHT: f32 = 1.0;
 
@@ -1741,6 +1776,7 @@ pub fn build_column_heatmaps(
             top_rival: String::new(),
             absent: false,
             absent_reason: String::new(),
+            field_peaks: field_peaks_by_cat.remove(c).unwrap_or_default(),
         });
     }
 

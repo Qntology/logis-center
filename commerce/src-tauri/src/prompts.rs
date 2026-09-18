@@ -1294,6 +1294,111 @@ pub fn get_trade_crop_prompt(
     )
 }
 
+pub fn trade_expected_vocab(category: &str, doc_type: &str, field: &str) -> Vec<String> {
+    fn read(path: &[&str]) -> Option<String> {
+        let mut cur: &serde_json::Value = &crate::parsing::BIAS_DICT;
+        for p in path {
+            cur = cur.get(*p)?;
+        }
+        cur.as_str().map(|s| s.to_string())
+    }
+    if crate::utils::ai_utils::detect_field_format(field) != crate::utils::ai_utils::FieldFormat::Enum {
+        return Vec::new();
+    }
+    let raw = match read(&["trade_schema", "overlay", doc_type, category, field])
+        .or_else(|| read(&["trade_schema", "base", category, field]))
+    {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let (desc, _) = split_type_marker(&raw);
+    let flat: String = desc
+        .chars()
+        .map(|c| if c == '(' || c == ')' || c == '[' || c == ']' { ' ' } else { c })
+        .collect();
+    let parts: Vec<String> = flat
+        .replace(" or ", ",")
+        .replace('/', ",")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let enumerated = parts.len() >= 2 && parts.iter().all(|p| p.split_whitespace().count() <= 4);
+    if !enumerated {
+        return Vec::new();
+    }
+    extract_example_tokens(&desc)
+}
+
+pub fn trade_field_definition(doc_lang: &str, field: &str) -> String {
+    let (phrases, _) = crate::utils::ai_utils::label_phrase_bank(doc_lang, "shipping_doc", field);
+    let mut picked: Vec<String> = Vec::new();
+    for p in phrases.iter() {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        let code_like = !t.chars().any(|c| c.is_lowercase()) && t.chars().count() <= 6;
+        if code_like { continue; }
+        if picked.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+        picked.push(t.to_string());
+        if picked.len() >= 4 { break; }
+    }
+    if picked.is_empty() {
+        field.replace('_', " ")
+    } else {
+        picked.join(", ")
+    }
+}
+
+pub fn get_trade_blind_read_prompt(doc_type: &str, field: &str, definition: &str) -> String {
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a crop of a {} document.\n\
+         \n\
+         [TASK]\n\
+         Find the printed label for the field below and copy the value printed next to or under it.\n\
+         - \"{}\": {}\n\
+         \n\
+         [RULES]\n\
+         1. Copy the characters exactly as printed. Never complete, translate or normalize them.\n\
+         2. If the value for this field is not printed in this image, return null. Never return what such documents usually contain.\n\
+         3. A caption or label is never the value.\n\
+         \n\
+         [OUTPUT]\n\
+         {{\"value\": null}}\n\
+         JSON ONLY.",
+        doc_type, field, definition
+    )
+}
+
+pub fn get_trade_recovery_prompt(doc_type: &str, fields: &[(String, String)]) -> String {
+    let mut defs = String::new();
+    let mut schema = String::new();
+    for (i, (f, d)) in fields.iter().enumerate() {
+        defs.push_str(&format!("- \"{}\": {}\n", f, d));
+        if i > 0 { schema.push_str(",\n"); }
+        schema.push_str(&format!("  \"{}\": {{\"label\": null, \"value\": null}}", f));
+    }
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a small crop of a {} document around one printed label.\n\
+         \n\
+         [TASK]\n\
+         For each field below, find the printed LABEL that names it and copy the value printed next to or under that label.\n\
+         {}\
+         \n\
+         [RULES]\n\
+         1. \"label\" is the caption text you actually read in the image. \"value\" is the text printed for that caption.\n\
+         2. Copy the characters exactly as printed. Never complete, translate or normalize them.\n\
+         3. If no label for a field is printed in this image, return null for both label and value of that field.\n\
+         4. Never put a caption into \"value\".\n\
+         \n\
+         [OUTPUT]\n\
+         {{\n{}\n}}\n\
+         JSON ONLY.",
+        doc_type, defs, schema
+    )
+}
+
 /// 🌟 [TRADE CONDITION — DEPTH 1] 질의 청크가 어느 '조건 카테고리' 인지 1갈래만 고릅니다.
 ///  ── 왜 쪼개는가 ──
 ///   기존 extract_shipping_conditions 는 44개 필드 + 변환 규칙 + 값 예시를

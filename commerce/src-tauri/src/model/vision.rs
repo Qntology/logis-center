@@ -432,6 +432,7 @@ impl crate::model::LogisModel {
                                 plan.score,
                                 &claimed,
                             );
+                            let verify_crop = crop.clone();
 
                             let tile_res = self.chat_with_qwen3_5_image_spinner(
                                 "You are a highly precise document data extraction assistant.",
@@ -449,7 +450,65 @@ impl crate::model::LogisModel {
                                 None
                             ).await?;
 
-                            let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+                            let mut tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+                            if !is_array_cat {
+                                let echo_fields: Vec<(String, String)> = tile_json
+                                    .as_object()
+                                    .map(|o| {
+                                        o.iter()
+                                            .filter_map(|(k, v)| {
+                                                let s = v.as_str()?.trim().to_string();
+                                                if s.is_empty() { return None; }
+                                                let vocab = crate::parsing::trade_expected_vocab(&plan.category, &detected_type, k);
+                                                if vocab.iter().any(|t| t.eq_ignore_ascii_case(&s)) {
+                                                    Some((k.clone(), s))
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                for (field, value) in echo_fields.into_iter() {
+                                    let definition = crate::parsing::trade_field_definition(&language, &field);
+                                    let blind_prompt = crate::parsing::get_trade_blind_read_prompt(&detected_type, &field, &definition);
+                                    let blind_res = self.chat_with_qwen3_5_image_spinner(
+                                        "You are a highly precise document data extraction assistant.",
+                                        &blind_prompt,
+                                        Some(verify_crop.clone()),
+                                        app_handle,
+                                        "extraction-progress",
+                                        json!({
+                                            "category": format!("Vision (Verify {}/{})", idx + 1, plans.len()),
+                                            "summary": format!("Verifying {}...", field)
+                                        }),
+                                        96,
+                                        cancel_token.clone(),
+                                        Some(task_id.clone()),
+                                        None
+                                    ).await?;
+                                    let blind_value = crate::parsing::parse_json_from_llm(&blind_res)
+                                        .get("value")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_default();
+                                    if crate::model::merge::same_printed_token(&value, &blind_value) {
+                                        emit_term(&format!(
+                                            "    ✅ [VOCAB ECHO VERIFIED] [{}] '{}' = \"{}\" | 기대 어휘 목록 없이 다시 읽어도 같은 토큰이 인쇄되어 있습니다.",
+                                            plan.category, field, value
+                                        ));
+                                    } else {
+                                        emit_term(&format!(
+                                            "    🚫 [VOCAB ECHO DROP] [{}] '{}' = \"{}\" | 프롬프트 기대 어휘와 같은 토큰인데, 목록 없이 다시 읽으면 \"{}\" 입니다. 인쇄되지 않은 기대 어휘 복사로 보고 폐기합니다.",
+                                            plan.category, field, value,
+                                            if blind_value.is_empty() { "null" } else { blind_value.as_str() }
+                                        ));
+                                        if let Some(o) = tile_json.as_object_mut() {
+                                            o.insert(field.clone(), Value::Null);
+                                        }
+                                    }
+                                }
+                            }
                             record_claim_violations(
                                 &claimed,
                                 &tile_json,
@@ -494,6 +553,189 @@ impl crate::model::LogisModel {
                                 tile.bbox,
                             );
                             merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
+                        }
+                    }
+
+                    {
+                        const FIELD_RECOVERY_BUDGET: usize = 4;
+                        let mut cands: Vec<(String, String, usize, f32)> = Vec::new();
+                        for hm in heatmaps.iter() {
+                            if crate::logic::TRADE_ARRAY_CATEGORIES.iter().any(|c| *c == hm.category.as_str()) { continue; }
+                            for (field, patch, z) in hm.field_peaks.iter() {
+                                if field.starts_with("__") || field == "doc_type" { continue; }
+                                let filled = final_data_map
+                                    .get(field)
+                                    .map(|v| !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
+                                    .unwrap_or(false);
+                                if filled { continue; }
+                                let legible = legibility.verdict.get(*patch).copied()
+                                    == Some(crate::models::siglip2::legibility::PatchLegibility::Legible);
+                                if !legible { continue; }
+                                cands.push((hm.category.clone(), field.clone(), *patch, *z));
+                            }
+                        }
+                        let windows = crate::model::merge::plan_recovery_windows(
+                            &cands,
+                            grid.grid_rows,
+                            grid.grid_cols,
+                            grid.orig_width,
+                            grid.orig_height,
+                            FIELD_RECOVERY_BUDGET,
+                        );
+                        if windows.is_empty() {
+                            emit_term("  ⚪ [FIELD RECOVERY] 비어 있으면서 자기 라벨 봉우리를 가진 필드가 없습니다.");
+                        } else {
+                            emit_term(&format!(
+                                "  🩺 [FIELD RECOVERY] 빈 필드 후보 {}개 | 봉우리 주변 소형 크롭 {}개를 다시 읽습니다 (상한 {}회).",
+                                cands.len(), windows.len(), FIELD_RECOVERY_BUDGET
+                            ));
+                            let schema_fields: Vec<String> = crate::parsing::get_detail_schema_fields(&detected_type, "", &language)
+                                .into_iter()
+                                .map(|(f, _, _, _)| f)
+                                .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
+                                .collect();
+                            let mut gate_banks: Option<Vec<(String, Vec<Vec<f32>>, Vec<f32>)>> = None;
+                            for (wi, (bbox, fields)) in windows.into_iter().enumerate() {
+                                if cancel_token
+                                    .as_ref()
+                                    .map_or(false, |t| t.load(std::sync::atomic::Ordering::Relaxed))
+                                {
+                                    break;
+                                }
+                                let (lg, _, _) = legibility.count_in_bbox(bbox, grid.orig_width, grid.orig_height);
+                                if lg == 0 { continue; }
+                                let micro_plan = crate::models::siglip2::vision_crop::CropPlan {
+                                    category: fields[0].0.clone(),
+                                    bbox,
+                                    score: fields[0].2,
+                                    margin: 0.0,
+                                    patch_count: 0,
+                                    top_field: fields[0].1.clone(),
+                                    owned_patches: 0,
+                                    twin_of: String::new(),
+                                };
+                                let micro = crate::models::siglip2::vision_crop::crop_region(&dynamic_image, &micro_plan, 512);
+                                let defs: Vec<(String, String)> = fields
+                                    .iter()
+                                    .map(|(_, f, _)| (f.clone(), crate::parsing::trade_field_definition(&language, f)))
+                                    .collect();
+                                emit_term(&format!(
+                                    "    🔎 [RECOVERY CROP {}] px({},{})-({},{}) | 필드 {:?}",
+                                    wi + 1, bbox.0, bbox.1, bbox.2, bbox.3,
+                                    fields.iter().map(|(c, f, z)| format!("{}.{}(z {:+.2})", c, f, z)).collect::<Vec<_>>()
+                                ));
+                                let prompt = crate::parsing::get_trade_recovery_prompt(&detected_type, &defs);
+                                let res = self.chat_with_qwen3_5_image_spinner(
+                                    "You are a highly precise document data extraction assistant.",
+                                    &prompt,
+                                    Some(micro),
+                                    app_handle,
+                                    "extraction-progress",
+                                    json!({
+                                        "category": format!("Vision (Recovery {})", wi + 1),
+                                        "summary": "Re-reading empty fields..."
+                                    }),
+                                    160,
+                                    cancel_token.clone(),
+                                    Some(task_id.clone()),
+                                    None
+                                ).await?;
+                                let parsed = crate::parsing::parse_json_from_llm(&res);
+                                for (cat, field, _) in fields.iter() {
+                                    let node = parsed.get(field);
+                                    let label = node
+                                        .and_then(|n| n.get("label"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_default();
+                                    let value = node
+                                        .and_then(|n| n.get("value"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_default();
+                                    if value.is_empty() || label.is_empty() {
+                                        emit_term(&format!(
+                                            "      ⚪ [RECOVERY NULL] {}.{} | 이 영역에 해당 라벨과 값이 없다고 답했습니다.",
+                                            cat, field
+                                        ));
+                                        continue;
+                                    }
+                                    if crate::model::merge::is_schema_echo(&value)
+                                        || value.eq_ignore_ascii_case(&label)
+                                        || crate::parsing::is_printed_label_echo(&value, &language)
+                                        || crate::parsing::is_printed_label_fragment(&value, &language)
+                                    {
+                                        emit_term(&format!(
+                                            "      🚫 [RECOVERY LABEL AS VALUE] {}.{} = \"{}\" | 값 자리에 라벨이 들어왔습니다.",
+                                            cat, field, value
+                                        ));
+                                        continue;
+                                    }
+                                    let claimed = collect_claimed(&final_data_map);
+                                    if let Some((owner, _)) = claimed.iter().find(|(_, v)| v.eq_ignore_ascii_case(&value)) {
+                                        emit_term(&format!(
+                                            "      🚫 [RECOVERY CLAIMED] {}.{} = \"{}\" | 이미 '{}' 가 확정한 값입니다.",
+                                            cat, field, value, owner
+                                        ));
+                                        continue;
+                                    }
+                                    if gate_banks.is_none() {
+                                        let mut phr_all: Vec<String> = Vec::new();
+                                        let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
+                                        for f in schema_fields.iter() {
+                                            let (ph, wt) = crate::utils::ai_utils::label_phrase_bank(&language, "shipping_doc", f);
+                                            for p in ph.iter() {
+                                                if !phr_all.contains(p) { phr_all.push(p.clone()); }
+                                            }
+                                            per_field.push((f.clone(), ph, wt));
+                                        }
+                                        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(phr_all.len());
+                                        for part in phr_all.chunks(200) {
+                                            let e = self
+                                                .get_embedding_batch(part.to_vec())
+                                                .await
+                                                .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+                                            embs.extend(e);
+                                        }
+                                        let table: std::collections::HashMap<String, Vec<f32>> =
+                                            phr_all.into_iter().zip(embs.into_iter()).collect();
+                                        let mut banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
+                                        for (f, ph, wt) in per_field.into_iter() {
+                                            let mut b: Vec<Vec<f32>> = Vec::new();
+                                            let mut w: Vec<f32> = Vec::new();
+                                            for (p, x) in ph.iter().zip(wt.iter()) {
+                                                if let Some(e) = table.get(p) {
+                                                    if e.is_empty() { continue; }
+                                                    b.push(e.clone());
+                                                    w.push(*x);
+                                                }
+                                            }
+                                            banks.push((f, b, w));
+                                        }
+                                        gate_banks = Some(banks);
+                                    }
+                                    let label_emb = self.get_embedding(label.clone()).await.unwrap_or_default();
+                                    let banks = gate_banks.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
+                                    let (ok, own, rival, rival_field) =
+                                        crate::model::merge::recovery_label_gate(&label_emb, field, banks);
+                                    if !ok {
+                                        emit_term(&format!(
+                                            "      🚫 [RECOVERY LABEL GATE] {}.{} = \"{}\" | 읽힌 라벨 \"{}\" 의 코사인: 자기 {:.4} vs '{}' {:.4} — 다른 필드의 라벨로 판정되어 폐기합니다.",
+                                            cat, field, value, label, own, rival_field, rival
+                                        ));
+                                        continue;
+                                    }
+                                    let mut patch = serde_json::Map::new();
+                                    patch.insert(field.clone(), json!(value.clone()));
+                                    let patch = Value::Object(patch);
+                                    record_grounding_claims(&mut grounding_claims, cat, &patch, bbox);
+                                    merge_extracted(&mut final_data_map, cat, &patch, &emit_term);
+                                    emit_term(&format!(
+                                        "      ✅ [RECOVERED] {}.{} = \"{}\" | 라벨 \"{}\" (자기 cos {:.4} vs 최강 경쟁 '{}' {:.4})",
+                                        cat, field, value, label, own, rival_field, rival
+                                    ));
+                                }
+                            }
                         }
                     }
 
