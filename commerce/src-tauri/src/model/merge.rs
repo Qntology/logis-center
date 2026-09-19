@@ -607,7 +607,75 @@ pub fn recovery_label_gate(
             .unwrap_or((String::new(), 0.0));
         return (true, own_out, rz, rf);
     }
-    (false, own_out, scored[0].1, scored[0].0.clone())
+
+    let winner = scored[0].0.clone();
+    let winner_z = scored[0].1;
+    if own != f32::MIN && scored.len() >= 2 && scored[1].0.as_str() == field {
+        let own_bank = banks.iter().find(|(f, _, _)| f.as_str() == field);
+        let rival_bank = banks.iter().find(|(f, _, _)| f.as_str() == winner.as_str());
+        if let (Some((_, ob, _)), Some((_, rb, _))) = (own_bank, rival_bank) {
+            if let Some((os, rs, on, rn)) =
+                crate::utils::ai_utils::discriminative_anchor_verdict(label_emb, ob, rb)
+            {
+                crate::utils::score_dynamics::record_baseline(
+                    "vision.discriminative_gate",
+                    if os > rs { 1.0 } else { 0.0 },
+                );
+                if os > rs {
+                    println!(
+                        "      🔬 [DISCRIMINATIVE ANCHOR] '{}'({:+.4}) 가 '{}'({:+.4}) 에게 졌지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 자기 {:.4}({}구) > 경쟁 {:.4}({}구) 로 뒤집힙니다. 한 필드의 이름이 다른 필드의 이름을 의미적으로 포함하면(소계는 총계를 포함합니다) 두 뱅크가 같은 성분을 공유해 그 공유분의 미세차가 승패를 가릅니다. 자기 필드로 확정합니다.",
+                        field, own, winner, winner_z, os, on, rs, rn
+                    );
+                    crate::utils::score_dynamics::record_confusion(field, &winner, os - rs);
+                    return (true, own_out, winner_z, winner);
+                }
+                println!(
+                    "      🔬 [DISCRIMINATIVE ANCHOR] '{}' vs '{}' 를 변별 구만으로 재검사했으나 자기 {:.4}({}구) ≤ 경쟁 {:.4}({}구) 로 결론이 같습니다. 원래 판정을 유지합니다.",
+                    field, winner, os, on, rs, rn
+                );
+            }
+        }
+    }
+    (false, own_out, winner_z, winner)
+}
+
+pub fn route_pairs_to_fields(
+    pairs: &[(String, String)],
+    pair_embs: &[Vec<f32>],
+    window_fields: &[String],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    if pairs.is_empty() || window_fields.is_empty() { return out; }
+    if pair_embs.len() != pairs.len() { return out; }
+
+    let mut rows: Vec<(String, &Vec<Vec<f32>>, &Vec<f32>)> = Vec::new();
+    for f in window_fields.iter() {
+        if let Some((_, b, w)) = banks.iter().find(|(n, _, _)| n == f) {
+            if b.is_empty() { continue; }
+            rows.push((f.clone(), b, w));
+        }
+    }
+    if rows.is_empty() { return out; }
+
+    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; pairs.len()]; rows.len()];
+    for (fi, (_, bank, weights)) in rows.iter().enumerate() {
+        for (pi, e) in pair_embs.iter().enumerate() {
+            if e.iter().all(|&v| v == 0.0) { continue; }
+            if pairs[pi].1.trim().is_empty() { continue; }
+            let fmt = crate::utils::ai_utils::detect_field_format(&rows[fi].0);
+            if !crate::utils::ai_utils::value_matches_format(fmt, &pairs[pi].1) { continue; }
+            matrix[fi][pi] =
+                crate::utils::ai_utils::weighted_max_pool_sim(e, bank, weights);
+        }
+    }
+
+    let assign = crate::utils::ai_utils::exclusive_assign_by_score(&matrix, 0.0, 0.0);
+    for (fi, a) in assign.iter().enumerate() {
+        let (pi, _own, _margin) = match a { Some(v) => *v, None => continue };
+        out.push((rows[fi].0.clone(), pairs[pi].0.clone(), pairs[pi].1.clone()));
+    }
+    out
 }
 
 pub fn plan_recovery_windows(
@@ -632,36 +700,82 @@ pub fn plan_recovery_windows(
     };
     let mut sorted: Vec<&(String, String, usize, f32)> = cands.iter().collect();
     sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-    let mut out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = Vec::new();
+    struct Slot {
+        row: usize,
+        c_lo: usize,
+        c_hi: usize,
+        fields: Vec<(String, String, f32)>,
+    }
+    let mut slots: Vec<Slot> = Vec::new();
     let mut merged_log: Vec<String> = Vec::new();
+    let mut row_log: Vec<String> = Vec::new();
     let mut overflow: Vec<String> = Vec::new();
     for c in sorted.into_iter() {
         let (cat, field, patch, z) = (&c.0, &c.1, c.2, c.3);
         let r = patch / cols;
         let col = patch % cols;
         if r >= rows { continue; }
-        let wide = to_px(
-            r.saturating_sub(1),
-            (r + 1).min(rows - 1),
-            col.saturating_sub(1),
-            (col + 2).min(cols - 1),
-        );
-        if let Some(slot) = out.iter_mut().find(|(b, _)| *b == wide) {
-            if slot.1.iter().any(|(_, f, _)| f == field) { continue; }
-            merged_log.push(format!("{}(z {:+.2})", field, z));
-            slot.1.push((cat.clone(), field.clone(), z));
+        let lo = col.saturating_sub(1);
+        let hi = (col + 2).min(cols.saturating_sub(1));
+
+        if let Some(s) = slots
+            .iter_mut()
+            .find(|s| s.row == r && lo <= s.c_hi && s.c_lo <= hi)
+        {
+            if s.fields.iter().any(|(_, f, _)| f == field) { continue; }
+            let grew = lo < s.c_lo || hi > s.c_hi;
+            if grew {
+                row_log.push(format!(
+                    "{}(r{} c{}~{} ⊕ c{}~{})",
+                    field, r, s.c_lo, s.c_hi, lo, hi
+                ));
+            } else {
+                merged_log.push(format!("{}(z {:+.2})", field, z));
+            }
+            if lo < s.c_lo { s.c_lo = lo; }
+            if hi > s.c_hi { s.c_hi = hi; }
+            s.fields.push((cat.clone(), field.clone(), z));
             continue;
         }
-        if out.len() >= budget {
+        if slots.len() >= budget {
             overflow.push(format!("{}(z {:+.2})", field, z));
             continue;
         }
-        out.push((wide, vec![(cat.clone(), field.clone(), z)]));
+        slots.push(Slot {
+            row: r,
+            c_lo: lo,
+            c_hi: hi,
+            fields: vec![(cat.clone(), field.clone(), z)],
+        });
     }
+
+    let out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = slots
+        .into_iter()
+        .map(|s| {
+            let bbox = to_px(
+                s.row.saturating_sub(1),
+                (s.row + 1).min(rows.saturating_sub(1)),
+                s.c_lo,
+                s.c_hi,
+            );
+            (bbox, s.fields)
+        })
+        .collect();
+
     if !merged_log.is_empty() {
         println!(
-            "    🧷 [RECOVERY WINDOW CLUSTER] 같은 픽셀 창을 가리키는 필드 {}개를 한 창에 묶었습니다: {:?} — 같은 자리를 가리키는 축들은 서로 경쟁자가 아니라 그 자리의 후보 집합입니다. 한 축만 물으면 그 축이 이 문서에 인쇄되지 않은 경우 같은 창에 있던 정답까지 함께 버려집니다.",
+            "    🧷 [RECOVERY WINDOW CLUSTER] 같은 픽셀 창을 가리키는 필드 {}개를 한 창에 묶었습니다: {:?} — 같은 자리를 가리키는 축들은 서로 경쟁자가 아니라 그 자리의 후보 집합입니다.",
             merged_log.len(), merged_log.iter().take(12).collect::<Vec<_>>()
+        );
+    }
+    if !row_log.is_empty() {
+        println!(
+            "    🧷 [RECOVERY WINDOW ROW MERGE] 앵커 패치가 같은 격자 행이고 열 창이 겹치는 후보 {}건을 하나의 창으로 확장했습니다: {:?} — 라벨과 값은 같은 인쇄 행에 놓이므로 같은 행의 겹치는 창은 서로 다른 지면이 아니라 한 줄의 조각입니다. 행을 넘지 않으므로 창 높이가 그대로이고 업스케일 배율도 보존됩니다. 이 병합이 없으면 한 줄을 두세 번 나눠 읽어 호출만 늘고, 라벨이 잘린 조각에서는 어느 축인지 판정할 근거가 사라집니다.",
+            row_log.len(), row_log.iter().take(12).collect::<Vec<_>>()
+        );
+        crate::utils::score_dynamics::record_baseline(
+            "vision.recovery_row_merge",
+            row_log.len() as f32,
         );
     }
     if !overflow.is_empty() {
@@ -1215,8 +1329,30 @@ pub fn merge_extracted(
                         _ => true,
                     }
                 };
+                let scalars = |v: &Value| -> Vec<(String, String)> {
+                    let o = match v.as_object() { Some(o) => o, None => return Vec::new() };
+                    o.iter()
+                        .filter_map(|(k, x)| match x {
+                            Value::String(s) if !s.trim().is_empty() => {
+                                Some((k.clone(), s.trim().to_lowercase()))
+                            }
+                            Value::Number(nn) => Some((k.clone(), nn.to_string())),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let subsumes = |outer: &Value, inner: &Value| -> bool {
+                    let a = scalars(outer);
+                    let b = scalars(inner);
+                    if b.is_empty() || b.len() > a.len() { return false; }
+                    b.iter()
+                        .all(|(k, v)| a.iter().any(|(ak, av)| ak == k && av == v))
+                };
+
                 let mut added = 0usize;
                 let mut dup = 0usize;
+                let mut subset = 0usize;
+                let mut absorbed = 0usize;
                 let mut ghost = 0usize;
                 if let Some(existing) = slot.as_array_mut() {
                     let mut keys: Vec<String> = existing.iter().map(row_key).collect();
@@ -1234,19 +1370,41 @@ pub fn merge_extracted(
                         let k = row_key(e);
                         if k.is_empty() { continue; }
                         if keys.iter().any(|x| x == &k) { dup += 1; continue; }
+                        if existing.iter().any(|x| subsumes(x, e)) {
+                            subset += 1;
+                            continue;
+                        }
+                        if let Some(pos) = existing.iter().position(|x| subsumes(e, x)) {
+                            existing[pos] = e.clone();
+                            keys[pos] = k;
+                            absorbed += 1;
+                            continue;
+                        }
                         keys.push(k);
                         existing.push(e.clone());
                         added += 1;
                     }
                 }
                 emit(&format!(
-                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 | 정체 없는 행 {}건 폐기 (누적 {}건)",
+                    "    ➕ [{}] 배열 신규 {}건 | 겹침 중복 {}건 제거 | 부분집합 {}건 흡수 | 기존 행 승격 {}건 | 정체 없는 행 {}건 폐기 (누적 {}건)",
                     category,
                     added,
                     dup,
+                    subset,
+                    absorbed,
                     ghost,
                     merged.get(category).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
                 ));
+                if subset + absorbed > 0 {
+                    emit(&format!(
+                        "    ♊ [ROW SUBSUMED] [{}] 스칼라 값 집합이 기존 행의 부분집합인 행 {}건과, 기존 행을 부분집합으로 품은 행 {}건을 병합했습니다. 완전 일치만 보면 같은 값을 절반만 담은 행이 새 레코드로 쌓입니다. 한 크롭이 라벨↔값을 온전히 읽고 다른 크롭이 값만 읽으면 정확히 이 모양이 되며, 그대로 두면 자연어 변환과 청크 인덱싱이 같은 사실을 두 번 문장으로 만듭니다.",
+                        category, subset, absorbed
+                    ));
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.row_subsumed",
+                        (subset + absorbed) as f32,
+                    );
+                }
             }
             return;
         }

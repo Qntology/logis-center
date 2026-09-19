@@ -1077,34 +1077,60 @@ pub fn measure_doc_text_height(
     let (w, h) = (gray.width() as usize, gray.height() as usize);
     if w == 0 || h < 8 { return None; }
 
-    // ── 행별 잉크량 ──
     let mut row_ink: Vec<u32> = vec![0; h];
+    let mut row_runs: Vec<u32> = vec![0; h];
+    let mut row_longest: Vec<u32> = vec![0; h];
     for y in 0..h {
         let mut c = 0u32;
+        let mut runs = 0u32;
+        let mut cur = 0u32;
+        let mut longest = 0u32;
         for x in 0..w {
-            if gray.get_pixel(x as u32, y as u32).0[0] < 160 { c += 1; }
+            if gray.get_pixel(x as u32, y as u32).0[0] < 160 {
+                c += 1;
+                if cur == 0 { runs += 1; }
+                cur += 1;
+                if cur > longest { longest = cur; }
+            } else {
+                cur = 0;
+            }
         }
         row_ink[y] = c;
+        row_runs[y] = runs;
+        row_longest[y] = longest;
     }
 
-    // ── 잉크 임계 : 자기 분포의 평균 ──
     let total: u64 = row_ink.iter().map(|v| *v as u64).sum();
     let mean = total as f32 / h as f32;
     if mean <= 0.0 { return None; }
 
-    // ── 연속 잉크 행 = 한 밴드 ──
+    let is_text_row = |y: usize| -> bool {
+        if (row_ink[y] as f32) <= mean { return false; }
+        row_runs[y] >= 2 && (row_longest[y] as usize) * 2 < w
+    };
+
     let mut bands: Vec<f32> = Vec::new();
+    let mut rule_rows = 0usize;
     let mut run = 0usize;
     for y in 0..h {
-        if row_ink[y] as f32 > mean {
+        if is_text_row(y) {
             run += 1;
-        } else if run > 0 {
+            continue;
+        }
+        if (row_ink[y] as f32) > mean { rule_rows += 1; }
+        if run > 0 {
             bands.push(run as f32);
             run = 0;
         }
     }
     if run > 0 { bands.push(run as f32); }
-    if bands.len() < 3 { return None; }
+    if bands.len() < 3 {
+        emit(&format!(
+            "  ⚪ [DOC TEXT HEIGHT] 괘선을 걷어내고 남은 글자 행 밴드가 {}개뿐이라 기준선을 세우지 못합니다. 클램프를 적용하지 않고 크롭별 추정을 그대로 씁니다.",
+            bands.len()
+        ));
+        return None;
+    }
 
     bands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = bands[bands.len() / 2];
@@ -1114,10 +1140,14 @@ pub fn measure_doc_text_height(
     let mad = dev[dev.len() / 2] * 1.4826;
 
     emit(&format!(
-        "  📐 [DOC TEXT HEIGHT] 문서 전체 잉크 행 밴드 {}개 | 중앙값 {:.1}px | MAD {:.1}px | 허용 상한 {:.1}px. 크롭 하나의 밴드가 두세 개뿐이면 그 안에서는 이상치를 볼 수 없으므로, 글자 높이의 기준선은 문서 전체 분포에서 가져옵니다.",
-        bands.len(), median, mad, median + mad.max(1.0)
+        "  📐 [DOC TEXT HEIGHT] 글자 행 밴드 {}개 | 중앙값 {:.1}px | MAD {:.1}px | 허용 상한 {:.1}px | 괘선으로 배제한 잉크 행 {}줄. 표 테두리는 행 전체가 하나의 연속 잉크 런이고 글자 행은 글자 사이 공백 때문에 런이 끊깁니다. 이 구분이 없으면 격자가 촘촘한 서식에서 1~2px 괘선이 밴드 다수를 차지해 중앙값이 글자 높이가 아니라 선 두께가 되고, 그러면 전 크롭이 상한 배율로 포화되어 추정이 사실상 상수가 됩니다.",
+        bands.len(), median, mad, median + mad.max(1.0), rule_rows
     ));
     crate::utils::score_dynamics::record_baseline("vision.doc_text_height", median);
+    crate::utils::score_dynamics::record_baseline(
+        "vision.doc_rule_rows",
+        rule_rows as f32 / h.max(1) as f32,
+    );
     Some((median, mad))
 }
 

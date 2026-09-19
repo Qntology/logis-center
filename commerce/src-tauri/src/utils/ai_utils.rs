@@ -1399,15 +1399,16 @@ pub fn discriminative_phrase_mask(
     rival_bank: &[Vec<f32>],
 ) -> Vec<bool> {
     let n = own_bank.len();
-    let mut keep = vec![false; n];
     if n == 0 || rival_bank.is_empty() {
         return vec![true; n];
     }
     let own_cohesion = bank_internal_cohesion(own_bank);
+    let rival_vec: Vec<Vec<f32>> = rival_bank.to_vec();
+    let mut keep = vec![false; n];
     let mut any = false;
     for (i, e) in own_bank.iter().enumerate() {
         if e.iter().all(|&v| v == 0.0) { continue; }
-        let cross = max_pool_sim(e, &rival_bank.to_vec());
+        let cross = max_pool_sim(e, &rival_vec);
         if cross < own_cohesion {
             keep[i] = true;
             any = true;
@@ -1441,6 +1442,9 @@ pub fn discriminative_anchor_verdict(
         .collect();
 
     if own_only.is_empty() || rival_only.is_empty() { return None; }
+    if own_only.len() == own_bank.len() && rival_only.len() == rival_bank.len() {
+        return None;
+    }
 
     let own_score = max_pool_sim(label_emb, &own_only);
     let rival_score = max_pool_sim(label_emb, &rival_only);
@@ -1579,9 +1583,9 @@ pub fn window_assign_verdict(
         return (true, "창 안 1위이며 자기 중립점수가 양수");
     }
     if rival_neutral <= 0.0 {
-        return (true, "창 안 1위이며 경쟁 축도 근거가 없음");
+        return (true, "창 안 1위이며 경쟁 축도 양수 근거가 없음");
     }
-    (false, "자기 중립점수가 음수이고 경쟁 축이 양수 근거를 가짐")
+    (false, "자기 중립점수가 음수인데 경쟁 축은 양수 근거를 가짐")
 }
 
 pub fn greedy_exclusive_assign(matrix: &Vec<Vec<f32>>) -> Vec<Option<(usize, f32, f32)>> {

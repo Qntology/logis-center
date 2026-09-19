@@ -936,7 +936,45 @@ impl crate::model::LogisModel {
                                 .map(|(f, _, _, _)| f)
                                 .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
                                 .collect();
-                            let mut gate_banks: Option<Vec<(String, Vec<Vec<f32>>, Vec<f32>)>> = None;
+                            let gate_banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = {
+                                let mut phr_all: Vec<String> = Vec::new();
+                                let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
+                                for f in schema_fields.iter() {
+                                    let (ph, wt) = crate::utils::ai_utils::label_phrase_bank(&language, "shipping_doc", f);
+                                    for p in ph.iter() {
+                                        if !phr_all.contains(p) { phr_all.push(p.clone()); }
+                                    }
+                                    per_field.push((f.clone(), ph, wt));
+                                }
+                                let mut embs: Vec<Vec<f32>> = Vec::with_capacity(phr_all.len());
+                                for part in phr_all.chunks(200) {
+                                    let e = self
+                                        .get_embedding_batch(part.to_vec())
+                                        .await
+                                        .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+                                    embs.extend(e);
+                                }
+                                let table: std::collections::HashMap<String, Vec<f32>> =
+                                    phr_all.into_iter().zip(embs.into_iter()).collect();
+                                let mut banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
+                                for (f, ph, wt) in per_field.into_iter() {
+                                    let mut b: Vec<Vec<f32>> = Vec::new();
+                                    let mut w: Vec<f32> = Vec::new();
+                                    for (p, x) in ph.iter().zip(wt.iter()) {
+                                        if let Some(e) = table.get(p) {
+                                            if e.is_empty() { continue; }
+                                            b.push(e.clone());
+                                            w.push(*x);
+                                        }
+                                    }
+                                    banks.push((f, b, w));
+                                }
+                                emit_term(&format!(
+                                    "    📖 [RECOVERY LABEL BANK] 스키마 필드 {}개의 라벨 뱅크를 창 루프 진입 전에 한 번만 세웁니다. 라벨↔값 쌍 읽기는 읽힌 라벨을 즉시 축에 배정해야 하므로 첫 창에서부터 뱅크가 필요하고, 창마다 다시 세우면 같은 임베딩을 반복 계산하게 됩니다.",
+                                    banks.len()
+                                ));
+                                banks
+                            };
                             let mut label_evidence: std::collections::HashMap<String, f32> =
                                 std::collections::HashMap::new();
                             for (wi, (bbox, fields)) in windows.into_iter().enumerate() {
@@ -971,7 +1009,17 @@ impl crate::model::LogisModel {
                                     wi + 1, bbox.0, bbox.1, bbox.2, bbox.3,
                                     fields.iter().map(|(c, f, z)| format!("{}.{}(z {:+.2})", c, f, z)).collect::<Vec<_>>()
                                 ));
-                                let prompt = crate::parsing::get_trade_recovery_prompt(&detected_type, &defs);
+
+                                let pair_mode = fields.len() >= 2;
+                                let prompt = if pair_mode {
+                                    emit_term(&format!(
+                                        "    🏷️ [PAIR READ] 창 {}: 축 {}개를 각각 묻는 대신 인쇄된 라벨↔값 쌍을 전부 옮겨 적게 합니다. 정의가 한 줄뿐인 축을 여러 개 나열하면 2B 모델이 '이 값이 어느 축인가' 를 스스로 판정해야 하고, 날짜 축 7개처럼 정의가 서로 구별되지 않으면 전부 null 을 돌려줍니다. 라벨→축 배정은 라벨 코사인 게이트의 일이므로 모델에게서 그 일을 빼앗습니다.",
+                                        wi + 1, fields.len()
+                                    ));
+                                    crate::parsing::get_trade_pair_read_prompt(&detected_type, &defs)
+                                } else {
+                                    crate::parsing::get_trade_recovery_prompt(&detected_type, &defs)
+                                };
                                 let res = self.chat_with_qwen3_5_image_spinner(
                                     "You are a highly precise document data extraction assistant.",
                                     &prompt,
@@ -980,14 +1028,91 @@ impl crate::model::LogisModel {
                                     "extraction-progress",
                                     json!({
                                         "category": format!("Vision (Recovery {})", wi + 1),
-                                        "summary": "Re-reading empty fields..."
+                                        "summary": if pair_mode { "Transcribing label/value pairs..." } else { "Re-reading empty fields..." }
                                     }),
-                                    160,
+                                    if pair_mode { 384 } else { 160 },
                                     cancel_token.clone(),
                                     Some(task_id.clone()),
                                     None
                                 ).await?;
-                                let parsed = crate::parsing::parse_json_from_llm(&res);
+                                let raw_parsed = crate::parsing::parse_json_from_llm(&res);
+                                let parsed = if !pair_mode {
+                                    raw_parsed
+                                } else {
+                                    let pairs: Vec<(String, String)> = raw_parsed
+                                        .get("pairs")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| {
+                                            arr.iter()
+                                                .filter_map(|e| {
+                                                    let l = e.get("label").and_then(|x| x.as_str())?.trim().to_string();
+                                                    let v = e
+                                                        .get("value")
+                                                        .and_then(|x| match x {
+                                                            Value::String(s) => Some(s.trim().to_string()),
+                                                            Value::Number(n) => Some(n.to_string()),
+                                                            _ => None,
+                                                        })
+                                                        .unwrap_or_default();
+                                                    if l.is_empty() || v.is_empty() { return None; }
+                                                    if crate::model::merge::is_schema_echo(&v) { return None; }
+                                                    Some((l, v))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if pairs.is_empty() {
+                                        emit_term(&format!(
+                                            "      ⚪ [PAIR READ EMPTY] 창 {} 에서 읽어낸 라벨↔값 쌍이 없습니다.",
+                                            wi + 1
+                                        ));
+                                        Value::Object(serde_json::Map::new())
+                                    } else {
+                                        emit_term(&format!(
+                                            "      🏷️ [PAIR READ] 창 {} 에서 쌍 {}건을 읽었습니다: {:?}",
+                                            wi + 1,
+                                            pairs.len(),
+                                            pairs.iter().map(|(l, v)| format!("\"{}\"→\"{}\"", l, v)).take(8).collect::<Vec<_>>()
+                                        ));
+                                        crate::utils::score_dynamics::record_baseline(
+                                            "vision.pair_read_count",
+                                            pairs.len() as f32,
+                                        );
+                                        let labels: Vec<String> = pairs.iter().map(|(l, _)| l.clone()).collect();
+                                        let pair_embs = self
+                                            .get_embedding_batch(labels)
+                                            .await
+                                            .unwrap_or_else(|_| vec![Vec::new(); pairs.len()]);
+                                        let window_fields: Vec<String> =
+                                            fields.iter().map(|(_, f, _)| f.clone()).collect();
+                                        let routed = crate::model::merge::route_pairs_to_fields(
+                                            &pairs, &pair_embs, &window_fields, &gate_banks,
+                                        );
+                                        let mut obj = serde_json::Map::new();
+                                        for (f, l, v) in routed.iter() {
+                                            emit_term(&format!(
+                                                "      🧭 [PAIR ROUTE] \"{}\" → {} = \"{}\" | 이 창이 물은 축 {:?} 안에서 라벨 뱅크 배타 배정으로 확정했습니다. 전체 스키마 재판정은 아래 라벨 게이트가 이어서 수행하며, 다른 축이 이기면 그쪽으로 이송됩니다.",
+                                                l, f, v, window_fields
+                                            ));
+                                            obj.insert(
+                                                f.clone(),
+                                                json!({ "label": l, "value": v }),
+                                            );
+                                        }
+                                        let unrouted: Vec<String> = pairs
+                                            .iter()
+                                            .filter(|(l, _)| !routed.iter().any(|(_, rl, _)| rl == l))
+                                            .map(|(l, v)| format!("\"{}\"→\"{}\"", l, v))
+                                            .collect();
+                                        if !unrouted.is_empty() {
+                                            emit_term(&format!(
+                                                "      ⚪ [PAIR UNROUTED] 이 창이 물은 축보다 쌍이 많아 배정되지 못한 {}건: {:?} — 배타 배정은 축 하나에 쌍 하나만 주므로 남는 쌍은 이번 회차에서 버립니다. 같은 자리를 다시 읽는 것보다 다음 회차의 재인덱싱에 맡기는 편이 호출을 아낍니다.",
+                                                unrouted.len(), unrouted.iter().take(6).collect::<Vec<_>>()
+                                            ));
+                                        }
+                                        Value::Object(obj)
+                                    }
+                                };
                                 for (cat, field, _) in fields.iter() {
                                     let is_verify = verify_fields.iter().any(|f| f == field);
                                     let current = final_data_map
@@ -1096,47 +1221,11 @@ impl crate::model::LogisModel {
                                         ));
                                         continue;
                                     }
-                                    if !blind_confirmed && gate_banks.is_none() {
-                                        let mut phr_all: Vec<String> = Vec::new();
-                                        let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
-                                        for f in schema_fields.iter() {
-                                            let (ph, wt) = crate::utils::ai_utils::label_phrase_bank(&language, "shipping_doc", f);
-                                            for p in ph.iter() {
-                                                if !phr_all.contains(p) { phr_all.push(p.clone()); }
-                                            }
-                                            per_field.push((f.clone(), ph, wt));
-                                        }
-                                        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(phr_all.len());
-                                        for part in phr_all.chunks(200) {
-                                            let e = self
-                                                .get_embedding_batch(part.to_vec())
-                                                .await
-                                                .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
-                                            embs.extend(e);
-                                        }
-                                        let table: std::collections::HashMap<String, Vec<f32>> =
-                                            phr_all.into_iter().zip(embs.into_iter()).collect();
-                                        let mut banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
-                                        for (f, ph, wt) in per_field.into_iter() {
-                                            let mut b: Vec<Vec<f32>> = Vec::new();
-                                            let mut w: Vec<f32> = Vec::new();
-                                            for (p, x) in ph.iter().zip(wt.iter()) {
-                                                if let Some(e) = table.get(p) {
-                                                    if e.is_empty() { continue; }
-                                                    b.push(e.clone());
-                                                    w.push(*x);
-                                                }
-                                            }
-                                            banks.push((f, b, w));
-                                        }
-                                        gate_banks = Some(banks);
-                                    }
                                     let (ok, own, rival, rival_field) = if blind_confirmed {
                                         (true, 0.0f32, 0.0f32, String::new())
                                     } else {
                                         let label_emb = self.get_embedding(label.clone()).await.unwrap_or_default();
-                                        let banks = gate_banks.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
-                                        crate::model::merge::recovery_label_gate(&label_emb, field, banks)
+                                        crate::model::merge::recovery_label_gate(&label_emb, field, &gate_banks)
                                     };
                                     let evidence = if blind_confirmed {
                                         "라벨 미판독 + 기대 필드명 없는 재판독 일치".to_string()
@@ -1152,15 +1241,23 @@ impl crate::model::LogisModel {
                                     let mut ok = ok;
                                     if !ok && !rival_field.is_empty() {
                                         let rival_in_window = fields.iter().any(|(_, f, _)| *f == rival_field);
-                                        if !rival_in_window {
+                                        let (pass, why) = crate::utils::ai_utils::window_assign_verdict(
+                                            own, rival, !rival_in_window,
+                                        );
+                                        if pass {
                                             emit_term(&format!(
-                                                "      🧷 [WINDOW ARGMAX] {}.{} = \"{}\" | 스키마 전체로는 '{}' 가 라벨 argmax 이지만 그 축은 이 창에서 묻지 않았습니다. 이 창이 물은 필드 {:?} 안에서는 '{}' 가 1위이므로 통과시킵니다. 같은 자리를 가리키는 축들을 한 창에 묶은 뒤 전체 스키마로 argmax 를 재면, 이 창의 후보가 아닌 축이 이겨 정답이 매번 이송 대상으로 밀려납니다.",
-                                                cat, field, value, rival_field,
-                                                fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>(),
-                                                field
+                                                "      🧷 [WINDOW ARGMAX] {}.{} = \"{}\" | 스키마 전체로는 '{}'({:+.4}) 가 라벨 argmax 이지만 그 축은 이 창에서 묻지 않았고, 이 축의 자기 중립점수는 {:+.4} 입니다. 근거: {}. 이 창이 물은 필드 {:?} 안에서 1위이므로 통과시킵니다.",
+                                                cat, field, value, rival_field, rival, own, why,
+                                                fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
                                             ));
                                             crate::utils::score_dynamics::record_baseline("vision.window_argmax", 1.0);
                                             ok = true;
+                                        } else if !rival_in_window {
+                                            crate::utils::score_dynamics::record_baseline("vision.window_argmax", 0.0);
+                                            emit_term(&format!(
+                                                "      🚫 [WINDOW ARGMAX BLOCKED] {}.{} = \"{}\" | 이 창이 그 축 하나만 물었으므로 창 안 argmax 는 자동으로 자기 자신입니다. 그러나 자기 중립점수가 {:+.4} 로 음수이고 경쟁 축 '{}' 는 {:+.4} 로 양수라, 읽힌 라벨이 이 축을 설명할 가능성 자체가 없습니다. 상대 근거만 보고 절대 근거를 버리면 창이 축 하나만 물을 때 게이트가 무조건 열립니다. 아래 REROUTE 로 소유 축을 찾습니다.",
+                                                cat, field, value, own, rival_field, rival
+                                            ));
                                         }
                                     }
                                     if !ok {
@@ -1265,6 +1362,19 @@ impl crate::model::LogisModel {
                     }
 
                     extracted_data = Value::Object(final_data_map);
+                    if let Some(m) = extracted_data.as_object_mut() {
+                        let n = self
+                            .remap_off_schema_axes(
+                                m, &mut grounding_claims, &detected_type, &language, &emit_term,
+                            )
+                            .await;
+                        if n > 0 {
+                            emit_term(&format!(
+                                "  ✅ [SCHEMA AXIS MAP] 스키마 밖 키 {}건을 같은 개념의 스키마 축으로 옮겼습니다. 접지 주장의 필드명도 함께 갱신했으므로 STEP 6 의 폐기 판정이 어긋나지 않습니다.",
+                                n
+                            ));
+                        }
+                    }
                 }
 
             } else {
@@ -2263,6 +2373,135 @@ impl crate::model::LogisModel {
             crate::utils::score_dynamics::leave_scope();
             Ok(())
         }
+    }
+
+    async fn remap_off_schema_axes<E: Fn(&str)>(
+        &self,
+        map: &mut serde_json::Map<String, Value>,
+        claims: &mut Vec<crate::models::siglip2::value_grounding::GroundingClaim>,
+        doc_type: &str,
+        doc_lang: &str,
+        emit: E,
+    ) -> usize {
+        use crate::utils::ai_utils::{cosine_similarity, detect_field_format, semantic_anchor_text, value_matches_format, FieldFormat};
+
+        let compat = |a: FieldFormat, b: FieldFormat| -> bool {
+            if a == b { return true; }
+            matches!(
+                (a, b),
+                (FieldFormat::Text, FieldFormat::Address)
+                    | (FieldFormat::Address, FieldFormat::Text)
+                    | (FieldFormat::Numeric, FieldFormat::Identifier)
+                    | (FieldFormat::Identifier, FieldFormat::Numeric)
+            )
+        };
+
+        let schema: Vec<String> = crate::parsing::get_detail_schema_fields(doc_type, "", doc_lang)
+            .into_iter()
+            .map(|(f, _, _, _)| f)
+            .filter(|f| !f.contains(','))
+            .collect();
+        if schema.is_empty() { return 0; }
+
+        let mut orphans: Vec<(String, String)> = Vec::new();
+        for (k, v) in map.iter() {
+            if v.is_object() || v.is_array() || v.is_null() { continue; }
+            let s = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if s.is_empty() || crate::model::merge::is_schema_echo(&s) { continue; }
+            if schema.iter().any(|f| f == k) { continue; }
+            let (known, cat) = crate::model::merge::trade_schema_owner_of(doc_type, k);
+            if !known || !cat.is_empty() { continue; }
+            orphans.push((k.clone(), s));
+        }
+        if orphans.is_empty() { return 0; }
+
+        let empty_at = |m: &serde_json::Map<String, Value>, f: &str| -> bool {
+            m.get(f).map_or(true, |x| {
+                x.is_null() || x.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+            })
+        };
+
+        let mut texts: Vec<String> = Vec::new();
+        for (k, _) in orphans.iter() {
+            texts.push(semantic_anchor_text(doc_lang, doc_type, k));
+        }
+        let head = texts.len();
+        for f in schema.iter() {
+            texts.push(semantic_anchor_text(doc_lang, doc_type, f));
+        }
+        let embs = match self.get_embedding_batch(texts).await {
+            Ok(e) if e.len() == head + schema.len() => e,
+            _ => {
+                emit("  ⚪ [SCHEMA AXIS MAP SKIP] 앵커 임베딩을 만들지 못해 스키마 밖 축을 그대로 둡니다.");
+                return 0;
+            }
+        };
+
+        let mut moved = 0usize;
+        for (oi, (key, raw)) in orphans.iter().enumerate() {
+            let q = &embs[oi];
+            if q.iter().all(|&x| x == 0.0) { continue; }
+            let want = detect_field_format(key);
+            let mut scored: Vec<(String, f32)> = Vec::new();
+            for (si, f) in schema.iter().enumerate() {
+                if !empty_at(map, f) { continue; }
+                if !compat(want, detect_field_format(f)) { continue; }
+                if !value_matches_format(detect_field_format(f), raw) { continue; }
+                let cat = crate::logic::trade_field_category(f);
+                if cat.is_empty() || crate::logic::is_trade_array_category(cat) { continue; }
+                let e = &embs[head + si];
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                scored.push((f.clone(), cosine_similarity(q, e)));
+            }
+            if scored.len() < 3 {
+                emit(&format!(
+                    "  ⚪ [SCHEMA AXIS MAP] '{}' 를 받아 줄 빈 스키마 축이 {}개뿐이라 자기 분포로 이상치를 판정할 수 없습니다. 루트에만 남겨 둡니다.",
+                    key, scored.len()
+                ));
+                continue;
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let tail: Vec<f32> = scored[1..].iter().map(|(_, s)| *s).collect();
+            let n = tail.len() as f32;
+            let mean = tail.iter().sum::<f32>() / n;
+            let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n)
+                .sqrt();
+            if sd <= 1e-6 || scored[0].1 - mean < sd {
+                emit(&format!(
+                    "  ⚪ [SCHEMA AXIS MAP] '{}' 의 최고 후보 '{}'({:.4}) 가 나머지 평균 {:.4} 에서 표준편차 {:.4} 만큼 떨어지지 못했습니다. 어느 축이라고 단정할 근거가 없으므로 루트에만 남겨 둡니다.",
+                    key, scored[0].0, scored[0].1, mean, sd
+                ));
+                continue;
+            }
+
+            let target = scored[0].0.clone();
+            let cat = crate::logic::trade_field_category(&target).to_string();
+            let val = map.remove(key).unwrap_or(json!(raw.clone()));
+            map.insert(target.clone(), val.clone());
+            let slot = map
+                .entry(cat.clone())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(o) = slot.as_object_mut() {
+                o.insert(target.clone(), val);
+            }
+            for c in claims.iter_mut() {
+                if c.field == *key && c.value.trim() == raw.trim() {
+                    c.field = target.clone();
+                    c.category = cat.clone();
+                }
+            }
+            crate::utils::score_dynamics::record_baseline("vision.schema_axis_map", 1.0);
+            emit(&format!(
+                "  🧭 [SCHEMA AXIS MAP] '{}' = \"{}\" → {}.{} (앵커 코사인 {:.4}, 나머지 평균 {:.4} + 표준편차 {:.4}). 이 키는 '{}' 서식의 로드된 스키마에 이름이 없지만 그 개념의 축은 존재합니다. 이름 완전일치만 보면 값이 루트에만 남아, 자연어 변환은 존재하지 않는 절을 만들고 청크 인덱싱의 스키마 화이트리스트가 그 절을 다시 폐기합니다. 읽어낸 값이 저장은 되고도 검색 경로에서는 존재하지 않게 되는 지점입니다.",
+                key, raw, cat, target, scored[0].1, mean, sd, doc_type
+            ));
+            moved += 1;
+        }
+        moved
     }
 
     pub async fn chat_with_qwen3_5_image_spinner(

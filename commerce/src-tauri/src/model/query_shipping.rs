@@ -1054,26 +1054,75 @@ impl crate::model::LogisModel {
                 // 단어가 하나뿐이면 걷어낼 라벨이 없습니다.
                 if words.len() < 2 { continue; }
 
-                let (lp, _) = crate::utils::ai_utils::label_phrase_bank(language, "shipping_doc", &field);
+                let (mut lp, _) = crate::utils::ai_utils::label_phrase_bank(language, "shipping_doc", &field);
+                if let Some(cat) = ship_field_category(&field) {
+                    if let Some((_, _, anchor)) = crate::logic::trade_condition_fields(&cat)
+                        .iter()
+                        .find(|(f, _, _)| *f == field.as_str())
+                    {
+                        for p in crate::utils::ai_utils::split_bias_phrases_full(anchor) {
+                            if crate::utils::ai_utils::is_value_example_phrase(&p) { continue; }
+                            if !lp.iter().any(|e| e == &p) { lp.push(p); }
+                        }
+                    }
+                }
+                if lp.is_empty() { continue; }
                 let vp = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped("shipping_doc", &field);
-                if lp.is_empty() || vp.is_empty() { continue; }
 
                 let lb = self.get_embedding_batch(lp).await.unwrap_or_default();
-                let vb = self.get_embedding_batch(vp).await.unwrap_or_default();
+                let vb = if vp.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch(vp).await.unwrap_or_default()
+                };
                 let we = self.get_embedding_batch(words.clone()).await.unwrap_or_default();
-                if lb.is_empty() || vb.is_empty() || we.len() != words.len() { continue; }
+                if lb.is_empty() || we.len() != words.len() { continue; }
 
                 let mut kept: Vec<String> = Vec::new();
                 let mut dropped: Vec<String> = Vec::new();
-                for (w, e) in words.iter().zip(we.iter()) {
-                    if e.iter().all(|&x| x == 0.0) { kept.push(w.clone()); continue; }
-                    let lab = crate::utils::ai_utils::max_pool_sim(e, &lb);
-                    let val = crate::utils::ai_utils::max_pool_sim(e, &vb);
-                    if val > lab {
-                        kept.push(w.clone());
-                    } else {
-                        dropped.push(format!("{}(라벨 {:.4} ≥ 값 {:.4})", w, lab, val));
+
+                if !vb.is_empty() {
+                    for (w, e) in words.iter().zip(we.iter()) {
+                        if e.iter().all(|&x| x == 0.0) { kept.push(w.clone()); continue; }
+                        let lab = crate::utils::ai_utils::max_pool_sim(e, &lb);
+                        let val = crate::utils::ai_utils::max_pool_sim(e, &vb);
+                        if val > lab {
+                            kept.push(w.clone());
+                        } else {
+                            dropped.push(format!("{}(라벨 {:.4} ≥ 값 {:.4})", w, lab, val));
+                        }
                     }
+                } else {
+                    let mut lab: Vec<(usize, f32)> = Vec::new();
+                    for (i, e) in we.iter().enumerate() {
+                        if e.iter().all(|&x| x == 0.0) { continue; }
+                        lab.push((i, crate::utils::ai_utils::max_pool_sim(e, &lb)));
+                    }
+                    if lab.len() < 2 { continue; }
+                    lab.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let tail: Vec<f32> = lab[1..].iter().map(|(_, s)| *s).collect();
+                    let n = tail.len() as f32;
+                    let mean = tail.iter().sum::<f32>() / n;
+                    let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
+                    if sd <= 1e-6 || lab[0].1 - mean < sd {
+                        emit_term(&format!(
+                            "   ⚪ [HINT RESIDUAL SKIP] {} 의 값 뱅크가 bias.json 에 없어 라벨 뱅크 자기 분포로만 판정했으나, 최고 라벨 유사도 {:.4} 가 나머지 평균 {:.4} 에서 표준편차 {:.4} 만큼 떨어지지 못했습니다. 어느 단어가 라벨인지 단정할 근거가 없으므로 원문을 그대로 씁니다.",
+                            field, lab[0].1, mean, sd
+                        ));
+                        continue;
+                    }
+                    let li = lab[0].0;
+                    for (i, w) in words.iter().enumerate() {
+                        if i == li {
+                            dropped.push(format!("{}(라벨 {:.4} vs 나머지 평균 {:.4} + 표준편차 {:.4})", w, lab[0].1, mean, sd));
+                        } else {
+                            kept.push(w.clone());
+                        }
+                    }
+                    emit_term(&format!(
+                        "   🧪 [HINT RESIDUAL / LABEL OUTLIER] {} 는 bias.json 의 multilingual_value_anchor 에 이 서식용 값 축이 없어 값 뱅크를 세울 수 없습니다. 대신 라벨 뱅크와의 유사도가 자기 분포에서 이상치인 단어 하나만 라벨로 보고 걷어냅니다. 값 뱅크가 없다는 이유로 잔차화를 통째로 건너뛰면, 값과 라벨이 섞인 문자열이 그대로 청크 검색에 들어가 신호가 희석됩니다.",
+                        field
+                    ));
                 }
                 if kept.is_empty() || dropped.is_empty() { continue; }
 

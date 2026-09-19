@@ -1558,6 +1558,39 @@ pub fn get_trade_recovery_prompt(doc_type: &str, fields: &[(String, String)]) ->
     )
 }
 
+pub fn get_trade_pair_read_prompt(doc_type: &str, fields: &[(String, String)]) -> String {
+    let mut hint = String::new();
+    for (f, d) in fields.iter().take(12) {
+        hint.push_str(&format!("- {}\n", d.replace('"', "'")));
+    }
+    let _ = fields;
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a small crop of a {} document. It contains one or more printed captions, each with a value next to it or under it.\n\
+         \n\
+         [TASK]\n\
+         Transcribe EVERY caption-and-value pair you can read in this crop. Do not decide which database field a pair belongs to — that decision is made elsewhere. Your only job is to copy what is printed.\n\
+         \n\
+         [WHAT THIS CROP IS ABOUT]\n\
+         The region was located because it should hold information of this kind:\n\
+         {}\
+         Use this only as orientation. If the crop shows a caption that is not described above, transcribe it anyway.\n\
+         \n\
+         [RULES]\n\
+         1. \"label\" is the caption text exactly as printed, including its case and punctuation.\n\
+         2. \"value\" is the text printed next to or under that caption, exactly as printed.\n\
+         3. Never translate, complete, normalize, reformat or re-type from memory. Copy character for character.\n\
+         4. One element per caption. If a caption has no value printed beside it, return null for \"value\".\n\
+         5. Do not invent a caption that is not printed. Do not merge two captions into one element.\n\
+         6. If the crop contains no readable caption at all, return an empty array.\n\
+         \n\
+         [OUTPUT]\n\
+         {{\"pairs\": [{{\"label\": null, \"value\": null}}]}}\n\
+         JSON ONLY.",
+        doc_type, hint
+    )
+}
+
 /// 🌟 [TRADE CONDITION — DEPTH 1] 질의 청크가 어느 '조건 카테고리' 인지 1갈래만 고릅니다.
 ///  ── 왜 쪼개는가 ──
 ///   기존 extract_shipping_conditions 는 44개 필드 + 변환 규칙 + 값 예시를
