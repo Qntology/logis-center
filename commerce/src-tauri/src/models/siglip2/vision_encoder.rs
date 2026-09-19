@@ -1309,6 +1309,7 @@ pub fn build_column_heatmaps(
     //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
     let mut field_peaks_by_cat: HashMap<String, Vec<(String, usize, f32)>> = HashMap::new();
+    let mut peak_cands: Vec<(String, String, Vec<(usize, f32)>)> = Vec::new();
     for (ki, fname) in keys.iter().enumerate() {
         if fname.starts_with("__") { continue; }
         let cat = match field_to_cat.get(fname) {
@@ -1330,15 +1331,68 @@ pub fn build_column_heatmaps(
         let mean = vals.iter().map(|(_, v)| *v).sum::<f32>() / cnt;
         let sd = (vals.iter().map(|(_, v)| (*v - mean) * (*v - mean)).sum::<f32>() / cnt).sqrt();
         if sd <= 1e-6 { continue; }
-        let (pi, pv) = vals
+        let gate = crate::utils::ai_utils::gumbel_expected_z(vals.len());
+        let mut ranked: Vec<(usize, f32)> = vals
             .iter()
-            .fold((usize::MAX, f32::MIN), |acc, (i, v)| if *v > acc.1 { (*i, *v) } else { acc });
-        let z = (pv - mean) / sd;
-        if z <= crate::utils::ai_utils::gumbel_expected_z(vals.len()) { continue; }
-        field_peaks_by_cat.entry(cat).or_default().push((fname.clone(), pi, z));
+            .map(|(i, v)| (*i, (*v - mean) / sd))
+            .filter(|(_, z)| *z > gate)
+            .collect();
+        if ranked.is_empty() { continue; }
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        peak_cands.push((cat, fname.clone(), ranked));
+    }
+    peak_cands.sort_by(|a, b| {
+        a.2.len()
+            .cmp(&b.2.len())
+            .then(b.2[0].1.partial_cmp(&a.2[0].1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut taken: Vec<(usize, String)> = Vec::new();
+    let mut displaced: Vec<String> = Vec::new();
+    let mut shared: Vec<String> = Vec::new();
+    for (cat, fname, ranked) in peak_cands.into_iter() {
+        if let Some((_, owner)) = taken.iter().find(|(q, _)| *q == ranked[0].0) {
+            crate::utils::score_dynamics::record_confusion(owner, &fname, 0.0);
+        }
+        let top_row = grid.rc(ranked[0].0).0;
+        let hit = ranked
+            .iter()
+            .find(|(p, _)| grid.rc(*p).0 == top_row && !taken.iter().any(|(q, _)| q == p))
+            .map(|(p, z)| (*p, *z));
+        match hit {
+            Some((p, z)) => {
+                if p != ranked[0].0 {
+                    displaced.push(format!("{}({}→{}, z {:+.2})", fname, ranked[0].0, p, z));
+                }
+                taken.push((p, fname.clone()));
+                field_peaks_by_cat.entry(cat).or_default().push((fname, p, z));
+            }
+            None => {
+                let (p, z) = ranked[0];
+                let owner = taken
+                    .iter()
+                    .find(|(q, _)| *q == p)
+                    .map(|(_, o)| o.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                crate::utils::score_dynamics::record_baseline("vision.peak_shared_z", z);
+                shared.push(format!("{}↔{}(패치 {}, z {:+.2})", fname, owner, p, z));
+                field_peaks_by_cat.entry(cat).or_default().push((fname, p, z));
+            }
+        }
+    }
+    if !displaced.is_empty() {
+        emit(&format!(
+            "    🔀 [PEAK NMS] 1순위 패치를 더 제약이 큰 필드에 내주고 같은 행의 차순위로 내려간 필드 {}개: {:?} — 라벨과 값은 같은 텍스트 행에 인쇄되므로, 행을 넘어간 차순위는 같은 필드의 다른 위치가 아니라 다른 레코드입니다.",
+            displaced.len(), displaced.iter().take(8).collect::<Vec<_>>()
+        ));
+    }
+    if !shared.is_empty() {
+        emit(&format!(
+            "    🤝 [PEAK SHARED] 같은 행에 빈 칸이 없어 1순위 봉우리를 공유로 보유한 필드 {}개: {:?} — 봉우리를 버리면 그 필드는 PEAK VERIFY 후보에서 통째로 사라져 잘린 값이 그대로 확정됩니다. 한 칸을 가리켜도 복구 윈도우는 필드마다 따로 열리므로 중복 판독이 일어나지 않습니다. 충돌 쌍은 혼동 사전에 기록했습니다.",
+            shared.len(), shared.iter().take(8).collect::<Vec<_>>()
+        ));
     }
     emit(&format!(
-        "    📍 [FIELD PEAKS] 자기 분포에서 √(2lnN) 을 넘는 필드 봉우리 {}개 (카테고리 {}개) — 빈 필드 복구의 위치 근거로 넘깁니다.",
+        "    📍 [FIELD PEAKS] 자기 분포에서 √(2lnN) 을 넘는 필드 봉우리 {}개 (카테고리 {}개) — 같은 행 안에서만 배타 배정하고, 자리가 없으면 공유로 보유했습니다. 빈 필드 복구의 위치 근거로 넘깁니다.",
         field_peaks_by_cat.values().map(|v| v.len()).sum::<usize>(),
         field_peaks_by_cat.len()
     ));

@@ -379,7 +379,7 @@ async fn reindex_pending_embeddings(
     //    처리할 문서가 0건이어도 CUDA 컨텍스트와 97M 임베딩 가중치를 매번 올렸다 내렸습니다.
     //    (로그 실측: [EMBED-LOCAL] 처리 로그가 없는데도 Loading Embedding Model 발생)
     //    이 스캔 구간은 LanceDB 조회만 사용하므로 모델이 전혀 필요 없습니다.
-    let mut pending: Vec<TradeDocument> = Vec::new();
+    let mut pending: Vec<(TradeDocument, bool)> = Vec::new();
     for doc in docs {
         if pending.len() >= scan_limit { break; }
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
@@ -479,8 +479,13 @@ async fn reindex_pending_embeddings(
         //    여기 도달하는 문서 수는 embed 게이트를 통과한 소수이므로
         //    쿼리 횟수가 후보 전체가 아니라 실제 미처리분으로 줄어듭니다.
         let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
-        if chunk_count > 0 { continue; }
-        pending.push(doc);
+        if chunk_count > 0 {
+            println!(
+                "[EMBED-LOCAL] 🧩 [CHUNK PRESENT] '{}' 는 청크 {}개가 이미 있습니다. 청크 인덱싱만 건너뛰고 문서 벡터는 이번 회차에서 채웁니다.",
+                doc.id, chunk_count
+            );
+        }
+        pending.push((doc, chunk_count == 0));
     }
 
     // 🌟 [VRAM GUARD] 처리 대상이 없으면 모델을 만들지 않고 즉시 반환합니다.
@@ -517,7 +522,7 @@ async fn reindex_pending_embeddings(
 
     let mut processed = 0usize;
     let mut yielded_to_task = false;
-    for doc in pending {
+    for (doc, needs_chunks) in pending {
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
         // 🌟 [BUSY RECHECK / 매 반복]
         //
@@ -686,11 +691,13 @@ async fn reindex_pending_embeddings(
         //    ① Qwen3.5 를 재로딩하거나 상주시켜야 하고
         //    ② 이미 확정된 문장을 다시 음차하여 결과를 오염시킵니다.
         let skip_translit = doc.mode == "analytic";
-        let _ = crate::scheduler::indexing::index_item_chunks(
-            &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
-            &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
-            skip_translit,
-        ).await;
+        if needs_chunks {
+            let _ = crate::scheduler::indexing::index_item_chunks(
+                &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
+                &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
+                skip_translit,
+            ).await;
+        }
 
         processed += 1;
     }
@@ -2791,6 +2798,7 @@ async fn ai_search_complex(
                         &scope_key,
                         "",
                     );
+                    crate::utils::score_dynamics::set_run_label(&query);
                     let (eligible, all_pass, per_field) = evaluate_dexie_plan(plan, &docs);
                     let drafts = docs.iter().filter(|d| is_relay_draft(d)).count();
                     crate::utils::score_dynamics::record_baseline("search.recall_n", docs.len() as f32);
@@ -2819,11 +2827,39 @@ async fn ai_search_complex(
                         if detail.is_empty() { "하드 조건 없음".to_string() } else { detail.join(" | ") }
                     );
                     if all_pass == 0 && eligible > 0 && !per_field.is_empty() {
+                        let corpus = crate::utils::score_dynamics::storage_doc_count(&types);
+                        let mut gap: Vec<String> = Vec::new();
+                        let mut narrow: Vec<String> = Vec::new();
+                        for (field, _satisfied, blocked) in per_field.iter() {
+                            if *blocked == 0 { continue; }
+                            match crate::utils::score_dynamics::storage_fill_prior(&types, field) {
+                                Some((p, filled, docs)) => {
+                                    crate::utils::score_dynamics::record_baseline("search.blocker_fill", p);
+                                    if filled * 2 < docs {
+                                        gap.push(format!("{}(저장 {}/{}건 · 사전 {:.3})", field, filled, docs, p));
+                                    } else {
+                                        narrow.push(format!("{}(저장 {}/{}건 · 사전 {:.3})", field, filled, docs, p));
+                                    }
+                                }
+                                None => narrow.push(format!("{}(저장 관측 미달)", field)),
+                            }
+                        }
                         println!(
-                            "[AI-SEARCH] ⚠️ [OVER-FILTER] 서식 범위 안 문서 {}건 중 하드 조건을 전부 만족하는 문서가 없습니다. 단독으로 걸러낸 필드: {:?}",
-                            eligible,
-                            per_field.iter().filter(|(_, _, b)| *b > 0).map(|(f, _, _)| f.clone()).collect::<Vec<_>>()
+                            "[AI-SEARCH] ⚠️ [OVER-FILTER] 서식 범위 안 문서 {}건 중 하드 조건을 전부 만족하는 문서가 없습니다. (같은 서식 저장본 {}건 기준)",
+                            eligible, corpus
                         );
+                        if !gap.is_empty() {
+                            println!(
+                                "[AI-SEARCH] 🕳️ [STORAGE GAP] 문서가 조건을 못 맞춘 것이 아니라 저장본에 필드 자체가 없습니다. 하드에서 내려야 할 축: {}",
+                                gap.join(" | ")
+                            );
+                        }
+                        if !narrow.is_empty() {
+                            println!(
+                                "[AI-SEARCH] 🎯 [TOO NARROW] 저장본에는 충분히 있는데 값이 조건을 벗어났습니다. 질의 해석을 의심할 축: {}",
+                                narrow.join(" | ")
+                            );
+                        }
                     }
                 }
                 println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());

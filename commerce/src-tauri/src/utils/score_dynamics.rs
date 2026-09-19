@@ -3,15 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-pub const SDS_RECIPE: &str = "sds-v2:welford+ring/tail-sd-entropy/granite-384/bias-json";
+pub const SDS_RECIPE: &str = "sds-v3:welford+ring/run-files/ledger-split/presence/granite-384/bias-json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Track {
     Vision,
     Trading,
     Commerce,
     Analytic,
     Search,
+    Index,
 }
 
 impl Track {
@@ -22,9 +23,20 @@ impl Track {
             Track::Commerce => "commerce",
             Track::Analytic => "analytic",
             Track::Search => "search",
+            Track::Index => "index",
         }
     }
-    /// (2차 스코프 발동, 1차 스코프 발동, 전역 발동)
+    pub fn from_name(name: &str) -> Option<Track> {
+        match name {
+            "vision" => Some(Track::Vision),
+            "trading" => Some(Track::Trading),
+            "commerce" => Some(Track::Commerce),
+            "analytic" => Some(Track::Analytic),
+            "search" => Some(Track::Search),
+            "index" => Some(Track::Index),
+            _ => None,
+        }
+    }
     pub fn min_obs(&self) -> (u64, u64, u64) {
         match self {
             Track::Vision => (20, 8, 30),
@@ -32,11 +44,58 @@ impl Track {
             Track::Commerce => (50, 20, 60),
             Track::Analytic => (40, 15, 0),
             Track::Search => (20, 8, 30),
+            Track::Index => (20, 8, 30),
         }
     }
-    /// 링 버퍼 크기 = 1차 스코프 발동 수. 새 상수를 만들지 않기 위한 재사용입니다.
     pub fn ring_len(&self) -> usize {
         self.min_obs().1 as usize
+    }
+    pub fn ledger(&self) -> Ledger {
+        match self {
+            Track::Vision | Track::Trading | Track::Commerce => Ledger::Extract,
+            Track::Analytic => Ledger::Analytic,
+            Track::Search => Ledger::Search,
+            Track::Index => Ledger::Index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ledger {
+    Extract,
+    Search,
+    Analytic,
+    Index,
+}
+
+impl Ledger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Ledger::Extract => "extract",
+            Ledger::Search => "search",
+            Ledger::Analytic => "analytic",
+            Ledger::Index => "index",
+        }
+    }
+    pub fn file_name(&self) -> &'static str {
+        match self {
+            Ledger::Extract => "extract.json",
+            Ledger::Search => "search.json",
+            Ledger::Analytic => "analytic.json",
+            Ledger::Index => "index.json",
+        }
+    }
+    pub fn all() -> [Ledger; 4] {
+        [Ledger::Extract, Ledger::Search, Ledger::Analytic, Ledger::Index]
+    }
+    pub fn from_name(name: &str) -> Option<Ledger> {
+        match name {
+            "extract" => Some(Ledger::Extract),
+            "search" => Some(Ledger::Search),
+            "analytic" => Some(Ledger::Analytic),
+            "index" => Some(Ledger::Index),
+            _ => None,
+        }
     }
 }
 
@@ -88,50 +147,52 @@ pub fn refine_primary(primary: &str) {
         (s.key_secondary(), ns.key_secondary(), ring)
     };
 
-    // 스코프 키를 먼저 교체합니다. (이후 관측은 새 키로)
+    let ledger = current_ledger();
+
     if let Ok(mut w) = ACTIVE_SCOPE.write() {
         w.primary = new_primary.clone();
     }
 
-    // 이전 키의 관측을 새 키로 흡수합니다.
     if old_key == new_key { return; }
     let moved = {
-        match SDS.write() {
-            Ok(mut store) => match store.scopes.remove(&old_key) {
-                Some(prev) => {
-                    let has = !prev.baseline.is_empty()
-                        || !prev.decay.is_empty()
-                        || !prev.axis_variance.is_empty()
-                        || !prev.field.is_empty()
-                        || !prev.confusion.is_empty()
-                        || !prev.category.is_empty()
-                        || !prev.spatial.is_empty()
-                        || !prev.transition.is_empty()
-                        || !prev.search_field.is_empty();
-                    if has {
-                        let cnt = prev.baseline.len()
-                            + prev.decay.len()
-                            + prev.field.len()
-                            + prev.confusion.len();
-                        store
-                            .scopes
-                            .entry(new_key.clone())
-                            .or_insert_with(ScopeStat::default)
-                            .absorb(prev, ring);
-                        cnt
-                    } else {
-                        0
+        match RUNS.write() {
+            Ok(mut runs) => match runs.get_mut(&ledger) {
+                Some(run) => match run.scopes.remove(&old_key) {
+                    Some(prev) => {
+                        let has = !prev.baseline.is_empty()
+                            || !prev.decay.is_empty()
+                            || !prev.axis_variance.is_empty()
+                            || !prev.field.is_empty()
+                            || !prev.confusion.is_empty()
+                            || !prev.category.is_empty()
+                            || !prev.spatial.is_empty()
+                            || !prev.transition.is_empty()
+                            || !prev.search_field.is_empty();
+                        if has {
+                            let cnt = prev.baseline.len()
+                                + prev.decay.len()
+                                + prev.field.len()
+                                + prev.confusion.len();
+                            run.scopes
+                                .entry(new_key.clone())
+                                .or_insert_with(ScopeStat::default)
+                                .absorb(prev, ring);
+                            cnt
+                        } else {
+                            0
+                        }
                     }
-                }
+                    None => 0,
+                },
                 None => 0,
             },
             Err(_) => 0,
         }
     };
     if moved > 0 {
-        if let Ok(mut d) = DIRTY.write() { *d = true; }
+        mark_dirty(ledger);
         println!(
-            "[SDS] 🔀 스코프 정밀화: '{}' → '{}' | 이전 관측 {}축을 새 스코프로 이관했습니다. (같은 문서의 관측이므로 귀속이 정확합니다)",
+            "[SDS] 🔀 스코프 정밀화: '{}' → '{}' | 이전 관측 {}축을 이번 실행 안에서 새 스코프로 이관했습니다. (같은 문서의 관측이므로 귀속이 정확합니다)",
             old_key, new_key, moved
         );
     }
@@ -464,65 +525,418 @@ impl ScopeStat {
     }
 }
 
-static SDS: Lazy<RwLock<SdsFile>> = Lazy::new(|| RwLock::new(SdsFile::default()));
-static DIRTY: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
-fn sds_path() -> std::path::PathBuf {
+static TEAM: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
+static BASES: Lazy<RwLock<HashMap<Ledger, SdsFile>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static RUNS: Lazy<RwLock<HashMap<Ledger, RunBuf>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static DIRTY: Lazy<RwLock<HashMap<Ledger, bool>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static INDEXING_DEPTH: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
+
+#[derive(Debug, Clone, Default)]
+struct RunBuf {
+    stamp: String,
+    label: String,
+    file: String,
+    started_ms: i64,
+    closing: bool,
+    observations: u64,
+    scopes: HashMap<String, ScopeStat>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RunFile {
+    recipe: String,
+    team: String,
+    ledger: String,
+    label: String,
+    started_at: i64,
+    updated_at: i64,
+    observations: u64,
+    #[serde(default)]
+    scopes: HashMap<String, ScopeStat>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PresenceDoc {
+    pub doc_type: String,
+    pub fields: Vec<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PresenceIndex {
+    pub recipe: String,
+    pub team: String,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub docs: HashMap<String, PresenceDoc>,
+}
+
+static PRESENCE: Lazy<RwLock<PresenceIndex>> = Lazy::new(|| RwLock::new(PresenceIndex::default()));
+static PRESENCE_DIRTY: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+
+fn sds_dir() -> std::path::PathBuf {
+    crate::utils::get_app_dir().join("score_dynamics")
+}
+
+fn legacy_sds_path() -> std::path::PathBuf {
     crate::utils::get_app_dir().join("score_dynamics.json")
 }
 
+fn ledger_path(l: Ledger) -> std::path::PathBuf {
+    sds_dir().join(l.file_name())
+}
+
+fn runs_dir(l: Ledger) -> std::path::PathBuf {
+    sds_dir().join("runs").join(l.as_str())
+}
+
+fn presence_path() -> std::path::PathBuf {
+    sds_dir().join("presence.json")
+}
+
+fn mark_dirty(l: Ledger) {
+    if let Ok(mut d) = DIRTY.write() { d.insert(l, true); }
+}
+
+fn is_dirty(l: Ledger) -> bool {
+    DIRTY.read().map(|d| *d.get(&l).unwrap_or(&false)).unwrap_or(false)
+}
+
+pub struct IndexingGuard;
+
+impl Drop for IndexingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut d) = INDEXING_DEPTH.write() {
+            *d = d.saturating_sub(1);
+        }
+    }
+}
+
+pub fn indexing_guard() -> IndexingGuard {
+    if let Ok(mut d) = INDEXING_DEPTH.write() { *d = d.saturating_add(1); }
+    IndexingGuard
+}
+
+fn indexing_active() -> bool {
+    INDEXING_DEPTH.read().map(|d| *d > 0).unwrap_or(false)
+}
+
+fn current_ledger() -> Ledger {
+    if indexing_active() { return Ledger::Index; }
+    match current_track() {
+        Some(t) => t.ledger(),
+        None => Ledger::Extract,
+    }
+}
+
+fn ledger_for_axis(axis: &str) -> Ledger {
+    let head = axis.split('.').next().unwrap_or("");
+    match Track::from_name(head) {
+        Some(Track::Index) => Ledger::Index,
+        Some(t) => {
+            let by_track = t.ledger();
+            if indexing_active() && by_track != Ledger::Index {
+                return Ledger::Index;
+            }
+            by_track
+        }
+        None => match head {
+            "indexing" => Ledger::Index,
+            "extract" => Ledger::Extract,
+            _ => current_ledger(),
+        },
+    }
+}
+
+fn ring_for_key(key: &str) -> usize {
+    let head = key.split('|').next().unwrap_or("");
+    match Track::from_name(head) {
+        Some(t) => t.ring_len(),
+        None => 12,
+    }
+}
+
+fn sanitize_label(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        if out.chars().count() >= 48 { break; }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let t = out.trim_matches('_').to_string();
+    if t.is_empty() { "run".to_string() } else { t }
+}
+
+fn unique_run_file(l: Ledger, stamp: &str, label: &str) -> String {
+    let dir = runs_dir(l);
+    let stem = format!("{}_{}", stamp, label);
+    let first = format!("{}.json", stem);
+    if !dir.join(&first).exists() { return first; }
+    for i in 2..1000u32 {
+        let c = format!("{}-{}.json", stem, i);
+        if !dir.join(&c).exists() { return c; }
+    }
+    format!("{}-{}.json", stem, chrono::Utc::now().timestamp_millis())
+}
+
+fn fresh_run(l: Ledger, label: &str) -> RunBuf {
+    let now = chrono::Local::now();
+    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let file = unique_run_file(l, &stamp, label);
+    RunBuf {
+        stamp,
+        label: label.to_string(),
+        file,
+        started_ms: now.timestamp_millis(),
+        closing: false,
+        observations: 0,
+        scopes: HashMap::new(),
+    }
+}
+
+fn open_run<'a>(runs: &'a mut HashMap<Ledger, RunBuf>, l: Ledger, label: &str) -> &'a mut RunBuf {
+    let run = runs.entry(l).or_insert_with(|| fresh_run(l, label));
+    if run.closing { *run = fresh_run(l, label); }
+    run
+}
+
+pub fn set_run_label(label: &str) {
+    let l = sanitize_label(label);
+    let ledger = current_ledger();
+    if let Ok(mut runs) = RUNS.write() {
+        let run = open_run(&mut runs, ledger, &l);
+        if run.label != l {
+            run.label = l.clone();
+            run.file = unique_run_file(ledger, &run.stamp, &l);
+        }
+    }
+}
+
+pub fn run_stamp() -> String {
+    let ledger = current_ledger();
+    RUNS.read()
+        .ok()
+        .and_then(|r| r.get(&ledger).map(|x| x.stamp.clone()))
+        .unwrap_or_default()
+}
+
+fn merged_scope(l: Ledger, key: &str) -> Option<ScopeStat> {
+    let base = BASES.read().ok()?.get(&l).and_then(|f| f.scopes.get(key).cloned());
+    let run = RUNS.read().ok()?.get(&l).and_then(|r| r.scopes.get(key).cloned());
+    match (base, run) {
+        (Some(mut b), Some(r)) => { b.absorb(r, ring_for_key(key)); Some(b) }
+        (Some(b), None) => Some(b),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
+fn merged_file(l: Ledger) -> SdsFile {
+    let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
+    let mut out = BASES
+        .read()
+        .ok()
+        .and_then(|b| b.get(&l).cloned())
+        .unwrap_or_else(|| SdsFile {
+            recipe: SDS_RECIPE.to_string(),
+            team: team.clone(),
+            updated_at: 0,
+            scopes: HashMap::new(),
+        });
+    out.recipe = SDS_RECIPE.to_string();
+    out.team = team;
+    if let Ok(runs) = RUNS.read() {
+        if let Some(run) = runs.get(&l) {
+            for (k, v) in run.scopes.iter() {
+                out.scopes
+                    .entry(k.clone())
+                    .or_insert_with(ScopeStat::default)
+                    .absorb(v.clone(), ring_for_key(k));
+            }
+        }
+    }
+    out.updated_at = chrono::Utc::now().timestamp_millis();
+    out
+}
+
 pub fn load(team: &str) {
-    let path = sds_path();
-    let mut fresh = SdsFile {
+    if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
+    let dir = sds_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    archive_legacy_ledger(team);
+
+    let mut loaded = 0usize;
+    let mut scopes_total = 0usize;
+    let mut bases: HashMap<Ledger, SdsFile> = HashMap::new();
+    for l in Ledger::all() {
+        let path = ledger_path(l);
+        let mut fresh = SdsFile {
+            recipe: SDS_RECIPE.to_string(),
+            team: team.to_string(),
+            updated_at: chrono::Utc::now().timestamp_millis(),
+            scopes: HashMap::new(),
+        };
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(txt) => match serde_json::from_str::<SdsFile>(&txt) {
+                    Ok(f) => {
+                        if f.recipe != SDS_RECIPE {
+                            println!(
+                                "[SDS] 🧹 [{}] 레시피 세대 불일치 (저장 '{}' vs 현재 '{}'). 이 원장을 폐기하고 새로 시작합니다.",
+                                l.as_str(), f.recipe, SDS_RECIPE
+                            );
+                        } else if !team.is_empty()
+                            && !f.team.is_empty()
+                            && f.team != team
+                            && f.team == local_default_team()
+                        {
+                            let n = f.scopes.len();
+                            let prev_team = f.team.clone();
+                            fresh = f;
+                            fresh.team = team.to_string();
+                            println!(
+                                "[SDS] 🚚 [TEAM MIGRATE / {}] 로컬 기본 팀 '{}' 의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다.",
+                                l.as_str(), prev_team, n, team
+                            );
+                        } else if !team.is_empty() && !f.team.is_empty() && f.team != team {
+                            println!(
+                                "[SDS] 🧹 [{}] 팀 불일치 (저장 '{}' vs 현재 '{}'). 이 원장을 폐기합니다. (스코프 격리 원칙)",
+                                l.as_str(), f.team, team
+                            );
+                        } else {
+                            scopes_total += f.scopes.len();
+                            loaded += 1;
+                            fresh = f;
+                            fresh.team = team.to_string();
+                        }
+                    }
+                    Err(e) => println!("[SDS] ⚠️ [{}] 원장 파싱 실패({}). 새로 시작합니다.", l.as_str(), e),
+                },
+                Err(e) => println!("[SDS] ⚠️ [{}] 원장 읽기 실패({}). 새로 시작합니다.", l.as_str(), e),
+            }
+        }
+        bases.insert(l, fresh);
+    }
+    if let Ok(mut w) = BASES.write() { *w = bases; }
+    if let Ok(mut w) = RUNS.write() { w.clear(); }
+    if let Ok(mut d) = DIRTY.write() { d.clear(); }
+    presence_load(team);
+
+    if loaded == 0 {
+        println!("[SDS] 🆕 저장된 원장이 없습니다. 냉간 시작합니다. (현행 판정 그대로)");
+    } else {
+        println!(
+            "[SDS] ✅ 원장 {}종을 불러왔습니다. 스코프 {}개 | 저장 보유 문서 {}건.",
+            loaded,
+            scopes_total,
+            PRESENCE.read().map(|p| p.docs.len()).unwrap_or(0)
+        );
+    }
+    for l in Ledger::all() { mark_dirty(l); }
+    flush();
+    println!("[SDS] 📍 원장 디렉터리: {}", sds_dir().display());
+    println!("[SDS] 📍 실행별 파일: {}", sds_dir().join("runs").join("<종류>").join("<시작시각>_<라벨>.json").display());
+}
+
+fn archive_legacy_ledger(team: &str) {
+    let legacy = legacy_sds_path();
+    if !legacy.exists() { return; }
+    let archive_dir = sds_dir().join("legacy");
+    let _ = std::fs::create_dir_all(&archive_dir);
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let target = archive_dir.join(format!("score_dynamics.{}.json", stamp));
+    match std::fs::rename(&legacy, &target) {
+        Ok(_) => println!(
+            "[SDS] 📦 [LEGACY ARCHIVE] 단일 누적 파일을 '{}' 로 보관했습니다. 전처리·인덱싱·검색 관측이 한 스코프에 섞여 있어 새 원장에 합산하지 않습니다. (팀 '{}')",
+            target.display(), team
+        ),
+        Err(e) => println!("[SDS] ⚠️ [LEGACY ARCHIVE] 단일 누적 파일 보관 실패({}). 그대로 두고 진행합니다.", e),
+    }
+}
+
+fn presence_load(team: &str) {
+    let path = presence_path();
+    let mut fresh = PresenceIndex {
         recipe: SDS_RECIPE.to_string(),
         team: team.to_string(),
         updated_at: chrono::Utc::now().timestamp_millis(),
-        scopes: HashMap::new(),
+        docs: HashMap::new(),
     };
     if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(txt) => match serde_json::from_str::<SdsFile>(&txt) {
-                Ok(f) => {
-                    if f.recipe != SDS_RECIPE {
-                        println!(
-                            "[SDS] 🧹 레시피 세대 불일치 (저장 '{}' vs 현재 '{}'). 통계를 전량 폐기하고 새로 시작합니다.",
-                            f.recipe, SDS_RECIPE
-                        );
-                    } else if !team.is_empty()
-                        && !f.team.is_empty()
-                        && f.team != team
-                        && f.team == local_default_team()
-                    {
-                        let n = f.scopes.len();
-                        let prev_team = f.team.clone();
-                        fresh = f;
-                        fresh.team = team.to_string();
-                        println!(
-                            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀 '{}' 에 귀속된 스코프 {}개를 실제 팀 '{}' 로 이관했습니다.",
-                            prev_team, n, team
-                        );
-                    } else if !team.is_empty() && !f.team.is_empty() && f.team != team {
-                        println!(
-                            "[SDS] 🧹 팀 불일치 (저장 '{}' vs 현재 '{}'). 통계를 전량 폐기합니다. (스코프 격리 원칙)",
-                            f.team, team
-                        );
-                    } else {
-                        let n = f.scopes.len();
-                        fresh = f;
-                        fresh.team = team.to_string();
-                        println!("[SDS] ✅ 점수 동역학 통계를 불러왔습니다. 스코프 {}개.", n);
-                    }
+        if let Ok(txt) = std::fs::read_to_string(&path) {
+            if let Ok(p) = serde_json::from_str::<PresenceIndex>(&txt) {
+                let team_ok = team.is_empty()
+                    || p.team.is_empty()
+                    || p.team == team
+                    || p.team == local_default_team();
+                if p.recipe == SDS_RECIPE && team_ok {
+                    fresh = p;
+                    fresh.team = team.to_string();
+                } else {
+                    println!("[SDS] 🧹 [PRESENCE] 세대 또는 팀 불일치로 저장 보유 현황을 새로 시작합니다.");
                 }
-                Err(e) => println!("[SDS] ⚠️ 통계 파싱 실패({}). 새로 시작합니다.", e),
-            },
-            Err(e) => println!("[SDS] ⚠️ 통계 읽기 실패({}). 새로 시작합니다.", e),
+            }
         }
-    } else {
-        println!("[SDS] 🆕 저장된 통계가 없습니다. 냉간 시작합니다. (현행 판정 그대로)");
     }
-    if let Ok(mut w) = SDS.write() { *w = fresh; }
-    if let Ok(mut d) = DIRTY.write() { *d = true; }
-    flush();
-    println!("[SDS] 📍 통계 파일 경로: {}", sds_path().display());
+    if let Ok(mut w) = PRESENCE.write() { *w = fresh; }
+    if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
+}
+
+pub fn presence_record(doc_type: &str, id: &str, fields: &[String]) {
+    let t = doc_type.trim().to_lowercase();
+    let key = id.trim().to_string();
+    if t.is_empty() || key.is_empty() { return; }
+    let mut sorted: Vec<String> = Vec::with_capacity(fields.len());
+    for f in fields.iter() {
+        let n = f.trim().to_string();
+        if n.is_empty() { continue; }
+        if !sorted.iter().any(|x| *x == n) { sorted.push(n); }
+    }
+    sorted.sort();
+    let now = chrono::Utc::now().timestamp_millis();
+    let changed = match PRESENCE.write() {
+        Ok(mut p) => {
+            let prev = p.docs.insert(
+                key,
+                PresenceDoc { doc_type: t, fields: sorted.clone(), updated_at: now },
+            );
+            match prev {
+                Some(old) => old.fields != sorted,
+                None => true,
+            }
+        }
+        Err(_) => false,
+    };
+    if changed {
+        if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
+    }
+}
+
+pub fn presence_forget(id: &str) {
+    let key = id.trim();
+    if key.is_empty() { return; }
+    let removed = PRESENCE.write().map(|mut p| p.docs.remove(key).is_some()).unwrap_or(false);
+    if removed {
+        if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
+    }
+}
+
+fn presence_flush() {
+    let dirty = PRESENCE_DIRTY.read().map(|d| *d).unwrap_or(false);
+    if !dirty { return; }
+    let snapshot = match PRESENCE.read() { Ok(p) => p.clone(), Err(_) => return };
+    let mut snapshot = snapshot;
+    snapshot.recipe = SDS_RECIPE.to_string();
+    snapshot.updated_at = chrono::Utc::now().timestamp_millis();
+    let txt = match serde_json::to_string_pretty(&snapshot) { Ok(t) => t, Err(_) => return };
+    let path = presence_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    if std::fs::write(&path, txt.as_bytes()).is_ok() {
+        if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = false; }
+    }
 }
 
 fn local_default_team() -> String {
@@ -530,28 +944,33 @@ fn local_default_team() -> String {
 }
 
 pub fn rebind_team(team: &str) {
-    let prev = SDS.read().ok().map(|s| s.team.clone()).unwrap_or_default();
+    let prev = TEAM.read().map(|t| t.clone()).unwrap_or_default();
     if prev.is_empty() || prev == team {
-        if let Ok(mut w) = SDS.write() {
-            w.team = team.to_string();
+        if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
+        if let Ok(mut b) = BASES.write() {
+            for f in b.values_mut() { f.team = team.to_string(); }
         }
+        if let Ok(mut p) = PRESENCE.write() { p.team = team.to_string(); }
         return;
     }
     if prev == local_default_team() {
-        let scopes = SDS.read().ok().map(|s| s.scopes.len()).unwrap_or(0);
-        if let Ok(mut w) = SDS.write() {
-            w.team = team.to_string();
+        let scopes: usize = BASES.read().map(|b| b.values().map(|f| f.scopes.len()).sum()).unwrap_or(0);
+        let docs = PRESENCE.read().map(|p| p.docs.len()).unwrap_or(0);
+        if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
+        if let Ok(mut b) = BASES.write() {
+            for f in b.values_mut() { f.team = team.to_string(); }
         }
-        if let Ok(mut d) = DIRTY.write() { *d = true; }
+        if let Ok(mut p) = PRESENCE.write() { p.team = team.to_string(); }
+        for l in Ledger::all() { mark_dirty(l); }
+        if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
         flush();
-        let after = SDS.read().ok().map(|s| s.scopes.len()).unwrap_or(0);
         println!(
-            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다. (이관 후 잔존 {}개)",
-            scopes, team, after
+            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개 · 저장 보유 문서 {}건을 실제 팀 '{}' 로 이관했습니다.",
+            scopes, docs, team
         );
         if scopes == 0 {
             println!(
-                "[SDS] ⚠️ [TEAM MIGRATE] 이관 시점에 메모리 스코프가 0개였습니다. load() 가 이미 폐기했을 가능성이 있으니 파일의 team 값을 확인하십시오."
+                "[SDS] ⚠️ [TEAM MIGRATE] 이관 시점에 메모리 스코프가 0개였습니다. load() 가 이미 폐기했을 가능성이 있으니 원장의 team 값을 확인하십시오."
             );
         }
         return;
@@ -562,84 +981,147 @@ pub fn rebind_team(team: &str) {
 }
 
 pub fn flush() {
-    let dirty = DIRTY.read().map(|d| *d).unwrap_or(false);
-    if !dirty {
-        // 🌟 [진단] '쓸 것이 없어서 안 썼다' 를 명시합니다.
-        //    이 줄이 없으면 '호출은 됐는데 아무 일도 안 일어난' 상황과
-        //    '호출 자체가 안 된' 상황을 구분할 수 없습니다.
-        println!("[SDS] ⏭️ 새 관측이 없어 저장을 건너뜁니다. (dirty=false)");
+    presence_flush();
+    let open: Vec<Ledger> = RUNS.read().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+    let mut targets: Vec<Ledger> = Vec::new();
+    for l in Ledger::all() {
+        if is_dirty(l) || open.contains(&l) { targets.push(l); }
+    }
+    if targets.is_empty() {
+        println!("[SDS] ⏭️ 새 관측이 없어 저장을 건너뜁니다. (열린 실행 0건)");
         return;
     }
-    let snapshot = match SDS.read() { Ok(s) => s.clone(), Err(_) => return };
-    let mut snapshot = snapshot;
-    snapshot.updated_at = chrono::Utc::now().timestamp_millis();
-    snapshot.recipe = SDS_RECIPE.to_string();
 
-    // 🌟 [상한] 기획 6-1 의 2MB 상한. 초과 시 관측 수가 적고 오래된 스코프부터 절삭합니다.
-    let mut txt = match serde_json::to_string_pretty(&snapshot) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    const CAP_BYTES: usize = 2 * 1024 * 1024;
-    if txt.len() > CAP_BYTES {
-        let mut keys: Vec<(String, u64, i64)> = snapshot
-            .scopes
-            .iter()
-            .map(|(k, v)| {
-                let obs: u64 = v.baseline.values().map(|w| w.n).sum::<u64>()
-                    + v.field.values().map(|f| f.seen).sum::<u64>();
-                (k.clone(), obs, v.updated_at)
-            })
-            .collect();
-        // 관측이 적고 오래된 순으로 정렬
-        keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-        let mut trimmed = snapshot.clone();
-        for (k, _, _) in keys {
-            if txt.len() <= CAP_BYTES { break; }
-            trimmed.scopes.remove(&k);
-            txt = serde_json::to_string_pretty(&trimmed).unwrap_or(txt);
+    let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
+    let mut finalize: Vec<Ledger> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+
+    for l in targets {
+        let run_meta = RUNS.read().ok().and_then(|r| r.get(&l).cloned());
+        if let Some(run) = run_meta.as_ref() {
+            let rf = RunFile {
+                recipe: SDS_RECIPE.to_string(),
+                team: team.clone(),
+                ledger: l.as_str().to_string(),
+                label: run.label.clone(),
+                started_at: run.started_ms,
+                updated_at: chrono::Utc::now().timestamp_millis(),
+                observations: run.observations,
+                scopes: run.scopes.clone(),
+            };
+            if let Ok(txt) = serde_json::to_string_pretty(&rf) {
+                let dir = runs_dir(l);
+                let _ = std::fs::create_dir_all(&dir);
+                let file = dir.join(&run.file);
+                match std::fs::write(&file, txt.as_bytes()) {
+                    Ok(_) => lines.push(format!(
+                        "{}={}건→{}",
+                        l.as_str(),
+                        run.observations,
+                        file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+                    )),
+                    Err(e) => println!("[SDS] ⚠️ [{}] 실행 파일 저장 실패: {}", l.as_str(), e),
+                }
+            }
+            if run.closing { finalize.push(l); }
         }
-        println!("[SDS] ✂️ 상한 초과로 저관측 스코프를 절삭했습니다. (잔존 {}개)", trimmed.scopes.len());
+
+        let snapshot = merged_file(l);
+        let mut txt = match serde_json::to_string_pretty(&snapshot) { Ok(t) => t, Err(_) => continue };
+        const CAP_BYTES: usize = 2 * 1024 * 1024;
+        if txt.len() > CAP_BYTES {
+            let mut keys: Vec<(String, u64, i64)> = snapshot
+                .scopes
+                .iter()
+                .map(|(k, v)| {
+                    let obs: u64 = v.baseline.values().map(|w| w.n).sum::<u64>()
+                        + v.field.values().map(|f| f.seen).sum::<u64>();
+                    (k.clone(), obs, v.updated_at)
+                })
+                .collect();
+            keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+            let mut trimmed = snapshot.clone();
+            for (k, _, _) in keys {
+                if txt.len() <= CAP_BYTES { break; }
+                trimmed.scopes.remove(&k);
+                txt = serde_json::to_string_pretty(&trimmed).unwrap_or(txt);
+            }
+            println!("[SDS] ✂️ [{}] 상한 초과로 저관측 스코프를 절삭했습니다. (잔존 {}개)", l.as_str(), trimmed.scopes.len());
+        }
+
+        let path = ledger_path(l);
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        match std::fs::write(&path, txt.as_bytes()) {
+            Ok(_) => {
+                if let Ok(mut d) = DIRTY.write() { d.insert(l, false); }
+                lines.push(format!("{}.json={}바이트", l.as_str(), txt.len()));
+            }
+            Err(e) => println!("[SDS] ⚠️ [{}] 원장 저장 실패: {}", l.as_str(), e),
+        }
     }
 
-    let path = sds_path();
-    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    match std::fs::write(&path, txt.as_bytes()) {
-        Ok(_) => {
-            if let Ok(mut d) = DIRTY.write() { *d = false; }
-            // 🌟 [DEBOUNCE v2] 저장에 성공했으므로 누적 관측 카운터를 0 으로 되돌립니다.
-            //    이 리셋이 없으면 카운터가 임계 이상으로 굳어 매 관측마다 파일을 씁니다.
-            if let Ok(mut t) = WRITE_TICK.write() { *t = 0; }
-            println!("[SDS] 💾 점수 동역학 통계를 저장했습니다. ({}바이트)", txt.len());
+    for l in finalize {
+        let run = RUNS.write().ok().and_then(|mut r| r.remove(&l));
+        if let Some(run) = run {
+            if let Ok(mut b) = BASES.write() {
+                let base = b.entry(l).or_insert_with(|| SdsFile {
+                    recipe: SDS_RECIPE.to_string(),
+                    team: team.clone(),
+                    updated_at: 0,
+                    scopes: HashMap::new(),
+                });
+                for (k, v) in run.scopes.into_iter() {
+                    let ring = ring_for_key(&k);
+                    base.scopes.entry(k).or_insert_with(ScopeStat::default).absorb(v, ring);
+                }
+                base.updated_at = chrono::Utc::now().timestamp_millis();
+            }
+            println!(
+                "[SDS] 🧾 [RUN CLOSED] {} | '{}' 관측 {}건을 원장에 합산했습니다. 다음 관측부터 새 실행 파일이 만들어집니다.",
+                l.as_str(), run.file, run.observations
+            );
         }
-        Err(e) => println!("[SDS] ⚠️ 통계 저장 실패: {}", e),
+    }
+
+    if let Ok(mut t) = WRITE_TICK.write() { *t = 0; }
+    if !lines.is_empty() {
+        println!("[SDS] 💾 저장 완료: {}", lines.join(" | "));
     }
 }
 
 pub fn purge() {
-    if let Ok(mut w) = SDS.write() {
-        *w = SdsFile {
+    let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
+    if let Ok(mut b) = BASES.write() { b.clear(); }
+    if let Ok(mut r) = RUNS.write() { r.clear(); }
+    if let Ok(mut d) = DIRTY.write() { d.clear(); }
+    if let Ok(mut p) = PRESENCE.write() {
+        *p = PresenceIndex {
             recipe: SDS_RECIPE.to_string(),
-            team: w.team.clone(),
+            team: team.clone(),
             updated_at: chrono::Utc::now().timestamp_millis(),
-            scopes: HashMap::new(),
+            docs: HashMap::new(),
         };
     }
-    let _ = std::fs::remove_file(sds_path());
-    if let Ok(mut d) = DIRTY.write() { *d = false; }
-    println!("[SDS] 🗑️ 점수 동역학 통계를 전량 삭제했습니다. 판정은 즉시 현행 상수로 복귀합니다.");
+    if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = false; }
+    let _ = std::fs::remove_dir_all(sds_dir());
+    let _ = std::fs::remove_file(legacy_sds_path());
+    println!("[SDS] 🗑️ 점수 동역학 원장·실행 파일·저장 보유 현황을 전량 삭제했습니다. 판정은 즉시 현행 상수로 복귀합니다.");
 }
 
 fn with_scope_mut<F: FnOnce(&mut ScopeStat, usize)>(f: F) {
-    // 🌟 [UNSCOPED FALLBACK] 스코프 유무와 무관하게 반드시 기록합니다.
+    with_scope_mut_in(current_ledger(), f);
+}
+
+fn with_scope_mut_in<F: FnOnce(&mut ScopeStat, usize)>(ledger: Ledger, f: F) {
     let (key, ring) = effective_scope_key();
-    if let Ok(mut w) = SDS.write() {
-        let e = w.scopes.entry(key).or_insert_with(ScopeStat::default);
+    if let Ok(mut runs) = RUNS.write() {
+        let run = open_run(&mut runs, ledger, ledger.as_str());
+        run.observations = run.observations.saturating_add(1);
+        let e = run.scopes.entry(key).or_insert_with(ScopeStat::default);
         f(e, ring);
         e.updated_at = chrono::Utc::now().timestamp_millis();
     }
-    if let Ok(mut d) = DIRTY.write() { *d = true; }
-    // 🌟 [AUTO FLUSH] 관측이 일정량 쌓이면 태스크 종료를 기다리지 않고 기록합니다.
+    mark_dirty(ledger);
     bump_and_maybe_flush();
 }
 
@@ -681,7 +1163,7 @@ fn bump_and_maybe_flush() {
 /// 축 베이스라인. TITLE FLOOR, 잡음대, pooled σ, net 표준편차 등.
 pub fn record_baseline(axis: &str, value: f32) {
     if !value.is_finite() { return; }
-    with_scope_mut(|s, ring| {
+    with_scope_mut_in(ledger_for_axis(axis), |s, ring| {
         s.baseline
             .entry(axis.to_string())
             .or_insert_with(Welford::default)
@@ -692,7 +1174,8 @@ pub fn record_baseline(axis: &str, value: f32) {
 /// 순위 감쇠 곡선. 후보 점수 배열 전체를 넘기면 형상만 압축해 저장합니다.
 pub fn record_decay(axis: &str, scores: &[f32]) {
     let shape = match decay_shape(scores) { Some(s) => s, None => return };
-    with_scope_mut(|s, ring| {
+    let ledger = ledger_for_axis(axis);
+    with_scope_mut_in(ledger, |s, ring| {
         let d = s.decay.entry(axis.to_string()).or_insert_with(DecayStat::default);
         d.margin.push(shape.margin, ring);
         d.top_gap_ratio.push(shape.top_gap_ratio, ring);
@@ -700,7 +1183,6 @@ pub fn record_decay(axis: &str, scores: &[f32]) {
         d.entropy_norm.push(shape.entropy_norm, ring);
         d.positive_ratio.push(shape.positive_ratio, ring);
     });
-    // 축 분산은 역분산 융합(Phase 1)의 직접 입력이므로 별도 축으로도 남깁니다.
     let var = {
         let v: Vec<f64> = scores.iter().filter(|x| x.is_finite()).map(|x| *x as f64).collect();
         if v.len() < 2 { 0.0 } else {
@@ -709,7 +1191,7 @@ pub fn record_decay(axis: &str, scores: &[f32]) {
         }
     };
     if var > 0.0 {
-        with_scope_mut(|s, ring| {
+        with_scope_mut_in(ledger, |s, ring| {
             s.axis_variance
                 .entry(axis.to_string())
                 .or_insert_with(Welford::default)
@@ -835,8 +1317,8 @@ where
 {
     let scope = current_scope()?;
     let track = current_track()?;
+    let ledger = current_ledger();
     let (m2, m1, mg) = track.min_obs();
-    let store = SDS.read().ok()?;
     for (key, need) in [
         (scope.key_secondary(), m2),
         (scope.key_primary(), m1),
@@ -844,8 +1326,8 @@ where
         ("unscoped||".to_string(), mg.max(m1)),
     ] {
         if need == 0 { continue; }
-        if let Some(st) = store.scopes.get(&key) {
-            if let Some((val, n)) = pick(st) {
+        if let Some(st) = merged_scope(ledger, &key) {
+            if let Some((val, n)) = pick(&st) {
                 if n >= need { return Some(val); }
             }
         }
@@ -946,10 +1428,10 @@ pub fn spatial_drift(category: &str) -> Option<f32> {
 pub fn transition_prior(from: &str, to: &str) -> Option<f32> {
     let scope = current_scope()?;
     let track = current_track()?;
+    let ledger = current_ledger();
     let (m2, m1, _) = track.min_obs();
-    let store = SDS.read().ok()?;
     for (key, need) in [(scope.key_secondary(), m2), (scope.key_primary(), m1)] {
-        let st = match store.scopes.get(&key) { Some(v) => v, None => continue };
+        let st = match merged_scope(ledger, &key) { Some(v) => v, None => continue };
         let total: u64 = st
             .transition
             .iter()
@@ -958,7 +1440,6 @@ pub fn transition_prior(from: &str, to: &str) -> Option<f32> {
             .sum();
         if total < need { continue; }
         let hit = st.transition.get(&format!("{}>{}", from, to)).copied().unwrap_or(0);
-        // 디리클레 평활: 관측되지 않은 전이도 0 이 되지 않게 합니다.
         let k = st.transition.len().max(1) as f64;
         return Some((((hit as f64) + 1.0) / ((total as f64) + k)) as f32);
     }
@@ -969,27 +1450,42 @@ pub fn transition_prior(from: &str, to: &str) -> Option<f32> {
 // 🌟 [진단] 현재 축적 상태 한 줄 요약. 태스크 종료 시 로그로 남깁니다.
 // =====================================================================
 pub fn report() -> String {
-    let store = match SDS.read() { Ok(s) => s, Err(_) => return "[SDS] (잠금 실패)".to_string() };
-    let scopes = store.scopes.len();
-    let baseline_obs: u64 = store.scopes.values().flat_map(|s| s.baseline.values()).map(|w| w.n).sum();
-    let decay_obs: u64 = store.scopes.values().flat_map(|s| s.decay.values()).map(|d| d.margin.n).sum();
-    let field_obs: u64 = store.scopes.values().flat_map(|s| s.field.values()).map(|f| f.seen).sum();
-    let confusion_obs: u64 = store.scopes.values().flat_map(|s| s.confusion.values()).map(|c| c.ties).sum();
-    // 🌟 [진단 보강] 기존 리포트는 baseline / decay / field / confusion 네 축만 셌습니다.
-    //    그래서 '비전은 도는데 category·spatial 이 안 쌓인다', 'analytic 은 아예 0건이다'
-    //    같은 배선 누락이 리포트만 봐서는 드러나지 않았습니다.
-    //    (실측: 비전 태스크가 spatial 20건을 쌓았는데 리포트는 "베이스라인 5 감쇠 1 필드 2")
-    //    기획 6-1 의 레코드군을 전부 세어, 리포트 한 줄로 배선 구멍을 특정할 수 있게 합니다.
-    let category_obs: u64 = store.scopes.values().flat_map(|s| s.category.values()).map(|c| c.realized_max.n).sum();
-    let spatial_obs: u64 = store.scopes.values().flat_map(|s| s.spatial.values()).map(|s| s.active_ratio.n).sum();
-    let transition_obs: u64 = store.scopes.values().flat_map(|s| s.transition.values()).sum();
-    let axis_obs: u64 = store.scopes.values().flat_map(|s| s.axis_variance.values()).map(|w| w.n).sum();
-    let search_obs: u64 = store.scopes.values().flat_map(|s| s.search_field.values()).map(|f| f.proposed).sum();
-    let search_eval: u64 = store.scopes.values().flat_map(|s| s.search_field.values()).map(|f| f.evaluated).sum();
+    let mut closed: Vec<String> = Vec::new();
+    if let Ok(mut runs) = RUNS.write() {
+        for (l, run) in runs.iter_mut() {
+            if run.observations == 0 { continue; }
+            run.closing = true;
+            closed.push(format!("{}:{}건", l.as_str(), run.observations));
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut docs_total = 0usize;
+    for l in Ledger::all() {
+        let f = merged_file(l);
+        if f.scopes.is_empty() { continue; }
+        let baseline_obs: u64 = f.scopes.values().flat_map(|s| s.baseline.values()).map(|w| w.n).sum();
+        let decay_obs: u64 = f.scopes.values().flat_map(|s| s.decay.values()).map(|d| d.margin.n).sum();
+        let field_obs: u64 = f.scopes.values().flat_map(|s| s.field.values()).map(|x| x.seen).sum();
+        let confusion_obs: u64 = f.scopes.values().flat_map(|s| s.confusion.values()).map(|c| c.ties).sum();
+        let category_obs: u64 = f.scopes.values().flat_map(|s| s.category.values()).map(|c| c.realized_max.n).sum();
+        let spatial_obs: u64 = f.scopes.values().flat_map(|s| s.spatial.values()).map(|s| s.active_ratio.n).sum();
+        let transition_obs: u64 = f.scopes.values().flat_map(|s| s.transition.values()).sum();
+        let axis_obs: u64 = f.scopes.values().flat_map(|s| s.axis_variance.values()).map(|w| w.n).sum();
+        let search_obs: u64 = f.scopes.values().flat_map(|s| s.search_field.values()).map(|x| x.proposed).sum();
+        let search_eval: u64 = f.scopes.values().flat_map(|s| s.search_field.values()).map(|x| x.evaluated).sum();
+        docs_total = PRESENCE.read().map(|p| p.docs.len()).unwrap_or(0);
+        parts.push(format!(
+            "{}(스코프 {} | 베이스라인 {} | 감쇠 {} | 축분산 {} | 필드 {} | 혼동 {} | 카테고리 {} | 공간 {} | 전이 {} | 검색조건 {} | 검색결과평가 {})",
+            l.as_str(), f.scopes.len(), baseline_obs, decay_obs, axis_obs, field_obs,
+            confusion_obs, category_obs, spatial_obs, transition_obs, search_obs, search_eval
+        ));
+    }
+    if parts.is_empty() { parts.push("관측 없음".to_string()); }
     format!(
-        "[SDS REPORT] 스코프 {}개 | 베이스라인 {} | 감쇠 {} | 축분산 {} | 필드 {} | 혼동 {} | 카테고리 {} | 공간 {} | 전이 {} | 검색조건 {} | 검색결과평가 {} | (Phase 0: 판정 미개입)",
-        scopes, baseline_obs, decay_obs, axis_obs, field_obs, confusion_obs,
-        category_obs, spatial_obs, transition_obs, search_obs, search_eval
+        "[SDS REPORT] {} | 저장 보유 문서 {}건 | 닫는 실행 [{}] | (Phase 0: 판정 미개입)",
+        parts.join(" | "),
+        docs_total,
+        if closed.is_empty() { "-".to_string() } else { closed.join(", ") }
     )
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1059,20 +1555,27 @@ pub fn storage_fill_prior(doc_types: &[String], field: &str) -> Option<(f32, u64
         .filter(|t| !t.is_empty())
         .collect();
     if wanted.is_empty() || field.is_empty() { return None; }
-    let store = SDS.read().ok()?;
+    let p = PRESENCE.read().ok()?;
     let mut docs = 0u64;
-    let mut assigned = 0u64;
-    for (key, st) in store.scopes.iter() {
-        let mut parts = key.splitn(3, '|');
-        let track = parts.next().unwrap_or("");
-        let primary = parts.next().unwrap_or("");
-        if track != Track::Vision.as_str() && track != Track::Trading.as_str() { continue; }
-        if !wanted.iter().any(|t| t == primary) { continue; }
-        let d = st.category.values().map(|c| c.realized_max.n).max().unwrap_or(0);
-        if d == 0 { continue; }
-        docs += d;
-        assigned += st.field.get(field).map(|f| f.assigned).unwrap_or(0).min(d);
+    let mut filled = 0u64;
+    for d in p.docs.values() {
+        if !wanted.iter().any(|t| *t == d.doc_type) { continue; }
+        docs += 1;
+        if d.fields.iter().any(|f| f == field) { filled += 1; }
     }
     if docs < Track::Vision.min_obs().1 { return None; }
-    Some((((assigned as f64 + 0.5) / (docs as f64 + 1.0)) as f32, assigned, docs))
+    Some((((filled as f64 + 0.5) / (docs as f64 + 1.0)) as f32, filled, docs))
+}
+
+pub fn storage_doc_count(doc_types: &[String]) -> u64 {
+    let wanted: Vec<String> = doc_types
+        .iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if wanted.is_empty() { return 0; }
+    PRESENCE
+        .read()
+        .map(|p| p.docs.values().filter(|d| wanted.iter().any(|t| *t == d.doc_type)).count() as u64)
+        .unwrap_or(0)
 }

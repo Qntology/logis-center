@@ -373,22 +373,24 @@ fn expand_col_band(
     }
 
     let mut run = 0usize;
-    let mut up_left = COL_BAND_UP_ROWS;
-    while up_left > 0 && r_min > 0 && (r_max - r_min + 1) < cap {
+    let mut guaranteed = COL_BAND_UP_ROWS;
+    while r_min > 0 && (r_max - r_min + 1) < cap {
         let nr = r_min - 1;
         if !band_has(nr) {
+            if note.is_empty() { note = format!("위 r{} 가 밴드 여백", nr); }
             break;
         }
-        if band_owned(nr) {
+        if band_owned(nr) || guaranteed > 0 {
             run = 0;
         } else {
             run += 1;
             if run > BAND_FOREIGN_RUN {
+                if note.is_empty() { note = format!("위 r{} 부터 남의 영토가 {}줄 연속", nr, run); }
                 break;
             }
         }
         r_min = nr;
-        up_left -= 1;
+        guaranteed = guaranteed.saturating_sub(1);
     }
 
     if note.is_empty() {
@@ -612,10 +614,12 @@ fn presence_gate(
     heatmaps: &[CategoryHeatmap],
     n: usize,
     identity_category: &str,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
     emit: &dyn Fn(&str),
 ) -> (std::collections::HashSet<String>, Vec<Option<usize>>) {
     use std::collections::{HashMap, HashSet};
     let mut wins: HashMap<String, usize> = HashMap::new();
+    let mut blind: HashMap<String, usize> = HashMap::new();
     let mut owner_of: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
         let mut best = f32::MIN;
@@ -631,10 +635,27 @@ fn presence_gate(
         }
         if let Some(o) = owner {
             if best > 0.0 {
-                owner_of[i] = Some(o);
-                *wins.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                if legibility.is_legible(i) {
+                    owner_of[i] = Some(o);
+                    *wins.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                } else {
+                    *blind.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                }
             }
         }
+    }
+    for hm in heatmaps.iter() {
+        let lg = wins.get(&hm.category).copied().unwrap_or(0);
+        let bl = blind.get(&hm.category).copied().unwrap_or(0);
+        if bl == 0 {
+            continue;
+        }
+        let ratio = lg as f32 / (lg + bl) as f32;
+        crate::utils::score_dynamics::record_baseline("crop.territory.legible_ratio", ratio);
+        emit(&format!(
+            "    🕳️ [TERRITORY BLIND] '{}' 가 argmax 로 차지한 {}칸 중 글자가 있는 칸은 {}칸({:.0}%) 뿐입니다. 나머지 {}칸은 여백이라 어떤 축도 설명할 내용이 없으므로 영토에서 제외합니다. 여백을 영토로 남겨두면 세로 밴드 확장이 남의 여백에서 멈추고 구제 지분까지 갉아먹습니다.",
+            hm.category, lg + bl, lg, ratio * 100.0, bl
+        ));
     }
     let mut out: HashSet<String> = HashSet::new();
     for hm in heatmaps.iter() {
@@ -1063,7 +1084,7 @@ pub fn plan_crops(
         legible_cnt, n
     ));
 
-    let (present, owner_of) = presence_gate(heatmaps, n, identity_category, emit);
+    let (present, owner_of) = presence_gate(heatmaps, n, identity_category, legibility, emit);
 
     let area_cap = (n / present.len().max(1)).max(4);
 
@@ -1877,6 +1898,7 @@ const TEXT_HEIGHT_MIN_COHERENCE: f32 = 0.15;
 const TEXT_HEIGHT_FLOOR_PX: f32 = 8.0;
 const TEXT_HEIGHT_CROP_FRACTION: f32 = 40.0;
 const TEXT_HEIGHT_CEIL_FRACTION: f32 = 3.0;
+const TEXT_HEIGHT_MIN_BANDS: usize = 4;
 
 fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     use image::GenericImageView;
@@ -1935,15 +1957,33 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     }
 
     // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
-    let th = best_lag as f32 * 0.6;
+    let th_pitch = best_lag as f32 * 0.6;
     let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
     let ceil = h as f32 / TEXT_HEIGHT_CEIL_FRACTION;
-    if th < floor || th > ceil {
+    if th_pitch < floor || th_pitch > ceil {
         println!(
             "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 기각합니다.",
-            th, floor, ceil, h
+            th_pitch, floor, ceil, h
         );
         return None;
+    }
+    let mut band_h: Vec<f32> = text_row_bands(img, (0, 0, w, h))
+        .iter()
+        .map(|b| b.y1.saturating_sub(b.y0) as f32)
+        .filter(|v| *v > 0.0)
+        .collect();
+    if band_h.len() < TEXT_HEIGHT_MIN_BANDS {
+        return Some(th_pitch);
+    }
+    band_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let low = band_h[band_h.len() / 4];
+    let th = low.min(th_pitch).max(floor);
+    crate::utils::score_dynamics::record_baseline("crop.text_height.band_ratio", low / th_pitch.max(1e-6));
+    if th < th_pitch {
+        println!(
+            "    📏 [TEXT HEIGHT / SMALLEST BAND] 잉크 행 밴드 {}개 | 하위 1/4 밴드 높이 {:.1}px | 지배 주기가 말하는 높이 {:.1}px → 채택 {:.1}px (하한 {:.1}px). 배율은 가장 작은 글자가 읽힐 때까지 올려야 하므로, 다수 본문의 주기만 보면 소형 라벨이 통째로 뭉개집니다.",
+            band_h.len(), low, th_pitch, th, floor
+        );
     }
     Some(th)
 }

@@ -558,6 +558,7 @@ impl crate::model::LogisModel {
 
                     {
                         const FIELD_RECOVERY_BUDGET: usize = 4;
+                        const PEAK_VERIFY_BUDGET: usize = 3;
                         let mut cands: Vec<(String, String, usize, f32)> = Vec::new();
                         let is_filled = |f: &str| -> bool {
                             final_data_map
@@ -594,10 +595,25 @@ impl crate::model::LogisModel {
                                         .map(|g| g.bbox)
                                         .collect();
                                     if sources.is_empty() { continue; }
-                                    let covered = sources.iter().any(|b| {
-                                        px >= b.0 as f32 && px <= b.2 as f32 && py >= b.1 as f32 && py <= b.3 as f32
-                                    });
-                                    if covered { continue; }
+                                    let mut covered = false;
+                                    let mut at_edge = false;
+                                    for b in sources.iter() {
+                                        let inside = px >= b.0 as f32 && px <= b.2 as f32
+                                            && py >= b.1 as f32 && py <= b.3 as f32;
+                                        if !inside { continue; }
+                                        covered = true;
+                                        let dx = (px - b.0 as f32).min(b.2 as f32 - px);
+                                        let dy = (py - b.1 as f32).min(b.3 as f32 - py);
+                                        if dx <= cw || dy <= ch { at_edge = true; }
+                                    }
+                                    if covered && !at_edge { continue; }
+                                    if covered {
+                                        emit_term(&format!(
+                                            "      ✂️ [PEAK AT CROP EDGE] {}.{} = \"{}\" | 라벨 봉우리가 자기 출처 크롭의 테두리에서 패치 한 칸 이내입니다. 봉우리를 포함했다는 사실만으로는 값이 온전하다는 증거가 되지 않습니다. 값이 크롭 경계에서 잘렸을 수 있으므로 재판독 대상에 넣습니다.",
+                                            hm.category, field,
+                                            final_data_map.get(field).and_then(|v| v.as_str()).unwrap_or("")
+                                        ));
+                                    }
                                     verify_fields.push(field.clone());
                                     cands.push((hm.category.clone(), field.clone(), *patch, *z));
                                     continue;
@@ -633,20 +649,43 @@ impl crate::model::LogisModel {
                                 verify_fields
                             ));
                         }
-                        let windows = crate::model::merge::plan_recovery_windows(
-                            &cands,
+                        let (verify_cands, empty_cands): (Vec<_>, Vec<_>) = cands
+                            .iter()
+                            .cloned()
+                            .partition(|(_, f, _, _)| verify_fields.iter().any(|v| v == f));
+                        let mut windows = crate::model::merge::plan_recovery_windows(
+                            &verify_cands,
+                            grid.grid_rows,
+                            grid.grid_cols,
+                            grid.orig_width,
+                            grid.orig_height,
+                            PEAK_VERIFY_BUDGET,
+                        );
+                        let taken: Vec<(u32, u32, u32, u32)> = windows.iter().map(|(b, _)| *b).collect();
+                        for w in crate::model::merge::plan_recovery_windows(
+                            &empty_cands,
                             grid.grid_rows,
                             grid.grid_cols,
                             grid.orig_width,
                             grid.orig_height,
                             FIELD_RECOVERY_BUDGET,
-                        );
+                        ) {
+                            if taken.iter().any(|b| *b == w.0) {
+                                emit_term(&format!(
+                                    "    ⛔ [RECOVERY WINDOW COLLIDE] 빈 필드 {:?} 의 창이 재검증 창과 같은 픽셀입니다. 같은 자리를 두 번 읽지 않도록 이 회차에서는 복구하지 않습니다.",
+                                    w.1.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
+                                ));
+                                continue;
+                            }
+                            windows.push(w);
+                        }
                         if windows.is_empty() {
                             emit_term("  ⚪ [FIELD RECOVERY] 비어 있으면서 자기 라벨 봉우리를 가진 필드가 없습니다.");
                         } else {
                             emit_term(&format!(
-                                "  🩺 [FIELD RECOVERY] 후보 {}개 (빈 필드 {} · 재검증 {}) | 봉우리 주변 소형 크롭 {}개를 다시 읽습니다 (상한 {}회).",
-                                cands.len(), cands.len() - verify_fields.len(), verify_fields.len(), windows.len(), FIELD_RECOVERY_BUDGET
+                                "  🩺 [FIELD RECOVERY] 후보 {}개 (빈 필드 {} · 재검증 {}) | 창 하나에 필드 하나로 소형 크롭 {}개를 다시 읽습니다 (재검증 상한 {}회 + 빈 필드 상한 {}회).",
+                                cands.len(), empty_cands.len(), verify_cands.len(), windows.len(),
+                                PEAK_VERIFY_BUDGET, FIELD_RECOVERY_BUDGET
                             ));
                             let schema_fields: Vec<String> = crate::parsing::get_detail_schema_fields(&detected_type, "", &language)
                                 .into_iter()

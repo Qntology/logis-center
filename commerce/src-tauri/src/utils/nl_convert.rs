@@ -2035,6 +2035,7 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Vec<f32>>,
 {
+    let _sds_index_guard = crate::utils::score_dynamics::indexing_guard();
     const SYSTEM_PROPERTIES: [&str; 20] = [
         "masked_text", "text", "unclassified", "context_intro", "json_data",
         "updated_at", "created_at", "digest", "index",

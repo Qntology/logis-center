@@ -1785,7 +1785,22 @@ pub fn ship_make_assignment(
                     ("between".to_string(), lo.value.clone(), Some(hi.value.clone()))
                 }
                 _ => {
-                    let n = &nums[0];
+                    let monetary = ship_is_monetary(field);
+                    let eligible: Vec<&ShipNumeric> = nums
+                        .iter()
+                        .filter(|n| if monetary { true } else { n.currency.is_empty() && !n.grouped })
+                        .collect();
+                    let pool: Vec<&ShipNumeric> =
+                        if eligible.is_empty() { nums.iter().collect() } else { eligible };
+                    let rank = |n: &ShipNumeric| -> (u8, u8, u8, usize) {
+                        (
+                            if n.operator.is_empty() { 0 } else { 1 },
+                            if monetary && !n.currency.is_empty() { 1 } else { 0 },
+                            if monetary && n.grouped { 1 } else { 0 },
+                            n.value.chars().filter(|c| c.is_ascii_digit()).count(),
+                        )
+                    };
+                    let n = pool.iter().copied().max_by_key(|n| rank(n))?;
                     let op = if n.operator.is_empty() {
                         trade_resolve_condition_operator(field, span_text)
                     } else {
@@ -2275,30 +2290,115 @@ impl crate::model::LogisModel {
         }
         doc_mentions.sort_by(|a, b| a.start.cmp(&b.start));
 
-        for &i in pending.iter() {
-            if roles[i] != ShipTokenRole::Content { continue; }
-            let q = table.get(&cores[i]);
-            if q.iter().all(|&v| v == 0.0) { continue; }
-            let lab = max_pool_sim(q, &label_bank);
-            let fun = max_pool_sim(q, &func_bank);
-            let opb = max_pool_sim(q, &op_all_bank);
-            crate::utils::score_dynamics::record_baseline("search.role.fun_margin", fun - lab);
-            crate::utils::score_dynamics::record_baseline("search.role.op_margin", opb - lab);
-            if fun >= opb && crate::utils::ai_utils::prejudice_dominates(lab, fun, lab_coh) {
-                roles[i] = ShipTokenRole::Function;
-                logs.push(format!(
-                    "   🗣️ [FUNCTION] \"{}\" | 기능어 cos {:.4} > 라벨 cos {:.4} × (1 + 응집도 {:.4})",
-                    cores[i], fun, lab, lab_coh.clamp(0.0, 0.5)
-                ));
-            } else if opb > lab && opb > fun {
-                roles[i] = ShipTokenRole::Operator;
-                logs.push(format!(
-                    "   ⚖️ [OPERATOR WORD] \"{}\" | 연산자 cos {:.4} > 라벨 cos {:.4} | 기능어 cos {:.4}",
-                    cores[i], opb, lab, fun
-                ));
+        {
+            let live: Vec<usize> = pending
+                .iter()
+                .copied()
+                .filter(|&i| roles[i] == ShipTokenRole::Content)
+                .filter(|&i| !table.get(&cores[i]).iter().all(|&v| v == 0.0))
+                .collect();
+            let queries: Vec<Vec<f32>> = live.iter().map(|&i| table.get(&cores[i]).clone()).collect();
+            let mut role_bias: Vec<(String, String, Vec<f32>)> = Vec::new();
+            for (key, bank) in [("label", &label_bank), ("function", &func_bank), ("operator", &op_all_bank)] {
+                for e in bank.iter() {
+                    if e.iter().all(|&v| v == 0.0) { continue; }
+                    role_bias.push(("role".to_string(), key.to_string(), e.clone()));
+                }
+            }
+            let no_prej: Vec<(String, String, Vec<f32>)> = Vec::new();
+            let (keys, net, _raw) =
+                crate::utils::ai_utils::bank_neutral_key_matrix(&queries, &role_bias, &no_prej);
+            let slot = |k: &str| keys.iter().position(|x| x == k);
+            let (ki_lab, ki_fun, ki_op) = (slot("label"), slot("function"), slot("operator"));
+            logs.push(format!(
+                "   ⚖️ [ROLE BANK-NEUTRAL] 토큰 {}개를 라벨({}구) · 기능어({}구) · 연산자({}구) 세 축으로 행·열 이중 센터링해 채점합니다. 원시 Max-Pool 절대 비교는 뱅크가 넓을수록 최댓값이 커져 라벨 뱅크가 구조적으로 이깁니다.",
+                live.len(), label_bank.len(), func_bank.len(), op_all_bank.len()
+            ));
+            for (qi, &i) in live.iter().enumerate() {
+                let pick = |ki: Option<usize>| -> f32 {
+                    match ki {
+                        Some(k) if net[k][qi] != f32::MIN => net[k][qi],
+                        _ => f32::MIN,
+                    }
+                };
+                let (nlab, nfun, nop) = (pick(ki_lab), pick(ki_fun), pick(ki_op));
+                if nlab == f32::MIN && nfun == f32::MIN && nop == f32::MIN { continue; }
+                let q = table.get(&cores[i]);
+                let lab = max_pool_sim(q, &label_bank);
+                let fun = max_pool_sim(q, &func_bank);
+                let opb = max_pool_sim(q, &op_all_bank);
+                crate::utils::score_dynamics::record_baseline("search.role.fun_margin", nfun - nlab);
+                crate::utils::score_dynamics::record_baseline("search.role.op_margin", nop - nlab);
+                if nfun >= nop && nfun > nlab && crate::utils::ai_utils::prejudice_dominates(lab, fun, lab_coh) {
+                    roles[i] = ShipTokenRole::Function;
+                    logs.push(format!(
+                        "   🗣️ [FUNCTION] \"{}\" | 중립 기능어 {:+.4} > 라벨 {:+.4} | 원시 cos 기능어 {:.4} vs 라벨 {:.4} × (1 + 응집도 {:.4})",
+                        cores[i], nfun, nlab, fun, lab, lab_coh.clamp(0.0, 0.5)
+                    ));
+                } else if nop > nlab && nop > nfun {
+                    roles[i] = ShipTokenRole::Operator;
+                    logs.push(format!(
+                        "   ⚖️ [OPERATOR WORD] \"{}\" | 중립 연산자 {:+.4} > 라벨 {:+.4} / 기능어 {:+.4} | 원시 cos 연산자 {:.4} vs 라벨 {:.4}",
+                        cores[i], nop, nlab, nfun, opb, lab
+                    ));
+                }
             }
         }
 
+        {
+            let mut live: Vec<(usize, f32, String)> = Vec::new();
+            for &i in pending.iter() {
+                if roles[i] != ShipTokenRole::Operator { continue; }
+                let q = table.get(&cores[i]);
+                if q.iter().all(|&v| v == 0.0) || op_keys.len() < 2 { continue; }
+                let scored: Vec<f32> = (0..op_keys.len())
+                    .map(|ki| {
+                        let b = max_pool_sim(q, &op_bias_banks[ki]);
+                        let p = max_pool_sim(q, &op_prej_banks[ki]);
+                        b - (p - b).max(0.0)
+                    })
+                    .collect();
+                let cnt = scored.len() as f32;
+                let mean = scored.iter().sum::<f32>() / cnt;
+                let sd = (scored.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                if sd <= 1e-6 { continue; }
+                let (top_i, top) = scored
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::MIN), |acc, (k, &v)| if v > acc.1 { (k, v) } else { acc });
+                let z = (top - mean) / sd;
+                crate::utils::score_dynamics::record_baseline("search.role.op_selfz", z);
+                live.push((i, z, op_keys[top_i].clone()));
+            }
+            if !live.is_empty() {
+                let cnt = live.len() as f32;
+                let mean = live.iter().map(|(_, z, _)| *z).sum::<f32>() / cnt;
+                let gsd = (live.iter().map(|(_, z, _)| (*z - mean) * (*z - mean)).sum::<f32>() / cnt).sqrt();
+                let gate = if live.len() >= 3 && gsd > 1e-6 {
+                    mean + gsd
+                } else {
+                    match crate::utils::score_dynamics::adaptive_baseline("search.role.op_selfz") {
+                        Some((m, s)) if s > 1e-6 => m + s,
+                        _ => f32::MIN,
+                    }
+                };
+                for (i, z, key) in live.into_iter() {
+                    if z >= gate {
+                        logs.push(format!(
+                            "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 자기 z {:+.3} ≥ 게이트 {:+.3} | 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
+                            cores[i], key, z, gate, op_keys.len()
+                        ));
+                        continue;
+                    }
+                    roles[i] = ShipTokenRole::Content;
+                    crate::utils::score_dynamics::record_confusion(&key, &cores[i], gate - z);
+                    logs.push(format!(
+                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 자기 z {:+.3} < 게이트 {:+.3} (평균 {:+.3} + 표준편차 {:+.3}) — 어느 연산자도 이 토큰을 배타적으로 설명하지 못했습니다. 뱅크 전체와 두루 비슷한 토큰은 연산자가 아니라 라벨이거나 기능어이므로 내용어로 되돌립니다.",
+                        cores[i], z, gate, mean, gsd
+                    ));
+                }
+            }
+        }
         let time_gate = gumbel_expected_z(time_banks.len());
         for &i in pending.iter() {
             if roles[i] != ShipTokenRole::Content { continue; }
@@ -2426,14 +2526,35 @@ impl crate::model::LogisModel {
                 Some(p) => p,
                 None => continue,
             };
-            if !(unit_top > lab_r && unit_top > fun_r && unit_top > op_r) {
-                conditional_time.push((i, p, unit_top, lab_r.max(fun_r).max(op_r)));
+            let (unit_gap, unit_sd) = {
+                let mut sims: Vec<f32> = unit_banks.iter().map(|(_, b)| max_pool_sim(q, b)).collect();
+                sims.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                if sims.len() < 2 {
+                    (0.0f32, 0.0f32)
+                } else {
+                    let cnt = sims.len() as f32;
+                    let mean = sims.iter().sum::<f32>() / cnt;
+                    let sd = (sims.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                    (sims[0] - sims[1], sd)
+                }
+            };
+            let unit_coh = unit_banks
+                .iter()
+                .find(|(k, _)| *k == unit_key)
+                .map(|(_, b)| crate::utils::ai_utils::bank_internal_cohesion(b))
+                .unwrap_or(0.0);
+            let rival = lab_r.max(fun_r).max(op_r);
+            let dominates = !crate::utils::ai_utils::prejudice_dominates(unit_top, rival, unit_coh);
+            let self_evident = unit_sd > 1e-6 && unit_gap > unit_sd;
+            if !dominates && !self_evident {
+                conditional_time.push((i, p, unit_top, rival));
                 continue;
             }
             roles[i] = ShipTokenRole::Temporal;
             logs.push(format!(
-                "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} > 라벨 {:.4}",
-                cores[i], p, unit_key, unit_top, lab_r
+                "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} | 경쟁 최고 {:.4} (응집도 여유 {:.4}) | 단위 뱅크 1·2위 격차 {:.4} vs 표준편차 {:.4} | 근거: {}",
+                cores[i], p, unit_key, unit_top, rival, unit_coh.clamp(0.0, 0.5), unit_gap, unit_sd,
+                if dominates { "경쟁 축 상대 우위" } else { "단위 뱅크 자체 변별" }
             ));
             parts.push((i, p));
         }

@@ -1173,28 +1173,28 @@
   "operators": {
     "eq": {
       "semantic": "exact match, equal",
-      "bias": "exactly, equal, same, precisely, identical",
-      "prejudice": "less, under, below, maximum, greater, over, above, minimum, top, highest, bottom, lowest"
+      "bias": "exactly, equal, same, precisely, identical, 정확히, 같은, 동일한, 딱, ちょうど, 同じ, 等しい, 正好, 等于, 相同, exactamente, igual, exactement, égal, genau, gleich",
+      "prejudice": "less, under, below, maximum, greater, over, above, minimum, top, highest, bottom, lowest, 이상, 이하, 초과, 미만, 최소, 최대, 以上, 以下, 未満, 超过, 至少, 最多"
     },
     "lte": {
       "semantic": "less than or equal to, maximum",
-      "bias": "less than or equal, maximum, up to, no more than, within",
-      "prejudice": "greater, over, above, minimum, more than, starting from, top, highest, bottom, lowest"
+      "bias": "less than or equal, maximum, up to, no more than, within, 이하, 최대, 까지, 이내, 넘지 않는, 안쪽, 以下, 最大, まで, 以内, 至多, 最多, 不超过, como máximo, hasta, au plus, jusqu'à, höchstens, bis",
+      "prejudice": "greater, over, above, minimum, more than, starting from, top, highest, bottom, lowest, 이상, 초과, 최소, 부터, 넘는, 以上, 超, 最低, 至少, 超过, al menos, au moins, mindestens"
     },
     "lt": {
       "semantic": "less than, strictly under",
-      "bias": "less than, under, below, cheaper than, lower than, fewer",
-      "prejudice": "greater, over, above, minimum, more than, starting from, equal, top, highest, bottom, lowest"
+      "bias": "less than, under, below, cheaper than, lower than, fewer, 미만, 보다 작은, 보다 적은, 싼, 저렴한, 가벼운, 未満, より小さい, より少ない, 少于, 小于, 低于, menos de, inferior a, moins de, inférieur à, weniger als, unter",
+      "prejudice": "greater, over, above, minimum, more than, starting from, equal, top, highest, bottom, lowest, 이상, 초과, 최소, 넘는, 같은, 以上, 超, 至少, 超过, 等于"
     },
     "gte": {
       "semantic": "greater than or equal to, minimum",
-      "bias": "greater than or equal, minimum, starting from, at least",
-      "prejudice": "less, under, below, maximum, up to, no more than, within, top, highest, bottom, lowest"
+      "bias": "greater than or equal, minimum, starting from, at least, 이상, 최소, 이상으로, 부터, 못지않은, 以上, 最低, 最小, 至少, 不少于, al menos, mínimo, a partir de, au moins, minimum, à partir de, mindestens, ab",
+      "prejudice": "less, under, below, maximum, up to, no more than, within, top, highest, bottom, lowest, 이하, 미만, 최대, 까지, 이내, 以下, 未満, 最大, 至多, 不超过, como máximo, au plus, höchstens"
     },
     "gt": {
       "semantic": "greater than, strictly over",
-      "bias": "greater than, over, above, more than, exceeds, higher, expensive, heavy",
-      "prejudice": "less, under, below, maximum, up to, no more than, within, equal, top, highest, bottom, lowest"
+      "bias": "greater than, over, above, more than, exceeds, higher, expensive, heavy, 초과, 넘는, 보다 큰, 보다 많은, 비싼, 무거운, 超, より大きい, より多い, 超过, 大于, 多于, más de, superior a, plus de, supérieur à, mehr als, über",
+      "prejudice": "less, under, below, maximum, up to, no more than, within, equal, top, highest, bottom, lowest, 이하, 미만, 최대, 까지, 이내, 같은, 以下, 未満, 至多, 不超过, 等于"
     },
     "top": {
       "semantic": "top, highest, maximum percentile, rank ascending",

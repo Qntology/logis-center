@@ -172,6 +172,7 @@ pub async fn index_item_chunks(
     task_id: &str,
     skip_transliteration: bool,
 ) -> anyhow::Result<usize> {
+    let _sds_index_guard = crate::utils::score_dynamics::indexing_guard();
     let page_type = item_type;
 
     let emit = |msg: &str| {

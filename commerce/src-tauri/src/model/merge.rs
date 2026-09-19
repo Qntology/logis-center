@@ -442,6 +442,14 @@ pub fn plan_recovery_windows(
     let cols = cols.max(1);
     let cw = orig_w as f32 / cols as f32;
     let ch = orig_h as f32 / rows as f32;
+    let to_px = |r0: usize, r1: usize, c0: usize, c1: usize| -> (u32, u32, u32, u32) {
+        (
+            (c0 as f32 * cw).floor() as u32,
+            (r0 as f32 * ch).floor() as u32,
+            (((c1 + 1) as f32 * cw).ceil() as u32).min(orig_w),
+            (((r1 + 1) as f32 * ch).ceil() as u32).min(orig_h),
+        )
+    };
     let mut sorted: Vec<&(String, String, usize, f32)> = cands.iter().collect();
     sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = Vec::new();
@@ -450,23 +458,29 @@ pub fn plan_recovery_windows(
         let r = patch / cols;
         let col = patch % cols;
         if r >= rows { continue; }
-        let r0 = r.saturating_sub(1);
-        let r1 = (r + 1).min(rows - 1);
-        let c0 = col.saturating_sub(1);
-        let c1 = (col + 2).min(cols - 1);
-        let bbox = (
-            (c0 as f32 * cw).floor() as u32,
-            (r0 as f32 * ch).floor() as u32,
-            (((c1 + 1) as f32 * cw).ceil() as u32).min(orig_w),
-            (((r1 + 1) as f32 * ch).ceil() as u32).min(orig_h),
-        );
-        if let Some(slot) = out.iter_mut().find(|(b, _)| *b == bbox) {
-            if !slot.1.iter().any(|(_, f, _)| f == field) {
-                slot.1.push((cat.clone(), field.clone(), z));
-            }
-            continue;
-        }
         if out.len() >= budget { continue; }
+        let wide = to_px(
+            r.saturating_sub(1),
+            (r + 1).min(rows - 1),
+            col.saturating_sub(1),
+            (col + 2).min(cols - 1),
+        );
+        let tight = to_px(r, r, col.saturating_sub(1), (col + 1).min(cols - 1));
+        let bbox = if !out.iter().any(|(b, _)| *b == wide) {
+            wide
+        } else if !out.iter().any(|(b, _)| *b == tight) {
+            println!(
+                "    ✂️ [RECOVERY WINDOW SPLIT] '{}' 의 기본 창(봉우리 ±1행 · −1~+2열)이 이미 다른 필드가 가져간 창과 같습니다. 봉우리 행만 남긴 좁은 창 px({},{})-({},{}) 로 분리합니다. 한 창에 두 필드를 넣으면 프롬프트가 한 자리를 두고 두 라벨을 물어보게 되어 둘 다 비어 돌아옵니다.",
+                field, tight.0, tight.1, tight.2, tight.3
+            );
+            tight
+        } else {
+            println!(
+                "    ⛔ [RECOVERY WINDOW COLLIDE] '{}' 는 좁힌 창까지 다른 필드의 창과 같은 픽셀입니다. 두 축이 문자 그대로 같은 자리를 가리키므로 이 회차에서는 복구하지 않습니다.",
+                field
+            );
+            continue;
+        };
         out.push((bbox, vec![(cat.clone(), field.clone(), z)]));
     }
     out
@@ -995,7 +1009,6 @@ pub fn merge_extracted(
                     off_schema_null += 1;
                     continue;
                 }
-                off_schema += 1;
                 let shown: String = v
                     .as_str()
                     .map(|s| s.to_string())
@@ -1003,11 +1016,46 @@ pub fn merge_extracted(
                     .chars()
                     .take(40)
                     .collect();
+                let target_empty = merged
+                    .get(k)
+                    .map(|x| x.is_null() || x.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                    .unwrap_or(true);
+                let shape_ok = v
+                    .as_str()
+                    .map(|s| {
+                        crate::utils::ai_utils::value_matches_format(
+                            crate::utils::ai_utils::detect_field_format(k),
+                            s,
+                        )
+                    })
+                    .unwrap_or(true);
+                if !owner.is_empty()
+                    && !crate::logic::is_trade_array_category(owner)
+                    && !crate::logic::is_trade_array_category(category)
+                    && target_empty
+                    && shape_ok
+                {
+                    emit(&format!(
+                        "    🔀 [SCHEMA REROUTE] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아니지만, 소속 '{}' 의 그 축이 비어 있고 값 형태도 맞습니다. 크롭 사각형이 옆 칸을 물고 있으면 모델은 인쇄된 값을 정직하게 읽은 것이므로 폐기하지 않고 소유 카테고리로 옮깁니다.",
+                        category, k, shown, owner
+                    ));
+                    merged.insert(k.clone(), v.clone());
+                    let slot = merged
+                        .entry(owner.to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                    if let Some(o) = slot.as_object_mut() {
+                        o.insert(k.clone(), v.clone());
+                    }
+                    crate::utils::score_dynamics::record_field_seen(k);
+                    crate::utils::score_dynamics::record_field_assigned(k, 0.0);
+                    crate::utils::score_dynamics::record_baseline("vision.schema_reroute", 1.0);
+                    continue;
+                }
+                off_schema += 1;
                 emit(&format!(
-                    "    🚫 [SCHEMA WHITELIST] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아닙니다 (소속: {}). 크롭 프롬프트는 '{}' 필드만 요청했으므로 모델이 스스로 만든 키입니다. 폐기합니다.",
+                    "    🚫 [SCHEMA WHITELIST] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아닙니다 (소속: {}). 소유 축이 이미 차 있거나 값 형태가 그 축과 맞지 않아 폐기합니다.",
                     category, k, shown,
-                    if owner.is_empty() { "스키마 밖" } else { owner },
-                    category
+                    if owner.is_empty() { "스키마 밖" } else { owner }
                 ));
                 crate::utils::score_dynamics::record_field_seen(k);
                 crate::utils::score_dynamics::record_field_reject(
