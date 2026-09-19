@@ -1269,7 +1269,7 @@ impl crate::model::LogisModel {
                                         crate::utils::score_dynamics::record_confusion(
                                             field, field, 0.0,
                                         );
-                                        emit(&format!(
+                                        emit_term(&format!(
                                             "      ⚪ [RECOVERY OCCUPIED] {}.{} 는 이미 \"{}\" 로 확정되어 있습니다. 이 창이 읽은 \"{}\" 는 같은 축을 두고 뒤에 온 주장이므로 채택하지 않습니다. 먼저 온 값이 라벨 근거와 함께 들어왔다면 순서가 곧 강도입니다.",
                                             cat, field, current, value
                                         ));
