@@ -1241,7 +1241,50 @@ pub fn get_trade_crop_prompt(
     score: f32,
     claimed: &[(String, String)],
 ) -> String {
-    let base = get_trade_category_schema(category, doc_type);
+    get_trade_crop_prompt_present(
+        category,
+        doc_type,
+        top_field,
+        score,
+        claimed,
+        &std::collections::HashSet::new(),
+    )
+}
+
+pub fn get_trade_crop_prompt_present(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+    absent: &std::collections::HashSet<String>,
+) -> String {
+    let mut effective: std::collections::HashSet<String> = absent.clone();
+    for (_, relay_fields) in crate::parsing::TRADE_RELAY_FIELDS.iter() {
+        for f in relay_fields.iter() {
+            effective.remove(*f);
+        }
+    }
+    let narrowed = effective.len();
+    let base = if effective.is_empty() {
+        get_trade_category_schema(category, doc_type)
+    } else {
+        get_trade_category_schema_present(category, doc_type, &effective)
+    };
+
+    let presence_block = if narrowed == 0 {
+        String::new()
+    } else {
+        String::from(
+            "\n[FIELD PRESENCE]\n\
+             The field list below is NOT the full schema of this document type. The vision encoder already \
+             measured where each axis is printed on this page, and the axes it found no printed evidence for \
+             have been removed before you were asked.\n\
+             Every field you see is one the page is expected to carry. A field that is absent from the list \
+             is absent from the page — do not invent a key for it, and do not redistribute a number you see \
+             into one of the remaining fields just to account for it.\n",
+        )
+    };
 
     let evidence = if top_field.is_empty() {
         String::new()
@@ -1266,8 +1309,11 @@ pub fn get_trade_crop_prompt(
     } else {
         let mut s = String::from(
             "\n[ALREADY CLAIMED VALUES]\n\
-             Previous crops of this same document already確 locked these values to other fields.\n\
-             Never return any of them for a field in this crop:\n",
+             Previous crops of this same document already locked the values below to the fields shown next to them.\n\
+             Those pairings are final. For a field in THIS crop:\n\
+             - Never return one of these values, even when it is the only number you can see in the crop.\n\
+             - If the only value you can read for a field is one of these, that field is not printed here. Return null for it.\n\
+             - Returning a locked value under a different field name creates two contradictory records of the same fact.\n",
         );
         for (k, v) in claimed.iter().take(24) {
             s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
@@ -1285,10 +1331,13 @@ pub fn get_trade_crop_prompt(
          2. Fill a field ONLY from that seen text. If the field's value is not printed in this crop, return null.\n\
          3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.\n\
          4. Never take a value from a neighbouring field just because it is the only number nearby.\n\
-         5. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}\n\n{}",
+         5. A number you can read does not have to belong to a field. If no printed label ties it to one of the \
+         fields below, leave every field null rather than assigning it to the closest-looking one.\n\
+         6. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}{}\n\n{}",
         category.to_uppercase(),
         doc_type,
         evidence,
+        presence_block,
         claimed_block,
         base
     )

@@ -222,12 +222,34 @@ pub fn cross_field_duplicate_groups(
             None => groups.push((key, vec![(c.category.clone(), c.field.clone(), v.to_string())])),
         }
     }
-    groups.retain(|(_, owners)| {
-        let mut cats: Vec<&str> = owners.iter().map(|(c, _, _)| c.as_str()).collect();
-        cats.sort();
-        cats.dedup();
-        cats.len() >= 2
-    });
+    {
+        let mut kept: Vec<(String, Vec<(String, String, String)>)> = Vec::new();
+        let mut same_field: Vec<String> = Vec::new();
+        for (key, owners) in groups.into_iter() {
+            let mut fields: Vec<&str> = owners.iter().map(|(_, f, _)| f.as_str()).collect();
+            fields.sort();
+            fields.dedup();
+            if fields.len() >= 2 {
+                kept.push((key, owners));
+                continue;
+            }
+            if owners.len() >= 2 {
+                same_field.push(format!(
+                    "\"{}\" ← {:?}",
+                    owners[0].2,
+                    owners.iter().map(|(c, f, _)| format!("{}.{}", c, f)).collect::<Vec<_>>()
+                ));
+            }
+        }
+        if !same_field.is_empty() {
+            println!(
+                "    ⚪ [SAME FIELD DUPLICATE] 같은 필드명이 서로 다른 카테고리에서 같은 값을 주장한 {}건은 소유권 경쟁이 아니라 카테고리 배정의 산물입니다. 두 주장이 가리키는 축이 하나뿐이라 어느 쪽을 지워도 그 필드의 값이 통째로 사라지므로 경쟁에서 제외합니다: {:?}",
+                same_field.len(),
+                same_field.iter().take(6).collect::<Vec<_>>()
+            );
+        }
+        groups = kept;
+    }
     groups
 }
 
@@ -245,33 +267,49 @@ pub fn resolve_cross_field_duplicates(
             None => continue,
         };
         if q.iter().all(|&x| x == 0.0) { continue; }
-        let mut scored: Vec<(usize, f32, f32)> = Vec::new();
+        let mut pool: Vec<f32> = Vec::new();
+        let mut per: Vec<(usize, f32, usize)> = Vec::new();
         for (oi, (_, field, _)) in owners.iter().enumerate() {
             let (phrases, weights) = crate::utils::ai_utils::label_phrase_bank(doc_lang, bank_type, field);
-            let mut bank: Vec<Vec<f32>> = Vec::new();
-            let mut wts: Vec<f32> = Vec::new();
+            let mut mx = f32::MIN;
+            let mut live = 0usize;
             for (p, w) in phrases.iter().zip(weights.iter()) {
-                if let Some(e) = lookup.get(p) {
-                    if e.iter().all(|&x| x == 0.0) { continue; }
-                    bank.push(e.clone());
-                    wts.push(*w);
-                }
+                let e = match lookup.get(p) { Some(e) => e, None => continue };
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = crate::utils::ai_utils::cosine_similarity(q, e) * *w;
+                pool.push(s);
+                live += 1;
+                if s > mx { mx = s; }
             }
-            if bank.is_empty() { continue; }
-            let own = crate::utils::ai_utils::weighted_max_pool_sim(q, &bank, &wts);
-            let coh = crate::utils::ai_utils::bank_internal_cohesion(&bank);
-            scored.push((oi, own, coh));
+            if live == 0 { continue; }
+            per.push((oi, mx, live));
         }
-        if scored.len() < 2 { continue; }
+        if per.len() < 2 || pool.len() < 2 { continue; }
+        let n = pool.len() as f32;
+        let mean = pool.iter().sum::<f32>() / n;
+        let sd = (pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n)
+            .sqrt()
+            .max(1e-6);
+        let mut scored: Vec<(usize, f32, usize)> = per
+            .iter()
+            .map(|(oi, mx, cnt)| {
+                (
+                    *oi,
+                    (mx - mean) / sd - crate::utils::ai_utils::gumbel_expected_z(*cnt),
+                    *cnt,
+                )
+            })
+            .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let (wi, w_own, _) = scored[0];
-        for &(li, l_own, l_coh) in scored.iter().skip(1) {
+        let (wi, w_z, w_cnt) = scored[0];
+        for &(li, l_z, l_cnt) in scored.iter().skip(1) {
             let (l_cat, l_field, l_raw) = &owners[li];
             let (w_cat, w_field, _) = &owners[wi];
-            if crate::utils::ai_utils::prejudice_dominates(l_own, w_own, l_coh) {
+            if w_z - l_z > 1.0 {
+                crate::utils::score_dynamics::record_confusion(w_field, l_field, w_z - l_z);
                 emit(&format!(
-                    "    🧭 [VALUE OWNER] \"{}\" | {}.{} (cos {:.4}) 가 {}.{} (cos {:.4}, 응집도 {:.4}) 를 응집도 여유 이상으로 앞섭니다. 후자의 값을 폐기합니다.",
-                    l_raw, w_cat, w_field, w_own, l_cat, l_field, l_own, l_coh
+                    "    🧭 [VALUE OWNER] \"{}\" | {}.{} (중립점수 {:+.4}, 라벨 {}구) 가 {}.{} (중립점수 {:+.4}, 라벨 {}구) 를 pooled σ 한 칸 이상 앞섭니다. 인쇄된 한 자리는 라벨을 하나만 가지므로 후자의 값을 폐기합니다. 원시 Max-Pool 은 라벨 구가 많은 축이 구조적으로 이기므로 표본 수 기대 최댓값을 차감한 뒤 비교합니다.",
+                    l_raw, w_cat, w_field, w_z, w_cnt, l_cat, l_field, l_z, l_cnt
                 ));
                 out.push(crate::models::siglip2::value_grounding::GroundingVerdict {
                     category: l_cat.clone(),
@@ -286,8 +324,8 @@ pub fn resolve_cross_field_duplicates(
                 });
             } else {
                 emit(&format!(
-                    "    🤝 [VALUE OWNER KEEP] \"{}\" | {}.{} (cos {:.4}) 와 {}.{} (cos {:.4}) 의 차이가 응집도 여유 {:.4} 안이라 둘 다 유지합니다.",
-                    l_raw, w_cat, w_field, w_own, l_cat, l_field, l_own, l_coh.clamp(0.0, 0.5)
+                    "    🤝 [VALUE OWNER KEEP] \"{}\" | {}.{} (중립점수 {:+.4}) 와 {}.{} (중립점수 {:+.4}) 의 차이가 {:+.4} 로 pooled σ 한 칸에 못 미칩니다. 같은 값이 두 축에 정당하게 인쇄되는 서식(송하인과 통지처가 같은 회사인 경우 등)이 있으므로 둘 다 유지합니다.",
+                    l_raw, w_cat, w_field, w_z, l_cat, l_field, l_z, w_z - l_z
                 ));
             }
         }
@@ -398,6 +436,22 @@ pub fn same_printed_token(a: &str, b: &str) -> bool {
         && long.ends_with('S')
 }
 
+pub fn same_printed_value(a: &str, b: &str) -> bool {
+    if same_printed_token(a, b) { return true; }
+    let num = |s: &str| -> Option<f64> {
+        let t: String = s
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        if !t.chars().any(|c| c.is_ascii_digit()) { return None; }
+        t.parse::<f64>().ok()
+    };
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
+        _ => false,
+    }
+}
+
 pub fn recovery_label_gate(
     label_emb: &[f32],
     target: &str,
@@ -406,28 +460,55 @@ pub fn recovery_label_gate(
     if label_emb.is_empty() || label_emb.iter().all(|&x| x == 0.0) {
         return (false, 0.0, 0.0, String::new());
     }
-    let mut own = 0.0f32;
-    let mut own_coh = 0.0f32;
-    let mut have_own = false;
-    let mut rival = 0.0f32;
-    let mut rival_field = String::new();
+    let mut pool: Vec<f32> = Vec::new();
+    let mut per: Vec<(String, f32, usize)> = Vec::new();
     for (f, bank, w) in banks.iter() {
-        if bank.is_empty() { continue; }
-        let s = crate::utils::ai_utils::weighted_max_pool_sim(label_emb, bank, w);
-        if f == target {
-            own = s;
-            own_coh = crate::utils::ai_utils::bank_internal_cohesion(bank);
-            have_own = true;
-        } else if s > rival {
-            rival = s;
-            rival_field = f.clone();
+        let mut mx = f32::MIN;
+        let mut live = 0usize;
+        for (i, e) in bank.iter().enumerate() {
+            if e.is_empty() || e.iter().all(|&x| x == 0.0) { continue; }
+            let s = crate::utils::ai_utils::cosine_similarity(label_emb, e)
+                * w.get(i).copied().unwrap_or(1.0);
+            pool.push(s);
+            live += 1;
+            if s > mx { mx = s; }
         }
+        if live == 0 { continue; }
+        per.push((f.clone(), mx, live));
     }
-    if !have_own || own <= 0.0 {
-        return (false, own, rival, rival_field);
+    if per.is_empty() {
+        return (false, 0.0, 0.0, String::new());
     }
-    let ok = !crate::utils::ai_utils::prejudice_dominates(own, rival, own_coh);
-    (ok, own, rival, rival_field)
+    if per.len() < 2 || pool.len() < 2 {
+        let own = per.iter().find(|(f, _, _)| f == target).map(|(_, s, _)| *s).unwrap_or(f32::MIN);
+        let out = if own == f32::MIN { 0.0 } else { own };
+        return (out > 0.0, out, 0.0, String::new());
+    }
+    let n = pool.len() as f32;
+    let mean = pool.iter().sum::<f32>() / n;
+    let sd = (pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n)
+        .sqrt()
+        .max(1e-6);
+    let mut scored: Vec<(String, f32)> = per
+        .iter()
+        .map(|(f, mx, cnt)| {
+            (
+                f.clone(),
+                (mx - mean) / sd - crate::utils::ai_utils::gumbel_expected_z(*cnt),
+            )
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let own = scored.iter().find(|(f, _)| f == target).map(|(_, z)| *z).unwrap_or(f32::MIN);
+    let own_out = if own == f32::MIN { 0.0 } else { own };
+    if scored[0].0 == target {
+        let (rf, rz) = scored
+            .get(1)
+            .map(|(f, z)| (f.clone(), *z))
+            .unwrap_or((String::new(), 0.0));
+        return (true, own_out, rz, rf);
+    }
+    (false, own_out, scored[0].1, scored[0].0.clone())
 }
 
 pub fn plan_recovery_windows(
@@ -877,6 +958,37 @@ pub fn apply_grounding_verdicts(
     ));
 }
 
+pub fn trade_schema_owner_of(doc_type: &str, field: &str) -> (bool, String) {
+    let ts = match crate::parsing::BIAS_DICT.get("trade_schema") {
+        Some(t) => t,
+        None => return (false, String::new()),
+    };
+    let mut known = false;
+    let mut found = String::new();
+    for node in [
+        ts.get("overlay").and_then(|o| o.get(doc_type)),
+        ts.get("base"),
+    ] {
+        let cats = match node.and_then(|n| n.as_object()) {
+            Some(c) => c,
+            None => continue,
+        };
+        if !cats.is_empty() {
+            known = true;
+        }
+        if !found.is_empty() {
+            continue;
+        }
+        for (cat, fields) in cats.iter() {
+            if fields.as_object().map_or(false, |fm| fm.contains_key(field)) {
+                found = cat.clone();
+                break;
+            }
+        }
+    }
+    (known, found)
+}
+
 pub fn merge_extracted(
     merged: &mut serde_json::Map<String, Value>,
     category: &str,
@@ -884,6 +996,12 @@ pub fn merge_extracted(
     emit: &dyn Fn(&str),
 ) {
     let is_array_category = category == "items" || category == "containers";
+    let doc_code = merged
+        .get("header")
+        .and_then(|h| h.get("doc_type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
     let coerced: Value;
     let incoming = if is_array_category && incoming.is_object() {
@@ -1029,26 +1147,49 @@ pub fn merge_extracted(
                         )
                     })
                     .unwrap_or(true);
+                let (schema_known, schema_cat) = if doc_code.is_empty() {
+                    (false, String::new())
+                } else {
+                    trade_schema_owner_of(&doc_code, k)
+                };
+                let structural = !schema_known || (!schema_cat.is_empty() && schema_cat == owner);
                 if !owner.is_empty()
                     && !crate::logic::is_trade_array_category(owner)
                     && !crate::logic::is_trade_array_category(category)
                     && target_empty
                     && shape_ok
                 {
-                    emit(&format!(
-                        "    🔀 [SCHEMA REROUTE] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아니지만, 소속 '{}' 의 그 축이 비어 있고 값 형태도 맞습니다. 크롭 사각형이 옆 칸을 물고 있으면 모델은 인쇄된 값을 정직하게 읽은 것이므로 폐기하지 않고 소유 카테고리로 옮깁니다.",
-                        category, k, shown, owner
-                    ));
+                    if structural {
+                        emit(&format!(
+                            "    🔀 [SCHEMA REROUTE] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아니지만, 소속 '{}' 의 그 축이 비어 있고 값 형태도 맞습니다. 크롭 사각형이 옆 칸을 물고 있으면 모델은 인쇄된 값을 정직하게 읽은 것이므로 폐기하지 않고 소유 카테고리로 옮깁니다.",
+                            category, k, shown, owner
+                        ));
+                    } else {
+                        emit(&format!(
+                            "    🧾 [ROOT ONLY REROUTE] [{}] '{}' = \"{}\" 의 규칙 기반 소속은 '{}' 이지만, 이 서식('{}') 의 로드된 스키마에서 그 축은 {}. 값은 인쇄되어 있을 수 있으므로 루트에 그대로 두되 카테고리 객체에는 넣지 않습니다. 스키마에 없는 축을 그룹 안에 넣으면 자연어 변환이 존재하지 않는 절을 만들고 그 문장이 그대로 임베딩됩니다.",
+                            category, k, shown, owner, doc_code,
+                            if schema_cat.is_empty() {
+                                "어느 카테고리에도 없습니다".to_string()
+                            } else {
+                                format!("'{}' 소속입니다", schema_cat)
+                            }
+                        ));
+                    }
                     merged.insert(k.clone(), v.clone());
-                    let slot = merged
-                        .entry(owner.to_string())
-                        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                    if let Some(o) = slot.as_object_mut() {
-                        o.insert(k.clone(), v.clone());
+                    if structural {
+                        let slot = merged
+                            .entry(owner.to_string())
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if let Some(o) = slot.as_object_mut() {
+                            o.insert(k.clone(), v.clone());
+                        }
                     }
                     crate::utils::score_dynamics::record_field_seen(k);
                     crate::utils::score_dynamics::record_field_assigned(k, 0.0);
-                    crate::utils::score_dynamics::record_baseline("vision.schema_reroute", 1.0);
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.schema_reroute",
+                        if structural { 1.0 } else { 0.0 },
+                    );
                     continue;
                 }
                 off_schema += 1;

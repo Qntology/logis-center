@@ -35,6 +35,24 @@ pub fn encode_phrases_shared(
     model: &Siglip2Model,
     phrases: &[String],
 ) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
+    encode_phrases_persisted(model, phrases, true)
+}
+
+pub fn encode_phrases_ephemeral(
+    model: &Siglip2Model,
+    phrases: &[String],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    Ok(encode_phrases_persisted(model, phrases, false)?
+        .into_iter()
+        .map(|a| (*a).clone())
+        .collect())
+}
+
+fn encode_phrases_persisted(
+    model: &Siglip2Model,
+    phrases: &[String],
+    persist: bool,
+) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
     use crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE as CACHE;
 
     if phrases.is_empty() {
@@ -102,8 +120,14 @@ pub fn encode_phrases_shared(
         }
     }
 
-    // ── ③ 캐시 적재 (메모리 + 디스크 append) ──
-    CACHE.put_batch(&fresh);
+    if persist {
+        CACHE.put_batch(&fresh);
+    } else {
+        println!(
+            "    🫧 [PHRASE EPHEMERAL] 새로 인코딩한 구 {}개를 캐시에 적재하지 않고 버립니다. 이 구들은 이 문서에서만 등장하는 값 문자열이라 다음 문서에서 다시 맞을 일이 없는데, 앵커 구와 같은 저장소를 쓰면 상한을 값이 잠식해 앵커 히트율이 무너집니다.",
+            fresh.len()
+        );
+    }
 
     Ok(slots
         .into_iter()

@@ -1559,6 +1559,13 @@ fn ship_compose_range(parts: &[ShipTimePart], today: chrono::NaiveDate) -> Optio
         (_, Some(mm), Some(dd)) => ship_day_range(yy, mm, dd),
         (_, Some(mm), None) => ship_month_range(yy, mm),
         (true, None, None) => ship_year_range(yy),
+        (true, None, Some(dd)) => {
+            println!(
+                "   🧯 [TEMPORAL REDUCE] 연 {} 과 일 {} 만 확정되고 월이 없습니다. 조각을 통째로 버리면 확정된 연도까지 함께 사라지므로, 확정 가능한 가장 넓은 구간인 연 범위로 축약합니다.",
+                yy, dd
+            );
+            ship_year_range(yy)
+        }
         _ => None,
     }
 }
@@ -2121,10 +2128,50 @@ impl crate::model::LogisModel {
         let op_prej_banks: Vec<Vec<Vec<f32>>> = op_prej_phr.iter().map(|b| table.bank(b)).collect();
         let op_all_bank: Vec<Vec<f32>> = op_bias_banks.iter().flatten().cloned().collect();
         let title_embs: Vec<Vec<f32>> = titles.iter().map(|(t, _)| table.get(t).clone()).collect();
-        let unit_banks: Vec<(String, Vec<Vec<f32>>)> = SHIP_TIME_UNIT_PIVOTS
-            .iter()
-            .map(|(k, raw)| (k.to_string(), table.bank(&split_bias_phrases_full(raw))))
-            .collect();
+        let unit_banks: Vec<(String, Vec<Vec<f32>>)> = {
+            let raw_units: Vec<(String, Vec<String>)> = SHIP_TIME_UNIT_PIVOTS
+                .iter()
+                .map(|(k, raw)| (k.to_string(), split_bias_phrases_full(raw)))
+                .collect();
+            let heads: Vec<Vec<f32>> = raw_units
+                .iter()
+                .map(|(_, ph)| table.get(ph.first().map(|s| s.as_str()).unwrap_or("")).clone())
+                .collect();
+            let mut out: Vec<(String, Vec<Vec<f32>>)> = Vec::with_capacity(raw_units.len());
+            let mut dropped: Vec<String> = Vec::new();
+            for (ui, (key, phrases)) in raw_units.iter().enumerate() {
+                let mut bank: Vec<Vec<f32>> = Vec::new();
+                for (pi, p) in phrases.iter().enumerate() {
+                    let e = table.get(p);
+                    if e.iter().all(|&v| v == 0.0) { continue; }
+                    if pi > 0 && !heads[ui].iter().all(|&v| v == 0.0) {
+                        let own = cosine_similarity(e, &heads[ui]);
+                        let (rk, rs) = raw_units
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| *k != ui)
+                            .map(|(k, (name, _))| (name.clone(), cosine_similarity(e, &heads[k])))
+                            .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
+                        if rs > own {
+                            dropped.push(format!("{}←\"{}\" (자기 '{}' {:.4} < '{}' {:.4})", key, p, key, own, rk, rs));
+                            continue;
+                        }
+                    }
+                    bank.push(e.clone());
+                }
+                if bank.is_empty() {
+                    bank = phrases.iter().map(|p| table.get(p).clone()).collect();
+                }
+                out.push((key.clone(), bank));
+            }
+            if !dropped.is_empty() {
+                logs.push(format!(
+                    "   🧹 [TIME UNIT SELF-POISON] 자기 단위 이름보다 다른 단위 이름에 더 가까운 앵커 구 {}개를 그 단위 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 단위가 이기므로, 다른 단위의 이름을 품은 구는 그 단위를 대신 설명해 1·2위를 뒤집습니다.",
+                    dropped.len(), dropped
+                ));
+            }
+            out
+        };
         let month_embs: Vec<Vec<f32>> = SHIP_MONTH_PIVOTS.iter().map(|m| table.get(m).clone()).collect();
         let time_banks: Vec<(String, Vec<Vec<f32>>)> = time_keys
             .iter()
@@ -2346,7 +2393,7 @@ impl crate::model::LogisModel {
         }
 
         {
-            let mut live: Vec<(usize, f32, String)> = Vec::new();
+            let mut live: Vec<(usize, f32, f32, bool, String)> = Vec::new();
             for &i in pending.iter() {
                 if roles[i] != ShipTokenRole::Operator { continue; }
                 let q = table.get(&cores[i]);
@@ -2367,34 +2414,62 @@ impl crate::model::LogisModel {
                     .enumerate()
                     .fold((0usize, f32::MIN), |acc, (k, &v)| if v > acc.1 { (k, v) } else { acc });
                 let z = (top - mean) / sd;
+                let second = scored
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != top_i)
+                    .map(|(_, v)| *v)
+                    .fold(f32::MIN, f32::max);
+                let self_evident = second > f32::MIN && (top - second) > sd;
+                let margin = max_pool_sim(q, &op_all_bank) - max_pool_sim(q, &label_bank);
                 crate::utils::score_dynamics::record_baseline("search.role.op_selfz", z);
-                live.push((i, z, op_keys[top_i].clone()));
+                crate::utils::score_dynamics::record_baseline("search.role.op_lab_margin", margin);
+                live.push((i, z, margin, self_evident, op_keys[top_i].clone()));
             }
             if !live.is_empty() {
-                let cnt = live.len() as f32;
-                let mean = live.iter().map(|(_, z, _)| *z).sum::<f32>() / cnt;
-                let gsd = (live.iter().map(|(_, z, _)| (*z - mean) * (*z - mean)).sum::<f32>() / cnt).sqrt();
-                let gate = if live.len() >= 3 && gsd > 1e-6 {
-                    mean + gsd
+                let mut sorted: Vec<f32> = live.iter().map(|(_, _, m, _, _)| *m).collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mut widest = 0.0f32;
+                let mut edge = f32::MAX;
+                for w in sorted.windows(2) {
+                    let g = w[1] - w[0];
+                    if g > widest { widest = g; edge = w[1]; }
+                }
+                let cut = if sorted.len() >= 2 && widest > 1e-6 {
+                    logs.push(format!(
+                        "   📐 [OPERATOR SPLIT] 후보 {}개의 '연산자 cos − 라벨 cos' 마진을 정렬해 가장 넓게 벌어진 자리에서 가릅니다. 마진 {:?} | 최대 격차 {:.4} → 기준 {:.4} 이상만 연산자로 남깁니다. 자기 z 의 평균+표준편차는 잡음 후보가 평균을 끌어올려 진짜 연산자까지 함께 기각합니다.",
+                        sorted.len(),
+                        sorted.iter().map(|m| format!("{:.4}", m)).collect::<Vec<_>>(),
+                        widest, edge
+                    ));
+                    crate::utils::score_dynamics::record_baseline("search.role.op_split_gap", widest);
+                    edge
                 } else {
-                    match crate::utils::score_dynamics::adaptive_baseline("search.role.op_selfz") {
-                        Some((m, s)) if s > 1e-6 => m + s,
-                        _ => f32::MIN,
-                    }
+                    logs.push(
+                        "   📐 [OPERATOR SPLIT SKIP] 후보가 하나뿐이거나 마진이 전부 같아 가를 자리가 없습니다. 뱅크 자체 변별만으로 판정합니다.".to_string(),
+                    );
+                    f32::MAX
                 };
-                for (i, z, key) in live.into_iter() {
-                    if z >= gate {
+                for (i, z, margin, self_evident, key) in live.into_iter() {
+                    let by_split = margin >= cut;
+                    if by_split || self_evident {
                         logs.push(format!(
-                            "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 자기 z {:+.3} ≥ 게이트 {:+.3} | 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
-                            cores[i], key, z, gate, op_keys.len()
+                            "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 마진 {:+.4} (기준 {:+.4}) | 자기 z {:+.3} | 근거: {} — 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
+                            cores[i], key, margin, cut, z,
+                            match (by_split, self_evident) {
+                                (true, true) => "분포 분할 + 뱅크 자체 변별",
+                                (true, false) => "분포 분할",
+                                _ => "뱅크 자체 변별(분할에서는 탈락했으나 1·2위 격차가 표준편차를 넘음)",
+                            },
+                            op_keys.len()
                         ));
                         continue;
                     }
                     roles[i] = ShipTokenRole::Content;
-                    crate::utils::score_dynamics::record_confusion(&key, &cores[i], gate - z);
+                    crate::utils::score_dynamics::record_confusion(&key, &cores[i], cut - margin);
                     logs.push(format!(
-                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 자기 z {:+.3} < 게이트 {:+.3} (평균 {:+.3} + 표준편차 {:+.3}) — 어느 연산자도 이 토큰을 배타적으로 설명하지 못했습니다. 뱅크 전체와 두루 비슷한 토큰은 연산자가 아니라 라벨이거나 기능어이므로 내용어로 되돌립니다.",
-                        cores[i], z, gate, mean, gsd
+                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 마진 {:+.4} < 기준 {:+.4} 이고 뱅크 자체 변별도 없습니다 (자기 z {:+.3}) — 연산자 어휘 전체와 두루 비슷할 뿐 어느 하나를 배타적으로 가리키지 못하므로 내용어로 되돌립니다.",
+                        cores[i], margin, cut, z
                     ));
                 }
             }
@@ -2482,7 +2557,7 @@ impl crate::model::LogisModel {
         }
 
         let mut year_like: Vec<(usize, i32)> = Vec::new();
-        let mut conditional_time: Vec<(usize, ShipTimePart, f32, f32)> = Vec::new();
+        let mut conditional_time: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
         for i in 0..n {
             if roles[i] != ShipTokenRole::Numeric { continue; }
             if numerics_raw.iter().any(|x| x.token == i) { continue; }
@@ -2504,10 +2579,15 @@ impl crate::model::LogisModel {
             }
             let q = table.get(&residue);
             if q.iter().all(|&v| v == 0.0) { continue; }
-            let (unit_key, unit_top) = unit_banks
+            let mut ranked: Vec<(String, f32)> = unit_banks
                 .iter()
                 .map(|(k, b)| (k.clone(), max_pool_sim(q, b)))
-                .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (unit_key, unit_top) = match ranked.first() {
+                Some((k, s)) => (k.clone(), *s),
+                None => continue,
+            };
             let lab_r = max_pool_sim(q, &label_bank);
             let fun_r = max_pool_sim(q, &func_bank);
             let op_r = max_pool_sim(q, &op_all_bank);
@@ -2516,19 +2596,21 @@ impl crate::model::LogisModel {
                 Some(v) => v,
                 None => continue,
             };
-            let part = match unit_key.as_str() {
-                "year" if digits == 4 && (1..=9999).contains(&v) => Some(ShipTimePart::Year(v as i32)),
-                "month" if (1..=12).contains(&v) => Some(ShipTimePart::Month(v as u32)),
-                "day" if (1..=31).contains(&v) => Some(ShipTimePart::Day(v as u32)),
-                _ => None,
+            let feasible = |k: &str| -> Option<ShipTimePart> {
+                match k {
+                    "year" if digits == 4 && (1..=9999).contains(&v) => Some(ShipTimePart::Year(v as i32)),
+                    "month" if (1..=12).contains(&v) => Some(ShipTimePart::Month(v as u32)),
+                    "day" if (1..=31).contains(&v) => Some(ShipTimePart::Day(v as u32)),
+                    _ => None,
+                }
             };
-            let p = match part {
-                Some(p) => p,
+            let cands: Vec<ShipTimePart> = ranked.iter().filter_map(|(k, _)| feasible(k)).collect();
+            let p = match cands.first() {
+                Some(p) => p.clone(),
                 None => continue,
             };
             let (unit_gap, unit_sd) = {
-                let mut sims: Vec<f32> = unit_banks.iter().map(|(_, b)| max_pool_sim(q, b)).collect();
-                sims.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                let sims: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
                 if sims.len() < 2 {
                     (0.0f32, 0.0f32)
                 } else {
@@ -2544,44 +2626,54 @@ impl crate::model::LogisModel {
                 .map(|(_, b)| crate::utils::ai_utils::bank_internal_cohesion(b))
                 .unwrap_or(0.0);
             let rival = lab_r.max(fun_r).max(op_r);
-            let dominates = !crate::utils::ai_utils::prejudice_dominates(unit_top, rival, unit_coh);
+            let lenient = !crate::utils::ai_utils::prejudice_dominates(unit_top, rival, unit_coh);
+            let outright = unit_top > rival;
             let self_evident = unit_sd > 1e-6 && unit_gap > unit_sd;
-            if !dominates && !self_evident {
-                conditional_time.push((i, p, unit_top, rival));
+            if !(outright && self_evident) {
+                logs.push(format!(
+                    "   ⏸️ [TIME UNIT DEFER] \"{}\" | 1위 '{}' cos {:.4} | 경쟁 최고 {:.4} | 단위 뱅크 1·2위 격차 {:.4} vs 표준편차 {:.4} → 단위 축만으로는 확정하지 못했습니다. 가능한 해석 {:?} 를 순서대로 들고 인접 시간 조각과의 연→월→일 연쇄에 맡깁니다. 응집도 여유를 허용하면 경쟁 축이 앞서는데도 단위 판정이 확정되어 월을 일로 읽습니다.",
+                    cores[i], unit_key, unit_top, rival, unit_gap, unit_sd, cands
+                ));
+                conditional_time.push((i, cands, unit_top, rival, lenient));
                 continue;
             }
             roles[i] = ShipTokenRole::Temporal;
             logs.push(format!(
-                "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} | 경쟁 최고 {:.4} (응집도 여유 {:.4}) | 단위 뱅크 1·2위 격차 {:.4} vs 표준편차 {:.4} | 근거: {}",
-                cores[i], p, unit_key, unit_top, rival, unit_coh.clamp(0.0, 0.5), unit_gap, unit_sd,
-                if dominates { "경쟁 축 상대 우위" } else { "단위 뱅크 자체 변별" }
+                "   🕒 [TIME UNIT / COSINE] \"{}\" → {:?} | 단위 '{}' cos {:.4} > 경쟁 최고 {:.4} | 단위 뱅크 1·2위 격차 {:.4} > 표준편차 {:.4} | 근거: 경쟁 축 완전 우위 + 뱅크 자체 변별",
+                cores[i], p, unit_key, unit_top, rival, unit_gap, unit_sd
             ));
             parts.push((i, p));
         }
         loop {
             let mut promoted = false;
-            let mut rest: Vec<(usize, ShipTimePart, f32, f32)> = Vec::new();
-            for (i, p, unit_top, rival) in conditional_time.into_iter() {
-                let linked = [i.wrapping_sub(1), i + 1].iter().any(|k| {
-                    parts.iter().any(|(j, q)| {
-                        *j == *k
-                            && matches!(
-                                (q, &p),
-                                (ShipTimePart::Year(_), ShipTimePart::Month(_))
-                                    | (ShipTimePart::Month(_), ShipTimePart::Day(_))
-                            )
+            let mut rest: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
+            for (i, cands, unit_top, rival, lenient) in conditional_time.into_iter() {
+                let linked = cands
+                    .iter()
+                    .find(|p| {
+                        [i.wrapping_sub(1), i + 1].iter().any(|k| {
+                            parts.iter().any(|(j, q)| {
+                                *j == *k
+                                    && matches!(
+                                        (q, *p),
+                                        (ShipTimePart::Year(_), ShipTimePart::Month(_))
+                                            | (ShipTimePart::Month(_), ShipTimePart::Day(_))
+                                    )
+                            })
+                        })
                     })
-                });
-                if linked {
-                    roles[i] = ShipTokenRole::Temporal;
-                    logs.push(format!(
-                        "   🕒 [TIME UNIT / ADJACENT] \"{}\" → {:?} | 단위 cos {:.4} ≤ 경쟁 cos {:.4} 이지만 인접 시간 조각과 연→월→일 순서로 이어집니다.",
-                        cores[i], p, unit_top, rival
-                    ));
-                    parts.push((i, p));
-                    promoted = true;
-                } else {
-                    rest.push((i, p, unit_top, rival));
+                    .cloned();
+                match linked {
+                    Some(p) => {
+                        roles[i] = ShipTokenRole::Temporal;
+                        logs.push(format!(
+                            "   🕒 [TIME UNIT / ADJACENT] \"{}\" → {:?} | 단위 cos {:.4} 와 경쟁 cos {:.4} 로는 확정하지 못했지만, 가능한 해석 {:?} 중 인접 시간 조각과 연→월→일 순서로 이어지는 것을 채택합니다. 단위의 순서는 어휘가 아니라 달력 구조가 정합니다.",
+                            cores[i], p, unit_top, rival, cands
+                        ));
+                        parts.push((i, p));
+                        promoted = true;
+                    }
+                    None => rest.push((i, cands, unit_top, rival, lenient)),
                 }
             }
             conditional_time = rest;
@@ -2599,6 +2691,24 @@ impl crate::model::LogisModel {
             }
             year_like = rest_years;
             if !promoted { break; }
+        }
+        for (i, cands, unit_top, rival, lenient) in conditional_time.into_iter() {
+            let p = match cands.first() {
+                Some(p) if lenient => p.clone(),
+                _ => {
+                    logs.push(format!(
+                        "   ⚪ [TIME UNIT DROP] \"{}\" | 단위 cos {:.4} 가 경쟁 축 {:.4} 에 응집도 여유까지 내주었고 인접 연쇄도 없습니다. 시간 조각으로 쓰지 않습니다.",
+                        cores[i], unit_top, rival
+                    ));
+                    continue;
+                }
+            };
+            roles[i] = ShipTokenRole::Temporal;
+            logs.push(format!(
+                "   🕒 [TIME UNIT / ARGMAX FALLBACK] \"{}\" → {:?} | 인접 연쇄가 없어 단위 뱅크 1위 해석을 그대로 씁니다. (단위 cos {:.4} | 경쟁 최고 {:.4}) — 연쇄가 없는 단독 시간 토큰은 종전과 동일하게 처리해 리콜을 잃지 않습니다.",
+                cores[i], p, unit_top, rival
+            ));
+            parts.push((i, p));
         }
         parts.sort_by(|a, b| a.0.cmp(&b.0));
 

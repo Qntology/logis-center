@@ -2777,14 +2777,48 @@ async fn ai_search_complex(
             }
 
             if search_mode == "shipping" && !dexie_plans.is_empty() {
-                let docs: Vec<Value> = ranked_results
-                    .iter()
-                    .filter_map(|r| match r.get("text") {
+                let has_hard = dexie_plans.iter().any(|p| {
+                    p.get("conditions")
+                        .and_then(|c| c.as_array())
+                        .map_or(false, |a| !a.is_empty())
+                });
+                let mut docs: Vec<Value> = Vec::new();
+                let mut hydrated = 0usize;
+                let mut unresolved = 0usize;
+                for r in ranked_results.iter() {
+                    let inline = match r.get("text") {
                         Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
                         Some(v) if v.is_object() => Some(v.clone()),
                         _ => None,
-                    })
-                    .collect();
+                    };
+                    if let Some(d) = inline {
+                        docs.push(d);
+                        continue;
+                    }
+                    if !has_hard { continue; }
+                    let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() {
+                        unresolved += 1;
+                        continue;
+                    }
+                    let fetched = match store_opt.as_ref() {
+                        Some(store) => store.get_item_by_id("items", id).await.ok().flatten(),
+                        None => None,
+                    };
+                    match fetched.and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok()) {
+                        Some(d) => {
+                            docs.push(d);
+                            hydrated += 1;
+                        }
+                        None => unresolved += 1,
+                    }
+                }
+                if hydrated > 0 || unresolved > 0 {
+                    println!(
+                        "[AI-SEARCH] 🧬 [DOC HYDRATE] 청크로만 회수된 행은 text 자리에 문장 한 줄이 들어 있어 JSON 파싱이 실패합니다. 저장본에서 {}건을 복원했고 {}건은 복원하지 못했습니다. 이 복원이 없으면 청크가 유일한 회수 경로인 질의에서 리콜 집계가 0건이 되어, 조건이 전부 걸러낸 것인지 애초에 회수가 안 된 것인지를 구분할 수 없습니다.",
+                        hydrated, unresolved
+                    );
+                }
                 for plan in dexie_plans.iter() {
                     let types: Vec<String> = plan
                         .get("types")
@@ -2828,21 +2862,39 @@ async fn ai_search_complex(
                     );
                     if all_pass == 0 && eligible > 0 && !per_field.is_empty() {
                         let corpus = crate::utils::score_dynamics::storage_doc_count(&types);
+                        let plan_alts = plan.get("alternates").cloned().unwrap_or(json!({}));
+                        let present_in_recall = |f: &str| -> usize {
+                            let mut axes: Vec<String> = vec![f.to_string()];
+                            if let Some(arr) = plan_alts.get(f).and_then(|v| v.as_array()) {
+                                for a in arr.iter() {
+                                    if let Some(s) = a.as_str() { axes.push(s.to_string()); }
+                                }
+                            }
+                            docs.iter()
+                                .filter(|d| {
+                                    axes.iter().any(|k| {
+                                        d.get(k.as_str()).map_or(false, |v| {
+                                            !(v.is_null()
+                                                || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                                        })
+                                    })
+                                })
+                                .count()
+                        };
                         let mut gap: Vec<String> = Vec::new();
                         let mut narrow: Vec<String> = Vec::new();
                         for (field, _satisfied, blocked) in per_field.iter() {
                             if *blocked == 0 { continue; }
-                            match crate::utils::score_dynamics::storage_fill_prior(&types, field) {
-                                Some((p, filled, docs)) => {
+                            let here = present_in_recall(field);
+                            let prior = match crate::utils::score_dynamics::storage_fill_prior(&types, field) {
+                                Some((p, filled, prior_docs)) => {
                                     crate::utils::score_dynamics::record_baseline("search.blocker_fill", p);
-                                    if filled * 2 < docs {
-                                        gap.push(format!("{}(저장 {}/{}건 · 사전 {:.3})", field, filled, docs, p));
-                                    } else {
-                                        narrow.push(format!("{}(저장 {}/{}건 · 사전 {:.3})", field, filled, docs, p));
-                                    }
+                                    format!("이력 {}/{}건 · 사전 {:.3}", filled, prior_docs, p)
                                 }
-                                None => narrow.push(format!("{}(저장 관측 미달)", field)),
-                            }
+                                None => "이력 없음".to_string(),
+                            };
+                            let line = format!("{}(이번 회수 {}/{}건 · {})", field, here, docs.len(), prior);
+                            if here == 0 { gap.push(line); } else { narrow.push(line); }
                         }
                         println!(
                             "[AI-SEARCH] ⚠️ [OVER-FILTER] 서식 범위 안 문서 {}건 중 하드 조건을 전부 만족하는 문서가 없습니다. (같은 서식 저장본 {}건 기준)",
@@ -2850,13 +2902,13 @@ async fn ai_search_complex(
                         );
                         if !gap.is_empty() {
                             println!(
-                                "[AI-SEARCH] 🕳️ [STORAGE GAP] 문서가 조건을 못 맞춘 것이 아니라 저장본에 필드 자체가 없습니다. 하드에서 내려야 할 축: {}",
+                                "[AI-SEARCH] 🕳️ [STORAGE GAP] 이번에 회수한 문서 어디에도 이 축이 저장되어 있지 않습니다. 값이 조건을 벗어난 것이 아니라 비교할 값 자체가 없으므로 하드에서 내려야 합니다: {}",
                                 gap.join(" | ")
                             );
                         }
                         if !narrow.is_empty() {
                             println!(
-                                "[AI-SEARCH] 🎯 [TOO NARROW] 저장본에는 충분히 있는데 값이 조건을 벗어났습니다. 질의 해석을 의심할 축: {}",
+                                "[AI-SEARCH] 🎯 [TOO NARROW] 회수한 문서에 이 축의 값이 실제로 들어 있는데 조건을 통과하지 못했습니다. 질의 해석(연산자·단위·자릿수)을 의심할 축: {}",
                                 narrow.join(" | ")
                             );
                         }

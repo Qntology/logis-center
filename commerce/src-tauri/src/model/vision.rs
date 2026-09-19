@@ -508,6 +508,87 @@ impl crate::model::LogisModel {
                                         }
                                     }
                                 }
+                                let dup_fields: Vec<(String, String)> = {
+                                    let mut seen: Vec<(String, String)> = Vec::new();
+                                    let mut dup: Vec<(String, String)> = Vec::new();
+                                    if let Some(o) = tile_json.as_object() {
+                                        for (k, v) in o.iter() {
+                                            let s = match v {
+                                                Value::String(s) => s.trim().to_string(),
+                                                Value::Number(n) => n.to_string(),
+                                                _ => continue,
+                                            };
+                                            if s.is_empty() || crate::model::merge::is_schema_echo(&s) { continue; }
+                                            if s.chars().filter(|c| c.is_alphanumeric()).count() < 2 { continue; }
+                                            if let Some((pk, pv)) = seen
+                                                .iter()
+                                                .find(|(_, x)| crate::model::merge::same_printed_value(x, &s))
+                                            {
+                                                if !dup.iter().any(|(dk, _)| dk == pk) {
+                                                    dup.push((pk.clone(), pv.clone()));
+                                                }
+                                                dup.push((k.clone(), s));
+                                                continue;
+                                            }
+                                            seen.push((k.clone(), s));
+                                        }
+                                    }
+                                    dup
+                                };
+                                if !dup_fields.is_empty() {
+                                    emit_term(&format!(
+                                        "    ♊ [INTRA-CROP DUPLICATE] [{}] 한 크롭 응답 안에서 같은 값이 서로 다른 축 {}개에 배정되었습니다: {:?} — 인쇄된 한 자리는 라벨을 하나만 가지므로 이 중 최대 하나만 참입니다. 각 축의 라벨만 따로 물어 확인합니다.",
+                                        plan.category,
+                                        dup_fields.len(),
+                                        dup_fields.iter().map(|(f, v)| format!("{}=\"{}\"", f, v)).collect::<Vec<_>>()
+                                    ));
+                                }
+                                for (field, value) in dup_fields.into_iter() {
+                                    let definition = crate::parsing::trade_field_definition(&language, &field);
+                                    let blind_prompt = crate::parsing::get_trade_blind_read_prompt(&detected_type, &field, &definition);
+                                    let blind_res = self.chat_with_qwen3_5_image_spinner(
+                                        "You are a highly precise document data extraction assistant.",
+                                        &blind_prompt,
+                                        Some(verify_crop.clone()),
+                                        app_handle,
+                                        "extraction-progress",
+                                        json!({
+                                            "category": format!("Vision (Duplicate {}/{})", idx + 1, plans.len()),
+                                            "summary": format!("Confirming {}...", field)
+                                        }),
+                                        96,
+                                        cancel_token.clone(),
+                                        Some(task_id.clone()),
+                                        None
+                                    ).await?;
+                                    let blind_value = crate::parsing::parse_json_from_llm(&blind_res)
+                                        .get("value")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .unwrap_or_default();
+                                    if crate::model::merge::same_printed_value(&value, &blind_value) {
+                                        crate::utils::score_dynamics::record_baseline("vision.dup_confirm", 1.0);
+                                        emit_term(&format!(
+                                            "    ✅ [DUPLICATE CONFIRMED] [{}] '{}' = \"{}\" | 이 축의 라벨만 물었을 때도 같은 값이 돌아옵니다. 이 자리에 이 축의 라벨이 실제로 인쇄되어 있습니다.",
+                                            plan.category, field, value
+                                        ));
+                                    } else {
+                                        crate::utils::score_dynamics::record_baseline("vision.dup_confirm", 0.0);
+                                        crate::utils::score_dynamics::record_field_seen(&field);
+                                        crate::utils::score_dynamics::record_field_reject(
+                                            &field,
+                                            crate::utils::score_dynamics::GateKind::Prejudice,
+                                        );
+                                        emit_term(&format!(
+                                            "    🚫 [DUPLICATE DROP] [{}] '{}' = \"{}\" | 이 축의 라벨만 물으면 \"{}\" 입니다. 같은 값을 나눠 가진 다른 축의 라벨을 보고 이 축까지 채운 것이므로 폐기합니다. 합이 총계와 맞아떨어지는 배분은 사후 검출이 불가능하므로 주장 시점에 끊어야 합니다.",
+                                            plan.category, field, value,
+                                            if blind_value.is_empty() { "null" } else { blind_value.as_str() }
+                                        ));
+                                        if let Some(o) = tile_json.as_object_mut() {
+                                            o.insert(field.clone(), Value::Null);
+                                        }
+                                    }
+                                }
                             }
                             record_claim_violations(
                                 &claimed,
@@ -557,8 +638,7 @@ impl crate::model::LogisModel {
                     }
 
                     {
-                        const FIELD_RECOVERY_BUDGET: usize = 4;
-                        const PEAK_VERIFY_BUDGET: usize = 3;
+                        let recovery_ceiling = plans.len().max(4);
                         let mut cands: Vec<(String, String, usize, f32)> = Vec::new();
                         let is_filled = |f: &str| -> bool {
                             final_data_map
@@ -653,39 +733,84 @@ impl crate::model::LogisModel {
                             .iter()
                             .cloned()
                             .partition(|(_, f, _, _)| verify_fields.iter().any(|v| v == f));
+                        let shared_peaks: Vec<usize> = {
+                            let mut count: std::collections::HashMap<usize, usize> =
+                                std::collections::HashMap::new();
+                            for hm in heatmaps.iter() {
+                                for (_, patch, _) in hm.field_peaks.iter() {
+                                    *count.entry(*patch).or_insert(0) += 1;
+                                }
+                            }
+                            count.into_iter().filter(|(_, n)| *n >= 2).map(|(p, _)| p).collect()
+                        };
+                        let (shared_cands, solo_cands): (Vec<_>, Vec<_>) = empty_cands
+                            .iter()
+                            .cloned()
+                            .partition(|(_, _, p, _)| shared_peaks.iter().any(|x| x == p));
+                        if !shared_cands.is_empty() {
+                            emit_term(&format!(
+                                "  🤝 [RECOVERY SHARED POOL] 봉우리를 다른 필드와 공유해 순위가 밀린 빈 필드 {}개에 별도 창 몫을 배정합니다: {:?} — 공유는 좌표 경쟁의 결과일 뿐 그 필드의 z 가 낮다는 뜻이 아닙니다. 한 줄로 세우면 공유 필드는 구조적으로 영원히 복구되지 않습니다.",
+                                shared_cands.len(),
+                                shared_cands.iter().map(|(_, f, _, z)| format!("{}(z {:+.2})", f, z)).take(8).collect::<Vec<_>>()
+                            ));
+                        }
+                        let budget_of = |list: &Vec<(String, String, usize, f32)>, label: &str| -> usize {
+                            if list.is_empty() { return 0; }
+                            let n = list.len() as f32;
+                            let mean = list.iter().map(|(_, _, _, z)| *z).sum::<f32>() / n;
+                            let sd = (list
+                                .iter()
+                                .map(|(_, _, _, z)| (*z - mean) * (*z - mean))
+                                .sum::<f32>()
+                                / n)
+                                .sqrt();
+                            let gate = mean + sd;
+                            let above = list.iter().filter(|(_, _, _, z)| *z >= gate).count();
+                            let picked = above.max(1).min(recovery_ceiling);
+                            emit_term(&format!(
+                                "    📐 [RECOVERY BUDGET / {}] 후보 {}개 | z 평균 {:+.3} + 표준편차 {:.3} = 게이트 {:+.3} | 게이트 통과 {}개 → 창 {}개 (상한 {}회는 이 문서가 이미 지불한 크롭 호출 수입니다)",
+                                label, list.len(), mean, sd, gate, above, picked, recovery_ceiling
+                            ));
+                            crate::utils::score_dynamics::record_baseline("vision.recovery_budget", picked as f32);
+                            picked
+                        };
                         let mut windows = crate::model::merge::plan_recovery_windows(
                             &verify_cands,
                             grid.grid_rows,
                             grid.grid_cols,
                             grid.orig_width,
                             grid.orig_height,
-                            PEAK_VERIFY_BUDGET,
+                            budget_of(&verify_cands, "PEAK VERIFY"),
                         );
-                        let taken: Vec<(u32, u32, u32, u32)> = windows.iter().map(|(b, _)| *b).collect();
-                        for w in crate::model::merge::plan_recovery_windows(
-                            &empty_cands,
-                            grid.grid_rows,
-                            grid.grid_cols,
-                            grid.orig_width,
-                            grid.orig_height,
-                            FIELD_RECOVERY_BUDGET,
-                        ) {
-                            if taken.iter().any(|b| *b == w.0) {
-                                emit_term(&format!(
-                                    "    ⛔ [RECOVERY WINDOW COLLIDE] 빈 필드 {:?} 의 창이 재검증 창과 같은 픽셀입니다. 같은 자리를 두 번 읽지 않도록 이 회차에서는 복구하지 않습니다.",
-                                    w.1.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
-                                ));
-                                continue;
+                        for (pool, pool_label) in [(&solo_cands, "EMPTY SOLO"), (&shared_cands, "EMPTY SHARED")] {
+                            let b = budget_of(pool, pool_label);
+                            if b == 0 { continue; }
+                            let taken: Vec<(u32, u32, u32, u32)> = windows.iter().map(|(bx, _)| *bx).collect();
+                            for w in crate::model::merge::plan_recovery_windows(
+                                pool,
+                                grid.grid_rows,
+                                grid.grid_cols,
+                                grid.orig_width,
+                                grid.orig_height,
+                                b,
+                            ) {
+                                if taken.iter().any(|bx| *bx == w.0) {
+                                    emit_term(&format!(
+                                        "    ⛔ [RECOVERY WINDOW COLLIDE] 빈 필드 {:?} 의 창이 이미 배정된 창과 같은 픽셀입니다. 같은 자리를 두 번 읽지 않도록 이 회차에서는 복구하지 않습니다.",
+                                        w.1.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
+                                    ));
+                                    continue;
+                                }
+                                windows.push(w);
                             }
-                            windows.push(w);
                         }
                         if windows.is_empty() {
                             emit_term("  ⚪ [FIELD RECOVERY] 비어 있으면서 자기 라벨 봉우리를 가진 필드가 없습니다.");
                         } else {
                             emit_term(&format!(
-                                "  🩺 [FIELD RECOVERY] 후보 {}개 (빈 필드 {} · 재검증 {}) | 창 하나에 필드 하나로 소형 크롭 {}개를 다시 읽습니다 (재검증 상한 {}회 + 빈 필드 상한 {}회).",
-                                cands.len(), empty_cands.len(), verify_cands.len(), windows.len(),
-                                PEAK_VERIFY_BUDGET, FIELD_RECOVERY_BUDGET
+                                "  🩺 [FIELD RECOVERY] 후보 {}개 (빈 필드 {} = 단독 {} + 공유 {} · 재검증 {}) | 창 하나에 필드 하나로 소형 크롭 {}개를 다시 읽습니다.",
+                                cands.len(), empty_cands.len(), solo_cands.len(), shared_cands.len(),
+                                verify_cands.len(), windows.len()
                             ));
                             let schema_fields: Vec<String> = crate::parsing::get_detail_schema_fields(&detected_type, "", &language)
                                 .into_iter()
@@ -693,6 +818,8 @@ impl crate::model::LogisModel {
                                 .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
                                 .collect();
                             let mut gate_banks: Option<Vec<(String, Vec<Vec<f32>>, Vec<f32>)>> = None;
+                            let mut label_evidence: std::collections::HashMap<String, f32> =
+                                std::collections::HashMap::new();
                             for (wi, (bbox, fields)) in windows.into_iter().enumerate() {
                                 if cancel_token
                                     .as_ref()
@@ -713,6 +840,7 @@ impl crate::model::LogisModel {
                                     twin_of: String::new(),
                                 };
                                 let micro = crate::models::siglip2::vision_crop::crop_region(&dynamic_image, &micro_plan, 512);
+                                let micro_verify = micro.clone();
                                 let defs: Vec<(String, String)> = fields
                                     .iter()
                                     .map(|(_, f, _)| (f.clone(), crate::parsing::trade_field_definition(&language, f)))
@@ -758,7 +886,7 @@ impl crate::model::LogisModel {
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.trim().to_string())
                                         .unwrap_or_default();
-                                    if value.is_empty() || label.is_empty() {
+                                    if value.is_empty() {
                                         if is_verify {
                                             emit_term(&format!(
                                                 "      ⚪ [VERIFY KEEP] {}.{} = \"{}\" | 봉우리 재판독이 비어 기존 값을 유지합니다.",
@@ -767,11 +895,55 @@ impl crate::model::LogisModel {
                                         } else {
                                             crate::utils::score_dynamics::record_baseline(&hit_axis, 0.0);
                                             emit_term(&format!(
-                                                "      ⚪ [RECOVERY NULL] {}.{} | 이 영역에 해당 라벨과 값이 없다고 답했습니다.",
+                                                "      ⚪ [RECOVERY NULL] {}.{} | 이 영역에 값이 없다고 답했습니다.",
                                                 cat, field
                                             ));
                                         }
                                         continue;
+                                    }
+                                    let mut blind_confirmed = false;
+                                    if label.is_empty() {
+                                        let definition = crate::parsing::trade_field_definition(&language, field);
+                                        let blind_prompt = crate::parsing::get_trade_blind_read_prompt(&detected_type, field, &definition);
+                                        let blind_res = self.chat_with_qwen3_5_image_spinner(
+                                            "You are a highly precise document data extraction assistant.",
+                                            &blind_prompt,
+                                            Some(micro_verify.clone()),
+                                            app_handle,
+                                            "extraction-progress",
+                                            json!({
+                                                "category": format!("Vision (Recovery Verify {})", wi + 1),
+                                                "summary": format!("Confirming {}...", field)
+                                            }),
+                                            96,
+                                            cancel_token.clone(),
+                                            Some(task_id.clone()),
+                                            None
+                                        ).await?;
+                                        let blind_value = crate::parsing::parse_json_from_llm(&blind_res)
+                                            .get("value")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.trim().to_string())
+                                            .unwrap_or_default();
+                                        if crate::model::merge::same_printed_token(&value, &blind_value) {
+                                            blind_confirmed = true;
+                                            crate::utils::score_dynamics::record_baseline("vision.labelless_confirm", 1.0);
+                                            emit_term(&format!(
+                                                "      ✅ [LABELLESS CONFIRMED] {}.{} = \"{}\" | 라벨을 읽지 못했지만 기대 필드명 없이 같은 창을 다시 읽어도 같은 토큰이 인쇄되어 있습니다. 라벨이 값과 다른 칸에 있거나 창 경계 밖일 뿐이므로 값을 버리지 않습니다.",
+                                                cat, field, value
+                                            ));
+                                        } else {
+                                            crate::utils::score_dynamics::record_baseline("vision.labelless_confirm", 0.0);
+                                            if !is_verify {
+                                                crate::utils::score_dynamics::record_baseline(&hit_axis, 0.0);
+                                            }
+                                            emit_term(&format!(
+                                                "      🚫 [LABELLESS DROP] {}.{} = \"{}\" | 라벨을 읽지 못했고, 기대 필드명 없이 다시 읽으면 \"{}\" 입니다. 인쇄되지 않은 값으로 보고 폐기합니다.",
+                                                cat, field, value,
+                                                if blind_value.is_empty() { "null" } else { blind_value.as_str() }
+                                            ));
+                                            continue;
+                                        }
                                     }
                                     if crate::model::merge::is_schema_echo(&value)
                                         || value.eq_ignore_ascii_case(&label)
@@ -803,7 +975,7 @@ impl crate::model::LogisModel {
                                         ));
                                         continue;
                                     }
-                                    if gate_banks.is_none() {
+                                    if !blind_confirmed && gate_banks.is_none() {
                                         let mut phr_all: Vec<String> = Vec::new();
                                         let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
                                         for f in schema_fields.iter() {
@@ -838,15 +1010,89 @@ impl crate::model::LogisModel {
                                         }
                                         gate_banks = Some(banks);
                                     }
-                                    let label_emb = self.get_embedding(label.clone()).await.unwrap_or_default();
-                                    let banks = gate_banks.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
-                                    let (ok, own, rival, rival_field) =
-                                        crate::model::merge::recovery_label_gate(&label_emb, field, banks);
+                                    let (ok, own, rival, rival_field) = if blind_confirmed {
+                                        (true, 0.0f32, 0.0f32, String::new())
+                                    } else {
+                                        let label_emb = self.get_embedding(label.clone()).await.unwrap_or_default();
+                                        let banks = gate_banks.as_ref().map(|b| b.as_slice()).unwrap_or(&[]);
+                                        crate::model::merge::recovery_label_gate(&label_emb, field, banks)
+                                    };
+                                    let evidence = if blind_confirmed {
+                                        "라벨 미판독 + 기대 필드명 없는 재판독 일치".to_string()
+                                    } else {
+                                        format!(
+                                            "라벨 \"{}\" (자기 중립점수 {:+.4} vs 최강 경쟁 '{}' {:+.4})",
+                                            label,
+                                            own,
+                                            if rival_field.is_empty() { "-" } else { rival_field.as_str() },
+                                            rival
+                                        )
+                                    };
                                     if !ok {
-                                        if !is_verify { crate::utils::score_dynamics::record_baseline(&hit_axis, 0.0); }
+                                        let fmt_ok = crate::utils::ai_utils::value_matches_format(
+                                            crate::utils::ai_utils::detect_field_format(&rival_field),
+                                            &value,
+                                        );
+                                        let in_schema = schema_fields.iter().any(|f| f == &rival_field);
+                                        if rival_field.is_empty() || !in_schema || !fmt_ok {
+                                            if !is_verify { crate::utils::score_dynamics::record_baseline(&hit_axis, 0.0); }
+                                            emit_term(&format!(
+                                                "      🚫 [RECOVERY LABEL GATE] {}.{} = \"{}\" | {} — 자기 필드가 argmax 가 아니고, 이길 필드로 옮길 수도 없어 폐기합니다. (스키마 소속 {} · 값 형식 {})",
+                                                cat, field, value, evidence, in_schema, fmt_ok
+                                            ));
+                                            continue;
+                                        }
+                                        let incumbent = final_data_map
+                                            .get(&rival_field)
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.trim().to_string())
+                                            .unwrap_or_default();
+                                        let incumbent_ev = label_evidence.get(&rival_field).copied();
+                                        if !incumbent.is_empty() {
+                                            if incumbent.eq_ignore_ascii_case(&value) {
+                                                emit_term(&format!(
+                                                    "      ⚪ [REROUTE SAME] {}.{} 의 값이 이미 '{}' 에 같은 문자열로 들어 있습니다. 중복 기록하지 않습니다.",
+                                                    cat, field, rival_field
+                                                ));
+                                                continue;
+                                            }
+                                            if incumbent_ev.map_or(false, |e| e >= rival) {
+                                                emit_term(&format!(
+                                                    "      ⚪ [REROUTE KEEP] {}.{} = \"{}\" 를 '{}' 로 옮기려 했으나, 그 자리의 \"{}\" 가 더 강한 라벨 근거({:+.4} ≥ {:+.4})를 갖고 있어 유지합니다.",
+                                                    cat, field, value, rival_field, incumbent,
+                                                    incumbent_ev.unwrap_or(f32::MIN), rival
+                                                ));
+                                                continue;
+                                            }
+                                            grounding_claims.retain(|g| {
+                                                !(g.field == rival_field && g.value.eq_ignore_ascii_case(&incumbent))
+                                            });
+                                        }
+                                        let rcat = crate::logic::trade_field_category(&rival_field);
+                                        let write_cat = if rcat.is_empty() { cat.as_str() } else { rcat };
+                                        let mut rpatch = serde_json::Map::new();
+                                        rpatch.insert(rival_field.clone(), json!(value.clone()));
+                                        let rpatch = Value::Object(rpatch);
+                                        record_grounding_claims(&mut grounding_claims, write_cat, &rpatch, bbox);
+                                        final_data_map.insert(rival_field.clone(), json!(value.clone()));
+                                        if !rcat.is_empty() && !crate::logic::is_trade_array_category(rcat) {
+                                            let slot = final_data_map
+                                                .entry(rcat.to_string())
+                                                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                                            if let Some(o) = slot.as_object_mut() {
+                                                o.insert(rival_field.clone(), json!(value.clone()));
+                                            }
+                                        }
+                                        label_evidence.insert(rival_field.clone(), rival);
+                                        crate::utils::score_dynamics::record_field_seen(&rival_field);
+                                        crate::utils::score_dynamics::record_field_assigned(&rival_field, rival);
+                                        crate::utils::score_dynamics::record_confusion(&rival_field, field, rival - own);
+                                        crate::utils::score_dynamics::record_baseline("vision.recovery_reroute", 1.0);
                                         emit_term(&format!(
-                                            "      🚫 [RECOVERY LABEL GATE] {}.{} = \"{}\" | 읽힌 라벨 \"{}\" 의 코사인: 자기 {:.4} vs '{}' {:.4} — 다른 필드의 라벨로 판정되어 폐기합니다.",
-                                            cat, field, value, label, own, rival_field, rival
+                                            "      🔀 [RECOVERY REROUTE] {}.{} 가 아니라 '{}' 로 확정합니다. 값 \"{}\" | {} | 이전 값 \"{}\" (근거 {}) — 읽힌 라벨이 가리키는 필드가 정답이고, 그 자리에 라벨 근거 없이 먼저 들어온 값은 교체 대상입니다.",
+                                            cat, field, rival_field, value, evidence,
+                                            if incumbent.is_empty() { "없음" } else { incumbent.as_str() },
+                                            match incumbent_ev { Some(e) => format!("{:+.4}", e), None => "없음".to_string() }
                                         ));
                                         continue;
                                     }
@@ -863,18 +1109,20 @@ impl crate::model::LogisModel {
                                         if let Some(o) = slot.as_object_mut() {
                                             o.insert(field.clone(), json!(value.clone()));
                                         }
+                                        label_evidence.insert(field.clone(), own);
                                         emit_term(&format!(
-                                            "      🔁 [VERIFY REPLACED] {}.{}: \"{}\" → \"{}\" | 라벨 \"{}\" (자기 cos {:.4} vs 최강 경쟁 '{}' {:.4})",
-                                            cat, field, current, value, label, own, rival_field, rival
+                                            "      🔁 [VERIFY REPLACED] {}.{}: \"{}\" → \"{}\" | {}",
+                                            cat, field, current, value, evidence
                                         ));
                                         continue;
                                     }
                                     crate::utils::score_dynamics::record_baseline(&hit_axis, 1.0);
                                     record_grounding_claims(&mut grounding_claims, cat, &patch, bbox);
                                     merge_extracted(&mut final_data_map, cat, &patch, &emit_term);
+                                    label_evidence.insert(field.clone(), own);
                                     emit_term(&format!(
-                                        "      ✅ [RECOVERED] {}.{} = \"{}\" | 라벨 \"{}\" (자기 cos {:.4} vs 최강 경쟁 '{}' {:.4})",
-                                        cat, field, value, label, own, rival_field, rival
+                                        "      ✅ [RECOVERED] {}.{} = \"{}\" | {}",
+                                        cat, field, value, evidence
                                     ));
                                 }
                             }
@@ -1059,6 +1307,99 @@ impl crate::model::LogisModel {
                     &language,
                     &emit_term,
                 );
+
+                {
+                    let survivors: Vec<crate::models::siglip2::value_grounding::GroundingClaim> =
+                        grounding_claims
+                            .iter()
+                            .filter(|c| {
+                                !verdicts.iter().any(|v| {
+                                    !v.accepted && v.field == c.field && v.value.trim() == c.value.trim()
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                    if survivors.is_empty() {
+                        emit_term("  ⚪ [VALUE GROUNDING v1 SKIP] v2 를 통과한 주장이 없어 패치 코사인 관측을 건너뜁니다.");
+                    } else {
+                        emit_term(&format!(
+                            "  🔬 [VALUE GROUNDING v1 / OBSERVE] v2 를 통과한 {}건을 패치 코사인으로 한 번 더 관측합니다. v2 는 출처 사각형 안에 글자가 있는지만 세므로 그 자리에 인쇄되지 않은 문자열도 통과합니다. 이번 회차는 관측만 하고 값을 폐기하지 않습니다. (Qwen3.5 반환 + SigLIP2 텍스트 인코더 1회 부착 비용이 듭니다)",
+                            survivors.len()
+                        ));
+                        self.deep_purge_resources().await;
+                        let ready = self.ensure_siglip2_ext(false, true).await;
+                        let probe = match ready {
+                            Err(e) => Err(e),
+                            Ok(_) => {
+                                self.with_siglip_text("value grounding v1 (stage 6)", |m| {
+                                    Ok(crate::models::siglip2::value_grounding::verify_claims(
+                                        &survivors,
+                                        &grid.patches,
+                                        grid.grid_rows,
+                                        grid.grid_cols,
+                                        grid.orig_width,
+                                        grid.orig_height,
+                                        &legibility,
+                                        |t| {
+                                            crate::models::siglip2::vision_encoder::encode_phrases_ephemeral(
+                                                m,
+                                                &[t.to_string()],
+                                            )
+                                            .ok()
+                                            .and_then(|v| v.into_iter().next())
+                                            .unwrap_or_default()
+                                        },
+                                        &emit_term,
+                                    ))
+                                })
+                                .await
+                            }
+                        };
+                        self.release_siglip2("value grounding v1 observe complete").await;
+                        match probe {
+                            Ok(list) => {
+                                let mut would_drop: Vec<String> = Vec::new();
+                                let mut held = 0usize;
+                                for v in list.iter() {
+                                    if v.reason.contains("보류") {
+                                        held += 1;
+                                        continue;
+                                    }
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.grounding_v1_in",
+                                        v.surprisal_in,
+                                    );
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.grounding_v1_reject",
+                                        if v.accepted { 0.0 } else { 1.0 },
+                                    );
+                                    if !v.accepted {
+                                        would_drop.push(format!(
+                                            "{}.{}=\"{}\" (in {:+.4} / out {:+.4} / {})",
+                                            v.category, v.field, v.value, v.surprisal_in, v.surprisal_out, v.reason
+                                        ));
+                                    }
+                                }
+                                if would_drop.is_empty() {
+                                    emit_term(&format!(
+                                        "  ✅ [VALUE GROUNDING v1 / OBSERVE] 판정 {}건(보류 {}건) 전부 패치 코사인으로도 접지되었습니다. 이 문서에서는 폐기 게이트를 켜도 잃는 값이 없습니다.",
+                                        list.len().saturating_sub(held), held
+                                    ));
+                                } else {
+                                    emit_term(&format!(
+                                        "  👁️ [VALUE GROUNDING v1 / OBSERVE] 폐기 게이트를 켰다면 {}건이 사라졌을 것입니다: {:?} — 값을 실제로 버리기 전에 이 목록이 환각만 담고 있는지 사람이 확인해야 합니다. SigLIP2 가 짧은 고유명사를 패치와 대조하는 능력은 이 코드베이스에서 측정된 적이 없습니다.",
+                                        would_drop.len(),
+                                        would_drop.iter().take(8).collect::<Vec<_>>()
+                                    ));
+                                }
+                            }
+                            Err(e) => emit_term(&format!(
+                                "  ⚪ [VALUE GROUNDING v1 SKIP] SigLIP2 텍스트 인코더를 올리지 못해 관측을 건너뜁니다: {}",
+                                e
+                            )),
+                        }
+                    }
+                }
 
                 let dup_groups = crate::model::merge::cross_field_duplicate_groups(&grounding_claims, &verdicts);
                 if !dup_groups.is_empty() {

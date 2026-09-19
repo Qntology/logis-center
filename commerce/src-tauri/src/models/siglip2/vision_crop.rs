@@ -1900,6 +1900,32 @@ const TEXT_HEIGHT_CROP_FRACTION: f32 = 40.0;
 const TEXT_HEIGHT_CEIL_FRACTION: f32 = 3.0;
 const TEXT_HEIGHT_MIN_BANDS: usize = 4;
 
+fn band_measured_text_height(img: &DynamicImage, w: u32, h: u32) -> Option<f32> {
+    let mut band_h: Vec<f32> = text_row_bands(img, (0, 0, w, h))
+        .iter()
+        .map(|b| b.y1.saturating_sub(b.y0) as f32)
+        .filter(|v| *v > 0.0)
+        .collect();
+    if band_h.is_empty() {
+        println!("    📏 [TEXT HEIGHT / BAND MEASURED] 잉크 행 밴드가 0개입니다. 이 크롭에는 글자 행이 없으므로 추정을 포기합니다.");
+        return None;
+    }
+    band_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = band_h.len();
+    let picked = if n >= TEXT_HEIGHT_MIN_BANDS { band_h[n / 4] } else { band_h[0] };
+    let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
+    let ceil = (h as f32 / TEXT_HEIGHT_CEIL_FRACTION).max(floor);
+    let th = picked.max(floor).min(ceil);
+    crate::utils::score_dynamics::record_baseline("crop.text_height.band_only", th);
+    println!(
+        "    📏 [TEXT HEIGHT / BAND MEASURED] 잉크 행 밴드 {}개 | 채택 기준 {} | 실측 {:.1}px → 채택 {:.1}px (허용 {:.1}~{:.1}px, 크롭 높이 {}px). 자기상관 주기가 성립하지 않는 소형 크롭에서는 실측한 행 밴드 높이 자체가 글자 높이입니다.",
+        n,
+        if n >= TEXT_HEIGHT_MIN_BANDS { "하위 1/4" } else { "최솟값" },
+        picked, th, floor, ceil, h
+    );
+    Some(th)
+}
+
 fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     use image::GenericImageView;
     let g = img.to_luma8();
@@ -1929,10 +1955,10 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     let min_lag = ((TEXT_HEIGHT_FLOOR_PX / 0.6).ceil() as usize).max(4);
     if max_lag <= min_lag {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 크롭 높이 {}px 로는 탐색 구간(lag {}~{})이 성립하지 않습니다. 추정을 기각합니다.",
+            "    📏 [TEXT HEIGHT REJECT] 크롭 높이 {}px 로는 탐색 구간(lag {}~{})이 성립하지 않습니다. 실측 행 밴드로 폴백합니다.",
             h, min_lag, max_lag
         );
-        return None;
+        return band_measured_text_height(img, w, h);
     }
 
     let mut best_lag = 0usize;
@@ -1945,44 +1971,53 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
         let norm = s / (prof.len() - lag) as f32;
         if norm > best { best = norm; best_lag = lag; }
     }
-    if best_lag == 0 || best <= 0.0 { return None; }
+    if best_lag == 0 || best <= 0.0 {
+        println!("    📏 [TEXT HEIGHT REJECT] 자기상관 최댓값이 양수가 아닙니다. 실측 행 밴드로 폴백합니다.");
+        return band_measured_text_height(img, w, h);
+    }
 
     let coherence = best / var;
     if coherence < TEXT_HEIGHT_MIN_COHERENCE {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 자기상관 응집도 {:.3} < {:.2} (lag {}) — 주기가 노이즈 수준입니다. 추정을 기각하고 보수적 배율로 내려갑니다.",
+            "    📏 [TEXT HEIGHT REJECT] 자기상관 응집도 {:.3} < {:.2} (lag {}) — 주기가 노이즈 수준입니다. 실측 행 밴드로 폴백합니다.",
             coherence, TEXT_HEIGHT_MIN_COHERENCE, best_lag
         );
-        return None;
+        return band_measured_text_height(img, w, h);
     }
 
-    // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
     let th_pitch = best_lag as f32 * 0.6;
     let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
     let ceil = h as f32 / TEXT_HEIGHT_CEIL_FRACTION;
     if th_pitch < floor || th_pitch > ceil {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 기각합니다.",
+            "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 실측 행 밴드로 폴백합니다.",
             th_pitch, floor, ceil, h
         );
-        return None;
+        return band_measured_text_height(img, w, h);
     }
     let mut band_h: Vec<f32> = text_row_bands(img, (0, 0, w, h))
         .iter()
         .map(|b| b.y1.saturating_sub(b.y0) as f32)
         .filter(|v| *v > 0.0)
         .collect();
-    if band_h.len() < TEXT_HEIGHT_MIN_BANDS {
+    if band_h.is_empty() {
+        println!(
+            "    📏 [TEXT HEIGHT / PITCH ONLY] 잉크 행 밴드가 0개라 실측으로 교차 확인할 수 없습니다. 지배 주기가 말하는 높이 {:.1}px 를 그대로 채택합니다.",
+            th_pitch
+        );
         return Some(th_pitch);
     }
     band_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let low = band_h[band_h.len() / 4];
+    let n_band = band_h.len();
+    let low = if n_band >= TEXT_HEIGHT_MIN_BANDS { band_h[n_band / 4] } else { band_h[0] };
     let th = low.min(th_pitch).max(floor);
     crate::utils::score_dynamics::record_baseline("crop.text_height.band_ratio", low / th_pitch.max(1e-6));
     if th < th_pitch {
         println!(
-            "    📏 [TEXT HEIGHT / SMALLEST BAND] 잉크 행 밴드 {}개 | 하위 1/4 밴드 높이 {:.1}px | 지배 주기가 말하는 높이 {:.1}px → 채택 {:.1}px (하한 {:.1}px). 배율은 가장 작은 글자가 읽힐 때까지 올려야 하므로, 다수 본문의 주기만 보면 소형 라벨이 통째로 뭉개집니다.",
-            band_h.len(), low, th_pitch, th, floor
+            "    📏 [TEXT HEIGHT / SMALLEST BAND] 잉크 행 밴드 {}개 | 채택 기준 {} 밴드 높이 {:.1}px | 지배 주기가 말하는 높이 {:.1}px → 채택 {:.1}px (하한 {:.1}px). 배율은 가장 작은 글자가 읽힐 때까지 올려야 하므로, 다수 본문의 주기만 보면 소형 라벨이 통째로 뭉개집니다.",
+            n_band,
+            if n_band >= TEXT_HEIGHT_MIN_BANDS { "하위 1/4" } else { "최솟값" },
+            low, th_pitch, th, floor
         );
     }
     Some(th)
