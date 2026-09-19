@@ -728,9 +728,7 @@ fn ensure_identity_band_crop(
         title_row += 1;
     }
     let band_start = (title_row + 1).min(rows - 1);
-    let band_end = ((rows as f32 * 0.40) as usize)
-        .max(band_start + 1)
-        .min(rows - 1);
+    let band_end = identity_band_end_row(rows, band_start);
 
     let cw = grid.orig_width as f32 / cols as f32;
     let ch = grid.orig_height as f32 / rows as f32;
@@ -2758,6 +2756,31 @@ pub fn plan_row_tiles(
         x0, y0, x1, y1, picked.len(), total, hy0, hy1
     ));
     Some(out)
+}
+
+fn identity_band_end_row(rows: usize, band_start: usize) -> usize {
+    ((rows as f32 * 0.40) as usize)
+        .max(band_start + 1)
+        .min(rows.saturating_sub(1))
+}
+
+pub fn identity_band_bottom_px(grid: &PatchGrid) -> u32 {
+    let rows = grid.grid_rows.max(1);
+    let band_end = identity_band_end_row(rows, 1);
+    let ch = grid.orig_height as f32 / rows as f32;
+    (((band_end + 1) as f32) * ch).round() as u32
+}
+
+pub fn table_row_evidence(
+    img: &DynamicImage,
+    bbox: (u32, u32, u32, u32),
+) -> (usize, usize, usize, bool) {
+    let bands = text_row_bands(img, bbox);
+    let table = bands
+        .iter()
+        .filter(|b| b.col_clusters >= TABLE_BAND_MIN_COLS)
+        .count();
+    (table, bands.len(), TABLE_BAND_MIN_COLS, table >= ROW_TILE_MIN_BANDS)
 }
 
 pub fn plan_overlap_tiles(

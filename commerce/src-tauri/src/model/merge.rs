@@ -572,6 +572,116 @@ pub fn reconcile_monetary_axes(
     dropped
 }
 
+pub fn row_identity_fields(category: &str) -> &'static [&'static str] {
+    match category {
+        "items" => &["description"],
+        "containers" => &["container_number", "seal_number", "type_size"],
+        "other_parties" => &["party_name", "signatory_name"],
+        "charges" => &["charge_code", "charge_description"],
+        "account_ledger" => &["transaction_date", "debit", "credit"],
+        _ => &[],
+    }
+}
+
+pub fn closed_vocab_echo(value: &str, vocab: &[String]) -> bool {
+    let mut seen = false;
+    for tok in value.split(|c: char| !c.is_alphanumeric()) {
+        if tok.is_empty() { continue; }
+        seen = true;
+        if !vocab.iter().any(|v| same_printed_token(v, tok)) {
+            return false;
+        }
+    }
+    seen
+}
+
+pub fn reconcile_package_axes(
+    merged: &mut serde_json::Map<String, Value>,
+    emit: &dyn Fn(&str),
+) -> usize {
+    fn num_of(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let t: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                if !t.chars().any(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                t.parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    }
+    let total = merged
+        .get("cargo")
+        .and_then(|c| c.get("package_count"))
+        .and_then(num_of)
+        .or_else(|| merged.get("package_count").and_then(num_of));
+    let total = match total {
+        Some(t) if t > 0.0 => t,
+        _ => return 0,
+    };
+    let mut dropped = 0usize;
+    let mut removed = 0usize;
+    if let Some(rows) = merged.get_mut("containers").and_then(|v| v.as_array_mut()) {
+        for r in rows.iter_mut() {
+            let o = match r.as_object_mut() {
+                Some(o) => o,
+                None => continue,
+            };
+            let n = match o.get("container_package_count").and_then(num_of) {
+                Some(n) => n,
+                None => continue,
+            };
+            if n > total {
+                emit(&format!(
+                    "  🧮 [PACKAGE RECONCILE] containers.container_package_count = {} 가 문서 총 포장수 cargo.package_count = {} 를 넘습니다. 컨테이너 한 대의 포장수는 문서 총계의 부분이므로 총계를 넘을 수 없습니다. 이 자리에 인쇄된 것은 포장수가 아니라 다른 총계이므로 비웁니다.",
+                    n, total
+                ));
+                o.insert("container_package_count".to_string(), Value::Null);
+                crate::utils::score_dynamics::record_field_seen("container_package_count");
+                crate::utils::score_dynamics::record_field_reject(
+                    "container_package_count",
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
+                dropped += 1;
+            }
+        }
+        let before = rows.len();
+        rows.retain(|r| {
+            let o = match r.as_object() {
+                Some(o) => o,
+                None => return false,
+            };
+            let filled = |v: &Value| -> bool {
+                match v {
+                    Value::String(s) => !s.trim().is_empty() && !is_schema_echo(s),
+                    Value::Number(_) => true,
+                    _ => false,
+                }
+            };
+            row_identity_fields("containers")
+                .iter()
+                .any(|k| o.get(*k).map(|v| filled(v)).unwrap_or(false))
+        });
+        removed = before - rows.len();
+    }
+    if dropped > 0 || removed > 0 {
+        emit(&format!(
+            "  🧮 [PACKAGE RECONCILE] 포장수 축 {}건 비움 | 정체성을 잃은 컨테이너 행 {}건 제거",
+            dropped, removed
+        ));
+    }
+    crate::utils::score_dynamics::record_baseline(
+        "vision.package_reconcile",
+        (dropped + removed) as f32,
+    );
+    dropped + removed
+}
+
 pub fn is_schema_echo(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -1739,18 +1849,9 @@ pub fn merge_extracted(
                             _ => false,
                         }
                     };
-                    match category {
-                        "items" => filled("description"),
-                        "containers" => {
-                            filled("container_number") || filled("seal_number") || filled("type_size")
-                        }
-                        "other_parties" => filled("party_name") || filled("signatory_name"),
-                        "charges" => filled("charge_code") || filled("charge_description"),
-                        "account_ledger" => {
-                            filled("transaction_date") || filled("debit") || filled("credit")
-                        }
-                        _ => true,
-                    }
+                    let ids = row_identity_fields(category);
+                    if ids.is_empty() { return true; }
+                    ids.iter().any(|k| filled(k))
                 };
                 let scalars = |v: &Value| -> Vec<(String, String)> {
                     let o = match v.as_object() { Some(o) => o, None => return Vec::new() };

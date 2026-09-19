@@ -718,11 +718,18 @@ impl crate::model::LogisModel {
                 let (top, second) = (ranked[0], ranked[1]);
                 let coh = crate::utils::ai_utils::bank_internal_cohesion(&g_banks[second.0]);
                 if !crate::utils::ai_utils::prejudice_dominates(second.1, top.1, coh) {
-                    crate::utils::score_dynamics::record_confusion(&g_fields[top.0].0, &g_fields[second.0].0, top.1 - second.1);
-                    emit_term(&format!(
-                        "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 원점수로 판정하고 혼동 쌍으로 기록합니다.",
-                        winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
-                    ));
+                    if top.1 - second.1 < 0.005 {
+                        emit_term(&format!(
+                            "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 차이가 동률 게이트 안이라 혼동 사전에는 원점수 승자가 아니라 아래 재판정의 승자를 기록합니다. 원점수 승자를 먼저 기록하면 Phase 1 에서 틀린 승자가 결정론이 됩니다.",
+                            winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
+                        ));
+                    } else {
+                        crate::utils::score_dynamics::record_confusion(&g_fields[top.0].0, &g_fields[second.0].0, top.1 - second.1);
+                        emit_term(&format!(
+                            "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 원점수로 판정하고 혼동 쌍으로 기록합니다.",
+                            winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
+                        ));
+                    }
                 }
             }
             for (fi, a) in g_assign.iter().enumerate() {
@@ -738,6 +745,75 @@ impl crate::model::LogisModel {
                     }
                     scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
                     scored.truncate(6);
+                    let currency_bound = bound_nums[wi].iter().any(|n| !n.currency.is_empty());
+                    let tie_floor = scored.first().map(|s| s.2 - 0.005).unwrap_or(f32::MAX);
+                    let tied_total = scored.iter().filter(|(_, _, sc)| *sc >= tie_floor).count();
+                    let tied_monetary: Vec<String> = scored
+                        .iter()
+                        .filter(|(f, _, sc)| *sc >= tie_floor && ship_is_monetary(f))
+                        .map(|(f, _, _)| f.clone())
+                        .collect();
+                    let taken_elsewhere = tied_monetary
+                        .first()
+                        .map(|f| {
+                            g_fields
+                                .iter()
+                                .enumerate()
+                                .any(|(k, gf)| gf.0 == *f && k != fi && g_assign[k].is_some())
+                        })
+                        .unwrap_or(false);
+                    if currency_bound && tied_total > 1 && tied_monetary.len() == 1 && !taken_elsewhere {
+                        let field = tied_monetary[0].clone();
+                        let fcat = ship_field_category(&field).unwrap_or_else(|| g_fields[fi].1.clone());
+                        let own_sc = scored
+                            .iter()
+                            .find(|(f, _, _)| *f == field)
+                            .map(|(_, _, s)| *s)
+                            .unwrap_or(own);
+                        emit_term(&format!(
+                            "   💱 [D2 CURRENCY TIE-BREAK] \"{}\" | 동률 후보 {}개 {:?} 중 통화가 결속된 수치를 받을 수 있는 금전 축은 '{}' 하나뿐입니다. 통화 단위는 질의가 이미 확정한 근거이므로 LLM 재판정 없이 확정합니다.",
+                            winners[wi].text, tied_total,
+                            scored.iter().filter(|(_, _, sc)| *sc >= tie_floor).map(|(f, _, s)| format!("{}({:.4})", f, s)).collect::<Vec<_>>(),
+                            field
+                        ));
+                        match ship_make_assignment(
+                            &field, &fcat, &span_surface(wi),
+                            &bound_nums[wi], &bound_ids[wi], None, winners[wi].score >= d1_gate,
+                        ) {
+                            Some(assignment) => {
+                                for (f, _, sc) in scored.iter() {
+                                    if *f == field || *sc < tie_floor { continue; }
+                                    crate::utils::score_dynamics::record_confusion(&field, f, own_sc - *sc);
+                                }
+                                let (kind, op, value) = ship_apply_assignment(assignment, &mut conditions, &mut hints, &mut claimed_fields);
+                                if let Some(code) = ship_companion_currency(&field, &bound_nums[wi]) {
+                                    if !claimed_fields.contains("currency") {
+                                        conditions.insert("currency".to_string(), json!({ "operator": "contains", "value": code }));
+                                        claimed_fields.insert("currency".to_string());
+                                        emit_term(&format!(
+                                            "   💱 [CURRENCY COMPANION] {} 의 통화 단위 → currency contains '{}'",
+                                            field, code
+                                        ));
+                                    }
+                                }
+                                for i in winners[wi].start..winners[wi].end {
+                                    if i < consumed_span.len() { consumed_span[i] = true; }
+                                }
+                                for num in bound_nums[wi].iter() {
+                                    if num.token < consumed_span.len() { consumed_span[num.token] = true; }
+                                }
+                                done_span[wi] = true;
+                                crate::utils::score_dynamics::record_baseline("search.currency_tie_break", 1.0);
+                                emit_term(&format!(
+                                    "   🔗 [D2 ASSIGN / {} / VALUE-FIRST] \"{}\" ({}) → {}.{} {} '{}' | Score: {:+.4} | 근거: 통화 결속 동률 해소",
+                                    kind, winners[wi].text, winners[wi].category, fcat, field, op, value, own_sc
+                                ));
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+                    crate::utils::score_dynamics::record_baseline("search.currency_tie_break", 0.0);
                     d2_llm_pending.push((wi, g_fields[fi].1.clone(), scored));
                     done_span[wi] = true;
                     emit_term(&format!(
@@ -1013,35 +1089,174 @@ impl crate::model::LogisModel {
                 for num in bound_nums[wi].iter() {
                     if num.token < consumed_span.len() { consumed_span[num.token] = true; }
                 }
+                let picked_sc = scored
+                    .iter()
+                    .find(|(f, _, _)| *f == picked)
+                    .map(|(_, _, s)| *s)
+                    .unwrap_or(0.0);
+                for (f, _, sc) in scored.iter() {
+                    if *f == picked { continue; }
+                    crate::utils::score_dynamics::record_confusion(&picked, f, picked_sc - *sc);
+                }
                 emit_term(&format!(
-                    "   🤖 [D2 LLM / {}] \"{}\" → {} {} '{}'",
-                    kind, winners[wi].text, picked, op, value
+                    "   🤖 [D2 LLM / {}] \"{}\" → {} {} '{}' | 혼동 사전에 LLM 판정 승자로 기록 (후보 {}개)",
+                    kind, winners[wi].text, picked, op, value, scored.len()
                 ));
             }
         }
 
-        // 🌟 [HINT RESIDUAL] 힌트 값에서 라벨 토큰을 걷어내고 값 토큰만 남깁니다.
-        //
-        //  ── 실측 사고 ──
-        //   "중국에 제조" 스팬이 items.country_of_manufacture 로 배정되면서
-        //   힌트 값이 "중국에서 제조된" 이 되었습니다. 저장값은 "China" 입니다.
-        //   값 토큰(중국)과 라벨 토큰(제조된)이 한 문자열에 섞이면
-        //   다국어 임베딩이 China 와 연결되어야 할 신호가 라벨 쪽으로 희석되고,
-        //   청크 property 타겟 검색이 0건으로 떨어집니다. (실측 score +0.0479)
-        //   같은 회차에 값만 담긴 힌트(unit_price='10', amount='1500')는 둘 다 1건씩 확보했습니다.
-        //
-        //  ── 판정 근거 ──
-        //   라벨 뱅크는 label_phrase_bank(그 필드의 인쇄 라벨),
-        //   값 뱅크는 multilingual_value_anchor_phrases_scoped(그 필드 값의 의미 도메인)입니다.
-        //   둘 다 bias.json 이 이미 소유한 사전이므로 어떤 언어의 어휘도 코드에 등장하지 않습니다.
-        //   각 단어를 두 뱅크와 Max-Pool 로 비교해 값 뱅크가 이기는 단어만 남깁니다.
-        //
-        //  ── 왜 조건이 아니라 힌트만인가 ──
-        //   하드 조건은 Dexie 가 저장값과 직접 비교하므로 원문이 유지되어야 합니다.
-        //   힌트는 임베딩 코사인에만 쓰이므로 잔차화가 정확히 이득입니다.
-        //
-        //  ── 전부 탈락하면 손대지 않습니다 ──
-        //   잔차가 비면 조건 자체가 사라져 리콜을 잃습니다. 희석된 값이라도 있는 편이 낫습니다.
+        {
+            let orphan: Vec<usize> = (0..winners.len())
+                .filter(|&wi| {
+                    let w = &winners[wi];
+                    w.category != "hub"
+                        && bound_nums[wi].is_empty()
+                        && bound_ids[wi].is_empty()
+                        && w.score >= d1_gate
+                        && (w.start..w.end).all(|i| !consumed_span.get(i).copied().unwrap_or(false))
+                })
+                .collect();
+            if !orphan.is_empty() {
+                let mut g_label: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
+                let mut t_fields: Vec<(String, String, usize)> = Vec::new();
+                let mut t_value: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut t_prej: Vec<Vec<Vec<f32>>> = Vec::new();
+                for gcat in cat_order.iter() {
+                    if gcat == "hub" { continue; }
+                    for (fname, _, anchor) in crate::logic::trade_condition_fields(gcat).iter() {
+                        if g_label.iter().any(|(f, _, _)| f.as_str() == *fname) { continue; }
+                        let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
+                        if let Some((_, aliases)) = crate::parsing::TRADE_COLUMN_ALIASES.iter().find(|(f, _)| *f == *fname) {
+                            for a in aliases.iter() {
+                                let a = a.trim();
+                                if a.is_empty() || ph.iter().any(|p| p == a) { continue; }
+                                ph.push(a.to_string());
+                                wt.push(1.0);
+                            }
+                        }
+                        if ph.is_empty() { continue; }
+                        let le = self.get_embedding_batch(ph.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
+                        let gi = g_label.len();
+                        g_label.push((fname.to_string(), le, wt));
+                        if claimed_fields.contains(*fname) { continue; }
+                        if !matches!(
+                            crate::utils::ai_utils::query_value_format(fname),
+                            crate::utils::ai_utils::FieldFormat::Text | crate::utils::ai_utils::FieldFormat::Address
+                        ) {
+                            continue;
+                        }
+                        let vp = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped("shipping_doc", fname);
+                        if vp.is_empty() { continue; }
+                        let ve = self.get_embedding_batch(vp.clone()).await
+                            .unwrap_or_else(|_| vec![vec![0.0; 384]; vp.len()]);
+                        let pp = crate::utils::ai_utils::prejudice_phrase_bank(language, "shipping_doc", fname);
+                        let pe = if pp.is_empty() {
+                            Vec::new()
+                        } else {
+                            self.get_embedding_batch(pp.clone()).await
+                                .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
+                        };
+                        t_fields.push((fname.to_string(), gcat.clone(), gi));
+                        t_value.push(ve);
+                        t_prej.push(pe);
+                    }
+                }
+                if t_fields.is_empty() {
+                    emit_term(&format!(
+                        "   ⚪ [D2 TEXT-FIRST SKIP] 값 뱅크(multilingual_value_anchor)를 가진 자유서술 축이 없어, D1 게이트를 넘고도 필드를 얻지 못한 스팬 {}개를 그대로 둡니다: {:?}",
+                        orphan.len(),
+                        orphan.iter().map(|wi| winners[*wi].text.clone()).collect::<Vec<_>>()
+                    ));
+                } else {
+                    emit_term(&format!(
+                        "   📐 [D2 TEXT-FIRST] D1 게이트를 넘었지만 자기 카테고리에서 필드를 얻지 못한 자유서술 스팬 {}개를 카테고리 경계 없이 값 뱅크를 가진 Text/Address 필드 {}개와 경쟁시킵니다. 라벨 단어인지의 판정은 후보 축 하나가 아니라 스키마 전체 라벨 뱅크 {}개의 최고점과 비교합니다. 값 뱅크가 그 최고점을 넘지 못하는 스팬은 어느 축의 라벨을 말한 것이므로 필터로 만들지 않습니다.",
+                        orphan.len(), t_fields.len(), g_label.len()
+                    ));
+                    let mut o_embs: Vec<Vec<f32>> = Vec::with_capacity(orphan.len());
+                    for wi in orphan.iter() {
+                        let e = self.get_embedding(winners[*wi].text.clone()).await.unwrap_or(vec![0.0; 384]);
+                        o_embs.push(e);
+                    }
+                    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; orphan.len()]; t_fields.len()];
+                    let mut span_lab: Vec<(String, f32)> = vec![(String::new(), f32::MIN); orphan.len()];
+                    let mut best_val: Vec<(String, f32)> = vec![(String::new(), f32::MIN); orphan.len()];
+                    for si in 0..orphan.len() {
+                        let e = &o_embs[si];
+                        if e.iter().all(|&v| v == 0.0) { continue; }
+                        let mut lab_global = f32::MIN;
+                        let mut lab_field = String::new();
+                        for (f, le, wt) in g_label.iter() {
+                            let s = crate::utils::ai_utils::weighted_max_pool_sim(e, le, wt);
+                            if s > lab_global {
+                                lab_global = s;
+                                lab_field = f.clone();
+                            }
+                        }
+                        span_lab[si] = (lab_field, lab_global);
+                        for fi in 0..t_fields.len() {
+                            let val = crate::utils::ai_utils::max_pool_sim(e, &t_value[fi]);
+                            if val > best_val[si].1 {
+                                best_val[si] = (t_fields[fi].0.clone(), val);
+                            }
+                            if val <= lab_global { continue; }
+                            if !t_prej[fi].is_empty() {
+                                let prej = crate::utils::ai_utils::max_pool_sim(e, &t_prej[fi]);
+                                let coh = crate::utils::ai_utils::bank_internal_cohesion(&t_value[fi]);
+                                if crate::utils::ai_utils::prejudice_dominates(val, prej, coh) { continue; }
+                            }
+                            matrix[fi][si] = val;
+                        }
+                    }
+                    let assign = crate::utils::ai_utils::exclusive_assign_by_score(&matrix, 0.0, 0.0);
+                    let mut routed: Vec<bool> = vec![false; orphan.len()];
+                    for (fi, a) in assign.iter().enumerate() {
+                        let (si, own, margin) = match a { Some(v) => *v, None => continue };
+                        let wi = orphan[si];
+                        let (field, fcat, gi) = (t_fields[fi].0.clone(), t_fields[fi].1.clone(), t_fields[fi].2);
+                        let assignment = match ship_make_assignment(&field, &fcat, &span_surface(wi), &[], &[], None, true) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let lab_own = crate::utils::ai_utils::weighted_max_pool_sim(&o_embs[si], &g_label[gi].1, &g_label[gi].2);
+                        let (kind, op, value) = ship_apply_assignment(assignment, &mut conditions, &mut hints, &mut claimed_fields);
+                        for i in winners[wi].start..winners[wi].end {
+                            if i < consumed_span.len() { consumed_span[i] = true; }
+                        }
+                        routed[si] = true;
+                        crate::utils::score_dynamics::record_baseline("search.text_first_route", 1.0);
+                        emit_term(&format!(
+                            "   🔗 [D2 ASSIGN / {} / TEXT-FIRST] \"{}\" ({}) → {}.{} {} '{}' | 값 뱅크 {:.4} > 전 스키마 라벨 최고 '{}' {:.4} (자기 라벨 {:.4}) | Margin: {:+.4}",
+                            kind, winners[wi].text, winners[wi].category, fcat, field, op, value, own,
+                            span_lab[si].0, span_lab[si].1, lab_own, margin
+                        ));
+                    }
+                    for (si, wi) in orphan.iter().enumerate() {
+                        if routed[si] { continue; }
+                        crate::utils::score_dynamics::record_baseline("search.text_first_route", 0.0);
+                        let (lf, lg) = &span_lab[si];
+                        let (bf, bv) = &best_val[si];
+                        let lab_shown = if *lg == f32::MIN { 0.0 } else { *lg };
+                        let val_shown = if *bv == f32::MIN { 0.0 } else { *bv };
+                        let why = if *bv != f32::MIN && *bv <= *lg {
+                            format!("전 스키마 라벨 뱅크 최고 '{}' {:.4} 가 값 뱅크 최고 '{}' {:.4} 를 이겨 라벨을 말한 스팬으로 봅니다.", lf, lab_shown, bf, val_shown)
+                        } else {
+                            "값 뱅크 우세 축이 없거나 편견에 밀려 배정하지 않습니다.".to_string()
+                        };
+                        emit_term(&format!(
+                            "   ⚪ [D2 TEXT-FIRST ORPHAN] \"{}\" ({}) | 최고 값 뱅크 '{}' {:.4} | 전 스키마 라벨 최고 '{}' {:.4} — {}",
+                            winners[*wi].text, winners[*wi].category,
+                            if bf.is_empty() { "-" } else { bf.as_str() },
+                            val_shown,
+                            if lf.is_empty() { "-" } else { lf.as_str() },
+                            lab_shown,
+                            why
+                        ));
+                    }
+                }
+            }
+        }
+
         if !hints.is_empty() {
             let hint_fields: Vec<String> = hints.keys().cloned().collect();
             for field in hint_fields.into_iter() {
@@ -1158,7 +1373,14 @@ impl crate::model::LogisModel {
                         field, why
                     ));
                 }
-                if kept.is_empty() || dropped.is_empty() { continue; }
+                if dropped.is_empty() {
+                    emit_term(&format!(
+                        "   ⚪ [HINT RESIDUAL PASS] {} 힌트 값 \"{}\" 의 단어 {}개가 전부 값 뱅크 쪽으로 읽혀 걷어낼 라벨 토큰이 없습니다. 값 뱅크의 값 예시 문장 안에 라벨성 서술어가 함께 들어 있으면 그 단어가 값으로 읽혀 여기서 살아남습니다. 원문을 그대로 씁니다.",
+                        field, raw, words.len()
+                    ));
+                    continue;
+                }
+                if kept.is_empty() { continue; }
 
                 let residual = kept.join(" ");
                 emit_term(&format!(
@@ -2606,20 +2828,39 @@ impl crate::model::LogisModel {
             if !live.is_empty() {
                 let mut sorted: Vec<f32> = live.iter().map(|(_, _, m, _, _)| *m).collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let gaps: Vec<f32> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
                 let mut widest = 0.0f32;
-                let mut edge = f32::MAX;
-                for w in sorted.windows(2) {
-                    let g = w[1] - w[0];
-                    if g > widest { widest = g; edge = w[1]; }
+                let mut widest_at = usize::MAX;
+                for (gi, g) in gaps.iter().enumerate() {
+                    if *g > widest { widest = *g; widest_at = gi; }
                 }
+                let edge = if widest_at == usize::MAX { f32::MAX } else { sorted[widest_at + 1] };
+                let split_firm = {
+                    let rest: Vec<f32> = gaps
+                        .iter()
+                        .enumerate()
+                        .filter(|(gi, _)| *gi != widest_at)
+                        .map(|(_, g)| *g)
+                        .collect();
+                    if rest.len() < 3 {
+                        false
+                    } else {
+                        let n = rest.len() as f32;
+                        let mean = rest.iter().sum::<f32>() / n;
+                        let sd = (rest.iter().map(|g| (g - mean) * (g - mean)).sum::<f32>() / n).sqrt();
+                        sd > 1e-6 && widest - mean >= sd
+                    }
+                };
                 let cut = if sorted.len() >= 2 && widest > 1e-6 {
                     logs.push(format!(
-                        "   📐 [OPERATOR SPLIT] 후보 {}개의 '연산자 cos − 라벨 cos' 마진을 정렬해 가장 넓게 벌어진 자리에서 가릅니다. 마진 {:?} | 최대 격차 {:.4} → 기준 {:.4} 이상만 연산자로 남깁니다. 자기 z 의 평균+표준편차는 잡음 후보가 평균을 끌어올려 진짜 연산자까지 함께 기각합니다.",
+                        "   📐 [OPERATOR SPLIT] 후보 {}개의 '연산자 cos − 라벨 cos' 마진을 정렬해 가장 넓게 벌어진 자리에서 가릅니다. 마진 {:?} | 최대 격차 {:.4} → 기준 {:.4} 이상만 연산자로 남깁니다. 격차 이상치 판정: {} — 최대 격차가 나머지 격차의 평균+표준편차를 넘을 때만 이 분할이 '이 토큰이 연산자인가' 를 답한 것으로 보고, 그때는 뱅크 자체 변별로 아래 무리를 되살리지 않습니다.",
                         sorted.len(),
                         sorted.iter().map(|m| format!("{:.4}", m)).collect::<Vec<_>>(),
-                        widest, edge
+                        widest, edge,
+                        if split_firm { "성립" } else { "불성립(격차 표본 3개 미만 또는 평탄)" }
                     ));
                     crate::utils::score_dynamics::record_baseline("search.role.op_split_gap", widest);
+                    crate::utils::score_dynamics::record_baseline("search.role.op_split_firm", if split_firm { 1.0 } else { 0.0 });
                     edge
                 } else {
                     logs.push(
@@ -2627,33 +2868,33 @@ impl crate::model::LogisModel {
                     );
                     f32::MAX
                 };
+                let cut_shown = if cut == f32::MAX { "없음".to_string() } else { format!("{:+.4}", cut) };
                 for (i, z, margin, self_evident, key) in live.into_iter() {
                     let by_split = margin >= cut;
-                    let by_self = self_evident && margin > 0.0;
-                    if self_evident && !by_self && !by_split {
-                        logs.push(format!(
-                            "   ↩️ [OPERATOR SELF-EVIDENCE REJECT] \"{}\" | 연산자 뱅크 안에서는 '{}' 가 1·2위 격차로 앞서지만(자기 z {:+.3}), 라벨 뱅크 대비 마진이 {:+.4} 로 양수가 아닙니다. 뱅크 자체 변별은 '연산자 중 어느 것인가' 만 답하지 '이 토큰이 연산자인가' 를 답하지 않습니다. 내용어로 되돌립니다.",
-                            cores[i], key, z, margin
-                        ));
-                    }
+                    let by_self = !split_firm && self_evident && margin > 0.0;
                     if by_split || by_self {
                         logs.push(format!(
-                            "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 마진 {:+.4} (기준 {:+.4}) | 자기 z {:+.3} | 근거: {} — 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
-                            cores[i], key, margin, cut, z,
-                            match (by_split, by_self) {
-                                (true, true) => "분포 분할 + 뱅크 자체 변별 + 라벨 대비 우위",
-                                (true, false) => "분포 분할",
-                                _ => "뱅크 자체 변별 + 라벨 대비 우위(분할에서는 탈락)",
-                            },
+                            "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 마진 {:+.4} (기준 {}) | 자기 z {:+.3} | 근거: {} — 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
+                            cores[i], key, margin, cut_shown, z,
+                            if by_split { "분포 분할" } else { "분할이 이상치로 성립하지 않아 뱅크 자체 변별 + 라벨 대비 우위로 판정" },
                             op_keys.len()
                         ));
                         continue;
                     }
                     roles[i] = ShipTokenRole::Content;
-                    crate::utils::score_dynamics::record_confusion(&key, &cores[i], cut - margin);
+                    if cut != f32::MAX {
+                        crate::utils::score_dynamics::record_confusion(&key, &cores[i], cut - margin);
+                    }
+                    let why = if margin <= 0.0 {
+                        "라벨 뱅크 대비 마진이 양수가 아닙니다".to_string()
+                    } else if self_evident {
+                        format!("연산자 뱅크 안에서는 '{}' 가 1·2위 격차로 앞서지만, 분포 분할이 이상치로 성립한 뒤에는 그 분할이 '이 토큰이 연산자인가' 를 답하고 뱅크 자체 변별은 '연산자 중 어느 것인가' 만 답합니다", key)
+                    } else {
+                        "뱅크 자체 변별도 없습니다".to_string()
+                    };
                     logs.push(format!(
-                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 마진 {:+.4} < 기준 {:+.4} 이고 뱅크 자체 변별도 없습니다 (자기 z {:+.3}) — 연산자 어휘 전체와 두루 비슷할 뿐 어느 하나를 배타적으로 가리키지 못하므로 내용어로 되돌립니다.",
-                        cores[i], margin, cut, z
+                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 마진 {:+.4} < 기준 {} | 자기 z {:+.3} | {} — 내용어로 되돌립니다.",
+                        cores[i], margin, cut_shown, z, why
                     ));
                 }
             }
