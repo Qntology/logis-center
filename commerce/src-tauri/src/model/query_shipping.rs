@@ -1100,28 +1100,50 @@ impl crate::model::LogisModel {
                     }
                     if lab.len() < 2 { continue; }
                     lab.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let tail: Vec<f32> = lab[1..].iter().map(|(_, s)| *s).collect();
-                    let n = tail.len() as f32;
-                    let mean = tail.iter().sum::<f32>() / n;
-                    let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
-                    if sd <= 1e-6 || lab[0].1 - mean < sd {
+
+                    // 🌟 [SMALL POOL FALLBACK] 단어가 둘뿐이면 꼬리가 1개라 표준편차가 0 이고,
+                    //    '평균 + 표준편차' 게이트는 수학적으로 절대 통과하지 못합니다.
+                    //    실측: "중국에서 제조된" → 최고 0.8295, 나머지 평균 0.6680, 표준편차 0.0000 → 기각.
+                    //    라벨 토큰이 값에 붙은 채 청크 검색에 들어가 STAGE-4C 가 0건이 되었습니다.
+                    //    이 코드베이스는 RECOVERY BUDGET 과 OPERATOR SPLIT 에서 이미 같은 판단을 했습니다:
+                    //    원소가 둘뿐인 풀에서 자기 분포 이상치 판정은 정의되지 않으므로,
+                    //    '엄격한 argmax' 라는 더 약하지만 성립하는 근거로 대체합니다.
+                    //    잔차가 비면 어차피 아래에서 원문을 유지하므로 값을 잃을 위험이 없습니다.
+                    let (decisive, why) = if lab.len() >= 3 {
+                        let tail: Vec<f32> = lab[1..].iter().map(|(_, s)| *s).collect();
+                        let n = tail.len() as f32;
+                        let mean = tail.iter().sum::<f32>() / n;
+                        let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
+                        if sd <= 1e-6 {
+                            (lab[0].1 > lab[1].1,
+                             format!("꼬리 표준편차가 0 이라 엄격 argmax 로 판정 (1위 {:.4} vs 2위 {:.4})", lab[0].1, lab[1].1))
+                        } else {
+                            (lab[0].1 - mean >= sd,
+                             format!("자기 분포 이상치 (1위 {:.4} vs 나머지 평균 {:.4} + 표준편차 {:.4})", lab[0].1, mean, sd))
+                        }
+                    } else {
+                        (lab[0].1 > lab[1].1,
+                         format!("후보가 {}개뿐이라 분포 판정 불가 → 엄격 argmax (1위 {:.4} vs 2위 {:.4})", lab.len(), lab[0].1, lab[1].1))
+                    };
+
+                    if !decisive {
                         emit_term(&format!(
-                            "   ⚪ [HINT RESIDUAL SKIP] {} 의 값 뱅크가 bias.json 에 없어 라벨 뱅크 자기 분포로만 판정했으나, 최고 라벨 유사도 {:.4} 가 나머지 평균 {:.4} 에서 표준편차 {:.4} 만큼 떨어지지 못했습니다. 어느 단어가 라벨인지 단정할 근거가 없으므로 원문을 그대로 씁니다.",
-                            field, lab[0].1, mean, sd
+                            "   ⚪ [HINT RESIDUAL SKIP] {} 의 값 뱅크가 bias.json 에 없어 라벨 뱅크만으로 판정했으나 근거가 서지 않습니다. {} — 어느 단어가 라벨인지 단정할 수 없으므로 원문을 그대로 씁니다.",
+                            field, why
                         ));
                         continue;
                     }
                     let li = lab[0].0;
                     for (i, w) in words.iter().enumerate() {
                         if i == li {
-                            dropped.push(format!("{}(라벨 {:.4} vs 나머지 평균 {:.4} + 표준편차 {:.4})", w, lab[0].1, mean, sd));
+                            dropped.push(format!("{}({})", w, why));
                         } else {
                             kept.push(w.clone());
                         }
                     }
                     emit_term(&format!(
-                        "   🧪 [HINT RESIDUAL / LABEL OUTLIER] {} 는 bias.json 의 multilingual_value_anchor 에 이 서식용 값 축이 없어 값 뱅크를 세울 수 없습니다. 대신 라벨 뱅크와의 유사도가 자기 분포에서 이상치인 단어 하나만 라벨로 보고 걷어냅니다. 값 뱅크가 없다는 이유로 잔차화를 통째로 건너뛰면, 값과 라벨이 섞인 문자열이 그대로 청크 검색에 들어가 신호가 희석됩니다.",
-                        field
+                        "   🧪 [HINT RESIDUAL / LABEL OUTLIER] {} 는 bias.json 의 multilingual_value_anchor 에 이 서식용 값 축이 없어 값 뱅크를 세울 수 없습니다. 대신 라벨 뱅크와의 유사도가 가장 높은 단어 하나만 라벨로 보고 걷어냅니다. 근거: {}. 값 뱅크가 없다는 이유로 잔차화를 통째로 건너뛰면, 값과 라벨이 섞인 문자열이 그대로 청크 검색에 들어가 신호가 희석됩니다.",
+                        field, why
                     ));
                 }
                 if kept.is_empty() || dropped.is_empty() { continue; }

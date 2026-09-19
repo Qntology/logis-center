@@ -479,14 +479,26 @@ fn purge_self_poisoned_anchors(
 
     let mut out: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::with_capacity(banks.len());
     let mut dropped: Vec<String> = Vec::new();
+    // 🌟 [OVER-PURGE DIAGNOSTIC] 필드별 제거 비율을 남깁니다.
+    //    SDS 의 vision.anchor_self_poison 은 총합만 기록하므로
+    //    '어느 필드가 뱅크를 잃었는가' 를 로그로 복원할 수 없었습니다.
+    //    D-4(총중량이 순중량에 밀림)의 원인이 이 정화인지 아닌지를
+    //    다음 회차에서 판정하려면 필드 단위 수치가 반드시 있어야 합니다.
+    let mut per_field: Vec<(String, usize, usize)> = Vec::new();
 
     for (fi, (fname, bank, weights)) in banks.iter().enumerate() {
         let own_head = match heads[fi] { Some(h) => h, None => {
             out.push((fname.clone(), bank.clone(), weights.clone()));
             continue;
         }};
+        // 🌟 [COHESION RELIEF] 절대 대소(rival > own)는 여유가 0이라,
+        //    동의어가 촘촘한 뱅크일수록 구조적으로 더 많이 잘립니다.
+        //    편견 게이트가 이미 같은 문제를 bank_internal_cohesion 여유로 풀었으므로
+        //    그 판정기를 그대로 씁니다. 새 상수가 생기지 않고 정화가 보수적으로 바뀝니다.
+        let own_cohesion = crate::utils::ai_utils::bank_internal_cohesion(bank);
         let mut kept_bank: Vec<Vec<f32>> = Vec::with_capacity(bank.len());
         let mut kept_w: Vec<f32> = Vec::with_capacity(weights.len());
+        let mut cut = 0usize;
 
         for (pi, e) in bank.iter().enumerate() {
             if e.iter().all(|&v| v == 0.0) { continue; }
@@ -505,16 +517,20 @@ fn purge_self_poisoned_anchors(
                 let s = cosine_similarity(e, h);
                 if s > rival { rival = s; rival_name = banks[gi].0.clone(); }
             }
-            if rival > own {
+            if rival > f32::MIN
+                && crate::utils::ai_utils::prejudice_dominates(own, rival, own_cohesion)
+            {
+                cut += 1;
                 dropped.push(format!(
-                    "{}←구{} (자기 '{}' {:.4} < '{}' {:.4})",
-                    fname, pi, fname, own, rival_name, rival
+                    "{}←구{} (자기 '{}' {:.4} × (1+{:.3}) < '{}' {:.4})",
+                    fname, pi, fname, own, own_cohesion.clamp(0.0, 0.5), rival_name, rival
                 ));
                 continue;
             }
             kept_bank.push(e.clone());
             kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
         }
+        if cut > 0 { per_field.push((fname.clone(), cut, bank.len())); }
 
         if kept_bank.is_empty() {
             out.push((fname.clone(), bank.clone(), weights.clone()));
@@ -527,10 +543,21 @@ fn purge_self_poisoned_anchors(
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
+            per_field.sort_by(|a, b| {
+                (b.1 as f32 / b.2.max(1) as f32)
+                    .partial_cmp(&(a.1 as f32 / a.2.max(1) as f32))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             println!(
-                "      🧹 [ANCHOR SELF-POISON] 자기 필드 대표 구보다 다른 필드 대표 구에 더 가까운 앵커 구 {}개를 그 필드 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 필드가 이기므로, 다른 필드의 이름을 품은 구는 그 필드를 대신 설명해 1·2위를 뒤집습니다. (뱅크는 회차 내 불변이므로 첫 정화만 출력합니다)",
+                "      🧹 [ANCHOR SELF-POISON] 자기 필드 대표 구보다 다른 필드 대표 구가 응집도 여유까지 넘어서 설명하는 앵커 구 {}개를 그 필드 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 필드가 이기므로, 다른 필드의 이름을 품은 구는 그 필드를 대신 설명해 1·2위를 뒤집습니다. (뱅크는 회차 내 불변이므로 첫 정화만 출력합니다)",
                 dropped.len(),
                 dropped.iter().take(8).collect::<Vec<_>>()
+            );
+            println!(
+                "      📉 [SELF-POISON BY FIELD] 제거 비율이 높은 필드: {:?} — 한 필드가 자기 뱅크의 절반 이상을 잃으면 그 축은 이후 모든 라벨 경쟁에서 구조적으로 불리해집니다. 총합만 보면 이 편향이 보이지 않습니다.",
+                per_field.iter().take(10)
+                    .map(|(f, c, t)| format!("{}({}/{})", f, c, t))
+                    .collect::<Vec<_>>()
             );
         }
         crate::utils::score_dynamics::record_baseline(
@@ -594,6 +621,46 @@ pub fn recovery_label_gate(
         })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 🌟 [DISCRIMINATIVE TIE-BREAK / 일반화]
+    //
+    //  ── 왜 '2위가 자기 필드일 때' 라는 조건을 뗐는가 ──
+    //   구버전은 자기 필드가 2위일 때만 재검사했습니다. 그래서 argmax 자체가 틀린 경우,
+    //   즉 자기 필드가 3위 이하로 밀렸거나 애초에 argmax 를 조회하는 호출(field="")에서는
+    //   한 번도 발화하지 못했습니다.
+    //   실측: 라벨 "TOTAL WEIGHT" 의 argmax 가 item_net_weight, 2위가 weight_net 이고
+    //   정답인 weight_gross 는 둘 다에 밀렸습니다. 세 뱅크 모두 'weight' 성분을 공유하므로
+    //   승패를 가른 것은 변별력이 아니라 공유분의 미세차입니다.
+    //
+    //  ── 왜 임계값이 필요 없는가 ──
+    //   discriminative_anchor_verdict 는 두 뱅크가 공유 성분을 하나도 갖지 않으면
+    //   None 을 돌려줍니다. 즉 '재검사할 이유가 있는가' 자체가 함수의 반환으로 판정되며,
+    //   '얼마나 붙었을 때 재검사할지' 라는 상수를 도입할 필요가 없습니다.
+    if scored.len() >= 2 {
+        let a = scored[0].0.clone();
+        let b = scored[1].0.clone();
+        let ab = banks.iter().find(|(f, _, _)| *f == a).map(|(_, x, _)| x.clone());
+        let bb = banks.iter().find(|(f, _, _)| *f == b).map(|(_, x, _)| x.clone());
+        if let (Some(ab), Some(bb)) = (ab, bb) {
+            if let Some((as_, bs_, an, bn)) =
+                crate::utils::ai_utils::discriminative_anchor_verdict(label_emb, &ab, &bb)
+            {
+                crate::utils::score_dynamics::record_baseline(
+                    "vision.discriminative_gate",
+                    if bs_ > as_ { 1.0 } else { 0.0 },
+                );
+                if bs_ > as_ {
+                    println!(
+                        "      🔬 [DISCRIMINATIVE ANCHOR] 라벨 argmax 는 '{}'({:+.4}) 였지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 '{}' {:.4}({}구) > '{}' {:.4}({}구) 로 뒤집힙니다. 한 필드의 이름이 다른 필드의 이름을 의미적으로 포함하면(총중량은 중량을, 소계는 총계를 포함합니다) 두 뱅크가 같은 성분을 공유해 그 공유분의 미세차가 승패를 가릅니다. 변별 구만 남긴 쪽을 1위로 확정합니다.",
+                        a, scored[0].1, b, bs_, bn, a, as_, an
+                    );
+                    crate::utils::score_dynamics::record_confusion(&b, &a, bs_ - as_);
+                    scored.swap(0, 1);
+                }
+            }
+        }
+    }
+
     let own = scored
         .iter()
         .find(|(f, _)| f.as_str() == field)
@@ -607,75 +674,203 @@ pub fn recovery_label_gate(
             .unwrap_or((String::new(), 0.0));
         return (true, own_out, rz, rf);
     }
-
-    let winner = scored[0].0.clone();
-    let winner_z = scored[0].1;
-    if own != f32::MIN && scored.len() >= 2 && scored[1].0.as_str() == field {
-        let own_bank = banks.iter().find(|(f, _, _)| f.as_str() == field);
-        let rival_bank = banks.iter().find(|(f, _, _)| f.as_str() == winner.as_str());
-        if let (Some((_, ob, _)), Some((_, rb, _))) = (own_bank, rival_bank) {
-            if let Some((os, rs, on, rn)) =
-                crate::utils::ai_utils::discriminative_anchor_verdict(label_emb, ob, rb)
-            {
-                crate::utils::score_dynamics::record_baseline(
-                    "vision.discriminative_gate",
-                    if os > rs { 1.0 } else { 0.0 },
-                );
-                if os > rs {
-                    println!(
-                        "      🔬 [DISCRIMINATIVE ANCHOR] '{}'({:+.4}) 가 '{}'({:+.4}) 에게 졌지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 자기 {:.4}({}구) > 경쟁 {:.4}({}구) 로 뒤집힙니다. 한 필드의 이름이 다른 필드의 이름을 의미적으로 포함하면(소계는 총계를 포함합니다) 두 뱅크가 같은 성분을 공유해 그 공유분의 미세차가 승패를 가릅니다. 자기 필드로 확정합니다.",
-                        field, own, winner, winner_z, os, on, rs, rn
-                    );
-                    crate::utils::score_dynamics::record_confusion(field, &winner, os - rs);
-                    return (true, own_out, winner_z, winner);
-                }
-                println!(
-                    "      🔬 [DISCRIMINATIVE ANCHOR] '{}' vs '{}' 를 변별 구만으로 재검사했으나 자기 {:.4}({}구) ≤ 경쟁 {:.4}({}구) 로 결론이 같습니다. 원래 판정을 유지합니다.",
-                    field, winner, os, on, rs, rn
-                );
-            }
-        }
-    }
-    (false, own_out, winner_z, winner)
+    (false, own_out, scored[0].1, scored[0].0.clone())
 }
 
+/// 🌟 [PAIR ROUTE] 읽어낸 라벨↔값 쌍 하나를 스키마 축 하나로 확정합니다.
+#[derive(Debug, Clone)]
+pub struct PairRoute {
+    pub field: String,
+    pub label: String,
+    pub value: String,
+    /// 라벨 뱅크 전체 경쟁에서 이 축이 얻은 중립점수
+    pub own: f32,
+    /// 이 창이 원래 물었던 축인가
+    pub in_window: bool,
+}
+
+/// 🌟 [FULL-SCHEMA PAIR ROUTING] 창이 물은 축이 아니라 '스키마 전체' 를 상대로 라우팅합니다.
+///
+///  ── 구버전이 무엇을 잃었나 (실측 4건) ──
+///   창 6  "INCOTERM"→"DAP"            버림 → incoterms 가 우회 경로로만 회수
+///   창 7  "INVOICE TOTAL"→"2000.00"   버림 → amount 영구 소실 (정답)
+///   창 8  "DATE"→"Apr-19-2022"        버림 → issue_date 영구 소실 (정답)
+///   창 9  "COUNTRY OF EXPORT"→"USA"   버림
+///   네 건 모두 Qwen 호출 비용을 이미 지불하고 라벨까지 정확히 읽은 뒤에 버렸습니다.
+///
+///  ── 왜 창 안 배타 배정을 폐기하는가 ──
+///   창은 '어디를 볼지' 를 정한 좌표 근거일 뿐이고,
+///   읽어낸 라벨은 '그것이 무엇인지' 를 말하는 직접 근거입니다.
+///   좌표 근거로 직접 근거를 가두면, 창 안에 정답 축이 없을 때 반드시 오배정이 생깁니다.
+///   실측: 창 6 은 중량 축 3개만 물었는데 "TOTAL NUMBER OF PACKAGES" 가 들어오자
+///   배타 배정이 남는 축(weight_gross)에 그 값을 억지로 꽂았고,
+///   그 오배정을 WINDOW ARGMAX 가 '창 안 1위' 라는 이유로 승인했습니다.
+///   전체 스키마에서 argmax 를 뽑으면 그 쌍은 package_count 로 가고,
+///   이미 채워져 있으므로 조용히 버려집니다 — 억지 배정이 구조적으로 사라집니다.
+///
+///  ── 네 가지 게이트 ──
+///   G1 중립점수 양수      : 인쇄된 라벨이 어떤 축도 설명하지 못하면 버립니다.
+///   G2 표 행 축 제외      : items / containers 열은 '어느 행인가' 를 말해 주는 근거가
+///                           쌍 하나에는 없으므로 배정하지 않습니다.
+///   G3 값 형식 일치       : query_value_format 을 씁니다. detect_field_format 은
+///                           reference_number 를 Text 로 보아 "Goods Sold" 같은
+///                           서술문이 참조 축에 들어오는 것을 막지 못합니다.
+///   G4 축당 쌍 하나       : 인쇄된 한 자리는 라벨을 하나만 가집니다.
 pub fn route_pairs_to_fields(
     pairs: &[(String, String)],
     pair_embs: &[Vec<f32>],
     window_fields: &[String],
     banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
-) -> Vec<(String, String, String)> {
-    let mut out: Vec<(String, String, String)> = Vec::new();
-    if pairs.is_empty() || window_fields.is_empty() { return out; }
-    if pair_embs.len() != pairs.len() { return out; }
+) -> (Vec<PairRoute>, Vec<String>) {
+    let mut out: Vec<PairRoute> = Vec::new();
+    let mut logs: Vec<String> = Vec::new();
+    if pairs.is_empty() || banks.is_empty() { return (out, logs); }
+    if pair_embs.len() != pairs.len() { return (out, logs); }
 
-    let mut rows: Vec<(String, &Vec<Vec<f32>>, &Vec<f32>)> = Vec::new();
-    for f in window_fields.iter() {
-        if let Some((_, b, w)) = banks.iter().find(|(n, _, _)| n == f) {
-            if b.is_empty() { continue; }
-            rows.push((f.clone(), b, w));
+    for (pi, (label, value)) in pairs.iter().enumerate() {
+        let e = &pair_embs[pi];
+        if e.is_empty() || e.iter().all(|&v| v == 0.0) { continue; }
+        if value.trim().is_empty() { continue; }
+
+        // field 를 빈 문자열로 넘기면 recovery_label_gate 는 argmax 축과 그 점수만 돌려줍니다.
+        // 변별 앵커 재검사(패치 B-2)도 이 경로에서 함께 수행됩니다.
+        let (_, _, rz, rf) = recovery_label_gate(e, "", banks);
+
+        if rf.is_empty() {
+            logs.push(format!(
+                "      ⚪ [PAIR ARGMAX NONE] \"{}\" → \"{}\" | 라벨 뱅크 어디에서도 점수를 얻지 못했습니다.",
+                label, value
+            ));
+            continue;
+        }
+        if rz <= 0.0 {
+            logs.push(format!(
+                "      🚫 [PAIR ARGMAX WEAK] \"{}\" → \"{}\" | 최강 축 '{}' 의 중립점수가 {:+.4} 로 양수가 아닙니다. 읽힌 라벨이 스키마의 어떤 축도 설명하지 못한다는 뜻이므로 버립니다. 음수 근거를 통과시키면 이 서식에 존재하지 않는 축(부가세번호 등)이 형태만 맞는 아무 축에나 들어갑니다.",
+                label, value, rf, rz
+            ));
+            continue;
+        }
+        let cat = crate::logic::trade_field_category(&rf);
+        if cat.is_empty() {
+            logs.push(format!(
+                "      🚫 [PAIR NO CATEGORY] \"{}\" → \"{}\" | 최강 축 '{}' 의 소속 카테고리를 판정할 수 없어 병합 대상에서 제외합니다.",
+                label, value, rf
+            ));
+            continue;
+        }
+        if crate::logic::TRADE_ARRAY_CATEGORIES.iter().any(|c| *c == cat) {
+            logs.push(format!(
+                "      🚫 [PAIR ROW AXIS] \"{}\" → \"{}\" | 최강 축 '{}' 는 표 행 카테고리 '{}' 의 열입니다. 라벨↔값 쌍 하나에는 어느 행인지를 말해 주는 근거가 없어 배정할 수 없습니다. 루트에 꽂으면 표에서 읽은 행 값과 서로 다른 사실이 한 이름에 공존합니다.",
+                label, value, rf, cat
+            ));
+            continue;
+        }
+        let fmt = crate::utils::ai_utils::query_value_format(&rf);
+        if !crate::utils::ai_utils::value_matches_format(fmt, value) {
+            logs.push(format!(
+                "      🚫 [PAIR FORMAT] \"{}\" → \"{}\" | 최강 축 '{}' 가 요구하는 값 형식({:?})과 맞지 않습니다.",
+                label, value, rf, fmt
+            ));
+            continue;
+        }
+
+        match out.iter_mut().find(|r| r.field == rf) {
+            Some(prev) => {
+                if rz > prev.own {
+                    logs.push(format!(
+                        "      ♊ [PAIR FIELD CONTEST] '{}' 를 두 쌍이 주장했습니다: \"{}\"({:+.4}) 와 \"{}\"({:+.4}). 인쇄된 한 자리는 라벨을 하나만 가지므로 점수가 높은 쪽만 남깁니다.",
+                        rf, label, rz, prev.label, prev.own
+                    ));
+                    prev.label = label.clone();
+                    prev.value = value.clone();
+                    prev.own = rz;
+                }
+            }
+            None => out.push(PairRoute {
+                field: rf.clone(),
+                label: label.clone(),
+                value: value.clone(),
+                own: rz,
+                in_window: window_fields.iter().any(|f| *f == rf),
+            }),
         }
     }
-    if rows.is_empty() { return out; }
 
-    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; pairs.len()]; rows.len()];
-    for (fi, (_, bank, weights)) in rows.iter().enumerate() {
-        for (pi, e) in pair_embs.iter().enumerate() {
-            if e.iter().all(|&v| v == 0.0) { continue; }
-            if pairs[pi].1.trim().is_empty() { continue; }
-            let fmt = crate::utils::ai_utils::detect_field_format(&rows[fi].0);
-            if !crate::utils::ai_utils::value_matches_format(fmt, &pairs[pi].1) { continue; }
-            matrix[fi][pi] =
-                crate::utils::ai_utils::weighted_max_pool_sim(e, bank, weights);
-        }
-    }
+    out.sort_by(|a, b| b.own.partial_cmp(&a.own).unwrap_or(std::cmp::Ordering::Equal));
+    (out, logs)
+}
 
-    let assign = crate::utils::ai_utils::exclusive_assign_by_score(&matrix, 0.0, 0.0);
-    for (fi, a) in assign.iter().enumerate() {
-        let (pi, _own, _margin) = match a { Some(v) => *v, None => continue };
-        out.push((rows[fi].0.clone(), pairs[pi].0.clone(), pairs[pi].1.clone()));
+/// 🌟 [RECOVERY WINDOW MERGE] 겹치는 복구 창을 하나로 합칩니다.
+///
+///  ── 실측 사고 ──
+///   창 6 px(514,688)-(743,860) 과 창 7 px(457,630)-(686,803) 은 서로의 중심을 품습니다.
+///   같은 지면을 두 번 읽어 "TOTAL NUMBER OF PACK" 과 "TOTAL WEIGHT" 가 중복으로 왔고,
+///   호출이 한 번 더 들었습니다.
+///   기존 COLLIDE 검사는 픽셀 완전 일치(`*bx == w.0`)만 보므로 이 쌍을 놓칩니다.
+///
+///  ── 왜 버리지 않고 합치는가 ──
+///   겹치는 두 창의 읽기 결과가 같지 않습니다. 창 7 만 "INVOICE TOTAL"→"2000.00" 을 읽었습니다.
+///   나중 창을 버리면 정답이 통째로 사라집니다. 합치면 한 번의 읽기로 양쪽 지면을 다 봅니다.
+///
+///  ── 왜 임계값이 없는가 ──
+///   겹침 판정은 '한쪽의 중심이 다른 쪽 안에 있는가' 라는 포함 관계이고,
+///   병합 허용은 '합친 사각형이 따로 읽을 때보다 픽셀을 더 먹지 않는가' 입니다.
+///   둘 다 비율 상수가 아니라 구조와 비용에서 유도됩니다.
+pub fn recovery_window_merge(
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    let center = |x: (u32, u32, u32, u32)| {
+        ((x.0 as f32 + x.2 as f32) / 2.0, (x.1 as f32 + x.3 as f32) / 2.0)
+    };
+    let inside = |p: (f32, f32), x: (u32, u32, u32, u32)| {
+        p.0 >= x.0 as f32 && p.0 <= x.2 as f32 && p.1 >= x.1 as f32 && p.1 <= x.3 as f32
+    };
+    if !(inside(center(a), b) || inside(center(b), a)) {
+        return None;
     }
-    out
+    let u = (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3));
+    let area = |x: (u32, u32, u32, u32)| {
+        (x.2.saturating_sub(x.0) as u64) * (x.3.saturating_sub(x.1) as u64)
+    };
+    if area(u) > area(a) + area(b) {
+        return None;
+    }
+    Some(u)
+}
+
+/// 🌟 [SINGLE ROW WRITE] 배열 카테고리에 스칼라 값을 안전하게 기입합니다.
+///
+///  ── 실측 사고 ──
+///   signatory_name = "John Smith" 가 other_parties(배열 카테고리)로 REROUTE 되었는데,
+///   기존 코드는 `if !is_trade_array_category(rcat)` 로 분기해 루트에만 쓰고 행에는 넣지 않았습니다.
+///   그 결과 저장본이
+///     other_parties[0] = { party_role: "SIGNATORY COMPANY", signatory_name: null }
+///     signatory_name   = "John Smith"      ← 루트에만 존재
+///   로 갈렸고, 자연어 변환이 서명자와 서명 회사를 서로 다른 절로 만들었습니다.
+///
+///  ── 왜 행이 하나일 때만 쓰는가 ──
+///   행이 여럿이면 '어느 행의 값인가' 를 말해 주는 근거가 쌍에도 라벨에도 없습니다.
+///   근거 없이 첫 행에 꽂으면 두 당사자의 사실이 한 행에서 뒤섞입니다.
+///   '틀린 행' 보다 '루트 고립' 이 항상 안전합니다.
+pub fn write_into_single_row(
+    merged: &mut serde_json::Map<String, Value>,
+    category: &str,
+    field: &str,
+    value: &str,
+) -> bool {
+    let arr = match merged.get_mut(category).and_then(|v| v.as_array_mut()) {
+        Some(a) => a,
+        None => return false,
+    };
+    if arr.len() != 1 { return false; }
+    let o = match arr[0].as_object_mut() { Some(o) => o, None => return false };
+    let empty = o.get(field).map_or(true, |x| {
+        x.is_null() || x.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+    });
+    if !empty { return false; }
+    o.insert(field.to_string(), json!(value));
+    true
 }
 
 pub fn plan_recovery_windows(

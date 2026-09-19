@@ -1677,8 +1677,24 @@ fn collect_storage_axes(docs: &[Value]) -> Vec<String> {
     out
 }
 
+/// 🌟 [MONETARY AXIS] 이 축이 돈을 담는가. 치환 호환성 판정의 1차 관문입니다.
+///
+///  ── 실측 사고 ──
+///   amount 가 저장되지 않아 AXIS SUBSTITUTE 가 열었습니다: amount → weight_net (0.6406).
+///   두 축은 detect_field_format 상 둘 다 Numeric 이라 형식 게이트를 그대로 통과합니다.
+///   그러나 amount 에는 CURRENCY COMPANION 이 붙인 `currency contains 'USD'` 가 따라다니고
+///   weight_net 에는 통화가 없습니다. 조건을 유지한 채 축만 바꾼다는 치환의 전제가 깨집니다.
+///   '1500 달러 이상' 이 '중량 1500 이상' 으로 해석되면 결과가 조용히 틀립니다.
+fn is_monetary_axis(field: &str) -> bool {
+    ["amount", "price", "charge", "value", "debit", "credit", "balance", "premium", "fee"]
+        .iter()
+        .any(|k| field.contains(k))
+}
+
 fn axis_format_compatible(a: &str, b: &str) -> bool {
     use crate::utils::ai_utils::{detect_field_format, FieldFormat};
+    // 🌟 금액 축과 비금액 축은 형식이 같아도 치환할 수 없습니다.
+    if is_monetary_axis(a) != is_monetary_axis(b) { return false; }
     let fa = detect_field_format(a);
     let fb = detect_field_format(b);
     if fa == fb { return true; }
@@ -1723,8 +1739,16 @@ async fn nearest_storage_axis(
     }
     scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    if scored.len() < 2 {
-        return scored.into_iter().next();
+    // 🌟 [SMALL POOL GUARD] 후보가 2개면 꼬리가 1개라 표준편차가 0 이거나 무의미합니다.
+    //    그 상태에서 '평균 + 표준편차' 를 재면 1위가 언제나 통과합니다.
+    //    remap_off_schema_axes 가 같은 이유로 이미 3개 미만을 기각하므로 기준을 맞춥니다.
+    //    치환하지 못하면 아래 STORAGE GAP → RUNTIME DEMOTE 가 받아 조건을 힌트로 내립니다.
+    if scored.len() < 3 {
+        println!(
+            "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP] '{}' 를 받아 줄 호환 축이 {}개뿐이라 자기 분포로 이상치를 판정할 수 없습니다. 근거 없는 치환보다 조건 강등이 안전합니다.",
+            blocked_field, scored.len()
+        );
+        return None;
     }
     let tail: Vec<f32> = scored[1..].iter().map(|(_, s)| *s).collect();
     let n = tail.len() as f32;
@@ -3040,6 +3064,11 @@ async fn ai_search_complex(
                         let page_type = types.first().cloned().unwrap_or_default();
                         let storage_axes = collect_storage_axes(&docs);
 
+                        // 🌟 [PRE-SUBSTITUTE SNAPSHOT] 아래 진단은 '치환 이전' 상태로 해야 합니다.
+                        //    실측: AXIS SUBSTITUTE 가 amount→weight_net 을 열자 TOO NARROW 이
+                        //    "회수 문서에 amount 값이 실제로 들어 있다" 고 보고했습니다.
+                        //    저장본에 amount 는 없습니다. 자기가 만든 대안 축을 사실로 착각한 것입니다.
+                        let pre_alts = plan_alternate_axis_map(plan);
                         let mut substituted: Vec<String> = Vec::new();
                         {
                             let plan_alts_now = plan_alternate_axis_map(plan);
@@ -3110,7 +3139,7 @@ async fn ai_search_complex(
                             continue;
                         }
 
-                        let plan_alts = plan.get("alternates").cloned().unwrap_or(json!({}));
+                        let plan_alts = pre_alts;
                         let present_in_recall = |f: &str| -> usize {
                             let mut axes: Vec<String> = vec![f.to_string()];
                             if let Some(arr) = plan_alts.get(f).and_then(|v| v.as_array()) {

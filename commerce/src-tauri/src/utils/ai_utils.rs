@@ -2658,6 +2658,49 @@ pub fn has_date_literal(s: &str) -> bool {
     false
 }
 
+// 🌟 [DATE SHAPE] 숫자-구분자 날짜 외에 '월 이름이 섞인 날짜' 까지 구조로 판정합니다.
+//
+//  ── 실측 사고 ──
+//   복구 창 8 이 "DATE" ↔ "Apr-19-2022" 쌍을 정확히 읽어 왔는데
+//   그 창이 물은 날짜 축 7개가 전부 형식 게이트에서 탈락해 배정이 0건이 되었습니다.
+//   has_date_literal 은 세 번째 숫자 그룹을 요구하므로 "Apr-19-2022" 는
+//   ["19","2022"] 두 그룹에서 멈추고 false 를 돌려줍니다.
+//   인쇄 원문은 정규화 이전이므로, 저장 직전 normalize_trading_data 가 ISO 로 바꾸기 전에
+//   이 게이트를 통과해야 합니다. 통과하지 못하면 정규화할 값 자체가 생기지 않습니다.
+//
+//  ── 왜 월 이름 사전을 만들지 않는가 ──
+//   월 이름은 언어마다 다르고, 사전을 코드에 적으면 언어가 늘 때마다 이 함수를 고쳐야 합니다.
+//   대신 '토큰 구조' 만 봅니다: 4자리 연도가 정확히 하나, 나머지는 1~31 범위의
+//   1~2자리 숫자이거나 3~12자 순수 알파벳 한 덩어리.
+//   어떤 라틴 문자 언어의 월 이름도 이 모양을 벗어나지 않고,
+//   금액("2000.00")·식별자("CI-43726")·중량("20KG")은 이 모양에 들어올 수 없습니다.
+pub fn has_date_shape(s: &str) -> bool {
+    if has_date_literal(s) { return true; }
+    let toks: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.len() < 2 || toks.len() > 3 { return false; }
+
+    let mut years = 0usize;
+    let mut days = 0usize;
+    let mut alpha = 0usize;
+    for t in toks.iter() {
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            let n = t.chars().count();
+            let v: u32 = match t.parse() { Ok(v) => v, Err(_) => return false };
+            if n == 4 && (1000..=9999).contains(&v) { years += 1; continue; }
+            if n <= 2 && (1..=31).contains(&v) { days += 1; continue; }
+            return false;
+        }
+        if !t.chars().all(|c| c.is_alphabetic()) { return false; }
+        let n = t.chars().count();
+        if n < 3 || n > 12 { return false; }
+        alpha += 1;
+    }
+    years == 1 && alpha <= 1 && (days + alpha) >= 1 && (years + days + alpha) == toks.len()
+}
+
 // 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)
 pub fn longest_code_token_len(s: &str) -> usize {
     let mut best = 0usize;
@@ -2746,10 +2789,14 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
     if is_bare_markup_token(v) { return false; }
     match fmt {
         FieldFormat::Synthesis => true,
-        FieldFormat::Enum => !has_date_literal(v),
+        FieldFormat::Enum => !has_date_shape(v),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
         FieldFormat::Numeric => {
-            if has_date_literal(v) {
+            // 🌟 has_date_literal 이 아니라 has_date_shape 를 봅니다.
+            //    "Apr-19-2022" 는 부호·점 필터를 통과하면 "-19-2022" 가 남아
+            //    '숫자가 있다' 는 이유로 수치 축이 날짜를 가져갈 수 있습니다.
+            //    날짜 축의 게이트를 여는 순간 수치 축의 게이트는 같은 문자열에 대해 닫아야 합니다.
+            if has_date_shape(v) {
                 return false;
             }
 
@@ -2773,11 +2820,11 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
             stripped.chars().any(|c| c.is_ascii_digit())
         },
         FieldFormat::Date => {
-            has_date_literal(v)
+            has_date_shape(v)
         },
         FieldFormat::Link => v.contains('/') || v.to_lowercase().starts_with("http"),
-        FieldFormat::TrackingCode => !has_date_literal(v) && longest_code_token_len(v) >= 8,
-        FieldFormat::Identifier => !has_date_literal(v) && longest_code_token_len(v) >= 4,
+        FieldFormat::TrackingCode => !has_date_shape(v) && longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => !has_date_shape(v) && longest_code_token_len(v) >= 4,
         FieldFormat::Phone => {
             let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
             if digits < 7 { return false; }

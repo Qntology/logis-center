@@ -904,7 +904,6 @@ impl crate::model::LogisModel {
                         for (pool, pool_label) in [(&solo_cands, "EMPTY SOLO"), (&shared_cands, "EMPTY SHARED")] {
                             let b = budget_of(pool, pool_label);
                             if b == 0 { continue; }
-                            let taken: Vec<(u32, u32, u32, u32)> = windows.iter().map(|(bx, _)| *bx).collect();
                             for w in crate::model::merge::plan_recovery_windows(
                                 pool,
                                 grid.grid_rows,
@@ -913,14 +912,39 @@ impl crate::model::LogisModel {
                                 grid.orig_height,
                                 b,
                             ) {
-                                if taken.iter().any(|bx| *bx == w.0) {
-                                    emit_term(&format!(
-                                        "    ⛔ [RECOVERY WINDOW COLLIDE] 빈 필드 {:?} 의 창이 이미 배정된 창과 같은 픽셀입니다. 같은 자리를 두 번 읽지 않도록 이 회차에서는 복구하지 않습니다.",
-                                        w.1.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
-                                    ));
-                                    continue;
+                                // 🌟 [WINDOW OVERLAP MERGE] 픽셀 완전 일치만 보던 검사를
+                                //    중심 포함 관계로 바꾸고, 충돌 시 버리는 대신 합칩니다.
+                                //    실측에서 창 6·7 이 서로의 중심을 품은 채 따로 호출되었고,
+                                //    창 7 만 읽은 "INVOICE TOTAL"→"2000.00" 이 존재했습니다.
+                                //    버리면 그 정답이 사라지므로 합쳐서 한 번에 읽습니다.
+                                let hit = windows.iter().position(|(bx, _)| {
+                                    crate::model::merge::recovery_window_merge(*bx, w.0).is_some()
+                                });
+                                match hit {
+                                    Some(i) => {
+                                        let u = match crate::model::merge::recovery_window_merge(windows[i].0, w.0) {
+                                            Some(u) => u,
+                                            None => { windows.push(w); continue; }
+                                        };
+                                        let added: Vec<String> = w.1.iter()
+                                            .filter(|(_, f, _)| !windows[i].1.iter().any(|(_, x, _)| x == f))
+                                            .map(|(_, f, _)| f.clone())
+                                            .collect();
+                                        emit_term(&format!(
+                                            "    🔗 [RECOVERY WINDOW OVERLAP MERGE] px({},{})-({},{}) 와 px({},{})-({},{}) 는 서로의 중심을 품고 있습니다. 두 창을 px({},{})-({},{}) 하나로 합치고 필드 {:?} 를 편입합니다. 겹치는 두 창은 같은 지면을 두 번 읽어 호출만 늘리는데, 버리면 그쪽 창만 읽은 라벨↔값 쌍이 통째로 사라집니다. 합친 사각형이 따로 읽을 때보다 픽셀을 더 먹지 않을 때만 병합합니다.",
+                                            windows[i].0.0, windows[i].0.1, windows[i].0.2, windows[i].0.3,
+                                            w.0.0, w.0.1, w.0.2, w.0.3,
+                                            u.0, u.1, u.2, u.3, added
+                                        ));
+                                        windows[i].0 = u;
+                                        for f in w.1.into_iter() {
+                                            if windows[i].1.iter().any(|(_, x, _)| *x == f.1) { continue; }
+                                            windows[i].1.push(f);
+                                        }
+                                        crate::utils::score_dynamics::record_baseline("vision.window_overlap_merge", 1.0);
+                                    }
+                                    None => windows.push(w),
                                 }
-                                windows.push(w);
                             }
                         }
                         if windows.is_empty() {
@@ -1036,6 +1060,9 @@ impl crate::model::LogisModel {
                                     None
                                 ).await?;
                                 let raw_parsed = crate::parsing::parse_json_from_llm(&res);
+                                // 🌟 [EXTRA FIELDS] 창이 묻지 않았지만 읽힌 라벨이 가리킨 축입니다.
+                                //    아래 확정 루프는 이 축들도 창 축과 똑같은 게이트를 통과시킵니다.
+                                let mut extra_fields: Vec<(String, String, f32)> = Vec::new();
                                 let parsed = if !pair_mode {
                                     raw_parsed
                                 } else {
@@ -1085,35 +1112,51 @@ impl crate::model::LogisModel {
                                             .unwrap_or_else(|_| vec![Vec::new(); pairs.len()]);
                                         let window_fields: Vec<String> =
                                             fields.iter().map(|(_, f, _)| f.clone()).collect();
-                                        let routed = crate::model::merge::route_pairs_to_fields(
+                                        let (routed, route_logs) = crate::model::merge::route_pairs_to_fields(
                                             &pairs, &pair_embs, &window_fields, &gate_banks,
                                         );
+                                        for line in route_logs.iter() { emit_term(line); }
                                         let mut obj = serde_json::Map::new();
-                                        for (f, l, v) in routed.iter() {
+                                        for r in routed.iter() {
                                             emit_term(&format!(
-                                                "      🧭 [PAIR ROUTE] \"{}\" → {} = \"{}\" | 이 창이 물은 축 {:?} 안에서 라벨 뱅크 배타 배정으로 확정했습니다. 전체 스키마 재판정은 아래 라벨 게이트가 이어서 수행하며, 다른 축이 이기면 그쪽으로 이송됩니다.",
-                                                l, f, v, window_fields
+                                                "      🧭 [PAIR ROUTE{}] \"{}\" → {} = \"{}\" | 스키마 {}축 전체와 경쟁시켜 중립점수 {:+.4} 로 확정했습니다. 창은 '어디를 볼지' 를 정한 좌표 근거일 뿐이고, 읽어낸 라벨은 '그것이 무엇인지' 를 말하는 직접 근거입니다. 좌표 근거로 직접 근거를 가두면 창 안에 정답 축이 없을 때 반드시 오배정이 생깁니다.",
+                                                if r.in_window { "" } else { " / OUT OF WINDOW" },
+                                                r.label, r.field, r.value, gate_banks.len(), r.own
                                             ));
+                                            if !r.in_window {
+                                                let c = crate::logic::trade_field_category(&r.field).to_string();
+                                                if !extra_fields.iter().any(|(_, f, _)| *f == r.field) {
+                                                    extra_fields.push((c, r.field.clone(), r.own));
+                                                }
+                                            }
                                             obj.insert(
-                                                f.clone(),
-                                                json!({ "label": l, "value": v }),
+                                                r.field.clone(),
+                                                json!({ "label": r.label, "value": r.value }),
                                             );
                                         }
-                                        let unrouted: Vec<String> = pairs
-                                            .iter()
-                                            .filter(|(l, _)| !routed.iter().any(|(_, rl, _)| rl == l))
-                                            .map(|(l, v)| format!("\"{}\"→\"{}\"", l, v))
-                                            .collect();
-                                        if !unrouted.is_empty() {
-                                            emit_term(&format!(
-                                                "      ⚪ [PAIR UNROUTED] 이 창이 물은 축보다 쌍이 많아 배정되지 못한 {}건: {:?} — 배타 배정은 축 하나에 쌍 하나만 주므로 남는 쌍은 이번 회차에서 버립니다. 같은 자리를 다시 읽는 것보다 다음 회차의 재인덱싱에 맡기는 편이 호출을 아낍니다.",
-                                                unrouted.len(), unrouted.iter().take(6).collect::<Vec<_>>()
-                                            ));
-                                        }
+                                        crate::utils::score_dynamics::record_baseline(
+                                            "vision.pair_route_ratio",
+                                            routed.len() as f32 / pairs.len().max(1) as f32,
+                                        );
                                         Value::Object(obj)
                                     }
                                 };
-                                for (cat, field, _) in fields.iter() {
+                                // 🌟 [EFFECTIVE FIELDS] 창이 물은 축 + 라벨이 데려온 축.
+                                //    두 집합에 같은 게이트(라벨 근거 / 값 형식 / 선점 / 이송)를 적용해야
+                                //    창 밖 축만 검증이 무른 경로가 생기지 않습니다.
+                                let eff_fields: Vec<(String, String, f32)> = {
+                                    let mut v = fields.clone();
+                                    for e in extra_fields.into_iter() {
+                                        if v.iter().any(|(_, f, _)| *f == e.1) { continue; }
+                                        emit_term(&format!(
+                                            "      ➕ [WINDOW FIELD EXPAND] 창 {} 이 묻지 않았지만 읽힌 라벨이 가리킨 축 '{}'({}) 를 확정 대상에 편입합니다.",
+                                            wi + 1, e.1, e.0
+                                        ));
+                                        v.push(e);
+                                    }
+                                    v
+                                };
+                                for (cat, field, _) in eff_fields.iter() {
                                     let is_verify = verify_fields.iter().any(|f| f == field);
                                     let current = final_data_map
                                         .get(field)
@@ -1240,7 +1283,7 @@ impl crate::model::LogisModel {
                                     };
                                     let mut ok = ok;
                                     if !ok && !rival_field.is_empty() {
-                                        let rival_in_window = fields.iter().any(|(_, f, _)| *f == rival_field);
+                                        let rival_in_window = eff_fields.iter().any(|(_, f, _)| *f == rival_field);
                                         let (pass, why) = crate::utils::ai_utils::window_assign_verdict(
                                             own, rival, !rival_in_window,
                                         );
@@ -1248,7 +1291,7 @@ impl crate::model::LogisModel {
                                             emit_term(&format!(
                                                 "      🧷 [WINDOW ARGMAX] {}.{} = \"{}\" | 스키마 전체로는 '{}'({:+.4}) 가 라벨 argmax 이지만 그 축은 이 창에서 묻지 않았고, 이 축의 자기 중립점수는 {:+.4} 입니다. 근거: {}. 이 창이 물은 필드 {:?} 안에서 1위이므로 통과시킵니다.",
                                                 cat, field, value, rival_field, rival, own, why,
-                                                fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
+                                                eff_fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
                                             ));
                                             crate::utils::score_dynamics::record_baseline("vision.window_argmax", 1.0);
                                             ok = true;
@@ -1314,6 +1357,21 @@ impl crate::model::LogisModel {
                                             if let Some(o) = slot.as_object_mut() {
                                                 o.insert(rival_field.clone(), json!(value.clone()));
                                             }
+                                        } else if !rcat.is_empty() {
+                                            // 🌟 [ARRAY ROW WRITE] 배열 카테고리로 이송된 스칼라를 행에도 넣습니다.
+                                            //    행이 하나뿐일 때만 기입합니다. 여럿이면 '어느 행인가' 의 근거가 없습니다.
+                                            let wrote = crate::model::merge::write_into_single_row(
+                                                &mut final_data_map, rcat, &rival_field, &value,
+                                            );
+                                            emit_term(&format!(
+                                                "      {} [ARRAY ROW WRITE] '{}' 는 배열 카테고리 '{}' 의 축입니다. {}",
+                                                if wrote { "✅" } else { "⚪" }, rival_field, rcat,
+                                                if wrote {
+                                                    "행이 하나뿐이라 그 행에 채웠습니다. 루트에만 두면 자연어 변환이 같은 당사자의 사실을 서로 다른 절로 쪼갭니다.".to_string()
+                                                } else {
+                                                    "행이 없거나 둘 이상이라 어느 행인지 단정할 근거가 없습니다. 루트에만 둡니다.".to_string()
+                                                }
+                                            ));
                                         }
                                         label_evidence.insert(rival_field.clone(), rival);
                                         crate::utils::score_dynamics::record_field_seen(&rival_field);
@@ -1350,7 +1408,22 @@ impl crate::model::LogisModel {
                                     }
                                     crate::utils::score_dynamics::record_baseline(&hit_axis, 1.0);
                                     record_grounding_claims(&mut grounding_claims, cat, &patch, bbox);
-                                    merge_extracted(&mut final_data_map, cat, &patch, &emit_term);
+                                    // 🌟 [ARRAY ROW WRITE] 배열 카테고리에 merge_extracted 를 그대로 태우면
+                                    //    ARRAY COERCE 가 축 하나만 담은 새 행을 만들어 같은 당사자가 두 행으로 갈립니다.
+                                    //    행이 하나뿐이면 그 행에 채우고, 그럴 수 없을 때만 기존 병합에 맡깁니다.
+                                    let row_done = crate::logic::is_trade_array_category(cat)
+                                        && crate::model::merge::write_into_single_row(
+                                            &mut final_data_map, cat, field, &value,
+                                        );
+                                    if row_done {
+                                        final_data_map.insert(field.clone(), json!(value.clone()));
+                                        emit_term(&format!(
+                                            "      ✅ [ARRAY ROW WRITE] {}.{} 를 기존 행 1건에 채웠습니다. 새 행을 만들면 같은 당사자의 사실이 두 레코드로 갈립니다.",
+                                            cat, field
+                                        ));
+                                    } else {
+                                        merge_extracted(&mut final_data_map, cat, &patch, &emit_term);
+                                    }
                                     label_evidence.insert(field.clone(), own);
                                     emit_term(&format!(
                                         "      ✅ [RECOVERED] {}.{} = \"{}\" | {}",
