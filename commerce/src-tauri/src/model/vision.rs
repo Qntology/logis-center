@@ -227,10 +227,75 @@ impl crate::model::LogisModel {
                                 }
                             }
                         }
-                        emit_term(&format!(
+                                                emit_term(&format!(
                             "  🚫 [TITLE ROW SUPPRESSION] 상단 {}행(제목 인쇄 행만) 점수 {}개 억제 → r2 라벨 행 생존, header 봉우리가 값 행(r2~r4)에서 결정됩니다.",
                             title_row_max + 1, suppressed
                         ));
+                    }
+
+                    {
+                        let cols = grid.grid_cols.max(1);
+                        let rows = grid.grid_rows.max(1);
+                        let cw = grid.orig_width as f32 / cols as f32;
+                        let ch = grid.orig_height as f32 / rows as f32;
+                        let blank: Vec<bool> = (0..rows * cols)
+                            .map(|i| {
+                                let r = i / cols;
+                                let c = i % cols;
+                                let bx = (
+                                    (c as f32 * cw).floor() as u32,
+                                    (r as f32 * ch).floor() as u32,
+                                    ((((c + 1) as f32) * cw).ceil() as u32).min(grid.orig_width),
+                                    ((((r + 1) as f32) * ch).ceil() as u32).min(grid.orig_height),
+                                );
+                                let (lg, il, bl) =
+                                    legibility.count_in_bbox(bx, grid.orig_width, grid.orig_height);
+                                lg == 0 && il == 0 && bl > 0
+                            })
+                            .collect();
+                        let blank_cnt = blank.iter().filter(|b| **b).count();
+                        let mut cut = 0usize;
+                        let mut shrunk: Vec<String> = Vec::new();
+                        let mut protected: Vec<String> = Vec::new();
+                        for hm in heatmaps.iter_mut() {
+                            let before = hm.scores.iter().filter(|s| **s > 0.0).count();
+                            if before == 0 { continue; }
+                            let after = hm
+                                .scores
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, s)| {
+                                    **s > 0.0 && !blank.get(*i).copied().unwrap_or(false)
+                                })
+                                .count();
+                            if after == 0 {
+                                protected.push(hm.category.clone());
+                                continue;
+                            }
+                            let m = hm.scores.len().min(blank.len());
+                            for i in 0..m {
+                                if blank[i] && hm.scores[i] > f32::MIN {
+                                    hm.scores[i] = f32::MIN;
+                                    cut += 1;
+                                }
+                            }
+                            shrunk.push(format!("{}({}→{})", hm.category, before, after));
+                        }
+                        emit_term(&format!(
+                            "  🫥 [BLANK CELL SUPPRESSION] 여백 칸 {}/{} 에서 점수 {}개를 내려놓았습니다. 활성 패치 변화: {} — 여백에서 카테고리끼리 상대 비교를 하면 전부 낮은 점수 중 잡음이 큰 쪽이 그 칸을 가져가고, 그 영토가 밴드 확장과 구제 지분을 왜곡합니다.",
+                            blank_cnt, rows * cols, cut,
+                            if shrunk.is_empty() { "-".to_string() } else { shrunk.join(" | ") }
+                        ));
+                        if !protected.is_empty() {
+                            emit_term(&format!(
+                                "  🛡️ [BLANK SUPPRESSION PROTECT] 여백을 걷어내면 활성 패치가 0개가 되는 카테고리 {:?} 는 원본을 유지합니다. 그 축의 봉우리가 전부 여백에 찍혔다는 뜻이며, 여기서 히트맵을 없애면 크롭 자체가 불가능해집니다.",
+                                protected
+                            ));
+                        }
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.blank_suppressed",
+                            cut as f32 / (rows * cols).max(1) as f32,
+                        );
                     }
 
                     // ── STEP 3.5 : NMS Arena ──
@@ -1190,6 +1255,26 @@ impl crate::model::LogisModel {
                                         }
                                         continue;
                                     }
+                                    // 🌟 [RECOVERY OCCUPIED] 이미 확정된 축에 다른 값이 들어오면
+                                    //    merge_extracted 의 '기존 스칼라 유지' 규칙이 조용히 버립니다.
+                                    //    그 전에 끊어야 blind read 호출 1회와 오해를 부르는
+                                    //    ✅ [RECOVERED] 로그, 그리고 접지 주장 오염이 사라집니다.
+                                    //    실측: 창 8 의 "CONSIGNEE VAT/EORI"→amount 가 창 4 의
+                                    //    "INVOICE TOTAL"→amount 를 덮으려다 여기서 멈춥니다.
+                                    if !is_verify
+                                        && !current.is_empty()
+                                        && !current.eq_ignore_ascii_case(&value)
+                                    {
+                                        crate::utils::score_dynamics::record_baseline(&hit_axis, 0.0);
+                                        crate::utils::score_dynamics::record_confusion(
+                                            field, field, 0.0,
+                                        );
+                                        emit(&format!(
+                                            "      ⚪ [RECOVERY OCCUPIED] {}.{} 는 이미 \"{}\" 로 확정되어 있습니다. 이 창이 읽은 \"{}\" 는 같은 축을 두고 뒤에 온 주장이므로 채택하지 않습니다. 먼저 온 값이 라벨 근거와 함께 들어왔다면 순서가 곧 강도입니다.",
+                                            cat, field, current, value
+                                        ));
+                                        continue;
+                                    }
                                     let mut blind_confirmed = false;
                                     if label.is_empty() {
                                         let definition = crate::parsing::trade_field_definition(&language, field);
@@ -1753,6 +1838,7 @@ impl crate::model::LogisModel {
                     apply_grounding_verdicts(map, &verdicts, &emit_term);
                     if is_trade_doc {
                         crate::model::merge::drop_row_echo_columns(map, &emit_term);
+                        crate::model::merge::reconcile_monetary_axes(map, &emit_term);
                         let doc_code = map
                             .get("header")
                             .and_then(|h| h.get("doc_type"))
@@ -2519,9 +2605,11 @@ impl crate::model::LogisModel {
             let q = &embs[oi];
             if q.iter().all(|&x| x == 0.0) { continue; }
             let want = detect_field_format(key);
+            let multiline = raw.lines().filter(|l| !l.trim().is_empty()).count() >= 2;
             let mut scored: Vec<(String, f32)> = Vec::new();
             for (si, f) in schema.iter().enumerate() {
                 if !empty_at(map, f) { continue; }
+                if multiline && detect_field_format(f) != FieldFormat::Address { continue; }
                 if !compat(want, detect_field_format(f)) { continue; }
                 if !value_matches_format(detect_field_format(f), raw) { continue; }
                 let cat = crate::logic::trade_field_category(f);
@@ -2530,25 +2618,41 @@ impl crate::model::LogisModel {
                 if e.iter().all(|&x| x == 0.0) { continue; }
                 scored.push((f.clone(), cosine_similarity(q, e)));
             }
-            if scored.len() < 3 {
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            if scored.is_empty() {
                 emit(&format!(
-                    "  ⚪ [SCHEMA AXIS MAP] '{}' 를 받아 줄 빈 스키마 축이 {}개뿐이라 자기 분포로 이상치를 판정할 수 없습니다. 루트에만 남겨 둡니다.",
-                    key, scored.len()
+                    "  ⚪ [SCHEMA AXIS MAP] '{}' 를 받아 줄 빈 스키마 축이 하나도 없습니다. 루트에만 남겨 둡니다.",
+                    key
                 ));
                 continue;
             }
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let tail: Vec<f32> = scored[1..].iter().map(|(_, s)| *s).collect();
-            let n = tail.len() as f32;
-            let mean = tail.iter().sum::<f32>() / n;
-            let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n)
-                .sqrt();
-            if sd <= 1e-6 || scored[0].1 - mean < sd {
+            if scored.len() < 3 {
+                let strict = multiline && (scored.len() == 1 || scored[0].1 > scored[1].1);
+                if !strict {
+                    emit(&format!(
+                        "  ⚪ [SCHEMA AXIS MAP] '{}' 를 받아 줄 빈 스키마 축이 {}개뿐이라 자기 분포로 이상치를 판정할 수 없습니다. 루트에만 남겨 둡니다.",
+                        key, scored.len()
+                    ));
+                    continue;
+                }
                 emit(&format!(
-                    "  ⚪ [SCHEMA AXIS MAP] '{}' 의 최고 후보 '{}'({:.4}) 가 나머지 평균 {:.4} 에서 표준편차 {:.4} 만큼 떨어지지 못했습니다. 어느 축이라고 단정할 근거가 없으므로 루트에만 남겨 둡니다.",
-                    key, scored[0].0, scored[0].1, mean, sd
+                    "  🧭 [SCHEMA AXIS MAP / MULTILINE] '{}' 은 줄바꿈으로 나뉜 주소 블록이라 후보를 주소 축 {}개로 좁혔습니다. 표본이 적어 분포 판정은 불가능하지만 형태가 이미 축의 종류를 확정했으므로 엄격 argmax 로 '{}'({:.4}) 를 채택합니다.",
+                    key, scored.len(), scored[0].0, scored[0].1
                 ));
-                continue;
+            } else {
+                let tail: Vec<f32> = scored[1..].iter().map(|(_, s)| *s).collect();
+                let n = tail.len() as f32;
+                let mean = tail.iter().sum::<f32>() / n;
+                let sd = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n)
+                    .sqrt();
+                if sd <= 1e-6 || scored[0].1 - mean < sd {
+                    emit(&format!(
+                        "  ⚪ [SCHEMA AXIS MAP] '{}' 의 최고 후보 '{}'({:.4}) 가 나머지 평균 {:.4} 에서 표준편차 {:.4} 만큼 떨어지지 못했습니다. 어느 축이라고 단정할 근거가 없으므로 루트에만 남겨 둡니다.",
+                        key, scored[0].0, scored[0].1, mean, sd
+                    ));
+                    continue;
+                }
             }
 
             let target = scored[0].0.clone();
@@ -2569,8 +2673,8 @@ impl crate::model::LogisModel {
             }
             crate::utils::score_dynamics::record_baseline("vision.schema_axis_map", 1.0);
             emit(&format!(
-                "  🧭 [SCHEMA AXIS MAP] '{}' = \"{}\" → {}.{} (앵커 코사인 {:.4}, 나머지 평균 {:.4} + 표준편차 {:.4}). 이 키는 '{}' 서식의 로드된 스키마에 이름이 없지만 그 개념의 축은 존재합니다. 이름 완전일치만 보면 값이 루트에만 남아, 자연어 변환은 존재하지 않는 절을 만들고 청크 인덱싱의 스키마 화이트리스트가 그 절을 다시 폐기합니다. 읽어낸 값이 저장은 되고도 검색 경로에서는 존재하지 않게 되는 지점입니다.",
-                key, raw, cat, target, scored[0].1, mean, sd, doc_type
+                "  🧭 [SCHEMA AXIS MAP] '{}' = \"{}\" → {}.{} (앵커 코사인 {:.4}). 이 키는 '{}' 서식의 로드된 스키마에 이름이 없지만 그 개념의 축은 존재합니다. 이름 완전일치만 보면 값이 루트에만 남아, 자연어 변환은 존재하지 않는 절을 만들고 청크 인덱싱의 스키마 화이트리스트가 그 절을 다시 폐기합니다. 읽어낸 값이 저장은 되고도 검색 경로에서는 존재하지 않게 되는 지점입니다.",
+                key, raw, cat, target, scored[0].1, doc_type
             ));
             moved += 1;
         }

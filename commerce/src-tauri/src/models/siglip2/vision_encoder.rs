@@ -512,7 +512,8 @@ fn run_title_gate(
     let mut scanned_patches = 0usize;
     let mut active_patches = 0usize;
     let mut positive_patches = 0usize;
-    let mut patch_contributions: Vec<(usize, usize, usize, String, f32)> = Vec::new();
+    let mut patch_best: std::collections::HashMap<String, (usize, usize, usize, f32)> =
+        std::collections::HashMap::new();
 
     emit(&format!(
         "     🔍 [TITLE GATE SCAN] 상단 밴드: {}행 / 전체 {}행 | 스캔 패치 범위: 0~{}",
@@ -557,10 +558,7 @@ fn run_title_gate(
             let e = best.entry(s.key.clone()).or_insert(f32::MIN);
             if s.surprisal > *e {
                 *e = s.surprisal;
-                // 🌟 [LOG] 타이틀 게이트에서 각 전문 키의 최고점을 갱신한 패치 기록
-                if patch_contributions.len() < 20 {
-                    patch_contributions.push((idx, r, c, s.key.clone(), s.surprisal));
-                }
+                patch_best.insert(s.key.clone(), (idx, r, c, s.surprisal));
             }
         }
     }
@@ -571,12 +569,26 @@ fn run_title_gate(
         scanned_patches, active_patches, positive_patches, best.len()
     ));
 
-    if !patch_contributions.is_empty() {
-        emit("     🔍 [TITLE GATE CONTRIBUTORS] 전문별 최고점 갱신 패치:");
-        for (idx, r, c, key, sur) in patch_contributions.iter() {
+    if !patch_best.is_empty() {
+        let mut rows: Vec<(String, usize, usize, usize, f32)> = patch_best
+            .iter()
+            .map(|(k, (i, r, c, s))| (k.clone(), *i, *r, *c, *s))
+            .collect();
+        rows.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        let spread = {
+            let mut uniq: Vec<usize> = rows.iter().map(|x| x.1).collect();
+            uniq.sort_unstable();
+            uniq.dedup();
+            uniq.len()
+        };
+        emit(&format!(
+            "     🔍 [TITLE GATE CONTRIBUTORS] 전문 {}개의 최종 최고점을 만든 서로 다른 패치 {}개. 한 패치가 전문 다수의 최고점을 독점하면 그 패치는 제목이 아니라 로고나 도장일 가능성이 큽니다.",
+            rows.len(), spread
+        ));
+        for (key, idx, r, c, sur) in rows.iter().take(12) {
             emit(&format!(
-                "       ↳ patch[{}] r{}c{} → '{}' {:+.4}",
-                idx, r, c, key, sur
+                "       ↳ '{}' ← patch[{}] r{}c{} {:+.4}",
+                key, idx, r, c, sur
             ));
         }
     }

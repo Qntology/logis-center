@@ -1006,6 +1006,16 @@
         "semantic": "the ICC trade term that fixes cost and risk transfer",
         "bias": "incoterms, trade terms, price terms, delivery terms, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP, ex works, free carrier, free on board, cost and freight, cost insurance and freight, delivered at place, delivered duty paid, 인코텀즈, 무역조건, 가격조건, 정형거래조건, 본선인도, 운임보험료포함, 공장인도, 관세지급인도, インコタームズ, 貿易条件, 国际贸易术语, 贸易条件",
         "prejudice": "payment terms, freight prepaid, freight collect, currency, amount, weight, document number, issue date, port, vessel"
+      },
+      "shipping_doc.country_of_manufacture": {
+        "semantic": "the country a shopper or trader names as where the goods were made",
+        "bias": "KOREA, SOUTH KOREA, CHINA, VIETNAM, JAPAN, TAIWAN, THAILAND, INDIA, INDONESIA, MALAYSIA, PHILIPPINES, BANGLADESH, CAMBODIA, TURKEY, USA, UNITED STATES, MEXICO, CANADA, BRAZIL, GERMANY, ITALY, FRANCE, SPAIN, UNITED KINGDOM, NETHERLANDS, POLAND, CZECH REPUBLIC, 대한민국, 한국, 중국, 베트남, 일본, 대만, 태국, 인도, 인도네시아, 말레이시아, 필리핀, 방글라데시, 캄보디아, 터키, 미국, 멕시코, 캐나다, 브라질, 독일, 이탈리아, 프랑스, 스페인, 영국, 네덜란드, 폴란드, 체코, 韓国, 中国, 越南, ベトナム, 日本, 台湾, タイ, インド, アメリカ, ドイツ, イタリア, フランス, 中國, 韩国, 越南, 日本, 泰国, 印度, 美国, 德国, 意大利, 法国, Corea, China, Vietnam, Japón, Estados Unidos, Alemania, Corée, Chine, Viêt Nam, Japon, États-Unis, Allemagne, Korea, Vietnam, Japan, Vereinigte Staaten, Deutschland, Coreia, Chine, Vietname, Japão, Estados Unidos, Alemanha, Corea, Cina, Vietnam, Giappone, Stati Uniti, Germania, Корея, Китай, Вьетнам, Япония, США, Германия, كوريا, الصين, فيتنام, اليابان, الولايات المتحدة, ألمانيا, कोरिया, चीन, वियतनाम, जापान, संयुक्त राज्य, जर्मनी, เกาหลี, จีน, เวียดนาม, ญี่ปุ่น, สหรัฐอเมริกา, เยอรมนี, Hàn Quốc, Trung Quốc, Việt Nam, Nhật Bản, Hoa Kỳ, Đức, Korea Selatan, Tiongkok, Vietnam, Jepang, Amerika Serikat, Jerman",
+        "prejudice": "country of manufacture, country of origin, made in, origin, manufactured in, place of origin, 제조국, 원산지, 생산국, 원산지국가, 제조국가, 선적항, 양륙항, 목적국, 도착지, port of loading, port of discharge, destination, document number, issue date, amount, weight, quantity"
+      },
+      "shipping_doc.description": {
+        "semantic": "the concrete goods printed on the line of a trade document",
+        "bias": "T-Shirt, Shorts, Jacket, Trousers, Dress, Knitwear, Cardigan, Sweater, Sneakers, Handbag, Wallet, Cotton Fabric, Polyester Yarn, Steel Coil, Aluminium Sheet, Copper Wire, Auto Parts, Brake Pad, Bearing, Semiconductor, Memory Module, LED Panel, Battery Cell, Solar Panel, Cosmetics, Skin Care Cream, Shampoo, Instant Noodle, Frozen Fish, Coffee Bean, Rice, Soybean, Furniture, Office Chair, Ceramic Tile, 티셔츠, 반바지, 자켓, 바지, 원피스, 니트, 가디건, 스웨터, 운동화, 핸드백, 지갑, 면직물, 폴리에스터 원사, 강판, 알루미늄 판, 구리선, 자동차 부품, 브레이크 패드, 베어링, 반도체, 메모리 모듈, LED 패널, 배터리 셀, 태양광 패널, 화장품, 스킨케어 크림, 샴푸, 라면, 냉동 수산물, 커피 원두, 쌀, 대두, 가구, 사무용 의자, 타일, Tシャツ, ショートパンツ, ジャケット, ニット, カーディガン, スニーカー, 自動車部品, 半導体, 化粧品, 冷凍魚, 家具, T恤, 短裤, 夹克, 针织, 开衫, 运动鞋, 汽车零件, 半导体, 化妆品, 冷冻鱼, 家具, camiseta, pantalón corto, chaqueta, punto, zapatillas, piezas de automóvil, cosméticos, muebles, t-shirt, short, veste, tricot, baskets, pièces automobiles, cosmétiques, meubles, T-Shirt, Shorts, Jacke, Strick, Sneaker, Autoteile, Kosmetik, Möbel, camiseta, bermuda, jaqueta, malha, tênis, peças automotivas, cosméticos, móveis, maglietta, pantaloncini, giacca, maglia, scarpe da ginnastica, ricambi auto, cosmetici, mobili, футболка, шорты, куртка, трикотаж, кроссовки, автозапчасти, косметика, мебель, قميص, شورت, سترة, تريكو, حذاء رياضي, قطع غيار سيارات, مستحضرات تجميل, أثاث, टी-शर्ट, शॉर्ट्स, जैकेट, बुना हुआ, स्नीकर्स, ऑटो पार्ट्स, सौंदर्य प्रसाधन, फर्नीचर, เสื้อยืด, กางเกงขาสั้น, แจ็คเก็ต, ถักนิตติ้ง, รองเท้าผ้าใบ, ชิ้นส่วนรถยนต์, เครื่องสำอาง, เฟอร์นิเจอร์, áo thun, quần short, áo khoác, áo len, giày thể thao, phụ tùng ô tô, mỹ phẩm, nội thất, kaos, celana pendek, jaket, rajut, sepatu kets, suku cadang mobil, kosmetik, furnitur",
+        "prejudice": "description of goods, description, commodity, commodity description, item description, goods description, nature of goods, 품명, 상품명세, 물품명, 물품명세, 화물명세, 품목명, item code, HS code, quantity, unit, unit price, amount, weight, document number, container number"
       }
     },
     "abstract_bridge": {
@@ -2145,7 +2155,7 @@
       "amount": {
         "semantic": "총액, 합계금액, 송장금액",
         "bias": "총액, 합계, 총금액, 송장금액, 계약금액, total amount, grand total, invoice value, total value, amount",
-        "prejudice": "운임, 보험료, 로컬차지, 세액, 단가, 중량, 수량, 통화, 서류번호, 발행일, 항구"
+        "prejudice": "운임, 보험료, 로컬차지, 세액, 단가, 중량, 수량, 통화, 서류번호, 발행일, 항구, 사업자등록번호, 부가세번호, 통관고유부호, 계좌번호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, taxpayer ID, TIN, business registration number, account number, customer number"
       },
       "container_number": {
         "semantic": "컨테이너번호",
@@ -2159,13 +2169,13 @@
       },
       "weight_gross": {
         "semantic": "총중량, 총량",
-        "bias": "총중량, 총량, 그로스웨이트, gross weight, G.W., total gross weight, KGS, KG, MT",
-        "prejudice": "순중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+        "bias": "총중량, 총량, 그로스웨이트, 전체중량, 화물중량, gross weight, G.W., total gross weight, total weight, shipment total weight, cargo weight, KGS, KG, MT",
+        "prejudice": "순중량, 넷웨이트, 운임중량, 청구중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호, net weight, chargeable weight, volumetric weight"
       },
       "weight_net": {
         "semantic": "순중량",
         "bias": "순중량, 넷웨이트, net weight, N.W., total net weight, KGS, KG",
-        "prejudice": "총중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호"
+        "prejudice": "총중량, 총량, 전체중량, 화물중량, 운임중량, 청구중량, 용적, 수량, 포장수, 금액, 통화, 서류번호, 발행일, 항구, 컨테이너번호, gross weight, G.W., total weight, chargeable weight, volumetric weight"
       },
       "volume": {
         "semantic": "용적, 부피, 재화중량",
@@ -2285,12 +2295,12 @@
       "amount_subtotal": {
         "semantic": "소계, 세전금액",
         "bias": "소계, 소계금액, 세전금액, 공급가액, 물품대금, 상품금액, subtotal, sub total, net amount, amount before tax, goods value",
-        "prejudice": "총액, 합계, 총금액, 세액, 부가세, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+        "prejudice": "총액, 합계, 총금액, 세액, 부가세, 운임, 보험료, 통화, 중량, 수량, 서류번호, 사업자등록번호, 부가세번호, 통관고유부호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, business registration number"
       },
       "amount_tax": {
         "semantic": "세액, 부가세",
-        "bias": "세액, 부가세, 부가가치세, 세금, 관세, VAT, tax, tax amount, VAT amount, duty",
-        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호"
+        "bias": "세액, 부가세, 부가가치세, 세금, 관세, tax amount, VAT amount, duty amount, tax payable",
+        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호, 사업자등록번호, 부가세번호, 부가세 등록번호, 세금계산서 번호, 통관고유부호, 수출자부호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, taxpayer ID, TIN, business registration number, customs registration number"
       },
       "freight_amount": {
         "semantic": "운임, 운송비",

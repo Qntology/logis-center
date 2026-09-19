@@ -24,7 +24,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     let type_str = if item_type.is_empty() { "item" } else { item_type };
                     intro.push_str(&format!("This {} is titled '{}'.", type_str, title));
                 } else if !context_name.is_empty() && context_name != "item" {
-                    intro.push_str(&format!("Regarding {},", context_name));
+                    intro.push_str(&format!("Regarding {}.", context_name));
                 }
 
                 if !intro.is_empty() && !sentences.contains(&intro) {
@@ -139,8 +139,31 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     let mut chunks: Vec<(String, String, bool)> = Vec::new();
 
     for sentence in &raw_sentences {
-        let s = sentence.trim().trim_end_matches('.').trim();
+        let mut s = sentence.trim().trim_end_matches('.').trim();
         if s.is_empty() {
+            continue;
+        }
+
+        let mut peeled = 0usize;
+        while let Some(rest) = s.strip_prefix("Regarding ") {
+            let (name, tail) = match rest.find(|c: char| c == ',' || c == '.') {
+                Some(p) => (rest[..p].trim(), rest[p + 1..].trim()),
+                None => (rest.trim(), ""),
+            };
+            if !name.is_empty() {
+                chunks.push((
+                    format!("Regarding {}", name),
+                    "context_intro".to_string(),
+                    false,
+                ));
+            }
+            peeled += 1;
+            s = tail;
+            if s.is_empty() {
+                break;
+            }
+        }
+        if peeled > 0 && s.is_empty() {
             continue;
         }
 
@@ -199,15 +222,9 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
             continue;
         }
 
-        // 패턴 6: "Regarding {context},"
-        // → 중첩 객체 컨텍스트 '도입부'일 뿐, 값이 존재하지 않습니다.
-        //   기존에는 property = context 로 확정되어 실제 값 청크가 들어와야 할
-        //   슬롯을 선점하고(예: "Regarding options,") 값 없는 쓰레기 벡터가 저장되었습니다.
-        //   전용 property 로 격리하여 run_phase_b_pipeline Step 0 에서 폐기합니다.
-        if s.strip_prefix("Regarding ").is_some() {
-            chunks.push((s.to_string(), "context_intro".to_string(), false));
-            continue;
-        }
+        // 패턴 6 은 위 [CONTEXT INTRO PEEL] 로 이관했습니다.
+        // 도입부는 값이 없는 '문맥 표지' 일 뿐이므로 청크가 되어서는 안 되고,
+        // 뒤따르는 값 문장을 삼켜서도 안 됩니다. 두 요구를 한 자리에서 처리합니다.
 
         // 패턴 7: "Its {key} is {value}"
         // → property = key (snake_case), confirmed = true

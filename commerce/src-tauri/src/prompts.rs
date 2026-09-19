@@ -1443,7 +1443,9 @@ pub fn get_trade_crop_prompt_scoped(
          4. Never take a value from a neighbouring field just because it is the only number nearby.\n\
          5. A number you can read does not have to belong to a field. If no printed label ties it to one of the \
          fields below, leave every field null rather than assigning it to the closest-looking one.\n\
-         6. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}{}\n\n{}",
+         6. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.\n\
+         7. A number printed under a caption that names a registration, tax, customs or membership identifier belongs to that identifier. \
+         It is never a quantity, a weight, a price, a subtotal or a total, however plainly numeric it looks. Leave those fields null rather than borrowing that number.{}{}{}\n\n{}",
         category.to_uppercase(),
         doc_type,
         evidence,
@@ -1583,6 +1585,8 @@ pub fn get_trade_pair_read_prompt(doc_type: &str, fields: &[(String, String)]) -
          4. One element per caption. If a caption has no value printed beside it, return null for \"value\".\n\
          5. Do not invent a caption that is not printed. Do not merge two captions into one element.\n\
          6. If the crop contains no readable caption at all, return an empty array.\n\
+         7. Copy the value with everything printed in that field: currency symbols, units, decimal points and thousand separators. \
+         Never strip them and never turn the value into a bare number. Those separators are what tell the routing stage whether a figure is money or an identifier.\n\
          \n\
          [OUTPUT]\n\
          {{\"pairs\": [{{\"label\": null, \"value\": null}}]}}\n\

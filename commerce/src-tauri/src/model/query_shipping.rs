@@ -873,9 +873,14 @@ impl crate::model::LogisModel {
                     feasible += 1;
                 }
                 if feasible == 0 {
+                    let significant = winners[*wi].score >= d1_gate;
                     emit_term(&format!(
-                        "   ⚪ [D2 NO VALUE EVIDENCE] \"{}\" ({}) 에는 식별자·수치·코드 값도, 유의미한 자유서술(D1 {:+.4} < {:.3})도 없어 조건을 만들지 않습니다.",
-                        winners[*wi].text, cat, winners[*wi].score, d1_gate
+                        "   ⚪ [D2 NO VALUE EVIDENCE] \"{}\" ({}) 에는 이 카테고리의 어떤 필드도 받을 수 있는 값 근거가 없습니다. 결속된 수치 {}건 · 식별자 {}건 · D1 {:+.4} {} 게이트 {:.3}. 자유서술 축(Text/Address)은 D1 이 게이트를 넘어야만 열리고, 수치·식별자 축은 결속된 값이 있어야만 열립니다.",
+                        winners[*wi].text, cat,
+                        bound_nums[*wi].len(), bound_ids[*wi].len(),
+                        winners[*wi].score,
+                        if significant { "≥" } else { "<" },
+                        d1_gate
                     ));
                 }
             }
@@ -1091,6 +1096,13 @@ impl crate::model::LogisModel {
                         } else {
                             dropped.push(format!("{}(라벨 {:.4} ≥ 값 {:.4})", w, lab, val));
                         }
+                    }
+                    if kept.is_empty() {
+                        emit_term(&format!(
+                            "   ⚪ [HINT RESIDUAL KEEP] {} 의 값 뱅크가 모든 단어를 라벨로 판정했습니다. 잔차가 비면 조건 자체가 사라져 리콜을 잃으므로 원문 \"{}\" 를 그대로 씁니다.",
+                            field, raw
+                        ));
+                        continue;
                     }
                 } else {
                     let mut lab: Vec<(usize, f32)> = Vec::new();
@@ -2617,14 +2629,21 @@ impl crate::model::LogisModel {
                 };
                 for (i, z, margin, self_evident, key) in live.into_iter() {
                     let by_split = margin >= cut;
-                    if by_split || self_evident {
+                    let by_self = self_evident && margin > 0.0;
+                    if self_evident && !by_self && !by_split {
+                        logs.push(format!(
+                            "   ↩️ [OPERATOR SELF-EVIDENCE REJECT] \"{}\" | 연산자 뱅크 안에서는 '{}' 가 1·2위 격차로 앞서지만(자기 z {:+.3}), 라벨 뱅크 대비 마진이 {:+.4} 로 양수가 아닙니다. 뱅크 자체 변별은 '연산자 중 어느 것인가' 만 답하지 '이 토큰이 연산자인가' 를 답하지 않습니다. 내용어로 되돌립니다.",
+                            cores[i], key, z, margin
+                        ));
+                    }
+                    if by_split || by_self {
                         logs.push(format!(
                             "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 마진 {:+.4} (기준 {:+.4}) | 자기 z {:+.3} | 근거: {} — 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
                             cores[i], key, margin, cut, z,
-                            match (by_split, self_evident) {
-                                (true, true) => "분포 분할 + 뱅크 자체 변별",
+                            match (by_split, by_self) {
+                                (true, true) => "분포 분할 + 뱅크 자체 변별 + 라벨 대비 우위",
                                 (true, false) => "분포 분할",
-                                _ => "뱅크 자체 변별(분할에서는 탈락했으나 1·2위 격차가 표준편차를 넘음)",
+                                _ => "뱅크 자체 변별 + 라벨 대비 우위(분할에서는 탈락)",
                             },
                             op_keys.len()
                         ));

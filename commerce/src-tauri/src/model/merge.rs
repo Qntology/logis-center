@@ -401,6 +401,177 @@ pub fn drop_row_echo_columns(merged: &mut serde_json::Map<String, Value>, emit: 
     }
 }
 
+/// 🌟 [MONETARY RECONCILE] 금액 축에 들어온 값이 이 문서의 돈인지 산술로 확인합니다.
+///
+///  ── 실측 사고 ──
+///   amount      = 1270221736   ← 수하인 부가세번호 (정답 2000)
+///   amount_tax  = 4832882      ← 수출자 부가세번호 (정답 없음)
+///   두 값 다 라벨 코사인이 정당하게 높았습니다. amount_tax 의 앵커에
+///   'VAT' 가 들어 있고 인쇄 라벨이 "EXPORTER VAT/EORI" 이기 때문입니다.
+///   값 형식 게이트는 Numeric 만 보므로 등록번호를 막지 못합니다.
+///
+///  ── 왜 산술인가 ──
+///   라벨로 못 가르는 것을 값으로 가르려면 어휘가 필요하고, 어휘는 이 코드가
+///   가질 수 없습니다. 그러나 인보이스의 돈은 서로 산술로 묶여 있습니다.
+///     · 세액은 과세표준을 넘을 수 없습니다.
+///     · 총계는 행 합계보다 작을 수 없습니다.
+///     · 총계는 소계 + 세액 + 부대비용으로 설명되어야 합니다.
+///   drop_row_echo_columns 가 행 합계 대 문서 총계를 대조하는 것과 같은 판정입니다.
+///
+///  ── 왜 '열 배' 인가 ──
+///   임계값이 아니라 자릿수 판정입니다. 부대비용 한 줄을 못 읽어 상한이
+///   낮게 잡히는 일은 흔하지만, 그 경우 오차는 배수가 아니라 비율입니다.
+///   상한의 열 배를 넘는다는 것은 같은 문서의 돈이 아니라는 뜻입니다.
+pub fn reconcile_monetary_axes(
+    merged: &mut serde_json::Map<String, Value>,
+    emit: &dyn Fn(&str),
+) -> usize {
+    fn num_of(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let t: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                if !t.chars().any(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                t.parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    }
+    fn read(m: &serde_json::Map<String, Value>, f: &str) -> Option<f64> {
+        if let Some(v) = m.get(f).and_then(num_of) {
+            return Some(v);
+        }
+        m.values()
+            .filter_map(|v| v.as_object())
+            .find_map(|o| o.get(f).and_then(num_of))
+    }
+    fn purge(m: &mut serde_json::Map<String, Value>, field: &str) {
+        m.remove(field);
+        let cats: Vec<String> = m.keys().cloned().collect();
+        for c in cats {
+            if let Some(o) = m.get_mut(&c).and_then(|v| v.as_object_mut()) {
+                o.remove(field);
+            }
+        }
+        for key in ["items", "line_items", "containers", "charges", "account_ledger"] {
+            if let Some(arr) = m.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for e in arr.iter_mut() {
+                    if let Some(o) = e.as_object_mut() {
+                        o.remove(field);
+                    }
+                }
+            }
+        }
+    }
+    fn reject(m: &mut serde_json::Map<String, Value>, field: &str) {
+        purge(m, field);
+        crate::utils::score_dynamics::record_field_seen(field);
+        crate::utils::score_dynamics::record_field_reject(
+            field,
+            crate::utils::score_dynamics::GateKind::Format,
+        );
+    }
+
+    let mut items_sum = 0.0f64;
+    let mut items_rows = 0usize;
+    for key in ["items", "line_items"] {
+        if let Some(arr) = merged.get(key).and_then(|v| v.as_array()) {
+            let mut s = 0.0f64;
+            let mut c = 0usize;
+            for r in arr.iter() {
+                if let Some(x) = r.get("total_price").and_then(num_of) {
+                    s += x;
+                    c += 1;
+                }
+            }
+            if c > items_rows {
+                items_sum = s;
+                items_rows = c;
+            }
+        }
+    }
+    let row_anchor = if items_rows > 0 && items_sum > 0.0 { Some(items_sum) } else { None };
+    let subtotal = read(merged, "amount_subtotal");
+    let base = row_anchor.or(subtotal).or_else(|| read(merged, "amount"));
+
+    let mut dropped = 0usize;
+
+    if let (Some(t), Some(b)) = (read(merged, "amount_tax"), base) {
+        if b > 0.0 && t > b {
+            emit(&format!(
+                "  🧮 [MONETARY RECONCILE] 'amount_tax' = {} 가 과세표준 {} 를 넘습니다. 세액이 과세표준보다 클 수는 없으므로 이 자리에 인쇄된 것은 금액이 아니라 등록번호(사업자·부가세·EORI)입니다. 라벨 뱅크에 'VAT' 가 들어 있으면 부가세번호가 세액 축으로 흘러드는데, Numeric 형식 게이트는 숫자라는 사실만 보므로 그 오배정을 걸러내지 못합니다.",
+                t, b
+            ));
+            reject(merged, "amount_tax");
+            dropped += 1;
+        }
+    }
+
+    let mut ceiling = 0.0f64;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(s) = row_anchor.or(subtotal) {
+        if s > 0.0 {
+            ceiling += s;
+            parts.push(format!(
+                "{} {}",
+                if row_anchor.is_some() { "행 합계" } else { "소계" },
+                s
+            ));
+        }
+    }
+    for extra in [
+        "amount_tax",
+        "freight_amount",
+        "insurance_amount",
+        "local_charges",
+        "freight_charge",
+        "insurance",
+    ] {
+        if let Some(v) = read(merged, extra) {
+            if v > 0.0 {
+                ceiling += v;
+                parts.push(format!("{} {}", extra, v));
+            }
+        }
+    }
+    let floor_ref = row_anchor.or(subtotal).unwrap_or(0.0);
+
+    for axis in ["amount", "grand_total_amount"] {
+        let g = match read(merged, axis) {
+            Some(v) => v,
+            None => continue,
+        };
+        if floor_ref > 0.0 && g < floor_ref {
+            emit(&format!(
+                "  🧮 [MONETARY RECONCILE] '{}' = {} 가 행 합계/소계 {} 보다 작습니다. 총계는 자기 구성 항목의 합보다 작을 수 없으므로 이 값은 이 문서의 총계가 아닙니다. 비웁니다.",
+                axis, g, floor_ref
+            ));
+            reject(merged, axis);
+            dropped += 1;
+            continue;
+        }
+        if ceiling > 0.0 && g > ceiling * 10.0 {
+            emit(&format!(
+                "  🧮 [MONETARY RECONCILE] '{}' = {} 는 이 문서가 설명할 수 있는 상한 {} ({}) 의 열 배를 넘습니다. 부대비용 한 줄을 놓쳐 상한이 낮게 잡히는 일은 흔하지만 그 오차는 비율이지 자릿수가 아닙니다. 자릿수가 다르면 같은 문서의 돈이 아니므로 비웁니다.",
+                axis, g, ceiling, parts.join(" + ")
+            ));
+            reject(merged, axis);
+            dropped += 1;
+        }
+    }
+
+    crate::utils::score_dynamics::record_baseline("vision.monetary_reconcile", dropped as f32);
+    if dropped == 0 {
+        emit("  ✅ [MONETARY RECONCILE] 금액 축이 서로 산술로 정합합니다.");
+    }
+    dropped
+}
+
 pub fn is_schema_echo(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -568,6 +739,33 @@ fn purge_self_poisoned_anchors(
     out
 }
 
+/// 🌟 [NAME CONTAINMENT] 한 필드 이름이 다른 필드 이름을 토큰 단위로 품는지 봅니다.
+///
+///  ── 왜 필요한가 ──
+///   discriminative_anchor_verdict 의 전제는 "한 필드의 이름이 다른 필드의
+///   이름을 의미적으로 포함한다"(총중량⊃중량, 소계⊃총계) 입니다.
+///   그 전제가 성립할 때만 두 뱅크가 공유 성분을 갖고, 공유분을 걷어낸
+///   재측정이 의미를 갖습니다.
+///
+///  ── 전제를 확인하지 않았을 때의 실측 ──
+///   incoterms ↔ container_measurement, currency ↔ exchange_rate 처럼
+///   무관한 두 축에서도 발화해, 뱅크가 작다는 이유만으로 정답을 뒤집었습니다.
+///   (한 회차 5건 발화 / 5건 전부 오답 방향)
+fn field_name_contains(a: &str, b: &str) -> bool {
+    let toks = |s: &str| -> Vec<String> {
+        s.split(|c: char| c == '_' || c == ' ' || c == '-')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    let (ta, tb) = (toks(a), toks(b));
+    if ta.is_empty() || tb.is_empty() || ta == tb {
+        return false;
+    }
+    let (small, big) = if ta.len() <= tb.len() { (&ta, &tb) } else { (&tb, &ta) };
+    small.iter().all(|t| big.iter().any(|x| x == t))
+}
+
 pub fn recovery_label_gate(
     label_emb: &[f32],
     field: &str,
@@ -639,19 +837,32 @@ pub fn recovery_label_gate(
     if scored.len() >= 2 {
         let a = scored[0].0.clone();
         let b = scored[1].0.clone();
+        let nested = field_name_contains(&a, &b);
         let ab = banks.iter().find(|(f, _, _)| *f == a).map(|(_, x, _)| x.clone());
         let bb = banks.iter().find(|(f, _, _)| *f == b).map(|(_, x, _)| x.clone());
-        if let (Some(ab), Some(bb)) = (ab, bb) {
+        if !nested {
+            crate::utils::score_dynamics::record_baseline("vision.discriminative_skip", 1.0);
+            println!(
+                "      ⏭ [DISCRIMINATIVE SKIP] 라벨 argmax '{}' 와 2위 '{}' 는 이름이 서로를 품지 않습니다. 두 뱅크가 공유 성분을 갖는다는 근거가 없으므로 잔차 재측정을 하지 않습니다. 무관한 두 축에서 재측정하면 남은 변별 구의 개수 차이가 그대로 승패가 되어, 뱅크가 작은 쪽이 구조적으로 이깁니다.",
+                a, b
+            );
+        } else if let (Some(ab), Some(bb)) = (ab, bb) {
             if let Some((as_, bs_, an, bn)) =
                 crate::utils::ai_utils::discriminative_anchor_verdict(label_emb, &ab, &bb)
             {
+                let size_fair = bn <= an;
                 crate::utils::score_dynamics::record_baseline(
                     "vision.discriminative_gate",
-                    if bs_ > as_ { 1.0 } else { 0.0 },
+                    if bs_ > as_ && size_fair { 1.0 } else { 0.0 },
                 );
-                if bs_ > as_ {
+                if bs_ > as_ && !size_fair {
                     println!(
-                        "      🔬 [DISCRIMINATIVE ANCHOR] 라벨 argmax 는 '{}'({:+.4}) 였지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 '{}' {:.4}({}구) > '{}' {:.4}({}구) 로 뒤집힙니다. 한 필드의 이름이 다른 필드의 이름을 의미적으로 포함하면(총중량은 중량을, 소계는 총계를 포함합니다) 두 뱅크가 같은 성분을 공유해 그 공유분의 미세차가 승패를 가릅니다. 변별 구만 남긴 쪽을 1위로 확정합니다.",
+                        "      ⏭ [DISCRIMINATIVE SIZE BIAS] '{}' {:.4}({}구) 가 '{}' {:.4}({}구) 를 앞섰지만, 이긴 쪽의 변별 구가 더 많습니다. Max-Pool 최댓값은 표본 수만으로도 커지므로 이 역전은 의미 차이가 아니라 뱅크 크기 차이입니다. argmax 를 유지합니다.",
+                        b, bs_, bn, a, as_, an
+                    );
+                } else if bs_ > as_ {
+                    println!(
+                        "      🔬 [DISCRIMINATIVE ANCHOR] 라벨 argmax 는 '{}'({:+.4}) 였지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 '{}' {:.4}({}구) > '{}' {:.4}({}구) 로 뒤집힙니다. 이름이 서로를 품는 두 축(총중량⊃중량, 소계⊃총계)은 뱅크 성분을 공유하므로 그 공유분의 미세차가 승패를 가릅니다. 변별 구만 남긴 쪽을 1위로 확정합니다.",
                         a, scored[0].1, b, bs_, bn, a, as_, an
                     );
                     crate::utils::score_dynamics::record_confusion(&b, &a, bs_ - as_);
@@ -1037,7 +1248,24 @@ pub fn reroute_closed_vocab_values(
             .get(&to_field)
             .map(|x| !(x.is_null() || x.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
             .unwrap_or(false);
-        if target_filled { continue; }
+        if target_filled {
+            let same = merged
+                .get(&to_field)
+                .and_then(|x| x.as_str())
+                .map_or(false, |x| same_printed_token(x, &v));
+            if same {
+                merged.remove(&k);
+                if let Some(o) = merged.get_mut(from_cat).and_then(|x| x.as_object_mut()) {
+                    o.remove(&k);
+                }
+                emit(&format!(
+                    "  🧹 [VOCAB LEAK DROP] {}.{} = \"{}\" | 이 토큰의 소유 축 '{}' 이 이미 같은 값으로 차 있습니다. 한 자리에 인쇄된 값이 두 축에 공존하면 자연어 변환이 같은 사실을 서로 다른 절로 두 번 만듭니다. 남의 축에서 지웁니다.",
+                    from_cat, k, v, to_field
+                ));
+                moved += 1;
+            }
+            continue;
+        }
         merged.remove(&k);
         if let Some(o) = merged.get_mut(from_cat).and_then(|x| x.as_object_mut()) {
             o.remove(&k);
