@@ -737,10 +737,36 @@ pub fn cross_field_ambiguous_phrase_mask(
     out
 }
 
-// 🌟 [DETERMINISTIC CONDITION VALUE] 조건 값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
-//    0.6B 모델에게 값 복사를 맡기면 value 키를 통째로 누락시켜 조건이 증발합니다.
-//    (로그: color 조건에 value 키가 없어 색상 필터 없이 FTS 가 실행됨)
-//    형식이 확정적인 필드는 LLM 없이 코드가 직접 복사합니다.
+pub fn residual_value_tokens(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> Vec<String> {
+    if token_embs.is_empty() { return Vec::new(); }
+    if label_bank.is_empty() || value_bank.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for (tok, emb) in token_embs.iter() {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let l = max_pool_sim(emb, &label_bank.to_vec());
+        let v = max_pool_sim(emb, &value_bank.to_vec());
+        if v > l { kept.push(tok.clone()); }
+    }
+    if kept.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    kept
+}
+
+pub fn residual_value_text(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> String {
+    residual_value_tokens(token_embs, label_bank, value_bank).join(" ")
+}
+
 pub fn deterministic_condition_value(chunks: &Vec<String>, numeric_only: bool) -> String {
     let joined = chunks
         .iter()
@@ -1367,10 +1393,60 @@ pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
     }
     if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
 }
-/// 🌟 [RELATIVE PREJUDICE] 편견이 자기 점수를 '응집도만큼의 여유' 이상으로
-///    앞설 때만 후보 자격을 박탈합니다.
-///
-///  반환 true = 폐기 대상
+
+pub fn discriminative_phrase_mask(
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Vec<bool> {
+    let n = own_bank.len();
+    let mut keep = vec![false; n];
+    if n == 0 || rival_bank.is_empty() {
+        return vec![true; n];
+    }
+    let own_cohesion = bank_internal_cohesion(own_bank);
+    let mut any = false;
+    for (i, e) in own_bank.iter().enumerate() {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let cross = max_pool_sim(e, &rival_bank.to_vec());
+        if cross < own_cohesion {
+            keep[i] = true;
+            any = true;
+        }
+    }
+    if !any { return vec![true; n]; }
+    keep
+}
+
+pub fn discriminative_anchor_verdict(
+    label_emb: &[f32],
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Option<(f32, f32, usize, usize)> {
+    if own_bank.is_empty() || rival_bank.is_empty() { return None; }
+
+    let own_keep = discriminative_phrase_mask(own_bank, rival_bank);
+    let rival_keep = discriminative_phrase_mask(rival_bank, own_bank);
+
+    let own_only: Vec<Vec<f32>> = own_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| own_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+    let rival_only: Vec<Vec<f32>> = rival_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| rival_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+
+    if own_only.is_empty() || rival_only.is_empty() { return None; }
+
+    let own_score = max_pool_sim(label_emb, &own_only);
+    let rival_score = max_pool_sim(label_emb, &rival_only);
+    Some((own_score, rival_score, own_only.len(), rival_only.len()))
+}
+
 pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
     if own <= 0.0 {
         return true;
@@ -1491,18 +1567,23 @@ pub fn correction_cosine_degraded(
     new_score < old_score
 }
 
-// 🌟 [MAX-COVERAGE GREEDY ASSIGN] 청크가 굶어 죽지 않는 1:1 배타 배정.
-//    exclusive_assign_by_score 의 rival 은 '같은 라인에 대한 다른 필드의 최고 점수'입니다.
-//    따라서 margin_threshold = 0.0 으로 호출하면
-//        margin = own - max_{f'≠f} matrix[f'][l] >= 0  ⟺  own 이 그 라인의 argmax
-//    가 되어, 각 라인은 자기 argmax 필드 하나에만 주장을 낼 수 있습니다.
-//    그 필드를 더 높은 점수의 다른 라인이 가져가면 차선책으로 이동할 기회 없이 소멸합니다.
-//    (로그: '가디건'/'무거운'/'제품중에서'/'제품으로'/'중에서'/'메세지도'/'보여줘' 가 전부 이 경로로 전멸.
-//     특히 color 뱅크는 50개 언어 색상명 ~700구라 Max-Pool 이 구조적으로 부풀려져
-//     무관한 청크의 argmax 를 독식하는 '흡수 싱크' 로 작동했습니다)
-//    여기서는 margin 을 '정렬 기준'이 아니라 '보고용 지표'로만 쓰고,
-//    유효한 모든 (필드 × 라인) 주장을 절대 점수 순으로 그리디 배정하여 커버리지를 최대화합니다.
-//    matrix[field][line], 음수는 무효 칸. 반환값 = field_idx -> Option<(line_idx, own, margin)>
+pub fn window_assign_verdict(
+    own_neutral: f32,
+    rival_neutral: f32,
+    asked_in_window: bool,
+) -> (bool, &'static str) {
+    if !asked_in_window {
+        return (false, "이 창이 묻지 않은 축");
+    }
+    if own_neutral > 0.0 {
+        return (true, "창 안 1위이며 자기 중립점수가 양수");
+    }
+    if rival_neutral <= 0.0 {
+        return (true, "창 안 1위이며 경쟁 축도 근거가 없음");
+    }
+    (false, "자기 중립점수가 음수이고 경쟁 축이 양수 근거를 가짐")
+}
+
 pub fn greedy_exclusive_assign(matrix: &Vec<Vec<f32>>) -> Vec<Option<(usize, f32, f32)>> {
     let field_count = matrix.len();
     let mut result: Vec<Option<(usize, f32, f32)>> = vec![None; field_count];

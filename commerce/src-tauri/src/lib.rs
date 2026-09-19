@@ -1591,7 +1591,10 @@ fn dexie_condition_passes(cond: &Value, doc: &Value, alternates: &Value) -> bool
     })
 }
 
-fn evaluate_dexie_plan(plan: &Value, docs: &[Value]) -> (usize, usize, Vec<(String, usize, usize)>) {
+fn evaluate_dexie_plan(
+    plan: &Value,
+    docs: &[Value],
+) -> (usize, usize, Vec<(String, usize, usize, usize)>) {
     let conds: Vec<Value> = plan
         .get("conditions")
         .and_then(|v| v.as_array())
@@ -1609,7 +1612,10 @@ fn evaluate_dexie_plan(plan: &Value, docs: &[Value]) -> (usize, usize, Vec<(Stri
         let f = path.strip_prefix("data.").unwrap_or(path).to_string();
         if !f.is_empty() && !fields.contains(&f) { fields.push(f); }
     }
-    let mut per: Vec<(String, usize, usize)> = fields.iter().map(|f| (f.clone(), 0usize, 0usize)).collect();
+    let mut per: Vec<(String, usize, usize, usize)> = fields
+        .iter()
+        .map(|f| (f.clone(), 0usize, 0usize, 0usize))
+        .collect();
     let mut eligible = 0usize;
     let mut all_pass = 0usize;
     for d in docs.iter() {
@@ -1641,12 +1647,93 @@ fn evaluate_dexie_plan(plan: &Value, docs: &[Value]) -> (usize, usize, Vec<(Stri
         for (i, pass) in ok.iter().enumerate() {
             if *pass {
                 per[i].1 += 1;
-            } else if fails == 1 {
-                per[i].2 += 1;
+            } else {
+                per[i].3 += 1;
+                if fails == 1 { per[i].2 += 1; }
             }
         }
     }
     (eligible, all_pass, per)
+}
+
+fn plan_alternate_axis_map(plan: &Value) -> Value {
+    plan.get("alternates").cloned().unwrap_or(json!({}))
+}
+
+fn collect_storage_axes(docs: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in docs.iter() {
+        if let Some(obj) = d.as_object() {
+            for (k, v) in obj.iter() {
+                if v.is_null() { continue; }
+                if let Some(s) = v.as_str() {
+                    if s.trim().is_empty() { continue; }
+                }
+                if v.is_object() || v.is_array() { continue; }
+                if !out.iter().any(|e| e == k) { out.push(k.clone()); }
+            }
+        }
+    }
+    out
+}
+
+fn axis_format_compatible(a: &str, b: &str) -> bool {
+    use crate::utils::ai_utils::{detect_field_format, FieldFormat};
+    let fa = detect_field_format(a);
+    let fb = detect_field_format(b);
+    if fa == fb { return true; }
+    matches!(
+        (fa, fb),
+        (FieldFormat::Numeric, FieldFormat::Identifier)
+            | (FieldFormat::Identifier, FieldFormat::Numeric)
+            | (FieldFormat::Text, FieldFormat::Address)
+            | (FieldFormat::Address, FieldFormat::Text)
+    )
+}
+
+async fn nearest_storage_axis(
+    model: &LogisModel,
+    page_type: &str,
+    blocked_field: &str,
+    storage_axes: &[String],
+) -> Option<(String, f32)> {
+    use crate::utils::ai_utils::{cosine_similarity, semantic_anchor_text};
+
+    let compatible: Vec<String> = storage_axes
+        .iter()
+        .filter(|a| a.as_str() != blocked_field)
+        .filter(|a| axis_format_compatible(blocked_field, a))
+        .cloned()
+        .collect();
+    if compatible.is_empty() { return None; }
+
+    let mut texts: Vec<String> = Vec::with_capacity(compatible.len() + 1);
+    texts.push(semantic_anchor_text("en", page_type, blocked_field));
+    for a in compatible.iter() {
+        texts.push(semantic_anchor_text("en", page_type, a));
+    }
+
+    let embs = model.get_embedding_batch(texts).await.ok()?;
+    if embs.len() != compatible.len() + 1 { return None; }
+
+    let target = &embs[0];
+    let mut scored: Vec<(String, f32)> = Vec::with_capacity(compatible.len());
+    for (i, a) in compatible.iter().enumerate() {
+        scored.push((a.clone(), cosine_similarity(target, &embs[i + 1])));
+    }
+    scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    if scored.len() < 2 {
+        return scored.into_iter().next();
+    }
+    let tail: Vec<f32> = scored[1..].iter().map(|(_, s)| *s).collect();
+    let n = tail.len() as f32;
+    let mean = tail.iter().sum::<f32>() / n;
+    let var = tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+    let sd = var.max(0.0).sqrt();
+    if sd <= 1e-6 { return None; }
+    if scored[0].1 - mean < sd { return None; }
+    Some(scored[0].clone())
 }
 
 fn is_relay_draft(doc: &Value) -> bool {
@@ -2740,6 +2827,91 @@ async fn ai_search_complex(
                 ranked_results.truncate(FINAL_LIMIT);
             }
 
+            let projection_axes: Vec<String> = {
+                let mut v: Vec<String> = Vec::new();
+                for plan in dexie_plans.iter() {
+                    if let Some(arr) = plan.get("projection").and_then(|p| p.as_array()) {
+                        for a in arr.iter() {
+                            if let Some(s) = a.as_str() {
+                                let t = s.trim();
+                                if !t.is_empty() && !v.iter().any(|e| e == t) {
+                                    v.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                v
+            };
+
+            if !projection_axes.is_empty() {
+                match store_opt.as_ref() {
+                    None => println!(
+                        "[AI-SEARCH] ⚠️ [PROJECTION SKIP] 표시 축 {:?} 를 요청받았지만 Store 가 없어 값을 실을 수 없습니다.",
+                        projection_axes
+                    ),
+                    Some(store) => {
+                        let mut attached = 0usize;
+                        let mut unresolved = 0usize;
+                        for item in ranked_results.iter_mut() {
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if id.is_empty() {
+                                unresolved += 1;
+                                continue;
+                            }
+                            let data: Value = match store.get_item_by_id("items", &id).await {
+                                Ok(Some(d)) => match serde_json::from_str(&d.json_data) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        unresolved += 1;
+                                        continue;
+                                    }
+                                },
+                                _ => {
+                                    unresolved += 1;
+                                    continue;
+                                }
+                            };
+                            let mut picked = serde_json::Map::new();
+                            for axis in projection_axes.iter() {
+                                let hit = data.get(axis.as_str()).cloned().or_else(|| {
+                                    data.as_object().and_then(|o| {
+                                        o.values()
+                                            .filter_map(|v| v.as_object())
+                                            .find_map(|inner| inner.get(axis.as_str()).cloned())
+                                    })
+                                });
+                                if let Some(val) = hit {
+                                    let empty = val.is_null()
+                                        || val
+                                            .as_str()
+                                            .map(|s| s.trim().is_empty())
+                                            .unwrap_or(false);
+                                    if !empty {
+                                        picked.insert(axis.clone(), val);
+                                    }
+                                }
+                            }
+                            if picked.is_empty() {
+                                continue;
+                            }
+                            attached += 1;
+                            item.as_object_mut()
+                                .unwrap()
+                                .insert("projection".to_string(), Value::Object(picked));
+                        }
+                        println!(
+                            "[AI-SEARCH] 🧷 [PROJECTION ATTACH] 질의가 '함께 보여달라' 고 지목한 축 {:?} 를 결과 {}건에 실었습니다 (값을 찾지 못한 행 {}건). 이 축은 회수 조건이 아니므로 결과 집합을 좁히지 않고 값만 덧붙입니다. 지금까지는 plan 안에 담겨 운반만 되고 아무도 읽지 않았습니다.",
+                            projection_axes, attached, unresolved
+                        );
+                    }
+                }
+            }
+
             // ── 검색 통계 로그 출력 ──
             let chunk_match_count = ranked_results.iter()
                 .filter(|r| r.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -2819,7 +2991,7 @@ async fn ai_search_complex(
                         hydrated, unresolved
                     );
                 }
-                for plan in dexie_plans.iter() {
+                for plan in dexie_plans.iter_mut() {
                     let types: Vec<String> = plan
                         .get("types")
                         .and_then(|v| v.as_array())
@@ -2845,11 +3017,14 @@ async fn ai_search_complex(
                         crate::utils::score_dynamics::record_baseline("search.pass_ratio", all_pass as f32 / eligible as f32);
                     }
                     let mut detail: Vec<String> = Vec::new();
-                    for (field, satisfied, blocked) in per_field.iter() {
+                    for (field, satisfied, sole, blocked) in per_field.iter() {
                         if eligible > 0 {
-                            crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, *blocked > 0);
+                            crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, *sole > 0);
                         }
-                        detail.push(format!("{}(만족 {} / 단독 차단 {})", field, satisfied, blocked));
+                        detail.push(format!(
+                            "{}(만족 {} / 단독 차단 {} / 차단 기여 {})",
+                            field, satisfied, sole, blocked
+                        ));
                     }
                     println!(
                         "[AI-SEARCH] 📈 [SDS / SEARCH OUTCOME] 'search|{}|' | 리콜 {}건 · 서식 범위 안 {}건 중 하드 조건 전부 만족 {}건 | 초안 {}건 | {}",
@@ -2862,6 +3037,79 @@ async fn ai_search_complex(
                     );
                     if all_pass == 0 && eligible > 0 && !per_field.is_empty() {
                         let corpus = crate::utils::score_dynamics::storage_doc_count(&types);
+                        let page_type = types.first().cloned().unwrap_or_default();
+                        let storage_axes = collect_storage_axes(&docs);
+
+                        let mut substituted: Vec<String> = Vec::new();
+                        {
+                            let plan_alts_now = plan_alternate_axis_map(plan);
+                            let mut add: Vec<(String, String, f32)> = Vec::new();
+                            for (field, _sat, _sole, blocked) in per_field.iter() {
+                                if *blocked == 0 { continue; }
+                                let mut axes: Vec<String> = vec![field.clone()];
+                                if let Some(arr) = plan_alts_now.get(field.as_str()).and_then(|v| v.as_array()) {
+                                    for a in arr.iter() {
+                                        if let Some(s) = a.as_str() { axes.push(s.to_string()); }
+                                    }
+                                }
+                                let here = docs
+                                    .iter()
+                                    .filter(|d| {
+                                        axes.iter().any(|k| {
+                                            d.get(k.as_str()).map_or(false, |v| {
+                                                !(v.is_null()
+                                                    || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                                            })
+                                        })
+                                    })
+                                    .count();
+                                if here > 0 { continue; }
+                                if let Some((cand, score)) =
+                                    nearest_storage_axis(&model, &page_type, field, &storage_axes).await
+                                {
+                                    add.push((field.clone(), cand, score));
+                                }
+                            }
+                            if !add.is_empty() {
+                                if let Some(obj) = plan.as_object_mut() {
+                                    let slot = obj.entry("alternates".to_string()).or_insert_with(|| json!({}));
+                                    if !slot.is_object() { *slot = json!({}); }
+                                    if let Some(m) = slot.as_object_mut() {
+                                        for (field, cand, score) in add.iter() {
+                                            let entry = m.entry(field.clone()).or_insert_with(|| json!([]));
+                                            if !entry.is_array() { *entry = json!([]); }
+                                            if let Some(arr) = entry.as_array_mut() {
+                                                if !arr.iter().any(|x| x.as_str() == Some(cand.as_str())) {
+                                                    arr.push(json!(cand));
+                                                }
+                                            }
+                                            substituted.push(format!("{} → {}({:.4})", field, cand, score));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let (eligible, all_pass, per_field) = if substituted.is_empty() {
+                            (eligible, all_pass, per_field)
+                        } else {
+                            let (e2, p2, f2) = evaluate_dexie_plan(plan, &docs);
+                            println!(
+                                "[AI-SEARCH] 🔁 [AXIS SUBSTITUTE] 회수 문서에 존재하지 않는 조건 축을, 그 문서가 실제로 가진 축 중 다국어 라벨 코사인이 자기 분포에서 유의하게 앞서고 값 형식이 같은 축으로 열었습니다: {:?}. 강등은 조건을 잃지만 치환은 조건을 유지하므로 치환을 먼저 시도합니다. 하드 조건 전부 만족 {}건 → {}건.",
+                                substituted, all_pass, p2
+                            );
+                            crate::utils::score_dynamics::record_baseline(
+                                "search.pass_ratio_after_substitute",
+                                if e2 > 0 { p2 as f32 / e2 as f32 } else { 0.0 },
+                            );
+                            (e2, p2, f2)
+                        };
+
+                        if all_pass > 0 {
+                            crate::utils::score_dynamics::leave_scope();
+                            continue;
+                        }
+
                         let plan_alts = plan.get("alternates").cloned().unwrap_or(json!({}));
                         let present_in_recall = |f: &str| -> usize {
                             let mut axes: Vec<String> = vec![f.to_string()];
@@ -2882,8 +3130,9 @@ async fn ai_search_complex(
                                 .count()
                         };
                         let mut gap: Vec<String> = Vec::new();
+                        let mut gap_fields: Vec<String> = Vec::new();
                         let mut narrow: Vec<String> = Vec::new();
-                        for (field, _satisfied, blocked) in per_field.iter() {
+                        for (field, _satisfied, _sole, blocked) in per_field.iter() {
                             if *blocked == 0 { continue; }
                             let here = present_in_recall(field);
                             let prior = match crate::utils::score_dynamics::storage_fill_prior(&types, field) {
@@ -2894,7 +3143,14 @@ async fn ai_search_complex(
                                 None => "이력 없음".to_string(),
                             };
                             let line = format!("{}(이번 회수 {}/{}건 · {})", field, here, docs.len(), prior);
-                            if here == 0 { gap.push(line); } else { narrow.push(line); }
+                            if here == 0 {
+                                gap.push(line);
+                                if !gap_fields.iter().any(|g| g == field) {
+                                    gap_fields.push(field.clone());
+                                }
+                            } else {
+                                narrow.push(line);
+                            }
                         }
                         println!(
                             "[AI-SEARCH] ⚠️ [OVER-FILTER] 서식 범위 안 문서 {}건 중 하드 조건을 전부 만족하는 문서가 없습니다. (같은 서식 저장본 {}건 기준)",
@@ -2902,9 +3158,53 @@ async fn ai_search_complex(
                         );
                         if !gap.is_empty() {
                             println!(
-                                "[AI-SEARCH] 🕳️ [STORAGE GAP] 이번에 회수한 문서 어디에도 이 축이 저장되어 있지 않습니다. 값이 조건을 벗어난 것이 아니라 비교할 값 자체가 없으므로 하드에서 내려야 합니다: {}",
+                                "[AI-SEARCH] 🕳️ [STORAGE GAP] 이번에 회수한 문서 어디에도 이 축이 저장되어 있지 않고, 형식이 맞는 대체 축도 없습니다. 값이 조건을 벗어난 것이 아니라 비교할 값 자체가 없으므로 하드에서 내려야 합니다: {}",
                                 gap.join(" | ")
                             );
+                            let mut demoted: Vec<String> = Vec::new();
+                            let mut carried: Vec<(String, Value)> = Vec::new();
+                            if let Some(arr) = plan.get_mut("conditions").and_then(|v| v.as_array_mut()) {
+                                let all: Vec<Value> = arr.drain(..).collect();
+                                for c in all.into_iter() {
+                                    let p = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let f = p.strip_prefix("data.").unwrap_or(p.as_str()).to_string();
+                                    if gap_fields.iter().any(|g| *g == f) {
+                                        let op = c.get("op").and_then(|v| v.as_str()).unwrap_or("eq").to_string();
+                                        let val = c.get("value").cloned().unwrap_or(Value::Null);
+                                        carried.push((f.clone(), json!({ "operator": op, "value": val })));
+                                        if !demoted.iter().any(|d| *d == f) { demoted.push(f); }
+                                    } else {
+                                        arr.push(c);
+                                    }
+                                }
+                            }
+                            if !carried.is_empty() {
+                                if let Some(obj) = plan.as_object_mut() {
+                                    let slot = obj.entry("hints".to_string()).or_insert_with(|| json!({}));
+                                    if !slot.is_object() { *slot = json!({}); }
+                                    if let Some(h) = slot.as_object_mut() {
+                                        for (f, v) in carried.into_iter() { h.insert(f, v); }
+                                    }
+                                }
+                            }
+                            if !demoted.is_empty() {
+                                for f in demoted.iter() {
+                                    crate::utils::score_dynamics::record_search_demotion(f);
+                                }
+                                println!(
+                                    "[AI-SEARCH] 🧮 [RUNTIME DEMOTE] 하드 조건 {:?} 를 이번 회차에서 즉시 힌트로 내립니다. 이 축은 회수한 문서 {}건 전부에 저장되어 있지 않아 어떤 값을 넣어도 통과할 수 없는 조건입니다. 그대로 두면 프런트의 executeDexiePlan 이 같은 조건을 다시 적용해 화면에는 0건만 남습니다. 판정 기준은 단독 차단이 아니라 차단 기여이므로, 조건이 둘 이상 동시에 깨져도 이 경로가 침묵하지 않습니다.",
+                                    demoted, docs.len()
+                                );
+                                let (re_eligible, re_pass, _) = evaluate_dexie_plan(plan, &docs);
+                                println!(
+                                    "[AI-SEARCH] 🔁 [RE-EVALUATE] 강등 후 하드 조건을 전부 만족하는 문서 {}건 / 서식 범위 안 {}건 (강등 전 {}건). 조건을 버린 것이 아니라 비교 불가능한 축만 힌트로 옮겼으므로 나머지 조건은 그대로 적용됩니다.",
+                                    re_pass, re_eligible, all_pass
+                                );
+                                crate::utils::score_dynamics::record_baseline(
+                                    "search.pass_ratio_after_demote",
+                                    if re_eligible > 0 { re_pass as f32 / re_eligible as f32 } else { 0.0 },
+                                );
+                            }
                         }
                         if !narrow.is_empty() {
                             println!(
@@ -2913,10 +3213,10 @@ async fn ai_search_complex(
                             );
                         }
                     }
+                    crate::utils::score_dynamics::leave_scope();
                 }
                 println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
                 crate::utils::score_dynamics::flush();
-                crate::utils::score_dynamics::leave_scope();
             }
             all_results = ranked_results;
         }

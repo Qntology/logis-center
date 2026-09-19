@@ -311,6 +311,47 @@ pub fn verify_claims_v2(
                 "vision.source_blank_ratio",
                 bl as f32 / total,
             );
+            crate::utils::score_dynamics::record_baseline(
+                "vision.source_illegible_ratio",
+                il as f32 / total,
+            );
+            let claim_fmt = crate::utils::ai_utils::detect_field_format(&c.field);
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.source_illegible_ratio.{:?}", claim_fmt),
+                il as f32 / total,
+            );
+            // 🌟 [NAME RESIDUE OBSERVE] 인명 축의 선행/후행 구두점을 관측만 합니다.
+            //
+            //  ── 왜 판정하지 않는가 ──
+            //   signatory_name = "-Jane" 의 선행 하이픈은 서명 획을 글자로 읽은
+            //   잔해일 가능성이 높습니다. 그러나 인명에는 하이픈이 정당하게
+            //   들어가는 경우가 있고(Jean-Luc, Smith-Jones), 구두점 하나를
+            //   폐기 근거로 쓰면 오탐 위험이 큽니다.
+            //   임계는 상수가 아니라 이 축의 자기 분포에서 유도해야 하므로
+            //   이번 회차는 분포만 모읍니다.
+            if c.field.ends_with("_name") {
+                let t = c.value.trim();
+                let edge = !t.is_empty()
+                    && (t.starts_with(|ch: char| !ch.is_alphanumeric())
+                        || t.ends_with(|ch: char| !ch.is_alphanumeric()));
+                crate::utils::score_dynamics::record_baseline(
+                    "vision.name_residue",
+                    if edge { 1.0 } else { 0.0 },
+                );
+                if edge {
+                    emit(&format!(
+                        "    👁️ [NAME RESIDUE OBSERVE] [{}] '{}' = \"{}\" | 인명 축의 값 양끝에 영숫자가 아닌 문자가 붙어 있습니다. 서명 획을 글자로 읽은 잔해일 수 있으나, 인명에 하이픈이 정당하게 들어가는 경우가 있어 이번 회차는 폐기하지 않고 관측만 합니다.",
+                        c.category, c.field, c.value
+                    ));
+                }
+            }
+            if il > 0 {
+                emit(&format!(
+                    "    👁️ [SOURCE BLUR OBSERVE] [{}] '{}' ({:?}) = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} (판독불가 비중 {:.0}%). 이번 회차는 폐기하지 않고 관측만 합니다. 판독가능 패치가 하나라도 있으면 통과시키는 현재 기준으로는 라벨만 선명하고 본문이 흐린 블록을 가려낼 수 없는데, 그 임계는 상수가 아니라 이 문서 자기 분포에서 유도해야 합니다.",
+                    c.category, c.field, claim_fmt, c.value, lg, il, bl,
+                    il as f32 / total * 100.0
+                ));
+            }
         }
         if !accepted {
             rejected += 1;

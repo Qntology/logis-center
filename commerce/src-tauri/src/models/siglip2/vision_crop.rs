@@ -1054,6 +1054,96 @@ fn rescue_uncovered_cells(
     ));
 }
 
+/// 🌟 [DOC TEXT HEIGHT BASELINE] 문서 전체의 글자 높이 중앙값과 MAD 를 한 번만 측정합니다.
+///
+///  ── 왜 문서 수준인가 ──
+///   크롭 하나의 잉크 행 밴드가 2개뿐이면 "최솟값" 기준이 곧 "유일값" 이 되어
+///   그 밴드가 글자 한 행인지 서명 획 덩어리인지 구분할 근거가 사라집니다.
+///   (실측: 복구 창 7 이 44.0px 를 채택해 배율 1.00x → 70토큰 → 한 글자도 못 읽음.
+///    같은 문서의 다른 22개 크롭은 8.0~14.4px, 중앙값 10.0px 였습니다)
+///   이상치는 자기 안에서 보이지 않고 무리 안에서만 보이므로 기준선을 문서로 올립니다.
+///
+///  ── 왜 중앙값 + MAD 인가 ──
+///   이 코드베이스가 SPATIAL RESIDUAL GATE 와 vision_encoder 의 robust z 에서
+///   이미 쓰는 동일한 분포 판정입니다. 새 상수가 생기지 않습니다.
+///
+///  ── 반환 ──
+///   (중앙값, MAD). 행 밴드가 3개 미만이면 판정이 불가능하므로 None.
+pub fn measure_doc_text_height(
+    img: &image::DynamicImage,
+    emit: &dyn Fn(&str),
+) -> Option<(f32, f32)> {
+    let gray = img.to_luma8();
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    if w == 0 || h < 8 { return None; }
+
+    // ── 행별 잉크량 ──
+    let mut row_ink: Vec<u32> = vec![0; h];
+    for y in 0..h {
+        let mut c = 0u32;
+        for x in 0..w {
+            if gray.get_pixel(x as u32, y as u32).0[0] < 160 { c += 1; }
+        }
+        row_ink[y] = c;
+    }
+
+    // ── 잉크 임계 : 자기 분포의 평균 ──
+    let total: u64 = row_ink.iter().map(|v| *v as u64).sum();
+    let mean = total as f32 / h as f32;
+    if mean <= 0.0 { return None; }
+
+    // ── 연속 잉크 행 = 한 밴드 ──
+    let mut bands: Vec<f32> = Vec::new();
+    let mut run = 0usize;
+    for y in 0..h {
+        if row_ink[y] as f32 > mean {
+            run += 1;
+        } else if run > 0 {
+            bands.push(run as f32);
+            run = 0;
+        }
+    }
+    if run > 0 { bands.push(run as f32); }
+    if bands.len() < 3 { return None; }
+
+    bands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = bands[bands.len() / 2];
+
+    let mut dev: Vec<f32> = bands.iter().map(|b| (b - median).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2] * 1.4826;
+
+    emit(&format!(
+        "  📐 [DOC TEXT HEIGHT] 문서 전체 잉크 행 밴드 {}개 | 중앙값 {:.1}px | MAD {:.1}px | 허용 상한 {:.1}px. 크롭 하나의 밴드가 두세 개뿐이면 그 안에서는 이상치를 볼 수 없으므로, 글자 높이의 기준선은 문서 전체 분포에서 가져옵니다.",
+        bands.len(), median, mad, median + mad.max(1.0)
+    ));
+    crate::utils::score_dynamics::record_baseline("vision.doc_text_height", median);
+    Some((median, mad))
+}
+
+/// 🌟 [TEXT HEIGHT CLAMP] 크롭 하나가 추정한 글자 높이를 문서 기준선으로 되돌립니다.
+///
+///  ── 왜 상한만 거는가 ──
+///   과소 추정은 배율을 올려 토큰만 늘릴 뿐 판독을 해치지 않습니다.
+///   과대 추정은 배율을 1.00x 로 떨어뜨려 판독 자체를 불가능하게 만듭니다.
+///   손실이 비대칭이므로 상한만 강제합니다.
+pub fn clamp_text_height(
+    estimated: f32,
+    baseline: Option<(f32, f32)>,
+    tag: &str,
+    emit: &dyn Fn(&str),
+) -> f32 {
+    let (median, mad) = match baseline { Some(v) => v, None => return estimated };
+    let cap = median + mad.max(1.0);
+    if estimated <= cap { return estimated; }
+    emit(&format!(
+        "    📐 [TEXT HEIGHT CLAMP / {}] 추정 {:.1}px 가 문서 상한 {:.1}px(중앙값 {:.1} + MAD {:.1})를 넘어 중앙값으로 되돌립니다. 이 크롭의 잉크 행 밴드가 서명 획이나 여러 행이 붙은 덩어리를 한 행으로 재고 있습니다. 그대로 두면 배율이 1.00x 로 떨어져 2B 모델이 한 글자도 읽지 못합니다.",
+        tag, estimated, cap, median, mad
+    ));
+    crate::utils::score_dynamics::record_baseline("vision.text_height_clamp", 1.0);
+    median
+}
+
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
@@ -2024,22 +2114,42 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
 }
 
 pub fn crop_region(
-    image: &DynamicImage,
+    img: &image::DynamicImage,
     plan: &CropPlan,
-    target_short: u32,
-) -> DynamicImage {
+    min_side: u32,
+) -> image::DynamicImage {
+    crop_region_clamped(img, plan, min_side, None, &|_| {})
+}
+
+pub fn crop_region_clamped(
+    img: &image::DynamicImage,
+    plan: &CropPlan,
+    min_side: u32,
+    height_baseline: Option<(f32, f32)>,
+    emit: &dyn Fn(&str),
+) -> image::DynamicImage {
     let (x0, y0, x1, y1) = plan.bbox;
     let w = x1.saturating_sub(x0).max(1);
     let h = y1.saturating_sub(y0).max(1);
-    let cropped = image.crop_imm(x0, y0, w, h);
+    let cropped = img.crop_imm(x0, y0, w, h);
 
-    // 🌟 글자 높이를 실측해 필요한 배율만 적용합니다.
+    // 🌟 [D-1] 실측 글자 높이를 '문서 기준선으로 되돌린 뒤' 배율을 계산합니다.
+    //
+    //  ── 순서가 중요한 이유 ──
+    //   배율을 먼저 확정하고 높이만 클램프하면 로그와 실제 전송 크기가 어긋나고,
+    //   창 7(44.0px → 1.00x)의 사고가 그대로 재현됩니다.
+    //   클램프된 높이로 배율을 다시 계산해야 640px 급 전송이 성립합니다.
     let factor = match estimate_text_height(&cropped) {
         Some(th) if th > 0.5 => {
-            let f = (VISION_PATCH_PX / th).clamp(1.0, 4.0);
+            let est_h = clamp_text_height(th, height_baseline, &plan.category, emit);
+            let f = if est_h > 0.5 {
+                (VISION_PATCH_PX / est_h).clamp(1.0, 4.0)
+            } else {
+                (VISION_PATCH_PX / th).clamp(1.0, 4.0)
+            };
             println!(
-                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px → 배율 {:.2}x (목표 {}px/글자)",
-                th, f, VISION_PATCH_PX as u32
+                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px(크롭 실측 {:.1}px) → 배율 {:.2}x (목표 {:.0}px/글자)",
+                est_h, th, f, VISION_PATCH_PX
             );
             f
         }
@@ -2047,7 +2157,7 @@ pub fn crop_region(
             // 프로파일에서 주기를 못 찾음 = 텍스트가 거의 없음.
             // 기존 짧은 변 규칙으로 폴백하되 상한을 낮게 둡니다.
             let short = w.min(h) as f32;
-            let f = (target_short as f32 / short).clamp(1.0, 2.0);
+            let f = (min_side as f32 / short).clamp(1.0, 2.0);
             println!(
                 "    📏 [TEXT-AWARE UPSCALE] 라인 주기 미검출(텍스트 희소) → 보수적 배율 {:.2}x",
                 f
@@ -2056,10 +2166,22 @@ pub fn crop_region(
         }
     };
 
+    let mut factor = factor;
+    let cap_w = CROP_MAX_SIDE_PX as f32 / w as f32;
+    let cap_h = CROP_MAX_SIDE_PX as f32 / h as f32;
+    let cap = if cap_w < cap_h { cap_w } else { cap_h };
+    if cap > 1.0 && factor > cap {
+        println!(
+            "    📐 [ISOTROPIC CAP] 크롭 {}x{} 의 배율 {:.2}x 가 긴 변 상한 {}px 를 넘어 {:.2}x 로 낮춥니다. 변마다 따로 자르면 종횡비가 깨져 글자가 한쪽으로 늘어나고, 그 왜곡은 ViT 패치 격자와 어긋나 식별 축을 담은 크롭에서 특히 손해가 큽니다.",
+            w, h, factor, CROP_MAX_SIDE_PX, cap
+        );
+        factor = cap;
+    }
+
     if factor <= 1.01 { return cropped; }
 
-    let nw = (((w as f32 * factor).round() as u32).max(1)).min(2048);
-    let nh = (((h as f32 * factor).round() as u32).max(1)).min(2048);
+    let nw = ((w as f32 * factor).round() as u32).max(1);
+    let nh = ((h as f32 * factor).round() as u32).max(1);
     cropped.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 

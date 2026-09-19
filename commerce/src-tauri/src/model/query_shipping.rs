@@ -1015,6 +1015,83 @@ impl crate::model::LogisModel {
             }
         }
 
+        // 🌟 [HINT RESIDUAL] 힌트 값에서 라벨 토큰을 걷어내고 값 토큰만 남깁니다.
+        //
+        //  ── 실측 사고 ──
+        //   "중국에 제조" 스팬이 items.country_of_manufacture 로 배정되면서
+        //   힌트 값이 "중국에서 제조된" 이 되었습니다. 저장값은 "China" 입니다.
+        //   값 토큰(중국)과 라벨 토큰(제조된)이 한 문자열에 섞이면
+        //   다국어 임베딩이 China 와 연결되어야 할 신호가 라벨 쪽으로 희석되고,
+        //   청크 property 타겟 검색이 0건으로 떨어집니다. (실측 score +0.0479)
+        //   같은 회차에 값만 담긴 힌트(unit_price='10', amount='1500')는 둘 다 1건씩 확보했습니다.
+        //
+        //  ── 판정 근거 ──
+        //   라벨 뱅크는 label_phrase_bank(그 필드의 인쇄 라벨),
+        //   값 뱅크는 multilingual_value_anchor_phrases_scoped(그 필드 값의 의미 도메인)입니다.
+        //   둘 다 bias.json 이 이미 소유한 사전이므로 어떤 언어의 어휘도 코드에 등장하지 않습니다.
+        //   각 단어를 두 뱅크와 Max-Pool 로 비교해 값 뱅크가 이기는 단어만 남깁니다.
+        //
+        //  ── 왜 조건이 아니라 힌트만인가 ──
+        //   하드 조건은 Dexie 가 저장값과 직접 비교하므로 원문이 유지되어야 합니다.
+        //   힌트는 임베딩 코사인에만 쓰이므로 잔차화가 정확히 이득입니다.
+        //
+        //  ── 전부 탈락하면 손대지 않습니다 ──
+        //   잔차가 비면 조건 자체가 사라져 리콜을 잃습니다. 희석된 값이라도 있는 편이 낫습니다.
+        if !hints.is_empty() {
+            let hint_fields: Vec<String> = hints.keys().cloned().collect();
+            for field in hint_fields.into_iter() {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                let raw = match hints.get(&field).and_then(|v| v.get("value")).and_then(|v| v.as_str()) {
+                    Some(s) => s.trim().to_string(),
+                    None => continue,
+                };
+                if raw.is_empty() { continue; }
+                let words: Vec<String> = raw
+                    .split_whitespace()
+                    .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+                    .filter(|w| !w.is_empty())
+                    .collect();
+                // 단어가 하나뿐이면 걷어낼 라벨이 없습니다.
+                if words.len() < 2 { continue; }
+
+                let (lp, _) = crate::utils::ai_utils::label_phrase_bank(language, "shipping_doc", &field);
+                let vp = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped("shipping_doc", &field);
+                if lp.is_empty() || vp.is_empty() { continue; }
+
+                let lb = self.get_embedding_batch(lp).await.unwrap_or_default();
+                let vb = self.get_embedding_batch(vp).await.unwrap_or_default();
+                let we = self.get_embedding_batch(words.clone()).await.unwrap_or_default();
+                if lb.is_empty() || vb.is_empty() || we.len() != words.len() { continue; }
+
+                let mut kept: Vec<String> = Vec::new();
+                let mut dropped: Vec<String> = Vec::new();
+                for (w, e) in words.iter().zip(we.iter()) {
+                    if e.iter().all(|&x| x == 0.0) { kept.push(w.clone()); continue; }
+                    let lab = crate::utils::ai_utils::max_pool_sim(e, &lb);
+                    let val = crate::utils::ai_utils::max_pool_sim(e, &vb);
+                    if val > lab {
+                        kept.push(w.clone());
+                    } else {
+                        dropped.push(format!("{}(라벨 {:.4} ≥ 값 {:.4})", w, lab, val));
+                    }
+                }
+                if kept.is_empty() || dropped.is_empty() { continue; }
+
+                let residual = kept.join(" ");
+                emit_term(&format!(
+                    "   🧪 [HINT RESIDUAL] {} 힌트 값 \"{}\" → \"{}\" | 걷어낸 라벨 토큰 {:?} — 값 토큰과 라벨 토큰이 한 문자열에 섞이면 다국어 임베딩이 저장값과 연결되어야 할 신호가 라벨 쪽으로 희석되어, 청크 property 타겟 검색이 0건으로 떨어집니다.",
+                    field, raw, residual, dropped
+                ));
+                crate::utils::score_dynamics::record_baseline(
+                    "search.hint_residual_dropped",
+                    dropped.len() as f32,
+                );
+                if let Some(h) = hints.get_mut(&field).and_then(|v| v.as_object_mut()) {
+                    h.insert("value".to_string(), json!(residual));
+                }
+            }
+        }
+
         // =====================================================================
         // STEP 10 : 벡터 근거가 전무하면 레거시 폴백 1회
         // =====================================================================
@@ -1875,6 +1952,23 @@ pub fn ship_sds_demotion_reason(field: &str, scope: &[String]) -> Option<String>
     }
     if crate::logic::is_trade_array_category(crate::logic::trade_field_category(field)) {
         return None;
+    }
+    if !scope.is_empty() {
+        let mut checked = 0usize;
+        let mut owned = 0usize;
+        for code in scope.iter() {
+            let up = code.to_uppercase();
+            let (known, cat) = crate::model::merge::trade_schema_owner_of(&up, field);
+            if !known { continue; }
+            checked += 1;
+            if !cat.is_empty() { owned += 1; }
+        }
+        if checked > 0 && owned == 0 {
+            return Some(format!(
+                "질의가 지목한 서식 {:?} 의 저장 스키마(base + overlay)에 '{}' 축이 존재하지 않습니다. 저장될 수 없는 축을 하드 조건으로 두면 회수 문서 전부가 비교할 값 없이 탈락해 결과가 확정적으로 0건이 됩니다. 조건을 버리지 않고 힌트로 내려 청크 검색에만 씁니다",
+                scope, field
+            ));
+        }
     }
     if let Some(rate) = crate::utils::score_dynamics::search_kill_rate(field) {
         let ceiling = 1.0 - 1.0 / crate::utils::score_dynamics::Track::Search.ring_len() as f32;
@@ -2761,12 +2855,42 @@ impl crate::model::LogisModel {
                     if first > 1 && roles.get(first - 1) == Some(&ShipTokenRole::Content) {
                         label_cands.push(first - 2);
                     }
+                    let scope_codes: Vec<String> = doc_mentions
+                        .iter()
+                        .flat_map(|m| m.codes.iter().cloned())
+                        .collect();
+                    let in_scope_schema = |f: &str| -> bool {
+                        if scope_codes.is_empty() { return true; }
+                        let mut checked = 0usize;
+                        for code in scope_codes.iter() {
+                            let (known, cat) = crate::model::merge::trade_schema_owner_of(&code.to_uppercase(), f);
+                            if !known { continue; }
+                            checked += 1;
+                            if !cat.is_empty() { return true; }
+                        }
+                        checked == 0
+                    };
+                    let scoped_banks: Vec<&(String, Vec<Vec<f32>>)> = date_banks
+                        .iter()
+                        .filter(|(f, _)| in_scope_schema(f))
+                        .collect();
+                    if !scope_codes.is_empty() && scoped_banks.len() < date_banks.len() {
+                        logs.push(format!(
+                            "   🎯 [DATE FIELD SCOPE] 질의가 지목한 서식 {:?} 의 저장 스키마에 존재하는 날짜 축 {}개로 후보를 좁힙니다 (전체 {}개). 날짜 라벨은 어느 서식에서나 비슷하게 읽히므로, 후보를 전 서식 합집합으로 두면 그 서식에 저장될 수 없는 축이 1위가 되어 조건이 확정적으로 0건을 만듭니다.",
+                            scope_codes, scoped_banks.len(), date_banks.len()
+                        ));
+                    }
+                    let pool: Vec<&(String, Vec<Vec<f32>>)> = if scoped_banks.is_empty() {
+                        date_banks.iter().collect()
+                    } else {
+                        scoped_banks
+                    };
                     let mut best: Option<(usize, String, f32)> = None;
                     for j in label_cands.into_iter() {
                         if roles.get(j) != Some(&ShipTokenRole::Content) { continue; }
                         let q = table.get(&cores[j]);
                         if q.iter().all(|&v| v == 0.0) { continue; }
-                        let (bf, bs) = date_banks
+                        let (bf, bs) = pool
                             .iter()
                             .map(|(f, b)| (f.clone(), max_pool_sim(q, b)))
                             .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });

@@ -456,6 +456,66 @@ fn extract_example_tokens(desc: &str) -> Vec<String> {
     out
 }
 
+fn is_format_placeholder(token: &str) -> bool {
+    let t = token.trim();
+    if t.chars().count() < 4 {
+        return false;
+    }
+    if t.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut runs = 0usize;
+    let mut cur: Option<char> = None;
+    let mut len = 0usize;
+    for ch in t.chars() {
+        if ch.is_alphabetic() {
+            match cur {
+                Some(c) if c.eq_ignore_ascii_case(&ch) => len += 1,
+                Some(_) => return false,
+                None => {
+                    cur = Some(ch);
+                    len = 1;
+                }
+            }
+        } else if cur.is_some() {
+            if len < 2 {
+                return false;
+            }
+            runs += 1;
+            cur = None;
+            len = 0;
+        }
+    }
+    if cur.is_some() {
+        if len < 2 {
+            return false;
+        }
+        runs += 1;
+    }
+    runs >= 2
+}
+
+fn strip_format_placeholders(desc: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for raw in desc.split_whitespace() {
+        let core = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        if !core.is_empty() && is_format_placeholder(core) {
+            continue;
+        }
+        kept.push(raw.to_string());
+    }
+    kept.join(" ")
+        .replace("()", " ")
+        .replace("[]", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string()
+}
+
 /// 🌟 [DOC-SPECIFIC IDENTITY RULES] doc_type 이 확정된 상태에서
 ///    이 서식에 실제로 인쇄되는 라벨과 참조 축만 알려줍니다.
 ///
@@ -976,7 +1036,7 @@ pub fn get_trade_category_schema_present(
     //        "SCHEMA:\n{}" 문자열로 빈 스키마를 판정합니다.
     //     ② process_trading_task 가 SCHEMA 블록에서 trim_start 후 '"' 로 시작하는
     //        라인 수로 필드 개수를 셉니다. 정의/금지 블록은 '-' 로 시작시켜 제외합니다.
-    let is_array = category == "items" || category == "containers";
+    let is_array = crate::logic::is_trade_array_category(category);
 
     let parsed: Vec<(String, String, &'static str)> = fields
         .iter()
@@ -986,11 +1046,24 @@ pub fn get_trade_category_schema_present(
         })
         .collect();
 
+    let mut prescription_dropped: Vec<String> = Vec::new();
     let defs = parsed
         .iter()
-        .map(|(k, d, t)| format!("- \"{}\" ({}): {}", k, t, d.replace('"', "'")))
+        .map(|(k, d, t)| {
+            let shown = strip_format_placeholders(d);
+            if shown != *d {
+                prescription_dropped.push(k.clone());
+            }
+            format!("- \"{}\" ({}): {}", k, t, shown.replace('"', "'"))
+        })
         .collect::<Vec<_>>()
         .join("\n");
+    if !prescription_dropped.is_empty() {
+        println!(
+            "  🧹 [FORMAT PRESCRIPTION DROP] 정의문에서 출력 형식 처방을 뗀 축 {:?}. 이 축들은 금지 목록에는 그대로 남아 에코를 계속 막습니다. 인쇄값이 처방과 다르면 2B 모델은 형식을 맞추려다 null 을 반환하는데, 형식 정규화는 저장 직전 단계의 책임이므로 스키마는 '이 축이 무엇인가' 만 말해야 합니다.",
+            prescription_dropped
+        );
+    }
 
     // 🌟 [CLOSED VOCAB SPLIT] 닫힌 어휘 필드의 예시는 '금지' 가 아니라 '기대값' 입니다.
     //
@@ -1259,6 +1332,32 @@ pub fn get_trade_crop_prompt_present(
     claimed: &[(String, String)],
     absent: &std::collections::HashSet<String>,
 ) -> String {
+    get_trade_crop_prompt_scoped(
+        category, doc_type, top_field, score, claimed,
+        absent, &std::collections::HashSet::new(),
+    )
+}
+
+/// 🌟 [PASS SCOPE] 부재 판정(absent)과 패스 분할(exclude)을 분리합니다.
+///
+///  ── 왜 분리해야 하는가 ──
+///   릴레이 보호는 '비전 PRESENCE 오판으로 릴레이 축이 통째로 사라지는 사고' 를
+///   막으려는 규칙입니다. 그 축은 문서 그래프의 연결고리라 한 번 비면 복구할 수 없습니다.
+///   그런데 2패스의 제외 집합은 '이 문서에 없다' 가 아니라 '이 패스에서는 묻지 않는다' 입니다.
+///   의미가 다른 두 집합이 한 인자를 공유하면 보호 규칙이 패스 분할을 그대로 되돌립니다.
+///   (실측: REST 패스가 4축이 아니라 11축을 물었고, 그 응답에 reference_bl 이 그대로 나왔습니다)
+///
+///  ── exclude 에는 보호를 걸지 않는 이유 ──
+///   같은 크롭의 다른 패스가 그 축을 이미 묻고 있으므로 축이 소실되지 않습니다.
+pub fn get_trade_crop_prompt_scoped(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+    absent: &std::collections::HashSet<String>,
+    exclude: &std::collections::HashSet<String>,
+) -> String {
     let mut effective: std::collections::HashSet<String> = absent.clone();
     for (_, relay_fields) in crate::parsing::TRADE_RELAY_FIELDS.iter() {
         for f in relay_fields.iter() {
@@ -1266,6 +1365,17 @@ pub fn get_trade_crop_prompt_present(
         }
     }
     let narrowed = effective.len();
+    // 🌟 릴레이 복구 '이후' 에 패스 제외를 적용합니다. 순서를 바꾸면 보호가 제외를 삼킵니다.
+    for f in exclude.iter() {
+        effective.insert(f.clone());
+    }
+    if !exclude.is_empty() {
+        println!(
+            "    🪪 [PASS SCOPE] 이 패스에서 묻지 않을 축 {}개를 스키마에서 뺍니다: {:?}. 릴레이 보호는 '부재 판정' 에만 적용되고 패스 분할에는 적용하지 않습니다. 같은 크롭의 다른 패스가 그 축을 이미 묻고 있으므로 축이 소실될 위험이 없습니다.",
+            exclude.len(),
+            exclude.iter().take(12).collect::<Vec<_>>()
+        );
+    }
     let base = if effective.is_empty() {
         get_trade_category_schema(category, doc_type)
     } else {
@@ -1806,7 +1916,8 @@ pub fn get_commerce_crop_prompt(
 
     for (name, desc) in fields.iter() {
         let (clean, ty) = split_type_marker(desc);
-        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, clean.replace('"', "'")));
+        let shown = strip_format_placeholders(&clean);
+        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, shown.replace('"', "'")));
         if !body.is_empty() {
             body.push_str(",\n");
         }

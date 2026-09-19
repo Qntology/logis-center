@@ -1424,15 +1424,31 @@ pub fn build_column_heatmaps(
     const FIELD_COUNT_NEUTRAL_WEIGHT: f32 = 1.0;
 
     let cat_pos = |c: &str| -> Option<usize> { cats.iter().position(|x| x == c) };
+    // 🌟 [PHRASE-COUNT NEUTRAL] 필드별 앵커 구 수를 bias_defs 에서 그대로 셉니다.
+    //
+    //  ── 왜 필드 수가 아니라 구 수인가 ──
+    //   score_patches_bank_neutral 의 Max-Pool 은 '구' 단위로 최댓값을 취합니다.
+    //   따라서 기대 최댓값 √(2 ln N) 의 N 은 실제 경쟁에 참여한 표본 수,
+    //   즉 구 수여야 합니다.
+    //   실측: settlement 는 필드 1개라 √(2 ln 1) = 0.000 을 차감했는데
+    //   그 한 필드가 구 17개를 갖고 있어 사실상 무보정이었습니다.
+    //   결과는 영토 36칸(최대) · 판독 가능 19%(최저) · 스키마 밖 폐기 7건입니다.
+    let mut field_phrases: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (_, f, _) in bias_defs.iter() {
+        *field_phrases.entry(f.clone()).or_insert(0) += 1;
+    }
     let mut cat_raw: Vec<Vec<f32>> = vec![vec![f32::MIN; n]; cats.len()];
     let mut cat_arg: Vec<Vec<usize>> = vec![vec![usize::MAX; n]; cats.len()];
     let mut cat_fields: Vec<usize> = vec![0usize; cats.len()];
+    let mut cat_phrases: Vec<usize> = vec![0usize; cats.len()];
     let mut mapped_keys = 0usize;
     for (ki, fname) in keys.iter().enumerate() {
         let cat = match field_to_cat.get(fname) { Some(c) => c.clone(), None => continue };
         let ci = match cat_pos(&cat) { Some(v) => v, None => continue };
         mapped_keys += 1;
         cat_fields[ci] += 1;
+        cat_phrases[ci] += field_phrases.get(fname).copied().unwrap_or(1);
         for i in 0..n {
             let v = matrix[ki][i];
             if v == f32::MIN { continue; }
@@ -1442,13 +1458,21 @@ pub fn build_column_heatmaps(
             }
         }
     }
-    // ── ① 필드 수 보정 ──
+    // ── ① Max-Pool 표본 수 보정 ──
     {
         let mut detail: Vec<String> = Vec::new();
         for ci in 0..cats.len() {
-            let f = cat_fields[ci].max(1);
-            let base = crate::utils::ai_utils::gumbel_expected_z(f) * FIELD_COUNT_NEUTRAL_WEIGHT;
-            detail.push(format!("{}({}필드 −{:.3})", cats[ci], cat_fields[ci], base));
+            // 🌟 구 수를 N 으로 씁니다. 집계 실패 시에만 필드 수로 폴백합니다.
+            let n_eff = cat_phrases[ci].max(cat_fields[ci]).max(1);
+            let base = crate::utils::ai_utils::gumbel_expected_z(n_eff) * FIELD_COUNT_NEUTRAL_WEIGHT;
+            detail.push(format!(
+                "{}({}구/{}필드 −{:.3})",
+                cats[ci], cat_phrases[ci], cat_fields[ci], base
+            ));
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.neutral_n.{}", cats[ci]),
+                n_eff as f32,
+            );
             if base <= 0.0 { continue; }
             for i in 0..n {
                 if cat_raw[ci][i] != f32::MIN { cat_raw[ci][i] -= base; }
@@ -1456,7 +1480,7 @@ pub fn build_column_heatmaps(
         }
         detail.sort();
         emit(&format!(
-            "    ⚖️ [CATEGORY-NEUTRAL] max-pool 필드 수 편향 보정: {}",
+            "    ⚖️ [CATEGORY-NEUTRAL] max-pool 표본 수(구 수) 편향 보정: {} — 기대 최댓값을 정하는 것은 필드 수가 아니라 Max-Pool 이 실제로 뽑는 드로잉 수입니다. 필드 1개에 구 17개를 몰아넣은 카테고리는 필드 수 기준으로 보정하면 차감이 0 이 되어 공짜 우위를 얻습니다.",
             detail.join(" | ")
         ));
     }

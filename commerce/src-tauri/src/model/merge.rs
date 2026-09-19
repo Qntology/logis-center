@@ -452,14 +452,105 @@ pub fn same_printed_value(a: &str, b: &str) -> bool {
     }
 }
 
+/// 🌟 [ANCHOR SELF-POISON] 다른 필드의 이름을 품은 앵커 구를 그 필드 뱅크에서 뺍니다.
+///
+///  ── 실측 사고 ──
+///   cargo.weight_net 의 앵커에 "CI Total net weight" 가 들어 있습니다.
+///   인쇄 라벨 "TOTAL WEIGHT" 는 총중량이므로 정답이 weight_gross 인데,
+///   그 구의 'Total' 이 공명해 weight_net 이 +1.8818 vs +1.7124 로 이겼습니다.
+///   Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 필드가 이기므로,
+///   다른 필드의 이름을 품은 구는 그 필드를 대신 설명합니다.
+///
+///  ── 같은 판정이 이미 있습니다 ──
+///   query_shipping.rs 의 [TIME UNIT SELF-POISON] 이 시간 단위 뱅크에서
+///   "day of month" 를 'day' 뱅크에서 끄는 것과 동일한 구조입니다.
+///   그쪽은 '자기 단위 이름' 을 기준 벡터로 쓰므로, 여기서도 각 필드의
+///   '대표 구'(뱅크 첫 구)를 기준으로 삼습니다.
+fn purge_self_poisoned_anchors(
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> Vec<(String, Vec<Vec<f32>>, Vec<f32>)> {
+    use crate::utils::ai_utils::cosine_similarity;
+
+    // 각 필드의 대표 구 = 그 필드 뱅크의 첫 유효 구
+    let heads: Vec<Option<&Vec<f32>>> = banks
+        .iter()
+        .map(|(_, b, _)| b.iter().find(|e| !e.iter().all(|&v| v == 0.0)))
+        .collect();
+
+    let mut out: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::with_capacity(banks.len());
+    let mut dropped: Vec<String> = Vec::new();
+
+    for (fi, (fname, bank, weights)) in banks.iter().enumerate() {
+        let own_head = match heads[fi] { Some(h) => h, None => {
+            out.push((fname.clone(), bank.clone(), weights.clone()));
+            continue;
+        }};
+        let mut kept_bank: Vec<Vec<f32>> = Vec::with_capacity(bank.len());
+        let mut kept_w: Vec<f32> = Vec::with_capacity(weights.len());
+
+        for (pi, e) in bank.iter().enumerate() {
+            if e.iter().all(|&v| v == 0.0) { continue; }
+            // 대표 구 자신은 항상 유지합니다. 빼면 뱅크가 소멸합니다.
+            if pi == 0 {
+                kept_bank.push(e.clone());
+                kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
+                continue;
+            }
+            let own = cosine_similarity(e, own_head);
+            let mut rival_name = String::new();
+            let mut rival = f32::MIN;
+            for (gi, h) in heads.iter().enumerate() {
+                if gi == fi { continue; }
+                let h = match h { Some(h) => h, None => continue };
+                let s = cosine_similarity(e, h);
+                if s > rival { rival = s; rival_name = banks[gi].0.clone(); }
+            }
+            if rival > own {
+                dropped.push(format!(
+                    "{}←구{} (자기 '{}' {:.4} < '{}' {:.4})",
+                    fname, pi, fname, own, rival_name, rival
+                ));
+                continue;
+            }
+            kept_bank.push(e.clone());
+            kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
+        }
+
+        if kept_bank.is_empty() {
+            out.push((fname.clone(), bank.clone(), weights.clone()));
+        } else {
+            out.push((fname.clone(), kept_bank, kept_w));
+        }
+    }
+
+    if !dropped.is_empty() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            println!(
+                "      🧹 [ANCHOR SELF-POISON] 자기 필드 대표 구보다 다른 필드 대표 구에 더 가까운 앵커 구 {}개를 그 필드 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 필드가 이기므로, 다른 필드의 이름을 품은 구는 그 필드를 대신 설명해 1·2위를 뒤집습니다. (뱅크는 회차 내 불변이므로 첫 정화만 출력합니다)",
+                dropped.len(),
+                dropped.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        crate::utils::score_dynamics::record_baseline(
+            "vision.anchor_self_poison",
+            dropped.len() as f32,
+        );
+    }
+    out
+}
+
 pub fn recovery_label_gate(
     label_emb: &[f32],
-    target: &str,
+    field: &str,
     banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
 ) -> (bool, f32, f32, String) {
-    if label_emb.is_empty() || label_emb.iter().all(|&x| x == 0.0) {
-        return (false, 0.0, 0.0, String::new());
+    if label_emb.is_empty() || banks.is_empty() {
+        return (true, 0.0, 0.0, String::new());
     }
+    let purged = purge_self_poisoned_anchors(banks);
+    let banks: &[(String, Vec<Vec<f32>>, Vec<f32>)] = &purged;
     let mut pool: Vec<f32> = Vec::new();
     let mut per: Vec<(String, f32, usize)> = Vec::new();
     for (f, bank, w) in banks.iter() {
@@ -480,7 +571,11 @@ pub fn recovery_label_gate(
         return (false, 0.0, 0.0, String::new());
     }
     if per.len() < 2 || pool.len() < 2 {
-        let own = per.iter().find(|(f, _, _)| f == target).map(|(_, s, _)| *s).unwrap_or(f32::MIN);
+        let own = per
+            .iter()
+            .find(|(f, _, _)| f.as_str() == field)
+            .map(|(_, s, _)| *s)
+            .unwrap_or(f32::MIN);
         let out = if own == f32::MIN { 0.0 } else { own };
         return (out > 0.0, out, 0.0, String::new());
     }
@@ -499,9 +594,13 @@ pub fn recovery_label_gate(
         })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let own = scored.iter().find(|(f, _)| f == target).map(|(_, z)| *z).unwrap_or(f32::MIN);
+    let own = scored
+        .iter()
+        .find(|(f, _)| f.as_str() == field)
+        .map(|(_, z)| *z)
+        .unwrap_or(f32::MIN);
     let own_out = if own == f32::MIN { 0.0 } else { own };
-    if scored[0].0 == target {
+    if scored[0].0.as_str() == field {
         let (rf, rz) = scored
             .get(1)
             .map(|(f, z)| (f.clone(), *z))
@@ -534,35 +633,42 @@ pub fn plan_recovery_windows(
     let mut sorted: Vec<&(String, String, usize, f32)> = cands.iter().collect();
     sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = Vec::new();
+    let mut merged_log: Vec<String> = Vec::new();
+    let mut overflow: Vec<String> = Vec::new();
     for c in sorted.into_iter() {
         let (cat, field, patch, z) = (&c.0, &c.1, c.2, c.3);
         let r = patch / cols;
         let col = patch % cols;
         if r >= rows { continue; }
-        if out.len() >= budget { continue; }
         let wide = to_px(
             r.saturating_sub(1),
             (r + 1).min(rows - 1),
             col.saturating_sub(1),
             (col + 2).min(cols - 1),
         );
-        let tight = to_px(r, r, col.saturating_sub(1), (col + 1).min(cols - 1));
-        let bbox = if !out.iter().any(|(b, _)| *b == wide) {
-            wide
-        } else if !out.iter().any(|(b, _)| *b == tight) {
-            println!(
-                "    ✂️ [RECOVERY WINDOW SPLIT] '{}' 의 기본 창(봉우리 ±1행 · −1~+2열)이 이미 다른 필드가 가져간 창과 같습니다. 봉우리 행만 남긴 좁은 창 px({},{})-({},{}) 로 분리합니다. 한 창에 두 필드를 넣으면 프롬프트가 한 자리를 두고 두 라벨을 물어보게 되어 둘 다 비어 돌아옵니다.",
-                field, tight.0, tight.1, tight.2, tight.3
-            );
-            tight
-        } else {
-            println!(
-                "    ⛔ [RECOVERY WINDOW COLLIDE] '{}' 는 좁힌 창까지 다른 필드의 창과 같은 픽셀입니다. 두 축이 문자 그대로 같은 자리를 가리키므로 이 회차에서는 복구하지 않습니다.",
-                field
-            );
+        if let Some(slot) = out.iter_mut().find(|(b, _)| *b == wide) {
+            if slot.1.iter().any(|(_, f, _)| f == field) { continue; }
+            merged_log.push(format!("{}(z {:+.2})", field, z));
+            slot.1.push((cat.clone(), field.clone(), z));
             continue;
-        };
-        out.push((bbox, vec![(cat.clone(), field.clone(), z)]));
+        }
+        if out.len() >= budget {
+            overflow.push(format!("{}(z {:+.2})", field, z));
+            continue;
+        }
+        out.push((wide, vec![(cat.clone(), field.clone(), z)]));
+    }
+    if !merged_log.is_empty() {
+        println!(
+            "    🧷 [RECOVERY WINDOW CLUSTER] 같은 픽셀 창을 가리키는 필드 {}개를 한 창에 묶었습니다: {:?} — 같은 자리를 가리키는 축들은 서로 경쟁자가 아니라 그 자리의 후보 집합입니다. 한 축만 물으면 그 축이 이 문서에 인쇄되지 않은 경우 같은 창에 있던 정답까지 함께 버려집니다.",
+            merged_log.len(), merged_log.iter().take(12).collect::<Vec<_>>()
+        );
+    }
+    if !overflow.is_empty() {
+        println!(
+            "    ⛔ [RECOVERY BUDGET OVERFLOW] 창 예산 {}개를 넘어 이번 회차에서 제외된 필드 {}개: {:?}",
+            budget, overflow.len(), overflow.iter().take(12).collect::<Vec<_>>()
+        );
     }
     out
 }
@@ -995,13 +1101,45 @@ pub fn merge_extracted(
     incoming: &Value,
     emit: &dyn Fn(&str),
 ) {
-    let is_array_category = category == "items" || category == "containers";
+    let is_array_category = crate::logic::is_trade_array_category(category);
     let doc_code = merged
         .get("header")
         .and_then(|h| h.get("doc_type"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+
+    let unwrapped: Value;
+    let incoming = {
+        let single = incoming.as_object().filter(|o| o.len() == 1).and_then(|o| {
+            let (k, v) = o.iter().next()?;
+            if !(v.is_object() || v.is_array()) { return None; }
+            let norm = |s: &str| -> String {
+                s.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .flat_map(|c| c.to_lowercase())
+                    .collect()
+            };
+            let key = norm(k);
+            if key == norm(category) || (!doc_code.is_empty() && key == norm(&doc_code)) {
+                Some((k.clone(), v.clone()))
+            } else {
+                None
+            }
+        });
+        match single {
+            Some((k, v)) => {
+                emit(&format!(
+                    "    📦 [CATEGORY UNWRAP] [{}] 응답 최상위가 '{}' 한 겹으로 감싸여 있습니다. 프롬프트가 카테고리명을 대문자로 지시하므로 모델이 그 이름을 래퍼 키로 되풀이한 것입니다. 한 겹 벗겨 내용을 그대로 병합합니다. 벗기지 않으면 객체 전체가 스키마 밖 키 하나로 취급되어 그 안의 값이 전부 사라집니다.",
+                    category, k
+                ));
+                crate::utils::score_dynamics::record_baseline("vision.category_unwrap", 1.0);
+                unwrapped = v;
+                &unwrapped
+            }
+            None => incoming,
+        }
+    };
 
     let coerced: Value;
     let incoming = if is_array_category && incoming.is_object() {
@@ -1068,6 +1206,11 @@ pub fn merge_extracted(
                         "items" => filled("description"),
                         "containers" => {
                             filled("container_number") || filled("seal_number") || filled("type_size")
+                        }
+                        "other_parties" => filled("party_name") || filled("signatory_name"),
+                        "charges" => filled("charge_code") || filled("charge_description"),
+                        "account_ledger" => {
+                            filled("transaction_date") || filled("debit") || filled("credit")
                         }
                         _ => true,
                     }
@@ -1192,6 +1335,45 @@ pub fn merge_extracted(
                     );
                     continue;
                 }
+                // 🌟 [ROOT ONLY PRESERVE] 소속이 없다고 해서 값이 틀린 것은 아닙니다.
+                //
+                //  ── 실측 사고 ──
+                //   country_of_ultimate_destination = "Germany" 는 이 문서의 정답입니다.
+                //   (인쇄된 ULTIMATE_DESTINATION 란을 정확히 읽었습니다)
+                //   그런데 trade_field_category 의 규칙에도, 어느 카테고리 스키마에도
+                //   그 이름이 없어 '소속: 스키마 밖' 으로 폐기되었습니다.
+                //   signature_name 은 규칙 기반 소속이 있어 바로 위 ROOT ONLY REROUTE 로
+                //   살아남았는데, 이 축은 그 경로에 진입조차 하지 못했습니다.
+                //
+                //  ── 왜 루트에만 두는가 ──
+                //   카테고리 객체에 넣으면 자연어 변환이 존재하지 않는 절을 만들고
+                //   그 문장이 그대로 임베딩됩니다. 루트는 그 위험이 없습니다.
+                //
+                //  ── 세 가지 조건을 모두 요구하는 이유 ──
+                //   ① 스칼라일 것      : 배열/객체를 루트에 올리면 구조가 무너집니다.
+                //   ② 형식이 맞을 것    : 모델이 만든 임의의 키가 전부 쌓이는 것을 막습니다.
+                //   ③ 중복이 아닐 것    : 이미 다른 축이 같은 인쇄값을 확정했다면 복제입니다.
+                let full_value = v
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| v.to_string());
+                let scalar_ok = v.is_string() || v.is_number();
+                let dup_owner = merged.iter().any(|(ek, ev)| {
+                    ek != k
+                        && ev.as_str().map(|s| same_printed_value(s, &full_value)).unwrap_or(false)
+                });
+                if owner.is_empty() && target_empty && shape_ok && scalar_ok && !dup_owner {
+                    merged.insert(k.clone(), v.clone());
+                    emit(&format!(
+                        "    🧾 [ROOT ONLY PRESERVE] [{}] '{}' = \"{}\" 는 이 서식의 로드된 스키마 어느 카테고리에도 없지만, 값이 스칼라이고 형태가 그 축이 요구하는 형식과 맞으며 같은 인쇄값을 가진 다른 축도 없습니다. 인쇄되어 있을 수 있으므로 루트에만 두고 카테고리 객체에는 넣지 않습니다. 스키마에 없는 축을 그룹 안에 넣으면 자연어 변환이 존재하지 않는 절을 만들고 그 문장이 그대로 임베딩됩니다.",
+                        category, k, shown
+                    ));
+                    crate::utils::score_dynamics::record_field_seen(k);
+                    crate::utils::score_dynamics::record_field_assigned(k, 0.0);
+                    crate::utils::score_dynamics::record_baseline("vision.root_only_preserve", 1.0);
+                    continue;
+                }
+
                 off_schema += 1;
                 emit(&format!(
                     "    🚫 [SCHEMA WHITELIST] [{}] '{}' = \"{}\" 는 이 카테고리의 축이 아닙니다 (소속: {}). 소유 축이 이미 차 있거나 값 형태가 그 축과 맞지 않아 폐기합니다.",
@@ -1271,7 +1453,7 @@ pub fn merge_extracted(
             crate::utils::score_dynamics::record_field_assigned(k, 0.0);
         }
 
-        if newly_added && category != "items" && category != "containers" {
+        if newly_added && !crate::logic::is_trade_array_category(category) {
             let slot = merged
                 .entry(category.to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));

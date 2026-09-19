@@ -263,6 +263,10 @@ impl crate::model::LogisModel {
 
                     // ── STEP 4 : Vision NMS & Cropping ──
                     emit_term("[STAGE-4] ✂️ Vision NMS & Cropping...");
+                    let height_baseline =
+                        crate::models::siglip2::vision_crop::measure_doc_text_height(
+                            &dynamic_image, &emit_term,
+                        );
                     let mut plans = crate::models::siglip2::vision_crop::plan_crops(
                         &heatmaps,
                         &grid,
@@ -292,12 +296,20 @@ impl crate::model::LogisModel {
                     emit_term(&format!("[STAGE-5] 🤖 크롭 {}개 정제 추출", plans.len()));
 
                     let mut final_data_map = serde_json::Map::new();
+                    for c in crate::logic::TRADE_EXTRACTION_CATEGORIES.iter() {
+                        if crate::logic::is_trade_array_category(c) {
+                            final_data_map.insert(c.to_string(), json!([]));
+                        } else {
+                            final_data_map.insert(c.to_string(), json!({}));
+                        }
+                    }
+                    emit_term(&format!(
+                        "  🗂️ [CATEGORY SLOTS] logic::TRADE_EXTRACTION_CATEGORIES 기준 {}개 슬롯을 만듭니다 (배열 {}개). 배열 카테고리를 객체로 미리 만들어 두면 병합이 그 자리에 배열을 넣지 못해, 크롭마다 원소 하나씩 쌓여야 할 값이 서로를 덮습니다.",
+                        crate::logic::TRADE_EXTRACTION_CATEGORIES.len(),
+                        crate::logic::TRADE_EXTRACTION_CATEGORIES.iter()
+                            .filter(|c| crate::logic::is_trade_array_category(c)).count()
+                    ));
                     final_data_map.insert("header".to_string(), json!({"doc_type": detected_type}));
-                    final_data_map.insert("parties".to_string(), json!({}));
-                    final_data_map.insert("logistics".to_string(), json!({}));
-                    final_data_map.insert("conditions".to_string(), json!({}));
-                    final_data_map.insert("financials".to_string(), json!({}));
-                    final_data_map.insert("cargo".to_string(), json!({}));
                     // 🌟 [ARRAY KEY UNIFY] 초기화 키를 카테고리명과 일치시킵니다.
                     //
                     //  ── 실측 사고 ──
@@ -425,32 +437,145 @@ impl crate::model::LogisModel {
                                 ));
                             }
 
-                            let prompt = crate::parsing::get_trade_crop_prompt(
-                                &plan.category,
-                                &detected_type,
-                                &plan.top_field,
-                                plan.score,
-                                &claimed,
-                            );
+                            let identity_pass: Option<(std::collections::HashSet<String>, std::collections::HashSet<String>)> =
+                                if plan.category == crate::logic::TRADE_IDENTITY_CATEGORY {
+                                    let all: Vec<String> =
+                                        crate::parsing::get_detail_schema_fields(&detected_type, "", &language)
+                                            .into_iter()
+                                            .map(|(f, _, _, _)| f)
+                                            .filter(|f| {
+                                                crate::logic::trade_field_category(f) == plan.category.as_str()
+                                            })
+                                            .collect();
+                                    let mut ident: std::collections::HashSet<String> =
+                                        std::collections::HashSet::new();
+                                    ident.insert(crate::logic::TRADE_IDENTITY_FIELD.to_string());
+                                    for f in all.iter() {
+                                        if f.starts_with("reference_") {
+                                            ident.insert(f.clone());
+                                        }
+                                    }
+                                    let rest: std::collections::HashSet<String> = all
+                                        .iter()
+                                        .filter(|f| !ident.contains(*f))
+                                        .cloned()
+                                        .collect();
+                                    if ident.is_empty() || rest.is_empty() {
+                                        None
+                                    } else {
+                                        emit_term(&format!(
+                                            "    🪪 [HEADER TWO-PASS] 식별 축 {}개와 비식별 축 {}개를 같은 크롭에 두 번 나눠 묻습니다. 한 프롬프트에 함께 두면 식별 규칙이 문서번호와 참조 축만 길게 설명하므로, 발행일처럼 정의가 한 줄뿐인 축이 구조적으로 밀려 비어 돌아옵니다. 두 번째 패스의 스키마에서 식별 축을 빼면 모델이 그 값을 넣을 자리가 없어져 경쟁 자체가 사라집니다. 이 크롭의 ViT 임베딩은 이미 계산되어 있어 추가 비용은 프롬프트 한 번뿐입니다.",
+                                            ident.len(), rest.len()
+                                        ));
+                                        Some((ident, rest))
+                                    }
+                                } else {
+                                    None
+                                };
+
+                            let passes: Vec<(String, std::collections::HashSet<String>)> =
+                                match identity_pass {
+                                    None => vec![(String::new(), std::collections::HashSet::new())],
+                                    Some((ident, rest)) => vec![
+                                        ("IDENTITY".to_string(), rest),
+                                        ("REST".to_string(), ident),
+                                    ],
+                                };
+
                             let verify_crop = crop.clone();
+                            let mut tile_json = Value::Object(serde_json::Map::new());
 
-                            let tile_res = self.chat_with_qwen3_5_image_spinner(
-                                "You are a highly precise document data extraction assistant.",
-                                &prompt,
-                                Some(crop),
-                                app_handle,
-                                "extraction-progress",
-                                json!({
-                                    "category": format!("Vision (Crop {}/{}{})", idx + 1, plans.len(), tile_tag),
-                                    "summary": format!("Extracting {}...", plan.category)
-                                }),
-                                1024,
-                                cancel_token.clone(),
-                                Some(task_id.clone()),
-                                None
-                            ).await?;
+                            for (pass_tag, absent_in_pass) in passes.into_iter() {
+                                let prompt = if pass_tag.is_empty() {
+                                    crate::parsing::get_trade_crop_prompt(
+                                        &plan.category,
+                                        &detected_type,
+                                        &plan.top_field,
+                                        plan.score,
+                                        &claimed,
+                                    )
+                                } else {
+                                    crate::parsing::get_trade_crop_prompt_scoped(
+                                        &plan.category,
+                                        &detected_type,
+                                        &plan.top_field,
+                                        plan.score,
+                                        &claimed,
+                                        &std::collections::HashSet::new(),
+                                        &absent_in_pass,
+                                    )
+                                };
 
-                            let mut tile_json = crate::parsing::parse_json_from_llm(&tile_res);
+                                let pass_res = self.chat_with_qwen3_5_image_spinner(
+                                    "You are a highly precise document data extraction assistant.",
+                                    &prompt,
+                                    Some(verify_crop.clone()),
+                                    app_handle,
+                                    "extraction-progress",
+                                    json!({
+                                        "category": format!(
+                                            "Vision (Crop {}/{}{}{})",
+                                            idx + 1, plans.len(), tile_tag,
+                                            if pass_tag.is_empty() { String::new() } else { format!(" / {}", pass_tag) }
+                                        ),
+                                        "summary": format!("Extracting {}...", plan.category)
+                                    }),
+                                    1024,
+                                    cancel_token.clone(),
+                                    Some(task_id.clone()),
+                                    None
+                                ).await?;
+
+                                let parsed_pass = crate::parsing::parse_json_from_llm(&pass_res);
+                                if !pass_tag.is_empty() {
+                                    let filled = parsed_pass
+                                        .as_object()
+                                        .map(|o| {
+                                            o.values()
+                                                .filter(|v| {
+                                                    !(v.is_null()
+                                                        || v.as_str()
+                                                            .map(|s| s.trim().is_empty())
+                                                            .unwrap_or(false))
+                                                })
+                                                .count()
+                                        })
+                                        .unwrap_or(0);
+                                    let asked = parsed_pass.as_object().map(|o| o.len()).unwrap_or(0);
+                                    emit_term(&format!(
+                                        "    📊 [HEADER PASS / {}] 질문 {}축 중 {}축이 채워졌습니다 (이 패스에서 뺀 축 {}개). 두 패스의 질문 축 합이 헤더 전체 축과 같아야 하며, 한쪽이 부풀어 있으면 패스 분할이 성립하지 않은 것입니다.",
+                                        pass_tag, asked, filled, absent_in_pass.len()
+                                    ));
+                                    crate::utils::score_dynamics::record_baseline(
+                                        &format!("vision.header_pass_yield.{}", pass_tag),
+                                        if asked == 0 { 0.0 } else { filled as f32 / asked as f32 },
+                                    );
+                                }
+
+                                if let (Some(dst), Some(src)) =
+                                    (tile_json.as_object_mut(), parsed_pass.as_object())
+                                {
+                                    for (k, v) in src.iter() {
+                                        let empty = v.is_null()
+                                            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
+                                        let have = dst
+                                            .get(k)
+                                            .map(|x| {
+                                                !(x.is_null()
+                                                    || x.as_str()
+                                                        .map(|s| s.trim().is_empty())
+                                                        .unwrap_or(false))
+                                            })
+                                            .unwrap_or(false);
+                                        if have && empty {
+                                            continue;
+                                        }
+                                        dst.insert(k.clone(), v.clone());
+                                    }
+                                } else if tile_json.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                                    tile_json = parsed_pass;
+                                }
+                            }
                             if !is_array_cat {
                                 let echo_fields: Vec<(String, String)> = tile_json
                                     .as_object()
@@ -756,20 +881,14 @@ impl crate::model::LogisModel {
                         }
                         let budget_of = |list: &Vec<(String, String, usize, f32)>, label: &str| -> usize {
                             if list.is_empty() { return 0; }
-                            let n = list.len() as f32;
-                            let mean = list.iter().map(|(_, _, _, z)| *z).sum::<f32>() / n;
-                            let sd = (list
-                                .iter()
-                                .map(|(_, _, _, z)| (*z - mean) * (*z - mean))
-                                .sum::<f32>()
-                                / n)
-                                .sqrt();
-                            let gate = mean + sd;
-                            let above = list.iter().filter(|(_, _, _, z)| *z >= gate).count();
-                            let picked = above.max(1).min(recovery_ceiling);
+                            let mut seats: Vec<usize> = Vec::new();
+                            for (_, _, p, _) in list.iter() {
+                                if !seats.iter().any(|x| x == p) { seats.push(*p); }
+                            }
+                            let picked = seats.len().min(recovery_ceiling);
                             emit_term(&format!(
-                                "    📐 [RECOVERY BUDGET / {}] 후보 {}개 | z 평균 {:+.3} + 표준편차 {:.3} = 게이트 {:+.3} | 게이트 통과 {}개 → 창 {}개 (상한 {}회는 이 문서가 이미 지불한 크롭 호출 수입니다)",
-                                label, list.len(), mean, sd, gate, above, picked, recovery_ceiling
+                                "    📐 [RECOVERY BUDGET / {}] 후보 {}개 | 서로 다른 봉우리 칸 {}개 → 창 {}개 (상한 {}회는 이 문서가 이미 지불한 크롭 호출 수입니다). z 평균+표준편차 게이트를 철회합니다. 원소가 둘뿐인 풀에서는 그 게이트가 수학적으로 항상 최댓값과 같아 정확히 하나만 통과시켰고, 열다섯 개 풀에서도 봉우리를 공유해 순위가 밀린 필드를 0.06 차이로 잘라냈습니다. 같은 칸을 가리키는 필드는 한 창에 묶이므로 창 수를 후보 수가 아니라 칸 수로 세면 호출이 늘지 않습니다.",
+                                label, list.len(), seats.len(), picked, recovery_ceiling
                             ));
                             crate::utils::score_dynamics::record_baseline("vision.recovery_budget", picked as f32);
                             picked
@@ -839,7 +958,9 @@ impl crate::model::LogisModel {
                                     owned_patches: 0,
                                     twin_of: String::new(),
                                 };
-                                let micro = crate::models::siglip2::vision_crop::crop_region(&dynamic_image, &micro_plan, 512);
+                                let micro = crate::models::siglip2::vision_crop::crop_region_clamped(
+                                    &dynamic_image, &micro_plan, 512, height_baseline, &emit_term,
+                                );
                                 let micro_verify = micro.clone();
                                 let defs: Vec<(String, String)> = fields
                                     .iter()
@@ -1028,6 +1149,20 @@ impl crate::model::LogisModel {
                                             rival
                                         )
                                     };
+                                    let mut ok = ok;
+                                    if !ok && !rival_field.is_empty() {
+                                        let rival_in_window = fields.iter().any(|(_, f, _)| *f == rival_field);
+                                        if !rival_in_window {
+                                            emit_term(&format!(
+                                                "      🧷 [WINDOW ARGMAX] {}.{} = \"{}\" | 스키마 전체로는 '{}' 가 라벨 argmax 이지만 그 축은 이 창에서 묻지 않았습니다. 이 창이 물은 필드 {:?} 안에서는 '{}' 가 1위이므로 통과시킵니다. 같은 자리를 가리키는 축들을 한 창에 묶은 뒤 전체 스키마로 argmax 를 재면, 이 창의 후보가 아닌 축이 이겨 정답이 매번 이송 대상으로 밀려납니다.",
+                                                cat, field, value, rival_field,
+                                                fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>(),
+                                                field
+                                            ));
+                                            crate::utils::score_dynamics::record_baseline("vision.window_argmax", 1.0);
+                                            ok = true;
+                                        }
+                                    }
                                     if !ok {
                                         let fmt_ok = crate::utils::ai_utils::value_matches_format(
                                             crate::utils::ai_utils::detect_field_format(&rival_field),
@@ -1170,6 +1305,10 @@ impl crate::model::LogisModel {
                     );
                 }
 
+                let commerce_height_baseline =
+                    crate::models::siglip2::vision_crop::measure_doc_text_height(
+                        &dynamic_image, &emit_term,
+                    );
                 let plans = crate::models::siglip2::vision_crop::plan_crops(
                     &heatmaps,
                     &grid,
@@ -1236,8 +1375,8 @@ impl crate::model::LogisModel {
                         }
                         crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
 
-                        let crop = crate::models::siglip2::vision_crop::crop_region(
-                            &dynamic_image, plan, 512
+                        let crop = crate::models::siglip2::vision_crop::crop_region_clamped(
+                            &dynamic_image, plan, 512, commerce_height_baseline, &emit_term,
                         );
 
                         emit_term(&format!(
@@ -1469,6 +1608,61 @@ impl crate::model::LogisModel {
                     }
                 }
                 crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &language);
+                {
+                    let read_axis = |name: &str| -> Option<String> {
+                        extracted_data
+                            .get(name)
+                            .cloned()
+                            .or_else(|| {
+                                extracted_data.as_object().and_then(|o| {
+                                    o.values()
+                                        .filter_map(|v| v.as_object())
+                                        .find_map(|inner| inner.get(name).cloned())
+                                })
+                            })
+                            .and_then(|v| match v {
+                                Value::String(s) if !s.trim().is_empty() => Some(s),
+                                Value::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            })
+                    };
+                    let mut shown: Vec<String> = Vec::new();
+                    let mut non_iso: Vec<String> = Vec::new();
+                    for axis in [
+                        "issue_date", "expiry_date", "etd", "eta",
+                        "departure_date", "arrival_date", "due_date",
+                        "transaction_date", "declaration_date", "clearance_date",
+                    ] {
+                        let v = match read_axis(axis) { Some(v) => v, None => continue };
+                        let iso = v.len() >= 10
+                            && v.as_bytes()[4] == b'-'
+                            && v.as_bytes()[7] == b'-'
+                            && v.chars().take(4).all(|c| c.is_ascii_digit());
+                        shown.push(format!("{}=\"{}\"{}", axis, v, if iso { "" } else { " ⚠" }));
+                        if !iso { non_iso.push(axis.to_string()); }
+                    }
+                    if shown.is_empty() {
+                        emit_term("  📅 [DATE NORMALIZE] 저장 직전 시점에 날짜 축이 하나도 없습니다. 회수 단계에서 날짜를 얻지 못했다는 뜻이므로, 이 문서에 대한 기간 조건은 어떤 값을 넣어도 통과하지 못합니다.");
+                    } else if non_iso.is_empty() {
+                        emit_term(&format!(
+                            "  📅 [DATE NORMALIZE] 날짜 축 {}개가 모두 ISO 형식입니다: {:?}. 질의의 기간 조건은 ISO 문자열로 비교하므로 이 형식이어야만 만납니다.",
+                            shown.len(), shown
+                        ));
+                    } else {
+                        emit_term(&format!(
+                            "  ⚠️ [DATE NORMALIZE] 날짜 축 {:?} 가 ISO 형식이 아닙니다 (전체: {:?}). 인쇄 원문이 그대로 남았다는 뜻이며, 이 상태로는 기간 조건이 문자열 비교로 떨어져 영원히 통과하지 못합니다. 정규화가 이 축 이름에 걸리지 않았는지, 루트 승격에서 이름이 바뀌었는지 확인해야 합니다.",
+                            non_iso, shown
+                        ));
+                    }
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.date_iso_ratio",
+                        if shown.is_empty() {
+                            0.0
+                        } else {
+                            (shown.len() - non_iso.len()) as f32 / shown.len() as f32
+                        },
+                    );
+                }
             }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let doc_type = if is_trade_doc {
@@ -1731,6 +1925,40 @@ impl crate::model::LogisModel {
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
+
+                if is_trade_doc {
+                    let chunk_cancel = cancel_token
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+                    let chunk_bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, hashed_cc));
+                    match crate::scheduler::indexing::index_item_chunks(
+                        db,
+                        self,
+                        &hashed_id,
+                        doc_type,
+                        &language,
+                        &final_data,
+                        true,
+                        &hashed_cc,
+                        &chunk_bcc,
+                        &ref_val,
+                        "shipping",
+                        "",
+                        &chunk_cancel,
+                        app_handle,
+                        &task_id,
+                        true,
+                    ).await {
+                        Ok(n) => emit_term(&format!(
+                            "  🧩 [VISION CHUNK INDEX] item_id='{}' | 청크 {}건 인덱싱 완료 (doc_type='{}'). 이 단계가 없으면 문서가 FTS 와 비전 벡터로만 회수되어, 질의의 속성 힌트와 크로스링구얼·음차 트랙이 붙을 자리가 없습니다. 음차는 생성 모델을 다시 올려야 하므로 이번 회차에서는 건너뛰고, 나중 회차의 재인덱싱에 맡깁니다.",
+                            hashed_id, n, doc_type
+                        )),
+                        Err(e) => emit_term(&format!(
+                            "  ⚠️ [VISION CHUNK INDEX] 청크 인덱싱에 실패했습니다: {}. 문서 저장 자체는 끝났으므로 파이프라인은 계속 진행합니다.",
+                            e
+                        )),
+                    }
+                }
 
                 let mut relay_starved: Vec<String> = Vec::new();
 
