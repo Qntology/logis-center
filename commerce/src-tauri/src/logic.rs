@@ -713,7 +713,7 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
 ///     "검사 통과한 서류 찾아줘" → identity 의 status 로 잘못 떨어짐
 ///     "미결제 잔액 있는 거래"   → terms 의 amount 로 잘못 떨어짐
 ///   Depth 1 이 틀리면 Depth 2 는 그 카테고리 안에서만 고르므로 복구가 불가능합니다.
-pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 10] = [
+pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 11] = [
     ("identity",
      "document kind, document type code, document number, bill of lading number, invoice number, purchase order number, contract number, tracking number, parcel number, reference number, document status, draft, in progress, completed, returned, error, issue date, date of issue, expiry date, validity date"),
     ("transport",
@@ -734,6 +734,8 @@ pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 10] = [
      "inspection certificate, inspection date, place of inspection, inspection result, pass or fail, certificate number, certified by, laboratory analysis, test result, specification value, treatment date, chemical used, dosage, exposure period, fumigation, heat treatment, cold treatment, ISPM 15 mark, weighing date, verified gross mass, survey report, damage findings, surveyor conclusion, phytosanitary, health certificate"),
     ("settlement",
      "statement of account, account ledger, transaction date, debit amount, credit amount, running balance, outstanding balance, ending balance, debit note, credit note, tax invoice, VAT amount, supply amount, reason for debit, reason for credit, payment status, unpaid, settled, due date, overdue, charge code, freight charge breakdown, terminal handling charge, documentation fee"),
+    ("items",
+     "description of goods, goods description, commodity, product name, article, item, line item, country of manufacture, country of origin, made in, manufactured in, unit price, price per unit, unit value, quantity, pieces, unit of measure, line total, total price per line, item code, model number, net weight per unit, gross weight per unit"),
 ];
 
 /// Depth 2 : 카테고리별 파라미터 (필드명, 프롬프트 설명, 앵커 구).
@@ -785,6 +787,8 @@ pub fn trade_condition_fields(category: &str) -> Vec<(&'static str, &'static str
              "consignee, importer, buyer, receiver, applicant, to order of"),
             ("notify_party_name", "Notify Party name",
              "notify party, notify, also notify"),
+            ("signatory_name",    "Person who signed the document",
+             "signatory name, signed by, authorized signatory, signer"),
         ],
         "terms" => vec![
             ("incoterms",            "Incoterms code",
@@ -892,6 +896,24 @@ pub fn trade_condition_fields(category: &str) -> Vec<(&'static str, &'static str
              "VAT type, taxable, zero rated, exempt, 과세, 영세, 면세"),
             ("charge_amount",      "Amount of an individual charge line",
              "charge amount, line charge, THC, terminal handling charge, documentation fee, handling charge"),
+        ],
+        "items" => vec![
+            ("description",            "Description of goods on a line item",
+             "description of goods, goods description, commodity, product name, article, item description, nature of goods"),
+            ("country_of_manufacture", "Country where the line item was manufactured",
+             "country of manufacture, country of origin, made in, manufactured in, origin"),
+            ("unit_price",             "Unit price of a line item",
+             "unit price, unit value, price per unit, rate per unit"),
+            ("quantity",               "Quantity of a line item",
+             "quantity, qty, pieces, number of units"),
+            ("total_price",            "Line total of a line item",
+             "total price, total value of the line, line total, line amount, extended amount"),
+            ("item_code",              "Item code or model number of a line item",
+             "item code, model number, article number, part number, SKU"),
+            ("item_net_weight",        "Net weight per unit of a line item",
+             "net weight per unit, unit weight, net weight per item"),
+            ("item_gross_weight",      "Gross weight per unit of a line item",
+             "gross weight per unit, gross weight per item"),
         ],
         _ => vec![],
     }
@@ -1190,7 +1212,7 @@ pub fn trade_field_category(field: &str) -> &'static str {
         //     role 을 원소 필드로 두면 한 영역에서 여러 역할을 순서대로 읽어내고,
         //     우리가 예상하지 못한 역할까지 스키마 변경 없이 수용합니다.
         "party_role" | "party_name" | "party_address"
-            | "party_contact" => "other_parties",
+            | "party_contact" | "signatory_name" => "other_parties",
 
         // ── logistics ──
         //  🌟 place_receipt / place_delivery 를 되살렸습니다.
@@ -1308,6 +1330,30 @@ pub fn trade_field_category(field: &str) -> &'static str {
         _ => trade_field_category_by_rule(field),
     }
 }
+
+pub const TRADE_ENUM_VALUE_ANCHORS: &[(&str, &[(&str, &str)])] = &[
+    ("currency", &[
+        ("USD", "USD, US dollar, United States dollar"),
+        ("EUR", "EUR, euro"),
+        ("JPY", "JPY, Japanese yen"),
+        ("CNY", "CNY, Chinese yuan renminbi"),
+        ("KRW", "KRW, South Korean won"),
+        ("GBP", "GBP, British pound sterling"),
+    ]),
+    ("incoterms", &[
+        ("EXW", "EXW, ex works"),
+        ("FCA", "FCA, free carrier"),
+        ("FAS", "FAS, free alongside ship"),
+        ("FOB", "FOB, free on board"),
+        ("CFR", "CFR, cost and freight"),
+        ("CIF", "CIF, cost insurance and freight"),
+        ("CPT", "CPT, carriage paid to"),
+        ("CIP", "CIP, carriage and insurance paid to"),
+        ("DAP", "DAP, delivered at place"),
+        ("DPU", "DPU, delivered at place unloaded"),
+        ("DDP", "DDP, delivered duty paid"),
+    ]),
+];
 
 pub const TRADE_ARRAY_CATEGORIES: &[&str] = &["items", "containers"];
 pub const TRADE_IDENTITY_CATEGORY: &str = "header";

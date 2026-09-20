@@ -154,11 +154,13 @@ pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
         }
     }
 
-    // ③ 문자 접두 n-gram (사전 없이 동작하는 최후 폴백)
     let chars: Vec<char> = surface.chars().collect();
     if chars.len() >= 3 {
         let hi = (chars.len() - 1).min(4);
         for n in 2..=hi {
+            if chars[n - 1].is_ascii_digit() && chars[n].is_ascii_digit() {
+                continue;
+            }
             push(&mut out, surface, chars[..n].iter().collect::<String>());
         }
     }

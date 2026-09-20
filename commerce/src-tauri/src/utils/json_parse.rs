@@ -18,6 +18,106 @@ pub fn sanitize_llm_input(text: &str) -> String {
     cleaned.replace("<|", "< |").replace("|>", "| >")
 }
 
+fn quote_bare_values(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = 0usize;
+    let mut fixed: Vec<String> = Vec::new();
+
+    while i < chars.len() {
+        let c = chars[i];
+        if escape {
+            out.push(c);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c != ':' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        out.push(':');
+        i += 1;
+        let mut ws = String::new();
+        while i < chars.len()
+            && (chars[i] == ' ' || chars[i] == '\t' || chars[i] == '\n' || chars[i] == '\r')
+        {
+            ws.push(chars[i]);
+            i += 1;
+        }
+        out.push_str(&ws);
+        if i >= chars.len() {
+            break;
+        }
+        let first = chars[i];
+        if first == '"' || first == '{' || first == '[' {
+            continue;
+        }
+
+        let mut tok = String::new();
+        while i < chars.len()
+            && chars[i] != ','
+            && chars[i] != '}'
+            && chars[i] != ']'
+            && chars[i] != '\n'
+            && chars[i] != '\r'
+        {
+            tok.push(chars[i]);
+            i += 1;
+        }
+        let trimmed = tok.trim_end().to_string();
+        let tail: String = tok.chars().skip(trimmed.chars().count()).collect();
+        let is_literal = matches!(trimmed.as_str(), "null" | "true" | "false");
+        let numeric_shape = trimmed
+            .chars()
+            .next()
+            .map(|c0| c0.is_ascii_digit() || c0 == '-' || c0 == '+')
+            .unwrap_or(false);
+        let is_number = numeric_shape && trimmed.parse::<f64>().is_ok();
+
+        if trimmed.is_empty() || is_literal || is_number {
+            out.push_str(&tok);
+        } else {
+            out.push('"');
+            out.push_str(&trimmed.replace('\\', "\\\\").replace('"', "\\\""));
+            out.push('"');
+            out.push_str(&tail);
+            if fixed.len() < 8 {
+                fixed.push(trimmed.clone());
+            }
+        }
+    }
+
+    if !fixed.is_empty() {
+        println!(
+            "[Parsing] 🩹 [BARE VALUE QUOTED] 따옴표 없는 값 {}개를 문자열로 감쌌습니다: {:?}",
+            fixed.len(),
+            fixed
+        );
+    }
+    out
+}
+
 pub fn normalize_to_json_string(input: &str) -> String {
     let mut s = input.replace(&['\u{00A0}', '\u{200B}', '\u{202F}', '\u{FEFF}'][..], " ").trim().to_string();
     // 🌟 [CRITICAL FIX] LLM이 흔히 생성하는 스마트 따옴표 및 전각 기호를 표준 ASCII 기호로 일괄 치환합니다.
@@ -46,6 +146,7 @@ pub fn normalize_to_json_string(input: &str) -> String {
     // 4. CSS selector/nested quotes protection (Simplified for Rust regex)
     let re_nested = Regex::new(r#"="([^"]*)""#).unwrap();
     s = re_nested.replace_all(&s, "=\\\"$1\\\"").to_string();
+    s = quote_bare_values(&s);
     // 5. Trailing Comma removal
     let re_trailing = Regex::new(r",\s*([\]}])").unwrap();
     s = re_trailing.replace_all(&s, "$1").to_string();
@@ -91,6 +192,136 @@ pub fn normalize_to_json_string(input: &str) -> String {
         s.push(c);
     }
     s
+}
+
+fn salvage_partial_json(src: &str) -> Option<serde_json::Value> {
+    let chars: Vec<char> = src.chars().collect();
+    let obj_at = chars.iter().position(|c| *c == '{');
+    let arr_at = chars.iter().position(|c| *c == '[');
+    let (start, is_obj) = match (obj_at, arr_at) {
+        (Some(o), Some(a)) => {
+            if o < a {
+                (o, true)
+            } else {
+                (a, false)
+            }
+        }
+        (Some(o), None) => (o, true),
+        (None, Some(a)) => (a, false),
+        (None, None) => return None,
+    };
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut closed = false;
+    let mut seg = String::new();
+    let mut segs: Vec<String> = Vec::new();
+
+    for i in start..chars.len() {
+        let c = chars[i];
+        if escape {
+            seg.push(c);
+            escape = false;
+            continue;
+        }
+        if in_string {
+            seg.push(c);
+            if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                seg.push(c);
+            }
+            '{' | '[' => {
+                depth += 1;
+                if depth > 1 {
+                    seg.push(c);
+                }
+            }
+            '}' | ']' => {
+                depth -= 1;
+                if depth >= 1 {
+                    seg.push(c);
+                }
+                if depth <= 0 {
+                    closed = true;
+                }
+            }
+            ',' if depth == 1 => {
+                if !seg.trim().is_empty() {
+                    segs.push(seg.clone());
+                }
+                seg.clear();
+            }
+            _ => {
+                seg.push(c);
+            }
+        }
+        if closed {
+            break;
+        }
+    }
+    if !seg.trim().is_empty() {
+        segs.push(seg);
+    }
+    if segs.is_empty() {
+        return None;
+    }
+
+    if is_obj {
+        let mut map = serde_json::Map::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for s in segs.iter() {
+            let candidate = format!("{{{}}}", s.trim());
+            match serde_json::from_str::<serde_json::Value>(&candidate) {
+                Ok(serde_json::Value::Object(o)) => {
+                    for (k, v) in o {
+                        map.insert(k, v);
+                    }
+                }
+                _ => {
+                    if dropped.len() < 8 {
+                        dropped.push(s.trim().chars().take(60).collect());
+                    }
+                }
+            }
+        }
+        if map.is_empty() {
+            return None;
+        }
+        println!(
+            "[Parsing] 🩹 [PAIR SALVAGE] 최상위 키 {}개를 보존하고 문법이 깨진 {}개만 버렸습니다: {:?}",
+            map.len(),
+            dropped.len(),
+            dropped
+        );
+        return Some(serde_json::Value::Object(map));
+    }
+
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    let mut dropped = 0usize;
+    for s in segs.iter() {
+        match serde_json::from_str::<serde_json::Value>(s.trim()) {
+            Ok(v) => arr.push(v),
+            Err(_) => dropped += 1,
+        }
+    }
+    if arr.is_empty() {
+        return None;
+    }
+    println!(
+        "[Parsing] 🩹 [ELEMENT SALVAGE] 배열 원소 {}개를 보존하고 문법이 깨진 {}개만 버렸습니다.",
+        arr.len(),
+        dropped
+    );
+    Some(serde_json::Value::Array(arr))
 }
 
 pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
@@ -142,6 +373,9 @@ pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
                     return v;
                 }
             }
+        }
+        if let Some(v) = salvage_partial_json(&repaired) {
+            return v;
         }
         println!("[Parsing] Attempting aggressive character-by-character truncation repair...");
         let mut shrink_attempt = to_repair.to_string();

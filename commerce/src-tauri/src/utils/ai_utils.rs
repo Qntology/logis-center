@@ -737,10 +737,36 @@ pub fn cross_field_ambiguous_phrase_mask(
     out
 }
 
-// 🌟 [DETERMINISTIC CONDITION VALUE] 조건 값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
-//    0.6B 모델에게 값 복사를 맡기면 value 키를 통째로 누락시켜 조건이 증발합니다.
-//    (로그: color 조건에 value 키가 없어 색상 필터 없이 FTS 가 실행됨)
-//    형식이 확정적인 필드는 LLM 없이 코드가 직접 복사합니다.
+pub fn residual_value_tokens(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> Vec<String> {
+    if token_embs.is_empty() { return Vec::new(); }
+    if label_bank.is_empty() || value_bank.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for (tok, emb) in token_embs.iter() {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let l = max_pool_sim(emb, &label_bank.to_vec());
+        let v = max_pool_sim(emb, &value_bank.to_vec());
+        if v > l { kept.push(tok.clone()); }
+    }
+    if kept.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    kept
+}
+
+pub fn residual_value_text(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> String {
+    residual_value_tokens(token_embs, label_bank, value_bank).join(" ")
+}
+
 pub fn deterministic_condition_value(chunks: &Vec<String>, numeric_only: bool) -> String {
     let joined = chunks
         .iter()
@@ -1367,10 +1393,64 @@ pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
     }
     if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
 }
-/// 🌟 [RELATIVE PREJUDICE] 편견이 자기 점수를 '응집도만큼의 여유' 이상으로
-///    앞설 때만 후보 자격을 박탈합니다.
-///
-///  반환 true = 폐기 대상
+
+pub fn discriminative_phrase_mask(
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Vec<bool> {
+    let n = own_bank.len();
+    if n == 0 || rival_bank.is_empty() {
+        return vec![true; n];
+    }
+    let own_cohesion = bank_internal_cohesion(own_bank);
+    let rival_vec: Vec<Vec<f32>> = rival_bank.to_vec();
+    let mut keep = vec![false; n];
+    let mut any = false;
+    for (i, e) in own_bank.iter().enumerate() {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let cross = max_pool_sim(e, &rival_vec);
+        if cross < own_cohesion {
+            keep[i] = true;
+            any = true;
+        }
+    }
+    if !any { return vec![true; n]; }
+    keep
+}
+
+pub fn discriminative_anchor_verdict(
+    label_emb: &[f32],
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Option<(f32, f32, usize, usize)> {
+    if own_bank.is_empty() || rival_bank.is_empty() { return None; }
+
+    let own_keep = discriminative_phrase_mask(own_bank, rival_bank);
+    let rival_keep = discriminative_phrase_mask(rival_bank, own_bank);
+
+    let own_only: Vec<Vec<f32>> = own_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| own_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+    let rival_only: Vec<Vec<f32>> = rival_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| rival_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+
+    if own_only.is_empty() || rival_only.is_empty() { return None; }
+    if own_only.len() == own_bank.len() && rival_only.len() == rival_bank.len() {
+        return None;
+    }
+
+    let own_score = max_pool_sim(label_emb, &own_only);
+    let rival_score = max_pool_sim(label_emb, &rival_only);
+    Some((own_score, rival_score, own_only.len(), rival_only.len()))
+}
+
 pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
     if own <= 0.0 {
         return true;
@@ -1491,18 +1571,23 @@ pub fn correction_cosine_degraded(
     new_score < old_score
 }
 
-// 🌟 [MAX-COVERAGE GREEDY ASSIGN] 청크가 굶어 죽지 않는 1:1 배타 배정.
-//    exclusive_assign_by_score 의 rival 은 '같은 라인에 대한 다른 필드의 최고 점수'입니다.
-//    따라서 margin_threshold = 0.0 으로 호출하면
-//        margin = own - max_{f'≠f} matrix[f'][l] >= 0  ⟺  own 이 그 라인의 argmax
-//    가 되어, 각 라인은 자기 argmax 필드 하나에만 주장을 낼 수 있습니다.
-//    그 필드를 더 높은 점수의 다른 라인이 가져가면 차선책으로 이동할 기회 없이 소멸합니다.
-//    (로그: '가디건'/'무거운'/'제품중에서'/'제품으로'/'중에서'/'메세지도'/'보여줘' 가 전부 이 경로로 전멸.
-//     특히 color 뱅크는 50개 언어 색상명 ~700구라 Max-Pool 이 구조적으로 부풀려져
-//     무관한 청크의 argmax 를 독식하는 '흡수 싱크' 로 작동했습니다)
-//    여기서는 margin 을 '정렬 기준'이 아니라 '보고용 지표'로만 쓰고,
-//    유효한 모든 (필드 × 라인) 주장을 절대 점수 순으로 그리디 배정하여 커버리지를 최대화합니다.
-//    matrix[field][line], 음수는 무효 칸. 반환값 = field_idx -> Option<(line_idx, own, margin)>
+pub fn window_assign_verdict(
+    own_neutral: f32,
+    rival_neutral: f32,
+    asked_in_window: bool,
+) -> (bool, &'static str) {
+    if !asked_in_window {
+        return (false, "이 창이 묻지 않은 축");
+    }
+    if own_neutral > 0.0 {
+        return (true, "창 안 1위이며 자기 중립점수가 양수");
+    }
+    if rival_neutral <= 0.0 {
+        return (true, "창 안 1위이며 경쟁 축도 양수 근거가 없음");
+    }
+    (false, "자기 중립점수가 음수인데 경쟁 축은 양수 근거를 가짐")
+}
+
 pub fn greedy_exclusive_assign(matrix: &Vec<Vec<f32>>) -> Vec<Option<(usize, f32, f32)>> {
     let field_count = matrix.len();
     let mut result: Vec<Option<(usize, f32, f32)>> = vec![None; field_count];
@@ -2525,6 +2610,16 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
     FieldFormat::Text
 }
 
+pub fn query_value_format(field_name: &str) -> FieldFormat {
+    let f = detect_field_format(field_name);
+    if matches!(f, FieldFormat::Text | FieldFormat::Enum)
+        && crate::utils::canonical::kind_of(field_name) == crate::utils::canonical::CanonKind::Identifier
+    {
+        return FieldFormat::Identifier;
+    }
+    f
+}
+
 // 🌟 "a-b-c" / "a/b/c" / "a.b.c" 형태의 실제 날짜 리터럴이 있는지 판정합니다.
 // "615600", "9", "26031514155635" 같은 순수 숫자 덩어리는 날짜로 인정하지 않습니다.
 pub fn has_date_literal(s: &str) -> bool {
@@ -2561,6 +2656,49 @@ pub fn has_date_literal(s: &str) -> bool {
         }
     }
     false
+}
+
+// 🌟 [DATE SHAPE] 숫자-구분자 날짜 외에 '월 이름이 섞인 날짜' 까지 구조로 판정합니다.
+//
+//  ── 실측 사고 ──
+//   복구 창 8 이 "DATE" ↔ "Apr-19-2022" 쌍을 정확히 읽어 왔는데
+//   그 창이 물은 날짜 축 7개가 전부 형식 게이트에서 탈락해 배정이 0건이 되었습니다.
+//   has_date_literal 은 세 번째 숫자 그룹을 요구하므로 "Apr-19-2022" 는
+//   ["19","2022"] 두 그룹에서 멈추고 false 를 돌려줍니다.
+//   인쇄 원문은 정규화 이전이므로, 저장 직전 normalize_trading_data 가 ISO 로 바꾸기 전에
+//   이 게이트를 통과해야 합니다. 통과하지 못하면 정규화할 값 자체가 생기지 않습니다.
+//
+//  ── 왜 월 이름 사전을 만들지 않는가 ──
+//   월 이름은 언어마다 다르고, 사전을 코드에 적으면 언어가 늘 때마다 이 함수를 고쳐야 합니다.
+//   대신 '토큰 구조' 만 봅니다: 4자리 연도가 정확히 하나, 나머지는 1~31 범위의
+//   1~2자리 숫자이거나 3~12자 순수 알파벳 한 덩어리.
+//   어떤 라틴 문자 언어의 월 이름도 이 모양을 벗어나지 않고,
+//   금액("2000.00")·식별자("CI-43726")·중량("20KG")은 이 모양에 들어올 수 없습니다.
+pub fn has_date_shape(s: &str) -> bool {
+    if has_date_literal(s) { return true; }
+    let toks: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.len() < 2 || toks.len() > 3 { return false; }
+
+    let mut years = 0usize;
+    let mut days = 0usize;
+    let mut alpha = 0usize;
+    for t in toks.iter() {
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            let n = t.chars().count();
+            let v: u32 = match t.parse() { Ok(v) => v, Err(_) => return false };
+            if n == 4 && (1000..=9999).contains(&v) { years += 1; continue; }
+            if n <= 2 && (1..=31).contains(&v) { days += 1; continue; }
+            return false;
+        }
+        if !t.chars().all(|c| c.is_alphabetic()) { return false; }
+        let n = t.chars().count();
+        if n < 3 || n > 12 { return false; }
+        alpha += 1;
+    }
+    years == 1 && alpha <= 1 && (days + alpha) >= 1 && (years + days + alpha) == toks.len()
 }
 
 // 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)
@@ -2651,10 +2789,14 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
     if is_bare_markup_token(v) { return false; }
     match fmt {
         FieldFormat::Synthesis => true,
-        FieldFormat::Enum => !has_date_literal(v),
+        FieldFormat::Enum => !has_date_shape(v),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
         FieldFormat::Numeric => {
-            if has_date_literal(v) {
+            // 🌟 has_date_literal 이 아니라 has_date_shape 를 봅니다.
+            //    "Apr-19-2022" 는 부호·점 필터를 통과하면 "-19-2022" 가 남아
+            //    '숫자가 있다' 는 이유로 수치 축이 날짜를 가져갈 수 있습니다.
+            //    날짜 축의 게이트를 여는 순간 수치 축의 게이트는 같은 문자열에 대해 닫아야 합니다.
+            if has_date_shape(v) {
                 return false;
             }
 
@@ -2678,11 +2820,11 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
             stripped.chars().any(|c| c.is_ascii_digit())
         },
         FieldFormat::Date => {
-            has_date_literal(v)
+            has_date_shape(v)
         },
         FieldFormat::Link => v.contains('/') || v.to_lowercase().starts_with("http"),
-        FieldFormat::TrackingCode => !has_date_literal(v) && longest_code_token_len(v) >= 8,
-        FieldFormat::Identifier => !has_date_literal(v) && longest_code_token_len(v) >= 4,
+        FieldFormat::TrackingCode => !has_date_shape(v) && longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => !has_date_shape(v) && longest_code_token_len(v) >= 4,
         FieldFormat::Phone => {
             let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
             if digits < 7 { return false; }

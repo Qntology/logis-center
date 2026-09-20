@@ -373,22 +373,24 @@ fn expand_col_band(
     }
 
     let mut run = 0usize;
-    let mut up_left = COL_BAND_UP_ROWS;
-    while up_left > 0 && r_min > 0 && (r_max - r_min + 1) < cap {
+    let mut guaranteed = COL_BAND_UP_ROWS;
+    while r_min > 0 && (r_max - r_min + 1) < cap {
         let nr = r_min - 1;
         if !band_has(nr) {
+            if note.is_empty() { note = format!("위 r{} 가 밴드 여백", nr); }
             break;
         }
-        if band_owned(nr) {
+        if band_owned(nr) || guaranteed > 0 {
             run = 0;
         } else {
             run += 1;
             if run > BAND_FOREIGN_RUN {
+                if note.is_empty() { note = format!("위 r{} 부터 남의 영토가 {}줄 연속", nr, run); }
                 break;
             }
         }
         r_min = nr;
-        up_left -= 1;
+        guaranteed = guaranteed.saturating_sub(1);
     }
 
     if note.is_empty() {
@@ -612,10 +614,12 @@ fn presence_gate(
     heatmaps: &[CategoryHeatmap],
     n: usize,
     identity_category: &str,
+    legibility: &crate::models::siglip2::legibility::LegibilityMap,
     emit: &dyn Fn(&str),
 ) -> (std::collections::HashSet<String>, Vec<Option<usize>>) {
     use std::collections::{HashMap, HashSet};
     let mut wins: HashMap<String, usize> = HashMap::new();
+    let mut blind: HashMap<String, usize> = HashMap::new();
     let mut owner_of: Vec<Option<usize>> = vec![None; n];
     for i in 0..n {
         let mut best = f32::MIN;
@@ -631,10 +635,27 @@ fn presence_gate(
         }
         if let Some(o) = owner {
             if best > 0.0 {
-                owner_of[i] = Some(o);
-                *wins.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                if legibility.is_legible(i) {
+                    owner_of[i] = Some(o);
+                    *wins.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                } else {
+                    *blind.entry(heatmaps[o].category.clone()).or_insert(0) += 1;
+                }
             }
         }
+    }
+    for hm in heatmaps.iter() {
+        let lg = wins.get(&hm.category).copied().unwrap_or(0);
+        let bl = blind.get(&hm.category).copied().unwrap_or(0);
+        if bl == 0 {
+            continue;
+        }
+        let ratio = lg as f32 / (lg + bl) as f32;
+        crate::utils::score_dynamics::record_baseline("crop.territory.legible_ratio", ratio);
+        emit(&format!(
+            "    🕳️ [TERRITORY BLIND] '{}' 가 argmax 로 차지한 {}칸 중 글자가 있는 칸은 {}칸({:.0}%) 뿐입니다. 나머지 {}칸은 여백이라 어떤 축도 설명할 내용이 없으므로 영토에서 제외합니다. 여백을 영토로 남겨두면 세로 밴드 확장이 남의 여백에서 멈추고 구제 지분까지 갉아먹습니다.",
+            hm.category, lg + bl, lg, ratio * 100.0, bl
+        ));
     }
     let mut out: HashSet<String> = HashSet::new();
     for hm in heatmaps.iter() {
@@ -707,9 +728,7 @@ fn ensure_identity_band_crop(
         title_row += 1;
     }
     let band_start = (title_row + 1).min(rows - 1);
-    let band_end = ((rows as f32 * 0.40) as usize)
-        .max(band_start + 1)
-        .min(rows - 1);
+    let band_end = identity_band_end_row(rows, band_start);
 
     let cw = grid.orig_width as f32 / cols as f32;
     let ch = grid.orig_height as f32 / rows as f32;
@@ -1033,6 +1052,126 @@ fn rescue_uncovered_cells(
     ));
 }
 
+/// 🌟 [DOC TEXT HEIGHT BASELINE] 문서 전체의 글자 높이 중앙값과 MAD 를 한 번만 측정합니다.
+///
+///  ── 왜 문서 수준인가 ──
+///   크롭 하나의 잉크 행 밴드가 2개뿐이면 "최솟값" 기준이 곧 "유일값" 이 되어
+///   그 밴드가 글자 한 행인지 서명 획 덩어리인지 구분할 근거가 사라집니다.
+///   (실측: 복구 창 7 이 44.0px 를 채택해 배율 1.00x → 70토큰 → 한 글자도 못 읽음.
+///    같은 문서의 다른 22개 크롭은 8.0~14.4px, 중앙값 10.0px 였습니다)
+///   이상치는 자기 안에서 보이지 않고 무리 안에서만 보이므로 기준선을 문서로 올립니다.
+///
+///  ── 왜 중앙값 + MAD 인가 ──
+///   이 코드베이스가 SPATIAL RESIDUAL GATE 와 vision_encoder 의 robust z 에서
+///   이미 쓰는 동일한 분포 판정입니다. 새 상수가 생기지 않습니다.
+///
+///  ── 반환 ──
+///   (중앙값, MAD). 행 밴드가 3개 미만이면 판정이 불가능하므로 None.
+pub fn measure_doc_text_height(
+    img: &image::DynamicImage,
+    emit: &dyn Fn(&str),
+) -> Option<(f32, f32)> {
+    let gray = img.to_luma8();
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    if w == 0 || h < 8 { return None; }
+
+    let mut row_ink: Vec<u32> = vec![0; h];
+    let mut row_runs: Vec<u32> = vec![0; h];
+    let mut row_longest: Vec<u32> = vec![0; h];
+    for y in 0..h {
+        let mut c = 0u32;
+        let mut runs = 0u32;
+        let mut cur = 0u32;
+        let mut longest = 0u32;
+        for x in 0..w {
+            if gray.get_pixel(x as u32, y as u32).0[0] < 160 {
+                c += 1;
+                if cur == 0 { runs += 1; }
+                cur += 1;
+                if cur > longest { longest = cur; }
+            } else {
+                cur = 0;
+            }
+        }
+        row_ink[y] = c;
+        row_runs[y] = runs;
+        row_longest[y] = longest;
+    }
+
+    let total: u64 = row_ink.iter().map(|v| *v as u64).sum();
+    let mean = total as f32 / h as f32;
+    if mean <= 0.0 { return None; }
+
+    let is_text_row = |y: usize| -> bool {
+        if (row_ink[y] as f32) <= mean { return false; }
+        row_runs[y] >= 2 && (row_longest[y] as usize) * 2 < w
+    };
+
+    let mut bands: Vec<f32> = Vec::new();
+    let mut rule_rows = 0usize;
+    let mut run = 0usize;
+    for y in 0..h {
+        if is_text_row(y) {
+            run += 1;
+            continue;
+        }
+        if (row_ink[y] as f32) > mean { rule_rows += 1; }
+        if run > 0 {
+            bands.push(run as f32);
+            run = 0;
+        }
+    }
+    if run > 0 { bands.push(run as f32); }
+    if bands.len() < 3 {
+        emit(&format!(
+            "  ⚪ [DOC TEXT HEIGHT] 괘선을 걷어내고 남은 글자 행 밴드가 {}개뿐이라 기준선을 세우지 못합니다. 클램프를 적용하지 않고 크롭별 추정을 그대로 씁니다.",
+            bands.len()
+        ));
+        return None;
+    }
+
+    bands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = bands[bands.len() / 2];
+
+    let mut dev: Vec<f32> = bands.iter().map(|b| (b - median).abs()).collect();
+    dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mad = dev[dev.len() / 2] * 1.4826;
+
+    emit(&format!(
+        "  📐 [DOC TEXT HEIGHT] 글자 행 밴드 {}개 | 중앙값 {:.1}px | MAD {:.1}px | 허용 상한 {:.1}px | 괘선으로 배제한 잉크 행 {}줄. 표 테두리는 행 전체가 하나의 연속 잉크 런이고 글자 행은 글자 사이 공백 때문에 런이 끊깁니다. 이 구분이 없으면 격자가 촘촘한 서식에서 1~2px 괘선이 밴드 다수를 차지해 중앙값이 글자 높이가 아니라 선 두께가 되고, 그러면 전 크롭이 상한 배율로 포화되어 추정이 사실상 상수가 됩니다.",
+        bands.len(), median, mad, median + mad.max(1.0), rule_rows
+    ));
+    crate::utils::score_dynamics::record_baseline("vision.doc_text_height", median);
+    crate::utils::score_dynamics::record_baseline(
+        "vision.doc_rule_rows",
+        rule_rows as f32 / h.max(1) as f32,
+    );
+    Some((median, mad))
+}
+
+/// 🌟 [TEXT HEIGHT CLAMP] 크롭 하나가 추정한 글자 높이를 문서 기준선으로 되돌립니다.
+///
+///  ── 왜 상한만 거는가 ──
+///   과소 추정은 배율을 올려 토큰만 늘릴 뿐 판독을 해치지 않습니다.
+///   과대 추정은 배율을 1.00x 로 떨어뜨려 판독 자체를 불가능하게 만듭니다.
+///   손실이 비대칭이므로 상한만 강제합니다.
+pub fn clamp_text_height(
+    estimated: f32,
+    baseline: Option<(f32, f32)>,
+    tag: &str,
+    emit: &dyn Fn(&str),
+) -> f32 {
+    let (median, mad) = match baseline { Some(v) => v, None => return estimated };
+    let cap = median + mad.max(1.0);
+    if estimated <= cap { return estimated; }
+    emit(&format!(
+        "    📐 [TEXT HEIGHT CLAMP / {}] 추정 {:.1}px 가 문서 상한 {:.1}px(중앙값 {:.1} + MAD {:.1})를 넘어 중앙값으로 되돌립니다. 이 크롭의 잉크 행 밴드가 서명 획이나 여러 행이 붙은 덩어리를 한 행으로 재고 있습니다. 그대로 두면 배율이 1.00x 로 떨어져 2B 모델이 한 글자도 읽지 못합니다.",
+        tag, estimated, cap, median, mad
+    ));
+    crate::utils::score_dynamics::record_baseline("vision.text_height_clamp", 1.0);
+    median
+}
+
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
@@ -1063,7 +1202,7 @@ pub fn plan_crops(
         legible_cnt, n
     ));
 
-    let (present, owner_of) = presence_gate(heatmaps, n, identity_category, emit);
+    let (present, owner_of) = presence_gate(heatmaps, n, identity_category, legibility, emit);
 
     let area_cap = (n / present.len().max(1)).max(4);
 
@@ -1877,6 +2016,33 @@ const TEXT_HEIGHT_MIN_COHERENCE: f32 = 0.15;
 const TEXT_HEIGHT_FLOOR_PX: f32 = 8.0;
 const TEXT_HEIGHT_CROP_FRACTION: f32 = 40.0;
 const TEXT_HEIGHT_CEIL_FRACTION: f32 = 3.0;
+const TEXT_HEIGHT_MIN_BANDS: usize = 4;
+
+fn band_measured_text_height(img: &DynamicImage, w: u32, h: u32) -> Option<f32> {
+    let mut band_h: Vec<f32> = text_row_bands(img, (0, 0, w, h))
+        .iter()
+        .map(|b| b.y1.saturating_sub(b.y0) as f32)
+        .filter(|v| *v > 0.0)
+        .collect();
+    if band_h.is_empty() {
+        println!("    📏 [TEXT HEIGHT / BAND MEASURED] 잉크 행 밴드가 0개입니다. 이 크롭에는 글자 행이 없으므로 추정을 포기합니다.");
+        return None;
+    }
+    band_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = band_h.len();
+    let picked = if n >= TEXT_HEIGHT_MIN_BANDS { band_h[n / 4] } else { band_h[0] };
+    let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
+    let ceil = (h as f32 / TEXT_HEIGHT_CEIL_FRACTION).max(floor);
+    let th = picked.max(floor).min(ceil);
+    crate::utils::score_dynamics::record_baseline("crop.text_height.band_only", th);
+    println!(
+        "    📏 [TEXT HEIGHT / BAND MEASURED] 잉크 행 밴드 {}개 | 채택 기준 {} | 실측 {:.1}px → 채택 {:.1}px (허용 {:.1}~{:.1}px, 크롭 높이 {}px). 자기상관 주기가 성립하지 않는 소형 크롭에서는 실측한 행 밴드 높이 자체가 글자 높이입니다.",
+        n,
+        if n >= TEXT_HEIGHT_MIN_BANDS { "하위 1/4" } else { "최솟값" },
+        picked, th, floor, ceil, h
+    );
+    Some(th)
+}
 
 fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     use image::GenericImageView;
@@ -1907,10 +2073,10 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     let min_lag = ((TEXT_HEIGHT_FLOOR_PX / 0.6).ceil() as usize).max(4);
     if max_lag <= min_lag {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 크롭 높이 {}px 로는 탐색 구간(lag {}~{})이 성립하지 않습니다. 추정을 기각합니다.",
+            "    📏 [TEXT HEIGHT REJECT] 크롭 높이 {}px 로는 탐색 구간(lag {}~{})이 성립하지 않습니다. 실측 행 밴드로 폴백합니다.",
             h, min_lag, max_lag
         );
-        return None;
+        return band_measured_text_height(img, w, h);
     }
 
     let mut best_lag = 0usize;
@@ -1923,48 +2089,95 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
         let norm = s / (prof.len() - lag) as f32;
         if norm > best { best = norm; best_lag = lag; }
     }
-    if best_lag == 0 || best <= 0.0 { return None; }
+    if best_lag == 0 || best <= 0.0 {
+        println!("    📏 [TEXT HEIGHT REJECT] 자기상관 최댓값이 양수가 아닙니다. 실측 행 밴드로 폴백합니다.");
+        return band_measured_text_height(img, w, h);
+    }
 
     let coherence = best / var;
     if coherence < TEXT_HEIGHT_MIN_COHERENCE {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 자기상관 응집도 {:.3} < {:.2} (lag {}) — 주기가 노이즈 수준입니다. 추정을 기각하고 보수적 배율로 내려갑니다.",
+            "    📏 [TEXT HEIGHT REJECT] 자기상관 응집도 {:.3} < {:.2} (lag {}) — 주기가 노이즈 수준입니다. 실측 행 밴드로 폴백합니다.",
             coherence, TEXT_HEIGHT_MIN_COHERENCE, best_lag
         );
-        return None;
+        return band_measured_text_height(img, w, h);
     }
 
-    // 라인 피치의 약 60% 가 실제 글자 높이(x-height + 어센더)
-    let th = best_lag as f32 * 0.6;
+    let th_pitch = best_lag as f32 * 0.6;
     let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
     let ceil = h as f32 / TEXT_HEIGHT_CEIL_FRACTION;
-    if th < floor || th > ceil {
+    if th_pitch < floor || th_pitch > ceil {
         println!(
-            "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 기각합니다.",
-            th, floor, ceil, h
+            "    📏 [TEXT HEIGHT REJECT] 추정 글자 높이 {:.1}px 가 허용 범위 {:.1}~{:.1}px 밖입니다 (크롭 높이 {}px). 자기상관이 여백 줄무늬나 표 괘선을 글자 주기로 오인한 것이므로 실측 행 밴드로 폴백합니다.",
+            th_pitch, floor, ceil, h
         );
-        return None;
+        return band_measured_text_height(img, w, h);
+    }
+    let mut band_h: Vec<f32> = text_row_bands(img, (0, 0, w, h))
+        .iter()
+        .map(|b| b.y1.saturating_sub(b.y0) as f32)
+        .filter(|v| *v > 0.0)
+        .collect();
+    if band_h.is_empty() {
+        println!(
+            "    📏 [TEXT HEIGHT / PITCH ONLY] 잉크 행 밴드가 0개라 실측으로 교차 확인할 수 없습니다. 지배 주기가 말하는 높이 {:.1}px 를 그대로 채택합니다.",
+            th_pitch
+        );
+        return Some(th_pitch);
+    }
+    band_h.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n_band = band_h.len();
+    let low = if n_band >= TEXT_HEIGHT_MIN_BANDS { band_h[n_band / 4] } else { band_h[0] };
+    let th = low.min(th_pitch).max(floor);
+    crate::utils::score_dynamics::record_baseline("crop.text_height.band_ratio", low / th_pitch.max(1e-6));
+    if th < th_pitch {
+        println!(
+            "    📏 [TEXT HEIGHT / SMALLEST BAND] 잉크 행 밴드 {}개 | 채택 기준 {} 밴드 높이 {:.1}px | 지배 주기가 말하는 높이 {:.1}px → 채택 {:.1}px (하한 {:.1}px). 배율은 가장 작은 글자가 읽힐 때까지 올려야 하므로, 다수 본문의 주기만 보면 소형 라벨이 통째로 뭉개집니다.",
+            n_band,
+            if n_band >= TEXT_HEIGHT_MIN_BANDS { "하위 1/4" } else { "최솟값" },
+            low, th_pitch, th, floor
+        );
     }
     Some(th)
 }
 
 pub fn crop_region(
-    image: &DynamicImage,
+    img: &image::DynamicImage,
     plan: &CropPlan,
-    target_short: u32,
-) -> DynamicImage {
+    min_side: u32,
+) -> image::DynamicImage {
+    crop_region_clamped(img, plan, min_side, None, &|_| {})
+}
+
+pub fn crop_region_clamped(
+    img: &image::DynamicImage,
+    plan: &CropPlan,
+    min_side: u32,
+    height_baseline: Option<(f32, f32)>,
+    emit: &dyn Fn(&str),
+) -> image::DynamicImage {
     let (x0, y0, x1, y1) = plan.bbox;
     let w = x1.saturating_sub(x0).max(1);
     let h = y1.saturating_sub(y0).max(1);
-    let cropped = image.crop_imm(x0, y0, w, h);
+    let cropped = img.crop_imm(x0, y0, w, h);
 
-    // 🌟 글자 높이를 실측해 필요한 배율만 적용합니다.
+    // 🌟 [D-1] 실측 글자 높이를 '문서 기준선으로 되돌린 뒤' 배율을 계산합니다.
+    //
+    //  ── 순서가 중요한 이유 ──
+    //   배율을 먼저 확정하고 높이만 클램프하면 로그와 실제 전송 크기가 어긋나고,
+    //   창 7(44.0px → 1.00x)의 사고가 그대로 재현됩니다.
+    //   클램프된 높이로 배율을 다시 계산해야 640px 급 전송이 성립합니다.
     let factor = match estimate_text_height(&cropped) {
         Some(th) if th > 0.5 => {
-            let f = (VISION_PATCH_PX / th).clamp(1.0, 4.0);
+            let est_h = clamp_text_height(th, height_baseline, &plan.category, emit);
+            let f = if est_h > 0.5 {
+                (VISION_PATCH_PX / est_h).clamp(1.0, 4.0)
+            } else {
+                (VISION_PATCH_PX / th).clamp(1.0, 4.0)
+            };
             println!(
-                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px → 배율 {:.2}x (목표 {}px/글자)",
-                th, f, VISION_PATCH_PX as u32
+                "    📏 [TEXT-AWARE UPSCALE] 추정 글자 높이 {:.1}px(크롭 실측 {:.1}px) → 배율 {:.2}x (목표 {:.0}px/글자)",
+                est_h, th, f, VISION_PATCH_PX
             );
             f
         }
@@ -1972,7 +2185,7 @@ pub fn crop_region(
             // 프로파일에서 주기를 못 찾음 = 텍스트가 거의 없음.
             // 기존 짧은 변 규칙으로 폴백하되 상한을 낮게 둡니다.
             let short = w.min(h) as f32;
-            let f = (target_short as f32 / short).clamp(1.0, 2.0);
+            let f = (min_side as f32 / short).clamp(1.0, 2.0);
             println!(
                 "    📏 [TEXT-AWARE UPSCALE] 라인 주기 미검출(텍스트 희소) → 보수적 배율 {:.2}x",
                 f
@@ -1981,11 +2194,93 @@ pub fn crop_region(
         }
     };
 
+    let mut factor = factor;
+    let cap_w = CROP_MAX_SIDE_PX as f32 / w as f32;
+    let cap_h = CROP_MAX_SIDE_PX as f32 / h as f32;
+    let cap = if cap_w < cap_h { cap_w } else { cap_h };
+    if cap > 1.0 && factor > cap {
+        println!(
+            "    📐 [ISOTROPIC CAP] 크롭 {}x{} 의 배율 {:.2}x 가 긴 변 상한 {}px 를 넘어 {:.2}x 로 낮춥니다. 변마다 따로 자르면 종횡비가 깨져 글자가 한쪽으로 늘어나고, 그 왜곡은 ViT 패치 격자와 어긋나 식별 축을 담은 크롭에서 특히 손해가 큽니다.",
+            w, h, factor, CROP_MAX_SIDE_PX, cap
+        );
+        factor = cap;
+    }
+
     if factor <= 1.01 { return cropped; }
 
-    let nw = (((w as f32 * factor).round() as u32).max(1)).min(2048);
-    let nh = (((h as f32 * factor).round() as u32).max(1)).min(2048);
+    let nw = ((w as f32 * factor).round() as u32).max(1);
+    let nh = ((h as f32 * factor).round() as u32).max(1);
     cropped.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+}
+
+pub fn crop_tile(
+    image: &DynamicImage,
+    plan: &CropPlan,
+    tile: &TilePlan,
+    target_short: u32,
+) -> DynamicImage {
+    let (hy0, hy1) = match tile.header_band {
+        Some(h) => h,
+        None => {
+            let mut p = plan.clone();
+            p.bbox = tile.bbox;
+            return crop_region(image, &p, target_short);
+        }
+    };
+
+    let (x0, ry0, x1, ry1) = tile.bbox;
+    let w = x1.saturating_sub(x0).max(1);
+    let hh = hy1.saturating_sub(hy0).max(1);
+    let rh = ry1.saturating_sub(ry0).max(1);
+    let total_h = hh + HEADER_STITCH_SEAM_PX + rh;
+
+    let head = image.crop_imm(x0, hy0, w, hh).to_rgb8();
+    let body = image.crop_imm(x0, ry0, w, rh).to_rgb8();
+
+    let mut canvas = image::RgbImage::new(w, total_h);
+    for px in canvas.pixels_mut() {
+        *px = image::Rgb([255u8, 255u8, 255u8]);
+    }
+    let hw = head.width().min(w);
+    let hd = head.height().min(hh);
+    for y in 0..hd {
+        for x in 0..hw {
+            canvas.put_pixel(x, y, *head.get_pixel(x, y));
+        }
+    }
+    let bw = body.width().min(w);
+    let bd = body.height().min(rh);
+    for y in 0..bd {
+        for x in 0..bw {
+            canvas.put_pixel(x, hh + HEADER_STITCH_SEAM_PX + y, *body.get_pixel(x, y));
+        }
+    }
+    let stitched = DynamicImage::ImageRgb8(canvas);
+
+    let mut factor = if tile.text_h > 0.5 {
+        (VISION_PATCH_PX / tile.text_h).clamp(1.0, 4.0)
+    } else {
+        let short = w.min(total_h) as f32;
+        (target_short as f32 / short).clamp(1.0, 2.0)
+    };
+    let cap_w = CROP_MAX_SIDE_PX as f32 / w as f32;
+    let cap_h = CROP_MAX_SIDE_PX as f32 / total_h as f32;
+    let cap = if cap_w < cap_h { cap_w } else { cap_h };
+    if cap > 1.0 && factor > cap {
+        factor = cap;
+    }
+
+    println!(
+        "    🧷 [HEADER STITCH] 표 헤더 y{}~{} ({}px) 를 데이터 행 y{}~{} ({}px) 위에 붙여 {}x{} 합성 크롭을 만들었습니다. 추정 글자 높이 {:.1}px → 배율 {:.2}x (종횡비 유지)",
+        hy0, hy1, hh, ry0, ry1, rh, w, total_h, tile.text_h, factor
+    );
+
+    if factor <= 1.01 {
+        return stitched;
+    }
+    let nw = ((w as f32 * factor).round() as u32).max(1);
+    let nh = ((total_h as f32 * factor).round() as u32).max(1);
+    stitched.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
 }
 
 pub fn whole_page_fallback(categories: &[&str], grid: &PatchGrid) -> Vec<CropPlan> {
@@ -2203,10 +2498,291 @@ pub struct TilePlan {
     pub bbox: (u32, u32, u32, u32),
     pub index: usize,
     pub total: usize,
+    pub header_band: Option<(u32, u32)>,
+    pub text_h: f32,
 }
 
 /// 세로 방향 겹침 분할. 무역 서식의 표는 가로로 넓고 세로로 쌓이므로
 /// 세로 분할이 행 손실을 최소화합니다.
+const ROW_BAND_MIN_H: u32 = 4;
+const ROW_BAND_MERGE_GAP: u32 = 4;
+const ROW_BAND_NOISE_SIGMA: f32 = 3.0;
+const ROW_TILE_PAD_PX: u32 = 6;
+const ROW_TILE_MAX: usize = 6;
+const ROW_TILE_MIN_BANDS: usize = 2;
+const TABLE_BAND_MIN_COLS: usize = 4;
+const TABLE_BAND_CLUSTER_TOL: usize = 1;
+const COL_CLUSTER_GAP: u32 = 6;
+const COL_CLUSTER_MIN_W: u32 = 4;
+const HEADER_STITCH_SEAM_PX: u32 = 2;
+const CROP_MAX_SIDE_PX: u32 = 2048;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RowBand {
+    pub y0: u32,
+    pub y1: u32,
+    pub col_clusters: usize,
+}
+
+pub fn text_row_bands(img: &DynamicImage, bbox: (u32, u32, u32, u32)) -> Vec<RowBand> {
+    use image::GenericImageView;
+    let (x0, y0, x1, y1) = bbox;
+    let w = x1.saturating_sub(x0).max(1);
+    let h = y1.saturating_sub(y0).max(1);
+    if h < ROW_BAND_MIN_H * 2 {
+        return Vec::new();
+    }
+    let g = img.crop_imm(x0, y0, w, h).to_luma8();
+    let (gw, gh) = g.dimensions();
+
+    let mut prof: Vec<f32> = Vec::with_capacity(gh as usize);
+    for y in 0..gh {
+        let mut s = 0.0f32;
+        for x in 0..gw {
+            s += 255.0 - g.get_pixel(x, y)[0] as f32;
+        }
+        prof.push(s / gw as f32);
+    }
+
+    let mut sorted = prof.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[sorted.len() / 10];
+    let peak = sorted[sorted.len() * 9 / 10];
+    if peak - floor < 1.0 {
+        return Vec::new();
+    }
+    let span_gate = floor + (peak - floor) * 0.25;
+    let half = &sorted[..(sorted.len() / 2).max(1)];
+    let hm: f32 = half.iter().sum::<f32>() / half.len() as f32;
+    let hsd: f32 = (half.iter().map(|v| (v - hm) * (v - hm)).sum::<f32>() / half.len() as f32).sqrt();
+    let noise_gate = hm + hsd * ROW_BAND_NOISE_SIGMA;
+    let gate = if noise_gate < span_gate { noise_gate } else { span_gate };
+
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut start: Option<u32> = None;
+    for y in 0..gh {
+        if prof[y as usize] > gate {
+            if start.is_none() {
+                start = Some(y);
+            }
+        } else if let Some(s) = start.take() {
+            runs.push((s, y));
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, gh));
+    }
+
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (bs, be) in runs.into_iter() {
+        match merged.last_mut() {
+            Some(last) if bs.saturating_sub(last.1) <= ROW_BAND_MERGE_GAP => {
+                last.1 = be;
+            }
+            _ => merged.push((bs, be)),
+        }
+    }
+    merged.retain(|(bs, be)| be.saturating_sub(*bs) >= ROW_BAND_MIN_H);
+
+    merged
+        .into_iter()
+        .map(|(bs, be)| {
+            let span = (be - bs).max(1) as f32;
+            let mut colp: Vec<f32> = Vec::with_capacity(gw as usize);
+            for x in 0..gw {
+                let mut s = 0.0f32;
+                for y in bs..be {
+                    s += 255.0 - g.get_pixel(x, y)[0] as f32;
+                }
+                colp.push(s / span);
+            }
+            let mut cs = colp.clone();
+            cs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let cfloor = cs[cs.len() / 10];
+            let cpeak = cs[cs.len() * 9 / 10];
+            let cgate = cfloor + (cpeak - cfloor).max(1.0) * 0.30;
+
+            let mut cruns: Vec<(u32, u32)> = Vec::new();
+            let mut cst: Option<u32> = None;
+            for x in 0..gw {
+                if colp[x as usize] > cgate {
+                    if cst.is_none() {
+                        cst = Some(x);
+                    }
+                } else if let Some(s) = cst.take() {
+                    cruns.push((s, x));
+                }
+            }
+            if let Some(s) = cst {
+                cruns.push((s, gw));
+            }
+
+            let mut cmerged: Vec<(u32, u32)> = Vec::new();
+            for (s, e) in cruns.into_iter() {
+                match cmerged.last_mut() {
+                    Some(last) if s.saturating_sub(last.1) <= COL_CLUSTER_GAP => {
+                        last.1 = e;
+                    }
+                    _ => cmerged.push((s, e)),
+                }
+            }
+            let clusters = cmerged
+                .iter()
+                .filter(|(s, e)| e.saturating_sub(*s) >= COL_CLUSTER_MIN_W)
+                .count();
+
+            RowBand {
+                y0: y0 + bs,
+                y1: y0 + be,
+                col_clusters: clusters,
+            }
+        })
+        .collect()
+}
+
+pub fn plan_row_tiles(
+    img: &DynamicImage,
+    bbox: (u32, u32, u32, u32),
+    emit: &dyn Fn(&str),
+) -> Option<Vec<TilePlan>> {
+    let (x0, y0, x1, y1) = bbox;
+    let bands = text_row_bands(img, bbox);
+    if bands.len() < ROW_TILE_MIN_BANDS {
+        emit(&format!(
+            "    ⏭ [ROW TILE SKIP] 크롭 px({},{})-({},{}) 안에서 잉크 행 밴드를 {}개밖에 못 찾았습니다. 균등 분할로 되돌립니다.",
+            x0, y0, x1, y1, bands.len()
+        ));
+        return None;
+    }
+
+    let table: Vec<RowBand> = bands
+        .iter()
+        .copied()
+        .filter(|b| b.col_clusters >= TABLE_BAND_MIN_COLS)
+        .collect();
+
+    let diff = |a: usize, b: usize| -> usize { if a > b { a - b } else { b - a } };
+
+    let picked: Vec<RowBand> = if table.len() >= ROW_TILE_MIN_BANDS {
+        let mut mode_cols = 0usize;
+        let mut mode_hits = 0usize;
+        for b in table.iter() {
+            let hits = table
+                .iter()
+                .filter(|o| diff(o.col_clusters, b.col_clusters) <= TABLE_BAND_CLUSTER_TOL)
+                .count();
+            if hits > mode_hits || (hits == mode_hits && b.col_clusters > mode_cols) {
+                mode_hits = hits;
+                mode_cols = b.col_clusters;
+            }
+        }
+        let aligned: Vec<RowBand> = table
+            .iter()
+            .copied()
+            .filter(|b| diff(b.col_clusters, mode_cols) <= TABLE_BAND_CLUSTER_TOL)
+            .collect();
+        let dropped: Vec<(u32, u32, usize)> = table
+            .iter()
+            .filter(|b| diff(b.col_clusters, mode_cols) > TABLE_BAND_CLUSTER_TOL)
+            .map(|b| (b.y0, b.y1, b.col_clusters))
+            .collect();
+        if aligned.len() >= ROW_TILE_MIN_BANDS {
+            emit(&format!(
+                "    📏 [ROW TILE / GRID ALIGN] 잉크 행 밴드 {}개 중 열 뭉치 {}개 이상인 후보 {}개, 그중 최빈 열 수 {}±{} 로 정렬된 표 행 {}개만 남깁니다 (y {:?}). 비표 블록 {}개 제외: {:?}",
+                bands.len(), TABLE_BAND_MIN_COLS, table.len(),
+                mode_cols, TABLE_BAND_CLUSTER_TOL, aligned.len(),
+                aligned.iter().map(|b| (b.y0, b.y1)).take(8).collect::<Vec<_>>(),
+                dropped.len(),
+                dropped.iter().take(6).collect::<Vec<_>>()
+            ));
+            aligned
+        } else {
+            emit(&format!(
+                "    📏 [ROW TILE / TABLE BANDS] 최빈 열 수 {}±{} 로 정렬된 행이 {}개뿐이라 열 정렬 필터를 기각하고 후보 {}개를 그대로 씁니다.",
+                mode_cols, TABLE_BAND_CLUSTER_TOL, aligned.len(), table.len()
+            ));
+            table
+        }
+    } else {
+        emit(&format!(
+            "    📏 [ROW TILE / ALL BANDS] 열 뭉치 {}개 이상인 행이 {}개뿐이라 표 행을 특정하지 못했습니다. 전체 밴드 {}개를 그대로 씁니다.",
+            TABLE_BAND_MIN_COLS, table.len(), bands.len()
+        ));
+        bands
+    };
+
+    let header = picked[0];
+    let hy0 = header.y0.saturating_sub(ROW_TILE_PAD_PX).max(y0);
+    let hy1 = (header.y1 + ROW_TILE_PAD_PX).min(y1);
+
+    let mut out: Vec<TilePlan> = Vec::new();
+    if hy1 > hy0 + 1 {
+        out.push(TilePlan {
+            bbox: (x0, hy0, x1, hy1),
+            index: 0,
+            total: 0,
+            header_band: None,
+            text_h: (header.y1.saturating_sub(header.y0)).max(1) as f32,
+        });
+    }
+
+    for b in picked.iter().skip(1) {
+        if out.len() >= ROW_TILE_MAX {
+            break;
+        }
+        let ty0 = b.y0.saturating_sub(ROW_TILE_PAD_PX).max(y0);
+        let ty1 = (b.y1 + ROW_TILE_PAD_PX).min(y1);
+        if ty1 <= ty0 + 1 {
+            continue;
+        }
+        out.push(TilePlan {
+            bbox: (x0, ty0, x1, ty1),
+            index: out.len(),
+            total: 0,
+            header_band: Some((hy0, hy1)),
+            text_h: (b.y1.saturating_sub(b.y0)).max(1) as f32,
+        });
+    }
+
+    if out.len() < 2 {
+        return None;
+    }
+    let total = out.len();
+    for p in out.iter_mut() {
+        p.total = total;
+    }
+    emit(&format!(
+        "    📏 [ROW TILE] 크롭 px({},{})-({},{}) 를 표 행 {}개 기준으로 타일 {}개로 만들었습니다. 1번은 헤더 밴드 y{}~{} 단독, 나머지는 그 헤더를 데이터 행 위에 붙인 합성 크롭입니다. 데이터 행 단독 크롭은 열 대응 근거가 없어 2B 모델이 값을 엉뚱한 필드에 넣습니다.",
+        x0, y0, x1, y1, picked.len(), total, hy0, hy1
+    ));
+    Some(out)
+}
+
+fn identity_band_end_row(rows: usize, band_start: usize) -> usize {
+    ((rows as f32 * 0.40) as usize)
+        .max(band_start + 1)
+        .min(rows.saturating_sub(1))
+}
+
+pub fn identity_band_bottom_px(grid: &PatchGrid) -> u32 {
+    let rows = grid.grid_rows.max(1);
+    let band_end = identity_band_end_row(rows, 1);
+    let ch = grid.orig_height as f32 / rows as f32;
+    (((band_end + 1) as f32) * ch).round() as u32
+}
+
+pub fn table_row_evidence(
+    img: &DynamicImage,
+    bbox: (u32, u32, u32, u32),
+) -> (usize, usize, usize, bool) {
+    let bands = text_row_bands(img, bbox);
+    let table = bands
+        .iter()
+        .filter(|b| b.col_clusters >= TABLE_BAND_MIN_COLS)
+        .count();
+    (table, bands.len(), TABLE_BAND_MIN_COLS, table >= ROW_TILE_MIN_BANDS)
+}
+
 pub fn plan_overlap_tiles(
     bbox: (u32, u32, u32, u32),
     tile_count: usize,
@@ -2214,7 +2790,7 @@ pub fn plan_overlap_tiles(
 ) -> Vec<TilePlan> {
     let (x0, y0, x1, y1) = bbox;
     if tile_count <= 1 || y1 <= y0 {
-        return vec![TilePlan { bbox, index: 0, total: 1 }];
+        return vec![TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 }];
     }
     let h = (y1 - y0) as f32;
     // t = 타일 높이. n 타일이 겹침 r 로 전체를 덮으려면
@@ -2222,7 +2798,7 @@ pub fn plan_overlap_tiles(
     let n = tile_count as f32;
     let denom = n - (n - 1.0) * overlap_ratio;
     if denom <= 0.0 {
-        return vec![TilePlan { bbox, index: 0, total: 1 }];
+        return vec![TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 }];
     }
     let t = h / denom;
     let step = t * (1.0 - overlap_ratio);
@@ -2238,10 +2814,12 @@ pub fn plan_overlap_tiles(
             bbox: (x0, ty0 as u32, x1, ty1 as u32),
             index: i,
             total: tile_count,
+            header_band: None,
+            text_h: 0.0,
         });
     }
     if out.is_empty() {
-        out.push(TilePlan { bbox, index: 0, total: 1 });
+        out.push(TilePlan { bbox, index: 0, total: 1, header_band: None, text_h: 0.0 });
     }
     let total = out.len();
     for p in out.iter_mut() {

@@ -1618,6 +1618,91 @@ pub fn is_printed_label_echo(value: &str, doc_lang: &str) -> bool {
     })
 }
 
+pub fn is_printed_label_fragment(value: &str, doc_lang: &str) -> bool {
+    fn weight(s: &str) -> usize {
+        s.chars()
+            .map(|c| {
+                let u = c as u32;
+                if (0x1100..=0x11FF).contains(&u)
+                    || (0x3040..=0x30FF).contains(&u)
+                    || (0x3400..=0x9FFF).contains(&u)
+                    || (0xAC00..=0xD7AF).contains(&u)
+                    || (0xF900..=0xFAFF).contains(&u)
+                {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    let norm = fold_column_label(value);
+    if norm.is_empty() || norm.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let v_tokens: Vec<&str> = norm.split_whitespace().collect();
+    let v_weight: usize = v_tokens.iter().map(|t| weight(t)).sum();
+    if v_weight < 4 {
+        return false;
+    }
+    let fragment_of = |label: &str| -> bool {
+        let l = fold_column_label(label);
+        if l.is_empty() || l == norm {
+            return false;
+        }
+        let l_tokens: Vec<&str> = l.split_whitespace().collect();
+        if v_tokens.len() > l_tokens.len() {
+            return false;
+        }
+        for start in 0..=(l_tokens.len() - v_tokens.len()) {
+            let window = &l_tokens[start..start + v_tokens.len()];
+            let w_weight: usize = window.iter().map(|t| weight(t)).sum();
+            if v_weight * 2 < w_weight {
+                continue;
+            }
+            if v_tokens.len() == 1 {
+                let (vt, lt) = (v_tokens[0], window[0]);
+                if lt != vt && weight(lt) >= weight(vt) + 2 && (lt.starts_with(vt) || lt.ends_with(vt)) {
+                    return true;
+                }
+                continue;
+            }
+            let last = v_tokens.len() - 1;
+            let mut exact = 0usize;
+            let mut ok = true;
+            for k in 0..v_tokens.len() {
+                let (vt, lt) = (v_tokens[k], window[k]);
+                let matched = if k == 0 {
+                    lt.ends_with(vt)
+                } else if k == last {
+                    lt.starts_with(vt)
+                } else {
+                    lt == vt
+                };
+                if !matched {
+                    ok = false;
+                    break;
+                }
+                if lt == vt {
+                    exact += 1;
+                }
+            }
+            if ok && exact >= 1 {
+                return true;
+            }
+        }
+        false
+    };
+    TRADE_PRINTED_LABELS
+        .iter()
+        .any(|l| alias_lang_matches(l, doc_lang) && fragment_of(l))
+        || TRADE_COLUMN_ALIASES.iter().any(|(_, aliases)| {
+            aliases
+                .iter()
+                .any(|a| alias_lang_matches(a, doc_lang) && fragment_of(a))
+        })
+}
+
 /// 🌟 [ROW CONTRACT] 표 타일 프롬프트에 실을 계약 문자열을 만듭니다.
 ///  실측 로그에서 타일 2 는 T-Shirt 행과 Shorts 행을 둘 다 담고 있었는데
 ///  응답이 객체 1개였고, 파이프라인이 그것을 배열 1원소로 승격했습니다.

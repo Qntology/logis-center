@@ -189,7 +189,7 @@ pub fn canonical_trade_triples(doc_type: &str) -> Vec<(String, String, String)> 
           number of pieces, total pieces, no. of pkgs, CTNS, PKGS"),
         ("weight_gross",
          "total gross weight, gross weight kg, G.W., cargo gross weight, \
-          verified gross mass, VGM, chargeable weight"),
+          verified gross mass, VGM, total weight, shipment total weight"),
         ("weight_net",
          "total net weight, net weight kg, N.W., cargo net weight"),
         ("volume",

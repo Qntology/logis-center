@@ -456,6 +456,66 @@ fn extract_example_tokens(desc: &str) -> Vec<String> {
     out
 }
 
+fn is_format_placeholder(token: &str) -> bool {
+    let t = token.trim();
+    if t.chars().count() < 4 {
+        return false;
+    }
+    if t.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut runs = 0usize;
+    let mut cur: Option<char> = None;
+    let mut len = 0usize;
+    for ch in t.chars() {
+        if ch.is_alphabetic() {
+            match cur {
+                Some(c) if c.eq_ignore_ascii_case(&ch) => len += 1,
+                Some(_) => return false,
+                None => {
+                    cur = Some(ch);
+                    len = 1;
+                }
+            }
+        } else if cur.is_some() {
+            if len < 2 {
+                return false;
+            }
+            runs += 1;
+            cur = None;
+            len = 0;
+        }
+    }
+    if cur.is_some() {
+        if len < 2 {
+            return false;
+        }
+        runs += 1;
+    }
+    runs >= 2
+}
+
+fn strip_format_placeholders(desc: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for raw in desc.split_whitespace() {
+        let core = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        if !core.is_empty() && is_format_placeholder(core) {
+            continue;
+        }
+        kept.push(raw.to_string());
+    }
+    kept.join(" ")
+        .replace("()", " ")
+        .replace("[]", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string()
+}
+
 /// 🌟 [DOC-SPECIFIC IDENTITY RULES] doc_type 이 확정된 상태에서
 ///    이 서식에 실제로 인쇄되는 라벨과 참조 축만 알려줍니다.
 ///
@@ -976,7 +1036,7 @@ pub fn get_trade_category_schema_present(
     //        "SCHEMA:\n{}" 문자열로 빈 스키마를 판정합니다.
     //     ② process_trading_task 가 SCHEMA 블록에서 trim_start 후 '"' 로 시작하는
     //        라인 수로 필드 개수를 셉니다. 정의/금지 블록은 '-' 로 시작시켜 제외합니다.
-    let is_array = category == "items" || category == "containers";
+    let is_array = crate::logic::is_trade_array_category(category);
 
     let parsed: Vec<(String, String, &'static str)> = fields
         .iter()
@@ -986,11 +1046,24 @@ pub fn get_trade_category_schema_present(
         })
         .collect();
 
+    let mut prescription_dropped: Vec<String> = Vec::new();
     let defs = parsed
         .iter()
-        .map(|(k, d, t)| format!("- \"{}\" ({}): {}", k, t, d.replace('"', "'")))
+        .map(|(k, d, t)| {
+            let shown = strip_format_placeholders(d);
+            if shown != *d {
+                prescription_dropped.push(k.clone());
+            }
+            format!("- \"{}\" ({}): {}", k, t, shown.replace('"', "'"))
+        })
         .collect::<Vec<_>>()
         .join("\n");
+    if !prescription_dropped.is_empty() {
+        println!(
+            "  🧹 [FORMAT PRESCRIPTION DROP] 정의문에서 출력 형식 처방을 뗀 축 {:?}. 이 축들은 금지 목록에는 그대로 남아 에코를 계속 막습니다. 인쇄값이 처방과 다르면 2B 모델은 형식을 맞추려다 null 을 반환하는데, 형식 정규화는 저장 직전 단계의 책임이므로 스키마는 '이 축이 무엇인가' 만 말해야 합니다.",
+            prescription_dropped
+        );
+    }
 
     // 🌟 [CLOSED VOCAB SPLIT] 닫힌 어휘 필드의 예시는 '금지' 가 아니라 '기대값' 입니다.
     //
@@ -1241,7 +1314,87 @@ pub fn get_trade_crop_prompt(
     score: f32,
     claimed: &[(String, String)],
 ) -> String {
-    let base = get_trade_category_schema(category, doc_type);
+    get_trade_crop_prompt_present(
+        category,
+        doc_type,
+        top_field,
+        score,
+        claimed,
+        &std::collections::HashSet::new(),
+    )
+}
+
+pub fn get_trade_crop_prompt_present(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+    absent: &std::collections::HashSet<String>,
+) -> String {
+    get_trade_crop_prompt_scoped(
+        category, doc_type, top_field, score, claimed,
+        absent, &std::collections::HashSet::new(),
+    )
+}
+
+/// 🌟 [PASS SCOPE] 부재 판정(absent)과 패스 분할(exclude)을 분리합니다.
+///
+///  ── 왜 분리해야 하는가 ──
+///   릴레이 보호는 '비전 PRESENCE 오판으로 릴레이 축이 통째로 사라지는 사고' 를
+///   막으려는 규칙입니다. 그 축은 문서 그래프의 연결고리라 한 번 비면 복구할 수 없습니다.
+///   그런데 2패스의 제외 집합은 '이 문서에 없다' 가 아니라 '이 패스에서는 묻지 않는다' 입니다.
+///   의미가 다른 두 집합이 한 인자를 공유하면 보호 규칙이 패스 분할을 그대로 되돌립니다.
+///   (실측: REST 패스가 4축이 아니라 11축을 물었고, 그 응답에 reference_bl 이 그대로 나왔습니다)
+///
+///  ── exclude 에는 보호를 걸지 않는 이유 ──
+///   같은 크롭의 다른 패스가 그 축을 이미 묻고 있으므로 축이 소실되지 않습니다.
+pub fn get_trade_crop_prompt_scoped(
+    category: &str,
+    doc_type: &str,
+    top_field: &str,
+    score: f32,
+    claimed: &[(String, String)],
+    absent: &std::collections::HashSet<String>,
+    exclude: &std::collections::HashSet<String>,
+) -> String {
+    let mut effective: std::collections::HashSet<String> = absent.clone();
+    for (_, relay_fields) in crate::parsing::TRADE_RELAY_FIELDS.iter() {
+        for f in relay_fields.iter() {
+            effective.remove(*f);
+        }
+    }
+    let narrowed = effective.len();
+    // 🌟 릴레이 복구 '이후' 에 패스 제외를 적용합니다. 순서를 바꾸면 보호가 제외를 삼킵니다.
+    for f in exclude.iter() {
+        effective.insert(f.clone());
+    }
+    if !exclude.is_empty() {
+        println!(
+            "    🪪 [PASS SCOPE] 이 패스에서 묻지 않을 축 {}개를 스키마에서 뺍니다: {:?}. 릴레이 보호는 '부재 판정' 에만 적용되고 패스 분할에는 적용하지 않습니다. 같은 크롭의 다른 패스가 그 축을 이미 묻고 있으므로 축이 소실될 위험이 없습니다.",
+            exclude.len(),
+            exclude.iter().take(12).collect::<Vec<_>>()
+        );
+    }
+    let base = if effective.is_empty() {
+        get_trade_category_schema(category, doc_type)
+    } else {
+        get_trade_category_schema_present(category, doc_type, &effective)
+    };
+
+    let presence_block = if narrowed == 0 {
+        String::new()
+    } else {
+        String::from(
+            "\n[FIELD PRESENCE]\n\
+             The field list below is NOT the full schema of this document type. The vision encoder already \
+             measured where each axis is printed on this page, and the axes it found no printed evidence for \
+             have been removed before you were asked.\n\
+             Every field you see is one the page is expected to carry. A field that is absent from the list \
+             is absent from the page — do not invent a key for it, and do not redistribute a number you see \
+             into one of the remaining fields just to account for it.\n",
+        )
+    };
 
     let evidence = if top_field.is_empty() {
         String::new()
@@ -1266,8 +1419,11 @@ pub fn get_trade_crop_prompt(
     } else {
         let mut s = String::from(
             "\n[ALREADY CLAIMED VALUES]\n\
-             Previous crops of this same document already確 locked these values to other fields.\n\
-             Never return any of them for a field in this crop:\n",
+             Previous crops of this same document already locked the values below to the fields shown next to them.\n\
+             Those pairings are final. For a field in THIS crop:\n\
+             - Never return one of these values, even when it is the only number you can see in the crop.\n\
+             - If the only value you can read for a field is one of these, that field is not printed here. Return null for it.\n\
+             - Returning a locked value under a different field name creates two contradictory records of the same fact.\n",
         );
         for (k, v) in claimed.iter().take(24) {
             s.push_str(&format!("- \"{}\" = \"{}\"\n", k, v));
@@ -1285,12 +1441,157 @@ pub fn get_trade_crop_prompt(
          2. Fill a field ONLY from that seen text. If the field's value is not printed in this crop, return null.\n\
          3. Never take a value from [FIELD DEFINITIONS] or [FORBIDDEN VALUES]. Those are descriptions, not data.\n\
          4. Never take a value from a neighbouring field just because it is the only number nearby.\n\
-         5. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.{}{}\n\n{}",
+         5. A number you can read does not have to belong to a field. If no printed label ties it to one of the \
+         fields below, leave every field null rather than assigning it to the closest-looking one.\n\
+         6. A null field is correct data. A fabricated one silently corrupts the document graph and can never be undone.\n\
+         7. A number printed under a caption that names a registration, tax, customs or membership identifier belongs to that identifier. \
+         It is never a quantity, a weight, a price, a subtotal or a total, however plainly numeric it looks. Leave those fields null rather than borrowing that number.{}{}{}\n\n{}",
         category.to_uppercase(),
         doc_type,
         evidence,
+        presence_block,
         claimed_block,
         base
+    )
+}
+
+pub fn trade_expected_vocab(category: &str, doc_type: &str, field: &str) -> Vec<String> {
+    fn read(path: &[&str]) -> Option<String> {
+        let mut cur: &serde_json::Value = &crate::parsing::BIAS_DICT;
+        for p in path {
+            cur = cur.get(*p)?;
+        }
+        cur.as_str().map(|s| s.to_string())
+    }
+    if crate::utils::ai_utils::detect_field_format(field) != crate::utils::ai_utils::FieldFormat::Enum {
+        return Vec::new();
+    }
+    let raw = match read(&["trade_schema", "overlay", doc_type, category, field])
+        .or_else(|| read(&["trade_schema", "base", category, field]))
+    {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let (desc, _) = split_type_marker(&raw);
+    let flat: String = desc
+        .chars()
+        .map(|c| if c == '(' || c == ')' || c == '[' || c == ']' { ' ' } else { c })
+        .collect();
+    let parts: Vec<String> = flat
+        .replace(" or ", ",")
+        .replace('/', ",")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let enumerated = parts.len() >= 2 && parts.iter().all(|p| p.split_whitespace().count() <= 4);
+    if !enumerated {
+        return Vec::new();
+    }
+    extract_example_tokens(&desc)
+}
+
+pub fn trade_field_definition(doc_lang: &str, field: &str) -> String {
+    let (phrases, _) = crate::utils::ai_utils::label_phrase_bank(doc_lang, "shipping_doc", field);
+    let mut picked: Vec<String> = Vec::new();
+    for p in phrases.iter() {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        let code_like = !t.chars().any(|c| c.is_lowercase()) && t.chars().count() <= 6;
+        if code_like { continue; }
+        if picked.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+        picked.push(t.to_string());
+        if picked.len() >= 4 { break; }
+    }
+    if picked.is_empty() {
+        field.replace('_', " ")
+    } else {
+        picked.join(", ")
+    }
+}
+
+pub fn get_trade_blind_read_prompt(doc_type: &str, field: &str, definition: &str) -> String {
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a crop of a {} document.\n\
+         \n\
+         [TASK]\n\
+         Find the printed label for the field below and copy the value printed next to or under it.\n\
+         - \"{}\": {}\n\
+         \n\
+         [RULES]\n\
+         1. Copy the characters exactly as printed. Never complete, translate or normalize them.\n\
+         2. If the value for this field is not printed in this image, return null. Never return what such documents usually contain.\n\
+         3. A caption or label is never the value.\n\
+         \n\
+         [OUTPUT]\n\
+         {{\"value\": null}}\n\
+         JSON ONLY.",
+        doc_type, field, definition
+    )
+}
+
+pub fn get_trade_recovery_prompt(doc_type: &str, fields: &[(String, String)]) -> String {
+    let mut defs = String::new();
+    let mut schema = String::new();
+    for (i, (f, d)) in fields.iter().enumerate() {
+        defs.push_str(&format!("- \"{}\": {}\n", f, d));
+        if i > 0 { schema.push_str(",\n"); }
+        schema.push_str(&format!("  \"{}\": {{\"label\": null, \"value\": null}}", f));
+    }
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a small crop of a {} document around one printed label.\n\
+         \n\
+         [TASK]\n\
+         For each field below, find the printed LABEL that names it and copy the value printed next to or under that label.\n\
+         {}\
+         \n\
+         [RULES]\n\
+         1. \"label\" is the caption text you actually read in the image. \"value\" is the text printed for that caption.\n\
+         2. Copy the characters exactly as printed. Never complete, translate or normalize them.\n\
+         3. If no label for a field is printed in this image, return null for both label and value of that field.\n\
+         4. Never put a caption into \"value\".\n\
+         \n\
+         [OUTPUT]\n\
+         {{\n{}\n}}\n\
+         JSON ONLY.",
+        doc_type, defs, schema
+    )
+}
+
+pub fn get_trade_pair_read_prompt(doc_type: &str, fields: &[(String, String)]) -> String {
+    let mut hint = String::new();
+    for (f, d) in fields.iter().take(12) {
+        hint.push_str(&format!("- {}\n", d.replace('"', "'")));
+    }
+    let _ = fields;
+    format!(
+        "[INPUT NOTICE]\n\
+         The image is a small crop of a {} document. It contains one or more printed captions, each with a value next to it or under it.\n\
+         \n\
+         [TASK]\n\
+         Transcribe EVERY caption-and-value pair you can read in this crop. Do not decide which database field a pair belongs to — that decision is made elsewhere. Your only job is to copy what is printed.\n\
+         \n\
+         [WHAT THIS CROP IS ABOUT]\n\
+         The region was located because it should hold information of this kind:\n\
+         {}\
+         Use this only as orientation. If the crop shows a caption that is not described above, transcribe it anyway.\n\
+         \n\
+         [RULES]\n\
+         1. \"label\" is the caption text exactly as printed, including its case and punctuation.\n\
+         2. \"value\" is the text printed next to or under that caption, exactly as printed.\n\
+         3. Never translate, complete, normalize, reformat or re-type from memory. Copy character for character.\n\
+         4. One element per caption. If a caption has no value printed beside it, return null for \"value\".\n\
+         5. Do not invent a caption that is not printed. Do not merge two captions into one element.\n\
+         6. If the crop contains no readable caption at all, return an empty array.\n\
+         7. Copy the value with everything printed in that field: currency symbols, units, decimal points and thousand separators. \
+         Never strip them and never turn the value into a bare number. Those separators are what tell the routing stage whether a figure is money or an identifier.\n\
+         \n\
+         [OUTPUT]\n\
+         {{\"pairs\": [{{\"label\": null, \"value\": null}}]}}\n\
+         JSON ONLY.",
+        doc_type, hint
     )
 }
 
@@ -1652,7 +1953,8 @@ pub fn get_commerce_crop_prompt(
 
     for (name, desc) in fields.iter() {
         let (clean, ty) = split_type_marker(desc);
-        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, clean.replace('"', "'")));
+        let shown = strip_format_placeholders(&clean);
+        defs.push_str(&format!("- \"{}\" ({}): {}\n", name, ty, shown.replace('"', "'")));
         if !body.is_empty() {
             body.push_str(",\n");
         }

@@ -246,7 +246,10 @@ pub fn verify_claims_v2(
         //    "SIGNATORY COMPANY" 는 이미지에 실제로 인쇄되어 있어 판독성 검사는 반드시 통과합니다.
         //    라벨인지 값인지는 픽셀이 아니라 어휘로만 판정할 수 있습니다.
         //    사전은 parsing.rs 의 TRADE_PRINTED_LABELS + TRADE_COLUMN_ALIASES 를 그대로 씁니다.
-        if !role_field(&c.field) && crate::parsing::is_printed_label_echo(&c.value, doc_lang) {
+        if !role_field(&c.field)
+            && (crate::parsing::is_printed_label_echo(&c.value, doc_lang)
+                || crate::parsing::is_printed_label_fragment(&c.value, doc_lang))
+        {
             rejected += 1;
             emit(&format!(
                 "    🚫 [LABEL ECHO] [{}] '{}' = \"{}\" | 이 문자열은 서식의 인쇄 라벨입니다. 값이 아니므로 폐기합니다.",
@@ -266,6 +269,25 @@ pub fn verify_claims_v2(
             continue;
         }
         let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
+        if lg + il + bl == 0 {
+            emit(&format!(
+                "    ⏸️ [SOURCE UNRESOLVED] [{}] '{}' = \"{}\" | bbox px({},{})-({},{}) 에 대응하는 판독성 패치가 0개입니다. 출처가 비어 있다는 관측이 아니라 기하 대응 실패이므로 폐기하지 않고 값을 유지합니다.",
+                c.category, c.field, c.value,
+                c.bbox.0, c.bbox.1, c.bbox.2, c.bbox.3
+            ));
+            out.push(GroundingVerdict {
+                category: c.category.clone(),
+                field: c.field.clone(),
+                value: c.value.clone(),
+                surprisal_in: 0.0,
+                surprisal_out: 0.0,
+                top_patch: 0,
+                top_legible: true,
+                accepted: true,
+                reason: "대응 패치 없음 — 검증 보류".to_string(),
+            });
+            continue;
+        }
         let accepted = lg > 0;
         // 🌟 [SDS / V-4 입력] 출처 영역의 판독성 구성입니다.
         //
@@ -289,6 +311,47 @@ pub fn verify_claims_v2(
                 "vision.source_blank_ratio",
                 bl as f32 / total,
             );
+            crate::utils::score_dynamics::record_baseline(
+                "vision.source_illegible_ratio",
+                il as f32 / total,
+            );
+            let claim_fmt = crate::utils::ai_utils::detect_field_format(&c.field);
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.source_illegible_ratio.{:?}", claim_fmt),
+                il as f32 / total,
+            );
+            // 🌟 [NAME RESIDUE OBSERVE] 인명 축의 선행/후행 구두점을 관측만 합니다.
+            //
+            //  ── 왜 판정하지 않는가 ──
+            //   signatory_name = "-Jane" 의 선행 하이픈은 서명 획을 글자로 읽은
+            //   잔해일 가능성이 높습니다. 그러나 인명에는 하이픈이 정당하게
+            //   들어가는 경우가 있고(Jean-Luc, Smith-Jones), 구두점 하나를
+            //   폐기 근거로 쓰면 오탐 위험이 큽니다.
+            //   임계는 상수가 아니라 이 축의 자기 분포에서 유도해야 하므로
+            //   이번 회차는 분포만 모읍니다.
+            if c.field.ends_with("_name") {
+                let t = c.value.trim();
+                let edge = !t.is_empty()
+                    && (t.starts_with(|ch: char| !ch.is_alphanumeric())
+                        || t.ends_with(|ch: char| !ch.is_alphanumeric()));
+                crate::utils::score_dynamics::record_baseline(
+                    "vision.name_residue",
+                    if edge { 1.0 } else { 0.0 },
+                );
+                if edge {
+                    emit(&format!(
+                        "    👁️ [NAME RESIDUE OBSERVE] [{}] '{}' = \"{}\" | 인명 축의 값 양끝에 영숫자가 아닌 문자가 붙어 있습니다. 서명 획을 글자로 읽은 잔해일 수 있으나, 인명에 하이픈이 정당하게 들어가는 경우가 있어 이번 회차는 폐기하지 않고 관측만 합니다.",
+                        c.category, c.field, c.value
+                    ));
+                }
+            }
+            if il > 0 {
+                emit(&format!(
+                    "    👁️ [SOURCE BLUR OBSERVE] [{}] '{}' ({:?}) = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} (판독불가 비중 {:.0}%). 이번 회차는 폐기하지 않고 관측만 합니다. 판독가능 패치가 하나라도 있으면 통과시키는 현재 기준으로는 라벨만 선명하고 본문이 흐린 블록을 가려낼 수 없는데, 그 임계는 상수가 아니라 이 문서 자기 분포에서 유도해야 합니다.",
+                    c.category, c.field, claim_fmt, c.value, lg, il, bl,
+                    il as f32 / total * 100.0
+                ));
+            }
         }
         if !accepted {
             rejected += 1;

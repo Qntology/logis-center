@@ -584,6 +584,7 @@ impl VectorStore {
         let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;
         table.delete(&format!("id = '{}'", id)).await?;
+        crate::utils::score_dynamics::presence_forget(id);
 
         // 🌟 [PHASE D] 연관 청크 동시 삭제
         let _ = self.delete_chunks_by_item(id).await;
@@ -598,6 +599,9 @@ impl VectorStore {
         let table = self.conn.open_table(target).execute().await?;
         let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
         table.delete(&format!("id IN ({})", id_list)).await?;
+        for id in ids.iter() {
+            crate::utils::score_dynamics::presence_forget(id);
+        }
 
         // 🌟 [PHASE D] 연관 청크 동시 삭제
         for id in &ids {
@@ -934,6 +938,37 @@ impl VectorStore {
         (None, None)
     }
 
+    const STORE_STAMPED_KEYS: [&'static str; 15] = [
+        "id", "type", "mode", "created_at", "updated_at",
+        "from", "to", "cc", "bcc", "ref",
+        "digest", "has_vision", "embed", "text", "masked_text",
+    ];
+
+    fn collect_filled_fields(v: &Value, depth: usize, out: &mut Vec<String>) {
+        let obj = match v.as_object() { Some(o) => o, None => return };
+        for (k, val) in obj.iter() {
+            if Self::STORE_STAMPED_KEYS.iter().any(|s| *s == k.as_str()) { continue; }
+            let filled = match val {
+                Value::Null => false,
+                Value::String(s) => !s.trim().is_empty(),
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(o) => !o.is_empty(),
+                _ => true,
+            };
+            if filled && !out.iter().any(|x| x == k) { out.push(k.clone()); }
+            if depth == 0 { continue; }
+            match val {
+                Value::Object(_) => Self::collect_filled_fields(val, depth - 1, out),
+                Value::Array(a) => {
+                    for e in a.iter() {
+                        if e.is_object() { Self::collect_filled_fields(e, depth - 1, out); }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub async fn upsert_item(
         &self, table_name: &str, id: &str, type_: &str, mut data_val: Value, vector: Option<Vec<f32>>,
         vision_vec: Option<Vec<f32>>,
@@ -967,13 +1002,13 @@ impl VectorStore {
         //   text 가 그대로면 벡터도 그대로여야 하고,
         //   text 가 바뀌었으면 reindex 가 다시 만들어야 합니다.
         //   어느 쪽이든 '0 으로 지우기' 가 정답인 경우는 없습니다.
-        let (carry_vec, carry_vision) = if vector.is_none() || vision_vec.is_none() {
-            self.read_existing_vectors(target, &final_id).await
-        } else {
-            (None, None)
-        };
-        let vector = vector.or(carry_vec);
-        let vision_vec = vision_vec.or(carry_vision);
+        let (stored_vec, stored_vision) = self.read_existing_vectors(target, &final_id).await;
+        let vector_gain = stored_vec.is_none()
+            && vector.as_ref().map_or(false, |v| v.len() == 384 && v.iter().any(|&x| x != 0.0));
+        let vision_gain = stored_vision.is_none()
+            && vision_vec.as_ref().map_or(false, |v| v.len() == 1152 && v.iter().any(|&x| x != 0.0));
+        let vector = vector.or(stored_vec);
+        let vision_vec = vision_vec.or(stored_vision);
         // 🌟 [SKIP GUARD v2] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
         //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
         //
@@ -1011,7 +1046,14 @@ impl VectorStore {
                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
                     .unwrap_or_default();
                 if old_digest == new_digest {
-                    return Ok(());
+                    if vector_gain || vision_gain {
+                        println!(
+                            "[STORE] 🧲 [VECTOR GAIN] id='{}' digest 는 동일하지만 저장본에 없던 벡터를 이번 호출이 들고 왔습니다. (text={} / vision={}) 스킵을 취소하고 기록합니다.",
+                            final_id, vector_gain, vision_gain
+                        );
+                    } else {
+                        return Ok(());
+                    }
                 }
             }
             if !envelope_same {
@@ -1040,6 +1082,11 @@ impl VectorStore {
             .as_ref()
             .map(|v| v.len() == 1152 && v.iter().any(|&x| x != 0.0))
             .unwrap_or(false);
+        let has_real_vector = vector
+            .as_ref()
+            .map(|v| v.len() == 384 && v.iter().any(|&x| x != 0.0))
+            .unwrap_or(false);
+        let presence_id = final_id.clone();
 
         let _ = table.delete(&format!("id = '{}'", final_id)).await;
         let mut final_data = data_val.clone();
@@ -1124,6 +1171,15 @@ impl VectorStore {
             if has_real_vision {
                 obj.insert("has_vision".to_string(), json!(1));
             }
+            if has_real_vector {
+                obj.insert("embed".to_string(), json!(1));
+            } else if obj.get("embed").map_or(false, |v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false)) {
+                println!(
+                    "[STORE] 🧹 [EMBED CLAIM DROP] id='{}' 의 embed=1 표식을 내립니다. 이번에 기록되는 텍스트 벡터가 0 벡터입니다. 다음 임베딩 회차의 후보로 되돌립니다.",
+                    final_id
+                );
+                obj.insert("embed".to_string(), json!(0));
+            }
         }
         let seed_defaults = needs_domain_seed(target, type_);
         let final_data = Self::canonicalize_data(final_data, seed_defaults);
@@ -1169,6 +1225,17 @@ impl VectorStore {
             Arc::new(StringArray::from(vec![Self::SCHEMA_VERSION])),
         ])?;
         table.add(vec![batch]).execute().await?;
+        let is_relay_draft = updated_ts == 0 && new_digest.is_empty();
+        if is_relay_draft {
+            println!(
+                "[STORE] 🧾 [PRESENCE SKIP] id='{}' type='{}' 은 릴레이가 만든 빈 초안입니다. 저장 사전에 넣지 않습니다. 초안은 '이 서식이 그 축을 보통 갖는가' 라는 관측에 기여할 수 없는데, 문서 1건을 추출할 때마다 10건 이상 생기므로 그대로 두면 껍데기가 다수를 이뤄 실제 문서의 축 보유율을 0 에 가깝게 끌어내립니다.",
+                presence_id, type_
+            );
+        } else {
+            let mut present_fields: Vec<String> = Vec::new();
+            Self::collect_filled_fields(&final_data, 1, &mut present_fields);
+            crate::utils::score_dynamics::presence_record(type_, &presence_id, &present_fields);
+        }
         Ok(())
     }
 

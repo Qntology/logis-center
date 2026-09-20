@@ -35,6 +35,24 @@ pub fn encode_phrases_shared(
     model: &Siglip2Model,
     phrases: &[String],
 ) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
+    encode_phrases_persisted(model, phrases, true)
+}
+
+pub fn encode_phrases_ephemeral(
+    model: &Siglip2Model,
+    phrases: &[String],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    Ok(encode_phrases_persisted(model, phrases, false)?
+        .into_iter()
+        .map(|a| (*a).clone())
+        .collect())
+}
+
+fn encode_phrases_persisted(
+    model: &Siglip2Model,
+    phrases: &[String],
+    persist: bool,
+) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
     use crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE as CACHE;
 
     if phrases.is_empty() {
@@ -102,8 +120,14 @@ pub fn encode_phrases_shared(
         }
     }
 
-    // ── ③ 캐시 적재 (메모리 + 디스크 append) ──
-    CACHE.put_batch(&fresh);
+    if persist {
+        CACHE.put_batch(&fresh);
+    } else {
+        println!(
+            "    🫧 [PHRASE EPHEMERAL] 새로 인코딩한 구 {}개를 캐시에 적재하지 않고 버립니다. 이 구들은 이 문서에서만 등장하는 값 문자열이라 다음 문서에서 다시 맞을 일이 없는데, 앵커 구와 같은 저장소를 쓰면 상한을 값이 잠식해 앵커 히트율이 무너집니다.",
+            fresh.len()
+        );
+    }
 
     Ok(slots
         .into_iter()
@@ -488,7 +512,8 @@ fn run_title_gate(
     let mut scanned_patches = 0usize;
     let mut active_patches = 0usize;
     let mut positive_patches = 0usize;
-    let mut patch_contributions: Vec<(usize, usize, usize, String, f32)> = Vec::new();
+    let mut patch_best: std::collections::HashMap<String, (usize, usize, usize, f32)> =
+        std::collections::HashMap::new();
 
     emit(&format!(
         "     🔍 [TITLE GATE SCAN] 상단 밴드: {}행 / 전체 {}행 | 스캔 패치 범위: 0~{}",
@@ -533,10 +558,7 @@ fn run_title_gate(
             let e = best.entry(s.key.clone()).or_insert(f32::MIN);
             if s.surprisal > *e {
                 *e = s.surprisal;
-                // 🌟 [LOG] 타이틀 게이트에서 각 전문 키의 최고점을 갱신한 패치 기록
-                if patch_contributions.len() < 20 {
-                    patch_contributions.push((idx, r, c, s.key.clone(), s.surprisal));
-                }
+                patch_best.insert(s.key.clone(), (idx, r, c, s.surprisal));
             }
         }
     }
@@ -547,12 +569,26 @@ fn run_title_gate(
         scanned_patches, active_patches, positive_patches, best.len()
     ));
 
-    if !patch_contributions.is_empty() {
-        emit("     🔍 [TITLE GATE CONTRIBUTORS] 전문별 최고점 갱신 패치:");
-        for (idx, r, c, key, sur) in patch_contributions.iter() {
+    if !patch_best.is_empty() {
+        let mut rows: Vec<(String, usize, usize, usize, f32)> = patch_best
+            .iter()
+            .map(|(k, (i, r, c, s))| (k.clone(), *i, *r, *c, *s))
+            .collect();
+        rows.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        let spread = {
+            let mut uniq: Vec<usize> = rows.iter().map(|x| x.1).collect();
+            uniq.sort_unstable();
+            uniq.dedup();
+            uniq.len()
+        };
+        emit(&format!(
+            "     🔍 [TITLE GATE CONTRIBUTORS] 전문 {}개의 최종 최고점을 만든 서로 다른 패치 {}개. 한 패치가 전문 다수의 최고점을 독점하면 그 패치는 제목이 아니라 로고나 도장일 가능성이 큽니다.",
+            rows.len(), spread
+        ));
+        for (key, idx, r, c, sur) in rows.iter().take(12) {
             emit(&format!(
-                "       ↳ patch[{}] r{}c{} → '{}' {:+.4}",
-                idx, r, c, key, sur
+                "       ↳ '{}' ← patch[{}] r{}c{} {:+.4}",
+                key, idx, r, c, sur
             ));
         }
     }
@@ -984,6 +1020,7 @@ pub struct CategoryHeatmap {
     pub top_rival: String,
     pub absent: bool,
     pub absent_reason: String,
+    pub field_peaks: Vec<(String, usize, f32)>,
 }
 
 /// 🌟 [STEP 2] 스키마 카테고리별 히트맵을 만듭니다.
@@ -1307,19 +1344,123 @@ pub fn build_column_heatmaps(
     //    행/열 이중 센터링으로 뱅크 크기·응집도 편향을 제거합니다.
     //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
+    let mut field_peaks_by_cat: HashMap<String, Vec<(String, usize, f32)>> = HashMap::new();
+    let mut peak_cands: Vec<(String, String, Vec<(usize, f32)>)> = Vec::new();
+    for (ki, fname) in keys.iter().enumerate() {
+        if fname.starts_with("__") { continue; }
+        let cat = match field_to_cat.get(fname) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+        let row = match matrix.get(ki) {
+            Some(r) => r,
+            None => continue,
+        };
+        let vals: Vec<(usize, f32)> = row
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v != f32::MIN)
+            .map(|(i, v)| (i, *v))
+            .collect();
+        if vals.len() < 3 { continue; }
+        let cnt = vals.len() as f32;
+        let mean = vals.iter().map(|(_, v)| *v).sum::<f32>() / cnt;
+        let sd = (vals.iter().map(|(_, v)| (*v - mean) * (*v - mean)).sum::<f32>() / cnt).sqrt();
+        if sd <= 1e-6 { continue; }
+        let gate = crate::utils::ai_utils::gumbel_expected_z(vals.len());
+        let mut ranked: Vec<(usize, f32)> = vals
+            .iter()
+            .map(|(i, v)| (*i, (*v - mean) / sd))
+            .filter(|(_, z)| *z > gate)
+            .collect();
+        if ranked.is_empty() { continue; }
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        peak_cands.push((cat, fname.clone(), ranked));
+    }
+    peak_cands.sort_by(|a, b| {
+        a.2.len()
+            .cmp(&b.2.len())
+            .then(b.2[0].1.partial_cmp(&a.2[0].1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut taken: Vec<(usize, String)> = Vec::new();
+    let mut displaced: Vec<String> = Vec::new();
+    let mut shared: Vec<String> = Vec::new();
+    for (cat, fname, ranked) in peak_cands.into_iter() {
+        if let Some((_, owner)) = taken.iter().find(|(q, _)| *q == ranked[0].0) {
+            crate::utils::score_dynamics::record_confusion(owner, &fname, 0.0);
+        }
+        let top_row = grid.rc(ranked[0].0).0;
+        let hit = ranked
+            .iter()
+            .find(|(p, _)| grid.rc(*p).0 == top_row && !taken.iter().any(|(q, _)| q == p))
+            .map(|(p, z)| (*p, *z));
+        match hit {
+            Some((p, z)) => {
+                if p != ranked[0].0 {
+                    displaced.push(format!("{}({}→{}, z {:+.2})", fname, ranked[0].0, p, z));
+                }
+                taken.push((p, fname.clone()));
+                field_peaks_by_cat.entry(cat).or_default().push((fname, p, z));
+            }
+            None => {
+                let (p, z) = ranked[0];
+                let owner = taken
+                    .iter()
+                    .find(|(q, _)| *q == p)
+                    .map(|(_, o)| o.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                crate::utils::score_dynamics::record_baseline("vision.peak_shared_z", z);
+                shared.push(format!("{}↔{}(패치 {}, z {:+.2})", fname, owner, p, z));
+                field_peaks_by_cat.entry(cat).or_default().push((fname, p, z));
+            }
+        }
+    }
+    if !displaced.is_empty() {
+        emit(&format!(
+            "    🔀 [PEAK NMS] 1순위 패치를 더 제약이 큰 필드에 내주고 같은 행의 차순위로 내려간 필드 {}개: {:?} — 라벨과 값은 같은 텍스트 행에 인쇄되므로, 행을 넘어간 차순위는 같은 필드의 다른 위치가 아니라 다른 레코드입니다.",
+            displaced.len(), displaced.iter().take(8).collect::<Vec<_>>()
+        ));
+    }
+    if !shared.is_empty() {
+        emit(&format!(
+            "    🤝 [PEAK SHARED] 같은 행에 빈 칸이 없어 1순위 봉우리를 공유로 보유한 필드 {}개: {:?} — 봉우리를 버리면 그 필드는 PEAK VERIFY 후보에서 통째로 사라져 잘린 값이 그대로 확정됩니다. 한 칸을 가리켜도 복구 윈도우는 필드마다 따로 열리므로 중복 판독이 일어나지 않습니다. 충돌 쌍은 혼동 사전에 기록했습니다.",
+            shared.len(), shared.iter().take(8).collect::<Vec<_>>()
+        ));
+    }
+    emit(&format!(
+        "    📍 [FIELD PEAKS] 자기 분포에서 √(2lnN) 을 넘는 필드 봉우리 {}개 (카테고리 {}개) — 같은 행 안에서만 배타 배정하고, 자리가 없으면 공유로 보유했습니다. 빈 필드 복구의 위치 근거로 넘깁니다.",
+        field_peaks_by_cat.values().map(|v| v.len()).sum::<usize>(),
+        field_peaks_by_cat.len()
+    ));
 
     const FIELD_COUNT_NEUTRAL_WEIGHT: f32 = 1.0;
 
     let cat_pos = |c: &str| -> Option<usize> { cats.iter().position(|x| x == c) };
+    // 🌟 [PHRASE-COUNT NEUTRAL] 필드별 앵커 구 수를 bias_defs 에서 그대로 셉니다.
+    //
+    //  ── 왜 필드 수가 아니라 구 수인가 ──
+    //   score_patches_bank_neutral 의 Max-Pool 은 '구' 단위로 최댓값을 취합니다.
+    //   따라서 기대 최댓값 √(2 ln N) 의 N 은 실제 경쟁에 참여한 표본 수,
+    //   즉 구 수여야 합니다.
+    //   실측: settlement 는 필드 1개라 √(2 ln 1) = 0.000 을 차감했는데
+    //   그 한 필드가 구 17개를 갖고 있어 사실상 무보정이었습니다.
+    //   결과는 영토 36칸(최대) · 판독 가능 19%(최저) · 스키마 밖 폐기 7건입니다.
+    let mut field_phrases: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (_, f, _) in bias_defs.iter() {
+        *field_phrases.entry(f.clone()).or_insert(0) += 1;
+    }
     let mut cat_raw: Vec<Vec<f32>> = vec![vec![f32::MIN; n]; cats.len()];
     let mut cat_arg: Vec<Vec<usize>> = vec![vec![usize::MAX; n]; cats.len()];
     let mut cat_fields: Vec<usize> = vec![0usize; cats.len()];
+    let mut cat_phrases: Vec<usize> = vec![0usize; cats.len()];
     let mut mapped_keys = 0usize;
     for (ki, fname) in keys.iter().enumerate() {
         let cat = match field_to_cat.get(fname) { Some(c) => c.clone(), None => continue };
         let ci = match cat_pos(&cat) { Some(v) => v, None => continue };
         mapped_keys += 1;
         cat_fields[ci] += 1;
+        cat_phrases[ci] += field_phrases.get(fname).copied().unwrap_or(1);
         for i in 0..n {
             let v = matrix[ki][i];
             if v == f32::MIN { continue; }
@@ -1329,13 +1470,21 @@ pub fn build_column_heatmaps(
             }
         }
     }
-    // ── ① 필드 수 보정 ──
+    // ── ① Max-Pool 표본 수 보정 ──
     {
         let mut detail: Vec<String> = Vec::new();
         for ci in 0..cats.len() {
-            let f = cat_fields[ci].max(1);
-            let base = crate::utils::ai_utils::gumbel_expected_z(f) * FIELD_COUNT_NEUTRAL_WEIGHT;
-            detail.push(format!("{}({}필드 −{:.3})", cats[ci], cat_fields[ci], base));
+            // 🌟 구 수를 N 으로 씁니다. 집계 실패 시에만 필드 수로 폴백합니다.
+            let n_eff = cat_phrases[ci].max(cat_fields[ci]).max(1);
+            let base = crate::utils::ai_utils::gumbel_expected_z(n_eff) * FIELD_COUNT_NEUTRAL_WEIGHT;
+            detail.push(format!(
+                "{}({}구/{}필드 −{:.3})",
+                cats[ci], cat_phrases[ci], cat_fields[ci], base
+            ));
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.neutral_n.{}", cats[ci]),
+                n_eff as f32,
+            );
             if base <= 0.0 { continue; }
             for i in 0..n {
                 if cat_raw[ci][i] != f32::MIN { cat_raw[ci][i] -= base; }
@@ -1343,7 +1492,7 @@ pub fn build_column_heatmaps(
         }
         detail.sort();
         emit(&format!(
-            "    ⚖️ [CATEGORY-NEUTRAL] max-pool 필드 수 편향 보정: {}",
+            "    ⚖️ [CATEGORY-NEUTRAL] max-pool 표본 수(구 수) 편향 보정: {} — 기대 최댓값을 정하는 것은 필드 수가 아니라 Max-Pool 이 실제로 뽑는 드로잉 수입니다. 필드 1개에 구 17개를 몰아넣은 카테고리는 필드 수 기준으로 보정하면 차감이 0 이 되어 공짜 우위를 얻습니다.",
             detail.join(" | ")
         ));
     }
@@ -1741,6 +1890,7 @@ pub fn build_column_heatmaps(
             top_rival: String::new(),
             absent: false,
             absent_reason: String::new(),
+            field_peaks: field_peaks_by_cat.remove(c).unwrap_or_default(),
         });
     }
 
