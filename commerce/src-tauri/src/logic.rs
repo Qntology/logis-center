@@ -419,14 +419,15 @@ pub fn doc_type_to_code(doc_type: &str) -> String {
             let upper = doc_type.to_uppercase();
             let norm = |s: &str| -> String {
                 s.chars()
-                    .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { ' ' })
+                    .map(|c| if c.is_alphanumeric() { c } else { ' ' })
                     .collect::<String>()
+                    .to_uppercase()
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ")
             };
             let key = norm(&upper);
-            for (code, title) in TRADE_DOC_TITLES.iter() {
+            for (code, title) in trade_title_pairs().iter() {
                 if norm(title) == key {
                     return code.to_string();
                 }
@@ -738,6 +739,581 @@ pub const TRADE_CONDITION_CATEGORIES: [(&str, &str); 11] = [
      "description of goods, goods description, commodity, product name, article, item, line item, country of manufacture, country of origin, made in, manufactured in, unit price, price per unit, unit value, quantity, pieces, unit of measure, line total, total price per line, item code, model number, net weight per unit, gross weight per unit"),
 ];
 
+pub const TRADE_CONDITION_CATEGORIES_ML: [(&str, &str); 11] = [
+    ("identity",
+     "Dokumentart, Dokumentnummer, Rechnungsnummer, Bestellnummer, Konnossementnummer, Vertragsnummer, Sendungsverfolgungsnummer, Dokumentstatus, Ausstellungsdatum, Ablaufdatum, \
+      type de document, numéro de document, numéro de facture, numéro de commande, numéro de connaissement, numéro de contrat, numéro de suivi, statut du document, date d'émission, date d'expiration, \
+      tipo de documento, número de documento, número de factura, número de pedido, número de conocimiento de embarque, número de contrato, número de seguimiento, estado del documento, fecha de emisión, fecha de vencimiento, \
+      tipo di documento, numero documento, numero fattura, numero ordine, numero polizza di carico, numero contratto, numero di tracciamento, stato del documento, data di emissione, data di scadenza, \
+      número do documento, número da fatura, número do pedido, número do conhecimento de embarque, número do contrato, número de rastreamento, situação do documento, data de emissão, data de validade, \
+      documenttype, documentnummer, factuurnummer, ordernummer, cognossementnummer, contractnummer, trackingnummer, documentstatus, uitgiftedatum, vervaldatum, \
+      typ dokumentu, číslo dokumentu, číslo faktury, číslo objednávky, číslo konosamentu, číslo smlouvy, sledovací číslo, stav dokumentu, datum vystavení, datum platnosti, \
+      نوع المستند, رقم المستند, رقم الفاتورة, رقم أمر الشراء, رقم بوليصة الشحن, رقم العقد, رقم التتبع, حالة المستند, تاريخ الإصدار, تاريخ الانتهاء, \
+      書類種別, 書類番号, 請求書番号, 注文番号, 船荷証券番号, 契約番号, 追跡番号, 書類の状態, 発行日, 有効期限, \
+      单据类型, 单据编号, 发票号, 订单号, 提单号, 合同号, 追踪号, 单据状态, 签发日期, 有效期, \
+      서류 종류, 문서번호, 송장번호, 주문번호, 선하증권번호, 계약번호, 추적번호, 문서 상태, 발행일, 만료일"),
+    ("transport",
+     "Schiffsname, Flugnummer, Reisenummer, Ladehafen, Löschhafen, Bestimmungshafen, Übernahmeort, Lieferort, voraussichtliche Abfahrt, voraussichtliche Ankunft, Transportart, Seefracht, Luftfracht, \
+      nom du navire, numéro de vol, numéro de voyage, port de chargement, port de déchargement, port de destination, lieu de réception, lieu de livraison, date de départ prévue, date d'arrivée prévue, mode de transport, fret maritime, fret aérien, \
+      nombre del buque, número de vuelo, número de viaje, puerto de carga, puerto de descarga, puerto de destino, lugar de recepción, lugar de entrega, fecha estimada de salida, fecha estimada de llegada, modo de transporte, flete marítimo, flete aéreo, \
+      nome della nave, numero di volo, numero di viaggio, porto di carico, porto di scarico, porto di destinazione, luogo di presa in carico, luogo di consegna, data prevista di partenza, data prevista di arrivo, modalità di trasporto, trasporto marittimo, trasporto aereo, \
+      nome do navio, número do voo, número da viagem, porto de embarque, porto de descarga, porto de destino, local de recebimento, local de entrega, data prevista de partida, data prevista de chegada, modo de transporte, frete marítimo, frete aéreo, \
+      scheepsnaam, vluchtnummer, reisnummer, laadhaven, loshaven, bestemmingshaven, plaats van ontvangst, plaats van levering, verwachte vertrekdatum, verwachte aankomstdatum, vervoerswijze, zeevracht, luchtvracht, \
+      název lodi, číslo letu, číslo plavby, přístav nakládky, přístav vykládky, přístav určení, místo převzetí, místo dodání, předpokládaný odjezd, předpokládaný příjezd, způsob dopravy, námořní přeprava, letecká přeprava, \
+      اسم السفينة, رقم الرحلة الجوية, رقم الرحلة البحرية, ميناء الشحن, ميناء التفريغ, ميناء الوصول, مكان الاستلام, مكان التسليم, موعد المغادرة المتوقع, موعد الوصول المتوقع, وسيلة النقل, شحن بحري, شحن جوي, \
+      船名, 便名, 航海番号, 積出港, 荷揚港, 仕向港, 受取地, 引渡地, 出港予定日, 入港予定日, 輸送手段, 海上輸送, 航空輸送, \
+      航班号, 航次, 装货港, 卸货港, 目的港, 收货地, 交货地, 预计离港, 预计到港, 运输方式, 海运, 空运, \
+      선박명, 항공편명, 항차, 선적항, 양하항, 목적항, 수취지, 인도지, 출항예정일, 도착예정일, 운송수단, 해상운송, 항공운송"),
+    ("parties",
+     "Versender, Exporteur, Verkäufer, Lieferant, Absender, Empfänger, Importeur, Käufer, Benachrichtigungsadresse, Begünstigter, Antragsteller, Firmenname, \
+      expéditeur, exportateur, vendeur, fournisseur, destinataire, importateur, acheteur, partie à notifier, bénéficiaire, donneur d'ordre, raison sociale, \
+      embarcador, exportador, vendedor, proveedor, consignatario, importador, comprador, parte a notificar, beneficiario, solicitante, razón social, \
+      spedizioniere, esportatore, venditore, fornitore, destinatario, importatore, acquirente, parte da notificare, beneficiario, ordinante, ragione sociale, \
+      fornecedor, consignatário, requerente, \
+      verlader, exporteur, verkoper, leverancier, geadresseerde, importeur, koper, begunstigde, aanvrager, bedrijfsnaam, \
+      odesílatel, vývozce, prodávající, dodavatel, příjemce, dovozce, kupující, oznamovací strana, oprávněný, žadatel, název společnosti, \
+      الشاحن, المصدر, البائع, المورد, المرسل إليه, المستورد, المشتري, الجهة المخطرة, المستفيد, مقدم الطلب, اسم الشركة, \
+      荷送人, 輸出者, 売主, 供給者, 荷受人, 輸入者, 買主, 着荷通知先, 受益者, 発行依頼人, 会社名, \
+      发货人, 出口商, 卖方, 供应商, 收货人, 进口商, 买方, 通知方, 受益人, 申请人, 公司名称, \
+      송하인, 수출자, 매도인, 공급자, 수하인, 수입자, 매수인, 통지처, 수익자, 개설의뢰인, 회사명"),
+    ("terms",
+     "Lieferbedingungen, Preisbedingungen, Zahlungsbedingungen, Akkreditiv, Fracht vorausbezahlt, Fracht unfrei, Währung, Gesamtbetrag, Rechnungswert, Frachtkosten, Versicherungskosten, \
+      conditions de livraison, conditions de prix, conditions de paiement, lettre de crédit, fret prépayé, fret dû, devise, montant total, valeur de la facture, frais de fret, frais d'assurance, \
+      condiciones de entrega, condiciones de precio, condiciones de pago, carta de crédito, flete prepagado, flete por cobrar, moneda, importe total, valor de la factura, gastos de flete, gastos de seguro, \
+      termini di resa, condizioni di prezzo, termini di pagamento, lettera di credito, nolo prepagato, nolo assegnato, valuta, importo totale, valore della fattura, spese di nolo, spese di assicurazione, \
+      condições de entrega, condições de preço, condições de pagamento, frete pré-pago, frete a pagar, moeda, valor total, valor da fatura, despesas de frete, despesas de seguro, \
+      leveringsvoorwaarden, prijsvoorwaarden, betalingsvoorwaarden, kredietbrief, vracht vooruitbetaald, vracht te betalen, valuta, totaalbedrag, factuurwaarde, vrachtkosten, verzekeringskosten, \
+      dodací podmínky, cenové podmínky, platební podmínky, akreditiv, přepravné předplaceno, přepravné k úhradě, měna, celková částka, hodnota faktury, náklady na přepravu, náklady na pojištění, \
+      الإنكوتيرمز, شروط التسليم, شروط السعر, شروط الدفع, خطاب الاعتماد, أجرة الشحن مدفوعة مسبقاً, أجرة الشحن عند التسليم, العملة, المبلغ الإجمالي, قيمة الفاتورة, رسوم الشحن, رسوم التأمين, \
+      インコタームズ, 引渡条件, 価格条件, 支払条件, 信用状, 運賃前払, 運賃着払, 通貨, 合計金額, 請求金額, 運賃, 保険料, \
+      国际贸易术语, 交货条件, 价格条件, 付款条件, 信用证, 运费预付, 运费到付, 币种, 总金额, 发票金额, 运费, 保险费, \
+      인코텀즈, 인도조건, 가격조건, 결제조건, 신용장, 운임선불, 운임후불, 통화, 총금액, 송장금액, 운임, 보험료"),
+    ("cargo",
+     "Containernummer, Plombennummer, Anzahl der Packstücke, Kartonanzahl, Palettenanzahl, Bruttogewicht, Nettogewicht, Volumen, Kubikmeter, Zolltarifnummer, Markierungen und Nummern, \
+      numéro de conteneur, numéro de scellé, nombre de colis, nombre de cartons, nombre de palettes, poids brut, poids net, volume, mètre cube, code SH, marques et numéros, \
+      número de contenedor, número de precinto, número de bultos, número de cajas, número de palés, peso bruto, peso neto, volumen, metro cúbico, código arancelario, marcas y números, \
+      numero del container, numero del sigillo, numero di colli, numero di cartoni, numero di pallet, peso lordo, peso netto, metro cubo, codice doganale, marche e numeri, \
+      número do contêiner, número do lacre, quantidade de volumes, quantidade de caixas, quantidade de paletes, peso líquido, código NCM, marcas e números, \
+      containernummer, zegelnummer, aantal colli, aantal dozen, aantal pallets, brutogewicht, nettogewicht, kubieke meter, GS-code, merken en nummers, \
+      číslo kontejneru, číslo plomby, počet balení, počet kartonů, počet palet, hrubá hmotnost, čistá hmotnost, objem, metr krychlový, kód HS, značky a čísla, \
+      رقم الحاوية, رقم الختم, عدد الطرود, عدد الكراتين, عدد المنصات, الوزن الإجمالي, الوزن الصافي, الحجم, متر مكعب, رمز النظام المنسق, العلامات والأرقام, \
+      コンテナ番号, シール番号, 梱包数, カートン数, パレット数, 総重量, 純重量, 容積, 立方メートル, HSコード, 荷印, \
+      集装箱号, 铅封号, 件数, 箱数, 托盘数, 毛重, 净重, 体积, 立方米, HS编码, 唛头, \
+      컨테이너번호, 봉인번호, 포장수량, 카톤수, 팔레트수, 총중량, 순중량, 용적, 입방미터, HS코드, 화인"),
+    ("reference",
+     "referenzierte Rechnungsnummer, referenzierte Konnossementnummer, referenzierte Bestellnummer, referenzierte Akkreditivnummer, referenzierte Buchungsnummer, referenzierte Vertragsnummer, unsere Referenz, Ihre Referenz, bezüglich Dokument, \
+      numéro de facture référencé, numéro de connaissement référencé, numéro de commande référencé, numéro de lettre de crédit référencé, numéro de réservation référencé, numéro de contrat référencé, notre référence, votre référence, document concerné, \
+      número de factura referenciado, número de conocimiento de embarque referenciado, número de pedido referenciado, número de carta de crédito referenciado, número de reserva referenciado, número de contrato referenciado, nuestra referencia, su referencia, documento relacionado, \
+      numero fattura di riferimento, numero polizza di carico di riferimento, numero ordine di riferimento, numero lettera di credito di riferimento, numero prenotazione di riferimento, numero contratto di riferimento, nostro riferimento, vostro riferimento, documento correlato, \
+      número da fatura referenciada, número do conhecimento de embarque referenciado, número do pedido referenciado, número da carta de crédito referenciada, número da reserva referenciada, número do contrato referenciado, nossa referência, sua referência, \
+      gerefereerd factuurnummer, gerefereerd cognossementnummer, gerefereerd ordernummer, gerefereerd kredietbriefnummer, gerefereerd boekingsnummer, gerefereerd contractnummer, onze referentie, uw referentie, betreffend document, \
+      odkazované číslo faktury, odkazované číslo konosamentu, odkazované číslo objednávky, odkazované číslo akreditivu, odkazované číslo rezervace, odkazované číslo smlouvy, naše značka, vaše značka, související dokument, \
+      رقم الفاتورة المرجعي, رقم بوليصة الشحن المرجعي, رقم أمر الشراء المرجعي, رقم خطاب الاعتماد المرجعي, رقم الحجز المرجعي, رقم العقد المرجعي, مرجعنا, مرجعكم, المستند المرتبط, \
+      参照請求書番号, 参照船荷証券番号, 参照注文番号, 参照信用状番号, 参照ブッキング番号, 参照契約番号, 当方参照番号, 貴社参照番号, 関連書類, \
+      参考发票号, 参考提单号, 参考订单号, 参考信用证号, 参考订舱号, 参考合同号, 我方参考号, 贵方参考号, 相关单据, \
+      참조 송장번호, 참조 선하증권번호, 참조 주문번호, 참조 신용장번호, 참조 부킹번호, 참조 계약번호, 당사 참조번호, 귀사 참조번호, 관련 문서"),
+    ("hub",
+     "alle Dokumente zu dieser Nummer, gesamte Dokumentenkette, alle Unterlagen dieser Sendung, alles was mit dieser Bestellung zusammenhängt, vollständiger Dokumentensatz, \
+      tous les documents liés à ce numéro, chaîne documentaire complète, tous les documents de cette expédition, tout ce qui concerne cette commande, jeu complet de documents, \
+      todos los documentos vinculados a este número, cadena documental completa, toda la documentación de este envío, todo lo relacionado con este pedido, juego completo de documentos, \
+      tutti i documenti collegati a questo numero, catena documentale completa, tutti i documenti di questa spedizione, tutto ciò che riguarda questo ordine, set completo di documenti, \
+      todos os documentos ligados a este número, toda a documentação deste embarque, tudo relacionado a este pedido, conjunto completo de documentos, \
+      alle documenten gekoppeld aan dit nummer, volledige documentketen, alle documenten van deze zending, alles wat met deze order samenhangt, volledige documentenset, \
+      všechny dokumenty spojené s tímto číslem, celý řetězec dokumentů, veškeré doklady této zásilky, vše související s touto objednávkou, kompletní sada dokumentů, \
+      جميع المستندات المرتبطة بهذا الرقم, سلسلة المستندات الكاملة, كافة أوراق هذه الشحنة, كل ما يتعلق بهذا الطلب, مجموعة المستندات الكاملة, \
+      この番号に関連する全ての書類, 書類チェーン全体, この出荷の全書類, この注文に関する全て, 書類一式, \
+      与此编号相关的所有单据, 完整单据链, 本批货物的全部单据, 与此订单相关的一切, 全套单据, \
+      이 번호와 관련된 모든 서류, 전체 문서 체인, 이 선적의 모든 서류, 이 주문과 연결된 전부, 서류 일체"),
+    ("customs",
+     "Zollanmeldungsnummer, Ausfuhranmeldung, Einfuhranmeldung, Anmeldedatum, Freigabedatum, Zollstellencode, Zollabfertigungsstatus, Zollsatz, Zollbetrag, Zollwert, Zollagent, Zolllager, \
+      numéro de déclaration en douane, déclaration d'exportation, déclaration d'importation, date de déclaration, date de dédouanement, code du bureau de douane, statut du dédouanement, taux de droit, montant des droits, valeur en douane, commissionnaire en douane, entrepôt sous douane, \
+      número de declaración aduanera, declaración de exportación, declaración de importación, fecha de declaración, fecha de despacho, código de la aduana, estado del despacho aduanero, tipo arancelario, importe de aranceles, valor en aduana, agente de aduanas, depósito aduanero, \
+      numero di dichiarazione doganale, dichiarazione di esportazione, dichiarazione di importazione, data della dichiarazione, data di sdoganamento, codice ufficio doganale, stato dello sdoganamento, aliquota daziaria, importo dei dazi, valore in dogana, spedizioniere doganale, deposito doganale, \
+      número da declaração aduaneira, declaração de exportação, declaração de importação, data da declaração, data do desembaraço, código da alfândega, situação do desembaraço, valor dos impostos, valor aduaneiro, despachante aduaneiro, armazém alfandegado, \
+      aangiftenummer, uitvoeraangifte, invoeraangifte, aangiftedatum, datum van vrijgave, code douanekantoor, status inklaring, tarief invoerrecht, bedrag invoerrechten, douanewaarde, douane-expediteur, douane-entrepot, \
+      číslo celního prohlášení, vývozní prohlášení, dovozní prohlášení, datum prohlášení, datum propuštění, kód celního úřadu, stav celního odbavení, celní sazba, výše cla, celní hodnota, celní deklarant, celní sklad, \
+      رقم البيان الجمركي, بيان التصدير, بيان الاستيراد, تاريخ البيان, تاريخ الإفراج, رمز المكتب الجمركي, حالة التخليص الجمركي, نسبة الرسوم, مبلغ الرسوم الجمركية, القيمة الجمركية, المخلص الجمركي, مستودع جمركي, \
+      通関申告番号, 輸出申告, 輸入申告, 申告日, 許可日, 税関コード, 通関状況, 関税率, 関税額, 課税価格, 通関業者, 保税倉庫, \
+      报关单号, 出口申报, 进口申报, 申报日期, 放行日期, 海关代码, 清关状态, 关税税率, 关税金额, 完税价格, 报关行, 保税仓库, \
+      수출입신고번호, 수출신고, 수입신고, 신고일, 통관일, 세관코드, 통관상태, 관세율, 관세액, 과세가격, 관세사, 보세창고"),
+    ("inspection",
+     "Inspektionszertifikat, Inspektionsdatum, Inspektionsort, Prüfergebnis, Zertifikatsnummer, Laboranalyse, Testergebnis, Begasung, Hitzebehandlung, Wiegedatum, Besichtigungsbericht, Schadensfeststellung, Pflanzengesundheitszeugnis, Gesundheitszeugnis, \
+      certificat d'inspection, date d'inspection, lieu d'inspection, résultat de l'inspection, numéro de certificat, analyse en laboratoire, résultat d'essai, fumigation, traitement thermique, date de pesée, rapport d'expertise, constat de dommages, certificat phytosanitaire, certificat sanitaire, \
+      certificado de inspección, fecha de inspección, lugar de inspección, resultado de la inspección, número de certificado, análisis de laboratorio, resultado de la prueba, fumigación, tratamiento térmico, fecha de pesaje, informe de peritaje, constatación de daños, certificado fitosanitario, certificado sanitario, \
+      certificato di ispezione, data dell'ispezione, luogo dell'ispezione, esito dell'ispezione, numero del certificato, analisi di laboratorio, risultato del test, fumigazione, trattamento termico, data di pesatura, rapporto di perizia, accertamento dei danni, certificato fitosanitario, certificato sanitario, \
+      certificado de inspeção, data da inspeção, local da inspeção, resultado da inspeção, número do certificado, análise laboratorial, resultado do teste, fumigação, data da pesagem, laudo de vistoria, constatação de danos, certificado fitossanitário, certificado sanitário, \
+      inspectiecertificaat, inspectiedatum, plaats van inspectie, inspectieresultaat, certificaatnummer, laboratoriumanalyse, testresultaat, fumigatie, hittebehandeling, weegdatum, expertiserapport, schadevaststelling, fytosanitair certificaat, gezondheidscertificaat, \
+      inspekční certifikát, datum inspekce, místo inspekce, výsledek inspekce, číslo certifikátu, laboratorní analýza, výsledek zkoušky, fumigace, tepelné ošetření, datum vážení, zpráva o průzkumu, zjištění škod, rostlinolékařské osvědčení, zdravotní osvědčení, \
+      شهادة فحص, تاريخ الفحص, مكان الفحص, نتيجة الفحص, رقم الشهادة, تحليل مخبري, نتيجة الاختبار, تبخير, معالجة حرارية, تاريخ الوزن, تقرير المعاينة, تحديد الأضرار, شهادة صحة نباتية, شهادة صحية, \
+      検査証明書, 検査日, 検査場所, 検査結果, 証明書番号, 検査分析, 試験結果, 燻蒸, 熱処理, 計量日, 鑑定報告書, 損害の所見, 植物検疫証明書, 衛生証明書, \
+      检验证书, 检验日期, 检验地点, 检验结果, 证书编号, 实验室分析, 测试结果, 熏蒸, 热处理, 称重日期, 检验报告, 损害查定, 植物检疫证书, 卫生证书, \
+      검사증명서, 검사일, 검사장소, 검사결과, 증명서번호, 실험실 분석, 시험결과, 훈증, 열처리, 계량일, 검정보고서, 손해 조사 결과, 식물검역증명서, 위생증명서"),
+    ("settlement",
+     "Kontoauszug, Kontobuch, Transaktionsdatum, Sollbetrag, Habenbetrag, laufender Saldo, offener Saldo, Endsaldo, Lastschrift, Gutschrift, Steuerrechnung, Umsatzsteuerbetrag, Zahlungsstatus, unbezahlt, beglichen, Fälligkeitsdatum, überfällig, \
+      relevé de compte, grand livre, date de transaction, montant au débit, montant au crédit, solde courant, solde impayé, solde final, note de débit, note de crédit, facture fiscale, montant de la TVA, statut du paiement, impayé, réglé, date d'échéance, en retard, \
+      estado de cuenta, libro mayor, fecha de transacción, importe al debe, importe al haber, saldo acumulado, saldo pendiente, saldo final, nota de débito, nota de crédito, factura fiscal, importe del IVA, estado del pago, impagado, liquidado, fecha de vencimiento, vencido, \
+      estratto conto, libro mastro, data della transazione, importo a debito, importo a credito, saldo progressivo, saldo insoluto, saldo finale, nota di debito, nota di credito, fattura fiscale, importo IVA, stato del pagamento, non pagato, saldato, data di scadenza, scaduto, \
+      extrato de conta, livro razão, data da transação, valor a débito, valor a crédito, saldo corrente, saldo em aberto, nota fiscal, valor do IVA, situação do pagamento, não pago, \
+      rekeningoverzicht, grootboek, transactiedatum, debetbedrag, creditbedrag, lopend saldo, openstaand saldo, eindsaldo, debetnota, creditnota, belastingfactuur, btw-bedrag, betalingsstatus, onbetaald, voldaan, vervaldatum, achterstallig, \
+      výpis z účtu, účetní kniha, datum transakce, částka má dáti, částka dal, průběžný zůstatek, nesplacený zůstatek, konečný zůstatek, vrubopis, dobropis, daňový doklad, částka DPH, stav platby, nezaplaceno, uhrazeno, datum splatnosti, po splatnosti, \
+      كشف حساب, دفتر الأستاذ, تاريخ المعاملة, مبلغ مدين, مبلغ دائن, الرصيد الجاري, الرصيد المستحق, الرصيد الختامي, إشعار مدين, إشعار دائن, فاتورة ضريبية, مبلغ ضريبة القيمة المضافة, حالة الدفع, غير مدفوع, مسدد, تاريخ الاستحقاق, متأخر, \
+      取引明細書, 元帳, 取引日, 借方金額, 貸方金額, 繰越残高, 未払残高, 期末残高, デビットノート, クレジットノート, 税務請求書, 消費税額, 支払状況, 未払, 決済済, 支払期日, 期限超過, \
+      对账单, 账簿, 交易日期, 借方金额, 贷方金额, 累计余额, 未结余额, 期末余额, 借项通知单, 贷项通知单, 税务发票, 增值税额, 付款状态, 未付, 已结清, 到期日, 逾期, \
+      거래명세서, 원장, 거래일, 차변금액, 대변금액, 누적잔액, 미결제잔액, 기말잔액, 차변표, 대변표, 세금계산서, 부가세액, 결제상태, 미납, 완납, 만기일, 연체"),
+    ("items",
+     "Warenbeschreibung, Warenbezeichnung, Handelsware, Produktname, Artikel, Herstellungsland, Ursprungsland, hergestellt in, Stückpreis, Menge, Maßeinheit, Positionssumme, Artikelnummer, Modellnummer, \
+      description des marchandises, désignation des marchandises, marchandise, nom du produit, article, ligne d'article, pays de fabrication, pays d'origine, fabriqué en, prix unitaire, quantité, unité de mesure, total de la ligne, référence article, numéro de modèle, \
+      descripción de la mercancía, denominación de la mercancía, producto, nombre del producto, artículo, línea de artículo, país de fabricación, país de origen, fabricado en, precio unitario, cantidad, unidad de medida, total de línea, código de artículo, número de modelo, \
+      descrizione delle merci, denominazione delle merci, merce, nome del prodotto, articolo, riga articolo, paese di fabbricazione, paese di origine, fabbricato in, prezzo unitario, quantità, unità di misura, totale riga, codice articolo, numero di modello, \
+      descrição das mercadorias, denominação da mercadoria, produto, nome do produto, artigo, linha do item, país de fabricação, país de origem, fabricado em, preço unitário, quantidade, total da linha, código do item, número do modelo, \
+      goederenomschrijving, omschrijving van de goederen, handelswaar, productnaam, artikel, regelitem, land van vervaardiging, land van oorsprong, vervaardigd in, eenheidsprijs, hoeveelheid, meeteenheid, regeltotaal, artikelnummer, modelnummer, \
+      popis zboží, označení zboží, komodita, název výrobku, položka, řádková položka, země výroby, země původu, vyrobeno v, jednotková cena, množství, měrná jednotka, celkem za řádek, kód položky, číslo modelu, \
+      وصف البضاعة, بيان البضاعة, السلعة, اسم المنتج, الصنف, بند السطر, بلد الصنع, بلد المنشأ, صنع في, سعر الوحدة, الكمية, وحدة القياس, إجمالي السطر, رمز الصنف, رقم الطراز, \
+      品名, 商品説明, 製品名, 品目, 明細行, 製造国, 原産国, 製造元, 単価, 数量, 単位, 明細合計, 品番, 型番, \
+      货物描述, 货物名称, 商品, 产品名称, 品目, 明细行, 制造国, 原产国, 产地, 单价, 数量, 计量单位, 行合计, 货号, 型号, \
+      품명, 상품 설명, 상품, 제품명, 품목, 명세행, 제조국, 원산지, 제조지, 단가, 수량, 단위, 라인합계, 품목코드, 모델번호"),
+];
+
+pub fn trade_condition_category_phrases(category: &str) -> Vec<String> {
+    let en = TRADE_CONDITION_CATEGORIES
+        .iter()
+        .find(|(c, _)| *c == category)
+        .map(|(_, raw)| *raw)
+        .unwrap_or("");
+    let ml = TRADE_CONDITION_CATEGORIES_ML
+        .iter()
+        .find(|(c, _)| *c == category)
+        .map(|(_, raw)| *raw)
+        .unwrap_or("");
+    anchor_phrases(en, ml)
+}
+
+pub fn trade_condition_all_phrases() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (c, _) in TRADE_CONDITION_CATEGORIES.iter() {
+        for p in trade_condition_category_phrases(c) {
+            if out.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
+            out.push(p);
+        }
+    }
+    out
+}
+
+pub fn merge_phrase_bank(
+    phrases: &mut Vec<String>,
+    weights: &mut Vec<f32>,
+    extra: &[String],
+    weight: f32,
+) -> usize {
+    while weights.len() < phrases.len() {
+        weights.push(1.0);
+    }
+    let mut added = 0usize;
+    for p in extra.iter() {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        if phrases.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+        phrases.push(t.to_string());
+        weights.push(weight);
+        added += 1;
+    }
+    added
+}
+
+pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
+    ("reference_po",
+     "P/O No., PO No., PO number, purchase order number, purchase order no, order no, order number, your order, customer order number, order reference",
+     "Bestellnummer, Best.-Nr., Ihre Bestellung, \
+      numéro de commande, N° de commande, votre commande, \
+      número de pedido, Nº de pedido, su pedido, \
+      numero d'ordine, N. ordine, vostro ordine, \
+      número do pedido, Nº do pedido, seu pedido, \
+      ordernummer, bestelnummer, uw order, \
+      číslo objednávky, č. objednávky, vaše objednávka, \
+      رقم أمر الشراء, رقم الطلبية, طلبكم, \
+      注文番号, 発注番号, 貴社注文番号, \
+      订单号, 采购订单号, 贵方订单号, \
+      주문번호, 발주번호, 귀사 주문번호"),
+    ("reference_invoice",
+     "invoice no, invoice number, commercial invoice no, commercial invoice number, invoice reference, against invoice, covering invoice, inv no",
+     "Rechnungsnummer, Rechnungs-Nr., Handelsrechnungsnummer, \
+      numéro de facture, N° de facture, numéro de facture commerciale, \
+      número de factura, Nº de factura, número de factura comercial, \
+      numero fattura, N. fattura, numero fattura commerciale, \
+      número da fatura, Nº da fatura, número da fatura comercial, \
+      factuurnummer, factuur nr., handelsfactuurnummer, \
+      číslo faktury, č. faktury, číslo obchodní faktury, \
+      رقم الفاتورة, رقم الفاتورة التجارية, \
+      請求書番号, インボイス番号, 商業送り状番号, \
+      发票号, 发票编号, 商业发票号, \
+      송장번호, 인보이스 번호, 상업송장번호"),
+    ("reference_bl",
+     "B/L No., BL No., bill of lading number, bill of lading no, ocean B/L no, airwaybill / bill of lading, waybill number, transport document number, B/L reference",
+     "Konnossementnummer, B/L-Nr., Frachtbriefnummer, Transportdokumentnummer, \
+      numéro de connaissement, N° de connaissement, numéro de lettre de transport, numéro du document de transport, \
+      número de conocimiento de embarque, Nº de B/L, número de carta de porte, número del documento de transporte, \
+      numero polizza di carico, N. polizza di carico, numero lettera di vettura, numero documento di trasporto, \
+      número do conhecimento de embarque, Nº do B/L, número da carta de porte, número do documento de transporte, \
+      cognossementnummer, B/L-nummer, vrachtbriefnummer, nummer vervoersdocument, \
+      číslo konosamentu, č. B/L, číslo nákladního listu, číslo přepravního dokladu, \
+      رقم بوليصة الشحن, رقم سند الشحن, رقم وثيقة النقل, \
+      船荷証券番号, B/L番号, 運送状番号, 輸送書類番号, \
+      提单号, B/L号, 运单号, 运输单据号, \
+      선하증권번호, B/L번호, 운송장번호, 운송서류번호"),
+    ("reference_lc",
+     "L/C No., LC No., letter of credit number, letter of credit no, documentary credit number, credit no, credit number, drawn under L/C, L/C reference",
+     "Akkreditivnummer, L/C-Nr., Dokumentenakkreditiv-Nummer, \
+      numéro de lettre de crédit, N° de L/C, numéro de crédit documentaire, \
+      número de carta de crédito, Nº de L/C, número de crédito documentario, \
+      numero lettera di credito, N. L/C, numero credito documentario, \
+      número da carta de crédito, Nº da L/C, número do crédito documentário, \
+      kredietbriefnummer, L/C-nummer, documentair kredietnummer, \
+      číslo akreditivu, č. L/C, číslo dokumentárního akreditivu, \
+      رقم خطاب الاعتماد, رقم الاعتماد المستندي, \
+      信用状番号, L/C番号, 荷為替信用状番号, \
+      信用证号, L/C号, 跟单信用证号, \
+      신용장번호, L/C번호, 화환신용장번호"),
+    ("reference_booking",
+     "booking no, booking number, booking reference, BKG No., booking confirmation number, space booking number",
+     "Buchungsnummer, Buchungs-Nr., Buchungsreferenz, \
+      numéro de réservation, N° de booking, référence de réservation, \
+      número de reserva, Nº de booking, referencia de reserva, \
+      numero di prenotazione, N. booking, riferimento prenotazione, \
+      número da reserva, Nº do booking, referência da reserva, \
+      boekingsnummer, booking nr., boekingsreferentie, \
+      číslo rezervace, č. bookingu, reference rezervace, \
+      رقم الحجز, مرجع الحجز, \
+      ブッキング番号, 予約番号, ブッキング照会番号, \
+      订舱号, 订舱编号, 订舱参考号, \
+      부킹번호, 예약번호, 부킹 참조번호"),
+    ("reference_contract",
+     "contract no, contract number, sales contract number, S/C No., agreement number, agreement no, contract reference",
+     "Vertragsnummer, Vertrags-Nr., Kaufvertragsnummer, \
+      numéro de contrat, N° de contrat, numéro de contrat de vente, \
+      número de contrato, Nº de contrato, número de contrato de venta, \
+      numero contratto, N. contratto, numero contratto di vendita, \
+      número do contrato, Nº do contrato, número do contrato de venda, \
+      contractnummer, contract nr., verkoopcontractnummer, \
+      číslo smlouvy, č. smlouvy, číslo kupní smlouvy, \
+      رقم العقد, رقم عقد البيع, \
+      契約番号, 契約No., 売買契約番号, \
+      合同号, 合同编号, 销售合同号, \
+      계약번호, 계약 No., 매매계약번호"),
+    ("reference_number",
+     "reference no, ref no, reference number, export reference, export ref., our reference, our ref., your reference, your ref., job no, file no, case no, order reference, customer reference, shipper's reference",
+     "Referenznummer, Ref.-Nr., Exportreferenz, unsere Referenz, Ihre Referenz, Aktenzeichen, \
+      numéro de référence, N° de réf., référence export, notre référence, votre référence, numéro de dossier, \
+      número de referencia, Nº de ref., referencia de exportación, nuestra referencia, su referencia, número de expediente, \
+      numero di riferimento, N. rif., riferimento export, nostro riferimento, vostro riferimento, numero pratica, \
+      número de referência, Nº de ref., referência de exportação, nossa referência, sua referência, número do processo, \
+      referentienummer, ref. nr., exportreferentie, onze referentie, uw referentie, dossiernummer, \
+      referenční číslo, ref. č., exportní reference, naše značka, vaše značka, číslo spisu, \
+      الرقم المرجعي, رقم المرجع, مرجع التصدير, مرجعنا, مرجعكم, رقم الملف, \
+      参照番号, 照会番号, 輸出参照番号, 当方参照, 貴社参照, 案件番号, \
+      参考号, 参考编号, 出口参考号, 我方参考号, 贵方参考号, 案卷号, \
+      참조번호, 조회번호, 수출 참조번호, 당사 참조번호, 귀사 참조번호, 사건번호"),
+    ("reference_awb",
+     "AWB No., air waybill number, air waybill no, airway bill number, airwaybill number, MAWB No., HAWB No.",
+     "Luftfrachtbriefnummer, AWB-Nr., \
+      numéro de lettre de transport aérien, N° de LTA, numéro AWB, \
+      número de guía aérea, Nº de guía aérea, número AWB, \
+      numero lettera di vettura aerea, N. LTA, numero AWB, \
+      número do conhecimento aéreo, Nº do AWB, número da guia aérea, \
+      luchtvrachtbriefnummer, AWB-nummer, \
+      číslo leteckého nákladního listu, č. AWB, \
+      رقم بوليصة الشحن الجوي, رقم AWB, \
+      航空運送状番号, AWB番号, \
+      空运单号, 航空运单号, AWB号, \
+      항공운송장번호, AWB번호"),
+    ("reference_hbl",
+     "House B/L No., HBL No., house bill of lading number, house bill of lading no, forwarder's B/L number",
+     "House-B/L-Nr., House-Konnossementnummer, Spediteurkonnossement-Nr., \
+      numéro de House B/L, numéro de connaissement maison, N° de HBL, \
+      número de House B/L, número de conocimiento de embarque hijo, Nº de HBL, \
+      numero House B/L, numero polizza di carico house, N. HBL, \
+      número do House B/L, número do conhecimento house, Nº do HBL, \
+      House B/L-nummer, house cognossementnummer, HBL-nummer, \
+      číslo House B/L, číslo house konosamentu, č. HBL, \
+      رقم بوليصة الشحن الفرعية, رقم HBL, \
+      ハウスB/L番号, HBL番号, ハウス船荷証券番号, \
+      货代提单号, House提单号, HBL号, \
+      하우스 B/L번호, HBL번호, 하우스 선하증권번호"),
+    ("reference_master_bl",
+     "Master B/L No., MBL No., master bill of lading number, master bill of lading no, ocean carrier B/L no",
+     "Master-B/L-Nr., Master-Konnossementnummer, Reederei-Konnossement-Nr., \
+      numéro de Master B/L, numéro de connaissement mère, N° de MBL, \
+      número de Master B/L, número de conocimiento de embarque madre, Nº de MBL, \
+      numero Master B/L, numero polizza di carico master, N. MBL, \
+      número do Master B/L, número do conhecimento master, Nº do MBL, \
+      Master B/L-nummer, master cognossementnummer, MBL-nummer, \
+      číslo Master B/L, číslo master konosamentu, č. MBL, \
+      رقم بوليصة الشحن الرئيسية, رقم MBL, \
+      マスターB/L番号, MBL番号, マスター船荷証券番号, \
+      船公司提单号, Master提单号, MBL号, \
+      마스터 B/L번호, MBL번호, 마스터 선하증권번호"),
+    ("reference_proforma",
+     "proforma invoice no, proforma invoice number, PI No., pro forma invoice number, proforma no",
+     "Proformarechnungsnummer, Proforma-Nr., PI-Nr., \
+      numéro de facture pro forma, N° de pro forma, N° de PI, \
+      número de factura proforma, Nº de proforma, Nº de PI, \
+      numero fattura proforma, N. proforma, N. PI, \
+      número da fatura pró-forma, Nº da pró-forma, Nº da PI, \
+      proformafactuurnummer, proforma nr., PI-nummer, \
+      číslo proforma faktury, č. proformy, č. PI, \
+      رقم الفاتورة المبدئية, رقم PI, \
+      プロフォーマインボイス番号, 見積送り状番号, PI番号, \
+      形式发票号, PI号, 形式发票编号, \
+      견적송장번호, 프로포마 인보이스 번호, PI번호"),
+    ("reference_do",
+     "delivery order no, delivery order number, D/O No., DO No., release order number",
+     "Auslieferungsauftragsnummer, D/O-Nr., Freigabeauftragsnummer, \
+      numéro de bon de livraison, N° de D/O, numéro d'ordre de livraison, \
+      número de orden de entrega, Nº de D/O, número de orden de liberación, \
+      numero ordine di consegna, N. D/O, numero ordine di svincolo, \
+      número da ordem de entrega, Nº do D/O, número da ordem de liberação, \
+      afleveringsordernummer, D/O-nummer, vrijgaveordernummer, \
+      číslo dodacího příkazu, č. D/O, číslo příkazu k vydání, \
+      رقم أمر التسليم, رقم D/O, رقم أمر الإفراج, \
+      荷渡指図書番号, D/O番号, 引渡指図番号, \
+      提货单号, D/O号, 放货单号, \
+      화물인도지시서번호, D/O번호, 인도지시번호"),
+    ("reference_export_decl",
+     "export declaration no, export declaration number, ED No., export entry number, export permit number, customs export declaration no",
+     "Ausfuhranmeldungsnummer, Ausfuhrerklärung-Nr., Ausfuhrgenehmigungsnummer, \
+      numéro de déclaration d'exportation, N° de déclaration export, numéro de DAE, \
+      número de declaración de exportación, Nº de DUA de exportación, número de despacho de exportación, \
+      numero dichiarazione di esportazione, N. dichiarazione export, numero bolla doganale export, \
+      número da declaração de exportação, Nº da DUE, número do despacho de exportação, \
+      uitvoeraangiftenummer, nummer exportaangifte, exportvergunningnummer, \
+      číslo vývozního prohlášení, č. vývozní deklarace, číslo vývozního povolení, \
+      رقم بيان التصدير, رقم إقرار التصدير, رقم إذن التصدير, \
+      輸出申告番号, 輸出許可番号, 輸出申告No., \
+      出口报关单号, 出口申报号, 出口许可证号, \
+      수출신고번호, 수출신고필증번호, 수출허가번호"),
+    ("reference_import_decl",
+     "import declaration no, import declaration number, ID No., import entry number, import permit number, customs import declaration no, entry no",
+     "Einfuhranmeldungsnummer, Einfuhrerklärung-Nr., Einfuhrgenehmigungsnummer, \
+      numéro de déclaration d'importation, N° de déclaration import, numéro de DAU, \
+      número de declaración de importación, Nº de DUA de importación, número de despacho de importación, \
+      numero dichiarazione di importazione, N. dichiarazione import, numero bolla doganale import, \
+      número da declaração de importação, Nº da DI, número do despacho de importação, \
+      invoeraangiftenummer, nummer importaangifte, importvergunningnummer, \
+      číslo dovozního prohlášení, č. dovozní deklarace, číslo dovozního povolení, \
+      رقم بيان الاستيراد, رقم إقرار الاستيراد, رقم إذن الاستيراد, \
+      輸入申告番号, 輸入許可番号, 輸入申告No., \
+      进口报关单号, 进口申报号, 进口许可证号, \
+      수입신고번호, 수입신고필증번호, 수입허가번호"),
+    ("reference_origin",
+     "certificate of origin no, certificate of origin number, C/O No., CO No., origin certificate number",
+     "Ursprungszeugnisnummer, UZ-Nr., Nummer des Ursprungszeugnisses, \
+      numéro de certificat d'origine, N° de C/O, numéro du certificat d'origine, \
+      número de certificado de origen, Nº de C/O, número del certificado de origen, \
+      numero certificato di origine, N. C/O, numero del certificato di origine, \
+      número do certificado de origem, Nº do C/O, número do certificado de origem, \
+      nummer certificaat van oorsprong, C/O-nummer, oorsprongscertificaatnummer, \
+      číslo osvědčení o původu, č. C/O, číslo certifikátu původu, \
+      رقم شهادة المنشأ, رقم C/O, \
+      原産地証明書番号, C/O番号, 原産地証明番号, \
+      原产地证书号, C/O号, 原产地证编号, \
+      원산지증명서번호, C/O번호, 원산지증명번호"),
+    ("reference_policy",
+     "insurance policy no, insurance policy number, policy no, policy number, certificate of insurance no, cover note number",
+     "Versicherungspolicennummer, Policen-Nr., Versicherungsscheinnummer, \
+      numéro de police d'assurance, N° de police, numéro de certificat d'assurance, \
+      número de póliza de seguro, Nº de póliza, número de certificado de seguro, \
+      numero polizza assicurativa, N. polizza, numero certificato di assicurazione, \
+      número da apólice de seguro, Nº da apólice, número do certificado de seguro, \
+      verzekeringspolisnummer, polisnummer, nummer verzekeringscertificaat, \
+      číslo pojistné smlouvy, č. pojistky, číslo pojistného certifikátu, \
+      رقم وثيقة التأمين, رقم البوليصة, رقم شهادة التأمين, \
+      保険証券番号, ポリシー番号, 保険証明書番号, \
+      保险单号, 保单号, 保险证明书号, \
+      보험증권번호, 보험 증권 No., 보험증명서번호"),
+    ("departure_date",
+     "date of exportation, date of export, export date, exportation date, date of shipment, shipment date, date shipped, shipped on, dispatch date, date of dispatch, date of departure",
+     "Ausfuhrdatum, Datum der Ausfuhr, Versanddatum, Verschiffungsdatum, Abfahrtsdatum, \
+      date d'exportation, date d'expédition, date d'embarquement, date de départ, \
+      fecha de exportación, fecha de embarque, fecha de envío, fecha de salida, \
+      data di esportazione, data di spedizione, data di imbarco, data di partenza, \
+      data de exportação, data de embarque, data de envio, data de partida, \
+      uitvoerdatum, datum van uitvoer, verzenddatum, verschepingsdatum, \
+      datum vývozu, datum odeslání, datum nalodění, datum odjezdu, \
+      تاريخ التصدير, تاريخ الشحن, تاريخ الإرسال, تاريخ المغادرة, \
+      輸出日, 出荷日, 船積日, 出港日, \
+      出口日期, 发货日期, 装运日期, 离港日期, \
+      수출일, 출하일, 선적일, 출항일"),
+    ("arrival_date",
+     "date of arrival, arrival date, arrived on, date arrived, discharge date, date of discharge",
+     "Ankunftsdatum, Datum der Ankunft, Löschdatum, \
+      date d'arrivée, date de déchargement, arrivé le, \
+      fecha de llegada, fecha de arribo, fecha de descarga, \
+      data di arrivo, data di scarico, arrivato il, \
+      data de chegada, data de descarga, \
+      aankomstdatum, datum van aankomst, losdatum, \
+      datum příjezdu, datum příchodu, datum vykládky, \
+      تاريخ الوصول, تاريخ التفريغ, \
+      到着日, 入港日, 荷揚日, \
+      到达日期, 到港日期, 卸货日期, \
+      도착일, 입항일, 양하일"),
+    ("place_delivery",
+     "place of delivery, final destination, place of final delivery, delivery place, delivered to, final delivery point, ultimate destination, place of destination, door delivery address",
+     "Lieferort, Auslieferungsort, Endbestimmungsort, endgültiger Bestimmungsort, \
+      lieu de livraison, lieu de livraison finale, destination finale, lieu de destination, \
+      lugar de entrega, lugar de entrega final, destino final, lugar de destino, \
+      luogo di consegna, luogo di consegna finale, destinazione finale, luogo di destinazione, \
+      local de entrega, local de entrega final, local de destino, \
+      plaats van levering, plaats van aflevering, eindbestemming, plaats van bestemming, \
+      místo dodání, místo konečného dodání, konečné místo určení, místo určení, \
+      مكان التسليم, مكان التسليم النهائي, الوجهة النهائية, مكان الوصول, \
+      引渡地, 最終引渡地, 最終仕向地, 配達先, \
+      交货地, 最终交货地, 最终目的地, 送货地址, \
+      인도지, 최종 인도지, 최종 목적지, 배송지"),
+    ("country_of_destination",
+     "country of destination, country of ultimate destination, ultimate destination country, destination country, final destination country, ship to country, country of final destination, importing country",
+     "Bestimmungsland, endgültiges Bestimmungsland, Empfangsland, Einfuhrland, \
+      pays de destination, pays de destination finale, pays destinataire, pays d'importation, \
+      país de destino, país de destino final, país destinatario, país de importación, \
+      paese di destinazione, paese di destinazione finale, paese destinatario, paese di importazione, \
+      país destinatário, país de importação, \
+      land van bestemming, land van eindbestemming, ontvangend land, land van invoer, \
+      země určení, země konečného určení, země příjemce, země dovozu, \
+      بلد الوصول, بلد المقصد النهائي, بلد الوجهة, بلد الاستيراد, \
+      仕向国, 最終仕向国, 到着国, 輸入国, \
+      目的国, 最终目的国, 到达国, 进口国, \
+      목적국, 최종 목적국, 도착국, 수입국"),
+    ("country_of_export",
+     "country of export, country of exportation, exporting country, country of dispatch, country of departure, ship from country, country of consignment, country of shipment",
+     "Ausfuhrland, Versendungsland, Abgangsland, Exportland, \
+      pays d'exportation, pays d'expédition, pays de départ, pays de provenance, \
+      país de exportación, país de expedición, país de salida, país de procedencia, \
+      paese di esportazione, paese di spedizione, paese di partenza, paese di provenienza, \
+      país de exportação, país de expedição, país de partida, país de procedência, \
+      land van uitvoer, land van verzending, land van vertrek, exportland, \
+      země vývozu, země odeslání, země odjezdu, vyvážející země, \
+      بلد التصدير, بلد الإرسال, بلد المغادرة, بلد المصدر, \
+      輸出国, 積出国, 出発国, 発送国, \
+      出口国, 发货国, 起运国, 启运国, \
+      수출국, 발송국, 출발국, 적출국"),
+    ("reason_for_export",
+     "reason for export, purpose of export, export reason, export purpose, purpose of shipment, reason for shipment, nature of transaction, purpose of transaction",
+     "Grund der Ausfuhr, Ausfuhrgrund, Zweck der Ausfuhr, Art des Geschäfts, \
+      motif de l'exportation, raison de l'exportation, objet de l'exportation, nature de la transaction, \
+      motivo de la exportación, razón de la exportación, propósito de la exportación, naturaleza de la transacción, \
+      motivo dell'esportazione, ragione dell'esportazione, scopo dell'esportazione, natura della transazione, \
+      motivo da exportação, razão da exportação, finalidade da exportação, natureza da transação, \
+      reden van uitvoer, doel van uitvoer, reden van verzending, aard van de transactie, \
+      důvod vývozu, účel vývozu, důvod odeslání, povaha transakce, \
+      سبب التصدير, غرض التصدير, سبب الشحن, طبيعة المعاملة, \
+      輸出理由, 輸出目的, 出荷理由, 取引の性質, \
+      出口原因, 出口目的, 发货原因, 交易性质, \
+      수출 사유, 수출 목적, 출하 사유, 거래 성격"),
+    ("sender_tax_number",
+     "exporter VAT/EORI, exporter VAT number, exporter EORI number, exporter tax ID, shipper tax ID, shipper VAT number, seller VAT no, seller tax ID, VAT registration number of exporter, tax identification number of exporter, exporter's tax number, sender tax number",
+     "USt-IdNr. des Exporteurs, EORI-Nummer des Exporteurs, Steuernummer des Versenders, USt-IdNr. des Verkäufers, \
+      numéro de TVA de l'exportateur, numéro EORI de l'exportateur, identifiant fiscal de l'expéditeur, numéro de TVA du vendeur, \
+      NIF del exportador, número de IVA del exportador, número EORI del exportador, identificación fiscal del remitente, \
+      partita IVA dell'esportatore, numero EORI dell'esportatore, codice fiscale dello speditore, partita IVA del venditore, \
+      NIF do exportador, número de IVA do exportador, número EORI do exportador, CNPJ do remetente, \
+      btw-nummer van de exporteur, EORI-nummer van de exporteur, fiscaal nummer van de afzender, btw-nummer van de verkoper, \
+      DIČ vývozce, číslo EORI vývozce, daňové číslo odesílatele, DIČ prodávajícího, \
+      الرقم الضريبي للمصدر, رقم EORI للمصدر, الرقم الضريبي للشاحن, الرقم الضريبي للبائع, \
+      輸出者VAT番号, 輸出者EORI番号, 荷送人の税番号, 売主の税務番号, \
+      出口商VAT号, 出口商EORI号, 发货人税号, 卖方税号, \
+      수출자 VAT번호, 수출자 EORI번호, 송하인 세금번호, 매도인 사업자번호"),
+    ("recipient_tax_number",
+     "consignee VAT/EORI, consignee VAT number, consignee EORI number, consignee tax ID, importer VAT no, importer EORI number, buyer tax ID, buyer VAT number, VAT registration number of consignee, tax identification number of importer, buyer's tax number, receiver tax number",
+     "USt-IdNr. des Empfängers, EORI-Nummer des Empfängers, Steuernummer des Importeurs, USt-IdNr. des Käufers, \
+      numéro de TVA du destinataire, numéro EORI du destinataire, identifiant fiscal de l'importateur, numéro de TVA de l'acheteur, \
+      NIF del consignatario, número de IVA del consignatario, número EORI del consignatario, identificación fiscal del importador, \
+      partita IVA del destinatario, numero EORI del destinatario, codice fiscale dell'importatore, partita IVA dell'acquirente, \
+      NIF do consignatário, número de IVA do consignatário, número EORI do consignatário, CNPJ do importador, \
+      btw-nummer van de geadresseerde, EORI-nummer van de geadresseerde, fiscaal nummer van de importeur, btw-nummer van de koper, \
+      DIČ příjemce, číslo EORI příjemce, daňové číslo dovozce, DIČ kupujícího, \
+      الرقم الضريبي للمرسل إليه, رقم EORI للمرسل إليه, الرقم الضريبي للمستورد, الرقم الضريبي للمشتري, \
+      荷受人VAT番号, 荷受人EORI番号, 輸入者の税番号, 買主の税務番号, \
+      收货人VAT号, 收货人EORI号, 进口商税号, 买方税号, \
+      수하인 VAT번호, 수하인 EORI번호, 수입자 세금번호, 매수인 사업자번호"),
+    ("signatory_name",
+     "signatory name, name of signatory, signed by, authorized signatory, name of authorized signatory, authorized signature, signature of exporter, signature of shipper, name and signature, printed name, name of the person signing",
+     "Name des Unterzeichners, unterzeichnet von, bevollmächtigter Unterzeichner, Unterschrift des Exporteurs, Name und Unterschrift, \
+      nom du signataire, signé par, signataire autorisé, signature de l'exportateur, nom et signature, \
+      nombre del firmante, firmado por, firmante autorizado, firma del exportador, nombre y firma, \
+      nome del firmatario, firmato da, firmatario autorizzato, firma dell'esportatore, nome e firma, \
+      nome do signatário, assinado por, signatário autorizado, assinatura do exportador, nome e assinatura, \
+      naam ondertekenaar, ondertekend door, gemachtigde ondertekenaar, handtekening exporteur, naam en handtekening, \
+      jméno podepisujícího, podepsal, oprávněný podepisující, podpis vývozce, jméno a podpis, \
+      اسم الموقع, وقعه, الموقع المفوض, توقيع المصدر, الاسم والتوقيع, \
+      署名者名, 署名者, 権限を有する署名者, 輸出者の署名, 氏名と署名, \
+      签署人姓名, 签署人, 授权签署人, 出口商签字, 姓名与签字, \
+      서명자 성명, 서명인, 권한 있는 서명자, 수출자 서명, 성명 및 서명"),
+    ("party_name",
+     "signatory company, company name, name of company, company, firm name, legal name, business name, organization name, name of the firm, entity name, corporate name",
+     "unterzeichnendes Unternehmen, Firmenname, Name der Firma, Firmenbezeichnung, Name der Organisation, \
+      société signataire, raison sociale, nom de la société, dénomination sociale, nom de l'organisation, \
+      empresa firmante, razón social, nombre de la empresa, denominación social, nombre de la organización, \
+      società firmataria, ragione sociale, nome della società, denominazione sociale, nome dell'organizzazione, \
+      empresa signatária, nome da empresa, denominação social, nome da organização, \
+      ondertekenend bedrijf, bedrijfsnaam, naam van het bedrijf, firmanaam, naam van de organisatie, \
+      podepisující společnost, název společnosti, název firmy, obchodní firma, název organizace, \
+      الشركة الموقعة, اسم الشركة, اسم المؤسسة, الاسم التجاري, اسم المنظمة, \
+      署名会社, 会社名, 企業名, 商号, 組織名, \
+      签署公司, 公司名称, 企业名称, 商号, 机构名称, \
+      서명 회사, 회사명, 기업명, 상호, 조직명"),
+    ("issue_date",
+     "date of issue, issue date, issued on, invoice date, date of invoice, document date, date of document, dated, date issued",
+     "Ausstellungsdatum, ausgestellt am, Rechnungsdatum, Belegdatum, Datum des Dokuments, \
+      date d'émission, émis le, date de la facture, date du document, date d'établissement, \
+      fecha de emisión, emitido el, fecha de la factura, fecha del documento, fecha de expedición, \
+      data di emissione, emesso il, data della fattura, data del documento, data di rilascio, \
+      data de emissão, emitido em, data da fatura, data do documento, \
+      datum van uitgifte, uitgegeven op, factuurdatum, documentdatum, datum van afgifte, \
+      datum vystavení, vystaveno dne, datum faktury, datum dokladu, datum vydání, \
+      تاريخ الإصدار, صدر في, تاريخ الفاتورة, تاريخ المستند, تاريخ التحرير, \
+      発行日, 発行日付, 請求書日付, 書類日付, 作成日, \
+      签发日期, 开具日期, 发票日期, 单据日期, 出具日期, \
+      발행일, 발행일자, 송장일자, 문서일자, 작성일"),
+    ("country_of_manufacture",
+     "country of manufacture, country of origin, made in, manufactured in, origin, origin country, manufacturing country, produced in, C/O",
+     "Herstellungsland, Ursprungsland, hergestellt in, Produktionsland, \
+      pays de fabrication, pays d'origine, fabriqué en, pays de production, \
+      país de fabricación, país de origen, fabricado en, país de producción, \
+      paese di fabbricazione, paese di origine, fabbricato in, paese di produzione, \
+      país de fabricação, país de origem, fabricado em, país de produção, \
+      land van vervaardiging, land van oorsprong, vervaardigd in, productieland, \
+      země výroby, země původu, vyrobeno v, země produkce, \
+      بلد الصنع, بلد المنشأ, صنع في, بلد الإنتاج, \
+      製造国, 原産国, 製造元, 生産国, \
+      制造国, 原产国, 产地, 生产国, \
+      제조국, 원산지, 제조지, 생산국, 제조된, 제조, 에서 제조된"),
+    ("description",
+     "description of goods, goods description, description, item description, commodity description, product description, name of goods, article description, description of merchandise",
+     "Warenbeschreibung, Warenbezeichnung, Artikelbeschreibung, Bezeichnung der Ware, \
+      description des marchandises, désignation des marchandises, description de l'article, libellé, \
+      descripción de la mercancía, denominación de la mercancía, descripción del artículo, concepto, \
+      descrizione delle merci, denominazione delle merci, descrizione dell'articolo, descrizione, \
+      descrição das mercadorias, denominação da mercadoria, descrição do item, \
+      goederenomschrijving, omschrijving van de goederen, artikelomschrijving, omschrijving, \
+      popis zboží, označení zboží, popis položky, popis, \
+      وصف البضاعة, بيان البضاعة, وصف الصنف, الوصف, \
+      品名, 商品説明, 品目説明, 商品名, \
+      货物描述, 货物名称, 品名, 商品描述, \
+      품명, 상품 설명, 품목 설명, 물품명"),
+];
+
+pub fn trade_label_supplement(field: &str) -> Vec<String> {
+    let key = field.trim();
+    for (f, en, ml) in TRADE_LABEL_SUPPLEMENT_ML.iter() {
+        if *f == key {
+            return anchor_phrases(en, ml);
+        }
+    }
+    Vec::new()
+}
+
+pub fn trade_label_supplement_fields() -> Vec<&'static str> {
+    TRADE_LABEL_SUPPLEMENT_ML.iter().map(|(f, _, _)| *f).collect()
+}
+
 /// Depth 2 : 카테고리별 파라미터 (필드명, 프롬프트 설명, 앵커 구).
 ///  ── 설계 원칙 ──
 ///   ① 필드명은 저장(get_trade_category_schema) 과 동일해야 합니다.
@@ -998,7 +1574,8 @@ pub fn trade_default_operator(field: &str) -> &'static str {
         | "declaration_number" | "certificate_number" | "policy_number"
         | "claim_number" | "customs_office_code" | "pccc_number"
         | "charge_code" | "un_number" | "cas_number"
-        | "fta_agreement_code" | "eccn" | "swift_code" | "account_number" => "eq",
+        | "fta_agreement_code" | "eccn" | "swift_code" | "account_number"
+        | "sender_tax_number" | "recipient_tax_number" => "eq",
 
         // ── 날짜 : 기준일 이후 ──
         //  질의가 "8월 이후 통관된 건" 처럼 하한을 뜻하는 경우가 압도적입니다.
@@ -1104,6 +1681,176 @@ pub const TRADE_CONTAINER_TABLE_ANCHOR: &str =
      container type size, number of packages column, gross weight column, measurement column, \
      container and seal table, equipment list";
 
+pub const TRADE_TITLE_LABEL_ANCHOR_ML: &str =
+    "Dokumentart, Dokumenttyp, Art des Dokuments, Titel dieses Dokuments, Formularname, Dokumentcode, \
+     type de document, nature du document, titre de ce document, nom du formulaire, code du document, \
+     tipo de documento, clase de documento, título de este documento, nombre del formulario, código del documento, \
+     tipo di documento, titolo di questo documento, nome del modulo, codice documento, \
+     título deste documento, nome do formulário, código do documento, \
+     documentsoort, documenttype, titel van dit document, formuliernaam, documentcode, \
+     typ dokumentu, druh dokumentu, název tohoto dokumentu, název formuláře, kód dokumentu, \
+     نوع المستند, صنف المستند, عنوان هذا المستند, اسم النموذج, رمز المستند, \
+     書類の種類, 書類種別, この書類の名称, 様式名, 書類コード, \
+     单据类型, 文件种类, 本单据名称, 表格名称, 单据代码, \
+     서류 종류, 문서 유형, 이 문서의 제목, 양식명, 서류 코드";
+
+pub const TRADE_REFERENCE_LABEL_ANCHOR_ML: &str =
+    "referenzierte Dokumentnummer, zugehörige Dokumentnummer, Nummer eines anderen Dokuments, Hauptdokumentnummer, Zahlungsbedingungen, ausgestellt unter, beigefügte Unterlagen, Bemerkung, \
+     numéro de document référencé, numéro de document associé, numéro d'un autre document, numéro du document principal, conditions de paiement, émis en vertu de, documents joints, remarque, \
+     número de documento referenciado, número de documento relacionado, número de otro documento, número del documento principal, condiciones de pago, emitido bajo, documentos adjuntos, observación, \
+     numero documento di riferimento, numero documento correlato, numero di un altro documento, numero documento principale, termini di pagamento, emesso ai sensi di, documenti allegati, osservazione, \
+     número de outro documento, número do documento principal, condições de pagamento, emitido sob, documentos anexos, observação, \
+     gerefereerd documentnummer, gerelateerd documentnummer, nummer van een ander document, hoofddocumentnummer, betalingsvoorwaarden, uitgegeven onder, bijgevoegde documenten, opmerking, \
+     odkazované číslo dokumentu, číslo souvisejícího dokumentu, číslo jiného dokumentu, číslo hlavního dokumentu, platební podmínky, vystaveno na základě, přiložené doklady, poznámka, \
+     رقم المستند المرجعي, رقم المستند المرتبط, رقم مستند آخر, رقم المستند الرئيسي, شروط الدفع, صادر بموجب, المستندات المرفقة, ملاحظة, \
+     参照書類番号, 関連書類番号, 他の書類の番号, 主書類番号, 支払条件, に基づき発行, 添付書類, 備考, \
+     参考单据号, 相关单据号, 其他单据编号, 主单据号, 付款条件, 依据签发, 附件, 备注, \
+     참조 문서번호, 관련 문서번호, 다른 문서의 번호, 주 문서번호, 결제조건, 근거 발행, 첨부서류, 비고";
+
+pub const TRADE_SELF_ID_LABEL_ANCHOR_ML: &str =
+    "Dokumentnummer, Nummer dieses Dokuments, unter dem Titel gedruckte Nummer, Rechnungsnummer, Bestellnummer, Zertifikatsnummer, Anmeldenummer, Konnossementnummer, Frachtbriefnummer, Policennummer, Buchungsnummer, \
+     numéro du document, numéro de ce document, numéro imprimé sous le titre, numéro de facture, numéro de commande, numéro de certificat, numéro de déclaration, numéro de connaissement, numéro de lettre de transport, numéro de police, numéro de réservation, \
+     número del documento, número de este documento, número impreso bajo el título, número de factura, número de pedido, número de certificado, número de declaración, número de conocimiento de embarque, número de carta de porte, número de póliza, número de reserva, \
+     numero del documento, numero di questo documento, numero stampato sotto il titolo, numero fattura, numero ordine, numero certificato, numero dichiarazione, numero polizza di carico, numero lettera di vettura, numero polizza, numero prenotazione, \
+     número do documento, número deste documento, número impresso sob o título, número da fatura, número do pedido, número do certificado, número da declaração, número do conhecimento de embarque, número da carta de porte, número da apólice, número da reserva, \
+     documentnummer, nummer van dit document, nummer onder de titel, factuurnummer, ordernummer, certificaatnummer, aangiftenummer, cognossementnummer, vrachtbriefnummer, polisnummer, boekingsnummer, \
+     číslo dokumentu, číslo tohoto dokumentu, číslo vytištěné pod názvem, číslo faktury, číslo objednávky, číslo certifikátu, číslo prohlášení, číslo konosamentu, číslo nákladního listu, číslo pojistky, číslo rezervace, \
+     رقم المستند, رقم هذا المستند, الرقم المطبوع تحت العنوان, رقم الفاتورة, رقم الطلب, رقم الشهادة, رقم الإقرار, رقم بوليصة الشحن, رقم وثيقة النقل, رقم وثيقة التأمين, رقم الحجز, \
+     書類番号, この書類の番号, 表題の下に印字された番号, 請求書番号, 注文番号, 証明書番号, 申告番号, 船荷証券番号, 運送状番号, 保険証券番号, ブッキング番号, \
+     单据编号, 本单据编号, 标题下方印制的编号, 发票号, 订单号, 证书编号, 申报编号, 提单号, 运单号, 保单号, 订舱号, \
+     문서번호, 이 문서의 번호, 제목 아래 인쇄된 번호, 송장번호, 주문번호, 증명서번호, 신고번호, 선하증권번호, 운송장번호, 보험증권번호, 부킹번호";
+
+pub const TRADE_ITEM_ATTRIBUTE_ANCHOR_ML: &str =
+    "Artikelattribut, Artikelnummer, Warenbeschreibung, Menge, Maßeinheit, Stückpreis, Positionssumme, Spaltenüberschrift, Zwischensumme, Gesamtmenge, \
+     attribut d'article, référence article, description des marchandises, quantité, unité de mesure, prix unitaire, total de ligne, en-tête de colonne, sous-total, quantité totale, \
+     atributo de artículo, código de artículo, descripción de la mercancía, cantidad, unidad de medida, precio unitario, total de línea, encabezado de columna, subtotal, cantidad total, \
+     attributo articolo, codice articolo, descrizione merce, quantità, unità di misura, prezzo unitario, totale riga, intestazione colonna, subtotale, quantità totale, \
+     atributo do item, código do item, descrição da mercadoria, quantidade, unidade de medida, preço unitário, total da linha, cabeçalho da coluna, quantidade total, \
+     artikelattribuut, artikelnummer, goederenomschrijving, hoeveelheid, meeteenheid, eenheidsprijs, regeltotaal, kolomkop, subtotaal, totale hoeveelheid, \
+     atribut položky, kód položky, popis zboží, množství, měrná jednotka, jednotková cena, celkem za řádek, záhlaví sloupce, mezisoučet, celkové množství, \
+     خاصية الصنف, رمز الصنف, وصف البضاعة, الكمية, وحدة القياس, سعر الوحدة, إجمالي البند, عنوان العمود, المجموع الفرعي, الكمية الإجمالية, \
+     品目属性, 品番, 品名, 数量, 単位, 単価, 明細合計, 列見出し, 小計, 合計数量, \
+     货号, 货物描述, 计量单位, 单价, 行合计, 列标题, 总数量, \
+     품목 속성, 품목코드, 품명, 수량, 단위, 단가, 라인합계, 열 머리글, 소계, 총수량";
+
+pub const TRADE_ROW_MARKER_ANCHOR_ML: &str =
+    "Zeilentrenner, Positionsnummer in einer Liste, Abschnittsschlüssel, Fortsetzung von vorheriger Seite, Seitenumbruch, Aufzählungszeichen, \
+     séparateur de ligne, numéro d'article dans une liste, clé de section, suite de la page précédente, saut de page, puce de liste, \
+     separador de fila, número de artículo en una lista, clave de sección, continuación de la página anterior, salto de página, viñeta de lista, \
+     separatore di riga, numero articolo in un elenco, chiave di sezione, continua dalla pagina precedente, interruzione di pagina, punto elenco, \
+     separador de linha, número do item em uma lista, chave de seção, continuação da página anterior, quebra de página, marcador de lista, \
+     rijscheiding, itemnummer in een lijst, sectiesleutel, vervolg van vorige pagina, pagina-einde, opsommingsteken, \
+     oddělovač řádků, číslo položky v seznamu, klíč sekce, pokračování z předchozí strany, konec stránky, odrážka, \
+     فاصل الصفوف, رقم البند في القائمة, مفتاح القسم, تابع من الصفحة السابقة, فاصل الصفحة, نقطة تعداد, \
+     行区切り, リスト内の項目番号, セクションキー, 前ページからの続き, 改ページ, 箇条書き記号, \
+     行分隔符, 列表中的项目编号, 章节键, 接上页, 分页符, 项目符号, \
+     행 구분자, 목록 내 항목 번호, 섹션 키, 이전 페이지에서 계속, 페이지 나눔, 글머리 기호";
+
+pub const SITE_CHROME_ANCHOR_ML: &str =
+    "Website-Name, Shopname, Markenslogan, Administratorseite, Verwaltungsmenü, Dashboard, Navigationsleiste, Fußzeile, Anmelden, Abmelden, Einstellungen, Besucherzähler, Willkommensnachricht, Suchformular, Seitennummerierung, \
+     nom du site, nom de la boutique, slogan de la marque, page d'administration, menu de gestion, tableau de bord, barre de navigation, pied de page, connexion, déconnexion, paramètres, compteur de visiteurs, message de bienvenue, formulaire de recherche, pagination, \
+     nombre del sitio, nombre de la tienda, eslogan de la marca, página de administración, menú de gestión, panel de control, barra de navegación, pie de página, iniciar sesión, cerrar sesión, ajustes, contador de visitantes, mensaje de bienvenida, formulario de búsqueda, paginación, \
+     nome del sito, nome del negozio, slogan del marchio, pagina di amministrazione, menu di gestione, cruscotto, barra di navigazione, piè di pagina, accedi, esci, impostazioni, contatore visitatori, messaggio di benvenuto, modulo di ricerca, paginazione, \
+     nome do site, nome da loja, slogan da marca, página do administrador, menu de gestão, painel de controle, barra de navegação, rodapé, entrar, sair, configurações, mensagem de boas-vindas, formulário de pesquisa, \
+     sitenaam, winkelnaam, merkslogan, beheerpagina, beheermenu, navigatiebalk, voettekst, inloggen, uitloggen, instellingen, bezoekersteller, welkomstbericht, zoekformulier, paginering, \
+     název webu, název obchodu, slogan značky, stránka správce, menu správy, přehled, navigační lišta, zápatí, přihlásit se, odhlásit se, nastavení, počítadlo návštěv, uvítací zpráva, vyhledávací formulář, stránkování, \
+     اسم الموقع, اسم المتجر, شعار العلامة التجارية, صفحة المسؤول, قائمة الإدارة, لوحة التحكم, شريط التنقل, التذييل, تسجيل الدخول, تسجيل الخروج, الإعدادات, عداد الزوار, رسالة ترحيب, نموذج البحث, ترقيم الصفحات, \
+     サイト名, ショップ名, ブランドスローガン, 管理者ページ, 管理メニュー, ダッシュボード, ナビゲーションバー, フッター, ログイン, ログアウト, 設定, 訪問者カウンター, ようこそメッセージ, 検索フォーム, ページ送り, \
+     网站名称, 商城名称, 品牌口号, 管理员页面, 管理菜单, 仪表盘, 导航栏, 页脚, 登录, 退出登录, 设置, 访客计数器, 欢迎信息, 搜索表单, 分页, \
+     사이트명, 쇼핑몰명, 브랜드 슬로건, 관리자 페이지, 관리 메뉴, 대시보드, 내비게이션 바, 푸터, 로그인, 로그아웃, 설정, 방문자 카운터, 환영 메시지, 검색 폼, 페이지네이션";
+
+pub const UI_ACTION_ANCHOR_ML: &str =
+    "Bearbeiten, Ändern, Löschen, Kopieren, Registrieren, Neu hinzufügen, Speichern, Abbrechen, Bestätigen, Absenden, Zurücksetzen, Details anzeigen, Verwalten, Drucken, Herunterladen, Alle auswählen, Vorschau, Teilen, \
+     Modifier, Supprimer, Copier, Enregistrer, Ajouter, Sauvegarder, Annuler, Confirmer, Envoyer, Réinitialiser, Voir le détail, Gérer, Imprimer, Télécharger, Tout sélectionner, Aperçu, Partager, \
+     Editar, Modificar, Eliminar, Copiar, Registrar, Añadir, Guardar, Cancelar, Confirmar, Enviar, Restablecer, Ver detalle, Administrar, Imprimir, Descargar, Seleccionar todo, Vista previa, Compartir, \
+     Modifica, Elimina, Copia, Registra, Aggiungi, Salva, Annulla, Conferma, Invia, Reimposta, Vedi dettaglio, Gestisci, Stampa, Scarica, Seleziona tutto, Anteprima, Condividi, \
+     Excluir, Adicionar, Salvar, Redefinir, Ver detalhes, Gerenciar, Baixar, Selecionar tudo, Pré-visualizar, Compartilhar, \
+     Bewerken, Wijzigen, Verwijderen, Kopiëren, Registreren, Toevoegen, Opslaan, Annuleren, Bevestigen, Verzenden, Resetten, Details bekijken, Beheren, Afdrukken, Downloaden, Alles selecteren, Voorbeeld, Delen, \
+     Upravit, Změnit, Smazat, Kopírovat, Registrovat, Přidat, Uložit, Zrušit, Potvrdit, Odeslat, Obnovit, Zobrazit detail, Spravovat, Tisk, Stáhnout, Vybrat vše, Náhled, Sdílet, \
+     تعديل, تغيير, حذف, نسخ, تسجيل, إضافة, حفظ, إلغاء, تأكيد, إرسال, إعادة تعيين, عرض التفاصيل, إدارة, طباعة, تنزيل, تحديد الكل, معاينة, مشاركة, \
+     編集, 修正, 削除, コピー, 登録, 追加, 保存, キャンセル, 確認, 送信, リセット, 詳細を見る, 管理, 印刷, ダウンロード, すべて選択, プレビュー, 共有, \
+     编辑, 修改, 删除, 复制, 注册, 新增, 取消, 提交, 重置, 查看详情, 打印, 下载, 全选, 预览, 分享, \
+     수정, 편집, 삭제, 복사, 등록, 추가, 저장, 취소, 확인, 제출, 초기화, 상세보기, 관리, 인쇄, 다운로드, 전체선택, 미리보기, 공유";
+
+pub const DECLARATION_BOILERPLATE_ANCHOR: &str =
+    "I declare all the information contained in this invoice to be true and correct, \
+     I hereby certify that the above information is true and accurate, \
+     we certify that this invoice is true and correct, the undersigned declares, \
+     declaration of exporter, signed under penalty of perjury, \
+     to the best of my knowledge and belief, we hereby confirm the accuracy of the above, attestation statement";
+
+pub const DECLARATION_BOILERPLATE_ANCHOR_ML: &str =
+    "Ich erkläre dass alle Angaben in dieser Rechnung wahr und richtig sind, Hiermit bestätigen wir die Richtigkeit der obigen Angaben, Erklärung des Ausführers, der Unterzeichner erklärt, nach bestem Wissen und Gewissen, \
+     Je déclare que toutes les informations contenues dans cette facture sont exactes et véridiques, Nous certifions que cette facture est sincère et véritable, déclaration de l'exportateur, le soussigné déclare, en toute connaissance de cause, \
+     Declaro que toda la información contenida en esta factura es verdadera y correcta, Certificamos que esta factura es verdadera y correcta, declaración del exportador, el abajo firmante declara, según mi leal saber y entender, \
+     Dichiaro che tutte le informazioni contenute in questa fattura sono veritiere e corrette, Si certifica che la presente fattura è veritiera e corretta, dichiarazione dell'esportatore, il sottoscritto dichiara, per quanto a mia conoscenza, \
+     Declaro que todas as informações contidas nesta fatura são verdadeiras e corretas, Certificamos que esta fatura é verdadeira e correta, declaração do exportador, o abaixo assinado declara, tanto quanto é do meu conhecimento, \
+     Ik verklaar dat alle informatie in deze factuur waar en juist is, Wij verklaren dat deze factuur juist en volledig is, verklaring van de exporteur, ondergetekende verklaart, naar beste weten, \
+     Prohlašuji že všechny údaje uvedené v této faktuře jsou pravdivé a správné, Potvrzujeme že tato faktura je pravdivá a správná, prohlášení vývozce, níže podepsaný prohlašuje, podle mého nejlepšího vědomí, \
+     أقر بأن جميع المعلومات الواردة في هذه الفاتورة صحيحة وسليمة, نشهد بأن هذه الفاتورة صحيحة ودقيقة, إقرار المصدر, يقر الموقع أدناه, على حد علمي, \
+     本請求書に記載された全ての情報が真実かつ正確であることを宣言します, 上記の内容が正確であることを証明します, 輸出者の申告, 署名者は以下のとおり宣言する, 私の知る限りにおいて, \
+     本人声明本发票所载全部信息真实无误, 兹证明本发票内容真实准确, 出口商声明, 签署人特此声明, 据本人所知, \
+     본 송장에 기재된 모든 정보가 사실이며 정확함을 선언합니다, 상기 내용이 사실임을 증명합니다, 수출자 신고서, 서명인은 다음과 같이 선언합니다, 본인이 아는 한";
+
+pub fn anchor_phrases(en: &str, ml: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in [en, ml] {
+        if raw.trim().is_empty() { continue; }
+        for p in crate::utils::ai_utils::split_bias_phrases_full(raw) {
+            let t = p.trim();
+            if t.is_empty() { continue; }
+            if out.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+pub fn trade_title_pairs() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    for (code, title) in TRADE_DOC_TITLES
+        .iter()
+        .chain(crate::utils::ai_utils::TRADE_DOC_TITLES_ML.iter())
+    {
+        let t = title.trim();
+        if t.is_empty() { continue; }
+        if out.iter().any(|(c, x)| *c == *code && x.eq_ignore_ascii_case(t)) { continue; }
+        out.push((*code, t));
+    }
+    out
+}
+
+pub fn trade_title_bank_defs(
+    cat: &str,
+) -> (Vec<(String, String, String)>, Vec<(String, String, String)>) {
+    let pairs = trade_title_pairs();
+    let mut codes: Vec<&'static str> = Vec::new();
+    for (c, _) in pairs.iter() {
+        if !codes.iter().any(|x| x == c) { codes.push(*c); }
+    }
+    let mut bias: Vec<(String, String, String)> = Vec::new();
+    let mut prej: Vec<(String, String, String)> = Vec::new();
+    for code in codes.iter() {
+        let own: Vec<&str> = pairs
+            .iter()
+            .filter(|(c, _)| c == code)
+            .map(|(_, t)| *t)
+            .collect();
+        for t in own.iter() {
+            bias.push((cat.to_string(), code.to_string(), t.to_string()));
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (c, t) in pairs.iter() {
+            if c == code { continue; }
+            if own.iter().any(|o| o.eq_ignore_ascii_case(t)) { continue; }
+            if seen.insert(t.to_lowercase()) {
+                prej.push((cat.to_string(), code.to_string(), t.to_string()));
+            }
+        }
+    }
+    (bias, prej)
+}
+
 /// Depth 2 보조 : 서식 코드 하나의 앵커 구.
 pub fn trade_code_anchor(code: &str) -> &'static str {
     match code {
@@ -1201,7 +1948,8 @@ pub fn trade_field_category(field: &str) -> &'static str {
         //   이미 이름으로 참조합니다. 배열로 바꾸면 그 배선이 전부 끊깁니다.
         //   기존 5축은 스칼라로 두고, 나머지 역할은 other_parties 가 받습니다.
         "sender_name" | "sender_address" | "recipient_name"
-            | "recipient_address" | "notify_party_name" => "parties",
+            | "recipient_address" | "notify_party_name"
+            | "sender_tax_number" | "recipient_tax_number" => "parties",
 
         // ── other_parties (배열) ──
         //  🌟 45종 예시에서 확인된 역할은 42개입니다.
@@ -1224,14 +1972,15 @@ pub fn trade_field_category(field: &str) -> &'static str {
             | "departure_date" | "arrival_date"
             | "transport_mode" | "means_of_conveyance"
             | "flag_state" | "terminal_of_discharge"
-            | "port_of_transshipment" | "cargo_closing_date" => "logistics",
+            | "port_of_transshipment" | "cargo_closing_date"
+            | "country_of_export" | "country_of_destination" => "logistics",
 
         // ── conditions ──
         "incoterms" | "payment_terms" | "freight_payment_term"
             | "partial_shipments" | "transshipment_allowed" | "latest_shipment_date"
             | "governing_law" | "arbitration" | "non_negotiable"
             | "temperature_control" | "storage_term" | "release_instruction"
-            | "special_instructions" => "conditions",
+            | "special_instructions" | "reason_for_export" => "conditions",
 
         // ── financials ──
         //  🌟 [FINANCIAL ALIAS GUARD] CI overlay 의 'insurance' / 'freight_charge' /

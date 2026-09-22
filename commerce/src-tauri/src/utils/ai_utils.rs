@@ -1579,11 +1579,14 @@ pub fn window_assign_verdict(
     if !asked_in_window {
         return (false, "이 창이 묻지 않은 축");
     }
-    if own_neutral > 0.0 {
-        return (true, "창 안 1위이며 자기 중립점수가 양수");
-    }
     if rival_neutral <= 0.0 {
         return (true, "창 안 1위이며 경쟁 축도 양수 근거가 없음");
+    }
+    if own_neutral > 0.0 && rival_neutral - own_neutral < 1.0 {
+        return (true, "창 안 1위이며 경쟁 축과의 격차가 pooled σ 한 칸 미만");
+    }
+    if own_neutral > 0.0 {
+        return (false, "자기 중립점수는 양수이지만 경쟁 축이 pooled σ 한 칸 이상 앞섬");
     }
     (false, "자기 중립점수가 음수인데 경쟁 축은 양수 근거를 가짐")
 }
@@ -2061,6 +2064,74 @@ pub fn label_phrase_bank(doc_lang: &str, page_type: &str, field_name: &str) -> (
     if phrases.len() > 48 { phrases.truncate(48); weights.truncate(48); }
     (phrases, weights)
 }
+
+pub const BANK_LANGS: [&str; 12] = ["en", "de", "es", "fr", "ja", "pt", "ar", "cs", "it", "ko", "nl", "zh"];
+
+pub fn label_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field_name: &str) -> (Vec<String>, Vec<f32>) {
+    let mut phrases: Vec<String> = Vec::new();
+    let mut weights: Vec<f32> = Vec::new();
+    let mut order: Vec<&str> = Vec::with_capacity(BANK_LANGS.len() + 1);
+    if !primary_lang.trim().is_empty() { order.push(primary_lang); }
+    for l in BANK_LANGS.iter() {
+        if !order.iter().any(|x| x == l) { order.push(*l); }
+    }
+    for lk in order.into_iter() {
+        let (ph, wt) = label_phrase_bank(lk, page_type, field_name);
+        for (p, w) in ph.into_iter().zip(wt.into_iter()) {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+            weights.push(w);
+        }
+    }
+    (phrases, weights)
+}
+
+pub const TRADE_DOC_TITLES_ML: &[(&str, &str)] = &[
+    ("BL", "Konnossement"), ("BL", "conocimiento de embarque"), ("BL", "connaissement"),
+    ("BL", "polizza di carico"), ("BL", "conhecimento de embarque"), ("BL", "cognossement"),
+    ("BL", "konosament"), ("BL", "بوليصة الشحن"), ("BL", "선하증권"), ("BL", "船荷証券"),
+    ("BL", "提单"), ("BL", "提單"),
+    ("AWB", "Luftfrachtbrief"), ("AWB", "guía aérea"), ("AWB", "lettre de transport aérien"),
+    ("AWB", "lettera di vettura aerea"), ("AWB", "conhecimento aéreo"), ("AWB", "luchtvrachtbrief"),
+    ("AWB", "letecký nákladní list"), ("AWB", "بوليصة الشحن الجوي"), ("AWB", "항공화물운송장"),
+    ("AWB", "航空貨物運送状"), ("AWB", "航空运单"),
+    ("CI", "Handelsrechnung"), ("CI", "factura comercial"), ("CI", "facture commerciale"),
+    ("CI", "fattura commerciale"), ("CI", "fatura comercial"), ("CI", "handelsfactuur"),
+    ("CI", "obchodní faktura"), ("CI", "فاتورة تجارية"), ("CI", "상업송장"), ("CI", "커머셜 인보이스"),
+    ("CI", "商業送り状"), ("CI", "コマーシャルインボイス"), ("CI", "商业发票"),
+    ("PL", "Packliste"), ("PL", "lista de empaque"), ("PL", "liste de colisage"),
+    ("PL", "distinta di imballaggio"), ("PL", "lista de embalagem"), ("PL", "romaneio"),
+    ("PL", "paklijst"), ("PL", "balicí list"), ("PL", "قائمة التعبئة"), ("PL", "포장명세서"),
+    ("PL", "梱包明細書"), ("PL", "パッキングリスト"), ("PL", "装箱单"),
+    ("PO", "Bestellung"), ("PO", "orden de compra"), ("PO", "ordem de compra"), ("PO", "bon de commande"),
+    ("PO", "ordine di acquisto"), ("PO", "pedido de compra"), ("PO", "inkooporder"),
+    ("PO", "objednávka"), ("PO", "أمر الشراء"), ("PO", "구매주문서"), ("PO", "발주서"),
+    ("PO", "注文書"), ("PO", "発注書"), ("PO", "采购订单"),
+    ("PI", "Proformarechnung"), ("PI", "factura proforma"), ("PI", "facture pro forma"),
+    ("PI", "facture proforma"), ("PI", "fattura proforma"), ("PI", "fatura proforma"),
+    ("PI", "proformafactuur"), ("PI", "proforma faktura"), ("PI", "فاتورة مبدئية"),
+    ("PI", "견적송장"), ("PI", "프로포마 인보이스"), ("PI", "見積送り状"),
+    ("PI", "プロフォーマインボイス"), ("PI", "形式发票"),
+    ("SC", "Kaufvertrag"), ("SC", "contrato de compraventa"), ("SC", "contrat de vente"),
+    ("SC", "contratto di vendita"), ("SC", "contrato de venda"), ("SC", "koopovereenkomst"),
+    ("SC", "kupní smlouva"), ("SC", "عقد البيع"), ("SC", "매매계약서"), ("SC", "売買契約書"),
+    ("SC", "销售合同"),
+    ("LC", "Akkreditiv"), ("LC", "carta de crédito"), ("LC", "lettre de crédit"),
+    ("LC", "lettera di credito"), ("LC", "kredietbrief"), ("LC", "akreditiv"),
+    ("LC", "خطاب اعتماد"), ("LC", "신용장"), ("LC", "信用状"), ("LC", "信用证"),
+    ("CO", "Ursprungszeugnis"), ("CO", "certificado de origen"), ("CO", "certificat d'origine"),
+    ("CO", "certificato di origine"), ("CO", "certificado de origem"), ("CO", "certificaat van oorsprong"),
+    ("CO", "osvědčení o původu"), ("CO", "شهادة المنشأ"), ("CO", "원산지증명"),
+    ("CO", "原産地証明書"), ("CO", "原产地证书"),
+    ("ED", "Ausfuhranmeldung"), ("ED", "declaración de exportación"), ("ED", "déclaration d'exportation"),
+    ("ED", "dichiarazione di esportazione"), ("ED", "declaração de exportação"), ("ED", "uitvoeraangifte"),
+    ("ED", "vývozní prohlášení"), ("ED", "بيان التصدير"), ("ED", "수출신고"),
+    ("ED", "輸出申告"), ("ED", "出口报关"),
+    ("ID", "Einfuhranmeldung"), ("ID", "declaración de importación"), ("ID", "déclaration d'importation"),
+    ("ID", "dichiarazione di importazione"), ("ID", "declaração de importação"), ("ID", "invoeraangifte"),
+    ("ID", "dovozní prohlášení"), ("ID", "بيان الاستيراد"), ("ID", "수입신고"),
+    ("ID", "輸入申告"), ("ID", "进口报关"),
+];
 
 // 🌟 [PREJUDICE PHRASE BANK] bias.json 이 필드마다 손으로 써 둔 "이 컬럼이 절대 아닌 라벨" 목록입니다.
 //    예) tracking_number.prejudice 에는 "주문번호" 가 리터럴로 들어 있어
@@ -2674,17 +2745,102 @@ pub fn has_date_literal(s: &str) -> bool {
 //   1~2자리 숫자이거나 3~12자 순수 알파벳 한 덩어리.
 //   어떤 라틴 문자 언어의 월 이름도 이 모양을 벗어나지 않고,
 //   금액("2000.00")·식별자("CI-43726")·중량("20KG")은 이 모양에 들어올 수 없습니다.
+pub fn normalize_digits_ascii(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let base = match c {
+                '\u{0660}'..='\u{0669}' => Some('\u{0660}'),
+                '\u{06F0}'..='\u{06F9}' => Some('\u{06F0}'),
+                '\u{FF10}'..='\u{FF19}' => Some('\u{FF10}'),
+                _ => None,
+            };
+            match base {
+                Some(b) => char::from_u32('0' as u32 + (c as u32 - b as u32)).unwrap_or(c),
+                None => c,
+            }
+        })
+        .collect()
+}
+
+pub const MONTH_NAMES_ML: [&str; 12] = [
+    "january, jan, januar, jänner, enero, ene, janvier, janv, gennaio, gen, janeiro, januari, leden, ledna, يناير, 一月",
+    "february, feb, februar, febrero, février, févr, fév, febbraio, fevereiro, fev, februari, únor, února, فبراير, شباط, 二月",
+    "march, mar, märz, marzo, mars, março, maart, březen, března, مارس, آذار, 三月",
+    "april, apr, abril, abr, avril, avr, aprile, duben, dubna, أبريل, إبريل, نيسان, 四月",
+    "may, mai, mayo, maggio, mag, maio, mei, květen, května, مايو, أيار, 五月",
+    "june, jun, juni, junio, juin, giugno, giu, junho, červen, června, يونيو, حزيران, 六月",
+    "july, jul, juli, julio, juillet, juil, luglio, lug, julho, červenec, července, يوليو, تموز, 七月",
+    "august, aug, agosto, ago, août, aout, augustus, srpen, srpna, أغسطس, آب, 八月",
+    "september, sep, sept, septiembre, septembre, settembre, set, setembro, září, سبتمبر, أيلول, 九月",
+    "october, oct, oktober, okt, octubre, octobre, ottobre, ott, outubro, out, říjen, října, أكتوبر, 十月",
+    "november, nov, noviembre, novembre, novembro, listopad, listopadu, نوفمبر, 十一月",
+    "december, dec, dezember, dez, diciembre, dic, décembre, déc, dicembre, dezembro, prosinec, prosince, ديسمبر, 十二月",
+];
+
+const DATE_UNIT_MARKERS: [&str; 8] = ["年", "月", "日", "년", "월", "일", "号", "號"];
+
+fn lower_alnum(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+pub fn month_from_name(core: &str) -> Option<u32> {
+    let norm = lower_alnum(core);
+    if norm.is_empty() { return None; }
+    for (mi, raw) in MONTH_NAMES_ML.iter().enumerate() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(mi as u32 + 1); }
+            let cjk = p.chars().any(|c| (c as u32) >= 0x2E80);
+            if p.chars().count() < 3 && !cjk { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 3
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(mi as u32 + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn has_date_shape(s: &str) -> bool {
     if has_date_literal(s) { return true; }
-    let toks: Vec<&str> = s
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
+    let norm = normalize_digits_ascii(s);
+    if has_date_literal(&norm) { return true; }
+    let mut segs: Vec<String> = Vec::new();
+    for tok in norm.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() { segs.push(cur); }
+    }
+    let toks: Vec<String> = segs
+        .into_iter()
+        .filter(|t| {
+            if t.chars().all(|c| c.is_ascii_digit()) { return true; }
+            if DATE_UNIT_MARKERS.iter().any(|u| *u == t.as_str()) { return false; }
+            if month_from_name(t).is_some() { return true; }
+            t.chars().count() > 2
+        })
         .collect();
     if toks.len() < 2 || toks.len() > 3 { return false; }
 
     let mut years = 0usize;
     let mut days = 0usize;
-    let mut alpha = 0usize;
+    let mut months = 0usize;
     for t in toks.iter() {
         if t.chars().all(|c| c.is_ascii_digit()) {
             let n = t.chars().count();
@@ -2693,12 +2849,10 @@ pub fn has_date_shape(s: &str) -> bool {
             if n <= 2 && (1..=31).contains(&v) { days += 1; continue; }
             return false;
         }
-        if !t.chars().all(|c| c.is_alphabetic()) { return false; }
-        let n = t.chars().count();
-        if n < 3 || n > 12 { return false; }
-        alpha += 1;
+        if month_from_name(t).is_some() { months += 1; continue; }
+        return false;
     }
-    years == 1 && alpha <= 1 && (days + alpha) >= 1 && (years + days + alpha) == toks.len()
+    years == 1 && months <= 1 && (days + months) >= 1
 }
 
 // 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)

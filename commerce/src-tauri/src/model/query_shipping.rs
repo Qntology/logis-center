@@ -402,12 +402,34 @@ impl crate::model::LogisModel {
         let d1_gate = crate::utils::ai_utils::gumbel_expected_z(crate::logic::TRADE_CONDITION_CATEGORIES.len());
         let mut need_d1_llm: Vec<usize> = Vec::new();
         for (wi, w) in winners.iter().enumerate() {
-            if w.score < d1_gate && !ship_value_near(&layers.roles, w.start, w.end, 2) {
+            let value_near = ship_value_near(&layers.roles, w.start, w.end, 2);
+            if w.score < d1_gate && !value_near {
                 continue;
             }
-            if w.alts.first().map_or(false, |(_, s)| *s >= w.score * 0.9) {
-                need_d1_llm.push(wi);
+            let tied = w.alts.first().map_or(false, |(_, s)| *s >= w.score * 0.9);
+            if !tied {
+                continue;
             }
+            if value_near {
+                let accepts_value = |c: &str| -> bool {
+                    ship_category_accepts(c, crate::utils::ai_utils::FieldFormat::Numeric)
+                        || ship_category_accepts(c, crate::utils::ai_utils::FieldFormat::Identifier)
+                };
+                let (alt, alt_score) = w
+                    .alts
+                    .first()
+                    .map(|(c, s)| (c.clone(), *s))
+                    .unwrap_or((String::new(), 0.0));
+                if accepts_value(&w.category) && accepts_value(&alt) {
+                    emit_term(&format!(
+                        "   ⚡ [D1 TIE / VALUE-FIRST DEFER] \"{}\" 의 1·2위 카테고리 '{}'({:+.4}) 와 '{}'({:+.4}) 가 동률이지만, 이 스팬에는 값이 붙어 있고 두 카테고리 모두 그 값 형식의 축을 갖습니다. 값이 붙은 스팬의 필드는 D2 VALUE-FIRST 가 카테고리 경계 없이 정하므로 카테고리 재판정은 결과를 바꾸지 못합니다. LLM 을 부르지 않습니다.",
+                        w.text, w.category, w.score, alt, alt_score
+                    ));
+                    crate::utils::score_dynamics::record_baseline("search.d1_tie_deferred", 1.0);
+                    continue;
+                }
+            }
+            need_d1_llm.push(wi);
         }
 
         if !need_d1_llm.is_empty() {
@@ -1694,16 +1716,143 @@ const SHIP_TEMPORAL_OPERATOR_PIVOTS: [(&str, &str); 2] = [
     ("lte", "before, until, earlier than, no later than, on or before"),
 ];
 
+/// 시간 단위 앵커 (en·de·es·fr·it·pt·nl·cs·ar·ko·ja·zh). 닫힌 어휘이므로 먼저 완전일치로 확정하고
+/// 실패할 때만 코사인 Max-Pool 로 내려갑니다. 영어 한 언어만 두고 교차언어 코사인에 기대면
+/// "4월에" 가 day 로 읽히는 식으로 단위 뱅크가 경쟁 축(라벨·기능어)에 집니다.
 const SHIP_TIME_UNIT_PIVOTS: [(&str, &str); 3] = [
-    ("year", "year, calendar year, annual"),
-    ("month", "month, calendar month"),
-    ("day", "day, day of month"),
+    (
+        "year",
+        "year, years, yr, calendar year, annual, \
+         Jahr, Jahre, Jahres, Kalenderjahr, \
+         año, años, \
+         année, années, \
+         anno, anni, \
+         ano, anos, \
+         jaar, jaren, kalenderjaar, \
+         rok, roku, roky, \
+         سنة, سنوات, عام, أعوام, \
+         년, 년도, 연도, 해, \
+         年, 年度, 年份, ねん",
+    ),
+    (
+        "month",
+        "month, months, calendar month, \
+         Monat, Monate, Monats, Kalendermonat, \
+         mes, meses, \
+         mois, \
+         mese, mesi, \
+         mês, \
+         maand, maanden, \
+         měsíc, měsíce, měsíců, \
+         شهر, شهور, أشهر, \
+         월, 달, \
+         月, 月份, がつ",
+    ),
+    (
+        "day",
+        "day, days, \
+         Tag, Tage, Tages, \
+         día, días, \
+         jour, jours, \
+         giorno, giorni, \
+         dia, dias, \
+         dag, dagen, \
+         den, dny, dní, dne, \
+         يوم, أيام, \
+         일, 일자, 날, \
+         日, 号, にち",
+    ),
 ];
 
-const SHIP_MONTH_PIVOTS: [&str; 12] = [
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
+const SHIP_CURRENCY_NAMES: &[(&str, &str)] = &[
+    ("USD", "usd, $, dollar, dollars, 달러, 美元, 美金, 米ドル, ドル, dólar, dólares, dollaro, dollari, dolar, dolary, دولار"),
+    ("EUR", "eur, €, euro, euros, 유로, 欧元, ユーロ, يورو"),
+    ("JPY", "jpy, yen, 엔, 엔화, 円, 日元, 日圓, ين"),
+    ("CNY", "cny, rmb, yuan, renminbi, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
+    ("KRW", "krw, ₩, won, 원, 원화, 韩元, 韓元, ウォン, وون"),
+    ("GBP", "gbp, £, sterling, 英镑, 英鎊, libra esterlina, sterlina"),
 ];
+
+fn ship_normalize_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn ship_unit_exact(residue: &str) -> Option<&'static str> {
+    let norm = ship_normalize_token(residue);
+    if norm.is_empty() { return None; }
+    for (unit, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
+        for p in raw.split(',') {
+            let p = ship_normalize_token(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*unit); }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 3
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(*unit);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ship_bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
+    let dim = match bank.iter().map(|e| e.len()).max() {
+        Some(d) if d > 0 => d,
+        _ => return Vec::new(),
+    };
+    let mut c = vec![0.0f32; dim];
+    let mut cnt = 0usize;
+    for e in bank.iter() {
+        if e.len() != dim || e.iter().all(|&v| v == 0.0) { continue; }
+        for (k, v) in e.iter().enumerate() { c[k] += v; }
+        cnt += 1;
+    }
+    if cnt == 0 { return Vec::new(); }
+    let norm = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        for v in c.iter_mut() { *v /= norm; }
+    }
+    c
+}
+
+fn ship_currency_name_exact(core: &str) -> Option<&'static str> {
+    let norm = ship_normalize_token(core);
+    if norm.is_empty() { return None; }
+    for (code, raw) in SHIP_CURRENCY_NAMES.iter() {
+        for p in raw.split(',') {
+            let p = ship_normalize_token(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*code); }
+            if p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 2
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(*code);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ship_currency_symbol(raw: &str) -> Option<&'static str> {
+    for (code, list) in SHIP_CURRENCY_NAMES.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            if raw.contains(p) { return Some(*code); }
+        }
+    }
+    None
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShipTokenRole {
@@ -1903,11 +2052,48 @@ pub fn ship_iso_day_range(literal: &str) -> Option<(String, String)> {
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
         .collect();
-    if groups.len() < 3 || groups[0].len() != 4 { return None; }
+    if groups.len() < 3 { return None; }
+    if groups[0].len() == 4 {
+        let y: i32 = groups[0].parse().ok()?;
+        let m: u32 = groups[1].parse().ok()?;
+        let d: u32 = groups[2].parse().ok()?;
+        return ship_day_range(y, m, d);
+    }
+    if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        let a: u32 = groups[0].parse().ok()?;
+        let b: u32 = groups[1].parse().ok()?;
+        let y: i32 = groups[2].parse().ok()?;
+        if a > 12 && b <= 12 { return ship_day_range(y, b, a); }
+        if b > 12 && a <= 12 { return ship_day_range(y, a, b); }
+        return ship_day_range(y, b, a);
+    }
+    None
+}
+
+pub fn ship_numeric_date_literal(core: &str) -> Option<String> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/' || c == '.').collect();
+    if groups.len() != 3 { return None; }
+    if !groups.iter().all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2 {
+        return Some(core.to_string());
+    }
+    if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        return Some(core.to_string());
+    }
+    None
+}
+
+pub fn ship_year_month_literal(core: &str) -> Option<(i32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/').collect();
+    if groups.len() != 2 { return None; }
+    if groups[0].len() != 4 || groups[1].is_empty() || groups[1].len() > 2 { return None; }
+    if !groups.iter().all(|g| g.chars().all(|c| c.is_ascii_digit())) { return None; }
     let y: i32 = groups[0].parse().ok()?;
     let m: u32 = groups[1].parse().ok()?;
-    let d: u32 = groups[2].parse().ok()?;
-    ship_day_range(y, m, d)
+    if !(1..=12).contains(&m) || !(1900..=2100).contains(&y) { return None; }
+    Some((y, m))
 }
 
 pub fn ship_relative_range(key: &str, today: chrono::NaiveDate) -> Option<(String, String)> {
@@ -2326,7 +2512,10 @@ impl crate::model::LogisModel {
         let n = words.len();
         let mut logs: Vec<String> = Vec::new();
         let mut roles: Vec<ShipTokenRole> = vec![ShipTokenRole::Content; n];
-        let cores: Vec<String> = words.iter().map(|w| ship_edge_core(w)).collect();
+        let cores: Vec<String> = words
+            .iter()
+            .map(|w| crate::utils::ai_utils::normalize_digits_ascii(&ship_edge_core(w)))
+            .collect();
 
         for i in 0..n {
             if consumed_words.contains(&words[i]) {
@@ -2413,7 +2602,10 @@ impl crate::model::LogisModel {
         }
 
         let mut titles: Vec<(String, Vec<String>)> = Vec::new();
-        for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
+        for (code, title) in crate::logic::TRADE_DOC_TITLES
+            .iter()
+            .chain(crate::utils::ai_utils::TRADE_DOC_TITLES_ML.iter())
+        {
             match titles.iter_mut().find(|(t, _)| t.as_str() == *title) {
                 Some((_, codes)) => codes.push(code.to_string()),
                 None => titles.push((title.to_string(), vec![code.to_string()])),
@@ -2430,10 +2622,14 @@ impl crate::model::LogisModel {
         let mut nondate_phr: Vec<String> = Vec::new();
         for (cat, _) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
             for (fname, _, anchor) in crate::logic::trade_condition_fields(cat).iter() {
-                let phrases: Vec<String> = split_bias_phrases_full(anchor)
+                let mut phrases: Vec<String> = split_bias_phrases_full(anchor)
                     .into_iter()
                     .filter(|p| !crate::utils::ai_utils::is_value_example_phrase(p))
                     .collect();
+                let (ml, _) = crate::utils::ai_utils::label_phrase_bank_multilingual("en", "shipping_doc", fname);
+                for p in ml.into_iter() {
+                    if !phrases.contains(&p) { phrases.push(p); }
+                }
                 if crate::utils::ai_utils::query_value_format(fname) == crate::utils::ai_utils::FieldFormat::Date {
                     if !date_fields.iter().any(|(f, _)| f.as_str() == *fname) {
                         date_fields.push((fname.to_string(), phrases));
@@ -2511,7 +2707,9 @@ impl crate::model::LogisModel {
         for (_, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
             for p in split_bias_phrases_full(raw) { ship_add_text(&p, &mut texts, &mut seen); }
         }
-        for m in SHIP_MONTH_PIVOTS.iter() { ship_add_text(m, &mut texts, &mut seen); }
+        for raw in crate::utils::ai_utils::MONTH_NAMES_ML.iter() {
+            for p in split_bias_phrases_full(raw) { ship_add_text(&p, &mut texts, &mut seen); }
+        }
         for (_, _, p) in time_phr.iter() { ship_add_text(p, &mut texts, &mut seen); }
         for (_, rows, _) in enum_tables.iter() {
             for (_, phrases) in rows.iter() {
@@ -2551,7 +2749,10 @@ impl crate::model::LogisModel {
                 .collect();
             let heads: Vec<Vec<f32>> = raw_units
                 .iter()
-                .map(|(_, ph)| table.get(ph.first().map(|s| s.as_str()).unwrap_or("")).clone())
+                .map(|(_, ph)| {
+                    let bank: Vec<Vec<f32>> = ph.iter().map(|p| table.get(p).clone()).collect();
+                    ship_bank_centroid(&bank)
+                })
                 .collect();
             let mut out: Vec<(String, Vec<Vec<f32>>)> = Vec::with_capacity(raw_units.len());
             let mut dropped: Vec<String> = Vec::new();
@@ -2582,13 +2783,16 @@ impl crate::model::LogisModel {
             }
             if !dropped.is_empty() {
                 logs.push(format!(
-                    "   🧹 [TIME UNIT SELF-POISON] 자기 단위 이름보다 다른 단위 이름에 더 가까운 앵커 구 {}개를 그 단위 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 단위가 이기므로, 다른 단위의 이름을 품은 구는 그 단위를 대신 설명해 1·2위를 뒤집습니다.",
+                    "   🧹 [TIME UNIT SELF-POISON] 자기 단위 뱅크 중심보다 다른 단위 뱅크 중심에 더 가까운 앵커 구 {}개를 그 단위 뱅크에서 끕니다: {:?} — 대표를 첫 구(영어) 하나로 두면 다른 언어의 구가 교차언어 거리 때문에 잘리므로, 12개 언어 구 전체의 중심으로 판정합니다.",
                     dropped.len(), dropped
                 ));
             }
             out
         };
-        let month_embs: Vec<Vec<f32>> = SHIP_MONTH_PIVOTS.iter().map(|m| table.get(m).clone()).collect();
+        let month_banks: Vec<Vec<Vec<f32>>> = crate::utils::ai_utils::MONTH_NAMES_ML
+            .iter()
+            .map(|raw| table.bank(&split_bias_phrases_full(raw)))
+            .collect();
         let time_banks: Vec<(String, Vec<Vec<f32>>)> = time_keys
             .iter()
             .map(|k| {
@@ -2729,12 +2933,34 @@ impl crate::model::LogisModel {
                             }
                         }
                     }
-                    for k in s..e { roles[k] = ShipTokenRole::DocType; }
+                    let (ms, me) = if width > 1 {
+                        let mut best_k = usize::MAX;
+                        let mut best_v = f32::MIN;
+                        for k in s..e {
+                            let v = title_top(table.get(&cores[k]));
+                            if v > best_v {
+                                best_v = v;
+                                best_k = k;
+                            }
+                        }
+                        if best_k != usize::MAX && best_v >= top - sd {
+                            logs.push(format!(
+                                "   ✂️ [DOC TYPE / SPAN SHRINK] \"{}\" 의 서식 cos {:.4} 는 단일 토큰 \"{}\" 의 {:.4} 에 서식 뱅크 σ {:.4} 안으로 붙어 있습니다. 나머지 토큰은 서식 판정에 기여하지 않았으므로 내용어로 남기고 그 토큰만 서식으로 잡습니다.",
+                                text, top, cores[best_k], best_v, sd
+                            ));
+                            (best_k, best_k + 1)
+                        } else {
+                            (s, e)
+                        }
+                    } else {
+                        (s, e)
+                    };
+                    for k in ms..me { roles[k] = ShipTokenRole::DocType; }
                     logs.push(format!(
                         "   📄 [DOC TYPE / COSINE] \"{}\" → {:?} | 최고 '{}' cos {:.4} | z {:+.3} > √(2lnN) {:.3} | 라벨 cos {:.4}",
-                        text, codes, titles[top_i].0, top, z, title_gate, lab
+                        cores[ms..me].join(" "), codes, titles[top_i].0, top, z, title_gate, lab
                     ));
-                    doc_mentions.push(ShipDocMention { start: s, end: e, codes, exact: false });
+                    doc_mentions.push(ShipDocMention { start: ms, end: me, codes, exact: false });
                     s = e;
                     continue;
                 }
@@ -2944,15 +3170,24 @@ impl crate::model::LogisModel {
             }
         }
 
-        let month_gate = gumbel_expected_z(month_embs.len());
+        let month_gate = gumbel_expected_z(month_banks.len());
         for &i in pending.iter() {
             if roles[i] != ShipTokenRole::Content { continue; }
             let adj_num = (i > 0 && roles[i - 1] == ShipTokenRole::Numeric)
                 || (i + 1 < n && roles[i + 1] == ShipTokenRole::Numeric);
             if !adj_num { continue; }
+            if let Some(m) = crate::utils::ai_utils::month_from_name(&cores[i]) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🗓️ [MONTH NAME / EXACT] \"{}\" → {}월 | 12개 언어 월 이름 표와 완전일치합니다. 수치 토큰과 맞닿아 있을 때만 승격합니다.",
+                    cores[i], m
+                ));
+                parts.push((i, ShipTimePart::Month(m)));
+                continue;
+            }
             let q = table.get(&cores[i]);
             if q.iter().all(|&v| v == 0.0) { continue; }
-            let sims: Vec<f32> = month_embs.iter().map(|m| cosine_similarity(q, m)).collect();
+            let sims: Vec<f32> = month_banks.iter().map(|b| max_pool_sim(q, b)).collect();
             let cnt = sims.len() as f32;
             let mean = sims.iter().sum::<f32>() / cnt;
             let sd = (sims.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
@@ -2984,7 +3219,10 @@ impl crate::model::LogisModel {
                     let opb = max_pool_sim(q, &op_all_bank);
                     if let Some((_, rows, foreign)) = enum_banks.iter().find(|(f, _, _)| f == "currency") {
                         let lab = max_pool_sim(q, foreign);
-                        if let Some((code, _, _)) = ship_enum_resolve(q, &letters, rows, fun, opb, lab) {
+                        let exact = ship_currency_name_exact(&letters)
+                            .filter(|c| rows.iter().any(|(r, _)| r.as_str() == *c))
+                            .map(|c| (c.to_string(), 1.0f32, 1.0f32));
+                        if let Some((code, _, _)) = exact.or_else(|| ship_enum_resolve(q, &letters, rows, fun, opb, lab)) {
                             roles[i] = ShipTokenRole::Numeric;
                             let (value, grouped) = ship_numeric_value(&number);
                             logs.push(format!(
@@ -2999,11 +3237,31 @@ impl crate::model::LogisModel {
         }
 
         let mut year_like: Vec<(usize, i32)> = Vec::new();
+        let mut day_like: Vec<(usize, u32)> = Vec::new();
         let mut conditional_time: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
         for i in 0..n {
             if roles[i] != ShipTokenRole::Numeric { continue; }
             if numerics_raw.iter().any(|x| x.token == i) { continue; }
             let core = &cores[i];
+            if let Some((yy, mm)) = ship_year_month_literal(core) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🕒 [YEAR-MONTH LITERAL] \"{}\" → Year({}), Month({}) | '연도-월' 두 조각 수치입니다. 마침표 구분은 금액(2000.05)과 겹치므로 '-' 와 '/' 만 인정합니다.",
+                    cores[i], yy, mm
+                ));
+                parts.push((i, ShipTimePart::Year(yy)));
+                parts.push((i, ShipTimePart::Month(mm)));
+                continue;
+            }
+            if let Some(lit) = ship_numeric_date_literal(core) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🕒 [DATE LITERAL] \"{}\" → 세 조각 수치 날짜 | 4자리 연도가 앞이면 연-월-일, 뒤이면 일-월-연으로 읽습니다. 두 조각이 모두 12 이하인 모호한 표기도 일-월 순(de·fr·es·it·pt·nl·cs·ar 관례)으로 둡니다. 정규식 경로는 '19.04.2022' 를 '19.04.20' 으로 잘라 연도를 잃습니다.",
+                    cores[i]
+                ));
+                parts.push((i, ShipTimePart::Iso(lit)));
+                continue;
+            }
             if let Some(lit) = crate::utils::ai_utils::extract_date_literal(core) {
                 roles[i] = ShipTokenRole::Temporal;
                 parts.push((i, ShipTimePart::Iso(lit)));
@@ -3016,8 +3274,27 @@ impl crate::model::LogisModel {
             if residue.is_empty() {
                 if let Some(v) = int_val {
                     if digits == 4 && (1900..=2100).contains(&v) { year_like.push((i, v as i32)); }
+                    if digits <= 2 && (1..=31).contains(&v) { day_like.push((i, v as u32)); }
                 }
                 continue;
+            }
+            if let (Some(unit_key), Some(v)) = (ship_unit_exact(&residue), int_val) {
+                let exact = match unit_key {
+                    "year" if digits == 4 && (1..=9999).contains(&v) => Some(ShipTimePart::Year(v as i32)),
+                    "month" if (1..=12).contains(&v) => Some(ShipTimePart::Month(v as u32)),
+                    "day" if (1..=31).contains(&v) => Some(ShipTimePart::Day(v as u32)),
+                    _ => None,
+                };
+                if let Some(p) = exact {
+                    roles[i] = ShipTokenRole::Temporal;
+                    crate::utils::score_dynamics::record_baseline("search.time.unit_exact", 1.0);
+                    logs.push(format!(
+                        "   🕒 [TIME UNIT / EXACT] \"{}\" → {:?} | 잔여 \"{}\" 가 12개 언어 단위 표의 '{}' 와 완전일치합니다. 닫힌 어휘는 코사인 경쟁에 넣지 않습니다.",
+                        cores[i], p, residue, unit_key
+                    ));
+                    parts.push((i, p));
+                    continue;
+                }
             }
             let q = table.get(&residue);
             if q.iter().all(|&v| v == 0.0) { continue; }
@@ -3086,6 +3363,28 @@ impl crate::model::LogisModel {
             ));
             parts.push((i, p));
         }
+        for j in 0..n {
+            if roles[j] != ShipTokenRole::Content { continue; }
+            if ship_unit_exact(&cores[j]) != Some("year") { continue; }
+            for k in [j.wrapping_sub(1), j + 1] {
+                if k >= n || roles[k] != ShipTokenRole::Numeric { continue; }
+                let pos = match year_like.iter().position(|(i, _)| *i == k) {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+                let (_, y) = year_like.remove(pos);
+                roles[k] = ShipTokenRole::Temporal;
+                roles[j] = ShipTokenRole::Temporal;
+                crate::utils::score_dynamics::record_baseline("search.time.unit_exact", 1.0);
+                logs.push(format!(
+                    "   🕒 [YEAR UNIT WORD / EXACT] \"{}\" + \"{}\" → Year({}) | 띄어 쓴 연도 단위어가 12개 언어 단위 표의 'year' 와 완전일치하고 이웃 수치가 4자리 연도입니다. 붙여 쓰는 한국어·CJK 와 달리 de·fr·es·it·pt·nl·cs·ar·en 은 단위어가 별도 토큰으로 옵니다. 월·일 단위어는 '3 months' 같은 기간 표현과 겹치므로 연도에만 적용합니다.",
+                    cores[j], cores[k], y
+                ));
+                parts.push((k, ShipTimePart::Year(y)));
+                parts.push((j, ShipTimePart::Year(y)));
+                break;
+            }
+        }
         loop {
             let mut promoted = false;
             let mut rest: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
@@ -3132,6 +3431,24 @@ impl crate::model::LogisModel {
                 }
             }
             year_like = rest_years;
+            let mut rest_days: Vec<(usize, u32)> = Vec::new();
+            for (i, d) in day_like.into_iter() {
+                let near_month = parts
+                    .iter()
+                    .any(|(k, p)| (*k + 1 == i || *k == i + 1) && matches!(p, ShipTimePart::Month(_)));
+                if near_month {
+                    roles[i] = ShipTokenRole::Temporal;
+                    logs.push(format!(
+                        "   🗓️ [DAY / ADJACENT] \"{}\" → Day({}) | 월 조각과 맞닿은 1~31 정수입니다. 일·월·연이 따로 인쇄된 표기를 한 구간으로 묶습니다.",
+                        cores[i], d
+                    ));
+                    parts.push((i, ShipTimePart::Day(d)));
+                    promoted = true;
+                } else {
+                    rest_days.push((i, d));
+                }
+            }
+            day_like = rest_days;
             if !promoted { break; }
         }
         for (i, cands, unit_top, rival, lenient) in conditional_time.into_iter() {
@@ -3203,10 +3520,12 @@ impl crate::model::LogisModel {
                     if first > 1 && roles.get(first - 1) == Some(&ShipTokenRole::Content) {
                         label_cands.push(first - 2);
                     }
-                    let scope_codes: Vec<String> = doc_mentions
-                        .iter()
-                        .flat_map(|m| m.codes.iter().cloned())
-                        .collect();
+                    let mut scope_codes: Vec<String> = Vec::new();
+                    for m in doc_mentions.iter() {
+                        for c in m.codes.iter() {
+                            if !scope_codes.contains(c) { scope_codes.push(c.clone()); }
+                        }
+                    }
                     let in_scope_schema = |f: &str| -> bool {
                         if scope_codes.is_empty() { return true; }
                         let mut checked = 0usize;
@@ -3233,24 +3552,88 @@ impl crate::model::LogisModel {
                     } else {
                         scoped_banks
                     };
+                    // 허브 보정: 'ETA'·'ETD' 같은 짧은 약어 구는 어떤 토큰과도 코사인이 높아 Max-Pool 에서
+                    // 자기 축을 대신 이깁니다. 살아 있는 질의 토큰 전체를 배경으로 구마다 평균 코사인을 재고
+                    // 그 성분을 뺀 뒤에야 "이 토큰에만 반응한 구" 가 남습니다.
+                    let bg: Vec<Vec<f32>> = cores
+                        .iter()
+                        .map(|c| table.get(c).clone())
+                        .filter(|v| !v.iter().all(|&x| x == 0.0))
+                        .collect();
+                    let hub_of = |e: &Vec<f32>| -> f32 {
+                        if bg.is_empty() { return 0.0; }
+                        bg.iter().map(|t| cosine_similarity(t, e)).sum::<f32>() / bg.len() as f32
+                    };
+                    let pool_hub: Vec<Vec<f32>> = pool
+                        .iter()
+                        .map(|(_, b)| b.iter().map(|e| hub_of(e)).collect())
+                        .collect();
+                    let nd_hub: Vec<f32> = nondate_bank.iter().map(|e| hub_of(e)).collect();
                     let mut best: Option<(usize, String, f32)> = None;
                     for j in label_cands.into_iter() {
                         if roles.get(j) != Some(&ShipTokenRole::Content) { continue; }
                         let q = table.get(&cores[j]);
                         if q.iter().all(|&v| v == 0.0) { continue; }
-                        let (bf, bs) = pool
+                        let mut all: Vec<f32> = Vec::new();
+                        let mut per_field: Vec<(String, f32, usize)> = Vec::new();
+                        for (fi, (f, b)) in pool.iter().enumerate() {
+                            if b.is_empty() { continue; }
+                            let mut mx = f32::MIN;
+                            for (ei, e) in b.iter().enumerate() {
+                                let s = cosine_similarity(q, e) - pool_hub[fi][ei];
+                                all.push(s);
+                                if s > mx { mx = s; }
+                            }
+                            per_field.push((f.clone(), mx, b.len()));
+                        }
+                        let mut nd_mx = f32::MIN;
+                        for (ei, e) in nondate_bank.iter().enumerate() {
+                            let s = cosine_similarity(q, e) - nd_hub[ei];
+                            all.push(s);
+                            if s > nd_mx { nd_mx = s; }
+                        }
+                        if per_field.is_empty() || nondate_bank.is_empty() || all.len() < 2 { continue; }
+                        let cnt = all.len() as f32;
+                        let mean = all.iter().sum::<f32>() / cnt;
+                        let sd = (all.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                        if sd <= 1e-6 { continue; }
+                        let z_of = |mx: f32, n: usize| -> f32 { (mx - mean) / sd - gumbel_expected_z(n.max(1)) };
+                        let mut ranked: Vec<(String, f32)> = per_field
                             .iter()
-                            .map(|(f, b)| (f.clone(), max_pool_sim(q, b)))
-                            .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
-                        let nd = max_pool_sim(q, &nondate_bank);
-                        if bs >= nd && best.as_ref().map_or(true, |b| bs > b.2) { best = Some((j, bf, bs)); }
+                            .map(|(f, mx, n)| (f.clone(), z_of(*mx, *n)))
+                            .collect();
+                        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        let z_nd = z_of(nd_mx, nondate_bank.len());
+                        let (bf, bz) = ranked[0].clone();
+                        let second = ranked.get(1).map(|x| x.1).unwrap_or(f32::MIN);
+                        // 날짜 축끼리의 z 표준편차. 1·2위 격차가 그 안이면 어느 축인지를 답한 것이 아니라 잡음이
+                        // 답한 것이므로 기본 축(issue_date)으로 물러납니다. 틀린 축을 하드 조건으로 잠그면 0건이 확정되고,
+                        // 치환으로 살아나더라도 SDS 에는 그 축의 '단독 차단' 이 오기록됩니다.
+                        let zs: Vec<f32> = ranked.iter().map(|x| x.1).collect();
+                        let zm = zs.iter().sum::<f32>() / zs.len() as f32;
+                        let zsd = (zs.iter().map(|x| (x - zm) * (x - zm)).sum::<f32>() / zs.len() as f32).sqrt();
+                        let ambiguous = ranked.len() >= 2 && (bz - second) < zsd;
+                        logs.push(format!(
+                            "   📅 [DATE LABEL PROBE] \"{}\" | 허브 보정 z 순위 [{}] vs 비날짜 라벨 z {:+.3} (구 {}개) | 1·2위 격차 {:+.3} vs 축 간 σ {:.3}{} — 구마다 질의 토큰 전체와의 평균 코사인(허브 성분)을 뺀 뒤 √(2 ln N) 기대 최댓값을 다시 뺐습니다. 약어 한 구가 뱅크 전체를 대신 이기는 자리를 막습니다.",
+                            cores[j],
+                            ranked.iter().take(3).map(|(f, z)| format!("{}{:+.3}", f, z)).collect::<Vec<_>>().join(", "),
+                            z_nd,
+                            nondate_bank.len(),
+                            bz - second,
+                            zsd,
+                            if ambiguous { " → 모호, 기본 축으로 후퇴" } else { "" }
+                        ));
+                        if ambiguous { continue; }
+                        if bz >= z_nd && best.as_ref().map_or(true, |b| bz > b.2) {
+                            best = Some((j, bf, bz));
+                        }
                     }
                     let field = match best {
                         Some((j, f, s)) => {
                             roles[j] = ShipTokenRole::Temporal;
                             tokens.push(j);
                             logs.push(format!(
-                                "   📅 [DATE FIELD / COSINE] 날짜 라벨 \"{}\" → {} (cos {:.4})",
+                                "   📅 [DATE FIELD / COSINE] 날짜 라벨 \"{}\" → {} (기대 최댓값 보정 z {:+.3})",
                                 cores[j], f, s
                             ));
                             f
@@ -3294,11 +3677,26 @@ impl crate::model::LogisModel {
         let mut enum_hits: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
         for i in 0..n {
             if roles[i] != ShipTokenRole::Content { continue; }
+            let adj_num = (i > 0 && roles[i - 1] == ShipTokenRole::Numeric)
+                || (i + 1 < n && roles[i + 1] == ShipTokenRole::Numeric);
             let q = table.get(&cores[i]);
-            if q.iter().all(|&v| v == 0.0) { continue; }
             let fun = max_pool_sim(q, &func_bank);
             let opb = max_pool_sim(q, &op_all_bank);
             for (field, rows, foreign) in enum_banks.iter() {
+                if field == "currency" && adj_num {
+                    let exact = ship_currency_name_exact(&cores[i])
+                        .or_else(|| ship_currency_symbol(&words[i]))
+                        .filter(|c| rows.iter().any(|(r, _)| r.as_str() == *c));
+                    if let Some(code) = exact {
+                        logs.push(format!(
+                            "   🏷️ [ENUM VALUE / EXACT] \"{}\" → {} = {} | 통화 명칭·기호 표와 완전일치합니다. 수치 토큰과 맞닿아 있을 때만 적용합니다.",
+                            cores[i], field, code
+                        ));
+                        enum_hits[i].push((field.clone(), code.to_string()));
+                        continue;
+                    }
+                }
+                if q.iter().all(|&v| v == 0.0) { continue; }
                 let lab = max_pool_sim(q, foreign);
                 if let Some((code, cos, gap)) = ship_enum_resolve(q, &cores[i], rows, fun, opb, lab) {
                     logs.push(format!(
@@ -3317,7 +3715,20 @@ impl crate::model::LogisModel {
             if value.is_empty() { continue; }
             let mut currency = String::new();
             let residue = ship_numeric_residue(&cores[i]);
-            if !residue.is_empty() {
+            let exact_cur = ship_currency_name_exact(&residue)
+                .or_else(|| ship_currency_symbol(&words[i]))
+                .filter(|c| {
+                    enum_banks
+                        .iter()
+                        .any(|(f, rows, _)| f == "currency" && rows.iter().any(|(r, _)| r.as_str() == *c))
+                });
+            if let Some(code) = exact_cur {
+                currency = code.to_string();
+                logs.push(format!(
+                    "   💱 [CURRENCY / EXACT] \"{}\" → {} | 수치에 붙은 통화 명칭·기호가 표와 완전일치합니다.",
+                    words[i], code
+                ));
+            } else if !residue.is_empty() {
                 let q = table.get(&residue);
                 let fun = max_pool_sim(q, &func_bank);
                 let opb = max_pool_sim(q, &op_all_bank);

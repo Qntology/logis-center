@@ -401,7 +401,7 @@ impl crate::model::LogisModel {
                         let mut phr_all: Vec<String> = Vec::new();
                         let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
                         for f in schema_fields.iter() {
-                            let (ph, wt) = crate::utils::ai_utils::label_phrase_bank(&language, "shipping_doc", f);
+                            let (ph, wt) = crate::utils::ai_utils::label_phrase_bank_multilingual(&language, "shipping_doc", f);
                             for p in ph.iter() {
                                 if !phr_all.contains(p) { phr_all.push(p.clone()); }
                             }
@@ -856,10 +856,14 @@ impl crate::model::LogisModel {
                                         let low = label.to_lowercase();
                                         let mut best_len = 0usize;
                                         let mut codes: Vec<String> = Vec::new();
-                                        for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
+                                        for (code, title) in crate::logic::TRADE_DOC_TITLES
+                                            .iter()
+                                            .chain(crate::utils::ai_utils::TRADE_DOC_TITLES_ML.iter())
+                                        {
                                             let t = title.to_lowercase();
                                             let n = t.chars().count();
-                                            if n < 5 || !low.contains(&t) { continue; }
+                                            let min_n = if t.chars().any(|c| (c as u32) >= 0x2E80) { 2 } else { 5 };
+                                            if n < min_n || !low.contains(&t) { continue; }
                                             if n > best_len {
                                                 best_len = n;
                                                 codes.clear();
@@ -884,11 +888,15 @@ impl crate::model::LogisModel {
                                             rest_embs.push(pair_embs.get(pi).cloned().unwrap_or_default());
                                             continue;
                                         }
-                                        let target = codes.iter().find_map(|c| {
-                                            crate::logic::trade_reference_field_of(c)
-                                                .filter(|rf| schema_fields.iter().any(|f| f.as_str() == *rf))
-                                                .map(|rf| (c.clone(), rf.to_string()))
-                                        });
+                                        let target = if crate::utils::ai_utils::has_date_shape(v) {
+                                            None
+                                        } else {
+                                            codes.iter().find_map(|c| {
+                                                crate::logic::trade_reference_field_of(c)
+                                                    .filter(|rf| schema_fields.iter().any(|f| f.as_str() == *rf))
+                                                    .map(|rf| (c.clone(), rf.to_string()))
+                                            })
+                                        };
                                         match target {
                                             Some((code, rf)) => {
                                                 let emb = pair_embs.get(pi).cloned().unwrap_or_default();
@@ -1537,9 +1545,20 @@ impl crate::model::LogisModel {
                         let recovery_ceiling = plans.len().max(4);
                         let mut cands: Vec<(String, String, usize, f32)> = Vec::new();
                         let is_filled = |f: &str| -> bool {
+                            let non_empty = |v: &Value| -> bool {
+                                !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                            };
+                            if final_data_map.get(f).map(|v| non_empty(v)).unwrap_or(false) {
+                                return true;
+                            }
+                            let cat = crate::logic::trade_field_category(f);
+                            if cat.is_empty() || !crate::logic::is_trade_array_category(cat) {
+                                return false;
+                            }
                             final_data_map
-                                .get(f)
-                                .map(|v| !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
+                                .get(cat)
+                                .and_then(|v| v.as_array())
+                                .map(|rows| rows.iter().any(|r| r.get(f).map(|v| non_empty(v)).unwrap_or(false)))
                                 .unwrap_or(false)
                         };
                         let mut filled_peaks: Vec<usize> = Vec::new();
@@ -2049,8 +2068,8 @@ impl crate::model::LogisModel {
                                         } else if !rival_in_window {
                                             crate::utils::score_dynamics::record_baseline("vision.window_argmax", 0.0);
                                             emit_term(&format!(
-                                                "      🚫 [WINDOW ARGMAX BLOCKED] {}.{} = \"{}\" | 이 창이 그 축 하나만 물었으므로 창 안 argmax 는 자동으로 자기 자신입니다. 그러나 자기 중립점수가 {:+.4} 로 음수이고 경쟁 축 '{}' 는 {:+.4} 로 양수라, 읽힌 라벨이 이 축을 설명할 가능성 자체가 없습니다. 상대 근거만 보고 절대 근거를 버리면 창이 축 하나만 물을 때 게이트가 무조건 열립니다. 아래 REROUTE 로 소유 축을 찾습니다.",
-                                                cat, field, value, own, rival_field, rival
+                                                "      🚫 [WINDOW ARGMAX BLOCKED] {}.{} = \"{}\" | 이 창이 그 축 하나만 물었으므로 창 안 argmax 는 자동으로 자기 자신입니다. 자기 중립점수 {:+.4} vs 경쟁 축 '{}' {:+.4} — {}. 양수라는 이유만으로 통과시키면 '이름' 계열 축 전부가 평균 위에 서는 라벨(SIGNATORY NAME)이 창을 연 축으로 흘러듭니다. 아래 REROUTE 로 소유 축을 찾습니다.",
+                                                cat, field, value, own, rival_field, rival, why
                                             ));
                                         }
                                     }
@@ -2567,6 +2586,7 @@ impl crate::model::LogisModel {
                     for axis in [
                         "issue_date", "expiry_date", "etd", "eta",
                         "departure_date", "arrival_date", "due_date",
+                        "latest_shipment_date", "valid_until",
                         "transaction_date", "declaration_date", "clearance_date",
                     ] {
                         let v = match read_axis(axis) { Some(v) => v, None => continue };
