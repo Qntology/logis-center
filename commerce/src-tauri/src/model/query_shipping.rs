@@ -748,11 +748,28 @@ impl crate::model::LogisModel {
                     let currency_bound = bound_nums[wi].iter().any(|n| !n.currency.is_empty());
                     let tie_floor = scored.first().map(|s| s.2 - 0.005).unwrap_or(f32::MAX);
                     let tied_total = scored.iter().filter(|(_, _, sc)| *sc >= tie_floor).count();
-                    let tied_monetary: Vec<String> = scored
+                    let span_is_row = crate::logic::is_trade_array_category(&winners[wi].category);
+                    let tied_monetary_all: Vec<String> = scored
                         .iter()
                         .filter(|(f, _, sc)| *sc >= tie_floor && ship_is_monetary(f))
                         .map(|(f, _, _)| f.clone())
                         .collect();
+                    let tied_monetary: Vec<String> = tied_monetary_all
+                        .iter()
+                        .filter(|f| {
+                            span_is_row
+                                || !ship_field_category(f.as_str())
+                                    .map(|c| crate::logic::is_trade_array_category(&c))
+                                    .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if tied_monetary_all.len() != tied_monetary.len() {
+                        emit_term(&format!(
+                            "   🧾 [D2 CURRENCY TIE-BREAK / ROW AXIS] \"{}\" 는 표 행 카테고리가 아닌 '{}' 스팬이라, 동률 금전 축 {:?} 중 표 행 축을 제외한 {:?} 만 문서 단위 후보로 둡니다. 행 축은 ship_make_assignment 에서도 힌트로만 내려가므로 문서 총액 조건의 후보가 될 수 없습니다.",
+                            winners[wi].text, winners[wi].category, tied_monetary_all, tied_monetary
+                        ));
+                    }
                     let taken_elsewhere = tied_monetary
                         .first()
                         .map(|f| {
