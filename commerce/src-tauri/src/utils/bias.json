@@ -2298,9 +2298,9 @@
         "prejudice": "총액, 합계, 총금액, 세액, 부가세, 운임, 보험료, 통화, 중량, 수량, 서류번호, 사업자등록번호, 부가세번호, 통관고유부호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, business registration number"
       },
       "amount_tax": {
-        "semantic": "세액, 부가세",
-        "bias": "세액, 부가세, 부가가치세, 세금, 관세, tax amount, VAT amount, duty amount, tax payable",
-        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호, 사업자등록번호, 부가세번호, 부가세 등록번호, 세금계산서 번호, 통관고유부호, 수출자부호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, taxpayer ID, TIN, business registration number, customs registration number"
+        "semantic": "세액, 부가세액",
+        "bias": "세액, 부가세액, 부가가치세액, 관세액, 납부세액, tax amount, VAT amount, duty amount, tax payable, Steuerbetrag, MwSt.-Betrag, montant de la TVA, importe del IVA, importo IVA, valor do IVA, btw-bedrag, částka DPH, مبلغ الضريبة, 税額, 消費税額, 税额, 增值税额",
+        "prejudice": "소계, 공급가액, 총액, 합계, 운임, 보험료, 통화, 중량, 수량, 서류번호, 사업자등록번호, 부가세번호, 부가세 등록번호, 세금계산서 번호, 통관고유부호, 수출자부호, VAT number, VAT registration number, VAT/EORI, EORI, EORI number, tax identification number, taxpayer ID, TIN, business registration number, customs registration number, USt-IdNr., Umsatzsteuer-Identifikationsnummer, Steuernummer, EORI-Nummer, numéro de TVA, numéro EORI, número de IVA, NIF, CIF, partita IVA, codice fiscale, número de contribuinte, btw-nummer, btw-identificatienummer, DIČ, daňové identifikační číslo, IČO, رقم التسجيل الضريبي, 法人番号, 適格請求書発行事業者登録番号, 納税者番号, 纳税人识别号, 统一社会信用代码, 海关注册编码"
       },
       "freight_amount": {
         "semantic": "운임, 운송비",
@@ -3430,9 +3430,9 @@
         "prejudice": "total amount, grand total, tax, VAT, freight, insurance, currency, weight, quantity, document number"
       },
       "amount_tax": {
-        "semantic": "Tax, VAT",
-        "bias": "VAT, tax, tax amount, VAT amount, duty",
-        "prejudice": "subtotal, total amount, grand total, freight, insurance, currency, weight, quantity, document number"
+        "semantic": "Tax amount, VAT amount",
+        "bias": "tax amount, VAT amount, duty amount, tax payable, sales tax amount, Steuerbetrag, MwSt.-Betrag, USt.-Betrag, montant de la taxe, montant de la TVA, importe del impuesto, importe del IVA, importo imposta, importo IVA, valor do imposto, valor do IVA, belastingbedrag, btw-bedrag, částka daně, částka DPH, مبلغ الضريبة, مبلغ ضريبة القيمة المضافة, 税額, 消費税額, 税额, 增值税额, 세액, 부가세액",
+        "prejudice": "subtotal, total amount, grand total, freight, insurance, currency, weight, quantity, document number, VAT number, VAT registration number, VAT/EORI, EORI number, tax identification number, taxpayer ID, TIN, business registration number, customs registration number, USt-IdNr., Umsatzsteuer-Identifikationsnummer, Steuernummer, EORI-Nummer, numéro de TVA, numéro EORI, numéro d'identification fiscale, número de IVA, NIF, CIF, número EORI, partita IVA, codice fiscale, numero EORI, número de contribuinte, btw-nummer, btw-identificatienummer, EORI-nummer, DIČ, daňové identifikační číslo, IČO, رقم التسجيل الضريبي, الرقم الضريبي, 法人番号, 適格請求書発行事業者登録番号, 納税者番号, 纳税人识别号, 统一社会信用代码, 海关注册编码, 사업자등록번호, 부가세번호, 통관고유부호, 수출자부호"
       },
       "freight_amount": {
         "semantic": "Freight, freight charge",

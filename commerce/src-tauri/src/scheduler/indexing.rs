@@ -342,6 +342,13 @@ pub async fn index_item_chunks(
         } else {
             let (mut phrases, mut weights_inner) =
                 crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+            let (ml_ph, ml_wt) =
+                crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, page_type, fname);
+            for (p, w) in ml_ph.into_iter().zip(ml_wt.into_iter()) {
+                if phrases.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
+                phrases.push(p);
+                weights_inner.push(w);
+            }
             let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
             for p in bridge_ph {
                 if phrases.iter().any(|e| e == &p) { continue; }

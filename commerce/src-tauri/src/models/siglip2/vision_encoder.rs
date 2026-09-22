@@ -471,30 +471,26 @@ fn run_title_gate(
     chrome_phrases: &[String],
     emit: &dyn Fn(&str),
 ) -> Option<(TitleGateVerdict, Vec<(String, f32)>)> {
-    let empty_names: Vec<String> = Vec::new();
-    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
-    let empty_skip: Vec<bool> = Vec::new();
+    let (t_bias, mut t_prej) = crate::logic::trade_title_bank_defs("title");
+    if t_bias.is_empty() {
+        return None;
+    }
 
-    // ── 뱅크: bias = 자기 전문 1구, prejudice = 다른 전문 + 크롬 ──
-    let mut t_bias: Vec<(String, String, String)> = Vec::new();
-    let mut t_prej: Vec<(String, String, String)> = Vec::new();
-
-    for (code, title) in TRADE_DOC_TITLES.iter() {
-        t_bias.push(("title".to_string(), code.to_string(), title.to_string()));
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-        for (other, other_title) in TRADE_DOC_TITLES.iter() {
-            if other == code {
-                continue;
-            }
-            if seen.insert(other_title) {
-                t_prej.push(("title".to_string(), code.to_string(), other_title.to_string()));
-            }
+    {
+        let mut codes: Vec<String> = Vec::new();
+        for (_, k, _) in t_bias.iter() {
+            if !codes.iter().any(|x| x == k) { codes.push(k.clone()); }
         }
-
-        for p in chrome_phrases.iter() {
-            if seen.insert(p.as_str()) {
-                t_prej.push(("title".to_string(), code.to_string(), p.clone()));
+        for code in codes.iter() {
+            let mut seen: std::collections::HashSet<String> = t_prej
+                .iter()
+                .filter(|(_, k, _)| k == code)
+                .map(|(_, _, p)| p.to_lowercase())
+                .collect();
+            for p in chrome_phrases.iter() {
+                if seen.insert(p.to_lowercase()) {
+                    t_prej.push(("title".to_string(), code.clone(), p.clone()));
+                }
             }
         }
     }
@@ -504,69 +500,49 @@ fn run_title_gate(
         Err(_) => return None,
     };
 
-    // ── 상단 30% 행만 제목 밴드로 봅니다 (레이아웃 구조 사실) ──
     let title_rows = (grid.grid_rows * 3 / 10).max(1);
-    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let (keys, matrix) = score_patches_bank_neutral(grid, &bank, None);
+    if keys.is_empty() {
+        return None;
+    }
 
-    // 🌟 [LOG] 타이틀 게이트 스캔 범위 및 패치 카운터
-    let mut scanned_patches = 0usize;
-    let mut active_patches = 0usize;
-    let mut positive_patches = 0usize;
+    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut patch_best: std::collections::HashMap<String, (usize, usize, usize, f32)> =
         std::collections::HashMap::new();
 
-    emit(&format!(
-        "     🔍 [TITLE GATE SCAN] 상단 밴드: {}행 / 전체 {}행 | 스캔 패치 범위: 0~{}",
-        title_rows, grid.grid_rows, title_rows * grid.grid_cols
-    ));
-
+    let mut scanned_patches = 0usize;
+    let mut active_patches = 0usize;
+    let mut positive_patches = 0usize;
     for idx in 0..grid.len() {
-        let (r, c) = grid.rc(idx);
-        if r >= title_rows {
-            continue;
-        }
-
+        if grid.rc(idx).0 >= title_rows { continue; }
         scanned_patches += 1;
-
-        let p = &grid.patches[idx];
-        if p.iter().all(|&v| v == 0.0) {
-            continue;
-        }
-
-        active_patches += 1;
-
-        let (scores, _) = surprisal_dual_scores(
-            p,
-            &bank.bias,
-            &bank.prejudice,
-            &empty_names,
-            &empty_banks,
-            &empty_skip,
-        );
-
-        if scores.is_empty() {
-            continue;
-        }
-
-        if scores[0].surprisal <= 0.0 {
-            continue;
-        }
-
-        positive_patches += 1;
-
-        for s in scores {
-            let e = best.entry(s.key.clone()).or_insert(f32::MIN);
-            if s.surprisal > *e {
-                *e = s.surprisal;
-                patch_best.insert(s.key.clone(), (idx, r, c, s.surprisal));
-            }
-        }
+        if !grid.patches[idx].iter().all(|&v| v == 0.0) { active_patches += 1; }
     }
 
-    // 🌟 [LOG] 타이틀 게이트 스캔 요약
     emit(&format!(
-        "     🔍 [TITLE GATE SCAN RESULT] 스캔 {} | 활성 {} | 양수 {} | 전문 키 {}개 발견",
-        scanned_patches, active_patches, positive_patches, best.len()
+        "     🔍 [TITLE GATE SCAN] 상단 밴드 {}행 / 전체 {}행 | 밴드 패치 {}개(활성 {}개) | 전문 구 {}개 · 편견 구 {}개 | 기준선은 전 페이지, 봉우리는 상단 밴드에서만 취합니다.",
+        title_rows, grid.grid_rows, scanned_patches, active_patches, t_bias.len(), t_prej.len()
+    ));
+
+    for (ki, key) in keys.iter().enumerate() {
+        let mut mx = f32::MIN;
+        let mut at = usize::MAX;
+        for idx in 0..grid.len() {
+            let v = matrix[ki][idx];
+            if v == f32::MIN { continue; }
+            if grid.rc(idx).0 >= title_rows { continue; }
+            if v > mx { mx = v; at = idx; }
+        }
+        if mx == f32::MIN || mx <= 0.0 || at == usize::MAX { continue; }
+        positive_patches += 1;
+        let (r, c) = grid.rc(at);
+        best.insert(key.clone(), mx);
+        patch_best.insert(key.clone(), (at, r, c, mx));
+    }
+
+    emit(&format!(
+        "     🔍 [TITLE GATE SCAN RESULT] 밴드 패치 {} | 활성 {} | 양수 전문 {}개 / 전체 {}개 (BANK-NEUTRAL, √(2 ln N) 차감 폐기)",
+        scanned_patches, active_patches, positive_patches, keys.len()
     ));
 
     if !patch_best.is_empty() {
@@ -667,10 +643,15 @@ pub fn classify_doc_type(
     //    같은 문자열을 매번 다시 쪼개고 HashSet 을 다시 만드는 순수 낭비입니다.
     let group_phrases: Vec<(&str, Vec<String>)> = crate::logic::TRADE_GROUPS
         .iter()
-        .map(|(g, raw)| (*g, split_bias_phrases_full(raw)))
+        .map(|(g, raw)| {
+            let mut own = split_bias_phrases_full(raw);
+            for t in crate::utils::ai_utils::trade_group_title_phrases(g) {
+                if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
+            }
+            (*g, own)
+        })
         .collect();
-    let chrome_phrases: Vec<String> =
-        split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR);
+    let chrome_phrases: Vec<String> = crate::logic::vision_chrome_phrases();
 
     let mut g_bias: Vec<(String, String, String)> = Vec::new();
     let mut g_prej: Vec<(String, String, String)> = Vec::new();
@@ -683,6 +664,7 @@ pub fn classify_doc_type(
                 continue;
             }
             for p in other_phrases.iter() {
+                if phrases.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
                 g_prej.push(("group".to_string(), gname.to_string(), p.clone()));
             }
         }
@@ -822,7 +804,13 @@ pub fn classify_doc_type(
 
     let code_phrases: Vec<(&str, Vec<String>)> = codes
         .iter()
-        .map(|c| (*c, split_bias_phrases_full(crate::logic::trade_code_anchor(c))))
+        .map(|c| {
+            let mut own = split_bias_phrases_full(crate::logic::trade_code_anchor(c));
+            for t in crate::utils::ai_utils::trade_code_title_phrases(c) {
+                if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
+            }
+            (*c, own)
+        })
         .collect();
 
     let mut c_bias: Vec<(String, String, String)> = Vec::new();
@@ -838,6 +826,7 @@ pub fn classify_doc_type(
                 continue;
             }
             for p in other_phrases.iter() {
+                if phrases.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
                 if seen.insert(p.as_str()) {
                     c_prej.push(("code".to_string(), c.to_string(), p.clone()));
                 }
@@ -1160,6 +1149,19 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
+        let (ml_phrases, _) = crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, doc_type, fname);
+        for p in ml_phrases.into_iter() {
+            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+                continue;
+            }
+            if bias_defs
+                .iter()
+                .any(|(c, k, e)| c == cat && k == fname && e.eq_ignore_ascii_case(&p))
+            {
+                continue;
+            }
+            bias_defs.push((cat.to_string(), fname.clone(), p));
+        }
     }
 
     // 🌟 [TABLE STRUCTURE ANCHOR 편입]
@@ -1220,7 +1222,7 @@ pub fn build_column_heatmaps(
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
     {
         let mut global: Vec<String> = Vec::new();
-        for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
+        for p in crate::logic::vision_chrome_phrases() {
             if !global.iter().any(|e| e == &p) {
                 global.push(p);
             }

@@ -10,6 +10,13 @@ pub struct GroundingClaim {
     pub bbox: (u32, u32, u32, u32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictGate {
+    Format,
+    Prejudice,
+    Held,
+}
+
 #[derive(Debug, Clone)]
 pub struct GroundingVerdict {
     pub category: String,
@@ -20,6 +27,7 @@ pub struct GroundingVerdict {
     pub top_patch: usize,
     pub top_legible: bool,
     pub accepted: bool,
+    pub gate: VerdictGate,
     pub reason: String,
 }
 
@@ -91,6 +99,7 @@ where
                 top_patch: 0,
                 top_legible: true,
                 accepted: true,
+                gate: VerdictGate::Held,
                 reason: "임베딩 생성 실패 — 검증 보류(값 유지)".to_string(),
             });
             continue;
@@ -113,6 +122,7 @@ where
                 top_patch: 0,
                 top_legible: true,
                 accepted: true,
+                gate: VerdictGate::Held,
                 reason: "크롭에 대응하는 패치 없음 — 검증 보류(값 유지)".to_string(),
             });
             continue;
@@ -164,6 +174,7 @@ where
                 top_patch,
                 top_legible,
                 accepted: false,
+                gate: VerdictGate::Format,
                 reason: "크롭 내부 접지 실패".to_string(),
             });
             continue;
@@ -190,6 +201,7 @@ where
                 top_patch,
                 top_legible,
                 accepted: false,
+                gate: VerdictGate::Format,
                 reason: format!("근거 패치가 {}", label),
             });
             continue;
@@ -212,6 +224,7 @@ where
             top_patch,
             top_legible,
             accepted: true,
+            gate: VerdictGate::Format,
             reason: "접지 확인".to_string(),
         });
     }
@@ -264,6 +277,7 @@ pub fn verify_claims_v2(
                 top_patch: 0,
                 top_legible: true,
                 accepted: false,
+                gate: VerdictGate::Prejudice,
                 reason: "인쇄 라벨을 값으로 읽음".to_string(),
             });
             continue;
@@ -284,6 +298,7 @@ pub fn verify_claims_v2(
                 top_patch: 0,
                 top_legible: true,
                 accepted: true,
+                gate: VerdictGate::Held,
                 reason: "대응 패치 없음 — 검증 보류".to_string(),
             });
             continue;
@@ -369,6 +384,7 @@ pub fn verify_claims_v2(
             top_patch: 0,
             top_legible: accepted,
             accepted,
+            gate: VerdictGate::Format,
             reason: if accepted { String::new() } else { "출처 영역에 읽을 내용이 없음".to_string() },
         });
     }

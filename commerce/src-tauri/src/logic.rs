@@ -1298,6 +1298,148 @@ pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
       品名, 商品説明, 品目説明, 商品名, \
       货物描述, 货物名称, 品名, 商品描述, \
       품명, 상품 설명, 품목 설명, 물품명"),
+    ("amount",
+     "invoice total, total invoice amount, total invoice value, grand total, total amount, total amount due, amount due, total payable, invoice amount, total sum",
+     "Rechnungsbetrag, Gesamtbetrag, Rechnungssumme, Endbetrag, zu zahlender Betrag, \
+      montant total, total de la facture, montant de la facture, montant à payer, total général, \
+      importe total, total de la factura, importe de la factura, importe a pagar, total general, \
+      importo totale, totale fattura, importo della fattura, importo da pagare, totale generale, \
+      valor total, total da fatura, valor da fatura, valor a pagar, \
+      totaalbedrag, factuurbedrag, factuurtotaal, te betalen bedrag, eindtotaal, \
+      celková částka, fakturovaná částka, částka k úhradě, celkem k úhradě, \
+      المبلغ الإجمالي, إجمالي الفاتورة, قيمة الفاتورة, المبلغ المستحق, \
+      合計金額, 請求金額, 総額, インボイス合計, お支払金額, \
+      总金额, 发票总额, 合计金额, 应付金额, \
+      총 금액, 총금액, 총액, 합계 금액, 송장 총액, 인보이스 총액, 청구 금액"),
+    ("amount_subtotal",
+     "subtotal, sub-total, sub total, amount before tax, total before tax, net amount before tax, taxable amount, taxable value, amount excluding tax",
+     "Zwischensumme, Nettobetrag, Betrag ohne MwSt., Summe netto, \
+      sous-total, montant HT, total hors taxes, montant hors taxes, \
+      base imponible, importe sin IVA, importe neto, \
+      subtotale, imponibile, importo senza IVA, totale imponibile, \
+      valor sem impostos, base de cálculo, valor antes de impostos, \
+      subtotaal, bedrag exclusief btw, totaal excl. btw, \
+      mezisoučet, základ daně, částka bez DPH, \
+      المجموع الفرعي, المبلغ قبل الضريبة, المبلغ الخاضع للضريبة, \
+      小計, 税抜金額, 課税対象額, \
+      小计, 不含税金额, 计税金额, \
+      소계, 공급가액, 세전 금액"),
+    ("amount_tax",
+     "tax amount, VAT amount, amount of VAT, total VAT, total tax, sales tax amount, GST amount, tax total, value added tax amount",
+     "Steuerbetrag, Mehrwertsteuerbetrag, MwSt.-Betrag, Umsatzsteuerbetrag, \
+      montant de la TVA, montant de la taxe, total TVA, \
+      importe del IVA, cuota de IVA, importe del impuesto, \
+      importo IVA, importo dell'imposta, totale IVA, \
+      valor do IVA, valor do imposto, \
+      btw-bedrag, belastingbedrag, totaal btw, \
+      částka DPH, výše daně, DPH celkem, \
+      مبلغ الضريبة, مبلغ ضريبة القيمة المضافة, \
+      消費税額, 税額, \
+      税额, 增值税额, \
+      세액, 부가세액, 부가가치세액"),
+    ("freight_amount",
+     "freight, freight charge, freight charges, freight cost, freight amount, ocean freight charge, air freight charge, shipping charge, carriage charge, transport charge",
+     "Frachtkosten, Frachtbetrag, Fracht, Transportkosten, \
+      frais de transport, montant du fret, fret, coût du transport, \
+      importe del flete, flete, costo del transporte, \
+      spese di trasporto, importo del nolo, nolo, costo del trasporto, \
+      valor do frete, frete, custo do transporte, \
+      vrachtbedrag, vracht, \
+      dopravné, přepravné, náklady na dopravu, \
+      أجرة الشحن, تكلفة الشحن, رسوم النقل, \
+      運賃, 輸送費, 海上運賃, 航空運賃, \
+      运费, 海运费, 空运费, 运输费用, \
+      운임, 운송료, 해상운임, 항공운임"),
+    ("unit_price",
+     "unit price, unit value, price per unit, price each, unit cost, rate per unit, price per piece",
+     "Einzelpreis, Stückpreis, Preis pro Einheit, \
+      prix unitaire, valeur unitaire, prix à l'unité, \
+      precio unitario, valor unitario, precio por unidad, \
+      prezzo unitario, valore unitario, prezzo per unità, \
+      preço unitário, valor unitário, preço por unidade, \
+      eenheidsprijs, prijs per stuk, stukprijs, \
+      jednotková cena, cena za kus, cena za jednotku, \
+      سعر الوحدة, قيمة الوحدة, السعر الإفرادي, \
+      単価, 単位価格, 1個あたりの価格, \
+      单价, 单位价格, 每件价格, \
+      단가, 개당 가격, 품목별 단가, 단위 가격"),
+    ("total_price",
+     "line total, line amount, line value, total price, extended price, extended amount, amount per line, row total",
+     "Gesamtpreis, Positionsbetrag, Zeilensumme, Positionswert, \
+      prix total, montant de la ligne, total de la ligne, valeur de la ligne, \
+      precio total, importe de línea, total de línea, valor de la línea, \
+      prezzo totale, importo riga, totale riga, valore della riga, \
+      preço total, valor da linha, total da linha, \
+      totaalprijs, regelbedrag, regeltotaal, \
+      celková cena, cena za řádek, částka za položku, \
+      السعر الإجمالي للبند, مبلغ البند, قيمة السطر, \
+      明細金額, 品目別金額, 行金額, \
+      总价, 行金额, 明细金额, \
+      품목별 금액, 행 금액, 라인 금액, 품목 합계액"),
+    ("quantity",
+     "quantity, qty, number of units, quantity shipped, quantity ordered, item quantity, quantity per line",
+     "Menge, Stückzahl, Anzahl der Einheiten, Liefermenge, Bestellmenge, \
+      quantité, qté, nombre d'unités, quantité expédiée, quantité commandée, \
+      cantidad, cant., número de unidades, cantidad enviada, cantidad pedida, \
+      quantità, q.tà, numero di unità, quantità spedita, quantità ordinata, \
+      quantidade, qtd., quantidade enviada, quantidade pedida, \
+      hoeveelheid, aantal eenheden, geleverde hoeveelheid, bestelde hoeveelheid, \
+      množství, počet jednotek, dodané množství, objednané množství, \
+      الكمية, عدد الوحدات, الكمية المشحونة, الكمية المطلوبة, \
+      数量, 個数, 出荷数量, 注文数量, \
+      个数, 发货数量, 订购数量, \
+      수량, 개수, 선적 수량, 주문 수량"),
+    ("weight_gross",
+     "gross weight, G.W., GW, gross wt., total gross weight, gross mass",
+     "Bruttogewicht, Gesamtbruttogewicht, Brutto-Gewicht, \
+      poids brut, poids brut total, \
+      peso bruto, peso bruto total, \
+      peso lordo, peso lordo totale, \
+      brutogewicht, totaal brutogewicht, \
+      hrubá hmotnost, celková hrubá hmotnost, \
+      الوزن القائم, الوزن الإجمالي, إجمالي الوزن القائم, \
+      総重量, グロス重量, \
+      毛重, 总毛重, \
+      총중량, 그로스 중량"),
+    ("weight_net",
+     "net weight, N.W., NW, net wt., total net weight, net mass",
+     "Nettogewicht, Gesamtnettogewicht, Netto-Gewicht, \
+      poids net, poids net total, \
+      peso neto, peso neto total, \
+      peso netto, peso netto totale, \
+      peso líquido, peso líquido total, \
+      nettogewicht, totaal nettogewicht, \
+      čistá hmotnost, celková čistá hmotnost, \
+      الوزن الصافي, إجمالي الوزن الصافي, \
+      正味重量, 純重量, ネット重量, \
+      净重, 总净重, \
+      순중량, 순 중량"),
+    ("package_count",
+     "total number of packages, total packages, total no. of packages, total no. of pkgs, total cartons, total number of cartons, packages in total, total package count",
+     "Gesamtzahl der Packstücke, Packstücke insgesamt, Gesamtanzahl der Kartons, \
+      nombre total de colis, total des colis, nombre total de cartons, \
+      número total de bultos, total de bultos, número total de cajas, \
+      numero totale di colli, totale colli, numero totale di cartoni, \
+      número total de volumes, total de volumes, número total de caixas, \
+      totaal aantal colli, colli in totaal, totaal aantal dozen, \
+      celkový počet balení, balení celkem, celkový počet kartonů, \
+      إجمالي عدد الطرود, العدد الإجمالي للطرود, إجمالي عدد الكراتين, \
+      総梱包数, 総個口数, 総カートン数, \
+      总件数, 总箱数, 包装总件数, \
+      총 포장수, 총 포장 개수, 총 카톤수, 총 박스수"),
+    ("volume",
+     "volume, measurement, total volume, total measurement, CBM, cubic meters, cubic metres, M3",
+     "Volumen, Rauminhalt, Gesamtvolumen, Kubikmeter, \
+      volume total, cubage, mètres cubes, \
+      volumen total, cubicaje, metros cúbicos, \
+      volume totale, cubatura, metri cubi, \
+      cubagem, \
+      inhoud, totaal volume, kubieke meter, \
+      objem, celkový objem, kubatura, metry krychlové, \
+      الحجم, الحجم الإجمالي, متر مكعب, \
+      容積, 総容積, 才数, 立方メートル, \
+      体积, 总体积, 尺码, 立方米, \
+      용적, 총 용적, 부피, 입방미터"),
 ];
 
 pub fn trade_label_supplement(field: &str) -> Vec<String> {
@@ -1660,6 +1802,23 @@ pub const VISION_CHROME_ANCHOR: &str =
      ruled lines, barcode stripes, QR code square, page number footer, printed form template, \
      decorative frame, background texture, scanned paper noise, staple hole, punch hole";
 
+pub const VISION_CHROME_ANCHOR_ML: &str =
+    "Firmenlogo, Briefkopf, Firmenstempel, Dienstsiegel, handschriftliche Unterschrift, Wasserzeichen, leerer Rand, Seitenrahmen, Tabellenlinien, Strichcode, QR-Code, Seitenzahl in der Fußzeile, Formularvorlage, Hintergrundmuster, Scanrauschen, Lochung, \
+     logo de l'entreprise, en-tête de lettre, cachet officiel, sceau rouge, signature manuscrite, filigrane, marge vide, bordure de page, lignes du tableau, code-barres, code QR, numéro de page en pied de page, modèle de formulaire, texture de fond, bruit de numérisation, perforation, \
+     logotipo de la empresa, membrete, sello oficial, sello rojo, firma manuscrita, marca de agua, margen en blanco, borde de página, líneas de la tabla, código de barras, código QR, número de página en el pie, plantilla de formulario, textura de fondo, ruido de escaneo, perforación, \
+     logo aziendale, carta intestata, timbro ufficiale, sigillo rosso, firma autografa, filigrana, margine vuoto, bordo della pagina, righe della tabella, codice a barre, codice QR, numero di pagina a piè di pagina, modello di modulo, trama di sfondo, rumore di scansione, foro di perforazione, \
+     logotipo da empresa, papel timbrado, carimbo oficial, selo vermelho, assinatura manuscrita, marca d'água, margem em branco, borda da página, linhas da tabela, código de barras, código QR, número de página no rodapé, modelo de formulário, textura de fundo, ruído de digitalização, furo de perfuração, \
+     bedrijfslogo, briefhoofd, officiële stempel, rood zegel, handgeschreven handtekening, watermerk, lege marge, paginarand, tabellijnen, streepjescode, QR-code, paginanummer in de voettekst, formuliersjabloon, achtergrondtextuur, scanruis, perforatiegat, \
+     firemní logo, hlavičkový papír, úřední razítko, červená pečeť, vlastnoruční podpis, vodoznak, prázdný okraj, okraj stránky, linky tabulky, čárový kód, QR kód, číslo stránky v zápatí, šablona formuláře, textura pozadí, šum skenování, děrovaný otvor, \
+     شعار الشركة, ترويسة الرسالة, ختم رسمي, ختم أحمر, توقيع بخط اليد, علامة مائية, هامش فارغ, حدود الصفحة, خطوط الجدول, الباركود, رمز الاستجابة السريعة, رقم الصفحة في التذييل, قالب النموذج, نسيج الخلفية, ضوضاء المسح, ثقب التخريم, \
+     会社ロゴ, レターヘッド, 社印, 角印, 丸印, 手書き署名, 透かし, 余白, ページ枠, 罫線, バーコード, QRコード, フッターのページ番号, 帳票テンプレート, 背景の地紋, スキャンノイズ, パンチ穴, \
+     公司标志, 信头, 公章, 红色印章, 手写签名, 水印, 空白页边, 页面边框, 表格线, 条形码, 二维码, 页脚页码, 表单模板, 背景底纹, 扫描噪点, 打孔, \
+     회사 로고, 레터헤드, 직인, 관인, 붉은 도장, 손글씨 서명, 워터마크, 빈 여백, 페이지 테두리, 표 괘선, 바코드, QR 코드, 바닥글 페이지 번호, 서식 템플릿, 배경 무늬, 스캔 잡티, 펀치 구멍";
+
+pub fn vision_chrome_phrases() -> Vec<String> {
+    anchor_phrases(VISION_CHROME_ANCHOR, VISION_CHROME_ANCHOR_ML)
+}
+
 pub const UI_ACTION_ANCHOR: &str =
     "edit button, modify, update, delete, remove, copy, duplicate, register, add new, \
      save, cancel, confirm, submit, apply, reset, search button, view detail, go to detail, \
@@ -1680,6 +1839,53 @@ pub const TRADE_CONTAINER_TABLE_ANCHOR: &str =
     "container list, container number column, seal number column, \
      container type size, number of packages column, gross weight column, measurement column, \
      container and seal table, equipment list";
+
+pub const TRADE_TITLE_LABEL_ANCHOR: &str = "document type, kind of document, type of form, \
+     name of this document, title of this document, document name, form name, \
+     document code, form code, classification of this document";
+
+pub const TRADE_REFERENCE_LABEL_ANCHOR: &str = "referenced document number, related document number, \
+     reference number of another document, master document number, associated document, \
+     payment terms, terms of payment, drawn under credit, issued under, \
+     attached documents, required documents, enclosed documents, remark, note";
+
+pub const TRADE_ITEM_ATTRIBUTE_ANCHOR: &str = "line item attribute, attribute of one product row, \
+     item code, stock keeping unit, article number, product description, \
+     quantity, unit of measure, unit price, line total, amount of this row, \
+     table column header, row number in a list, subtotal, discount, total quantity";
+
+pub const TRADE_ROW_MARKER_ANCHOR: &str = "row separator, table row marker, line item index, \
+     item number in a list, section key, group key, metadata key, \
+     continued from previous page, page break marker, list bullet";
+
+pub const SITE_CHROME_ANCHOR: &str = "site name, shopping mall name, brand slogan, \
+     administrator page, admin home, admin main menu, management menu, \
+     dashboard, control panel, back office, console, \
+     global navigation bar, breadcrumb, sidebar menu, footer, copyright notice, banner, \
+     login, logout, sign in, sign out, my page, member management, \
+     settings, configuration, preferences, \
+     visitor counter, today visitors, yesterday visitors, total visitors, \
+     software version number, welcome message, home, index page, \
+     search form, filter form, page navigation, pagination";
+
+pub fn trade_title_label_phrases() -> Vec<String> {
+    anchor_phrases(TRADE_TITLE_LABEL_ANCHOR, TRADE_TITLE_LABEL_ANCHOR_ML)
+}
+pub fn trade_reference_label_phrases() -> Vec<String> {
+    anchor_phrases(TRADE_REFERENCE_LABEL_ANCHOR, TRADE_REFERENCE_LABEL_ANCHOR_ML)
+}
+pub fn trade_item_attribute_phrases() -> Vec<String> {
+    anchor_phrases(TRADE_ITEM_ATTRIBUTE_ANCHOR, TRADE_ITEM_ATTRIBUTE_ANCHOR_ML)
+}
+pub fn trade_row_marker_phrases() -> Vec<String> {
+    anchor_phrases(TRADE_ROW_MARKER_ANCHOR, TRADE_ROW_MARKER_ANCHOR_ML)
+}
+pub fn site_chrome_phrases() -> Vec<String> {
+    anchor_phrases(SITE_CHROME_ANCHOR, SITE_CHROME_ANCHOR_ML)
+}
+pub fn ui_action_phrases() -> Vec<String> {
+    anchor_phrases(UI_ACTION_ANCHOR, UI_ACTION_ANCHOR_ML)
+}
 
 pub const TRADE_TITLE_LABEL_ANCHOR_ML: &str =
     "Dokumentart, Dokumenttyp, Art des Dokuments, Titel dieses Dokuments, Formularname, Dokumentcode, \
@@ -1791,6 +1997,26 @@ pub const DECLARATION_BOILERPLATE_ANCHOR_ML: &str =
      本請求書に記載された全ての情報が真実かつ正確であることを宣言します, 上記の内容が正確であることを証明します, 輸出者の申告, 署名者は以下のとおり宣言する, 私の知る限りにおいて, \
      本人声明本发票所载全部信息真实无误, 兹证明本发票内容真实准确, 出口商声明, 签署人特此声明, 据本人所知, \
      본 송장에 기재된 모든 정보가 사실이며 정확함을 선언합니다, 상기 내용이 사실임을 증명합니다, 수출자 신고서, 서명인은 다음과 같이 선언합니다, 본인이 아는 한";
+
+pub const HANDLING_INSTRUCTION_ANCHOR: &str =
+    "handle with care, fragile, this side up, keep dry, keep away from heat, \
+     do not stack, do not drop, do not freeze, protect from moisture, \
+     store in a cool dry place, keep refrigerated, temperature controlled, \
+     partial shipment not allowed, transshipment not allowed, deliver before, \
+     notify party on arrival, lift here, use no hooks, stack no more than";
+
+pub const HANDLING_INSTRUCTION_ANCHOR_ML: &str =
+    "Vorsicht zerbrechlich, oben, trocken halten, vor Hitze schützen, nicht stapeln, nicht stürzen, kühl und trocken lagern, vor Nässe schützen, Teillieferung nicht erlaubt, Umladung nicht erlaubt, \
+     fragile manipuler avec soin, haut, tenir au sec, craint la chaleur, ne pas gerber, ne pas jeter, stocker au frais et au sec, protéger de l'humidité, expédition partielle non autorisée, transbordement non autorisé, \
+     frágil manéjese con cuidado, este lado arriba, mantener seco, proteger del calor, no apilar, no dejar caer, almacenar en lugar fresco y seco, proteger de la humedad, embarque parcial no permitido, transbordo no permitido, \
+     fragile maneggiare con cura, alto, tenere all'asciutto, proteggere dal calore, non impilare, non lasciare cadere, conservare in luogo fresco e asciutto, spedizione parziale non consentita, trasbordo non consentito, \
+     frágil manuseie com cuidado, este lado para cima, manter seco, proteger do calor, não empilhar, não deixar cair, armazenar em local fresco e seco, embarque parcial não permitido, transbordo não permitido, \
+     breekbaar voorzichtig behandelen, deze zijde boven, droog houden, uit de buurt van hitte houden, niet stapelen, niet laten vallen, koel en droog bewaren, deelzending niet toegestaan, overslag niet toegestaan, \
+     křehké opatrně manipulovat, touto stranou nahoru, udržujte v suchu, chraňte před teplem, nestohovat, neházet, skladujte v chladu a suchu, částečná dodávka není povolena, překládka není povolena, \
+     قابل للكسر يرجى الحذر, هذا الجانب لأعلى, يحفظ جافا, يحفظ بعيدا عن الحرارة, ممنوع التكديس, لا تسقط, يخزن في مكان بارد وجاف, الشحن الجزئي غير مسموح, إعادة الشحن غير مسموح, \
+     取扱注意, われもの注意, 天地無用, 水濡れ厳禁, 直射日光を避ける, 積み重ね禁止, 落下厳禁, 冷暗所保管, 分割積み不可, 積み替え不可, \
+     小心轻放, 易碎品, 此面向上, 保持干燥, 避免受热, 禁止堆叠, 严禁摔落, 阴凉干燥处存放, 不允许分批装运, 不允许转运, \
+     취급주의, 파손주의, 천지무용, 습기엄금, 직사광선 피함, 적재금지, 낙하엄금, 서늘하고 건조한 곳 보관, 분할선적 불가, 환적 불가";
 
 pub fn anchor_phrases(en: &str, ml: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();

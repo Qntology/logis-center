@@ -399,11 +399,17 @@ impl crate::model::LogisModel {
                         .collect();
                     let gate_banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = {
                         let mut phr_all: Vec<String> = Vec::new();
+                        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                         let mut per_field: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
+                        let sup_fields = crate::logic::trade_label_supplement_fields();
+                        let mut sup_hit = 0usize;
+                        let mut thin = 0usize;
                         for f in schema_fields.iter() {
-                            let (ph, wt) = crate::utils::ai_utils::label_phrase_bank_multilingual(&language, "shipping_doc", f);
+                            let (ph, wt) = crate::model::merge::owner_label_bank(&language, "shipping_doc", f);
+                            if sup_fields.iter().any(|s| *s == f.as_str()) { sup_hit += 1; }
+                            if ph.len() <= 2 { thin += 1; }
                             for p in ph.iter() {
-                                if !phr_all.contains(p) { phr_all.push(p.clone()); }
+                                if seen.insert(p.clone()) { phr_all.push(p.clone()); }
                             }
                             per_field.push((f.clone(), ph, wt));
                         }
@@ -431,8 +437,8 @@ impl crate::model::LogisModel {
                             banks.push((f, b, w));
                         }
                         emit_term(&format!(
-                            "  📖 [LABEL BANK] 스키마 필드 {}개의 라벨 뱅크를 크롭 루프 진입 전에 한 번만 세웁니다. 스칼라 크롭은 스키마 프롬프트 대신 인쇄된 라벨↔값 쌍을 옮겨 적고, 읽힌 라벨을 이 뱅크로 스키마 전체에 라우팅합니다. 크롭의 카테고리는 '어디를 볼지' 만 정하고 '그것이 무엇인지' 는 라벨이 정합니다.",
-                            banks.len()
+                            "  📖 [LABEL BANK] 스키마 필드 {}개의 라벨 뱅크를 크롭 루프 진입 전에 한 번만 세웁니다 (고유 구 {}개 · 보강표 적용 {}축 · 구 2개 이하 {}축). 스칼라 크롭은 스키마 프롬프트 대신 인쇄된 라벨↔값 쌍을 옮겨 적고, 읽힌 라벨을 이 뱅크로 스키마 전체에 라우팅합니다. 뱅크 정의는 merge.rs 의 owner_label_bank 하나뿐이므로 이 뱅크와 소유권 경쟁·복구 게이트의 뱅크가 어긋날 수 없습니다. '구 2개 이하' 축이 남아 있으면 그 축은 다국어가 아니라 구 자체가 없는 것이므로 bias.json 또는 보강표에 넣어야 합니다.",
+                            banks.len(), table.len(), sup_hit, thin
                         ));
                         banks
                     };
@@ -852,14 +858,12 @@ impl crate::model::LogisModel {
                                         .get_embedding_batch(labels)
                                         .await
                                         .unwrap_or_else(|_| vec![Vec::new(); pairs.len()]);
+                                    let title_table = crate::utils::ai_utils::all_trade_doc_titles();
                                     let doc_title_codes = |label: &str| -> Vec<String> {
                                         let low = label.to_lowercase();
                                         let mut best_len = 0usize;
                                         let mut codes: Vec<String> = Vec::new();
-                                        for (code, title) in crate::logic::TRADE_DOC_TITLES
-                                            .iter()
-                                            .chain(crate::utils::ai_utils::TRADE_DOC_TITLES_ML.iter())
-                                        {
+                                        for (code, title) in title_table.iter() {
                                             let t = title.to_lowercase();
                                             let n = t.chars().count();
                                             let min_n = if t.chars().any(|c| (c as u32) >= 0x2E80) { 2 } else { 5 };
@@ -868,8 +872,8 @@ impl crate::model::LogisModel {
                                                 best_len = n;
                                                 codes.clear();
                                             }
-                                            if n == best_len && !codes.iter().any(|c| c.as_str() == *code) {
-                                                codes.push(code.to_string());
+                                            if n == best_len && !codes.iter().any(|c| c == code) {
+                                                codes.push(code.clone());
                                             }
                                         }
                                         codes
@@ -2453,7 +2457,7 @@ impl crate::model::LogisModel {
                                 let mut would_drop: Vec<String> = Vec::new();
                                 let mut held = 0usize;
                                 for v in list.iter() {
-                                    if v.reason.contains("보류") {
+                                    if v.gate == crate::models::siglip2::value_grounding::VerdictGate::Held {
                                         held += 1;
                                         continue;
                                     }
@@ -2497,20 +2501,28 @@ impl crate::model::LogisModel {
                 if !dup_groups.is_empty() {
                     let bank_type = if is_trade_doc { "shipping_doc" } else { "goods" };
                     let mut texts: Vec<String> = Vec::new();
+                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                     for (value, owners) in dup_groups.iter() {
-                        if !texts.contains(value) {
+                        if seen.insert(value.clone()) {
                             texts.push(value.clone());
                         }
                         for (_, field, _) in owners.iter() {
-                            let (phrases, _) = crate::utils::ai_utils::label_phrase_bank(&language, bank_type, field);
+                            let (phrases, _) = crate::model::merge::owner_label_bank(&language, bank_type, field);
                             for p in phrases {
-                                if !texts.contains(&p) {
+                                if seen.insert(p.clone()) {
                                     texts.push(p);
                                 }
                             }
                         }
                     }
-                    let embs = self.get_embedding_batch(texts.clone()).await.unwrap_or_default();
+                    let mut embs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+                    for part in texts.chunks(200) {
+                        let e = self
+                            .get_embedding_batch(part.to_vec())
+                            .await
+                            .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+                        embs.extend(e);
+                    }
                     let lookup: std::collections::HashMap<String, Vec<f32>> =
                         texts.into_iter().zip(embs.into_iter()).collect();
                     let owner_verdicts = crate::model::merge::resolve_cross_field_duplicates(
@@ -2519,12 +2531,104 @@ impl crate::model::LogisModel {
                     verdicts.extend(owner_verdicts);
                 }
 
+                {
+                    const FREE_TEXT_AXES: [&str; 2] = ["special_instructions", "marks_numbers"];
+                    let mut cands: Vec<(String, String, String)> = Vec::new();
+                    if let Some(root) = extracted_data.as_object() {
+                        for (cat, node) in root.iter() {
+                            let obj = match node.as_object() { Some(o) => o, None => continue };
+                            for f in FREE_TEXT_AXES.iter() {
+                                let s = match obj.get(*f).and_then(|v| v.as_str()) {
+                                    Some(s) => s.trim(),
+                                    None => continue,
+                                };
+                                if s.chars().count() < 24 && s.split_whitespace().count() < 6 {
+                                    continue;
+                                }
+                                cands.push((cat.clone(), (*f).to_string(), s.to_string()));
+                            }
+                        }
+                    }
+                    if !cands.is_empty() {
+                        let decl = crate::logic::anchor_phrases(
+                            crate::logic::DECLARATION_BOILERPLATE_ANCHOR,
+                            crate::logic::DECLARATION_BOILERPLATE_ANCHOR_ML,
+                        );
+                        let instr = crate::logic::anchor_phrases(
+                            crate::logic::HANDLING_INSTRUCTION_ANCHOR,
+                            crate::logic::HANDLING_INSTRUCTION_ANCHOR_ML,
+                        );
+                        let n_val = cands.len();
+                        let n_decl = decl.len();
+                        let mut texts: Vec<String> = cands.iter().map(|(_, _, v)| v.clone()).collect();
+                        texts.extend(decl);
+                        texts.extend(instr);
+                        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+                        for part in texts.chunks(200) {
+                            let e = self
+                                .get_embedding_batch(part.to_vec())
+                                .await
+                                .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+                            embs.extend(e);
+                        }
+                        let decl_bank: Vec<Vec<f32>> = embs[n_val..n_val + n_decl]
+                            .iter()
+                            .filter(|e| !e.is_empty())
+                            .cloned()
+                            .collect();
+                        let instr_bank: Vec<Vec<f32>> = embs[n_val + n_decl..]
+                            .iter()
+                            .filter(|e| !e.is_empty())
+                            .cloned()
+                            .collect();
+                        if decl_bank.is_empty() || instr_bank.is_empty() {
+                            emit_term("  ⚪ [DECLARATION GATE SKIP] 서식 전문 또는 화물 지시문 앵커를 임베딩하지 못했습니다. 한쪽 뱅크만으로 판정하려면 절대 임계가 필요해지므로 판정하지 않습니다.");
+                        } else {
+                            let cohesion = crate::utils::ai_utils::bank_internal_cohesion(&instr_bank);
+                            for (i, (cat, field, value)) in cands.iter().enumerate() {
+                                let q = match embs.get(i) {
+                                    Some(q) if !q.is_empty() => q,
+                                    _ => continue,
+                                };
+                                let own = crate::utils::ai_utils::max_pool_sim(q, &instr_bank);
+                                let prej = crate::utils::ai_utils::max_pool_sim(q, &decl_bank);
+                                if crate::utils::ai_utils::prejudice_dominates(own, prej, cohesion) {
+                                    emit_term(&format!(
+                                        "    📜 [DECLARATION BOILERPLATE] {}.{} = \"{}\" | 서식 전문 {:.4} 가 화물 지시문 {:.4} 를 결속 여유 {:.3} 넘어 앞섭니다. 수출자 확인 문구는 같은 서식이면 모든 문서에 똑같이 인쇄되므로, 이 축에 들어가는 순간 그 축의 변별력이 0 이 되고 자연어 변환을 타고 청크까지 색인되어 실제 지시문을 밀어냅니다. 폐기합니다.",
+                                        cat, field, value, prej, own, cohesion.clamp(0.0, 0.5)
+                                    ));
+                                    crate::utils::score_dynamics::record_baseline("vision.declaration_boilerplate", 1.0);
+                                    verdicts.push(crate::models::siglip2::value_grounding::GroundingVerdict {
+                                        category: cat.clone(),
+                                        field: field.clone(),
+                                        value: value.clone(),
+                                        surprisal_in: 0.0,
+                                        surprisal_out: 0.0,
+                                        top_patch: 0,
+                                        top_legible: true,
+                                        accepted: false,
+                                        gate: crate::models::siglip2::value_grounding::VerdictGate::Prejudice,
+                                        reason: "서식 전문 (수출자 확인 문구)".to_string(),
+                                    });
+                                } else {
+                                    emit_term(&format!(
+                                        "    ✅ [DECLARATION GATE KEEP] {}.{} = \"{}\" | 화물 지시문 {:.4} 가 서식 전문 {:.4} 를 앞섭니다. 이 문서에만 있는 지시문으로 보고 유지합니다.",
+                                        cat, field, value, own, prej
+                                    ));
+                                    crate::utils::score_dynamics::record_baseline("vision.declaration_boilerplate", 0.0);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(map) = extracted_data.as_object_mut() {
                     apply_grounding_verdicts(map, &verdicts, &emit_term);
                     if is_trade_doc {
                         crate::model::merge::drop_row_echo_columns(map, &emit_term);
                         crate::model::merge::reconcile_monetary_axes(map, &emit_term);
                         crate::model::merge::reconcile_package_axes(map, &emit_term);
+                        crate::model::merge::reconcile_weight_basis(map, &emit_term);
                         let doc_code = map
                             .get("header")
                             .and_then(|h| h.get("doc_type"))
@@ -2552,7 +2656,7 @@ impl crate::model::LogisModel {
                     .and_then(|f| f.get("currency"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty() && s != "N/A" && s != "null");
+                    .filter(|s| !crate::model::merge::is_schema_echo(s));
                 if let (Some(c), Some(obj)) = (nested_cur, extracted_data.as_object_mut()) {
                     let root_empty = obj
                         .get("currency")
@@ -2701,14 +2805,14 @@ impl crate::model::LogisModel {
                         from_header
                             .or(from_root)
                             .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+                            .filter(|s| !crate::model::merge::is_schema_echo(s))
                             .unwrap_or_else(|| task_id.clone())
                     }
                 } else {
                     extracted_data.get("tracking_number")
                         .and_then(|s| s.as_str())
                         .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+                        .filter(|s| !crate::model::merge::is_schema_echo(s))
                         .unwrap_or_else(|| task_id.clone())
                 };
                 let raw_no: &str = raw_no_owned.as_str();
@@ -2789,8 +2893,7 @@ impl crate::model::LogisModel {
                         for (k, v) in src {
                             if v.is_null() { continue; }
                             if let Some(s) = v.as_str() {
-                                // "N/A" 는 LLM 이 '못 찾았다' 는 뜻으로 쓰는 값이라 조건이 될 수 없습니다.
-                                if s.trim().is_empty() || s == "N/A" { continue; }
+                                if crate::model::merge::is_schema_echo(s) { continue; }
                             }
                             let name = canonical_name(&k);
                             // 이미 채워진 축은 덮어쓰지 않습니다. (아래 식별자 블록이 우선)
@@ -2942,7 +3045,7 @@ impl crate::model::LogisModel {
                         let search_field = &relay_key.search_field;
                         let source_field = &relay_key.source_field;
                         let link_value = relay_key.raw.clone();
-                        if link_value.is_empty() || link_value == "N/A" {
+                        if crate::model::merge::is_schema_echo(&link_value) {
                             continue;
                         }
                         let link_value = final_data.get(source_field)
@@ -2950,7 +3053,7 @@ impl crate::model::LogisModel {
                             .unwrap_or("")
                             .trim()
                             .to_string();
-                        if link_value.is_empty() || link_value == "N/A" {
+                        if crate::model::merge::is_schema_echo(&link_value) {
                             relay_starved.push(format!("{}←{}(빈 키)", target_type, source_field));
                             continue;
                         }
@@ -3030,9 +3133,9 @@ impl crate::model::LogisModel {
                                     .unwrap_or("");
                                 if !reverse_field.is_empty() {
                                     if let Some(my_doc_number) = extracted_data.get("doc_number").and_then(|v| v.as_str()) {
-                                        if !my_doc_number.is_empty() && my_doc_number != "N/A" {
+                                        if !crate::model::merge::is_schema_echo(my_doc_number) {
                                             let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
-                                            if existing_ref.is_empty() || existing_ref == "N/A" {
+                                            if crate::model::merge::is_schema_echo(existing_ref) {
                                                 ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
                                                 needs_update = true;
                                             }
@@ -3060,12 +3163,12 @@ impl crate::model::LogisModel {
                                         .and_then(|l| l.get(field))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    if my_val.is_empty() || my_val == "N/A" { continue; }
+                                    if crate::model::merge::is_schema_echo(my_val) { continue; }
                                     let their_val = ej.get("logistics")
                                         .and_then(|l| l.get(field))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    if their_val.is_empty() || their_val == "N/A" {
+                                    if crate::model::merge::is_schema_echo(their_val) {
                                         if let Some(logistics_obj) = ej.get_mut("logistics").and_then(|l| l.as_object_mut()) {
                                             logistics_obj.insert(field.to_string(), json!(my_val));
                                             needs_update = true;
@@ -3080,7 +3183,7 @@ impl crate::model::LogisModel {
                                         .and_then(|c| c.get(field))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    if my_val.is_empty() || my_val == "N/A" { continue; }
+                                    if crate::model::merge::is_schema_echo(my_val) { continue; }
                                     let their_containers = ej.get("containers").and_then(|c| c.as_array());
                                     let their_has = their_containers.map_or(false, |arr| {
                                         arr.iter().any(|c| c.get(field).and_then(|v| v.as_str()).map_or(false, |v| v == my_val))
@@ -3271,25 +3374,38 @@ impl crate::model::LogisModel {
             })
         };
 
-        let mut texts: Vec<String> = Vec::new();
-        for (k, _) in orphans.iter() {
-            texts.push(semantic_anchor_text(doc_lang, doc_type, k));
-        }
-        let head = texts.len();
-        for f in schema.iter() {
-            texts.push(semantic_anchor_text(doc_lang, doc_type, f));
-        }
-        let embs = match self.get_embedding_batch(texts).await {
-            Ok(e) if e.len() == head + schema.len() => e,
+        let orphan_texts: Vec<String> = orphans
+            .iter()
+            .map(|(k, _)| semantic_anchor_text(doc_lang, doc_type, k))
+            .collect();
+        let schema_groups: Vec<Vec<String>> = schema
+            .iter()
+            .map(|f| {
+                let (mut ph, _) = crate::model::merge::owner_label_bank(doc_lang, doc_type, f);
+                for p in crate::utils::ai_utils::split_bias_phrases_full(&semantic_anchor_text(doc_lang, doc_type, f)) {
+                    if crate::utils::ai_utils::is_value_example_phrase(&p) { continue; }
+                    if !ph.iter().any(|e| e.eq_ignore_ascii_case(&p)) { ph.push(p); }
+                }
+                ph
+            })
+            .collect();
+        let orphan_embs = match self.get_embedding_batch(orphan_texts).await {
+            Ok(e) if e.len() == orphans.len() => e,
             _ => {
                 emit("  ⚪ [SCHEMA AXIS MAP SKIP] 앵커 임베딩을 만들지 못해 스키마 밖 축을 그대로 둡니다.");
                 return 0;
             }
         };
+        let schema_heads: Vec<Vec<f32>> = self
+            .ship_embed_phrase_groups(&schema_groups)
+            .await
+            .iter()
+            .map(|bank| crate::model::merge::bank_centroid(bank))
+            .collect();
 
         let mut moved = 0usize;
         for (oi, (key, raw)) in orphans.iter().enumerate() {
-            let q = &embs[oi];
+            let q = &orphan_embs[oi];
             if q.iter().all(|&x| x == 0.0) { continue; }
             let want = detect_field_format(key);
             let multiline = raw.lines().filter(|l| !l.trim().is_empty()).count() >= 2;
@@ -3301,8 +3417,8 @@ impl crate::model::LogisModel {
                 if !value_matches_format(detect_field_format(f), raw) { continue; }
                 let cat = crate::logic::trade_field_category(f);
                 if cat.is_empty() || crate::logic::is_trade_array_category(cat) { continue; }
-                let e = &embs[head + si];
-                if e.iter().all(|&x| x == 0.0) { continue; }
+                let e = &schema_heads[si];
+                if e.is_empty() { continue; }
                 scored.push((f.clone(), cosine_similarity(q, e)));
             }
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -1656,6 +1656,44 @@ fn evaluate_dexie_plan(
     (eligible, all_pass, per)
 }
 
+/// 힌트 축이 회수 문서에서 실제로 만족되었는지 관측합니다.
+///
+///  ── 왜 하드와 분리하는가 ──
+///   힌트는 결과 집합을 좁히지 않으므로 all_pass 계산에 넣으면 안 됩니다.
+///   그러나 '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에
+///   직접 쓰이는 정보인데, 지금은 evaluated 가 0 이라 관측 자체가 없습니다.
+fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize)> {
+    let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
+    let hints = match plan.get("hints").and_then(|v| v.as_object()) {
+        Some(h) => h.clone(),
+        None => return Vec::new(),
+    };
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    for (field, spec) in hints.iter() {
+        let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
+        let want = spec.get("value").cloned().unwrap_or(Value::Null);
+        if want.is_null() { continue; }
+        let kind = if want.is_number() { "number" } else { "string" };
+        let cond = json!({
+            "path": format!("data.{}", field),
+            "op": op,
+            "value": want,
+            "kind": kind
+        });
+        let mut present = 0usize;
+        let mut satisfied = 0usize;
+        for d in docs.iter() {
+            let has = d.get(field.as_str()).map_or(false, |v| {
+                !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+            });
+            if has { present += 1; }
+            if dexie_condition_passes(&cond, d, &alternates) { satisfied += 1; }
+        }
+        out.push((field.clone(), satisfied, present));
+    }
+    out
+}
+
 fn plan_alternate_axis_map(plan: &Value) -> Value {
     plan.get("alternates").cloned().unwrap_or(json!({}))
 }
@@ -1758,6 +1796,46 @@ async fn nearest_storage_axis(
     if sd <= 1e-6 { return None; }
     if scored[0].1 - mean < sd { return None; }
     Some(scored[0].clone())
+}
+
+/// 문자 체계 판정. FTS(ngram 문자열 포함)가 물리적으로 성립할 수 있는지를 가릅니다.
+///
+///  ── 왜 언어가 아니라 문자 체계인가 ──
+///   FTS 는 의미가 아니라 바이트/문자 일치입니다. 한국어 질의와 영어 청크는
+///   같은 뜻이어도 공통 부분 문자열이 없어 FTS 가 구조적으로 0건입니다.
+///   반대로 중국어 질의와 일본어 청크는 한자를 공유해 부분적으로 발화합니다.
+///   언어 판정기보다 문자 체계가 이 물음에 더 정확히 답합니다.
+fn dominant_script(s: &str) -> &'static str {
+    let (mut latin, mut hangul, mut kana, mut han, mut arabic, mut cyrillic) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for c in s.chars() {
+        let u = c as u32;
+        if c.is_ascii_alphabetic() || (0x00C0..=0x024F).contains(&u) {
+            latin += 1;
+        } else if (0xAC00..=0xD7A3).contains(&u) || (0x1100..=0x11FF).contains(&u) {
+            hangul += 1;
+        } else if (0x3040..=0x30FF).contains(&u) {
+            kana += 1;
+        } else if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
+            han += 1;
+        } else if (0x0600..=0x06FF).contains(&u) || (0x0750..=0x077F).contains(&u) {
+            arabic += 1;
+        } else if (0x0400..=0x04FF).contains(&u) {
+            cyrillic += 1;
+        }
+    }
+    let mut best: (&'static str, usize) = ("none", 0);
+    for (name, n) in [
+        ("latin", latin),
+        ("hangul", hangul),
+        ("kana", kana),
+        ("han", han),
+        ("arabic", arabic),
+        ("cyrillic", cyrillic),
+    ] {
+        if n > best.1 { best = (name, n); }
+    }
+    best.0
 }
 
 fn is_relay_draft(doc: &Value) -> bool {
@@ -2392,16 +2470,26 @@ async fn ai_search_complex(
                     //      substantial 은 LanceDB 물리 컬럼이 아니라 SQL 로는 절대 반영되지 않지만,
                     //      item_chunks 의 property 컬럼에는 그대로 존재하므로
                     //      '무거운 → weight' 의도를 여기서 실제 검색으로 회수합니다.
-                    let mut condition_props: Vec<String> = ctx.get("condition")
+                    let hard_props: Vec<String> = ctx.get("condition")
                         .and_then(|v| v.as_object())
                         .map(|obj| obj.keys().cloned().collect())
                         .unwrap_or_default();
+                    let mut hint_props: Vec<String> = Vec::new();
+                    let mut condition_props: Vec<String> = hard_props.clone();
                     if let Some(hint_obj) = ctx.get("hint").and_then(|v| v.as_object()) {
                         for k in hint_obj.keys() {
+                            if hard_props.iter().any(|p| p == k) { continue; }
+                            if !hint_props.iter().any(|p| p == k) { hint_props.push(k.clone()); }
                             if !condition_props.iter().any(|p| p == k) {
                                 condition_props.push(k.clone());
                             }
                         }
+                    }
+                    if !hint_props.is_empty() {
+                        println!(
+                            "[AI-SEARCH]   ⚖️ [TRACK WEIGHT] 하드 조건 축 {:?} 는 Column 트랙 전액(×3.0), 힌트 축 {:?} 는 절반(×1.5)을 받습니다. 하드는 질의가 '이 축을 걸겠다' 고 확정한 것이고 힌트는 '그 축일 수도 있다' 는 추정이라, 같은 눈금으로 더하면 추정 축이 랭킹을 주도합니다. 타겟 청크 검색(STAGE-4C)은 두 축 모두에 그대로 수행해 리콜은 잃지 않습니다.",
+                            hard_props, hint_props
+                        );
                     }
 
                     let substantial_prop = ctx.get("substantial")
@@ -2502,10 +2590,14 @@ async fn ai_search_complex(
                         //      청크 매칭은 '본문 매칭' 이므로 FTS 트랙(2.0)과 동일 스케일로 환산하고,
                         //      PLINKO 가 확정한 속성과 일치하면 Column 트랙(3.0)을 추가로 얹습니다.
                         let mut score = raw_cosine * 2.0;
-                        if !condition_props.is_empty() && condition_props.contains(&property) {
+                        if hard_props.contains(&property) {
                             let column_track = raw_cosine * 3.0;
                             score += column_track;
-                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B / HARD] property='{}' 확정 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                        } else if hint_props.contains(&property) {
+                            let column_track = raw_cosine * 1.5;
+                            score += column_track;
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B / HINT] property='{}' 힌트 축 매칭 → Column 트랙 절반 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
                         }
 
                         // 🌟 [STAGE-4X CROSS-LINGUAL VALUE BONUS]
@@ -2523,12 +2615,30 @@ async fn ai_search_complex(
                                 FieldFormat::Text | FieldFormat::Address
                             );
                             if value_bearing {
-                                let cross_lingual_track = raw_cosine * 1.5;
-                                score += cross_lingual_track;
-                                println!(
-                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
-                                    property, cross_lingual_track, raw_cosine, score
-                                );
+                                let qs = dominant_script(&query);
+                                let cs = dominant_script(&chunk_text);
+                                let script_gap = qs != "none" && cs != "none" && qs != cs;
+                                if script_gap {
+                                    let cross_lingual_track = raw_cosine * 2.0;
+                                    score += cross_lingual_track;
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "search.crosslingual_cos",
+                                        raw_cosine,
+                                    );
+                                    println!(
+                                        "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' | 질의 문자 체계 '{}' ≠ 청크 '{}' → FTS 가 물리적으로 0건인 구간이므로 그 트랙(×2.0)을 코사인이 대신합니다. +{:.4} (cos {:.4}) → 최종 {:.4}",
+                                        property, qs, cs, cross_lingual_track, raw_cosine, score
+                                    );
+                                } else {
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "search.samelingual_cos",
+                                        raw_cosine,
+                                    );
+                                    println!(
+                                        "[AI-SEARCH]   ⚪ [STAGE-4X SKIP] property='{}' | 질의와 청크가 같은 문자 체계 '{}' 라 FTS 트랙이 이미 이 값을 평가했습니다. 같은 증거를 두 번 더하지 않습니다. (cos {:.4})",
+                                        property, qs, raw_cosine
+                                    );
+                                }
                             }
                         }
 
@@ -3049,6 +3159,27 @@ async fn ai_search_complex(
                             "{}(만족 {} / 단독 차단 {} / 차단 기여 {})",
                             field, satisfied, sole, blocked
                         ));
+                    }
+                    let hint_eval = evaluate_dexie_hints(plan, &docs);
+                    if !hint_eval.is_empty() {
+                        let mut hint_detail: Vec<String> = Vec::new();
+                        for (field, satisfied, present) in hint_eval.iter() {
+                            if !docs.is_empty() {
+                                crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                crate::utils::score_dynamics::record_baseline(
+                                    "search.hint_present_ratio",
+                                    *present as f32 / docs.len() as f32,
+                                );
+                            }
+                            hint_detail.push(format!(
+                                "{}(만족 {} / 축 보유 {} / 회수 {})",
+                                field, satisfied, present, docs.len()
+                            ));
+                        }
+                        println!(
+                            "[AI-SEARCH] 📈 [SDS / HINT OUTCOME] 힌트 축 {}개를 결과 집합과 무관하게 관측만 합니다: {} — 힌트는 필터가 아니므로 통과 여부가 결과를 바꾸지 않지만, '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에 쓰입니다. 지금까지는 evaluated 가 0 이라 이 정보가 원장에 전혀 쌓이지 않았습니다.",
+                            hint_eval.len(), hint_detail.join(" | ")
+                        );
                     }
                     println!(
                         "[AI-SEARCH] 📈 [SDS / SEARCH OUTCOME] 'search|{}|' | 리콜 {}건 · 서식 범위 안 {}건 중 하드 조건 전부 만족 {}건 | 초안 {}건 | {}",

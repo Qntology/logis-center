@@ -410,10 +410,10 @@ pub fn split_bias_phrases_weighted_full(raw: &str) -> (Vec<String>, Vec<f32>) {
 //    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
 pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
-    // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드는 공용 'shipping_doc' 노드로 접습니다.
     let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let primary = crate::utils::bias_schema::lang_code_of(doc_lang);
 
-    for lk in [doc_lang, "en", "ko"] {
+    for lk in [primary.as_str(), "en", "ko"] {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(s) = lang_node
             .get(page_type)
@@ -2008,12 +2008,9 @@ pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
 //    여기서는 원본 JSON 을 직접 읽어 다국어 구 뱅크를 복원합니다.
 fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<serde_json::Value> {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
-    // 🌟 [BIAS TYPE CANONICALIZE] BL / CI / PL 등 무역 서식 코드는 bias.json 에
-    //    개별 노드가 없습니다. 공용 'shipping_doc' 노드로 접어 조회하지 않으면
-    //    label_phrase_bank / prejudice_phrase_bank 가 항상 빈 배열을 돌려주고,
-    //    그 결과 무역 문서의 헤더 코사인 맵과 청크 PLINKO 가 판정 근거를 잃습니다.
     let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
-    let lang_keys = [doc_lang, "en", "ko"];
+    let primary = crate::utils::bias_schema::lang_code_of(doc_lang);
+    let lang_keys = [primary.as_str(), "en", "ko"];
     for lk in lang_keys {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(n) = lang_node.get(page_type).and_then(|p| p.get(field_name)) {
@@ -2067,16 +2064,41 @@ pub fn label_phrase_bank(doc_lang: &str, page_type: &str, field_name: &str) -> (
 
 pub const BANK_LANGS: [&str; 12] = ["en", "de", "es", "fr", "ja", "pt", "ar", "cs", "it", "ko", "nl", "zh"];
 
+pub fn bank_lang_order(primary_lang: &str) -> Vec<String> {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let mut order: Vec<String> = Vec::with_capacity(BANK_LANGS.len() + 1);
+    let primary = crate::utils::bias_schema::lang_code_of(primary_lang);
+    if dict.get(primary.as_str()).is_some() {
+        order.push(primary);
+    }
+    for l in BANK_LANGS.iter() {
+        if dict.get(*l).is_none() { continue; }
+        if !order.iter().any(|x| x.as_str() == *l) { order.push((*l).to_string()); }
+    }
+    if order.is_empty() {
+        order.push("en".to_string());
+    }
+    order
+}
+
+pub fn bank_lang_coverage() -> (Vec<&'static str>, Vec<&'static str>) {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let mut have: Vec<&'static str> = Vec::new();
+    let mut miss: Vec<&'static str> = Vec::new();
+    for l in BANK_LANGS.iter() {
+        match dict.get(*l) {
+            Some(_) => have.push(*l),
+            None => miss.push(*l),
+        }
+    }
+    (have, miss)
+}
+
 pub fn label_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field_name: &str) -> (Vec<String>, Vec<f32>) {
     let mut phrases: Vec<String> = Vec::new();
     let mut weights: Vec<f32> = Vec::new();
-    let mut order: Vec<&str> = Vec::with_capacity(BANK_LANGS.len() + 1);
-    if !primary_lang.trim().is_empty() { order.push(primary_lang); }
-    for l in BANK_LANGS.iter() {
-        if !order.iter().any(|x| x == l) { order.push(*l); }
-    }
-    for lk in order.into_iter() {
-        let (ph, wt) = label_phrase_bank(lk, page_type, field_name);
+    for lk in bank_lang_order(primary_lang).into_iter() {
+        let (ph, wt) = label_phrase_bank(&lk, page_type, field_name);
         for (p, w) in ph.into_iter().zip(wt.into_iter()) {
             if phrases.iter().any(|e| e == &p) { continue; }
             phrases.push(p);
@@ -2084,6 +2106,17 @@ pub fn label_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field
         }
     }
     (phrases, weights)
+}
+
+pub fn prejudice_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field_name: &str) -> Vec<String> {
+    let mut phrases: Vec<String> = Vec::new();
+    for lk in bank_lang_order(primary_lang).into_iter() {
+        for p in prejudice_phrase_bank(&lk, page_type, field_name) {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+        }
+    }
+    phrases
 }
 
 pub const TRADE_DOC_TITLES_ML: &[(&str, &str)] = &[
@@ -2132,6 +2165,47 @@ pub const TRADE_DOC_TITLES_ML: &[(&str, &str)] = &[
     ("ID", "dovozní prohlášení"), ("ID", "بيان الاستيراد"), ("ID", "수입신고"),
     ("ID", "輸入申告"), ("ID", "进口报关"),
 ];
+
+pub fn all_trade_doc_titles() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let absorb = |code: String, title: String, out: &mut Vec<(String, String)>| {
+        let t = title.trim().to_string();
+        if code.is_empty() || t.is_empty() { return; }
+        if out.iter().any(|(c, e)| *c == code && e.eq_ignore_ascii_case(&t)) { return; }
+        out.push((code, t));
+    };
+    for (code, title) in crate::logic::TRADE_DOC_TITLES.iter().chain(TRADE_DOC_TITLES_ML.iter()) {
+        absorb(code.to_string(), title.to_string(), &mut out);
+    }
+    for (code, title) in crate::logic::trade_title_pairs().iter() {
+        absorb(code.to_string(), title.to_string(), &mut out);
+    }
+    out
+}
+
+pub fn trade_code_title_phrases(code: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (c, title) in all_trade_doc_titles().into_iter() {
+        if !c.eq_ignore_ascii_case(code) { continue; }
+        if out.iter().any(|e| e.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    out
+}
+
+pub fn trade_group_title_phrases(group: &str) -> Vec<String> {
+    let codes: Vec<&str> = match crate::logic::TRADE_GROUP_CODES.iter().find(|(g, _)| *g == group) {
+        Some((_, cs)) => cs.to_vec(),
+        None => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (c, title) in all_trade_doc_titles().into_iter() {
+        if !codes.iter().any(|x| x.eq_ignore_ascii_case(&c)) { continue; }
+        if out.iter().any(|e| e.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    out
+}
 
 // 🌟 [PREJUDICE PHRASE BANK] bias.json 이 필드마다 손으로 써 둔 "이 컬럼이 절대 아닌 라벨" 목록입니다.
 //    예) tracking_number.prejudice 에는 "주문번호" 가 리터럴로 들어 있어

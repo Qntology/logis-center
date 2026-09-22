@@ -443,92 +443,20 @@ pub fn field_format_to_string(field_name: &str) -> String {
 ///   - bias_phrases: semantic 앵커 + bias 구를 split_bias_phrases_full 로 분할한 목록
 ///   - prejudice_phrases: prejudice 구를 분할한 목록
 fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> (Vec<String>, Vec<String>) {
-    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let is_trade = crate::utils::bias_schema::is_trade_doc_type(page_type);
 
-    let mut bias_phrases: Vec<String> = Vec::new();
-    let mut prejudice_phrases: Vec<String> = Vec::new();
+    let (mut bias_phrases, _weights) = if is_trade {
+        crate::model::merge::owner_label_bank(doc_lang, canon, field_name)
+    } else {
+        crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, canon, field_name)
+    };
 
-    // 1. semantic 앵커 추출 (기존 semantic_anchor_text 로직 인라인)
-    for lk in [doc_lang, "en", "ko"] {
-        let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
-        if let Some(s) = lang_node
-            .get(page_type)
-            .and_then(|p| p.get(field_name))
-            .and_then(|n| n.get("semantic"))
-            .and_then(|v| v.as_str())
-        {
-            if !s.trim().is_empty() {
-                for phrase in s.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                    let p = phrase.trim().to_string();
-                    if !p.is_empty() && !bias_phrases.iter().any(|e| e == &p) {
-                        bias_phrases.push(p);
-                    }
-                }
-                break;
-            }
-        }
-        if let Some(s) = lang_node
-            .get("default")
-            .and_then(|p| p.get(field_name))
-            .and_then(|n| n.get("semantic"))
-            .and_then(|v| v.as_str())
-        {
-            if !s.trim().is_empty() {
-                for phrase in s.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                    let p = phrase.trim().to_string();
-                    if !p.is_empty() && !bias_phrases.iter().any(|e| e == &p) {
-                        bias_phrases.push(p);
-                    }
-                }
-                break;
-            }
-        }
-    }
+    let mut prejudice_phrases =
+        crate::utils::ai_utils::prejudice_phrase_bank_multilingual(doc_lang, canon, field_name);
 
-    // 2. bias 구 추출
-    for lk in [doc_lang, "en", "ko"] {
-        let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
-        if let Some(b) = lang_node
-            .get(page_type)
-            .and_then(|p| p.get(field_name))
-            .and_then(|n| n.get("bias"))
-            .and_then(|v| v.as_str())
-        {
-            if !b.trim().is_empty() {
-                for phrase in b.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                    let p = phrase.trim().to_string();
-                    if !p.is_empty() && !bias_phrases.iter().any(|e| e == &p) {
-                        bias_phrases.push(p);
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    // 3. prejudice 구 추출
-    for lk in [doc_lang, "en", "ko"] {
-        let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
-        if let Some(p) = lang_node
-            .get(page_type)
-            .and_then(|pp| pp.get(field_name))
-            .and_then(|n| n.get("prejudice"))
-            .and_then(|v| v.as_str())
-        {
-            if !p.trim().is_empty() {
-                for phrase in p.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                    let ph = phrase.trim().to_string();
-                    if !ph.is_empty() && !prejudice_phrases.iter().any(|e| e == &ph) {
-                        prejudice_phrases.push(ph);
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    // 4. 루트 전역 노드 폴백 (color, metrics.*, operators.* 등)
     if bias_phrases.is_empty() {
+        let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
         let mut stack: Vec<&serde_json::Value> = vec![dict];
         let mut hops = 0usize;
         while let Some(node) = stack.pop() {
@@ -536,18 +464,18 @@ fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> 
             if hops > 4096 { break; }
             if let Some(obj) = node.as_object() {
                 if let Some(child) = obj.get(field_name) {
-                    if let Some(b) = child.get("bias").and_then(|v| v.as_str()) {
-                        for phrase in b.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                            let p = phrase.trim().to_string();
-                            if !p.is_empty() && !bias_phrases.iter().any(|e| e == &p) {
-                                bias_phrases.push(p);
+                    for key in ["semantic", "bias"] {
+                        if let Some(b) = child.get(key).and_then(|v| v.as_str()) {
+                            for p in crate::utils::ai_utils::split_bias_phrases_full(b) {
+                                if !bias_phrases.iter().any(|e| e == &p) {
+                                    bias_phrases.push(p);
+                                }
                             }
                         }
                     }
                     if let Some(p) = child.get("prejudice").and_then(|v| v.as_str()) {
-                        for phrase in p.split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|') {
-                            let ph = phrase.trim().to_string();
-                            if !ph.is_empty() && !prejudice_phrases.iter().any(|e| e == &ph) {
+                        for ph in crate::utils::ai_utils::split_bias_phrases_full(p) {
+                            if !prejudice_phrases.iter().any(|e| e == &ph) {
                                 prejudice_phrases.push(ph);
                             }
                         }
@@ -560,10 +488,6 @@ fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> 
             }
         }
     }
-
-    // 5. bias_phrases 상한 (기존 split_bias_phrases 의 48개 상한과 동일)
-    if bias_phrases.len() > 48 { bias_phrases.truncate(48); }
-    if prejudice_phrases.len() > 48 { prejudice_phrases.truncate(48); }
 
     (bias_phrases, prejudice_phrases)
 }
@@ -949,6 +873,7 @@ pub fn lang_code_to_full_name(code: &str) -> String {
         "vi" => "vietnamese".to_string(),
         "tr" => "turkish".to_string(),
         "pl" => "polish".to_string(),
+        "cs" => "czech".to_string(),
         "id" | "ms" => "indonesian".to_string(),
         _ => code.to_string(),
     }
