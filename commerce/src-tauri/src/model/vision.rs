@@ -9,6 +9,7 @@ use base64::Engine;
 use tauri::Emitter;
 use crate::openai_types::*;
 use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts, record_claim_violations};
+static VISION_KV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl crate::model::LogisModel {
 
@@ -152,17 +153,23 @@ impl crate::model::LogisModel {
                     } else {
                         verdict.code_candidates.clone()
                     };
-                if verdict.title_confirmed && tie_candidates.len() <= 1 {
+                let tie_margin: f32 = if verdict.title_confirmed && tie_candidates.len() >= 2 {
+                    (tie_candidates[0].1 - tie_candidates[1].1).abs()
+                } else {
+                    verdict.code_margin
+                };
+                crate::utils::score_dynamics::record_baseline("vision.tie_margin", tie_margin);
+                if verdict.title_confirmed && (tie_candidates.len() <= 1 || tie_margin >= 0.15) {
                     emit_term(&format!(
-                        "  🪪 [TITLE VERDICT TRUSTED] 코드 마진 {:+.4} 이지만 판정 '{}' 은 상단 밴드에 인쇄된 서식 전문에서 직접 읽었고 같은 행에 경쟁 전문이 없습니다. 후보 전체를 나열한 LLM 재판정은 격자 안의 참조 라벨을 제목으로 오인할 수 있으므로 열지 않습니다.",
-                        verdict.code_margin, verdict.code
+                        "  🪪 [TITLE VERDICT TRUSTED] 판정 '{}' 은 상단 밴드에 인쇄된 서식 전문에서 직접 읽었습니다. 제목 행 밴드 안 1·2위 마진 {:+.4} (전체 코드 대비 마진 {:+.4}). 밴드 밖 코드는 이미 후보가 아니므로 재판정 여부는 밴드 안 마진으로 정합니다. LLM 재판정을 열지 않습니다.",
+                        verdict.code, tie_margin, verdict.code_margin
                     ));
-                } else if verdict.code_margin < 0.15 && tie_candidates.len() > 1 {
+                } else if tie_margin < 0.15 && tie_candidates.len() > 1 {
                     emit_term(&format!(
-                        "  🤝 [TIE BREAK] 코드 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행 (후보 {}개{}).",
-                        verdict.code_margin,
+                        "  🤝 [TIE BREAK] 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행 (후보 {}개{}).",
+                        tie_margin,
                         tie_candidates.len(),
-                        if verdict.title_confirmed { " — 제목 행에서 동점인 전문만" } else { "" }
+                        if verdict.title_confirmed { " — 제목 행에서 동점인 전문만, 밴드 안 마진 기준" } else { "" }
                     ));
                     let prompt = crate::parsing::get_trade_doc_classification_prompt_with_evidence(
                         &verdict.group,
@@ -807,6 +814,44 @@ impl crate::model::LogisModel {
                                 }
                             }
                             if identity_pass_ran {
+                                let dn_now: Option<String> = tile_json
+                                    .get(crate::logic::TRADE_IDENTITY_FIELD)
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty() && !crate::model::merge::is_schema_echo(s))
+                                    .or_else(|| {
+                                        final_data_map
+                                            .get(crate::logic::TRADE_IDENTITY_FIELD)
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty() && !crate::model::merge::is_schema_echo(s))
+                                    });
+                                if let Some(dn) = dn_now {
+                                    let echo: Vec<String> = tile_json
+                                        .as_object()
+                                        .map(|o| {
+                                            o.iter()
+                                                .filter(|(k, v)| {
+                                                    k.starts_with("reference_")
+                                                        && v.as_str()
+                                                            .map(|s| crate::model::merge::same_printed_value(s.trim(), &dn))
+                                                            .unwrap_or(false)
+                                                })
+                                                .map(|(k, _)| k.clone())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    if let Some(o) = tile_json.as_object_mut() {
+                                        for k in echo.iter() {
+                                            o.insert(k.clone(), Value::Null);
+                                            crate::utils::score_dynamics::record_baseline("vision.self_reference_echo", 1.0);
+                                            emit_term(&format!(
+                                                "    🚫 [SELF-REFERENCE ECHO] 식별 패스가 '{}' 에 자기 문서번호 \"{}\" 를 그대로 되돌려주었습니다. 참조 축은 다른 문서의 번호만 담을 수 있으므로 비웁니다. 그대로 두면 릴레이가 자기 자신을 가리키는 초안을 만듭니다.",
+                                                k, dn
+                                            ));
+                                        }
+                                    }
+                                }
                                 if let Some(o) = tile_json.as_object() {
                                     for (k, v) in o.iter() {
                                         let filled = !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false));
@@ -3820,13 +3865,29 @@ impl crate::model::LogisModel {
             ..Default::default()
         };
         
-        gen.generate(
-            params, 
+        // 🌟 [KV SESSION PER CALL] 비전 호출마다 KV 디렉터리를 새로 씁니다.
+        //  같은 task_id 세션을 크롭마다 재사용하면, SSD 계획으로 흘러간 앞선 호출이
+        //  DirectStorage 로 열어 둔 b0 의 어텐션 층 파일을 다음 호출이 지우고 다시 만들다
+        //  delete-pending 이름에 부딪혀 '액세스가 거부되었습니다 (os error 5)' 가 납니다.
+        //  크롭마다 프롬프트가 달라 세션 접두 캐시가 재사용될 여지도 없습니다.
+        //  base_payload.task_id 는 원래 session_id 로 이미 주입되었으므로 로그 귀속은 바뀌지 않습니다.
+        let kv_session: Option<String> = session_id.as_ref().map(|sid| {
+            format!("{}_v{}", sid, VISION_KV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        });
+        let kv_dir = kv_session
+            .as_ref()
+            .map(|s| crate::utils::paths::get_kv_dir(Some(_app_handle)).join(s));
+        let out = gen.generate(
+            params,
             cancellation_token.clone(),
-            session_id, // 🌟 SSD 저장 및 병합 캐시 활성화!
+            kv_session,
             Some("inference".to_string()),
-            None, // 🌟 5번째 인자인 ignore_list 자리에 None을 명시적으로 추가합니다.
-            semantic_prejudice  // 🌟 변경
-        ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e))
+            None,
+            semantic_prejudice
+        ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e));
+        if let Some(d) = kv_dir {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        out
     }
 }
