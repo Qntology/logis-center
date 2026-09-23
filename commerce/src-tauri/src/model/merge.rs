@@ -11,12 +11,12 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 
     if let Some(h) = data.get("header") {
         if let Some(no) = h.get("document_number").and_then(|s| s.as_str()) {
-            if no != "N/A" && !no.is_empty() {
+            if !is_schema_echo(no) {
                 parts.push(format!("Document number is {}.", no));
             }
         }
         if let Some(date) = h.get("issue_date").and_then(|s| s.as_str()) {
-            if date != "N/A" && !date.is_empty() {
+            if !is_schema_echo(date) {
                 parts.push(format!("Issued on {}.", date));
             }
         }
@@ -35,8 +35,8 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
         let sup = p.get("supplier_name").and_then(|s| s.as_str());
         let buy = p.get("buyer_name").and_then(|s| s.as_str());
         
-        let has_sup = sup.is_some() && sup.unwrap() != "N/A";
-        let has_buy = buy.is_some() && buy.unwrap() != "N/A";
+        let has_sup = sup.map_or(false, |s| !is_schema_echo(s));
+        let has_buy = buy.map_or(false, |s| !is_schema_echo(s));
 
         if has_sup && has_buy {
             parts.push(format!("Transaction involved {} as the supplier/shipper and {} as the buyer/consignee.", sup.unwrap(), buy.unwrap()));
@@ -62,7 +62,7 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
         let pod = l.get("location_port_of_discharge").and_then(|s| s.as_str());
         
         if let (Some(o), Some(d)) = (pol, pod) {
-            if o != "N/A" && d != "N/A" {
+            if !is_schema_echo(o) && !is_schema_echo(d) {
                 parts.push(format!("Shipped from {} to {}.", o, d));
             }
         }
@@ -270,7 +270,7 @@ pub fn resolve_cross_field_duplicates(
         let mut pool: Vec<f32> = Vec::new();
         let mut per: Vec<(usize, f32, usize)> = Vec::new();
         for (oi, (_, field, _)) in owners.iter().enumerate() {
-            let (phrases, weights) = crate::utils::ai_utils::label_phrase_bank(doc_lang, bank_type, field);
+            let (phrases, weights) = owner_label_bank(doc_lang, bank_type, field);
             let mut mx = f32::MIN;
             let mut live = 0usize;
             for (p, w) in phrases.iter().zip(weights.iter()) {
@@ -320,6 +320,7 @@ pub fn resolve_cross_field_duplicates(
                     top_patch: 0,
                     top_legible: true,
                     accepted: false,
+                    gate: crate::models::siglip2::value_grounding::VerdictGate::Prejudice,
                     reason: "필드 소유권 경쟁 패배 (다른 축이 같은 값을 더 잘 설명함)".to_string(),
                 });
             } else {
@@ -595,6 +596,172 @@ pub fn closed_vocab_echo(value: &str, vocab: &[String]) -> bool {
     seen
 }
 
+/// 🌟 [WEIGHT BASIS] '총중량' 과 '순중량' 을 라벨이 아니라 산술로 가릅니다.
+///
+///  ── 왜 라벨로는 못 가르는가 ──
+///   영어 "TOTAL WEIGHT", 독일어 "Gesamtgewicht", 프랑스어 "poids total",
+///   중국어 "总重量" 에는 총/순 표지가 없습니다. 이 라벨 하나로 weight_gross 와
+///   weight_net 중 어느 쪽인지 판정할 근거가 인쇄물에 존재하지 않습니다.
+///   실측에서도 두 축이 +1.8818 대 +1.7124 의 잡음 차로 뒤집혔습니다.
+///   어느 쪽 뱅크에 구를 넣어도 그 잡음이 결정론적 오답으로 바뀔 뿐입니다.
+///
+///  ── 산술은 근거가 됩니다 ──
+///   순중량 총계는 품목 순중량의 합을 넘을 수 없고,
+///   총중량은 그 합보다 작을 수 없습니다. 포장재는 더해질 뿐 빠지지 않습니다.
+///   drop_row_echo_columns 가 행 합계 대 문서 총계를 대조하는 것과 같은 판정입니다.
+///
+///  ── 모든 행에 단위중량이 있을 때만 발화합니다 ──
+///   한 행이라도 비어 있으면 합계가 과소 추정되어 정상 값을 오답으로 만듭니다.
+///   근거가 불완전하면 판정하지 않고 관측만 남깁니다.
+pub fn reconcile_weight_basis(
+    merged: &mut serde_json::Map<String, Value>,
+    emit: &dyn Fn(&str),
+) -> usize {
+    fn num_of(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => {
+                let t: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                if !t.chars().any(|c| c.is_ascii_digit()) { return None; }
+                t.parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    }
+    fn read(m: &serde_json::Map<String, Value>, f: &str) -> Option<f64> {
+        if let Some(v) = m.get(f).and_then(num_of) { return Some(v); }
+        m.values()
+            .filter_map(|v| v.as_object())
+            .find_map(|o| o.get(f).and_then(num_of))
+    }
+    fn move_axis(m: &mut serde_json::Map<String, Value>, from: &str, to: &str, v: Value) {
+        m.remove(from);
+        let cats: Vec<String> = m.keys().cloned().collect();
+        for c in cats {
+            if let Some(o) = m.get_mut(&c).and_then(|x| x.as_object_mut()) {
+                o.remove(from);
+            }
+        }
+        m.insert(to.to_string(), v.clone());
+        let slot = m
+            .entry("cargo".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(o) = slot.as_object_mut() {
+            o.insert(to.to_string(), v);
+        }
+    }
+
+    let mut rows: Vec<&Value> = Vec::new();
+    for key in ["items", "line_items"] {
+        if let Some(arr) = merged.get(key).and_then(|v| v.as_array()) {
+            if arr.len() > rows.len() {
+                rows = arr.iter().collect();
+            }
+        }
+    }
+    if rows.is_empty() { return 0; }
+
+    let mut net_sum = 0.0f64;
+    let mut missing = 0usize;
+    for r in rows.iter() {
+        let unit = r.get("item_net_weight").and_then(num_of);
+        let qty = r.get("quantity").and_then(num_of).unwrap_or(1.0);
+        match unit {
+            Some(u) => net_sum += u * qty,
+            None => missing += 1,
+        }
+    }
+    if missing > 0 || net_sum <= 0.0 {
+        emit(&format!(
+            "  👁️ [WEIGHT BASIS OBSERVE] 품목 {}행 중 {}행에 단위 순중량이 없어 총계를 산술로 검증할 수 없습니다. 'TOTAL WEIGHT' 계열 라벨은 총/순 표지가 없어 라벨만으로는 어느 축인지 알 수 없으므로, 이번 회차는 현재 배정을 그대로 둡니다.",
+            rows.len(), missing
+        ));
+        crate::utils::score_dynamics::record_baseline("vision.weight_basis_observe", 1.0);
+        return 0;
+    }
+
+    let net = read(merged, "weight_net");
+    let gross = read(merged, "weight_gross");
+    let eps = net_sum.abs() * 1e-6;
+    let mut fixed = 0usize;
+
+    if let Some(n) = net {
+        if n > net_sum + eps {
+            let v = json!(n);
+            if gross.is_none() {
+                emit(&format!(
+                    "  🧮 [WEIGHT BASIS] 'weight_net' = {} 이 품목 순중량 합 {} 을 넘습니다. 순중량 총계는 자기 구성 항목의 합을 넘을 수 없으므로 이 자리에 인쇄된 것은 총중량입니다. 비어 있는 'weight_gross' 로 옮깁니다. 이 판정은 라벨이 아니라 산술이므로 'TOTAL WEIGHT' 처럼 총/순 표지가 없는 라벨에서도 성립합니다.",
+                    n, net_sum
+                ));
+                move_axis(merged, "weight_net", "weight_gross", v);
+            } else {
+                emit(&format!(
+                    "  🧮 [WEIGHT BASIS] 'weight_net' = {} 이 품목 순중량 합 {} 을 넘는데 'weight_gross' 도 이미 {} 로 차 있습니다. 옮길 자리가 없으므로 비웁니다.",
+                    n, net_sum, gross.unwrap_or(0.0)
+                ));
+                merged.remove("weight_net");
+                let cats: Vec<String> = merged.keys().cloned().collect();
+                for c in cats {
+                    if let Some(o) = merged.get_mut(&c).and_then(|x| x.as_object_mut()) {
+                        o.remove("weight_net");
+                    }
+                }
+            }
+            crate::utils::score_dynamics::record_field_seen("weight_net");
+            crate::utils::score_dynamics::record_field_reject(
+                "weight_net",
+                crate::utils::score_dynamics::GateKind::Format,
+            );
+            fixed += 1;
+        }
+    }
+
+    if fixed == 0 {
+        if let Some(g) = gross {
+            if g + eps < net_sum {
+                let v = json!(g);
+                if net.is_none() {
+                    emit(&format!(
+                        "  🧮 [WEIGHT BASIS] 'weight_gross' = {} 이 품목 순중량 합 {} 보다 작습니다. 포장재는 더해질 뿐 빠지지 않으므로 총중량이 순중량 합보다 작을 수 없습니다. 비어 있는 'weight_net' 으로 옮깁니다.",
+                        g, net_sum
+                    ));
+                    move_axis(merged, "weight_gross", "weight_net", v);
+                } else {
+                    emit(&format!(
+                        "  🧮 [WEIGHT BASIS] 'weight_gross' = {} 이 품목 순중량 합 {} 보다 작은데 'weight_net' 도 이미 차 있습니다. 비웁니다.",
+                        g, net_sum
+                    ));
+                    merged.remove("weight_gross");
+                    let cats: Vec<String> = merged.keys().cloned().collect();
+                    for c in cats {
+                        if let Some(o) = merged.get_mut(&c).and_then(|x| x.as_object_mut()) {
+                            o.remove("weight_gross");
+                        }
+                    }
+                }
+                crate::utils::score_dynamics::record_field_seen("weight_gross");
+                crate::utils::score_dynamics::record_field_reject(
+                    "weight_gross",
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
+                fixed += 1;
+            }
+        }
+    }
+
+    if fixed == 0 {
+        emit(&format!(
+            "  ✅ [WEIGHT BASIS] 중량 축이 품목 순중량 합 {} 과 산술로 정합합니다.",
+            net_sum
+        ));
+    }
+    crate::utils::score_dynamics::record_baseline("vision.weight_basis", fixed as f32);
+    fixed
+}
+
 pub fn reconcile_package_axes(
     merged: &mut serde_json::Map<String, Value>,
     emit: &dyn Fn(&str),
@@ -698,7 +865,43 @@ pub fn is_schema_echo(s: &str) -> bool {
             | "string" | "number" | "boolean" | "array" | "object" | "integer" | "float"
             | "yyyy-mm-dd" | "yyyy-mm-ddthh:mm:ss" | "iso8601" | "iso 8601"
             | "not specified" | "not available" | "not found"
+            | "nicht angegeben" | "nicht verfügbar" | "keine angabe" | "unbekannt" | "entfällt"
+            | "non spécifié" | "non renseigné" | "non disponible" | "inconnu" | "sans objet"
+            | "no especificado" | "no disponible" | "desconocido" | "no aplica" | "sin datos"
+            | "non specificato" | "non disponibile" | "sconosciuto" | "non applicabile"
+            | "não especificado" | "não disponível" | "desconhecido" | "não aplicável"
+            | "niet opgegeven" | "niet beschikbaar" | "onbekend" | "niet van toepassing"
+            | "neuvedeno" | "nedostupné" | "neznámé" | "nevztahuje se"
+            | "غير محدد" | "غير متوفر" | "غير معروف" | "لا ينطبق"
+            | "指定なし" | "該当なし" | "不明" | "未記入" | "なし"
+            | "未指定" | "不适用" | "未知" | "无" | "未提供"
+            | "해당 없음" | "해당없음" | "정보 없음" | "정보없음" | "미기재" | "없음" | "미상"
     )
+}
+
+const PLURAL_SUFFIXES_ML: [&str; 6] = ["S", "ES", "N", "EN", "X", "Y"];
+const PLURAL_VOWEL_SWAPS_ML: [(char, char); 4] = [('O', 'I'), ('A', 'E'), ('E', 'I'), ('A', 'Y')];
+
+fn plural_equivalent(short: &str, long: &str) -> bool {
+    let sc = short.chars().count();
+    let lc = long.chars().count();
+    if sc == 0 || lc < sc { return false; }
+    if lc > sc {
+        return match long.strip_prefix(short) {
+            Some("S") => true,
+            Some(rest) => sc >= 3 && PLURAL_SUFFIXES_ML.iter().any(|s| *s == rest),
+            None => false,
+        };
+    }
+    if sc < 4 { return false; }
+    let mut a: Vec<char> = short.chars().collect();
+    let mut b: Vec<char> = long.chars().collect();
+    let la = match a.pop() { Some(c) => c, None => return false };
+    let lb = match b.pop() { Some(c) => c, None => return false };
+    if a != b { return false; }
+    PLURAL_VOWEL_SWAPS_ML
+        .iter()
+        .any(|(s, p)| (*s == la && *p == lb) || (*s == lb && *p == la))
 }
 
 pub fn same_printed_token(a: &str, b: &str) -> bool {
@@ -712,9 +915,7 @@ pub fn same_printed_token(a: &str, b: &str) -> bool {
     if x.is_empty() || y.is_empty() { return false; }
     if x == y { return true; }
     let (short, long) = if x.chars().count() <= y.chars().count() { (&x, &y) } else { (&y, &x) };
-    long.starts_with(short.as_str())
-        && long.chars().count() == short.chars().count() + 1
-        && long.ends_with('S')
+    plural_equivalent(short, long)
 }
 
 pub fn same_printed_value(a: &str, b: &str) -> bool {
@@ -731,6 +932,50 @@ pub fn same_printed_value(a: &str, b: &str) -> bool {
         (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
         _ => false,
     }
+}
+
+/// 뱅크 전체의 중심 벡터. 자기 정화의 기준점입니다.
+///
+///  ── 왜 첫 구(head)가 아니라 중심인가 ──
+///   기존 구현은 뱅크의 첫 유효 구를 대표로 삼았습니다. 라벨 뱅크가 영어 한 벌일 때는
+///   첫 구가 곧 그 필드의 이름이라 무해했지만, 12개 언어 구를 합치면 첫 구는 '영어 표기' 일 뿐입니다.
+///   비영어 구는 교차언어 거리 때문에 자기 대표와의 코사인이 구조적으로 낮아져,
+///   의미가 정확한 번역어까지 '자기 필드를 설명하지 못한다' 는 이유로 잘려 나갑니다.
+///   query_shipping.rs 의 [TIME UNIT SELF-POISON] 이 같은 이유로 이미 중심 방식을 씁니다.
+pub fn bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
+    let dim = match bank.iter().map(|e| e.len()).max() {
+        Some(d) if d > 0 => d,
+        _ => return Vec::new(),
+    };
+    let mut c = vec![0.0f32; dim];
+    let mut cnt = 0usize;
+    for e in bank.iter() {
+        if e.len() != dim || e.iter().all(|&v| v == 0.0) { continue; }
+        for (k, v) in e.iter().enumerate() { c[k] += v; }
+        cnt += 1;
+    }
+    if cnt == 0 { return Vec::new(); }
+    let norm = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        for v in c.iter_mut() { *v /= norm; }
+    }
+    c
+}
+
+/// 소유권 경쟁·복구 게이트가 쓰는 라벨 뱅크. 다국어 + 보강표를 합칩니다.
+///
+///  ── 왜 함수로 빼는가 ──
+///   이 뱅크를 만드는 곳과 그 구의 임베딩을 미리 계산해 두는 곳(vision.rs 의 lookup)이
+///   서로 다른 파일에 있습니다. 두 곳이 각자 뱅크를 조립하면 한쪽만 다국어가 되는 순간
+///   lookup 에 없는 구가 조용히 건너뛰어져, 구를 늘렸는데 점수가 그대로인 상태가 됩니다.
+pub fn owner_label_bank(doc_lang: &str, bank_type: &str, field: &str) -> (Vec<String>, Vec<f32>) {
+    let (mut ph, mut wt) =
+        crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, bank_type, field);
+    let sup = crate::logic::trade_label_supplement(field);
+    if !sup.is_empty() {
+        crate::logic::merge_phrase_bank(&mut ph, &mut wt, &sup, 1.0);
+    }
+    (ph, wt)
 }
 
 /// 🌟 [ANCHOR SELF-POISON] 다른 필드의 이름을 품은 앵커 구를 그 필드 뱅크에서 뺍니다.
@@ -752,10 +997,29 @@ fn purge_self_poisoned_anchors(
 ) -> Vec<(String, Vec<Vec<f32>>, Vec<f32>)> {
     use crate::utils::ai_utils::cosine_similarity;
 
-    // 각 필드의 대표 구 = 그 필드 뱅크의 첫 유효 구
-    let heads: Vec<Option<&Vec<f32>>> = banks
+    // 각 필드의 대표 벡터 = 그 필드 뱅크 전체의 중심
+    let heads: Vec<Option<Vec<f32>>> = banks
         .iter()
-        .map(|(_, b, _)| b.iter().find(|e| !e.iter().all(|&v| v == 0.0)))
+        .map(|(_, b, _)| {
+            let c = bank_centroid(b);
+            if c.is_empty() { None } else { Some(c) }
+        })
+        .collect();
+    // 중심에 가장 가까운 구가 그 뱅크를 가장 잘 대표합니다. 이 구만 정화에서 면제합니다.
+    // 인덱스 0(영어)을 무조건 면제하면 다국어 뱅크에서 영어만 특권을 갖습니다.
+    let anchors: Vec<usize> = banks
+        .iter()
+        .enumerate()
+        .map(|(fi, (_, b, _))| {
+            let h = match heads[fi].as_ref() { Some(h) => h, None => return 0usize };
+            let mut best = (0usize, f32::MIN);
+            for (pi, e) in b.iter().enumerate() {
+                if e.iter().all(|&v| v == 0.0) { continue; }
+                let s = cosine_similarity(e, h);
+                if s > best.1 { best = (pi, s); }
+            }
+            best.0
+        })
         .collect();
 
     let mut out: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::with_capacity(banks.len());
@@ -768,7 +1032,7 @@ fn purge_self_poisoned_anchors(
     let mut per_field: Vec<(String, usize, usize)> = Vec::new();
 
     for (fi, (fname, bank, weights)) in banks.iter().enumerate() {
-        let own_head = match heads[fi] { Some(h) => h, None => {
+        let own_head = match heads[fi].as_ref() { Some(h) => h, None => {
             out.push((fname.clone(), bank.clone(), weights.clone()));
             continue;
         }};
@@ -783,8 +1047,8 @@ fn purge_self_poisoned_anchors(
 
         for (pi, e) in bank.iter().enumerate() {
             if e.iter().all(|&v| v == 0.0) { continue; }
-            // 대표 구 자신은 항상 유지합니다. 빼면 뱅크가 소멸합니다.
-            if pi == 0 {
+            // 중심에 가장 가까운 구는 항상 유지합니다. 빼면 뱅크가 소멸합니다.
+            if pi == anchors[fi] {
                 kept_bank.push(e.clone());
                 kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
                 continue;
@@ -794,7 +1058,7 @@ fn purge_self_poisoned_anchors(
             let mut rival = f32::MIN;
             for (gi, h) in heads.iter().enumerate() {
                 if gi == fi { continue; }
-                let h = match h { Some(h) => h, None => continue };
+                let h = match h.as_ref() { Some(h) => h, None => continue };
                 let s = cosine_similarity(e, h);
                 if s > rival { rival = s; rival_name = banks[gi].0.clone(); }
             }
@@ -1607,17 +1871,17 @@ pub fn apply_grounding_verdicts(
         for v in verdicts.iter() {
             crate::utils::score_dynamics::record_field_seen(&v.field);
             seen += 1;
-            if !v.accepted {
-                let kind = if v.reason.contains("인쇄 라벨") {
-                    crate::utils::score_dynamics::GateKind::Prejudice
-                } else {
-                    crate::utils::score_dynamics::GateKind::Format
-                };
-                crate::utils::score_dynamics::record_field_reject(&v.field, kind);
+            if v.gate == crate::models::siglip2::value_grounding::VerdictGate::Held {
+                held += 1;
                 continue;
             }
-            if v.reason.contains("보류") {
-                held += 1;
+            if !v.accepted {
+                let kind = match v.gate {
+                    crate::models::siglip2::value_grounding::VerdictGate::Prejudice =>
+                        crate::utils::score_dynamics::GateKind::Prejudice,
+                    _ => crate::utils::score_dynamics::GateKind::Format,
+                };
+                crate::utils::score_dynamics::record_field_reject(&v.field, kind);
                 continue;
             }
             // surprisal_out 은 크롭 밖 패치가 하나도 없을 때 f32::MIN 입니다.

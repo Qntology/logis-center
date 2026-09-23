@@ -181,24 +181,42 @@ impl crate::model::LogisModel {
         self.check_embedding_downloaded().await?;
         self.ensure_embedding().await?;
 
+        let cat_phrases: Vec<(String, Vec<String>)> = crate::logic::TRADE_CONDITION_CATEGORIES
+            .iter()
+            .map(|(cat, _)| (cat.to_string(), crate::logic::trade_condition_category_phrases(cat)))
+            .collect();
         let mut d1_bias: Vec<(String, String, String)> = Vec::new();
         let mut d1_prej: Vec<(String, String, String)> = Vec::new();
-        for (cat, raw) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
-            for p in crate::utils::ai_utils::split_bias_phrases_full(raw) {
-                d1_bias.push(("cond".to_string(), cat.to_string(), p));
+        let mut shared_skipped = 0usize;
+        for (cat, phrases) in cat_phrases.iter() {
+            for p in phrases.iter() {
+                d1_bias.push(("cond".to_string(), cat.clone(), p.clone()));
             }
-            for (other, other_raw) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
+            for (other, other_phrases) in cat_phrases.iter() {
                 if other == cat { continue; }
-                for p in crate::utils::ai_utils::split_bias_phrases_full(other_raw) {
-                    d1_prej.push(("cond".to_string(), cat.to_string(), p));
+                for p in other_phrases.iter() {
+                    if phrases.iter().any(|x| x.eq_ignore_ascii_case(p)) {
+                        shared_skipped += 1;
+                        continue;
+                    }
+                    d1_prej.push(("cond".to_string(), cat.clone(), p.clone()));
                 }
             }
+        }
+        if shared_skipped > 0 {
+            emit_term(&format!(
+                "   🧹 [D1 SELF-PREJUDICE DROP] 두 카테고리가 같은 구를 공유해 자기 판정 구가 자기 편견으로도 들어가려 한 자리 {}건을 제외했습니다. 영어 한 벌일 때는 카테고리 간 표기가 거의 겹치지 않아 드러나지 않던 결함인데, 12개 언어를 합치면 '증명서 번호'·'계약번호' 처럼 같은 번역어가 여러 카테고리에 동시에 존재해 자기 점수가 자기 편견에 상쇄됩니다.",
+                shared_skipped
+            ));
         }
 
         // 유일 구만 1회 임베딩하고 재사용합니다.
         let mut uniq_d1: Vec<String> = Vec::new();
+        let mut d1_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (_, _, p) in d1_bias.iter().chain(d1_prej.iter()) {
-            if !uniq_d1.iter().any(|e| e == p) { uniq_d1.push(p.clone()); }
+            if d1_index.contains_key(p) { continue; }
+            d1_index.insert(p.clone(), uniq_d1.len());
+            uniq_d1.push(p.clone());
         }
         let mut uniq_d1_embs: Vec<Vec<f32>> = Vec::with_capacity(uniq_d1.len());
         for part in uniq_d1.chunks(200) {
@@ -206,10 +224,11 @@ impl crate::model::LogisModel {
                 .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
             uniq_d1_embs.extend(e);
         }
+        let zero_d1 = vec![0.0f32; 384];
         let d1_emb_of = |p: &str| -> Vec<f32> {
-            match uniq_d1.iter().position(|e| e == p) {
-                Some(i) => uniq_d1_embs[i].clone(),
-                None => vec![0.0f32; 384],
+            match d1_index.get(p) {
+                Some(&i) => uniq_d1_embs[i].clone(),
+                None => zero_d1.clone(),
             }
         };
         let d1_bias_bank: Vec<(String, String, Vec<f32>)> = d1_bias.iter()
@@ -402,12 +421,34 @@ impl crate::model::LogisModel {
         let d1_gate = crate::utils::ai_utils::gumbel_expected_z(crate::logic::TRADE_CONDITION_CATEGORIES.len());
         let mut need_d1_llm: Vec<usize> = Vec::new();
         for (wi, w) in winners.iter().enumerate() {
-            if w.score < d1_gate && !ship_value_near(&layers.roles, w.start, w.end, 2) {
+            let value_near = ship_value_near(&layers.roles, w.start, w.end, 2);
+            if w.score < d1_gate && !value_near {
                 continue;
             }
-            if w.alts.first().map_or(false, |(_, s)| *s >= w.score * 0.9) {
-                need_d1_llm.push(wi);
+            let tied = w.alts.first().map_or(false, |(_, s)| *s >= w.score * 0.9);
+            if !tied {
+                continue;
             }
+            if value_near {
+                let accepts_value = |c: &str| -> bool {
+                    ship_category_accepts(c, crate::utils::ai_utils::FieldFormat::Numeric)
+                        || ship_category_accepts(c, crate::utils::ai_utils::FieldFormat::Identifier)
+                };
+                let (alt, alt_score) = w
+                    .alts
+                    .first()
+                    .map(|(c, s)| (c.clone(), *s))
+                    .unwrap_or((String::new(), 0.0));
+                if accepts_value(&w.category) && accepts_value(&alt) {
+                    emit_term(&format!(
+                        "   ⚡ [D1 TIE / VALUE-FIRST DEFER] \"{}\" 의 1·2위 카테고리 '{}'({:+.4}) 와 '{}'({:+.4}) 가 동률이지만, 이 스팬에는 값이 붙어 있고 두 카테고리 모두 그 값 형식의 축을 갖습니다. 값이 붙은 스팬의 필드는 D2 VALUE-FIRST 가 카테고리 경계 없이 정하므로 카테고리 재판정은 결과를 바꾸지 못합니다. LLM 을 부르지 않습니다.",
+                        w.text, w.category, w.score, alt, alt_score
+                    ));
+                    crate::utils::score_dynamics::record_baseline("search.d1_tie_deferred", 1.0);
+                    continue;
+                }
+            }
+            need_d1_llm.push(wi);
         }
 
         if !need_d1_llm.is_empty() {
@@ -479,7 +520,8 @@ impl crate::model::LogisModel {
         let hub_intent = has_code_values
             && d1_view.iter().any(|w| w.category == "hub" && w.score >= d1_gate);
 
-        let (doc_scope, projection, scope_logs) = ship_resolve_doc_scope(&layers.doc_mentions, &d1_view);
+        let (doc_scope, projection, scope_logs) =
+            ship_resolve_doc_scope(&layers.doc_mentions, &d1_view, &layers.relation_marks);
         for line in scope_logs.iter() { emit_term(line); }
 
         let mut identity_codes: Vec<String> = Vec::new();
@@ -637,9 +679,11 @@ impl crate::model::LogisModel {
             .collect();
         if !value_spans.is_empty() {
             let mut g_fields: Vec<(String, String, String)> = Vec::new();
-            let mut g_banks: Vec<Vec<Vec<f32>>> = Vec::new();
             let mut g_weights: Vec<Vec<f32>> = Vec::new();
-            let mut g_prejs: Vec<Vec<Vec<f32>>> = Vec::new();
+            let mut g_phr: Vec<Vec<String>> = Vec::new();
+            let mut g_prej_phr: Vec<Vec<String>> = Vec::new();
+            let mut out_of_scope: Vec<String> = Vec::new();
+            let mut supplemented = 0usize;
             for gcat in cat_order.iter() {
                 if gcat == "hub" { continue; }
                 for (fname, fdesc, anchor) in crate::logic::trade_condition_fields(gcat).iter() {
@@ -654,6 +698,10 @@ impl crate::model::LogisModel {
                     ) {
                         continue;
                     }
+                    if !ship_field_in_scope(fname, &final_scope) {
+                        out_of_scope.push(fname.to_string());
+                        continue;
+                    }
                     let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
                     if let Some((_, aliases)) = crate::parsing::TRADE_COLUMN_ALIASES.iter().find(|(f, _)| *f == *fname) {
                         for a in aliases.iter() {
@@ -663,31 +711,40 @@ impl crate::model::LogisModel {
                             wt.push(1.0);
                         }
                     }
+                    let sup = crate::logic::trade_label_supplement(fname);
+                    if !sup.is_empty() {
+                        supplemented += crate::logic::merge_phrase_bank(&mut ph, &mut wt, &sup, 1.0);
+                    }
                     if ph.is_empty() { continue; }
-                    let embs = self.get_embedding_batch(ph.clone()).await
-                        .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
-                    let pp = crate::utils::ai_utils::prejudice_phrase_bank(language, "shipping_doc", fname);
-                    let pe = if pp.is_empty() {
-                        Vec::new()
-                    } else {
-                        self.get_embedding_batch(pp.clone()).await
-                            .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
-                    };
+                    let pp = crate::utils::ai_utils::prejudice_phrase_bank_multilingual(language, "shipping_doc", fname);
                     g_fields.push((fname.to_string(), gcat.clone(), fdesc.to_string()));
-                    g_banks.push(embs);
                     g_weights.push(wt);
-                    g_prejs.push(pe);
+                    g_phr.push(ph);
+                    g_prej_phr.push(pp);
                 }
             }
-            emit_term(&format!(
-                "   📐 [D2 VALUE-FIRST] 값이 결속된 스팬 {}개를 카테고리 경계 없이 수치·식별자 필드 {}개와 경쟁시킵니다.",
-                value_spans.len(), g_fields.len()
-            ));
-            let mut g_span_embs: Vec<Vec<f32>> = Vec::with_capacity(value_spans.len());
-            for wi in value_spans.iter() {
-                let e = self.get_embedding(winners[*wi].text.clone()).await.unwrap_or(vec![0.0; 384]);
-                g_span_embs.push(e);
+            let g_banks = self.ship_embed_phrase_groups(&g_phr).await;
+            let g_prejs = self.ship_embed_phrase_groups(&g_prej_phr).await;
+            if !out_of_scope.is_empty() {
+                emit_term(&format!(
+                    "   🎯 [D2 FIELD SCOPE] 질의가 지목한 서식 {:?} 의 저장 스키마에 존재하지 않는 축 {}개를 값 경쟁에서 제외했습니다: {:?} — 저장될 수 없는 축이 1위가 되면 어떤 값을 넣어도 통과하지 못하는 하드 조건이 만들어집니다. 날짜 축에는 이미 같은 기준(DATE FIELD SCOPE)이 적용되어 있었는데 값 축에만 빠져 있었습니다.",
+                    final_scope, out_of_scope.len(),
+                    out_of_scope.iter().take(12).collect::<Vec<_>>()
+                ));
             }
+            emit_term(&format!(
+                "   📐 [D2 VALUE-FIRST] 값이 결속된 스팬 {}개를 카테고리 경계 없이 수치·식별자 필드 {}개와 경쟁시킵니다. 라벨 뱅크 {}구 + 편견 뱅크 {}구를 배치 2회로 임베딩했습니다 (다국어 보강 라벨 {}구 포함, 필드마다 따로 부르면 {}회).",
+                value_spans.len(), g_fields.len(),
+                g_phr.iter().map(|v| v.len()).sum::<usize>(),
+                g_prej_phr.iter().map(|v| v.len()).sum::<usize>(),
+                supplemented,
+                g_fields.len() * 2
+            ));
+            let g_span_texts: Vec<String> = value_spans.iter().map(|wi| winners[*wi].text.clone()).collect();
+            let g_span_embs: Vec<Vec<f32>> = self
+                .get_embedding_batch(g_span_texts.clone())
+                .await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; g_span_texts.len()]);
             let mut g_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; value_spans.len()]; g_fields.len()];
             for (si, wi) in value_spans.iter().enumerate() {
                 let e = &g_span_embs[si];
@@ -716,20 +773,27 @@ impl crate::model::LogisModel {
                 ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 if ranked.len() < 2 { continue; }
                 let (top, second) = (ranked[0], ranked[1]);
-                let coh = crate::utils::ai_utils::bank_internal_cohesion(&g_banks[second.0]);
-                if !crate::utils::ai_utils::prejudice_dominates(second.1, top.1, coh) {
-                    if top.1 - second.1 < 0.005 {
-                        emit_term(&format!(
-                            "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 차이가 동률 게이트 안이라 혼동 사전에는 원점수 승자가 아니라 아래 재판정의 승자를 기록합니다. 원점수 승자를 먼저 기록하면 Phase 1 에서 틀린 승자가 결정론이 됩니다.",
-                            winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
-                        ));
-                    } else {
-                        crate::utils::score_dynamics::record_confusion(&g_fields[top.0].0, &g_fields[second.0].0, top.1 - second.1);
-                        emit_term(&format!(
-                            "   🤝 [D2 VALUE-FIRST NEAR TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) — 원점수로 판정하고 혼동 쌍으로 기록합니다.",
-                            winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1
-                        ));
-                    }
+                let gap = top.1 - second.1;
+                let feas: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
+                let cnt = feas.len() as f32;
+                let mean = feas.iter().sum::<f32>() / cnt;
+                let sd = (feas.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                if gap < 0.005 {
+                    emit_term(&format!(
+                        "   🤝 [D2 VALUE-FIRST TIE] \"{}\" | {} ({:.4}) vs {} ({:.4}) | 격차 {:.4} — 동률 게이트 안이라 혼동 사전에는 원점수 승자가 아니라 아래 재판정의 승자를 기록합니다. 원점수 승자를 먼저 기록하면 Phase 1 에서 틀린 승자가 결정론이 됩니다.",
+                        winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1, gap
+                    ));
+                } else if sd > 1e-6 && gap < sd {
+                    crate::utils::score_dynamics::record_confusion(&g_fields[top.0].0, &g_fields[second.0].0, gap);
+                    emit_term(&format!(
+                        "   🤝 [D2 VALUE-FIRST CLOSE CALL] \"{}\" | {} ({:.4}) vs {} ({:.4}) | 격차 {:.4} < 후보 {}개의 표준편차 {:.4} — 원점수로 판정하되 다음 회차를 위해 혼동 쌍으로 기록합니다.",
+                        winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1, gap, feas.len(), sd
+                    ));
+                } else {
+                    emit_term(&format!(
+                        "   ✅ [D2 VALUE-FIRST DECISIVE] \"{}\" | {} ({:.4}) 가 {} ({:.4}) 를 격차 {:.4} (후보 {}개 표준편차 {:.4}) 로 앞섭니다. 혼동 사전에 넣지 않습니다 — 동률이 아닌 쌍을 기록하면 그 쌍이 나중에 결정론적 타이브레이커로 읽혀, 경쟁한 적 없는 축이 고정 승자가 됩니다.",
+                        winners[*wi].text, g_fields[top.0].0, top.1, g_fields[second.0].0, second.1, gap, feas.len(), sd
+                    ));
                 }
             }
             for (fi, a) in g_assign.iter().enumerate() {
@@ -748,11 +812,28 @@ impl crate::model::LogisModel {
                     let currency_bound = bound_nums[wi].iter().any(|n| !n.currency.is_empty());
                     let tie_floor = scored.first().map(|s| s.2 - 0.005).unwrap_or(f32::MAX);
                     let tied_total = scored.iter().filter(|(_, _, sc)| *sc >= tie_floor).count();
-                    let tied_monetary: Vec<String> = scored
+                    let span_is_row = crate::logic::is_trade_array_category(&winners[wi].category);
+                    let tied_monetary_all: Vec<String> = scored
                         .iter()
                         .filter(|(f, _, sc)| *sc >= tie_floor && ship_is_monetary(f))
                         .map(|(f, _, _)| f.clone())
                         .collect();
+                    let tied_monetary: Vec<String> = tied_monetary_all
+                        .iter()
+                        .filter(|f| {
+                            span_is_row
+                                || !ship_field_category(f.as_str())
+                                    .map(|c| crate::logic::is_trade_array_category(&c))
+                                    .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if tied_monetary_all.len() != tied_monetary.len() {
+                        emit_term(&format!(
+                            "   🧾 [D2 CURRENCY TIE-BREAK / ROW AXIS] \"{}\" 는 표 행 카테고리가 아닌 '{}' 스팬이라, 동률 금전 축 {:?} 중 표 행 축을 제외한 {:?} 만 문서 단위 후보로 둡니다. 행 축은 ship_make_assignment 에서도 힌트로만 내려가므로 문서 총액 조건의 후보가 될 수 없습니다.",
+                            winners[wi].text, winners[wi].category, tied_monetary_all, tied_monetary
+                        ));
+                    }
                     let taken_elsewhere = tied_monetary
                         .first()
                         .map(|f| {
@@ -877,11 +958,17 @@ impl crate::model::LogisModel {
 
             let mut f_names: Vec<String> = Vec::new();
             let mut f_descs: Vec<String> = Vec::new();
-            let mut f_banks: Vec<Vec<Vec<f32>>> = Vec::new();
             let mut f_weights: Vec<Vec<f32>> = Vec::new();
-            let mut f_prejs: Vec<Vec<Vec<f32>>> = Vec::new();
+            let mut f_phr: Vec<Vec<String>> = Vec::new();
+            let mut f_prej_phr: Vec<Vec<String>> = Vec::new();
+            let mut f_out_of_scope: Vec<String> = Vec::new();
+            let mut f_supplemented = 0usize;
             for (fname, fdesc, anchor) in fields.iter() {
                 if claimed_fields.contains(*fname) { continue; }
+                if !ship_field_in_scope(fname, &final_scope) {
+                    f_out_of_scope.push(fname.to_string());
+                    continue;
+                }
                 let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
                 if let Some((_, aliases)) = crate::parsing::TRADE_COLUMN_ALIASES.iter().find(|(f, _)| *f == *fname) {
                     for a in aliases.iter() {
@@ -891,35 +978,44 @@ impl crate::model::LogisModel {
                         wt.push(1.0);
                     }
                 }
+                let sup = crate::logic::trade_label_supplement(fname);
+                if !sup.is_empty() {
+                    f_supplemented += crate::logic::merge_phrase_bank(&mut ph, &mut wt, &sup, 1.0);
+                }
                 if ph.is_empty() { continue; }
-                let embs = self.get_embedding_batch(ph.clone()).await
-                    .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
-                let pp = crate::utils::ai_utils::prejudice_phrase_bank(language, "shipping_doc", fname);
-                let pe = if pp.is_empty() {
-                    Vec::new()
-                } else {
-                    self.get_embedding_batch(pp.clone()).await
-                        .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
-                };
+                let pp = crate::utils::ai_utils::prejudice_phrase_bank_multilingual(language, "shipping_doc", fname);
                 f_names.push(fname.to_string());
                 f_descs.push(fdesc.to_string());
-                f_banks.push(embs);
                 f_weights.push(wt);
-                f_prejs.push(pe);
+                f_phr.push(ph);
+                f_prej_phr.push(pp);
             }
-            if f_names.is_empty() { continue; }
+            if f_names.is_empty() {
+                if !f_out_of_scope.is_empty() {
+                    emit_term(&format!(
+                        "   ⚪ [D2 BANK SKIP] 카테고리 '{}' 의 후보 필드가 전부 서식 {:?} 의 저장 스키마 밖입니다: {:?}",
+                        cat, final_scope, f_out_of_scope
+                    ));
+                }
+                continue;
+            }
+            let f_banks = self.ship_embed_phrase_groups(&f_phr).await;
+            let f_prejs = self.ship_embed_phrase_groups(&f_prej_phr).await;
 
             emit_term(&format!(
-                "   📐 [D2 BANK] 카테고리 '{}' | 후보 필드 {}개 | 대상 스팬 {}개",
-                cat, f_names.len(), span_idxs.len()
+                "   📐 [D2 BANK] 카테고리 '{}' | 후보 필드 {}개 (스키마 밖 {}개 제외) | 대상 스팬 {}개 | 라벨 {}구 + 편견 {}구를 배치 2회로 임베딩 (다국어 보강 {}구 포함)",
+                cat, f_names.len(), f_out_of_scope.len(), span_idxs.len(),
+                f_phr.iter().map(|v| v.len()).sum::<usize>(),
+                f_prej_phr.iter().map(|v| v.len()).sum::<usize>(),
+                f_supplemented
             ));
 
             let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; span_idxs.len()]; f_names.len()];
-            let mut span_embs: Vec<Vec<f32>> = Vec::with_capacity(span_idxs.len());
-            for wi in span_idxs.iter() {
-                let e = self.get_embedding(winners[*wi].text.clone()).await.unwrap_or(vec![0.0; 384]);
-                span_embs.push(e);
-            }
+            let span_texts: Vec<String> = span_idxs.iter().map(|wi| winners[*wi].text.clone()).collect();
+            let span_embs: Vec<Vec<f32>> = self
+                .get_embedding_batch(span_texts.clone())
+                .await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; span_texts.len()]);
 
             for (si, wi) in span_idxs.iter().enumerate() {
                 let e = &span_embs[si];
@@ -1117,14 +1213,21 @@ impl crate::model::LogisModel {
                 })
                 .collect();
             if !orphan.is_empty() {
-                let mut g_label: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
+                let mut lab_names: Vec<String> = Vec::new();
+                let mut lab_phr: Vec<Vec<String>> = Vec::new();
+                let mut lab_wt: Vec<Vec<f32>> = Vec::new();
                 let mut t_fields: Vec<(String, String, usize)> = Vec::new();
-                let mut t_value: Vec<Vec<Vec<f32>>> = Vec::new();
-                let mut t_prej: Vec<Vec<Vec<f32>>> = Vec::new();
+                let mut t_value_phr: Vec<Vec<String>> = Vec::new();
+                let mut t_prej_phr: Vec<Vec<String>> = Vec::new();
+                let mut t_out_of_scope: Vec<String> = Vec::new();
                 for gcat in cat_order.iter() {
                     if gcat == "hub" { continue; }
                     for (fname, _, anchor) in crate::logic::trade_condition_fields(gcat).iter() {
-                        if g_label.iter().any(|(f, _, _)| f.as_str() == *fname) { continue; }
+                        if lab_names.iter().any(|f| f.as_str() == *fname) { continue; }
+                        if !ship_field_in_scope(fname, &final_scope) {
+                            t_out_of_scope.push(fname.to_string());
+                            continue;
+                        }
                         let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(anchor);
                         if let Some((_, aliases)) = crate::parsing::TRADE_COLUMN_ALIASES.iter().find(|(f, _)| *f == *fname) {
                             for a in aliases.iter() {
@@ -1134,11 +1237,15 @@ impl crate::model::LogisModel {
                                 wt.push(1.0);
                             }
                         }
+                        let sup = crate::logic::trade_label_supplement(fname);
+                        if !sup.is_empty() {
+                            crate::logic::merge_phrase_bank(&mut ph, &mut wt, &sup, 1.0);
+                        }
                         if ph.is_empty() { continue; }
-                        let le = self.get_embedding_batch(ph.clone()).await
-                            .unwrap_or_else(|_| vec![vec![0.0; 384]; ph.len()]);
-                        let gi = g_label.len();
-                        g_label.push((fname.to_string(), le, wt));
+                        let gi = lab_names.len();
+                        lab_names.push(fname.to_string());
+                        lab_phr.push(ph);
+                        lab_wt.push(wt);
                         if claimed_fields.contains(*fname) { continue; }
                         if !matches!(
                             crate::utils::ai_utils::query_value_format(fname),
@@ -1148,19 +1255,26 @@ impl crate::model::LogisModel {
                         }
                         let vp = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped("shipping_doc", fname);
                         if vp.is_empty() { continue; }
-                        let ve = self.get_embedding_batch(vp.clone()).await
-                            .unwrap_or_else(|_| vec![vec![0.0; 384]; vp.len()]);
-                        let pp = crate::utils::ai_utils::prejudice_phrase_bank(language, "shipping_doc", fname);
-                        let pe = if pp.is_empty() {
-                            Vec::new()
-                        } else {
-                            self.get_embedding_batch(pp.clone()).await
-                                .unwrap_or_else(|_| vec![vec![0.0; 384]; pp.len()])
-                        };
                         t_fields.push((fname.to_string(), gcat.clone(), gi));
-                        t_value.push(ve);
-                        t_prej.push(pe);
+                        t_value_phr.push(vp);
+                        t_prej_phr.push(crate::utils::ai_utils::prejudice_phrase_bank_multilingual(language, "shipping_doc", fname));
                     }
+                }
+                let lab_banks = self.ship_embed_phrase_groups(&lab_phr).await;
+                let t_value = self.ship_embed_phrase_groups(&t_value_phr).await;
+                let t_prej = self.ship_embed_phrase_groups(&t_prej_phr).await;
+                let g_label: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = lab_names
+                    .into_iter()
+                    .zip(lab_banks.into_iter())
+                    .zip(lab_wt.into_iter())
+                    .map(|((f, b), w)| (f, b, w))
+                    .collect();
+                if !t_out_of_scope.is_empty() {
+                    emit_term(&format!(
+                        "   🎯 [TEXT-FIRST LABEL SCOPE] 라벨 최고점을 겨루는 스키마 축에서, 서식 {:?} 의 저장 스키마 밖인 {}개를 뺐습니다: {:?} — 검사·증명 서식 전용 축(계량일 등)이 상용송장 질의의 라벨 최고점을 가져가면, 값 축이 아무리 잘 맞아도 '라벨을 말한 스팬' 으로 판정되어 필터가 만들어지지 않습니다.",
+                        final_scope, t_out_of_scope.len(),
+                        t_out_of_scope.iter().take(12).collect::<Vec<_>>()
+                    ));
                 }
                 if t_fields.is_empty() {
                     emit_term(&format!(
@@ -1173,33 +1287,63 @@ impl crate::model::LogisModel {
                         "   📐 [D2 TEXT-FIRST] D1 게이트를 넘었지만 자기 카테고리에서 필드를 얻지 못한 자유서술 스팬 {}개를 카테고리 경계 없이 값 뱅크를 가진 Text/Address 필드 {}개와 경쟁시킵니다. 라벨 단어인지의 판정은 후보 축 하나가 아니라 스키마 전체 라벨 뱅크 {}개의 최고점과 비교합니다. 값 뱅크가 그 최고점을 넘지 못하는 스팬은 어느 축의 라벨을 말한 것이므로 필터로 만들지 않습니다.",
                         orphan.len(), t_fields.len(), g_label.len()
                     ));
-                    let mut o_embs: Vec<Vec<f32>> = Vec::with_capacity(orphan.len());
-                    for wi in orphan.iter() {
-                        let e = self.get_embedding(winners[*wi].text.clone()).await.unwrap_or(vec![0.0; 384]);
-                        o_embs.push(e);
-                    }
+                    let o_texts: Vec<String> = orphan.iter().map(|wi| winners[*wi].text.clone()).collect();
+                    let o_embs: Vec<Vec<f32>> = self
+                        .get_embedding_batch(o_texts.clone())
+                        .await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; o_texts.len()]);
                     let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; orphan.len()]; t_fields.len()];
                     let mut span_lab: Vec<(String, f32)> = vec![(String::new(), f32::MIN); orphan.len()];
                     let mut best_val: Vec<(String, f32)> = vec![(String::new(), f32::MIN); orphan.len()];
+                    let mut lab_gate_of: Vec<f32> = vec![f32::MIN; orphan.len()];
+                    let mut val_z_of: Vec<f32> = vec![f32::MIN; orphan.len()];
+                    let lab_draw = crate::utils::ai_utils::gumbel_expected_z(g_label.len().max(1));
+                    let val_draw = crate::utils::ai_utils::gumbel_expected_z(t_fields.len().max(1));
+                    emit_term(&format!(
+                        "   📏 [TEXT-FIRST SAMPLE CORRECTION] 라벨 축은 뱅크 {}개에서 뽑은 최댓값이고 값 축은 뱅크 {}개에서 뽑은 최댓값입니다. 보정 없이 비교하면 뱅크 수가 많은 라벨 쪽이 구조적으로 이겨 모든 스팬이 '라벨을 말한 것' 으로 판정됩니다. 두 최댓값을 같은 분포로 표준화한 뒤 각자의 √(2 ln N) 기대 최댓값({:.3} vs {:.3})을 차감해 비교합니다.",
+                        g_label.len(), t_fields.len(), lab_draw, val_draw
+                    ));
                     for si in 0..orphan.len() {
                         let e = &o_embs[si];
                         if e.iter().all(|&v| v == 0.0) { continue; }
-                        let mut lab_global = f32::MIN;
-                        let mut lab_field = String::new();
-                        for (f, le, wt) in g_label.iter() {
-                            let s = crate::utils::ai_utils::weighted_max_pool_sim(e, le, wt);
-                            if s > lab_global {
-                                lab_global = s;
-                                lab_field = f.clone();
+                        let lab_scores: Vec<f32> = g_label
+                            .iter()
+                            .map(|(_, le, wt)| crate::utils::ai_utils::weighted_max_pool_sim(e, le, wt))
+                            .collect();
+                        let val_scores: Vec<f32> = (0..t_fields.len())
+                            .map(|fi| crate::utils::ai_utils::max_pool_sim(e, &t_value[fi]))
+                            .collect();
+                        let (mut lab_global, mut lab_field) = (f32::MIN, String::new());
+                        for (gi, s) in lab_scores.iter().enumerate() {
+                            if *s > lab_global {
+                                lab_global = *s;
+                                lab_field = g_label[gi].0.clone();
                             }
                         }
                         span_lab[si] = (lab_field, lab_global);
+                        let mut pool: Vec<f32> = lab_scores.clone();
+                        pool.extend(val_scores.iter().copied());
+                        let cnt = pool.len() as f32;
+                        let mean = pool.iter().sum::<f32>() / cnt;
+                        let sd = (pool.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                        let corrected = sd > 1e-6;
+                        let lab_gate = if corrected {
+                            (lab_global - mean) / sd - lab_draw
+                        } else {
+                            f32::MIN
+                        };
+                        lab_gate_of[si] = lab_gate;
                         for fi in 0..t_fields.len() {
-                            let val = crate::utils::ai_utils::max_pool_sim(e, &t_value[fi]);
+                            let val = val_scores[fi];
                             if val > best_val[si].1 {
                                 best_val[si] = (t_fields[fi].0.clone(), val);
                             }
-                            if val <= lab_global { continue; }
+                            let val_z = if corrected { (val - mean) / sd - val_draw } else { val };
+                            if val > best_val[si].1 || val_z > val_z_of[si] {
+                                val_z_of[si] = val_z_of[si].max(val_z);
+                            }
+                            let pass = if corrected { val_z > lab_gate } else { val > lab_global };
+                            if !pass { continue; }
                             if !t_prej[fi].is_empty() {
                                 let prej = crate::utils::ai_utils::max_pool_sim(e, &t_prej[fi]);
                                 let coh = crate::utils::ai_utils::bank_internal_cohesion(&t_value[fi]);
@@ -1238,8 +1382,13 @@ impl crate::model::LogisModel {
                         let (bf, bv) = &best_val[si];
                         let lab_shown = if *lg == f32::MIN { 0.0 } else { *lg };
                         let val_shown = if *bv == f32::MIN { 0.0 } else { *bv };
-                        let why = if *bv != f32::MIN && *bv <= *lg {
-                            format!("전 스키마 라벨 뱅크 최고 '{}' {:.4} 가 값 뱅크 최고 '{}' {:.4} 를 이겨 라벨을 말한 스팬으로 봅니다.", lf, lab_shown, bf, val_shown)
+                        let why = if val_z_of[si] != f32::MIN && lab_gate_of[si] != f32::MIN {
+                            format!(
+                                "표본 수 보정 후 값 축 z {:+.3} 가 라벨 축 z {:+.3} 를 넘지 못해 라벨을 말한 스팬으로 봅니다. (원점수: 라벨 최고 '{}' {:.4} vs 값 최고 '{}' {:.4})",
+                                val_z_of[si], lab_gate_of[si], lf, lab_shown, bf, val_shown
+                            )
+                        } else if *bv != f32::MIN && *bv <= *lg {
+                            format!("전 스키마 라벨 뱅크 최고 '{}' {:.4} 가 값 뱅크 최고 '{}' {:.4} 를 이겨 라벨을 말한 스팬으로 봅니다. (분산이 0 이라 표본 수 보정을 적용하지 못했습니다)", lf, lab_shown, bf, val_shown)
                         } else {
                             "값 뱅크 우세 축이 없거나 편견에 밀려 배정하지 않습니다.".to_string()
                         };
@@ -1274,7 +1423,7 @@ impl crate::model::LogisModel {
                 // 단어가 하나뿐이면 걷어낼 라벨이 없습니다.
                 if words.len() < 2 { continue; }
 
-                let (mut lp, _) = crate::utils::ai_utils::label_phrase_bank(language, "shipping_doc", &field);
+                let (mut lp, _) = crate::utils::ai_utils::label_phrase_bank_multilingual(language, "shipping_doc", &field);
                 if let Some(cat) = ship_field_category(&field) {
                     if let Some((_, _, anchor)) = crate::logic::trade_condition_fields(&cat)
                         .iter()
@@ -1284,6 +1433,20 @@ impl crate::model::LogisModel {
                             if crate::utils::ai_utils::is_value_example_phrase(&p) { continue; }
                             if !lp.iter().any(|e| e == &p) { lp.push(p); }
                         }
+                    }
+                }
+                {
+                    let before = lp.len();
+                    for p in crate::logic::trade_label_supplement(&field).into_iter() {
+                        if crate::utils::ai_utils::is_value_example_phrase(&p) { continue; }
+                        if lp.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
+                        lp.push(p);
+                    }
+                    if lp.len() > before {
+                        emit_term(&format!(
+                            "   🏷️ [HINT LABEL BANK / ML] {} 의 라벨 뱅크를 {}구 → {}구 로 넓혔습니다. 잔차화는 '이 단어가 라벨인가 값인가' 를 라벨 뱅크와의 코사인으로 가르는데, 뱅크가 영어뿐이면 '제조된'·'원산지' 같은 비영어 라벨어가 값 쪽으로 읽혀 값 문자열에 그대로 남고, 그 상태로 청크 검색에 들어가 신호가 희석됩니다.",
+                            field, before, lp.len()
+                        ));
                     }
                 }
                 if lp.is_empty() { continue; }
@@ -1672,21 +1835,176 @@ impl crate::model::LogisModel {
 
 const SHIP_BIND_RADIUS: usize = 6;
 
-const SHIP_TEMPORAL_OPERATOR_PIVOTS: [(&str, &str); 2] = [
-    ("gte", "after, since, onward, later than, on or after"),
-    ("lte", "before, until, earlier than, no later than, on or before"),
+const SHIP_TEMPORAL_OPERATOR_PIVOTS: [(&str, &str, &str); 2] = [
+    (
+        "gte",
+        "after, since, onward, later than, on or after",
+        "nach, seit, später als, am oder nach, \
+         después de, desde, a partir de, posterior a, en o después de, \
+         après, depuis, à partir de, postérieur à, le ou après, \
+         dopo, a partire da, successivo a, il o dopo, \
+         depois de, a partir de, posterior a, em ou depois de, \
+         sinds, vanaf, later dan, op of na, \
+         počínaje, později než, v den nebo po, \
+         بعد, منذ, اعتبارا من, لاحقا لـ, في أو بعد, \
+         以降, 以後, 以来, より後, それ以降, \
+         之后, 以后, 晚于, 自此之后, \
+         이후, 부터, 이래, 보다 늦은, 그 이후",
+    ),
+    (
+        "lte",
+        "before, until, earlier than, no later than, on or before",
+        "vor, bis, früher als, spätestens, am oder vor, \
+         antes de, hasta, anterior a, a más tardar, en o antes de, \
+         avant, jusqu'à, antérieur à, au plus tard, le ou avant, \
+         prima di, fino a, precedente a, entro, il o prima, \
+         antes de, até, anterior a, no máximo até, em ou antes de, \
+         voor, tot, eerder dan, uiterlijk, op of voor, \
+         před, dříve než, nejpozději, v den nebo před, \
+         قبل, حتى, أبكر من, في موعد أقصاه, في أو قبل, \
+         以前, まで, より前, 遅くとも, それ以前, \
+         之前, 以前, 早于, 最迟, 截至, \
+         이전, 까지, 보다 이른, 늦어도, 그 이전",
+    ),
 ];
 
+/// 시간 단위 앵커 (en·de·es·fr·it·pt·nl·cs·ar·ko·ja·zh). 닫힌 어휘이므로 먼저 완전일치로 확정하고
+/// 실패할 때만 코사인 Max-Pool 로 내려갑니다. 영어 한 언어만 두고 교차언어 코사인에 기대면
+/// "4월에" 가 day 로 읽히는 식으로 단위 뱅크가 경쟁 축(라벨·기능어)에 집니다.
 const SHIP_TIME_UNIT_PIVOTS: [(&str, &str); 3] = [
-    ("year", "year, calendar year, annual"),
-    ("month", "month, calendar month"),
-    ("day", "day, day of month"),
+    (
+        "year",
+        "year, years, yr, calendar year, annual, \
+         Jahr, Jahre, Jahres, Kalenderjahr, \
+         año, años, \
+         année, années, \
+         anno, anni, \
+         ano, anos, \
+         jaar, jaren, kalenderjaar, \
+         rok, roku, roky, \
+         سنة, سنوات, عام, أعوام, \
+         년, 년도, 연도, 해, \
+         年, 年度, 年份, ねん",
+    ),
+    (
+        "month",
+        "month, months, calendar month, \
+         Monat, Monate, Monats, Kalendermonat, \
+         mes, meses, \
+         mois, \
+         mese, mesi, \
+         mês, \
+         maand, maanden, \
+         měsíc, měsíce, měsíců, \
+         شهر, شهور, أشهر, \
+         월, 달, \
+         月, 月份, がつ",
+    ),
+    (
+        "day",
+        "day, days, \
+         Tag, Tage, Tages, \
+         día, días, \
+         jour, jours, \
+         giorno, giorni, \
+         dia, dias, \
+         dag, dagen, \
+         den, dny, dní, dne, \
+         يوم, أيام, \
+         일, 일자, 날, \
+         日, 号, にち",
+    ),
 ];
 
-const SHIP_MONTH_PIVOTS: [&str; 12] = [
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
+const SHIP_CURRENCY_NAMES: &[(&str, &str)] = &[
+    ("USD", "usd, $, dollar, dollars, us-dollar, dólar, dólares, dollaro, dollari, dolar, dolary, dolarů, 달러, 미국달러, 美元, 美金, 米ドル, ドル, دولار, دولارات"),
+    ("EUR", "eur, €, euro, euros, eura, 유로, 欧元, 歐元, ユーロ, يورو"),
+    ("JPY", "jpy, yen, yens, iene, ienes, jeny, jenů, 엔, 엔화, 円, 日元, 日圓, ين, ين ياباني"),
+    ("CNY", "cny, rmb, yuan, yuans, renminbi, iuane, jüan, jüany, jüanů, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
+    ("KRW", "krw, ₩, won, wons, wony, wonů, 원, 원화, 韩元, 韓元, ウォン, وون"),
+    ("GBP", "gbp, £, sterling, pound sterling, pounds sterling, britisches pfund, livre sterling, livres sterling, libra esterlina, libras esterlinas, sterlina, sterline, britse pond, libra šterlinků, 영국 파운드, 英镑, 英鎊, 英ポンド, جنيه إسترليني"),
 ];
+
+fn ship_normalize_token(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn ship_unit_exact(residue: &str) -> Option<&'static str> {
+    let norm = ship_normalize_token(residue);
+    if norm.is_empty() { return None; }
+    for (unit, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
+        for p in raw.split(',') {
+            let p = ship_normalize_token(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*unit); }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 3
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(*unit);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ship_bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
+    let dim = match bank.iter().map(|e| e.len()).max() {
+        Some(d) if d > 0 => d,
+        _ => return Vec::new(),
+    };
+    let mut c = vec![0.0f32; dim];
+    let mut cnt = 0usize;
+    for e in bank.iter() {
+        if e.len() != dim || e.iter().all(|&v| v == 0.0) { continue; }
+        for (k, v) in e.iter().enumerate() { c[k] += v; }
+        cnt += 1;
+    }
+    if cnt == 0 { return Vec::new(); }
+    let norm = c.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-9 {
+        for v in c.iter_mut() { *v /= norm; }
+    }
+    c
+}
+
+fn ship_currency_name_exact(core: &str) -> Option<&'static str> {
+    let norm = ship_normalize_token(core);
+    if norm.is_empty() { return None; }
+    for (code, raw) in SHIP_CURRENCY_NAMES.iter() {
+        for p in raw.split(',') {
+            let p = ship_normalize_token(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*code); }
+            if p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 2
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(*code);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ship_currency_symbol(raw: &str) -> Option<&'static str> {
+    for (code, list) in SHIP_CURRENCY_NAMES.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            if raw.contains(p) { return Some(*code); }
+        }
+    }
+    None
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShipTokenRole {
@@ -1746,6 +2064,7 @@ pub struct ShipQueryLayers {
     pub numerics: Vec<ShipNumeric>,
     pub identifiers: Vec<(usize, String)>,
     pub doc_mentions: Vec<ShipDocMention>,
+    pub relation_marks: Vec<usize>,
     pub enum_hits: Vec<Vec<(String, String)>>,
     pub temporal: Option<ShipTemporal>,
     pub logs: Vec<String>,
@@ -1886,11 +2205,48 @@ pub fn ship_iso_day_range(literal: &str) -> Option<(String, String)> {
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())
         .collect();
-    if groups.len() < 3 || groups[0].len() != 4 { return None; }
+    if groups.len() < 3 { return None; }
+    if groups[0].len() == 4 {
+        let y: i32 = groups[0].parse().ok()?;
+        let m: u32 = groups[1].parse().ok()?;
+        let d: u32 = groups[2].parse().ok()?;
+        return ship_day_range(y, m, d);
+    }
+    if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        let a: u32 = groups[0].parse().ok()?;
+        let b: u32 = groups[1].parse().ok()?;
+        let y: i32 = groups[2].parse().ok()?;
+        if a > 12 && b <= 12 { return ship_day_range(y, b, a); }
+        if b > 12 && a <= 12 { return ship_day_range(y, a, b); }
+        return ship_day_range(y, b, a);
+    }
+    None
+}
+
+pub fn ship_numeric_date_literal(core: &str) -> Option<String> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/' || c == '.').collect();
+    if groups.len() != 3 { return None; }
+    if !groups.iter().all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2 {
+        return Some(core.to_string());
+    }
+    if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        return Some(core.to_string());
+    }
+    None
+}
+
+pub fn ship_year_month_literal(core: &str) -> Option<(i32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/').collect();
+    if groups.len() != 2 { return None; }
+    if groups[0].len() != 4 || groups[1].is_empty() || groups[1].len() > 2 { return None; }
+    if !groups.iter().all(|g| g.chars().all(|c| c.is_ascii_digit())) { return None; }
     let y: i32 = groups[0].parse().ok()?;
     let m: u32 = groups[1].parse().ok()?;
-    let d: u32 = groups[2].parse().ok()?;
-    ship_day_range(y, m, d)
+    if !(1..=12).contains(&m) || !(1900..=2100).contains(&y) { return None; }
+    Some((y, m))
 }
 
 pub fn ship_relative_range(key: &str, today: chrono::NaiveDate) -> Option<(String, String)> {
@@ -2011,11 +2367,70 @@ pub fn ship_category_accepts(category: &str, want: crate::utils::ai_utils::Field
     })
 }
 
+/// 이 축이 질의가 지목한 서식의 저장 스키마에 존재하는가.
+///
+///  ── 왜 필요한가 ──
+///   D2 는 카테고리의 전 필드로 뱅크를 세웁니다. reference 카테고리는 45종 서식의
+///   참조 축을 모두 들고 있어 후보가 53개인데, CI 스키마에 실제로 존재하는 축은 그중 일부입니다.
+///   존재하지 않는 축을 뱅크에 넣으면 ① 임베딩과 코사인을 헛돌리고
+///   ② 그 축이 1위가 되면 저장될 수 없는 조건이 만들어져 결과가 확정적으로 0건이 됩니다.
+///   (날짜 축은 DATE FIELD SCOPE 가 이미 같은 기준으로 좁히고 있습니다)
+///
+///  ── 모르면 통과 ──
+///   trade_schema_owner_of 가 그 서식을 모른다고 답하면 판정 근거가 없는 것이므로
+///   좁히지 않습니다. 스코프가 비어 있을 때도 전부 통과입니다.
+pub fn ship_field_in_scope(field: &str, scope: &[String]) -> bool {
+    if scope.is_empty() { return true; }
+    let mut checked = 0usize;
+    for code in scope.iter() {
+        let (known, cat) = crate::model::merge::trade_schema_owner_of(&code.to_uppercase(), field);
+        if !known { continue; }
+        checked += 1;
+        if !cat.is_empty() { return true; }
+    }
+    checked == 0
+}
+
 pub fn ship_field_category(field: &str) -> Option<String> {
     crate::logic::TRADE_CONDITION_CATEGORIES
         .iter()
         .find(|(c, _)| crate::logic::trade_condition_fields(c).iter().any(|(f, _, _)| *f == field))
         .map(|(c, _)| c.to_string())
+}
+
+pub const SHIP_OPERATOR_BIND_RADIUS: usize = 2;
+
+/// 이 연산자 토큰이 실제로 비교할 대상을 가질 수 있는가.
+///
+///  ── 왜 필요한가 ──
+///   OPERATOR SPLIT 은 '연산자 뱅크가 이 토큰을 라벨보다 잘 설명하는가' 만 봅니다.
+///   그런데 비교 연산자는 비교 대상이 있어야 연산자입니다. 대상이 없는데 연산자로 남으면
+///   아래 numerics_raw 의 연산자 탐색이 거리 2 안에서 그 토큰을 주워,
+///   전혀 다른 수치에 엉뚱한 연산자를 붙입니다.
+///
+///  ── 경로 규칙 ──
+///   수치 결속 탐색(ship_bind_values / numerics 연산자 탐색)과 같은 규칙을 씁니다.
+///   사이에 Content 와 Unit 만 있을 때 '경로가 열려 있다' 고 봅니다.
+///   기능어·다른 연산자·서식명이 끼면 문장 경계로 보고 막습니다.
+pub fn ship_operator_bindable(roles: &[ShipTokenRole], i: usize) -> bool {
+    let n = roles.len();
+    for dist in 1..=SHIP_OPERATOR_BIND_RADIUS {
+        for j in [i + dist, i.wrapping_sub(dist)] {
+            if j >= n { continue; }
+            let (lo, hi) = if j > i { (i + 1, j) } else { (j + 1, i) };
+            let clear = (lo..hi).all(|k| {
+                matches!(roles[k], ShipTokenRole::Content | ShipTokenRole::Unit)
+            });
+            if !clear { continue; }
+            if matches!(
+                roles[j],
+                ShipTokenRole::Numeric | ShipTokenRole::Temporal | ShipTokenRole::Identifier
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn ship_value_near(roles: &[ShipTokenRole], start: usize, end: usize, radius: usize) -> bool {
@@ -2074,17 +2489,26 @@ pub fn ship_bind_values(
 pub fn ship_resolve_doc_scope(
     mentions: &[ShipDocMention],
     winners: &[ShipWinnerView],
+    relation_marks: &[usize],
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut scope: Vec<String> = Vec::new();
     let mut projection: Vec<String> = Vec::new();
     let mut logs: Vec<String> = Vec::new();
 
-    let relational = |m: &ShipDocMention| -> bool {
-        winners.iter().any(|w| {
+    fn relational(
+        m: &ShipDocMention,
+        winners: &[ShipWinnerView],
+        relation_marks: &[usize],
+    ) -> (bool, bool) {
+        let by_winner = winners.iter().any(|w| {
             (w.category == "reference" || w.category == "hub")
                 && (w.end == m.start || w.start == m.end)
-        })
-    };
+        });
+        let by_mark = relation_marks.iter().any(|&k| {
+            (k < m.start && m.start - k <= 2) || (k >= m.end && k - m.end <= 1)
+        });
+        (by_winner, by_mark)
+    }
     fn absorb(m: &ShipDocMention, scope: &mut Vec<String>, logs: &mut Vec<String>) {
         if m.codes.iter().any(|c| scope.contains(c)) {
             logs.push(format!(
@@ -2101,7 +2525,14 @@ pub fn ship_resolve_doc_scope(
 
     let mut deferred: Vec<&ShipDocMention> = Vec::new();
     for m in mentions.iter() {
-        if relational(m) {
+        let (by_winner, by_mark) = relational(m, winners, relation_marks);
+        if by_mark && !by_winner {
+            logs.push(format!(
+                "   🔗 [RELATION ADJACENT] {:?} 옆에 관계 표지가 있어 이 서식 언급을 조회 범위가 아니라 연결 축으로 읽습니다. D1 카테고리가 이 스팬을 reference·hub 로 판정하지 못해도 성립합니다.",
+                m.codes
+            ));
+        }
+        if by_winner || by_mark {
             deferred.push(m);
         } else {
             absorb(m, &mut scope, &mut logs);
@@ -2298,6 +2729,48 @@ pub fn ship_sds_demotion_reason(field: &str, scope: &[String]) -> Option<String>
 }
 
 impl crate::model::LogisModel {
+    /// 여러 필드의 구 묶음을 **한 번의 배치 임베딩**으로 만듭니다.
+    ///
+    ///  ── 무엇이 문제였나 ──
+    ///   D2 뱅크 구축이 필드마다 get_embedding_batch 를 따로 불렀습니다.
+    ///   실측 로그에 '요청 2건 | 실연산 1건' 같은 마이크로 배치가 60회 이상 찍힙니다.
+    ///   호출마다 락 획득·캐시 조회·텐서 할당이 붙으므로, 구 수가 아니라 호출 수가 비용입니다.
+    ///   다국어 뱅크로 구가 12배가 되면 이 구조가 그대로 12배 느려집니다.
+    ///
+    ///  ── 중복 접기 ──
+    ///   필드 간에 같은 구(별칭·보강 라벨)가 겹치므로 유일 구만 실연산합니다.
+    pub async fn ship_embed_phrase_groups(&self, groups: &[Vec<String>]) -> Vec<Vec<Vec<f32>>> {
+        let mut uniq: Vec<String> = Vec::new();
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for g in groups.iter() {
+            for p in g.iter() {
+                if index.contains_key(p) { continue; }
+                index.insert(p.clone(), uniq.len());
+                uniq.push(p.clone());
+            }
+        }
+        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(uniq.len());
+        for part in uniq.chunks(200) {
+            let e = self
+                .get_embedding_batch(part.to_vec())
+                .await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
+            embs.extend(e);
+        }
+        let zero = vec![0.0f32; 384];
+        groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|p| match index.get(p) {
+                        Some(&i) => embs.get(i).cloned().unwrap_or_else(|| zero.clone()),
+                        None => zero.clone(),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     pub async fn build_shipping_query_layers(
         &self,
         words: &[String],
@@ -2309,7 +2782,10 @@ impl crate::model::LogisModel {
         let n = words.len();
         let mut logs: Vec<String> = Vec::new();
         let mut roles: Vec<ShipTokenRole> = vec![ShipTokenRole::Content; n];
-        let cores: Vec<String> = words.iter().map(|w| ship_edge_core(w)).collect();
+        let cores: Vec<String> = words
+            .iter()
+            .map(|w| crate::utils::ai_utils::normalize_digits_ascii(&ship_edge_core(w)))
+            .collect();
 
         for i in 0..n {
             if consumed_words.contains(&words[i]) {
@@ -2330,12 +2806,12 @@ impl crate::model::LogisModel {
         }
         let pending: Vec<usize> = (0..n).filter(|&i| roles[i] == ShipTokenRole::Content).collect();
 
-        let mut label_phr: Vec<String> = Vec::new();
-        for (_, raw) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
-            for p in split_bias_phrases_full(raw) {
-                if !label_phr.contains(&p) { label_phr.push(p); }
-            }
-        }
+        let label_phr: Vec<String> = crate::logic::trade_condition_all_phrases();
+        logs.push(format!(
+            "   🏷️ [LABEL BANK / ML] 조건 카테고리 {}개의 12개 언어 라벨 구 {}개로 라벨 축을 세웁니다. 영어 한 벌만 두면 '단가가'·'금액이'·'번호도' 같은 비영어 라벨어가 라벨 축에서 설명되지 못해, 기능어·연산자 축이 그 토큰을 대신 가져갑니다.",
+            crate::logic::TRADE_CONDITION_CATEGORIES.len(),
+            label_phr.len()
+        ));
         let mut func_phr: Vec<String> = Vec::new();
         for node in ["verb", "expression"] {
             if let Some(obj) = crate::parsing::BIAS_DICT
@@ -2361,6 +2837,19 @@ impl crate::model::LogisModel {
                 if !func_phr.contains(&p) { func_phr.push(p); }
             }
         }
+        {
+            let mut added = 0usize;
+            for p in ship_function_pivot_phrases().into_iter() {
+                if func_phr.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
+                func_phr.push(p);
+                added += 1;
+            }
+            logs.push(format!(
+                "   🗣️ [FUNCTION BANK / ML] bias.json 의 verb·expression·ignore 구 {}개에 12개 언어 요청 동사·담화 표지 {}개를 더했습니다. 요청 동사와 담화 표지는 어느 언어에서나 닫힌 집합인데, 기존 뱅크는 사실상 영어뿐이라 '보여줘'·'알려주고'·'묶어서'·'같이'·'것만' 이 기능어 축에서 설명되지 못하고 라벨·연산자 축으로 흘러갔습니다.",
+                func_phr.len() - added, added
+            ));
+        }
+        let relation_phr = ship_relation_pivot_phrases();
 
         let mut op_keys: Vec<String> = Vec::new();
         let mut op_bias_phr: Vec<Vec<String>> = Vec::new();
@@ -2376,11 +2865,10 @@ impl crate::model::LogisModel {
                         }
                     }
                 }
-                for (tk, extra) in SHIP_TEMPORAL_OPERATOR_PIVOTS.iter() {
-                    if *tk == k.as_str() {
-                        for p in split_bias_phrases_full(extra) {
-                            if !b.contains(&p) { b.push(p); }
-                        }
+                for (tk, extra, extra_ml) in SHIP_TEMPORAL_OPERATOR_PIVOTS.iter() {
+                    if *tk != k.as_str() { continue; }
+                    for p in crate::logic::anchor_phrases(extra, extra_ml) {
+                        if !b.iter().any(|e| e.eq_ignore_ascii_case(&p)) { b.push(p); }
                     }
                 }
                 let mut p: Vec<String> = Vec::new();
@@ -2396,10 +2884,12 @@ impl crate::model::LogisModel {
         }
 
         let mut titles: Vec<(String, Vec<String>)> = Vec::new();
-        for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
-            match titles.iter_mut().find(|(t, _)| t.as_str() == *title) {
-                Some((_, codes)) => codes.push(code.to_string()),
-                None => titles.push((title.to_string(), vec![code.to_string()])),
+        for (code, title) in crate::utils::ai_utils::all_trade_doc_titles().into_iter() {
+            match titles.iter_mut().find(|(t, _)| t.eq_ignore_ascii_case(&title)) {
+                Some((_, codes)) => {
+                    if !codes.iter().any(|c| *c == code) { codes.push(code); }
+                }
+                None => titles.push((title, vec![code])),
             }
         }
 
@@ -2413,10 +2903,14 @@ impl crate::model::LogisModel {
         let mut nondate_phr: Vec<String> = Vec::new();
         for (cat, _) in crate::logic::TRADE_CONDITION_CATEGORIES.iter() {
             for (fname, _, anchor) in crate::logic::trade_condition_fields(cat).iter() {
-                let phrases: Vec<String> = split_bias_phrases_full(anchor)
+                let mut phrases: Vec<String> = split_bias_phrases_full(anchor)
                     .into_iter()
                     .filter(|p| !crate::utils::ai_utils::is_value_example_phrase(p))
                     .collect();
+                let (ml, _) = crate::utils::ai_utils::label_phrase_bank_multilingual("en", "shipping_doc", fname);
+                for p in ml.into_iter() {
+                    if !phrases.contains(&p) { phrases.push(p); }
+                }
                 if crate::utils::ai_utils::query_value_format(fname) == crate::utils::ai_utils::FieldFormat::Date {
                     if !date_fields.iter().any(|(f, _)| f.as_str() == *fname) {
                         date_fields.push((fname.to_string(), phrases));
@@ -2484,7 +2978,12 @@ impl crate::model::LogisModel {
         for vs in raw_variants.iter() {
             for v in vs.iter() { ship_add_text(v, &mut texts, &mut seen); }
         }
-        for p in label_phr.iter().chain(func_phr.iter()).chain(nondate_phr.iter()) {
+        for p in label_phr
+            .iter()
+            .chain(func_phr.iter())
+            .chain(nondate_phr.iter())
+            .chain(relation_phr.iter())
+        {
             ship_add_text(p, &mut texts, &mut seen);
         }
         for bank in op_bias_phr.iter().chain(op_prej_phr.iter()) {
@@ -2494,7 +2993,9 @@ impl crate::model::LogisModel {
         for (_, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
             for p in split_bias_phrases_full(raw) { ship_add_text(&p, &mut texts, &mut seen); }
         }
-        for m in SHIP_MONTH_PIVOTS.iter() { ship_add_text(m, &mut texts, &mut seen); }
+        for raw in crate::utils::ai_utils::MONTH_NAMES_ML.iter() {
+            for p in split_bias_phrases_full(raw) { ship_add_text(&p, &mut texts, &mut seen); }
+        }
         for (_, _, p) in time_phr.iter() { ship_add_text(p, &mut texts, &mut seen); }
         for (_, rows, _) in enum_tables.iter() {
             for (_, phrases) in rows.iter() {
@@ -2532,12 +3033,18 @@ impl crate::model::LogisModel {
                 .iter()
                 .map(|(k, raw)| (k.to_string(), split_bias_phrases_full(raw)))
                 .collect();
-            let heads: Vec<Vec<f32>> = raw_units
+            let full_banks: Vec<Vec<Vec<f32>>> = raw_units
                 .iter()
-                .map(|(_, ph)| table.get(ph.first().map(|s| s.as_str()).unwrap_or("")).clone())
+                .map(|(_, ph)| ph.iter().map(|p| table.get(p).clone()).collect())
+                .collect();
+            let heads: Vec<Vec<f32>> = full_banks.iter().map(|b| ship_bank_centroid(b)).collect();
+            let cohs: Vec<f32> = full_banks
+                .iter()
+                .map(|b| crate::utils::ai_utils::bank_internal_cohesion(b))
                 .collect();
             let mut out: Vec<(String, Vec<Vec<f32>>)> = Vec::with_capacity(raw_units.len());
             let mut dropped: Vec<String> = Vec::new();
+            let mut spared: Vec<String> = Vec::new();
             for (ui, (key, phrases)) in raw_units.iter().enumerate() {
                 let mut bank: Vec<Vec<f32>> = Vec::new();
                 for (pi, p) in phrases.iter().enumerate() {
@@ -2551,27 +3058,45 @@ impl crate::model::LogisModel {
                             .filter(|(k, _)| *k != ui)
                             .map(|(k, (name, _))| (name.clone(), cosine_similarity(e, &heads[k])))
                             .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
-                        if rs > own {
-                            dropped.push(format!("{}←\"{}\" (자기 '{}' {:.4} < '{}' {:.4})", key, p, key, own, rk, rs));
+                        if crate::utils::ai_utils::prejudice_dominates(own, rs, cohs[ui]) {
+                            dropped.push(format!(
+                                "{}←\"{}\" (자기 '{}' {:.4} × (1+{:.3}) < '{}' {:.4})",
+                                key, p, key, own, cohs[ui].clamp(0.0, 0.5), rk, rs
+                            ));
                             continue;
+                        }
+                        if rs > own {
+                            spared.push(format!(
+                                "{}←\"{}\" (자기 '{}' {:.4} vs '{}' {:.4}, 차이 {:.4})",
+                                key, p, key, own, rk, rs, rs - own
+                            ));
                         }
                     }
                     bank.push(e.clone());
                 }
                 if bank.is_empty() {
-                    bank = phrases.iter().map(|p| table.get(p).clone()).collect();
+                    bank = full_banks[ui].clone();
                 }
                 out.push((key.clone(), bank));
             }
             if !dropped.is_empty() {
                 logs.push(format!(
-                    "   🧹 [TIME UNIT SELF-POISON] 자기 단위 이름보다 다른 단위 이름에 더 가까운 앵커 구 {}개를 그 단위 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 단위가 이기므로, 다른 단위의 이름을 품은 구는 그 단위를 대신 설명해 1·2위를 뒤집습니다.",
+                    "   🧹 [TIME UNIT SELF-POISON] 자기 단위 뱅크 중심보다 다른 단위 뱅크 중심이 응집도 여유까지 넘어서 설명하는 앵커 구 {}개를 그 단위 뱅크에서 끕니다: {:?} — 대표를 첫 구(영어) 하나로 두면 다른 언어의 구가 교차언어 거리 때문에 잘리므로, 12개 언어 구 전체의 중심으로 판정합니다.",
                     dropped.len(), dropped
+                ));
+            }
+            if !spared.is_empty() {
+                logs.push(format!(
+                    "   🛟 [TIME UNIT SELF-POISON SPARED] 다른 단위 중심이 근소하게 앞서지만 응집도 여유를 넘지 못해 살려 둔 구 {}개: {:?} — 절대 비교(경쟁 > 자기)로 자르면 0.0004 차이로도 그 언어의 연·월·일 구가 통째로 사라집니다. 뱅크 내부 응집도만큼은 교차언어 잡음으로 보고 허용합니다.",
+                    spared.len(), spared
                 ));
             }
             out
         };
-        let month_embs: Vec<Vec<f32>> = SHIP_MONTH_PIVOTS.iter().map(|m| table.get(m).clone()).collect();
+        let month_banks: Vec<Vec<Vec<f32>>> = crate::utils::ai_utils::MONTH_NAMES_ML
+            .iter()
+            .map(|raw| table.bank(&split_bias_phrases_full(raw)))
+            .collect();
         let time_banks: Vec<(String, Vec<Vec<f32>>)> = time_keys
             .iter()
             .map(|k| {
@@ -2712,12 +3237,34 @@ impl crate::model::LogisModel {
                             }
                         }
                     }
-                    for k in s..e { roles[k] = ShipTokenRole::DocType; }
+                    let (ms, me) = if width > 1 {
+                        let mut best_k = usize::MAX;
+                        let mut best_v = f32::MIN;
+                        for k in s..e {
+                            let v = title_top(table.get(&cores[k]));
+                            if v > best_v {
+                                best_v = v;
+                                best_k = k;
+                            }
+                        }
+                        if best_k != usize::MAX && best_v >= top - sd {
+                            logs.push(format!(
+                                "   ✂️ [DOC TYPE / SPAN SHRINK] \"{}\" 의 서식 cos {:.4} 는 단일 토큰 \"{}\" 의 {:.4} 에 서식 뱅크 σ {:.4} 안으로 붙어 있습니다. 나머지 토큰은 서식 판정에 기여하지 않았으므로 내용어로 남기고 그 토큰만 서식으로 잡습니다.",
+                                text, top, cores[best_k], best_v, sd
+                            ));
+                            (best_k, best_k + 1)
+                        } else {
+                            (s, e)
+                        }
+                    } else {
+                        (s, e)
+                    };
+                    for k in ms..me { roles[k] = ShipTokenRole::DocType; }
                     logs.push(format!(
                         "   📄 [DOC TYPE / COSINE] \"{}\" → {:?} | 최고 '{}' cos {:.4} | z {:+.3} > √(2lnN) {:.3} | 라벨 cos {:.4}",
-                        text, codes, titles[top_i].0, top, z, title_gate, lab
+                        cores[ms..me].join(" "), codes, titles[top_i].0, top, z, title_gate, lab
                     ));
-                    doc_mentions.push(ShipDocMention { start: s, end: e, codes, exact: false });
+                    doc_mentions.push(ShipDocMention { start: ms, end: me, codes, exact: false });
                     s = e;
                     continue;
                 }
@@ -2736,11 +3283,53 @@ impl crate::model::LogisModel {
         }
         doc_mentions.sort_by(|a, b| a.start.cmp(&b.start));
 
+        let relation_bank = table.bank(&relation_phr);
+        let mut relation_marks: Vec<usize> = Vec::new();
+        {
+            let rel_coh = crate::utils::ai_utils::bank_internal_cohesion(&relation_bank);
+            for &i in pending.iter() {
+                if roles[i] != ShipTokenRole::Content { continue; }
+                if ship_relation_exact(&cores[i]) {
+                    relation_marks.push(i);
+                    logs.push(format!(
+                        "   🔗 [RELATION MARK / EXACT] \"{}\" 가 12개 언어 관계 표지 표와 일치합니다. 이 표지는 '어느 서식을 조회할지' 가 아니라 '이 서식이 다른 서식과 이어져 있는지' 를 말합니다.",
+                        cores[i]
+                    ));
+                    continue;
+                }
+                let q = table.get(&cores[i]);
+                if q.iter().all(|&v| v == 0.0) || relation_bank.is_empty() { continue; }
+                let rel = max_pool_sim(q, &relation_bank);
+                let rival = max_pool_sim(q, &label_bank)
+                    .max(max_pool_sim(q, &func_bank))
+                    .max(max_pool_sim(q, &op_all_bank));
+                if crate::utils::ai_utils::prejudice_dominates(rival, rel, rel_coh) {
+                    relation_marks.push(i);
+                    logs.push(format!(
+                        "   🔗 [RELATION MARK / COSINE] \"{}\" | 관계 뱅크 {:.4} 가 라벨·기능어·연산자 최고 {:.4} 를 응집도 {:.4} 여유까지 넘어섭니다.",
+                        cores[i], rel, rival, rel_coh.clamp(0.0, 0.5)
+                    ));
+                }
+            }
+            if relation_marks.is_empty() {
+                logs.push(format!(
+                    "   ⚪ [RELATION MARK NONE] 관계 표지 구 {}개 중 어느 것도 이 질의의 토큰을 설명하지 못했습니다. 서식 언급은 전부 조회 범위로 읽습니다.",
+                    relation_phr.len()
+                ));
+            } else {
+                logs.push(format!(
+                    "   🔗 [RELATION AXIS] 관계 표지 토큰 {:?} 를 D1 카테고리와 독립된 축으로 확정했습니다. 기존에는 인접 스팬이 reference·hub 카테고리로 판정되어야만 '함께 보여줄 서식' 이 성립했는데, 그 판정은 D1 잡음에 흔들립니다. 관계 표지는 그 자체가 직접 근거입니다.",
+                    relation_marks.iter().map(|&i| cores[i].clone()).collect::<Vec<_>>()
+                ));
+            }
+        }
+
         {
             let live: Vec<usize> = pending
                 .iter()
                 .copied()
                 .filter(|&i| roles[i] == ShipTokenRole::Content)
+                .filter(|&i| !relation_marks.contains(&i))
                 .filter(|&i| !table.get(&cores[i]).iter().all(|&v| v == 0.0))
                 .collect();
             let queries: Vec<Vec<f32>> = live.iter().map(|&i| table.get(&cores[i]).clone()).collect();
@@ -2883,7 +3472,10 @@ impl crate::model::LogisModel {
                     }
                     roles[i] = ShipTokenRole::Content;
                     if cut != f32::MAX {
-                        crate::utils::score_dynamics::record_confusion(&key, &cores[i], cut - margin);
+                        crate::utils::score_dynamics::record_baseline(
+                            "search.role.op_revoked_margin",
+                            cut - margin,
+                        );
                     }
                     let why = if margin <= 0.0 {
                         "라벨 뱅크 대비 마진이 양수가 아닙니다".to_string()
@@ -2899,6 +3491,27 @@ impl crate::model::LogisModel {
                 }
             }
         }
+
+        {
+            let targets: Vec<usize> = (0..n)
+                .filter(|&i| roles[i] == ShipTokenRole::Operator)
+                .filter(|&i| !ship_operator_bindable(&roles, i))
+                .collect();
+            if !targets.is_empty() {
+                let shown: Vec<String> = targets.iter().map(|&i| cores[i].clone()).collect();
+                for &i in targets.iter() {
+                    roles[i] = ShipTokenRole::Function;
+                    crate::utils::score_dynamics::record_baseline("search.role.op_unbindable", 1.0);
+                }
+                logs.push(format!(
+                    "   ⛓️‍💥 [OPERATOR UNBINDABLE] 연산자로 살아남았지만 {}토큰 안에 결속할 수치·시간·식별자가 없는 토큰 {}개를 기능어로 내립니다: {:?} — 비교 연산자는 비교 대상이 있을 때만 연산자입니다. 대상이 없으면 그 토큰은 '~만', '함께' 같은 담화 표지이고, 연산자로 남겨 두면 뒤의 수치 결속 탐색이 엉뚱한 자리에서 그 연산자를 주워 '이하'를 '미만'으로 바꾸는 식의 조용한 오역이 생깁니다.",
+                    SHIP_OPERATOR_BIND_RADIUS, targets.len(), shown
+                ));
+            } else {
+                crate::utils::score_dynamics::record_baseline("search.role.op_unbindable", 0.0);
+            }
+        }
+
         let time_gate = gumbel_expected_z(time_banks.len());
         for &i in pending.iter() {
             if roles[i] != ShipTokenRole::Content { continue; }
@@ -2927,15 +3540,24 @@ impl crate::model::LogisModel {
             }
         }
 
-        let month_gate = gumbel_expected_z(month_embs.len());
+        let month_gate = gumbel_expected_z(month_banks.len());
         for &i in pending.iter() {
             if roles[i] != ShipTokenRole::Content { continue; }
             let adj_num = (i > 0 && roles[i - 1] == ShipTokenRole::Numeric)
                 || (i + 1 < n && roles[i + 1] == ShipTokenRole::Numeric);
             if !adj_num { continue; }
+            if let Some(m) = crate::utils::ai_utils::month_from_name(&cores[i]) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🗓️ [MONTH NAME / EXACT] \"{}\" → {}월 | 12개 언어 월 이름 표와 완전일치합니다. 수치 토큰과 맞닿아 있을 때만 승격합니다.",
+                    cores[i], m
+                ));
+                parts.push((i, ShipTimePart::Month(m)));
+                continue;
+            }
             let q = table.get(&cores[i]);
             if q.iter().all(|&v| v == 0.0) { continue; }
-            let sims: Vec<f32> = month_embs.iter().map(|m| cosine_similarity(q, m)).collect();
+            let sims: Vec<f32> = month_banks.iter().map(|b| max_pool_sim(q, b)).collect();
             let cnt = sims.len() as f32;
             let mean = sims.iter().sum::<f32>() / cnt;
             let sd = (sims.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
@@ -2967,7 +3589,10 @@ impl crate::model::LogisModel {
                     let opb = max_pool_sim(q, &op_all_bank);
                     if let Some((_, rows, foreign)) = enum_banks.iter().find(|(f, _, _)| f == "currency") {
                         let lab = max_pool_sim(q, foreign);
-                        if let Some((code, _, _)) = ship_enum_resolve(q, &letters, rows, fun, opb, lab) {
+                        let exact = ship_currency_name_exact(&letters)
+                            .filter(|c| rows.iter().any(|(r, _)| r.as_str() == *c))
+                            .map(|c| (c.to_string(), 1.0f32, 1.0f32));
+                        if let Some((code, _, _)) = exact.or_else(|| ship_enum_resolve(q, &letters, rows, fun, opb, lab)) {
                             roles[i] = ShipTokenRole::Numeric;
                             let (value, grouped) = ship_numeric_value(&number);
                             logs.push(format!(
@@ -2982,11 +3607,31 @@ impl crate::model::LogisModel {
         }
 
         let mut year_like: Vec<(usize, i32)> = Vec::new();
+        let mut day_like: Vec<(usize, u32)> = Vec::new();
         let mut conditional_time: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
         for i in 0..n {
             if roles[i] != ShipTokenRole::Numeric { continue; }
             if numerics_raw.iter().any(|x| x.token == i) { continue; }
             let core = &cores[i];
+            if let Some((yy, mm)) = ship_year_month_literal(core) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🕒 [YEAR-MONTH LITERAL] \"{}\" → Year({}), Month({}) | '연도-월' 두 조각 수치입니다. 마침표 구분은 금액(2000.05)과 겹치므로 '-' 와 '/' 만 인정합니다.",
+                    cores[i], yy, mm
+                ));
+                parts.push((i, ShipTimePart::Year(yy)));
+                parts.push((i, ShipTimePart::Month(mm)));
+                continue;
+            }
+            if let Some(lit) = ship_numeric_date_literal(core) {
+                roles[i] = ShipTokenRole::Temporal;
+                logs.push(format!(
+                    "   🕒 [DATE LITERAL] \"{}\" → 세 조각 수치 날짜 | 4자리 연도가 앞이면 연-월-일, 뒤이면 일-월-연으로 읽습니다. 두 조각이 모두 12 이하인 모호한 표기도 일-월 순(de·fr·es·it·pt·nl·cs·ar 관례)으로 둡니다. 정규식 경로는 '19.04.2022' 를 '19.04.20' 으로 잘라 연도를 잃습니다.",
+                    cores[i]
+                ));
+                parts.push((i, ShipTimePart::Iso(lit)));
+                continue;
+            }
             if let Some(lit) = crate::utils::ai_utils::extract_date_literal(core) {
                 roles[i] = ShipTokenRole::Temporal;
                 parts.push((i, ShipTimePart::Iso(lit)));
@@ -2999,8 +3644,27 @@ impl crate::model::LogisModel {
             if residue.is_empty() {
                 if let Some(v) = int_val {
                     if digits == 4 && (1900..=2100).contains(&v) { year_like.push((i, v as i32)); }
+                    if digits <= 2 && (1..=31).contains(&v) { day_like.push((i, v as u32)); }
                 }
                 continue;
+            }
+            if let (Some(unit_key), Some(v)) = (ship_unit_exact(&residue), int_val) {
+                let exact = match unit_key {
+                    "year" if digits == 4 && (1..=9999).contains(&v) => Some(ShipTimePart::Year(v as i32)),
+                    "month" if (1..=12).contains(&v) => Some(ShipTimePart::Month(v as u32)),
+                    "day" if (1..=31).contains(&v) => Some(ShipTimePart::Day(v as u32)),
+                    _ => None,
+                };
+                if let Some(p) = exact {
+                    roles[i] = ShipTokenRole::Temporal;
+                    crate::utils::score_dynamics::record_baseline("search.time.unit_exact", 1.0);
+                    logs.push(format!(
+                        "   🕒 [TIME UNIT / EXACT] \"{}\" → {:?} | 잔여 \"{}\" 가 12개 언어 단위 표의 '{}' 와 완전일치합니다. 닫힌 어휘는 코사인 경쟁에 넣지 않습니다.",
+                        cores[i], p, residue, unit_key
+                    ));
+                    parts.push((i, p));
+                    continue;
+                }
             }
             let q = table.get(&residue);
             if q.iter().all(|&v| v == 0.0) { continue; }
@@ -3069,6 +3733,28 @@ impl crate::model::LogisModel {
             ));
             parts.push((i, p));
         }
+        for j in 0..n {
+            if roles[j] != ShipTokenRole::Content { continue; }
+            if ship_unit_exact(&cores[j]) != Some("year") { continue; }
+            for k in [j.wrapping_sub(1), j + 1] {
+                if k >= n || roles[k] != ShipTokenRole::Numeric { continue; }
+                let pos = match year_like.iter().position(|(i, _)| *i == k) {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+                let (_, y) = year_like.remove(pos);
+                roles[k] = ShipTokenRole::Temporal;
+                roles[j] = ShipTokenRole::Temporal;
+                crate::utils::score_dynamics::record_baseline("search.time.unit_exact", 1.0);
+                logs.push(format!(
+                    "   🕒 [YEAR UNIT WORD / EXACT] \"{}\" + \"{}\" → Year({}) | 띄어 쓴 연도 단위어가 12개 언어 단위 표의 'year' 와 완전일치하고 이웃 수치가 4자리 연도입니다. 붙여 쓰는 한국어·CJK 와 달리 de·fr·es·it·pt·nl·cs·ar·en 은 단위어가 별도 토큰으로 옵니다. 월·일 단위어는 '3 months' 같은 기간 표현과 겹치므로 연도에만 적용합니다.",
+                    cores[j], cores[k], y
+                ));
+                parts.push((k, ShipTimePart::Year(y)));
+                parts.push((j, ShipTimePart::Year(y)));
+                break;
+            }
+        }
         loop {
             let mut promoted = false;
             let mut rest: Vec<(usize, Vec<ShipTimePart>, f32, f32, bool)> = Vec::new();
@@ -3115,6 +3801,24 @@ impl crate::model::LogisModel {
                 }
             }
             year_like = rest_years;
+            let mut rest_days: Vec<(usize, u32)> = Vec::new();
+            for (i, d) in day_like.into_iter() {
+                let near_month = parts
+                    .iter()
+                    .any(|(k, p)| (*k + 1 == i || *k == i + 1) && matches!(p, ShipTimePart::Month(_)));
+                if near_month {
+                    roles[i] = ShipTokenRole::Temporal;
+                    logs.push(format!(
+                        "   🗓️ [DAY / ADJACENT] \"{}\" → Day({}) | 월 조각과 맞닿은 1~31 정수입니다. 일·월·연이 따로 인쇄된 표기를 한 구간으로 묶습니다.",
+                        cores[i], d
+                    ));
+                    parts.push((i, ShipTimePart::Day(d)));
+                    promoted = true;
+                } else {
+                    rest_days.push((i, d));
+                }
+            }
+            day_like = rest_days;
             if !promoted { break; }
         }
         for (i, cands, unit_top, rival, lenient) in conditional_time.into_iter() {
@@ -3186,10 +3890,12 @@ impl crate::model::LogisModel {
                     if first > 1 && roles.get(first - 1) == Some(&ShipTokenRole::Content) {
                         label_cands.push(first - 2);
                     }
-                    let scope_codes: Vec<String> = doc_mentions
-                        .iter()
-                        .flat_map(|m| m.codes.iter().cloned())
-                        .collect();
+                    let mut scope_codes: Vec<String> = Vec::new();
+                    for m in doc_mentions.iter() {
+                        for c in m.codes.iter() {
+                            if !scope_codes.contains(c) { scope_codes.push(c.clone()); }
+                        }
+                    }
                     let in_scope_schema = |f: &str| -> bool {
                         if scope_codes.is_empty() { return true; }
                         let mut checked = 0usize;
@@ -3216,24 +3922,88 @@ impl crate::model::LogisModel {
                     } else {
                         scoped_banks
                     };
+                    // 허브 보정: 'ETA'·'ETD' 같은 짧은 약어 구는 어떤 토큰과도 코사인이 높아 Max-Pool 에서
+                    // 자기 축을 대신 이깁니다. 살아 있는 질의 토큰 전체를 배경으로 구마다 평균 코사인을 재고
+                    // 그 성분을 뺀 뒤에야 "이 토큰에만 반응한 구" 가 남습니다.
+                    let bg: Vec<Vec<f32>> = cores
+                        .iter()
+                        .map(|c| table.get(c).clone())
+                        .filter(|v| !v.iter().all(|&x| x == 0.0))
+                        .collect();
+                    let hub_of = |e: &Vec<f32>| -> f32 {
+                        if bg.is_empty() { return 0.0; }
+                        bg.iter().map(|t| cosine_similarity(t, e)).sum::<f32>() / bg.len() as f32
+                    };
+                    let pool_hub: Vec<Vec<f32>> = pool
+                        .iter()
+                        .map(|(_, b)| b.iter().map(|e| hub_of(e)).collect())
+                        .collect();
+                    let nd_hub: Vec<f32> = nondate_bank.iter().map(|e| hub_of(e)).collect();
                     let mut best: Option<(usize, String, f32)> = None;
                     for j in label_cands.into_iter() {
                         if roles.get(j) != Some(&ShipTokenRole::Content) { continue; }
                         let q = table.get(&cores[j]);
                         if q.iter().all(|&v| v == 0.0) { continue; }
-                        let (bf, bs) = pool
+                        let mut all: Vec<f32> = Vec::new();
+                        let mut per_field: Vec<(String, f32, usize)> = Vec::new();
+                        for (fi, (f, b)) in pool.iter().enumerate() {
+                            if b.is_empty() { continue; }
+                            let mut mx = f32::MIN;
+                            for (ei, e) in b.iter().enumerate() {
+                                let s = cosine_similarity(q, e) - pool_hub[fi][ei];
+                                all.push(s);
+                                if s > mx { mx = s; }
+                            }
+                            per_field.push((f.clone(), mx, b.len()));
+                        }
+                        let mut nd_mx = f32::MIN;
+                        for (ei, e) in nondate_bank.iter().enumerate() {
+                            let s = cosine_similarity(q, e) - nd_hub[ei];
+                            all.push(s);
+                            if s > nd_mx { nd_mx = s; }
+                        }
+                        if per_field.is_empty() || nondate_bank.is_empty() || all.len() < 2 { continue; }
+                        let cnt = all.len() as f32;
+                        let mean = all.iter().sum::<f32>() / cnt;
+                        let sd = (all.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / cnt).sqrt();
+                        if sd <= 1e-6 { continue; }
+                        let z_of = |mx: f32, n: usize| -> f32 { (mx - mean) / sd - gumbel_expected_z(n.max(1)) };
+                        let mut ranked: Vec<(String, f32)> = per_field
                             .iter()
-                            .map(|(f, b)| (f.clone(), max_pool_sim(q, b)))
-                            .fold((String::new(), f32::MIN), |acc, x| if x.1 > acc.1 { x } else { acc });
-                        let nd = max_pool_sim(q, &nondate_bank);
-                        if bs >= nd && best.as_ref().map_or(true, |b| bs > b.2) { best = Some((j, bf, bs)); }
+                            .map(|(f, mx, n)| (f.clone(), z_of(*mx, *n)))
+                            .collect();
+                        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        let z_nd = z_of(nd_mx, nondate_bank.len());
+                        let (bf, bz) = ranked[0].clone();
+                        let second = ranked.get(1).map(|x| x.1).unwrap_or(f32::MIN);
+                        // 날짜 축끼리의 z 표준편차. 1·2위 격차가 그 안이면 어느 축인지를 답한 것이 아니라 잡음이
+                        // 답한 것이므로 기본 축(issue_date)으로 물러납니다. 틀린 축을 하드 조건으로 잠그면 0건이 확정되고,
+                        // 치환으로 살아나더라도 SDS 에는 그 축의 '단독 차단' 이 오기록됩니다.
+                        let zs: Vec<f32> = ranked.iter().map(|x| x.1).collect();
+                        let zm = zs.iter().sum::<f32>() / zs.len() as f32;
+                        let zsd = (zs.iter().map(|x| (x - zm) * (x - zm)).sum::<f32>() / zs.len() as f32).sqrt();
+                        let ambiguous = ranked.len() >= 2 && (bz - second) < zsd;
+                        logs.push(format!(
+                            "   📅 [DATE LABEL PROBE] \"{}\" | 허브 보정 z 순위 [{}] vs 비날짜 라벨 z {:+.3} (구 {}개) | 1·2위 격차 {:+.3} vs 축 간 σ {:.3}{} — 구마다 질의 토큰 전체와의 평균 코사인(허브 성분)을 뺀 뒤 √(2 ln N) 기대 최댓값을 다시 뺐습니다. 약어 한 구가 뱅크 전체를 대신 이기는 자리를 막습니다.",
+                            cores[j],
+                            ranked.iter().take(3).map(|(f, z)| format!("{}{:+.3}", f, z)).collect::<Vec<_>>().join(", "),
+                            z_nd,
+                            nondate_bank.len(),
+                            bz - second,
+                            zsd,
+                            if ambiguous { " → 모호, 기본 축으로 후퇴" } else { "" }
+                        ));
+                        if ambiguous { continue; }
+                        if bz >= z_nd && best.as_ref().map_or(true, |b| bz > b.2) {
+                            best = Some((j, bf, bz));
+                        }
                     }
                     let field = match best {
                         Some((j, f, s)) => {
                             roles[j] = ShipTokenRole::Temporal;
                             tokens.push(j);
                             logs.push(format!(
-                                "   📅 [DATE FIELD / COSINE] 날짜 라벨 \"{}\" → {} (cos {:.4})",
+                                "   📅 [DATE FIELD / COSINE] 날짜 라벨 \"{}\" → {} (기대 최댓값 보정 z {:+.3})",
                                 cores[j], f, s
                             ));
                             f
@@ -3277,11 +4047,26 @@ impl crate::model::LogisModel {
         let mut enum_hits: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
         for i in 0..n {
             if roles[i] != ShipTokenRole::Content { continue; }
+            let adj_num = (i > 0 && roles[i - 1] == ShipTokenRole::Numeric)
+                || (i + 1 < n && roles[i + 1] == ShipTokenRole::Numeric);
             let q = table.get(&cores[i]);
-            if q.iter().all(|&v| v == 0.0) { continue; }
             let fun = max_pool_sim(q, &func_bank);
             let opb = max_pool_sim(q, &op_all_bank);
             for (field, rows, foreign) in enum_banks.iter() {
+                if field == "currency" && adj_num {
+                    let exact = ship_currency_name_exact(&cores[i])
+                        .or_else(|| ship_currency_symbol(&words[i]))
+                        .filter(|c| rows.iter().any(|(r, _)| r.as_str() == *c));
+                    if let Some(code) = exact {
+                        logs.push(format!(
+                            "   🏷️ [ENUM VALUE / EXACT] \"{}\" → {} = {} | 통화 명칭·기호 표와 완전일치합니다. 수치 토큰과 맞닿아 있을 때만 적용합니다.",
+                            cores[i], field, code
+                        ));
+                        enum_hits[i].push((field.clone(), code.to_string()));
+                        continue;
+                    }
+                }
+                if q.iter().all(|&v| v == 0.0) { continue; }
                 let lab = max_pool_sim(q, foreign);
                 if let Some((code, cos, gap)) = ship_enum_resolve(q, &cores[i], rows, fun, opb, lab) {
                     logs.push(format!(
@@ -3300,7 +4085,20 @@ impl crate::model::LogisModel {
             if value.is_empty() { continue; }
             let mut currency = String::new();
             let residue = ship_numeric_residue(&cores[i]);
-            if !residue.is_empty() {
+            let exact_cur = ship_currency_name_exact(&residue)
+                .or_else(|| ship_currency_symbol(&words[i]))
+                .filter(|c| {
+                    enum_banks
+                        .iter()
+                        .any(|(f, rows, _)| f == "currency" && rows.iter().any(|(r, _)| r.as_str() == *c))
+                });
+            if let Some(code) = exact_cur {
+                currency = code.to_string();
+                logs.push(format!(
+                    "   💱 [CURRENCY / EXACT] \"{}\" → {} | 수치에 붙은 통화 명칭·기호가 표와 완전일치합니다.",
+                    words[i], code
+                ));
+            } else if !residue.is_empty() {
                 let q = table.get(&residue);
                 let fun = max_pool_sim(q, &func_bank);
                 let opb = max_pool_sim(q, &op_all_bank);
@@ -3429,9 +4227,140 @@ impl crate::model::LogisModel {
             numerics: numerics_raw,
             identifiers,
             doc_mentions,
+            relation_marks,
             enum_hits,
             temporal,
             logs,
         }
     }
+}
+
+pub const SHIP_FUNCTION_PIVOTS: &str =
+    "show me, show, display, tell me, let me know, list, list them, give me, \
+     find, search for, look up, retrieve, group, group them, group by, bundle, bundle them, \
+     only, just, only those, those only, among, among those, of those, from those, out of these, \
+     please, I want, I need, I would like, \
+     also, as well, too, in addition, along with, together, \
+     summarize, sort, sort by, order by, arrange by";
+
+pub const SHIP_FUNCTION_PIVOTS_ML: &str =
+    "zeig mir, zeigen, anzeigen, sag mir, teile mir mit, auflisten, gib mir, \
+     finde, suche, nachschlagen, gruppieren, bündeln, \
+     nur, lediglich, nur diese, unter, davon, aus diesen, \
+     bitte, ich möchte, ich brauche, auch, ebenfalls, zusammen, \
+     zusammenfassen, sortieren, sortieren nach, \
+     montre-moi, montrer, afficher, dis-moi, fais-moi savoir, lister, donne-moi, \
+     trouve, cherche, rechercher, regrouper, grouper, \
+     seulement, uniquement, ceux-là seulement, parmi, de ceux-ci, \
+     s'il te plaît, je veux, j'ai besoin, aussi, également, ensemble, \
+     résumer, trier, trier par, \
+     muéstrame, mostrar, ver, dime, indícame, listar, dame, \
+     encuentra, busca, consultar, agrupar, agrupa, \
+     solo, únicamente, solo esos, entre, de esos, de estos, \
+     por favor, quiero, necesito, también, además, junto con, \
+     resumir, ordenar, ordenar por, \
+     mostrami, mostra, visualizza, dimmi, fammi sapere, elenca, dammi, \
+     trova, cerca, consultare, raggruppa, raggruppare, \
+     soltanto, solo quelli, tra, di quelli, \
+     per favore, voglio, ho bisogno, anche, inoltre, insieme, \
+     riassumi, ordina, ordina per, \
+     mostre-me, exibir, diga-me, me informe, me dê, \
+     encontre, busque, agrupe, \
+     apenas, somente, apenas esses, desses, \
+     quero, preciso, além disso, juntamente com, \
+     laat me zien, toon, weergeven, vertel me, laat weten, lijst, geef me, \
+     zoek, opzoeken, groepeer, groeperen, \
+     alleen, slechts, alleen deze, onder, van deze, \
+     alsjeblieft, ik wil, ik heb nodig, ook, eveneens, samen, \
+     samenvatten, sorteren, sorteren op, \
+     ukaž mi, zobraz, ukázat, řekni mi, dej vědět, vypiš, dej mi, \
+     najdi, hledej, vyhledat, seskup, seskupit, \
+     pouze, jen, jen tyto, mezi, z těchto, \
+     prosím, chci, potřebuji, také, rovněž, společně, \
+     shrň, seřadit, seřadit podle, \
+     أرني, اعرض, أظهر, أخبرني, أعلمني, اسرد, أعطني, \
+     ابحث, ابحث عن, استعلم, جمع, اجمع, صنف, \
+     فقط, فحسب, هذه فقط, من بين, من هذه, \
+     من فضلك, أريد, أحتاج, أيضا, كذلك, مع, \
+     لخص, رتب, رتب حسب, \
+     見せて, 表示して, 教えて, 知らせて, 一覧にして, 出して, \
+     探して, 検索して, 照会して, まとめて, グループにして, \
+     だけ, のみ, それだけ, のうち, その中で, \
+     お願いします, したい, 必要です, も, また, 一緒に, \
+     要約して, 並べ替えて, 順に並べて, \
+     给我看, 显示, 展示, 告诉我, 列出, 给我, \
+     查找, 搜索, 查询, 分组, 归类, \
+     只, 仅, 只要这些, 其中, 这些中, \
+     请, 我要, 我需要, 也, 还有, 一起, \
+     总结, 排序, 按顺序排列, \
+     보여줘, 보여주세요, 표시해줘, 알려줘, 알려주고, 알려주세요, \
+     나열해줘, 목록으로, 찾아줘, 검색해줘, 조회해줘, \
+     묶어서, 묶어줘, 그룹으로, 정리해줘, \
+     것만, 인 것만, 한 것만, 오직, 단지, \
+     중에서, 중에, 그중에서, 가운데, \
+     부탁해, 하고 싶어, 필요해, 또한, 역시, 같이, 함께, \
+     요약해줘, 정렬해줘, 순서대로";
+
+pub fn ship_function_pivot_phrases() -> Vec<String> {
+    crate::logic::anchor_phrases(SHIP_FUNCTION_PIVOTS, SHIP_FUNCTION_PIVOTS_ML)
+}
+
+pub const SHIP_RELATION_PIVOTS: &str =
+    "linked, linked to, connected, connected to, related, related to, associated, associated with, \
+     corresponding, corresponding to, attached, referenced, tied to, matching, \
+     linked document, connected document, related document, related documents, \
+     its linked, the associated one, the corresponding one";
+
+pub const SHIP_RELATION_PIVOTS_ML: &str =
+    "verknüpft, verknüpft mit, verbunden, verbunden mit, zugehörig, zugeordnet, \
+     entsprechend, beigefügt, referenziert, dazugehörig, \
+     verknüpftes Dokument, zugehöriges Dokument, zugehörige Dokumente, \
+     lié, lié à, connecté, associé, associé à, correspondant, joint, référencé, rattaché, \
+     document lié, document associé, documents associés, \
+     vinculado, vinculado a, conectado, relacionado, relacionado con, asociado, \
+     correspondiente, adjunto, referenciado, \
+     documento vinculado, documento relacionado, documentos relacionados, \
+     collegato, collegato a, connesso, correlato, correlato a, associato, \
+     corrispondente, allegato, referenziato, \
+     documento collegato, documenti correlati, \
+     conectado a, relacionado a, associado a, correspondente, anexo, \
+     documento vinculado, documentos relacionados, \
+     gekoppeld, gekoppeld aan, verbonden, gerelateerd, gerelateerd aan, geassocieerd, \
+     overeenkomstig, bijgevoegd, gerefereerd, \
+     gekoppeld document, gerelateerd document, gerelateerde documenten, \
+     propojený, propojený s, spojený, související, související s, přiřazený, \
+     odpovídající, přiložený, odkazovaný, \
+     propojený dokument, související dokument, související dokumenty, \
+     مرتبط, مرتبط بـ, متصل, ذو صلة, مرتبط به, مرافق, مقابل, مرفق, مشار إليه, \
+     المستند المرتبط, المستندات ذات الصلة, \
+     紐づく, 紐づいた, 紐づけられた, 関連する, 関連した, 連携した, 対応する, 添付の, 参照された, \
+     関連書類, 紐づく書類, 対応する書類, \
+     关联的, 关联, 相关的, 相关, 对应的, 附带的, 引用的, 挂钩的, \
+     关联单据, 相关单据, 对应单据, \
+     연결된, 연결, 연계된, 연계, 관련된, 관련, 대응되는, 딸린, 붙은, 참조된, \
+     연결 문서, 관련 서류, 대응 서류";
+
+pub fn ship_relation_pivot_phrases() -> Vec<String> {
+    crate::logic::anchor_phrases(SHIP_RELATION_PIVOTS, SHIP_RELATION_PIVOTS_ML)
+}
+
+pub fn ship_relation_exact(core: &str) -> bool {
+    let norm = ship_normalize_token(core);
+    if norm.chars().count() < 2 { return false; }
+    for raw in [SHIP_RELATION_PIVOTS, SHIP_RELATION_PIVOTS_ML] {
+        for p in raw.split(',') {
+            let p = ship_normalize_token(p);
+            if p.chars().count() < 2 { continue; }
+            if norm == p { return true; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 3
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }

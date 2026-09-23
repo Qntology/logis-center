@@ -410,10 +410,10 @@ pub fn split_bias_phrases_weighted_full(raw: &str) -> (Vec<String>, Vec<f32>) {
 //    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
 pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
-    // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드는 공용 'shipping_doc' 노드로 접습니다.
     let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let primary = crate::utils::bias_schema::lang_code_of(doc_lang);
 
-    for lk in [doc_lang, "en", "ko"] {
+    for lk in [primary.as_str(), "en", "ko"] {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(s) = lang_node
             .get(page_type)
@@ -1579,11 +1579,14 @@ pub fn window_assign_verdict(
     if !asked_in_window {
         return (false, "이 창이 묻지 않은 축");
     }
-    if own_neutral > 0.0 {
-        return (true, "창 안 1위이며 자기 중립점수가 양수");
-    }
     if rival_neutral <= 0.0 {
         return (true, "창 안 1위이며 경쟁 축도 양수 근거가 없음");
+    }
+    if own_neutral > 0.0 && rival_neutral - own_neutral < 1.0 {
+        return (true, "창 안 1위이며 경쟁 축과의 격차가 pooled σ 한 칸 미만");
+    }
+    if own_neutral > 0.0 {
+        return (false, "자기 중립점수는 양수이지만 경쟁 축이 pooled σ 한 칸 이상 앞섬");
     }
     (false, "자기 중립점수가 음수인데 경쟁 축은 양수 근거를 가짐")
 }
@@ -2005,12 +2008,9 @@ pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
 //    여기서는 원본 JSON 을 직접 읽어 다국어 구 뱅크를 복원합니다.
 fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<serde_json::Value> {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
-    // 🌟 [BIAS TYPE CANONICALIZE] BL / CI / PL 등 무역 서식 코드는 bias.json 에
-    //    개별 노드가 없습니다. 공용 'shipping_doc' 노드로 접어 조회하지 않으면
-    //    label_phrase_bank / prejudice_phrase_bank 가 항상 빈 배열을 돌려주고,
-    //    그 결과 무역 문서의 헤더 코사인 맵과 청크 PLINKO 가 판정 근거를 잃습니다.
     let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
-    let lang_keys = [doc_lang, "en", "ko"];
+    let primary = crate::utils::bias_schema::lang_code_of(doc_lang);
+    let lang_keys = [primary.as_str(), "en", "ko"];
     for lk in lang_keys {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(n) = lang_node.get(page_type).and_then(|p| p.get(field_name)) {
@@ -2060,6 +2060,167 @@ pub fn label_phrase_bank(doc_lang: &str, page_type: &str, field_name: &str) -> (
     }
     if phrases.len() > 48 { phrases.truncate(48); weights.truncate(48); }
     (phrases, weights)
+}
+
+pub const BANK_LANGS: [&str; 12] = ["en", "de", "es", "fr", "ja", "pt", "ar", "cs", "it", "ko", "nl", "zh"];
+
+pub fn bank_lang_order(primary_lang: &str) -> Vec<String> {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let mut order: Vec<String> = Vec::with_capacity(BANK_LANGS.len() + 1);
+    let primary = crate::utils::bias_schema::lang_code_of(primary_lang);
+    if dict.get(primary.as_str()).is_some() {
+        order.push(primary);
+    }
+    for l in BANK_LANGS.iter() {
+        if dict.get(*l).is_none() { continue; }
+        if !order.iter().any(|x| x.as_str() == *l) { order.push((*l).to_string()); }
+    }
+    if order.is_empty() {
+        order.push("en".to_string());
+    }
+    order
+}
+
+pub fn bank_lang_coverage() -> (Vec<&'static str>, Vec<&'static str>) {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let mut have: Vec<&'static str> = Vec::new();
+    let mut miss: Vec<&'static str> = Vec::new();
+    for l in BANK_LANGS.iter() {
+        match dict.get(*l) {
+            Some(_) => have.push(*l),
+            None => miss.push(*l),
+        }
+    }
+    (have, miss)
+}
+
+pub fn label_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field_name: &str) -> (Vec<String>, Vec<f32>) {
+    let mut phrases: Vec<String> = Vec::new();
+    let mut weights: Vec<f32> = Vec::new();
+    for lk in bank_lang_order(primary_lang).into_iter() {
+        let (ph, wt) = label_phrase_bank(&lk, page_type, field_name);
+        for (p, w) in ph.into_iter().zip(wt.into_iter()) {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+            weights.push(w);
+        }
+    }
+    (phrases, weights)
+}
+
+pub fn prejudice_phrase_bank_multilingual(primary_lang: &str, page_type: &str, field_name: &str) -> Vec<String> {
+    let mut phrases: Vec<String> = Vec::new();
+    for lk in bank_lang_order(primary_lang).into_iter() {
+        for p in prejudice_phrase_bank(&lk, page_type, field_name) {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+        }
+    }
+    phrases
+}
+
+/// 전문 비교 키: 소문자 + 각 언어의 문자·숫자만 남깁니다.
+/// "Air Waybill" / "AIRWAYBILL" / "Air-Waybill" 이 같은 키가 됩니다.
+pub fn trade_title_key(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn build_all_trade_doc_titles() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut push = |code: &str, title: &str| {
+        let t = title.trim();
+        if t.is_empty() { return; }
+        if !seen.insert((code.to_string(), trade_title_key(t))) { return; }
+        out.push((code.to_string(), t.to_string()));
+    };
+    for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
+        push(code, title);
+    }
+    for (code, title) in crate::logic::TRADE_DOC_TITLES_ML.iter() {
+        push(code, title);
+    }
+    for (code, title) in crate::logic::trade_title_pairs().iter() {
+        push(code, title);
+    }
+    let en_keys: Vec<(String, String)> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(c, t)| (c.to_string(), trade_title_key(t)))
+        .collect();
+    for (en_title, ml) in crate::logic::TRADE_DOC_TITLES_ML_FULL.iter() {
+        let k = trade_title_key(en_title);
+        for (code, key) in en_keys.iter() {
+            if *key != k { continue; }
+            for phrase in ml.split(',') {
+                push(code, phrase);
+            }
+        }
+    }
+    out
+}
+
+/// 서식 전문 전체표 (코드, 전문). 영문·기존 ML·title bank·12개 언어 확장표를 합치고
+/// (코드, 정규화 키) 로 중복을 접습니다. 프로세스당 한 번만 만듭니다.
+pub fn all_trade_doc_titles() -> Vec<(String, String)> {
+    static TABLE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_all_trade_doc_titles).clone()
+}
+
+/// 코드 하나의 전문 전체 (영문 + 기존 ML + 12개 언어 확장표).
+pub fn trade_code_title_phrases(code: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (c, title) in all_trade_doc_titles().into_iter() {
+        if c != code { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    out
+}
+
+/// 12개 언어 확장표에서 TRADE_DOC_TITLES 의 어떤 영문 전문과도 맞지 않는 키.
+pub fn trade_title_ml_orphans() -> Vec<String> {
+    let en: std::collections::HashSet<String> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(_, t)| trade_title_key(t))
+        .collect();
+    crate::logic::TRADE_DOC_TITLES_ML_FULL
+        .iter()
+        .filter(|(t, _)| !en.contains(&trade_title_key(t)))
+        .map(|(t, _)| t.to_string())
+        .collect()
+}
+
+/// 그룹 개념표에서 TRADE_GROUP_CODES 에 없는 그룹명.
+pub fn trade_group_ml_orphans() -> Vec<String> {
+    crate::logic::TRADE_GROUPS_ML
+        .iter()
+        .filter(|(g, _)| !crate::logic::TRADE_GROUP_CODES.iter().any(|(x, _)| x == g))
+        .map(|(g, _)| g.to_string())
+        .collect()
+}
+
+/// 그룹 뱅크 구: 소속 코드의 전문 전체(12개 언어) + 그룹 개념 구.
+pub fn trade_group_title_phrases(group: &str) -> Vec<String> {
+    let codes: Vec<&str> = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .find(|(g, _)| *g == group)
+        .map(|(_, cs)| cs.to_vec())
+        .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for (code, title) in all_trade_doc_titles().into_iter() {
+        if !codes.iter().any(|c| *c == code.as_str()) { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    for (g, ml) in crate::logic::TRADE_GROUPS_ML.iter() {
+        if *g != group { continue; }
+        for p in ml.split(',') {
+            let p = p.trim();
+            if p.is_empty() || out.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
+            out.push(p.to_string());
+        }
+    }
+    out
 }
 
 // 🌟 [PREJUDICE PHRASE BANK] bias.json 이 필드마다 손으로 써 둔 "이 컬럼이 절대 아닌 라벨" 목록입니다.
@@ -2674,17 +2835,102 @@ pub fn has_date_literal(s: &str) -> bool {
 //   1~2자리 숫자이거나 3~12자 순수 알파벳 한 덩어리.
 //   어떤 라틴 문자 언어의 월 이름도 이 모양을 벗어나지 않고,
 //   금액("2000.00")·식별자("CI-43726")·중량("20KG")은 이 모양에 들어올 수 없습니다.
+pub fn normalize_digits_ascii(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let base = match c {
+                '\u{0660}'..='\u{0669}' => Some('\u{0660}'),
+                '\u{06F0}'..='\u{06F9}' => Some('\u{06F0}'),
+                '\u{FF10}'..='\u{FF19}' => Some('\u{FF10}'),
+                _ => None,
+            };
+            match base {
+                Some(b) => char::from_u32('0' as u32 + (c as u32 - b as u32)).unwrap_or(c),
+                None => c,
+            }
+        })
+        .collect()
+}
+
+pub const MONTH_NAMES_ML: [&str; 12] = [
+    "january, jan, januar, jänner, enero, ene, janvier, janv, gennaio, gen, janeiro, januari, leden, ledna, يناير, 一月",
+    "february, feb, februar, febrero, février, févr, fév, febbraio, fevereiro, fev, februari, únor, února, فبراير, شباط, 二月",
+    "march, mar, märz, marzo, mars, março, maart, březen, března, مارس, آذار, 三月",
+    "april, apr, abril, abr, avril, avr, aprile, duben, dubna, أبريل, إبريل, نيسان, 四月",
+    "may, mai, mayo, maggio, mag, maio, mei, květen, května, مايو, أيار, 五月",
+    "june, jun, juni, junio, juin, giugno, giu, junho, červen, června, يونيو, حزيران, 六月",
+    "july, jul, juli, julio, juillet, juil, luglio, lug, julho, červenec, července, يوليو, تموز, 七月",
+    "august, aug, agosto, ago, août, aout, augustus, srpen, srpna, أغسطس, آب, 八月",
+    "september, sep, sept, septiembre, septembre, settembre, set, setembro, září, سبتمبر, أيلول, 九月",
+    "october, oct, oktober, okt, octubre, octobre, ottobre, ott, outubro, out, říjen, října, أكتوبر, 十月",
+    "november, nov, noviembre, novembre, novembro, listopad, listopadu, نوفمبر, 十一月",
+    "december, dec, dezember, dez, diciembre, dic, décembre, déc, dicembre, dezembro, prosinec, prosince, ديسمبر, 十二月",
+];
+
+const DATE_UNIT_MARKERS: [&str; 8] = ["年", "月", "日", "년", "월", "일", "号", "號"];
+
+fn lower_alnum(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+pub fn month_from_name(core: &str) -> Option<u32> {
+    let norm = lower_alnum(core);
+    if norm.is_empty() { return None; }
+    for (mi, raw) in MONTH_NAMES_ML.iter().enumerate() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(mi as u32 + 1); }
+            let cjk = p.chars().any(|c| (c as u32) >= 0x2E80);
+            if p.chars().count() < 3 && !cjk { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if !rest.is_empty()
+                    && rest.chars().count() <= 3
+                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    return Some(mi as u32 + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn has_date_shape(s: &str) -> bool {
     if has_date_literal(s) { return true; }
-    let toks: Vec<&str> = s
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
+    let norm = normalize_digits_ascii(s);
+    if has_date_literal(&norm) { return true; }
+    let mut segs: Vec<String> = Vec::new();
+    for tok in norm.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() { segs.push(cur); }
+    }
+    let toks: Vec<String> = segs
+        .into_iter()
+        .filter(|t| {
+            if t.chars().all(|c| c.is_ascii_digit()) { return true; }
+            if DATE_UNIT_MARKERS.iter().any(|u| *u == t.as_str()) { return false; }
+            if month_from_name(t).is_some() { return true; }
+            t.chars().count() > 2
+        })
         .collect();
     if toks.len() < 2 || toks.len() > 3 { return false; }
 
     let mut years = 0usize;
     let mut days = 0usize;
-    let mut alpha = 0usize;
+    let mut months = 0usize;
     for t in toks.iter() {
         if t.chars().all(|c| c.is_ascii_digit()) {
             let n = t.chars().count();
@@ -2693,12 +2939,10 @@ pub fn has_date_shape(s: &str) -> bool {
             if n <= 2 && (1..=31).contains(&v) { days += 1; continue; }
             return false;
         }
-        if !t.chars().all(|c| c.is_alphabetic()) { return false; }
-        let n = t.chars().count();
-        if n < 3 || n > 12 { return false; }
-        alpha += 1;
+        if month_from_name(t).is_some() { months += 1; continue; }
+        return false;
     }
-    years == 1 && alpha <= 1 && (days + alpha) >= 1 && (years + days + alpha) == toks.len()
+    years == 1 && months <= 1 && (days + months) >= 1
 }
 
 // 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)

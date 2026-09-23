@@ -1656,6 +1656,44 @@ fn evaluate_dexie_plan(
     (eligible, all_pass, per)
 }
 
+/// 힌트 축이 회수 문서에서 실제로 만족되었는지 관측합니다.
+///
+///  ── 왜 하드와 분리하는가 ──
+///   힌트는 결과 집합을 좁히지 않으므로 all_pass 계산에 넣으면 안 됩니다.
+///   그러나 '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에
+///   직접 쓰이는 정보인데, 지금은 evaluated 가 0 이라 관측 자체가 없습니다.
+fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize)> {
+    let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
+    let hints = match plan.get("hints").and_then(|v| v.as_object()) {
+        Some(h) => h.clone(),
+        None => return Vec::new(),
+    };
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    for (field, spec) in hints.iter() {
+        let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
+        let want = spec.get("value").cloned().unwrap_or(Value::Null);
+        if want.is_null() { continue; }
+        let kind = if want.is_number() { "number" } else { "string" };
+        let cond = json!({
+            "path": format!("data.{}", field),
+            "op": op,
+            "value": want,
+            "kind": kind
+        });
+        let mut present = 0usize;
+        let mut satisfied = 0usize;
+        for d in docs.iter() {
+            let has = d.get(field.as_str()).map_or(false, |v| {
+                !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+            });
+            if has { present += 1; }
+            if dexie_condition_passes(&cond, d, &alternates) { satisfied += 1; }
+        }
+        out.push((field.clone(), satisfied, present));
+    }
+    out
+}
+
 fn plan_alternate_axis_map(plan: &Value) -> Value {
     plan.get("alternates").cloned().unwrap_or(json!({}))
 }
@@ -1760,9 +1798,188 @@ async fn nearest_storage_axis(
     Some(scored[0].clone())
 }
 
+/// 문자 체계 판정. FTS(ngram 문자열 포함)가 물리적으로 성립할 수 있는지를 가릅니다.
+///
+///  ── 왜 언어가 아니라 문자 체계인가 ──
+///   FTS 는 의미가 아니라 바이트/문자 일치입니다. 한국어 질의와 영어 청크는
+///   같은 뜻이어도 공통 부분 문자열이 없어 FTS 가 구조적으로 0건입니다.
+///   반대로 중국어 질의와 일본어 청크는 한자를 공유해 부분적으로 발화합니다.
+///   언어 판정기보다 문자 체계가 이 물음에 더 정확히 답합니다.
+fn dominant_script(s: &str) -> &'static str {
+    let (mut latin, mut hangul, mut kana, mut han, mut arabic, mut cyrillic) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for c in s.chars() {
+        let u = c as u32;
+        if c.is_ascii_alphabetic() || (0x00C0..=0x024F).contains(&u) {
+            latin += 1;
+        } else if (0xAC00..=0xD7A3).contains(&u) || (0x1100..=0x11FF).contains(&u) {
+            hangul += 1;
+        } else if (0x3040..=0x30FF).contains(&u) {
+            kana += 1;
+        } else if (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u) {
+            han += 1;
+        } else if (0x0600..=0x06FF).contains(&u) || (0x0750..=0x077F).contains(&u) {
+            arabic += 1;
+        } else if (0x0400..=0x04FF).contains(&u) {
+            cyrillic += 1;
+        }
+    }
+    let mut best: (&'static str, usize) = ("none", 0);
+    for (name, n) in [
+        ("latin", latin),
+        ("hangul", hangul),
+        ("kana", kana),
+        ("han", han),
+        ("arabic", arabic),
+        ("cyrillic", cyrillic),
+    ] {
+        if n > best.1 { best = (name, n); }
+    }
+    best.0
+}
+
 fn is_relay_draft(doc: &Value) -> bool {
     doc.get("updated_at").and_then(|v| v.as_i64()) == Some(0)
         && doc.get("digest").and_then(|v| v.as_str()).map_or(false, |s| s.is_empty())
+}
+
+// =====================================================================
+// 🌟 [QUERY-SIDE MODE REROUTE] 커머스 질의가 무역 서식을 지목하는지 판정합니다.
+// ---------------------------------------------------------------------
+//  비전 경로의 [MODE REROUTE] 와 대칭입니다. 커머스 태스크로 올라온 서식 이미지는
+//  mode='shipping', type='CI' 처럼 저장되므로, 같은 질의가 커머스 스코프
+//  (mode='commerce', type IN (goods, ...)) 로 나가면 구조적으로 0건입니다.
+// =====================================================================
+static TRADE_QUERY_BANKS: Lazy<RwLock<Option<(Vec<(String, Vec<f32>)>, Vec<Vec<f32>>)>>> =
+    Lazy::new(|| RwLock::new(None));
+
+async fn trade_query_banks(
+    model: &LogisModel,
+) -> Option<(Vec<(String, Vec<f32>)>, Vec<Vec<f32>>)> {
+    if let Ok(g) = TRADE_QUERY_BANKS.read() {
+        if let Some(b) = g.as_ref() {
+            return Some(b.clone());
+        }
+    }
+    let titles = crate::utils::ai_utils::all_trade_doc_titles();
+    let comm = crate::logic::anchor_phrases(
+        crate::logic::COMMERCE_QUERY_ANCHOR,
+        crate::logic::COMMERCE_QUERY_ANCHOR_ML,
+    );
+    let mut texts: Vec<String> = titles.iter().map(|(_, t)| t.clone()).collect();
+    let n_title = texts.len();
+    texts.extend(comm.iter().cloned());
+    let mut embs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for part in texts.chunks(200) {
+        let e = model
+            .get_embedding_batch(part.to_vec())
+            .await
+            .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+        embs.extend(e);
+    }
+    if embs.len() != texts.len() {
+        return None;
+    }
+    let title_bank: Vec<(String, Vec<f32>)> = titles
+        .iter()
+        .zip(embs.iter().take(n_title))
+        .filter(|(_, e)| !e.is_empty())
+        .map(|((c, _), e)| (c.clone(), e.clone()))
+        .collect();
+    let comm_bank: Vec<Vec<f32>> = embs
+        .iter()
+        .skip(n_title)
+        .filter(|e| !e.is_empty())
+        .cloned()
+        .collect();
+    if title_bank.len() < 3 || comm_bank.len() < 3 {
+        return None;
+    }
+    if let Ok(mut g) = TRADE_QUERY_BANKS.write() {
+        *g = Some((title_bank.clone(), comm_bank.clone()));
+    }
+    Some((title_bank, comm_bank))
+}
+
+/// 한 뱅크에 대한 질의의 자기 분포 초과분: (z_top − √(2lnN), top cos, top idx)
+fn bank_excess(sims: &[f32]) -> Option<(f32, f32, usize)> {
+    if sims.len() < 3 { return None; }
+    let n = sims.len() as f32;
+    let mean = sims.iter().sum::<f32>() / n;
+    let sd = (sims.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
+    if sd <= 1e-6 { return None; }
+    let mut ti = 0usize;
+    for (i, s) in sims.iter().enumerate() {
+        if *s > sims[ti] { ti = i; }
+    }
+    let z = (sims[ti] - mean) / sd;
+    let expected = (2.0 * n.ln()).sqrt();
+    Some((z - expected, sims[ti], ti))
+}
+
+async fn probe_trade_query<E: Fn(&str)>(
+    model: &LogisModel,
+    query: &str,
+    emit: &E,
+) -> Option<String> {
+    use crate::utils::ai_utils::cosine_similarity;
+
+    // ① 서식 코드 접두 번호 (코드 직후에 숫자 또는 구분자, 숫자 4자리 이상)
+    let codes: Vec<&str> = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .flat_map(|(_, cs)| cs.iter().copied())
+        .collect();
+    for tok in query.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'')
+    }) {
+        let core = tok
+            .trim_start_matches(|c: char| !c.is_ascii_alphabetic())
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        let t = core.to_uppercase();
+        if t.len() < 6 { continue; }
+        for code in codes.iter() {
+            let code: &str = *code;
+            if code.len() < 2 || !t.starts_with(code) { continue; }
+            let rest = &t[code.len()..];
+            let stripped = rest.trim_start_matches(|c: char| matches!(c, '-' | '/' | ':' | '#' | '.' | '_'));
+            if stripped.len() == rest.len() && !stripped.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            let digits = stripped.chars().filter(|c| c.is_ascii_digit()).count();
+            let clean = stripped
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '_'));
+            if digits >= 4 && clean {
+                emit(&format!(
+                    "[TRADE QUERY PROBE] 🔑 질의 토큰 '{}' 이 서식 코드 '{}' 의 접두 번호 형태입니다. 저장 시 resolve_trade_doc_identity 가 같은 접두 규칙으로 문서번호를 확정하므로, 이 토큰은 그 서식의 문서번호를 그대로 옮겨 적은 것입니다.",
+                    tok.trim(), code
+                ));
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    // ② 서식 전문 뱅크 vs 커머스 개념 뱅크
+    let (title_bank, comm_bank) = trade_query_banks(model).await?;
+    let q = model.get_embedding(query.to_string()).await.ok()?;
+    if q.is_empty() { return None; }
+    let t_sims: Vec<f32> = title_bank.iter().map(|(_, e)| cosine_similarity(&q, e)).collect();
+    let c_sims: Vec<f32> = comm_bank.iter().map(|e| cosine_similarity(&q, e)).collect();
+    let (t_ex, t_top, t_idx) = bank_excess(&t_sims)?;
+    let (c_ex, c_top, _) = bank_excess(&c_sims)?;
+    let code = title_bank[t_idx].0.clone();
+    if t_ex > 0.0 && t_ex > c_ex {
+        emit(&format!(
+            "[TRADE QUERY PROBE] 📄 서식 전문 뱅크 초과분 {:+.3} (최고 '{}' cos {:.4}, N={}) 이 커머스 개념 뱅크 초과분 {:+.3} (cos {:.4}, N={}) 을 앞섭니다. 두 뱅크의 최댓값 기대치 √(2lnN) 을 각각 뺀 값이므로 뱅크 크기 차이는 이미 상쇄되어 있습니다.",
+            t_ex, code, t_top, t_sims.len(), c_ex, c_top, c_sims.len()
+        ));
+        return Some(code);
+    }
+    emit(&format!(
+        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없습니다.",
+        t_ex, code, t_top, c_ex, c_top
+    ));
+    None
 }
 
 #[tauri::command]
@@ -2100,6 +2317,33 @@ async fn ai_search_complex(
         }
 
         
+        let search_mode: String = if search_mode == "commerce" {
+            crate::utils::score_dynamics::enter_scope(
+                "",
+                crate::utils::score_dynamics::Track::Search,
+                "probe",
+                "",
+            );
+            let verdict = probe_trade_query(&model, &query, &emit_term).await;
+            crate::utils::score_dynamics::record_baseline(
+                "search.query_reroute",
+                if verdict.is_some() { 1.0 } else { 0.0 },
+            );
+            crate::utils::score_dynamics::leave_scope();
+            match verdict {
+                Some(code) => {
+                    emit_term(&format!(
+                        "[MODE REROUTE / QUERY] 🔀 mode='commerce' 요청이지만 질의가 무역 서식 '{}' 을 지목합니다. 서식 이미지는 비전 경로의 MODE REROUTE 로 mode='shipping' 에 저장되므로 커머스 스코프로는 구조적으로 0건입니다. 질의 해석·비전 트랙·스코프·Dexie 플랜을 모두 shipping 으로 전환합니다.",
+                        code
+                    ));
+                    "shipping".to_string()
+                }
+                None => search_mode.clone(),
+            }
+        } else {
+            search_mode.clone()
+        };
+
         let structured_query = match search_mode.as_str() {
             "shipping" => {
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -2392,16 +2636,26 @@ async fn ai_search_complex(
                     //      substantial 은 LanceDB 물리 컬럼이 아니라 SQL 로는 절대 반영되지 않지만,
                     //      item_chunks 의 property 컬럼에는 그대로 존재하므로
                     //      '무거운 → weight' 의도를 여기서 실제 검색으로 회수합니다.
-                    let mut condition_props: Vec<String> = ctx.get("condition")
+                    let hard_props: Vec<String> = ctx.get("condition")
                         .and_then(|v| v.as_object())
                         .map(|obj| obj.keys().cloned().collect())
                         .unwrap_or_default();
+                    let mut hint_props: Vec<String> = Vec::new();
+                    let mut condition_props: Vec<String> = hard_props.clone();
                     if let Some(hint_obj) = ctx.get("hint").and_then(|v| v.as_object()) {
                         for k in hint_obj.keys() {
+                            if hard_props.iter().any(|p| p == k) { continue; }
+                            if !hint_props.iter().any(|p| p == k) { hint_props.push(k.clone()); }
                             if !condition_props.iter().any(|p| p == k) {
                                 condition_props.push(k.clone());
                             }
                         }
+                    }
+                    if !hint_props.is_empty() {
+                        println!(
+                            "[AI-SEARCH]   ⚖️ [TRACK WEIGHT] 하드 조건 축 {:?} 는 Column 트랙 전액(×3.0), 힌트 축 {:?} 는 절반(×1.5)을 받습니다. 하드는 질의가 '이 축을 걸겠다' 고 확정한 것이고 힌트는 '그 축일 수도 있다' 는 추정이라, 같은 눈금으로 더하면 추정 축이 랭킹을 주도합니다. 타겟 청크 검색(STAGE-4C)은 두 축 모두에 그대로 수행해 리콜은 잃지 않습니다.",
+                            hard_props, hint_props
+                        );
                     }
 
                     let substantial_prop = ctx.get("substantial")
@@ -2502,10 +2756,14 @@ async fn ai_search_complex(
                         //      청크 매칭은 '본문 매칭' 이므로 FTS 트랙(2.0)과 동일 스케일로 환산하고,
                         //      PLINKO 가 확정한 속성과 일치하면 Column 트랙(3.0)을 추가로 얹습니다.
                         let mut score = raw_cosine * 2.0;
-                        if !condition_props.is_empty() && condition_props.contains(&property) {
+                        if hard_props.contains(&property) {
                             let column_track = raw_cosine * 3.0;
                             score += column_track;
-                            println!("[AI-SEARCH]   🎯 [STAGE-4B] property='{}' PLINKO 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B / HARD] property='{}' 확정 조건 매칭 → Column 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
+                        } else if hint_props.contains(&property) {
+                            let column_track = raw_cosine * 1.5;
+                            score += column_track;
+                            println!("[AI-SEARCH]   🎯 [STAGE-4B / HINT] property='{}' 힌트 축 매칭 → Column 트랙 절반 +{:.4} (cos {:.4}) → 최종 {:.4}", property, column_track, raw_cosine, score);
                         }
 
                         // 🌟 [STAGE-4X CROSS-LINGUAL VALUE BONUS]
@@ -2523,12 +2781,30 @@ async fn ai_search_complex(
                                 FieldFormat::Text | FieldFormat::Address
                             );
                             if value_bearing {
-                                let cross_lingual_track = raw_cosine * 1.5;
-                                score += cross_lingual_track;
-                                println!(
-                                    "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' 자유서술 값 속성 → 크로스링구얼 트랙 +{:.4} (cos {:.4}) → 최종 {:.4}",
-                                    property, cross_lingual_track, raw_cosine, score
-                                );
+                                let qs = dominant_script(&query);
+                                let cs = dominant_script(&chunk_text);
+                                let script_gap = qs != "none" && cs != "none" && qs != cs;
+                                if script_gap {
+                                    let cross_lingual_track = raw_cosine * 2.0;
+                                    score += cross_lingual_track;
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "search.crosslingual_cos",
+                                        raw_cosine,
+                                    );
+                                    println!(
+                                        "[AI-SEARCH]   🌐 [STAGE-4X] property='{}' | 질의 문자 체계 '{}' ≠ 청크 '{}' → FTS 가 물리적으로 0건인 구간이므로 그 트랙(×2.0)을 코사인이 대신합니다. +{:.4} (cos {:.4}) → 최종 {:.4}",
+                                        property, qs, cs, cross_lingual_track, raw_cosine, score
+                                    );
+                                } else {
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "search.samelingual_cos",
+                                        raw_cosine,
+                                    );
+                                    println!(
+                                        "[AI-SEARCH]   ⚪ [STAGE-4X SKIP] property='{}' | 질의와 청크가 같은 문자 체계 '{}' 라 FTS 트랙이 이미 이 값을 평가했습니다. 같은 증거를 두 번 더하지 않습니다. (cos {:.4})",
+                                        property, qs, raw_cosine
+                                    );
+                                }
                             }
                         }
 
@@ -2972,7 +3248,7 @@ async fn ai_search_complex(
                     prop, brief, rec_note);
             }
 
-            if search_mode == "shipping" && !dexie_plans.is_empty() {
+            if search_mode != "analytic" && !dexie_plans.is_empty() {
                 let has_hard = dexie_plans.iter().any(|p| {
                     p.get("conditions")
                         .and_then(|c| c.as_array())
@@ -3031,7 +3307,8 @@ async fn ai_search_complex(
                     crate::utils::score_dynamics::set_run_label(&query);
                     let (eligible, all_pass, per_field) = evaluate_dexie_plan(plan, &docs);
                     let drafts = docs.iter().filter(|d| is_relay_draft(d)).count();
-                    crate::utils::score_dynamics::record_baseline("search.recall_n", docs.len() as f32);
+                    crate::utils::score_dynamics::record_baseline("search.recall_n", ranked_results.len() as f32);
+                    crate::utils::score_dynamics::record_baseline("search.hydrated_n", docs.len() as f32);
                     crate::utils::score_dynamics::record_baseline("search.eligible_n", eligible as f32);
                     crate::utils::score_dynamics::record_baseline("search.hard_n", per_field.len() as f32);
                     if !docs.is_empty() {
@@ -3049,6 +3326,27 @@ async fn ai_search_complex(
                             "{}(만족 {} / 단독 차단 {} / 차단 기여 {})",
                             field, satisfied, sole, blocked
                         ));
+                    }
+                    let hint_eval = evaluate_dexie_hints(plan, &docs);
+                    if !hint_eval.is_empty() {
+                        let mut hint_detail: Vec<String> = Vec::new();
+                        for (field, satisfied, present) in hint_eval.iter() {
+                            if !docs.is_empty() {
+                                crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                crate::utils::score_dynamics::record_baseline(
+                                    "search.hint_present_ratio",
+                                    *present as f32 / docs.len() as f32,
+                                );
+                            }
+                            hint_detail.push(format!(
+                                "{}(만족 {} / 축 보유 {} / 회수 {})",
+                                field, satisfied, present, docs.len()
+                            ));
+                        }
+                        println!(
+                            "[AI-SEARCH] 📈 [SDS / HINT OUTCOME] 힌트 축 {}개를 결과 집합과 무관하게 관측만 합니다: {} — 힌트는 필터가 아니므로 통과 여부가 결과를 바꾸지 않지만, '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에 쓰입니다. 지금까지는 evaluated 가 0 이라 이 정보가 원장에 전혀 쌓이지 않았습니다.",
+                            hint_eval.len(), hint_detail.join(" | ")
+                        );
                     }
                     println!(
                         "[AI-SEARCH] 📈 [SDS / SEARCH OUTCOME] 'search|{}|' | 리콜 {}건 · 서식 범위 안 {}건 중 하드 조건 전부 만족 {}건 | 초안 {}건 | {}",
@@ -3244,9 +3542,9 @@ async fn ai_search_complex(
                     }
                     crate::utils::score_dynamics::leave_scope();
                 }
-                println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
-                crate::utils::score_dynamics::flush();
             }
+            println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
+            crate::utils::score_dynamics::flush();
             all_results = ranked_results;
         }
         // =====================================================================
@@ -3449,7 +3747,8 @@ async fn ai_search_complex(
             "structured": structured_query,
             "results": all_results,
             "dexie_plans": dexie_plans,
-            "report": analytic_report
+            "report": analytic_report,
+            "mode": search_mode
         }))
     }.await; 
 

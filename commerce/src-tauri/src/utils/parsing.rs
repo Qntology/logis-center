@@ -1887,7 +1887,7 @@ pub fn extract_doc_table_headers_sync(
 ///    `&Html` / `ElementRef` 가 이 함수에 전혀 등장하지 않으므로
 ///    `tokio::spawn` 내부에서 안전하게 `.await` 할 수 있습니다.
 pub async fn extract_doc_table_headers_async(
-    mut grid: Vec<Vec<String>>,
+    grid: Vec<Vec<String>>,
     pending_embedding: Vec<(usize, String)>,
     doc_lang: &str,
     model: &crate::model::LogisModel,
@@ -2100,7 +2100,7 @@ pub fn extract_trade_relay_keys_for(data: &Value, doc_lang: &str, doc_type: &str
         .or_else(|| data.get("document_number"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.as_str() != "N/A")
+        .filter(|s| !crate::model::merge::is_schema_echo(s))
     {
         if !is_printed_label_echo(&doc_num_raw, doc_lang) && crate::utils::hash::is_valid_relay_key(&doc_num_raw) {
             let normalized = crate::utils::hash::normalize_identifier(&doc_num_raw);
@@ -2211,7 +2211,7 @@ pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) 
         .get("doc_number")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .filter(|s| s.chars().count() >= 2 && s != "null" && s != "N/A");
+        .filter(|s| s.chars().count() >= 2 && !crate::model::merge::is_schema_echo(s));
 
     if let Some(dn) = &direct_doc_number {
         let idx = crate::utils::hash::relay_index(dn);

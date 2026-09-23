@@ -228,7 +228,16 @@ fn trade_desc_to_anchor(desc: &str) -> String {
     for m in ["{String}", "{Number}", "{Boolean}", "{Array}"] {
         s = s.replace(m, " ");
     }
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        match ch {
+            '(' | '[' => depth += 1,
+            ')' | ']' => { if depth > 0 { depth -= 1; } }
+            _ => { if depth == 0 { out.push(ch); } }
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// bias.json 설명문의 타입 마커를 스키마 타입 문자열로 변환합니다.
@@ -279,6 +288,8 @@ pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
         "de" => match page_type { "order" => "bestellung", "goods" => "produkt", "tracking" => "sendungsverfolgung", "review" => "bewertung", "coupon" | "event" => "event", _ => "dokument" },
         "nl" => match page_type { "order" => "bestelling", "goods" => "product", "tracking" => "tracking", "review" => "beoordeling", "coupon" | "event" => "evenement", _ => "document" },
         "it" => match page_type { "order" => "ordine", "goods" => "prodotto", "tracking" => "tracciamento", "review" => "recensione", "coupon" | "event" => "evento", _ => "documento" },
+        "fr" => match page_type { "order" => "commande", "goods" => "produit", "tracking" => "suivi", "review" => "avis", "coupon" | "event" => "événement", _ => "document" },
+        "cs" => match page_type { "order" => "objednávka", "goods" => "produkt", "tracking" => "sledování", "review" => "recenze", "coupon" | "event" => "událost", _ => "dokument" },
         "id" | "ms" => match page_type { "order" => "pesanan", "goods" => "produk", "tracking" => "pelacakan", "review" => "ulasan", "coupon" | "event" => "acara", _ => "dokumen" },
         "vi" => match page_type { "order" => "đơn hàng", "goods" => "sản phẩm", "tracking" => "theo dõi", "review" => "đánh giá", "coupon" | "event" => "sự kiện", _ => "tài liệu" },
         "th" => match page_type { "order" => "คำสั่งซื้อ", "goods" => "สินค้า", "tracking" => "การติดตาม", "review" => "รีวิว", "coupon" | "event" => "กิจกรรม", _ => "เอกสาร" },
@@ -422,14 +433,12 @@ pub fn get_page_type_classification_bias(page_type: &str, lang: &str) -> String 
         // title bias의 시맨틱 키워드만 포함 (예시값 제외)
         if let Some(title_obj) = localized_obj.get("title") {
             if let Some(b) = title_obj.get("bias").and_then(|v| v.as_str()) {
-                // 예시값(긴 문장)은 제거하고 쉼표 앞의 핵심 키워드만 추출
-                let keywords: Vec<&str> = b.split(',').take(3).collect();
-                for kw in keywords {
+                for kw in b.split(',').take(3) {
                     let kw_trimmed = kw.trim();
-                    if kw_trimmed.len() < 20 {
-                        bias.push_str(" ");
-                        bias.push_str(kw_trimmed);
-                    }
+                    if kw_trimmed.is_empty() { continue; }
+                    if crate::utils::ai_utils::is_value_example_phrase(kw_trimmed) { continue; }
+                    bias.push_str(" ");
+                    bias.push_str(kw_trimmed);
                 }
             }
         }
@@ -720,39 +729,68 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
     let lang_code_owned = lang_code_of(lang);
     let lang_code = lang_code_owned.as_str();
     let localized_type = get_localized_page_type(page_type, lang);
+    let is_trade = is_trade_doc_type(page_type);
+    let domain_tag: &str = if is_trade { "" } else { page_type };
     let mut add = |key: &str, field_type: &str, en_bias: &str, en_prejudice: &str| {
-        // 🌟 [핵심 변경] 콤마(,)를 기준으로 텍스트를 분리하여 모든 의미 단위(동의어)마다 독립적으로 영어 도메인(page_type)을 부착합니다.
         let inject_domain = |text: &str, domain: &str| -> String {
             if text.trim().is_empty() { return String::new(); }
+            if domain.is_empty() {
+                return text
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
             text.split(',')
                 .map(|s| format!("{} {}", domain, s.trim()))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let mut final_bias = inject_domain(en_bias, page_type);
-        let mut final_prejudice = inject_domain(en_prejudice, page_type);
+        let mut final_bias = inject_domain(en_bias, domain_tag);
+        let mut final_prejudice = inject_domain(en_prejudice, domain_tag);
         let mut semantic_desc = String::new();
-        // 🌟 [BIAS TYPE CANONICALIZE] 무역 서식 코드(BL/CI/PL...)는 bias.json 에
-        //    개별 노드가 없으므로 공용 'shipping_doc' 노드로 접어서 조회합니다.
         let bias_type_key = canonical_bias_type(page_type);
-        if let Some(localized_obj) = BIAS_DICT
+        let localized_obj = BIAS_DICT
             .get(lang_code)
+            .or_else(|| BIAS_DICT.get("en"))
             .and_then(|l| {
                 l.get(page_type)
                     .or_else(|| if bias_type_key != page_type { l.get(bias_type_key) } else { None })
                     .or_else(|| l.get("default"))
             })
-            .and_then(|p| p.get(key))
-        {
-            if let Some(semantic) = localized_obj.get("semantic").and_then(|v| v.as_str()) {
+            .and_then(|p| p.get(key));
+        if let Some(obj) = localized_obj {
+            if let Some(semantic) = obj.get("semantic").and_then(|v| v.as_str()) {
                 semantic_desc = semantic.to_string();
             }
-            if let Some(bias_str) = localized_obj.get("bias").and_then(|v| v.as_str()) {
-                let localized_b = inject_domain(&bias_str.replace("{TYPE}", &localized_type), page_type);
+        }
+        if is_trade {
+            let (ph, _w) = crate::utils::ai_utils::label_phrase_bank_multilingual(
+                lang_code,
+                bias_type_key,
+                key,
+            );
+            if !ph.is_empty() {
+                let joined = ph.join(", ");
+                final_bias = if final_bias.is_empty() { joined } else { format!("{}, {}", final_bias, joined) };
+            }
+            let pj = crate::utils::ai_utils::prejudice_phrase_bank_multilingual(
+                lang_code,
+                bias_type_key,
+                key,
+            );
+            if !pj.is_empty() {
+                let joined = pj.join(", ");
+                final_prejudice = if final_prejudice.is_empty() { joined } else { format!("{}, {}", final_prejudice, joined) };
+            }
+        } else if let Some(obj) = localized_obj {
+            if let Some(bias_str) = obj.get("bias").and_then(|v| v.as_str()) {
+                let localized_b = inject_domain(&bias_str.replace("{TYPE}", &localized_type), domain_tag);
                 final_bias = if final_bias.is_empty() { localized_b } else { format!("{}, {}", final_bias, localized_b) };
             }
-            if let Some(prejudice_str) = localized_obj.get("prejudice").and_then(|v| v.as_str()) {
-                let localized_p = inject_domain(&prejudice_str.replace("{TYPE}", &localized_type), page_type);
+            if let Some(prejudice_str) = obj.get("prejudice").and_then(|v| v.as_str()) {
+                let localized_p = inject_domain(&prejudice_str.replace("{TYPE}", &localized_type), domain_tag);
                 final_prejudice = if final_prejudice.is_empty() { localized_p } else { format!("{}, {}", final_prejudice, localized_p) };
             }
         }

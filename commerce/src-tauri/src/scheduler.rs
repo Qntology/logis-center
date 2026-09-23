@@ -47,6 +47,22 @@ fn best_thead_th_dbg(sel: &str, html: &str) -> usize {
     doc.select(&q).next().map(|e| e.select(&th).count()).unwrap_or(0)
 }
 
+/// 🌟 [PREJUDICE PAIR] 영어 편견 문장 벡터에 문서 언어 편견 문장 벡터를 더합니다.
+///  두 벡터 중 최댓값(max_pool_sim)으로 재므로 단일 문장 코사인에 맞춰 둔 임계 눈금이 그대로 유지됩니다.
+///  수십 구의 뱅크로 바꾸면 최댓값이 구조적으로 올라가 0.35 / 0.38 / 0.50 / 0.55 임계가 한꺼번에 어긋납니다.
+async fn prejudice_pair(model: &LogisModel, en_text: &str, doc_lang: &str) -> Vec<Vec<f32>> {
+    let mut out: Vec<Vec<f32>> = Vec::new();
+    if let Ok(e) = model.get_embedding(en_text.to_string()).await {
+        if !e.is_empty() { out.push(e); }
+    }
+    if let Some(local) = crate::logic::site_chrome_sentence(doc_lang) {
+        if let Ok(e) = model.get_embedding(local).await {
+            if !e.is_empty() { out.push(e); }
+        }
+    }
+    if out.is_empty() { out.push(vec![0.0f32; 384]); }
+    out
+}
 
 pub async fn process_task(
     task: Task,
@@ -702,7 +718,7 @@ pub async fn process_task(
         } else { 0 };
 
         let universal_prejudice = "global navigation, menus, footer, aside, search form, search filter.";
-        let universal_prej_emb = model.get_embedding(universal_prejudice.to_string()).await.unwrap_or(vec![0.0; 384]);
+        let universal_prej_embs = prejudice_pair(&model, universal_prejudice, &doc_lang).await;
         
         let mut global_boilerplate_texts = std::collections::HashSet::new();
         let re_numeric = regex::Regex::new(r"^\D*\d+[\d,\.]*\D*$").unwrap();
@@ -845,7 +861,7 @@ pub async fn process_task(
                 } else {
                     if text.len() > 3 {
                         let text_emb = model.get_embedding(text.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                        let ui_noise_score = cosine_similarity(&universal_prej_emb, &text_emb);
+                        let ui_noise_score = max_pool_sim(&text_emb, &universal_prej_embs);
                         if ui_noise_score > 0.35 {
                             global_boilerplate_texts.insert(text.clone());
                             emit_term(&format!("  🚫 [GLOBAL DROP] 판정 전 전역 중복 UI 탈락: '{}' ({}회 발견, NoiseScore: {:.4})", text, count, ui_noise_score));
@@ -938,7 +954,7 @@ pub async fn process_task(
                 let text_part = if let Some(idx) = pug_lines[line_idx].find('|') { pug_lines[line_idx][idx + 1..].trim() } else { "" };
                 if text_part.is_empty() { continue; }
                 
-                let line_prej_score = cosine_similarity(&universal_prej_emb, &line_embeddings[line_idx]);
+                let line_prej_score = max_pool_sim(&line_embeddings[line_idx], &universal_prej_embs);
                 if line_prej_score > 0.55 {
                     if !seen_candidates.contains(text_part) {
                         seen_candidates.insert(text_part.to_string());
@@ -1035,7 +1051,7 @@ pub async fn process_task(
 
             for (sel, block_pug) in track_a_pugs_clean {
                 let block_emb = block_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
-                let block_prej_score = cosine_similarity(&universal_prej_emb, &block_emb);
+                let block_prej_score = max_pool_sim(&block_emb, &universal_prej_embs);
                 
                 if block_prej_score > 0.50 {
                     if let Some((start_idx, end_idx)) = find_block_indices_in_pug(&pug_lines, &block_pug) {
@@ -1056,7 +1072,7 @@ pub async fn process_task(
 
             {
                 let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
-                let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                let nav_prej_embs = prejudice_pair(&model, nav_prejudice_text, &doc_lang).await;
 
                 let categories = ["order", "goods", "tracking", "review", "coupon", "event"];
                 let mut category_embs = Vec::new();
@@ -1073,7 +1089,7 @@ pub async fn process_task(
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
                     if !line_embeddings[i].iter().all(|&v| v == 0.0) {
-                        let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
+                        let nav_score = max_pool_sim(&line_embeddings[i], &nav_prej_embs);
                         if nav_score > 0.38 {
                             let title_line_sim = cosine_similarity(&early_title_emb, &line_embeddings[i]);
 
@@ -1373,7 +1389,7 @@ pub async fn process_task(
             }
 
             let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
-            let chrome_prej_emb = model.get_embedding(chrome_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+            let chrome_prej_embs = prejudice_pair(&model, chrome_prejudice_text, &doc_lang).await;
 
             {
                 if !title_candidates.is_empty() {
@@ -1398,7 +1414,7 @@ pub async fn process_task(
                         let max_s: f32 = sims.iter().cloned().fold(0.0f32, f32::max);
                         raw_domain_max[idx] = max_s;
                         raw_contrast[idx] = max_s - mean_s;
-                        raw_chrome[idx] = cosine_similarity(&chrome_prej_emb, emb);
+                        raw_chrome[idx] = max_pool_sim(emb, &chrome_prej_embs);
                         let mut c = 0usize;
                         for (li, le) in line_embeddings.iter().enumerate() {
                             if wiped_indices[li] { continue; }
@@ -1606,7 +1622,7 @@ pub async fn process_task(
                     let mut dropped_win = 0usize;
                     for (wi, we) in raw_embs.into_iter().enumerate() {
                         if we.iter().all(|&v| v == 0.0) { continue; }
-                        let chrome_s = cosine_similarity(&chrome_prej_emb, &we);
+                        let chrome_s = max_pool_sim(&we, &chrome_prej_embs);
                         let mut dom_s = 0.0f32;
                         for ci in 0..categories.len() {
                             let s = max_pool_sim(&we, &category_phrase_embs[ci].1);
@@ -1653,7 +1669,7 @@ pub async fn process_task(
                 let direct_margin = (ord_t.get(0).copied().unwrap_or(0.0)
                     - ord_t.get(1).copied().unwrap_or(0.0)).max(0.0);
                 let direct_trust = ((direct_margin - 0.02) / 0.08).clamp(0.0, 1.0);
-                let chrome_s = cosine_similarity(&chrome_prej_emb, &title_emb);
+                let chrome_s = max_pool_sim(&title_emb, &chrome_prej_embs);
                 let chrome_trust = ((dom_max - chrome_s) / 0.15).clamp(0.0, 1.0);
                 let mut wc = title_window_contrast.clone();
                 wc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
@@ -1897,11 +1913,11 @@ pub async fn process_task(
             emit_term(&format!("  🧩 [LAYOUT ANCHOR SPLIT] ListPhrases: {} | FormPhrases: {}", list_phrase_embs.len(), form_phrase_embs.len()));
 
             let layout_chrome_text = "global navigation, menus, header, footer, sidebar, breadcrumb, admin main menu, main menu, admin page, administrator page, dashboard, control panel, site name, shopping mall, welcome, home, index, basic search, search form, search filter, login, logout, notice, banner, copyright";
-            let nav_chrome_emb = model.get_embedding(layout_chrome_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+            let nav_chrome_embs = prejudice_pair(&model, layout_chrome_text, &doc_lang).await;
 
             {
                 let nav_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, top bar, bottom bar, navigation bar, submenu, category menu, management menu, settings menu, configuration menu";
-                let nav_prej_emb = model.get_embedding(nav_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                let nav_prej_embs = prejudice_pair(&model, nav_prejudice_text, &doc_lang).await;
 
                 let domain_phrase_embs: Vec<Vec<f32>> = {
                     let anchor_text = crate::parsing::get_page_type_classification_bias(&page_type, &doc_lang);
@@ -1932,7 +1948,7 @@ pub async fn process_task(
                     if trimmed.is_empty() { continue; }
 
                     if !line_embeddings[i].iter().all(|&v| v == 0.0) {
-                        let nav_score = cosine_similarity(&nav_prej_emb, &line_embeddings[i]);
+                        let nav_score = max_pool_sim(&line_embeddings[i], &nav_prej_embs);
                         if nav_score > 0.38 {
 
                             let mut domain_sim = 0.0f32;
@@ -2087,7 +2103,7 @@ pub async fn process_task(
             let mut processed_form_blocks = std::collections::HashSet::new();
 
             let nav_block_prejudice_text = "global navigation, menus, header, footer, aside, sidebar, breadcrumb, search form, pagination, admin menu, top menu, quick menu, sub menu, depth menu, side navigation, left menu, right menu, navigation bar, submenu, category menu, management menu, settings menu, configuration menu, snb, gnb, nav, sidebar, side bar, left panel, right panel, quick links";
-            let nav_block_prej_emb = model.get_embedding(nav_block_prejudice_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+            let nav_block_prej_embs = prejudice_pair(&model, nav_block_prejudice_text, &doc_lang).await;
 
             let mut unique_bc_pugs_to_embed = Vec::new();
             let mut track_bc_pugs_clean: Vec<(usize, String, String, f32)> = Vec::new();
@@ -2119,7 +2135,7 @@ pub async fn process_task(
                 };
 
                 let sel_emb = model.get_embedding(sel_naturalized.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                let sel_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_emb);
+                let sel_nav_score = max_pool_sim(&sel_emb, &nav_block_prej_embs);
 
                 let sel_id_class_tokens: String = sel.to_lowercase()
                     .split(|c: char| c == ' ' || c == '>')
@@ -2141,7 +2157,7 @@ pub async fn process_task(
                 let mut sel_id_emb_opt: Option<Vec<f32>> = None;
                 if !sel_id_class_tokens.is_empty() {
                     let sel_id_emb = model.get_embedding(sel_id_class_tokens.clone()).await.unwrap_or(vec![0.0f32; 384]);
-                    sel_id_nav_score = cosine_similarity(&nav_block_prej_emb, &sel_id_emb);
+                    sel_id_nav_score = max_pool_sim(&sel_id_emb, &nav_block_prej_embs);
                     sel_id_emb_opt = Some(sel_id_emb);
                 }
 
@@ -2195,7 +2211,7 @@ pub async fn process_task(
                 let is_list_track = i < 5;
                 let block_emb = bc_embeddings_map.get(&block_pug).cloned().unwrap_or(vec![0.0; 384]);
 
-                let nav_block_score = cosine_similarity(&nav_block_prej_emb, &block_emb);
+                let nav_block_score = max_pool_sim(&block_emb, &nav_block_prej_embs);
 
                 if nav_block_score > 0.25 {
 
@@ -2290,7 +2306,7 @@ pub async fn process_task(
                         let l = max_pool_sim(he, &list_phrase_embs);
                         let f = max_pool_sim(he, &form_phrase_embs);
                         let gap = (l - f).abs();
-                        let chrome_s = cosine_similarity(&nav_chrome_emb, he);
+                        let chrome_s = max_pool_sim(he, &nav_chrome_embs);
                         let layout_max = l.max(f);
                         if chrome_s >= layout_max * 0.90 {
                             emit_term(&format!("  🚫 [HEADING CHROME DROP] '{}' (h{}) | ChromeSim: {:.4} >= LayoutMax: {:.4} x 0.90", txt, tier + 1, chrome_s, layout_max));
@@ -3341,11 +3357,10 @@ pub async fn process_task(
             
             
             let ui_action_embs: Vec<Vec<f32>> = {
-                let phrases: Vec<String> = crate::logic::UI_ACTION_ANCHOR
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let phrases: Vec<String> = crate::logic::anchor_phrases(
+                    crate::logic::UI_ACTION_ANCHOR,
+                    crate::logic::UI_ACTION_ANCHOR_ML,
+                );
                 if phrases.is_empty() {
                     Vec::new()
                 } else {
@@ -7015,6 +7030,7 @@ pub async fn process_task(
                     "ja" => "JPY",
                     "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
                     "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
+                    "cs" => "CZK",
                     "ru" => "RUB",
                     "th" => "THB",
                     "vi" => "VND",

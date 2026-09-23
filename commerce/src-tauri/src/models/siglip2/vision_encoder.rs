@@ -314,6 +314,7 @@ pub struct DocTypeVerdict {
     pub code_candidates: Vec<(String, f32)>,
     pub title_confirmed: bool,
     pub title_text: String,
+    pub title_band: Vec<(String, f32)>,
 }
 
 fn bank_neutral_key_scores(
@@ -463,6 +464,7 @@ struct TitleGateVerdict {
     title: String,
     score: f32,
     margin: f32,
+    band: Vec<(String, f32)>,
 }
 
 fn run_title_gate(
@@ -471,30 +473,26 @@ fn run_title_gate(
     chrome_phrases: &[String],
     emit: &dyn Fn(&str),
 ) -> Option<(TitleGateVerdict, Vec<(String, f32)>)> {
-    let empty_names: Vec<String> = Vec::new();
-    let empty_banks: Vec<Vec<Vec<f32>>> = Vec::new();
-    let empty_skip: Vec<bool> = Vec::new();
+    let (t_bias, mut t_prej) = crate::logic::trade_title_bank_defs("title");
+    if t_bias.is_empty() {
+        return None;
+    }
 
-    // ── 뱅크: bias = 자기 전문 1구, prejudice = 다른 전문 + 크롬 ──
-    let mut t_bias: Vec<(String, String, String)> = Vec::new();
-    let mut t_prej: Vec<(String, String, String)> = Vec::new();
-
-    for (code, title) in TRADE_DOC_TITLES.iter() {
-        t_bias.push(("title".to_string(), code.to_string(), title.to_string()));
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-        for (other, other_title) in TRADE_DOC_TITLES.iter() {
-            if other == code {
-                continue;
-            }
-            if seen.insert(other_title) {
-                t_prej.push(("title".to_string(), code.to_string(), other_title.to_string()));
-            }
+    {
+        let mut codes: Vec<String> = Vec::new();
+        for (_, k, _) in t_bias.iter() {
+            if !codes.iter().any(|x| x == k) { codes.push(k.clone()); }
         }
-
-        for p in chrome_phrases.iter() {
-            if seen.insert(p.as_str()) {
-                t_prej.push(("title".to_string(), code.to_string(), p.clone()));
+        for code in codes.iter() {
+            let mut seen: std::collections::HashSet<String> = t_prej
+                .iter()
+                .filter(|(_, k, _)| k == code)
+                .map(|(_, _, p)| p.to_lowercase())
+                .collect();
+            for p in chrome_phrases.iter() {
+                if seen.insert(p.to_lowercase()) {
+                    t_prej.push(("title".to_string(), code.clone(), p.clone()));
+                }
             }
         }
     }
@@ -504,69 +502,49 @@ fn run_title_gate(
         Err(_) => return None,
     };
 
-    // ── 상단 30% 행만 제목 밴드로 봅니다 (레이아웃 구조 사실) ──
     let title_rows = (grid.grid_rows * 3 / 10).max(1);
-    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let (keys, matrix) = score_patches_bank_neutral(grid, &bank, None);
+    if keys.is_empty() {
+        return None;
+    }
 
-    // 🌟 [LOG] 타이틀 게이트 스캔 범위 및 패치 카운터
-    let mut scanned_patches = 0usize;
-    let mut active_patches = 0usize;
-    let mut positive_patches = 0usize;
+    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut patch_best: std::collections::HashMap<String, (usize, usize, usize, f32)> =
         std::collections::HashMap::new();
 
-    emit(&format!(
-        "     🔍 [TITLE GATE SCAN] 상단 밴드: {}행 / 전체 {}행 | 스캔 패치 범위: 0~{}",
-        title_rows, grid.grid_rows, title_rows * grid.grid_cols
-    ));
-
+    let mut scanned_patches = 0usize;
+    let mut active_patches = 0usize;
+    let mut positive_patches = 0usize;
     for idx in 0..grid.len() {
-        let (r, c) = grid.rc(idx);
-        if r >= title_rows {
-            continue;
-        }
-
+        if grid.rc(idx).0 >= title_rows { continue; }
         scanned_patches += 1;
-
-        let p = &grid.patches[idx];
-        if p.iter().all(|&v| v == 0.0) {
-            continue;
-        }
-
-        active_patches += 1;
-
-        let (scores, _) = surprisal_dual_scores(
-            p,
-            &bank.bias,
-            &bank.prejudice,
-            &empty_names,
-            &empty_banks,
-            &empty_skip,
-        );
-
-        if scores.is_empty() {
-            continue;
-        }
-
-        if scores[0].surprisal <= 0.0 {
-            continue;
-        }
-
-        positive_patches += 1;
-
-        for s in scores {
-            let e = best.entry(s.key.clone()).or_insert(f32::MIN);
-            if s.surprisal > *e {
-                *e = s.surprisal;
-                patch_best.insert(s.key.clone(), (idx, r, c, s.surprisal));
-            }
-        }
+        if !grid.patches[idx].iter().all(|&v| v == 0.0) { active_patches += 1; }
     }
 
-    // 🌟 [LOG] 타이틀 게이트 스캔 요약
     emit(&format!(
-        "     🔍 [TITLE GATE SCAN RESULT] 스캔 {} | 활성 {} | 양수 {} | 전문 키 {}개 발견",
-        scanned_patches, active_patches, positive_patches, best.len()
+        "     🔍 [TITLE GATE SCAN] 상단 밴드 {}행 / 전체 {}행 | 밴드 패치 {}개(활성 {}개) | 전문 구 {}개 · 편견 구 {}개 | 기준선은 전 페이지, 봉우리는 상단 밴드에서만 취합니다.",
+        title_rows, grid.grid_rows, scanned_patches, active_patches, t_bias.len(), t_prej.len()
+    ));
+
+    for (ki, key) in keys.iter().enumerate() {
+        let mut mx = f32::MIN;
+        let mut at = usize::MAX;
+        for idx in 0..grid.len() {
+            let v = matrix[ki][idx];
+            if v == f32::MIN { continue; }
+            if grid.rc(idx).0 >= title_rows { continue; }
+            if v > mx { mx = v; at = idx; }
+        }
+        if mx == f32::MIN || mx <= 0.0 || at == usize::MAX { continue; }
+        positive_patches += 1;
+        let (r, c) = grid.rc(at);
+        best.insert(key.clone(), mx);
+        patch_best.insert(key.clone(), (at, r, c, mx));
+    }
+
+    emit(&format!(
+        "     🔍 [TITLE GATE SCAN RESULT] 밴드 패치 {} | 활성 {} | 양수 전문 {}개 / 전체 {}개 (BANK-NEUTRAL, √(2 ln N) 차감 폐기)",
+        scanned_patches, active_patches, positive_patches, keys.len()
     ));
 
     if !patch_best.is_empty() {
@@ -614,17 +592,72 @@ fn run_title_gate(
         ));
     }
 
-    let (top_code, top_score) = sorted[0].clone();
-    let margin = top_score - sorted.get(1).map(|x| x.1).unwrap_or(top_score);
-
-    // 동명 서식은 마진 0 → 거부
-    if margin <= 0.0 {
+    if sorted.len() >= 2 && sorted[0].1 == sorted[1].1 {
         emit(&format!(
-            "   ⚪ [TITLE GATE] '{}' 와 2위 전문 점수가 동률(마진 {:+.4})이라 거부하고 벡터 판정에 위임합니다.",
-            top_code, margin
+            "   ⚪ [TITLE GATE] '{}' 와 '{}' 의 전문 점수가 완전 동률({:+.4})입니다. 같은 전문을 공유하는 서식이므로 거부하고 벡터 판정에 위임합니다.",
+            sorted[0].0, sorted[1].0, sorted[0].1
         ));
         return None;
     }
+
+    let top_score = sorted[0].1;
+    let tie_band: Vec<(String, f32, usize)> = sorted
+        .iter()
+        .filter(|(_, s)| *s >= top_score - 1.0)
+        .filter_map(|(c, s)| patch_best.get(c).map(|(_, r, _, _)| (c.clone(), *s, *r)))
+        .collect();
+    let min_row = tie_band.iter().map(|(_, _, r)| *r).min().unwrap_or(0);
+    let mut band_top: Vec<(String, f32)> = tie_band
+        .iter()
+        .filter(|(_, _, r)| *r == min_row)
+        .map(|(c, s, _)| (c.clone(), *s))
+        .collect();
+    band_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top_code = sorted[0].0.clone();
+    let mut verdict_score = top_score;
+    let mut tie_broken = false;
+    if let Some((c, s)) = band_top.first() {
+        if *c != top_code {
+            emit(&format!(
+                "     🥇 [TITLE ROW TIE-BREAK] 1위 '{}'({:+.4}) 와 pooled σ 한 칸 안에 든 전문 {}개 가운데 가장 위 행 r{} 에 봉우리를 둔 '{}'({:+.4}) 를 제목으로 확정합니다. 서식 제목은 상단에 인쇄되고, 그 아래 격자 안의 서식 전문은 다른 문서를 가리키는 참조 라벨입니다.",
+                top_code, top_score, tie_band.len(), min_row, c, s
+            ));
+            top_code = c.clone();
+            verdict_score = *s;
+            tie_broken = true;
+        }
+    }
+    crate::utils::score_dynamics::record_baseline(
+        "vision.title_row_tiebreak",
+        if tie_broken { 1.0 } else { 0.0 },
+    );
+    if band_top.len() >= 2 {
+        emit(&format!(
+            "     🎞️ [TITLE ROW BAND] 제목 행 r{} 에서 동점 안에 든 전문 {}개: {:?} — 마진이 부족하면 LLM 재판정은 이 밴드 안에서만 고릅니다.",
+            min_row,
+            band_top.len(),
+            band_top.iter().map(|(c, s)| format!("{}({:+.3})", c, s)).collect::<Vec<_>>()
+        ));
+    }
+
+    let runner_up = sorted
+        .iter()
+        .filter(|(c, _)| *c != top_code)
+        .map(|(_, s)| *s)
+        .fold(f32::MIN, f32::max);
+    let margin = if runner_up == f32::MIN {
+        verdict_score
+    } else {
+        (verdict_score - runner_up).abs()
+    };
+    crate::utils::score_dynamics::record_baseline("vision.title_margin", margin);
+    emit(&format!(
+        "     👑 [TITLE GATE VERDICT] '{}' | Surprisal {:+.4} | 마진 {:+.4}{}",
+        top_code,
+        verdict_score,
+        margin,
+        if tie_broken { " (행 순서로 확정)" } else { "" }
+    ));
 
     let title = TRADE_DOC_TITLES
         .iter()
@@ -643,8 +676,9 @@ fn run_title_gate(
             code: top_code,
             group,
             title,
-            score: top_score,
+            score: verdict_score,
             margin,
+            band: band_top,
         },
         sorted,
     ))
@@ -667,10 +701,15 @@ pub fn classify_doc_type(
     //    같은 문자열을 매번 다시 쪼개고 HashSet 을 다시 만드는 순수 낭비입니다.
     let group_phrases: Vec<(&str, Vec<String>)> = crate::logic::TRADE_GROUPS
         .iter()
-        .map(|(g, raw)| (*g, split_bias_phrases_full(raw)))
+        .map(|(g, raw)| {
+            let mut own = split_bias_phrases_full(raw);
+            for t in crate::utils::ai_utils::trade_group_title_phrases(g) {
+                if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
+            }
+            (*g, own)
+        })
         .collect();
-    let chrome_phrases: Vec<String> =
-        split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR);
+    let chrome_phrases: Vec<String> = crate::logic::vision_chrome_phrases();
 
     let mut g_bias: Vec<(String, String, String)> = Vec::new();
     let mut g_prej: Vec<(String, String, String)> = Vec::new();
@@ -683,6 +722,7 @@ pub fn classify_doc_type(
                 continue;
             }
             for p in other_phrases.iter() {
+                if phrases.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
                 g_prej.push(("group".to_string(), gname.to_string(), p.clone()));
             }
         }
@@ -822,7 +862,13 @@ pub fn classify_doc_type(
 
     let code_phrases: Vec<(&str, Vec<String>)> = codes
         .iter()
-        .map(|c| (*c, split_bias_phrases_full(crate::logic::trade_code_anchor(c))))
+        .map(|c| {
+            let mut own = split_bias_phrases_full(crate::logic::trade_code_anchor(c));
+            for t in crate::utils::ai_utils::trade_code_title_phrases(c) {
+                if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
+            }
+            (*c, own)
+        })
         .collect();
 
     let mut c_bias: Vec<(String, String, String)> = Vec::new();
@@ -838,6 +884,7 @@ pub fn classify_doc_type(
                 continue;
             }
             for p in other_phrases.iter() {
+                if phrases.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
                 if seen.insert(p.as_str()) {
                     c_prej.push(("code".to_string(), c.to_string(), p.clone()));
                 }
@@ -947,18 +994,81 @@ pub fn classify_doc_type(
         .as_ref()
         .map(|(g, _)| g.title.clone())
         .unwrap_or_default();
-    if let Some((_gate, title_sorted)) = title_gate_result {
+    let title_band: Vec<(String, f32)> = title_gate_result
+        .as_ref()
+        .map(|(g, _)| g.band.clone())
+        .unwrap_or_default();
+    let mut forced_margin: Option<f32> = None;
+    if let Some((gate, title_sorted)) = title_gate_result {
+        let axis_excess = |vals: &[f32]| -> f32 {
+            let n = vals.len();
+            if n < 2 {
+                return 0.0;
+            }
+            let mean = vals.iter().sum::<f32>() / n as f32;
+            let sd = (vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32)
+                .sqrt()
+                .max(1e-6);
+            let top = vals.iter().cloned().fold(f32::MIN, f32::max);
+            (top - mean) / sd - crate::utils::ai_utils::gumbel_expected_z(n)
+        };
+        let body_vals: Vec<f32> = c_scores.iter().map(|(_, s)| *s).collect();
+        let title_vals: Vec<f32> = title_sorted.iter().map(|(_, s)| *s).collect();
+        let body_excess = axis_excess(&body_vals);
+        let title_excess = axis_excess(&title_vals);
+        crate::utils::score_dynamics::record_baseline("vision.code_body_excess", body_excess);
+        crate::utils::score_dynamics::record_baseline("vision.code_title_excess", title_excess);
+        if title_vals.len() >= 2 {
+            crate::utils::score_dynamics::record_decay("vision.doc_title", &title_vals);
+        }
+        let w_body = body_excess.max(0.0);
+        let w_title = title_excess.max(0.0);
+        emit(&format!(
+            "  ⚖️ [TITLE AXIS FUSION] 바디 축 초과분 {:+.4} | 제목 축 초과분 {:+.4} (각 축 1위의 z − √(2 ln N)) → 가중 body {:.3} : title {:.3}. 초과분이 0 이하인 축은 N개 무작위 드로잉의 기대 최댓값조차 넘지 못한 평평한 분포이므로 융합에서 제외합니다. 두 축이 모두 평평하면 제목 밴드만 본 제목 게이트의 판정을 그대로 씁니다.",
+            body_excess, title_excess, w_body, w_title
+        ));
         for (cname, cs) in c_scores.iter_mut() {
-            if let Some((_, ts)) = title_sorted.iter().find(|(t, _)| t == cname) {
-                *cs += 2.0 * ts;
+            let title = title_sorted
+                .iter()
+                .find(|(t, _)| t == cname)
+                .map(|(_, v)| *v);
+            let body = *cs;
+            *cs = match title {
+                Some(t) if w_body > 0.0 && w_title > 0.0 => {
+                    (w_body * body + w_title * t) / (w_body + w_title)
+                }
+                Some(_) if w_body > 0.0 => body,
+                Some(t) => t,
+                None if w_body > 0.0 => body,
+                None => f32::MIN,
+            };
+        }
+        c_scores.retain(|(_, s)| *s > f32::MIN);
+        c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if w_body <= 0.0 {
+            if let Some(pos) = c_scores.iter().position(|(c, _)| c == &gate.code) {
+                if pos != 0 {
+                    let item = c_scores.remove(pos);
+                    emit(&format!(
+                        "  🥇 [TITLE VERDICT FIRST] 바디 축이 평평해 제목 게이트의 판정 '{}' 를 선두로 올립니다. (점수순 1위였던 '{}' 는 행 순서 동점 판정에서 밀린 전문입니다)",
+                        item.0, c_scores[0].0
+                    ));
+                    c_scores.insert(0, item);
+                }
+                forced_margin = Some(gate.margin);
             }
         }
-        c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    if c_scores.is_empty() {
+        c_scores.push((codes[0].to_string(), 0.0));
     }
 
     let mut code = c_scores[0].0.clone();
     let mut code_score = c_scores[0].1;
     let mut code_margin = code_score - c_scores.get(1).map(|x| x.1).unwrap_or(code_score);
+    if let Some(m) = forced_margin {
+        code_margin = m;
+    }
     let mut final_group = best_group.clone();
     let mut final_group_score = group_score;
     let mut final_group_margin = group_margin;
@@ -1000,6 +1110,7 @@ pub fn classify_doc_type(
         code_candidates: c_scores,
         title_confirmed,
         title_text,
+        title_band,
     })
 }
 
@@ -1160,6 +1271,19 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
+        let (ml_phrases, _) = crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, doc_type, fname);
+        for p in ml_phrases.into_iter() {
+            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+                continue;
+            }
+            if bias_defs
+                .iter()
+                .any(|(c, k, e)| c == cat && k == fname && e.eq_ignore_ascii_case(&p))
+            {
+                continue;
+            }
+            bias_defs.push((cat.to_string(), fname.clone(), p));
+        }
     }
 
     // 🌟 [TABLE STRUCTURE ANCHOR 편입]
@@ -1220,7 +1344,7 @@ pub fn build_column_heatmaps(
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
     {
         let mut global: Vec<String> = Vec::new();
-        for p in split_bias_phrases_full(crate::logic::VISION_CHROME_ANCHOR) {
+        for p in crate::logic::vision_chrome_phrases() {
             if !global.iter().any(|e| e == &p) {
                 global.push(p);
             }
