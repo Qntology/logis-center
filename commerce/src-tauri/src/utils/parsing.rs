@@ -1887,7 +1887,7 @@ pub fn extract_doc_table_headers_sync(
 ///    `&Html` / `ElementRef` 가 이 함수에 전혀 등장하지 않으므로
 ///    `tokio::spawn` 내부에서 안전하게 `.await` 할 수 있습니다.
 pub async fn extract_doc_table_headers_async(
-    mut grid: Vec<Vec<String>>,
+    grid: Vec<Vec<String>>,
     pending_embedding: Vec<(usize, String)>,
     doc_lang: &str,
     model: &crate::model::LogisModel,

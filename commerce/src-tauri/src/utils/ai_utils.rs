@@ -2119,90 +2119,106 @@ pub fn prejudice_phrase_bank_multilingual(primary_lang: &str, page_type: &str, f
     phrases
 }
 
-pub const TRADE_DOC_TITLES_ML: &[(&str, &str)] = &[
-    ("BL", "Konnossement"), ("BL", "conocimiento de embarque"), ("BL", "connaissement"),
-    ("BL", "polizza di carico"), ("BL", "conhecimento de embarque"), ("BL", "cognossement"),
-    ("BL", "konosament"), ("BL", "بوليصة الشحن"), ("BL", "선하증권"), ("BL", "船荷証券"),
-    ("BL", "提单"), ("BL", "提單"),
-    ("AWB", "Luftfrachtbrief"), ("AWB", "guía aérea"), ("AWB", "lettre de transport aérien"),
-    ("AWB", "lettera di vettura aerea"), ("AWB", "conhecimento aéreo"), ("AWB", "luchtvrachtbrief"),
-    ("AWB", "letecký nákladní list"), ("AWB", "بوليصة الشحن الجوي"), ("AWB", "항공화물운송장"),
-    ("AWB", "航空貨物運送状"), ("AWB", "航空运单"),
-    ("CI", "Handelsrechnung"), ("CI", "factura comercial"), ("CI", "facture commerciale"),
-    ("CI", "fattura commerciale"), ("CI", "fatura comercial"), ("CI", "handelsfactuur"),
-    ("CI", "obchodní faktura"), ("CI", "فاتورة تجارية"), ("CI", "상업송장"), ("CI", "커머셜 인보이스"),
-    ("CI", "商業送り状"), ("CI", "コマーシャルインボイス"), ("CI", "商业发票"),
-    ("PL", "Packliste"), ("PL", "lista de empaque"), ("PL", "liste de colisage"),
-    ("PL", "distinta di imballaggio"), ("PL", "lista de embalagem"), ("PL", "romaneio"),
-    ("PL", "paklijst"), ("PL", "balicí list"), ("PL", "قائمة التعبئة"), ("PL", "포장명세서"),
-    ("PL", "梱包明細書"), ("PL", "パッキングリスト"), ("PL", "装箱单"),
-    ("PO", "Bestellung"), ("PO", "orden de compra"), ("PO", "ordem de compra"), ("PO", "bon de commande"),
-    ("PO", "ordine di acquisto"), ("PO", "pedido de compra"), ("PO", "inkooporder"),
-    ("PO", "objednávka"), ("PO", "أمر الشراء"), ("PO", "구매주문서"), ("PO", "발주서"),
-    ("PO", "注文書"), ("PO", "発注書"), ("PO", "采购订单"),
-    ("PI", "Proformarechnung"), ("PI", "factura proforma"), ("PI", "facture pro forma"),
-    ("PI", "facture proforma"), ("PI", "fattura proforma"), ("PI", "fatura proforma"),
-    ("PI", "proformafactuur"), ("PI", "proforma faktura"), ("PI", "فاتورة مبدئية"),
-    ("PI", "견적송장"), ("PI", "프로포마 인보이스"), ("PI", "見積送り状"),
-    ("PI", "プロフォーマインボイス"), ("PI", "形式发票"),
-    ("SC", "Kaufvertrag"), ("SC", "contrato de compraventa"), ("SC", "contrat de vente"),
-    ("SC", "contratto di vendita"), ("SC", "contrato de venda"), ("SC", "koopovereenkomst"),
-    ("SC", "kupní smlouva"), ("SC", "عقد البيع"), ("SC", "매매계약서"), ("SC", "売買契約書"),
-    ("SC", "销售合同"),
-    ("LC", "Akkreditiv"), ("LC", "carta de crédito"), ("LC", "lettre de crédit"),
-    ("LC", "lettera di credito"), ("LC", "kredietbrief"), ("LC", "akreditiv"),
-    ("LC", "خطاب اعتماد"), ("LC", "신용장"), ("LC", "信用状"), ("LC", "信用证"),
-    ("CO", "Ursprungszeugnis"), ("CO", "certificado de origen"), ("CO", "certificat d'origine"),
-    ("CO", "certificato di origine"), ("CO", "certificado de origem"), ("CO", "certificaat van oorsprong"),
-    ("CO", "osvědčení o původu"), ("CO", "شهادة المنشأ"), ("CO", "원산지증명"),
-    ("CO", "原産地証明書"), ("CO", "原产地证书"),
-    ("ED", "Ausfuhranmeldung"), ("ED", "declaración de exportación"), ("ED", "déclaration d'exportation"),
-    ("ED", "dichiarazione di esportazione"), ("ED", "declaração de exportação"), ("ED", "uitvoeraangifte"),
-    ("ED", "vývozní prohlášení"), ("ED", "بيان التصدير"), ("ED", "수출신고"),
-    ("ED", "輸出申告"), ("ED", "出口报关"),
-    ("ID", "Einfuhranmeldung"), ("ID", "declaración de importación"), ("ID", "déclaration d'importation"),
-    ("ID", "dichiarazione di importazione"), ("ID", "declaração de importação"), ("ID", "invoeraangifte"),
-    ("ID", "dovozní prohlášení"), ("ID", "بيان الاستيراد"), ("ID", "수입신고"),
-    ("ID", "輸入申告"), ("ID", "进口报关"),
-];
+/// 전문 비교 키: 소문자 + 각 언어의 문자·숫자만 남깁니다.
+/// "Air Waybill" / "AIRWAYBILL" / "Air-Waybill" 이 같은 키가 됩니다.
+pub fn trade_title_key(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
 
-pub fn all_trade_doc_titles() -> Vec<(String, String)> {
+fn build_all_trade_doc_titles() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let absorb = |code: String, title: String, out: &mut Vec<(String, String)>| {
-        let t = title.trim().to_string();
-        if code.is_empty() || t.is_empty() { return; }
-        if out.iter().any(|(c, e)| *c == code && e.eq_ignore_ascii_case(&t)) { return; }
-        out.push((code, t));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut push = |code: &str, title: &str| {
+        let t = title.trim();
+        if t.is_empty() { return; }
+        if !seen.insert((code.to_string(), trade_title_key(t))) { return; }
+        out.push((code.to_string(), t.to_string()));
     };
-    for (code, title) in crate::logic::TRADE_DOC_TITLES.iter().chain(TRADE_DOC_TITLES_ML.iter()) {
-        absorb(code.to_string(), title.to_string(), &mut out);
+    for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
+        push(code, title);
+    }
+    for (code, title) in crate::logic::TRADE_DOC_TITLES_ML.iter() {
+        push(code, title);
     }
     for (code, title) in crate::logic::trade_title_pairs().iter() {
-        absorb(code.to_string(), title.to_string(), &mut out);
+        push(code, title);
+    }
+    let en_keys: Vec<(String, String)> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(c, t)| (c.to_string(), trade_title_key(t)))
+        .collect();
+    for (en_title, ml) in crate::logic::TRADE_DOC_TITLES_ML_FULL.iter() {
+        let k = trade_title_key(en_title);
+        for (code, key) in en_keys.iter() {
+            if *key != k { continue; }
+            for phrase in ml.split(',') {
+                push(code, phrase);
+            }
+        }
     }
     out
 }
 
+/// 서식 전문 전체표 (코드, 전문). 영문·기존 ML·title bank·12개 언어 확장표를 합치고
+/// (코드, 정규화 키) 로 중복을 접습니다. 프로세스당 한 번만 만듭니다.
+pub fn all_trade_doc_titles() -> Vec<(String, String)> {
+    static TABLE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_all_trade_doc_titles).clone()
+}
+
+/// 코드 하나의 전문 전체 (영문 + 기존 ML + 12개 언어 확장표).
 pub fn trade_code_title_phrases(code: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (c, title) in all_trade_doc_titles().into_iter() {
-        if !c.eq_ignore_ascii_case(code) { continue; }
-        if out.iter().any(|e| e.eq_ignore_ascii_case(&title)) { continue; }
+        if c != code { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
         out.push(title);
     }
     out
 }
 
+/// 12개 언어 확장표에서 TRADE_DOC_TITLES 의 어떤 영문 전문과도 맞지 않는 키.
+pub fn trade_title_ml_orphans() -> Vec<String> {
+    let en: std::collections::HashSet<String> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(_, t)| trade_title_key(t))
+        .collect();
+    crate::logic::TRADE_DOC_TITLES_ML_FULL
+        .iter()
+        .filter(|(t, _)| !en.contains(&trade_title_key(t)))
+        .map(|(t, _)| t.to_string())
+        .collect()
+}
+
+/// 그룹 개념표에서 TRADE_GROUP_CODES 에 없는 그룹명.
+pub fn trade_group_ml_orphans() -> Vec<String> {
+    crate::logic::TRADE_GROUPS_ML
+        .iter()
+        .filter(|(g, _)| !crate::logic::TRADE_GROUP_CODES.iter().any(|(x, _)| x == g))
+        .map(|(g, _)| g.to_string())
+        .collect()
+}
+
+/// 그룹 뱅크 구: 소속 코드의 전문 전체(12개 언어) + 그룹 개념 구.
 pub fn trade_group_title_phrases(group: &str) -> Vec<String> {
-    let codes: Vec<&str> = match crate::logic::TRADE_GROUP_CODES.iter().find(|(g, _)| *g == group) {
-        Some((_, cs)) => cs.to_vec(),
-        None => return Vec::new(),
-    };
+    let codes: Vec<&str> = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .find(|(g, _)| *g == group)
+        .map(|(_, cs)| cs.to_vec())
+        .unwrap_or_default();
     let mut out: Vec<String> = Vec::new();
-    for (c, title) in all_trade_doc_titles().into_iter() {
-        if !codes.iter().any(|x| x.eq_ignore_ascii_case(&c)) { continue; }
-        if out.iter().any(|e| e.eq_ignore_ascii_case(&title)) { continue; }
+    for (code, title) in all_trade_doc_titles().into_iter() {
+        if !codes.iter().any(|c| *c == code.as_str()) { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
         out.push(title);
+    }
+    for (g, ml) in crate::logic::TRADE_GROUPS_ML.iter() {
+        if *g != group { continue; }
+        for p in ml.split(',') {
+            let p = p.trim();
+            if p.is_empty() || out.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
+            out.push(p.to_string());
+        }
     }
     out
 }

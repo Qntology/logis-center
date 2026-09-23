@@ -146,22 +146,34 @@ impl crate::model::LogisModel {
 
                 let mut detected_type = verdict.code.clone();
 
-                // 마진 부족 시에만 LLM 재판정 1회
-                if verdict.code_margin < 0.15 && verdict.code_candidates.len() > 1 {
+                let tie_candidates: Vec<(String, f32)> =
+                    if verdict.title_confirmed && !verdict.title_band.is_empty() {
+                        verdict.title_band.clone()
+                    } else {
+                        verdict.code_candidates.clone()
+                    };
+                if verdict.title_confirmed && tie_candidates.len() <= 1 {
                     emit_term(&format!(
-                        "  🤝 [TIE BREAK] 코드 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행.",
-                        verdict.code_margin
+                        "  🪪 [TITLE VERDICT TRUSTED] 코드 마진 {:+.4} 이지만 판정 '{}' 은 상단 밴드에 인쇄된 서식 전문에서 직접 읽었고 같은 행에 경쟁 전문이 없습니다. 후보 전체를 나열한 LLM 재판정은 격자 안의 참조 라벨을 제목으로 오인할 수 있으므로 열지 않습니다.",
+                        verdict.code_margin, verdict.code
+                    ));
+                } else if verdict.code_margin < 0.15 && tie_candidates.len() > 1 {
+                    emit_term(&format!(
+                        "  🤝 [TIE BREAK] 코드 마진 {:+.4} 가 임계 미만. LLM 재판정 1회 수행 (후보 {}개{}).",
+                        verdict.code_margin,
+                        tie_candidates.len(),
+                        if verdict.title_confirmed { " — 제목 행에서 동점인 전문만" } else { "" }
                     ));
                     let prompt = crate::parsing::get_trade_doc_classification_prompt_with_evidence(
                         &verdict.group,
-                        &verdict.code_candidates,
+                        &tie_candidates,
                     );
                     let type_res = self.chat_with_qwen3_5_image_spinner(
                         "You are a document classifier.", &prompt, Some(dynamic_image.clone()), app_handle, "extraction-progress",
                         json!({ "category": "Vision (Step 2)", "summary": "Verifying document type..." }), 64, cancel_token.clone(), Some(task_id.clone()), None
                     ).await?;
                     if let Some(v) = crate::parsing::parse_json_from_llm(&type_res).get("doc_type").and_then(|d| d.as_str()) {
-                        if verdict.code_candidates.iter().any(|(c, _)| c == v) {
+                        if tie_candidates.iter().any(|(c, _)| c == v) {
                             emit_term(&format!("  ✅ [TIE BREAK] LLM 판정 '{}' 채택.", v));
                             detected_type = v.to_string();
                         } else {
@@ -171,9 +183,23 @@ impl crate::model::LogisModel {
                             ));
                         }
                     }
+                    crate::utils::score_dynamics::record_baseline(
+                        "vision.tie_break_changed",
+                        if detected_type == verdict.code { 0.0 } else { 1.0 },
+                    );
                 }
 
                 emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
+                {
+                    let t_orphans = crate::utils::ai_utils::trade_title_ml_orphans();
+                    let g_orphans = crate::utils::ai_utils::trade_group_ml_orphans();
+                    if !t_orphans.is_empty() || !g_orphans.is_empty() {
+                        emit_term(&format!(
+                            "  ⚠️ [ML TABLE ORPHANS] 12개 언어 전문표에서 TRADE_DOC_TITLES 의 영문 전문과 맞지 않는 키 {}개 {:?} · TRADE_GROUP_CODES 에 없는 그룹 {}개 {:?} — 이 항목의 다국어 구는 어느 코드·그룹에도 붙지 않았습니다. 표의 키를 TRADE_DOC_TITLES / TRADE_GROUP_CODES 의 표기와 같게 고치면 사라집니다.",
+                            t_orphans.len(), t_orphans, g_orphans.len(), g_orphans
+                        ));
+                    }
+                }
                 crate::utils::score_dynamics::refine_primary(&detected_type);
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
@@ -392,11 +418,21 @@ impl crate::model::LogisModel {
                     final_data_map.insert("items".to_string(), json!([]));
                     final_data_map.insert("containers".to_string(), json!([]));
 
+                    let self_ref_field: String = crate::logic::trade_reference_field_of(&detected_type)
+                        .unwrap_or("")
+                        .to_string();
                     let schema_fields: Vec<String> = crate::parsing::get_detail_schema_fields(&detected_type, "", &language)
                         .into_iter()
                         .map(|(f, _, _, _)| f)
                         .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
+                        .filter(|f| self_ref_field.is_empty() || *f != self_ref_field)
                         .collect();
+                    if !self_ref_field.is_empty() {
+                        emit_term(&format!(
+                            "  🧹 [SELF-REFERENCE FIELD DROP] '{}' 는 '{}' 서식이 자기 자신을 가리키는 참조 축이라 이 문서에 존재할 수 없습니다. 라벨 뱅크와 식별 패스에서 제외해, 자기 문서번호가 doc_number 대신 이 축으로 라우팅되는 경로를 막습니다.",
+                            self_ref_field, detected_type
+                        ));
+                    }
                     let gate_banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = {
                         let mut phr_all: Vec<String> = Vec::new();
                         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -446,6 +482,7 @@ impl crate::model::LogisModel {
                     let mut pair_label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                     let mut identity_locked: std::collections::HashSet<String> = std::collections::HashSet::new();
                     let mut read_legible: Vec<usize> = Vec::new();
+                    let mut deferred_pairs: Vec<(String, String, Vec<f32>, (u32, u32, u32, u32))> = Vec::new();
                     let peak_cols = grid.grid_cols.max(1);
                     let peak_cw = grid.orig_width as f32 / peak_cols as f32;
                     let peak_ch = grid.orig_height as f32 / grid.grid_rows.max(1) as f32;
@@ -635,7 +672,7 @@ impl crate::model::LogisModel {
                                             std::collections::HashSet::new();
                                         ident.insert(crate::logic::TRADE_IDENTITY_FIELD.to_string());
                                         for f in all.iter() {
-                                            if f.starts_with("reference_") {
+                                            if f.starts_with("reference_") && *f != self_ref_field {
                                                 ident.insert(f.clone());
                                             }
                                         }
@@ -860,23 +897,38 @@ impl crate::model::LogisModel {
                                         .unwrap_or_else(|_| vec![Vec::new(); pairs.len()]);
                                     let title_table = crate::utils::ai_utils::all_trade_doc_titles();
                                     let doc_title_codes = |label: &str| -> Vec<String> {
-                                        let low = label.to_lowercase();
-                                        let mut best_len = 0usize;
-                                        let mut codes: Vec<String> = Vec::new();
+                                        let key: String = label
+                                            .to_lowercase()
+                                            .chars()
+                                            .filter(|c| c.is_alphanumeric())
+                                            .collect();
+                                        let mut hits: Vec<(String, String)> = Vec::new();
                                         for (code, title) in title_table.iter() {
-                                            let t = title.to_lowercase();
+                                            let t: String = title
+                                                .to_lowercase()
+                                                .chars()
+                                                .filter(|c| c.is_alphanumeric())
+                                                .collect();
                                             let n = t.chars().count();
                                             let min_n = if t.chars().any(|c| (c as u32) >= 0x2E80) { 2 } else { 5 };
-                                            if n < min_n || !low.contains(&t) { continue; }
-                                            if n > best_len {
-                                                best_len = n;
-                                                codes.clear();
-                                            }
-                                            if n == best_len && !codes.iter().any(|c| c == code) {
-                                                codes.push(code.clone());
+                                            if n < min_n || !key.contains(&t) { continue; }
+                                            match hits.iter_mut().find(|(c, _)| c == code) {
+                                                Some((_, prev)) => {
+                                                    if t.len() > prev.len() { *prev = t; }
+                                                }
+                                                None => hits.push((code.clone(), t)),
                                             }
                                         }
-                                        codes
+                                        let mut codes: Vec<(String, usize)> = Vec::new();
+                                        for (code, t) in hits.iter() {
+                                            let nested = hits.iter().any(|(oc, ot)| {
+                                                oc != code && ot.len() > t.len() && ot.contains(t.as_str())
+                                            });
+                                            if nested { continue; }
+                                            codes.push((code.clone(), t.chars().count()));
+                                        }
+                                        codes.sort_by(|a, b| b.1.cmp(&a.1));
+                                        codes.into_iter().map(|(c, _)| c).collect()
                                     };
                                     let mut queue: Vec<(String, String, String, f32, bool)> = Vec::new();
                                     let mut rest_pairs: Vec<(String, String)> = Vec::new();
@@ -927,6 +979,17 @@ impl crate::model::LogisModel {
                                         &rest_pairs, &rest_embs, &cat_fields, &gate_banks,
                                     );
                                     for line in route_logs.iter() { emit_term(line); }
+                                    for (pi, (l, v)) in rest_pairs.iter().enumerate() {
+                                        if routed.iter().any(|r| r.label == *l && r.value == *v) { continue; }
+                                        let emb = match rest_embs.get(pi) {
+                                            Some(e) if !e.is_empty() => e.clone(),
+                                            _ => continue,
+                                        };
+                                        if deferred_pairs.iter().any(|(dl, dv, _, _)| dl.eq_ignore_ascii_case(l) && dv.eq_ignore_ascii_case(v)) {
+                                            continue;
+                                        }
+                                        deferred_pairs.push((l.clone(), v.clone(), emb, tile.bbox));
+                                    }
                                     for r in routed.iter() {
                                         queue.push((r.label.clone(), r.value.clone(), r.field.clone(), r.own, r.in_window));
                                     }
@@ -1011,6 +1074,74 @@ impl crate::model::LogisModel {
                                                 if row_current.is_empty() { "비어 있음" } else { row_current.as_str() }
                                             ));
                                             continue;
+                                        }
+                                        if !crate::logic::is_trade_array_category(&rcat) {
+                                            let mut echo: Option<(String, String, usize, usize, bool)> = None;
+                                            for acat in crate::logic::TRADE_ARRAY_CATEGORIES.iter() {
+                                                let rows = match final_data_map.get(*acat).and_then(|v| v.as_array()) {
+                                                    Some(a) => a,
+                                                    None => continue,
+                                                };
+                                                for (ri, row) in rows.iter().enumerate() {
+                                                    let o = match row.as_object() { Some(o) => o, None => continue };
+                                                    let hit = o.iter().find(|(_, v)| {
+                                                        let s = scalar_text(*v);
+                                                        !s.is_empty() && crate::model::merge::same_printed_value(&s, &value)
+                                                    });
+                                                    let afield = match hit { Some((k, _)) => k.clone(), None => continue };
+                                                    let label_in_row = o.iter().any(|(k, v)| {
+                                                        if *k == afield { return false; }
+                                                        let s = scalar_text(v);
+                                                        !s.is_empty() && crate::model::merge::same_printed_value(&s, &label)
+                                                    });
+                                                    echo = Some((acat.to_string(), afield, ri, rows.len(), label_in_row));
+                                                    break;
+                                                }
+                                                if echo.is_some() { break; }
+                                            }
+                                            if let Some((acat, afield, ri, nrows, label_in_row)) = echo {
+                                                let fmt = crate::utils::ai_utils::detect_field_format(&field);
+                                                let numeric_like = matches!(
+                                                    fmt,
+                                                    crate::utils::ai_utils::FieldFormat::Numeric
+                                                        | crate::utils::ai_utils::FieldFormat::Identifier
+                                                        | crate::utils::ai_utils::FieldFormat::TrackingCode
+                                                );
+                                                let mut column_own = f32::MIN;
+                                                if !label_in_row && numeric_like && nrows >= 2 {
+                                                    if let Some(emb) = pairs
+                                                        .iter()
+                                                        .position(|(l, _)| l == &label)
+                                                        .and_then(|i| pair_embs.get(i))
+                                                    {
+                                                        let (_, o, _, _) = crate::model::merge::recovery_label_gate(emb, &afield, &gate_banks);
+                                                        column_own = o;
+                                                    }
+                                                }
+                                                let is_cell = label_in_row
+                                                    || (numeric_like
+                                                        && nrows >= 2
+                                                        && column_own != f32::MIN
+                                                        && column_own >= own - 1.0);
+                                                if is_cell {
+                                                    crate::utils::score_dynamics::record_baseline("vision.pair_table_cell_echo", 1.0);
+                                                    crate::utils::score_dynamics::record_field_seen(&field);
+                                                    crate::utils::score_dynamics::record_field_reject(
+                                                        &field,
+                                                        crate::utils::score_dynamics::GateKind::Prejudice,
+                                                    );
+                                                    emit_term(&format!(
+                                                        "      🚫 [PAIR TABLE CELL ECHO] \"{}\" → {} = \"{}\" | 이 값은 이미 읽은 {} 표 {}번째 행의 '{}' 칸과 같습니다{}. 표 행의 칸을 라벨↔값 쌍으로 다시 읽은 것이므로 스칼라 축에 넣지 않습니다. 총계 축에 어느 한 행의 값이 들어가면 산술 정합이 그 총계를 지우고, 참조 축에 품목 코드가 들어가면 존재하지 않는 문서를 가리키게 됩니다.",
+                                                        label, field, value, acat, ri + 1, afield,
+                                                        if label_in_row {
+                                                            " (라벨도 같은 행의 다른 칸입니다)".to_string()
+                                                        } else {
+                                                            format!(" (라벨의 '{}' 열 중립점수 {:+.4} 가 '{}' {:+.4} 와 pooled σ 한 칸 안)", afield, column_own, field, own)
+                                                        }
+                                                    ));
+                                                    continue;
+                                                }
+                                            }
                                         }
                                         if let Some((owner, _)) = claimed_now
                                             .iter()
@@ -1544,7 +1675,132 @@ impl crate::model::LogisModel {
                             merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                         }
                     }
-
+                    if !deferred_pairs.is_empty() {
+                        let scalar_banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = gate_banks
+                            .iter()
+                            .filter(|(f, _, _)| {
+                                let c = crate::logic::trade_field_category(f);
+                                !c.is_empty()
+                                    && !crate::logic::is_trade_array_category(c)
+                                    && f.as_str() != crate::logic::TRADE_IDENTITY_FIELD
+                            })
+                            .cloned()
+                            .collect();
+                        let scalar_fields: Vec<String> = scalar_banks.iter().map(|(f, _, _)| f.clone()).collect();
+                        let mut keep: Vec<(String, String)> = Vec::new();
+                        let mut keep_embs: Vec<Vec<f32>> = Vec::new();
+                        let mut keep_bbox: Vec<(u32, u32, u32, u32)> = Vec::new();
+                        let mut cell_echo = 0usize;
+                        {
+                            let is_table_cell = |value: &str| -> Option<(String, String)> {
+                                for acat in crate::logic::TRADE_ARRAY_CATEGORIES.iter() {
+                                    let rows = match final_data_map.get(*acat).and_then(|v| v.as_array()) {
+                                        Some(a) => a,
+                                        None => continue,
+                                    };
+                                    for row in rows.iter() {
+                                        let o = match row.as_object() { Some(o) => o, None => continue };
+                                        for (k, v) in o.iter() {
+                                            let s = match v {
+                                                Value::String(s) => s.trim().to_string(),
+                                                Value::Number(n) => n.to_string(),
+                                                _ => continue,
+                                            };
+                                            if s.is_empty() { continue; }
+                                            if crate::model::merge::same_printed_value(&s, value) {
+                                                return Some((acat.to_string(), k.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            };
+                            for (label, value, emb, bbox) in deferred_pairs.iter() {
+                                if let Some((acat, afield)) = is_table_cell(value) {
+                                    cell_echo += 1;
+                                    emit_term(&format!(
+                                        "      🧾 [DEFERRED PAIR / TABLE CELL] \"{}\" → \"{}\" | 값이 {} 표의 '{}' 칸과 같습니다. 표 행을 라벨↔값 쌍으로 읽은 것이므로 스칼라 재라우팅에서 제외합니다.",
+                                        label, value, acat, afield
+                                    ));
+                                    continue;
+                                }
+                                keep.push((label.clone(), value.clone()));
+                                keep_embs.push(emb.clone());
+                                keep_bbox.push(*bbox);
+                            }
+                        }
+                        emit_term(&format!(
+                            "  🔁 [DEFERRED PAIR PASS] 크롭 루프에서 라우팅되지 못한 쌍 {}건 중 표 칸 에코 {}건을 제외한 {}건을 스칼라 축 {}개만으로 다시 라우팅합니다. 표 열이 라벨 argmax 를 가져가 막힌 총계·중량 축은 표를 다 읽은 뒤에야 '어느 행의 값도 아니다' 를 확인할 수 있습니다.",
+                            deferred_pairs.len(), cell_echo, keep.len(), scalar_fields.len()
+                        ));
+                        if !keep.is_empty() && !scalar_banks.is_empty() {
+                            let (routed, logs) = crate::model::merge::route_pairs_to_fields(
+                                &keep, &keep_embs, &scalar_fields, &scalar_banks,
+                            );
+                            for line in logs.iter() { emit_term(line); }
+                            let mut adopted = 0usize;
+                            for r in routed.iter() {
+                                let bbox = keep
+                                    .iter()
+                                    .position(|(l, v)| *l == r.label && *v == r.value)
+                                    .and_then(|i| keep_bbox.get(i).copied())
+                                    .unwrap_or((0, 0, grid.orig_width, grid.orig_height));
+                                let rcat = crate::logic::trade_field_category(&r.field).to_string();
+                                if rcat.is_empty() || crate::logic::is_trade_array_category(&rcat) { continue; }
+                                if identity_locked.contains(&r.field) { continue; }
+                                if r.value.eq_ignore_ascii_case(&r.label)
+                                    || crate::model::merge::is_schema_echo(&r.value)
+                                    || crate::parsing::is_printed_label_echo(&r.value, &language)
+                                    || crate::parsing::is_printed_label_fragment(&r.value, &language)
+                                {
+                                    continue;
+                                }
+                                let current = final_data_map
+                                    .get(&r.field)
+                                    .map(|v| match v {
+                                        Value::String(s) => s.trim().to_string(),
+                                        Value::Number(n) => n.to_string(),
+                                        _ => String::new(),
+                                    })
+                                    .unwrap_or_default();
+                                if !current.is_empty() {
+                                    emit_term(&format!(
+                                        "      ⚪ [DEFERRED PAIR / OCCUPIED] \"{}\" → {} = \"{}\" | 이미 \"{}\" 가 있습니다. 미뤄진 쌍은 빈 축만 채웁니다.",
+                                        r.label, r.field, r.value, current
+                                    ));
+                                    continue;
+                                }
+                                let claimed = collect_claimed(&final_data_map);
+                                if let Some((owner, _)) = claimed.iter().find(|(k, v)| *k != r.field && v.eq_ignore_ascii_case(&r.value)) {
+                                    emit_term(&format!(
+                                        "      🚫 [DEFERRED PAIR / CLAIMED] \"{}\" → {} = \"{}\" | 이미 '{}' 가 확정한 값입니다.",
+                                        r.label, r.field, r.value, owner
+                                    ));
+                                    continue;
+                                }
+                                final_data_map.insert(r.field.clone(), json!(r.value.clone()));
+                                if let Some(o) = final_data_map.get_mut(&rcat).and_then(|v| v.as_object_mut()) {
+                                    o.insert(r.field.clone(), json!(r.value.clone()));
+                                }
+                                let mut p = serde_json::Map::new();
+                                p.insert(r.field.clone(), json!(r.value.clone()));
+                                record_grounding_claims(&mut grounding_claims, &rcat, &Value::Object(p), bbox);
+                                pair_evidence.insert(r.field.clone(), r.own);
+                                pair_label.insert(r.field.clone(), r.label.clone());
+                                crate::utils::score_dynamics::record_field_seen(&r.field);
+                                crate::utils::score_dynamics::record_field_assigned(&r.field, r.own);
+                                adopted += 1;
+                                emit_term(&format!(
+                                    "      ✅ [DEFERRED PAIR ROUTE] \"{}\" → {}.{} = \"{}\" | 스칼라 축 {}개와 경쟁시켜 중립점수 {:+.4}",
+                                    r.label, rcat, r.field, r.value, scalar_fields.len(), r.own
+                                ));
+                            }
+                            crate::utils::score_dynamics::record_baseline(
+                                "vision.deferred_pair_adopt",
+                                adopted as f32 / keep.len().max(1) as f32,
+                            );
+                        }
+                    }
                     {
                         let recovery_ceiling = plans.len().max(4);
                         let mut cands: Vec<(String, String, usize, f32)> = Vec::new();
@@ -2584,7 +2840,8 @@ impl crate::model::LogisModel {
                         if decl_bank.is_empty() || instr_bank.is_empty() {
                             emit_term("  ⚪ [DECLARATION GATE SKIP] 서식 전문 또는 화물 지시문 앵커를 임베딩하지 못했습니다. 한쪽 뱅크만으로 판정하려면 절대 임계가 필요해지므로 판정하지 않습니다.");
                         } else {
-                            let cohesion = crate::utils::ai_utils::bank_internal_cohesion(&instr_bank);
+                            let instr_coh = crate::utils::ai_utils::bank_internal_cohesion(&instr_bank);
+                            let decl_coh = crate::utils::ai_utils::bank_internal_cohesion(&decl_bank);
                             for (i, (cat, field, value)) in cands.iter().enumerate() {
                                 let q = match embs.get(i) {
                                     Some(q) if !q.is_empty() => q,
@@ -2592,10 +2849,11 @@ impl crate::model::LogisModel {
                                 };
                                 let own = crate::utils::ai_utils::max_pool_sim(q, &instr_bank);
                                 let prej = crate::utils::ai_utils::max_pool_sim(q, &decl_bank);
-                                if crate::utils::ai_utils::prejudice_dominates(own, prej, cohesion) {
+                                crate::utils::score_dynamics::record_baseline("vision.declaration_gap", prej - own);
+                                if prej > own {
                                     emit_term(&format!(
-                                        "    📜 [DECLARATION BOILERPLATE] {}.{} = \"{}\" | 서식 전문 {:.4} 가 화물 지시문 {:.4} 를 결속 여유 {:.3} 넘어 앞섭니다. 수출자 확인 문구는 같은 서식이면 모든 문서에 똑같이 인쇄되므로, 이 축에 들어가는 순간 그 축의 변별력이 0 이 되고 자연어 변환을 타고 청크까지 색인되어 실제 지시문을 밀어냅니다. 폐기합니다.",
-                                        cat, field, value, prej, own, cohesion.clamp(0.0, 0.5)
+                                        "    📜 [DECLARATION BOILERPLATE] {}.{} = \"{}\" | 서식 전문 {:.4} 가 화물 지시문 {:.4} 를 앞섭니다 (뱅크 결속 전문 {:.3} / 지시문 {:.3}). 수출자 확인 문구는 같은 서식이면 모든 문서에 똑같이 인쇄되므로, 이 축에 들어가는 순간 그 축의 변별력이 0 이 되고 자연어 변환을 타고 청크까지 색인되어 실제 지시문을 밀어냅니다. 폐기합니다.",
+                                        cat, field, value, prej, own, decl_coh, instr_coh
                                     ));
                                     crate::utils::score_dynamics::record_baseline("vision.declaration_boilerplate", 1.0);
                                     verdicts.push(crate::models::siglip2::value_grounding::GroundingVerdict {
@@ -2612,7 +2870,7 @@ impl crate::model::LogisModel {
                                     });
                                 } else {
                                     emit_term(&format!(
-                                        "    ✅ [DECLARATION GATE KEEP] {}.{} = \"{}\" | 화물 지시문 {:.4} 가 서식 전문 {:.4} 를 앞섭니다. 이 문서에만 있는 지시문으로 보고 유지합니다.",
+                                        "    ✅ [DECLARATION GATE KEEP] {}.{} = \"{}\" | 화물 지시문 {:.4} 가 서식 전문 {:.4} 이상입니다. 이 문서에만 있는 지시문으로 보고 유지합니다.",
                                         cat, field, value, own, prej
                                     ));
                                     crate::utils::score_dynamics::record_baseline("vision.declaration_boilerplate", 0.0);

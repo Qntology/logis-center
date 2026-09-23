@@ -1843,6 +1843,145 @@ fn is_relay_draft(doc: &Value) -> bool {
         && doc.get("digest").and_then(|v| v.as_str()).map_or(false, |s| s.is_empty())
 }
 
+// =====================================================================
+// 🌟 [QUERY-SIDE MODE REROUTE] 커머스 질의가 무역 서식을 지목하는지 판정합니다.
+// ---------------------------------------------------------------------
+//  비전 경로의 [MODE REROUTE] 와 대칭입니다. 커머스 태스크로 올라온 서식 이미지는
+//  mode='shipping', type='CI' 처럼 저장되므로, 같은 질의가 커머스 스코프
+//  (mode='commerce', type IN (goods, ...)) 로 나가면 구조적으로 0건입니다.
+// =====================================================================
+static TRADE_QUERY_BANKS: Lazy<RwLock<Option<(Vec<(String, Vec<f32>)>, Vec<Vec<f32>>)>>> =
+    Lazy::new(|| RwLock::new(None));
+
+async fn trade_query_banks(
+    model: &LogisModel,
+) -> Option<(Vec<(String, Vec<f32>)>, Vec<Vec<f32>>)> {
+    if let Ok(g) = TRADE_QUERY_BANKS.read() {
+        if let Some(b) = g.as_ref() {
+            return Some(b.clone());
+        }
+    }
+    let titles = crate::utils::ai_utils::all_trade_doc_titles();
+    let comm = crate::logic::anchor_phrases(
+        crate::logic::COMMERCE_QUERY_ANCHOR,
+        crate::logic::COMMERCE_QUERY_ANCHOR_ML,
+    );
+    let mut texts: Vec<String> = titles.iter().map(|(_, t)| t.clone()).collect();
+    let n_title = texts.len();
+    texts.extend(comm.iter().cloned());
+    let mut embs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for part in texts.chunks(200) {
+        let e = model
+            .get_embedding_batch(part.to_vec())
+            .await
+            .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
+        embs.extend(e);
+    }
+    if embs.len() != texts.len() {
+        return None;
+    }
+    let title_bank: Vec<(String, Vec<f32>)> = titles
+        .iter()
+        .zip(embs.iter().take(n_title))
+        .filter(|(_, e)| !e.is_empty())
+        .map(|((c, _), e)| (c.clone(), e.clone()))
+        .collect();
+    let comm_bank: Vec<Vec<f32>> = embs
+        .iter()
+        .skip(n_title)
+        .filter(|e| !e.is_empty())
+        .cloned()
+        .collect();
+    if title_bank.len() < 3 || comm_bank.len() < 3 {
+        return None;
+    }
+    if let Ok(mut g) = TRADE_QUERY_BANKS.write() {
+        *g = Some((title_bank.clone(), comm_bank.clone()));
+    }
+    Some((title_bank, comm_bank))
+}
+
+/// 한 뱅크에 대한 질의의 자기 분포 초과분: (z_top − √(2lnN), top cos, top idx)
+fn bank_excess(sims: &[f32]) -> Option<(f32, f32, usize)> {
+    if sims.len() < 3 { return None; }
+    let n = sims.len() as f32;
+    let mean = sims.iter().sum::<f32>() / n;
+    let sd = (sims.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
+    if sd <= 1e-6 { return None; }
+    let mut ti = 0usize;
+    for (i, s) in sims.iter().enumerate() {
+        if *s > sims[ti] { ti = i; }
+    }
+    let z = (sims[ti] - mean) / sd;
+    let expected = (2.0 * n.ln()).sqrt();
+    Some((z - expected, sims[ti], ti))
+}
+
+async fn probe_trade_query<E: Fn(&str)>(
+    model: &LogisModel,
+    query: &str,
+    emit: &E,
+) -> Option<String> {
+    use crate::utils::ai_utils::cosine_similarity;
+
+    // ① 서식 코드 접두 번호 (코드 직후에 숫자 또는 구분자, 숫자 4자리 이상)
+    let codes: Vec<&str> = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .flat_map(|(_, cs)| cs.iter().copied())
+        .collect();
+    for tok in query.split(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '[' | ']' | '"' | '\'')
+    }) {
+        let core = tok
+            .trim_start_matches(|c: char| !c.is_ascii_alphabetic())
+            .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        let t = core.to_uppercase();
+        if t.len() < 6 { continue; }
+        for code in codes.iter() {
+            let code: &str = *code;
+            if code.len() < 2 || !t.starts_with(code) { continue; }
+            let rest = &t[code.len()..];
+            let stripped = rest.trim_start_matches(|c: char| matches!(c, '-' | '/' | ':' | '#' | '.' | '_'));
+            if stripped.len() == rest.len() && !stripped.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            let digits = stripped.chars().filter(|c| c.is_ascii_digit()).count();
+            let clean = stripped
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '_'));
+            if digits >= 4 && clean {
+                emit(&format!(
+                    "[TRADE QUERY PROBE] 🔑 질의 토큰 '{}' 이 서식 코드 '{}' 의 접두 번호 형태입니다. 저장 시 resolve_trade_doc_identity 가 같은 접두 규칙으로 문서번호를 확정하므로, 이 토큰은 그 서식의 문서번호를 그대로 옮겨 적은 것입니다.",
+                    tok.trim(), code
+                ));
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    // ② 서식 전문 뱅크 vs 커머스 개념 뱅크
+    let (title_bank, comm_bank) = trade_query_banks(model).await?;
+    let q = model.get_embedding(query.to_string()).await.ok()?;
+    if q.is_empty() { return None; }
+    let t_sims: Vec<f32> = title_bank.iter().map(|(_, e)| cosine_similarity(&q, e)).collect();
+    let c_sims: Vec<f32> = comm_bank.iter().map(|e| cosine_similarity(&q, e)).collect();
+    let (t_ex, t_top, t_idx) = bank_excess(&t_sims)?;
+    let (c_ex, c_top, _) = bank_excess(&c_sims)?;
+    let code = title_bank[t_idx].0.clone();
+    if t_ex > 0.0 && t_ex > c_ex {
+        emit(&format!(
+            "[TRADE QUERY PROBE] 📄 서식 전문 뱅크 초과분 {:+.3} (최고 '{}' cos {:.4}, N={}) 이 커머스 개념 뱅크 초과분 {:+.3} (cos {:.4}, N={}) 을 앞섭니다. 두 뱅크의 최댓값 기대치 √(2lnN) 을 각각 뺀 값이므로 뱅크 크기 차이는 이미 상쇄되어 있습니다.",
+            t_ex, code, t_top, t_sims.len(), c_ex, c_top, c_sims.len()
+        ));
+        return Some(code);
+    }
+    emit(&format!(
+        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없습니다.",
+        t_ex, code, t_top, c_ex, c_top
+    ));
+    None
+}
+
 #[tauri::command]
 async fn get_all_documents(
     state: State<'_, AppState>,
@@ -2178,6 +2317,33 @@ async fn ai_search_complex(
         }
 
         
+        let search_mode: String = if search_mode == "commerce" {
+            crate::utils::score_dynamics::enter_scope(
+                "",
+                crate::utils::score_dynamics::Track::Search,
+                "probe",
+                "",
+            );
+            let verdict = probe_trade_query(&model, &query, &emit_term).await;
+            crate::utils::score_dynamics::record_baseline(
+                "search.query_reroute",
+                if verdict.is_some() { 1.0 } else { 0.0 },
+            );
+            crate::utils::score_dynamics::leave_scope();
+            match verdict {
+                Some(code) => {
+                    emit_term(&format!(
+                        "[MODE REROUTE / QUERY] 🔀 mode='commerce' 요청이지만 질의가 무역 서식 '{}' 을 지목합니다. 서식 이미지는 비전 경로의 MODE REROUTE 로 mode='shipping' 에 저장되므로 커머스 스코프로는 구조적으로 0건입니다. 질의 해석·비전 트랙·스코프·Dexie 플랜을 모두 shipping 으로 전환합니다.",
+                        code
+                    ));
+                    "shipping".to_string()
+                }
+                None => search_mode.clone(),
+            }
+        } else {
+            search_mode.clone()
+        };
+
         let structured_query = match search_mode.as_str() {
             "shipping" => {
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -3082,7 +3248,7 @@ async fn ai_search_complex(
                     prop, brief, rec_note);
             }
 
-            if search_mode == "shipping" && !dexie_plans.is_empty() {
+            if search_mode != "analytic" && !dexie_plans.is_empty() {
                 let has_hard = dexie_plans.iter().any(|p| {
                     p.get("conditions")
                         .and_then(|c| c.as_array())
@@ -3141,7 +3307,8 @@ async fn ai_search_complex(
                     crate::utils::score_dynamics::set_run_label(&query);
                     let (eligible, all_pass, per_field) = evaluate_dexie_plan(plan, &docs);
                     let drafts = docs.iter().filter(|d| is_relay_draft(d)).count();
-                    crate::utils::score_dynamics::record_baseline("search.recall_n", docs.len() as f32);
+                    crate::utils::score_dynamics::record_baseline("search.recall_n", ranked_results.len() as f32);
+                    crate::utils::score_dynamics::record_baseline("search.hydrated_n", docs.len() as f32);
                     crate::utils::score_dynamics::record_baseline("search.eligible_n", eligible as f32);
                     crate::utils::score_dynamics::record_baseline("search.hard_n", per_field.len() as f32);
                     if !docs.is_empty() {
@@ -3375,9 +3542,9 @@ async fn ai_search_complex(
                     }
                     crate::utils::score_dynamics::leave_scope();
                 }
-                println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
-                crate::utils::score_dynamics::flush();
             }
+            println!("[AI-SEARCH] {}", crate::utils::score_dynamics::report());
+            crate::utils::score_dynamics::flush();
             all_results = ranked_results;
         }
         // =====================================================================
@@ -3580,7 +3747,8 @@ async fn ai_search_complex(
             "structured": structured_query,
             "results": all_results,
             "dexie_plans": dexie_plans,
-            "report": analytic_report
+            "report": analytic_report,
+            "mode": search_mode
         }))
     }.await; 
 

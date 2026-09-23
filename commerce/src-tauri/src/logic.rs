@@ -1819,6 +1819,51 @@ pub fn vision_chrome_phrases() -> Vec<String> {
     anchor_phrases(VISION_CHROME_ANCHOR, VISION_CHROME_ANCHOR_ML)
 }
 
+/// 🌟 [COMMERCE QUERY ANCHOR] 질의가 '상품·주문·배송 조회' 를 뜻하는지 판정하는 개념 뱅크.
+///  서식 전문 뱅크(all_trade_doc_titles)의 상대 편입니다. 질의 쪽 MODE REROUTE 가
+///  두 뱅크의 자기 분포 초과분을 비교해 커머스 유지 / 서식 전환을 정합니다.
+pub const COMMERCE_QUERY_ANCHOR: &str = "product, item, goods, sale price, discount, brand, product detail, product listing, shopping cart, checkout, order status, order history, product review, rating, seller, shop, store, delivery status, parcel tracking, tracking number, shipping fee, coupon, stock, sold out, wishlist, category, size, color, option";
+
+pub const COMMERCE_QUERY_ANCHOR_ML: &str = "Produkt, Artikel, Verkaufspreis, Rabatt, Marke, Produktseite, Warenkorb, Kasse, Bestellstatus, Bewertung, Verkäufer, Shop, Lieferstatus, Sendungsverfolgung, Versandkosten, Gutschein, Lagerbestand, ausverkauft, Wunschliste, Kategorie, Größe, Farbe, \
+producto, artículo, precio de venta, descuento, marca, página de producto, carrito, pago, estado del pedido, reseña, vendedor, tienda, estado de entrega, seguimiento del paquete, gastos de envío, cupón, existencias, agotado, lista de deseos, categoría, talla, color, \
+produit, article, prix de vente, remise, marque, fiche produit, panier, paiement, statut de la commande, avis client, vendeur, boutique, statut de livraison, suivi de colis, frais de port, code promo, stock, épuisé, liste de souhaits, catégorie, taille, couleur, \
+商品, アイテム, 販売価格, 割引, ブランド, 商品ページ, カート, 決済, 注文状況, レビュー, 出品者, ショップ, 配送状況, 荷物追跡, 送料, クーポン, 在庫, 売り切れ, ほしい物リスト, カテゴリー, サイズ, カラー, \
+produto, item, preço de venda, desconto, marca, página do produto, carrinho, finalizar compra, status do pedido, avaliação, vendedor, loja, status da entrega, rastreamento de encomenda, frete, cupom, estoque, esgotado, lista de desejos, categoria, tamanho, cor, \
+منتج, سلعة, سعر البيع, خصم, علامة تجارية, صفحة المنتج, سلة التسوق, الدفع, حالة الطلب, تقييم, بائع, متجر, حالة التوصيل, تتبع الشحنة, رسوم الشحن, قسيمة, المخزون, نفدت الكمية, قائمة الرغبات, فئة, مقاس, لون, \
+produkt, zboží, prodejní cena, sleva, značka, stránka produktu, nákupní košík, pokladna, stav objednávky, recenze, prodejce, obchod, stav doručení, sledování zásilky, poštovné, kupón, skladem, vyprodáno, seznam přání, kategorie, velikost, barva, \
+prodotto, articolo, prezzo di vendita, sconto, marca, scheda prodotto, carrello, cassa, stato dell'ordine, recensione, venditore, negozio, stato della consegna, tracciamento del pacco, spese di spedizione, coupon, disponibilità, esaurito, lista dei desideri, categoria, taglia, colore, \
+상품, 제품, 판매가, 할인, 브랜드, 상품 상세, 장바구니, 결제, 주문 상태, 상품평, 리뷰, 판매자, 쇼핑몰, 배송 상태, 택배 조회, 배송비, 쿠폰, 재고, 품절, 위시리스트, 카테고리, 사이즈, 색상, \
+product, artikel, verkoopprijs, korting, merk, productpagina, winkelwagen, afrekenen, bestelstatus, beoordeling, verkoper, webshop, bezorgstatus, pakket volgen, verzendkosten, kortingscode, voorraad, uitverkocht, verlanglijst, categorie, maat, kleur, \
+商品, 货品, 售价, 折扣, 品牌, 商品详情, 购物车, 结算, 订单状态, 评价, 卖家, 店铺, 配送状态, 快递查询, 运费, 优惠券, 库存, 售罄, 心愿单, 分类, 尺码, 颜色";
+
+/// 🌟 [SITE CHROME / 12 LANGUAGES] 사이트 껍데기 문장 — 내비게이션·헤더·푸터·관리자 메뉴·로그인·공지·저작권.
+///  키는 언어 코드, 값은 쉼표로 이은 구입니다. scheduler.rs 의 prejudice_pair 가 영어 편견 문장 옆에
+///  문서 언어 문장 하나를 더 세워 두 벡터 중 최댓값으로 잽니다. 영어는 scheduler.rs 의 기존 문장을 그대로 씁니다.
+pub const SITE_CHROME_ML: &[(&str, &str)] = &[
+    ("de", "globale Navigation, Menü, Hauptmenü, Kopfzeile, Fußzeile, Seitenleiste, Brotkrümelnavigation, Suchformular, Suchfilter, Seitennummerierung, Admin-Menü, Verwaltungsmenü, Schnellmenü, Untermenü, Kategoriemenü, Einstellungsmenü, Anmelden, Abmelden, Einstellungen, Meine Seite, Hinweis, Banner, Copyright, Dashboard, Verwaltungsseite, Administratorseite, Startseite, Willkommen, Seitenname"),
+    ("es", "navegación global, menú, menú principal, encabezado, pie de página, barra lateral, ruta de navegación, formulario de búsqueda, filtro de búsqueda, paginación, menú de administración, menú rápido, submenú, menú de categorías, menú de configuración, iniciar sesión, cerrar sesión, configuración, mi página, aviso, banner, derechos de autor, panel de control, página de administración, página del administrador, inicio, bienvenido, nombre del sitio"),
+    ("fr", "navigation globale, menu, menu principal, en-tête, pied de page, barre latérale, fil d'Ariane, formulaire de recherche, filtre de recherche, pagination, menu d'administration, menu rapide, sous-menu, menu des catégories, menu des paramètres, connexion, déconnexion, paramètres, mon compte, avis, bannière, droits d'auteur, tableau de bord, page d'administration, page administrateur, accueil, bienvenue, nom du site"),
+    ("ja", "グローバルナビゲーション, メニュー, メインメニュー, ヘッダー, フッター, サイドバー, パンくずリスト, 検索フォーム, 検索フィルター, ページネーション, 管理メニュー, クイックメニュー, サブメニュー, カテゴリーメニュー, 設定メニュー, ログイン, ログアウト, 設定, マイページ, お知らせ, バナー, 著作権, ダッシュボード, 管理画面, 管理者ページ, ホーム, ようこそ, サイト名"),
+    ("pt", "navegação global, menu, menu principal, cabeçalho, rodapé, barra lateral, trilha de navegação, formulário de pesquisa, filtro de pesquisa, paginação, menu de administração, menu rápido, submenu, menu de categorias, menu de configurações, entrar, sair, configurações, minha página, aviso, banner, direitos autorais, painel de controle, página de administração, página do administrador, início, bem-vindo, nome do site"),
+    ("ar", "التنقل العام, القائمة, القائمة الرئيسية, الترويسة, التذييل, الشريط الجانبي, مسار التنقل, نموذج البحث, مرشح البحث, ترقيم الصفحات, قائمة الإدارة, القائمة السريعة, القائمة الفرعية, قائمة الفئات, قائمة الإعدادات, تسجيل الدخول, تسجيل الخروج, الإعدادات, صفحتي, إشعار, لافتة, حقوق النشر, لوحة التحكم, صفحة الإدارة, صفحة المسؤول, الصفحة الرئيسية, مرحبا, اسم الموقع"),
+    ("cs", "globální navigace, menu, hlavní menu, záhlaví, zápatí, postranní panel, drobečková navigace, vyhledávací formulář, filtr vyhledávání, stránkování, administrační menu, rychlé menu, podmenu, menu kategorií, menu nastavení, přihlásit, odhlásit, nastavení, moje stránka, oznámení, banner, autorská práva, nástěnka, administrační stránka, stránka správce, domů, vítejte, název webu"),
+    ("it", "navigazione globale, menu, menu principale, intestazione, piè di pagina, barra laterale, breadcrumb, modulo di ricerca, filtro di ricerca, paginazione, menu di amministrazione, menu rapido, sottomenu, menu categorie, menu impostazioni, accedi, esci, impostazioni, la mia pagina, avviso, banner, copyright, pannello di controllo, pagina di amministrazione, pagina amministratore, home, benvenuto, nome del sito"),
+    ("ko", "전체 메뉴, 메뉴, 메인 메뉴, 헤더, 푸터, 사이드바, 경로 탐색, 검색 폼, 검색 필터, 페이지 이동, 관리자 메뉴, 퀵 메뉴, 서브 메뉴, 카테고리 메뉴, 설정 메뉴, 로그인, 로그아웃, 설정, 마이페이지, 공지사항, 배너, 저작권, 대시보드, 관리자 페이지, 관리 페이지, 홈, 환영합니다, 사이트명"),
+    ("nl", "globale navigatie, menu, hoofdmenu, koptekst, voettekst, zijbalk, kruimelpad, zoekformulier, zoekfilter, paginering, beheermenu, snelmenu, submenu, categoriemenu, instellingenmenu, inloggen, uitloggen, instellingen, mijn pagina, mededeling, banner, auteursrecht, dashboard, beheerpagina, beheerderspagina, home, welkom, sitenaam"),
+    ("zh", "全局导航, 菜单, 主菜单, 页眉, 页脚, 侧边栏, 面包屑导航, 搜索表单, 搜索筛选, 分页, 管理菜单, 快捷菜单, 子菜单, 分类菜单, 设置菜单, 登录, 退出登录, 设置, 我的页面, 公告, 横幅, 版权, 仪表盘, 管理页面, 管理员页面, 首页, 欢迎, 站点名称"),
+];
+
+/// 문서 언어의 사이트 껍데기 문장. 영어이거나 표에 없는 언어면 None 입니다.
+pub fn site_chrome_sentence(lang: &str) -> Option<String> {
+    let key = lang.trim().to_lowercase();
+    let short = key.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
+    if short.is_empty() || short == "en" { return None; }
+    SITE_CHROME_ML
+        .iter()
+        .find(|(l, _)| *l == short)
+        .map(|(_, s)| s.to_string())
+}
+
 pub const UI_ACTION_ANCHOR: &str =
     "edit button, modify, update, delete, remove, copy, duplicate, register, add new, \
      save, cancel, confirm, submit, apply, reset, search button, view detail, go to detail, \
@@ -1965,18 +2010,17 @@ pub const SITE_CHROME_ANCHOR_ML: &str =
      网站名称, 商城名称, 品牌口号, 管理员页面, 管理菜单, 仪表盘, 导航栏, 页脚, 登录, 退出登录, 设置, 访客计数器, 欢迎信息, 搜索表单, 分页, \
      사이트명, 쇼핑몰명, 브랜드 슬로건, 관리자 페이지, 관리 메뉴, 대시보드, 내비게이션 바, 푸터, 로그인, 로그아웃, 설정, 방문자 카운터, 환영 메시지, 검색 폼, 페이지네이션";
 
-pub const UI_ACTION_ANCHOR_ML: &str =
-    "Bearbeiten, Ändern, Löschen, Kopieren, Registrieren, Neu hinzufügen, Speichern, Abbrechen, Bestätigen, Absenden, Zurücksetzen, Details anzeigen, Verwalten, Drucken, Herunterladen, Alle auswählen, Vorschau, Teilen, \
-     Modifier, Supprimer, Copier, Enregistrer, Ajouter, Sauvegarder, Annuler, Confirmer, Envoyer, Réinitialiser, Voir le détail, Gérer, Imprimer, Télécharger, Tout sélectionner, Aperçu, Partager, \
-     Editar, Modificar, Eliminar, Copiar, Registrar, Añadir, Guardar, Cancelar, Confirmar, Enviar, Restablecer, Ver detalle, Administrar, Imprimir, Descargar, Seleccionar todo, Vista previa, Compartir, \
-     Modifica, Elimina, Copia, Registra, Aggiungi, Salva, Annulla, Conferma, Invia, Reimposta, Vedi dettaglio, Gestisci, Stampa, Scarica, Seleziona tutto, Anteprima, Condividi, \
-     Excluir, Adicionar, Salvar, Redefinir, Ver detalhes, Gerenciar, Baixar, Selecionar tudo, Pré-visualizar, Compartilhar, \
-     Bewerken, Wijzigen, Verwijderen, Kopiëren, Registreren, Toevoegen, Opslaan, Annuleren, Bevestigen, Verzenden, Resetten, Details bekijken, Beheren, Afdrukken, Downloaden, Alles selecteren, Voorbeeld, Delen, \
-     Upravit, Změnit, Smazat, Kopírovat, Registrovat, Přidat, Uložit, Zrušit, Potvrdit, Odeslat, Obnovit, Zobrazit detail, Spravovat, Tisk, Stáhnout, Vybrat vše, Náhled, Sdílet, \
-     تعديل, تغيير, حذف, نسخ, تسجيل, إضافة, حفظ, إلغاء, تأكيد, إرسال, إعادة تعيين, عرض التفاصيل, إدارة, طباعة, تنزيل, تحديد الكل, معاينة, مشاركة, \
-     編集, 修正, 削除, コピー, 登録, 追加, 保存, キャンセル, 確認, 送信, リセット, 詳細を見る, 管理, 印刷, ダウンロード, すべて選択, プレビュー, 共有, \
-     编辑, 修改, 删除, 复制, 注册, 新增, 取消, 提交, 重置, 查看详情, 打印, 下载, 全选, 预览, 分享, \
-     수정, 편집, 삭제, 복사, 등록, 추가, 저장, 취소, 확인, 제출, 초기화, 상세보기, 관리, 인쇄, 다운로드, 전체선택, 미리보기, 공유";
+pub const UI_ACTION_ANCHOR_ML: &str = "löschen, bearbeiten, ändern, Details anzeigen, mehr anzeigen, auswählen, bestätigen, abbrechen, speichern, anwenden, herunterladen, drucken, kopieren, teilen, in den Warenkorb, jetzt kaufen, bestellen, zur Kasse, schließen, öffnen, erweitern, einklappen, zurück, weiter, suchen, zurücksetzen, senden, hochladen, registrieren, \
+eliminar, editar, modificar, ver detalles, ver más, seleccionar, confirmar, cancelar, guardar, aplicar, descargar, imprimir, copiar, compartir, añadir al carrito, comprar ahora, pedir, pagar, cerrar, abrir, expandir, contraer, anterior, siguiente, buscar, restablecer, enviar, subir, registrarse, \
+supprimer, modifier, éditer, voir les détails, voir plus, sélectionner, confirmer, annuler, enregistrer, appliquer, télécharger, imprimer, copier, partager, ajouter au panier, acheter maintenant, commander, payer, fermer, ouvrir, développer, réduire, précédent, suivant, rechercher, réinitialiser, envoyer, téléverser, s'inscrire, \
+削除, 編集, 修正, 詳細を見る, もっと見る, 選択, 確認, キャンセル, 保存, 適用, ダウンロード, 印刷, コピー, 共有, カートに入れる, 今すぐ購入, 注文する, 購入手続き, 閉じる, 開く, 展開, 折りたたむ, 前へ, 次へ, 検索, リセット, 送信, アップロード, 会員登録, \
+excluir, editar, modificar, ver detalhes, ver mais, selecionar, confirmar, cancelar, salvar, aplicar, baixar, imprimir, copiar, compartilhar, adicionar ao carrinho, comprar agora, pedir, finalizar compra, fechar, abrir, expandir, recolher, anterior, próximo, buscar, redefinir, enviar, carregar, cadastrar, \
+حذف, تعديل, تحرير, عرض التفاصيل, عرض المزيد, اختيار, تأكيد, إلغاء, حفظ, تطبيق, تنزيل, طباعة, نسخ, مشاركة, أضف إلى السلة, اشتر الآن, اطلب, الدفع, إغلاق, فتح, توسيع, طي, السابق, التالي, بحث, إعادة تعيين, إرسال, رفع, تسجيل, \
+smazat, upravit, změnit, zobrazit detail, zobrazit více, vybrat, potvrdit, zrušit, uložit, použít, stáhnout, tisk, kopírovat, sdílet, přidat do košíku, koupit nyní, objednat, pokladna, zavřít, otevřít, rozbalit, sbalit, předchozí, další, hledat, obnovit, odeslat, nahrát, registrovat, \
+elimina, modifica, aggiorna, vedi dettagli, mostra altro, seleziona, conferma, annulla, salva, applica, scarica, stampa, copia, condividi, aggiungi al carrello, acquista ora, ordina, procedi all'acquisto, chiudi, apri, espandi, comprimi, precedente, successivo, cerca, reimposta, invia, carica, registrati, \
+삭제, 수정, 변경, 상세보기, 더보기, 선택, 확인, 취소, 저장, 적용, 다운로드, 인쇄, 복사, 공유, 장바구니 담기, 바로 구매, 주문하기, 결제하기, 닫기, 열기, 펼치기, 접기, 이전, 다음, 검색, 초기화, 전송, 업로드, 회원가입, \
+verwijderen, bewerken, wijzigen, details bekijken, meer bekijken, selecteren, bevestigen, annuleren, opslaan, toepassen, downloaden, afdrukken, kopiëren, delen, in winkelwagen, nu kopen, bestellen, afrekenen, sluiten, openen, uitklappen, inklappen, vorige, volgende, zoeken, resetten, verzenden, uploaden, registreren, \
+删除, 编辑, 修改, 查看详情, 查看更多, 选择, 确认, 取消, 保存, 应用, 下载, 打印, 复制, 分享, 加入购物车, 立即购买, 下单, 结算, 关闭, 打开, 展开, 收起, 上一页, 下一页, 搜索, 重置, 提交, 上传, 注册";
 
 pub const DECLARATION_BOILERPLATE_ANCHOR: &str =
     "I declare all the information contained in this invoice to be true and correct, \
@@ -2018,6 +2062,130 @@ pub const HANDLING_INSTRUCTION_ANCHOR_ML: &str =
      小心轻放, 易碎品, 此面向上, 保持干燥, 避免受热, 禁止堆叠, 严禁摔落, 阴凉干燥处存放, 不允许分批装运, 不允许转运, \
      취급주의, 파손주의, 천지무용, 습기엄금, 직사광선 피함, 적재금지, 낙하엄금, 서늘하고 건조한 곳 보관, 분할선적 불가, 환적 불가";
 
+pub const TRADE_DOC_TITLES_ML: &[(&str, &str)] = &[
+    ("BL", "Konnossement"), ("BL", "conocimiento de embarque"), ("BL", "connaissement"),
+    ("BL", "polizza di carico"), ("BL", "conhecimento de embarque"), ("BL", "cognossement"),
+    ("BL", "konosament"), ("BL", "بوليصة الشحن"), ("BL", "선하증권"), ("BL", "船荷証券"),
+    ("BL", "提单"), ("BL", "提單"),
+    ("AWB", "Luftfrachtbrief"), ("AWB", "guía aérea"), ("AWB", "lettre de transport aérien"),
+    ("AWB", "lettera di vettura aerea"), ("AWB", "conhecimento aéreo"), ("AWB", "luchtvrachtbrief"),
+    ("AWB", "letecký nákladní list"), ("AWB", "بوليصة الشحن الجوي"), ("AWB", "항공화물운송장"),
+    ("AWB", "航空貨物運送状"), ("AWB", "航空运单"),
+    ("CI", "Handelsrechnung"), ("CI", "factura comercial"), ("CI", "facture commerciale"),
+    ("CI", "fattura commerciale"), ("CI", "fatura comercial"), ("CI", "handelsfactuur"),
+    ("CI", "obchodní faktura"), ("CI", "فاتورة تجارية"), ("CI", "상업송장"), ("CI", "커머셜 인보이스"),
+    ("CI", "商業送り状"), ("CI", "コマーシャルインボイス"), ("CI", "商业发票"),
+    ("PL", "Packliste"), ("PL", "lista de empaque"), ("PL", "liste de colisage"),
+    ("PL", "distinta di imballaggio"), ("PL", "lista de embalagem"), ("PL", "romaneio"),
+    ("PL", "paklijst"), ("PL", "balicí list"), ("PL", "قائمة التعبئة"), ("PL", "포장명세서"),
+    ("PL", "梱包明細書"), ("PL", "パッキングリスト"), ("PL", "装箱单"),
+    ("PO", "Bestellung"), ("PO", "orden de compra"), ("PO", "ordem de compra"), ("PO", "bon de commande"),
+    ("PO", "ordine di acquisto"), ("PO", "pedido de compra"), ("PO", "inkooporder"),
+    ("PO", "objednávka"), ("PO", "أمر الشراء"), ("PO", "구매주문서"), ("PO", "발주서"),
+    ("PO", "注文書"), ("PO", "発注書"), ("PO", "采购订单"),
+    ("PI", "Proformarechnung"), ("PI", "factura proforma"), ("PI", "facture pro forma"),
+    ("PI", "facture proforma"), ("PI", "fattura proforma"), ("PI", "fatura proforma"),
+    ("PI", "proformafactuur"), ("PI", "proforma faktura"), ("PI", "فاتورة مبدئية"),
+    ("PI", "견적송장"), ("PI", "프로포마 인보이스"), ("PI", "見積送り状"),
+    ("PI", "プロフォーマインボイス"), ("PI", "形式发票"),
+    ("SC", "Kaufvertrag"), ("SC", "contrato de compraventa"), ("SC", "contrat de vente"),
+    ("SC", "contratto di vendita"), ("SC", "contrato de venda"), ("SC", "koopovereenkomst"),
+    ("SC", "kupní smlouva"), ("SC", "عقد البيع"), ("SC", "매매계약서"), ("SC", "売買契約書"),
+    ("SC", "销售合同"),
+    ("LC", "Akkreditiv"), ("LC", "carta de crédito"), ("LC", "lettre de crédit"),
+    ("LC", "lettera di credito"), ("LC", "kredietbrief"), ("LC", "akreditiv"),
+    ("LC", "خطاب اعتماد"), ("LC", "신용장"), ("LC", "信用状"), ("LC", "信用证"),
+    ("CO", "Ursprungszeugnis"), ("CO", "certificado de origen"), ("CO", "certificat d'origine"),
+    ("CO", "certificato di origine"), ("CO", "certificado de origem"), ("CO", "certificaat van oorsprong"),
+    ("CO", "osvědčení o původu"), ("CO", "شهادة المنشأ"), ("CO", "원산지증명"),
+    ("CO", "原産地証明書"), ("CO", "原产地证书"),
+    ("ED", "Ausfuhranmeldung"), ("ED", "declaración de exportación"), ("ED", "déclaration d'exportation"),
+    ("ED", "dichiarazione di esportazione"), ("ED", "declaração de exportação"), ("ED", "uitvoeraangifte"),
+    ("ED", "vývozní prohlášení"), ("ED", "بيان التصدير"), ("ED", "수출신고"),
+    ("ED", "輸出申告"), ("ED", "出口报关"),
+    ("ID", "Einfuhranmeldung"), ("ID", "declaración de importación"), ("ID", "déclaration d'importation"),
+    ("ID", "dichiarazione di importazione"), ("ID", "declaração de importação"), ("ID", "invoeraangifte"),
+    ("ID", "dovozní prohlášení"), ("ID", "بيان الاستيراد"), ("ID", "수입신고"),
+    ("ID", "輸入申告"), ("ID", "进口报关"),
+];
+
+/// 🌟 [TRADE DOC TITLES / 12 LANGUAGES]
+///  키: TRADE_DOC_TITLES 의 영문 전문 (대소문자·구두점·공백 무시)
+///  값: 쉼표로 나눈 11개 언어 전문
+///  ai_utils::all_trade_doc_titles 가 영문 전문으로 코드를 찾아 붙입니다.
+///  키가 TRADE_DOC_TITLES 와 맞지 않는 항목은 [ML TABLE ORPHANS] 로그에 나타납니다.
+pub const TRADE_DOC_TITLES_ML_FULL: &[(&str, &str)] = &[
+    ("Commercial Invoice", "Handelsrechnung, Factura comercial, Facture commerciale, 商業送り状, コマーシャルインボイス, Fatura comercial, فاتورة تجارية, Obchodní faktura, Fattura commerciale, 상업송장, Handelsfactuur, 商业发票"),
+    ("Proforma Invoice", "Proformarechnung, Factura proforma, Facture pro forma, プロフォーマインボイス, 見積送り状, Fatura pró-forma, فاتورة مبدئية, Proforma faktura, Fattura proforma, 견적송장, Pro-formafactuur, 形式发票"),
+    ("Customs Invoice", "Zollrechnung, Factura de aduana, Facture douanière, 税関送り状, Fatura aduaneira, فاتورة جمركية, Celní faktura, Fattura doganale, 세관송장, Douanefactuur, 海关发票"),
+    ("Packing List", "Packliste, Lista de empaque, Liste de colisage, 梱包明細書, パッキングリスト, Lista de embalagem, Romaneio, قائمة التعبئة, Balicí list, Lista di imballaggio, 포장명세서, Paklijst, 装箱单"),
+    ("Bill of Lading", "Konnossement, Conocimiento de embarque, Connaissement, 船荷証券, Conhecimento de embarque, بوليصة الشحن, Konosament, Polizza di carico, 선하증권, Cognossement, 提单"),
+    ("House Bill of Lading", "House-Konnossement, Conocimiento de embarque house, Connaissement house, ハウス船荷証券, Conhecimento de embarque house, بوليصة شحن فرعية, House konosament, Polizza di carico house, 하우스 선하증권, House cognossement, 货代提单"),
+    ("Master Bill of Lading", "Master-Konnossement, Conocimiento de embarque master, Connaissement master, マスター船荷証券, Conhecimento de embarque master, بوليصة الشحن الرئيسية, Master konosament, Polizza di carico master, 마스터 선하증권, Master cognossement, 船东提单"),
+    ("Sea Waybill", "Seefrachtbrief, Carta de porte marítimo, Lettre de transport maritime, 海上運送状, بيان الشحن البحري, Námořní nákladní list, Lettera di vettura marittima, 해상화물운송장, Zeevrachtbrief, 海运单"),
+    ("Air Waybill", "Luftfrachtbrief, Guía aérea, Conocimiento aéreo, Lettre de transport aérien, 航空運送状, エアウェイビル, Conhecimento aéreo, بوليصة الشحن الجوي, Letecký nákladní list, Lettera di vettura aerea, 항공화물운송장, Luchtvrachtbrief, 航空运单"),
+    ("House Air Waybill", "House-Luftfrachtbrief, Guía aérea house, Lettre de transport aérien house, ハウスエアウェイビル, Conhecimento aéreo house, بوليصة شحن جوي فرعية, House letecký nákladní list, Lettera di vettura aerea house, 하우스 항공화물운송장, House luchtvrachtbrief, 货代航空运单"),
+    ("Master Air Waybill", "Master-Luftfrachtbrief, Guía aérea master, Lettre de transport aérien master, マスターエアウェイビル, Conhecimento aéreo master, بوليصة الشحن الجوي الرئيسية, Master letecký nákladní list, Lettera di vettura aerea master, 마스터 항공화물운송장, Master luchtvrachtbrief, 主航空运单"),
+    ("Certificate of Origin", "Ursprungszeugnis, Certificado de origen, Certificat d'origine, 原産地証明書, Certificado de origem, شهادة المنشأ, Osvědčení o původu, Certificato di origine, 원산지증명서, Certificaat van oorsprong, 原产地证书"),
+    ("Letter of Credit", "Akkreditiv, Carta de crédito, Lettre de crédit, Crédit documentaire, 信用状, خطاب اعتماد, Akreditiv, Lettera di credito, 신용장, Documentair krediet, 信用证"),
+    ("Import Declaration", "Einfuhranmeldung, Declaración de importación, Déclaration d'importation, 輸入申告書, Declaração de importação, إقرار الاستيراد, Dovozní prohlášení, Dichiarazione di importazione, 수입신고서, Invoeraangifte, 进口报关单"),
+    ("Export Declaration", "Ausfuhranmeldung, Declaración de exportación, Déclaration d'exportation, 輸出申告書, Declaração de exportação, إقرار التصدير, Vývozní prohlášení, Dichiarazione di esportazione, 수출신고서, Uitvoeraangifte, 出口报关单"),
+    ("Purchase Order", "Bestellung, Kaufauftrag, Orden de compra, Bon de commande, 注文書, 発注書, Ordem de compra, Pedido de compra, أمر شراء, Objednávka, Ordine di acquisto, 구매주문서, 발주서, Inkooporder, 采购订单"),
+    ("Delivery Order", "Lieferauftrag, Auslieferungsauftrag, Orden de entrega, Ordre de livraison, 荷渡指図書, Ordem de entrega, أمر التسليم, Dodací příkaz, Ordine di consegna, 화물인도지시서, Afleveringsorder, 提货单"),
+    ("Arrival Notice", "Ankunftsanzeige, Aviso de llegada, Avis d'arrivée, 貨物到着案内, アライバルノーティス, Aviso de chegada, إشعار الوصول, Oznámení o příjezdu, Avviso di arrivo, 화물도착통지서, Aankomstbericht, 到货通知"),
+    ("Booking Confirmation", "Buchungsbestätigung, Confirmación de reserva, Confirmation de réservation, ブッキング確認書, Confirmação de reserva, تأكيد الحجز, Potvrzení rezervace, Conferma di prenotazione, 부킹확인서, 선적예약확인서, Boekingsbevestiging, 订舱确认书"),
+    ("Shipping Instruction", "Versandanweisung, Instrucciones de embarque, Instructions d'expédition, 船積指図書, Instruções de embarque, تعليمات الشحن, Přepravní instrukce, Istruzioni di spedizione, 선적지시서, Verschepingsinstructie, 装船指示"),
+    ("Freight Invoice", "Frachtrechnung, Factura de flete, Facture de fret, 運賃請求書, Fatura de frete, فاتورة الشحن, Faktura za přepravu, Fattura di trasporto, 운임청구서, Vrachtfactuur, 运费发票"),
+    ("Tax Invoice", "Steuerrechnung, Factura fiscal, Facture fiscale, 適格請求書, 税務請求書, Nota fiscal, فاتورة ضريبية, Daňový doklad, Fattura fiscale, 세금계산서, Btw-factuur, 税务发票"),
+    ("Debit Note", "Belastungsanzeige, Lastschriftanzeige, Nota de débito, Note de débit, デビットノート, 借方票, إشعار مدين, Vrubopis, Nota di addebito, 차변전표, Debetnota, 借记单"),
+    ("Credit Note", "Gutschrift, Nota de crédito, Note de crédit, Facture d'avoir, クレジットノート, 貸方票, إشعار دائن, Dobropis, Nota di credito, 대변전표, Creditnota, 贷记单"),
+    ("Weight Certificate", "Gewichtsbescheinigung, Certificado de peso, Certificat de poids, 重量証明書, شهادة الوزن, Vážní list, Certificato di peso, 중량증명서, Gewichtscertificaat, 重量证明"),
+    ("Verified Gross Mass", "Verifizierte Bruttomasse, Masa bruta verificada, Masse brute vérifiée, コンテナ総重量証明, Massa bruta verificada, الكتلة الإجمالية المتحقق منها, Ověřená hrubá hmotnost, Massa lorda verificata, 검증총중량, Geverifieerde brutomassa, 核实总重"),
+    ("Dangerous Goods Declaration", "Gefahrguterklärung, Declaración de mercancías peligrosas, Déclaration de marchandises dangereuses, 危険物申告書, Declaração de mercadorias perigosas, إقرار البضائع الخطرة, Prohlášení o nebezpečném zboží, Dichiarazione merci pericolose, 위험물신고서, Verklaring gevaarlijke goederen, 危险品申报单"),
+    ("Insurance Policy", "Versicherungspolice, Póliza de seguro, Police d'assurance, 保険証券, Apólice de seguro, بوليصة التأمين, Pojistná smlouva, Polizza di assicurazione, 보험증권, Verzekeringspolis, 保险单"),
+    ("Insurance Certificate", "Versicherungszertifikat, Certificado de seguro, Certificat d'assurance, 保険証明書, شهادة التأمين, Pojistný certifikát, Certificato di assicurazione, 보험증명서, Verzekeringscertificaat, 保险证明"),
+    ("Certificate of Analysis", "Analysenzertifikat, Certificado de análisis, Certificat d'analyse, 分析証明書, Certificado de análise, شهادة التحليل, Certifikát analýzy, Certificato di analisi, 성분분석증명서, Analysecertificaat, 分析证书"),
+    ("Certificate of Conformity", "Konformitätsbescheinigung, Certificado de conformidad, Certificat de conformité, 適合証明書, Certificado de conformidade, شهادة المطابقة, Certifikát shody, Certificato di conformità, 적합성증명서, Conformiteitscertificaat, 合格证书"),
+    ("Phytosanitary Certificate", "Pflanzengesundheitszeugnis, Certificado fitosanitario, Certificat phytosanitaire, 植物検疫証明書, Certificado fitossanitário, شهادة الصحة النباتية, Rostlinolékařské osvědčení, Certificato fitosanitario, 식물검역증명서, Fytosanitair certificaat, 植物检疫证书"),
+    ("Health Certificate", "Gesundheitszeugnis, Certificado sanitario, Certificat sanitaire, 衛生証明書, Certificado sanitário, شهادة صحية, Zdravotní osvědčení, Certificato sanitario, 위생증명서, Gezondheidscertificaat, 卫生证书"),
+    ("Fumigation Certificate", "Begasungszertifikat, Certificado de fumigación, Certificat de fumigation, 燻蒸証明書, Certificado de fumigação, شهادة التبخير, Certifikát o fumigaci, Certificato di fumigazione, 훈증증명서, Fumigatiecertificaat, 熏蒸证书"),
+    ("Inspection Report", "Inspektionsbericht, Prüfbericht, Informe de inspección, Rapport d'inspection, 検査報告書, Relatório de inspeção, تقرير التفتيش, Inspekční zpráva, Rapporto di ispezione, 검사보고서, Inspectierapport, 检验报告"),
+    ("Inspection Certificate", "Inspektionszertifikat, Certificado de inspección, Certificat d'inspection, 検査証明書, Certificado de inspeção, شهادة التفتيش, Inspekční certifikát, Certificato di ispezione, 검사증명서, Inspectiecertificaat, 检验证书"),
+    ("Sales Contract", "Kaufvertrag, Contrato de compraventa, Contrat de vente, 売買契約書, Contrato de venda, عقد البيع, Kupní smlouva, Contratto di vendita, 매매계약서, Koopovereenkomst, 销售合同"),
+    ("Mate's Receipt", "Bordempfangsschein, Recibo del primer oficial, Reçu de bord, 本船受取証, Recibo de bordo, إيصال الضابط الأول, Lodní potvrzenka, Ricevuta di bordo, 본선수취증, Stuurmansreçu, 大副收据"),
+    ("Warehouse Receipt", "Lagerschein, Recibo de almacén, Récépissé d'entrepôt, 倉庫証券, Recibo de armazém, إيصال المستودع, Skladištní list, Ricevuta di magazzino, 창고증권, Opslagbewijs, 仓单"),
+    ("Equipment Interchange Receipt", "Containerübergabeschein, Recibo de intercambio de equipo, Reçu d'échange d'équipement, 機器受渡証, Recibo de intercâmbio de equipamento, إيصال تبادل المعدات, Předávací protokol kontejneru, Ricevuta di interscambio container, 기기인수도증, Containerwisselbewijs, 设备交接单"),
+    ("Proof of Delivery", "Liefernachweis, Zustellnachweis, Comprobante de entrega, Preuve de livraison, 配達証明, Comprovante de entrega, إثبات التسليم, Doklad o doručení, Prova di consegna, 배송완료증명, Afleverbewijs, 签收单"),
+    ("CMR Consignment Note", "CMR-Frachtbrief, Carta de porte CMR, Lettre de voiture CMR, CMR運送状, بوليصة شحن CMR, Nákladní list CMR, Lettera di vettura CMR, 국제도로화물운송장, CMR-vrachtbrief, 国际公路运单"),
+    ("Rail Waybill", "Eisenbahnfrachtbrief, Carta de porte ferroviario, Lettre de voiture ferroviaire, 鉄道運送状, Carta de porte ferroviário, بوليصة الشحن بالسكك الحديدية, Železniční nákladní list, Lettera di vettura ferroviaria, 철도화물운송장, Spoorvrachtbrief, 铁路运单"),
+    ("Forwarder's Cargo Receipt", "Spediteurübernahmebescheinigung, Recibo de carga del transitario, Récépissé de transitaire, 貨物受取証, Recibo de carga do transitário, إيصال استلام البضائع من وكيل الشحن, Potvrzení zasílatele o převzetí, Ricevuta di carico dello spedizioniere, 운송주선인 화물수취증, Expediteursontvangstbewijs, 货代收货证明"),
+    ("Bill of Exchange", "Wechsel, Letra de cambio, Lettre de change, 為替手形, Letra de câmbio, كمبيالة, Směnka, Cambiale, 환어음, Wisselbrief, 汇票"),
+    ("Quotation", "Angebot, Cotización, Devis commercial, Offre de prix, 見積書, Cotação, Orçamento, عرض سعر, Cenová nabídka, Preventivo, 견적서, Offerte, 报价单"),
+    ("Order Confirmation", "Auftragsbestätigung, Confirmación de pedido, Confirmation de commande, 注文確認書, Confirmação de pedido, تأكيد الطلب, Potvrzení objednávky, Conferma d'ordine, 주문확인서, Orderbevestiging, 订单确认"),
+    ("Delivery Note", "Lieferschein, Albarán, Nota de entrega, Bon de livraison, 納品書, مذكرة التسليم, Dodací list, Bolla di consegna, Documento di trasporto, 납품서, Pakbon, 送货单"),
+    ("Cargo Manifest", "Ladungsmanifest, Manifiesto de carga, Manifeste de cargaison, 積荷目録, Manifesto de carga, بيان الشحنة, Manifest nákladu, Manifesto di carico, 적하목록, Ladingmanifest, 载货清单"),
+    ("Shipping Bill", "Ausfuhrschein, Póliza de exportación, Déclaration d'expédition, 船積申告書, Guia de exportação, بوليصة الشحن الجمركية, Vývozní celní doklad, Bolletta di esportazione, 선적신고서, Uitvoerdocument, 出口装运单"),
+    ("Bill of Entry", "Einfuhrschein, Declaración de entrada, Déclaration d'entrée, 輸入申告, Declaração de entrada, بيان الدخول الجمركي, Celní prohlášení, Bolletta doganale, 수입통관신고서, Invoerdocument, 进口报关单"),
+    ("Remittance Advice", "Zahlungsavis, Aviso de remesa, Avis de paiement, 送金通知書, Aviso de remessa, إشعار التحويل, Avízo o platbě, Avviso di pagamento, 송금통지서, Betalingsadvies, 汇款通知"),
+    ("Payment Receipt", "Zahlungsbeleg, Quittung, Recibo de pago, Reçu de paiement, 領収書, Recibo de pagamento, إيصال الدفع, Doklad o zaplacení, Ricevuta di pagamento, 영수증, Betalingsbewijs, 付款收据"),
+    ("Bank Guarantee", "Bankgarantie, Garantía bancaria, Garantie bancaire, 銀行保証状, Garantia bancária, ضمان بنكي, Bankovní záruka, Garanzia bancaria, 은행보증서, 银行保函"),
+    ("Statement of Account", "Kontoauszug, Estado de cuenta, Relevé de compte, 取引明細書, Extrato de conta, كشف حساب, Výpis z účtu, Estratto conto, 거래명세서, Rekeningoverzicht, 对账单"),
+    ("Survey Report", "Havariebericht, Schadensgutachten, Informe de peritaje, Rapport d'expertise, 鑑定報告書, Laudo de vistoria, تقرير المعاينة, Znalecký posudek, Perizia, 검정보고서, Expertiserapport, 鉴定报告"),
+];
+
+/// 🌟 [TRADE GROUPS / 12 LANGUAGES]
+///  키: TRADE_GROUP_CODES 의 그룹명. 값: 그 그룹의 '개념' 구 (서식 전문이 아니라 서류 부류를 부르는 말).
+///  그룹 뱅크의 서식 전문은 소속 코드의 전문(위 표 포함)에서 자동으로 모이므로 여기엔 부류 명칭만 둡니다.
+pub const TRADE_GROUPS_ML: &[(&str, &str)] = &[
+    ("shipping", "Transportdokument, Frachtpapiere, documento de transporte, documentos de embarque, document de transport, titre de transport, 運送書類, 船積書類, documento de transporte, documentos de embarque, مستندات النقل, مستندات الشحن, přepravní doklad, přepravní dokumenty, documento di trasporto, documenti di spedizione, 운송서류, 선적서류, vervoersdocument, transportdocumenten, 运输单据, 装运单据"),
+    ("commercial", "Handelsdokument, Handelspapiere, documento comercial, document commercial, 商業書類, 商取引書類, documento comercial, مستندات تجارية, obchodní doklad, documento commerciale, 상업서류, handelsdocument, 商业单据"),
+    ("customs", "Zolldokument, Zollpapiere, documento aduanero, document douanier, 通関書類, 税関書類, documento aduaneiro, مستندات جمركية, celní doklad, documento doganale, 통관서류, douanedocument, 报关单据, 海关单证"),
+    ("settlement", "Zahlungsdokument, Finanzdokument, documento de pago, documento financiero, document de paiement, document financier, 決済書類, 金融書類, documento de pagamento, documento financeiro, مستندات الدفع, مستندات مالية, platební doklad, finanční doklad, documento di pagamento, documento finanziario, 결제서류, 금융서류, betalingsdocument, financieel document, 结算单据, 金融单据"),
+    ("insurance", "Versicherungsdokument, documento de seguro, document d'assurance, 保険書類, documento de seguro, مستندات التأمين, pojistný doklad, documento assicurativo, 보험서류, verzekeringsdocument, 保险单据"),
+    ("inspection", "Prüfzertifikat, Bescheinigung, Zeugnis, certificado, informe de inspección, certificat, attestation, 証明書, 検査書類, certificado, atestado, شهادة, مستندات الفحص, osvědčení, certifikát, certificato, attestato, 증명서, 검사서류, certificaat, keuringsdocument, 证书, 检验单据"),
+    ("contract", "Vertrag, Bestellunterlagen, contrato, documentos de pedido, contrat, documents de commande, 契約書, 注文書類, contrato, documentos de pedido, عقد, مستندات الطلب, smlouva, objednávkové doklady, contratto, documenti d'ordine, 계약서, 주문서류, contract, orderdocumenten, 合同, 订单单据"),
+];
+
 pub fn anchor_phrases(en: &str, ml: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in [en, ml] {
@@ -2036,7 +2204,7 @@ pub fn trade_title_pairs() -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> = Vec::new();
     for (code, title) in TRADE_DOC_TITLES
         .iter()
-        .chain(crate::utils::ai_utils::TRADE_DOC_TITLES_ML.iter())
+        .chain(TRADE_DOC_TITLES_ML.iter())
     {
         let t = title.trim();
         if t.is_empty() { continue; }
