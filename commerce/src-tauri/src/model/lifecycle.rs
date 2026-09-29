@@ -835,10 +835,7 @@ impl LogisModel {
             None => self.ensure_qwen3_5(false).await?,
         }
 
-        let mut gen_guard = self.qwen3_5_generator.lock().await;
-        let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
-
-        let params = crate::openai_types::ChatCompletionParameters {
+        let make_params = || crate::openai_types::ChatCompletionParameters {
             messages: vec![
                 crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
                     content: "You respell each word of the source text into the target writing system by sound only. You never translate meaning. You process every word independently. Return strictly the requested JSON format.".to_string(),
@@ -853,7 +850,33 @@ impl LogisModel {
             ..Default::default()
         };
 
-        let res = gen.generate(params, cancel_token.clone(), None, None, None, None)
+        let lang_variant = crate::model::lang_llm::resident_variant();
+        let first = {
+            let mut gen_guard = self.qwen3_5_generator.lock().await;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
+            let r = gen.generate(make_params(), cancel_token.clone(), None, None, None, None).await;
+            let _ = gen.clear_kv_cache();
+            r
+        };
+        let err = match first {
+            Ok(res) => return Ok(res),
+            Err(e) => e,
+        };
+        let code = match lang_variant {
+            Some(code) => code,
+            None => return Err(anyhow::anyhow!("Qwen3.5 transliteration failed: {}", err)),
+        };
+        let why = format!("음차 생성 실패: {}", err);
+        crate::model::lang_llm::mark_runtime_failure(&code, &why);
+        println!(
+            "[TRANSLIT] ⚠️ Qwen3.5-4B-{} {} — 이번 세션 동안 음차는 Qwen3.5-2B 로 진행하고, 이번 호출도 2B 로 다시 수행합니다.",
+            code, why
+        );
+        self.ensure_qwen3_5(false).await?;
+
+        let mut gen_guard = self.qwen3_5_generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
+        let res = gen.generate(make_params(), cancel_token.clone(), None, None, None, None)
             .await
             .map_err(|e| anyhow::anyhow!("Qwen3.5 transliteration failed: {}", e))?;
         let _ = gen.clear_kv_cache();

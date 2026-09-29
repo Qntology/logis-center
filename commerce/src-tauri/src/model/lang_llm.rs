@@ -29,6 +29,7 @@ const CHUNK_TIMEOUT_SECS: u64 = 60;
 const FILE_ATTEMPTS: u32 = 4;
 const PROGRESS_STEP: u64 = 5;
 const PROGRESS_MIN_BYTES: u64 = 64 * 1024 * 1024;
+const CONVERT_LABEL: &str = "Q4_K_M 변환";
 
 const KNOWN_CODES: &[&str] = &[
     "afr", "asm", "ast", "aze", "bak", "bel", "ben", "bos", "bul", "cat", "ceb", "ces",
@@ -124,7 +125,7 @@ fn weight_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
-pub fn is_ready(code: &str) -> bool {
+pub fn files_ready(code: &str) -> bool {
     let dir = model_dir(code);
     if !dir.is_dir() {
         return false;
@@ -138,9 +139,19 @@ pub fn is_ready(code: &str) -> bool {
     weight_bytes(&dir) >= LANG_LLM_MIN_WEIGHT_BYTES
 }
 
+pub fn is_ready(code: &str) -> bool {
+    files_ready(code) && crate::model::lang_gguf::runtime_ready(&model_dir(code))
+}
+
 pub fn resident_estimate_mb(code: &str) -> u64 {
-    let bytes = weight_bytes(&model_dir(code));
-    ((bytes as f64 * LANG_LLM_RESIDENT_RATIO) / (1024.0 * 1024.0)).ceil() as u64
+    let dir = model_dir(code);
+    let runtime = crate::model::lang_gguf::runtime_bytes(&dir);
+    let bytes = if runtime > 0 {
+        runtime as f64
+    } else {
+        weight_bytes(&dir) as f64 * LANG_LLM_RESIDENT_RATIO
+    };
+    (bytes / (1024.0 * 1024.0)).ceil() as u64
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +403,7 @@ pub fn resolve_engine(
             state(code).phase
         };
         let st = state(code);
+        let converting = files_ready(code);
         let line = match phase {
             DlPhase::Unavailable => format!(
                 "🚫 [TRANSLIT ENGINE] {} 저장소에서 필수 파일을 받을 수 없습니다 ({}). 이 언어는 이번 세션 동안 Qwen3.5-2B + 발음 게이트로 음차합니다.",
@@ -404,6 +416,13 @@ pub fn resolve_engine(
                 st.error,
                 ((st.retry_at_ms - now_ms()).max(0) / 60_000) + 1
             ),
+            DlPhase::Downloading if st.file == CONVERT_LABEL && st.total > 0 => format!(
+                "🔧 [TRANSLIT ENGINE] {} 실행용 변환 {}% ({} / {}) — 변환하는 동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며, 끝나면 다음 캐시 미스부터 자동으로 4B 로 전환합니다.",
+                repo_id(code),
+                percent(st.done, st.total),
+                gb(st.done),
+                gb(st.total)
+            ),
             DlPhase::Downloading if st.total > 0 => format!(
                 "{} — 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며, 완료되면 다음 캐시 미스부터 자동으로 4B 로 전환합니다.",
                 progress_line(code, &st)
@@ -412,9 +431,18 @@ pub fn resolve_engine(
                 "✅ [TRANSLIT ENGINE] {} 파일 준비를 방금 마쳤습니다. 다음 태스크부터 4B 를 검토합니다.",
                 repo_id(code)
             ),
+            DlPhase::Absent if converting => format!(
+                "⚪ [TRANSLIT ENGINE] {} 파일은 받아 두었지만 실행용 변환(Q4_K_M GGUF)이 아직입니다. LLM 음차가 실제로 필요해지는 순간 백그라운드로 변환합니다. 지금은 Qwen3.5-2B + 발음 게이트로 진행합니다.",
+                repo_id(code)
+            ),
             DlPhase::Absent => format!(
                 "⚪ [TRANSLIT ENGINE] {} 은 아직 받지 않았습니다. 이 문서 언어는 라틴 문자라 LLM 음차가 드물어, LLM 음차가 실제로 필요해지는 순간 백그라운드로 받습니다. 지금은 Qwen3.5-2B + 발음 게이트로 진행합니다.",
                 repo_id(code)
+            ),
+            _ if converting => format!(
+                "🔧 [TRANSLIT ENGINE] {} 파일은 준비되어 있어 실행용 변환(Q4_K_M GGUF, 첫 준비에 한 번)을 백그라운드로 진행합니다. 저장 위치 {}. 그동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며 작업을 멈출 필요가 없습니다.",
+                repo_id(code),
+                crate::model::lang_gguf::runtime_dir(&model_dir(code)).display()
             ),
             _ => format!(
                 "📥 [TRANSLIT ENGINE] {} 가 설치되어 있지 않아 백그라운드 다운로드를 시작했습니다 (약 7.9GB · 저장 위치 {}). 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며 작업을 멈출 필요가 없습니다.",
@@ -428,7 +456,7 @@ pub fn resolve_engine(
         return (
             TranslitEngine::Base2B,
             format!(
-                "🔌 [TRANSLIT ENGINE] {} 파일은 준비되었지만 4B safetensors 런타임 로더가 아직 연결되지 않았습니다. 이번 태스크는 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                "🔌 [TRANSLIT ENGINE] {} 는 준비되었지만 Qwen3.5-4B 로더가 등록되지 않았습니다 (run() 의 register_loader). 이번 태스크는 Qwen3.5-2B + 발음 게이트로 음차합니다.",
                 repo_id(code)
             ),
         );
@@ -721,6 +749,10 @@ fn fail(code: &str, app: &tauri::AppHandle, task_id: &str, why: &str) {
 
 async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
     let dir = model_dir(code);
+    if files_ready(code) {
+        finish_repo(code, app, task_id).await;
+        return;
+    }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         fail(code, app, task_id, &format!("모델 폴더를 만들 수 없습니다: {}", e));
         return;
@@ -792,30 +824,130 @@ async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
             }
         }
     }
-    if is_ready(code) {
-        set_state(code, |s| {
-            s.phase = DlPhase::Ready;
-            s.error.clear();
-        });
-        publish(app, code);
-        let next = if loader().is_some() {
-            "다음 음차 캐시 미스부터 이 모델로 전환합니다."
-        } else {
-            "4B safetensors 런타임 로더가 연결되기 전까지는 Qwen3.5-2B + 발음 게이트로 진행합니다."
-        };
-        announce(
-            app,
-            task_id,
-            &format!(
-                "✅ [LANG-LLM] {} 다운로드·검증 완료 (가중치 {}). {}",
-                repo_id(code),
-                gb(weight_bytes(&dir)),
-                next
-            ),
-        );
-    } else {
+    if !files_ready(code) {
         fail(code, app, task_id, "필수 파일 또는 가중치 용량 검증에 실패했습니다");
+        return;
     }
+    finish_repo(code, app, task_id).await;
+}
+
+async fn finish_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
+    if !convert_runtime(code, app, task_id).await {
+        return;
+    }
+    let dir = model_dir(code);
+    set_state(code, |s| {
+        s.phase = DlPhase::Ready;
+        s.error.clear();
+    });
+    publish(app, code);
+    let next = if loader().is_some() {
+        "다음 음차 캐시 미스부터 이 모델로 전환합니다."
+    } else {
+        "Qwen3.5-4B 로더가 등록되기 전까지는 Qwen3.5-2B + 발음 게이트로 진행합니다."
+    };
+    announce(
+        app,
+        task_id,
+        &format!(
+            "✅ [LANG-LLM] {} 준비 완료 (원본 가중치 {} → 실행 파일 {}). {}",
+            repo_id(code),
+            gb(weight_bytes(&dir)),
+            gb(crate::model::lang_gguf::runtime_bytes(&dir)),
+            next
+        ),
+    );
+}
+
+async fn convert_runtime(code: &str, app: &tauri::AppHandle, task_id: &str) -> bool {
+    let dir = model_dir(code);
+    if crate::model::lang_gguf::runtime_ready(&dir) {
+        return true;
+    }
+    announce(
+        app,
+        task_id,
+        &format!(
+            "🔧 [LANG-LLM] {} 를 Qwen3.5 런타임이 읽는 GGUF(Q4_K_M 규칙)로 변환합니다. 저장 위치: {} | 원본 safetensors 는 그대로 두고 첫 준비에 한 번만 수행합니다. 그동안 음차는 Qwen3.5-2B + 발음 게이트로 계속 진행됩니다.",
+            repo_id(code),
+            crate::model::lang_gguf::runtime_dir(&dir).display()
+        ),
+    );
+    set_state(code, |s| {
+        s.phase = DlPhase::Downloading;
+        s.file = CONVERT_LABEL.to_string();
+        s.done = 0;
+        s.total = 0;
+        s.bytes_per_sec = 0.0;
+    });
+    publish(app, code);
+    let (c, a, t) = (code.to_string(), app.clone(), task_id.to_string());
+    let started = Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let next_mark = std::sync::atomic::AtomicU64::new(PROGRESS_STEP);
+        crate::model::lang_gguf::prepare(&model_dir(&c), &|done, total| {
+            let bps = done as f64 / started.elapsed().as_secs_f64().max(0.001);
+            set_state(&c, |s| {
+                s.done = done;
+                s.total = total;
+                s.bytes_per_sec = bps;
+            });
+            let pct = percent(done, total);
+            if total > 0 && pct >= next_mark.load(Ordering::SeqCst) {
+                next_mark.store((pct / PROGRESS_STEP) * PROGRESS_STEP + PROGRESS_STEP, Ordering::SeqCst);
+                announce(
+                    &a,
+                    &t,
+                    &format!(
+                        "🔧 [LANG-LLM] {} · {} {}% ({} / {}) · 남은 약 {}",
+                        repo_name(&c),
+                        CONVERT_LABEL,
+                        pct,
+                        gb(done),
+                        gb(total),
+                        eta(total.saturating_sub(done), bps)
+                    ),
+                );
+                publish(&a, &c);
+            }
+        })
+    })
+    .await;
+    let err = match joined {
+        Ok(Ok(_)) => {
+            announce(
+                app,
+                task_id,
+                &format!(
+                    "✅ [LANG-LLM] {} 변환 완료 ({} · {}초).",
+                    repo_name(code),
+                    gb(crate::model::lang_gguf::runtime_bytes(&dir)),
+                    started.elapsed().as_secs()
+                ),
+            );
+            return true;
+        }
+        Ok(Err(e)) => format!("{:#}", e),
+        Err(e) => e.to_string(),
+    };
+    let why = format!("Q4_K_M 변환 실패: {}", err);
+    mark_runtime_failure(code, &why);
+    set_state(code, |s| {
+        s.phase = DlPhase::Failed;
+        s.error = why.clone();
+        s.retry_at_ms = now_ms() + FAIL_RETRY_SECS * 1000;
+    });
+    publish(app, code);
+    announce(
+        app,
+        task_id,
+        &format!(
+            "⚠️ [LANG-LLM] {} {} — 받은 원본 파일은 그대로 두었습니다. 이번 세션 동안은 Qwen3.5-2B + 발음 게이트로 음차하고, 앱을 다시 시작하면 변환을 다시 시도합니다.",
+            repo_id(code),
+            why
+        ),
+    );
+    false
 }
 
 fn installed_codes() -> Vec<String> {
@@ -852,6 +984,9 @@ pub fn status_json(code: &str) -> Value {
         "dir": model_dir(code).to_string_lossy(),
         "phase": format!("{:?}", st.phase),
         "ready": is_ready(code),
+        "files_ready": files_ready(code),
+        "runtime_file": crate::model::lang_gguf::runtime_gguf(&model_dir(code)).to_string_lossy(),
+        "runtime_bytes": crate::model::lang_gguf::runtime_bytes(&model_dir(code)),
         "file": st.file,
         "done": st.done,
         "total": st.total,

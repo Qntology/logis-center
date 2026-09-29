@@ -5280,6 +5280,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    crate::model::lang_llm::register_loader(crate::model::lang_gguf::load_runtime);
     let model = Arc::new(TokioMutex::new(None));
     let store = Arc::new(TokioMutex::new(None));
     let cancellation_token = Arc::new(AtomicBool::new(false));
