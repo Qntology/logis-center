@@ -3416,7 +3416,14 @@ impl crate::model::LogisModel {
                             cond_start,
                             cond_end,
                             p.operator,
-                            format!("Exact period {} ~ {} (op={}, 연도명시={})", start, end, p.operator, p.year_explicit),
+                            if cond_start == start && cond_end == end {
+                                format!("Exact period {} ~ {} (op={}, 연도명시={})", start, end, p.operator, p.year_explicit)
+                            } else {
+                                format!(
+                                    "Exact period {} ~ {} (op={}, 연도명시={}, 계절 '{}' 적용 · 원래 {} ~ {})",
+                                    cond_start, cond_end, p.operator, p.year_explicit, verified_season, start, end
+                                )
+                            },
                         ))
                     }
                     None => crate::utils::time_guide::resolve_intent(

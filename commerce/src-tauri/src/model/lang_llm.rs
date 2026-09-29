@@ -30,6 +30,9 @@ const FILE_ATTEMPTS: u32 = 4;
 const PROGRESS_STEP: u64 = 5;
 const PROGRESS_MIN_BYTES: u64 = 64 * 1024 * 1024;
 const CONVERT_LABEL: &str = "Q4_K_M 변환";
+const WAIT_TICK_MS: u64 = 1000;
+const WAIT_HEARTBEAT_SECS: u64 = 30;
+const WAIT_RETRIES: u32 = 3;
 
 const KNOWN_CODES: &[&str] = &[
     "afr", "asm", "ast", "aze", "bak", "bel", "ben", "bos", "bul", "cat", "ceb", "ces",
@@ -75,14 +78,27 @@ const ISO1_TO_ALPHAEDGE: &[(&str, &str)] = &[
 
 pub fn alphaedge_code(doc_lang: &str) -> Option<&'static str> {
     let lower = doc_lang.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
     if let Some(c) = KNOWN_CODES.iter().find(|c| **c == lower.as_str()) {
         return Some(*c);
     }
     let base = lower.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
+    if let Some((_, code)) = ISO1_TO_ALPHAEDGE.iter().find(|(iso1, _)| *iso1 == base) {
+        return Some(*code);
+    }
+    let norm = crate::utils::bias_schema::lang_code_of(&lower);
+    let norm_base = norm.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
     ISO1_TO_ALPHAEDGE
         .iter()
-        .find(|(iso1, _)| *iso1 == base)
+        .find(|(iso1, _)| *iso1 == norm_base)
         .map(|(_, code)| *code)
+}
+
+pub fn needs_lang_engine(doc_lang: &str) -> bool {
+    alphaedge_code(doc_lang).is_some()
+        && !crate::nl_convert::is_latin_dominant(&crate::nl_convert::native_script_sample(doc_lang, "", ""))
 }
 
 pub fn repo_name(code: &str) -> String {
@@ -198,6 +214,7 @@ static QUEUE: Lazy<Mutex<VecDeque<(String, tauri::AppHandle, String)>>> =
 static WORKER: AtomicBool = AtomicBool::new(false);
 static RESIDENT: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static BOUND: Lazy<Mutex<Option<(String, usize)>>> = Lazy::new(|| Mutex::new(None));
+static WAITERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -478,14 +495,329 @@ pub fn lang_engine_available(doc_lang: &str) -> bool {
     }
 }
 
-fn announce(app: &tauri::AppHandle, task_id: &str, msg: &str) {
-    println!("{}", msg);
-    if !task_id.is_empty() {
-        let _ = app.emit(
-            "task-console-log",
-            json!({"task_id": task_id, "text": format!("{}\n", msg)}),
+pub fn engine_tag(doc_lang: &str) -> String {
+    match alphaedge_code(doc_lang) {
+        Some(c) if lang_engine_available(doc_lang) => format!("4B-{}", c),
+        _ => "2B".to_string(),
+    }
+}
+
+pub fn prefetch(doc_lang: &str, app: &tauri::AppHandle, task_id: &str) -> Option<String> {
+    if !needs_lang_engine(doc_lang) {
+        return None;
+    }
+    let code = alphaedge_code(doc_lang)?;
+    if runtime_failure(code).is_some() {
+        return None;
+    }
+    if is_ready(code) {
+        return Some(format!(
+            "🧠 [TRANSLIT ENGINE / PREFETCH] 문서 언어 '{}' 의 음차 엔진 {} 이 준비되어 있습니다. 음차 단계에서 바로 씁니다.",
+            doc_lang,
+            repo_id(code)
+        ));
+    }
+    let phase = request_download(code, app, task_id);
+    let st = state(code);
+    let line = match phase {
+        DlPhase::Queued => format!(
+            "📥 [TRANSLIT ENGINE / PREFETCH] 문서 언어 '{}' 의 음차 엔진 {} 이 아직 없어 지금부터 백그라운드로 받습니다 (저장 위치 {}). 추출은 그대로 진행하고, 음차 단계에 이르렀을 때 준비가 안 되어 있으면 그 자리에서 기다립니다.",
+            doc_lang,
+            repo_id(code),
+            model_dir(code).display()
+        ),
+        DlPhase::Downloading if st.file == CONVERT_LABEL => format!(
+            "🔧 [TRANSLIT ENGINE / PREFETCH] {} 실행용 변환이 진행 중입니다 ({}%). 음차 단계에서 끝날 때까지 기다립니다.",
+            repo_id(code),
+            percent(st.done, st.total)
+        ),
+        DlPhase::Downloading => format!(
+            "{} — 음차 단계에서 끝날 때까지 기다립니다.",
+            progress_line(code, &st)
+        ),
+        DlPhase::Failed => format!(
+            "⚠️ [TRANSLIT ENGINE / PREFETCH] {} 이전 다운로드가 실패했습니다 ({}). 음차 단계에서 받은 곳부터 다시 이어받습니다.",
+            repo_id(code),
+            st.error
+        ),
+        DlPhase::Unavailable => format!(
+            "🚫 [TRANSLIT ENGINE / PREFETCH] {} 저장소에서 필수 파일을 받을 수 없습니다 ({}). 이 언어는 이번 세션 동안 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+            repo_id(code),
+            st.error
+        ),
+        DlPhase::Ready | DlPhase::Absent => format!(
+            "⚪ [TRANSLIT ENGINE / PREFETCH] {} 상태 {:?}. 음차 단계에서 다시 확인합니다.",
+            repo_id(code),
+            phase
+        ),
+    };
+    Some(line)
+}
+
+pub fn translit_demand(item: &Value) -> usize {
+    fn skip_key(k: &str) -> bool {
+        let l = k.to_lowercase();
+        l == "id" || l == "link" || l == "index" || l == "type" || l == "detail" || l == "digest"
+            || l == "text" || l == "masked_text" || l == "mode" || l == "updated_at" || l == "created_at"
+            || l.contains("url") || l.contains("link") || l.contains("image")
+            || l.starts_with("rel_") || l.starts_with("reference_") || l.starts_with('_')
+            || l.contains("insight") || l.contains("summary") || l.contains("analysis")
+    }
+    fn walk(v: &Value, out: &mut usize) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m.iter() {
+                    if skip_key(k) {
+                        continue;
+                    }
+                    match x {
+                        Value::String(s) => {
+                            let t = s.trim();
+                            let n = t.chars().count();
+                            if n < 2 || n > 150 || t.contains("://") {
+                                continue;
+                            }
+                            let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+                            if digits * 2 >= n {
+                                continue;
+                            }
+                            let (_, latin) = crate::nl_convert::split_words_by_script(t);
+                            if latin.iter().any(|w| w.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2) {
+                                *out += 1;
+                            }
+                        }
+                        Value::Array(_) | Value::Object(_) => walk(x, out),
+                        _ => {}
+                    }
+                }
+            }
+            Value::Array(a) => {
+                for x in a.iter() {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut n = 0usize;
+    walk(item, &mut n);
+    n
+}
+
+pub async fn await_engine(
+    doc_lang: &str,
+    app: &tauri::AppHandle,
+    task_id: &str,
+    cancel: &std::sync::Arc<AtomicBool>,
+    demand: usize,
+) -> (TranslitEngine, String) {
+    if !needs_lang_engine(doc_lang) {
+        return resolve_engine(doc_lang, app, task_id, false);
+    }
+    let code = match alphaedge_code(doc_lang) {
+        Some(c) => c,
+        None => return resolve_engine(doc_lang, app, task_id, false),
+    };
+    if is_ready(code) || runtime_failure(code).is_some() {
+        return resolve_engine(doc_lang, app, task_id, true);
+    }
+    if demand == 0 {
+        let phase = request_download(code, app, task_id);
+        return (
+            TranslitEngine::Base2B,
+            format!(
+                "⚪ [TRANSLIT ENGINE / WAIT SKIP] 이 문서의 값에는 라틴 문자 단어가 없어 LLM 음차가 필요하지 않습니다. {} 은 백그라운드로 계속 받고({:?}) 이번 태스크는 기다리지 않습니다.",
+                repo_id(code),
+                phase
+            ),
         );
     }
+    let started = Instant::now();
+    let mut retries = 0u32;
+    let mut last_beat = Instant::now();
+    let _waiting = WaitGuard::new(task_id);
+    announce(
+        app,
+        task_id,
+        &format!(
+            "⏸️ [TRANSLIT ENGINE / WAIT] 음차 단계에 도달했지만 {} 이 아직 준비되지 않았습니다 (라틴 단어를 가진 값 {}개). 이 태스크는 여기서 멈추고 모델을 먼저 받은 뒤(필요하면 실행용 변환까지) 같은 자리에서 음차를 이어 갑니다. 그동안 Qwen3.5-2B 로 음차하지 않습니다 — 2B 결과가 캐시에 남으면 4B 가 준비된 뒤에도 그 값이 재사용되기 때문입니다.",
+            repo_id(code),
+            demand
+        ),
+    );
+    progress_card(app, task_id, "Model Download", &format!("Waiting for {}...", repo_name(code)));
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return (
+                TranslitEngine::Base2B,
+                format!(
+                    "🛑 [TRANSLIT ENGINE / WAIT] 태스크가 취소되어 {} 대기를 중단합니다. 다운로드는 백그라운드에서 계속됩니다.",
+                    repo_id(code)
+                ),
+            );
+        }
+        if is_ready(code) {
+            break;
+        }
+        let st = state(code);
+        match st.phase {
+            DlPhase::Unavailable => {
+                return (
+                    TranslitEngine::Base2B,
+                    format!(
+                        "🚫 [TRANSLIT ENGINE / WAIT] {} 저장소에서 필수 파일을 받을 수 없습니다 ({}). 기다려도 해결되지 않으므로 이번 태스크는 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                        repo_id(code),
+                        st.error
+                    ),
+                );
+            }
+            DlPhase::Failed => {
+                if runtime_failure(code).is_some() {
+                    break;
+                }
+                if retries >= WAIT_RETRIES {
+                    return (
+                        TranslitEngine::Base2B,
+                        format!(
+                            "⚠️ [TRANSLIT ENGINE / WAIT] {} 다운로드를 {}번 다시 시도했지만 이어받지 못했습니다 ({}). 이번 태스크는 Qwen3.5-2B + 발음 게이트로 음차하고, 받은 부분(.part)은 다음 태스크가 이어받습니다.",
+                            repo_id(code),
+                            retries,
+                            st.error
+                        ),
+                    );
+                }
+                retries += 1;
+                set_state(code, |s| {
+                    s.retry_at_ms = 0;
+                });
+                announce(
+                    app,
+                    task_id,
+                    &format!(
+                        "🔁 [TRANSLIT ENGINE / WAIT] 다운로드가 끊겨({}) 받은 곳부터 바로 이어받습니다 ({}/{}).",
+                        st.error, retries, WAIT_RETRIES
+                    ),
+                );
+                request_download(code, app, task_id);
+            }
+            DlPhase::Absent | DlPhase::Ready => {
+                request_download(code, app, task_id);
+            }
+            DlPhase::Queued | DlPhase::Downloading => {}
+        }
+        if last_beat.elapsed().as_secs() >= WAIT_HEARTBEAT_SECS {
+            last_beat = Instant::now();
+            let st = state(code);
+            let line = if st.file == CONVERT_LABEL {
+                format!(
+                    "🔧 [LANG-LLM] {} · {} {}% ({} / {})",
+                    repo_name(code),
+                    CONVERT_LABEL,
+                    percent(st.done, st.total),
+                    gb(st.done),
+                    gb(st.total)
+                )
+            } else if st.total > 0 {
+                progress_line(code, &st)
+            } else {
+                format!("📥 [LANG-LLM] {} · 연결 중 ({:?})", repo_name(code), st.phase)
+            };
+            announce(
+                app,
+                task_id,
+                &format!("⏳ [TRANSLIT ENGINE / WAIT] {} · 대기 {}초", line, started.elapsed().as_secs()),
+            );
+            progress_card(
+                app,
+                task_id,
+                "Model Download",
+                &format!("{} {}%", if st.file == CONVERT_LABEL { CONVERT_LABEL } else { "Downloading" }, percent(st.done, st.total)),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(WAIT_TICK_MS)).await;
+    }
+    let waited = started.elapsed().as_secs();
+    crate::utils::score_dynamics::record_baseline("indexing.translit_engine_wait_secs", waited as f32);
+    let (engine, status) = resolve_engine(doc_lang, app, task_id, true);
+    announce(
+        app,
+        task_id,
+        &format!("▶️ [TRANSLIT ENGINE / RESUME] {}초 기다린 뒤 음차를 같은 자리에서 이어 갑니다. {}", waited, status),
+    );
+    progress_card(app, task_id, "Handover", "Resuming transliteration...");
+    (engine, status)
+}
+
+fn console_targets(task_id: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if !task_id.is_empty() {
+        out.push(task_id.to_string());
+    }
+    if let Ok(w) = WAITERS.lock() {
+        for t in w.iter() {
+            if !out.iter().any(|x| x == t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    out
+}
+
+fn announce(app: &tauri::AppHandle, task_id: &str, msg: &str) {
+    println!("{}", msg);
+    for t in console_targets(task_id) {
+        let _ = app.emit(
+            "task-console-log",
+            json!({"task_id": t, "text": format!("{}\n", msg)}),
+        );
+    }
+}
+
+fn announce_fresh_line(app: &tauri::AppHandle, task_id: &str, msg: &str) {
+    println!("\n{}", msg);
+    for t in console_targets(task_id) {
+        let _ = app.emit(
+            "task-console-log",
+            json!({"task_id": t, "text": format!("{}\n", msg)}),
+        );
+    }
+}
+
+struct WaitGuard(String);
+
+impl WaitGuard {
+    fn new(task_id: &str) -> Self {
+        if !task_id.is_empty() {
+            if let Ok(mut w) = WAITERS.lock() {
+                w.push(task_id.to_string());
+            }
+        }
+        WaitGuard(task_id.to_string())
+    }
+}
+
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut w) = WAITERS.lock() {
+            if let Some(i) = w.iter().position(|x| *x == self.0) {
+                w.remove(i);
+            }
+        }
+    }
+}
+
+fn progress_card(app: &tauri::AppHandle, task_id: &str, category: &str, summary: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "task_id": task_id,
+        "category": category,
+        "summary": summary,
+        "spinner": "📥"
+    });
+    let _ = app.emit("extraction-progress", &payload);
+    crate::utils::logger::log_task_progress(app, task_id, &payload);
 }
 
 fn publish(app: &tauri::AppHandle, code: &str) {
@@ -590,10 +922,14 @@ async fn download_file(
         if have > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={}-", have));
         }
-        let res = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let res = match tokio::time::timeout(Duration::from_secs(CHUNK_TIMEOUT_SECS), req.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 last_err = e.to_string();
+                continue;
+            }
+            Err(_) => {
+                last_err = format!("{}초 동안 응답 헤더가 오지 않았습니다", CHUNK_TIMEOUT_SECS);
                 continue;
             }
         };
@@ -699,7 +1035,7 @@ async fn download_file(
                     });
                     if loud && percent(done, total) >= next_mark {
                         next_mark = (percent(done, total) / PROGRESS_STEP) * PROGRESS_STEP + PROGRESS_STEP;
-                        announce(app, task_id, &progress_line(code, &state(code)));
+                        announce_fresh_line(app, task_id, &progress_line(code, &state(code)));
                         publish(app, code);
                     }
                 }
@@ -739,7 +1075,7 @@ fn fail(code: &str, app: &tauri::AppHandle, task_id: &str, why: &str) {
         app,
         task_id,
         &format!(
-            "⚠️ [LANG-LLM] {} 다운로드 실패: {} — 받은 부분은 .part 로 남겨 두고 {}분 뒤 다음 태스크에서 이어받습니다. 그동안 음차는 Qwen3.5-2B + 발음 게이트로 진행합니다.",
+            "⚠️ [LANG-LLM] {} 다운로드 실패: {} — 받은 부분은 .part 로 남겨 둡니다. 음차 단계에서 기다리는 태스크는 바로 이어받기를 다시 시도하고, 기다리는 태스크가 없으면 {}분 뒤 다음 태스크에서 이어받습니다.",
             repo_id(code),
             why,
             FAIL_RETRY_SECS / 60
@@ -770,7 +1106,7 @@ async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
         app,
         task_id,
         &format!(
-            "📥 [LANG-LLM] {} 백그라운드 다운로드를 시작합니다. 저장 위치: {} | 필수 파일 {:?} | 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 계속 진행되므로 작업을 멈추거나 직접 받을 필요가 없습니다.",
+            "📥 [LANG-LLM] {} 백그라운드 다운로드를 시작합니다. 저장 위치: {} | 필수 파일 {:?} | 추출 단계는 그대로 진행되고, 음차 단계에 이른 태스크는 이 다운로드(와 실행용 변환)가 끝날 때까지 그 자리에서 기다렸다가 4B 로 이어 갑니다. 직접 받을 필요는 없습니다.",
             repo_id(code),
             dir.display(),
             LANG_LLM_REQUIRED
@@ -868,7 +1204,7 @@ async fn convert_runtime(code: &str, app: &tauri::AppHandle, task_id: &str) -> b
         app,
         task_id,
         &format!(
-            "🔧 [LANG-LLM] {} 를 Qwen3.5 런타임이 읽는 GGUF(Q4_K_M 규칙)로 변환합니다. 저장 위치: {} | 원본 safetensors 는 그대로 두고 첫 준비에 한 번만 수행합니다. 그동안 음차는 Qwen3.5-2B + 발음 게이트로 계속 진행됩니다.",
+            "🔧 [LANG-LLM] {} 를 Qwen3.5 런타임이 읽는 GGUF(Q4_K_M 규칙)로 변환합니다. 저장 위치: {} | 원본 safetensors 는 그대로 두고 첫 준비에 한 번만 수행합니다. 음차 단계에서 기다리는 태스크는 변환이 끝나는 즉시 4B 로 이어 갑니다.",
             repo_id(code),
             crate::model::lang_gguf::runtime_dir(&dir).display()
         ),
@@ -895,7 +1231,7 @@ async fn convert_runtime(code: &str, app: &tauri::AppHandle, task_id: &str) -> b
             let pct = percent(done, total);
             if total > 0 && pct >= next_mark.load(Ordering::SeqCst) {
                 next_mark.store((pct / PROGRESS_STEP) * PROGRESS_STEP + PROGRESS_STEP, Ordering::SeqCst);
-                announce(
+                announce_fresh_line(
                     &a,
                     &t,
                     &format!(

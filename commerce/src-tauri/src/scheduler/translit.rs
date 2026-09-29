@@ -9,14 +9,43 @@ fn translit_cache_key(word: &str, lang: &str) -> String {
     format!("{}\u{1}{}", lang.trim().to_lowercase(), word.trim())
 }
 
-static TRANSLIT_RECHECKED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<String>>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static TRANSLIT_RECHECKED: once_cell::sync::Lazy<std::sync::Mutex<Option<std::collections::HashSet<String>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
-fn first_recheck(word: &str, lang: &str) -> bool {
-    TRANSLIT_RECHECKED
-        .lock()
-        .map(|mut s| s.insert(translit_cache_key(word, lang)))
-        .unwrap_or(false)
+fn recheck_ledger_path() -> std::path::PathBuf {
+    crate::utils::get_app_dir().join("cache").join("translit_recheck.json")
+}
+
+fn first_recheck(word: &str, lang: &str, engine: &str) -> bool {
+    let key = format!("{}\u{1}{}", translit_cache_key(word, lang), engine);
+    let mut guard = match TRANSLIT_RECHECKED.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if guard.is_none() {
+        let loaded: std::collections::HashSet<String> = std::fs::read_to_string(recheck_ledger_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        *guard = Some(loaded);
+    }
+    let set = match guard.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+    if !set.insert(key) {
+        return false;
+    }
+    let path = recheck_ledger_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let list: Vec<&String> = set.iter().collect();
+    if let Ok(body) = serde_json::to_string(&list) {
+        let _ = std::fs::write(&path, body);
+    }
+    true
 }
 
 // =====================================================================
@@ -159,7 +188,8 @@ fn save_translit_cache(
         "word": word,
         "lang": lang,
         "native": native,
-        "roman": roman
+        "roman": roman,
+        "engine": crate::model::lang_llm::engine_tag(lang)
     }));
 }
 
@@ -282,6 +312,7 @@ pub async fn generate_transliteration_aliases(
     let mut skipped = 0usize;
     let mut phonetic_dropped = 0usize;
     let lang_engine_ready = crate::model::lang_llm::lang_engine_available(doc_lang);
+    let recheck_engine = crate::model::lang_llm::engine_tag(doc_lang);
 
     let mut generation_ready = false;
     let mut engine_label = String::from("Qwen3.5-2B");
@@ -335,12 +366,12 @@ pub async fn generate_transliteration_aliases(
 
         let cached_hit = query_translit_cache(app_handle, &src, doc_lang).await.filter(|hit| {
             match crate::nl_convert::cached_translit_recheck(&src, &hit.0, doc_lang, lang_engine_ready)
-                .filter(|_| first_recheck(&src, doc_lang))
+                .filter(|_| first_recheck(&src, doc_lang, &recheck_engine))
             {
                 Some(why) => {
                     emit(&format!(
-                        "  🔁 [TRANSLIT CACHE / RECHECK] '{}' 캐시 별칭 native='{}' 을 다시 만듭니다: {}",
-                        src, hit.0, why
+                        "  🔁 [TRANSLIT CACHE / RECHECK] '{}' 캐시 별칭 native='{}' 을 다시 만듭니다: {} (엔진 {} 기준 최초 1회 · 결과가 같아도 이 엔진으로는 다시 만들지 않습니다)",
+                        src, hit.0, why, recheck_engine
                     ));
                     false
                 }

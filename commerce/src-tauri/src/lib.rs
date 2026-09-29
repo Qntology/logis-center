@@ -1524,15 +1524,21 @@ fn dexie_value_passes(op: &str, kind: &str, have: &Value, want: &Value) -> bool 
         };
     }
     let (h, w) = (as_text(have), as_text(want));
+    let cross = || -> bool {
+        match (have.as_str(), want.as_str()) {
+            (Some(hv), Some(wv)) => cross_script_value_match(wv, hv).is_some(),
+            _ => false,
+        }
+    };
     match op {
-        "contains" => h.contains(&w),
-        "not_contains" => !h.contains(&w),
-        "neq" => h != w,
+        "contains" => h.contains(&w) || cross(),
+        "not_contains" => !(h.contains(&w) || cross()),
+        "neq" => h != w && !cross(),
         "gte" => h >= w,
         "gt" => h > w,
         "lte" => h <= w,
         "lt" => h < w,
-        _ => h == w,
+        _ => h == w || cross(),
     }
 }
 
@@ -1942,6 +1948,38 @@ async fn nearest_storage_axis(
 ///   같은 뜻이어도 공통 부분 문자열이 없어 FTS 가 구조적으로 0건입니다.
 ///   반대로 중국어 질의와 일본어 청크는 한자를 공유해 부분적으로 발화합니다.
 ///   언어 판정기보다 문자 체계가 이 물음에 더 정확히 답합니다.
+fn cross_script_value_match(want: &str, have: &str) -> Option<(&'static str, f32)> {
+    let w = want.trim();
+    let h = have.trim();
+    if w.is_empty() || h.is_empty() {
+        return None;
+    }
+    let (ws, hs) = (dominant_script(w), dominant_script(h));
+    if ws == "none" || hs == "none" || ws == hs {
+        return None;
+    }
+    if let (Some(a), Some(b)) = (
+        crate::utils::ai_utils::country_code_of(w),
+        crate::utils::ai_utils::country_code_of(h),
+    ) {
+        if a == b {
+            return Some(("country", 1.0));
+        }
+    }
+    if let (Some(a), Some(b)) = (
+        crate::utils::ai_utils::currency_name_exact(w),
+        crate::utils::ai_utils::currency_name_exact(h),
+    ) {
+        if a == b {
+            return Some(("currency", 1.0));
+        }
+    }
+    match crate::nl_convert::phonetic_similarity(w, h) {
+        Some(s) if s >= crate::nl_convert::PHONETIC_PASS => Some(("phonetic", s)),
+        _ => None,
+    }
+}
+
 fn dominant_script(s: &str) -> &'static str {
     let (mut latin, mut hangul, mut kana, mut han, mut arabic, mut cyrillic) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -3015,6 +3053,35 @@ async fn ai_search_complex(
                                 if chunk_id.ends_with("_tn") { "native" } else { "roman" },
                                 property, chunk_text, alias_track, raw_cosine, score
                             );
+                        }
+
+                        let wanted_value: Option<String> = ctx
+                            .get("condition")
+                            .and_then(|v| v.get(property.as_str()))
+                            .or_else(|| ctx.get("hint").and_then(|v| v.get(property.as_str())))
+                            .and_then(|spec| spec.get("value"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        if let Some(want) = wanted_value {
+                            let chunk_value = crate::nl_convert::extract_value_from_chunk(&chunk_text);
+                            let have = if chunk_value.trim().is_empty() { chunk_text.clone() } else { chunk_value };
+                            if let Some((how, sim)) = cross_script_value_match(&want, &have) {
+                                let value_track = if how == "phonetic" { sim } else { 1.0 };
+                                score += value_track;
+                                crate::utils::score_dynamics::record_baseline("search.value_match_cross_script", sim);
+                                println!(
+                                    "[AI-SEARCH]   🧭 [STAGE-4Z / VALUE MATCH] property='{}' | 질의 값 '{}' ↔ 청크 값 '{}' | 문자 체계가 달라 FTS 가 0건인 자리에서 {} 근거로 값이 일치합니다 ({:.2}) → 값 일치 트랙 +{:.4} → 최종 {:.4}. 코사인 {:.4} 만으로는 '같은 값' 과 '비슷한 값' 을 가르지 못하므로, 정규 코드 일치는 +1.0, 발음 골격 일치는 유사도만큼 더합니다.",
+                                    property,
+                                    want,
+                                    have,
+                                    match how { "country" => "국가 정규 코드", "currency" => "통화 정규 코드", _ => "발음 골격" },
+                                    sim,
+                                    value_track,
+                                    score,
+                                    raw_cosine
+                                );
+                            }
                         }
 
                         // 🌟 [EVIDENCE VOLUME] 합산 점수는 '몇 개의 청크가 함께 반응했는가' 라는

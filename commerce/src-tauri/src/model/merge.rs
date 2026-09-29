@@ -2121,12 +2121,22 @@ pub fn plan_recovery_windows(
     let out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = slots
         .into_iter()
         .map(|s| {
-            let bbox = to_px(
-                s.row.saturating_sub(1),
-                (s.row + 1).min(rows.saturating_sub(1)),
-                s.c_lo,
-                s.c_hi,
-            );
+            let block = s
+                .fields
+                .iter()
+                .any(|(_, f, _)| matches!(crate::logic::trade_field_category(f), "parties" | "other_parties"));
+            let (r1, c_hi) = if block {
+                ((s.row + 3).min(rows.saturating_sub(1)), (s.c_hi + 2).min(cols.saturating_sub(1)))
+            } else {
+                ((s.row + 1).min(rows.saturating_sub(1)), s.c_hi)
+            };
+            if block {
+                println!(
+                    "    🧱 [RECOVERY WINDOW / PARTY BLOCK] {:?} 는 캡션 아래로 이름·주소·세번이 여러 줄 쌓이는 당사자 상자라, 봉우리 아래 1행 대신 3행·오른쪽 2열까지 창을 넓힙니다.",
+                    s.fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
+                );
+            }
+            let bbox = to_px(s.row.saturating_sub(1), r1, s.c_lo, c_hi);
             (bbox, s.fields)
         })
         .collect();

@@ -969,6 +969,29 @@ pub async fn relay_join(
                 }
             }
         }
+        let units_total_before_void: f64 = units.values().sum();
+        let mut void_only: Vec<String> = Vec::new();
+        for (tid, n) in hits.iter() {
+            let v = void_hits.get(tid).copied().unwrap_or(0);
+            if v >= *n {
+                void_only.push(tid.clone());
+            }
+        }
+        for tid in void_only.iter() {
+            hits.remove(tid);
+            units.remove(tid);
+        }
+        let units_net: std::collections::HashMap<String, f64> = units
+            .iter()
+            .map(|(k, u)| (k.clone(), (u - void_units.get(k).copied().unwrap_or(0.0)).max(0.0)))
+            .collect();
+        crate::utils::score_dynamics::record_baseline("search.relay_void_only", void_only.len() as f32);
+        if !void_only.is_empty() {
+            emit(&format!(
+                "[AI-SEARCH] 🚫 [RELAY PERIOD / VOID ONLY] 기간 안에서 취소·환불·반품 문서로만 가리켜진 {} {}건은 판매 관계가 성립하지 않아 결과 집합에서 제외합니다: {:?}. 이 질의는 판매·거래 관계로 기간을 옮긴 질의이므로 취소된 주문은 '팔린 것' 이 아닙니다. 제외 목록은 플랜의 relay.void_only 에 남깁니다.",
+                primary, void_only.len(), void_only.iter().take(8).collect::<Vec<_>>()
+            ));
+        }
         rep.partners_in_period += in_period_ids.len();
         rep.period_targets += hits.len();
         crate::utils::score_dynamics::record_baseline("search.relay_period_partners", in_period_ids.len() as f32);
@@ -1045,6 +1068,9 @@ pub async fn relay_join(
                     if let Some(u) = units.get(&id) {
                         o.insert("relay_period_units".to_string(), unit_json(*u));
                     }
+                    if let Some(u) = units_net.get(&id) {
+                        o.insert("relay_period_units_net".to_string(), unit_json(*u));
+                    }
                     if let Some(u) = void_units.get(&id) {
                         o.insert("relay_period_void_units".to_string(), unit_json(*u));
                     }
@@ -1058,9 +1084,11 @@ pub async fn relay_join(
         }
         let target_ids: Vec<String> = hits.keys().cloned().collect();
         let units_exact = inexact.is_empty();
-        let units_total: f64 = units.values().sum();
+        let units_total: f64 = units_total_before_void;
+        let units_net_total: f64 = units_net.values().sum();
         let void_units_total: f64 = void_units.values().sum();
         let units_map: serde_json::Map<String, Value> = units.iter().map(|(k, v)| (k.clone(), unit_json(*v))).collect();
+        let units_net_map: serde_json::Map<String, Value> = units_net.iter().map(|(k, v)| (k.clone(), unit_json(*v))).collect();
         let void_units_map: serde_json::Map<String, Value> = void_units.iter().map(|(k, v)| (k.clone(), unit_json(*v))).collect();
         if let Some(o) = plan.as_object_mut() {
             o.insert("relay".to_string(), json!({
@@ -1069,9 +1097,11 @@ pub async fn relay_join(
                 "partner_types": partner_types,
                 "date_fields": date_fields,
                 "target_ids": target_ids,
+                "void_only": void_only,
                 "hits": hits,
                 "void_hits": void_hits,
                 "units": units_map,
+                "units_net": units_net_map,
                 "void_units": void_units_map,
                 "units_exact": units_exact,
                 "partner_ids": in_period_ids,
@@ -1082,9 +1112,9 @@ pub async fn relay_join(
         crate::utils::score_dynamics::record_baseline("search.relay_dropped", dropped as f32);
         crate::utils::score_dynamics::record_baseline("search.relay_units_exact", if units_exact { 1.0 } else { 0.0 });
         emit(&format!(
-            "[AI-SEARCH] 🔗 [RELAY PERIOD JOIN] '{}' 질의의 기간은 판매·거래 관계의 시점이라 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축 {:?} 로 옮겼습니다. 기간 안 연결 문서 {}건(취소·환불·반품 {}건 포함)이 '{}' 로 가리키는 {} {}건을 결과 집합으로 확정합니다 (재회수 {}건 · 기간 밖/미연결 제외 {}건). 취소 건은 빼지 않고 relay_period_void 로 따로 표시합니다. 수량 합 {}개 (취소·환불·반품 {}개){}",
-            primary, start, end, partner_types, date_fields, in_period_ids.len(), void_partners, key, primary, hits.len(), rescued_ids.len(), dropped,
-            unit_json(units_total), unit_json(void_units_total),
+            "[AI-SEARCH] 🔗 [RELAY PERIOD JOIN] '{}' 질의의 기간은 판매·거래 관계의 시점이라 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축 {:?} 로 옮겼습니다. 기간 안 연결 문서 {}건(취소·환불·반품 {}건 포함)이 '{}' 로 가리키는 {} {}건을 결과 집합으로 확정합니다 (재회수 {}건 · 기간 밖/미연결 제외 {}건 · 취소 건만 가리켜진 제외 {}건). 판매 수량 합 {}개 (취소·환불·반품 {}개를 뺀 값 · 빼기 전 {}개){}",
+            primary, start, end, partner_types, date_fields, in_period_ids.len(), void_partners, key, primary, hits.len(), rescued_ids.len(), dropped, void_only.len(),
+            unit_json(units_net_total), unit_json(void_units_total), unit_json(units_total),
             if units_exact { " — 연결 문서의 quantity 를 그대로 더했습니다." } else { " — quantity 가 없거나 한 문서가 여러 상대를 가리키는 경우는 1개로 셌습니다(relay_period_units_exact=false)." }
         ));
         crate::utils::score_dynamics::leave_scope();

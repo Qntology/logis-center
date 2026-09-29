@@ -1587,6 +1587,8 @@ pub fn get_trade_pair_read_prompt(doc_type: &str, fields: &[(String, String)]) -
          6. If the crop contains no readable caption at all, return an empty array.\n\
          7. Copy the value with everything printed in that field: currency symbols, units, decimal points and thousand separators. \
          Never strip them and never turn the value into a bare number. Those separators are what tell the routing stage whether a figure is money or an identifier.\n\
+         8. If a caption is a heading printed above a block of several lines (for example a party box: company name, address lines, tax id), \
+         the whole block is the value of that caption. Copy every line of the block in printed order, joined with ' / '. Do not keep only the first line.\n\
          \n\
          [OUTPUT]\n\
          {{\"pairs\": [{{\"label\": null, \"value\": null}}]}}\n\
@@ -3135,6 +3137,7 @@ write how that word sounds in the [TARGET LANGUAGE] writing system.
 
 [RULES]
 - Digits inside a word must be copied exactly as they appear.
+- Fill BOTH keys. "transliteration" must contain every word key listed in [OUTPUT FORMAT], each with its respelling.
 
 [OUTPUT FORMAT]
 { "language": "{TARGET_LANGUAGE}", "transcription": { "{SOURCE}" : String }, "transliteration": {TRANSLITERATION_OBJ} }

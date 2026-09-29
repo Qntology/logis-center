@@ -1137,6 +1137,42 @@ pub fn build_transliteration_prompt_for_words(words: &[String], target_language:
 /// [LANGUAGE TRACK SANITIZE] 특정 단어 목록에 대한 LLM 응답만 파싱합니다.
 /// sanitize_transliteration_dual 의 단어 제한 버전입니다.
 /// source_value 대신 명시적 words 목록을 사용하여 응답 매핑을 수행합니다.
+fn transcription_fallback(
+    parsed: &serde_json::Value,
+    joined_src: &str,
+    word_map: &dyn Fn(&serde_json::Value) -> String,
+) -> String {
+    let tc = match parsed.get("transcription") {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    if let Some(s) = tc.as_str() {
+        return s.trim().to_string();
+    }
+    let map = match tc.as_object() {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    let src_lower = joined_src.trim().to_lowercase();
+    for (k, v) in map.iter() {
+        if k.trim().to_lowercase() == src_lower {
+            if let Some(s) = v.as_str() {
+                return s.trim().to_string();
+            }
+        }
+    }
+    let mapped = word_map(tc);
+    if !mapped.is_empty() && !mapped.eq_ignore_ascii_case(joined_src.trim()) {
+        return mapped;
+    }
+    if map.len() == 1 && joined_src.split_whitespace().count() == 1 {
+        if let Some(s) = map.values().next().and_then(|v| v.as_str()) {
+            return s.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
     let src_words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
@@ -1190,6 +1226,17 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
+        }
+    }
+    let joined_src = words.join(" ");
+    if transliteration.is_empty() || transliteration.eq_ignore_ascii_case(&joined_src) {
+        let from_transcription = transcription_fallback(&parsed, &joined_src, &extract_word_map);
+        if !from_transcription.is_empty() && !from_transcription.eq_ignore_ascii_case(&joined_src) {
+            println!(
+                "    ↩️ [TRANSLIT KEY FALLBACK] 응답에 transliteration 이 비어 transcription 값을 씁니다: '{}' → '{}'",
+                joined_src, from_transcription
+            );
+            transliteration = from_transcription;
         }
     }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1352,13 +1399,21 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
     if let Some(tr_obj) = parsed.get("transliteration") {
         transliteration = extract_word_map(tr_obj);
     }
-    // ── 폴백: 문자열 형식 호환 ──
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
-    // 공백 정규화
+    if transliteration.is_empty() || transliteration.eq_ignore_ascii_case(src_clean_ref) {
+        let from_transcription = transcription_fallback(&parsed, src_clean_ref, &extract_word_map);
+        if !from_transcription.is_empty() && !from_transcription.eq_ignore_ascii_case(src_clean_ref) {
+            println!(
+                "    ↩️ [TRANSLIT KEY FALLBACK] 응답에 transliteration 이 비어 transcription 값을 씁니다: '{}' → '{}'",
+                src_clean_ref, from_transcription
+            );
+            transliteration = from_transcription;
+        }
+    }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
     // ── G1/G2/G3 게이트: transliteration 기준 ──
     let src_non_latin = src_clean_ref

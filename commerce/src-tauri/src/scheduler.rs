@@ -214,6 +214,9 @@ pub async fn process_task(
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
+            if let Some(line) = crate::model::lang_llm::prefetch("korean", app_handle, &task.id) {
+                emit_term(&format!("[Scheduler] {}", line));
+            }
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
@@ -375,6 +378,9 @@ pub async fn process_task(
         "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
         doc_lang
     );
+    if let Some(line) = crate::model::lang_llm::prefetch(&doc_lang, app_handle, &task.id) {
+        emit_term(&format!("[Scheduler] {}", line));
+    }
     // =====================================================================
     // 🌟 [MODE REROUTE] mode 가 commerce 여도 문서가 무역 서식이면 shipping 으로 넘깁니다.
     // ---------------------------------------------------------------------
@@ -4233,6 +4239,26 @@ pub async fn process_task(
                     let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
                     let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
                     let owner_fmt = detect_field_format(&owner_field);
+                    if owner_fmt == FieldFormat::Link && !is_id_link_field(&owner_field) {
+                        if let Some(src) = crate::utils::ai_utils::line_media_src(item_lines_ref[line_idx]) {
+                            header_owned_lines.insert(line_idx);
+                            let already = pre_mapped_hints
+                                .iter()
+                                .any(|h: &serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str()));
+                            if !already {
+                                pre_mapped_hints.push(json!({
+                                    "target_column": owner_field.clone(),
+                                    "extracted_value": src.clone(),
+                                    "line_rank": 2
+                                }));
+                                rep_meta.insert(owner_field.clone(), (line_idx, (0u8, 0u8, 2i32, 0.0f32, src.chars().count())));
+                                crate::utils::score_dynamics::record_field_assigned(&owner_field, 0.0);
+                                crate::utils::score_dynamics::record_baseline("commerce.media_src_harvest", 1.0);
+                                emit_term(&format!("    🖼️ [HEADER OWNED / MEDIA SRC] '{}' ← Item Line {} | 이 칸에는 글자 값이 없고 img 의 src 만 있습니다. Link 형식 필드는 글자가 아니라 주소가 값이므로 src 를 그대로 확정합니다: {}", owner_field, line_idx + 1, src));
+                            }
+                            continue;
+                        }
+                    }
                     let min_chars = if owner_fmt == FieldFormat::Numeric { 1 } else { 2 };
                     if clean_text.is_empty() || clean_text.chars().count() < min_chars { continue; }
 
@@ -4732,8 +4758,12 @@ pub async fn process_task(
                 }
 
 
-                for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
-                    
+                let field_order: Vec<usize> = (0..fields.len())
+                    .filter(|i| !field_is_analytic[*i])
+                    .chain((0..fields.len()).filter(|i| field_is_analytic[*i]))
+                    .collect();
+                for f_idx in field_order {
+                    let (field_name, field_desc, bias_target, prejudice_target) = fields[f_idx].clone();
 
                     let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                     let mut bypassed_values: Vec<(String, String)> = Vec::new();
@@ -4979,6 +5009,22 @@ pub async fn process_task(
                         }
                     }
 
+                    if field_format == FieldFormat::Enum
+                        && field_name != "status"
+                        && !field_name.to_lowercase().contains("currency")
+                        && has_vector_match
+                        && header_forced_assign.contains_key(&field_name)
+                    {
+                        let raw_cell = line_values.get(best_item_idx).map(|s| s.trim().to_string()).unwrap_or_default();
+                        if let Some(plain) = crate::utils::ai_utils::enum_cell_plain(&field_name, &raw_cell) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(plain.clone()));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, best_item_margin);
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_direct_assign", 1.0);
+                            emit_term(&format!("    🎯 [ENUM DIRECT] '{}' ← Item Line {} (\"{}\") → '{}' | 헤더 코사인으로 확정된 열의 값이 짧은 닫힌 어휘 모양이라 LLM 에게 다시 묻지 않고 그대로 확정합니다. 이 자리의 LLM 은 같은 원문 표기를 그대로 돌려주고 있었고, 정규화 표가 없는 축이라 원문 표기를 보존합니다.", field_name, best_item_idx + 1, raw_cell, plain));
+                            continue;
+                        }
+                    }
+
                     let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
 
                     
@@ -5006,10 +5052,26 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
-                    let targeted_pug = filtered_full_item_pug.clone();
+                    let synthesis_sheet: Option<String> = if field_is_analytic[f_idx] {
+                        crate::utils::ai_utils::synthesis_value_sheet(&item_val, &page_type, &doc_lang)
+                    } else {
+                        None
+                    };
+                    let targeted_pug = match synthesis_sheet.as_ref() {
+                        Some(sheet) => sheet.clone(),
+                        None => filtered_full_item_pug.clone(),
+                    };
 
                     if field_is_analytic[f_idx] {
-                        emit_term(&format!("    🧠 [SYNTHESIS FIELD] Field: '{}' | 단일 라인 환원 불가 → 전체 아이템 컨텍스트 요약 모드 (HeaderOwn: {:.4})", field_name, best_thead_own));
+                        match synthesis_sheet.as_ref() {
+                            Some(sheet) => {
+                                crate::utils::score_dynamics::record_baseline("commerce.synthesis_sheet_fields", sheet.lines().count() as f32);
+                                emit_term(&format!("    🧠 [SYNTHESIS FIELD / VALUE SHEET] Field: '{}' | 이 아이템에서 이미 확정된 값 {}개만 요약 재료로 넘깁니다. 원문 PUG 를 넘기면 회원정보수정·메일보내기 같은 UI 액션 구와 다른 칸의 날짜·금액이 요약에 섞여 들어옵니다. (HeaderOwn: {:.4})", field_name, sheet.lines().count(), best_thead_own));
+                            }
+                            None => {
+                                emit_term(&format!("    🧠 [SYNTHESIS FIELD] Field: '{}' | 확정된 값이 2개 미만이라 전체 아이템 컨텍스트 요약 모드 (HeaderOwn: {:.4})", field_name, best_thead_own));
+                            }
+                        }
                     } else if has_vector_match {
                         emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' ({:?}) | Line: {} | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4}", field_name, field_format, best_item_idx + 1, best_item_raw, best_item_contrast, best_item_margin));
                     } else {
@@ -8061,12 +8123,17 @@ pub async fn process_task(
 
     {
         emit_term("[Scheduler] 🔤 Preparing crossover for synonym expansion...");
-        let translit_fetch = !crate::nl_convert::is_latin_dominant(
-            &crate::nl_convert::native_script_sample(&doc_lang, "", ""),
-        );
-        let (translit_engine, translit_status) =
-            crate::model::lang_llm::resolve_engine(&doc_lang, app_handle, &task.id, translit_fetch);
+        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data);
+        let (translit_engine, translit_status) = crate::model::lang_llm::await_engine(
+            &doc_lang,
+            app_handle,
+            &task.id,
+            cancellation_token,
+            translit_demand,
+        )
+        .await;
         emit_term(&format!("[Scheduler]    {}", translit_status));
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Planning VRAM crossover...", "spinner": "🔤" }));
 
         let free_mb = model.get_free_vram_mb();

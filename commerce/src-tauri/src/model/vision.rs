@@ -679,15 +679,40 @@ impl crate::model::LogisModel {
                         let mut pending_read: Vec<usize> = Vec::new();
                         if !row_tile_cat && plan.category != crate::logic::TRADE_IDENTITY_CATEGORY {
                             let mine = legible_set_in(plan.bbox);
-                            if !array_plan && !mine.is_empty() && mine.iter().all(|i| read_legible.contains(i)) {
+                            let region_read = !array_plan && !mine.is_empty() && mine.iter().all(|i| read_legible.contains(i));
+                            let unread_axes: Vec<String> = if region_read {
+                                schema_fields
+                                    .iter()
+                                    .filter(|f| crate::logic::trade_field_category(f) == plan.category.as_str())
+                                    .filter(|f| !pair_evidence.contains_key(f.as_str()))
+                                    .filter(|f| {
+                                        final_data_map
+                                            .get(f.as_str())
+                                            .map_or(true, |v| v.is_null() || v.as_str().map_or(false, |s| s.trim().is_empty()))
+                                    })
+                                    .filter(|f| field_peak_inside(f, plan.bbox))
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            if region_read && unread_axes.is_empty() {
                                 emit_term(&format!(
-                                    "    ♻️ [REGION ALREADY READ] '{}' 크롭 px({},{})-({},{}) 의 판독 가능 패치 {}칸이 앞선 스칼라 크롭들이 이미 쌍으로 읽은 지면 안에 전부 들어 있습니다. 쌍 읽기는 카테고리와 무관하게 스키마 전체로 라우팅하므로 같은 지면을 다시 읽어도 새 쌍이 나오지 않습니다. 이 크롭의 호출을 건너뜁니다.",
+                                    "    ♻️ [REGION ALREADY READ] '{}' 크롭 px({},{})-({},{}) 의 판독 가능 패치 {}칸이 앞선 스칼라 크롭들이 이미 쌍으로 읽은 지면 안에 전부 들어 있고, 이 범주의 축 가운데 라벨 봉우리가 이 크롭 안에 있으면서 비어 있는 축도 없습니다. 이 크롭의 호출을 건너뜁니다.",
                                     plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, mine.len()
                                 ));
                                 crate::utils::score_dynamics::record_baseline("vision.region_already_read", 1.0);
                                 continue;
                             }
-                            crate::utils::score_dynamics::record_baseline("vision.region_already_read", 0.0);
+                            if region_read {
+                                crate::utils::score_dynamics::record_baseline("vision.region_reread", 1.0);
+                                emit_term(&format!(
+                                    "    🔁 [REGION RE-READ] '{}' 크롭 px({},{})-({},{}) 의 지면은 앞선 크롭이 읽었지만, 이 범주의 축 {:?} 는 라벨 봉우리가 이 크롭 안에 있는데 아직 어떤 쌍도 이 축으로 라우팅되지 않았습니다. 앞선 크롭은 다른 범주의 정의로 물었으므로 이름·주소가 여러 줄로 쌓인 당사자 상자 같은 블록은 쌍으로 옮겨지지 않았을 수 있습니다. 같은 지면이라도 이 범주 정의로 다시 읽습니다.",
+                                    plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, unread_axes
+                                ));
+                            } else {
+                                crate::utils::score_dynamics::record_baseline("vision.region_already_read", 0.0);
+                            }
                             pending_read = mine;
                         }
                         let tile_cats: &[&str] = if array_as_pairs {
@@ -2454,7 +2479,7 @@ impl crate::model::LogisModel {
                                     pruned.push(field.clone());
                                     continue;
                                 }
-                                let hit_rate = crate::utils::score_dynamics::adaptive_baseline(&format!("vision.recovery_hit.{}", field))
+                                let hit_rate = crate::utils::score_dynamics::adaptive_baseline(&format!("vision.recovery_hit.v2.{}", field))
                                     .map(|(m, _)| m);
                                 if hit_rate.map_or(false, |m| m <= 0.0) {
                                     history_skip.push(field.clone());
@@ -2750,7 +2775,7 @@ impl crate::model::LogisModel {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
-                                    let hit_axis = format!("vision.recovery_hit.{}", field);
+                                    let hit_axis = format!("vision.recovery_hit.v2.{}", field);
                                     let node = parsed.get(field);
                                     let label = node
                                         .and_then(|n| n.get("label"))
@@ -4210,6 +4235,16 @@ impl crate::model::LogisModel {
                         .clone()
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                     let chunk_bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, hashed_cc));
+                    let translit_demand = crate::model::lang_llm::translit_demand(&final_data);
+                    let (_translit_engine, translit_status) = crate::model::lang_llm::await_engine(
+                        &language,
+                        app_handle,
+                        &task_id,
+                        &chunk_cancel,
+                        translit_demand,
+                    )
+                    .await;
+                    emit_term(&format!("  {}", translit_status));
                     match crate::scheduler::indexing::index_item_chunks(
                         db,
                         self,
@@ -4226,10 +4261,10 @@ impl crate::model::LogisModel {
                         &chunk_cancel,
                         app_handle,
                         &task_id,
-                        true,
+                        false,
                     ).await {
                         Ok(n) => emit_term(&format!(
-                            "  🧩 [VISION CHUNK INDEX] item_id='{}' | 청크 {}건 인덱싱 완료 (doc_type='{}'). 이 단계가 없으면 문서가 FTS 와 비전 벡터로만 회수되어, 질의의 속성 힌트와 크로스링구얼·음차 트랙이 붙을 자리가 없습니다. 음차는 생성 모델을 다시 올려야 하므로 이번 회차에서는 건너뛰고, 나중 회차의 재인덱싱에 맡깁니다.",
+                            "  🧩 [VISION CHUNK INDEX] item_id='{}' | 청크 {}건 인덱싱 완료 (doc_type='{}'). 이 단계가 없으면 문서가 FTS 와 비전 벡터로만 회수되어, 질의의 속성 힌트와 크로스링구얼·음차 트랙이 붙을 자리가 없습니다. 음차 별칭도 이 회차에서 함께 만듭니다 — 영문 서식의 값('T-Shirt')을 한글 질의('티셔츠')가 별칭 트랙으로 맞추려면 이 문서의 별칭 행이 있어야 합니다.",
                             hashed_id, n, doc_type
                         )),
                         Err(e) => emit_term(&format!(

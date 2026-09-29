@@ -1257,6 +1257,30 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
     walk(item);
 
     if let Some(obj) = item.as_object_mut() {
+        for (name_key, addr_key) in [
+            ("sender_name", "sender_address"),
+            ("recipient_name", "recipient_address"),
+        ] {
+            let raw = obj.get(name_key).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if !raw.contains(" / ") { continue; }
+            let parts: Vec<String> = raw
+                .split(" / ")
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if parts.len() < 2 { continue; }
+            let addr_empty = obj
+                .get(addr_key)
+                .map_or(true, |v| v.is_null() || v.as_str().map_or(false, |s| s.trim().is_empty()));
+            obj.insert(name_key.to_string(), json!(parts[0].clone()));
+            if addr_empty {
+                obj.insert(addr_key.to_string(), json!(parts[1..].join(", ")));
+            }
+            println!(
+                "  🧱 [PARTY BLOCK SPLIT] {} 에 여러 줄 블록이 들어와 첫 줄 '{}' 을 이름으로, 나머지 {}줄을 {} 로 나눕니다.",
+                name_key, parts[0], parts.len() - 1, if addr_empty { addr_key } else { "(이미 채워진 주소는 유지)" }
+            );
+        }
         let cur = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if crate::model::merge::is_schema_echo(&cur) {
             obj.insert("currency".to_string(), json!(crate::utils::ai_utils::default_currency_for_lang(doc_lang)));
@@ -1870,6 +1894,11 @@ pub async fn process_trading_task(
     
     doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
     println!("[TRADING] Detected document language (page {}): {}", page_idx + 1, doc_lang);
+    if page_idx == 0 {
+        if let Some(line) = crate::model::lang_llm::prefetch(&doc_lang, app_handle, &task.id) {
+            emit_term(&format!("[TRADING] {}", line));
+        }
+    }
     emit_term("[TRADING STEP A] Classifying trade document type (2-depth)...");
     log_task_progress(app_handle, &task.id, &json!({
         "category": "Classification", "summary": "Identifying trade document group...", "spinner": "⠋"
@@ -4415,6 +4444,17 @@ pub async fn process_trading_task(
         &from_addr, &team_id, &cc_val, &bcc, &ref_val, Some(&item_digest)).await;
 
     {
+        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data);
+        let (_translit_engine, translit_status) = crate::model::lang_llm::await_engine(
+            &doc_lang,
+            app_handle,
+            &task.id,
+            cancellation_token,
+            translit_demand,
+        )
+        .await;
+        emit_term(&format!("  {}", translit_status));
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         let chunk_count = index_item_chunks(
             &store,
             &model,
@@ -4422,7 +4462,7 @@ pub async fn process_trading_task(
             &doc_type,
             &doc_lang,
             &extracted_data,
-            true,               
+            true,
             &cc_val,
             &bcc,
             &ref_val,
@@ -4431,7 +4471,7 @@ pub async fn process_trading_task(
             cancellation_token,
             app_handle,
             &task.id,
-            false,              
+            false,
         ).await.unwrap_or(0);
 
         emit_term(&format!(

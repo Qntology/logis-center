@@ -6560,6 +6560,141 @@ pub fn line_real_href(line: &str) -> Option<String> {
     None
 }
 
+pub fn line_media_src(line: &str) -> Option<String> {
+    let re = match regex::Regex::new(r#"src=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for cap in re.captures_iter(line) {
+        if let Some(m) = cap.get(1) {
+            let v = m.as_str().trim();
+            if v.is_empty() || v.starts_with("data:") || v.starts_with("javascript:") { continue; }
+            if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("//") || v.starts_with('/') {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn enum_cell_plain(field_name: &str, raw: &str) -> Option<String> {
+    let v: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if v.is_empty() || is_bare_markup_token(&v) { return None; }
+    if v.chars().any(|c| c.is_ascii_digit()) { return None; }
+    if v.chars().any(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '|' | ':' | '/' | ';' | ',' | '<' | '>' | '=')) { return None; }
+    if v.split_whitespace().count() > 3 || v.chars().count() > 24 { return None; }
+    if !v.chars().any(|c| c.is_alphabetic()) { return None; }
+    if enum_value_reject(field_name, &v).is_some() { return None; }
+    Some(v)
+}
+
+pub fn synthesis_value_sheet(item: &serde_json::Value, page_type: &str, doc_lang: &str) -> Option<String> {
+    let obj = item.as_object()?;
+    let skip = |k: &str| -> bool {
+        let l = k.to_lowercase();
+        l == "id" || l == "link" || l == "index" || l == "type" || l == "detail" || l == "digest"
+            || l == "text" || l == "masked_text" || l == "mode" || l == "updated_at" || l == "created_at"
+            || l.starts_with("rel_") || l.starts_with("reference_") || l.starts_with('_')
+            || l.contains("insight") || l.contains("summary") || l.contains("analysis")
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for (k, v) in obj.iter() {
+        if skip(k) { continue; }
+        let text = match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|x| match x {
+                    serde_json::Value::String(s) => Some(s.trim().to_string()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Object(o) => o
+                        .get("title")
+                        .or_else(|| o.get("name"))
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        if text.is_empty() || text == "null" { continue; }
+        let label = indexing_leaf_label(doc_lang, page_type, k);
+        let label = if label.trim().is_empty() { humanize_url_token(k) } else { label };
+        lines.push(format!("{}: {}", label.trim(), text));
+    }
+    if lines.len() < 2 {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+pub const COUNTRY_NAMES_ML: &[(&str, &str)] = &[
+    ("KR", "korea, south korea, republic of korea, rok, 대한민국, 한국, 남한, 韓国, 大韓民国, 韩国, 韓國, 大韩民国, corée, corée du sud, corea, corea del sur, coreia, coreia do sul, südkorea, corea del sud, южная корея, корея, hàn quốc, เกาหลี, เกาหลีใต้, korea selatan"),
+    ("CN", "china, people's republic of china, prc, p.r.c., 중국, 중화인민공화국, 中国, 中華人民共和国, 中华人民共和国, 中國, 中華人民共和國, chine, république populaire de chine, volksrepublik china, cina, китай, кнр, trung quốc, จีน, tiongkok"),
+    ("VN", "vietnam, viet nam, 베트남, ベトナム, 越南, viêt nam, việt nam, vietname, вьетнам, เวียดนาม"),
+    ("JP", "japan, 일본, 日本, 日本国, japon, japón, japão, giappone, япония, nhật bản, ญี่ปุ่น, jepang"),
+    ("TW", "taiwan, 대만, 타이완, 台湾, 台灣, 臺灣, taïwan, taiwán, тайвань, đài loan, ไต้หวัน"),
+    ("TH", "thailand, 태국, タイ, 泰国, 泰國, thaïlande, tailandia, tailândia, thailandia, таиланд, thái lan, ประเทศไทย, ไทย"),
+    ("IN", "india, 인도, インド, 印度, inde, índia, индия, ấn độ, อินเดีย"),
+    ("ID", "indonesia, 인도네시아, インドネシア, 印度尼西亚, 印尼, indonésie, indonésia, индонезия, อินโดนีเซีย"),
+    ("MY", "malaysia, 말레이시아, マレーシア, 马来西亚, 馬來西亞, malaisie, malasia, malásia, малайзия, มาเลเซีย"),
+    ("PH", "philippines, 필리핀, フィリピン, 菲律宾, 菲律賓, filipinas, philippinen, filippine, филиппины, ฟิลิปปินส์, filipina"),
+    ("BD", "bangladesh, 방글라데시, バングラデシュ, 孟加拉国, 孟加拉國, бангладеш, บังกลาเทศ"),
+    ("KH", "cambodia, 캄보디아, カンボジア, 柬埔寨, cambodge, camboya, camboja, cambogia, kambodscha, камбоджа, กัมพูชา, kamboja"),
+    ("TR", "turkey, türkiye, turkiye, 터키, 튀르키예, トルコ, 土耳其, turquie, turquía, turquia, turchia, türkei, турция, thổ nhĩ kỳ, ตุรกี, turki"),
+    ("US", "usa, u.s.a., u.s., united states, united states of america, america, 미국, 아메리카, アメリカ, 米国, 美国, 美國, états-unis, etats-unis, estados unidos, stati uniti, vereinigte staaten, сша, hoa kỳ, สหรัฐอเมริกา, สหรัฐ, amerika serikat"),
+    ("MX", "mexico, méxico, 멕시코, メキシコ, 墨西哥, mexique, mexiko, messico, мексика, เม็กซิโก, meksiko"),
+    ("CA", "canada, 캐나다, カナダ, 加拿大, canadá, kanada, канада, แคนาดา"),
+    ("BR", "brazil, brasil, 브라질, ブラジル, 巴西, brésil, brasile, brasilien, бразилия, บราซิล"),
+    ("DE", "germany, deutschland, 독일, ドイツ, 德国, 德國, allemagne, alemania, alemanha, germania, германия, đức, เยอรมนี, jerman"),
+    ("IT", "italy, italia, 이탈리아, イタリア, 意大利, 義大利, italie, itália, italien, италия, ý, อิตาลี"),
+    ("FR", "france, 프랑스, フランス, 法国, 法國, francia, frança, frankreich, франция, pháp, ฝรั่งเศส, prancis"),
+    ("ES", "spain, españa, 스페인, スペイン, 西班牙, espagne, espanha, spagna, spanien, испания, tây ban nha, สเปน, spanyol"),
+    ("GB", "uk, u.k., united kingdom, great britain, britain, england, 영국, イギリス, 英国, 英國, royaume-uni, reino unido, regno unito, vereinigtes königreich, großbritannien, великобритания, anh, สหราชอาณาจักร, อังกฤษ, inggris"),
+    ("NL", "netherlands, the netherlands, holland, 네덜란드, オランダ, 荷兰, 荷蘭, pays-bas, países bajos, países baixos, paesi bassi, niederlande, нидерланды, hà lan, เนเธอร์แลนด์, belanda"),
+    ("PL", "poland, polska, 폴란드, ポーランド, 波兰, 波蘭, pologne, polonia, polónia, polen, польша, ba lan, โปแลนด์, polandia"),
+    ("CZ", "czech republic, czechia, česko, česká republika, 체코, チェコ, 捷克, tchéquie, république tchèque, chequia, república checa, chéquia, cechia, tschechien, чехия, séc, เช็ก"),
+    ("SG", "singapore, 싱가포르, シンガポール, 新加坡, singapour, singapur, singapura, сингапур, สิงคโปร์"),
+    ("HK", "hong kong, hongkong, 홍콩, 香港, гонконг, ฮ่องกง"),
+    ("AU", "australia, 호주, 오스트레일리아, オーストラリア, 澳大利亚, 澳洲, australie, austrália, australien, австралия, úc, ออสเตรเลีย"),
+];
+
+fn country_norm(value: &str) -> String {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn country_code_of(value: &str) -> Option<&'static str> {
+    let joined = country_norm(value);
+    if joined.is_empty() || joined.split(' ').count() > 5 {
+        return None;
+    }
+    for (code, raw) in COUNTRY_NAMES_ML.iter() {
+        for name in raw.split(',') {
+            let n = country_norm(name);
+            if n.is_empty() { continue; }
+            if joined == n {
+                return Some(*code);
+            }
+            if joined.ends_with(&format!(" {}", n)) {
+                return Some(*code);
+            }
+            if !n.is_ascii() && joined.starts_with(&n) && joined.chars().count() - n.chars().count() <= 2 {
+                return Some(*code);
+            }
+        }
+    }
+    None
+}
+
 pub fn is_multi_value_field(field_name: &str) -> bool {
     let lower = field_name.to_lowercase();
     ["options", "tags", "goods", "additional_goods", "additional_image", "region_restrictions", "address"]
