@@ -61,3 +61,39 @@ pub fn entity_seed(cc: &str, raw: &str) -> String {
     }
     format!("{}:{}", scope, t)
 }
+
+pub fn relay_type_key(type_: &str) -> String {
+    let t = type_.trim();
+    if let Some(code) = crate::utils::bias_schema::canonical_trade_doc_code(t) {
+        return code.to_string();
+    }
+    let family = crate::utils::canonical::relay_type_family(t);
+    match family.as_str() {
+        "goods" | "order" | "tracking" => family,
+        _ => t.to_lowercase(),
+    }
+}
+
+pub fn relay_seed(type_key: &str, scope: &str, raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if crate::utils::bias_schema::is_trade_doc_type(type_key) {
+        return t.to_string();
+    }
+    if type_key == "tracking" && crate::utils::hash::is_valid_relay_key(t) {
+        return t.to_string();
+    }
+    let s = scope.trim();
+    if s.is_empty() {
+        t.to_string()
+    } else {
+        format!("{}:{}", s, t)
+    }
+}
+
+pub fn entity_key_index(type_: &str, team_id: &str, scope: &str, raw: &str) -> u32 {
+    let key = relay_type_key(type_);
+    entity_index(&key, team_id, &relay_seed(&key, scope, raw))
+}

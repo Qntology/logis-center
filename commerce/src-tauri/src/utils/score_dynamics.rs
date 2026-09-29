@@ -1338,6 +1338,14 @@ pub fn adaptive_baseline(axis: &str) -> Option<(f32, f32)> {
     })
 }
 
+pub fn adaptive_baseline_n(axis: &str) -> Option<(f32, f32, u64)> {
+    resolve(|st| {
+        st.baseline
+            .get(axis)
+            .map(|w| ((w.mean as f32, w.sd() as f32, w.n), w.n))
+    })
+}
+
 /// 축 신뢰도. 역분산 융합의 가중치로 씁니다(Phase 1).
 /// 분산이 작을수록(변별력 없음) 낮은 값을 돌려줍니다.
 pub fn axis_confidence(axis: &str) -> Option<f32> {
@@ -1373,7 +1381,7 @@ pub fn learned_specificity(field: &str) -> Option<f32> {
     resolve(|st| {
         st.field.get(field).map(|f| {
             let rejected = f.reject_format + f.reject_prejudice + f.reject_enum + f.reject_self_id;
-            let denom = f.seen.max(1) as f64;
+            let denom = f.seen.max(rejected).max(1) as f64;
             ((rejected as f64 / denom) as f32, f.seen)
         })
     })

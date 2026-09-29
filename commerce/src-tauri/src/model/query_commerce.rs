@@ -1608,6 +1608,53 @@ impl crate::model::LogisModel {
                     );
                 }
 
+                let relay_intent: Option<(String, f32, f32, f32)> = if validity_axes {
+                    None
+                } else {
+                    let bridge = crate::parsing::BIAS_DICT
+                        .get("search_bridge")
+                        .and_then(|sb| sb.get("sales_to_order"));
+                    let bank = |k: &str| -> Vec<String> {
+                        bridge
+                            .and_then(|n| n.get(k))
+                            .and_then(|v| v.as_str())
+                            .map(|s| crate::utils::ai_utils::split_bias_phrases_full(s))
+                            .unwrap_or_default()
+                    };
+                    let bias_bank = bank("bias");
+                    let prej_bank = bank("prejudice");
+                    let mut cand_words: Vec<String> = Vec::new();
+                    for w in words.iter() {
+                        if period_words.contains(*w) || w.chars().any(|c| c.is_ascii_digit()) {
+                            continue;
+                        }
+                        cand_words.push(w.to_string());
+                    }
+                    if bias_bank.is_empty() || prej_bank.is_empty() || cand_words.is_empty() {
+                        None
+                    } else {
+                        let bias_embs = self.get_embedding_batch(bias_bank).await.unwrap_or_default();
+                        let prej_embs = self.get_embedding_batch(prej_bank).await.unwrap_or_default();
+                        let word_embs = self.get_embedding_batch(cand_words.clone()).await.unwrap_or_default();
+                        let mut best: Option<(String, f32, f32)> = None;
+                        let mut prej_max = 0.0f32;
+                        for (w, e) in cand_words.iter().zip(word_embs.iter()) {
+                            if e.iter().all(|&x| x == 0.0) {
+                                continue;
+                            }
+                            let b = crate::utils::ai_utils::max_pool_sim(e, &bias_embs);
+                            let p = crate::utils::ai_utils::max_pool_sim(e, &prej_embs);
+                            if p > prej_max {
+                                prej_max = p;
+                            }
+                            if best.as_ref().map_or(true, |(_, bb, bp)| b - p > *bb - *bp) {
+                                best = Some((w.clone(), b, p));
+                            }
+                        }
+                        best.map(|(w, b, p)| (w, b, p, prej_max))
+                    }
+                };
+
                 // 🌟 [DOMAIN TYPE WORD DETECTION]
                 //    "이벤트로", "주문에서" 같은 도메인 지시어는 속성 값이 아니라 테이블 타입 지표입니다.
                 //    로컬라이즈된 타입 이름(get_localized_page_type)과의 코사인 비교로 판정합니다.
@@ -2196,11 +2243,28 @@ impl crate::model::LogisModel {
                                             }
                                         }
                                     } else {
-                                        emit_term(&format!(
-                                            "      ✂️ [FILTER TERM DROP] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}",
-                                            effective_word, top.category, top.key, top.surprisal, top.max_cos, top.n, schema_top
-                                        ));
-                                        forced_filter_routes.push((word.to_string(), top.category.clone(), top.key.clone(), top.surprisal));
+                                        let temporal = top.category == "time_filters" || top.category == "season_filters";
+                                        let raw_top = f_scores
+                                            .iter()
+                                            .max_by(|a, b| a.max_cos.partial_cmp(&b.max_cos).unwrap_or(std::cmp::Ordering::Equal));
+                                        let anchored = !temporal || raw_top.map_or(true, |r| r.category == top.category);
+                                        if anchored {
+                                            emit_term(&format!(
+                                                "      ✂️ [FILTER TERM DROP] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}",
+                                                effective_word, top.category, top.key, top.surprisal, top.max_cos, top.n, schema_top
+                                            ));
+                                            forced_filter_routes.push((word.to_string(), top.category.clone(), top.key.clone(), top.surprisal));
+                                        } else {
+                                            let (rc, rk, rcos) = raw_top
+                                                .map(|r| (r.category.clone(), r.key.clone(), r.max_cos))
+                                                .unwrap_or_default();
+                                            crate::utils::score_dynamics::record_baseline("search.time_route_unanchored", 1.0);
+                                            crate::utils::score_dynamics::record_baseline("search.time_route_raw_gap", rcos - top.max_cos);
+                                            emit_term(&format!(
+                                                "      ✂️ [FILTER TERM DROP / TIME UNANCHORED] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4} 이지만 원시 코사인 1위는 다른 필터 계열 {}.{} (cos {:.4}) 입니다. 구가 몇 개뿐인 시간 뱅크는 표준화 점수가 쉽게 양수가 되므로, 두 척도가 같은 계열을 가리키지 않으면 시간 의도(time_filters 시드)로 쓰지 않습니다. 속성 배정에서는 빼고 FTS 검색어로 남깁니다.",
+                                                effective_word, top.category, top.key, top.surprisal, top.max_cos, top.n, schema_top, rc, rk, rcos
+                                            ));
+                                        }
                                     }
 
                                     retained_words.push(word);
@@ -3363,6 +3427,54 @@ impl crate::model::LogisModel {
                     )
                     .map(|ip| (ip.start, ip.end, "between", ip.label)),
                 };
+                let relay_period: Option<Value> = match resolved.as_ref() {
+                    Some((start, end, op, label)) if !validity_axes => {
+                        let target_domain = crate::parsing::BIAS_DICT
+                            .get("search_bridge")
+                            .and_then(|sb| sb.get("sales_to_order"))
+                            .and_then(|n| n.get("target_domain"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("order")
+                            .to_string();
+                        let via = match relay_intent.as_ref() {
+                            Some((_, b, p, pmax)) if b > p && *b >= *pmax => Some(target_domain.clone()),
+                            _ => None,
+                        };
+                        let (iw, ib, ip, ipmax) = relay_intent
+                            .clone()
+                            .unwrap_or_else(|| (String::new(), 0.0, 0.0, 0.0));
+                        let start_v = if *op == "lte" { Value::Null } else { json!(format!("{}T00:00:00", start)) };
+                        let end_v = if *op == "gte" { Value::Null } else { json!(format!("{}T23:59:59", end)) };
+                        crate::utils::score_dynamics::record_baseline("search.time.relay_carry", 1.0);
+                        crate::utils::score_dynamics::record_baseline("search.relay_intent_margin", ib - ip);
+                        emit_term(&format!(
+                            "  🔗 [RELAY PERIOD CARRY] {} ({} ~ {}) 는 '{}' 에 하드 조건으로 싣지 않지만 relay_period 로 운반합니다. 판매 관계 근거: '{}' 판매 브릿지 {:.4} · 등록/노출 편견 {:.4} (질의 안 편견 최고 {:.4}) → {}",
+                            label,
+                            start,
+                            end,
+                            seg_type,
+                            iw,
+                            ib,
+                            ip,
+                            ipmax,
+                            match via.as_ref() {
+                                Some(v) => format!("판매·거래 관계로 확정했습니다. 검색 단계가 기간을 '{}' 의 날짜 축으로 옮깁니다.", v),
+                                None => "관계 근거가 약해 검색 단계는 기간을 옮기지 않고 표시만 합니다.".to_string(),
+                            }
+                        ));
+                        Some(json!({
+                            "start": start_v,
+                            "end": end_v,
+                            "op": op,
+                            "label": label,
+                            "via": via,
+                            "intent_word": iw,
+                            "intent_bias": ib,
+                            "intent_prejudice": ip
+                        }))
+                    }
+                    _ => None,
+                };
                 let deterministic_json: Option<Value> = match resolved {
                     None => None,
                     Some((start, end, op, label)) => {
@@ -3982,6 +4094,9 @@ impl crate::model::LogisModel {
                             emit_term(&format!("  🧷 [UNASSIGNED RESCUE] 조건 미확정 청크 {:?} 를 FTS 검색어로 보존합니다.", unassigned_chunks));
                         }
                         obj.insert("unassigned".to_string(), json!(unassigned_chunks.clone()));
+                        if let Some(rp) = relay_period.as_ref() {
+                            obj.insert("relay_period".to_string(), rp.clone());
+                        }
 
                         if !exact_season_key.is_empty() {
                             obj.insert("exact_season".to_string(), json!(exact_season_key.clone()));
@@ -4009,6 +4124,9 @@ impl crate::model::LogisModel {
                         }
                         obj.insert("condition".to_string(), json!(cond));
                         obj.insert("unassigned".to_string(), json!(unassigned_chunks.clone()));
+                        if let Some(rp) = relay_period.as_ref() {
+                            obj.insert("relay_period".to_string(), rp.clone());
+                        }
                         if !exact_season_key.is_empty() {
                             obj.insert("exact_season".to_string(), json!(exact_season_key.clone()));
                         }
@@ -4102,6 +4220,7 @@ impl crate::model::LogisModel {
                 let mut groups: std::collections::HashMap<String, DomainGroup> = std::collections::HashMap::new();
                 let mut group_order: Vec<String> = Vec::new();
                 let mut global_candidates: Vec<String> = Vec::new();
+                let mut relay_periods: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
 
                 // ── 1) 도메인 축 : 세그먼트를 '확정 타입'별로 그룹핑합니다. 절대 서로 섞지 않습니다.
                 for seg in ctx_arr.iter() {
@@ -4224,6 +4343,9 @@ impl crate::model::LogisModel {
                                 if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
                             }
                         }
+                    }
+                    if let Some(rp) = seg.get("relay_period").filter(|v| v.is_object()) {
+                        relay_periods.entry(seg_type.clone()).or_insert_with(|| rp.clone());
                     }
 
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
@@ -4411,6 +4533,9 @@ impl crate::model::LogisModel {
                     ctx.insert("condition".to_string(), Value::Object(g.condition.clone()));
                     ctx.insert("alternates".to_string(), Value::Object(g.alternates.clone()));
                     ctx.insert("unassigned".to_string(), json!(g.value_words.clone()));
+                    if let Some(rp) = relay_periods.get(dom) {
+                        ctx.insert("relay_period".to_string(), rp.clone());
+                    }
                     if !g.substantial_host.is_empty() {
                         ctx.insert("substantial_host".to_string(), json!(g.substantial_host.clone()));
                     }

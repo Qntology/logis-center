@@ -44,7 +44,9 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "embed", "node", "item",
                         "table",
                         "doc_type",
+                        "ledger", "relay_origin", "_relay_bound",
                     ].contains(&key.as_str()) { continue; }
+                    if key.starts_with("rel_") { continue; }
                     if crate::store::ENVELOPE_COLUMNS.contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
                     if crate::utils::canonical::is_relay_index_key(key)
@@ -1450,6 +1452,209 @@ pub fn assign_transliterations(source_value: &str, stage1: &str, stage2: &str) -
     }
 
     (native, roman)
+}
+
+pub const PHONETIC_PASS: f32 = 0.60;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PhoneClass {
+    P,
+    T,
+    K,
+    S,
+    G,
+    L,
+    M,
+    N,
+}
+
+fn phone_score(a: PhoneClass, b: PhoneClass) -> f32 {
+    if a == b {
+        return 1.0;
+    }
+    match (a, b) {
+        (PhoneClass::G, PhoneClass::K) | (PhoneClass::K, PhoneClass::G) | (PhoneClass::G, PhoneClass::S) | (PhoneClass::S, PhoneClass::G) => 1.0,
+        (PhoneClass::T, PhoneClass::S) | (PhoneClass::S, PhoneClass::T) | (PhoneClass::M, PhoneClass::N) | (PhoneClass::N, PhoneClass::M) => 0.5,
+        _ => 0.0,
+    }
+}
+
+fn phone_skeleton(romanized: &str) -> Vec<PhoneClass> {
+    let mut out: Vec<PhoneClass> = Vec::new();
+    for word in romanized.split_whitespace() {
+        let c: Vec<char> = word.chars().collect();
+        let mut last: Option<PhoneClass> = None;
+        let mut i = 0usize;
+        while i < c.len() {
+            let x = c[i];
+            let nx = c.get(i + 1).copied();
+            let mut emitted: Vec<PhoneClass> = Vec::new();
+            let mut step = 1usize;
+            match (x, nx) {
+                ('p', Some('h')) => { emitted.push(PhoneClass::P); step = 2; }
+                ('t', Some('h')) => { emitted.push(PhoneClass::T); step = 2; }
+                ('s', Some('h')) | ('c', Some('h')) => { emitted.push(PhoneClass::S); step = 2; }
+                ('t', Some('s')) | ('t', Some('z')) | ('d', Some('z')) | ('d', Some('j')) => { emitted.push(PhoneClass::S); step = 2; }
+                ('c', Some('k')) | ('q', Some('u')) | ('g', Some('h')) => { emitted.push(PhoneClass::K); step = 2; }
+                ('n', Some('g')) => { emitted.push(PhoneClass::N); step = 2; }
+                ('x', _) => { emitted.push(PhoneClass::K); emitted.push(PhoneClass::S); }
+                ('c', Some(n)) if n == 'e' || n == 'i' || n == 'y' => emitted.push(PhoneClass::S),
+                ('g', Some(n)) if n == 'e' || n == 'i' || n == 'y' => emitted.push(PhoneClass::G),
+                ('r', n) if !n.map_or(false, |v| "aeiouy".contains(v)) => {}
+                ('c', _) | ('k', _) | ('g', _) | ('q', _) => emitted.push(PhoneClass::K),
+                ('b', _) | ('p', _) | ('f', _) | ('v', _) => emitted.push(PhoneClass::P),
+                ('t', _) | ('d', _) => emitted.push(PhoneClass::T),
+                ('s', _) | ('z', _) | ('j', _) => emitted.push(PhoneClass::S),
+                ('l', _) | ('r', _) => emitted.push(PhoneClass::L),
+                ('m', _) => emitted.push(PhoneClass::M),
+                ('n', _) => emitted.push(PhoneClass::N),
+                _ => {}
+            }
+            for p in emitted {
+                if last != Some(p) {
+                    out.push(p);
+                }
+                last = Some(p);
+            }
+            i += step;
+        }
+    }
+    out
+}
+
+fn romanize_for_phonetics(text: &str) -> String {
+    any_ascii::any_ascii(text)
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_lowercase() { c } else { ' ' })
+        .collect()
+}
+
+fn letter_name_reading(src: &str) -> Option<String> {
+    const NAMES: [&str; 26] = [
+        "ei", "bi", "si", "di", "i", "ef", "ji", "eichi", "ai", "jei", "kei", "el", "em",
+        "en", "ou", "pi", "kyu", "ar", "es", "ti", "yu", "bi", "dabeulyu", "eks", "wai", "ji",
+    ];
+    let mut changed = false;
+    let words: Vec<String> = src
+        .split_whitespace()
+        .map(|w| {
+            let letters: Vec<char> = w.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            let acronym = (1..=5).contains(&letters.len())
+                && letters.iter().all(|c| c.is_ascii_uppercase())
+                && w.chars().all(|c| c.is_ascii_alphanumeric());
+            if !acronym {
+                return w.to_string();
+            }
+            changed = true;
+            letters
+                .iter()
+                .map(|c| NAMES[(*c as u8 - b'A') as usize])
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect();
+    if changed { Some(words.join(" ")) } else { None }
+}
+
+pub fn phonetic_similarity(a: &str, b: &str) -> Option<f32> {
+    let sa = phone_skeleton(&romanize_for_phonetics(a));
+    let sb = phone_skeleton(&romanize_for_phonetics(b));
+    if sa.len().max(sb.len()) < 2 {
+        return None;
+    }
+    let (n, m) = (sa.len(), sb.len());
+    let mut dp = vec![vec![0.0f32; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            let diag = dp[i - 1][j - 1] + phone_score(sa[i - 1], sb[j - 1]);
+            dp[i][j] = diag.max(dp[i - 1][j]).max(dp[i][j - 1]);
+        }
+    }
+    Some(2.0 * dp[n][m] / (n + m) as f32)
+}
+
+pub fn phonetic_gate(latin_src: &str, native: &str) -> (bool, Option<f32>) {
+    if native.trim().is_empty() || latin_src.trim().is_empty() {
+        return (true, None);
+    }
+    let mut best = phonetic_similarity(latin_src, native);
+    if let Some(alt) = letter_name_reading(latin_src) {
+        if let Some(s) = phonetic_similarity(&alt, native) {
+            best = Some(best.map_or(s, |b| b.max(s)));
+        }
+    }
+    match best {
+        Some(s) => (s >= PHONETIC_PASS, Some(s)),
+        None => (true, None),
+    }
+}
+
+pub fn gate_native_alias(latin_src: &str, native: String, tag: &str) -> String {
+    if native.trim().is_empty() || is_latin_dominant(&native) {
+        return native;
+    }
+    let (ok, sim) = phonetic_gate(latin_src, &native);
+    if let Some(s) = sim {
+        crate::utils::score_dynamics::record_baseline("indexing.translit_phonetic_sim", s);
+        crate::utils::score_dynamics::record_baseline(
+            "indexing.translit_phonetic_reject",
+            if ok { 0.0 } else { 1.0 },
+        );
+    }
+    if ok {
+        return native;
+    }
+    println!(
+        "    🚫 [{} PHONETIC REJECT] '{}' → '{}' | 자음 골격 유사도 {:.2} < {:.2} — 소리가 원문과 맞지 않는 음차라 별칭으로 쓰지 않습니다.",
+        tag,
+        latin_src,
+        native,
+        sim.unwrap_or(0.0),
+        PHONETIC_PASS
+    );
+    String::new()
+}
+
+pub fn cached_translit_recheck(
+    src: &str,
+    cached_native: &str,
+    doc_lang: &str,
+    lang_engine: bool,
+) -> Option<String> {
+    let (_non_latin, latin) = split_words_by_script(src);
+    if latin.is_empty() {
+        return None;
+    }
+    if is_latin_dominant(&native_script_sample(doc_lang, "", "")) {
+        return None;
+    }
+    let src_words: std::collections::HashSet<String> = strip_special_chars_for_transliteration(src)
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+    let added: Vec<&str> = cached_native
+        .split_whitespace()
+        .filter(|w| !src_words.contains(&w.to_lowercase()))
+        .collect();
+    if added.is_empty() {
+        return if lang_engine {
+            Some("문서언어 별칭이 비어 있어 언어별 4B 로 한 번 더 시도합니다".to_string())
+        } else {
+            None
+        };
+    }
+    let (ok, sim) = phonetic_gate(&latin.join(" "), &added.join(" "));
+    if ok {
+        None
+    } else {
+        Some(format!(
+            "캐시 별칭 '{}' 의 자음 골격 유사도 {:.2} 가 {:.2} 미만입니다",
+            added.join(" "),
+            sim.unwrap_or(0.0),
+            PHONETIC_PASS
+        ))
+    }
 }
 
 /// [PHASE B - 로그 헬퍼] 메타데이터 부여 + NMS + FORMAT GATE 전체 결과를 출력합니다.

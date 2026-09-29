@@ -941,8 +941,8 @@
       "trigger_words": "sales, sold, selling, revenue, sales volume, purchase volume, transaction, turnover, sales performance",
       "target_domain": "order",
       "semantic": "sales performance, revenue, transaction volume, sold items",
-      "bias": "sales, sold, selling, revenue, turnover, transaction, purchase volume, sales volume, sales performance",
-      "prejudice": "product registration, product list, display, exposure, traffic, page views, impressions"
+      "bias": "sales, sold, selling, revenue, turnover, transaction, purchase volume, sales volume, sales performance, 판매, 판매된, 판매량, 팔린, 매출, 거래, 구매, 구매량, 주문량",
+      "prejudice": "product registration, product list, display, exposure, traffic, page views, impressions, 상품 등록, 등록된, 등록일, 상품 목록, 진열, 노출, 조회수"
     },
     "domain_affinity": {
       "coupon": ["event", "goods"],
@@ -1558,6 +1558,11 @@
         "bias": "가전, 인테리어, 특가상품, 3C",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 통화, 화폐, 단위, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
       },
+      "category": {
+        "semantic": "카테고리, 분류, 상품분류, 카테고리명, 상품카테고리",
+        "bias": "패션의류, 잡화, 뷰티, 가전, 디지털, 컴퓨터, 노트북, 식품, 생활용품, 패션의류/잡화/뷰티 > 원피스",
+        "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 수정일, 결제수단, 결제방법, 은행, 계좌, 무통장, 카드, 모델명, 브랜드명, 제조사, 공급사, 공급사명, 업체코드, 상품상태, 상세설명, 본문, 요약설명, 태그, 키워드, 검색어, 원산지, 제조국, 판매가, 할인가, 가격, 공급가, 시중가, 포인트, 순위, 원가, 통화, 수량, 재고, 재고량, 단위, 대표이미지, 썸네일, 택배사, 배송비, 배송방법, 옵션, 추가상품, 관련상품"
+      },
       "color": {
         "semantic": "색상, 컬러, 색",
         "bias": "상품색상, 컬러, 색, 베이지, 검정, 블랙, 흰색, 화이트, 빨강, 레드, 파랑, 블루, 초록, 그린, 노랑, 옐로우, 분홍, 핑크, 갈색, 브라운, 회색, 그레이, 보라, 퍼플, 남색, 네이비, 아이보리, 은색, 실버, 금색, 골드",
@@ -1619,7 +1624,7 @@
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 판매가, 할인가, 가격, 공급가, 원가, 매입가, 정상가, 소비자가, 기존가격, 수량, 재고, 재고량, 품절임박, 재고경고, 단위, 단위명, 과세, 세금, 부가세, 과세코드, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송비, 배송요금, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
       },
       "compare_at_price": {
-        "semantic": "정상가, 소비자가, 기존가격",
+        "semantic": "정상가, 소비자가, 기존가격, 시중가",
         "bias": "20000, 35000, 1,800,000",
         "prejudice": "식별자, 링크, 주소, 코드, 판매상태, 노출상태, 상품명, 품목명, 이름, 등록일, 작성일, 결제수단, 결제방법, 은행, 계좌, 입금처, 무통장, 카드, 신용카드, 모델명, 브랜드명, 제조사, 상품상태, 중고, 상세설명, 본문, 요약설명, 태그, 키워드, 원산지, 제조국, 출시일, 발매일, 제조일자, 생산일, 유통기한, 만료일, 수량, 재고, 재고량, 품절임박, 재고경고, 단위, 단위명, 대표이미지, 썸네일, 추가이미지, 비디오, 동영상, 택배사, 운송업체, 배송방법, 배송형태, 배송기간, 소요일, 묶음배송, 합배송, 가로, 너비, 세로, 높이, 길이, 무게, 중량, 옵션, 선택항목, 추가상품, 관련상품"
       },
@@ -1737,12 +1742,12 @@
       },
       "goods": {
         "semantic": "주문상품, 상품명, 제품명, 품목",
-        "bias": "아이폰, 15, 무선, 키보드, 나이키, 운동화",
+        "bias": "아이폰, 15, 무선, 키보드, 나이키, 운동화, 원피스, 니트, 티셔츠, 주문명, 주문제목, 주문이름, 대표상품명, 상품명 외 2건",
         "prejudice": "식별자, 링크, 주문번호, 운송장번호, 송장, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문자, 구매자, 보낸사람, 이름, 주소, 위치, 연락처, 전화번호, 핸드폰, 수령인, 받는사람, 은행, 무통장, 계좌, 입금처, 카드, 신용카드, 결제카드, 주문일자, 입금일, 결제수단, 결제방법, 결제사, PG사, 결제경로"
       },
       "sender_name": {
         "semantic": "주문자, 구매자, 보낸사람, 이름",
-        "bias": "주문명, 주문제목, 주문이름, 홍길동, 이영희, 주식회사, 테스트",
+        "bias": "홍길동, 이영희, 김영수, 주식회사, 회원, 비회원",
         "prejudice": "링크, 주문번호, 운송장번호, 송장, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 연락처, 전화번호, 핸드폰, 주소, 위치, 은행, 무통장, 계좌, 입금처, 카드, 신용카드, 결제카드, 주문일자, 입금일, 결제수단, 결제방법, 결제사, PG사, 결제경로"
       },
       "sender_address": {
@@ -1757,7 +1762,7 @@
       },
       "recipient_name": {
         "semantic": "수령인, 받는사람, 이름",
-        "bias": "주문명, 주문제목, 주문이름, 김철수, 박지성",
+        "bias": "김철수, 박지성, 이민정, 받는분",
         "prejudice": "링크, 주문번호, 운송장번호, 송장, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 주소, 위치, 연락처, 전화번호, 핸드폰, 은행, 무통장, 계좌, 입금처, 카드, 신용카드, 결제카드, 주문일자, 입금일, 결제수단, 결제방법, 결제사, PG사, 결제경로"
       },
       "recipient_address": {
@@ -1799,6 +1804,21 @@
         "semantic": "결제사, PG사, 결제경로",
         "bias": "토스페이먼츠, NHN, KCP, KG이니시스, 나이스페이먼츠, 다날",
         "prejudice": "식별자, 링크, 주문번호, 운송장번호, 송장, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 주문자, 구매자, 보낸사람, 이름, 주소, 위치, 연락처, 전화번호, 핸드폰, 수령인, 받는사람, 주문일자, 입금일"
+      },
+      "quantity": {
+        "semantic": "수량, 주문수량, 구매수량, 주문 개수",
+        "bias": "1, 2, 3, 10",
+        "prejudice": "식별자, 링크, 주문번호, 운송장번호, 송장, 번호, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 주문자, 구매자, 보낸사람, 이름, 주소, 연락처, 전화번호, 수령인, 받는사람, 은행, 무통장, 계좌, 카드, 결제수단, 결제방법, 상품금액, 주문금액, 총주문액, 결제금액, 배송비, 판매가, 가격, 판매자, 가맹점"
+      },
+      "amount": {
+        "semantic": "총주문액, 주문금액, 결제금액, 총결제금액, 합계금액, 주문합계",
+        "bias": "15000, 29900원, 1,500,000",
+        "prejudice": "식별자, 링크, 주문번호, 운송장번호, 송장, 번호, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 주문자, 구매자, 이름, 주소, 연락처, 전화번호, 수령인, 은행, 무통장, 계좌, 카드, 결제수단, 결제방법, 수량, 주문수량, 배송비, 배송요금, 상품금액, 판매가, 단가, 판매자, 가맹점"
+      },
+      "shipping_fee": {
+        "semantic": "배송비, 배송요금, 택배비",
+        "bias": "3000원, 2500, 0, 무료",
+        "prejudice": "식별자, 링크, 주문번호, 운송장번호, 송장, 번호, 주문상태, 배송상태, 상태, 주문일, 결제일, 날짜, 주문상품, 상품명, 제품명, 품목, 주문자, 구매자, 이름, 주소, 연락처, 전화번호, 수령인, 은행, 무통장, 계좌, 카드, 결제수단, 결제방법, 수량, 주문수량, 총주문액, 주문금액, 결제금액, 상품금액, 판매가, 판매자, 가맹점"
       }
     },
     "review": {
@@ -2695,6 +2715,11 @@
         "bias": "Electronics, Home Decor, Special Offer, 3C",
         "prejudice": "identifier, link, address, code, sales status, display status, registration date, creation date, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, country of origin, release date, manufacture date, expiration date, sale price, discount price, price, supply price, cost price, purchase price, currency, unit, regular price, MSRP, original price, quantity, stock, inventory level, low stock warning, unit name, taxable, tax, VAT, tax code, main image, thumbnail, additional image, video, clip, carrier, courier, shipping fee, shipping cost, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
+      "category": {
+        "semantic": "Category, product category, classification, category name, category path",
+        "bias": "Fashion, Apparel, Accessories, Beauty, Electronics, Digital, Computers, Laptops, Food, Household",
+        "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, registration date, creation date, modified date, payment method, bank, account, wire transfer, card, model name, brand name, manufacturer, supplier, supplier name, vendor code, product condition, detailed description, body text, short description, tags, keywords, search terms, country of origin, sale price, discount price, price, supply price, market price, points, rank, cost price, currency, quantity, stock, inventory level, unit, main image, thumbnail, carrier, shipping fee, shipping method, options, add-on item, related product"
+      },
       "color": {
         "semantic": "Color, hue",
         "bias": "product color, color, beige, black, white, red, blue, green, yellow, pink, brown, gray, purple, navy, ivory, silver, gold",
@@ -2756,7 +2781,7 @@
         "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, registration date, creation date, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, tags, keywords, country of origin, release date, manufacture date, expiration date, sale price, discount price, price, supply price, cost price, purchase price, regular price, MSRP, original price, quantity, stock, inventory level, low stock warning, unit, unit name, taxable, tax, VAT, tax code, main image, thumbnail, additional image, video, clip, carrier, courier, shipping fee, shipping cost, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
       "compare_at_price": {
-        "semantic": "Regular price, MSRP, original price",
+        "semantic": "Regular price, MSRP, original price, market price, list price",
         "bias": "20.00, 35.00, 1,800.00",
         "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, registration date, creation date, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, tags, keywords, country of origin, release date, manufacture date, expiration date, quantity, stock, inventory level, low stock warning, unit, unit name, main image, thumbnail, additional image, video, clip, carrier, courier, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
@@ -2874,12 +2899,12 @@
       },
       "goods": {
         "semantic": "Order item, product name, item name, item",
-        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers",
+        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more",
         "prejudice": "identifier, link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_name": {
         "semantic": "Orderer, buyer, sender, name",
-        "bias": "order name, order title, John Doe, Jane Smith, Inc., Test",
+        "bias": "John Doe, Jane Smith, Inc., member, guest",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, contact, phone number, mobile, address, location, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_address": {
@@ -2894,7 +2919,7 @@
       },
       "recipient_name": {
         "semantic": "Recipient, receiver, name",
-        "bias": "order name, order title, Jane Doe, Michael Smith",
+        "bias": "Jane Doe, Michael Smith, Emily Brown",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, address, location, contact, phone number, mobile, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "recipient_address": {
@@ -2936,6 +2961,21 @@
         "semantic": "Payment gateway, PG, payment route",
         "bias": "Stripe, PayPal, Square, Adyen, Braintree, Authorize.Net",
         "prejudice": "identifier, link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, date of order, deposit date"
+      },
+      "quantity": {
+        "semantic": "Quantity, order quantity, qty, number of items ordered",
+        "bias": "1, 2, 3, 10",
+        "prejudice": "identifier, link, order number, tracking number, waybill, row number, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, orderer, buyer, sender, name, address, contact, phone number, recipient, receiver, bank, account, wire transfer, card, payment method, payment option, item amount, order amount, order total, payment amount, shipping fee, sale price, price, seller, franchise"
+      },
+      "amount": {
+        "semantic": "Order total, order amount, payment amount, total paid, grand total",
+        "bias": "15.00, $29.99, 1,500.00",
+        "prejudice": "identifier, link, order number, tracking number, waybill, row number, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, orderer, buyer, name, address, contact, phone number, recipient, bank, account, wire transfer, card, payment method, payment option, quantity, order quantity, qty, shipping fee, shipping cost, item amount, sale price, unit price, seller, franchise"
+      },
+      "shipping_fee": {
+        "semantic": "Shipping fee, shipping cost, delivery charge",
+        "bias": "$3.00, 2.50, 0, Free",
+        "prejudice": "identifier, link, order number, tracking number, waybill, row number, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, orderer, buyer, name, address, contact, phone number, recipient, bank, account, wire transfer, card, payment method, payment option, quantity, order quantity, qty, order total, order amount, payment amount, item amount, sale price, seller, franchise"
       }
     },
     "review": {

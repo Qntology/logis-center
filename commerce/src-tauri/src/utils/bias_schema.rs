@@ -587,10 +587,12 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
             add("code", "String", "code sku item", "");
             add("status", "String", "status condition", "");
             add("title", "String", "title name product", "");
+            add("category", "String", "category classification path", "");
             add("color", "String", "color hue shade tint", "");
             add("registration_date", "String", "date registration", "");
             add("sale_price", "Number", "sale price discount", "");
             add("supply_price", "Number", "supply price cost", "");
+            add("compare_at_price", "Number", "compare original market price", "");
             add("currency", "String", "currency", "");
             add("quantity", "Number", "quantity inventory stock", "");
             add("stock_keeping_unit", "String", "sku code", "");
@@ -606,6 +608,9 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
             add("recipient_name", "String", "recipient receiver name", "");
             add("payment_method", "String", "payment method type", "");
             add("payment_date", "String", "payment date", "");
+            add("quantity", "Number", "quantity ordered count", "");
+            add("amount", "Number", "order total amount payment", "");
+            add("shipping_fee", "Number", "shipping fee cost", "");
         },
         "coupon" | "event" => {
             add("id,link", "", "id link", "");
@@ -897,6 +902,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("description", "String", "description detail", "");
             add("short_description", "String", "short description summary", "");
             add("tags", "Array of Strings", "tags keywords", "");
+            add("category", "String", "category classification path", "");
             add("color", "String", "color hue shade tint", "");
             add("origin_country", "String", "origin country", "");
             add("manufacturer", "String", "manufacturer", "");
@@ -945,6 +951,9 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("payment_date", "String", "payment date", "");
             add("payment_method", "String", "payment method type", "");
             add("payment_origin", "String", "payment origin pg gateway", "");
+            add("quantity", "Number", "quantity ordered count", "");
+            add("amount", "Number", "order total amount payment", "");
+            add("shipping_fee", "Number", "shipping fee cost", "");
         },
         "coupon" | "event" => {
             add("id,link", "", "id link", "");

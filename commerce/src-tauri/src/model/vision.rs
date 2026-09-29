@@ -92,8 +92,26 @@ impl crate::model::LogisModel {
             let mut relay_plan: Vec<(&'static str, crate::parsing::TradeRelayKey)> = Vec::new();
             let mut cached_verdict:
                 Option<crate::models::siglip2::vision_encoder::DocTypeVerdict> = None;
+            let layout_hit = crate::models::siglip2::layout_cache::LAYOUT_CACHE.probe(
+                &grid,
+                &legibility,
+                !is_trade_doc,
+                &emit_term,
+            );
+            let layout_reuse = layout_hit.as_ref().map_or(false, |h| h.reuse());
+            let mut layout_fresh: Option<Vec<crate::models::siglip2::layout_cache::CachedHeatmap>> = None;
+            if let Some(h) = layout_hit.as_ref().filter(|h| h.reuse()) {
+                cached_verdict = h.verdict();
+                if h.route_trade && !is_trade_doc {
+                    emit_term(&format!(
+                        "  🔀 [MODE REROUTE / LAYOUT CACHE] 신뢰 템플릿 '{}' 이 trading 서식('{}')입니다. 사전 분류 없이 trading 파이프라인으로 전환합니다.",
+                        h.template_id, h.detected_type
+                    ));
+                    is_trade_doc = true;
+                }
+            }
 
-            if !is_trade_doc {
+            if !is_trade_doc && !layout_reuse {
                 // 🌟 [LAZY TEXT] 앵커가 전부 캐시에 있으면 텍스트 인코더 없이 판정됩니다.
                 match self
                     .with_siglip_text("doc type classification (reroute probe)", |m| {
@@ -169,7 +187,13 @@ impl crate::model::LogisModel {
                 if !conflict && leads {
                     crate::utils::score_dynamics::record_baseline("vision.tie_margin", tie_margin);
                 }
-                if verdict.title_confirmed && !conflict && leads && (tie_candidates.len() <= 1 || tie_margin >= 0.15) {
+                if let Some(t) = layout_hit.as_ref().filter(|h| h.reuse() && !h.detected_type.is_empty()) {
+                    detected_type = t.detected_type.clone();
+                    emit_term(&format!(
+                        "  🗂️ [LAYOUT CACHE / VERDICT] 신뢰 템플릿 '{}' 의 확정 서식 '{}' 을 그대로 씁니다. 이 서식에서 LLM 재판정이 필요했던 경우에도 그 결과가 템플릿에 들어 있으므로 다시 묻지 않습니다.",
+                        t.template_id, t.detected_type
+                    ));
+                } else if verdict.title_confirmed && !conflict && leads && (tie_candidates.len() <= 1 || tie_margin >= 0.15) {
                     emit_term(&format!(
                         "  🪪 [TITLE VERDICT TRUSTED] 판정 '{}' 은 상단 제목 행에 인쇄된 서식 전문의 선두이고 바디 축과 충돌하지 않습니다. 제목 행 밴드 안 1·2위 마진 {:+.4}. 밴드 밖 코드는 이미 후보가 아니므로 재판정 여부는 밴드 안 마진으로 정합니다. LLM 재판정을 열지 않습니다.",
                         verdict.code, tie_margin
@@ -257,14 +281,35 @@ impl crate::model::LogisModel {
                     } else {
                         vec![verdict.title_text.clone()]
                     };
-                    let mut heatmaps = self
-                        .with_siglip_text("column heatmaps (trade)", |m| {
-                            crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                                m, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
-                            )
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
+                    let reused_heatmaps = layout_hit
+                        .as_ref()
+                        .filter(|h| h.reuse())
+                        .and_then(|h| h.heatmaps_for(&detected_type));
+                    let mut heatmaps = match reused_heatmaps {
+                        Some(hm) => {
+                            emit_term(&format!(
+                                "  🗂️ [LAYOUT CACHE / HEATMAP REUSE] 신뢰 템플릿의 열 히트맵 {}개를 그대로 씁니다. 제목 행·여백 억제, 아레나, 크롭 계획은 이 문서의 판독 지도로 다시 계산하므로 표 길이나 빈 칸이 달라도 이 문서 기준으로 잘립니다.",
+                                hm.len()
+                            ));
+                            hm
+                        }
+                        None => {
+                            let hm = self
+                                .with_siglip_text("column heatmaps (trade)", |m| {
+                                    crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                                        m, &grid, &detected_type, &language, Some(&legibility), &title_prej, &emit_term
+                                    )
+                                })
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Heatmap build failed: {}", e))?;
+                            let snap = crate::models::siglip2::layout_cache::snapshot(&hm);
+                            if let Some(h) = layout_hit.as_ref() {
+                                crate::models::siglip2::layout_cache::LAYOUT_CACHE.observe(h, &detected_type, &snap, &emit_term);
+                            }
+                            layout_fresh = Some(snap);
+                            hm
+                        }
+                    };
                     {
                         let title_row_max = (grid.grid_rows / 18).max(1).min(grid.grid_rows.saturating_sub(1));
                         let mut suppressed = 0usize;
@@ -3259,6 +3304,17 @@ impl crate::model::LogisModel {
                             ));
                         }
                     }
+                    crate::models::siglip2::layout_cache::LAYOUT_CACHE.commit(
+                        layout_hit.as_ref(),
+                        layout_fresh.as_ref(),
+                        &grid,
+                        &legibility,
+                        true,
+                        &detected_type,
+                        Some(&verdict),
+                        &extracted_data,
+                        &emit_term,
+                    );
                 }
 
             } else {
@@ -3274,14 +3330,35 @@ impl crate::model::LogisModel {
                 crate::utils::score_dynamics::refine_primary(commerce_page_type);
                 // 🌟 [SCOPED LOCK + LAZY TEXT] trade 분기와 동일한 셀프 데드락 방지 구조를
                 //    with_siglip_text 가 그대로 제공하며, 캐시 미스가 없으면 인코더를 올리지 않습니다.
-                let mut heatmaps = self
-                    .with_siglip_text("column heatmaps (commerce)", |m| {
-                        crate::models::siglip2::vision_encoder::build_column_heatmaps(
-                            m, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
-                        )
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
+                let reused_heatmaps = layout_hit
+                    .as_ref()
+                    .filter(|h| h.reuse())
+                    .and_then(|h| h.heatmaps_for(commerce_page_type));
+                let mut heatmaps = match reused_heatmaps {
+                    Some(hm) => {
+                        emit_term(&format!(
+                            "  🗂️ [LAYOUT CACHE / HEATMAP REUSE] 신뢰 템플릿의 커머스 열 히트맵 {}개를 그대로 씁니다. 아레나와 크롭 계획은 이 문서의 판독 지도로 다시 계산합니다.",
+                            hm.len()
+                        ));
+                        hm
+                    }
+                    None => {
+                        let hm = self
+                            .with_siglip_text("column heatmaps (commerce)", |m| {
+                                crate::models::siglip2::vision_encoder::build_column_heatmaps(
+                                    m, &grid, commerce_page_type, &language, Some(&legibility), &[], &emit_term
+                                )
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Commerce heatmap failed: {}", e))?;
+                        let snap = crate::models::siglip2::layout_cache::snapshot(&hm);
+                        if let Some(h) = layout_hit.as_ref() {
+                            crate::models::siglip2::layout_cache::LAYOUT_CACHE.observe(h, commerce_page_type, &snap, &emit_term);
+                        }
+                        layout_fresh = Some(snap);
+                        hm
+                    }
+                };
 
                 {
                     let mut protect: Vec<&str> =
@@ -3421,6 +3498,17 @@ impl crate::model::LogisModel {
                         }
                     }
                     extracted_data = Value::Object(merged);
+                    crate::models::siglip2::layout_cache::LAYOUT_CACHE.commit(
+                        layout_hit.as_ref(),
+                        layout_fresh.as_ref(),
+                        &grid,
+                        &legibility,
+                        false,
+                        commerce_page_type,
+                        cached_verdict.as_ref(),
+                        &extracted_data,
+                        &emit_term,
+                    );
                 }
             }
 
@@ -3471,6 +3559,8 @@ impl crate::model::LogisModel {
                             .collect();
                     let v1_history =
                         crate::utils::score_dynamics::adaptive_baseline("vision.grounding_v1_doc_reject");
+                    let v1_claims = crate::utils::score_dynamics::adaptive_baseline_n("vision.grounding_v1_reject")
+                        .filter(|(m, sd, n)| *n >= 2 && *m - 1.96 * *sd / (*n as f32).sqrt() > 0.5);
                     if survivors.is_empty() {
                         emit_term("  ⚪ [VALUE GROUNDING v1 SKIP] v2 를 통과한 주장이 없어 패치 코사인 관측을 건너뜁니다.");
                     } else if let Some((reject_mean, reject_sd)) = v1_history.filter(|(m, _)| *m > 0.5) {
@@ -3478,6 +3568,12 @@ impl crate::model::LogisModel {
                         emit_term(&format!(
                             "  ⏭️ [VALUE GROUNDING v1 RETIRED] 이 서식 스코프에서 v1 관측을 거친 문서들의 문서별 폐기 비율이 평균 {:.3} (σ {:.3}) 입니다. 환각은 소수여야 하는데 문서마다 과반을 폐기하는 게이트는 환각이 아니라 짧은 값 문자열 자체를 거르고 있다는 뜻이므로, 관측을 더 쌓아도 게이트로 켤 근거가 생기지 않습니다. Qwen3.5 반환 → SigLIP2 텍스트 인코더 부착 → 임베딩 재적재 비용을 이번 문서부터 지불하지 않습니다.",
                             reject_mean, reject_sd
+                        ));
+                    } else if let Some((claim_mean, claim_sd, claim_n)) = v1_claims {
+                        crate::utils::score_dynamics::record_baseline("vision.grounding_v1_retired", 1.0);
+                        emit_term(&format!(
+                            "  ⏭️ [VALUE GROUNDING v1 RETIRED / CLAIMS] v2 로 접지가 확인된 주장 {}건 가운데 v1 이 버리자고 한 비율이 평균 {:.3} (σ {:.3}) 이고 95% 하한 {:.3} 도 과반입니다. 문서 단위 표본(vision.grounding_v1_doc_reject)은 아직 모자라지만 주장 단위로는 v1 이 환각이 아니라 인쇄된 짧은 값 자체를 거른다는 결론이 이미 섭니다. SigLIP2 텍스트 인코더 부착과 임베딩 재적재 비용을 이번 문서부터 지불하지 않습니다.",
+                            claim_n, claim_mean, claim_sd, claim_mean - 1.96 * claim_sd / (claim_n as f32).sqrt()
                         ));
                     } else {
                         emit_term(&format!(
@@ -3507,7 +3603,7 @@ impl crate::model::LogisModel {
                                             .and_then(|v| v.into_iter().next())
                                             .unwrap_or_default()
                                         },
-                                        &emit_term,
+                                        &|_: &str| {},
                                     ))
                                 })
                                 .await
@@ -3796,16 +3892,23 @@ impl crate::model::LogisModel {
                 }
             }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
-            let doc_type = if is_trade_doc {
-                extracted_data.get("header")
+            let doc_type_owned: String = if is_trade_doc {
+                let raw = extracted_data.get("header")
                     .and_then(|h| h.get("doc_type"))
                     .and_then(|s| s.as_str())
                     .or_else(|| extracted_data.get("doc_type").and_then(|s| s.as_str()))
-                    .unwrap_or("shipping_doc")
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("shipping_doc");
+                let code = crate::logic::doc_type_to_code(raw);
+                match crate::utils::bias_schema::canonical_trade_doc_code(&code) {
+                    Some(c) => c.to_string(),
+                    None => raw.to_string(),
+                }
             } else {
-                "goods"
+                "goods".to_string()
             };
-            
+            let doc_type: &str = doc_type_owned.as_str();
             let masked_nl = nl.clone(); // 마스킹은 백엔드 push_data 단계에서 동적으로 수행됩니다.
 
             let item_digest = crate::utils::hash::digest(&nl);
@@ -3830,29 +3933,19 @@ impl crate::model::LogisModel {
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 let from_addr = "0x0000000000000000000000000000000000000000";
-                let team_id = crate::utils::hash::hash_id(from_addr); 
-                let hashed_cc = crate::utils::hash::hash_id(if is_trade_doc { "local.shipping" } else { "local.commerce" });
+                let team_id = crate::utils::hash::hash_id(from_addr);
+                let hashed_cc = if is_trade_doc {
+                    crate::parsing::trading_cc()
+                } else {
+                    crate::utils::hash::hash_id("local.commerce")
+                };
 
-                // 식별자(ID) 추출 기준 분기
-                // 🌟 [DOC NUMBER RESOLVE]
-                //  ── 무엇이 문제였나 ──
-                //   Slice & Merge 경로의 extracted_data 는 { header:{...}, parties:{...}, ... } 중첩이라
-                //   루트에 document_number 가 없고, TRACKING Fast-Track 경로는 루트에 tracking_number 를 넣습니다.
-                //   기존 코드는 무역 모드에서 '루트 document_number' 하나만 봤기 때문에
-                //   두 경로 모두 항상 None → raw_no = task_id 였습니다.
-                //   task_id 는 스캔마다 새로 생기므로 index/id/ref 가 매번 달라져
-                //   같은 문서를 다시 스캔해도 upsert 가 아니라 신규 행이 계속 쌓였습니다.
-                //  ── 탐색 순서 ──
-                //   header.document_number → header.doc_number
-                //   → 루트 document_number → 루트 doc_number → 루트 tracking_number
-                //   "N/A" 는 LLM 이 '못 찾았다' 는 뜻으로 쓰는 값이라 식별자가 될 수 없습니다.
+                let auto_identity = if item_digest.is_empty() {
+                    task_id.clone()
+                } else {
+                    format!("AUTO-{}-{}", doc_type, item_digest)
+                };
                 let raw_no_owned: String = if is_trade_doc {
-                    // 🌟 [DOC IDENTITY v3] parsing.rs 의 resolve_trade_doc_identity 가
-                    //    접두어 완전일치 + 벡터 근거로 문서 식별자를 확정합니다.
-                    //    기존은 header / 루트만 훑다가 없으면 즉시 task_id 폴백이었습니다.
-                    //    그 결과 'BL-55432219' 가 r2~r3 에 인쇄되어 있어도
-                    //    doc_number = "" → task_id 폴백 → 재스캔마다 다른 index 가 되어
-                    //    같은 문서가 누적되었습니다.
                     let (resolved_no, _resolved_idx, _is_fallback) =
                         crate::parsing::resolve_trade_doc_identity(&doc_type, &extracted_data, &language);
                     
@@ -3877,35 +3970,29 @@ impl crate::model::LogisModel {
                             .or(from_root)
                             .map(|s| s.trim().to_string())
                             .filter(|s| !crate::model::merge::is_schema_echo(s))
-                            .unwrap_or_else(|| task_id.clone())
+                            .unwrap_or_else(|| auto_identity.clone())
                     }
                 } else {
                     extracted_data.get("tracking_number")
                         .and_then(|s| s.as_str())
                         .map(|s| s.trim().to_string())
                         .filter(|s| !crate::model::merge::is_schema_echo(s))
-                        .unwrap_or_else(|| task_id.clone())
+                        .unwrap_or_else(|| auto_identity.clone())
                 };
                 let raw_no: &str = raw_no_owned.as_str();
-                emit_term(&format!("[STAGE-3] 문서 식별자 확정: '{}' (task_id 폴백 여부: {})",
-                    raw_no, raw_no == task_id.as_str()));
+                emit_term(&format!("[STAGE-3] 문서 식별자 확정: '{}' (내용 기반 결정론 폴백 여부: {})",
+                    raw_no, raw_no == auto_identity.as_str()));
 
                 let table_name = "items"; 
                 
                 let clean_no = crate::utils::hash::normalize_identifier(raw_no);
-                // 🌟 [RELAY INDEX v3] hash.rs 의 relay_index 를 사용합니다.
-                //    기존은 `crc32(hash_id(type + clean_no))` 였는데,
-                //    이 경로에는 `normalize_identifier` 의 전각 접기가 반영되지 않았습니다.
-                //    `relay_index` 는 `normalize_identifier` 통과값을 받아
-                //    전각 영숫자(ＣＩ－４３７２６)도 반각과 동일하게 취급합니다.
-                let index_val = if crate::utils::hash::is_valid_relay_key(raw_no) {
-                    crate::utils::hash::relay_index(raw_no)
-                } else {
-                    // 유효하지 않은 키(예: task_id 폴백)는 기존 경로 유지
-                    crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, clean_no)))
-                };
-                let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
-                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
+                let index_val = crate::scheduler::entity_key_index(doc_type, &team_id, &hashed_cc, raw_no);
+                let hashed_id = crate::scheduler::entity_id(&team_id, index_val);
+                let mut ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
+                emit_term(&format!(
+                    "  🔑 [VISION IDENTITY] {} '{}' → index {} · id '{}' | 텍스트 경로(trading.rs)·커머스 목록·상세와 같은 entity_key_index 식입니다. 같은 서식이 이미지와 텍스트 두 경로로 들어와도 한 행으로 합쳐지고, 다른 서식의 rel_ 축이 같은 index 로 착지합니다.",
+                    doc_type, raw_no, index_val, hashed_id
+                ));
 
                 let mut final_data = if extracted_data.is_object() { extracted_data.clone() } else { json!({ "raw_output": extracted_data }) };
                 final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
@@ -4014,6 +4101,84 @@ impl crate::model::LogisModel {
                     ));
                 }
 
+                let doc_bcc = crate::scheduler::entity_bcc(doc_type, &hashed_cc);
+                let prev_json: Option<Value> = db
+                    .get_item_by_id(table_name, &hashed_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+                let prev_prior = crate::utils::canonical::ledger_prior(prev_json.as_ref());
+                let mut vision_stats: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+                let mut vision_linked = 0usize;
+                let mut vision_drafted = 0usize;
+                if is_trade_doc {
+                    let (_, _, trade_ref) = crate::parsing::trading_envelope(&team_id, doc_type, &final_data, &hashed_id);
+                    ref_val = trade_ref;
+                    relay_plan = crate::parsing::plan_trade_relays(doc_type, &extracted_data, &language);
+                    let mut forward_cols: Vec<String> = Vec::new();
+                    for (target_type, relay_key) in relay_plan.iter() {
+                        if relay_key.search_field != "doc_number" {
+                            continue;
+                        }
+                        let link_value = final_data
+                            .get(&relay_key.source_field)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if crate::model::merge::is_schema_echo(&link_value) {
+                            continue;
+                        }
+                        let target_index = crate::scheduler::entity_key_index(target_type, &team_id, "", &link_value);
+                        let col = crate::logic::trading_index_column(target_type);
+                        if let Some(o) = final_data.as_object_mut() {
+                            o.insert(col.clone(), json!(target_index));
+                        }
+                        forward_cols.push(format!("{}={}", col, target_index));
+                    }
+                    if !forward_cols.is_empty() {
+                        emit_term(&format!(
+                            "  🔑 [VISION RELAY INDEX] 정방향 연결 축 {:?} 을 저장 전에 새깁니다. trading.rs 가 rel_{{코드}} 에 상대 index 를 넣는 것과 같은 규약이라 검색의 relay_out 이 두 경로 문서를 똑같이 풉니다.",
+                            forward_cols
+                        ));
+                    }
+                    let mut carried: Vec<String> = Vec::new();
+                    if prev_prior == crate::utils::canonical::LedgerPrior::Placeholder {
+                        if let (Some(prev), Some(obj)) = (prev_json.as_ref().and_then(|v| v.as_object()), final_data.as_object_mut()) {
+                            for (k, v) in prev.iter() {
+                                if !(k.starts_with("rel_") || k.starts_with("reference_")) {
+                                    continue;
+                                }
+                                if crate::utils::canonical::relay_value_is_placeholder(k, v) {
+                                    continue;
+                                }
+                                let blank_here = obj
+                                    .get(k)
+                                    .map_or(true, |cur| crate::utils::canonical::relay_value_is_placeholder(k, cur));
+                                if blank_here {
+                                    obj.insert(k.clone(), v.clone());
+                                    carried.push(k.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !carried.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("vision.relay_placeholder_carry", carried.len() as f32);
+                        emit_term(&format!(
+                            "  🧷 [VISION PLACEHOLDER CARRY] '{}' 자리에 다른 서식이 먼저 만든 자리 초안이 있었습니다. 초안이 들고 있던 연결 축 {:?} 을 원본으로 옮긴 뒤 저장합니다. 옮기지 않으면 원본 저장이 초안을 덮어 역방향 연결이 사라집니다.",
+                            hashed_id, carried
+                        ));
+                    }
+                    if let Some(o) = final_data.as_object_mut() {
+                        o.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
+                    }
+                    crate::scheduler::relay_ledger::add_delta(
+                        &mut vision_stats,
+                        doc_type,
+                        crate::utils::canonical::ledger_delta(prev_prior, true),
+                    );
+                }
                 if let Some(o) = final_data.as_object_mut() {
                     o.insert(
                         "updated_at".to_string(),
@@ -4026,7 +4191,7 @@ impl crate::model::LogisModel {
                     None
                 };
                 let _ = db.upsert_item(
-                    table_name, // 분기된 테이블 적용
+                    table_name,
                     &hashed_id,
                     doc_type,
                     final_data.clone(),
@@ -4035,7 +4200,7 @@ impl crate::model::LogisModel {
                     Some(from_addr),
                     Some(&team_id),
                     Some(&hashed_cc),
-                    Some(&crate::utils::hash::hash_id(&format!("{}{}", doc_type, hashed_cc))),
+                    Some(&doc_bcc),
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
@@ -4081,7 +4246,6 @@ impl crate::model::LogisModel {
                 
 
                 if is_trade_doc {
-                    relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data, &language);
                     if relay_plan.is_empty() {
                         emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");
                     } else {
@@ -4116,109 +4280,115 @@ impl crate::model::LogisModel {
                             "  🔗 [TRADE RELAY] {} → {} | {}='{}' 로 연결 검색...",
                             doc_type, target_type, search_field, link_value
                         ));
-                        // 🌟 [RELAY SEARCH v5] get_all_items로 여러 결과를 가져온 후,
-                        //    자기 자신 제외 + 타입 검증으로 유효한 상대 문서를 찾습니다.
-                        //    find_item_by_property는 첫 번째 결과만 반환하므로,
-                        //    자기 자신이 먼저 나오면 무조건 SELF-SKIP 되는 문제를 해결합니다.
-                        let escaped_link = link_value.replace('\'', "''");
-                        let filter = format!(
-                            "(data LIKE '%\"{}\":\"{}\"%') OR (data LIKE '%\"{}\":[%\"{}\"%')",
-                            search_field, escaped_link, search_field, escaped_link
-                        );
-                        let relay_search = db.get_all_items("items", 10, 0, Some(filter)).await;
+
+                        let is_forward = search_field.as_str() == "doc_number" || search_field.as_str() == "no";
                         let mut found_target: Option<(String, Value)> = None;
-                        match relay_search {
-                            Ok(docs) => {
-                                for doc in docs {
-                                    // 🌟 [SELF-SEARCH GUARD] 자기 자신 제외
-                                    if doc.id == hashed_id {
-                                        continue;
-                                    }
-                                    // 🌟 [TYPE GUARD] 검색된 문서의 타입이 목표 타입과 일치해야 합니다.
-                                    //    저장 시 type_은 전체 이름(예: "COMMERCIAL INVOICE")으로 설정되지만,
-                                    //    릴레이 검색 시 target_type은 코드(예: "BL", "PL")입니다.
-                                    //    따라서 전체 이름을 코드로 변환하여 비교합니다.
-                                    let found_doc_type = doc.r#type.clone();
-                                    let found_code = crate::logic::doc_type_to_code(&found_doc_type);
-                                    // data JSON에서도 doc_type 확인
-                                    let parsed: Value = match serde_json::from_str(&doc.json_data) {
-                                        Ok(v) => v,
-                                        Err(_) => continue,
-                                    };
-                                    let data_doc_type = parsed.get("doc_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let data_code = crate::logic::doc_type_to_code(data_doc_type);
-                                    // 타입 검증: 전체 이름 또는 코드 모두 매칭 시도
-                                    let type_matches = if found_code == *target_type {
-                                        true
-                                    } else if data_code == *target_type {
-                                        true
-                                    } else if found_doc_type == *target_type {
-                                        true
-                                    } else if data_doc_type == *target_type {
-                                        true
-                                    } else {
-                                        false
-                                    };
-                                    if !type_matches {
-                                        continue;
-                                    }
-                                    // 🌟 [FIELD VALUE VERIFY] search_field 값이 정확히 일치하는지 확인
-                                    let field_ok = match parsed.get(search_field) {
-                                        Some(Value::String(s)) => s.trim() == link_value,
-                                        Some(Value::Array(a)) => a
-                                            .iter()
-                                            .any(|x| x.as_str().map_or(false, |s| s.trim() == link_value)),
-                                        _ => false,
-                                    };
-                                    if !field_ok {
-                                        continue;
-                                    }
-                                    found_target = Some((doc.id, parsed));
-                                    break;
+                        if is_forward {
+                            let direct_index = crate::scheduler::entity_key_index(target_type, &team_id, "", &link_value);
+                            let direct_id = crate::scheduler::entity_id(&team_id, direct_index);
+                            if let Ok(Some(doc)) = db.get_item_by_id("items", &direct_id).await {
+                                let direct_code = crate::logic::doc_type_to_code(&doc.r#type);
+                                if direct_code != *target_type && doc.r#type != *target_type {
+                                    crate::utils::score_dynamics::record_baseline("vision.relay_type_guard", 1.0);
+                                    emit_term(&format!(
+                                        "  🔀 [TRADE RELAY / TYPE GUARD] {} → {} (index={}) 자리의 문서 '{}' 가 '{}' 타입입니다. index 는 서식 코드를 해시에 포함하므로 이 충돌은 기존 데이터 오염입니다. 연결도 초안 생성도 하지 않습니다.",
+                                        doc_type, target_type, direct_index, direct_id, doc.r#type
+                                    ));
+                                    continue;
                                 }
-                            },
-                            Err(e) => {
-                                emit_term(&format!(
-                                    "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
-                                    target_type, e
-                                ));
-                                continue;
+                                if let Ok(parsed) = serde_json::from_str::<Value>(&doc.json_data) {
+                                    emit_term(&format!(
+                                        "  🔍 [TRADE RELAY / DIRECT ID] {} → {} | 번호 '{}' 로 index {} 를 재현해 id '{}' 를 바로 찾았습니다.",
+                                        doc_type, target_type, link_value, direct_index, direct_id
+                                    ));
+                                    found_target = Some((doc.id.clone(), parsed));
+                                }
+                            }
+                        }
+                        if found_target.is_none() {
+                            let escaped_link = link_value.replace('\'', "''");
+                            let filter = format!(
+                                "(data LIKE '%\"{}\":\"{}\"%') OR (data LIKE '%\"{}\":[%\"{}\"%')",
+                                search_field, escaped_link, search_field, escaped_link
+                            );
+                            let relay_search = db.get_all_items("items", 10, 0, Some(filter)).await;
+                            match relay_search {
+                                Ok(docs) => {
+                                    for doc in docs {
+                                        if doc.id == hashed_id {
+                                            continue;
+                                        }
+                                        let found_doc_type = doc.r#type.clone();
+                                        let found_code = crate::logic::doc_type_to_code(&found_doc_type);
+                                        let parsed: Value = match serde_json::from_str(&doc.json_data) {
+                                            Ok(v) => v,
+                                            Err(_) => continue,
+                                        };
+                                        let data_doc_type = parsed.get("doc_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let data_code = crate::logic::doc_type_to_code(data_doc_type);
+                                        let type_matches = if found_code == *target_type {
+                                            true
+                                        } else if data_code == *target_type {
+                                            true
+                                        } else if found_doc_type == *target_type {
+                                            true
+                                        } else if data_doc_type == *target_type {
+                                            true
+                                        } else {
+                                            false
+                                        };
+                                        if !type_matches {
+                                            continue;
+                                        }
+                                        let field_ok = match parsed.get(search_field) {
+                                            Some(Value::String(s)) => s.trim() == link_value,
+                                            Some(Value::Array(a)) => a
+                                                .iter()
+                                                .any(|x| x.as_str().map_or(false, |s| s.trim() == link_value)),
+                                            _ => false,
+                                        };
+                                        if !field_ok {
+                                            continue;
+                                        }
+                                        found_target = Some((doc.id, parsed));
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    emit_term(&format!(
+                                        "  ⚠️ [TRADE RELAY v4] {} 검색 실패: {:?}",
+                                        target_type, e
+                                    ));
+                                    continue;
+                                }
                             }
                         }
                         match found_target {
                             Some((existing_id, mut ej)) => {
                                 let mut needs_update = false;
-                                // 🌟 [REVERSE REFERENCE INJECT] 현재 문서의 식별자를 타겟의 참조 필드에 역주입합니다.
-                                //    역할 기반으로 역참조 필드명을 결정합니다.
-                                let reverse_field = crate::logic::trade_reference_field_of(&doc_type)
+                                let reverse_field = crate::logic::trade_reference_field_of(doc_type)
                                     .unwrap_or("");
                                 if !reverse_field.is_empty() {
-                                    if let Some(my_doc_number) = extracted_data.get("doc_number").and_then(|v| v.as_str()) {
-                                        if !crate::model::merge::is_schema_echo(my_doc_number) {
-                                            let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
-                                            if crate::model::merge::is_schema_echo(existing_ref) {
-                                                ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
-                                                needs_update = true;
-                                            }
+                                    let my_doc_number = final_data
+                                        .get("doc_number")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !crate::model::merge::is_schema_echo(s));
+                                    if let Some(my_doc_number) = my_doc_number {
+                                        let existing_ref = ej.get(reverse_field).and_then(|v| v.as_str()).unwrap_or("");
+                                        if crate::model::merge::is_schema_echo(existing_ref) {
+                                            ej.as_object_mut().unwrap().insert(reverse_field.to_string(), json!(my_doc_number));
+                                            needs_update = true;
                                         }
                                     }
                                 }
-                                // 🌟 [RELAY INDEX CROSS-LINK] relay_index 를 타겟 문서의 봉투에 주입합니다.
-                                //    이렇게 하면 두 문서가 같은 릴레이 축에서 서로를 찾을 수 있습니다.
-                                let my_relay_idx = if crate::utils::hash::is_valid_relay_key(raw_no) {
-                                    crate::utils::hash::relay_index(raw_no)
-                                } else {
-                                    0
-                                };
-                                if my_relay_idx > 0 {
-                                    let relay_col = crate::logic::trading_index_column(&doc_type);
-                                    let their_relay = ej.get(&relay_col).and_then(|v| v.as_u64()).unwrap_or(0);
-                                    if their_relay == 0 {
-                                        ej.as_object_mut().unwrap().insert(relay_col.clone(), json!(my_relay_idx));
-                                        needs_update = true;
-                                    }
+                                let relay_col = crate::logic::trading_index_column(doc_type);
+                                let their_relay = ej.get(&relay_col).and_then(|v| v.as_u64()).unwrap_or(0);
+                                if their_relay == 0 {
+                                    ej.as_object_mut().unwrap().insert(relay_col.clone(), json!(index_val));
+                                    needs_update = true;
                                 }
                                 // 물류 정보 상호 보완 (vessel, pol, pod, etd, eta)
                                 for field in ["vessel", "voyage_number", "pol", "pod", "etd", "eta"] {
@@ -4266,9 +4436,39 @@ impl crate::model::LogisModel {
                                         }
                                     }
                                 }
+                                vision_linked += 1;
+                                let found_prior = crate::utils::canonical::ledger_prior(Some(&ej));
+                                if found_prior == crate::utils::canonical::LedgerPrior::Placeholder {
+                                    if let Some(obj) = ej.as_object_mut() {
+                                        let slot = obj
+                                            .entry(crate::utils::canonical::RELAY_ORIGIN_KEY.to_string())
+                                            .or_insert_with(|| json!([]));
+                                        if !slot.is_array() {
+                                            *slot = json!([]);
+                                        }
+                                        if let Some(arr) = slot.as_array_mut() {
+                                            if !arr.iter().any(|x| x.as_str() == Some(doc_type)) {
+                                                arr.push(json!(doc_type));
+                                                needs_update = true;
+                                            }
+                                        }
+                                    }
+                                }
                                 if needs_update {
-                                    if !crate::utils::canonical::is_relay_placeholder(&ej) {
-                                        ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                    match found_prior {
+                                        crate::utils::canonical::LedgerPrior::Placeholder => {}
+                                        crate::utils::canonical::LedgerPrior::Draft => {
+                                            ej.as_object_mut().unwrap().insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
+                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                            crate::scheduler::relay_ledger::add_delta(
+                                                &mut vision_stats,
+                                                target_type,
+                                                crate::utils::canonical::ledger_delta(found_prior, true),
+                                            );
+                                        }
+                                        _ => {
+                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                        }
                                     }
                                     let merged_text = crate::parsing::json_to_natural_language(&ej);
                                     ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
@@ -4277,12 +4477,12 @@ impl crate::model::LogisModel {
                                         "items", &existing_id, target_type, ej, None,
                                         None,
                                         Some(from_addr), Some(&team_id), Some(&hashed_cc),
-                                        Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                        Some(&crate::scheduler::entity_bcc(target_type, &hashed_cc)),
                                         Some(&ref_val), None
                                     ).await;
                                     emit_term(&format!(
-                                        "  ✅ [TRADE RELAY v4] 기존 {} 문서 '{}' 에 {} 정보 병합 완료.",
-                                        target_type, existing_id, doc_type
+                                        "  ✅ [TRADE RELAY v4] 기존 {} 문서 '{}' ({:?}) 에 {} 연결 축 병합 완료.",
+                                        target_type, existing_id, found_prior, doc_type
                                     ));
                                 }
                             },
@@ -4296,58 +4496,69 @@ impl crate::model::LogisModel {
                                     ));
                                     continue;
                                 }
-                                let draft_index = crate::utils::hash::relay_index(&link_value);
-                                let draft_id = if draft_index > 0 {
-                                    crate::utils::hash::hash_id(&format!("{}{}", team_id, draft_index))
-                                } else {
-                                    crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
-                                };
+                                let draft_index = crate::scheduler::entity_key_index(target_type, &team_id, "", &link_value);
+                                let draft_id = crate::scheduler::entity_id(&team_id, draft_index);
                                 if let Ok(Some(occupant)) = db.get_item_by_id("items", &draft_id).await {
                                     crate::utils::score_dynamics::record_baseline("vision.relay_id_occupied", 1.0);
                                     emit_term(&format!(
-                                        "  ⚪ [TRADE RELAY v4 / ID OCCUPIED] {} 자리 '{}' 에 이미 '{}' 타입 문서가 있습니다. 이미지 파이프라인의 문서 id 는 번호만으로 정해지므로 같은 번호의 다른 서식일 수 있어 덮어쓰지 않습니다.",
+                                        "  ⚪ [TRADE RELAY v4 / ID OCCUPIED] {} 자리 '{}' 에 이미 '{}' 타입 문서가 있습니다. index 는 서식 코드를 해시에 포함하므로 이 자리는 같은 서식의 같은 번호여야 합니다. 덮어쓰지 않습니다.",
                                         target_type, draft_id, occupant.r#type
                                     ));
                                     continue;
                                 }
+                                let reverse_field = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
+                                let my_number = final_data
+                                    .get("doc_number")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !crate::model::merge::is_schema_echo(s))
+                                    .unwrap_or_else(|| raw_no.to_string());
                                 let mut draft_data = json!({});
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
                                     obj.insert("type".to_string(), json!(target_type));
-                                    if draft_index > 0 {
-                                        obj.insert("index".to_string(), json!(draft_index));
-                                    }
+                                    obj.insert("index".to_string(), json!(draft_index));
                                     obj.insert(search_key.clone(), json!(link_value.clone()));
+                                    if !reverse_field.is_empty() && reverse_field != search_key.as_str() && !my_number.starts_with("AUTO-") {
+                                        obj.insert(reverse_field.to_string(), json!(my_number.clone()));
+                                    }
+                                    obj.insert(crate::logic::trading_index_column(doc_type), json!(index_val));
                                     obj.insert("doc_type".to_string(), json!(target_type));
                                     obj.insert("updated_at".to_string(), json!(0));
                                     obj.insert("mode".to_string(), json!("shipping"));
+                                    obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("placeholder"));
+                                    obj.insert(crate::utils::canonical::RELAY_ORIGIN_KEY.to_string(), json!([doc_type]));
                                     obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, search_key, link_value)));
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
                                     None,
                                     Some(from_addr), Some(&team_id), Some(&hashed_cc),
-                                    Some(&crate::utils::hash::hash_id(&format!("{}{}", target_type, hashed_cc))),
+                                    Some(&crate::scheduler::entity_bcc(target_type, &hashed_cc)),
                                     Some(&ref_val), None
                                 ).await;
+                                vision_drafted += 1;
+                                crate::scheduler::relay_ledger::add_delta(
+                                    &mut vision_stats,
+                                    target_type,
+                                    crate::utils::canonical::LEDGER_PLACEHOLDER_DELTA,
+                                );
                                 emit_term(&format!(
-                                    "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
-                                    target_type, draft_id, search_key, link_value
+                                    "  📝 [TRADE RELAY v4] {} 자리 초안 '{}' 생성 ({}: '{}', index={}, 역참조 {}='{}'). 원본이 텍스트·이미지 어느 경로로 들어와도 같은 id 로 착지해 초안이 해소됩니다.",
+                                    target_type, draft_id, search_key, link_value, draft_index, reverse_field, my_number
                                 ));
                             },
                         }
                     }
                 }
 
-                // 🌟 [CRITICAL FIX] 이미지 데이터 저장 직후, DB의 Task와 Message 상태도 9(DONE)로 완전히 굳혀버립니다!
-                // 🌟 [RELAY v4 SUMMARY] plan_trade_relays 기반 집계로 교체합니다.
                 if relay_plan.is_empty() {
                     emit_term("  ⚪ [TRADE RELAY v4] 릴레이 키가 확보되지 않았습니다. 추출 결과에서 유효한 참조 번호가 없습니다.");
                 } else {
                     let linked = relay_plan.iter()
                         .filter(|(_, k)| !k.raw.is_empty() && k.raw != "N/A")
                         .count();
-                    
+
                     emit_term(&format!(
                         "  ✅ [TRADE RELAY v4 SUMMARY] 계획 {}건 | 유효 키 {}건 | 역할: {:?}",
                         relay_plan.len(),
@@ -4355,7 +4566,27 @@ impl crate::model::LogisModel {
                         relay_plan.iter().map(|(t, k)| format!("{}:{}", t, k.role)).collect::<Vec<_>>()
                     ));
                 }
-                // 이 두 줄이 없어서 3초마다 UI가 이전 상태(1)를 DB에서 퍼와 덮어씌우고 있었습니다.
+                if is_trade_doc {
+                    let now_ms_metrics = chrono::Utc::now().timestamp_millis();
+                    let mut metrics_doc = final_data.clone();
+                    if let Some(o) = metrics_doc.as_object_mut() {
+                        if o.get("type").is_none() {
+                            o.insert("type".to_string(), json!(doc_type));
+                        }
+                        if o.get("created_at").is_none() {
+                            o.insert("created_at".to_string(), json!(now_ms_metrics));
+                        }
+                        let rel_keys: Vec<String> = o.keys().filter(|k| k.starts_with("rel_")).cloned().collect();
+                        for k in rel_keys {
+                            o.remove(&k);
+                        }
+                    }
+                    let _ = crate::utils::metrics::update_team_base_metrics(db, &team_id, &hashed_cc, &vec![metrics_doc], vision_stats.clone()).await;
+                    emit_term(&format!(
+                        "  📊 [VISION LEDGER] {} '{}' 저장 전 상태 {:?} | 기존 문서 연결 {}건 · 자리 초안 {}건 | 원장 변화 {:?} → 팀 base(cc=trading) 에 반영했습니다. 텍스트 경로와 같은 팀·cc 라 두 경로의 count 가 한곳에 모입니다.",
+                        doc_type, hashed_id, prev_prior, vision_linked, vision_drafted, vision_stats
+                    ));
+                }
                 let _ = db.update_task_status(&task_id, 9).await;
                 let _ = db.update_message_status(&task_id, 9, Some("Extraction Complete")).await;
             }

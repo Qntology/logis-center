@@ -5046,6 +5046,403 @@ pub fn default_currency_for_lang(doc_lang: &str) -> &'static str {
         _ => "USD",
     }
 }
+#[derive(Debug, Clone, Default)]
+pub struct SynthesisGate {
+    pub kept: String,
+    pub dropped: Vec<(String, Vec<String>)>,
+    pub total: usize,
+}
+
+const SYN_MONTHS: [(&str, u32); 24] = [
+    ("january", 1), ("february", 2), ("march", 3), ("april", 4), ("may", 5), ("june", 6),
+    ("july", 7), ("august", 8), ("september", 9), ("october", 10), ("november", 11), ("december", 12),
+    ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("jun", 6), ("jul", 7),
+    ("aug", 8), ("sep", 9), ("sept", 9), ("oct", 10), ("nov", 11), ("dec", 12),
+];
+
+const SYN_CURRENCY_WORDS: [(&str, &str); 16] = [
+    ("krw", "KRW"), ("won", "KRW"), ("usd", "USD"), ("dollar", "USD"), ("dollars", "USD"),
+    ("eur", "EUR"), ("euro", "EUR"), ("euros", "EUR"), ("jpy", "JPY"), ("yen", "JPY"),
+    ("cny", "CNY"), ("rmb", "CNY"), ("yuan", "CNY"), ("renminbi", "CNY"), ("gbp", "GBP"),
+    ("inr", "INR"),
+];
+
+fn syn_month(word: &str) -> Option<u32> {
+    let w = word.trim_end_matches('.').to_lowercase();
+    SYN_MONTHS.iter().find(|(n, _)| *n == w).map(|(_, m)| *m)
+}
+
+fn syn_full_year(y: u32) -> u32 {
+    if y >= 100 {
+        y
+    } else if y < 70 {
+        2000 + y
+    } else {
+        1900 + y
+    }
+}
+
+fn syn_number_key(raw: &str) -> Option<String> {
+    let t: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    let t = t.trim_matches('.');
+    if t.is_empty() {
+        return None;
+    }
+    let (int, frac) = match t.split_once('.') {
+        Some((a, b)) => (a.to_string(), b.trim_end_matches('0').to_string()),
+        None => (t.to_string(), String::new()),
+    };
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    if frac.is_empty() {
+        Some(int.to_string())
+    } else {
+        Some(format!("{}.{}", int, frac))
+    }
+}
+
+fn syn_date_literal(tok: &str) -> Option<(Option<u32>, u32, u32)> {
+    let parts: Vec<&str> = tok
+        .split(|c: char| c == '-' || c == '/' || c == '.')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let num = |p: &str| -> Option<u32> {
+        if p.chars().all(|c| c.is_ascii_digit()) { p.parse().ok() } else { None }
+    };
+    if let (Some(a), Some(b), Some(c)) = (num(parts[0]), num(parts[1]), num(parts[2])) {
+        if parts[0].len() >= 2 && (1..=12).contains(&b) && (1..=31).contains(&c) {
+            return Some((Some(syn_full_year(a)), b, c));
+        }
+        return None;
+    }
+    if let (Some(m), Some(d), Some(y)) = (syn_month(parts[0]), num(parts[1]), num(parts[2])) {
+        if (1..=31).contains(&d) {
+            return Some((Some(syn_full_year(y)), m, d));
+        }
+    }
+    if let (Some(d), Some(m), Some(y)) = (num(parts[0]), syn_month(parts[1]), num(parts[2])) {
+        if (1..=31).contains(&d) {
+            return Some((Some(syn_full_year(y)), m, d));
+        }
+    }
+    None
+}
+
+fn syn_currencies(tok: &str, iso_ok: bool) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let chars: Vec<char> = tok.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        let after_digit = i > 0 && chars[i - 1].is_ascii_digit();
+        match ch {
+            '$' => out.push("USD"),
+            '€' => out.push("EUR"),
+            '£' => out.push("GBP"),
+            '₩' => out.push("KRW"),
+            '¥' | '￥' => {
+                out.push("JPY");
+                out.push("CNY");
+            }
+            '원' if after_digit || chars.len() == 1 => out.push("KRW"),
+            '元' if after_digit || chars.len() == 1 => out.push("CNY"),
+            '円' if after_digit || chars.len() == 1 => out.push("JPY"),
+            _ => {}
+        }
+    }
+    for run in tok.split(|c: char| !c.is_ascii_alphabetic()).filter(|r| r.len() >= 3) {
+        let lower = run.to_lowercase();
+        if let Some((_, code)) = SYN_CURRENCY_WORDS.iter().find(|(w, _)| *w == lower) {
+            out.push(code);
+        } else if iso_ok && run.len() == 3 && run.chars().all(|c| c.is_ascii_uppercase()) {
+            if let Some(code) = ISO_4217_ACTIVE.split_whitespace().find(|c| *c == run) {
+                out.push(code);
+            }
+        }
+    }
+    out
+}
+
+fn syn_amount_like(tok: &str) -> bool {
+    let core = syn_core(tok);
+    let digits = core.chars().filter(|c| c.is_ascii_digit()).count();
+    digits >= 3 || (digits >= 2 && core.contains(|c: char| c == ',' || c == '.'))
+}
+
+fn syn_core(tok: &str) -> &str {
+    tok.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+fn syn_day(tok: &str) -> Option<u32> {
+    let core = syn_core(tok).to_lowercase();
+    let digits: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let rest = &core[digits.len()..];
+    if digits.is_empty() || !["", "st", "nd", "rd", "th"].contains(&rest) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|d| (1..=31).contains(d))
+}
+
+#[derive(Default)]
+struct SynSource {
+    numbers: std::collections::HashSet<String>,
+    years: std::collections::HashSet<u32>,
+    month_days: std::collections::HashSet<(u32, u32)>,
+    months: std::collections::HashSet<u32>,
+    currencies: std::collections::HashSet<&'static str>,
+}
+
+fn syn_source(source: &str, doc_lang: &str) -> SynSource {
+    let mut s = SynSource::default();
+    s.currencies.insert(default_currency_for_lang(doc_lang));
+    let toks: Vec<&str> = source
+        .split(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']' || c == '=')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, raw) in toks.iter().enumerate() {
+        for c in syn_currencies(raw, true) {
+            s.currencies.insert(c);
+        }
+        let core = syn_core(raw);
+        if let Some((y, m, d)) = syn_date_literal(core) {
+            if let Some(y) = y {
+                s.years.insert(y);
+            }
+            s.month_days.insert((m, d));
+            s.months.insert(m);
+        }
+        if let Some(m) = syn_month(core) {
+            let next_day = toks.get(i + 1).and_then(|t| syn_day(t));
+            let prev_day = if i > 0 { syn_day(toks[i - 1]) } else { None };
+            if let Some(d) = next_day.or(prev_day) {
+                s.month_days.insert((m, d));
+                s.months.insert(m);
+            }
+        }
+        for run in core.split(|c: char| !(c.is_ascii_digit() || c == ',' || c == '.')) {
+            if !run.chars().any(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if let Some(k) = syn_number_key(run) {
+                if let Ok(y) = k.parse::<u32>() {
+                    if (1900..=2099).contains(&y) {
+                        s.years.insert(y);
+                    }
+                }
+                s.numbers.insert(k);
+            }
+        }
+        let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !kd.is_empty() {
+            let rest: String = core.chars().skip(kd.chars().count()).collect();
+            if let Ok(n) = kd.parse::<u32>() {
+                if rest.starts_with('년') {
+                    s.years.insert(syn_full_year(n));
+                } else if rest.starts_with('월') && (1..=12).contains(&n) {
+                    s.months.insert(n);
+                    if let Some(d) = toks.get(i + 1).and_then(|t| {
+                        let c = syn_core(t);
+                        let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                        if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok() } else { None }
+                    }) {
+                        s.month_days.insert((n, d));
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+fn syn_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for i in 0..chars.len() {
+        cur.push(chars[i]);
+        let end = matches!(chars[i], '.' | '!' | '?' | '。');
+        let next_ws = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
+        if end && next_ws {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+            cur.clear();
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}
+
+fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
+    let mut bad: Vec<String> = Vec::new();
+    let toks: Vec<&str> = sentence.split_whitespace().collect();
+    let mut used = vec![false; toks.len()];
+    for (i, raw) in toks.iter().enumerate() {
+        let core = syn_core(raw);
+        let lower = core.to_lowercase();
+        if lower.len() == 4 && (lower.starts_with("19") || lower.starts_with("20")) && lower.ends_with("xx") {
+            bad.push(format!("연도 자리표시 {}", core));
+            used[i] = true;
+            continue;
+        }
+        if let Some((y, m, d)) = syn_date_literal(core) {
+            used[i] = true;
+            if !src.month_days.contains(&(m, d)) {
+                bad.push(format!("날짜 {}", core));
+            } else if let Some(y) = y {
+                if !src.years.contains(&y) {
+                    bad.push(format!("연도 {}", y));
+                }
+            }
+            continue;
+        }
+        if let Some(m) = syn_month(core) {
+            let next_day = toks.get(i + 1).and_then(|t| syn_day(t));
+            let prev_day = if i > 0 { syn_day(toks[i - 1]) } else { None };
+            match (next_day, prev_day) {
+                (Some(d), _) => {
+                    used[i] = true;
+                    if i + 1 < used.len() {
+                        used[i + 1] = true;
+                    }
+                    if !src.month_days.contains(&(m, d)) {
+                        bad.push(format!("날짜 {} {}", core, d));
+                    }
+                }
+                (None, Some(d)) => {
+                    used[i] = true;
+                    used[i - 1] = true;
+                    if !src.month_days.contains(&(m, d)) {
+                        bad.push(format!("날짜 {} {}", d, core));
+                    }
+                }
+                (None, None) => {
+                    let prev = if i > 0 { syn_core(toks[i - 1]).to_lowercase() } else { String::new() };
+                    let full = lower.len() > 4 || lower == "june" || lower == "july";
+                    if full && ["in", "during", "since", "until", "by"].contains(&prev.as_str()) {
+                        used[i] = true;
+                        if !src.months.contains(&m) {
+                            bad.push(format!("월 {}", core));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !kd.is_empty() && kd.len() <= 2 {
+            let rest = &core[kd.len()..];
+            if let Ok(n) = kd.parse::<u32>() {
+                if rest.starts_with('월') && (1..=12).contains(&n) {
+                    used[i] = true;
+                    let day = toks.get(i + 1).and_then(|t| {
+                        let c = syn_core(t);
+                        let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                        if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok() } else { None }
+                    });
+                    match day {
+                        Some(d) => {
+                            if i + 1 < used.len() {
+                                used[i + 1] = true;
+                            }
+                            if !src.month_days.contains(&(n, d)) {
+                                bad.push(format!("날짜 {}월 {}일", n, d));
+                            }
+                        }
+                        None => {
+                            if !src.months.contains(&n) {
+                                bad.push(format!("월 {}월", n));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+    for (i, raw) in toks.iter().enumerate() {
+        let iso_ok = raw.chars().any(|c| c.is_ascii_digit())
+            || (i > 0 && syn_amount_like(toks[i - 1]))
+            || toks.get(i + 1).map_or(false, |t| syn_amount_like(t));
+        let cur = syn_currencies(raw, iso_ok);
+        if !cur.is_empty() && !cur.iter().any(|c| src.currencies.contains(c)) {
+            let shown = raw
+                .trim_start_matches(|c: char| matches!(c, '(' | '\'' | '"'))
+                .trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '\'' | '"'));
+            bad.push(format!("통화 {}", shown));
+        }
+        if used[i] || raw.contains(':') {
+            continue;
+        }
+        let core = syn_core(raw);
+        let letters = core.chars().filter(|c| c.is_alphabetic()).count();
+        let currency_letters = !cur.is_empty();
+        if letters > 0 && !currency_letters {
+            let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let rest = &core[kd.len()..];
+            if kd.len() == 4 && rest.starts_with('년') {
+                if let Ok(y) = kd.parse::<u32>() {
+                    if !src.years.contains(&y) {
+                        bad.push(format!("연도 {}", y));
+                    }
+                }
+            }
+            continue;
+        }
+        let digit_part: String = core
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+            .collect();
+        let key = match syn_number_key(&digit_part) {
+            Some(k) => k,
+            None => continue,
+        };
+        let int_digits = key.split('.').next().unwrap_or("").len();
+        if int_digits == 4 && !digit_part.contains(',') {
+            if let Ok(y) = key.parse::<u32>() {
+                if (1900..=2099).contains(&y) {
+                    if !src.years.contains(&y) && !src.numbers.contains(&key) {
+                        bad.push(format!("연도 {}", y));
+                    }
+                    continue;
+                }
+            }
+        }
+        if int_digits < 3 {
+            continue;
+        }
+        if !src.numbers.contains(&key) {
+            bad.push(format!("수치 {}", digit_part.trim_end_matches(|c: char| c == ',' || c == '.')));
+        }
+    }
+    bad
+}
+
+pub fn synthesis_fact_gate(text: &str, source: &str, doc_lang: &str) -> SynthesisGate {
+    let src = syn_source(source, doc_lang);
+    let sentences = syn_sentences(text);
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Vec<(String, Vec<String>)> = Vec::new();
+    for s in sentences.iter() {
+        let bad = syn_ungrounded(s, &src);
+        if bad.is_empty() {
+            kept.push(s.clone());
+        } else {
+            dropped.push((s.clone(), bad));
+        }
+    }
+    SynthesisGate {
+        kept: kept.join(" "),
+        dropped,
+        total: sentences.len(),
+    }
+}
 
 pub const ISO_4217_ACTIVE: &str = "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL";
 

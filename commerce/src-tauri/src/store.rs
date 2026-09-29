@@ -1263,10 +1263,6 @@ impl VectorStore {
         let env_ref  = resolve_envelope_field(r#ref, &final_data, "ref");
 
         if let Some(obj) = final_data.as_object_mut() {
-            // 별칭 보정 (기존 동작 유지)
-            if let Some(tn) = obj.get("tracking_number").cloned() {
-                if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
-            }
             if let Some(p) = obj.get("price").cloned() {
                 if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
             }

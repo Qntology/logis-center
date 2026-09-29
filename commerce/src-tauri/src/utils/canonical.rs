@@ -12,7 +12,7 @@ const FORCE_ID: &[&str] = &[
 ];
 const FORCE_NUM: &[&str] = &[
     "status", "views", "created_at", "updated_at",
-    "index", "goods", "order", "tracking",
+    "index", "goods", "order", "tracking", "event",
 ];
 const FORCE_BOOL: &[&str] = &[
     "detail", "node", "embed",
@@ -93,7 +93,7 @@ pub fn iso_to_epoch_ms(t: &str) -> Option<i64> {
     None
 }
 
-pub const RELAY_INDEX_KEYS: &[&str] = &["goods", "order", "tracking"];
+pub const RELAY_INDEX_KEYS: &[&str] = &["goods", "order", "tracking", "event"];
 
 pub fn is_relay_index_key(key: &str) -> bool {
     let k = key.trim().to_lowercase();
@@ -234,6 +234,11 @@ pub fn is_relay_placeholder(doc: &serde_json::Value) -> bool {
     updated_zero && digest_empty
 }
 
+pub const LEDGER_KEY: &str = "ledger";
+pub const RELAY_BOUND_KEY: &str = "_relay_bound";
+pub const RELAY_ORIGIN_KEY: &str = "relay_origin";
+pub const RELAY_TRANSIENT_KEYS: &[&str] = &[RELAY_BOUND_KEY, RELAY_ORIGIN_KEY];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerPrior {
     Absent,
@@ -243,11 +248,30 @@ pub enum LedgerPrior {
 }
 
 pub fn ledger_prior(doc: Option<&serde_json::Value>) -> LedgerPrior {
-    match doc {
-        None => LedgerPrior::Absent,
-        Some(d) if d.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) > 0 => LedgerPrior::Confirmed,
-        Some(d) if is_relay_placeholder(d) => LedgerPrior::Placeholder,
-        Some(_) => LedgerPrior::Draft,
+    let d = match doc {
+        None => return LedgerPrior::Absent,
+        Some(d) => d,
+    };
+    match d.get(LEDGER_KEY).and_then(|v| v.as_str()).map(|s| s.trim()) {
+        Some("count") => return LedgerPrior::Confirmed,
+        Some("draft") => return LedgerPrior::Draft,
+        Some("placeholder") => return LedgerPrior::Placeholder,
+        _ => {}
+    }
+    if d.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+        LedgerPrior::Confirmed
+    } else if is_relay_placeholder(d) {
+        LedgerPrior::Placeholder
+    } else {
+        LedgerPrior::Draft
+    }
+}
+
+pub fn ledger_state(prior: LedgerPrior, confirm: bool) -> &'static str {
+    if confirm || prior == LedgerPrior::Confirmed {
+        "count"
+    } else {
+        "draft"
     }
 }
 
@@ -264,3 +288,80 @@ pub fn ledger_delta(prior: LedgerPrior, confirm: bool) -> (i64, i64, i64) {
 }
 
 pub const LEDGER_PLACEHOLDER_DELTA: (i64, i64, i64) = (1, 0, 0);
+
+pub fn relay_establishes(target_type: &str, by_type: &str) -> bool {
+    let t = relay_type_family(target_type);
+    let b = relay_type_family(by_type);
+    if t.is_empty() || b.is_empty() || t == b {
+        return false;
+    }
+    match t.as_str() {
+        "goods" => b == "order" || b == "tracking",
+        "order" => b == "goods" || b == "tracking",
+        "tracking" => b == "order" || b == "goods",
+        "event" => b == "goods" || b == "order",
+        "review" => b == "goods",
+        _ => true,
+    }
+}
+
+pub fn relay_edge_target(key: &str) -> Option<String> {
+    let k = key.trim();
+    if let Some(code) = k.strip_prefix("rel_") {
+        let c = code.trim();
+        return if c.is_empty() { None } else { Some(c.to_uppercase()) };
+    }
+    if RELAY_LINK_KEYS.iter().any(|x| *x == k) {
+        return Some(k.to_string());
+    }
+    None
+}
+
+fn push_edge(out: &mut Vec<(String, u32)>, key: &str, index: u32) {
+    if !out.iter().any(|(k, i)| k == key && *i == index) {
+        out.push((key.to_string(), index));
+    }
+}
+
+pub fn relay_edges(doc: &serde_json::Value) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return out,
+    };
+    let own_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let own_family = relay_type_family(own_type);
+    let own_code = own_type.trim().to_uppercase();
+    for key in RELAY_LINK_KEYS.iter() {
+        if *key == own_family.as_str() {
+            continue;
+        }
+        match obj.get(*key) {
+            Some(serde_json::Value::Array(arr)) => {
+                for el in arr.iter() {
+                    if let Some(i) = relay_ref_index(el.get("index")) {
+                        push_edge(&mut out, key, i);
+                    }
+                }
+            }
+            other => {
+                if let Some(i) = relay_ref_index(other) {
+                    push_edge(&mut out, key, i);
+                }
+            }
+        }
+    }
+    for (k, v) in obj.iter() {
+        let code = match k.strip_prefix("rel_") {
+            Some(c) => c.trim().to_uppercase(),
+            None => continue,
+        };
+        if code.is_empty() || code == own_code {
+            continue;
+        }
+        if let Some(i) = relay_ref_index(Some(v)) {
+            push_edge(&mut out, k, i);
+        }
+    }
+    out
+}

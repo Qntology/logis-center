@@ -1,0 +1,875 @@
+use once_cell::sync::{Lazy, OnceCell};
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tauri::Emitter;
+
+pub const LANG_LLM_OWNER: &str = "alphaedge-ai";
+pub const LANG_LLM_FILES: [&str; 9] = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "merges.txt",
+    "vocab.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "model.safetensors",
+];
+pub const LANG_LLM_REQUIRED: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+pub const LANG_LLM_MIN_WEIGHT_BYTES: u64 = 400_000_000;
+pub const LANG_LLM_RESIDENT_RATIO: f64 = 0.30;
+
+const WEIGHT_EXTS: [&str; 5] = ["safetensors", "bin", "pt", "pth", "gguf"];
+const FAIL_RETRY_SECS: i64 = 600;
+const CHUNK_TIMEOUT_SECS: u64 = 60;
+const FILE_ATTEMPTS: u32 = 4;
+const PROGRESS_STEP: u64 = 5;
+const PROGRESS_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+const KNOWN_CODES: &[&str] = &[
+    "afr", "asm", "ast", "aze", "bak", "bel", "ben", "bos", "bul", "cat", "ceb", "ces",
+    "cym", "dan", "deu", "ell", "eng", "est", "eus", "fas", "fin", "fra", "gle", "glg",
+    "guj", "hat", "heb", "hin", "hrv", "hun", "hye", "ind", "isl", "ita", "jav", "jpn",
+    "kan", "kat", "kaz", "khm", "kor", "lao", "lit", "ltz", "lvs", "mal", "mar", "min",
+    "mkd", "mlt", "mya", "nep", "nld", "nno", "nob", "oci", "pan", "pol", "por", "ron",
+    "rus", "scn", "sin", "slk", "slv", "snd", "spa", "srp", "sun", "swe", "tam", "tat",
+    "tel", "tgk", "tgl", "tha", "tur", "ukr", "urd", "vie", "war", "ydd", "zho",
+];
+
+pub type LangLlmLoader = fn(
+    &Path,
+    &candle_core::Device,
+) -> anyhow::Result<crate::models::qwen3_5::generate::Qwen3_5GenerateModel>;
+
+static LOADER: OnceCell<LangLlmLoader> = OnceCell::new();
+
+pub fn register_loader(f: LangLlmLoader) -> bool {
+    LOADER.set(f).is_ok()
+}
+
+pub fn loader() -> Option<LangLlmLoader> {
+    LOADER.get().copied()
+}
+
+const ISO1_TO_ALPHAEDGE: &[(&str, &str)] = &[
+    ("ko", "kor"), ("en", "eng"), ("ja", "jpn"), ("zh", "zho"), ("fr", "fra"), ("de", "deu"),
+    ("es", "spa"), ("it", "ita"), ("pt", "por"), ("nl", "nld"), ("ru", "rus"), ("uk", "ukr"),
+    ("be", "bel"), ("bg", "bul"), ("sr", "srp"), ("mk", "mkd"), ("kk", "kaz"), ("th", "tha"),
+    ("el", "ell"), ("ta", "tam"), ("te", "tel"), ("hi", "hin"), ("mr", "mar"), ("ne", "nep"),
+    ("bn", "ben"), ("fa", "fas"), ("ur", "urd"), ("vi", "vie"), ("id", "ind"), ("tr", "tur"),
+    ("pl", "pol"), ("cs", "ces"), ("sk", "slk"), ("sl", "slv"), ("hr", "hrv"), ("bs", "bos"),
+    ("ro", "ron"), ("hu", "hun"), ("fi", "fin"), ("et", "est"), ("lv", "lvs"), ("lt", "lit"),
+    ("sv", "swe"), ("da", "dan"), ("no", "nob"), ("nb", "nob"), ("nn", "nno"), ("is", "isl"),
+    ("ga", "gle"), ("gl", "glg"), ("eu", "eus"), ("ca", "cat"), ("cy", "cym"), ("mt", "mlt"),
+    ("lb", "ltz"), ("oc", "oci"), ("ka", "kat"), ("hy", "hye"), ("az", "aze"), ("ba", "bak"),
+    ("tt", "tat"), ("tg", "tgk"), ("tl", "tgl"), ("fil", "tgl"), ("jv", "jav"), ("su", "sun"),
+    ("km", "khm"), ("lo", "lao"), ("my", "mya"), ("si", "sin"), ("pa", "pan"), ("gu", "guj"),
+    ("kn", "kan"), ("ml", "mal"), ("sd", "snd"), ("he", "heb"), ("iw", "heb"), ("ht", "hat"),
+    ("yi", "ydd"), ("af", "afr"), ("as", "asm"),
+];
+
+pub fn alphaedge_code(doc_lang: &str) -> Option<&'static str> {
+    let lower = doc_lang.trim().to_lowercase();
+    if let Some(c) = KNOWN_CODES.iter().find(|c| **c == lower.as_str()) {
+        return Some(*c);
+    }
+    let base = lower.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
+    ISO1_TO_ALPHAEDGE
+        .iter()
+        .find(|(iso1, _)| *iso1 == base)
+        .map(|(_, code)| *code)
+}
+
+pub fn repo_name(code: &str) -> String {
+    format!("Qwen3.5-4B-{}-16384", code)
+}
+
+pub fn repo_id(code: &str) -> String {
+    format!("{}/{}", LANG_LLM_OWNER, repo_name(code))
+}
+
+pub fn model_dir(code: &str) -> PathBuf {
+    crate::utils::get_app_dir().join("models").join(repo_name(code))
+}
+
+fn file_url(code: &str, file: &str) -> String {
+    format!("https://huggingface.co/{}/resolve/main/{}", repo_id(code), file)
+}
+
+fn weight_bytes(dir: &Path) -> u64 {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_file() {
+                return None;
+            }
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !WEIGHT_EXTS.contains(&ext.as_str()) {
+                return None;
+            }
+            e.metadata().ok().map(|m| m.len())
+        })
+        .sum()
+}
+
+pub fn is_ready(code: &str) -> bool {
+    let dir = model_dir(code);
+    if !dir.is_dir() {
+        return false;
+    }
+    for f in LANG_LLM_REQUIRED.iter() {
+        match std::fs::metadata(dir.join(f)) {
+            Ok(m) if m.len() > 0 => {}
+            _ => return false,
+        }
+    }
+    weight_bytes(&dir) >= LANG_LLM_MIN_WEIGHT_BYTES
+}
+
+pub fn resident_estimate_mb(code: &str) -> u64 {
+    let bytes = weight_bytes(&model_dir(code));
+    ((bytes as f64 * LANG_LLM_RESIDENT_RATIO) / (1024.0 * 1024.0)).ceil() as u64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DlPhase {
+    Absent,
+    Queued,
+    Downloading,
+    Ready,
+    Failed,
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+pub struct DlState {
+    pub phase: DlPhase,
+    pub file: String,
+    pub done: u64,
+    pub total: u64,
+    pub bytes_per_sec: f64,
+    pub error: String,
+    pub retry_at_ms: i64,
+    pub updated_ms: i64,
+}
+
+impl DlState {
+    fn new(phase: DlPhase) -> Self {
+        Self {
+            phase,
+            file: String::new(),
+            done: 0,
+            total: 0,
+            bytes_per_sec: 0.0,
+            error: String::new(),
+            retry_at_ms: 0,
+            updated_ms: now_ms(),
+        }
+    }
+}
+
+static STATES: Lazy<Mutex<HashMap<String, DlState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static RUNTIME_FAIL: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static QUEUE: Lazy<Mutex<VecDeque<(String, tauri::AppHandle, String)>>> =
+    Lazy::new(|| Mutex::new(VecDeque::new()));
+static WORKER: AtomicBool = AtomicBool::new(false);
+static RESIDENT: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static BOUND: Lazy<Mutex<Option<(String, usize)>>> = Lazy::new(|| Mutex::new(None));
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn set_state<F: FnOnce(&mut DlState)>(code: &str, f: F) {
+    if let Ok(mut m) = STATES.lock() {
+        let e = m
+            .entry(code.to_string())
+            .or_insert_with(|| DlState::new(DlPhase::Absent));
+        f(e);
+        e.updated_ms = now_ms();
+    }
+}
+
+pub fn state(code: &str) -> DlState {
+    let mut s = STATES
+        .lock()
+        .ok()
+        .and_then(|m| m.get(code).cloned())
+        .unwrap_or_else(|| DlState::new(DlPhase::Absent));
+    let ready = is_ready(code);
+    if s.phase != DlPhase::Downloading && s.phase != DlPhase::Queued && ready {
+        s.phase = DlPhase::Ready;
+    } else if s.phase == DlPhase::Ready && !ready {
+        s.phase = DlPhase::Absent;
+    }
+    s
+}
+
+pub fn mark_runtime_failure(code: &str, why: &str) {
+    if let Ok(mut m) = RUNTIME_FAIL.lock() {
+        m.insert(code.to_string(), why.to_string());
+    }
+}
+
+pub fn runtime_failure(code: &str) -> Option<String> {
+    RUNTIME_FAIL.lock().ok().and_then(|m| m.get(code).cloned())
+}
+
+pub fn resident_variant() -> Option<String> {
+    RESIDENT.lock().ok().and_then(|g| g.clone())
+}
+
+pub fn set_resident_variant(v: Option<String>) {
+    if let Ok(mut g) = RESIDENT.lock() {
+        *g = v;
+    }
+}
+
+pub struct TranslitBinding {
+    code: Option<String>,
+}
+
+impl TranslitBinding {
+    pub fn none() -> Self {
+        Self { code: None }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.code.is_some()
+    }
+}
+
+impl Drop for TranslitBinding {
+    fn drop(&mut self) {
+        let code = match self.code.take() {
+            Some(c) => c,
+            None => return,
+        };
+        if let Ok(mut b) = BOUND.lock() {
+            let clear = match b.as_mut() {
+                Some((c, n)) if *c == code => {
+                    *n = n.saturating_sub(1);
+                    *n == 0
+                }
+                _ => false,
+            };
+            if clear {
+                *b = None;
+            }
+        }
+    }
+}
+
+pub fn bind_translit(code: &str) -> TranslitBinding {
+    if let Ok(mut b) = BOUND.lock() {
+        match b.as_mut() {
+            None => {
+                *b = Some((code.to_string(), 1));
+                return TranslitBinding { code: Some(code.to_string()) };
+            }
+            Some((c, n)) if c.as_str() == code => {
+                *n += 1;
+                return TranslitBinding { code: Some(code.to_string()) };
+            }
+            _ => {}
+        }
+    }
+    TranslitBinding::none()
+}
+
+pub fn bound_translit_code() -> Option<String> {
+    BOUND.lock().ok().and_then(|b| b.as_ref().map(|(c, _)| c.clone()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranslitEngine {
+    Lang4B { code: String },
+    Base2B,
+}
+
+impl TranslitEngine {
+    pub fn is_lang(&self) -> bool {
+        matches!(self, TranslitEngine::Lang4B { .. })
+    }
+
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            TranslitEngine::Lang4B { code } => Some(code.as_str()),
+            TranslitEngine::Base2B => None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            TranslitEngine::Lang4B { code } => format!("Qwen3.5-4B-{} (alphaedge-ai)", code),
+            TranslitEngine::Base2B => "Qwen3.5-2B".to_string(),
+        }
+    }
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.2}GB", bytes as f64 / 1_000_000_000.0)
+}
+
+fn eta(remaining: u64, bps: f64) -> String {
+    if bps < 1.0 {
+        return "계산 중".to_string();
+    }
+    let secs = (remaining as f64 / bps).round() as u64;
+    if secs >= 3600 {
+        format!("{}시간 {}분", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}분 {}초", secs / 60, secs % 60)
+    } else {
+        format!("{}초", secs)
+    }
+}
+
+fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        (done.min(total) * 100) / total
+    }
+}
+
+fn progress_line(code: &str, st: &DlState) -> String {
+    format!(
+        "📥 [LANG-LLM] {} · {} {}% ({} / {}) · {:.1}MB/s · 남은 약 {}",
+        repo_name(code),
+        st.file,
+        percent(st.done, st.total),
+        gb(st.done),
+        gb(st.total),
+        st.bytes_per_sec / 1_000_000.0,
+        eta(st.total.saturating_sub(st.done), st.bytes_per_sec)
+    )
+}
+
+pub fn resolve_engine(
+    doc_lang: &str,
+    app: &tauri::AppHandle,
+    task_id: &str,
+    fetch: bool,
+) -> (TranslitEngine, String) {
+    let code = match alphaedge_code(doc_lang) {
+        Some(c) => c,
+        None => {
+            return (
+                TranslitEngine::Base2B,
+                format!(
+                    "🔤 [TRANSLIT ENGINE] 문서 언어 '{}' 에 대응하는 alphaedge-ai Qwen3.5-4B 언어 모델이 없어 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                    doc_lang
+                ),
+            )
+        }
+    };
+    if let Some(why) = runtime_failure(code) {
+        return (
+            TranslitEngine::Base2B,
+            format!(
+                "⚠️ [TRANSLIT ENGINE] Qwen3.5-4B-{} 는 이번 세션에서 쓸 수 없습니다 ({}). 앱을 다시 시작하기 전까지 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                code, why
+            ),
+        );
+    }
+    if !is_ready(code) {
+        let phase = if fetch {
+            request_download(code, app, task_id)
+        } else {
+            state(code).phase
+        };
+        let st = state(code);
+        let line = match phase {
+            DlPhase::Unavailable => format!(
+                "🚫 [TRANSLIT ENGINE] {} 저장소에서 필수 파일을 받을 수 없습니다 ({}). 이 언어는 이번 세션 동안 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                repo_id(code),
+                st.error
+            ),
+            DlPhase::Failed => format!(
+                "⚠️ [TRANSLIT ENGINE] {} 다운로드가 실패해 대기 중입니다 ({}). 약 {}분 뒤 다음 태스크에서 받은 곳부터 이어받습니다. 그동안 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                repo_id(code),
+                st.error,
+                ((st.retry_at_ms - now_ms()).max(0) / 60_000) + 1
+            ),
+            DlPhase::Downloading if st.total > 0 => format!(
+                "{} — 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며, 완료되면 다음 캐시 미스부터 자동으로 4B 로 전환합니다.",
+                progress_line(code, &st)
+            ),
+            DlPhase::Ready => format!(
+                "✅ [TRANSLIT ENGINE] {} 파일 준비를 방금 마쳤습니다. 다음 태스크부터 4B 를 검토합니다.",
+                repo_id(code)
+            ),
+            DlPhase::Absent => format!(
+                "⚪ [TRANSLIT ENGINE] {} 은 아직 받지 않았습니다. 이 문서 언어는 라틴 문자라 LLM 음차가 드물어, LLM 음차가 실제로 필요해지는 순간 백그라운드로 받습니다. 지금은 Qwen3.5-2B + 발음 게이트로 진행합니다.",
+                repo_id(code)
+            ),
+            _ => format!(
+                "📥 [TRANSLIT ENGINE] {} 가 설치되어 있지 않아 백그라운드 다운로드를 시작했습니다 (약 7.9GB · 저장 위치 {}). 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 진행하며 작업을 멈출 필요가 없습니다.",
+                repo_id(code),
+                model_dir(code).display()
+            ),
+        };
+        return (TranslitEngine::Base2B, line);
+    }
+    if loader().is_none() {
+        return (
+            TranslitEngine::Base2B,
+            format!(
+                "🔌 [TRANSLIT ENGINE] {} 파일은 준비되었지만 4B safetensors 런타임 로더가 아직 연결되지 않았습니다. 이번 태스크는 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                repo_id(code)
+            ),
+        );
+    }
+    (
+        TranslitEngine::Lang4B { code: code.to_string() },
+        format!(
+            "🧠 [TRANSLIT ENGINE] 음차 엔진: Qwen3.5-4B-{} (alphaedge-ai · vocab 16384) | 상주 예상 {}MB",
+            code,
+            resident_estimate_mb(code)
+        ),
+    )
+}
+
+pub fn lang_engine_available(doc_lang: &str) -> bool {
+    match alphaedge_code(doc_lang) {
+        Some(c) => loader().is_some() && runtime_failure(c).is_none() && is_ready(c),
+        None => false,
+    }
+}
+
+fn announce(app: &tauri::AppHandle, task_id: &str, msg: &str) {
+    println!("{}", msg);
+    if !task_id.is_empty() {
+        let _ = app.emit(
+            "task-console-log",
+            json!({"task_id": task_id, "text": format!("{}\n", msg)}),
+        );
+    }
+}
+
+fn publish(app: &tauri::AppHandle, code: &str) {
+    let _ = app.emit("lang-llm-status", status_json(code));
+}
+
+pub fn request_download(code: &str, app: &tauri::AppHandle, task_id: &str) -> DlPhase {
+    if is_ready(code) {
+        return DlPhase::Ready;
+    }
+    let st = state(code);
+    match st.phase {
+        DlPhase::Unavailable | DlPhase::Queued | DlPhase::Downloading => return st.phase,
+        DlPhase::Failed if now_ms() < st.retry_at_ms => return DlPhase::Failed,
+        _ => {}
+    }
+    set_state(code, |s| {
+        s.phase = DlPhase::Queued;
+        s.error.clear();
+    });
+    if let Ok(mut q) = QUEUE.lock() {
+        if !q.iter().any(|(c, _, _)| c.as_str() == code) {
+            q.push_back((code.to_string(), app.clone(), task_id.to_string()));
+        }
+    }
+    spawn_worker_if_idle();
+    DlPhase::Queued
+}
+
+fn spawn_worker_if_idle() {
+    if WORKER.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async {
+        loop {
+            let next = QUEUE.lock().ok().and_then(|mut q| q.pop_front());
+            match next {
+                Some((code, app, task_id)) => download_repo(&code, &app, &task_id).await,
+                None => {
+                    WORKER.store(false, Ordering::SeqCst);
+                    let pending = QUEUE.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                    if pending && !WORKER.swap(true, Ordering::SeqCst) {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+enum DlError {
+    Missing(u16),
+    Failed(String),
+}
+
+fn content_range_total(res: &reqwest::Response) -> Option<u64> {
+    res.headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit('/').next())
+        .and_then(|t| t.trim().parse::<u64>().ok())
+}
+
+fn backoff_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 | 1 => 0,
+        2 => 3,
+        3 => 10,
+        _ => 30,
+    }
+}
+
+async fn download_file(
+    client: &reqwest::Client,
+    code: &str,
+    file: &str,
+    dir: &Path,
+    app: &tauri::AppHandle,
+    task_id: &str,
+) -> Result<u64, DlError> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let dst = dir.join(file);
+    if let Ok(m) = std::fs::metadata(&dst) {
+        if m.len() > 0 {
+            return Ok(m.len());
+        }
+    }
+    let part = dir.join(format!("{}.part", file));
+    let url = file_url(code, file);
+    let mut last_err = String::new();
+
+    for attempt in 1..=FILE_ATTEMPTS {
+        let wait = backoff_secs(attempt);
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
+        let have = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        let mut req = client.get(&url);
+        if have > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={}-", have));
+        }
+        let res = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        let status = res.status().as_u16();
+        if matches!(status, 401 | 403 | 404) {
+            return Err(DlError::Missing(status));
+        }
+        if status == 416 {
+            let remote = match client
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .await
+            {
+                Ok(r) => content_range_total(&r),
+                Err(_) => None,
+            };
+            if remote == Some(have) {
+                if dst.exists() {
+                    let _ = std::fs::remove_file(&dst);
+                }
+                if std::fs::rename(&part, &dst).is_ok() {
+                    return Ok(have);
+                }
+            }
+            let _ = std::fs::remove_file(&part);
+            last_err = "HTTP 416 (이어받기 범위가 서버 파일과 맞지 않아 처음부터 다시 받습니다)".to_string();
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            last_err = format!("HTTP {}", status);
+            continue;
+        }
+        let resumed = status == 206 && have > 0;
+        let total = if resumed {
+            content_range_total(&res).unwrap_or(0)
+        } else {
+            res.content_length().unwrap_or(0)
+        };
+        let loud = total >= PROGRESS_MIN_BYTES;
+        let mut done = if resumed { have } else { 0 };
+        let opened = if resumed {
+            tokio::fs::OpenOptions::new().append(true).open(&part).await
+        } else {
+            tokio::fs::File::create(&part).await
+        };
+        let mut f = match opened {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = format!("임시 파일 열기 실패: {}", e);
+                continue;
+            }
+        };
+        set_state(code, |s| {
+            s.phase = DlPhase::Downloading;
+            s.file = file.to_string();
+            s.done = done;
+            s.total = total;
+            s.bytes_per_sec = 0.0;
+        });
+        if resumed && loud {
+            announce(
+                app,
+                task_id,
+                &format!(
+                    "↪️ [LANG-LLM] {} 이어받기: 이미 받은 {} 다음부터 계속합니다.",
+                    file,
+                    gb(have)
+                ),
+            );
+        }
+        let started = Instant::now();
+        let mut session_bytes: u64 = 0;
+        let mut next_mark = if total > 0 {
+            (percent(done, total) / PROGRESS_STEP) * PROGRESS_STEP + PROGRESS_STEP
+        } else {
+            u64::MAX
+        };
+        let mut stream = res.bytes_stream();
+        let mut broken: Option<String> = None;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(CHUNK_TIMEOUT_SECS), stream.next()).await {
+                Err(_) => {
+                    broken = Some(format!("{}초 동안 데이터가 오지 않았습니다", CHUNK_TIMEOUT_SECS));
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    broken = Some(e.to_string());
+                    break;
+                }
+                Ok(Some(Ok(chunk))) => {
+                    if let Err(e) = f.write_all(&chunk).await {
+                        broken = Some(format!("디스크 기록 실패: {}", e));
+                        break;
+                    }
+                    done += chunk.len() as u64;
+                    session_bytes += chunk.len() as u64;
+                    let bps = session_bytes as f64 / started.elapsed().as_secs_f64().max(0.001);
+                    set_state(code, |s| {
+                        s.done = done;
+                        s.bytes_per_sec = bps;
+                    });
+                    if loud && percent(done, total) >= next_mark {
+                        next_mark = (percent(done, total) / PROGRESS_STEP) * PROGRESS_STEP + PROGRESS_STEP;
+                        announce(app, task_id, &progress_line(code, &state(code)));
+                        publish(app, code);
+                    }
+                }
+            }
+        }
+        let _ = f.flush().await;
+        drop(f);
+        if let Some(e) = broken {
+            last_err = e;
+            continue;
+        }
+        let written = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if total > 0 && written != total {
+            last_err = format!("크기 불일치 {} / {}", written, total);
+            continue;
+        }
+        if dst.exists() {
+            let _ = std::fs::remove_file(&dst);
+        }
+        if let Err(e) = std::fs::rename(&part, &dst) {
+            last_err = format!("파일 이름 확정 실패: {}", e);
+            continue;
+        }
+        return Ok(written);
+    }
+    Err(DlError::Failed(last_err))
+}
+
+fn fail(code: &str, app: &tauri::AppHandle, task_id: &str, why: &str) {
+    set_state(code, |s| {
+        s.phase = DlPhase::Failed;
+        s.error = why.to_string();
+        s.retry_at_ms = now_ms() + FAIL_RETRY_SECS * 1000;
+    });
+    publish(app, code);
+    announce(
+        app,
+        task_id,
+        &format!(
+            "⚠️ [LANG-LLM] {} 다운로드 실패: {} — 받은 부분은 .part 로 남겨 두고 {}분 뒤 다음 태스크에서 이어받습니다. 그동안 음차는 Qwen3.5-2B + 발음 게이트로 진행합니다.",
+            repo_id(code),
+            why,
+            FAIL_RETRY_SECS / 60
+        ),
+    );
+}
+
+async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
+    let dir = model_dir(code);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        fail(code, app, task_id, &format!("모델 폴더를 만들 수 없습니다: {}", e));
+        return;
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    set_state(code, |s| {
+        s.phase = DlPhase::Downloading;
+        s.error.clear();
+    });
+    publish(app, code);
+    announce(
+        app,
+        task_id,
+        &format!(
+            "📥 [LANG-LLM] {} 백그라운드 다운로드를 시작합니다. 저장 위치: {} | 필수 파일 {:?} | 받는 동안 음차는 Qwen3.5-2B + 발음 게이트로 계속 진행되므로 작업을 멈추거나 직접 받을 필요가 없습니다.",
+            repo_id(code),
+            dir.display(),
+            LANG_LLM_REQUIRED
+        ),
+    );
+    for file in LANG_LLM_FILES.iter() {
+        let required = LANG_LLM_REQUIRED.contains(file);
+        match download_file(&client, code, file, &dir, app, task_id).await {
+            Ok(_) => {}
+            Err(DlError::Missing(status)) if !required => {
+                announce(
+                    app,
+                    task_id,
+                    &format!(
+                        "⚪ [LANG-LLM] 선택 파일 {} 이 저장소에 없습니다 (HTTP {}). 필수 파일이 아니므로 건너뜁니다.",
+                        file, status
+                    ),
+                );
+            }
+            Err(DlError::Missing(status)) => {
+                set_state(code, |s| {
+                    s.phase = DlPhase::Unavailable;
+                    s.error = format!("{} HTTP {}", file, status);
+                });
+                publish(app, code);
+                announce(
+                    app,
+                    task_id,
+                    &format!(
+                        "🚫 [LANG-LLM] {} 의 필수 파일 {} 을 받을 수 없습니다 (HTTP {}). 이 언어는 이번 세션 동안 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                        repo_id(code),
+                        file,
+                        status
+                    ),
+                );
+                return;
+            }
+            Err(DlError::Failed(e)) if !required => {
+                announce(
+                    app,
+                    task_id,
+                    &format!(
+                        "⚠️ [LANG-LLM] 선택 파일 {} 을 받지 못했습니다 ({}). 필수 파일이 아니므로 계속합니다.",
+                        file, e
+                    ),
+                );
+            }
+            Err(DlError::Failed(e)) => {
+                fail(code, app, task_id, &format!("{}: {}", file, e));
+                return;
+            }
+        }
+    }
+    if is_ready(code) {
+        set_state(code, |s| {
+            s.phase = DlPhase::Ready;
+            s.error.clear();
+        });
+        publish(app, code);
+        let next = if loader().is_some() {
+            "다음 음차 캐시 미스부터 이 모델로 전환합니다."
+        } else {
+            "4B safetensors 런타임 로더가 연결되기 전까지는 Qwen3.5-2B + 발음 게이트로 진행합니다."
+        };
+        announce(
+            app,
+            task_id,
+            &format!(
+                "✅ [LANG-LLM] {} 다운로드·검증 완료 (가중치 {}). {}",
+                repo_id(code),
+                gb(weight_bytes(&dir)),
+                next
+            ),
+        );
+    } else {
+        fail(code, app, task_id, "필수 파일 또는 가중치 용량 검증에 실패했습니다");
+    }
+}
+
+fn installed_codes() -> Vec<String> {
+    let root = crate::utils::get_app_dir().join("models");
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("Qwen3.5-4B-") {
+                if let Some(code) = rest.strip_suffix("-16384") {
+                    if !code.is_empty() && !out.iter().any(|c| c == code) {
+                        out.push(code.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(m) = STATES.lock() {
+        for k in m.keys() {
+            if !out.iter().any(|c| c == k) {
+                out.push(k.clone());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+pub fn status_json(code: &str) -> Value {
+    let st = state(code);
+    json!({
+        "code": code,
+        "repo": repo_id(code),
+        "dir": model_dir(code).to_string_lossy(),
+        "phase": format!("{:?}", st.phase),
+        "ready": is_ready(code),
+        "file": st.file,
+        "done": st.done,
+        "total": st.total,
+        "percent": percent(st.done, st.total),
+        "bytes_per_sec": st.bytes_per_sec,
+        "error": st.error,
+        "loader_linked": loader().is_some(),
+        "runtime_failure": runtime_failure(code),
+    })
+}
+
+pub fn status_report(doc_lang: Option<&str>) -> Value {
+    if let Some(code) = doc_lang.and_then(alphaedge_code) {
+        return status_json(code);
+    }
+    let langs: Vec<Value> = installed_codes().iter().map(|c| status_json(c)).collect();
+    json!({
+        "languages": langs,
+        "loader_linked": loader().is_some(),
+    })
+}

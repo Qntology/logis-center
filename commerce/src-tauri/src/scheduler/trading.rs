@@ -4108,6 +4108,7 @@ pub async fn process_trading_task(
         obj.insert("doc_number".to_string(), json!(doc_number.clone()));
         obj.insert("no".to_string(), json!(doc_number.clone()));
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+        obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
     }
 
     let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default();
@@ -4330,6 +4331,7 @@ pub async fn process_trading_task(
 
                     if was_draft {
                         o.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                        o.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
                     }
                     if o.get("mode").is_none() {
                         o.insert("mode".to_string(), json!("shipping"));
@@ -4378,6 +4380,8 @@ pub async fn process_trading_task(
                     obj.insert(foreign_col.clone(), json!(foreign_index));
                     obj.insert("updated_at".to_string(), json!(0));
                     obj.insert("mode".to_string(), json!("shipping"));
+                    obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("placeholder"));
+                    obj.insert(crate::utils::canonical::RELAY_ORIGIN_KEY.to_string(), json!([doc_type.clone()]));
                     
                     obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", foreign_type, foreign_field, doc_number)));
                 }

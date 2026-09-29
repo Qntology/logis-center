@@ -8,6 +8,7 @@ pub mod nms_arena;
 pub mod value_grounding;
 pub mod tokenizer;
 pub mod phrase_cache;
+pub mod layout_cache;
 
 
 use candle_core::{DType, Device};

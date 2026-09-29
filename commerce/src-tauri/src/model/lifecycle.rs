@@ -449,15 +449,18 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
 
-        // 🌟 [추가] 현재 로드된 모델이 목표와 같다면 로딩 과정을 건너뛰고 즉시 반환하여 VRAM 낭비 및 지연 방지
+        if target_size == ModelSize::Qwen3_5
+            && crate::model::lang_llm::resident_variant().is_some()
+            && self.qwen3_5_generator.lock().await.is_some()
+        {
+            println!("[RELAY] 🔁 음차 전용 Qwen3.5-4B 가 상주 중이라 범용 Qwen3.5-2B 로 교체합니다. 이미 올라온 모델로 보고 건너뛰는 빠른 경로를 타지 않습니다.");
+            *self.current_size.lock().await = None;
+        }
         {
             let current = self.current_size.lock().await;
             if *current == Some(target_size) {
                 let is_loaded = match target_size {
                     ModelSize::Qwen => {
-                        // 🌟 [VISION-JIT] secure_vram_relay(Qwen) 의 호출자는 Base PUG 베이킹 /
-                        //    타이틀 추출 / ingest_pug_to_ssd 세 곳뿐이며 전부 순수 텍스트 경로입니다.
-                        //    기존에는 is_baking=false 인 타이틀 추출에서도 mmproj 가 통째로 상주했습니다.
                         let mut gen_guard = self.generator.lock().await;
                         if let Some(gen) = gen_guard.as_mut() {
                             if gen.is_vision_jit_capable() && gen.vision_resident() {
@@ -822,7 +825,15 @@ impl LogisModel {
         Ok(res)
     }
     pub async fn call_qwen3_5_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        self.ensure_qwen3_5(false).await?;
+        match crate::model::lang_llm::bound_translit_code() {
+            Some(code) => {
+                if let Err(e) = self.ensure_qwen3_5_lang(&code).await {
+                    println!("[TRANSLIT] ⚠️ Qwen3.5-4B-{} 를 쓸 수 없어 이번 호출은 Qwen3.5-2B 로 진행합니다: {}", code, e);
+                    self.ensure_qwen3_5(false).await?;
+                }
+            }
+            None => self.ensure_qwen3_5(false).await?,
+        }
 
         let mut gen_guard = self.qwen3_5_generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
@@ -851,7 +862,174 @@ impl LogisModel {
         Ok(res)
     }
 
+    pub async fn ensure_qwen3_5_lang(&self, code: &str) -> anyhow::Result<()> {
+        use crate::model::lang_llm;
+        {
+            let guard = self.qwen3_5_generator.lock().await;
+            if guard.is_some() && lang_llm::resident_variant().as_deref() == Some(code) {
+                return Ok(());
+            }
+        }
+        if let Some(why) = lang_llm::runtime_failure(code) {
+            return Err(anyhow!("Qwen3.5-4B-{} 는 이번 세션에서 쓸 수 없습니다: {}", code, why));
+        }
+        let loader = lang_llm::loader()
+            .ok_or_else(|| anyhow!("Qwen3.5-4B safetensors 런타임 로더가 연결되지 않았습니다"))?;
+        if !lang_llm::is_ready(code) {
+            return Err(anyhow!("{} 파일이 아직 준비되지 않았습니다", lang_llm::repo_id(code)));
+        }
+
+        let need = lang_llm::resident_estimate_mb(code)
+            + super::ACTIVATION_HEADROOM_MB.load(std::sync::atomic::Ordering::SeqCst);
+        let gen_resident = self.generation_resident().await;
+        let embed_resident = self.embedding_resident().await;
+        if !self.is_cpu_mode {
+            let reclaimable = if gen_resident { super::GEN_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 }
+                + if embed_resident { super::EMBED_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 };
+            let ceiling = self.get_free_vram_mb() + reclaimable;
+            if ceiling < need {
+                let why = format!("VRAM 부족 (확보 가능 {}MB < 4B 예산 {}MB)", ceiling, need);
+                lang_llm::mark_runtime_failure(code, &why);
+                return Err(anyhow!("{}", why));
+            }
+        }
+
+        let dir = lang_llm::model_dir(code);
+        println!(
+            "[MODEL] Loading Qwen3.5-4B-{} (alphaedge-ai · vocab 16384 · 텍스트 전용) from {:?} | 예산 {}MB",
+            code, dir, need
+        );
+        let _load_hold = self.hold_generation();
+        if gen_resident {
+            self.unload_generation_slots("Qwen3.5-4B 음차 전용 모델 로드").await;
+        }
+        if self.siglip2_model.lock().await.is_some() {
+            self.release_siglip2("Qwen3.5-4B 음차 전용 모델 로드").await;
+        }
+        if !self.is_cpu_mode {
+            let free = self.get_free_vram_mb();
+            if free < need && self.embedding_resident().await {
+                println!(
+                    "[CROSSOVER] 🔻 [SWAP-OUT EMBED] Qwen3.5-4B-{} | 자유 {}MB < 4B 예산 {}MB → 임베딩을 먼저 반환합니다.",
+                    code, free, need
+                );
+                self.unload_embedding().await;
+                Self::mark_swap();
+            } else if self.embedding_resident().await {
+                super::COEXIST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                println!(
+                    "[MODEL] 🤝 [CROSSOVER/COEXIST] 자유 {}MB >= Qwen3.5-4B-{} 예산 {}MB. 임베딩을 상주시킨 채 로드합니다.",
+                    free, code, need
+                );
+            }
+        }
+
+        let pre_empty = !self.generation_resident().await && !self.embedding_resident().await;
+        let before = self.get_free_vram_mb();
+        {
+            *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
+        }
+        let dev = self.device_config.device.clone();
+        let load_dir = dir.clone();
+        let load = tokio::time::timeout(
+            Duration::from_secs(900),
+            tokio::task::spawn_blocking(move || loader(&load_dir, &dev)),
+        )
+        .await;
+        let gen = match load {
+            Ok(Ok(Ok(g))) => g,
+            Ok(Ok(Err(e))) => {
+                *self.current_size.lock().await = None;
+                lang_llm::mark_runtime_failure(code, &e.to_string());
+                return Err(anyhow!("Qwen3.5-4B-{} load failed: {}", code, e));
+            }
+            Ok(Err(join_err)) => {
+                *self.current_size.lock().await = None;
+                lang_llm::mark_runtime_failure(code, &join_err.to_string());
+                return Err(anyhow!("Qwen3.5-4B-{} load task join error: {}", code, join_err));
+            }
+            Err(_) => {
+                *self.current_size.lock().await = None;
+                lang_llm::mark_runtime_failure(code, "load timeout (900s)");
+                return Err(anyhow!("Qwen3.5-4B-{} load timeout (900s)", code));
+            }
+        };
+        {
+            *self.qwen3_5_generator.lock().await = Some(gen);
+        }
+        lang_llm::set_resident_variant(Some(code.to_string()));
+        self.observe_generation_cost_strict(before, pre_empty);
+        println!(
+            "[MODEL] 🎉 Qwen3.5-4B-{} 로드 완료. 자유 {}MB",
+            code,
+            self.get_free_vram_mb()
+        );
+        Ok(())
+    }
+
+    pub async fn enter_translit_generation(
+        &self,
+        doc_lang: &str,
+        cancel: Option<Arc<AtomicBool>>,
+        reason: &str,
+        task_id: &str,
+    ) -> anyhow::Result<(crate::model::lang_llm::TranslitEngine, crate::model::lang_llm::TranslitBinding)> {
+        use crate::model::lang_llm::{self, TranslitBinding, TranslitEngine};
+        let (engine, status) = lang_llm::resolve_engine(doc_lang, &self.app_handle, task_id, true);
+        println!("[CROSSOVER] {}", status);
+        if let TranslitEngine::Lang4B { code } = &engine {
+            let binding = lang_llm::bind_translit(code);
+            if binding.is_bound() {
+                let _hold = self.hold_generation();
+                match self.ensure_qwen3_5_lang(code).await {
+                    Ok(()) => {
+                        let phase = self.sync_crossover_phase().await;
+                        println!(
+                            "[CROSSOVER] 🧠 [GENERATION PHASE] {} | Qwen3.5-4B-{} 상주 확정 (phase={} | 자유 {}MB)",
+                            reason,
+                            code,
+                            phase,
+                            self.get_free_vram_mb()
+                        );
+                        return Ok((engine.clone(), binding));
+                    }
+                    Err(e) => {
+                        println!(
+                            "[CROSSOVER] ⚠️ Qwen3.5-4B-{} 로 전환하지 못해 Qwen3.5-2B 로 진행합니다: {}",
+                            code, e
+                        );
+                    }
+                }
+            } else {
+                println!(
+                    "[CROSSOVER] ⚪ 다른 언어의 4B 음차가 진행 중이라 이번 호출은 Qwen3.5-2B 로 진행합니다. (요청 {})",
+                    code
+                );
+            }
+        }
+        self.switch_to_generation(ModelSize::Qwen3_5, cancel, None, reason).await?;
+        Ok((TranslitEngine::Base2B, TranslitBinding::none()))
+    }
+
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
+        if crate::model::lang_llm::resident_variant().is_some() {
+            let dropped = {
+                let mut guard = self.qwen3_5_generator.lock().await;
+                match guard.take() {
+                    Some(mut g) => {
+                        let _ = g.clear_kv_cache();
+                        drop(g);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            crate::model::lang_llm::set_resident_variant(None);
+            if dropped {
+                *self.current_size.lock().await = None;
+                println!("[MODEL] 🔁 음차 전용 Qwen3.5-4B 를 내리고 범용 Qwen3.5-2B 를 올립니다. (vision: {})", needs_vision);
+            }
+        }
         {
             let mut guard = self.qwen3_5_generator.lock().await;
             if let Some(gen) = guard.as_mut() {

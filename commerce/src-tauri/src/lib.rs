@@ -1487,7 +1487,8 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         "substantial": ctx.get("substantial").cloned().unwrap_or(json!("")),
         "find": ctx.get("find").cloned().unwrap_or(json!("")),
         "hints": ctx.get("hint").cloned().unwrap_or(json!({})),
-        "projection": ctx.get("projection").cloned().unwrap_or(json!([]))
+        "projection": ctx.get("projection").cloned().unwrap_or(json!([])),
+        "relay_period": ctx.get("relay_period").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -1569,6 +1570,13 @@ fn evaluate_dexie_plan(
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase())).collect())
         .unwrap_or_default();
+    let primary = plan
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(crate::utils::canonical::relay_type_family)
+        .unwrap_or_default();
+    let primary_scoped = !primary.is_empty()
+        && types.iter().any(|t| crate::utils::canonical::relay_type_family(t) == primary);
     let mut fields: Vec<String> = Vec::new();
     for c in conds.iter() {
         let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1582,16 +1590,15 @@ fn evaluate_dexie_plan(
     let mut eligible = 0usize;
     let mut all_pass = 0usize;
     for d in docs.iter() {
-        if !types.is_empty() {
-            let t = d
-                .get("type")
-                .or_else(|| d.get("doc_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            if !types.iter().any(|x| *x == t) { continue; }
-        }
+        let t = d
+            .get("type")
+            .or_else(|| d.get("doc_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !types.is_empty() && !types.iter().any(|x| *x == t) { continue; }
+        if primary_scoped && crate::utils::canonical::relay_type_family(&t) != primary { continue; }
         eligible += 1;
         let ok: Vec<bool> = fields
             .iter()
@@ -2283,6 +2290,9 @@ async fn delete_documents(
     }
 }
 
+static VISION_QUERY_MEMO: Lazy<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 #[tauri::command]
 async fn ai_search_complex(
     state: State<'_, AppState>,
@@ -2559,39 +2569,59 @@ async fn ai_search_complex(
             if cancel_token.load(Ordering::Relaxed) {
                 return Err("Search cancelled by user".to_string());
             }
-            emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더로 비전 질의 벡터를 생성합니다...");
-
-            // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
-            model.deep_purge_resources().await;
-
-            match model.check_siglip2_downloaded().await {
-                Err(e) => {
-                    emit_term(&format!(
-                        "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
-                    ));
-                }
-                Ok(_) => {
-                    match model.ensure_siglip2(true).await {
-                        Err(e) => {
-                            emit_term(&format!(
-                                "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
-                            ));
-                        }
-                        Ok(_) => {
-                            {
-                                let guard = model.siglip2_model.lock().await;
-                                if let Some(sig) = guard.as_ref() {
-                                    if sig.has_text() {
-                                        vision_qvec = crate::models::siglip2::vision_encoder::encode_query_text(
-                                            sig, &query,
-                                        ).ok();
+            let qkey = query.trim().to_string();
+            let remembered = VISION_QUERY_MEMO
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&qkey).cloned())
+                .or_else(|| {
+                    crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE
+                        .get(&qkey)
+                        .map(|v| (*v).clone())
+                });
+            if let Some(v) = remembered {
+                emit_term("[VISION TRACK] ⚡ 같은 질의의 비전 질의 벡터가 이미 있어 SigLIP2 를 올리지 않습니다. (퍼지·로드·해제·VRAM 대기 0회)");
+                vision_qvec = Some(v);
+            } else {
+                emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더만 올려 비전 질의 벡터를 생성합니다. 질의 인코딩에는 비전 인코더가 쓰이지 않아 올리지 않습니다.");
+                match model.check_siglip2_downloaded().await {
+                    Err(e) => {
+                        emit_term(&format!(
+                            "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
+                        ));
+                    }
+                    Ok(_) => {
+                        model.unload_generation_slots("vision query text encoding").await;
+                        match model.ensure_siglip2_ext(false, true).await {
+                            Err(e) => {
+                                emit_term(&format!(
+                                    "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
+                                ));
+                            }
+                            Ok(_) => {
+                                {
+                                    let guard = model.siglip2_model.lock().await;
+                                    if let Some(sig) = guard.as_ref() {
+                                        if sig.has_text() {
+                                            vision_qvec = crate::models::siglip2::vision_encoder::encode_phrases_ephemeral(
+                                                sig,
+                                                &[qkey.clone()],
+                                            )
+                                            .ok()
+                                            .and_then(|v| v.into_iter().next());
+                                        }
                                     }
                                 }
+                                model.release_siglip2("search vision query encoded").await;
                             }
-                            // 인코딩이 끝났으면 즉시 반환합니다. (비전 820MB + 텍스트 1.4GB)
-                            model.release_siglip2("search vision query encoded").await;
                         }
                     }
+                }
+                if let (Some(v), Ok(mut m)) = (vision_qvec.as_ref(), VISION_QUERY_MEMO.lock()) {
+                    if m.len() >= 256 {
+                        m.clear();
+                    }
+                    m.insert(qkey.clone(), v.clone());
                 }
             }
 
@@ -3296,6 +3326,25 @@ async fn ai_search_complex(
                 ranked_results.truncate(FINAL_LIMIT);
             }
 
+            if let Some(store) = store_opt.as_ref() {
+                let relay_rep = crate::scheduler::relay_ledger::relay_join(
+                    store,
+                    &mut ranked_results,
+                    &mut dexie_plans,
+                    &search_mode,
+                    &cc,
+                    &team_id,
+                    &emit_term,
+                ).await;
+                if relay_rep.changed_set() {
+                    ranked_results.sort_by(|a, b| {
+                        let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
             let projection_axes: Vec<String> = {
                 let mut v: Vec<String> = Vec::new();
                 for plan in dexie_plans.iter() {
@@ -3397,7 +3446,12 @@ async fn ai_search_complex(
                 let prop = item.get("matched_property").and_then(|v| v.as_str()).unwrap_or("-");
                 let is_chunk = item.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false);
                 let is_alias = item.get("alias_match").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ctx = item.get("context_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let ctx = item
+                    .get("doc_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| item.get("context_type").and_then(|v| v.as_str()))
+                    .unwrap_or("?");
                 let matched_text = item.get("matched_chunk")
                     .or_else(|| item.get("text"))
                     .and_then(|v| v.as_str())
@@ -4984,6 +5038,11 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn get_lang_llm_status(language: Option<String>) -> Result<serde_json::Value, String> {
+    Ok(crate::model::lang_llm::status_report(language.as_deref()))
+}
+
+#[tauri::command]
 async fn delete_all_models() -> Result<String, String> {
     let app_dir = crate::utils::get_app_dir();
     let models_dir = app_dir.join("models");
@@ -4991,9 +5050,8 @@ async fn delete_all_models() -> Result<String, String> {
         std::fs::remove_dir_all(&models_dir).map_err(|e| e.to_string())?;
     }
 
-    // 🌟 [VISION-CACHE] 모델이 사라지면 ViT 출력의 재현성도 보장할 수 없으므로
-    //    캐시된 비전 임베딩을 함께 폐기합니다.
     crate::models::vision_cache::VISION_CACHE.clear_all();
+    crate::models::siglip2::layout_cache::LAYOUT_CACHE.clear_all();
 
     Ok("Deleted".to_string())
 }
@@ -5002,12 +5060,8 @@ async fn delete_all_models() -> Result<String, String> {
 async fn reset_lancedb(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // 🌟 [SDS PURGE] 팩토리 리셋은 '판정 근거를 포함한 전량 초기화' 입니다.
-    //    문서를 지우면서 그 문서들에서 유도한 통계를 남기면
-    //    존재하지 않는 데이터의 분포로 판정하게 됩니다.
-    //    또한 이 삭제가 기획 8-2 의 롤백 수단입니다.
-    //    (코드 롤백 없이 파일 삭제만으로 적응 이전 동작으로 복귀)
     crate::utils::score_dynamics::purge();
+    crate::models::siglip2::layout_cache::LAYOUT_CACHE.clear_all();
     let mut store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         db.reset_database().await.map_err(|e| e.to_string())?;
@@ -5465,7 +5519,8 @@ pub fn run() {
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
             get_query_embedding, reindex_pending_embeddings, structure_pending_analytics,
-            translit_cache_respond, get_embedding_batch_for_translit
+            translit_cache_respond, get_embedding_batch_for_translit,
+            get_lang_llm_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

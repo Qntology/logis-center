@@ -17,7 +17,7 @@ pub mod translit;
 pub mod indexing;
 mod worker;
 mod entity;
-mod relay_ledger;
+pub mod relay_ledger;
 pub mod trading;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
@@ -30,7 +30,7 @@ use crate::utils::json_utils::merge_node;
 use crate::js_templates::*;
 
 pub use worker::start_background_worker;
-pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, entity_seed};
+pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, entity_seed, entity_key_index, relay_type_key, relay_seed};
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
 
@@ -3806,15 +3806,13 @@ pub async fn process_task(
                         let joined_ok = joined.0 >= hdr_abs_floor && joined.2 >= hdr_score_floor;
                         let mut chosen = joined;
                         let mut is_leaf = false;
-                        if !joined_ok {
-                            if let Some(Some(le)) = header_leaf_embs.get(h) {
-                                if !le.iter().all(|&v| v == 0.0) {
-                                    let leaf = score_of(le);
-                                    let leaf_ok = leaf.0 >= hdr_abs_floor && leaf.2 >= hdr_score_floor;
-                                    if leaf_ok {
-                                        chosen = leaf;
-                                        is_leaf = true;
-                                    }
+                        if let Some(Some(le)) = header_leaf_embs.get(h) {
+                            if !le.iter().all(|&v| v == 0.0) {
+                                let leaf = score_of(le);
+                                let leaf_ok = leaf.0 >= hdr_abs_floor && leaf.2 >= hdr_score_floor;
+                                if leaf_ok && (!joined_ok || leaf.2 > joined.2) {
+                                    chosen = leaf;
+                                    is_leaf = true;
                                 }
                             }
                         }
@@ -3832,7 +3830,12 @@ pub async fn process_task(
                             continue;
                         }
                         if is_leaf {
-                            emit_term(&format!("    🌿 [HEADER LEAF RESCUE] '{}' → '{}' | 조인 라벨 Score {:+.4} 가 하한 미달이라, 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 로 다시 쟀습니다 → Score {:+.4}", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                            if joined_ok {
+                                crate::utils::score_dynamics::record_baseline("commerce.header_leaf_evidence", 1.0);
+                                emit_term(&format!("    🌿 [HEADER LEAF EVIDENCE] '{}' → '{}' | 조인 라벨 Score {:+.4} 보다 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 의 Score {:+.4} 가 높아 하위 라벨을 근거로 씁니다. 상위 그룹명은 형제 칼럼 전부에 같이 붙어 조인 라벨끼리의 마진을 깎으므로, 조인 라벨이 하한을 겨우 넘긴 칼럼은 배타 배정의 마진에서 떨어집니다.", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                            } else {
+                                emit_term(&format!("    🌿 [HEADER LEAF RESCUE] '{}' → '{}' | 조인 라벨 Score {:+.4} 가 하한 미달이라, 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 로 다시 쟀습니다 → Score {:+.4}", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                            }
                         }
                         hdr_matrix[f][h] = score;
                         hdr_leaf_won[f][h] = is_leaf;
@@ -4261,6 +4264,7 @@ pub async fn process_task(
                         _ => value_matches_format(owner_fmt, clean_text),
                     };
                     if !owner_fmt_ok {
+                        crate::utils::score_dynamics::record_field_seen(&owner_field);
                         crate::utils::score_dynamics::record_field_reject(
                             &owner_field,
                             if owner_fmt == FieldFormat::Enum {
@@ -4288,7 +4292,7 @@ pub async fn process_task(
 
                     let raw_line = item_lines_ref[line_idx];
                     let multi_line = owner_line_counts.get(&owner_field).copied().unwrap_or(0) >= 2;
-                    let action_margin: Option<f32> = if multi_line && !ui_action_embs.is_empty() {
+                    let action_scores: Option<(f32, f32)> = if multi_line && !ui_action_embs.is_empty() {
                         match fields.iter().position(|(n, _, _, _)| n == &owner_field) {
                             Some(oi) => {
                                 let v_emb = model.get_embedding(clean_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
@@ -4298,7 +4302,7 @@ pub async fn process_task(
                                     let own = weighted_max_pool_sim(&v_emb, &field_phrase_embs[oi], &field_phrase_weights[oi]);
                                     let chrome = max_pool_sim(&v_emb, &ui_action_embs);
                                     crate::utils::score_dynamics::record_baseline("commerce.premap_action_margin", own - chrome);
-                                    Some(own - chrome)
+                                    Some((own - chrome, chrome))
                                 }
                             }
                             None => None,
@@ -4306,12 +4310,31 @@ pub async fn process_task(
                     } else {
                         None
                     };
-                    let action_like = action_margin.map_or(false, |m| m < 0.0);
-                    let line_margin = action_margin.unwrap_or(0.0);
+                    let action_margin = action_scores.map(|(m, _)| m);
                     let is_real_href = line_real_href(raw_line).is_some();
                     let real_links = owner_real_href.get(&owner_field).copied().unwrap_or(0);
                     let dead_links = owner_dead_href.get(&owner_field).copied().unwrap_or(0);
                     let menu_penalty: u8 = if is_real_href && dead_links >= 1 && real_links >= 2 { 1 } else { 0 };
+                    let dropdown_trigger = !is_real_href && raw_line.contains("href=") && dead_links == 1 && real_links >= 2;
+                    let noise_band = if dropdown_trigger && action_scores.is_some() {
+                        crate::utils::score_dynamics::adaptive_baseline("commerce.premap_action_margin")
+                            .map(|(_, sd)| sd)
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let trigger_hold = dropdown_trigger
+                        && action_scores.map_or(false, |(m, chrome)| m < 0.0 && m >= -noise_band && chrome < 0.999);
+                    if trigger_hold {
+                        crate::utils::score_dynamics::record_baseline("commerce.premap_trigger_hold", 1.0);
+                        emit_term(&format!(
+                            "    🛡️ [PREMAP TRIGGER HOLD] '{}' ← Item Line {} (\"{}\") | 같은 칸의 실링크 {}개가 드롭다운 메뉴이고 이 줄은 그 메뉴를 여는 죽은 링크 트리거입니다. 트리거 글자는 칸의 값(주문자 이름 등)이고 UI 액션 구와 글자가 같지 않습니다. 필드 구 - UI 액션 구 = {:+.4} 가 SDS commerce.premap_action_margin 표준편차 {:.4} 안쪽이라 코사인만으로 UI 액션으로 강등하지 않습니다.",
+                            owner_field, line_idx + 1, clean_text, real_links,
+                            action_margin.unwrap_or(0.0), noise_band
+                        ));
+                    }
+                    let action_like = !trigger_hold && action_margin.map_or(false, |m| m < 0.0);
+                    let line_margin = action_margin.unwrap_or(0.0);
                     let line_rank: i32 = if is_real_href {
                         2
                     } else if is_bracket_annotation(clean_text) {
@@ -4600,6 +4623,7 @@ pub async fn process_task(
                         .collect();
                     emit_term(&format!("    🧱 [COLUMN ABSENT] 헤더 매핑이 없는 닫힌 어휘 필드(열거형·색상 등)의 후보 중, 헤더 판정에서 그 필드의 칸이 될 수 없다고 나왔고 값도 그 필드의 어휘에 걸리지 않는 라인 {}건을 배정 행렬에서 뺐습니다. {:?} (헤더가 없는 라인, 값이 어휘에 걸리는 라인, 자유 글자 필드와 통화·id,link·링크 필드는 그대로 둡니다)", column_absent_total, per_field));
                 }
+                let mut evt_blocked: Vec<usize> = Vec::new();
                 for (f, a) in vector_assignment.iter().enumerate() {
                     let l = match a { Some((l, _, _)) => *l, None => continue };
                     if header_forced_assign.contains_key(&fields[f].0) { continue; }
@@ -4611,8 +4635,23 @@ pub async fn process_task(
                     let z = (vector_raw_matrix[f][l] - mean) / sd - gumbel_expected_z(cands.len());
                     crate::utils::score_dynamics::record_baseline("commerce.value_assign_evt", z);
                     if z < 0.0 {
-                        emit_term(&format!("    📐 [VALUE ASSIGN EVT] '{}' ← Line {} | 배정된 라인의 유사도가 후보 {}개 분포에서 무작위 최댓값 기대치에 못 미칩니다 (z {:+.3}). 이번 라운드는 관측만 하고 배정은 그대로 둡니다.", fields[f].0, l + 1, cands.len(), z));
+                        let header_foreign = crate::utils::ai_utils::header_judged_foreign(
+                            &fields[f].0,
+                            line_header_label[l].as_deref(),
+                            &header_evaluated,
+                            &header_plausible,
+                        ) && !crate::utils::ai_utils::value_equals_vocabulary(&line_values[l], &list_field_vocab[f]);
+                        crate::utils::score_dynamics::record_baseline("commerce.value_assign_evt_block", if header_foreign { 1.0 } else { 0.0 });
+                        if header_foreign {
+                            emit_term(&format!("    🚫 [VALUE ASSIGN EVT BLOCK] '{}' ← Line {} (헤더 '{}') | 배정 유사도가 후보 {}개의 무작위 최댓값 기대치에 못 미치고 (z {:+.3}), 이 라인의 헤더도 헤더 판정에서 '{}' 의 칸이 될 수 없다고 나왔습니다. 서로 독립인 두 음성 근거가 겹쳐 배정을 풉니다. 풀지 않으면 LLM 이 이 라인을 근거로 옆 칸의 값을 빌려 옵니다.", fields[f].0, l + 1, line_header_label[l].as_deref().unwrap_or(""), cands.len(), z, fields[f].0));
+                            evt_blocked.push(f);
+                            continue;
+                        }
+                        emit_term(&format!("    📐 [VALUE ASSIGN EVT] '{}' ← Line {} | 배정된 라인의 유사도가 후보 {}개 분포에서 무작위 최댓값 기대치에 못 미칩니다 (z {:+.3}). 이 라인의 헤더가 이 필드의 칸이 될 수 없다는 판정은 없어 이번 라운드는 관측만 하고 배정은 그대로 둡니다.", fields[f].0, l + 1, cands.len(), z));
                     }
+                }
+                for f in evt_blocked {
+                    vector_assignment[f] = None;
                 }
 
                 
@@ -5209,7 +5248,6 @@ pub async fn process_task(
                                             serde_json::Value::Object(o) => o.is_empty(),
                                             _ => false,
                                         };
-
                                         if !is_empty_val {
                                             let extracted_str = if val.is_string() {
                                                 val.as_str().unwrap_or("").trim().to_string()
@@ -5219,10 +5257,33 @@ pub async fn process_task(
                                                 String::new()
                                             };
 
-                                            
-                                            
-                                            
-                                            
+                                            if is_synthesis_field && !extracted_str.is_empty() {
+                                                let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
+                                                crate::utils::score_dynamics::record_baseline(
+                                                    "commerce.synthesis_sentence_drop",
+                                                    if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
+                                                );
+                                                if !gate.dropped.is_empty() {
+                                                    emit_term(&format!(
+                                                        "    🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                                                        k,
+                                                        gate.total,
+                                                        gate.dropped.len(),
+                                                        gate.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                                                        gate.kept
+                                                    ));
+                                                    if let Some(o) = parsed_val.as_object_mut() {
+                                                        if gate.kept.is_empty() {
+                                                            o.remove(*k);
+                                                        } else {
+                                                            o.insert(k.to_string(), json!(gate.kept));
+                                                        }
+                                                    }
+                                                    found_valid_value = true;
+                                                    continue;
+                                                }
+                                            }
+
                                             let key_fmt = detect_field_format(k);
                                             let strict_post = matches!(
                                                 key_fmt,
@@ -5326,6 +5387,42 @@ pub async fn process_task(
 
                                                         if !is_matched {
                                                             requires_retry = true;
+                                                        } else if !doc_title.contains(&extracted_str)
+                                                            && header_plausible.get(*k).map_or(false, |s| !s.is_empty())
+                                                        {
+                                                            let lower_p = extracted_str.to_lowercase();
+                                                            let digits_p: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                            let short_digits = !digits_p.is_empty() && digits_p.len() < 3 && extracted_str.len() == digits_p.len();
+                                                            let hosts: Vec<Option<&str>> = json_contexts
+                                                                .iter()
+                                                                .filter(|ctx| {
+                                                                    let raw = ctx.get("value").and_then(|x| x.as_str()).unwrap_or("");
+                                                                    let t = raw.to_lowercase();
+                                                                    let direct = t.contains(&lower_p)
+                                                                        && (!short_digits || t.split(|c: char| !c.is_alphanumeric()).any(|w| w == lower_p));
+                                                                    let by_digits = digits_p.len() >= 3
+                                                                        && raw.chars().filter(|c| c.is_ascii_digit()).collect::<String>().contains(&digits_p);
+                                                                    direct || by_digits
+                                                                })
+                                                                .map(|ctx| ctx.get("metadata").and_then(|x| x.as_str()))
+                                                                .collect();
+                                                            let foreign_only = !hosts.is_empty()
+                                                                && hosts.iter().all(|h| {
+                                                                    crate::utils::ai_utils::header_judged_foreign(k, *h, &header_evaluated, &header_plausible)
+                                                                });
+                                                            crate::utils::score_dynamics::record_baseline(
+                                                                "commerce.value_provenance_reject",
+                                                                if foreign_only { 1.0 } else { 0.0 },
+                                                            );
+                                                            if foreign_only {
+                                                                emit_term(&format!("    🚫 [VALUE PROVENANCE REJECT] '{}' = '{}' 는 이 아이템에서 헤더 {:?} 칸에만 있습니다. 그 헤더들은 전부 헤더 판정에서 '{}' 의 칸이 될 수 없다고 나왔고 이 필드가 가질 수 있는 칸은 따로 있습니다. 옆 칸의 값을 빌려 온 것이므로 폐기하고 재시도합니다.", k, extracted_str, hosts.iter().map(|h| h.unwrap_or("")).collect::<Vec<_>>(), k));
+                                                                crate::utils::score_dynamics::record_field_seen(k);
+                                                                crate::utils::score_dynamics::record_field_reject(
+                                                                    k,
+                                                                    crate::utils::score_dynamics::GateKind::Prejudice,
+                                                                );
+                                                                requires_retry = true;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -5594,10 +5691,15 @@ pub async fn process_task(
                         if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
                             let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
                             let cands = collect_id_link_candidates(&raw_refs);
+                            let small_list = id_census.rows < 3;
                             let mut ranked: Vec<(usize, f32)> = cands
                                 .iter()
                                 .enumerate()
-                                .filter(|(_, c)| !c.is_host_part && id_census.row_unique(&c.role_phrase))
+                                .filter(|(_, c)| {
+                                    !c.is_host_part
+                                        && (id_census.row_unique(&c.role_phrase)
+                                            || (small_list && candidate_type_evidence(c, self_aliases) >= 2))
+                                })
                                 .map(|(ci, c)| (ci, id_resource_affinity(&url, c, self_aliases) + 0.01 * c.prior))
                                 .collect();
                             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -5615,15 +5717,20 @@ pub async fn process_task(
                                     let c = &cands[bi];
                                     let (present, distinct) = id_census.coverage(&c.role_phrase);
                                     unique_rescued += 1;
-                                    crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_rescue", 1.0);
-                                    recovered = Some((
-                                        c.token.clone(),
-                                        normalize_list_link(&c.href),
+                                    let reason = if id_census.row_unique(&c.role_phrase) {
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_rescue", 1.0);
                                         format!(
                                             "행 고유 식별자 (역할 '{}' · {}행 중 {}행 보유 · 값 {}종 전부 상이 · 자기 자원 근거 {:.2})",
                                             c.role_phrase, id_census.rows, present, distinct, top
-                                        ),
-                                    ));
+                                        )
+                                    } else {
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_small_list_rescue", 1.0);
+                                        format!(
+                                            "소량 목록 타입 식별자 (역할 '{}' · {}행이라 행 고유성은 판정할 수 없지만 파라미터 키가 자기 타입 별칭을 지목 · 자기 자원 근거 {:.2})",
+                                            c.role_phrase, id_census.rows, top
+                                        )
+                                    };
+                                    recovered = Some((c.token.clone(), normalize_list_link(&c.href), reason));
                                 }
                             }
                         }
@@ -5781,7 +5888,7 @@ pub async fn process_task(
                                 Some(k) => k,
                                 None => continue,
                             };
-                            let f_index = entity_index(&ftype, &team_id, &entity_seed(&task.cc, &token));
+                            let f_index = entity_key_index(&ftype, &team_id, &task.cc, &token);
                             if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
                                 let companion = format!("{}_title", key);
                                 let text_val = obj
@@ -5800,6 +5907,7 @@ pub async fn process_task(
                                 }
                                 obj.insert(key.to_string(), json!(f_index));
                             }
+                            relay_ledger::mark_relay_bound(&mut all_extracted_items[item_idx], key);
                             relay_bound += 1;
                             emit_term(&format!(
                                 "  🔗 [RELAY REF BIND] Item {}/{}: {} ← '{}' (역할 '{}') → {}.{} = {} | 행에 인쇄된 상대 문서의 식별자로 상대 index 를 결정론으로 재현했습니다. 글자 값은 {}_title 로 옮겨 검색 문장은 그대로 유지합니다.",
@@ -7453,7 +7561,6 @@ pub async fn process_task(
                                         serde_json::Value::Object(o) => o.is_empty(),
                                         _ => false,
                                     };
-
                                     if !is_empty_val {
                                         let extracted_str = if val.is_string() {
                                             val.as_str().unwrap_or("").trim().to_string()
@@ -7463,8 +7570,33 @@ pub async fn process_task(
                                             String::new()
                                         };
 
-                                        
-                                        
+                                        if is_synthesis_field && !extracted_str.is_empty() {
+                                            let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
+                                            crate::utils::score_dynamics::record_baseline(
+                                                "commerce.synthesis_sentence_drop",
+                                                if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
+                                            );
+                                            if !gate.dropped.is_empty() {
+                                                emit_term(&format!(
+                                                    "  🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                                                    k,
+                                                    gate.total,
+                                                    gate.dropped.len(),
+                                                    gate.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                                                    gate.kept
+                                                ));
+                                                if let Some(o) = item_val.as_object_mut() {
+                                                    if gate.kept.is_empty() {
+                                                        o.remove(*k);
+                                                    } else {
+                                                        o.insert(k.to_string(), json!(gate.kept));
+                                                    }
+                                                }
+                                                found_valid_value = true;
+                                                continue;
+                                            }
+                                        }
+
                                         let key_fmt = detect_field_format(k);
                                         let strict_post = matches!(
                                             key_fmt,
@@ -7676,10 +7808,30 @@ pub async fn process_task(
             
 
             if let Some(q) = obj.get("quantity").cloned() {
-                let q_val = if q.is_number() { q.as_i64().unwrap_or(0) }
-                            else if let Some(s) = q.as_str() { s.parse::<i64>().unwrap_or(0) }
-                            else { 0 };
-                obj.insert("quantity".to_string(), json!(q_val));
+                let q_val: Option<i64> = if q.is_number() {
+                    q.as_i64().or_else(|| q.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64))
+                } else if let Some(s) = q.as_str() {
+                    let lead: String = s
+                        .trim()
+                        .chars()
+                        .filter(|c| *c != ',' && !c.is_whitespace())
+                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    lead.parse::<i64>()
+                        .ok()
+                        .or_else(|| lead.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f.round() as i64))
+                } else {
+                    None
+                };
+                match q_val {
+                    Some(v) => {
+                        obj.insert("quantity".to_string(), json!(v));
+                    }
+                    None => {
+                        println!("[Scheduler] 🧮 [QUANTITY KEEP] quantity={} 는 수치로 읽을 수 없어 0 으로 바꾸지 않고 비웁니다. 0 은 '재고 없음·수량 0' 이라는 다른 사실이라, 읽지 못한 값을 0 으로 저장하면 검색 조건(재고 0 · 수량 합)이 거짓 문서를 만납니다.", q);
+                        obj.remove("quantity");
+                    }
+                }
             }
             
             
@@ -7909,64 +8061,92 @@ pub async fn process_task(
 
     {
         emit_term("[Scheduler] 🔤 Preparing crossover for synonym expansion...");
-        emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+        let translit_fetch = !crate::nl_convert::is_latin_dominant(
+            &crate::nl_convert::native_script_sample(&doc_lang, "", ""),
+        );
+        let (translit_engine, translit_status) =
+            crate::model::lang_llm::resolve_engine(&doc_lang, app_handle, &task.id, translit_fetch);
+        emit_term(&format!("[Scheduler]    {}", translit_status));
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Planning VRAM crossover...", "spinner": "🔤" }));
 
-        // 🌟 [CROSSOVER / BUDGET] 하드코딩 임계치(2600MB)를 제거합니다.
-        //
-        //  ── 무엇이 문제였나 ──
-        //   2600 이라는 숫자는 임베딩 실제 상주 비용과도, Qwen3.5 실제 비용과도
-        //   무관한 값이었습니다. GPU 를 바꾸거나 모델을 교체하면 즉시 틀립니다.
-        //   게다가 CONCURRENT 분기는 두 모델을 '무조건' 함께 올리므로
-        //   판정이 낙관적이면 그 순간이 곧 피크가 됩니다.
-        //
-        //  ── 무엇으로 바꾸는가 ──
-        //   embedding_budget_mb() / generation_budget_mb() 는
-        //   ① 디스크 가중치 크기로 시작하고
-        //   ② 첫 로드 전후의 free VRAM 차이로 실측값으로 교체되며
-        //   ③ 대량 배치에서 관측한 activation 여유를 더해 돌려줍니다.
-        //   판정 근거가 전부 실측이므로 상수를 손댈 이유가 없습니다.
-        //
-        //  ── 여기서 미리 올리지 않는 이유 ──
-        //   음차는 캐시 히트가 대부분입니다. 이 시점에 Qwen3.5 를 올리면
-        //   캐시로만 끝나는 아이템에서 2GB 를 헛돌립니다.
-        //   실제 전환은 translit.rs 의 첫 캐시 미스 시점에서 일어납니다.
         let free_mb = model.get_free_vram_mb();
         let embed_need = model.embedding_budget_mb();
-        let gen_need = model.generation_budget_mb(crate::model::ModelSize::Qwen3_5);
+        let gen_need = match translit_engine.code() {
+            Some(code) => crate::model::lang_llm::resident_estimate_mb(code),
+            None => model.generation_budget_mb(crate::model::ModelSize::Qwen3_5),
+        };
+        let gen_label = translit_engine.label();
         if free_mb >= embed_need + gen_need {
             emit_term(&format!(
-                "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + Qwen3.5 {}MB. 스왑 없이 진행할 수 있습니다.",
-                free_mb, embed_need, gen_need
+                "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + {} {}MB. 스왑 없이 진행할 수 있습니다.",
+                free_mb, embed_need, gen_label, gen_need
             ));
         } else {
             emit_term(&format!(
-                "[Scheduler] 🔁 [CROSSOVER/SWAP 예상] 자유 {}MB < 임베딩 {}MB + Qwen3.5 {}MB. 페이즈별 교차 상주로 진행합니다.",
-                free_mb, embed_need, gen_need
+                "[Scheduler] 🔁 [CROSSOVER/SWAP 예상] 자유 {}MB < 임베딩 {}MB + {} {}MB. 페이즈별 교차 상주로 진행합니다.",
+                free_mb, embed_need, gen_label, gen_need
             ));
         }
-        // 임베딩 가중치 파일 존재만 확인하고, 로드는 실제 사용 시점으로 미룹니다.
         model.check_embedding_downloaded().await?;
         emit_term("[Scheduler] ✅ [CROSSOVER] 지연 로드 계획 확정. 각 페이즈 진입 시점에 필요한 모델만 올립니다.");
     }
-    let id_val_raw = extracted_data.get("id")
+    let extracted_id_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
         .or_else(|| extracted_data.get("tracking_number"))
         .or_else(|| extracted_data.get("index"))
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
-    
-    
-    
-    
-    let index_val = entity_index(&page_type, &team_id, &entity_seed(&task.cc, &id_val_raw));
+    let url_self_token: Option<(String, String, u8)> = if is_detail {
+        let self_aliases = crate::logic::relay_type_aliases(&page_type);
+        let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(&url)
+            .into_iter()
+            .map(|c| {
+                let ev = candidate_type_evidence(&c, self_aliases);
+                (c.token, c.role_phrase, ev)
+            })
+            .filter(|(_, _, ev)| *ev >= 1)
+            .collect();
+        typed.sort_by(|a, b| b.2.cmp(&a.2));
+        match typed.first() {
+            Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
+                Some((tok.clone(), role.clone(), *ev))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let id_val_raw = match url_self_token.as_ref() {
+        Some((tok, role, ev)) => {
+            crate::utils::score_dynamics::record_baseline("commerce.detail_url_identity", 1.0);
+            emit_term(&format!(
+                "  🪪 [DETAIL URL IDENTITY] {} 상세 식별자 '{}' (URL 역할 '{}' · 타입 근거 {}) | 추출기 id '{}' 대신 목록이 쓰는 것과 같은 URL 자기 식별자로 index 를 만듭니다. 그래야 목록 행과 상세 페이지가 같은 문서로 합쳐지고 다른 문서의 참조도 같은 index 로 착지합니다.",
+                page_type, tok, role, ev, extracted_id_raw
+            ));
+            tok.clone()
+        }
+        None if !extracted_id_raw.trim().is_empty() => extracted_id_raw.clone(),
+        None if is_detail => {
+            let seed = match url::Url::parse(&url) {
+                Ok(u) => format!("{}{}", u.path(), u.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase(),
+                Err(_) => url.to_string(),
+            };
+            let auto = format!("AUTO-{}-{}", page_type, crate::utils::hash::digest(&seed));
+            emit_term(&format!(
+                "  ⚠️ [DETAIL ID FALLBACK] 상세 식별자가 URL 에도 추출 결과에도 없어 링크 기반 결정론 키 '{}' 를 씁니다. 빈 값으로 index 를 만들면 식별자 없는 상세 페이지가 전부 한 행으로 합쳐집니다.",
+                auto
+            ));
+            auto
+        }
+        None => extracted_id_raw.clone(),
+    };
+    let index_val = entity_key_index(&page_type, &team_id, &task.cc, &id_val_raw);
     let generated_id = entity_id(&team_id, index_val);
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
         obj.insert("id".to_string(), json!(generated_id.clone()));
-        
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
 
@@ -7981,45 +8161,42 @@ pub async fn process_task(
 
     if page_type == "order" {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
-            let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            for good in goods_arr {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
-                if !g_no.is_empty() {
-                    let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
-                    let clean_tracking_no = normalize_entity_key(tracking_number);
-                    if clean_tracking_no.is_empty() {
-                        emit_term(&format!(
-                            "  ⚪ [ORDER-ITEM BRIDGE SKIP] 주문 '{}' 은 송장번호가 비어 tracking 문서를 만들지 않습니다. 빈 값으로 index 를 만들면 송장 없는 모든 주문이 tracking 한 행으로 합쳐집니다. 상품 연결은 goods 배열 릴레이가 처리합니다.",
-                            id_val_raw
-                        ));
-                        break;
-                    }
-                    let tracking_index = entity_index("tracking", &team_id, &entity_seed(&task.cc, tracking_number));
-                    let goods_index = entity_index("goods", &team_id, &entity_seed(&task.cc, g_no));
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let clean_tracking_no = normalize_entity_key(&tracking_number);
+            let first_goods = goods_arr.iter().find_map(|good| {
+                good.get("id")
+                    .or_else(|| good.get("no"))
+                    .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.trim().to_string()) })
+                    .filter(|s| !s.is_empty())
+            });
+            match (clean_tracking_no.is_empty(), first_goods) {
+                (true, Some(_)) => {
+                    emit_term(&format!(
+                        "  ⚪ [ORDER-ITEM BRIDGE SKIP] 주문 '{}' 은 송장번호가 비어 tracking 문서를 만들지 않습니다. 빈 값으로 index 를 만들면 송장 없는 모든 주문이 tracking 한 행으로 합쳐집니다. 상품 연결은 goods 배열 릴레이가 처리합니다.",
+                        id_val_raw
+                    ));
+                }
+                (false, Some(g_no)) => {
+                    let tracking_index = entity_key_index("tracking", &team_id, &task.cc, &tracking_number);
+                    let goods_index = entity_key_index("goods", &team_id, &task.cc, &g_no);
                     let tracking_id = entity_id(&team_id, tracking_index);
                     let mut tracking_data = extracted_data.clone();
-
                     if let Some(obj) = tracking_data.as_object_mut() {
                         obj.insert("type".to_string(), json!("tracking"));
                         obj.insert("no".to_string(), json!(clean_tracking_no));
                         obj.insert("index".to_string(), json!(tracking_index));
                         obj.insert("goods".to_string(), json!(goods_index));
                         obj.insert("order".to_string(), json!(index_val));
+                        obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
                     }
-
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
                     let masked_tracking_text = tracking_text.clone();
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 384]);
-
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
-
-                    let tracking_bcc = entity_bcc("tracking", &cc_val);
-
+                    let tracking_bcc = entity_bcc("tracking", &task.cc);
                     let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
-
                     let tracking_prior = crate::utils::canonical::ledger_prior(
                         store
                             .get_item_by_id("tracking", &tracking_id)
@@ -8030,10 +8207,10 @@ pub async fn process_task(
                             .as_ref(),
                     );
                     relay_ledger::add_delta(&mut stats_diff, "tracking", crate::utils::canonical::ledger_delta(tracking_prior, true));
-
                     save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
                         &task.from, &team_id, &task.cc, &tracking_bcc, &tracking_ref, None).await;
                 }
+                _ => {}
             }
         }
     }
@@ -8105,12 +8282,7 @@ pub async fn process_task(
         }
 
         let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
-        let self_delta = crate::utils::canonical::ledger_delta(self_prior, true);
-        relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
-        emit_term(&format!(
-            "  📒 [RELAY LEDGER / SELF] {} '{}' 상세 문서 | 이전 상태 {:?} → count 확정 | 원장 변화 {:?}",
-            page_type, target_id, self_prior, self_delta
-        ));
+        let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
 
         let vector = if let Some(v) = existing_vector {
             Some(v)
@@ -8118,18 +8290,15 @@ pub async fn process_task(
             Some(model.get_embedding(text_to_embed).await?)
         };
 
-        
-        
-        
         if let Some(t_idx) = relay_ledger::bind_tracking_ref(&mut extracted_data, &page_type, &team_id, &task.cc) {
             emit_term(&format!(
-                "  🔑 [TRACKING INDEX PRE-COMPUTE] 주문의 tracking 연결 index {} 확정. 송장번호로 index 를 만들 때 사이트 범위 시드를 함께 씁니다.",
+                "  🔑 [TRACKING INDEX PRE-COMPUTE] 주문의 tracking 연결 index {} 확정. 유효한 송장번호는 사이트와 무관한 시드로 만들어, 다른 사이트나 행동 로그가 같은 송장을 가리켜도 같은 index 로 만납니다.",
                 t_idx
             ));
         }
         let detail_extra = relay_ledger::goods_array_refs(&mut extracted_data, &team_id, &task.cc);
         let self_index = crate::utils::canonical::relay_ref_index(extracted_data.get("index")).unwrap_or(index_val);
-        {
+        let bridge = {
             let relay_env = relay_ledger::RelayEnv {
                 store: &store,
                 app_handle,
@@ -8140,10 +8309,24 @@ pub async fn process_task(
                 ref_val: &ref_val,
                 search_mode: &search_mode,
             };
-            let _ = relay_ledger::bridge_relays(&relay_env, &page_type, &target_id, self_index, &mut extracted_data, &detail_extra, &mut stats_diff).await;
+            relay_ledger::bridge_relays(&relay_env, &page_type, &target_id, self_index, &mut extracted_data, &detail_extra, &mut stats_diff).await
+        };
+        let confirm = relay_ledger::self_established(self_prior, origin_ok, &bridge);
+        let self_delta = crate::utils::canonical::ledger_delta(self_prior, confirm);
+        relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+        let self_state = crate::utils::canonical::ledger_state(self_prior, confirm);
+        let self_ts = if self_state == "count" { chrono::Utc::now().timestamp_millis() } else { 0 };
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("updated_at".to_string(), json!(self_ts));
+            obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!(self_state));
         }
+        emit_term(&format!(
+            "  📒 [RELAY LEDGER / SELF] {} '{}' 상세 문서 | 이전 상태 {:?} | 성립 관계 정방향 {}건 · 역방향 {}건 · 자리 초안 출처 성립 {} | {} | 원장 변화 {:?}",
+            page_type, target_id, self_prior, bridge.establishing_out, bridge.referrers, origin_ok,
+            if self_state == "count" { "count 확정" } else { "draft 유지 (성립 관계 없음)" },
+            self_delta
+        ));
 
-        
         save_item(&store, &target_table, &target_id, &page_type, extracted_data.clone(), vector,
             &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
         items_to_process.push(extracted_data.clone());
@@ -8415,7 +8598,7 @@ pub async fn process_task(
                 } else {
                     original_id.clone()
                 };
-                let index_val = entity_index(&page_type, &team_id, &entity_seed(&task.cc, &identity_seed));
+                let index_val = entity_key_index(&page_type, &team_id, &task.cc, &identity_seed);
                 let hashed_item_id = entity_id(&team_id, index_val);
 
                 if let Some(obj) = single_item.as_object_mut() {
@@ -8432,6 +8615,7 @@ pub async fn process_task(
                     .as_ref()
                     .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok());
                 let self_prior = crate::utils::canonical::ledger_prior(existing_json.as_ref());
+                let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json.as_ref());
                 if let Some(ej) = existing_json.as_ref() {
                     single_item = merge_node(ej, &single_item);
                     if let Some(obj) = single_item.as_object_mut() {
@@ -8444,28 +8628,32 @@ pub async fn process_task(
                 }
 
                 let bridge = relay_ledger::bridge_relays(&relay_env, &page_type, &hashed_item_id, index_val, &mut single_item, &[], &mut stats_diff).await;
-                let confirm = bridge.referenced || self_prior == crate::utils::canonical::LedgerPrior::Placeholder;
+                let confirm = relay_ledger::self_established(self_prior, origin_ok, &bridge);
                 let self_delta = crate::utils::canonical::ledger_delta(self_prior, confirm);
                 relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+                let self_state = crate::utils::canonical::ledger_state(self_prior, confirm);
                 let kept_ts = existing_json
                     .as_ref()
                     .and_then(|e| e.get("updated_at").and_then(|v| v.as_i64()))
-                    .filter(|t| *t > 0);
-                let self_ts = match kept_ts {
-                    Some(t) => t,
-                    None if confirm => chrono::Utc::now().timestamp_millis(),
-                    None => 0,
+                    .filter(|t| *t > 0 && self_prior == crate::utils::canonical::LedgerPrior::Confirmed);
+                let self_ts = if self_state == "count" {
+                    kept_ts.unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+                } else {
+                    0
                 };
                 if let Some(obj) = single_item.as_object_mut() {
                     obj.insert("updated_at".to_string(), json!(self_ts));
+                    obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!(self_state));
                 }
                 emit_term(&format!(
-                    "  📒 [RELAY LEDGER / SELF] {} '{}' | 이전 상태 {:?} | 역방향 참조 {}건 | {} | 원장 변화 {:?}",
+                    "  📒 [RELAY LEDGER / SELF] {} '{}' | 이전 상태 {:?} | 성립 관계 정방향 {}건 · 역방향 {}건 · 자리 초안 출처 성립 {} | {} | 원장 변화 {:?}",
                     page_type,
                     hashed_item_id,
                     self_prior,
+                    bridge.establishing_out,
                     bridge.referrers,
-                    if self_ts > 0 { "count 확정" } else { "draft 유지 (목록 전용)" },
+                    origin_ok,
+                    if self_state == "count" { "count 확정" } else { "draft 유지 (성립 관계 없음)" },
                     self_delta
                 ));
 

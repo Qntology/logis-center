@@ -797,6 +797,25 @@ pub async fn run_analytic_structuring(
             o.remove("embed");
         }
 
+        let relay_team = {
+            let zero = "0x0000000000000000000000000000000000000000";
+            let to = doc.to.trim();
+            if !to.is_empty() && to != zero {
+                to.to_string()
+            } else {
+                let from = doc.from.trim();
+                crate::utils::hash::hash_id(if from.is_empty() { zero } else { from })
+            }
+        };
+        let url_relays = crate::scheduler::relay_ledger::bind_url_relays(&mut new_data, &link, &relay_team, &doc.cc);
+        if !url_relays.is_empty() {
+            crate::utils::score_dynamics::record_baseline("analytic.relay_bound", url_relays.len() as f32);
+            emit_term(&format!(
+                "  🔗 [ANALYTIC RELAY] id='{}' | 행동 이벤트 링크의 파라미터 키가 타입 별칭을 지목해 연결 축 {:?} 를 새겼습니다. 커머스 목록·상세와 같은 entity_key_index(타입, 팀, cc, 식별자) 식이라 검색에서 이 행동이 해당 상품·주문 문서로 relay 됩니다. 행동 로그는 원장(base)에 세지 않습니다.",
+                doc.id, url_relays
+            ));
+        }
+
         let _ = store
             .upsert_item(
                 "items",
