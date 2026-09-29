@@ -122,6 +122,65 @@ pub fn is_embed_excluded_type(type_: &str) -> bool {
     false
 }
 
+pub fn is_relay_draft(doc: &Value) -> bool {
+    let updated_zero = doc.get("updated_at").and_then(|v| v.as_i64()) == Some(0);
+    let digest_empty = doc
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .map_or(false, |s| s.trim().is_empty());
+    let embedded = doc
+        .get("embed")
+        .map_or(false, |v| v.as_i64() == Some(1) || v.as_bool() == Some(true));
+    updated_zero && digest_empty && !embedded
+}
+
+pub fn draft_named_by_query(doc: &Value, query_text: &str) -> bool {
+    let keep = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    let tokens: Vec<String> = query_text
+        .split(|c: char| !keep(c))
+        .filter(|t| t.chars().count() >= 5 && t.chars().any(|c| c.is_ascii_digit()))
+        .map(|t| t.to_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for key in ["no", "doc_number", "tracking_number", "code"] {
+        let raw = match doc.get(key) {
+            Some(Value::String(s)) => s.trim().to_lowercase(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        if !raw.is_empty() {
+            names.push(raw);
+        }
+    }
+    if let Some(text) = doc.get("text").and_then(|v| v.as_str()) {
+        for w in text.split_whitespace().skip(1) {
+            let t = w.trim_matches(|c: char| !keep(c)).to_lowercase();
+            if !t.is_empty() {
+                names.push(t);
+            }
+        }
+    }
+    tokens.iter().any(|t| names.iter().any(|n| n == t))
+}
+
+pub fn drop_unnamed_drafts(
+    combined: &mut std::collections::HashMap<String, (String, f32)>,
+    query_text: &str,
+) -> usize {
+    if query_text.trim().is_empty() {
+        return 0;
+    }
+    let before = combined.len();
+    combined.retain(|_, (txt, _)| match serde_json::from_str::<Value>(txt.as_str()) {
+        Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
+        Err(_) => true,
+    });
+    before - combined.len()
+}
+
 /// 봉투 값 1개를 확정합니다. 인자 → data → 빈 문자열 순으로 우선합니다.
 /// upsert_item 이 물리 컬럼과 data 양쪽에 '같은 값' 을 쓰기 위한 단일 판정기입니다.
 pub fn resolve_envelope_field(arg: Option<&str>, data: &Value, key: &str) -> String {
@@ -822,6 +881,11 @@ impl VectorStore {
                         Some(Value::String(s)) => {
                             let t = s.trim();
                             if t.is_empty() || t == "null" || t == "N/A" { continue; }
+                            if crate::utils::canonical::is_relay_index_key(&k)
+                                && crate::utils::canonical::relay_text_is_content(t)
+                            {
+                                continue;
+                            }
                             if k == "status" {
                                 crate::logic::parse_status(t) as f64
                             } else if let Some(ms) = iso_to_epoch_ms(t) {
@@ -1007,8 +1071,8 @@ impl VectorStore {
             && vector.as_ref().map_or(false, |v| v.len() == 384 && v.iter().any(|&x| x != 0.0));
         let vision_gain = stored_vision.is_none()
             && vision_vec.as_ref().map_or(false, |v| v.len() == 1152 && v.iter().any(|&x| x != 0.0));
-        let vector = vector.or(stored_vec);
-        let vision_vec = vision_vec.or(stored_vision);
+        let vector = vector.filter(|v| !v.is_empty()).or(stored_vec);
+        let vision_vec = vision_vec.filter(|v| !v.is_empty()).or(stored_vision);
         // 🌟 [SKIP GUARD v2] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
         //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
         //
@@ -1041,12 +1105,63 @@ impl VectorStore {
                 && doc.updated_at_ts >= new_updated_at
                 && !new_digest.is_empty()
             {
-                let old_digest = serde_json::from_str::<Value>(&doc.json_data)
-                    .ok()
+                let old_json = serde_json::from_str::<Value>(&doc.json_data).ok();
+                let old_digest = old_json
+                    .as_ref()
                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
                     .unwrap_or_default();
                 if old_digest == new_digest {
-                    if vector_gain || vision_gain {
+                    let repair_keys = ["index", "goods", "order", "tracking", "event", "no", "code", "tracking_number"];
+                    let incoming = {
+                        let mut part = serde_json::Map::new();
+                        for k in repair_keys.iter() {
+                            if let Some(v) = data_val.get(*k) {
+                                part.insert(k.to_string(), v.clone());
+                            }
+                        }
+                        Self::canonicalize_data(Value::Object(part), false)
+                    };
+                    let stored_of = |k: &str| old_json.as_ref().and_then(|v| v.get(k));
+                    let mut key_repair: Vec<String> = Vec::new();
+                    if let Some(inc) = incoming.get("index") {
+                        let stored = stored_of("index");
+                        if stored != Some(inc) {
+                            let team = resolve_envelope_field(to, &data_val, "to");
+                            let proves = |v: Option<&Value>| -> bool {
+                                v.and_then(|x| x.as_u64())
+                                    .filter(|n| *n <= u64::from(u32::MAX))
+                                    .map_or(false, |n| crate::scheduler::entity_id(&team, n as u32) == final_id)
+                            };
+                            if !proves(stored) && proves(Some(inc)) {
+                                key_repair.push("index".to_string());
+                            }
+                        }
+                    }
+                    for k in repair_keys.iter().skip(1) {
+                        let stored_empty = stored_of(k).map_or(false, crate::utils::canonical::relay_key_is_empty);
+                        let incoming_real = incoming
+                            .get(*k)
+                            .map_or(false, |v| !crate::utils::canonical::relay_key_is_empty(v));
+                        if stored_empty && incoming_real {
+                            key_repair.push(k.to_string());
+                        }
+                    }
+                    if !key_repair.is_empty() {
+                        if let Some(mut patched) = old_json.clone() {
+                            if let (Some(dst), Some(src)) = (patched.as_object_mut(), incoming.as_object()) {
+                                for k in key_repair.iter() {
+                                    if let Some(v) = src.get(k.as_str()) {
+                                        dst.insert(k.clone(), v.clone());
+                                    }
+                                }
+                            }
+                            data_val = patched;
+                        }
+                        println!(
+                            "[STORE] 🧭 [KEY REPAIR] id='{}' digest 는 동일하지만 저장본의 식별·연결 키 {:?} 가 비어 있거나(0·빈 값) index 가 id 와 맞지 않고, 이번 호출은 올바른 값을 들고 왔습니다. 저장본(벡터 포함)을 그대로 두고 그 키만 고쳐 다시 기록합니다. index 는 entity_id(팀, index) == id 로 검증된 값만 쓰고, 나머지 키는 저장본이 비어 있을 때만 채웁니다.",
+                            final_id, key_repair
+                        );
+                    } else if vector_gain || vision_gain {
                         println!(
                             "[STORE] 🧲 [VECTOR GAIN] id='{}' digest 는 동일하지만 저장본에 없던 벡터를 이번 호출이 들고 왔습니다. (text={} / vision={}) 스킵을 취소하고 기록합니다.",
                             final_id, vector_gain, vision_gain
@@ -1148,10 +1263,6 @@ impl VectorStore {
         let env_ref  = resolve_envelope_field(r#ref, &final_data, "ref");
 
         if let Some(obj) = final_data.as_object_mut() {
-            // 별칭 보정 (기존 동작 유지)
-            if let Some(tn) = obj.get("tracking_number").cloned() {
-                if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
-            }
             if let Some(p) = obj.get("price").cloned() {
                 if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
             }
@@ -1541,7 +1652,11 @@ impl VectorStore {
 
          if !is_empty_vec {
              let mut vq = table.query();
-             if let Some(ref f) = scope { vq = vq.only_if(f.clone()); }
+             let embed_scope = match &scope {
+                 Some(f) => format!("({}) AND data LIKE '%\"embed\":1%'", f),
+                 None => "data LIKE '%\"embed\":1%'".to_string(),
+             };
+             vq = vq.only_if(embed_scope);
 
              if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
                  let vq_with_vector = vq_with_vector.column("vector");
@@ -1609,6 +1724,7 @@ impl VectorStore {
                 }
             }
         }
+        let mut drafts_dropped = drop_unnamed_drafts(&mut combined, query_text);
         if combined.is_empty() {
              let mut q = table.query();
              if let Some(ref f) = scope { q = q.only_if(f.clone()); }
@@ -1627,6 +1743,13 @@ impl VectorStore {
              }
          }
 
+         drafts_dropped += drop_unnamed_drafts(&mut combined, query_text);
+         if drafts_dropped > 0 {
+             println!(
+                 "[STORE] 🧾 [RECALL DRAFT DROP] 릴레이가 만든 빈 초안 {}건을 리콜에서 뺍니다. 초안은 벡터도 digest 도 없는 껍데기라 n-gram FTS 의 우연 일치와 0 벡터의 L2 거리(1.0)로 실문서보다 앞에 섭니다. 질의가 초안의 번호를 직접 적은 경우만 남깁니다.",
+                 drafts_dropped
+             );
+         }
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 

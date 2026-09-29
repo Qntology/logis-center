@@ -94,6 +94,7 @@ pub async fn update_team_base_metrics(
             let numeric_keys: Vec<String> = item.as_object()
                 .map(|o| o.keys()
                     .filter(|k| !METRIC_SKIP.iter().any(|s| s == &k.as_str()))
+                    .filter(|k| !crate::utils::canonical::RELAY_LINK_KEYS.iter().any(|s| s == &k.as_str()) && !k.starts_with("rel_"))
                     .filter(|k| kind_of(k) == CanonKind::Numeric)
                     .cloned()
                     .collect())

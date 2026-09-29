@@ -91,7 +91,6 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 1 : bias.json 완전일치 + 접두일치 (벡터·LLM 없이 확정)
         // =====================================================================
-        let (deterministic_time, _) = crate::parsing::get_deterministic_time_guide(&query, language);
         let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
         let mut det_event_keys: Vec<String> = Vec::new();
         for w in query.split_whitespace() {
@@ -120,6 +119,17 @@ impl crate::model::LogisModel {
                 det_time_key, det_season_key, det_event_keys
             ));
         }
+        let (period_clock, period_southern) = crate::utils::time_guide::lang_clock(language);
+        let exact_today = crate::utils::time_guide::date_of_ms(&period_clock, now_ms)
+            .unwrap_or_else(|| crate::utils::time_guide::today_in(&period_clock));
+        let exact_words: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
+        let exact_period = crate::utils::ai_utils::exact_absolute_period(&exact_words, exact_today);
+        if let Some(p) = exact_period.as_ref() {
+            emit_term(&format!(
+                "   📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?}",
+                p.start, p.end, p.operator, p.granularity, p.year_explicit, p.tokens, p.evidence
+            ));
+        }
 
         // =====================================================================
         // STEP 2 : Stanza 형태소 토큰화 (UPOS + Lemma)
@@ -145,7 +155,7 @@ impl crate::model::LogisModel {
         // 🌟 [DUAL AXIS] 드롭 대상 품사도 '청크 후보' 에는 남깁니다.
         //    '클릭한' 이 VERB 로 판정되어도 그것이 event 판정의 유일한 근거이기 때문입니다.
         //    드롭은 keywords / target 산출 시에만 적용합니다.
-        const DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+        const DROP_TAGS: [&str; 7] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let content_flags: Vec<bool> = tokens
             .iter()
@@ -382,10 +392,9 @@ impl crate::model::LogisModel {
             if sims.is_empty() {
                 return (f32::MIN, 0.0);
             }
-            let n = sims.len() as f32;
             let mx = sims.iter().cloned().fold(f32::MIN, f32::max);
             let z = (mx - g_mean) / g_sd;
-            let expect = (2.0 * n.max(2.0).ln()).sqrt();
+            let expect = crate::utils::ai_utils::gumbel_expected_z(sims.len().max(2));
             (z - expect, mx)
         };
 
@@ -747,6 +756,17 @@ impl crate::model::LogisModel {
                 }
             }
         }
+        if let Some(p) = exact_period.as_ref() {
+            for &i in p.tokens.iter() {
+                if i < consumed.len() {
+                    consumed[i] = true;
+                }
+            }
+            emit_term(&format!(
+                "   📅 [EXACT PERIOD CONSUMED] {:?} 는 기간 조건으로 소비되어 검색 키워드에서 제외됩니다.",
+                p.tokens.iter().filter_map(|&i| all_words.get(i).cloned()).collect::<Vec<_>>()
+            ));
+        }
 
         // =====================================================================
         // STEP 8 : 마진 부족 시에만 LLM 1회 재판정
@@ -764,11 +784,12 @@ impl crate::model::LogisModel {
         };
 
         let time_context = format!(
-            "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".\n{}",
-            current_iso, now_ms, language, deterministic_time
+            "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".",
+            current_iso, now_ms, language
         );
 
         let need_time_llm = det_time_key.is_empty()
+            && exact_period.is_none()
             && !vec_time.is_empty()
             && vec_time_alts
                 .first()
@@ -977,6 +998,12 @@ impl crate::model::LogisModel {
                 for word in w.text.split_whitespace() {
                     let word_str = word.trim();
                     if word_str.is_empty() { continue; }
+                    let in_period = exact_period.as_ref().map_or(false, |p| {
+                        p.tokens.iter().any(|&i| {
+                            all_words.get(i).map_or(false, |aw| aw == word_str || aw.starts_with(word_str))
+                        })
+                    });
+                    if in_period { continue; }
                     // Stanza POS에서 동사/조사로 판정된 단어는 제외
                     let is_func = all_words.iter().position(|aw| aw == word_str)
                         .map(|idx| !content_flags.get(idx).copied().unwrap_or(true))
@@ -998,6 +1025,21 @@ impl crate::model::LogisModel {
                 }
             }
         }
+        let mut stem_added: Vec<String> = Vec::new();
+        for k in keywords.clone().iter() {
+            for (stem, _) in crate::utils::ai_utils::closed_tail_stems(k) {
+                if !keywords.iter().any(|x| *x == stem) {
+                    stem_added.push(format!("{}→{}", k, stem));
+                    keywords.push(stem);
+                }
+            }
+        }
+        if !stem_added.is_empty() {
+            emit_term(&format!(
+                "   ✂️ [KEYWORD STEM] 닫힌 조사·어미 표(shipping 서식 전문 대조와 같은 표)로 떼어낸 어간 {:?} 를 원형과 함께 검색어에 넣습니다. FTS 는 어절을 통째로 한 토큰으로 색인하므로 '상품을' 은 '상품' 을 찾지 못합니다. 원형도 남겨 두어 저장 텍스트가 조사까지 붙은 형태여도 만납니다.",
+                stem_added
+            ));
+        }
         let target = if keywords.is_empty() {
             query.clone()
         } else {
@@ -1013,34 +1055,88 @@ impl crate::model::LogisModel {
         // =====================================================================
         let mut started_at: i64 = 0;
         let mut expired_at: i64 = 0;
-
-        if !season_intent.is_empty() {
-            let (y, _, _) = crate::analytic::ymd_of(now_ms);
-            let year = if time_intent == "last_year" { y - 1 } else { y };
-            if let Some((s, e)) = crate::analytic::season_range(&season_intent, year) {
-                started_at = s;
-                expired_at = e;
+        let mut exact_used = false;
+        let show = |ms: i64| -> String {
+            if ms <= 0 {
+                return "-".to_string();
             }
-        }
-        if started_at == 0 {
-            if let Some((s, e)) = crate::analytic::time_intent_range(&time_intent, now_ms) {
-                started_at = s;
-                expired_at = e;
-            }
-        }
+            crate::utils::time_guide::date_of_ms(&period_clock, ms)
+                .map(|d| d.to_string())
+                .unwrap_or_default()
+        };
 
-        if started_at > 0 {
-            emit_term(&format!(
-                "   🗓️ [PERIOD CONFIRMED] time='{}' | season='{}' → {} ~ {} (epoch ms)",
-                if time_intent.is_empty() { "-" } else { &time_intent },
-                if season_intent.is_empty() { "-" } else { &season_intent },
-                started_at,
-                expired_at
-            ));
-        } else {
-            emit_term(
-                "   🗓️ [PERIOD] 벡터가 확정한 기간 표현이 없어 전체 구간을 검색합니다. (근거 없는 기간 조건을 만들지 않습니다)",
+        if let Some(p) = exact_period.as_ref() {
+            let (start, end) = crate::utils::time_guide::anchor_exact_period(
+                p.start,
+                p.end,
+                p.year_explicit,
+                &det_time_key,
+                exact_today,
+                true,
             );
+            let (cond_start, cond_end, season_used) = crate::utils::time_guide::exact_with_season(
+                start,
+                end,
+                p.granularity,
+                &season_intent,
+                period_southern,
+            );
+            let (sa, ea) = crate::utils::time_guide::operator_bounds_ms(&period_clock, cond_start, cond_end, p.operator);
+            if sa > 0 || ea > 0 {
+                started_at = sa.max(0);
+                expired_at = ea.max(0);
+                exact_used = true;
+                emit_term(&format!(
+                    "   🗓️ [PERIOD CONFIRMED / EXACT] 질의 기간 {} ~ {} (op={}, 연도명시={}, 계절={}) → 조건 {} ~ {} | started_at={} | expired_at={} (epoch ms, 달력 UTC{}). 상대 시간 의도 '{}' 는 절대 기간으로 대체됩니다.",
+                    start,
+                    end,
+                    p.operator,
+                    p.year_explicit,
+                    if season_used { season_intent.as_str() } else { "-" },
+                    show(started_at),
+                    show(expired_at),
+                    started_at,
+                    expired_at,
+                    period_clock,
+                    if time_intent.is_empty() { "-" } else { time_intent.as_str() }
+                ));
+                time_intent.clear();
+                if !season_used {
+                    season_intent.clear();
+                }
+            }
+        }
+
+        if !exact_used {
+            if let Some((s, e)) = crate::utils::time_guide::intent_period(
+                &time_intent,
+                &season_intent,
+                exact_today,
+                period_southern,
+                crate::utils::time_guide::SeasonAnchor::Latest,
+            ) {
+                let (s_ms, e_ms) = crate::utils::time_guide::period_ms(&period_clock, s, e);
+                started_at = s_ms;
+                expired_at = e_ms;
+            }
+
+            if started_at > 0 {
+                emit_term(&format!(
+                    "   🗓️ [PERIOD CONFIRMED] time='{}' | season='{}' → {} ~ {} (epoch ms) = {} ~ {} (달력 UTC{}) — commerce·shipping 과 같은 기간 해석기(utils/time_guide)로 계산합니다. 계절은 이미 시작한 가장 최근 회차를 씁니다. 행동 기록은 미래에 없으므로 아직 오지 않은 계절을 고르면 조건이 확정적으로 0건이 됩니다. '최근' 은 세 도메인 공통 {}일입니다.",
+                    if time_intent.is_empty() { "-" } else { &time_intent },
+                    if season_intent.is_empty() { "-" } else { &season_intent },
+                    started_at,
+                    expired_at,
+                    show(started_at),
+                    show(expired_at),
+                    period_clock,
+                    crate::utils::time_guide::RECENT_DAYS
+                ));
+            } else {
+                emit_term(
+                    "   🗓️ [PERIOD] 벡터가 확정한 기간 표현이 없어 전체 구간을 검색합니다. (근거 없는 기간 조건을 만들지 않습니다)",
+                );
+            }
         }
 
         // =====================================================================
@@ -1051,6 +1147,11 @@ impl crate::model::LogisModel {
             condition.insert(
                 "created_at".to_string(),
                 json!({ "operator": "gte", "value": started_at }),
+            );
+        } else if expired_at > 0 {
+            condition.insert(
+                "created_at".to_string(),
+                json!({ "operator": "lte", "value": expired_at }),
             );
         }
 
@@ -1064,7 +1165,7 @@ impl crate::model::LogisModel {
             "unassigned": keywords
         }));
 
-        if expired_at > 0 {
+        if started_at > 0 && expired_at > 0 {
             let mut upper = serde_json::Map::new();
             upper.insert(
                 "created_at".to_string(),

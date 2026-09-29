@@ -69,27 +69,8 @@ pub fn event_type_prejudice_phrases(event_type: &str) -> Vec<String> {
 ///  time_filters / season_filters 의 exact_match 와 동일한 계약이며,
 ///  일치하면 벡터 경쟁도 LLM 도 거치지 않고 즉시 확정합니다.
 pub fn event_type_exact_match(word: &str) -> Option<String> {
-    let w = word.trim().to_lowercase();
-    if w.is_empty() {
-        return None;
-    }
-    let obj = crate::parsing::BIAS_DICT
-        .get("analytic_event_filters")
-        .and_then(|v| v.as_object())?;
-    for (key, node) in obj {
-        if !ANALYTIC_SEARCH_TYPES.iter().any(|t| t == key) {
-            continue;
-        }
-        if let Some(arr) = node.get("exact_match").and_then(|v| v.as_array()) {
-            if arr
-                .iter()
-                .any(|x| x.as_str().map_or(false, |s| s.trim().to_lowercase() == w))
-            {
-                return Some(key.clone());
-            }
-        }
-    }
-    None
+    crate::utils::ai_utils::exact_match_filter_key("analytic_event_filters", word)
+        .filter(|k| ANALYTIC_SEARCH_TYPES.iter().any(|t| t == k))
 }
 
 /// 🌟 [EVENT PREFIX MATCH] 교착어 어절을 위해 exact_match 배열을 '접두 사전' 으로 재사용합니다.
@@ -167,6 +148,9 @@ pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
 
     if out.len() > 3 {
         out.truncate(3);
+    }
+    for (stem, _) in crate::utils::ai_utils::closed_tail_stems(surface) {
+        push(&mut out, surface, stem);
     }
     out
 }
@@ -813,6 +797,25 @@ pub async fn run_analytic_structuring(
             o.remove("embed");
         }
 
+        let relay_team = {
+            let zero = "0x0000000000000000000000000000000000000000";
+            let to = doc.to.trim();
+            if !to.is_empty() && to != zero {
+                to.to_string()
+            } else {
+                let from = doc.from.trim();
+                crate::utils::hash::hash_id(if from.is_empty() { zero } else { from })
+            }
+        };
+        let url_relays = crate::scheduler::relay_ledger::bind_url_relays(&mut new_data, &link, &relay_team, &doc.cc);
+        if !url_relays.is_empty() {
+            crate::utils::score_dynamics::record_baseline("analytic.relay_bound", url_relays.len() as f32);
+            emit_term(&format!(
+                "  🔗 [ANALYTIC RELAY] id='{}' | 행동 이벤트 링크의 파라미터 키가 타입 별칭을 지목해 연결 축 {:?} 를 새겼습니다. 커머스 목록·상세와 같은 entity_key_index(타입, 팀, cc, 식별자) 식이라 검색에서 이 행동이 해당 상품·주문 문서로 relay 됩니다. 행동 로그는 원장(base)에 세지 않습니다.",
+                doc.id, url_relays
+            ));
+        }
+
         let _ = store
             .upsert_item(
                 "items",
@@ -1356,23 +1359,6 @@ pub fn normalize_report_output(raw: &str) -> String {
 //   LLM 이 '이번달' 을 2026-03-01 로 적어도 그 값이 실제 epoch 인지 보증할 수 없기 때문입니다.
 // =====================================================================
 
-fn ms_of(y: i32, m: u32, d: u32) -> i64 {
-    chrono::NaiveDate::from_ymd_opt(y, m, d)
-        .and_then(|dd| dd.and_hms_opt(0, 0, 0))
-        .map(|nd| nd.and_utc().timestamp_millis())
-        .unwrap_or(0)
-}
-
-fn month_start(y: i32, m: u32) -> i64 { ms_of(y, m, 1) }
-
-fn next_month(y: i32, m: u32) -> (i32, u32) {
-    if m == 12 { (y + 1, 1) } else { (y, m + 1) }
-}
-
-fn prev_month(y: i32, m: u32) -> (i32, u32) {
-    if m == 1 { (y - 1, 12) } else { (y, m - 1) }
-}
-
 pub fn ymd_of(ts: i64) -> (i32, u32, u32) {
     match chrono::DateTime::from_timestamp_millis(ts) {
         Some(dt) => {
@@ -1383,45 +1369,17 @@ pub fn ymd_of(ts: i64) -> (i32, u32, u32) {
     }
 }
 
-/// 🌟 [TIME RANGE] time_filters 캐노니컬 키를 epoch ms 구간으로 확정합니다.
 pub fn time_intent_range(intent: &str, now_ms: i64) -> Option<(i64, i64)> {
-    let (y, m, d) = ymd_of(now_ms);
-    match intent {
-        "today" => {
-            let s = ms_of(y, m, d);
-            Some((s, s + 86_400_000 - 1))
-        },
-        "yesterday" => {
-            let s = ms_of(y, m, d) - 86_400_000;
-            Some((s, s + 86_400_000 - 1))
-        },
-        "this_month" => {
-            let s = month_start(y, m);
-            let (ny, nm) = next_month(y, m);
-            Some((s, month_start(ny, nm) - 1))
-        },
-        "last_month" => {
-            let (py, pm) = prev_month(y, m);
-            let s = month_start(py, pm);
-            Some((s, month_start(y, m) - 1))
-        },
-        "this_year" => Some((ms_of(y, 1, 1), ms_of(y + 1, 1, 1) - 1)),
-        "last_year" => Some((ms_of(y - 1, 1, 1), ms_of(y, 1, 1) - 1)),
-        "recently" => Some((now_ms - 7 * 86_400_000, now_ms)),
-        _ => None,
-    }
+    let utc = chrono::FixedOffset::east_opt(0)?;
+    let today = crate::utils::time_guide::date_of_ms(&utc, now_ms)?;
+    let (s, e) = crate::utils::time_guide::relative_period(intent, today)?;
+    Some(crate::utils::time_guide::period_ms(&utc, s, e))
 }
 
-/// 🌟 [SEASON RANGE] season_filters 캐노니컬 키를 해당 연도의 구간으로 확정합니다.
-///    time_intent 가 과거를 가리키면 호출부가 year 를 이미 낮춰서 넘깁니다.
 pub fn season_range(season: &str, year: i32) -> Option<(i64, i64)> {
-    match season {
-        "spring" => Some((ms_of(year, 3, 1), ms_of(year, 6, 1) - 1)),
-        "summer" => Some((ms_of(year, 6, 1), ms_of(year, 9, 1) - 1)),
-        "autumn" => Some((ms_of(year, 9, 1), ms_of(year, 12, 1) - 1)),
-        "winter" => Some((ms_of(year, 12, 1), ms_of(year + 1, 3, 1) - 1)),
-        _ => None,
-    }
+    let utc = chrono::FixedOffset::east_opt(0)?;
+    let (s, e) = crate::utils::time_guide::season_period(season, year, false)?;
+    Some(crate::utils::time_guide::period_ms(&utc, s, e))
 }
 
 /// 🌟 [DETERMINISTIC TIME] bias.json 의 exact_match 배열로 완전일치 판정합니다.
@@ -1459,7 +1417,10 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
     if t_key.is_empty() || s_key.is_empty() {
         for c in &candidates {
             if t_key.is_empty() {
-                if let Some((k, stem)) =
+                if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("time_filters", c) {
+                    println!("[ANALYTIC] 🕒 [TIME EXACT + TAIL] '{}' → time_filters.{} | exact_match 원소 뒤에 닫힌 조사가 두 겹까지만 붙은 형태입니다(받침 호응 확인). 접두 일치는 두 글자 이상 어간만 받으므로 '봄에'·'봄에는' 같은 한 글자 어간은 이 경로가 잡습니다.", c, k);
+                    t_key = k;
+                } else if let Some((k, stem)) =
                     crate::utils::ai_utils::prefix_match_filter_stem("time_filters", c)
                 {
                     println!("[ANALYTIC] 🕒 [TIME PREFIX MATCH] '{}' ← 접두 '{}' → time_filters.{}", c, stem, k);
@@ -1467,7 +1428,10 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
                 }
             }
             if s_key.is_empty() {
-                if let Some((k, stem)) =
+                if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("season_filters", c) {
+                    println!("[ANALYTIC] 🌤️ [SEASON EXACT + TAIL] '{}' → season_filters.{} | exact_match 원소 뒤에 닫힌 조사가 두 겹까지만 붙은 형태입니다(받침 호응 확인). 접두 일치는 두 글자 이상 어간만 받으므로 '봄에'·'봄에는' 같은 한 글자 어간은 이 경로가 잡습니다.", c, k);
+                    s_key = k;
+                } else if let Some((k, stem)) =
                     crate::utils::ai_utils::prefix_match_filter_stem("season_filters", c)
                 {
                     println!("[ANALYTIC] 🌤️ [SEASON PREFIX MATCH] '{}' ← 접두 '{}' → season_filters.{}", c, stem, k);

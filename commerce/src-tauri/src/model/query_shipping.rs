@@ -113,7 +113,7 @@ impl crate::model::LogisModel {
 
         // 🌟 [DUAL AXIS] 드롭 대상 품사도 '청크 후보' 에는 남깁니다.
         //    '선적된' 이 VERB 로 판정되어도 그것이 transport 판정의 유일한 근거일 수 있습니다.
-        const DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+        const DROP_TAGS: [&str; 7] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let content_flags: Vec<bool> = tokens
             .iter()
@@ -137,11 +137,20 @@ impl crate::model::LogisModel {
         let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
         let mut seen_chunk: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        let relation_exact: Vec<bool> = (0..all_words.len())
+            .map(|i| layers.relation_marks.contains(&i) && ship_relation_exact(&all_words[i]))
+            .collect();
+        if relation_exact.iter().any(|&r| r) {
+            emit_term(&format!(
+                "   🔗 [RELATION MARK / D1 EXCLUDE] 관계 표지 {:?} 는 D1 카테고리와 독립된 축으로 이미 확정했으므로 청크 후보에서 뺍니다. 후보로 두면 '연결' 이 검사·증명 카테고리의 승자가 되는 식으로 조건과 무관한 D1 승자가 생기고, 그 승자가 겹치는 이웃 스팬을 NMS 로 누릅니다.",
+                (0..all_words.len()).filter(|&i| relation_exact[i]).map(|i| all_words[i].clone()).collect::<Vec<_>>()
+            ));
+        }
         for s in 0..all_words.len() {
-            if layers.roles.get(s) != Some(&ShipTokenRole::Content) { continue; }
+            if layers.roles.get(s) != Some(&ShipTokenRole::Content) || relation_exact[s] { continue; }
             let max_e = all_words.len().min(s + 6);
             for e in (s + 1)..=max_e {
-                if (s..e).any(|i| layers.roles.get(i) != Some(&ShipTokenRole::Content)) { break; }
+                if (s..e).any(|i| layers.roles.get(i) != Some(&ShipTokenRole::Content) || relation_exact[i]) { break; }
 
                 let surface = all_words[s..e].join(" ");
                 if !surface.trim().is_empty() {
@@ -1083,8 +1092,47 @@ impl crate::model::LogisModel {
                 }
 
                 let field = f_names[fi].clone();
+                let mut surface = span_surface(wi);
+                if matches!(
+                    crate::utils::ai_utils::query_value_format(&field),
+                    crate::utils::ai_utils::FieldFormat::Text | crate::utils::ai_utils::FieldFormat::Address
+                ) {
+                    if let Some((span_val, span_lab, picked)) = self
+                        .ship_label_span_value(
+                            &field,
+                            winners[wi].start,
+                            winners[wi].end,
+                            &all_words,
+                            &layers.variants,
+                            &layers.roles,
+                            &consumed_span,
+                            &f_banks[fi],
+                            &f_weights[fi],
+                        )
+                        .await
+                    {
+                        match picked {
+                            Some((k, value, val, lab)) => {
+                                emit_term(&format!(
+                                    "   🏷️ [D2 LABEL SPAN → VALUE] \"{}\" 는 '{}' 의 라벨입니다 (라벨 뱅크 {:.4} > 값 뱅크 {:.4}). 라벨 단어를 값으로 두면 힌트가 '{} contains {}' 가 되어 저장값과 만날 수 없고, 원장에는 그 축이 매번 만족 0 으로 쌓여 다음 회차의 강등 판정을 오염시킵니다. 맞닿은 내용어 \"{}\" (값 뱅크 {:.4} > 라벨 뱅크 {:.4}) 를 값으로 씁니다.",
+                                    span_surface(wi), field, span_lab, span_val, field, span_surface(wi), value, val, lab
+                                ));
+                                crate::utils::score_dynamics::record_baseline("search.label_span_value", 1.0);
+                                if k < consumed_span.len() { consumed_span[k] = true; }
+                                surface = value;
+                            }
+                            None => {
+                                emit_term(&format!(
+                                    "   ⚪ [D2 LABEL SPAN / NO VALUE] \"{}\" 는 '{}' 의 라벨입니다 (라벨 뱅크 {:.4} > 값 뱅크 {:.4}). 맞닿은 열린 내용어 중 값 뱅크가 라벨 뱅크와 이 스팬 자신을 둘 다 넘는 토큰이 없어 기존 표면형을 그대로 씁니다. 힌트는 필터가 아니므로 결과를 바꾸지 않고, 이 비율은 SDS search.label_span_value 로 관측합니다.",
+                                    span_surface(wi), field, span_lab, span_val
+                                ));
+                                crate::utils::score_dynamics::record_baseline("search.label_span_value", 0.0);
+                            }
+                        }
+                    }
+                }
                 let assignment = match ship_make_assignment(
-                    &field, cat, &span_surface(wi),
+                    &field, cat, &surface,
                     &bound_nums[wi], &bound_ids[wi],
                     enum_code_for(&field, winners[wi].start, winners[wi].end).as_deref(),
                     winners[wi].score >= d1_gate,
@@ -1835,122 +1883,8 @@ impl crate::model::LogisModel {
 
 const SHIP_BIND_RADIUS: usize = 6;
 
-const SHIP_TEMPORAL_OPERATOR_PIVOTS: [(&str, &str, &str); 2] = [
-    (
-        "gte",
-        "after, since, onward, later than, on or after",
-        "nach, seit, später als, am oder nach, \
-         después de, desde, a partir de, posterior a, en o después de, \
-         après, depuis, à partir de, postérieur à, le ou après, \
-         dopo, a partire da, successivo a, il o dopo, \
-         depois de, a partir de, posterior a, em ou depois de, \
-         sinds, vanaf, later dan, op of na, \
-         počínaje, později než, v den nebo po, \
-         بعد, منذ, اعتبارا من, لاحقا لـ, في أو بعد, \
-         以降, 以後, 以来, より後, それ以降, \
-         之后, 以后, 晚于, 自此之后, \
-         이후, 부터, 이래, 보다 늦은, 그 이후",
-    ),
-    (
-        "lte",
-        "before, until, earlier than, no later than, on or before",
-        "vor, bis, früher als, spätestens, am oder vor, \
-         antes de, hasta, anterior a, a más tardar, en o antes de, \
-         avant, jusqu'à, antérieur à, au plus tard, le ou avant, \
-         prima di, fino a, precedente a, entro, il o prima, \
-         antes de, até, anterior a, no máximo até, em ou antes de, \
-         voor, tot, eerder dan, uiterlijk, op of voor, \
-         před, dříve než, nejpozději, v den nebo před, \
-         قبل, حتى, أبكر من, في موعد أقصاه, في أو قبل, \
-         以前, まで, より前, 遅くとも, それ以前, \
-         之前, 以前, 早于, 最迟, 截至, \
-         이전, 까지, 보다 이른, 늦어도, 그 이전",
-    ),
-];
-
-/// 시간 단위 앵커 (en·de·es·fr·it·pt·nl·cs·ar·ko·ja·zh). 닫힌 어휘이므로 먼저 완전일치로 확정하고
-/// 실패할 때만 코사인 Max-Pool 로 내려갑니다. 영어 한 언어만 두고 교차언어 코사인에 기대면
-/// "4월에" 가 day 로 읽히는 식으로 단위 뱅크가 경쟁 축(라벨·기능어)에 집니다.
-const SHIP_TIME_UNIT_PIVOTS: [(&str, &str); 3] = [
-    (
-        "year",
-        "year, years, yr, calendar year, annual, \
-         Jahr, Jahre, Jahres, Kalenderjahr, \
-         año, años, \
-         année, années, \
-         anno, anni, \
-         ano, anos, \
-         jaar, jaren, kalenderjaar, \
-         rok, roku, roky, \
-         سنة, سنوات, عام, أعوام, \
-         년, 년도, 연도, 해, \
-         年, 年度, 年份, ねん",
-    ),
-    (
-        "month",
-        "month, months, calendar month, \
-         Monat, Monate, Monats, Kalendermonat, \
-         mes, meses, \
-         mois, \
-         mese, mesi, \
-         mês, \
-         maand, maanden, \
-         měsíc, měsíce, měsíců, \
-         شهر, شهور, أشهر, \
-         월, 달, \
-         月, 月份, がつ",
-    ),
-    (
-        "day",
-        "day, days, \
-         Tag, Tage, Tages, \
-         día, días, \
-         jour, jours, \
-         giorno, giorni, \
-         dia, dias, \
-         dag, dagen, \
-         den, dny, dní, dne, \
-         يوم, أيام, \
-         일, 일자, 날, \
-         日, 号, にち",
-    ),
-];
-
-const SHIP_CURRENCY_NAMES: &[(&str, &str)] = &[
-    ("USD", "usd, $, dollar, dollars, us-dollar, dólar, dólares, dollaro, dollari, dolar, dolary, dolarů, 달러, 미국달러, 美元, 美金, 米ドル, ドル, دولار, دولارات"),
-    ("EUR", "eur, €, euro, euros, eura, 유로, 欧元, 歐元, ユーロ, يورو"),
-    ("JPY", "jpy, yen, yens, iene, ienes, jeny, jenů, 엔, 엔화, 円, 日元, 日圓, ين, ين ياباني"),
-    ("CNY", "cny, rmb, yuan, yuans, renminbi, iuane, jüan, jüany, jüanů, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
-    ("KRW", "krw, ₩, won, wons, wony, wonů, 원, 원화, 韩元, 韓元, ウォン, وون"),
-    ("GBP", "gbp, £, sterling, pound sterling, pounds sterling, britisches pfund, livre sterling, livres sterling, libra esterlina, libras esterlinas, sterlina, sterline, britse pond, libra šterlinků, 영국 파운드, 英镑, 英鎊, 英ポンド, جنيه إسترليني"),
-];
-
 fn ship_normalize_token(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn ship_unit_exact(residue: &str) -> Option<&'static str> {
-    let norm = ship_normalize_token(residue);
-    if norm.is_empty() { return None; }
-    for (unit, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
-        for p in raw.split(',') {
-            let p = ship_normalize_token(p);
-            if p.is_empty() { continue; }
-            if norm == p { return Some(*unit); }
-            if let Some(rest) = norm.strip_prefix(p.as_str()) {
-                if !rest.is_empty()
-                    && rest.chars().count() <= 3
-                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
-                {
-                    return Some(*unit);
-                }
-            }
-        }
-    }
-    None
+    crate::utils::ai_utils::lower_alnum(s)
 }
 
 fn ship_bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
@@ -1974,36 +1908,11 @@ fn ship_bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
 }
 
 fn ship_currency_name_exact(core: &str) -> Option<&'static str> {
-    let norm = ship_normalize_token(core);
-    if norm.is_empty() { return None; }
-    for (code, raw) in SHIP_CURRENCY_NAMES.iter() {
-        for p in raw.split(',') {
-            let p = ship_normalize_token(p);
-            if p.is_empty() { continue; }
-            if norm == p { return Some(*code); }
-            if p.chars().count() < 2 { continue; }
-            if let Some(rest) = norm.strip_prefix(p.as_str()) {
-                if !rest.is_empty()
-                    && rest.chars().count() <= 2
-                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
-                {
-                    return Some(*code);
-                }
-            }
-        }
-    }
-    None
+    crate::utils::ai_utils::currency_name_exact(core)
 }
 
 fn ship_currency_symbol(raw: &str) -> Option<&'static str> {
-    for (code, list) in SHIP_CURRENCY_NAMES.iter() {
-        for p in list.split(',') {
-            let p = p.trim();
-            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
-            if raw.contains(p) { return Some(*code); }
-        }
-    }
-    None
+    crate::utils::ai_utils::currency_symbol_in(raw)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2173,10 +2082,7 @@ pub fn ship_is_long_code(n: &ShipNumeric) -> bool {
 }
 
 fn ship_fmt_range(a: chrono::NaiveDate, b: chrono::NaiveDate) -> (String, String) {
-    (
-        format!("{}T00:00:00", a.format("%Y-%m-%d")),
-        format!("{}T23:59:59", b.format("%Y-%m-%d")),
-    )
+    crate::utils::time_guide::iso_bounds(a, b)
 }
 
 pub fn ship_day_range(y: i32, m: u32, d: u32) -> Option<(String, String)> {
@@ -2250,26 +2156,7 @@ pub fn ship_year_month_literal(core: &str) -> Option<(i32, u32)> {
 }
 
 pub fn ship_relative_range(key: &str, today: chrono::NaiveDate) -> Option<(String, String)> {
-    use chrono::Datelike;
-    match key {
-        "today" => Some(ship_fmt_range(today, today)),
-        "yesterday" => {
-            let y = today.pred_opt()?;
-            Some(ship_fmt_range(y, y))
-        }
-        "this_month" => ship_month_range(today.year(), today.month()),
-        "last_month" => {
-            let prev = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)?.pred_opt()?;
-            ship_month_range(prev.year(), prev.month())
-        }
-        "this_year" => ship_year_range(today.year()),
-        "last_year" => ship_year_range(today.year() - 1),
-        "recently" => {
-            let from = today.checked_sub_signed(chrono::Duration::days(30))?;
-            Some(ship_fmt_range(from, today))
-        }
-        _ => None,
-    }
+    crate::utils::time_guide::relative_period(key, today).map(|(a, b)| ship_fmt_range(a, b))
 }
 
 fn ship_compose_range(parts: &[ShipTimePart], today: chrono::NaiveDate) -> Option<(String, String)> {
@@ -2486,6 +2373,12 @@ pub fn ship_bind_values(
     best.map(|(wi, _, _)| wi)
 }
 
+pub fn ship_mention_by_mark(m: &ShipDocMention, relation_marks: &[usize]) -> bool {
+    relation_marks.iter().any(|&k| {
+        (k < m.start && m.start - k <= 2) || (k >= m.end && k - m.end <= 1)
+    })
+}
+
 pub fn ship_resolve_doc_scope(
     mentions: &[ShipDocMention],
     winners: &[ShipWinnerView],
@@ -2504,10 +2397,7 @@ pub fn ship_resolve_doc_scope(
             (w.category == "reference" || w.category == "hub")
                 && (w.end == m.start || w.start == m.end)
         });
-        let by_mark = relation_marks.iter().any(|&k| {
-            (k < m.start && m.start - k <= 2) || (k >= m.end && k - m.end <= 1)
-        });
-        (by_winner, by_mark)
+        (by_winner, ship_mention_by_mark(m, relation_marks))
     }
     fn absorb(m: &ShipDocMention, scope: &mut Vec<String>, logs: &mut Vec<String>) {
         if m.codes.iter().any(|c| scope.contains(c)) {
@@ -2771,6 +2661,73 @@ impl crate::model::LogisModel {
             .collect()
     }
 
+    pub async fn ship_label_span_value(
+        &self,
+        field: &str,
+        start: usize,
+        end: usize,
+        words: &[String],
+        variants: &[Vec<String>],
+        roles: &[ShipTokenRole],
+        consumed: &[bool],
+        label_bank: &Vec<Vec<f32>>,
+        label_wt: &Vec<f32>,
+    ) -> Option<(f32, f32, Option<(usize, String, f32, f32)>)> {
+        use crate::utils::ai_utils::{max_pool_sim, weighted_max_pool_sim};
+        if start >= end || end > words.len() || label_bank.is_empty() { return None; }
+        let value_phr = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped("shipping_doc", field);
+        if value_phr.is_empty() { return None; }
+        let open = |k: usize| -> bool {
+            roles.get(k) == Some(&ShipTokenRole::Content) && !consumed.get(k).copied().unwrap_or(true)
+        };
+        let mut cand: Vec<usize> = Vec::new();
+        let mut k = start;
+        while k > 0 && start - k < SHIP_OPERATOR_BIND_RADIUS {
+            k -= 1;
+            if !open(k) { break; }
+            cand.push(k);
+        }
+        let mut k = end;
+        while k < words.len() && k - end < SHIP_OPERATOR_BIND_RADIUS {
+            if !open(k) { break; }
+            cand.push(k);
+            k += 1;
+        }
+        let mut forms: Vec<(usize, String)> = Vec::new();
+        for &c in cand.iter() {
+            let base = ship_edge_core(&words[c]);
+            if !base.is_empty() { forms.push((c, base)); }
+            if let Some(vs) = variants.get(c) {
+                for v in vs.iter() {
+                    let v = v.trim().to_string();
+                    if v.is_empty() || forms.iter().any(|(fc, f)| *fc == c && *f == v) { continue; }
+                    forms.push((c, v));
+                }
+            }
+        }
+        let mut texts: Vec<String> = vec![words[start..end].join(" ")];
+        texts.extend(forms.iter().map(|(_, f)| f.clone()));
+        let embs = self.get_embedding_batch(texts).await.ok()?;
+        if embs.len() != forms.len() + 1 || embs[0].iter().all(|&v| v == 0.0) { return None; }
+        let value_bank = self.ship_embed_phrase_groups(&[value_phr]).await.into_iter().next()?;
+        if value_bank.is_empty() { return None; }
+        let span_val = max_pool_sim(&embs[0], &value_bank);
+        let span_lab = weighted_max_pool_sim(&embs[0], label_bank, label_wt);
+        if span_val >= span_lab { return None; }
+        let mut best: Option<(usize, String, f32, f32)> = None;
+        for (fi, (c, f)) in forms.iter().enumerate() {
+            let e = &embs[fi + 1];
+            if e.iter().all(|&v| v == 0.0) { continue; }
+            let val = max_pool_sim(e, &value_bank);
+            let lab = weighted_max_pool_sim(e, label_bank, label_wt);
+            if val <= lab || val <= span_val { continue; }
+            if best.as_ref().map_or(true, |b| val > b.2) {
+                best = Some((*c, f.clone(), val, lab));
+            }
+        }
+        Some((span_val, span_lab, best))
+    }
+
     pub async fn build_shipping_query_layers(
         &self,
         words: &[String],
@@ -2865,11 +2822,8 @@ impl crate::model::LogisModel {
                         }
                     }
                 }
-                for (tk, extra, extra_ml) in SHIP_TEMPORAL_OPERATOR_PIVOTS.iter() {
-                    if *tk != k.as_str() { continue; }
-                    for p in crate::logic::anchor_phrases(extra, extra_ml) {
-                        if !b.iter().any(|e| e.eq_ignore_ascii_case(&p)) { b.push(p); }
-                    }
+                for p in crate::utils::ai_utils::temporal_operator_phrases(k) {
+                    if !b.iter().any(|e| e.eq_ignore_ascii_case(&p)) { b.push(p); }
                 }
                 let mut p: Vec<String> = Vec::new();
                 if let Some(s) = node.get("prejudice").and_then(|v| v.as_str()) {
@@ -2990,7 +2944,7 @@ impl crate::model::LogisModel {
             for p in bank.iter() { ship_add_text(p, &mut texts, &mut seen); }
         }
         for (t, _) in titles.iter() { ship_add_text(t, &mut texts, &mut seen); }
-        for (_, raw) in SHIP_TIME_UNIT_PIVOTS.iter() {
+        for (_, raw) in crate::utils::ai_utils::TIME_UNIT_PIVOTS_ML.iter() {
             for p in split_bias_phrases_full(raw) { ship_add_text(&p, &mut texts, &mut seen); }
         }
         for raw in crate::utils::ai_utils::MONTH_NAMES_ML.iter() {
@@ -3029,7 +2983,7 @@ impl crate::model::LogisModel {
         let op_all_bank: Vec<Vec<f32>> = op_bias_banks.iter().flatten().cloned().collect();
         let title_embs: Vec<Vec<f32>> = titles.iter().map(|(t, _)| table.get(t).clone()).collect();
         let unit_banks: Vec<(String, Vec<Vec<f32>>)> = {
-            let raw_units: Vec<(String, Vec<String>)> = SHIP_TIME_UNIT_PIVOTS
+            let raw_units: Vec<(String, Vec<String>)> = crate::utils::ai_utils::TIME_UNIT_PIVOTS_ML
                 .iter()
                 .map(|(k, raw)| (k.to_string(), split_bias_phrases_full(raw)))
                 .collect();
@@ -3126,11 +3080,8 @@ impl crate::model::LogisModel {
         let mut doc_mentions: Vec<ShipDocMention> = Vec::new();
         for &i in pending.iter() {
             let core = &cores[i];
-            let is_upper = core.chars().any(|c| c.is_ascii_uppercase())
-                && core.chars().all(|c| c.is_ascii_uppercase() || c == '_');
-            if !is_upper { continue; }
-            let title = match crate::logic::TRADE_DOC_TITLES.iter().find(|(c, _)| *c == core.as_str()) {
-                Some((_, t)) => *t,
+            let codes = match crate::utils::ai_utils::trade_code_mention(core) {
+                Some(c) => c,
                 None => continue,
             };
             let next_is_value = matches!(
@@ -3138,17 +3089,59 @@ impl crate::model::LogisModel {
                 Some(ShipTokenRole::Numeric) | Some(ShipTokenRole::Identifier)
             );
             if next_is_value { continue; }
-            let codes: Vec<String> = crate::logic::TRADE_DOC_TITLES
-                .iter()
-                .filter(|(_, t)| *t == title)
-                .map(|(c, _)| c.to_string())
-                .collect();
             roles[i] = ShipTokenRole::DocType;
             logs.push(format!(
                 "   📄 [DOC TYPE / CODE] \"{}\" → {:?} (서식 코드 완전일치)",
                 core, codes
             ));
             doc_mentions.push(ShipDocMention { start: i, end: i + 1, codes, exact: true });
+        }
+
+        {
+            let max_w = crate::utils::ai_utils::trade_title_max_words();
+            let mut hits: Vec<String> = Vec::new();
+            let mut s = 0usize;
+            while s < n {
+                if roles[s] != ShipTokenRole::Content {
+                    s += 1;
+                    continue;
+                }
+                let mut found: Option<(usize, Vec<String>)> = None;
+                for w in (1..=max_w).rev() {
+                    if s + w > n || !(s..s + w).all(|k| roles[k] == ShipTokenRole::Content) { continue; }
+                    let joined: String = cores[s..s + w].iter().map(|c| ship_normalize_token(c)).collect();
+                    if let Some(codes) = crate::utils::ai_utils::trade_title_exact(&joined) {
+                        found = Some((w, codes));
+                        break;
+                    }
+                }
+                let (w, codes) = match found {
+                    Some(v) => v,
+                    None => {
+                        s += 1;
+                        continue;
+                    }
+                };
+                let next_is_value = matches!(
+                    roles.get(s + w),
+                    Some(ShipTokenRole::Numeric) | Some(ShipTokenRole::Identifier)
+                );
+                if next_is_value {
+                    s += w;
+                    continue;
+                }
+                for k in s..s + w { roles[k] = ShipTokenRole::DocType; }
+                hits.push(format!("{}→{:?}", cores[s..s + w].join(" "), codes));
+                doc_mentions.push(ShipDocMention { start: s, end: s + w, codes, exact: true });
+                s += w;
+            }
+            crate::utils::score_dynamics::record_baseline("search.title.exact", hits.len() as f32);
+            if !hits.is_empty() {
+                logs.push(format!(
+                    "   📄 [DOC TYPE / TITLE EXACT] 12개 언어 서식 전문 표와 완전일치한 표현 {}개: {:?} — 서식 이름은 서식 코드와 같은 닫힌 어휘라 코사인 경쟁에 넣지 않습니다. 코사인 경로는 서식 뱅크 전체의 분포에서 z 를 재므로, 여러 서식이 함께 쓰는 단어('invoice'·'인보이스')가 섞인 표현은 전문을 그대로 적어도 게이트를 넘지 못할 수 있습니다. 가장 긴 서식 이름부터 대조하므로 'house bill of lading' 이 'bill of lading' 에 먼저 잡히지 않습니다. 한국어·일본어·중국어는 조사만 붙은 형태('상업송장을')까지 인정하고, 바로 뒤에 수치·식별자가 오면 번호 라벨로 보고 확정하지 않습니다. 라틴 문자 한 단어짜리 서식 이름('Procura'·'Offerte' 처럼 다른 언어에서는 일반 낱말일 수 있는 것)은 이 표로 확정하지 않고 기존 코사인 경로에 맡깁니다.",
+                    hits.len(), hits
+                ));
+            }
         }
 
         let mut parts: Vec<(usize, ShipTimePart)> = Vec::new();
@@ -3179,16 +3172,31 @@ impl crate::model::LogisModel {
             i += 1;
         }
         let lab_coh = crate::utils::ai_utils::bank_internal_cohesion(&label_bank);
-        let title_gate = gumbel_expected_z(title_embs.len());
+        let title_gate = crate::utils::ai_utils::gumbel_decision_z(title_embs.len());
         let title_top = |q: &Vec<f32>| -> f32 {
             title_embs.iter().map(|t| cosine_similarity(q, t)).fold(f32::MIN, f32::max)
         };
         let mut title_best: Option<(String, f32, f32, f32)> = None;
+        let closed_op: Vec<bool> = (0..n)
+            .map(|k| {
+                let one = [cores[k].clone()];
+                roles[k] == ShipTokenRole::Content
+                    && (crate::utils::ai_utils::comparator_exact(&one).is_some()
+                        || crate::utils::ai_utils::temporal_operator_exact(&one).is_some()
+                        || ship_relation_exact(&cores[k]))
+            })
+            .collect();
+        if closed_op.iter().any(|&c| c) {
+            logs.push(format!(
+                "   📄 [DOC TYPE / CLOSED CLASS SKIP] 비교 연산자·시간 연산자·관계 표지 표와 완전일치한 토큰 {:?} 은 서식 이름 후보에서 뺍니다. 닫힌 어휘로 역할이 정해진 토큰을 서식 뱅크와 코사인으로 겨루게 두면, 연산자 토큰이 서식 후보 1위가 되어 robust z 게이트를 넘을 수 있고(그때는 라벨·기능어·연산자 대비 우위 검사 하나만 남습니다), 서식 판정의 SDS 기준선(search.title.robust_z · search.title.dominance)도 연산자 토큰의 점수로 채워집니다.",
+                (0..n).filter(|&k| closed_op[k]).map(|k| cores[k].clone()).collect::<Vec<_>>()
+            ));
+        }
         for width in (1..=3usize).rev() {
             let mut s = 0usize;
             while s + width <= n {
                 let e = s + width;
-                if !(s..e).all(|k| roles[k] == ShipTokenRole::Content) {
+                if !(s..e).all(|k| roles[k] == ShipTokenRole::Content && !closed_op[k]) {
                     s += 1;
                     continue;
                 }
@@ -3261,7 +3269,7 @@ impl crate::model::LogisModel {
                     };
                     for k in ms..me { roles[k] = ShipTokenRole::DocType; }
                     logs.push(format!(
-                        "   📄 [DOC TYPE / COSINE] \"{}\" → {:?} | 최고 '{}' cos {:.4} | z {:+.3} > √(2lnN) {:.3} | 라벨 cos {:.4}",
+                        "   📄 [DOC TYPE / COSINE] \"{}\" → {:?} | 최고 '{}' cos {:.4} | z {:+.3} > √(2lnN) + 최댓값 표준편차 {:.3} | 라벨 cos {:.4}",
                         cores[ms..me].join(" "), codes, titles[top_i].0, top, z, title_gate, lab
                     ));
                     doc_mentions.push(ShipDocMention { start: ms, end: me, codes, exact: false });
@@ -3320,6 +3328,111 @@ impl crate::model::LogisModel {
                 logs.push(format!(
                     "   🔗 [RELATION AXIS] 관계 표지 토큰 {:?} 를 D1 카테고리와 독립된 축으로 확정했습니다. 기존에는 인접 스팬이 reference·hub 카테고리로 판정되어야만 '함께 보여줄 서식' 이 성립했는데, 그 판정은 D1 잡음에 흔들립니다. 관계 표지는 그 자체가 직접 근거입니다.",
                     relation_marks.iter().map(|&i| cores[i].clone()).collect::<Vec<_>>()
+                ));
+            }
+        }
+
+        let mut op_exact: Vec<Option<&'static str>> = vec![None; n];
+        let mut op_group: Vec<Option<usize>> = vec![None; n];
+        {
+            let mut hits: Vec<String> = Vec::new();
+            let mut i = 0usize;
+            while i < n {
+                let open = |k: usize| roles[k] == ShipTokenRole::Content && !relation_marks.contains(&k);
+                if !open(i) {
+                    i += 1;
+                    continue;
+                }
+                let mut matched: Option<(&'static str, usize)> = None;
+                for w in (1..=3usize).rev() {
+                    if i + w > n || !(i..i + w).all(|k| open(k)) { continue; }
+                    if let Some(key) = crate::utils::ai_utils::comparator_exact(&cores[i..i + w]) {
+                        matched = Some((key, w));
+                        break;
+                    }
+                }
+                match matched {
+                    Some((key, w)) => {
+                        for k in i..i + w {
+                            roles[k] = ShipTokenRole::Operator;
+                            op_exact[k] = Some(key);
+                            op_group[k] = Some(i);
+                        }
+                        hits.push(format!("\"{}\"→{}", cores[i..i + w].join(" "), key));
+                        i += w;
+                    }
+                    None => i += 1,
+                }
+            }
+            crate::utils::score_dynamics::record_baseline("search.role.op_exact", hits.len() as f32);
+            if !hits.is_empty() {
+                logs.push(format!(
+                    "   ⚖️ [OPERATOR / EXACT] 12개 언어 비교 연산자 표와 완전일치한 표현 {}개: {:?} — 비교 연산자는 시간 단위·관계 표지·통화명과 같은 닫힌 어휘라 코사인 경쟁에 넣지 않습니다. 코사인으로 가르면 '이하인' 이 '수하인'·'송하인' 라벨 구에 더 가까워 연산자 자격을 잃고 당사자 축의 값이 됩니다(연산자와 라벨의 코사인 마진은 SDS search.role.op_lab_margin 분포에서 잡음 폭 안입니다). 한국어·일본어·중국어는 조사·어미(인·이고·의·の·的 등)만 붙은 형태까지 인정하고, 결속할 수치가 없으면 아래 UNBINDABLE 이 기능어로 내립니다.",
+                    hits.len(), hits
+                ));
+            }
+        }
+
+        {
+            let fun_pivots: Vec<Vec<String>> = ship_function_pivot_phrases()
+                .into_iter()
+                .map(|p| {
+                    p.split_whitespace()
+                        .map(ship_normalize_token)
+                        .filter(|x| !x.is_empty())
+                        .collect::<Vec<String>>()
+                })
+                .filter(|parts| !parts.is_empty() && parts.len() <= 3)
+                .collect();
+            let title_keys: std::collections::HashSet<String> = titles
+                .iter()
+                .map(|(t, _)| ship_normalize_token(t))
+                .filter(|t| !t.is_empty())
+                .collect();
+            let mut hits: Vec<String> = Vec::new();
+            let mut i = 0usize;
+            while i < n {
+                let open = |k: usize| roles[k] == ShipTokenRole::Content && !relation_marks.contains(&k);
+                if !open(i) {
+                    i += 1;
+                    continue;
+                }
+                let mut matched: Option<usize> = None;
+                for w in (1..=3usize).rev() {
+                    if i + w > n || !(i..i + w).all(|k| open(k)) { continue; }
+                    let norm: Vec<String> = cores[i..i + w].iter().map(|c| ship_normalize_token(c)).collect();
+                    if !fun_pivots.iter().any(|p| *p == norm) { continue; }
+                    let in_title = (0..=2usize).any(|l| {
+                        (0..=2usize).any(|r| {
+                            if l + r == 0 || l > i || i + w + r > n { return false; }
+                            let joined: String = cores[i - l..i + w + r].iter().map(|c| ship_normalize_token(c)).collect();
+                            title_keys.contains(&joined)
+                        })
+                    });
+                    if in_title { continue; }
+                    if matches!(
+                        roles.get(i + w),
+                        Some(ShipTokenRole::Numeric) | Some(ShipTokenRole::Identifier) | Some(ShipTokenRole::Temporal)
+                    ) {
+                        continue;
+                    }
+                    matched = Some(w);
+                    break;
+                }
+                match matched {
+                    Some(w) => {
+                        for k in i..i + w { roles[k] = ShipTokenRole::Function; }
+                        hits.push(cores[i..i + w].join(" "));
+                        i += w;
+                    }
+                    None => i += 1,
+                }
+            }
+            crate::utils::score_dynamics::record_baseline("search.role.fun_exact", hits.len() as f32);
+            if !hits.is_empty() {
+                logs.push(format!(
+                    "   🗣️ [FUNCTION / EXACT] 12개 언어 요청 동사·담화 표지 표와 완전일치한 표현 {}개를 기능어로 확정합니다: {:?} — 요청 동사와 담화 표지는 닫힌 어휘라 코사인 경쟁에 넣지 않습니다. 역할 채점의 기능어 판정은 라벨 뱅크 응집도만큼의 여유를 요구하는데, 라벨 뱅크가 촘촘하면 표와 글자까지 같은 '보여줘'(cos 1.0)도 그 여유를 넘지 못해 내용어로 남고, 그대로 D1 후보가 되어 '것만'·'중에서' 같은 담화 표지가 식별·정산 카테고리를 차지합니다. 바로 뒤에 수치·식별자·시간이 오는 자리(unter 1000, entre 100 처럼 범위·비교로도 읽히는 표현)와 이웃 토큰과 합쳐 서식 이름이 되는 자리(packing list 의 list)는 이 표로 확정하지 않고 기존 경로에 맡깁니다.",
+                    hits.len(), hits
                 ));
             }
         }
@@ -3384,6 +3497,7 @@ impl crate::model::LogisModel {
             let mut live: Vec<(usize, f32, f32, bool, String)> = Vec::new();
             for &i in pending.iter() {
                 if roles[i] != ShipTokenRole::Operator { continue; }
+                if op_exact[i].is_some() { continue; }
                 let q = table.get(&cores[i]);
                 if q.iter().all(|&v| v == 0.0) || op_keys.len() < 2 { continue; }
                 let scored: Vec<f32> = (0..op_keys.len())
@@ -3458,10 +3572,65 @@ impl crate::model::LogisModel {
                     f32::MAX
                 };
                 let cut_shown = if cut == f32::MAX { "없음".to_string() } else { format!("{:+.4}", cut) };
+                let op_words: std::collections::HashSet<String> = op_bias_phr
+                    .iter()
+                    .flatten()
+                    .flat_map(|p| p.split_whitespace().map(ship_normalize_token).collect::<Vec<String>>())
+                    .collect();
+                let title_words: std::collections::HashSet<String> = titles
+                    .iter()
+                    .flat_map(|(t, _)| {
+                        let ws: Vec<String> = t
+                            .split_whitespace()
+                            .map(ship_normalize_token)
+                            .filter(|w| !w.is_empty())
+                            .collect();
+                        let last = ws.len().saturating_sub(1);
+                        ws.into_iter()
+                            .enumerate()
+                            .filter(|(k, _)| *k == 0 || *k == last)
+                            .map(|(_, w)| w)
+                            .collect::<Vec<String>>()
+                    })
+                    .filter(|w| w.chars().count() >= 2 && !op_words.contains(w))
+                    .collect();
                 for (i, z, margin, self_evident, key) in live.into_iter() {
-                    let by_split = margin >= cut;
+                    let by_split = margin >= cut && margin > 0.0;
                     let by_self = !split_firm && self_evident && margin > 0.0;
-                    if by_split || by_self {
+                    let survives = by_split || by_self;
+                    let q = table.get(&cores[i]);
+                    let title_cos = title_top(q);
+                    let op_cos = max_pool_sim(q, &op_all_bank);
+                    let by_title_cos = !title_embs.is_empty() && title_cos >= op_cos;
+                    let title_word = if survives {
+                        std::iter::once(cores[i].clone())
+                            .chain(raw_variants[i].iter().cloned())
+                            .map(|v| ship_normalize_token(&v))
+                            .find(|v| title_words.contains(v))
+                    } else {
+                        None
+                    };
+                    let revoked = by_title_cos || title_word.is_some();
+                    crate::utils::score_dynamics::record_baseline(
+                        "search.role.op_title_revoked",
+                        if revoked { 1.0 } else { 0.0 },
+                    );
+                    if revoked {
+                        roles[i] = ShipTokenRole::Function;
+                        let evidence = match title_word.as_ref() {
+                            Some(w) => format!(
+                                "서식 이름의 첫 단어나 끝 단어 '{}' 와 같고 연산자 뱅크 어휘에는 없습니다 (서식 이름 cos {:.4} / 연산자 cos {:.4})",
+                                w, title_cos, op_cos
+                            ),
+                            None => format!("서식 이름 cos {:.4} ≥ 연산자 cos {:.4}", title_cos, op_cos),
+                        };
+                        logs.push(format!(
+                            "   ↩️ [OPERATOR REVOKED / TITLE] \"{}\" | {} | 연산자 분할 {} — 서식 이름을 이루는 단어는 비교 연산자가 아닙니다. 서식 판정 게이트를 넘지 못한 서식 일반명('인보이스')은 조회 범위를 말하는 담화 성분이므로 기능어로 둡니다. 연산자로 남기면 옆에 수치가 오는 순간('인보이스 3건') 그 수치에 비교 조건을 붙입니다. 이 판정은 연산자 분할이 끝난 뒤에 합니다. 분할 전에 후보를 빼면 남은 후보의 마진 분포가 바뀌어 분할 기준이 음수 쪽으로 내려가고, 라벨 쪽이 더 가까운 토큰까지 연산자로 남습니다. 서식 이름 단어 대조는 분할을 통과한 토큰에만 합니다. 서식 이름에는 'weight'·'arrival' 같은 라벨 단어도 들어 있어, 분할에서 탈락해 내용어로 돌아갈 토큰까지 기능어로 내리면 라벨을 잃습니다. 서식 이름 가운데 자리의 연결어('of'·'van'·'do'·'za')는 대조에서 뺍니다.",
+                            cores[i], evidence, if survives { "통과" } else { "탈락" }
+                        ));
+                        continue;
+                    }
+                    if survives {
                         logs.push(format!(
                             "   ⚖️ [OPERATOR SELF-EVIDENCE] \"{}\" → '{}' | 마진 {:+.4} (기준 {}) | 자기 z {:+.3} | 근거: {} — 연산자 뱅크 {}개 중 한 곳만 이 토큰을 배타적으로 설명합니다.",
                             cores[i], key, margin, cut_shown, z,
@@ -3471,7 +3640,7 @@ impl crate::model::LogisModel {
                         continue;
                     }
                     roles[i] = ShipTokenRole::Content;
-                    if cut != f32::MAX {
+                    if cut != f32::MAX && margin < cut {
                         crate::utils::score_dynamics::record_baseline(
                             "search.role.op_revoked_margin",
                             cut - margin,
@@ -3485,22 +3654,31 @@ impl crate::model::LogisModel {
                         "뱅크 자체 변별도 없습니다".to_string()
                     };
                     logs.push(format!(
-                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 마진 {:+.4} < 기준 {} | 자기 z {:+.3} | {} — 내용어로 되돌립니다.",
-                        cores[i], margin, cut_shown, z, why
+                        "   ↩️ [OPERATOR REVOKED] \"{}\" | 마진 {:+.4} {} 기준 {} | 자기 z {:+.3} | {} — 내용어로 되돌립니다.",
+                        cores[i], margin, if margin < cut { "<" } else { "≥" }, cut_shown, z, why
                     ));
                 }
             }
         }
 
         {
+            let bindable: Vec<bool> = (0..n)
+                .map(|i| roles[i] == ShipTokenRole::Operator && ship_operator_bindable(&roles, i))
+                .collect();
             let targets: Vec<usize> = (0..n)
                 .filter(|&i| roles[i] == ShipTokenRole::Operator)
-                .filter(|&i| !ship_operator_bindable(&roles, i))
+                .filter(|&i| !bindable[i])
+                .filter(|&i| match op_group[i] {
+                    Some(g) => !(0..n).any(|k| op_group[k] == Some(g) && bindable[k]),
+                    None => true,
+                })
                 .collect();
             if !targets.is_empty() {
                 let shown: Vec<String> = targets.iter().map(|&i| cores[i].clone()).collect();
                 for &i in targets.iter() {
                     roles[i] = ShipTokenRole::Function;
+                    op_exact[i] = None;
+                    op_group[i] = None;
                     crate::utils::score_dynamics::record_baseline("search.role.op_unbindable", 1.0);
                 }
                 logs.push(format!(
@@ -3648,7 +3826,7 @@ impl crate::model::LogisModel {
                 }
                 continue;
             }
-            if let (Some(unit_key), Some(v)) = (ship_unit_exact(&residue), int_val) {
+            if let (Some(unit_key), Some(v)) = (crate::utils::ai_utils::time_unit_exact(&residue), int_val) {
                 let exact = match unit_key {
                     "year" if digits == 4 && (1..=9999).contains(&v) => Some(ShipTimePart::Year(v as i32)),
                     "month" if (1..=12).contains(&v) => Some(ShipTimePart::Month(v as u32)),
@@ -3735,7 +3913,7 @@ impl crate::model::LogisModel {
         }
         for j in 0..n {
             if roles[j] != ShipTokenRole::Content { continue; }
-            if ship_unit_exact(&cores[j]) != Some("year") { continue; }
+            if crate::utils::ai_utils::time_unit_exact(&cores[j]) != Some("year") { continue; }
             for k in [j.wrapping_sub(1), j + 1] {
                 if k >= n || roles[k] != ShipTokenRole::Numeric { continue; }
                 let pos = match year_like.iter().position(|(i, _)| *i == k) {
@@ -3860,24 +4038,85 @@ impl crate::model::LogisModel {
                 if !tokens.contains(k) { tokens.push(*k); }
             }
             match ship_compose_range(&group_parts, today) {
-                Some((start, end)) => {
+                Some((mut start, mut end)) => {
                     let first = *tokens.first().unwrap_or(&0);
                     let last = *tokens.last().unwrap_or(&0);
                     let mut operator = "between".to_string();
-                    let mut probes: Vec<usize> = vec![last + 1];
-                    if first > 0 { probes.push(first - 1); }
-                    if last + 2 < n && roles.get(last + 1) == Some(&ShipTokenRole::Content) { probes.push(last + 2); }
-                    for j in probes.into_iter() {
-                        if roles.get(j) != Some(&ShipTokenRole::Operator) { continue; }
-                        let q = table.get(&cores[j]);
-                        if let Some(k) = ship_op_key(q, &op_keys, &op_bias_banks, &op_prej_banks) {
-                            if k == "gte" || k == "gt" {
-                                operator = "gte".to_string();
-                            } else if k == "lte" || k == "lt" { operator = "lte".to_string(); }
-                            if operator != "between" {
-                                tokens.push(j);
-                                roles[j] = ShipTokenRole::Temporal;
-                                break;
+                    let lo = first.saturating_sub(3);
+                    let hi = (last + 4).min(n);
+                    let exact_period = crate::utils::ai_utils::exact_absolute_period(&words[lo..hi], today)
+                        .map(|p| {
+                            let covered: Vec<usize> = p.tokens.iter().map(|t| t + lo).collect();
+                            (p, covered)
+                        })
+                        .filter(|(_, covered)| tokens.iter().all(|t| covered.contains(t)));
+                    crate::utils::score_dynamics::record_baseline(
+                        "search.time.period_exact",
+                        if exact_period.is_some() { 1.0 } else { 0.0 },
+                    );
+                    let mut exact_range = false;
+                    if let Some((p, covered)) = exact_period {
+                        let (s, e) = ship_fmt_range(p.start, p.end);
+                        let changed = s != start || e != end || p.operator != "between";
+                        start = s;
+                        end = e;
+                        operator = p.operator.to_string();
+                        exact_range = p.range;
+                        let mut added: Vec<String> = Vec::new();
+                        for t in covered.into_iter() {
+                            if tokens.contains(&t) { continue; }
+                            if !matches!(
+                                roles.get(t),
+                                Some(ShipTokenRole::Content)
+                                    | Some(ShipTokenRole::Function)
+                                    | Some(ShipTokenRole::Operator)
+                                    | Some(ShipTokenRole::Numeric)
+                                    | Some(ShipTokenRole::Temporal)
+                            ) {
+                                continue;
+                            }
+                            tokens.push(t);
+                            roles[t] = ShipTokenRole::Temporal;
+                            added.push(cores[t].clone());
+                        }
+                        tokens.sort();
+                        if changed || !added.is_empty() {
+                            logs.push(format!(
+                                "   🕒 [TEMPORAL / EXACT PERIOD] {} ~ {} | 연산자 {} | 편입 토큰 {:?} | 근거 {:?} — 연·월·일 단위, 시간 연산자(이후·까지·以降·まで·after·until 등), 같은 단위의 반복(3월부터 5월까지)을 12개 언어 닫힌 어휘 표로 확정했습니다. 코사인으로 모은 시간 조각을 이 표가 전부 설명할 때만 채택하므로, 표가 모르는 조각이 섞인 구간은 기존 경로를 그대로 탑니다. 조각을 하나씩 조립하면 첫 월만 남아 '3월부터 5월까지' 가 3월 한 달로 줄고, 단위에 붙은 '까지' 는 연산자로 읽히지 않습니다.",
+                                start, end, operator, added, p.evidence
+                            ));
+                        }
+                    }
+                    if operator == "between" && !exact_range {
+                        let span_lo = tokens.iter().copied().min().unwrap_or(first);
+                        let span_hi = tokens.iter().copied().max().unwrap_or(last);
+                        let mut probes: Vec<usize> = vec![span_hi + 1];
+                        if span_lo > 0 { probes.push(span_lo - 1); }
+                        if span_hi + 2 < n && roles.get(span_hi + 1) == Some(&ShipTokenRole::Content) { probes.push(span_hi + 2); }
+                        for j in probes.into_iter() {
+                            let open_role = matches!(
+                                roles.get(j),
+                                Some(ShipTokenRole::Content) | Some(ShipTokenRole::Function) | Some(ShipTokenRole::Operator)
+                            );
+                            let exact_temporal = if open_role {
+                                crate::utils::ai_utils::temporal_operator_exact(&[cores[j].clone()])
+                            } else {
+                                None
+                            };
+                            if exact_temporal.is_none() && roles.get(j) != Some(&ShipTokenRole::Operator) { continue; }
+                            let q = table.get(&cores[j]);
+                            let exact_key = exact_temporal
+                                .map(|k| k.to_string())
+                                .or_else(|| op_exact.get(j).copied().flatten().map(|k| k.to_string()));
+                            if let Some(k) = exact_key.or_else(|| ship_op_key(q, &op_keys, &op_bias_banks, &op_prej_banks)) {
+                                if k == "gte" || k == "gt" {
+                                    operator = "gte".to_string();
+                                } else if k == "lte" || k == "lt" { operator = "lte".to_string(); }
+                                if operator != "between" {
+                                    tokens.push(j);
+                                    roles[j] = ShipTokenRole::Temporal;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3890,8 +4129,45 @@ impl crate::model::LogisModel {
                     if first > 1 && roles.get(first - 1) == Some(&ShipTokenRole::Content) {
                         label_cands.push(first - 2);
                     }
+                    let span_lo = tokens.iter().copied().min().unwrap_or(first);
+                    let span_hi = tokens.iter().copied().max().unwrap_or(last);
+                    let mut outer: Vec<usize> = Vec::new();
+                    if span_hi + 1 < n { outer.push(span_hi + 1); }
+                    if span_hi + 2 < n && roles.get(span_hi + 1) == Some(&ShipTokenRole::Content) { outer.push(span_hi + 2); }
+                    if span_lo > 0 { outer.push(span_lo - 1); }
+                    if span_lo > 1 && roles.get(span_lo - 1) == Some(&ShipTokenRole::Content) { outer.push(span_lo - 2); }
+                    for j in outer.into_iter() {
+                        if !label_cands.contains(&j) { label_cands.push(j); }
+                    }
+                    let anchored_codes: Vec<String> = doc_mentions
+                        .iter()
+                        .filter(|m| !ship_mention_by_mark(m, &relation_marks))
+                        .flat_map(|m| m.codes.iter().cloned())
+                        .collect();
+                    let projected = |m: &ShipDocMention| -> bool {
+                        ship_mention_by_mark(m, &relation_marks)
+                            && !anchored_codes.is_empty()
+                            && !m.codes.iter().any(|c| anchored_codes.contains(c))
+                            && m.codes.iter().any(|c| crate::logic::trade_reference_field_of(c).is_some())
+                    };
+                    let projected_codes: Vec<String> = doc_mentions
+                        .iter()
+                        .filter(|m| projected(m))
+                        .flat_map(|m| m.codes.iter().cloned())
+                        .collect();
+                    crate::utils::score_dynamics::record_baseline(
+                        "search.time.scope_relation_drop",
+                        projected_codes.len() as f32,
+                    );
+                    if !projected_codes.is_empty() {
+                        logs.push(format!(
+                            "   🔗 [DATE FIELD SCOPE / RELATION] 관계 표지 옆에 붙은 서식 {:?} 는 조회 범위가 아니라 함께 보여줄 연결 축이므로 날짜 축 후보 범위에서 뺍니다. 기준은 DOC PROJECTION 의 관계 표지 규칙(범위 서식이 따로 있고, 코드가 겹치지 않으며, 참조 축이 있는 서식)과 같습니다. 값 축(D2 FIELD SCOPE)은 연결 서식을 뺀 범위로 좁히는데 날짜 축만 연결 서식까지 넓히면, 연결 서식에만 있는 날짜 축이 1위가 되어 조회 서식에는 없는 축에 기간이 잠깁니다.",
+                            projected_codes
+                        ));
+                    }
                     let mut scope_codes: Vec<String> = Vec::new();
                     for m in doc_mentions.iter() {
+                        if projected(m) { continue; }
                         for c in m.codes.iter() {
                             if !scope_codes.contains(c) { scope_codes.push(c.clone()); }
                         }
@@ -4129,36 +4405,50 @@ impl crate::model::LogisModel {
         let mut op_of_token: Vec<Option<String>> = vec![None; n];
         for i in 0..n {
             if roles[i] == ShipTokenRole::Operator {
-                op_of_token[i] = ship_op_key(table.get(&cores[i]), &op_keys, &op_bias_banks, &op_prej_banks);
+                op_of_token[i] = match op_exact[i] {
+                    Some(k) => Some(k.to_string()),
+                    None => ship_op_key(table.get(&cores[i]), &op_keys, &op_bias_banks, &op_prej_banks),
+                };
             }
         }
         for num in numerics_raw.iter_mut() {
             let i = num.token;
             let residue = ship_numeric_residue(&cores[i]);
             if !residue.is_empty() {
-                let q = table.get(&residue);
-                let lab = max_pool_sim(q, &label_bank);
-                let fun = max_pool_sim(q, &func_bank);
-                let opb = max_pool_sim(q, &op_all_bank);
-                if opb > lab && opb > fun {
-                    if let Some(k) = ship_op_key(q, &op_keys, &op_bias_banks, &op_prej_banks) { num.operator = k; }
+                if let Some(k) = crate::utils::ai_utils::comparator_exact(&[residue.clone()]) {
+                    num.operator = k.to_string();
+                } else {
+                    let q = table.get(&residue);
+                    let lab = max_pool_sim(q, &label_bank);
+                    let fun = max_pool_sim(q, &func_bank);
+                    let opb = max_pool_sim(q, &op_all_bank);
+                    if opb > lab && opb > fun {
+                        if let Some(k) = ship_op_key(q, &op_keys, &op_bias_banks, &op_prej_banks) { num.operator = k; }
+                    }
                 }
             }
             if !num.operator.is_empty() { continue; }
-            'search: for dist in 1..=2usize {
-                for j in [i + dist, i.wrapping_sub(dist)] {
-                    if j >= n { continue; }
-                    let (lo, hi) = if j > i { (i + 1, j) } else { (j + 1, i) };
-                    let clear = (lo..hi).all(|k| {
-                        matches!(roles[k], ShipTokenRole::Content | ShipTokenRole::Unit)
-                    });
-                    if !clear { continue; }
-                    if roles[j] == ShipTokenRole::Operator {
+            for exact_only in [true, false] {
+                let mut found: Option<String> = None;
+                'search: for dist in 1..=2usize {
+                    for j in [i + dist, i.wrapping_sub(dist)] {
+                        if j >= n { continue; }
+                        let (lo, hi) = if j > i { (i + 1, j) } else { (j + 1, i) };
+                        let clear = (lo..hi).all(|k| {
+                            matches!(roles[k], ShipTokenRole::Content | ShipTokenRole::Unit)
+                        });
+                        if !clear { continue; }
+                        if roles[j] != ShipTokenRole::Operator { continue; }
+                        if exact_only && op_exact[j].is_none() { continue; }
                         if let Some(k) = op_of_token[j].clone() {
-                            num.operator = k;
+                            found = Some(k);
                             break 'search;
                         }
                     }
+                }
+                if let Some(k) = found {
+                    num.operator = k;
+                    break;
                 }
             }
         }
@@ -4353,10 +4643,7 @@ pub fn ship_relation_exact(core: &str) -> bool {
             if p.chars().count() < 2 { continue; }
             if norm == p { return true; }
             if let Some(rest) = norm.strip_prefix(p.as_str()) {
-                if !rest.is_empty()
-                    && rest.chars().count() <= 3
-                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
-                {
+                if crate::utils::ai_utils::short_tail_ok(rest, 3) {
                     return true;
                 }
             }

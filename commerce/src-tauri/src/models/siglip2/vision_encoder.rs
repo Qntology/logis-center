@@ -315,6 +315,7 @@ pub struct DocTypeVerdict {
     pub title_confirmed: bool,
     pub title_text: String,
     pub title_band: Vec<(String, f32)>,
+    pub conflict_candidates: Vec<(String, f32)>,
 }
 
 fn bank_neutral_key_scores(
@@ -999,6 +1000,7 @@ pub fn classify_doc_type(
         .map(|(g, _)| g.band.clone())
         .unwrap_or_default();
     let mut forced_margin: Option<f32> = None;
+    let mut conflict_candidates: Vec<(String, f32)> = Vec::new();
     if let Some((gate, title_sorted)) = title_gate_result {
         let axis_excess = |vals: &[f32]| -> f32 {
             let n = vals.len();
@@ -1021,42 +1023,74 @@ pub fn classify_doc_type(
         if title_vals.len() >= 2 {
             crate::utils::score_dynamics::record_decay("vision.doc_title", &title_vals);
         }
-        let w_body = body_excess.max(0.0);
-        let w_title = title_excess.max(0.0);
+        let body_noise = if body_vals.len() >= 2 {
+            crate::utils::ai_utils::gumbel_max_sd(body_vals.len())
+        } else {
+            f32::MAX
+        };
+        let body_decisive = body_excess >= body_noise;
+        let band_margin = if gate.band.len() >= 2 {
+            gate.band[0].1 - gate.band[1].1
+        } else {
+            gate.margin
+        };
+        let body_top = c_scores.first().map(|(c, _)| c.clone()).unwrap_or_default();
+        let leader_is_candidate = c_scores.iter().any(|(c, _)| *c == gate.code);
+        let conflict = body_decisive && !body_top.is_empty() && body_top != gate.code;
+        crate::utils::score_dynamics::record_baseline("vision.title_band_margin", band_margin);
+        crate::utils::score_dynamics::record_baseline("vision.title_band_top", gate.score);
+        crate::utils::score_dynamics::record_baseline(
+            "vision.body_decisive",
+            if body_decisive { 1.0 } else { 0.0 },
+        );
+        crate::utils::score_dynamics::record_baseline(
+            "vision.title_body_conflict",
+            if conflict { 1.0 } else { 0.0 },
+        );
         emit(&format!(
-            "  ⚖️ [TITLE AXIS FUSION] 바디 축 초과분 {:+.4} | 제목 축 초과분 {:+.4} (각 축 1위의 z − √(2 ln N)) → 가중 body {:.3} : title {:.3}. 초과분이 0 이하인 축은 N개 무작위 드로잉의 기대 최댓값조차 넘지 못한 평평한 분포이므로 융합에서 제외합니다. 두 축이 모두 평평하면 제목 밴드만 본 제목 게이트의 판정을 그대로 씁니다.",
-            body_excess, title_excess, w_body, w_title
-        ));
-        for (cname, cs) in c_scores.iter_mut() {
-            let title = title_sorted
-                .iter()
-                .find(|(t, _)| t == cname)
-                .map(|(_, v)| *v);
-            let body = *cs;
-            *cs = match title {
-                Some(t) if w_body > 0.0 && w_title > 0.0 => {
-                    (w_body * body + w_title * t) / (w_body + w_title)
-                }
-                Some(_) if w_body > 0.0 => body,
-                Some(t) => t,
-                None if w_body > 0.0 => body,
-                None => f32::MIN,
-            };
-        }
-        c_scores.retain(|(_, s)| *s > f32::MIN);
-        c_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if w_body <= 0.0 {
-            if let Some(pos) = c_scores.iter().position(|(c, _)| c == &gate.code) {
-                if pos != 0 {
-                    let item = c_scores.remove(pos);
-                    emit(&format!(
-                        "  🥇 [TITLE VERDICT FIRST] 바디 축이 평평해 제목 게이트의 판정 '{}' 를 선두로 올립니다. (점수순 1위였던 '{}' 는 행 순서 동점 판정에서 밀린 전문입니다)",
-                        item.0, c_scores[0].0
-                    ));
-                    c_scores.insert(0, item);
-                }
-                forced_margin = Some(gate.margin);
+            "  ⚖️ [TITLE AXIS FUSION] 제목 행 밴드 {:?} 의 선두 '{}' (밴드 안 마진 {:+.4}) | 바디 축 1위 '{}' 초과분 {:+.4} vs 결정 기준 {:.4} (코드 {}개 최댓값 분포의 표준편차 = π/√6 ÷ √(2 ln N)) | 제목 축 전체 초과분 {:+.4} → {}",
+            gate.band.iter().map(|(c, s)| format!("{}({:+.3})", c, s)).collect::<Vec<_>>(),
+            gate.code,
+            band_margin,
+            body_top,
+            body_excess,
+            body_noise,
+            body_vals.len(),
+            title_excess,
+            if conflict {
+                "두 축이 서로 다른 서식을 가리키므로 LLM 재판정"
+            } else if body_top == gate.code {
+                "두 축 일치"
+            } else {
+                "바디 축 1위가 최댓값 잡음 범위 안이라 제목 행 판정 유지"
             }
+        ));
+        if conflict {
+            conflict_candidates = gate.band.clone();
+            if !conflict_candidates.iter().any(|(c, _)| *c == body_top) {
+                let t = title_sorted
+                    .iter()
+                    .find(|(c, _)| *c == body_top)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.0);
+                conflict_candidates.push((body_top.clone(), t));
+            }
+            emit(&format!(
+                "  ⚔️ [TITLE BODY CONFLICT] 제목 행은 '{}' 를, 바디 축은 결정 기준을 넘는 '{}' 를 가리킵니다. 어느 한쪽을 조용히 채택하지 않고 후보 {:?} 로 LLM 재판정을 엽니다.",
+                gate.code,
+                body_top,
+                conflict_candidates.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>()
+            ));
+        }
+        if leader_is_candidate {
+            c_scores.retain(|(c, _)| *c != gate.code);
+            c_scores.insert(0, (gate.code.clone(), gate.score));
+            forced_margin = Some(if conflict { 0.0 } else { band_margin });
+        } else {
+            emit(&format!(
+                "  ⚪ [TITLE LEADER OUTSIDE CANDIDATES] 제목 행 선두 '{}' 가 이번 코드 후보에 없습니다. 바디 순서를 유지하고 재판정 단계에 제목 밴드를 넘깁니다.",
+                gate.code
+            ));
         }
     }
     if c_scores.is_empty() {
@@ -1111,6 +1145,7 @@ pub fn classify_doc_type(
         title_confirmed,
         title_text,
         title_band,
+        conflict_candidates,
     })
 }
 
@@ -1161,6 +1196,7 @@ pub fn build_column_heatmaps(
     let schema_fields = crate::parsing::get_detail_schema_fields(doc_type, "", doc_lang);
     let mut bias_defs: Vec<(String, String, String)> = Vec::new();
     let mut field_to_cat: HashMap<String, String> = HashMap::new();
+    let mut sup_stage: Vec<(String, String, String)> = Vec::new();
 
     // 🌟 [SELF-REFERENCE ANCHOR DROP] 자기 자신을 가리키는 참조 축은 존재할 수 없습니다.
     //
@@ -1284,6 +1320,76 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
+        if crate::utils::bias_schema::is_trade_doc_type(doc_type) {
+            for p in crate::logic::trade_label_supplement(fname).into_iter() {
+                let compact: Vec<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
+                let digits = compact.iter().filter(|c| c.is_ascii_digit()).count();
+                if compact.is_empty() || digits * 4 >= compact.len() {
+                    continue;
+                }
+                if sup_stage
+                    .iter()
+                    .any(|(_, k, e)| k == fname && e.eq_ignore_ascii_case(&p))
+                {
+                    continue;
+                }
+                sup_stage.push((cat.to_string(), fname.clone(), p));
+            }
+        }
+    }
+    if !sup_stage.is_empty() {
+        let lowered: Vec<(String, String)> = bias_defs
+            .iter()
+            .chain(sup_stage.iter())
+            .map(|(_, k, e)| (k.clone(), e.to_lowercase()))
+            .collect();
+        let mut kept: Vec<(String, String, String)> = Vec::new();
+        let mut family_heads: Vec<String> = Vec::new();
+        let mut parent_labels = 0usize;
+        for (c, k, p) in sup_stage.into_iter() {
+            let lower = p.to_lowercase();
+            let mut owners: Vec<&str> = Vec::new();
+            let mut self_qualified = false;
+            for (ok, oe) in lowered.iter() {
+                if *oe == lower || !oe.contains(lower.as_str()) {
+                    continue;
+                }
+                if *ok == k {
+                    self_qualified = true;
+                } else if !owners.iter().any(|o| *o == ok.as_str()) {
+                    owners.push(ok.as_str());
+                }
+            }
+            let shared = owners.len() >= 2;
+            if bias_defs
+                .iter()
+                .any(|(bc, bk, be)| *bc == c && *bk == k && be.eq_ignore_ascii_case(&p))
+            {
+                continue;
+            }
+            if shared && self_qualified {
+                family_heads.push(format!(
+                    "{}:\"{}\" ⊂ {:?}",
+                    k,
+                    p,
+                    owners.iter().take(3).collect::<Vec<_>>()
+                ));
+                continue;
+            }
+            if shared {
+                parent_labels += 1;
+            }
+            kept.push((c, k, p));
+        }
+        let added = kept.len();
+        bias_defs.extend(kept);
+        emit(&format!(
+            "  🧩 [SUPPLEMENT ANCHOR] 12개 언어 보강 라벨 {}구를 히트맵 앵커에 편입했습니다. 계열 머리어 {}구만 뺍니다: {:?} — 계열 머리어는 다른 필드 둘 이상이 한정해서 쓰고(departure date · arrival date ⊃ date) 이 필드도 따로 한정형(issue date)을 가진 구입니다. 패치 코사인에서 그 계열의 라벨 칸 전부에 반응해 봉우리를 다른 축으로 옮깁니다. 다른 필드만 한정형을 갖고 이 필드는 한정 없이 쓰는 대표 라벨(B/L No. ⊂ House B/L No. · Master B/L No.) {}구와, 같은 필드 안에서만 더 긴 표기가 있는 핵심 라벨(gross weight ⊂ total gross weight)은 남깁니다.",
+            added,
+            family_heads.len(),
+            family_heads.iter().take(12).collect::<Vec<_>>(),
+            parent_labels
+        ));
     }
 
     // 🌟 [TABLE STRUCTURE ANCHOR 편입]
@@ -1511,7 +1617,16 @@ pub fn build_column_heatmaps(
     let mut shared: Vec<String> = Vec::new();
     for (cat, fname, ranked) in peak_cands.into_iter() {
         if let Some((_, owner)) = taken.iter().find(|(q, _)| *q == ranked[0].0) {
-            crate::utils::score_dynamics::record_confusion(owner, &fname, 0.0);
+            let owner_z = field_peaks_by_cat
+                .values()
+                .flat_map(|v| v.iter())
+                .find(|(f, p, _)| f == owner && *p == ranked[0].0)
+                .map(|(_, _, z)| *z);
+            crate::utils::score_dynamics::record_confusion(
+                owner,
+                &fname,
+                owner_z.map(|oz| oz - ranked[0].1).unwrap_or(f32::NAN),
+            );
         }
         let top_row = grid.rc(ranked[0].0).0;
         let hit = ranked

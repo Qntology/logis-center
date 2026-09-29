@@ -1634,7 +1634,13 @@ impl Qwen3_5TextModel {
             malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
         }
 
-        let registry = KVRegistry::new();
+        let registry = KVRegistry {
+            entries: std::sync::Arc::new(std::sync::RwLock::new(
+                (0..128)
+                    .map(|i| crate::models::qwen::quantized_model::RegistryEntry::new(i * 1024, 0, num_layers.max(28)))
+                    .collect(),
+            )),
+        };
         let mut layers = vec![];
         for i in 0..num_layers {
             let layer_type = if (i + 1) % full_attention_interval == 0 { "full_attention".to_string() } else { "linear_attention".to_string() };
@@ -2039,7 +2045,7 @@ impl Qwen3_5TextModel {
             let needed_blocks = (total_tokens + 1023) / 1024;
             while reg.len() < needed_blocks {
                 let off = reg.len() * 1024;
-                reg.push(crate::models::qwen::quantized_model::RegistryEntry::new(off, 0, 28));
+                reg.push(crate::models::qwen::quantized_model::RegistryEntry::new(off, 0, self.layers.len().max(28)));
             }
         }
 

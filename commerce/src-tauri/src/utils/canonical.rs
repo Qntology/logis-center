@@ -12,7 +12,7 @@ const FORCE_ID: &[&str] = &[
 ];
 const FORCE_NUM: &[&str] = &[
     "status", "views", "created_at", "updated_at",
-    "index", "goods", "order", "tracking",
+    "index", "goods", "order", "tracking", "event",
 ];
 const FORCE_BOOL: &[&str] = &[
     "detail", "node", "embed",
@@ -91,4 +91,277 @@ pub fn iso_to_epoch_ms(t: &str) -> Option<i64> {
         return d.and_hms_opt(0, 0, 0).map(|x| x.and_utc().timestamp_millis());
     }
     None
+}
+
+pub const RELAY_INDEX_KEYS: &[&str] = &["goods", "order", "tracking", "event"];
+
+pub fn is_relay_index_key(key: &str) -> bool {
+    let k = key.trim().to_lowercase();
+    RELAY_INDEX_KEYS.iter().any(|x| *x == k)
+}
+
+pub fn relay_text_is_content(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && !t.eq_ignore_ascii_case("null")
+        && !t.eq_ignore_ascii_case("n/a")
+        && t.chars().any(|c| c.is_alphabetic())
+}
+
+pub fn relay_value_is_content(v: &serde_json::Value) -> bool {
+    v.as_str().map_or(false, relay_text_is_content)
+}
+
+pub const RELAY_IDENTITY_KEYS: &[&str] = &["id", "index"];
+
+pub const RELAY_ZERO_EMPTY_KEYS: &[&str] = &[
+    "goods", "order", "tracking", "event", "status", "index", "created_at", "updated_at",
+    "width", "height", "length", "weight",
+];
+
+pub fn relay_value_is_placeholder(field: &str, v: &serde_json::Value) -> bool {
+    let zero_empty = RELAY_ZERO_EMPTY_KEYS.iter().any(|k| *k == field);
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            t.is_empty()
+                || t.eq_ignore_ascii_case("null")
+                || t.eq_ignore_ascii_case("n/a")
+                || (zero_empty && t.parse::<f64>().map_or(false, |x| x == 0.0))
+        }
+        serde_json::Value::Number(n) => zero_empty && n.as_f64() == Some(0.0),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Bool(b) => zero_empty && !*b,
+    }
+}
+
+pub const RELAY_LINK_KEYS: &[&str] = &["goods", "order", "tracking", "event"];
+
+pub fn relay_key_is_empty(v: &serde_json::Value) -> bool {
+    relay_value_is_placeholder("index", v)
+}
+
+pub fn relay_type_family(t: &str) -> String {
+    match t.trim().to_lowercase().as_str() {
+        "receiving" | "shipping" | "tracking" => "tracking".to_string(),
+        "sales" | "order" => "order".to_string(),
+        "coupon" | "event" => "event".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn relay_type_matches(expected: &str, found: &serde_json::Value) -> bool {
+    match found.get("type").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => relay_type_family(t) == relay_type_family(expected),
+        _ => true,
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RelayWriteLog {
+    pub written: Vec<String>,
+    pub kept: Vec<String>,
+}
+
+pub fn relay_write(
+    dst: &mut serde_json::Value,
+    field: &str,
+    val: serde_json::Value,
+    overwrite: bool,
+    log: &mut RelayWriteLog,
+) -> bool {
+    if relay_value_is_placeholder(field, &val) {
+        return false;
+    }
+    let obj = match dst.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+    let identity = RELAY_IDENTITY_KEYS.iter().any(|k| *k == field);
+    let has_value = obj.get(field).map_or(false, |cur| !relay_value_is_placeholder(field, cur));
+    let anchored = has_value && (RELAY_LINK_KEYS.iter().any(|k| *k == field) || !overwrite);
+    if identity || anchored {
+        if obj.get(field) != Some(&val) && !log.kept.iter().any(|f| f == field) {
+            log.kept.push(field.to_string());
+        }
+        return false;
+    }
+    if obj.get(field) == Some(&val) {
+        return false;
+    }
+    obj.insert(field.to_string(), val);
+    if !log.written.iter().any(|f| f == field) {
+        log.written.push(field.to_string());
+    }
+    true
+}
+
+pub fn relay_key_for_type(t: &str) -> Option<&'static str> {
+    match relay_type_family(t).as_str() {
+        "goods" => Some("goods"),
+        "order" => Some("order"),
+        "tracking" => Some("tracking"),
+        "event" => Some("event"),
+        _ => None,
+    }
+}
+
+pub fn relay_ref_index(v: Option<&serde_json::Value>) -> Option<u32> {
+    let n = v?.as_u64()?;
+    if n == 0 || n > u64::from(u32::MAX) {
+        None
+    } else {
+        Some(n as u32)
+    }
+}
+
+pub fn relay_companion_base(key: &str) -> Option<&'static str> {
+    let k = key.trim().to_lowercase();
+    RELAY_LINK_KEYS
+        .iter()
+        .copied()
+        .find(|base| k.len() == base.len() + 6 && k.starts_with(*base) && k.ends_with("_title"))
+}
+
+pub fn is_relay_placeholder(doc: &serde_json::Value) -> bool {
+    let updated_zero = doc.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+    let digest_empty = doc
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .map_or(true, |s| s.trim().is_empty());
+    updated_zero && digest_empty
+}
+
+pub const LEDGER_KEY: &str = "ledger";
+pub const RELAY_BOUND_KEY: &str = "_relay_bound";
+pub const RELAY_ORIGIN_KEY: &str = "relay_origin";
+pub const RELAY_TRANSIENT_KEYS: &[&str] = &[RELAY_BOUND_KEY, RELAY_ORIGIN_KEY];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerPrior {
+    Absent,
+    Placeholder,
+    Draft,
+    Confirmed,
+}
+
+pub fn ledger_prior(doc: Option<&serde_json::Value>) -> LedgerPrior {
+    let d = match doc {
+        None => return LedgerPrior::Absent,
+        Some(d) => d,
+    };
+    match d.get(LEDGER_KEY).and_then(|v| v.as_str()).map(|s| s.trim()) {
+        Some("count") => return LedgerPrior::Confirmed,
+        Some("draft") => return LedgerPrior::Draft,
+        Some("placeholder") => return LedgerPrior::Placeholder,
+        _ => {}
+    }
+    if d.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+        LedgerPrior::Confirmed
+    } else if is_relay_placeholder(d) {
+        LedgerPrior::Placeholder
+    } else {
+        LedgerPrior::Draft
+    }
+}
+
+pub fn ledger_state(prior: LedgerPrior, confirm: bool) -> &'static str {
+    if confirm || prior == LedgerPrior::Confirmed {
+        "count"
+    } else {
+        "draft"
+    }
+}
+
+pub fn ledger_delta(prior: LedgerPrior, confirm: bool) -> (i64, i64, i64) {
+    match (prior, confirm) {
+        (LedgerPrior::Absent, false) => (1, 0, 1),
+        (LedgerPrior::Absent, true) => (0, 1, 1),
+        (LedgerPrior::Placeholder, false) => (0, 0, 1),
+        (LedgerPrior::Placeholder, true) => (-1, 1, 1),
+        (LedgerPrior::Draft, false) => (0, 0, 0),
+        (LedgerPrior::Draft, true) => (-1, 1, 0),
+        (LedgerPrior::Confirmed, _) => (0, 0, 0),
+    }
+}
+
+pub const LEDGER_PLACEHOLDER_DELTA: (i64, i64, i64) = (1, 0, 0);
+
+pub fn relay_establishes(target_type: &str, by_type: &str) -> bool {
+    let t = relay_type_family(target_type);
+    let b = relay_type_family(by_type);
+    if t.is_empty() || b.is_empty() || t == b {
+        return false;
+    }
+    match t.as_str() {
+        "goods" => b == "order" || b == "tracking",
+        "order" => b == "goods" || b == "tracking",
+        "tracking" => b == "order" || b == "goods",
+        "event" => b == "goods" || b == "order",
+        "review" => b == "goods",
+        _ => true,
+    }
+}
+
+pub fn relay_edge_target(key: &str) -> Option<String> {
+    let k = key.trim();
+    if let Some(code) = k.strip_prefix("rel_") {
+        let c = code.trim();
+        return if c.is_empty() { None } else { Some(c.to_uppercase()) };
+    }
+    if RELAY_LINK_KEYS.iter().any(|x| *x == k) {
+        return Some(k.to_string());
+    }
+    None
+}
+
+fn push_edge(out: &mut Vec<(String, u32)>, key: &str, index: u32) {
+    if !out.iter().any(|(k, i)| k == key && *i == index) {
+        out.push((key.to_string(), index));
+    }
+}
+
+pub fn relay_edges(doc: &serde_json::Value) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return out,
+    };
+    let own_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let own_family = relay_type_family(own_type);
+    let own_code = own_type.trim().to_uppercase();
+    for key in RELAY_LINK_KEYS.iter() {
+        if *key == own_family.as_str() {
+            continue;
+        }
+        match obj.get(*key) {
+            Some(serde_json::Value::Array(arr)) => {
+                for el in arr.iter() {
+                    if let Some(i) = relay_ref_index(el.get("index")) {
+                        push_edge(&mut out, key, i);
+                    }
+                }
+            }
+            other => {
+                if let Some(i) = relay_ref_index(other) {
+                    push_edge(&mut out, key, i);
+                }
+            }
+        }
+    }
+    for (k, v) in obj.iter() {
+        let code = match k.strip_prefix("rel_") {
+            Some(c) => c.trim().to_uppercase(),
+            None => continue,
+        };
+        if code.is_empty() || code == own_code {
+            continue;
+        }
+        if let Some(i) = relay_ref_index(Some(v)) {
+            push_edge(&mut out, k, i);
+        }
+    }
+    out
 }

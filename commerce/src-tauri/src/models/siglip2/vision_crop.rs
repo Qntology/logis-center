@@ -1994,14 +1994,16 @@ pub fn plan_crops(
                 0u8
             } else if !identity_category.is_empty() && p.category == identity_category {
                 1u8
-            } else {
+            } else if table_categories.iter().any(|c| *c == p.category.as_str()) {
                 2u8
+            } else {
+                3u8
             }
         });
         let after: Vec<String> = plans.iter().map(|p| p.category.clone()).collect();
         if before != after {
             emit(&format!(
-                "    🥇 [IDENTITY FIRST ORDER] 문서 기본키 크롭을 선두로 재정렬했습니다. {:?} → {:?}",
+                "    🥇 [IDENTITY FIRST ORDER] 문서 기본키 크롭을 선두로, 표 크롭을 스칼라 크롭보다 앞으로 재정렬했습니다. {:?} → {:?} — 표 행이 먼저 병합되어 있어야 뒤의 스칼라 크롭이 표 칸을 라벨↔값 쌍으로 다시 읽었을 때 TABLE CELL ECHO 가 그 값을 문서 총계로 올리지 않습니다. 표 행은 금지 목록(ALREADY CLAIMED)에 들어가지 않으므로, 순서를 앞당겨도 스칼라 크롭의 스키마 패스가 받는 금지 목록에 표 칸 값이 새로 실리지 않습니다.",
                 before, after
             ));
         }

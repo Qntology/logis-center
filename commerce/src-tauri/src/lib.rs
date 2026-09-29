@@ -434,26 +434,7 @@ async fn reindex_pending_embeddings(
                 continue;
             }
         }
-        // 🌟 [ORDER SWAP / N+1 제거]
-        //
-        //  ── 무엇이 문제였나 ──
-        //   count_chunks_by_item 을 '가장 먼저' 호출하여 후보 문서 수만큼
-        //   LanceDB 쿼리를 날렸습니다. 500건이면 500회이고,
-        //   item_chunks 에 item_id 인덱스가 없어 각각 full scan 입니다.
-        //   이것이 백그라운드가 CPU 를 붙들고 있던 두 번째 원인입니다.
-        //
-        //  ── 왜 순서를 바꿔도 되는가 ──
-        //   embed 플래그는 메모리에 이미 올라온 json_data 파싱만으로 판정되며
-        //   비용이 0 에 가깝습니다. 대부분의 문서는 여기서 탈락합니다.
-        //   물리적 사실(chunk_count)이 더 신뢰도가 높다는 기존 판단은 옳지만,
-        //   그 검사는 '싼 검사를 통과한 소수' 에만 적용하면 충분합니다.
-        //   두 검사의 결론은 동일하고 순서만 바뀌므로 판정 결과가 달라지지 않습니다.
         if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
-            // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 type 이 도메인 타입(tracking/goods/...)
-            //    이라서 EMBED_EXCLUDE_TYPES 문자열 목록으로는 절대 잡히지 않습니다.
-            //    (서버 index.ts 의 home 문서 = { table:'pages', type:'tracking', data:{node,item} })
-            //    그래서 '구조 마커' 로 판정합니다. 셀렉터 캐시는 검색 대상이 아니므로
-            //    임베딩도, 청크 인덱싱도, 음차도 전부 불필요합니다.
             let is_page_cache = data_val.get("table")
                     .and_then(|v| v.as_str())
                     .map_or(false, |t| t == "pages" || t == "page")
@@ -471,13 +452,14 @@ async fn reindex_pending_embeddings(
                 .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
                 .unwrap_or(false);
             if already {
-                continue; // 이미 임베딩 완료된 아이템
+                continue;
+            }
+            if (target_mode == "commerce" || target_mode == "shipping")
+                && crate::utils::canonical::is_relay_placeholder(&data_val)
+            {
+                continue;
             }
         }
-        // 🌟 [CHUNK COUNT — 싼 검사 통과분에만] 물리적 사실로 최종 확인합니다.
-        //    embed 마커가 없는데 청크가 존재하는 경우(마커 유실 등)를 잡습니다.
-        //    여기 도달하는 문서 수는 embed 게이트를 통과한 소수이므로
-        //    쿼리 횟수가 후보 전체가 아니라 실제 미처리분으로 줄어듭니다.
         let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
         if chunk_count > 0 {
             println!(
@@ -1301,26 +1283,7 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     //
     //   노드가 없으면 별칭 없이 그대로 통과하므로, 기존 동작을 깨지 않습니다.
     fn normalize_path(key: &str) -> String {
-        let k = key.trim();
-
-        if let Some(alias_obj) = crate::parsing::BIAS_DICT
-            .get("search_bridge")
-            .and_then(|sb| sb.get("path_alias"))
-            .and_then(|v| v.as_object())
-        {
-            for (canonical, list) in alias_obj {
-                if canonical == k {
-                    return format!("data.{}", canonical);
-                }
-                if let Some(arr) = list.as_array() {
-                    if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
-                        return format!("data.{}", canonical);
-                    }
-                }
-            }
-        }
-
-        format!("data.{}", k)
+        format!("data.{}", crate::utils::bias_schema::canonical_field_name(key))
     }
 
     // 🌟 [KIND] Dexie 실행 엔진이 인덱스 쿼리를 쓸지 .filter() 를 쓸지 판정하는 힌트입니다.
@@ -1524,7 +1487,8 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         "substantial": ctx.get("substantial").cloned().unwrap_or(json!("")),
         "find": ctx.get("find").cloned().unwrap_or(json!("")),
         "hints": ctx.get("hint").cloned().unwrap_or(json!({})),
-        "projection": ctx.get("projection").cloned().unwrap_or(json!([]))
+        "projection": ctx.get("projection").cloned().unwrap_or(json!([])),
+        "relay_period": ctx.get("relay_period").cloned().unwrap_or(Value::Null)
     })
 }
 
@@ -1560,15 +1524,21 @@ fn dexie_value_passes(op: &str, kind: &str, have: &Value, want: &Value) -> bool 
         };
     }
     let (h, w) = (as_text(have), as_text(want));
+    let cross = || -> bool {
+        match (have.as_str(), want.as_str()) {
+            (Some(hv), Some(wv)) => cross_script_value_match(wv, hv).is_some(),
+            _ => false,
+        }
+    };
     match op {
-        "contains" => h.contains(&w),
-        "not_contains" => !h.contains(&w),
-        "neq" => h != w,
+        "contains" => h.contains(&w) || cross(),
+        "not_contains" => !(h.contains(&w) || cross()),
+        "neq" => h != w && !cross(),
         "gte" => h >= w,
         "gt" => h > w,
         "lte" => h <= w,
         "lt" => h < w,
-        _ => h == w,
+        _ => h == w || cross(),
     }
 }
 
@@ -1606,6 +1576,13 @@ fn evaluate_dexie_plan(
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase())).collect())
         .unwrap_or_default();
+    let primary = plan
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(crate::utils::canonical::relay_type_family)
+        .unwrap_or_default();
+    let primary_scoped = !primary.is_empty()
+        && types.iter().any(|t| crate::utils::canonical::relay_type_family(t) == primary);
     let mut fields: Vec<String> = Vec::new();
     for c in conds.iter() {
         let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1619,16 +1596,15 @@ fn evaluate_dexie_plan(
     let mut eligible = 0usize;
     let mut all_pass = 0usize;
     for d in docs.iter() {
-        if !types.is_empty() {
-            let t = d
-                .get("type")
-                .or_else(|| d.get("doc_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_lowercase();
-            if !types.iter().any(|x| *x == t) { continue; }
-        }
+        let t = d
+            .get("type")
+            .or_else(|| d.get("doc_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !types.is_empty() && !types.iter().any(|x| *x == t) { continue; }
+        if primary_scoped && crate::utils::canonical::relay_type_family(&t) != primary { continue; }
         eligible += 1;
         let ok: Vec<bool> = fields
             .iter()
@@ -1662,34 +1638,104 @@ fn evaluate_dexie_plan(
 ///   힌트는 결과 집합을 좁히지 않으므로 all_pass 계산에 넣으면 안 됩니다.
 ///   그러나 '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에
 ///   직접 쓰이는 정보인데, 지금은 evaluated 가 0 이라 관측 자체가 없습니다.
-fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize)> {
+fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize, usize)> {
+    use crate::utils::canonical::{kind_of, CanonKind};
     let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
     let hints = match plan.get("hints").and_then(|v| v.as_object()) {
         Some(h) => h.clone(),
         None => return Vec::new(),
     };
-    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut out: Vec<(String, usize, usize, usize)> = Vec::new();
     for (field, spec) in hints.iter() {
         let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
         let want = spec.get("value").cloned().unwrap_or(Value::Null);
         if want.is_null() { continue; }
-        let kind = if want.is_number() { "number" } else { "string" };
-        let cond = json!({
-            "path": format!("data.{}", field),
-            "op": op,
-            "value": want,
-            "kind": kind
-        });
+        let numeric_axis = matches!(kind_of(field), CanonKind::Numeric);
+        let kind = if want.is_number()
+            || (numeric_axis && want.as_str().map_or(false, |s| s.trim().parse::<f64>().is_ok()))
+        {
+            "number"
+        } else {
+            "string"
+        };
+        let mut axes: Vec<String> = vec![field.clone()];
+        if let Some(arr) = alternates.get(field.as_str()).and_then(|v| v.as_array()) {
+            for a in arr.iter() {
+                if let Some(s) = a.as_str() {
+                    if !axes.iter().any(|x| x == s) { axes.push(s.to_string()); }
+                }
+            }
+        }
+        let negative = op == "neq" || op == "not_contains";
+        let ranking = op == "top" || op == "bottom";
+        let want_script = want.as_str().map(|s| dominant_script(s)).unwrap_or("none");
         let mut present = 0usize;
         let mut satisfied = 0usize;
+        let mut cross_script = 0usize;
         for d in docs.iter() {
-            let has = d.get(field.as_str()).map_or(false, |v| {
-                !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
-            });
-            if has { present += 1; }
-            if dexie_condition_passes(&cond, d, &alternates) { satisfied += 1; }
+            let values: Vec<&Value> = axes
+                .iter()
+                .flat_map(|k| doc_axis_values(d, k))
+                .filter(|v| !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
+                .collect();
+            if !values.is_empty() { present += 1; }
+            let pass = if values.is_empty() {
+                negative
+            } else if ranking {
+                true
+            } else if negative {
+                values.iter().all(|v| dexie_value_passes(op, kind, v, &want))
+            } else {
+                values.iter().any(|v| dexie_value_passes(op, kind, v, &want))
+            };
+            if pass { satisfied += 1; }
+            let foreign = kind == "string"
+                && !pass
+                && !values.is_empty()
+                && want_script != "none"
+                && values.iter().all(|v| {
+                    v.as_str().map_or(false, |s| {
+                        let sc = dominant_script(s);
+                        sc != "none" && sc != want_script
+                    })
+                });
+            if foreign { cross_script += 1; }
         }
-        out.push((field.clone(), satisfied, present));
+        out.push((field.clone(), satisfied, present, cross_script));
+    }
+    out
+}
+
+fn doc_axis_values<'a>(doc: &'a Value, field: &str) -> Vec<&'a Value> {
+    let mut out: Vec<&'a Value> = Vec::new();
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return out,
+    };
+    let scalar = |v: &Value| !(v.is_object() || v.is_array());
+    if let Some(v) = obj.get(field) {
+        match v {
+            Value::Array(xs) => out.extend(xs.iter().filter(|x| scalar(x))),
+            other if scalar(other) => out.push(other),
+            _ => {}
+        }
+    }
+    for node in obj.values() {
+        match node {
+            Value::Object(o) => {
+                if let Some(v) = o.get(field).filter(|v| scalar(v)) {
+                    out.push(v);
+                }
+            }
+            Value::Array(rows) => {
+                for r in rows.iter() {
+                    if let Some(v) = r.as_object().and_then(|o| o.get(field)).filter(|v| scalar(v)) {
+                        out.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     out
 }
@@ -1745,37 +1791,126 @@ fn axis_format_compatible(a: &str, b: &str) -> bool {
     )
 }
 
+fn storage_page_type(page_type: &str) -> String {
+    let t = page_type.trim();
+    if crate::utils::bias_schema::is_trade_doc_type(t) {
+        return t.to_string();
+    }
+    let upper = t.to_uppercase();
+    if crate::utils::bias_schema::is_trade_doc_type(&upper) {
+        return upper;
+    }
+    t.to_string()
+}
+
+fn axis_label_bank(page_type: &str, field: &str) -> Vec<String> {
+    use crate::utils::ai_utils::{is_value_example_phrase, label_phrase_bank_multilingual, semantic_anchor_text};
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let (raw, _) = if crate::utils::bias_schema::is_trade_doc_type(page_type) {
+        crate::model::merge::owner_label_bank("en", canon, field)
+    } else {
+        label_phrase_bank_multilingual("en", canon, field)
+    };
+    let mut bank: Vec<String> = Vec::new();
+    for p in raw.into_iter() {
+        let t = p.trim();
+        if t.is_empty() || is_value_example_phrase(t) { continue; }
+        if bank.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+        bank.push(t.to_string());
+        if bank.len() >= 128 { break; }
+    }
+    if bank.is_empty() {
+        let s = semantic_anchor_text("en", page_type, field);
+        if !s.trim().is_empty() { bank.push(s); }
+    }
+    bank
+}
+
+fn bank_affinity(a: &[&[f32]], b: &[&[f32]]) -> f32 {
+    use crate::utils::ai_utils::cosine_similarity;
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let directed = |x: &[&[f32]], y: &[&[f32]]| -> f32 {
+        x.iter()
+            .map(|u| y.iter().map(|v| cosine_similarity(u, v)).fold(f32::MIN, f32::max))
+            .sum::<f32>()
+            / x.len() as f32
+    };
+    0.5 * (directed(a, b) + directed(b, a))
+}
+
 async fn nearest_storage_axis(
     model: &LogisModel,
     page_type: &str,
     blocked_field: &str,
     storage_axes: &[String],
 ) -> Option<(String, f32)> {
-    use crate::utils::ai_utils::{cosine_similarity, semantic_anchor_text};
-
+    let pt = storage_page_type(page_type);
+    let page_type = pt.as_str();
+    let schema: Vec<String> = crate::parsing::get_detail_schema_fields(page_type, "", "en")
+        .into_iter()
+        .map(|(f, _, _, _)| f)
+        .filter(|f| !crate::utils::bias_schema::is_system_axis(f))
+        .collect();
+    if schema.is_empty() {
+        println!(
+            "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NO SCHEMA] '{}' 서식의 스키마 축 목록을 얻지 못했습니다. 저장본의 created_at·updated_at·type 같은 메타 축이 후보로 섞이므로 치환하지 않고 강등 경로에 맡깁니다.",
+            page_type
+        );
+        return None;
+    }
     let compatible: Vec<String> = storage_axes
         .iter()
         .filter(|a| a.as_str() != blocked_field)
+        .filter(|a| schema.iter().any(|s| s == *a))
         .filter(|a| axis_format_compatible(blocked_field, a))
         .cloned()
         .collect();
     if compatible.is_empty() { return None; }
 
-    let mut texts: Vec<String> = Vec::with_capacity(compatible.len() + 1);
-    texts.push(semantic_anchor_text("en", page_type, blocked_field));
+    let mut banks: Vec<Vec<String>> = Vec::with_capacity(compatible.len() + 1);
+    banks.push(axis_label_bank(page_type, blocked_field));
     for a in compatible.iter() {
-        texts.push(semantic_anchor_text("en", page_type, a));
+        banks.push(axis_label_bank(page_type, a));
     }
+    let mut uniq: Vec<String> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for b in banks.iter() {
+        for p in b.iter() {
+            if index.contains_key(p) { continue; }
+            index.insert(p.clone(), uniq.len());
+            uniq.push(p.clone());
+        }
+    }
+    let mut embs: Vec<Vec<f32>> = Vec::with_capacity(uniq.len());
+    for part in uniq.chunks(200) {
+        let e = model.get_embedding_batch(part.to_vec()).await.ok()?;
+        if e.len() != part.len() { return None; }
+        embs.extend(e);
+    }
+    let vecs: Vec<Vec<&[f32]>> = banks
+        .iter()
+        .map(|b| {
+            b.iter()
+                .filter_map(|p| index.get(p).map(|&i| embs[i].as_slice()))
+                .filter(|e| !e.is_empty() && !e.iter().all(|&v| v == 0.0))
+                .collect()
+        })
+        .collect();
+    if vecs[0].is_empty() { return None; }
 
-    let embs = model.get_embedding_batch(texts).await.ok()?;
-    if embs.len() != compatible.len() + 1 { return None; }
-
-    let target = &embs[0];
     let mut scored: Vec<(String, f32)> = Vec::with_capacity(compatible.len());
     for (i, a) in compatible.iter().enumerate() {
-        scored.push((a.clone(), cosine_similarity(target, &embs[i + 1])));
+        if vecs[i + 1].is_empty() { continue; }
+        scored.push((a.clone(), bank_affinity(&vecs[0], &vecs[i + 1])));
     }
     scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!(
+        "[AI-SEARCH] 🧮 [AXIS SUBSTITUTE / BANK AFFINITY] '{}' ({}구) ↔ 저장 축 {}개 다국어 라벨 뱅크 양방향 최근접 평균: {:?}",
+        blocked_field,
+        vecs[0].len(),
+        scored.len(),
+        scored.iter().take(6).map(|(a, s)| format!("{}({:.4})", a, s)).collect::<Vec<_>>()
+    );
 
     // 🌟 [SMALL POOL GUARD] 후보가 2개면 꼬리가 1개라 표준편차가 0 이거나 무의미합니다.
     //    그 상태에서 '평균 + 표준편차' 를 재면 1위가 언제나 통과합니다.
@@ -1794,7 +1929,15 @@ async fn nearest_storage_axis(
     let var = tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
     let sd = var.max(0.0).sqrt();
     if sd <= 1e-6 { return None; }
-    if scored[0].1 - mean < sd { return None; }
+    let z = (scored[0].1 - mean) / sd;
+    let need = crate::utils::ai_utils::gumbel_expected_z(scored.len()).max(1.0);
+    if z < need {
+        println!(
+            "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NOT AN OUTLIER] '{}' → 1위 '{}' ({:.4}) 가 나머지 {}개 평균 {:.4} 보다 {:.2}σ 앞서지만, 후보 {}개 중 최댓값이 우연히 앞서는 기대치 {:.2}σ 에 못 미칩니다. 같은 계열(날짜·금액) 축끼리는 뱅크가 비슷해 누가 1위여도 이상치가 아니며, 이때 치환하면 조건이 조용히 다른 사실로 바뀝니다.",
+            blocked_field, scored[0].0, scored[0].1, scored.len() - 1, mean, z, scored.len(), need
+        );
+        return None;
+    }
     Some(scored[0].clone())
 }
 
@@ -1805,6 +1948,38 @@ async fn nearest_storage_axis(
 ///   같은 뜻이어도 공통 부분 문자열이 없어 FTS 가 구조적으로 0건입니다.
 ///   반대로 중국어 질의와 일본어 청크는 한자를 공유해 부분적으로 발화합니다.
 ///   언어 판정기보다 문자 체계가 이 물음에 더 정확히 답합니다.
+fn cross_script_value_match(want: &str, have: &str) -> Option<(&'static str, f32)> {
+    let w = want.trim();
+    let h = have.trim();
+    if w.is_empty() || h.is_empty() {
+        return None;
+    }
+    let (ws, hs) = (dominant_script(w), dominant_script(h));
+    if ws == "none" || hs == "none" || ws == hs {
+        return None;
+    }
+    if let (Some(a), Some(b)) = (
+        crate::utils::ai_utils::country_code_of(w),
+        crate::utils::ai_utils::country_code_of(h),
+    ) {
+        if a == b {
+            return Some(("country", 1.0));
+        }
+    }
+    if let (Some(a), Some(b)) = (
+        crate::utils::ai_utils::currency_name_exact(w),
+        crate::utils::ai_utils::currency_name_exact(h),
+    ) {
+        if a == b {
+            return Some(("currency", 1.0));
+        }
+    }
+    match crate::nl_convert::phonetic_similarity(w, h) {
+        Some(s) if s >= crate::nl_convert::PHONETIC_PASS => Some(("phonetic", s)),
+        _ => None,
+    }
+}
+
 fn dominant_script(s: &str) -> &'static str {
     let (mut latin, mut hangul, mut kana, mut han, mut arabic, mut cyrillic) =
         (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -1839,8 +2014,7 @@ fn dominant_script(s: &str) -> &'static str {
 }
 
 fn is_relay_draft(doc: &Value) -> bool {
-    doc.get("updated_at").and_then(|v| v.as_i64()) == Some(0)
-        && doc.get("digest").and_then(|v| v.as_str()).map_or(false, |s| s.is_empty())
+    crate::store::is_relay_draft(doc)
 }
 
 // =====================================================================
@@ -1913,7 +2087,7 @@ fn bank_excess(sims: &[f32]) -> Option<(f32, f32, usize)> {
         if *s > sims[ti] { ti = i; }
     }
     let z = (sims[ti] - mean) / sd;
-    let expected = (2.0 * n.ln()).sqrt();
+    let expected = crate::utils::ai_utils::gumbel_expected_z(sims.len());
     Some((z - expected, sims[ti], ti))
 }
 
@@ -1960,6 +2134,27 @@ async fn probe_trade_query<E: Fn(&str)>(
     }
 
     // ② 서식 전문 뱅크 vs 커머스 개념 뱅크
+    let mentions = crate::utils::ai_utils::trade_doc_mentions_exact(query);
+    let listed: Vec<String> = mentions
+        .iter()
+        .map(|m| {
+            format!(
+                "{}→{:?}{}",
+                m.text,
+                m.codes,
+                if !m.by_title { "·코드" } else if m.partial { "·부분" } else { "·전문" }
+            )
+        })
+        .collect();
+    crate::utils::score_dynamics::record_baseline("search.query_trade_mentions", mentions.len() as f32);
+    if let Some((code, why)) = crate::utils::ai_utils::trade_mentions_decisive(&mentions) {
+        crate::utils::score_dynamics::record_baseline("search.query_reroute_exact", 1.0);
+        emit(&format!(
+            "[TRADE QUERY PROBE] 🔒 질의에 서로 다른 허브 서식(PO·CI·BL·LC) 두 가지가 닫힌 어휘로 적혀 있습니다: {} | 전체 {:?}. 허브 서식은 무역 참조 그래프의 중심이라 서로 다른 둘이 함께 적히면 무역 서식 질의로 확정합니다. 같은 허브를 코드와 이름으로 두 번 적은 경우와 공백 없는 중국어·일본어 서식명이 다른 글자에 이어 붙은 부분 일치는 여기서 세지 않고 코사인 확인을 거칩니다. 서식 코드·서식 이름 표는 shipping 질의 해석과 같은 표를 쓰되, 질의 분류용이라 처격 조사가 붙은 허브 코드(CI에)도 셉니다.",
+            why, listed
+        ));
+        return Some(code);
+    }
     let (title_bank, comm_bank) = trade_query_banks(model).await?;
     let q = model.get_embedding(query.to_string()).await.ok()?;
     if q.is_empty() { return None; }
@@ -1975,9 +2170,22 @@ async fn probe_trade_query<E: Fn(&str)>(
         ));
         return Some(code);
     }
+    let top_named = mentions
+        .iter()
+        .find(|m| crate::utils::ai_utils::trade_mention_is_hub(m) && m.codes.iter().any(|c| *c == code));
+    if let Some(m) = top_named {
+        if t_ex > c_ex {
+            crate::utils::score_dynamics::record_baseline("search.query_reroute_exact", 1.0);
+            emit(&format!(
+                "[TRADE QUERY PROBE] 🔒 허브 서식 '{}' {:?}{} 이 질의에 적혀 있고, 서식 전문 뱅크 최고 '{}' (cos {:.4}) 가 바로 그 서식입니다. 서식 뱅크 초과분 {:+.3} 이 커머스 뱅크 초과분 {:+.3} 을 앞서므로(뱅크 크기 보정 뒤 비교) 음수여도 전환합니다. 서식 이름에 조건을 여럿 붙인 긴 질의는 서식 뱅크 전체와 두루 닮아 평균이 올라가므로 최댓값의 z 초과분이 작게 나옵니다. 글자 근거가 초과분의 절대 기준을 대신합니다.",
+                m.text, m.codes, if m.partial { " (공백 없이 다른 글자에 이어 붙은 부분 일치라 코사인 확인을 함께 봅니다)" } else { " (닫힌 어휘 완전 일치)" }, code, t_top, t_ex, c_ex
+            ));
+            return Some(code);
+        }
+    }
     emit(&format!(
-        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없습니다.",
-        t_ex, code, t_top, c_ex, c_top
+        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없고, 닫힌 어휘 서식 이름 {:?} 도 전환 근거가 되지 못했습니다.",
+        t_ex, code, t_top, c_ex, c_top, listed
     ));
     None
 }
@@ -2119,6 +2327,9 @@ async fn delete_documents(
         Err("DB not initialized".to_string())
     }
 }
+
+static VISION_QUERY_MEMO: Lazy<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[tauri::command]
 async fn ai_search_complex(
@@ -2396,39 +2607,59 @@ async fn ai_search_complex(
             if cancel_token.load(Ordering::Relaxed) {
                 return Err("Search cancelled by user".to_string());
             }
-            emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더로 비전 질의 벡터를 생성합니다...");
-
-            // Qwen3.5 를 먼저 반환해 SigLIP2 가 올라갈 공간을 확보합니다.
-            model.deep_purge_resources().await;
-
-            match model.check_siglip2_downloaded().await {
-                Err(e) => {
-                    emit_term(&format!(
-                        "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
-                    ));
-                }
-                Ok(_) => {
-                    match model.ensure_siglip2(true).await {
-                        Err(e) => {
-                            emit_term(&format!(
-                                "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
-                            ));
-                        }
-                        Ok(_) => {
-                            {
-                                let guard = model.siglip2_model.lock().await;
-                                if let Some(sig) = guard.as_ref() {
-                                    if sig.has_text() {
-                                        vision_qvec = crate::models::siglip2::vision_encoder::encode_query_text(
-                                            sig, &query,
-                                        ).ok();
+            let qkey = query.trim().to_string();
+            let remembered = VISION_QUERY_MEMO
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&qkey).cloned())
+                .or_else(|| {
+                    crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE
+                        .get(&qkey)
+                        .map(|v| (*v).clone())
+                });
+            if let Some(v) = remembered {
+                emit_term("[VISION TRACK] ⚡ 같은 질의의 비전 질의 벡터가 이미 있어 SigLIP2 를 올리지 않습니다. (퍼지·로드·해제·VRAM 대기 0회)");
+                vision_qvec = Some(v);
+            } else {
+                emit_term("[VISION TRACK] 🖼️ SigLIP2 텍스트 인코더만 올려 비전 질의 벡터를 생성합니다. 질의 인코딩에는 비전 인코더가 쓰이지 않아 올리지 않습니다.");
+                match model.check_siglip2_downloaded().await {
+                    Err(e) => {
+                        emit_term(&format!(
+                            "[VISION TRACK] ⚪ SigLIP2 미설치로 비전 검색을 건너뜁니다: {}", e
+                        ));
+                    }
+                    Ok(_) => {
+                        model.unload_generation_slots("vision query text encoding").await;
+                        match model.ensure_siglip2_ext(false, true).await {
+                            Err(e) => {
+                                emit_term(&format!(
+                                    "[VISION TRACK] ⚪ SigLIP2 로드 실패로 비전 검색을 건너뜁니다: {}", e
+                                ));
+                            }
+                            Ok(_) => {
+                                {
+                                    let guard = model.siglip2_model.lock().await;
+                                    if let Some(sig) = guard.as_ref() {
+                                        if sig.has_text() {
+                                            vision_qvec = crate::models::siglip2::vision_encoder::encode_phrases_ephemeral(
+                                                sig,
+                                                &[qkey.clone()],
+                                            )
+                                            .ok()
+                                            .and_then(|v| v.into_iter().next());
+                                        }
                                     }
                                 }
+                                model.release_siglip2("search vision query encoded").await;
                             }
-                            // 인코딩이 끝났으면 즉시 반환합니다. (비전 820MB + 텍스트 1.4GB)
-                            model.release_siglip2("search vision query encoded").await;
                         }
                     }
+                }
+                if let (Some(v), Ok(mut m)) = (vision_qvec.as_ref(), VISION_QUERY_MEMO.lock()) {
+                    if m.len() >= 256 {
+                        m.clear();
+                    }
+                    m.insert(qkey.clone(), v.clone());
                 }
             }
 
@@ -2782,7 +3013,8 @@ async fn ai_search_complex(
                             );
                             if value_bearing {
                                 let qs = dominant_script(&query);
-                                let cs = dominant_script(&chunk_text);
+                                let chunk_value = crate::nl_convert::extract_value_from_chunk(&chunk_text);
+                                let cs = dominant_script(if chunk_value.trim().is_empty() { &chunk_text } else { &chunk_value });
                                 let script_gap = qs != "none" && cs != "none" && qs != cs;
                                 if script_gap {
                                     let cross_lingual_track = raw_cosine * 2.0;
@@ -2821,6 +3053,35 @@ async fn ai_search_complex(
                                 if chunk_id.ends_with("_tn") { "native" } else { "roman" },
                                 property, chunk_text, alias_track, raw_cosine, score
                             );
+                        }
+
+                        let wanted_value: Option<String> = ctx
+                            .get("condition")
+                            .and_then(|v| v.get(property.as_str()))
+                            .or_else(|| ctx.get("hint").and_then(|v| v.get(property.as_str())))
+                            .and_then(|spec| spec.get("value"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        if let Some(want) = wanted_value {
+                            let chunk_value = crate::nl_convert::extract_value_from_chunk(&chunk_text);
+                            let have = if chunk_value.trim().is_empty() { chunk_text.clone() } else { chunk_value };
+                            if let Some((how, sim)) = cross_script_value_match(&want, &have) {
+                                let value_track = if how == "phonetic" { sim } else { 1.0 };
+                                score += value_track;
+                                crate::utils::score_dynamics::record_baseline("search.value_match_cross_script", sim);
+                                println!(
+                                    "[AI-SEARCH]   🧭 [STAGE-4Z / VALUE MATCH] property='{}' | 질의 값 '{}' ↔ 청크 값 '{}' | 문자 체계가 달라 FTS 가 0건인 자리에서 {} 근거로 값이 일치합니다 ({:.2}) → 값 일치 트랙 +{:.4} → 최종 {:.4}. 코사인 {:.4} 만으로는 '같은 값' 과 '비슷한 값' 을 가르지 못하므로, 정규 코드 일치는 +1.0, 발음 골격 일치는 유사도만큼 더합니다.",
+                                    property,
+                                    want,
+                                    have,
+                                    match how { "country" => "국가 정규 코드", "currency" => "통화 정규 코드", _ => "발음 골격" },
+                                    sim,
+                                    value_track,
+                                    score,
+                                    raw_cosine
+                                );
+                            }
                         }
 
                         // 🌟 [EVIDENCE VOLUME] 합산 점수는 '몇 개의 청크가 함께 반응했는가' 라는
@@ -2992,7 +3253,12 @@ async fn ai_search_complex(
                     .get("started_at")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0)
-                    > 0;
+                    > 0
+                    || structured_query
+                        .get("expired_at")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        > 0;
                 if explicit_period {
                     emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
                 } else if let Some(store) = store_opt.as_ref() {
@@ -3127,6 +3393,25 @@ async fn ai_search_complex(
                 ranked_results.truncate(FINAL_LIMIT);
             }
 
+            if let Some(store) = store_opt.as_ref() {
+                let relay_rep = crate::scheduler::relay_ledger::relay_join(
+                    store,
+                    &mut ranked_results,
+                    &mut dexie_plans,
+                    &search_mode,
+                    &cc,
+                    &team_id,
+                    &emit_term,
+                ).await;
+                if relay_rep.changed_set() {
+                    ranked_results.sort_by(|a, b| {
+                        let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
             let projection_axes: Vec<String> = {
                 let mut v: Vec<String> = Vec::new();
                 for plan in dexie_plans.iter() {
@@ -3228,7 +3513,12 @@ async fn ai_search_complex(
                 let prop = item.get("matched_property").and_then(|v| v.as_str()).unwrap_or("-");
                 let is_chunk = item.get("chunk_match").and_then(|v| v.as_bool()).unwrap_or(false);
                 let is_alias = item.get("alias_match").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ctx = item.get("context_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let ctx = item
+                    .get("doc_type")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| item.get("context_type").and_then(|v| v.as_str()))
+                    .unwrap_or("?");
                 let matched_text = item.get("matched_chunk")
                     .or_else(|| item.get("text"))
                     .and_then(|v| v.as_str())
@@ -3330,18 +3620,32 @@ async fn ai_search_complex(
                     let hint_eval = evaluate_dexie_hints(plan, &docs);
                     if !hint_eval.is_empty() {
                         let mut hint_detail: Vec<String> = Vec::new();
-                        for (field, satisfied, present) in hint_eval.iter() {
+                        for (field, satisfied, present, cross_script) in hint_eval.iter() {
+                            let unobservable = *satisfied == 0 && *present > 0 && *cross_script == *present;
                             if !docs.is_empty() {
-                                crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                crate::utils::score_dynamics::record_baseline(
+                                    "search.hint_cross_script",
+                                    if unobservable { 1.0 } else { 0.0 },
+                                );
+                                if !unobservable {
+                                    crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                }
                                 crate::utils::score_dynamics::record_baseline(
                                     "search.hint_present_ratio",
                                     *present as f32 / docs.len() as f32,
                                 );
                             }
-                            hint_detail.push(format!(
-                                "{}(만족 {} / 축 보유 {} / 회수 {})",
-                                field, satisfied, present, docs.len()
-                            ));
+                            hint_detail.push(if unobservable {
+                                format!(
+                                    "{}(평가 보류: 축 보유 {}건 전부가 힌트 값과 문자 체계가 달라 문자열 비교가 성립하지 않음 / 회수 {})",
+                                    field, present, docs.len()
+                                )
+                            } else {
+                                format!(
+                                    "{}(만족 {} / 축 보유 {} / 회수 {})",
+                                    field, satisfied, present, docs.len()
+                                )
+                            });
                         }
                         println!(
                             "[AI-SEARCH] 📈 [SDS / HINT OUTCOME] 힌트 축 {}개를 결과 집합과 무관하게 관측만 합니다: {} — 힌트는 필터가 아니므로 통과 여부가 결과를 바꾸지 않지만, '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에 쓰입니다. 지금까지는 evaluated 가 0 이라 이 정보가 원장에 전혀 쌓이지 않았습니다.",
@@ -3391,6 +3695,24 @@ async fn ai_search_complex(
                                     })
                                     .count();
                                 if here > 0 { continue; }
+                                let nested = docs
+                                    .iter()
+                                    .filter(|d| {
+                                        axes.iter().any(|k| {
+                                            doc_axis_values(d, k).iter().any(|v| {
+                                                !(v.is_null()
+                                                    || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                                            })
+                                        })
+                                    })
+                                    .count();
+                                if nested > 0 {
+                                    println!(
+                                        "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NESTED] '{}' 는 회수 문서 {}건에 표 행(배열) 안의 값으로 저장되어 있습니다. 축이 없는 것이 아니라 경로가 루트가 아닐 뿐이므로, 루트에 있는 다른 축으로 치환하면 '품목 단가' 조건이 '문서 총액' 같은 다른 사실로 바뀝니다. 치환하지 않고 아래 강등 경로에 맡깁니다.",
+                                        field, nested
+                                    );
+                                    continue;
+                                }
                                 if let Some((cand, score)) =
                                     nearest_storage_axis(&model, &page_type, field, &storage_axes).await
                                 {
@@ -3652,14 +3974,17 @@ async fn ai_search_complex(
                     let time_intent = structured_query.get("time_intent").and_then(|v| v.as_str()).unwrap_or("");
                     let season_intent = structured_query.get("season_intent").and_then(|v| v.as_str()).unwrap_or("");
 
-                    let period_str = if started_at > 0 {
-                        let s = chrono::DateTime::from_timestamp_millis(started_at)
-                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
-                            .unwrap_or_default();
-                        let e = chrono::DateTime::from_timestamp_millis(expired_at)
-                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
-                            .unwrap_or_default();
-                        format!("{} ~ {}", s, e)
+                    let period_str = if started_at > 0 || expired_at > 0 {
+                        let (period_clock, _) = crate::utils::time_guide::lang_clock(&language);
+                        let day = |ms: i64| -> String {
+                            if ms <= 0 {
+                                return String::new();
+                            }
+                            crate::utils::time_guide::date_of_ms(&period_clock, ms)
+                                .map(|d| d.format("%Y-%m-%d").to_string())
+                                .unwrap_or_default()
+                        };
+                        format!("{} ~ {}", day(started_at), day(expired_at))
                     } else {
                         "all time".to_string()
                     };
@@ -4780,6 +5105,11 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn get_lang_llm_status(language: Option<String>) -> Result<serde_json::Value, String> {
+    Ok(crate::model::lang_llm::status_report(language.as_deref()))
+}
+
+#[tauri::command]
 async fn delete_all_models() -> Result<String, String> {
     let app_dir = crate::utils::get_app_dir();
     let models_dir = app_dir.join("models");
@@ -4787,9 +5117,8 @@ async fn delete_all_models() -> Result<String, String> {
         std::fs::remove_dir_all(&models_dir).map_err(|e| e.to_string())?;
     }
 
-    // 🌟 [VISION-CACHE] 모델이 사라지면 ViT 출력의 재현성도 보장할 수 없으므로
-    //    캐시된 비전 임베딩을 함께 폐기합니다.
     crate::models::vision_cache::VISION_CACHE.clear_all();
+    crate::models::siglip2::layout_cache::LAYOUT_CACHE.clear_all();
 
     Ok("Deleted".to_string())
 }
@@ -4798,12 +5127,8 @@ async fn delete_all_models() -> Result<String, String> {
 async fn reset_lancedb(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    // 🌟 [SDS PURGE] 팩토리 리셋은 '판정 근거를 포함한 전량 초기화' 입니다.
-    //    문서를 지우면서 그 문서들에서 유도한 통계를 남기면
-    //    존재하지 않는 데이터의 분포로 판정하게 됩니다.
-    //    또한 이 삭제가 기획 8-2 의 롤백 수단입니다.
-    //    (코드 롤백 없이 파일 삭제만으로 적응 이전 동작으로 복귀)
     crate::utils::score_dynamics::purge();
+    crate::models::siglip2::layout_cache::LAYOUT_CACHE.clear_all();
     let mut store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         db.reset_database().await.map_err(|e| e.to_string())?;
@@ -5022,6 +5347,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    crate::model::lang_llm::register_loader(crate::model::lang_gguf::load_runtime);
     let model = Arc::new(TokioMutex::new(None));
     let store = Arc::new(TokioMutex::new(None));
     let cancellation_token = Arc::new(AtomicBool::new(false));
@@ -5261,7 +5587,8 @@ pub fn run() {
             save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
             get_query_embedding, reindex_pending_embeddings, structure_pending_analytics,
-            translit_cache_respond, get_embedding_batch_for_translit
+            translit_cache_respond, get_embedding_batch_for_translit,
+            get_lang_llm_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

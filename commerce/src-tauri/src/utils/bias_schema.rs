@@ -6,10 +6,42 @@ pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
     serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
 });
 
+const LANG_NAME_CODES: &[(&str, &str)] = &[
+    ("korean", "ko"), ("한국어", "ko"), ("한국", "ko"),
+    ("japanese", "ja"), ("日本語", "ja"),
+    ("chinese", "zh"), ("中文", "zh"), ("汉语", "zh"), ("漢語", "zh"),
+    ("english", "en"),
+    ("german", "de"), ("deutsch", "de"),
+    ("spanish", "es"), ("español", "es"), ("espanol", "es"),
+    ("french", "fr"), ("français", "fr"), ("francais", "fr"),
+    ("italian", "it"), ("italiano", "it"),
+    ("portuguese", "pt"), ("português", "pt"), ("portugues", "pt"),
+    ("dutch", "nl"), ("nederlands", "nl"),
+    ("czech", "cs"), ("čeština", "cs"), ("cestina", "cs"),
+    ("arabic", "ar"), ("العربية", "ar"),
+    ("albanian", "sq"), ("armenian", "hy"), ("bengali", "bn"), ("bulgarian", "bg"),
+    ("croatian", "hr"), ("estonian", "et"), ("filipino", "tl"), ("tagalog", "tl"),
+    ("georgian", "ka"), ("greek", "el"), ("icelandic", "is"), ("indonesian", "id"),
+    ("kazakh", "kk"), ("khmer", "km"), ("latvian", "lv"), ("lithuanian", "lt"),
+    ("malayalam", "ml"), ("malay", "ms"), ("marathi", "mr"), ("persian", "fa"),
+    ("polish", "pl"), ("serbian", "sr"), ("slovak", "sk"), ("swedish", "sv"),
+    ("turkish", "tr"),
+];
+
 pub fn lang_code_of(lang: &str) -> String {
     let l = lang.trim().to_lowercase();
     if l.starts_with("zh-tw") || l.starts_with("zh-hk") || l.starts_with("zh-hant") {
         return "zh-tw".to_string();
+    }
+    let hit = LANG_NAME_CODES
+        .iter()
+        .find(|(name, _)| l.starts_with(*name))
+        .or_else(|| LANG_NAME_CODES.iter().find(|(name, _)| !name.is_ascii() && l.contains(*name)));
+    if let Some((_, code)) = hit {
+        if *code == "zh" && (l.contains("tradition") || l.contains('繁') || l.contains("hant")) {
+            return "zh-tw".to_string();
+        }
+        return code.to_string();
     }
     let code: String = l.chars().take_while(|c| c.is_ascii_alphabetic()).take(2).collect();
     if code.chars().count() >= 2 { code } else { "en".to_string() }
@@ -258,20 +290,30 @@ fn trade_desc_to_type(desc: &str) -> &'static str {
 ///   스칼라로 다루면 두 번째 이후가 통째로 소실됩니다.
 ///   (실측: 상품 표 2행 중 Shorts 행 소실)
 pub fn is_trade_array_category(category: &str) -> bool {
-    matches!(
-        category,
-        "items"
-            | "containers"
-            | "parties"
-            | "charges"
-            | "test_results"
-            | "findings_and_damage"
-            | "account_ledger"
-            | "adjustments"
-            | "packing_details"
-            | "licensed_items"
-            | "purchased_items"
-    )
+    crate::logic::is_trade_array_category(category)
+}
+
+pub fn canonical_field_name(raw: &str) -> String {
+    let k = raw.trim();
+    if let Some(alias_obj) = BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("path_alias"))
+        .and_then(|v| v.as_object())
+    {
+        for (canonical, list) in alias_obj {
+            if canonical == k { return canonical.clone(); }
+            if let Some(arr) = list.as_array() {
+                if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
+                    return canonical.clone();
+                }
+            }
+        }
+    }
+    k.to_string()
+}
+
+pub fn is_system_axis(field: &str) -> bool {
+    matches!(field, "id,link" | "status" | "doc_type")
 }
 
 pub fn get_localized_page_type(page_type: &str, lang: &str) -> String {
@@ -545,10 +587,12 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
             add("code", "String", "code sku item", "");
             add("status", "String", "status condition", "");
             add("title", "String", "title name product", "");
+            add("category", "String", "category classification path", "");
             add("color", "String", "color hue shade tint", "");
             add("registration_date", "String", "date registration", "");
             add("sale_price", "Number", "sale price discount", "");
             add("supply_price", "Number", "supply price cost", "");
+            add("compare_at_price", "Number", "compare original market price", "");
             add("currency", "String", "currency", "");
             add("quantity", "Number", "quantity inventory stock", "");
             add("stock_keeping_unit", "String", "sku code", "");
@@ -564,6 +608,9 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
             add("recipient_name", "String", "recipient receiver name", "");
             add("payment_method", "String", "payment method type", "");
             add("payment_date", "String", "payment date", "");
+            add("quantity", "Number", "quantity ordered count", "");
+            add("amount", "Number", "order total amount payment", "");
+            add("shipping_fee", "Number", "shipping fee cost", "");
         },
         "coupon" | "event" => {
             add("id,link", "", "id link", "");
@@ -855,6 +902,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("description", "String", "description detail", "");
             add("short_description", "String", "short description summary", "");
             add("tags", "Array of Strings", "tags keywords", "");
+            add("category", "String", "category classification path", "");
             add("color", "String", "color hue shade tint", "");
             add("origin_country", "String", "origin country", "");
             add("manufacturer", "String", "manufacturer", "");
@@ -903,6 +951,9 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
             add("payment_date", "String", "payment date", "");
             add("payment_method", "String", "payment method type", "");
             add("payment_origin", "String", "payment origin pg gateway", "");
+            add("quantity", "Number", "quantity ordered count", "");
+            add("amount", "Number", "order total amount payment", "");
+            add("shipping_fee", "Number", "shipping fee cost", "");
         },
         "coupon" | "event" => {
             add("id,link", "", "id link", "");

@@ -411,3 +411,66 @@ pub fn verify_claims_v2(
     ));
     out
 }
+
+fn same_claim_value(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if let (Ok(x), Ok(y)) = (a.parse::<f64>(), b.parse::<f64>()) {
+        return (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0);
+    }
+    let fold = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let (fa, fb) = (fold(a), fold(b));
+    !fa.is_empty() && fa == fb
+}
+
+pub fn retain_merged_claims(
+    claims: &mut Vec<GroundingClaim>,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<GroundingClaim> {
+    use serde_json::Value;
+    fn hit(x: &Value, value: &str) -> bool {
+        match x {
+            Value::String(s) => same_claim_value(s, value),
+            Value::Number(n) => same_claim_value(&n.to_string(), value),
+            Value::Bool(b) => same_claim_value(&b.to_string(), value),
+            Value::Array(xs) => xs.iter().any(|e| !e.is_object() && hit(e, value)),
+            _ => false,
+        }
+    }
+    fn holds(node: &Value, field: &str, value: &str) -> bool {
+        match node {
+            Value::Object(o) => o.get(field).map(|x| hit(x, value)).unwrap_or(false),
+            Value::Array(rows) => rows.iter().any(|r| {
+                r.as_object()
+                    .and_then(|o| o.get(field))
+                    .map(|x| hit(x, value))
+                    .unwrap_or(false)
+            }),
+            _ => false,
+        }
+    }
+    let mut dropped: Vec<GroundingClaim> = Vec::new();
+    claims.retain(|c| {
+        let v = c.value.trim();
+        if v.is_empty() {
+            return true;
+        }
+        let kept = data.get(&c.field).map(|x| hit(x, v)).unwrap_or(false)
+            || data.values().any(|node| holds(node, &c.field, v));
+        if !kept {
+            dropped.push(c.clone());
+        }
+        kept
+    });
+    dropped
+}

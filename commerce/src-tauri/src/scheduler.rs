@@ -17,6 +17,7 @@ pub mod translit;
 pub mod indexing;
 mod worker;
 mod entity;
+pub mod relay_ledger;
 pub mod trading;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
@@ -29,7 +30,7 @@ use crate::utils::json_utils::merge_node;
 use crate::js_templates::*;
 
 pub use worker::start_background_worker;
-pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc};
+pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, entity_seed, entity_key_index, relay_type_key, relay_seed};
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
 
@@ -213,6 +214,9 @@ pub async fn process_task(
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
+            if let Some(line) = crate::model::lang_llm::prefetch("korean", app_handle, &task.id) {
+                emit_term(&format!("[Scheduler] {}", line));
+            }
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
@@ -374,6 +378,9 @@ pub async fn process_task(
         "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
         doc_lang
     );
+    if let Some(line) = crate::model::lang_llm::prefetch(&doc_lang, app_handle, &task.id) {
+        emit_term(&format!("[Scheduler] {}", line));
+    }
     // =====================================================================
     // 🌟 [MODE REROUTE] mode 가 commerce 여도 문서가 무역 서식이면 shipping 으로 넘깁니다.
     // ---------------------------------------------------------------------
@@ -3211,7 +3218,7 @@ pub async fn process_task(
                 None
             } else {
                 emit_term(&format!(
-                    "  🏷️ [HEADER GRID → PUG] {}행 x {}열 격자를 목록 분해에 주입합니다. (alt 라벨 + canonical 필드명 동봉)",
+                    "  🏷️ [HEADER GRID → PUG] {}행 x {}열 격자를 목록 분해에 주입합니다. (alt 라벨 + field 속성, 값 구분자 '|' 는 속성에 싣지 않음)",
                     trade_headers.len(),
                     trade_headers.first().map(|r| r.len()).unwrap_or(0)
                 ));
@@ -3286,27 +3293,46 @@ pub async fn process_task(
             
             
             let mut dead_action_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut control_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut plain_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut cell_value_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
             for item_pug in &pug_list {
                 let mut seen_in_this_item = std::collections::HashSet::new();
+                let mut seen_control = std::collections::HashSet::new();
+                let mut seen_plain = std::collections::HashSet::new();
                 for line in item_pug.lines() {
-
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
                         if !text_part.is_empty() && text_part.len() > 2 {
                             seen_in_this_item.insert(text_part.to_string());
+                            if pug_line_is_ui_control(line) {
+                                seen_control.insert(text_part.to_string());
+                            } else {
+                                seen_plain.insert(text_part.to_string());
+                            }
                         }
                     }
                 }
                 for text in seen_in_this_item {
                     *text_frequency.entry(text).or_insert(0) += 1;
                 }
+                for text in seen_control {
+                    *control_texts.entry(text).or_insert(0) += 1;
+                }
+                for text in seen_plain {
+                    *plain_texts.entry(text).or_insert(0) += 1;
+                }
 
                 let cell_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 let mut seen_sub = std::collections::HashSet::new();
                 let mut seen_dead = std::collections::HashSet::new();
+                let mut seen_cell_value = std::collections::HashSet::new();
 
                 for cell in parse_pug_grid(&cell_lines) {
+                    if let Some(t) = pug_cell_sole_value(&cell_lines, &cell.line_indices) {
+                        if t.len() > 2 { seen_cell_value.insert(t); }
+                    }
                     let has_real_link = cell.line_indices.iter()
                         .any(|&li| line_real_href(&cell_lines[li]).is_some());
                     if !has_real_link { continue; }
@@ -3330,27 +3356,34 @@ pub async fn process_task(
 
                 for t in seen_sub { *subordinate_texts.entry(t).or_insert(0) += 1; }
                 for t in seen_dead { *dead_action_texts.entry(t).or_insert(0) += 1; }
+                for t in seen_cell_value { *cell_value_texts.entry(t).or_insert(0) += 1; }
             }
 
             let mut boilerplate_texts = std::collections::HashSet::new();
+            let mut control_boilerplate: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut hard_drop_texts: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             let fields = parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
 
             let enum_guard_embs: Vec<Vec<f32>> = {
-                let mut embs = Vec::new();
-                for (fname, _, bias_target, _) in fields.iter() {
-                    let is_enum_like = fname.contains("status")
-                        || fname.contains("payment_method")
-                        || fname.contains("payment_origin")
-                        || fname.contains("condition")
-                        || fname.contains("currency");
-                    if is_enum_like {
-                        let e = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
-                        embs.push(e);
+                let mut phrases: Vec<String> = Vec::new();
+                for (fname, _, _, _) in fields.iter() {
+                    if detect_field_format(fname) != FieldFormat::Enum { continue; }
+                    let (mut label_phrases, _) = label_phrase_bank(&doc_lang, &page_type, fname);
+                    if label_phrases.is_empty() {
+                        label_phrases = label_phrase_bank_multilingual(&doc_lang, &page_type, fname).0;
+                    }
+                    for p in label_phrases {
+                        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
                     }
                 }
-                embs
+                if phrases.is_empty() {
+                    Vec::new()
+                } else {
+                    model.get_embedding_batch(phrases.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                }
             };
             
             
@@ -3382,61 +3415,91 @@ pub async fn process_task(
                     if count >= threshold {
 
                         let is_numeric_data = re_numeric.is_match(&text);
-                        
+                        if !is_numeric_data && text.len() > 3 && has_date_shape(&text) {
+                            crate::utils::score_dynamics::record_baseline("commerce.repeat_date_protect", 1.0);
+                            emit_term(&format!("[Scheduler] 🛡️ [DATE SHAPE PROTECT] 반복되지만 날짜 모양이라 UI 문구가 될 수 없어 실데이터로 보호: '{}' ({} / {} 아이템)", text, count, total_items));
+                            continue;
+                        }
                         if !is_numeric_data && text.len() > 3 {
-
-                            
-                            
-                            
-                            
-                            
-                            
                             let sub_hits = subordinate_texts.get(&text).copied().unwrap_or(0);
                             let dead_hits = dead_action_texts.get(&text).copied().unwrap_or(0);
-                            if sub_hits >= threshold || dead_hits >= threshold {
-                                boilerplate_texts.insert(text.clone());
-                                emit_term(&format!("[Scheduler] 🚫 [ACTION LINE DROP] 구조적으로 UI 액션/종속 라인 확정 탈락: '{}' ({} / {} 아이템 | Subordinate: {} | DeadHref: {})", text, count, total_items, sub_hits, dead_hits));
-                                continue;
-                            }
 
-                            
-                            //
-                            
-                            
-                            
-                            
-                            //
-                            
-                            
-                            
-                            
-                            
-                            
-                            //
-                            
-                            
-                            
                             let mut enum_sim = 0.0f32;
                             let mut chrome_sim = 0.0f32;
+                            let mut sim_pool: Vec<f32> = Vec::new();
                             if !enum_guard_embs.is_empty() || !ui_action_embs.is_empty() {
                                 let t_emb = model.get_embedding(text.clone()).await.unwrap_or(vec![0.0f32; 384]);
                                 for ge in &enum_guard_embs {
                                     let s = cosine_similarity(ge, &t_emb);
+                                    sim_pool.push(s);
                                     if s > enum_sim { enum_sim = s; }
                                 }
                                 for ce in &ui_action_embs {
                                     let s = cosine_similarity(ce, &t_emb);
+                                    sim_pool.push(s);
                                     if s > chrome_sim { chrome_sim = s; }
                                 }
                             }
-                            if enum_sim > chrome_sim {
-                                crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
-                                emit_term(&format!("[Scheduler] 🛡️ [ENUM VECTOR PROTECT] 반복되지만 스키마 유사도({:.4}) > UI 액션 유사도({:.4}) 이므로 실데이터로 보호: '{}' ({} / {} 아이템)", enum_sim, chrome_sim, text, count, total_items));
+                            let exact_chrome = chrome_sim >= 0.999;
+                            let exact_enum = enum_sim >= 0.999;
+                            let exact_action = exact_chrome && !exact_enum;
+                            let bank_shift = if !exact_chrome && sim_pool.len() >= 2 && !enum_guard_embs.is_empty() && !ui_action_embs.is_empty() {
+                                let n = sim_pool.len() as f32;
+                                let mean = sim_pool.iter().sum::<f32>() / n;
+                                let sd = (sim_pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                                sd * (gumbel_expected_z(ui_action_embs.len()) - gumbel_expected_z(enum_guard_embs.len()))
+                            } else {
+                                0.0
+                            };
+                            let control_hits = control_texts.get(&text).copied().unwrap_or(0);
+                            let plain_hits = plain_texts.get(&text).copied().unwrap_or(0);
+                            let semantic_data = if exact_chrome {
+                                exact_enum && control_hits < threshold
+                            } else {
+                                enum_sim + bank_shift >= chrome_sim
+                            };
+                            if sub_hits >= threshold || dead_hits >= threshold {
+                                boilerplate_texts.insert(text.clone());
+                                let hard = dead_hits >= threshold && !semantic_data;
+                                if hard {
+                                    hard_drop_texts.insert(text.clone());
+                                }
+                                emit_term(&format!("[Scheduler] 🚫 [ACTION LINE DROP] 구조적으로 UI 액션/종속 라인 확정 탈락: '{}' ({} / {} 아이템 | Subordinate: {} | DeadHref: {}{})", text, count, total_items, sub_hits, dead_hits, if hard { " | UI 액션 쪽 죽은 링크라 헤더 소유 칸도 보호하지 않음" } else { "" }));
+                                continue;
+                            }
+                            let control_drop = if exact_chrome {
+                                control_hits > 0
+                            } else {
+                                control_hits >= threshold && !semantic_data
+                            };
+                            if control_drop {
+                                control_boilerplate.insert(text.clone());
+                                if exact_action {
+                                    hard_drop_texts.insert(text.clone());
+                                }
+                                crate::utils::score_dynamics::record_baseline("commerce.ui_control_drop", 1.0);
+                                emit_term(&format!("[Scheduler] 🚫 [UI CONTROL DROP] '{}' 는 버튼/입력 컨트롤로 {} / {} 아이템에 나오고 UI 액션 쪽입니다 (EnumSim {:.4} + 보정 {:+.4} vs ChromeSim {:.4}). 컨트롤 라인을 탈락 대상으로 둡니다. 컨트롤 밖 같은 글자는 {} 아이템 → {}", text, control_hits, total_items, enum_sim, bank_shift, chrome_sim, plain_hits, if exact_action { "UI 액션 글자라 아래 판정을 계속합니다." } else if plain_hits < threshold { "반복 기준 미달이라 그대로 둡니다." } else { "아래 칸·의미 판정을 계속합니다." }));
+                                if plain_hits < threshold && !exact_action {
+                                    continue;
+                                }
+                            }
+                            let cell_hits = cell_value_texts.get(&text).copied().unwrap_or(0);
+                            if cell_hits >= threshold && !exact_action {
+                                crate::utils::score_dynamics::record_baseline("commerce.cell_value_margin", enum_sim - chrome_sim);
+                                emit_term(&format!("[Scheduler] 🛡️ [CELL VALUE PROTECT] 반복되지만 {} / {} 아이템에서 링크·입력 없는 표 칸의 유일한 글자(버튼·숨김 입력은 제외하고 셈)라 컬럼 상수값으로 보호: '{}' (참고: EnumSim {:.4} + 보정 {:+.4} vs ChromeSim {:.4})", cell_hits, total_items, text, enum_sim, bank_shift, chrome_sim));
                                 continue;
                             }
                             crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
+                            crate::utils::score_dynamics::record_baseline("commerce.ui_action_bank_shift", bank_shift);
+                            if semantic_data {
+                                emit_term(&format!("[Scheduler] 🛡️ [ENUM VECTOR PROTECT] 반복되지만 열거형 값 구 유사도({:.4}) + 은행 크기 보정({:+.4}) >= UI 액션 유사도({:.4}) 이므로 실데이터로 보호: '{}' ({} / {} 아이템)", enum_sim, bank_shift, chrome_sim, text, count, total_items));
+                                continue;
+                            }
                             boilerplate_texts.insert(text.clone());
-                            emit_term(&format!("[Scheduler] 🚫 [UI ACTION DROP] 전역 중복 텍스트 탈락: '{}' ({} / {} 아이템 | EnumSim: {:.4} <= ChromeSim: {:.4})", text, count, total_items, enum_sim, chrome_sim));
+                            if exact_action {
+                                hard_drop_texts.insert(text.clone());
+                            }
+                            emit_term(&format!("[Scheduler] 🚫 [UI ACTION DROP] 전역 중복 텍스트 탈락: '{}' ({} / {} 아이템 | EnumSim: {:.4} + 보정 {:+.4} vs ChromeSim: {:.4}{})", text, count, total_items, enum_sim, bank_shift, chrome_sim, if exact_action { " | UI 액션 구와 글자 그대로 일치 → 열거형 컬럼의 단독 값일 때만 헤더 소유 보호" } else if exact_chrome { " | 열거형·UI 액션 양쪽과 글자 그대로 일치 → 헤더 소유 칸만 보호" } else { " | UI 액션 쪽" }));
                         }
                     }
                 }
@@ -3547,20 +3610,7 @@ pub async fn process_task(
             let mut thead_embeddings = vec![vec![0.0; 384]; thead_lines.len()];
             
 
-            let thead_cells = parse_pug_grid(&thead_lines);
-            let mut header_cols: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-
-            for cell in &thead_cells {
-                for c in cell.col..(cell.col + cell.colspan) {
-                    let existing = header_cols.entry(c).or_insert(String::new());
-                    if !existing.is_empty() && !cell.text.is_empty() {
-                        existing.push_str(" > ");
-                    }
-                    if !cell.text.is_empty() {
-                        existing.push_str(&cell.text);
-                    }
-                }
-            }
+            let header_grid = HeaderGrid::new(parse_pug_grid(&thead_lines));
 
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
@@ -3609,21 +3659,113 @@ pub async fn process_task(
             }
 
 
-            let mut unique_headers = Vec::new();
-            for (_, h_text) in &header_cols {
-                let clean_h = h_text.trim();
-                if !clean_h.is_empty() && !unique_headers.contains(&clean_h.to_string()) {
-                    unique_headers.push(clean_h.to_string());
+            let mut unique_headers: Vec<String> = Vec::new();
+            let mut item_grids: Vec<Vec<GridCell>> = Vec::with_capacity(pug_list.len());
+            let mut interleaved_items = 0usize;
+            for item_pug in pug_list.iter() {
+                let item_cell_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
+                let cells = parse_pug_grid(&item_cell_lines);
+                if header_grid.interleaved_with(&cells) {
+                    interleaved_items += 1;
+                }
+                item_grids.push(cells);
+            }
+            let page_interleaved = interleaved_items > 0 && interleaved_items * 2 > pug_list.len();
+            for cells in item_grids.iter() {
+                for cell in cells.iter() {
+                    let label = header_grid.cell_label(cell.row, cell.col, cell.colspan, cell.rowspan, page_interleaved);
+                    let clean_h = label.trim();
+                    if !clean_h.is_empty() && !unique_headers.iter().any(|h| h == clean_h) {
+                        unique_headers.push(clean_h.to_string());
+                    }
                 }
             }
+            if unique_headers.is_empty() {
+                for col in 0..header_grid.column_count() {
+                    let label = header_grid.column_label(col);
+                    let clean_h = label.trim();
+                    if !clean_h.is_empty() && !unique_headers.iter().any(|h| h == clean_h) {
+                        unique_headers.push(clean_h.to_string());
+                    }
+                }
+            }
+            if page_interleaved {
+                emit_term(&format!(
+                    "  🧩 [HEADER GRID LABEL] 헤더 {}행과 본문 칸 배치가 행마다 겹치는 교차 배치 아이템 {}/{}개 (과반) → 좌표가 정확히 겹치는 헤더 칸은 그 칸 라벨을, 나머지 칸은 조인 라벨을 씁니다. | 라벨 {}개: {:?}",
+                    header_grid.rows, interleaved_items, pug_list.len(), unique_headers.len(), unique_headers
+                ));
+            }
+            crate::utils::score_dynamics::record_baseline(
+                "commerce.header_interleaved",
+                if page_interleaved { 1.0 } else { 0.0 },
+            );
 
             let mut header_to_field_map = std::collections::HashMap::new();
+            let mut header_evaluated: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut header_plausible: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            let list_field_vocab: Vec<Vec<String>> = fields
+                .iter()
+                .map(|(n, _, _, _)| crate::utils::ai_utils::field_value_vocabulary(&doc_lang, &page_type, n))
+                .collect();
+            let list_status_pivot = if fields.iter().any(|(n, _, _, _)| n == "status") {
+                crate::utils::ai_utils::status_pivot_bank(&model, &page_type, &doc_lang).await
+            } else {
+                None
+            };
+            if let Some(p) = list_status_pivot.as_ref() {
+                crate::utils::score_dynamics::record_baseline("commerce.status_pivot_align_z", p.align_z);
+                emit_term(&format!(
+                    "  🌉 [STATUS PIVOT BANK] '{}' 상태 목록 {}개 ↔ 'en' 같은 자리 | 정렬 z {:+.2} (기준 {:.1}) → {}",
+                    p.lang,
+                    p.src.len(),
+                    p.align_z,
+                    crate::utils::ai_utils::STATUS_PIVOT_ALIGN_Z,
+                    if p.usable() {
+                        "같은 자리끼리 번역 쌍으로 확인되어, 상태 원문을 영어 캐노니컬 어휘로 옮기는 데 씁니다"
+                    } else {
+                        "자리 대응이 확인되지 않아 쓰지 않습니다"
+                    }
+                ));
+            }
 
             if !unique_headers.is_empty() {
                 let header_embs: Vec<Vec<f32>> = model
                     .get_embedding_batch(unique_headers.clone())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_headers.len()]);
+                let header_terminal: Vec<String> = unique_headers
+                    .iter()
+                    .map(|h| h.rsplit(" > ").next().unwrap_or("").trim().to_string())
+                    .collect();
+                let header_leaf_texts: Vec<Option<String>> = unique_headers
+                    .iter()
+                    .zip(header_terminal.iter())
+                    .map(|(h, leaf)| {
+                        if leaf.is_empty() || leaf == h.trim() { return None; }
+                        let shared = header_terminal.iter().filter(|t| *t == leaf).count();
+                        if shared == 1 { Some(leaf.clone()) } else { None }
+                    })
+                    .collect();
+                let leaf_batch: Vec<String> = header_leaf_texts.iter().filter_map(|x| x.clone()).collect();
+                let leaf_batch_embs: Vec<Vec<f32>> = if leaf_batch.is_empty() {
+                    Vec::new()
+                } else {
+                    model.get_embedding_batch(leaf_batch.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; leaf_batch.len()])
+                };
+                let mut header_leaf_embs: Vec<Option<Vec<f32>>> = Vec::with_capacity(unique_headers.len());
+                {
+                    let mut k = 0usize;
+                    for lt in header_leaf_texts.iter() {
+                        if lt.is_some() {
+                            header_leaf_embs.push(leaf_batch_embs.get(k).cloned());
+                            k += 1;
+                        } else {
+                            header_leaf_embs.push(None);
+                        }
+                    }
+                }
 
                 let mut hdr_field_names: Vec<String> = Vec::new();
                 let mut hdr_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
@@ -3656,49 +3798,80 @@ pub async fn process_task(
                 let hdr_margin = 0.03f32;
 
                 let mut hdr_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_headers.len()]; hdr_field_names.len()];
+                let mut hdr_leaf_won: Vec<Vec<bool>> = vec![vec![false; unique_headers.len()]; hdr_field_names.len()];
                 for f in 0..hdr_field_names.len() {
                     for h in 0..unique_headers.len() {
                         if header_embs[h].iter().all(|&v| v == 0.0) { continue; }
-                        // 🌟 [SDS 계측] 이 필드가 이 헤더와 경쟁했다는 사실 자체를 남깁니다.
-                        //
-                        //  ── 왜 필요한가 ──
-                        //   score_dynamics.json 에서 field.* 관측은 트레이딩 경로가 전부입니다.
-                        //   커머스 0건, 비전 0건이라 T-3(학습형 prejudice)를 이 두 트랙으로
-                        //   확장할 근거가 없습니다. seen 이 있어야 거절률이 비율로 읽힙니다.
                         crate::utils::score_dynamics::record_field_seen(&hdr_field_names[f]);
-                        let own = weighted_max_pool_sim(&header_embs[h], &hdr_label_embs[f], &hdr_label_weights[f]);
+                        let score_of = |emb: &Vec<f32>| -> (f32, f32, f32) {
+                            let own = weighted_max_pool_sim(emb, &hdr_label_embs[f], &hdr_label_weights[f]);
+                            let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(emb, &hdr_prej_embs[f]) };
+                            (own, prej, own - prej)
+                        };
+                        let joined = score_of(&header_embs[h]);
+                        let joined_ok = joined.0 >= hdr_abs_floor && joined.2 >= hdr_score_floor;
+                        let mut chosen = joined;
+                        let mut is_leaf = false;
+                        if let Some(Some(le)) = header_leaf_embs.get(h) {
+                            if !le.iter().all(|&v| v == 0.0) {
+                                let leaf = score_of(le);
+                                let leaf_ok = leaf.0 >= hdr_abs_floor && leaf.2 >= hdr_score_floor;
+                                if leaf_ok && (!joined_ok || leaf.2 > joined.2) {
+                                    chosen = leaf;
+                                    is_leaf = true;
+                                }
+                            }
+                        }
+                        let (own, prej, score) = chosen;
                         if own < hdr_abs_floor {
-                            // 라벨 자체가 약해서 탈락한 경우입니다. 편견과 구분해 둡니다.
                             crate::utils::score_dynamics::record_near_miss(&hdr_field_names[f]);
                             continue;
                         }
-                        let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&header_embs[h], &hdr_prej_embs[f]) };
-                        let score = own - prej;
                         if score < hdr_score_floor {
                             emit_term(&format!("    🚫 [HEADER PREJUDICE DROP] '{}' → '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4} < {:.2}", unique_headers[h], hdr_field_names[f], own, prej, score, hdr_score_floor));
-                            // 🌟 [SDS 계측] 라벨은 충분했는데 편견이 이겨서 탈락한 경우입니다.
                             crate::utils::score_dynamics::record_field_reject(
                                 &hdr_field_names[f],
                                 crate::utils::score_dynamics::GateKind::Prejudice,
                             );
                             continue;
                         }
+                        if is_leaf {
+                            if joined_ok {
+                                crate::utils::score_dynamics::record_baseline("commerce.header_leaf_evidence", 1.0);
+                                emit_term(&format!("    🌿 [HEADER LEAF EVIDENCE] '{}' → '{}' | 조인 라벨 Score {:+.4} 보다 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 의 Score {:+.4} 가 높아 하위 라벨을 근거로 씁니다. 상위 그룹명은 형제 칼럼 전부에 같이 붙어 조인 라벨끼리의 마진을 깎으므로, 조인 라벨이 하한을 겨우 넘긴 칼럼은 배타 배정의 마진에서 떨어집니다.", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                            } else {
+                                emit_term(&format!("    🌿 [HEADER LEAF RESCUE] '{}' → '{}' | 조인 라벨 Score {:+.4} 가 하한 미달이라, 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 로 다시 쟀습니다 → Score {:+.4}", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                            }
+                        }
                         hdr_matrix[f][h] = score;
+                        hdr_leaf_won[f][h] = is_leaf;
                     }
                 }
 
+                for h in 0..unique_headers.len() {
+                    if !header_embs[h].iter().all(|&v| v == 0.0) {
+                        header_evaluated.insert(unique_headers[h].clone());
+                    }
+                }
+                for f in 0..hdr_field_names.len() {
+                    if hdr_label_embs[f].iter().all(|e| e.iter().all(|&v| v == 0.0)) {
+                        continue;
+                    }
+                    let set: std::collections::HashSet<String> = (0..unique_headers.len())
+                        .filter(|&h| hdr_matrix[f][h] >= hdr_score_floor)
+                        .map(|h| unique_headers[h].clone())
+                        .collect();
+                    header_plausible.insert(hdr_field_names[f].clone(), set);
+                }
                 let hdr_assign = exclusive_assign(&hdr_matrix, hdr_score_floor, hdr_margin);
                 for (f, a) in hdr_assign.iter().enumerate() {
                     match a {
                         Some((h, score, margin)) => {
                             header_to_field_map.insert(unique_headers[*h].clone(), hdr_field_names[f].clone());
-                            emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}", unique_headers[*h], hdr_field_names[f], score, margin));
-                            // 🌟 [SDS 계측] 헤더 확정 마진을 남깁니다.
-                            //
-                            //  ── 실측 ──
-                            //   확정 3건의 마진이 +0.0538 / +0.0829 / +0.0330 이었습니다.
-                            //   고정 임계 hdr_margin = 0.03 바로 위입니다.
-                            //   이 상수가 이 사이트에서 적절한지는 분포를 봐야 알 수 있습니다.
+                            emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}{}", unique_headers[*h], hdr_field_names[f], score, margin, if hdr_leaf_won[f][*h] { " | 하위 라벨 기준" } else { "" }));
+                            if hdr_leaf_won[f][*h] {
+                                crate::utils::score_dynamics::record_baseline("commerce.header_leaf_win", 1.0);
+                            }
                             crate::utils::score_dynamics::record_field_assigned(
                                 &hdr_field_names[f],
                                 *margin,
@@ -3798,6 +3971,39 @@ pub async fn process_task(
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 
 
+                let item_cells = parse_pug_grid(&item_lines);
+                let mut line_owner_field: Vec<Option<String>> = vec![None; item_lines.len()];
+                let mut line_header_label: Vec<Option<String>> = vec![None; item_lines.len()];
+                for cell in &item_cells {
+                    let h_text = header_grid.cell_label(cell.row, cell.col, cell.colspan, cell.rowspan, page_interleaved);
+                    let h_clean = h_text.trim();
+                    if h_clean.is_empty() { continue; }
+                    let owner = header_to_field_map.get(h_clean).cloned();
+                    for &line_idx in &cell.line_indices {
+                        if line_idx >= item_lines.len() { continue; }
+                        line_header_label[line_idx] = Some(h_clean.to_string());
+                        if let Some(o) = &owner {
+                            line_owner_field[line_idx] = Some(o.clone());
+                        }
+                    }
+                }
+                let mut line_aux_control: Vec<bool> = vec![false; item_lines.len()];
+                let mut line_sole_value: Vec<bool> = vec![false; item_lines.len()];
+                for cell in &item_cells {
+                    let visible: Vec<usize> = cell.line_indices.iter().copied()
+                        .filter(|&li| li < item_lines.len() && pug_line_visible_data(&item_lines[li]))
+                        .collect();
+                    if visible.len() == 1 {
+                        line_sole_value[visible[0]] = true;
+                    }
+                    if visible.is_empty() { continue; }
+                    for &li in &cell.line_indices {
+                        if li < item_lines.len() && pug_line_is_ui_control(&item_lines[li]) {
+                            line_aux_control[li] = true;
+                        }
+                    }
+                }
+
                 for i in 0..item_lines.len() {
                     {
                         let l = item_lines[i].trim_start();
@@ -3819,51 +4025,48 @@ pub async fn process_task(
                     let line = &item_lines[i];
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
-                        if boilerplate_texts.contains(text_part) {
-
-                            
-                            
-                            
-                            let has_link_or_event = line_real_href(line).is_some() || line.contains("onclick") || line.contains("data-url");
-                            if has_link_or_event {
-                                emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (실제 이동 href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
-                                continue;
+                        let is_control = pug_line_is_ui_control(line);
+                        let control_dup = is_control && control_boilerplate.contains(text_part);
+                        if boilerplate_texts.contains(text_part) || control_dup {
+                            if !is_control {
+                                let has_link_or_event = line_real_href(line).is_some() || line.contains("onclick") || line.contains("data-url");
+                                if has_link_or_event {
+                                    emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (실제 이동 href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
+                                    continue;
+                                }
+                            }
+                            let owner_enum = line_owner_field[i].as_ref().map_or(false, |o| detect_field_format(o) == FieldFormat::Enum);
+                            let header_protectable = !(is_control && line_aux_control[i])
+                                && (!hard_drop_texts.contains(text_part) || (owner_enum && line_sole_value[i] && !line.contains("href=")));
+                            if header_protectable {
+                                if let Some(owner) = line_owner_field[i].as_ref() {
+                                    crate::utils::score_dynamics::record_baseline("commerce.header_repeat_protect", 1.0);
+                                    emit_term(&format!("    🛡️ [HEADER OWNED PROTECT / REPEAT] Item Line {}/{} : {} (전 아이템 반복 텍스트지만 '{}' 컬럼으로 헤더 코사인 확정된 칸의 값이라 보호합니다)", i + 1, item_lines.len(), text_part, owner));
+                                    continue;
+                                }
                             }
 
-                            emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
+                            emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} ({})", i + 1, item_lines.len(), text_part, if is_control { "반복 버튼/입력 컨트롤 탈락" } else { "반복 UI 탈락" }));
 
                             item_lines[i] = format!("{} ", &line[..=idx]);
                         }
                     }
                 }
 
-
-                let item_cells = parse_pug_grid(&item_lines);
                 let mut line_enriched_texts = vec![String::new(); item_lines.len()];
-                
-                
-                
-                let mut line_owner_field: Vec<Option<String>> = vec![None; item_lines.len()];
-                
                 for cell in &item_cells {
-                    let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
-                    let owner = header_to_field_map.get(h_text.trim()).cloned();
                     for &line_idx in &cell.line_indices {
-                        if let Some(o) = &owner {
-                            line_owner_field[line_idx] = Some(o.clone());
-                        }
+                        if line_idx >= item_lines.len() { continue; }
                         let original_text = if let Some(p) = item_lines[line_idx].find('|') {
                             item_lines[line_idx][p + 1..].trim()
                         } else {
                             ""
                         };
-                        if !original_text.is_empty() {
-                            line_enriched_texts[line_idx] = if h_text.is_empty() {
-                                original_text.to_string()
-                            } else {
-                                format!("{} | {}", h_text, original_text)
-                            };
-                        }
+                        if original_text.is_empty() { continue; }
+                        line_enriched_texts[line_idx] = match &line_header_label[line_idx] {
+                            Some(h) => format!("{} | {}", h, original_text),
+                            None => original_text.to_string(),
+                        };
                     }
                 }
 
@@ -4009,6 +4212,23 @@ pub async fn process_task(
                 let mut header_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut header_id_tokens: Vec<String> = Vec::new();
 
+                let mut owner_line_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut owner_real_href: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut owner_dead_href: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for line_idx in 0..item_lines_ref.len() {
+                    if let Some(o) = &line_owner_field[line_idx] {
+                        if line_values[line_idx].is_empty() || line_aux_control[line_idx] { continue; }
+                        *owner_line_counts.entry(o.clone()).or_insert(0) += 1;
+                        let raw = item_lines_ref[line_idx];
+                        if line_real_href(raw).is_some() {
+                            *owner_real_href.entry(o.clone()).or_insert(0) += 1;
+                        } else if raw.contains("href=") {
+                            *owner_dead_href.entry(o.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut rep_meta: std::collections::HashMap<String, (usize, (u8, u8, i32, f32, usize))> = std::collections::HashMap::new();
+
                 for line_idx in 0..item_lines_ref.len() {
                     let owner_field = match &line_owner_field[line_idx] {
                         Some(o) => o.clone(),
@@ -4018,9 +4238,36 @@ pub async fn process_task(
 
                     let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
                     let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
-                    if clean_text.is_empty() || clean_text.chars().count() < 2 { continue; }
+                    let owner_fmt = detect_field_format(&owner_field);
+                    if owner_fmt == FieldFormat::Link && !is_id_link_field(&owner_field) {
+                        if let Some(src) = crate::utils::ai_utils::line_media_src(item_lines_ref[line_idx]) {
+                            header_owned_lines.insert(line_idx);
+                            let already = pre_mapped_hints
+                                .iter()
+                                .any(|h: &serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str()));
+                            if !already {
+                                pre_mapped_hints.push(json!({
+                                    "target_column": owner_field.clone(),
+                                    "extracted_value": src.clone(),
+                                    "line_rank": 2
+                                }));
+                                rep_meta.insert(owner_field.clone(), (line_idx, (0u8, 0u8, 2i32, 0.0f32, src.chars().count())));
+                                crate::utils::score_dynamics::record_field_assigned(&owner_field, 0.0);
+                                crate::utils::score_dynamics::record_baseline("commerce.media_src_harvest", 1.0);
+                                emit_term(&format!("    🖼️ [HEADER OWNED / MEDIA SRC] '{}' ← Item Line {} | 이 칸에는 글자 값이 없고 img 의 src 만 있습니다. Link 형식 필드는 글자가 아니라 주소가 값이므로 src 를 그대로 확정합니다: {}", owner_field, line_idx + 1, src));
+                            }
+                            continue;
+                        }
+                    }
+                    let min_chars = if owner_fmt == FieldFormat::Numeric { 1 } else { 2 };
+                    if clean_text.is_empty() || clean_text.chars().count() < min_chars { continue; }
 
                     header_owned_lines.insert(line_idx);
+
+                    if line_aux_control[line_idx] {
+                        emit_term(&format!("    ⏭️ [AUX CONTROL SKIP] '{}' ← Item Line {} (\"{}\") | 같은 칸에 데이터 라인이 있는 버튼/입력 컨트롤이라 값 후보에서 뺍니다. 라인은 이 컬럼 소유로 남습니다.", owner_field, line_idx + 1, clean_text));
+                        continue;
+                    }
 
                     if is_id_link_field(&owner_field) {
                         for tok in clean_text.split(|c: char| !c.is_alphanumeric()) {
@@ -4029,6 +4276,30 @@ pub async fn process_task(
                             if !header_id_tokens.iter().any(|t| t == tok) { header_id_tokens.push(tok.to_string()); }
                         }
                         emit_term(&format!("    🔑 [HEADER OWNED / ID COLUMN] Item Line {} 는 '{}' 컬럼입니다. 결정론적 ID/LINK 해석기에 위임하고 타 컬럼 선점을 차단합니다.", line_idx + 1, owner_field));
+                        continue;
+                    }
+
+                    let owner_fmt_ok = match owner_fmt {
+                        FieldFormat::Link | FieldFormat::Synthesis => true,
+                        FieldFormat::Identifier => {
+                            clean_text.chars().any(|c| c.is_ascii_digit()) || value_token_in_url_pool(clean_text, &url_pool)
+                        }
+                        FieldFormat::Enum => {
+                            value_matches_format(owner_fmt, clean_text) && enum_value_reject(&owner_field, clean_text).is_none()
+                        }
+                        _ => value_matches_format(owner_fmt, clean_text),
+                    };
+                    if !owner_fmt_ok {
+                        crate::utils::score_dynamics::record_field_seen(&owner_field);
+                        crate::utils::score_dynamics::record_field_reject(
+                            &owner_field,
+                            if owner_fmt == FieldFormat::Enum {
+                                crate::utils::score_dynamics::GateKind::Enum
+                            } else {
+                                crate::utils::score_dynamics::GateKind::Format
+                            },
+                        );
+                        emit_term(&format!("    🚫 [HEADER OWNED FORMAT REJECT] '{}' ({:?}) ← Item Line {} (\"{}\") | 헤더 칸의 값이 필드 형식과 맞지 않아 주입하지 않습니다. 라인은 이 컬럼 소유로 남아 다른 필드도 가져가지 못합니다.", owner_field, owner_fmt, line_idx + 1, clean_text));
                         continue;
                     }
 
@@ -4045,37 +4316,90 @@ pub async fn process_task(
                         continue;
                     }
 
-                    
-                    
-                    
-                    
-                    
                     let raw_line = item_lines_ref[line_idx];
-                    let line_rank: i32 = if line_real_href(raw_line).is_some() {
+                    let multi_line = owner_line_counts.get(&owner_field).copied().unwrap_or(0) >= 2;
+                    let action_scores: Option<(f32, f32)> = if multi_line && !ui_action_embs.is_empty() {
+                        match fields.iter().position(|(n, _, _, _)| n == &owner_field) {
+                            Some(oi) => {
+                                let v_emb = model.get_embedding(clean_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                                if v_emb.iter().all(|&v| v == 0.0) {
+                                    None
+                                } else {
+                                    let own = weighted_max_pool_sim(&v_emb, &field_phrase_embs[oi], &field_phrase_weights[oi]);
+                                    let chrome = max_pool_sim(&v_emb, &ui_action_embs);
+                                    crate::utils::score_dynamics::record_baseline("commerce.premap_action_margin", own - chrome);
+                                    Some((own - chrome, chrome))
+                                }
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let action_margin = action_scores.map(|(m, _)| m);
+                    let is_real_href = line_real_href(raw_line).is_some();
+                    let real_links = owner_real_href.get(&owner_field).copied().unwrap_or(0);
+                    let dead_links = owner_dead_href.get(&owner_field).copied().unwrap_or(0);
+                    let menu_penalty: u8 = if is_real_href && dead_links >= 1 && real_links >= 2 { 1 } else { 0 };
+                    let dropdown_trigger = !is_real_href && raw_line.contains("href=") && dead_links == 1 && real_links >= 2;
+                    let noise_band = if dropdown_trigger && action_scores.is_some() {
+                        crate::utils::score_dynamics::adaptive_baseline("commerce.premap_action_margin")
+                            .map(|(_, sd)| sd)
+                            .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let trigger_hold = dropdown_trigger
+                        && action_scores.map_or(false, |(m, chrome)| m < 0.0 && m >= -noise_band && chrome < 0.999);
+                    if trigger_hold {
+                        crate::utils::score_dynamics::record_baseline("commerce.premap_trigger_hold", 1.0);
+                        emit_term(&format!(
+                            "    🛡️ [PREMAP TRIGGER HOLD] '{}' ← Item Line {} (\"{}\") | 같은 칸의 실링크 {}개가 드롭다운 메뉴이고 이 줄은 그 메뉴를 여는 죽은 링크 트리거입니다. 트리거 글자는 칸의 값(주문자 이름 등)이고 UI 액션 구와 글자가 같지 않습니다. 필드 구 - UI 액션 구 = {:+.4} 가 SDS commerce.premap_action_margin 표준편차 {:.4} 안쪽이라 코사인만으로 UI 액션으로 강등하지 않습니다.",
+                            owner_field, line_idx + 1, clean_text, real_links,
+                            action_margin.unwrap_or(0.0), noise_band
+                        ));
+                    }
+                    let action_like = !trigger_hold && action_margin.map_or(false, |m| m < 0.0);
+                    let line_margin = action_margin.unwrap_or(0.0);
+                    let line_rank: i32 = if is_real_href {
                         2
-                    } else if raw_line.contains("href=") {
+                    } else if is_bracket_annotation(clean_text) {
                         0
                     } else {
                         1
                     };
+                    let new_key: (u8, u8, i32, f32, usize) = (
+                        menu_penalty,
+                        if action_like { 1 } else { 0 },
+                        line_rank,
+                        line_margin,
+                        clean_text.chars().count(),
+                    );
+                    if action_like || menu_penalty == 1 {
+                        crate::utils::score_dynamics::record_baseline("commerce.premap_action_demote", 1.0);
+                        emit_term(&format!("    🧹 [PREMAP DEMOTE] '{}' ← Item Line {} (\"{}\") |{}{} | 필드 구 - UI 액션 구 = {:+.4}", owner_field, line_idx + 1, clean_text, if menu_penalty == 1 { format!(" 드롭다운 메뉴 링크 (같은 칸 죽은 링크 트리거 {}개 · 실링크 {}개)", dead_links, real_links) } else { String::new() }, if action_like { " · UI 액션 쪽" } else { "" }, line_margin));
+                    }
 
                     if let Some(existing) = pre_mapped_hints.iter_mut().find(|h: &&mut serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str())) {
                         let prev = existing.get("extracted_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let prev_rank = existing.get("line_rank").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        let prev_key = rep_meta.get(&owner_field).map(|m| m.1).unwrap_or((0, 0, 1, 0.0, prev.chars().count()));
 
                         if is_multi_value_field(&owner_field) {
-                            if !prev.is_empty() && prev != clean_text {
+                            if action_like {
+                                emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 다중값 병합에서 UI 액션 라인 \"{}\" 는 제외합니다.", owner_field, clean_text));
+                            } else if prev_key.1 == 1 {
+                                existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(clean_text));
+                                rep_meta.insert(owner_field.clone(), (line_idx, new_key));
+                                emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_key.2, clean_text, line_rank));
+                            } else if !prev.is_empty() && prev != clean_text {
                                 existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(format!("{} {}", prev, clean_text)));
                             }
-                        } else if prev.is_empty()
-                            || line_rank > prev_rank
-                            || (line_rank == prev_rank && clean_text.chars().count() > prev.chars().count())
-                        {
+                        } else if prev.is_empty() || premap_rep_better(new_key, prev_key) {
                             existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(clean_text));
-                            existing.as_object_mut().unwrap().insert("line_rank".to_string(), json!(line_rank));
-                            emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_rank, clean_text, line_rank));
+                            rep_meta.insert(owner_field.clone(), (line_idx, new_key));
+                            emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_key.2, clean_text, line_rank));
                         } else {
-                            emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 는 이미 상위 랭크 대표값(\"{}\")을 확보하여 \"{}\" (Rank {}) 는 병합하지 않습니다.", owner_field, prev, clean_text, line_rank));
+                            emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 는 이미 상위 대표값(\"{}\")을 확보하여 \"{}\" (Rank {}) 는 병합하지 않습니다.", owner_field, prev, clean_text, line_rank));
                         }
                     } else {
                         pre_mapped_hints.push(json!({
@@ -4083,8 +4407,22 @@ pub async fn process_task(
                             "extracted_value": clean_text,
                             "line_rank": line_rank
                         }));
+                        rep_meta.insert(owner_field.clone(), (line_idx, new_key));
                     }
                     emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' (Rank {}) via Header cosine", line_idx + 1, owner_field, line_rank));
+                }
+
+                let premap_handoff: Vec<(String, usize)> = rep_meta
+                    .iter()
+                    .filter(|(_, (_, k))| k.1 == 1)
+                    .map(|(o, (li, _))| (o.clone(), *li))
+                    .collect();
+                let mut premap_handoff_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (owner, li) in premap_handoff {
+                    pre_mapped_hints.retain(|h| h.get("target_column").and_then(|v| v.as_str()) != Some(owner.as_str()));
+                    premap_handoff_fields.insert(owner.clone());
+                    crate::utils::score_dynamics::record_baseline("commerce.premap_action_handoff", 1.0);
+                    emit_term(&format!("    🎯 [PREMAP ACTION HANDOFF] '{}' 칸의 후보가 모두 UI 액션 쪽이라 값 우회(PRE-MAP BYPASS)를 멈추고, 한 줄 강제 없이 아이템 전체 문맥으로 LLM 이 고르게 합니다. (최선 후보 Item Line {})", owner, li + 1));
                 }
                 
 
@@ -4197,11 +4535,16 @@ pub async fn process_task(
                     }
                 }
 
-                
-                
-                
-                
-                
+                let field_header_mapped: Vec<bool> = fields
+                    .iter()
+                    .map(|(n, _, _, _)| header_to_field_map.values().any(|v| v == n))
+                    .collect();
+                let mut enum_value_blocked = 0usize;
+                let mut column_contract_blocked = 0usize;
+                let mut column_absent_blocked = vec![0usize; fields.len()];
+                let aux_control_lines = (0..item_lines_ref.len())
+                    .filter(|&l| line_aux_control[l] && !det_consumed_lines.contains(&l) && !line_values[l].is_empty())
+                    .count();
                 let (mut vector_assignment, vector_raw_matrix): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>) = {
                     let line_count = item_lines_ref.len();
                     let field_count = field_phrase_embs.len();
@@ -4214,6 +4557,7 @@ pub async fn process_task(
                             if item_lines_ref[l].trim().is_empty() { continue; }
                             if item_embeddings[l].iter().all(|&v| v == 0.0) { continue; }
                             if det_consumed_lines.contains(&l) { continue; }
+                            if line_aux_control[l] { continue; }
 
                             let value = &line_values[l];
                             let format_ok = match fmt {
@@ -4221,6 +4565,29 @@ pub async fn process_task(
                                 _ => value_matches_format(fmt, value),
                             };
                             if !format_ok { continue; }
+                            if fmt == FieldFormat::Enum && enum_value_reject(&fields[f].0, value).is_some() {
+                                enum_value_blocked += 1;
+                                continue;
+                            }
+                            if field_header_mapped.get(f).copied().unwrap_or(false) {
+                                if let Some(h) = &line_header_label[l] {
+                                    let owner_of_line = header_to_field_map.get(h.as_str()).map(|o| o.as_str());
+                                    if owner_of_line != Some(fields[f].0.as_str()) {
+                                        column_contract_blocked += 1;
+                                        continue;
+                                    }
+                                }
+                            } else if crate::utils::ai_utils::header_column_foreign(
+                                &fields[f].0,
+                                line_header_label[l].as_deref(),
+                                value,
+                                &list_field_vocab[f],
+                                &header_evaluated,
+                                &header_plausible,
+                            ) {
+                                column_absent_blocked[f] += 1;
+                                continue;
+                            }
 
                             raw[f][l] = weighted_max_pool_sim(
                                 &item_embeddings[l],
@@ -4245,6 +4612,19 @@ pub async fn process_task(
                             .collect();
                         if cands.len() == 1 {
                             let l = cands[0];
+                            let lone_foreign = column_absent_blocked[f] > 0
+                                || (!list_field_vocab[f].is_empty()
+                                    && crate::utils::ai_utils::header_judged_foreign(
+                                        &fields[f].0,
+                                        line_header_label[l].as_deref(),
+                                        &header_evaluated,
+                                        &header_plausible,
+                                    ));
+                            if lone_foreign
+                                && !crate::utils::ai_utils::value_equals_vocabulary(&line_values[l], &list_field_vocab[f])
+                            {
+                                continue;
+                            }
                             assign[f] = Some((l, centered[f][l], 0.0));
                             claimed[l] = true;
                         }
@@ -4252,6 +4632,53 @@ pub async fn process_task(
 
                     (assign, raw)
                 };
+                if enum_value_blocked > 0 || column_contract_blocked > 0 || aux_control_lines > 0 {
+                    crate::utils::score_dynamics::record_baseline("commerce.enum_value_block", enum_value_blocked as f32);
+                    crate::utils::score_dynamics::record_baseline("commerce.column_contract_block", column_contract_blocked as f32);
+                    crate::utils::score_dynamics::record_baseline("commerce.aux_control_block", aux_control_lines as f32);
+                    emit_term(&format!("    🧱 [COLUMN CONTRACT] 열거형 값이 될 수 없는 후보(순수 수치·통화 표지 없음) {}건, 헤더로 컬럼이 확정된 필드의 다른 컬럼 후보 {}건을 배정 행렬에서 제외했고, 데이터 칸에 붙은 보조 버튼/입력 라인 {}개는 후보에서 뺐습니다.", enum_value_blocked, column_contract_blocked, aux_control_lines));
+                }
+                let column_absent_total: usize = column_absent_blocked.iter().sum();
+                if column_absent_total > 0 {
+                    crate::utils::score_dynamics::record_baseline("commerce.column_absent_block", column_absent_total as f32);
+                    let per_field: Vec<String> = fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(f, _)| column_absent_blocked[*f] > 0)
+                        .map(|(f, (n, _, _, _))| format!("{}:{}", n, column_absent_blocked[f]))
+                        .collect();
+                    emit_term(&format!("    🧱 [COLUMN ABSENT] 헤더 매핑이 없는 닫힌 어휘 필드(열거형·색상 등)의 후보 중, 헤더 판정에서 그 필드의 칸이 될 수 없다고 나왔고 값도 그 필드의 어휘에 걸리지 않는 라인 {}건을 배정 행렬에서 뺐습니다. {:?} (헤더가 없는 라인, 값이 어휘에 걸리는 라인, 자유 글자 필드와 통화·id,link·링크 필드는 그대로 둡니다)", column_absent_total, per_field));
+                }
+                let mut evt_blocked: Vec<usize> = Vec::new();
+                for (f, a) in vector_assignment.iter().enumerate() {
+                    let l = match a { Some((l, _, _)) => *l, None => continue };
+                    if header_forced_assign.contains_key(&fields[f].0) { continue; }
+                    let cands: Vec<f32> = vector_raw_matrix[f].iter().copied().filter(|v| *v > -1.0).collect();
+                    if cands.len() < 3 { continue; }
+                    let n = cands.len() as f32;
+                    let mean = cands.iter().sum::<f32>() / n;
+                    let sd = (cands.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                    let z = (vector_raw_matrix[f][l] - mean) / sd - gumbel_expected_z(cands.len());
+                    crate::utils::score_dynamics::record_baseline("commerce.value_assign_evt", z);
+                    if z < 0.0 {
+                        let header_foreign = crate::utils::ai_utils::header_judged_foreign(
+                            &fields[f].0,
+                            line_header_label[l].as_deref(),
+                            &header_evaluated,
+                            &header_plausible,
+                        ) && !crate::utils::ai_utils::value_equals_vocabulary(&line_values[l], &list_field_vocab[f]);
+                        crate::utils::score_dynamics::record_baseline("commerce.value_assign_evt_block", if header_foreign { 1.0 } else { 0.0 });
+                        if header_foreign {
+                            emit_term(&format!("    🚫 [VALUE ASSIGN EVT BLOCK] '{}' ← Line {} (헤더 '{}') | 배정 유사도가 후보 {}개의 무작위 최댓값 기대치에 못 미치고 (z {:+.3}), 이 라인의 헤더도 헤더 판정에서 '{}' 의 칸이 될 수 없다고 나왔습니다. 서로 독립인 두 음성 근거가 겹쳐 배정을 풉니다. 풀지 않으면 LLM 이 이 라인을 근거로 옆 칸의 값을 빌려 옵니다.", fields[f].0, l + 1, line_header_label[l].as_deref().unwrap_or(""), cands.len(), z, fields[f].0));
+                            evt_blocked.push(f);
+                            continue;
+                        }
+                        emit_term(&format!("    📐 [VALUE ASSIGN EVT] '{}' ← Line {} | 배정된 라인의 유사도가 후보 {}개 분포에서 무작위 최댓값 기대치에 못 미칩니다 (z {:+.3}). 이 라인의 헤더가 이 필드의 칸이 될 수 없다는 판정은 없어 이번 라운드는 관측만 하고 배정은 그대로 둡니다.", fields[f].0, l + 1, cands.len(), z));
+                    }
+                }
+                for f in evt_blocked {
+                    vector_assignment[f] = None;
+                }
 
                 
                 
@@ -4331,8 +4758,12 @@ pub async fn process_task(
                 }
 
 
-                for (f_idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.clone().into_iter().enumerate() {
-                    
+                let field_order: Vec<usize> = (0..fields.len())
+                    .filter(|i| !field_is_analytic[*i])
+                    .chain((0..fields.len()).filter(|i| field_is_analytic[*i]))
+                    .collect();
+                for f_idx in field_order {
+                    let (field_name, field_desc, bias_target, prejudice_target) = fields[f_idx].clone();
 
                     let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                     let mut bypassed_values: Vec<(String, String)> = Vec::new();
@@ -4425,6 +4856,43 @@ pub async fn process_task(
                         }
                     }
 
+                    let currency_ev = if field_name.to_lowercase().contains("currency") {
+                        let texts: Vec<String> = (0..item_lines_ref.len())
+                            .map(|l| {
+                                if line_enriched_texts[l].is_empty() {
+                                    line_values[l].clone()
+                                } else {
+                                    line_enriched_texts[l].clone()
+                                }
+                            })
+                            .collect();
+                        Some(crate::utils::ai_utils::currency_evidence(&texts))
+                    } else {
+                        None
+                    };
+                    if let Some(ev) = currency_ev.as_ref() {
+                        let unmarked_price_line = (0..item_lines_ref.len()).any(|l| {
+                            let price_owned = line_owner_field[l].as_deref().map_or(false, |o| {
+                                let lo = o.to_lowercase();
+                                lo.contains("price") || lo.contains("amount")
+                            });
+                            let text = if line_enriched_texts[l].is_empty() { &line_values[l] } else { &line_enriched_texts[l] };
+                            price_owned && line_sole_value[l] && crate::utils::ai_utils::currency_line_unmarked(text)
+                        });
+                        if let Some(code) = ev.single().filter(|_| !unmarked_price_line) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(code));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, 0.0);
+                            crate::utils::score_dynamics::record_baseline("commerce.currency_grounded", 1.0);
+                            emit_term(&format!("    💱 [CURRENCY GROUNDED] '{}' ← '{}' | 이 아이템 라인의 통화 표지가 금액에 붙은 한 가지 코드로만 풀립니다 ({}). LLM 없이 확정합니다.", field_name, code, ev.describe()));
+                            continue;
+                        }
+                        if ev.is_silent() {
+                            crate::utils::score_dynamics::record_baseline("commerce.currency_silent_default", 1.0);
+                            emit_term(&format!("    💱 [CURRENCY GROUNDED / DEFAULT] '{}' | 이 아이템 라인 어디에도 통화 표지가 없습니다. LLM 에게 묻지 않고 비워 두며, 저장 직전 문서 언어 기본 통화가 들어갑니다.", field_name));
+                            continue;
+                        }
+                    }
+
                     
                     let (best_item_idx, best_item_contrast, best_item_margin, has_vector_match) = match vector_assignment[f_idx] {
                         Some((l, contrast, margin)) => (l, contrast, margin, true),
@@ -4465,11 +4933,8 @@ pub async fn process_task(
                             for other in 0..field_phrase_embs.len() {
                                 if other == f_idx { continue; }
                                 if field_is_analytic[other] { continue; }
-                                let s = weighted_max_pool_sim(
-                                    &item_embeddings[l],
-                                    &field_phrase_embs[other],
-                                    &field_phrase_weights[other],
-                                );
+                                let s = vector_raw_matrix[other][l];
+                                if s < 0.0 { continue; }
                                 if s > rival { rival = s; }
                             }
                             if own <= rival { continue; }
@@ -4501,6 +4966,65 @@ pub async fn process_task(
                         }
                     }
 
+                    if !field_is_analytic[f_idx]
+                        && !has_vector_match
+                        && !is_id_link_field(&field_name)
+                        && !premap_handoff_fields.contains(&field_name)
+                        && field_header_mapped.get(f_idx).copied().unwrap_or(false)
+                    {
+                        emit_term(&format!("    ⛔ [HEADER COLUMN EMPTY] Field: '{}' ({:?}) | 헤더로 컬럼이 확정된 필드인데 이 아이템의 그 칸에 형식을 통과한 값이 없습니다. 다른 칸에서 빌려 오지 않도록 LLM 호출 없이 빈 값으로 확정합니다.", field_name, field_format));
+                        crate::utils::score_dynamics::record_field_reject(
+                            &field_name,
+                            crate::utils::score_dynamics::GateKind::Format,
+                        );
+                        crate::utils::score_dynamics::record_baseline("commerce.header_column_empty", 1.0);
+                        continue;
+                    }
+
+                    if !field_is_analytic[f_idx]
+                        && !has_vector_match
+                        && !is_id_link_field(&field_name)
+                        && !premap_handoff_fields.contains(&field_name)
+                        && !field_header_mapped.get(f_idx).copied().unwrap_or(false)
+                        && column_absent_blocked.get(f_idx).copied().unwrap_or(0) > 0
+                        && vector_raw_matrix[f_idx].iter().all(|v| *v < 0.0)
+                    {
+                        emit_term(&format!("    ⛔ [HEADER ABSENT SKIP] Field: '{}' ({:?}) | 이 필드에 매핑된 헤더가 없고 후보 라인이 모두 막혔습니다. 그중 {}건은 헤더 판정에서 이 필드의 칸이 될 수 없다고 나왔고 값도 이 필드의 어휘에 걸리지 않은 라인입니다. 다른 칸에서 빌려 오지 않도록 LLM 호출 없이 빈 값으로 확정합니다.", field_name, field_format, column_absent_blocked[f_idx]));
+                        crate::utils::score_dynamics::record_field_reject(
+                            &field_name,
+                            crate::utils::score_dynamics::GateKind::Prejudice,
+                        );
+                        crate::utils::score_dynamics::record_baseline("commerce.header_absent_skip", 1.0);
+                        continue;
+                    }
+
+                    if field_name == "status" && has_vector_match {
+                        let raw_status = line_values.get(best_item_idx).map(|s| s.trim().to_string()).unwrap_or_default();
+                        if let Some((key, route)) = crate::utils::ai_utils::status_canonical_exact(&raw_status, &page_type, list_status_pivot.as_ref()) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(key.clone()));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, 0.0);
+                            crate::utils::score_dynamics::record_baseline("commerce.status_pivot_hit", 1.0);
+                            emit_term(&format!("    🌉 [STATUS EXACT] '{}' ← Item Line {} (\"{}\") → '{}' | {} | 배정된 상태 칸의 값 전체가 닫힌 상태 어휘와 정확히 맞아 LLM 없이 확정합니다.", field_name, best_item_idx + 1, raw_status, key, route));
+                            continue;
+                        }
+                    }
+
+                    if field_format == FieldFormat::Enum
+                        && field_name != "status"
+                        && !field_name.to_lowercase().contains("currency")
+                        && has_vector_match
+                        && header_forced_assign.contains_key(&field_name)
+                    {
+                        let raw_cell = line_values.get(best_item_idx).map(|s| s.trim().to_string()).unwrap_or_default();
+                        if let Some(plain) = crate::utils::ai_utils::enum_cell_plain(&field_name, &raw_cell) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(plain.clone()));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, best_item_margin);
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_direct_assign", 1.0);
+                            emit_term(&format!("    🎯 [ENUM DIRECT] '{}' ← Item Line {} (\"{}\") → '{}' | 헤더 코사인으로 확정된 열의 값이 짧은 닫힌 어휘 모양이라 LLM 에게 다시 묻지 않고 그대로 확정합니다. 이 자리의 LLM 은 같은 원문 표기를 그대로 돌려주고 있었고, 정규화 표가 없는 축이라 원문 표기를 보존합니다.", field_name, best_item_idx + 1, raw_cell, plain));
+                            continue;
+                        }
+                    }
+
                     let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
 
                     
@@ -4528,10 +5052,26 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
-                    let targeted_pug = filtered_full_item_pug.clone();
+                    let synthesis_sheet: Option<String> = if field_is_analytic[f_idx] {
+                        crate::utils::ai_utils::synthesis_value_sheet(&item_val, &page_type, &doc_lang)
+                    } else {
+                        None
+                    };
+                    let targeted_pug = match synthesis_sheet.as_ref() {
+                        Some(sheet) => sheet.clone(),
+                        None => filtered_full_item_pug.clone(),
+                    };
 
                     if field_is_analytic[f_idx] {
-                        emit_term(&format!("    🧠 [SYNTHESIS FIELD] Field: '{}' | 단일 라인 환원 불가 → 전체 아이템 컨텍스트 요약 모드 (HeaderOwn: {:.4})", field_name, best_thead_own));
+                        match synthesis_sheet.as_ref() {
+                            Some(sheet) => {
+                                crate::utils::score_dynamics::record_baseline("commerce.synthesis_sheet_fields", sheet.lines().count() as f32);
+                                emit_term(&format!("    🧠 [SYNTHESIS FIELD / VALUE SHEET] Field: '{}' | 이 아이템에서 이미 확정된 값 {}개만 요약 재료로 넘깁니다. 원문 PUG 를 넘기면 회원정보수정·메일보내기 같은 UI 액션 구와 다른 칸의 날짜·금액이 요약에 섞여 들어옵니다. (HeaderOwn: {:.4})", field_name, sheet.lines().count(), best_thead_own));
+                            }
+                            None => {
+                                emit_term(&format!("    🧠 [SYNTHESIS FIELD] Field: '{}' | 확정된 값이 2개 미만이라 전체 아이템 컨텍스트 요약 모드 (HeaderOwn: {:.4})", field_name, best_thead_own));
+                            }
+                        }
                     } else if has_vector_match {
                         emit_term(&format!("    🎯 [MATCHED CONTEXT] Field: '{}' ({:?}) | Line: {} | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4}", field_name, field_format, best_item_idx + 1, best_item_raw, best_item_contrast, best_item_margin));
                     } else {
@@ -4770,7 +5310,6 @@ pub async fn process_task(
                                             serde_json::Value::Object(o) => o.is_empty(),
                                             _ => false,
                                         };
-
                                         if !is_empty_val {
                                             let extracted_str = if val.is_string() {
                                                 val.as_str().unwrap_or("").trim().to_string()
@@ -4780,15 +5319,39 @@ pub async fn process_task(
                                                 String::new()
                                             };
 
-                                            
-                                            
-                                            
-                                            
+                                            if is_synthesis_field && !extracted_str.is_empty() {
+                                                let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
+                                                crate::utils::score_dynamics::record_baseline(
+                                                    "commerce.synthesis_sentence_drop",
+                                                    if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
+                                                );
+                                                if !gate.dropped.is_empty() {
+                                                    emit_term(&format!(
+                                                        "    🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                                                        k,
+                                                        gate.total,
+                                                        gate.dropped.len(),
+                                                        gate.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                                                        gate.kept
+                                                    ));
+                                                    if let Some(o) = parsed_val.as_object_mut() {
+                                                        if gate.kept.is_empty() {
+                                                            o.remove(*k);
+                                                        } else {
+                                                            o.insert(k.to_string(), json!(gate.kept));
+                                                        }
+                                                    }
+                                                    found_valid_value = true;
+                                                    continue;
+                                                }
+                                            }
+
                                             let key_fmt = detect_field_format(k);
                                             let strict_post = matches!(
                                                 key_fmt,
                                                 FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Text
                                                     | FieldFormat::Numeric | FieldFormat::Enum | FieldFormat::Identifier
+                                                    | FieldFormat::Phone | FieldFormat::Address
                                             );
                                             if strict_post && !extracted_str.is_empty() && !value_matches_format(key_fmt, &extracted_str) {
                                                 emit_term(&format!("    🚫 [FORMAT REJECT] '{}' ({:?}) 에 형식 불일치 값 '{}' 반환. 폐기 후 재시도합니다.", k, key_fmt, extracted_str));
@@ -4800,6 +5363,43 @@ pub async fn process_task(
                                                 requires_retry = true;
                                                 extracted_values_for_retry.push(extracted_str.clone());
                                                 continue;
+                                            }
+                                            let enum_reject = if key_fmt == FieldFormat::Enum { enum_value_reject(k, &extracted_str) } else { None };
+                                            if let Some(why) = enum_reject {
+                                                crate::utils::score_dynamics::record_field_seen(k);
+                                                crate::utils::score_dynamics::record_field_reject(
+                                                    k,
+                                                    crate::utils::score_dynamics::GateKind::Enum,
+                                                );
+                                                let amount_answer = k.to_lowercase().contains("currency") && currency_amount_like(&extracted_str);
+                                                let prior_amount = ignore_list.iter().any(|s| currency_amount_like(s) && !global_ignore_list.contains(s));
+                                                if amount_answer && prior_amount {
+                                                    emit_term(&format!("    💱 [CURRENCY AMOUNT STOP] '{}' 에 금액 '{}' 반환 ({}). 이 필드에서 금액 답을 이미 한 번 버렸는데 다시 금액이 와서, 이 아이템에는 통화 표지가 없다고 보고 재시도를 멈춥니다. 값은 비워 두고, 저장 직전 문서 언어 기본 통화가 들어갑니다.", k, extracted_str, why));
+                                                    crate::utils::score_dynamics::record_baseline("commerce.currency_amount_stop", 1.0);
+                                                    if let Some(o) = parsed_val.as_object_mut() {
+                                                        o.remove(*k);
+                                                    }
+                                                    found_valid_value = true;
+                                                    continue;
+                                                }
+                                                emit_term(&format!("    🚫 [ENUM VALUE GATE] '{}' 에 '{}' 반환 ({}). 열거형 값이 될 수 없어 폐기 후 재시도합니다.", k, extracted_str, why));
+                                                requires_retry = true;
+                                                extracted_values_for_retry.push(extracted_str.clone());
+                                                continue;
+                                            }
+
+                                            if k.to_lowercase().contains("currency") {
+                                                if let Some(ev) = currency_ev.as_ref() {
+                                                    if !crate::utils::ai_utils::currency_answer_admitted(&extracted_str, ev) {
+                                                        emit_term(&format!("    🚫 [CURRENCY UNGROUNDED] '{}' 에 '{}' 반환. 이 아이템 라인의 통화 표지({})로 뒷받침되지 않아 채우지 않습니다. 재시도하지 않고 저장 직전 문서 언어 기본 통화에 맡깁니다.", k, extracted_str, ev.describe()));
+                                                        crate::utils::score_dynamics::record_baseline("commerce.currency_ungrounded", 1.0);
+                                                        if let Some(o) = parsed_val.as_object_mut() {
+                                                            o.remove(*k);
+                                                        }
+                                                        found_valid_value = true;
+                                                        continue;
+                                                    }
+                                                }
                                             }
 
                                             found_valid_value = true;
@@ -4849,6 +5449,42 @@ pub async fn process_task(
 
                                                         if !is_matched {
                                                             requires_retry = true;
+                                                        } else if !doc_title.contains(&extracted_str)
+                                                            && header_plausible.get(*k).map_or(false, |s| !s.is_empty())
+                                                        {
+                                                            let lower_p = extracted_str.to_lowercase();
+                                                            let digits_p: String = extracted_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                                            let short_digits = !digits_p.is_empty() && digits_p.len() < 3 && extracted_str.len() == digits_p.len();
+                                                            let hosts: Vec<Option<&str>> = json_contexts
+                                                                .iter()
+                                                                .filter(|ctx| {
+                                                                    let raw = ctx.get("value").and_then(|x| x.as_str()).unwrap_or("");
+                                                                    let t = raw.to_lowercase();
+                                                                    let direct = t.contains(&lower_p)
+                                                                        && (!short_digits || t.split(|c: char| !c.is_alphanumeric()).any(|w| w == lower_p));
+                                                                    let by_digits = digits_p.len() >= 3
+                                                                        && raw.chars().filter(|c| c.is_ascii_digit()).collect::<String>().contains(&digits_p);
+                                                                    direct || by_digits
+                                                                })
+                                                                .map(|ctx| ctx.get("metadata").and_then(|x| x.as_str()))
+                                                                .collect();
+                                                            let foreign_only = !hosts.is_empty()
+                                                                && hosts.iter().all(|h| {
+                                                                    crate::utils::ai_utils::header_judged_foreign(k, *h, &header_evaluated, &header_plausible)
+                                                                });
+                                                            crate::utils::score_dynamics::record_baseline(
+                                                                "commerce.value_provenance_reject",
+                                                                if foreign_only { 1.0 } else { 0.0 },
+                                                            );
+                                                            if foreign_only {
+                                                                emit_term(&format!("    🚫 [VALUE PROVENANCE REJECT] '{}' = '{}' 는 이 아이템에서 헤더 {:?} 칸에만 있습니다. 그 헤더들은 전부 헤더 판정에서 '{}' 의 칸이 될 수 없다고 나왔고 이 필드가 가질 수 있는 칸은 따로 있습니다. 옆 칸의 값을 빌려 온 것이므로 폐기하고 재시도합니다.", k, extracted_str, hosts.iter().map(|h| h.unwrap_or("")).collect::<Vec<_>>(), k));
+                                                                crate::utils::score_dynamics::record_field_seen(k);
+                                                                crate::utils::score_dynamics::record_field_reject(
+                                                                    k,
+                                                                    crate::utils::score_dynamics::GateKind::Prejudice,
+                                                                );
+                                                                requires_retry = true;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -5049,6 +5685,20 @@ pub async fn process_task(
                 let total_extracted_items = all_extracted_items.len();
                 let mut retry_count = 0usize;
                 let mut reject_count = 0usize;
+                let id_census = IdRoleCensus::build(&all_item_raw_lines);
+                let self_aliases = crate::logic::relay_type_aliases(&page_type);
+                let mut unique_rescued = 0usize;
+                let normalize_list_link = |raw: &str| -> String {
+                    match url::Url::parse(&url).ok().and_then(|base| base.join(raw).ok()) {
+                        Some(abs) => format!(
+                            "{}{}",
+                            abs.path(),
+                            abs.query().map(|q| format!("?{}", q)).unwrap_or_default()
+                        )
+                        .to_lowercase(),
+                        None => raw.to_string(),
+                    }
+                };
 
                 for item_idx in 0..total_extracted_items {
                     let (has_id, has_link) = {
@@ -5099,6 +5749,55 @@ pub async fn process_task(
                     }
 
                     
+                    if recovered.is_none() {
+                        if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
+                            let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
+                            let cands = collect_id_link_candidates(&raw_refs);
+                            let small_list = id_census.rows < 3;
+                            let mut ranked: Vec<(usize, f32)> = cands
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| {
+                                    !c.is_host_part
+                                        && (id_census.row_unique(&c.role_phrase)
+                                            || (small_list && candidate_type_evidence(c, self_aliases) >= 2))
+                                })
+                                .map(|(ci, c)| (ci, id_resource_affinity(&url, c, self_aliases) + 0.01 * c.prior))
+                                .collect();
+                            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            if let Some(&(bi, top)) = ranked.first() {
+                                let contested = ranked.iter().skip(1).any(|(ci, s)| {
+                                    (top - *s).abs() < 1e-6 && !same_id_token(&cands[*ci].token, &cands[bi].token)
+                                });
+                                if contested {
+                                    crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_contested", 1.0);
+                                    emit_term(&format!(
+                                        "      ⚖️ [ID/LINK ROW-UNIQUE CONTESTED] Item {}/{}: 행마다 값이 다른 식별 후보가 둘 이상이고 자기 자원 근거가 같아 고르지 않습니다. 틀린 자기 식별자는 서로 다른 문서를 한 행으로 합칩니다.",
+                                        item_idx + 1, total_extracted_items
+                                    ));
+                                } else {
+                                    let c = &cands[bi];
+                                    let (present, distinct) = id_census.coverage(&c.role_phrase);
+                                    unique_rescued += 1;
+                                    let reason = if id_census.row_unique(&c.role_phrase) {
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_rescue", 1.0);
+                                        format!(
+                                            "행 고유 식별자 (역할 '{}' · {}행 중 {}행 보유 · 값 {}종 전부 상이 · 자기 자원 근거 {:.2})",
+                                            c.role_phrase, id_census.rows, present, distinct, top
+                                        )
+                                    } else {
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_small_list_rescue", 1.0);
+                                        format!(
+                                            "소량 목록 타입 식별자 (역할 '{}' · {}행이라 행 고유성은 판정할 수 없지만 파라미터 키가 자기 타입 별칭을 지목 · 자기 자원 근거 {:.2})",
+                                            c.role_phrase, id_census.rows, top
+                                        )
+                                    };
+                                    recovered = Some((c.token.clone(), normalize_list_link(&c.href), reason));
+                                }
+                            }
+                        }
+                    }
+
                     if recovered.is_none() {
                         if let Some((ref pat_prefix, ref pat_suffix)) = discovered_url_pattern {
                             let labeled = all_item_labeled_lines.get(item_idx).cloned().unwrap_or_default();
@@ -5174,6 +5873,118 @@ pub async fn process_task(
                         emit_term(&format!("  🔄 [ID/LINK RETRY] Item {}/{}: {} → \"id\": \"{}\", \"link\": \"{}\"", item_idx + 1, total_extracted_items, reason, found_id, constructed_link));
                     } else {
                         emit_term(&format!("  ⚪ [ID/LINK RETRY SKIP] Item {}/{}: 코사인 게이트를 통과한 식별자 후보가 없어 id/link 를 비워 둡니다. (잘못된 링크보다 빈 값이 안전합니다)", item_idx + 1, total_extracted_items));
+                    }
+                }
+
+                {
+                    let own_family = crate::utils::canonical::relay_type_family(&page_type);
+                    let related_types = crate::logic::related(&page_type);
+                    let relay_foreign: Vec<&str> = ["goods", "order", "tracking"]
+                        .iter()
+                        .copied()
+                        .filter(|t| *t != own_family.as_str() && related_types.iter().any(|r| r == t))
+                        .collect();
+                    let mut verify_swapped = 0usize;
+                    let mut relay_bound = 0usize;
+                    for item_idx in 0..total_extracted_items {
+                        let raw_lines = match all_item_raw_lines.get(item_idx) {
+                            Some(l) => l,
+                            None => continue,
+                        };
+                        let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
+                        let cands = collect_id_link_candidates(&raw_refs);
+                        if cands.is_empty() {
+                            continue;
+                        }
+                        let mut self_token = all_extracted_items[item_idx]
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if !self_token.is_empty() && id_census.rows >= 3 {
+                            let chosen: Vec<&IdLinkCandidate> = cands
+                                .iter()
+                                .filter(|c| same_id_token(&c.token, &self_token))
+                                .collect();
+                            let chosen_unique = chosen.iter().any(|c| id_census.row_unique(&c.role_phrase));
+                            if !chosen.is_empty() && !chosen_unique {
+                                let chosen_aff = chosen
+                                    .iter()
+                                    .map(|c| id_resource_affinity(&url, c, self_aliases))
+                                    .fold(0.0f32, f32::max);
+                                let mut alt: Vec<(usize, f32)> = cands
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, c)| !c.is_host_part && id_census.row_unique(&c.role_phrase))
+                                    .map(|(ci, c)| (ci, id_resource_affinity(&url, c, self_aliases)))
+                                    .collect();
+                                alt.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                if let Some(&(ai, a_aff)) = alt.first() {
+                                    let contested = alt.iter().skip(1).any(|(ci, s)| {
+                                        (a_aff - *s).abs() < 1e-6 && !same_id_token(&cands[*ci].token, &cands[ai].token)
+                                    });
+                                    if a_aff > chosen_aff && !contested {
+                                        let c = &cands[ai];
+                                        emit_term(&format!(
+                                            "  🔁 [ID/LINK UNIQUE VERIFY] Item {}/{}: 코사인이 고른 '{}' 는 여러 행이 같은 값을 공유하는 역할이라 이 행 자신의 식별자가 아니라 다른 문서를 가리키는 참조입니다. 행 고유 역할 '{}' 의 '{}' 로 교체합니다. (자기 자원 근거 {:.2} > {:.2})",
+                                            item_idx + 1, total_extracted_items, self_token, c.role_phrase, c.token, a_aff, chosen_aff
+                                        ));
+                                        if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
+                                            obj.insert("id".to_string(), json!(c.token.clone()));
+                                            obj.insert("link".to_string(), json!(normalize_list_link(&c.href)));
+                                        }
+                                        self_token = c.token.clone();
+                                        verify_swapped += 1;
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_swap", 1.0);
+                                    }
+                                }
+                            }
+                        }
+
+                        if relay_foreign.is_empty() {
+                            continue;
+                        }
+                        for (ftype, token, role) in collect_typed_relay_refs(&cands, &self_token, &relay_foreign) {
+                            let key = match crate::utils::canonical::relay_key_for_type(&ftype) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+                            let f_index = entity_key_index(&ftype, &team_id, &task.cc, &token);
+                            if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
+                                let companion = format!("{}_title", key);
+                                let text_val = obj
+                                    .get(key)
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| crate::utils::canonical::relay_text_is_content(s));
+                                let companion_empty = obj
+                                    .get(&companion)
+                                    .and_then(|v| v.as_str())
+                                    .map_or(true, |s| s.trim().is_empty());
+                                if let Some(t) = text_val {
+                                    if companion_empty {
+                                        obj.insert(companion.clone(), json!(t));
+                                    }
+                                }
+                                obj.insert(key.to_string(), json!(f_index));
+                            }
+                            relay_ledger::mark_relay_bound(&mut all_extracted_items[item_idx], key);
+                            relay_bound += 1;
+                            emit_term(&format!(
+                                "  🔗 [RELAY REF BIND] Item {}/{}: {} ← '{}' (역할 '{}') → {}.{} = {} | 행에 인쇄된 상대 문서의 식별자로 상대 index 를 결정론으로 재현했습니다. 글자 값은 {}_title 로 옮겨 검색 문장은 그대로 유지합니다.",
+                                item_idx + 1, total_extracted_items, ftype, token, role, page_type, key, f_index, key
+                            ));
+                        }
+                    }
+                    crate::utils::score_dynamics::record_baseline("commerce.relay_ref_bound", relay_bound as f32);
+                    if unique_rescued > 0 || verify_swapped > 0 || relay_bound > 0 {
+                        emit_term(&format!(
+                            "  🧬 [ID/RELAY CENSUS] {}행 | 행 고유 역할 {:?} | 자기 식별자 복구 {}건 · 교체 {}건 | 상대 참조 결속 {}건",
+                            id_census.rows,
+                            id_census.roles.keys().filter(|r| id_census.row_unique(r)).collect::<Vec<_>>(),
+                            unique_rescued, verify_swapped, relay_bound
+                        ));
                     }
                 }
 
@@ -5885,13 +6696,14 @@ pub async fn process_task(
                         
                         
                         
-                        if f_fmt == FieldFormat::Enum && is_pure_numeric_value(pair_val) {
+                        let enum_reject = if f_fmt == FieldFormat::Enum { enum_value_reject(&d_field_names[f], pair_val) } else { None };
+                        if let Some(why) = enum_reject {
                             crate::utils::score_dynamics::record_field_reject(
                                 &d_field_names[f],
                                 crate::utils::score_dynamics::GateKind::Enum,
                             );
-                            emit_term(&format!("    🚫 [ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치이므로 열거형 후보가 될 수 없습니다.",
-                                unique_phrases[h], d_field_names[f], pair_val));
+                            emit_term(&format!("    🚫 [ENUM VALUE GATE] '{}' → '{}' | 값 \"{}\" 은 열거형 후보가 될 수 없습니다 ({}).",
+                                unique_phrases[h], d_field_names[f], pair_val, why));
                             continue;
                         }
 
@@ -6058,15 +6870,6 @@ pub async fn process_task(
 
             
             for l in &pair_owned_lines { det_consumed_lines.insert(*l); }
-
-            
-            
-            
-            
-            
-            
-            
-            
             
             let mut enum_resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             {
@@ -6074,16 +6877,8 @@ pub async fn process_task(
                 if select_groups.is_empty() {
                     emit_term("  ⚪ [ENUM SELECT] 문서에 <select> 컨트롤이 없어 상태 선택자 해석을 건너뜁니다.");
                 } else {
-                    let status_keys = enum_status_keys(&page_type);
-                    let mut key_banks: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
-                    for k in &status_keys {
-                        let phrases = status_key_phrases(k);
-                        let e = model.get_embedding_batch(phrases.clone()).await
-                            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()]);
-                        key_banks.push((k.to_string(), e));
-                    }
+                    let key_banks = status_key_banks(&model, &page_type).await;
 
-                    
                     let rival_phrases: Vec<String> = {
                         let mut v: Vec<String> = vec![
                             "delivery company".to_string(), "courier company".to_string(),
@@ -6221,22 +7016,18 @@ pub async fn process_task(
                     if let Some(gi) = chosen {
                         let g = &select_groups[gi];
                         let sel_emb = model.get_embedding(g.selected.clone()).await.unwrap_or(vec![0.0; 384]);
-                        let mut best_key = String::new();
-                        let mut best = f32::MIN;
-                        let mut second = f32::MIN;
-                        for (k, kb) in &key_banks {
-                            let s = max_pool_sim(&sel_emb, kb);
+                        let key_scores = status_key_scores(&sel_emb, &key_banks);
+                        for (k, s) in key_scores.iter() {
                             emit_term(&format!("      🧭 [STATUS KEY] '{}' ← selected \"{}\" | MaxPool: {:.4}", k, g.selected, s));
-                            if s > best { second = best; best = s; best_key = k.clone(); }
-                            else if s > second { second = s; }
                         }
-                        if !best_key.is_empty() && best > 0.35 && (best - second) > 0.01 {
-                            enum_resolved.insert("status".to_string(), best_key.clone());
+                        let pick = pick_status_key(&key_scores);
+                        if pick.accepted() {
+                            enum_resolved.insert("status".to_string(), pick.key.clone());
                             emit_term(&format!("  ✅ [ENUM SELECT RESOLVED] '{}' (selected: \"{}\") → status = '{}' | Top: {:.4} | Margin: {:+.4}",
-                                g.selector, g.selected, best_key, best, best - second));
+                                g.selector, g.selected, pick.key, pick.top, pick.margin()));
                         } else {
                             emit_term(&format!("  ⚠️ [ENUM SELECT UNRESOLVED] selected \"{}\" 의 캐노니컬 마진 부족 (Top {:.4} / 2nd {:.4}). 기존 경로로 위임합니다.",
-                                g.selected, best, second));
+                                g.selected, pick.top, pick.second));
                         }
                     }
                 }
@@ -6832,7 +7623,6 @@ pub async fn process_task(
                                         serde_json::Value::Object(o) => o.is_empty(),
                                         _ => false,
                                     };
-
                                     if !is_empty_val {
                                         let extracted_str = if val.is_string() {
                                             val.as_str().unwrap_or("").trim().to_string()
@@ -6842,8 +7632,33 @@ pub async fn process_task(
                                             String::new()
                                         };
 
-                                        
-                                        
+                                        if is_synthesis_field && !extracted_str.is_empty() {
+                                            let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
+                                            crate::utils::score_dynamics::record_baseline(
+                                                "commerce.synthesis_sentence_drop",
+                                                if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
+                                            );
+                                            if !gate.dropped.is_empty() {
+                                                emit_term(&format!(
+                                                    "  🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                                                    k,
+                                                    gate.total,
+                                                    gate.dropped.len(),
+                                                    gate.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                                                    gate.kept
+                                                ));
+                                                if let Some(o) = item_val.as_object_mut() {
+                                                    if gate.kept.is_empty() {
+                                                        o.remove(*k);
+                                                    } else {
+                                                        o.insert(k.to_string(), json!(gate.kept));
+                                                    }
+                                                }
+                                                found_valid_value = true;
+                                                continue;
+                                            }
+                                        }
+
                                         let key_fmt = detect_field_format(k);
                                         let strict_post = matches!(
                                             key_fmt,
@@ -6858,6 +7673,29 @@ pub async fn process_task(
                                                 k,
                                                 crate::utils::score_dynamics::GateKind::Format,
                                             );
+                                            requires_retry = true;
+                                            extracted_values_for_retry.push(extracted_str.clone());
+                                            continue;
+                                        }
+                                        let enum_reject = if key_fmt == FieldFormat::Enum { enum_value_reject(k, &extracted_str) } else { None };
+                                        if let Some(why) = enum_reject {
+                                            crate::utils::score_dynamics::record_field_seen(k);
+                                            crate::utils::score_dynamics::record_field_reject(
+                                                k,
+                                                crate::utils::score_dynamics::GateKind::Enum,
+                                            );
+                                            let amount_answer = k.to_lowercase().contains("currency") && currency_amount_like(&extracted_str);
+                                            let prior_amount = ignore_list.iter().any(|s| currency_amount_like(s) && !global_ignore_list.contains(s));
+                                            if amount_answer && prior_amount {
+                                                emit_term(&format!("  💱 [CURRENCY AMOUNT STOP] '{}' 에 금액 '{}' 반환 ({}). 이 필드에서 금액 답을 이미 한 번 버렸는데 다시 금액이 와서, 이 문서에는 통화 표지가 없다고 보고 재시도를 멈춥니다. 값은 비워 두고, 저장 직전 문서 언어 기본 통화가 들어갑니다.", k, extracted_str, why));
+                                                crate::utils::score_dynamics::record_baseline("commerce.currency_amount_stop", 1.0);
+                                                if let Some(o) = item_val.as_object_mut() {
+                                                    o.remove(*k);
+                                                }
+                                                found_valid_value = true;
+                                                continue;
+                                            }
+                                            emit_term(&format!("  🚫 [ENUM VALUE GATE] '{}' 에 '{}' 반환 ({}). 열거형 값이 될 수 없어 폐기 후 재시도합니다.", k, extracted_str, why));
                                             requires_retry = true;
                                             extracted_values_for_retry.push(extracted_str.clone());
                                             continue;
@@ -7023,31 +7861,39 @@ pub async fn process_task(
             }
             
 
-            let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim();
-            if currency_val.is_empty() || currency_val == "null" {
-                let default_currency = match doc_lang_str.as_str() {
-                    "ko" => "KRW",
-                    "ja" => "JPY",
-                    "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
-                    "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
-                    "cs" => "CZK",
-                    "ru" => "RUB",
-                    "th" => "THB",
-                    "vi" => "VND",
-                    "hi" | "bn" => "INR",
-                    "en" | _ => "USD",
-                };
-                obj.insert("currency".to_string(), json!(default_currency));
-            } else {
-                obj.insert("currency".to_string(), json!(currency_val.to_uppercase()));
+            let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let currency_norm = normalize_currency_value(&currency_val, &doc_lang_str);
+            if currency_code_of(&currency_val).is_none() && currency_amount_like(&currency_val) {
+                println!("[Scheduler] 💱 [CURRENCY AMOUNT FALLBACK] currency='{}' 는 글자·통화기호 없는 금액 모양이라 통화가 될 수 없어 문서 언어 기본 통화 '{}' 로 대체합니다.", currency_val, currency_norm);
             }
+            obj.insert("currency".to_string(), json!(currency_norm));
             
 
             if let Some(q) = obj.get("quantity").cloned() {
-                let q_val = if q.is_number() { q.as_i64().unwrap_or(0) }
-                            else if let Some(s) = q.as_str() { s.parse::<i64>().unwrap_or(0) }
-                            else { 0 };
-                obj.insert("quantity".to_string(), json!(q_val));
+                let q_val: Option<i64> = if q.is_number() {
+                    q.as_i64().or_else(|| q.as_f64().filter(|f| f.is_finite()).map(|f| f.round() as i64))
+                } else if let Some(s) = q.as_str() {
+                    let lead: String = s
+                        .trim()
+                        .chars()
+                        .filter(|c| *c != ',' && !c.is_whitespace())
+                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    lead.parse::<i64>()
+                        .ok()
+                        .or_else(|| lead.parse::<f64>().ok().filter(|f| f.is_finite()).map(|f| f.round() as i64))
+                } else {
+                    None
+                };
+                match q_val {
+                    Some(v) => {
+                        obj.insert("quantity".to_string(), json!(v));
+                    }
+                    None => {
+                        println!("[Scheduler] 🧮 [QUANTITY KEEP] quantity={} 는 수치로 읽을 수 없어 0 으로 바꾸지 않고 비웁니다. 0 은 '재고 없음·수량 0' 이라는 다른 사실이라, 읽지 못한 값을 0 으로 저장하면 검색 조건(재고 0 · 수량 합)이 거짓 문서를 만납니다.", q);
+                        obj.remove("quantity");
+                    }
+                }
             }
             
             
@@ -7137,6 +7983,83 @@ pub async fn process_task(
         }
     };
 
+    {
+        let status_values: Vec<String> = if is_detail {
+            extracted_data.get("status").and_then(|x| x.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default()
+        } else {
+            extracted_data
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|it| it.get("status").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut status_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut status_pending: Vec<String> = Vec::new();
+        for s in status_values.iter() {
+            let t = s.trim();
+            if t.is_empty() || t == "null" || crate::logic::parse_status(t) != 0 { continue; }
+            if status_map.contains_key(t) || status_pending.iter().any(|p| p == t) { continue; }
+            let lower = t.to_lowercase();
+            if crate::logic::parse_status(&lower) != 0 {
+                status_map.insert(t.to_string(), lower);
+            } else {
+                status_pending.push(t.to_string());
+            }
+        }
+        if !status_pending.is_empty() {
+            let banks = status_key_banks(&model, &page_type).await;
+            let pivot = crate::utils::ai_utils::status_pivot_bank(&model, &page_type, &doc_lang).await;
+            if is_detail {
+                if let Some(p) = pivot.as_ref() {
+                    crate::utils::score_dynamics::record_baseline("commerce.status_pivot_align_z", p.align_z);
+                }
+            }
+            for raw in status_pending.iter() {
+                if let Some((key, route)) = crate::utils::ai_utils::status_canonical_exact(raw, &page_type, pivot.as_ref()) {
+                    emit_term(&format!("  🌉 [STATUS PIVOT] '{}' → '{}' | {} | 닫힌 상태 어휘와 정확히 맞아 코사인 비교 없이 확정합니다.", raw, key, route));
+                    crate::utils::score_dynamics::record_baseline("commerce.status_pivot_hit", 1.0);
+                    status_map.insert(raw.clone(), key);
+                    continue;
+                }
+                let emb = model.get_embedding(raw.clone()).await.unwrap_or(vec![0.0f32; 384]);
+                let pick = pick_status_key(&status_key_scores(&emb, &banks));
+                if pick.second > f32::MIN {
+                    crate::utils::score_dynamics::record_baseline("commerce.status_canonical_margin", pick.top - pick.second);
+                }
+                if pick.accepted_with(0.35, 0.03) && crate::logic::parse_status(&pick.key) != 0 {
+                    emit_term(&format!("  🧭 [STATUS CANONICAL] '{}' → '{}' | Top: {:.4} | Margin: {:+.4} (parse_status 가 모르는 원문은 저장 시 0 이 되므로 상태 캐노니컬 뱅크로 환산합니다)", raw, pick.key, pick.top, pick.margin()));
+                    status_map.insert(raw.clone(), pick.key.clone());
+                } else {
+                    emit_term(&format!("  ⚪ [STATUS CANONICAL UNRESOLVED] '{}' | '{}' Top: {:.4} / 2nd: {:.4} → 확정 불가, 원문을 유지합니다.", raw, pick.key, pick.top, pick.second));
+                }
+            }
+        }
+        if !status_map.is_empty() {
+            let apply_status = |v: &mut serde_json::Value| {
+                let cur = v.get("status").and_then(|x| x.as_str()).map(|s| s.trim().to_string());
+                if let Some(c) = cur {
+                    if let Some(k) = status_map.get(&c) {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("status".to_string(), json!(k));
+                        }
+                    }
+                }
+            };
+            if is_detail {
+                apply_status(&mut extracted_data);
+            } else if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
+                for it in items.iter_mut() {
+                    apply_status(it);
+                }
+            }
+        }
+    }
+
     if is_detail {
         normalize_data(&mut extracted_data);
     } else {
@@ -7200,64 +8123,97 @@ pub async fn process_task(
 
     {
         emit_term("[Scheduler] 🔤 Preparing crossover for synonym expansion...");
-        emit_term("[Scheduler]    (Qwen3 0.6B 음차 능력 부족으로 Qwen3.5 2B로 분리 동작)");
+        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data);
+        let (translit_engine, translit_status) = crate::model::lang_llm::await_engine(
+            &doc_lang,
+            app_handle,
+            &task.id,
+            cancellation_token,
+            translit_demand,
+        )
+        .await;
+        emit_term(&format!("[Scheduler]    {}", translit_status));
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Planning VRAM crossover...", "spinner": "🔤" }));
 
-        // 🌟 [CROSSOVER / BUDGET] 하드코딩 임계치(2600MB)를 제거합니다.
-        //
-        //  ── 무엇이 문제였나 ──
-        //   2600 이라는 숫자는 임베딩 실제 상주 비용과도, Qwen3.5 실제 비용과도
-        //   무관한 값이었습니다. GPU 를 바꾸거나 모델을 교체하면 즉시 틀립니다.
-        //   게다가 CONCURRENT 분기는 두 모델을 '무조건' 함께 올리므로
-        //   판정이 낙관적이면 그 순간이 곧 피크가 됩니다.
-        //
-        //  ── 무엇으로 바꾸는가 ──
-        //   embedding_budget_mb() / generation_budget_mb() 는
-        //   ① 디스크 가중치 크기로 시작하고
-        //   ② 첫 로드 전후의 free VRAM 차이로 실측값으로 교체되며
-        //   ③ 대량 배치에서 관측한 activation 여유를 더해 돌려줍니다.
-        //   판정 근거가 전부 실측이므로 상수를 손댈 이유가 없습니다.
-        //
-        //  ── 여기서 미리 올리지 않는 이유 ──
-        //   음차는 캐시 히트가 대부분입니다. 이 시점에 Qwen3.5 를 올리면
-        //   캐시로만 끝나는 아이템에서 2GB 를 헛돌립니다.
-        //   실제 전환은 translit.rs 의 첫 캐시 미스 시점에서 일어납니다.
         let free_mb = model.get_free_vram_mb();
         let embed_need = model.embedding_budget_mb();
-        let gen_need = model.generation_budget_mb(crate::model::ModelSize::Qwen3_5);
+        let gen_need = match translit_engine.code() {
+            Some(code) => crate::model::lang_llm::resident_estimate_mb(code),
+            None => model.generation_budget_mb(crate::model::ModelSize::Qwen3_5),
+        };
+        let gen_label = translit_engine.label();
         if free_mb >= embed_need + gen_need {
             emit_term(&format!(
-                "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + Qwen3.5 {}MB. 스왑 없이 진행할 수 있습니다.",
-                free_mb, embed_need, gen_need
+                "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + {} {}MB. 스왑 없이 진행할 수 있습니다.",
+                free_mb, embed_need, gen_label, gen_need
             ));
         } else {
             emit_term(&format!(
-                "[Scheduler] 🔁 [CROSSOVER/SWAP 예상] 자유 {}MB < 임베딩 {}MB + Qwen3.5 {}MB. 페이즈별 교차 상주로 진행합니다.",
-                free_mb, embed_need, gen_need
+                "[Scheduler] 🔁 [CROSSOVER/SWAP 예상] 자유 {}MB < 임베딩 {}MB + {} {}MB. 페이즈별 교차 상주로 진행합니다.",
+                free_mb, embed_need, gen_label, gen_need
             ));
         }
-        // 임베딩 가중치 파일 존재만 확인하고, 로드는 실제 사용 시점으로 미룹니다.
         model.check_embedding_downloaded().await?;
         emit_term("[Scheduler] ✅ [CROSSOVER] 지연 로드 계획 확정. 각 페이즈 진입 시점에 필요한 모델만 올립니다.");
     }
-    let id_val_raw = extracted_data.get("id")
+    let extracted_id_raw = extracted_data.get("id")
         .or_else(|| extracted_data.get("no"))
         .or_else(|| extracted_data.get("code"))
         .or_else(|| extracted_data.get("tracking_number"))
         .or_else(|| extracted_data.get("index"))
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
-    
-    
-    
-    
-    let index_val = entity_index(&page_type, &team_id, &id_val_raw);
+    let url_self_token: Option<(String, String, u8)> = if is_detail {
+        let self_aliases = crate::logic::relay_type_aliases(&page_type);
+        let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(&url)
+            .into_iter()
+            .map(|c| {
+                let ev = candidate_type_evidence(&c, self_aliases);
+                (c.token, c.role_phrase, ev)
+            })
+            .filter(|(_, _, ev)| *ev >= 1)
+            .collect();
+        typed.sort_by(|a, b| b.2.cmp(&a.2));
+        match typed.first() {
+            Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
+                Some((tok.clone(), role.clone(), *ev))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let id_val_raw = match url_self_token.as_ref() {
+        Some((tok, role, ev)) => {
+            crate::utils::score_dynamics::record_baseline("commerce.detail_url_identity", 1.0);
+            emit_term(&format!(
+                "  🪪 [DETAIL URL IDENTITY] {} 상세 식별자 '{}' (URL 역할 '{}' · 타입 근거 {}) | 추출기 id '{}' 대신 목록이 쓰는 것과 같은 URL 자기 식별자로 index 를 만듭니다. 그래야 목록 행과 상세 페이지가 같은 문서로 합쳐지고 다른 문서의 참조도 같은 index 로 착지합니다.",
+                page_type, tok, role, ev, extracted_id_raw
+            ));
+            tok.clone()
+        }
+        None if !extracted_id_raw.trim().is_empty() => extracted_id_raw.clone(),
+        None if is_detail => {
+            let seed = match url::Url::parse(&url) {
+                Ok(u) => format!("{}{}", u.path(), u.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase(),
+                Err(_) => url.to_string(),
+            };
+            let auto = format!("AUTO-{}-{}", page_type, crate::utils::hash::digest(&seed));
+            emit_term(&format!(
+                "  ⚠️ [DETAIL ID FALLBACK] 상세 식별자가 URL 에도 추출 결과에도 없어 링크 기반 결정론 키 '{}' 를 씁니다. 빈 값으로 index 를 만들면 식별자 없는 상세 페이지가 전부 한 행으로 합쳐집니다.",
+                auto
+            ));
+            auto
+        }
+        None => extracted_id_raw.clone(),
+    };
+    let index_val = entity_key_index(&page_type, &team_id, &task.cc, &id_val_raw);
     let generated_id = entity_id(&team_id, index_val);
 
     if let Some(obj) = extracted_data.as_object_mut() {
         obj.insert("index".to_string(), json!(index_val));
         obj.insert("id".to_string(), json!(generated_id.clone()));
-        
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
 
@@ -7268,54 +8224,60 @@ pub async fn process_task(
         store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
     };
 
+    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+
     if page_type == "order" {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
-            let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            for good in goods_arr {
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-                let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
-                if !g_no.is_empty() {
-                    let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
-                    
-                    //
-                    
-                    
-                    
-                    
-                    
-                    
-                    let clean_tracking_no = normalize_entity_key(tracking_number);
-                    let tracking_index = entity_index("tracking", &team_id, tracking_number);
-                    let goods_index = entity_index("goods", &team_id, g_no);
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let clean_tracking_no = normalize_entity_key(&tracking_number);
+            let first_goods = goods_arr.iter().find_map(|good| {
+                good.get("id")
+                    .or_else(|| good.get("no"))
+                    .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.trim().to_string()) })
+                    .filter(|s| !s.is_empty())
+            });
+            match (clean_tracking_no.is_empty(), first_goods) {
+                (true, Some(_)) => {
+                    emit_term(&format!(
+                        "  ⚪ [ORDER-ITEM BRIDGE SKIP] 주문 '{}' 은 송장번호가 비어 tracking 문서를 만들지 않습니다. 빈 값으로 index 를 만들면 송장 없는 모든 주문이 tracking 한 행으로 합쳐집니다. 상품 연결은 goods 배열 릴레이가 처리합니다.",
+                        id_val_raw
+                    ));
+                }
+                (false, Some(g_no)) => {
+                    let tracking_index = entity_key_index("tracking", &team_id, &task.cc, &tracking_number);
+                    let goods_index = entity_key_index("goods", &team_id, &task.cc, &g_no);
                     let tracking_id = entity_id(&team_id, tracking_index);
                     let mut tracking_data = extracted_data.clone();
-                    
                     if let Some(obj) = tracking_data.as_object_mut() {
                         obj.insert("type".to_string(), json!("tracking"));
                         obj.insert("no".to_string(), json!(clean_tracking_no));
                         obj.insert("index".to_string(), json!(tracking_index));
                         obj.insert("goods".to_string(), json!(goods_index));
                         obj.insert("order".to_string(), json!(index_val));
+                        obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!("count"));
                     }
-                    
-                    
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
                     let masked_tracking_text = tracking_text.clone();
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                    
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
-                    
-                    
-                    
-                    let tracking_bcc = entity_bcc("tracking", &cc_val);
-                    
+                    let tracking_bcc = entity_bcc("tracking", &task.cc);
                     let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
-
+                    let tracking_prior = crate::utils::canonical::ledger_prior(
+                        store
+                            .get_item_by_id("tracking", &tracking_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok())
+                            .as_ref(),
+                    );
+                    relay_ledger::add_delta(&mut stats_diff, "tracking", crate::utils::canonical::ledger_delta(tracking_prior, true));
                     save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
                         &task.from, &team_id, &task.cc, &tracking_bcc, &tracking_ref, None).await;
                 }
+                _ => {}
             }
         }
     }
@@ -7336,38 +8298,27 @@ pub async fn process_task(
     let bcc = entity_bcc(&page_type, &cc_val);
     let ref_val = task.r#ref.clone();
     let mut items_to_process = Vec::new();
-    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
     if is_detail {
         
 
         let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
-        let item_digest = crate::utils::hash::digest(&text_to_embed); 
-        let mut target_id = generated_id.clone(); 
-        
+        let item_digest = crate::utils::hash::digest(&text_to_embed);
+        let mut target_id = generated_id.clone();
+
         let mut existing_vector = None;
-        let mut is_new = true;
-        let mut was_draft = false;
+        let mut existing_json_found: Option<serde_json::Value> = None;
 
-        
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-            is_new = false;
-            
-            
-            
-            
-            was_draft = existing_item.updated_at_ts == 0;
-
-            
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
                 let old_digest = existing_json.get("digest").and_then(|d| d.as_str()).unwrap_or("");
                 if old_digest == item_digest {
                     existing_vector = Some(existing_item.vector);
                 }
                 extracted_data = merge_node(&existing_json, &extracted_data);
+                existing_json_found = Some(existing_json);
             }
-        } 
-        
+        }
         else if !url.is_empty() {
             let normalized_link = if let Ok(parsed_url) = url::Url::parse(&url) {
                 format!("{}{}", parsed_url.path(), parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase()
@@ -7376,12 +8327,8 @@ pub async fn process_task(
             };
             if let Ok(Some((found_id, json_val))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
-                is_new = false;
 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    
-                    was_draft = existing_item.updated_at_ts == 0;
-
                     if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
                         let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
                         if old_digest == item_digest {
@@ -7393,34 +8340,16 @@ pub async fn process_task(
                 extracted_data = merge_node(&json_val, &extracted_data);
                 if let Some(obj) = extracted_data.as_object_mut() {
                     obj.insert("id".to_string(), json!(target_id.clone()));
+                    if let Some(found_index) = crate::utils::canonical::relay_ref_index(json_val.get("index")) {
+                        obj.insert("index".to_string(), json!(found_index));
+                    }
                 }
+                existing_json_found = Some(json_val);
             }
         }
 
-        if is_new {
-            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.1 += 1;
-            e.2 += 1;
-        } else if was_draft {
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.0 -= 1;
-            e.1 += 1;
-            e.2 += 1;
-            if let Some(obj) = extracted_data.as_object_mut() {
-                obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-            }
-        }
+        let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
+        let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
 
         let vector = if let Some(v) = existing_vector {
             Some(v)
@@ -7428,383 +8357,43 @@ pub async fn process_task(
             Some(model.get_embedding(text_to_embed).await?)
         };
 
-        
-        
-        
-        if page_type == "order" {
-            if let Some(tn_raw) = extracted_data.get("tracking_number")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()) 
-            {
-                if !tn_raw.trim().is_empty() {
-                    
-                    let clean_tn_pre = normalize_entity_key(&tn_raw);
-                    if !clean_tn_pre.is_empty() {
-                        let tracking_index_pre = entity_index("tracking", &team_id, &tn_raw);
-                        
-                        if let Some(obj) = extracted_data.as_object_mut() {
-                            obj.insert("tracking".to_string(), json!(tracking_index_pre));
-                        }
-                        
-                        emit_term(&format!("  🔑 [TRACKING INDEX PRE-COMPUTE] tracking_number '{}' → 정규화 '{}' → tracking index {} 사전 설정 완료.", tn_raw, clean_tn_pre, tracking_index_pre));
-                    }
-                }
-            }
+        if let Some(t_idx) = relay_ledger::bind_tracking_ref(&mut extracted_data, &page_type, &team_id, &task.cc) {
+            emit_term(&format!(
+                "  🔑 [TRACKING INDEX PRE-COMPUTE] 주문의 tracking 연결 index {} 확정. 유효한 송장번호는 사이트와 무관한 시드로 만들어, 다른 사이트나 행동 로그가 같은 송장을 가리켜도 같은 index 로 만납니다.",
+                t_idx
+            ));
         }
-
-        let related_types = crate::logic::related(&page_type);
-        for foreign_type in related_types {
-            if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
-                for q in queries {
-                    match store.find_item_by_property("items", "index", &q.value).await {
-                        Ok(Some((foreign_id, mut foreign_data))) => {
-                            let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                            let mut needs_update = false;
-
-
-                            if let Some(update) = &merge_rule.update {
-                                for field in &update.includes {
-                                    if update.from == page_type {
-                                        if let Some(val) = extracted_data.get(field).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                            needs_update = true;
-                                        }
-                                    } else if update.to == page_type {
-                                        if let Some(val) = foreign_data.get(field).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                        }
-                                    }
-                                }
-                                if let Some(foreign_info) = &update.foreign {
-                                    if update.from == page_type {
-                                        if let Some(val) = extracted_data.get(&foreign_info.to).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                            needs_update = true;
-                                        }
-                                    } else if update.to == page_type {
-                                        if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                        }
-                                    }
-                                }
-                            }
-
-
-                            if let Some(upsert) = &merge_rule.upsert {
-                                for field in &upsert.includes {
-                                    if upsert.from == page_type {
-                                        if let Some(val) = extracted_data.get(field).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                            needs_update = true;
-                                        }
-                                    } else if upsert.to == page_type {
-                                        if let Some(val) = foreign_data.get(field).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                        }
-                                    }
-                                }
-                            }
-
-
-                            if needs_update {
-                                if was_foreign_draft && merge_rule.update.as_ref().map_or(false, |u| u.to == foreign_type) {
-                                    let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                    e.0 -= 1;
-                                    e.1 += 1;
-                                    
-                                    e.2 += 1;
-                                    foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                }
-                                let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                let masked_merged_text = merged_text.clone();
-                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                
-                                foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-
-                                
-                                save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                            }
-                        },
-                        Ok(None) => {
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            let mut found_existing = false;
-                            if let Ok(cross_results) = store.get_all_items("items", 1, 0,
-                                Some(format!("type = '{}' AND data LIKE '%\"index\":{}%'", foreign_type, q.value))
-                            ).await {
-                                if !cross_results.is_empty() {
-                                    found_existing = true;
-                                    emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (index={}). 새 draft 생성을 건너뜁니다.", foreign_type, q.value));
-                                }
-                            }
-
-                            
-                            
-                            
-                            
-                            if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
-                                if let Some(order_idx) = extracted_data.get("index") {
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    let needle = crate::store::json_property_needle("order", order_idx);
-                                    let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                    if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
-                                        if !fallback_results.is_empty() {
-                                            found_existing = true;
-                                            
-                                            
-                                            emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !found_existing {
-                                let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                e.0 += 1;
-                                e.2 += 1;
-                                let mut draft_data = json!({});
-                                let val_str = match &q.value {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    serde_json::Value::Number(n) => n.to_string(),
-                                    _ => q.value.to_string(),
-                                };
-                                
-                                //
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                let draft_index = entity_index(foreign_type, &team_id, &val_str);
-                                let draft_id = entity_id(&team_id, draft_index);
-                                
-                                
-                                
-                                let foreign_bcc = entity_bcc(foreign_type, &cc_val);
-                                if let Some(obj) = draft_data.as_object_mut() {
-                                    obj.insert("id".to_string(), json!(draft_id.clone()));
-                                    obj.insert("type".to_string(), json!(foreign_type));
-                                    
-                                    obj.insert("index".to_string(), json!(draft_index));
-                                    obj.insert(q.column.clone(), q.value.clone());
-                                    obj.insert("updated_at".to_string(), json!(0));
-                                    
-                                    
-                                    obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                    
-                                    obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
-                                }
-                                save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
-                            }
-                        },
-                        _ => {}
-                    }
-                }
-            }
+        let detail_extra = relay_ledger::goods_array_refs(&mut extracted_data, &team_id, &task.cc);
+        let self_index = crate::utils::canonical::relay_ref_index(extracted_data.get("index")).unwrap_or(index_val);
+        let bridge = {
+            let relay_env = relay_ledger::RelayEnv {
+                store: &store,
+                app_handle,
+                task_id: &task.id,
+                team_id: &team_id,
+                from: &task.from,
+                cc: &task.cc,
+                ref_val: &ref_val,
+                search_mode: &search_mode,
+            };
+            relay_ledger::bridge_relays(&relay_env, &page_type, &target_id, self_index, &mut extracted_data, &detail_extra, &mut stats_diff).await
+        };
+        let confirm = relay_ledger::self_established(self_prior, origin_ok, &bridge);
+        let self_delta = crate::utils::canonical::ledger_delta(self_prior, confirm);
+        relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+        let self_state = crate::utils::canonical::ledger_state(self_prior, confirm);
+        let self_ts = if self_state == "count" { chrono::Utc::now().timestamp_millis() } else { 0 };
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("updated_at".to_string(), json!(self_ts));
+            obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!(self_state));
         }
+        emit_term(&format!(
+            "  📒 [RELAY LEDGER / SELF] {} '{}' 상세 문서 | 이전 상태 {:?} | 성립 관계 정방향 {}건 · 역방향 {}건 · 자리 초안 출처 성립 {} | {} | 원장 변화 {:?}",
+            page_type, target_id, self_prior, bridge.establishing_out, bridge.referrers, origin_ok,
+            if self_state == "count" { "count 확정" } else { "draft 유지 (성립 관계 없음)" },
+            self_delta
+        ));
 
-
-        if page_type == "order" {
-            if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
-                if !tn_raw.trim().is_empty() {
-                    let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
-                    if !clean_tn.is_empty() {
-                        emit_term(&format!("  📦 [TRACKING RELAY] order 전처리에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
-                        match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
-                            Ok(Some((tracking_id, mut tracking_data))) => {
-
-                                let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                let mut needs_update = false;
-
-                                for field in ["width", "height", "length", "weight"] {
-                                    if let Some(val) = extracted_data.get(field).cloned() {
-                                        let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        if existing == 0.0 {
-                                            tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
-                                            needs_update = true;
-                                        }
-                                    }
-                                }
-
-                                if let Some(order_index) = extracted_data.get("index") {
-                                    if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
-                                        tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                        needs_update = true;
-                                    }
-                                }
-
-                                if let Some(tracking_index) = tracking_data.get("index").cloned() {
-                                    if extracted_data.get("tracking").is_none() || extracted_data.get("tracking") == Some(&json!(0)) {
-                                        extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                    }
-                                }
-                                if needs_update {
-                                    if was_foreign_draft {
-                                        let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                        e.0 -= 1;
-                                        e.1 += 1;
-                                        e.2 += 1;
-                                        tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                    }
-                                    let merged_text = parsing::json_to_natural_language(&tracking_data);
-                                    let masked_merged_text = merged_text.clone();
-                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                    tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                    tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                    if tracking_data.get("mode").is_none() {
-                                        tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                    }
-                                    
-                                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                    emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
-                                }
-                            },
-                            Ok(None) => {
-                                
-                                let mut found_existing_tracking = false;
-                                let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
-                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
-                                if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
-                                    if !tracking_cross.is_empty() {
-                                        found_existing_tracking = true;
-                                        let existing_tracking_id = &tracking_cross[0].id;
-                                        
-                                        if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
-                                            if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
-                                                if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
-                                                    if let Some(order_index) = extracted_data.get("index") {
-                                                        ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                    }
-                                                    if let Some(tn_val) = extracted_data.get("tracking") {
-                                                        ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
-                                                    }
-                                                    ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                    ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                    let merged_text = crate::parsing::json_to_natural_language(&ej);
-                                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                    ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                    ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                    if ej.get("mode").is_none() {
-                                                        ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                    }
-                                                    
-                                                    save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                }
-                                                if let Some(tracking_index) = ej.get("index").cloned() {
-                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                                }
-                                            }
-                                        }
-                                        emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
-                                    }
-                                }
-
-                                
-                                
-                                
-                                
-                                if !found_existing_tracking {
-                                    if let Some(order_index_val) = extracted_data.get("index") {
-                                        match store.find_item_by_property("tracking", "order", order_index_val).await {
-                                            Ok(Some((fallback_tid, mut fallback_tdata))) => {
-                                                found_existing_tracking = true;
-                                                let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                                if let Some(obj) = fallback_tdata.as_object_mut() {
-                                                    obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                    if let Some(tn_idx) = extracted_data.get("tracking") {
-                                                        obj.insert("tracking".to_string(), tn_idx.clone());
-                                                    }
-                                                    obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                }
-                                                if was_fb_draft {
-                                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                    e.0 -= 1;
-                                                    e.1 += 1;
-                                                }
-                                                let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
-                                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                if fallback_tdata.get("mode").is_none() {
-                                                    fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                }
-                                                
-                                                save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
-                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
-                                                }
-                                                emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
-                                            },
-                                            _ => {}
-                                        }
-                                    }
-                                }
-
-                                if !found_existing_tracking {
-                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                    e.0 += 1;
-                                    e.2 += 1;
-                                    
-                                    
-                                    
-                                    let tracking_index = entity_index("tracking", &team_id, &clean_tn);
-                                    let draft_id = entity_id(&team_id, tracking_index);
-                                    let tracking_bcc = entity_bcc("tracking", &cc_val);
-                                    let mut draft_data = json!({});
-                                    if let Some(obj) = draft_data.as_object_mut() {
-                                        obj.insert("id".to_string(), json!(draft_id.clone()));
-                                        obj.insert("type".to_string(), json!("tracking"));
-                                        obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                        obj.insert("index".to_string(), json!(tracking_index));
-                                        if let Some(order_index) = extracted_data.get("index") {
-                                            obj.insert("order".to_string(), order_index.clone());
-                                        }
-                                        obj.insert("updated_at".to_string(), json!(0));
-                                        
-                                        obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                        obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
-                                    }
-                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                    save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                        &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
-                                    emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-
-        
         save_item(&store, &target_table, &target_id, &page_type, extracted_data.clone(), vector,
             &task.from, &team_id, &task.cc, &bcc, &ref_val, Some(&item_digest)).await;
         items_to_process.push(extracted_data.clone());
@@ -7872,44 +8461,7 @@ pub async fn process_task(
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
                     };
 
-                    let fmt_str = {
-                        let lower = fname.to_lowercase();
-                        let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-                        let has = |k: &str| keys.iter().any(|x| x == k);
-
-                        if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-                            "Synthesis".to_string()
-                        } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-                            "TrackingCode".to_string()
-                        } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-                            "Identifier".to_string()
-                        } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-                            "Link".to_string()
-                        } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-                            "Date".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-                                || k == "cellphone" || k == "contact" || k == "number"
-                        }) {
-                            "Phone".to_string()
-                        } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-                            "Address".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-                                || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-                        }) {
-                            "Enum".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-                                || k == "width" || k == "height" || k == "length" || k.contains("fee")
-                                || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-                                || k.contains("duration")
-                        }) {
-                            "Numeric".to_string()
-                        } else {
-                            "Text".to_string()
-                        }
-                    };
+                    let fmt_str = crate::nl_convert::field_format_to_string(fname);
 
                     idx_field_names.push(fname.clone());
                     idx_field_phrase_embs.push(phrase_embs);
@@ -8075,6 +8627,16 @@ pub async fn process_task(
     } else {
         
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
+            let relay_env = relay_ledger::RelayEnv {
+                store: &store,
+                app_handle,
+                task_id: &task.id,
+                team_id: &team_id,
+                from: &task.from,
+                cc: &task.cc,
+                ref_val: &ref_val,
+                search_mode: &search_mode,
+            };
             for item_val in items.iter() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -8103,7 +8665,7 @@ pub async fn process_task(
                 } else {
                     original_id.clone()
                 };
-                let index_val = entity_index(&page_type, &team_id, &identity_seed);
+                let index_val = entity_key_index(&page_type, &team_id, &task.cc, &identity_seed);
                 let hashed_item_id = entity_id(&team_id, index_val);
 
                 if let Some(obj) = single_item.as_object_mut() {
@@ -8111,351 +8673,91 @@ pub async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                     obj.insert("id".to_string(), json!(hashed_item_id.clone()));
                     obj.insert("index".to_string(), json!(index_val));
-                    
                     obj.insert("updated_at".to_string(), json!(0));
                 }
+                relay_ledger::bind_tracking_ref(&mut single_item, &page_type, &team_id, &task.cc);
 
-
-                let text_to_embed = single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item));
-                let item_digest = crate::utils::hash::digest(&text_to_embed);
-                
-                let mut existing_vector = None;
-                let mut is_new = true;
-
-
-                if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
-                    is_new = false;
-
-                    
-                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
-                        if old_digest == item_digest {
-                            existing_vector = Some(existing_item.vector);
+                let existing_item = store.get_item_by_id(&target_table, &hashed_item_id).await.ok().flatten();
+                let existing_json: Option<serde_json::Value> = existing_item
+                    .as_ref()
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok());
+                let self_prior = crate::utils::canonical::ledger_prior(existing_json.as_ref());
+                let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json.as_ref());
+                if let Some(ej) = existing_json.as_ref() {
+                    single_item = merge_node(ej, &single_item);
+                    if let Some(obj) = single_item.as_object_mut() {
+                        obj.insert("id".to_string(), json!(hashed_item_id.clone()));
+                        obj.insert("index".to_string(), json!(index_val));
+                        if ej.get("detail").map_or(false, |v| v.as_i64() == Some(1) || v.as_bool() == Some(true)) {
+                            obj.insert("detail".to_string(), json!(true));
                         }
                     }
                 }
 
-                if is_new {
-                    let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-                    e.0 += 1;
-                    e.2 += 1;
+                let bridge = relay_ledger::bridge_relays(&relay_env, &page_type, &hashed_item_id, index_val, &mut single_item, &[], &mut stats_diff).await;
+                let confirm = relay_ledger::self_established(self_prior, origin_ok, &bridge);
+                let self_delta = crate::utils::canonical::ledger_delta(self_prior, confirm);
+                relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+                let self_state = crate::utils::canonical::ledger_state(self_prior, confirm);
+                let kept_ts = existing_json
+                    .as_ref()
+                    .and_then(|e| e.get("updated_at").and_then(|v| v.as_i64()))
+                    .filter(|t| *t > 0 && self_prior == crate::utils::canonical::LedgerPrior::Confirmed);
+                let self_ts = if self_state == "count" {
+                    kept_ts.unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+                } else {
+                    0
+                };
+                if let Some(obj) = single_item.as_object_mut() {
+                    obj.insert("updated_at".to_string(), json!(self_ts));
+                    obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!(self_state));
                 }
-                
+                emit_term(&format!(
+                    "  📒 [RELAY LEDGER / SELF] {} '{}' | 이전 상태 {:?} | 성립 관계 정방향 {}건 · 역방향 {}건 · 자리 초안 출처 성립 {} | {} | 원장 변화 {:?}",
+                    page_type,
+                    hashed_item_id,
+                    self_prior,
+                    bridge.establishing_out,
+                    bridge.referrers,
+                    origin_ok,
+                    if self_state == "count" { "count 확정" } else { "draft 유지 (성립 관계 없음)" },
+                    self_delta
+                ));
+
+                let text_to_embed = if existing_json.is_some() {
+                    let mut text_view = single_item.clone();
+                    if let Some(o) = text_view.as_object_mut() {
+                        match item_val.get("id").filter(|v| !v.is_null()) {
+                            Some(raw_id) => {
+                                o.insert("id".to_string(), raw_id.clone());
+                            }
+                            None => {
+                                o.remove("id");
+                            }
+                        }
+                    }
+                    let merged_text = parsing::json_to_natural_language(&text_view);
+                    if let Some(obj) = single_item.as_object_mut() {
+                        obj.insert("text".to_string(), json!(merged_text.clone()));
+                        obj.insert("masked_text".to_string(), json!(merged_text.clone()));
+                    }
+                    merged_text
+                } else {
+                    single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item))
+                };
+                let item_digest = crate::utils::hash::digest(&text_to_embed);
+                let existing_vector = existing_item.as_ref().and_then(|doc| {
+                    let old_digest = existing_json
+                        .as_ref()
+                        .and_then(|e| e.get("digest").and_then(|d| d.as_str()))
+                        .unwrap_or("");
+                    if old_digest == item_digest { Some(doc.vector.clone()) } else { None }
+                });
                 let vector = if let Some(v) = existing_vector {
                     Some(v)
                 } else {
                     Some(model.get_embedding(text_to_embed).await?)
                 };
-
-                
-                let related_types = crate::logic::related(&page_type);
-                for foreign_type in related_types {
-                    if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
-                        for q in queries {
-                            match store.find_item_by_property("items", "index", &q.value).await {
-                                Ok(Some((foreign_id, mut foreign_data))) => {
-                                    let mut needs_update = false;
-
-                                    if let Some(update) = &merge_rule.update {
-                                        for field in &update.includes {
-                                            if update.from == page_type {
-                                                if let Some(val) = single_item.get(field).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                                    needs_update = true;
-                                                }
-                                            } else if update.to == page_type {
-                                                if let Some(val) = foreign_data.get(field).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
-                                                }
-                                            }
-                                        }
-                                        if let Some(foreign_info) = &update.foreign {
-                                            if update.from == page_type {
-                                                if let Some(val) = single_item.get(&foreign_info.to).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                                    needs_update = true;
-                                                }
-                                            } else if update.to == page_type {
-                                                if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                                }
-                                            }
-                                        }
-                                    }
-
-
-                                    if let Some(upsert) = &merge_rule.upsert {
-                                        for field in &upsert.includes {
-                                            if upsert.from == page_type {
-                                                if let Some(val) = single_item.get(field).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                                    needs_update = true;
-                                                }
-                                            } else if upsert.to == page_type {
-                                                if let Some(val) = foreign_data.get(field).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if needs_update {
-                                        let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                        let masked_merged_text = merged_text.clone();
-                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-
-                                        foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                        foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                        if foreign_data.get("mode").is_none() {
-                                            foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                        }
-
-                                        
-                                        save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                    }
-                                },
-                                Ok(None) => {
-                                    
-                                    
-                                    let mut found_existing = false;
-                                    let val_str_for_search = match &q.value {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        _ => q.value.to_string(),
-                                    };
-                                    if !val_str_for_search.is_empty() {
-                                        
-                                        
-                                        
-                                        let needle = crate::store::json_property_needle(&q.column, &q.value);
-                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                        if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
-                                            if !cross_results.is_empty() {
-                                                found_existing = true;
-                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
-                                            }
-                                        }
-                                    }
-
-                                    
-                                    if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
-                                        if let Some(order_idx) = single_item.get("index") {
-                                            
-                                            
-                                            let needle = crate::store::json_property_needle("order", order_idx);
-                                            let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                            if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
-                                                if !fallback_results.is_empty() {
-                                                    found_existing = true;
-                                                    emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if !found_existing {
-                                        let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                        e.0 += 1;
-                                        e.2 += 1;
-                                        let mut draft_data = json!({});
-                                        let val_str = match &q.value {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            serde_json::Value::Number(n) => n.to_string(),
-                                            _ => q.value.to_string(),
-                                        };
-                                        
-                                        
-                                        let draft_index = entity_index(foreign_type, &team_id, &val_str);
-                                        let draft_id = entity_id(&team_id, draft_index);
-                                        let foreign_bcc = entity_bcc(foreign_type, &cc_val);
-                                        if let Some(obj) = draft_data.as_object_mut() {
-                                            obj.insert("id".to_string(), json!(draft_id.clone()));
-                                            obj.insert("type".to_string(), json!(foreign_type));
-                                            obj.insert("index".to_string(), json!(draft_index));
-                                            obj.insert(q.column.clone(), q.value.clone());
-                                            obj.insert("updated_at".to_string(), json!(0));
-                                            obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                            obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
-                                        }
-                                        save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                            &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
-                                    }
-                                },
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                if page_type == "order" {
-                    if let Some(tn_raw) = single_item.get("tracking_number").and_then(|v| v.as_str()) {
-                        if !tn_raw.trim().is_empty() {
-                            let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
-                            if !clean_tn.is_empty() {
-                                emit_term(&format!("  📦 [TRACKING RELAY] order 리스트 아이템에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
-                                match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
-                                    Ok(Some((tracking_id, mut tracking_data))) => {
-
-                                        let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                        let mut needs_update = false;
-
-                                        for field in ["width", "height", "length", "weight"] {
-                                            if let Some(val) = single_item.get(field).cloned() {
-                                                let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                if existing == 0.0 {
-                                                    tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
-                                                    needs_update = true;
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(order_index) = single_item.get("index") {
-                                            if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
-                                                tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                needs_update = true;
-                                            }
-                                        }
-
-                                        if let Some(tracking_index) = tracking_data.get("index").cloned() {
-                                            if single_item.get("tracking").is_none() || single_item.get("tracking") == Some(&json!(0)) {
-                                                single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                            }
-                                        }
-                                        if needs_update {
-                                            if was_foreign_draft {
-                                                let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                e.0 -= 1;
-                                                e.1 += 1;
-                                                e.2 += 1;
-                                                tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                            }
-                                            let merged_text = parsing::json_to_natural_language(&tracking_data);
-                                            let masked_merged_text = merged_text.clone();
-                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                            tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                            tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                            
-                                            if tracking_data.get("mode").is_none() {
-                                                tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                            }
-                                            save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                            emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
-                                        }
-                                    },
-                                    Ok(None) => {
-                                        
-                                        let mut found_existing_tracking = false;
-                                        let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
-                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
-                                        if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
-                                            if !tracking_cross.is_empty() {
-                                                found_existing_tracking = true;
-                                                let existing_tracking_id = &tracking_cross[0].id;
-                                                if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
-                                                    if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
-                                                        if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
-                                                            if let Some(order_index) = single_item.get("index") {
-                                                                ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                            }
-                                                            if let Some(tn_val) = single_item.get("tracking") {
-                                                                ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
-                                                            }
-                                                            ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                            let merged_text = crate::parsing::json_to_natural_language(&ej);
-                                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                            ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                            ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                            if ej.get("mode").is_none() {
-                                                                ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                            }
-                                                            
-                                                            save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                        }
-                                                        if let Some(tracking_index) = ej.get("index").cloned() {
-                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                                        }
-                                                    }
-                                                }
-                                                emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
-                                            }
-                                        }
-
-                                        
-                                        if !found_existing_tracking {
-                                            if let Some(order_index_val) = single_item.get("index") {
-                                                match store.find_item_by_property("tracking", "order", order_index_val).await {
-                                                    Ok(Some((fallback_tid, mut fallback_tdata))) => {
-                                                        found_existing_tracking = true;
-                                                        let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                                        if let Some(obj) = fallback_tdata.as_object_mut() {
-                                                            obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                            if let Some(tn_idx) = single_item.get("tracking") {
-                                                                obj.insert("tracking".to_string(), tn_idx.clone());
-                                                            }
-                                                            obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                        }
-                                                        if was_fb_draft {
-                                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                            e.0 -= 1;
-                                                            e.1 += 1;
-                                                        }
-                                                        let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
-                                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                        fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                        fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                        if fallback_tdata.get("mode").is_none() {
-                                                            fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                        }
-                                                        
-                                                        save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                        if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
-                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
-                                                        }
-                                                        emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
-                                                    },
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-
-                                        if !found_existing_tracking {
-                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                            e.0 += 1;
-                                            e.2 += 1;
-                                            
-                                            let tracking_index = entity_index("tracking", &team_id, &clean_tn);
-                                            let draft_id = entity_id(&team_id, tracking_index);
-                                            let tracking_bcc = entity_bcc("tracking", &cc_val);
-                                            let mut draft_data = json!({});
-                                            if let Some(obj) = draft_data.as_object_mut() {
-                                                obj.insert("id".to_string(), json!(draft_id.clone()));
-                                                obj.insert("type".to_string(), json!("tracking"));
-                                                obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                obj.insert("index".to_string(), json!(tracking_index));
-                                                if let Some(order_index) = single_item.get("index") {
-                                                    obj.insert("order".to_string(), order_index.clone());
-                                                }
-                                                obj.insert("updated_at".to_string(), json!(0));
-                                                obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                                obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
-                                            }
-                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                            save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                                &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
-                                            emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
-                                        }
-                                    },
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
 
                 
                 save_item(&store, &target_table, &hashed_item_id, &page_type, single_item.clone(), vector,
@@ -8508,44 +8810,7 @@ pub async fn process_task(
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
                             };
 
-                            let fmt_str = {
-                                let lower = fname.to_lowercase();
-                                let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-                                let has = |k: &str| keys.iter().any(|x| x == k);
-
-                                if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-                                    "Synthesis".to_string()
-                                } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-                                    "TrackingCode".to_string()
-                                } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-                                    "Identifier".to_string()
-                                } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-                                    "Link".to_string()
-                                } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-                                    "Date".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-                                        || k == "cellphone" || k == "contact" || k == "number"
-                                }) {
-                                    "Phone".to_string()
-                                } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-                                    "Address".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-                                        || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-                                }) {
-                                    "Enum".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-                                        || k == "width" || k == "height" || k == "length" || k.contains("fee")
-                                        || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-                                        || k.contains("duration")
-                                }) {
-                                    "Numeric".to_string()
-                                } else {
-                                    "Text".to_string()
-                                }
-                            };
+                            let fmt_str = crate::nl_convert::field_format_to_string(fname);
 
                             idx_field_names.push(fname.clone());
                             idx_field_phrase_embs.push(phrase_embs);

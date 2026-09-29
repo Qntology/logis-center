@@ -124,3 +124,60 @@ pub fn parse_pug_grid(lines: &[String]) -> Vec<GridCell> {
     }
     cells
 }
+
+pub fn grid_row_count(cells: &[GridCell]) -> usize {
+    cells.iter().map(|c| c.row + 1).max().unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HeaderGrid {
+    pub cells: Vec<GridCell>,
+    pub rows: usize,
+}
+
+impl HeaderGrid {
+    pub fn new(cells: Vec<GridCell>) -> Self {
+        let rows = grid_row_count(&cells);
+        HeaderGrid { cells, rows }
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.cells.iter().map(|c| c.col + c.colspan).max().unwrap_or(0)
+    }
+
+    pub fn column_label(&self, col: usize) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for cell in self.cells.iter() {
+            if col < cell.col || col >= cell.col + cell.colspan { continue; }
+            if cell.text.is_empty() { continue; }
+            parts.push(cell.text.as_str());
+        }
+        parts.join(" > ")
+    }
+
+    pub fn interleaved_with(&self, item_cells: &[GridCell]) -> bool {
+        if self.rows < 2 { return false; }
+        if grid_row_count(item_cells) != self.rows { return false; }
+        let mut exact = 0usize;
+        for c in item_cells.iter() {
+            if c.rowspan > 1 { continue; }
+            let hit = self.cells.iter().any(|h| {
+                h.row == c.row && h.col == c.col && h.colspan == c.colspan && h.rowspan <= 1
+            });
+            if !hit { return false; }
+            exact += 1;
+        }
+        exact > 0
+    }
+
+    pub fn cell_label(&self, row: usize, col: usize, colspan: usize, rowspan: usize, interleaved: bool) -> String {
+        if interleaved && rowspan <= 1 {
+            if let Some(h) = self.cells.iter().find(|h| {
+                h.row == row && h.col == col && h.colspan == colspan && h.rowspan <= 1 && !h.text.is_empty()
+            }) {
+                return h.text.clone();
+            }
+        }
+        self.column_label(col)
+    }
+}

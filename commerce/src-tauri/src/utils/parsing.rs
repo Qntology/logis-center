@@ -596,12 +596,11 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         }
                         let title = parts.join(" ");
                         if !title.is_empty() {
-                            let safe = title.replace("\"", "'");
+                            let safe = title.replace("\"", "'").replace('|', "/");
                             let canonical = canonicalize_trade_column(&title, &c.doc_lang);
-                            if canonical.is_empty() {
-                                other_attributes.push(format!("alt=\"{}\"", safe));
-                            } else {
-                                other_attributes.push(format!("alt=\"{}|{}\"", safe, canonical));
+                            other_attributes.push(format!("alt=\"{}\"", safe));
+                            if !canonical.is_empty() {
+                                other_attributes.push(format!("field=\"{}\"", canonical));
                             }
                         }
                     }
@@ -649,6 +648,11 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                             }
                         }
 
+                        let safe_value = if name_str == "href" || name_str == "src" {
+                            safe_value.replace('|', "%7C")
+                        } else {
+                            safe_value.replace('|', "/")
+                        };
                         other_attributes.push(format!("{}=\"{}\"", name_str, safe_value));
                     }
                 }
@@ -672,7 +676,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                     if let Some(val) = element.attr("value") {
                         let trimmed = val.trim();
                         if !trimmed.is_empty() && !trimmed.contains('\n') {
-                            inline_content = trimmed.to_string();
+                            inline_content = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
                             is_inline_text = true;
                         }
                     }
@@ -683,7 +687,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                     }
                     let clean = text_buf.trim();
                     if !clean.is_empty() && !clean.contains('\n') {
-                        inline_content = clean.to_string();
+                        inline_content = clean.split_whitespace().collect::<Vec<_>>().join(" ");
                         is_inline_text = true;
                     }
                 } else if !has_data_bearing_descendant(node) {
@@ -695,7 +699,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                         
                         // 텍스트가 존재하고, 줄바꿈이 없으며, 너무 길지 않은(150자 이내) 경우에만 인라인 압축을 허용합니다.
                         if !clean.is_empty() && !clean.contains('\n') && clean.len() < 150 {
-                            let mut clean_text = clean.replace("\"", "'").replace("  ", " ");
+                            let mut clean_text = clean.replace("\"", "'").split_whitespace().collect::<Vec<_>>().join(" ");
                             if let Ok(re) = regex::Regex::new(r"(\d{1,3}(?:,\d{3})+)(\.\d+)?") {
                                 clean_text = re.replace_all(&clean_text, |caps: &regex::Captures| {
                                     let int_part = caps.get(1).map_or("", |m| m.as_str()).replace(",", "");
@@ -768,7 +772,7 @@ pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, out
                 let text_content = text.trim();
                 if !text_content.is_empty() {
                     
-                    let mut clean_text = text_content.replace("\"", "'");
+                    let mut clean_text = text_content.replace("\"", "'").split_whitespace().collect::<Vec<_>>().join(" ");
                     
                     // 정규식: 1~3자리 숫자 뒤에 (콤마 + 3자리 숫자)가 1번 이상 반복되고, 선택적으로 소수점이 붙는 패턴
                     if let Ok(re) = regex::Regex::new(r"(\d{1,3}(?:,\d{3})+)(\.\d+)?") {
@@ -1461,13 +1465,14 @@ fn detect_label_script(text: &str) -> LabelScript {
 ///  doc_lang 이 빈 문자열이면(미확정) 전체 매칭으로 폴백합니다.
 fn alias_lang_matches(alias: &str, doc_lang: &str) -> bool {
     if doc_lang.is_empty() { return true; }
+    let code = crate::utils::bias_schema::lang_code_of(doc_lang);
     let script = detect_label_script(alias);
     match script {
         LabelScript::Latin   => true,
-        LabelScript::Korean  => doc_lang == "ko",
-        LabelScript::Japanese=> doc_lang == "ja",
-        LabelScript::Chinese => doc_lang.starts_with("zh"),
-        LabelScript::Arabic  => doc_lang == "ar",
+        LabelScript::Korean  => code == "ko",
+        LabelScript::Japanese=> code == "ja",
+        LabelScript::Chinese => code.starts_with("zh") || code == "ja",
+        LabelScript::Arabic  => code == "ar",
     }
 }
 
@@ -2201,7 +2206,7 @@ pub fn extract_trade_relay_keys_for(data: &Value, doc_lang: &str, doc_type: &str
 }
 
 pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) -> (String, u32, bool) {
-    let keys = extract_trade_relay_keys(data, doc_lang);
+    let keys = extract_trade_relay_keys_for(data, doc_lang, doc_type);
 
     // 🌟 [DOC NUMBER DIRECT] extracted_data에서 doc_number를 직접 확인합니다.
     //    extract_trade_relay_keys의 "self" 역할 매핑이 유효성 검사에서

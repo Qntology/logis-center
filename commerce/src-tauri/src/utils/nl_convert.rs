@@ -27,8 +27,10 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     intro.push_str(&format!("Regarding {}.", context_name));
                 }
 
-                if !intro.is_empty() && !sentences.contains(&intro) {
-                    sentences.push(intro);
+                let intro_at = sentences.len();
+                let intro_waits = title.is_empty();
+                if !intro.is_empty() && !intro_waits && !sentences.contains(&intro) {
+                    sentences.push(intro.clone());
                 }
 
                 for (key, v) in map {
@@ -38,19 +40,26 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "origin", "mode", "detail",
                         "updated_at", "created_at", "updated_at_ts", "created_at_ts",
                         "digest", "vector", "vision_vec", "from", "to", "cc", "bcc", "ref",
-                        "is_masked", "tier", "score",
-                        // 🌟 [RELAY INDEX] canonical.rs FORCE_NUM 의 릴레이 축.
-                        //    값은 crc32(normalize_identifier(...)) 결과 숫자입니다.
-                        "goods", "order", "tracking", "views",
-                        // 🌟 [SYSTEM FLAG] canonical.rs FORCE_BOOL 의 0|1 플래그.
+                        "is_masked", "tier", "score", "views",
                         "embed", "node", "item",
-                        // 🌟 [TABLE ROUTING] store.rs 의 물리 테이블 라우팅 키.
                         "table",
                         "doc_type",
+                        "ledger", "relay_origin", "_relay_bound",
                     ].contains(&key.as_str()) { continue; }
+                    if key.starts_with("rel_") { continue; }
+                    if crate::store::ENVELOPE_COLUMNS.contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
+                    if crate::utils::canonical::is_relay_index_key(key)
+                        && (!crate::utils::canonical::relay_value_is_content(v)
+                            || map.iter().any(|(k2, v2)| v2 == v && k2.starts_with(&format!("{}_", key))))
+                    {
+                        continue;
+                    }
 
-                    let clean_key = key.replace("_", " ");
+                    let clean_key = match crate::utils::canonical::relay_companion_base(key) {
+                        Some(base) => base.to_string(),
+                        None => key.replace("_", " "),
+                    };
 
                     if v.is_object() || v.is_array() {
                         parse_node(v, &clean_key, sentences);
@@ -72,6 +81,13 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                             sentences.push(format!("Its {} is {}.", clean_key, val_str));
                         }
                     }
+                }
+                if !intro.is_empty()
+                    && intro_waits
+                    && sentences[intro_at..].iter().any(|x| !sentences[..intro_at].contains(x))
+                    && !sentences[..intro_at].contains(&intro)
+                {
+                    sentences.insert(intro_at, intro);
                 }
             },
             serde_json::Value::Array(arr) => {
@@ -206,8 +222,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
             let property = context_raw.to_lowercase().replace(' ', "_");
 
             // 콤마로 배열 값 분할
-            let values: Vec<&str> = values_part
-                .split(',')
+            let values: Vec<&str> = split_clause_commas(values_part)
+                .into_iter()
                 .map(|v| v.trim())
                 .filter(|v| !v.is_empty())
                 .collect();
@@ -304,8 +320,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     for (chunk_text, property, confirmed) in &chunks {
         if chunk_text.chars().count() > 150 {
             // 콤마 기준으로 분할 시도
-            let parts: Vec<&str> = chunk_text
-                .split(',')
+            let parts: Vec<&str> = split_clause_commas(chunk_text)
+                .into_iter()
                 .map(|p| p.trim())
                 .filter(|p| !p.is_empty())
                 .collect();
@@ -313,12 +329,20 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
             if parts.len() > 1 {
                 // 🌟 [라벨 접두어 추출]
                 let label_prefix = extract_label_prefix(chunk_text);
+                let merge_fragments = crate::utils::ai_utils::detect_field_format(property)
+                    == crate::utils::ai_utils::FieldFormat::Synthesis;
 
                 for (pi, part) in parts.iter().enumerate() {
-                    // 첫 조각은 원본 그대로 (이미 라벨 포함)
                     if pi == 0 {
                         expanded.push((part.to_string(), property.clone(), *confirmed));
                         continue;
+                    }
+                    if merge_fragments && is_clause_fragment(part) {
+                        if let Some(last) = expanded.last_mut() {
+                            last.0.push_str(", ");
+                            last.0.push_str(part);
+                            continue;
+                        }
                     }
                     // 후속 조각에 라벨 접두어 복원
                     let restored = if let Some(prefix) = &label_prefix {
@@ -381,6 +405,40 @@ pub fn log_chunk_split_result(chunks: &[(String, String, bool)]) {
         let flag = if *confirmed { "✓" } else { "?" };
         println!("    [{}] {} property='{}' | text='{}'", i, flag, prop, text);
     }
+}
+
+pub fn split_clause_commas(s: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for k in 0..chars.len() {
+        let (bi, ch) = chars[k];
+        if ch != ',' { continue; }
+        let prev_digit = k > 0 && chars[k - 1].1.is_ascii_digit();
+        let next_digit = chars.get(k + 1).map_or(false, |x| x.1.is_ascii_digit());
+        if prev_digit && next_digit { continue; }
+        out.push(&s[start..bi]);
+        start = bi + ch.len_utf8();
+    }
+    out.push(&s[start..]);
+    out
+}
+
+pub fn is_clause_fragment(part: &str) -> bool {
+    let mut body = part.trim();
+    for p in ["and ", "or ", "with ", "but "] {
+        if let Some(rest) = body.strip_prefix(p) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    let words: Vec<&str> = body.split_whitespace().collect();
+    if words.len() < 3 {
+        return true;
+    }
+    !words
+        .iter()
+        .any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
 }
 
 // =====================================================================
@@ -502,7 +560,7 @@ fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> 
 ///   "This goods is titled '테스트상품'" → "테스트상품"
 ///   "tags includes 가전"       → "가전"
 ///   매칭 실패 시 전체 텍스트 반환
-fn extract_value_from_chunk(chunk_text: &str) -> String {
+pub fn extract_value_from_chunk(chunk_text: &str) -> String {
     let s = chunk_text.trim();
 
     // "Its {key} is {value}"
@@ -762,6 +820,9 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
             continue;
         }
 
+        let identifier_like = chunk.property_format == "Text"
+            && crate::utils::ai_utils::query_value_format(&chunk.property)
+                == crate::utils::ai_utils::FieldFormat::Identifier;
         let passes = match chunk.property_format.as_str() {
             "Numeric" => val.chars().any(|c| c.is_ascii_digit()),
             "Date" => {
@@ -780,7 +841,13 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
             },
             "Link" => val.contains('/') || val.to_lowercase().starts_with("http"),
             "Enum" => true, // Enum 은 어떤 값이든 허용
-            "Text" => val.chars().any(|c| c.is_alphabetic()),
+            "Text" => {
+                val.chars().any(|c| c.is_alphabetic())
+                    || (identifier_like
+                        && val
+                            .split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| tok.chars().count() >= 4 && tok.chars().any(|c| c.is_ascii_digit())))
+            },
             "Address" => val.chars().any(|c| c.is_alphabetic()) && val.split_whitespace().count() >= 2,
             "Synthesis" => true,
             _ => true,
@@ -795,7 +862,7 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
                 println!(
                     "  🛡️ [FORMAT GATE BYPASS] '{}' (property='{}', format='{}') 형식 불일치이지만 JSON 구조 확정이므로 보호",
                     if chunk.chunk_text.chars().count() > 60 {
-                        format!("{}...", &chunk.chunk_text[..57])
+                        format!("{}...", chunk.chunk_text.chars().take(57).collect::<String>())
                     } else {
                         chunk.chunk_text.clone()
                     },
@@ -1070,6 +1137,42 @@ pub fn build_transliteration_prompt_for_words(words: &[String], target_language:
 /// [LANGUAGE TRACK SANITIZE] 특정 단어 목록에 대한 LLM 응답만 파싱합니다.
 /// sanitize_transliteration_dual 의 단어 제한 버전입니다.
 /// source_value 대신 명시적 words 목록을 사용하여 응답 매핑을 수행합니다.
+fn transcription_fallback(
+    parsed: &serde_json::Value,
+    joined_src: &str,
+    word_map: &dyn Fn(&serde_json::Value) -> String,
+) -> String {
+    let tc = match parsed.get("transcription") {
+        Some(v) => v,
+        None => return String::new(),
+    };
+    if let Some(s) = tc.as_str() {
+        return s.trim().to_string();
+    }
+    let map = match tc.as_object() {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    let src_lower = joined_src.trim().to_lowercase();
+    for (k, v) in map.iter() {
+        if k.trim().to_lowercase() == src_lower {
+            if let Some(s) = v.as_str() {
+                return s.trim().to_string();
+            }
+        }
+    }
+    let mapped = word_map(tc);
+    if !mapped.is_empty() && !mapped.eq_ignore_ascii_case(joined_src.trim()) {
+        return mapped;
+    }
+    if map.len() == 1 && joined_src.split_whitespace().count() == 1 {
+        if let Some(s) = map.values().next().and_then(|v| v.as_str()) {
+            return s.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
     let src_words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
@@ -1123,6 +1226,17 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
+        }
+    }
+    let joined_src = words.join(" ");
+    if transliteration.is_empty() || transliteration.eq_ignore_ascii_case(&joined_src) {
+        let from_transcription = transcription_fallback(&parsed, &joined_src, &extract_word_map);
+        if !from_transcription.is_empty() && !from_transcription.eq_ignore_ascii_case(&joined_src) {
+            println!(
+                "    ↩️ [TRANSLIT KEY FALLBACK] 응답에 transliteration 이 비어 transcription 값을 씁니다: '{}' → '{}'",
+                joined_src, from_transcription
+            );
+            transliteration = from_transcription;
         }
     }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1285,13 +1399,21 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
     if let Some(tr_obj) = parsed.get("transliteration") {
         transliteration = extract_word_map(tr_obj);
     }
-    // ── 폴백: 문자열 형식 호환 ──
     if transliteration.is_empty() {
         if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
-    // 공백 정규화
+    if transliteration.is_empty() || transliteration.eq_ignore_ascii_case(src_clean_ref) {
+        let from_transcription = transcription_fallback(&parsed, src_clean_ref, &extract_word_map);
+        if !from_transcription.is_empty() && !from_transcription.eq_ignore_ascii_case(src_clean_ref) {
+            println!(
+                "    ↩️ [TRANSLIT KEY FALLBACK] 응답에 transliteration 이 비어 transcription 값을 씁니다: '{}' → '{}'",
+                src_clean_ref, from_transcription
+            );
+            transliteration = from_transcription;
+        }
+    }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
     // ── G1/G2/G3 게이트: transliteration 기준 ──
     let src_non_latin = src_clean_ref
@@ -1385,6 +1507,209 @@ pub fn assign_transliterations(source_value: &str, stage1: &str, stage2: &str) -
     }
 
     (native, roman)
+}
+
+pub const PHONETIC_PASS: f32 = 0.60;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PhoneClass {
+    P,
+    T,
+    K,
+    S,
+    G,
+    L,
+    M,
+    N,
+}
+
+fn phone_score(a: PhoneClass, b: PhoneClass) -> f32 {
+    if a == b {
+        return 1.0;
+    }
+    match (a, b) {
+        (PhoneClass::G, PhoneClass::K) | (PhoneClass::K, PhoneClass::G) | (PhoneClass::G, PhoneClass::S) | (PhoneClass::S, PhoneClass::G) => 1.0,
+        (PhoneClass::T, PhoneClass::S) | (PhoneClass::S, PhoneClass::T) | (PhoneClass::M, PhoneClass::N) | (PhoneClass::N, PhoneClass::M) => 0.5,
+        _ => 0.0,
+    }
+}
+
+fn phone_skeleton(romanized: &str) -> Vec<PhoneClass> {
+    let mut out: Vec<PhoneClass> = Vec::new();
+    for word in romanized.split_whitespace() {
+        let c: Vec<char> = word.chars().collect();
+        let mut last: Option<PhoneClass> = None;
+        let mut i = 0usize;
+        while i < c.len() {
+            let x = c[i];
+            let nx = c.get(i + 1).copied();
+            let mut emitted: Vec<PhoneClass> = Vec::new();
+            let mut step = 1usize;
+            match (x, nx) {
+                ('p', Some('h')) => { emitted.push(PhoneClass::P); step = 2; }
+                ('t', Some('h')) => { emitted.push(PhoneClass::T); step = 2; }
+                ('s', Some('h')) | ('c', Some('h')) => { emitted.push(PhoneClass::S); step = 2; }
+                ('t', Some('s')) | ('t', Some('z')) | ('d', Some('z')) | ('d', Some('j')) => { emitted.push(PhoneClass::S); step = 2; }
+                ('c', Some('k')) | ('q', Some('u')) | ('g', Some('h')) => { emitted.push(PhoneClass::K); step = 2; }
+                ('n', Some('g')) => { emitted.push(PhoneClass::N); step = 2; }
+                ('x', _) => { emitted.push(PhoneClass::K); emitted.push(PhoneClass::S); }
+                ('c', Some(n)) if n == 'e' || n == 'i' || n == 'y' => emitted.push(PhoneClass::S),
+                ('g', Some(n)) if n == 'e' || n == 'i' || n == 'y' => emitted.push(PhoneClass::G),
+                ('r', n) if !n.map_or(false, |v| "aeiouy".contains(v)) => {}
+                ('c', _) | ('k', _) | ('g', _) | ('q', _) => emitted.push(PhoneClass::K),
+                ('b', _) | ('p', _) | ('f', _) | ('v', _) => emitted.push(PhoneClass::P),
+                ('t', _) | ('d', _) => emitted.push(PhoneClass::T),
+                ('s', _) | ('z', _) | ('j', _) => emitted.push(PhoneClass::S),
+                ('l', _) | ('r', _) => emitted.push(PhoneClass::L),
+                ('m', _) => emitted.push(PhoneClass::M),
+                ('n', _) => emitted.push(PhoneClass::N),
+                _ => {}
+            }
+            for p in emitted {
+                if last != Some(p) {
+                    out.push(p);
+                }
+                last = Some(p);
+            }
+            i += step;
+        }
+    }
+    out
+}
+
+fn romanize_for_phonetics(text: &str) -> String {
+    any_ascii::any_ascii(text)
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_lowercase() { c } else { ' ' })
+        .collect()
+}
+
+fn letter_name_reading(src: &str) -> Option<String> {
+    const NAMES: [&str; 26] = [
+        "ei", "bi", "si", "di", "i", "ef", "ji", "eichi", "ai", "jei", "kei", "el", "em",
+        "en", "ou", "pi", "kyu", "ar", "es", "ti", "yu", "bi", "dabeulyu", "eks", "wai", "ji",
+    ];
+    let mut changed = false;
+    let words: Vec<String> = src
+        .split_whitespace()
+        .map(|w| {
+            let letters: Vec<char> = w.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            let acronym = (1..=5).contains(&letters.len())
+                && letters.iter().all(|c| c.is_ascii_uppercase())
+                && w.chars().all(|c| c.is_ascii_alphanumeric());
+            if !acronym {
+                return w.to_string();
+            }
+            changed = true;
+            letters
+                .iter()
+                .map(|c| NAMES[(*c as u8 - b'A') as usize])
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect();
+    if changed { Some(words.join(" ")) } else { None }
+}
+
+pub fn phonetic_similarity(a: &str, b: &str) -> Option<f32> {
+    let sa = phone_skeleton(&romanize_for_phonetics(a));
+    let sb = phone_skeleton(&romanize_for_phonetics(b));
+    if sa.len().max(sb.len()) < 2 {
+        return None;
+    }
+    let (n, m) = (sa.len(), sb.len());
+    let mut dp = vec![vec![0.0f32; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            let diag = dp[i - 1][j - 1] + phone_score(sa[i - 1], sb[j - 1]);
+            dp[i][j] = diag.max(dp[i - 1][j]).max(dp[i][j - 1]);
+        }
+    }
+    Some(2.0 * dp[n][m] / (n + m) as f32)
+}
+
+pub fn phonetic_gate(latin_src: &str, native: &str) -> (bool, Option<f32>) {
+    if native.trim().is_empty() || latin_src.trim().is_empty() {
+        return (true, None);
+    }
+    let mut best = phonetic_similarity(latin_src, native);
+    if let Some(alt) = letter_name_reading(latin_src) {
+        if let Some(s) = phonetic_similarity(&alt, native) {
+            best = Some(best.map_or(s, |b| b.max(s)));
+        }
+    }
+    match best {
+        Some(s) => (s >= PHONETIC_PASS, Some(s)),
+        None => (true, None),
+    }
+}
+
+pub fn gate_native_alias(latin_src: &str, native: String, tag: &str) -> String {
+    if native.trim().is_empty() || is_latin_dominant(&native) {
+        return native;
+    }
+    let (ok, sim) = phonetic_gate(latin_src, &native);
+    if let Some(s) = sim {
+        crate::utils::score_dynamics::record_baseline("indexing.translit_phonetic_sim", s);
+        crate::utils::score_dynamics::record_baseline(
+            "indexing.translit_phonetic_reject",
+            if ok { 0.0 } else { 1.0 },
+        );
+    }
+    if ok {
+        return native;
+    }
+    println!(
+        "    🚫 [{} PHONETIC REJECT] '{}' → '{}' | 자음 골격 유사도 {:.2} < {:.2} — 소리가 원문과 맞지 않는 음차라 별칭으로 쓰지 않습니다.",
+        tag,
+        latin_src,
+        native,
+        sim.unwrap_or(0.0),
+        PHONETIC_PASS
+    );
+    String::new()
+}
+
+pub fn cached_translit_recheck(
+    src: &str,
+    cached_native: &str,
+    doc_lang: &str,
+    lang_engine: bool,
+) -> Option<String> {
+    let (_non_latin, latin) = split_words_by_script(src);
+    if latin.is_empty() {
+        return None;
+    }
+    if is_latin_dominant(&native_script_sample(doc_lang, "", "")) {
+        return None;
+    }
+    let src_words: std::collections::HashSet<String> = strip_special_chars_for_transliteration(src)
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+    let added: Vec<&str> = cached_native
+        .split_whitespace()
+        .filter(|w| !src_words.contains(&w.to_lowercase()))
+        .collect();
+    if added.is_empty() {
+        return if lang_engine {
+            Some("문서언어 별칭이 비어 있어 언어별 4B 로 한 번 더 시도합니다".to_string())
+        } else {
+            None
+        };
+    }
+    let (ok, sim) = phonetic_gate(&latin.join(" "), &added.join(" "));
+    if ok {
+        None
+    } else {
+        Some(format!(
+            "캐시 별칭 '{}' 의 자음 골격 유사도 {:.2} 가 {:.2} 미만입니다",
+            added.join(" "),
+            sim.unwrap_or(0.0),
+            PHONETIC_PASS
+        ))
+    }
 }
 
 /// [PHASE B - 로그 헬퍼] 메타데이터 부여 + NMS + FORMAT GATE 전체 결과를 출력합니다.
@@ -1978,22 +2303,59 @@ where
     Fut: std::future::Future<Output = Vec<f32>>,
 {
     let _sds_index_guard = crate::utils::score_dynamics::indexing_guard();
-    const SYSTEM_PROPERTIES: [&str; 20] = [
+    const SYSTEM_PROPERTIES: [&str; 17] = [
         "masked_text", "text", "unclassified", "context_intro", "json_data",
-        "updated_at", "created_at", "digest", "index",
-        // 릴레이 인덱스 (canonical.rs FORCE_NUM)
-        "goods", "order", "tracking", "views",
-        // 시스템 플래그 (canonical.rs FORCE_BOOL)
+        "updated_at", "created_at", "digest", "index", "views",
         "embed", "node", "item", "detail",
-        // 라우팅 / 서식 코드 에코
         "table", "doc_type", "mode",
     ];
+    const SYSTEM_HASH_PROPERTIES: [&str; 6] = ["id", "ref", "cc", "bcc", "from", "to"];
+    let is_system_hash = |t: &str| -> bool {
+        let w = t.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        w.len() == 42
+            && (w.starts_with("0x") || w.starts_with("0X"))
+            && w[2..].chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let is_envelope_key = |p: &str| -> bool {
+        crate::store::ENVELOPE_COLUMNS.contains(&p) && !SYSTEM_HASH_PROPERTIES.contains(&p)
+    };
+    let mut hash_dropped = 0usize;
+    let mut relay_dropped = 0usize;
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
-        .filter(|(_, property, _)| {
-            !SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str())
+        .filter(|(text, property, _)| {
+            if SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str()) || is_envelope_key(property.as_str()) {
+                return false;
+            }
+            if crate::utils::canonical::is_relay_index_key(property)
+                && !crate::utils::canonical::relay_text_is_content(&extract_value_from_chunk(text))
+            {
+                relay_dropped += 1;
+                return false;
+            }
+            if SYSTEM_HASH_PROPERTIES.iter().any(|s| *s == property.as_str())
+                && text.split_whitespace().any(|t| is_system_hash(t))
+            {
+                hash_dropped += 1;
+                return false;
+            }
+            true
         })
         .collect();
+    crate::utils::score_dynamics::record_baseline("indexing.system_hash_drop", hash_dropped as f32);
+    crate::utils::score_dynamics::record_baseline("indexing.relay_literal_drop", relay_dropped as f32);
+    if relay_dropped > 0 {
+        println!(
+            "  🚫 [PHASE A FILTER / RELAY INDEX] 릴레이 인덱스 키(goods·order·tracking)에 숫자 값(crc32 인덱스)을 가진 청크 {}개를 뺍니다. 같은 키라도 글자가 들어 있는 값(주문 목록의 상품명 등)은 문서 내용이므로 남깁니다.",
+            relay_dropped
+        );
+    }
+    if hash_dropped > 0 {
+        println!(
+            "  🚫 [PHASE A FILTER / SYSTEM HASH] 저장소가 발급한 해시 식별자(0x + 16진 40자리)를 값으로 가진 청크 {}개를 뺍니다. 문서에 인쇄된 사실이 아니라서 검색이 만날 이유가 없고, 인덱싱 역검증에서 매번 doc_number 에 밀려 CONFIRM FLAG 와 혼동 사전(id,link ↔ doc_number)에 같은 잡음을 문서마다 남깁니다. 인쇄된 번호(상품 코드 등)는 이 모양이 아니므로 남습니다.",
+            hash_dropped
+        );
+    }
 
     let removed_count = raw_chunks.len() - filtered_chunks.len();
     if removed_count > 0 {

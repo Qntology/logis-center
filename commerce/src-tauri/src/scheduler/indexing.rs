@@ -368,44 +368,7 @@ pub async fn index_item_chunks(
             idx_field_phrase_weights.push(Vec::new());
         }
 
-        let fmt_str = {
-            let lower = fname.to_lowercase();
-            let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-            let has = |k: &str| keys.iter().any(|x| x == k);
-
-            if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-                "Synthesis".to_string()
-            } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-                "TrackingCode".to_string()
-            } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-                "Identifier".to_string()
-            } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-                "Link".to_string()
-            } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-                "Date".to_string()
-            } else if keys.iter().any(|k| {
-                k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-                    || k == "cellphone" || k == "contact" || k == "number"
-            }) {
-                "Phone".to_string()
-            } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-                "Address".to_string()
-            } else if keys.iter().any(|k| {
-                k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-                    || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-            }) {
-                "Enum".to_string()
-            } else if keys.iter().any(|k| {
-                k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-                    || k == "width" || k == "height" || k == "length" || k.contains("fee")
-                    || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-                    || k.contains("duration")
-            }) {
-                "Numeric".to_string()
-            } else {
-                "Text".to_string()
-            }
-        };
+        let fmt_str = crate::nl_convert::field_format_to_string(fname);
 
         idx_field_names.push(fname.clone());
         idx_field_phrase_embs.push(phrase_embs);

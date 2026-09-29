@@ -80,6 +80,17 @@ pub fn related(item_type: &str) -> Vec<&str> {
     }
 }
 
+pub fn relay_type_aliases(item_type: &str) -> &'static [&'static str] {
+    match crate::utils::canonical::relay_type_family(item_type).as_str() {
+        "goods" => &["goods", "goodsno", "gs", "gsid", "item", "itemno", "it", "itid", "product", "productno", "prd", "prdno", "pdt", "branduid"],
+        "order" => &["order", "orderno", "ordernum", "orderid", "od", "odid", "ord", "ordno", "ordnum"],
+        "tracking" => &["tracking", "delivery", "dlv", "invoice", "invoiceno", "waybill", "shipment", "parcel"],
+        "event" => &["event", "coupon", "cp", "cpn", "promotion", "promo", "ev"],
+        "review" => &["review", "rv"],
+        _ => &[],
+    }
+}
+
 /// 🌟 [TRADE RELAY] 무역 서식 간 연결고리 규칙입니다.
 /// Commerce의 relay()가 order↔tracking을 tracking_number로 연결하듯,
 /// 무역 서식은 reference_invoice / reference_lc / reference_booking / container_number로 연결합니다.
@@ -1260,18 +1271,18 @@ pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
       签署公司, 公司名称, 企业名称, 商号, 机构名称, \
       서명 회사, 회사명, 기업명, 상호, 조직명"),
     ("issue_date",
-     "date of issue, issue date, issued on, invoice date, date of invoice, document date, date of document, dated, date issued",
-     "Ausstellungsdatum, ausgestellt am, Rechnungsdatum, Belegdatum, Datum des Dokuments, \
+     "date of issue, issue date, issued on, invoice date, date of invoice, document date, date of document, dated, date issued, date",
+     "Ausstellungsdatum, ausgestellt am, Rechnungsdatum, Belegdatum, Datum des Dokuments, Datum, \
       date d'émission, émis le, date de la facture, date du document, date d'établissement, \
-      fecha de emisión, emitido el, fecha de la factura, fecha del documento, fecha de expedición, \
-      data di emissione, emesso il, data della fattura, data del documento, data di rilascio, \
+      fecha de emisión, emitido el, fecha de la factura, fecha del documento, fecha de expedición, fecha, \
+      data di emissione, emesso il, data della fattura, data del documento, data di rilascio, data, \
       data de emissão, emitido em, data da fatura, data do documento, \
       datum van uitgifte, uitgegeven op, factuurdatum, documentdatum, datum van afgifte, \
       datum vystavení, vystaveno dne, datum faktury, datum dokladu, datum vydání, \
-      تاريخ الإصدار, صدر في, تاريخ الفاتورة, تاريخ المستند, تاريخ التحرير, \
-      発行日, 発行日付, 請求書日付, 書類日付, 作成日, \
-      签发日期, 开具日期, 发票日期, 单据日期, 出具日期, \
-      발행일, 발행일자, 송장일자, 문서일자, 작성일"),
+      تاريخ الإصدار, صدر في, تاريخ الفاتورة, تاريخ المستند, تاريخ التحرير, التاريخ, \
+      発行日, 発行日付, 請求書日付, 書類日付, 作成日, 日付, \
+      签发日期, 开具日期, 发票日期, 单据日期, 出具日期, 日期, \
+      발행일, 발행일자, 송장일자, 문서일자, 작성일, 날짜, 일자"),
     ("country_of_manufacture",
      "country of manufacture, country of origin, made in, manufactured in, origin, origin country, manufacturing country, produced in, C/O",
      "Herstellungsland, Ursprungsland, hergestellt in, Produktionsland, \
@@ -1390,19 +1401,19 @@ pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
       个数, 发货数量, 订购数量, \
       수량, 개수, 선적 수량, 주문 수량"),
     ("weight_gross",
-     "gross weight, G.W., GW, gross wt., total gross weight, gross mass",
-     "Bruttogewicht, Gesamtbruttogewicht, Brutto-Gewicht, \
-      poids brut, poids brut total, \
-      peso bruto, peso bruto total, \
-      peso lordo, peso lordo totale, \
-      brutogewicht, totaal brutogewicht, \
-      hrubá hmotnost, celková hrubá hmotnost, \
-      الوزن القائم, الوزن الإجمالي, إجمالي الوزن القائم, \
-      総重量, グロス重量, \
-      毛重, 总毛重, \
-      총중량, 그로스 중량"),
+     "gross weight, G.W., GW, G/W, gross wt., total gross weight, gross mass, total weight, shipping weight, total shipping weight, shipment weight",
+     "Bruttogewicht, Gesamtbruttogewicht, Brutto-Gewicht, Gesamtgewicht, Versandgewicht, \
+      poids brut, poids brut total, poids total, poids d'expédition, \
+      peso bruto, peso bruto total, peso total, peso de envío, peso de envio, \
+      peso lordo, peso lordo totale, peso totale, peso di spedizione, \
+      brutogewicht, totaal brutogewicht, totaalgewicht, verzendgewicht, \
+      hrubá hmotnost, celková hrubá hmotnost, celková hmotnost, přepravní hmotnost, \
+      الوزن القائم, الوزن الإجمالي, إجمالي الوزن القائم, الوزن الكلي, وزن الشحنة, \
+      総重量, グロス重量, 合計重量, 出荷重量, \
+      毛重, 总毛重, 总重量, 发货重量, \
+      총중량, 그로스 중량, 총 무게, 전체 중량, 선적 중량"),
     ("weight_net",
-     "net weight, N.W., NW, net wt., total net weight, net mass",
+     "net weight, N.W., NW, N/W, net wt., total net weight, net mass",
      "Nettogewicht, Gesamtnettogewicht, Netto-Gewicht, \
       poids net, poids net total, \
       peso neto, peso neto total, \
@@ -1414,6 +1425,19 @@ pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
       正味重量, 純重量, ネット重量, \
       净重, 总净重, \
       순중량, 순 중량"),
+    ("item_net_weight",
+     "unit weight, unit net weight, net weight per unit, weight per unit, net weight per piece, weight per piece, unit wt.",
+     "Stückgewicht, Einzelgewicht, Gewicht pro Einheit, Nettogewicht pro Stück, \
+      poids unitaire, poids net unitaire, poids par unité, \
+      peso unitario, peso neto unitario, peso por unidad, \
+      peso netto unitario, peso per unità, \
+      peso unitário, peso líquido unitário, peso por unidade, \
+      eenheidsgewicht, gewicht per stuk, nettogewicht per stuk, \
+      jednotková hmotnost, hmotnost za kus, čistá hmotnost za kus, \
+      وزن الوحدة, الوزن الصافي للوحدة, الوزن لكل وحدة, \
+      単位重量, 単重, 正味単重, \
+      单位重量, 单重, 每件重量, 单件净重, \
+      단위 중량, 단위중량, 개당 중량, 단위 순중량"),
     ("package_count",
      "total number of packages, total packages, total no. of packages, total no. of pkgs, total cartons, total number of cartons, packages in total, total package count",
      "Gesamtzahl der Packstücke, Packstücke insgesamt, Gesamtanzahl der Kartons, \
@@ -2121,11 +2145,11 @@ pub const TRADE_DOC_TITLES_ML_FULL: &[(&str, &str)] = &[
     ("Packing List", "Packliste, Lista de empaque, Liste de colisage, 梱包明細書, パッキングリスト, Lista de embalagem, Romaneio, قائمة التعبئة, Balicí list, Lista di imballaggio, 포장명세서, Paklijst, 装箱单"),
     ("Bill of Lading", "Konnossement, Conocimiento de embarque, Connaissement, 船荷証券, Conhecimento de embarque, بوليصة الشحن, Konosament, Polizza di carico, 선하증권, Cognossement, 提单"),
     ("House Bill of Lading", "House-Konnossement, Conocimiento de embarque house, Connaissement house, ハウス船荷証券, Conhecimento de embarque house, بوليصة شحن فرعية, House konosament, Polizza di carico house, 하우스 선하증권, House cognossement, 货代提单"),
-    ("Master Bill of Lading", "Master-Konnossement, Conocimiento de embarque master, Connaissement master, マスター船荷証券, Conhecimento de embarque master, بوليصة الشحن الرئيسية, Master konosament, Polizza di carico master, 마스터 선하증권, Master cognossement, 船东提单"),
+    ("Bill of Lading", "Master-Konnossement, Conocimiento de embarque master, Connaissement master, マスター船荷証券, Conhecimento de embarque master, بوليصة الشحن الرئيسية, Master konosament, Polizza di carico master, 마스터 선하증권, Master cognossement, 船东提单"),
     ("Sea Waybill", "Seefrachtbrief, Carta de porte marítimo, Lettre de transport maritime, 海上運送状, بيان الشحن البحري, Námořní nákladní list, Lettera di vettura marittima, 해상화물운송장, Zeevrachtbrief, 海运单"),
     ("Air Waybill", "Luftfrachtbrief, Guía aérea, Conocimiento aéreo, Lettre de transport aérien, 航空運送状, エアウェイビル, Conhecimento aéreo, بوليصة الشحن الجوي, Letecký nákladní list, Lettera di vettura aerea, 항공화물운송장, Luchtvrachtbrief, 航空运单"),
-    ("House Air Waybill", "House-Luftfrachtbrief, Guía aérea house, Lettre de transport aérien house, ハウスエアウェイビル, Conhecimento aéreo house, بوليصة شحن جوي فرعية, House letecký nákladní list, Lettera di vettura aerea house, 하우스 항공화물운송장, House luchtvrachtbrief, 货代航空运单"),
-    ("Master Air Waybill", "Master-Luftfrachtbrief, Guía aérea master, Lettre de transport aérien master, マスターエアウェイビル, Conhecimento aéreo master, بوليصة الشحن الجوي الرئيسية, Master letecký nákladní list, Lettera di vettura aerea master, 마스터 항공화물운송장, Master luchtvrachtbrief, 主航空运单"),
+    ("Air Waybill", "House-Luftfrachtbrief, Guía aérea house, Lettre de transport aérien house, ハウスエアウェイビル, Conhecimento aéreo house, بوليصة شحن جوي فرعية, House letecký nákladní list, Lettera di vettura aerea house, 하우스 항공화물운송장, House luchtvrachtbrief, 货代航空运单"),
+    ("Air Waybill", "Master-Luftfrachtbrief, Guía aérea master, Lettre de transport aérien master, マスターエアウェイビル, Conhecimento aéreo master, بوليصة الشحن الجوي الرئيسية, Master letecký nákladní list, Lettera di vettura aerea master, 마스터 항공화물운송장, Master luchtvrachtbrief, 主航空运单"),
     ("Certificate of Origin", "Ursprungszeugnis, Certificado de origen, Certificat d'origine, 原産地証明書, Certificado de origem, شهادة المنشأ, Osvědčení o původu, Certificato di origine, 원산지증명서, Certificaat van oorsprong, 原产地证书"),
     ("Letter of Credit", "Akkreditiv, Carta de crédito, Lettre de crédit, Crédit documentaire, 信用状, خطاب اعتماد, Akreditiv, Lettera di credito, 신용장, Documentair krediet, 信用证"),
     ("Import Declaration", "Einfuhranmeldung, Declaración de importación, Déclaration d'importation, 輸入申告書, Declaração de importação, إقرار الاستيراد, Dovozní prohlášení, Dichiarazione di importazione, 수입신고서, Invoeraangifte, 进口报关单"),
@@ -2134,43 +2158,49 @@ pub const TRADE_DOC_TITLES_ML_FULL: &[(&str, &str)] = &[
     ("Delivery Order", "Lieferauftrag, Auslieferungsauftrag, Orden de entrega, Ordre de livraison, 荷渡指図書, Ordem de entrega, أمر التسليم, Dodací příkaz, Ordine di consegna, 화물인도지시서, Afleveringsorder, 提货单"),
     ("Arrival Notice", "Ankunftsanzeige, Aviso de llegada, Avis d'arrivée, 貨物到着案内, アライバルノーティス, Aviso de chegada, إشعار الوصول, Oznámení o příjezdu, Avviso di arrivo, 화물도착통지서, Aankomstbericht, 到货通知"),
     ("Booking Confirmation", "Buchungsbestätigung, Confirmación de reserva, Confirmation de réservation, ブッキング確認書, Confirmação de reserva, تأكيد الحجز, Potvrzení rezervace, Conferma di prenotazione, 부킹확인서, 선적예약확인서, Boekingsbevestiging, 订舱确认书"),
-    ("Shipping Instruction", "Versandanweisung, Instrucciones de embarque, Instructions d'expédition, 船積指図書, Instruções de embarque, تعليمات الشحن, Přepravní instrukce, Istruzioni di spedizione, 선적지시서, Verschepingsinstructie, 装船指示"),
+    ("Shipping Request", "Versandauftrag, Versandanweisung, Solicitud de embarque, Instrucciones de embarque, Demande d'expédition, Instructions d'expédition, 船積依頼書, 船積指図書, Solicitação de embarque, Instruções de embarque, طلب الشحن, تعليمات الشحن, Žádost o přepravu, Přepravní instrukce, Richiesta di spedizione, Istruzioni di spedizione, 선적요청서, 선적지시서, Verschepingsverzoek, Verschepingsinstructie, 托运单, 装船指示"),
     ("Freight Invoice", "Frachtrechnung, Factura de flete, Facture de fret, 運賃請求書, Fatura de frete, فاتورة الشحن, Faktura za přepravu, Fattura di trasporto, 운임청구서, Vrachtfactuur, 运费发票"),
     ("Tax Invoice", "Steuerrechnung, Factura fiscal, Facture fiscale, 適格請求書, 税務請求書, Nota fiscal, فاتورة ضريبية, Daňový doklad, Fattura fiscale, 세금계산서, Btw-factuur, 税务发票"),
     ("Debit Note", "Belastungsanzeige, Lastschriftanzeige, Nota de débito, Note de débit, デビットノート, 借方票, إشعار مدين, Vrubopis, Nota di addebito, 차변전표, Debetnota, 借记单"),
     ("Credit Note", "Gutschrift, Nota de crédito, Note de crédit, Facture d'avoir, クレジットノート, 貸方票, إشعار دائن, Dobropis, Nota di credito, 대변전표, Creditnota, 贷记单"),
     ("Weight Certificate", "Gewichtsbescheinigung, Certificado de peso, Certificat de poids, 重量証明書, شهادة الوزن, Vážní list, Certificato di peso, 중량증명서, Gewichtscertificaat, 重量证明"),
-    ("Verified Gross Mass", "Verifizierte Bruttomasse, Masa bruta verificada, Masse brute vérifiée, コンテナ総重量証明, Massa bruta verificada, الكتلة الإجمالية المتحقق منها, Ověřená hrubá hmotnost, Massa lorda verificata, 검증총중량, Geverifieerde brutomassa, 核实总重"),
     ("Dangerous Goods Declaration", "Gefahrguterklärung, Declaración de mercancías peligrosas, Déclaration de marchandises dangereuses, 危険物申告書, Declaração de mercadorias perigosas, إقرار البضائع الخطرة, Prohlášení o nebezpečném zboží, Dichiarazione merci pericolose, 위험물신고서, Verklaring gevaarlijke goederen, 危险品申报单"),
     ("Insurance Policy", "Versicherungspolice, Póliza de seguro, Police d'assurance, 保険証券, Apólice de seguro, بوليصة التأمين, Pojistná smlouva, Polizza di assicurazione, 보험증권, Verzekeringspolis, 保险单"),
-    ("Insurance Certificate", "Versicherungszertifikat, Certificado de seguro, Certificat d'assurance, 保険証明書, شهادة التأمين, Pojistný certifikát, Certificato di assicurazione, 보험증명서, Verzekeringscertificaat, 保险证明"),
+    ("Insurance Policy", "Versicherungszertifikat, Certificado de seguro, Certificat d'assurance, 保険証明書, شهادة التأمين, Pojistný certifikát, Certificato di assicurazione, 보험증명서, Verzekeringscertificaat, 保险证明"),
     ("Certificate of Analysis", "Analysenzertifikat, Certificado de análisis, Certificat d'analyse, 分析証明書, Certificado de análise, شهادة التحليل, Certifikát analýzy, Certificato di analisi, 성분분석증명서, Analysecertificaat, 分析证书"),
-    ("Certificate of Conformity", "Konformitätsbescheinigung, Certificado de conformidad, Certificat de conformité, 適合証明書, Certificado de conformidade, شهادة المطابقة, Certifikát shody, Certificato di conformità, 적합성증명서, Conformiteitscertificaat, 合格证书"),
+    ("Inspection Certificate", "Konformitätsbescheinigung, Certificado de conformidad, Certificat de conformité, 適合証明書, Certificado de conformidade, شهادة المطابقة, Certifikát shody, Certificato di conformità, 적합성증명서, Conformiteitscertificaat, 合格证书"),
     ("Phytosanitary Certificate", "Pflanzengesundheitszeugnis, Certificado fitosanitario, Certificat phytosanitaire, 植物検疫証明書, Certificado fitossanitário, شهادة الصحة النباتية, Rostlinolékařské osvědčení, Certificato fitosanitario, 식물검역증명서, Fytosanitair certificaat, 植物检疫证书"),
     ("Health Certificate", "Gesundheitszeugnis, Certificado sanitario, Certificat sanitaire, 衛生証明書, Certificado sanitário, شهادة صحية, Zdravotní osvědčení, Certificato sanitario, 위생증명서, Gezondheidscertificaat, 卫生证书"),
     ("Fumigation Certificate", "Begasungszertifikat, Certificado de fumigación, Certificat de fumigation, 燻蒸証明書, Certificado de fumigação, شهادة التبخير, Certifikát o fumigaci, Certificato di fumigazione, 훈증증명서, Fumigatiecertificaat, 熏蒸证书"),
-    ("Inspection Report", "Inspektionsbericht, Prüfbericht, Informe de inspección, Rapport d'inspection, 検査報告書, Relatório de inspeção, تقرير التفتيش, Inspekční zpráva, Rapporto di ispezione, 검사보고서, Inspectierapport, 检验报告"),
+    ("Inspection Certificate", "Inspektionsbericht, Prüfbericht, Informe de inspección, Rapport d'inspection, 検査報告書, Relatório de inspeção, تقرير التفتيش, Inspekční zpráva, Rapporto di ispezione, 검사보고서, Inspectierapport, 检验报告"),
     ("Inspection Certificate", "Inspektionszertifikat, Certificado de inspección, Certificat d'inspection, 検査証明書, Certificado de inspeção, شهادة التفتيش, Inspekční certifikát, Certificato di ispezione, 검사증명서, Inspectiecertificaat, 检验证书"),
     ("Sales Contract", "Kaufvertrag, Contrato de compraventa, Contrat de vente, 売買契約書, Contrato de venda, عقد البيع, Kupní smlouva, Contratto di vendita, 매매계약서, Koopovereenkomst, 销售合同"),
-    ("Mate's Receipt", "Bordempfangsschein, Recibo del primer oficial, Reçu de bord, 本船受取証, Recibo de bordo, إيصال الضابط الأول, Lodní potvrzenka, Ricevuta di bordo, 본선수취증, Stuurmansreçu, 大副收据"),
     ("Warehouse Receipt", "Lagerschein, Recibo de almacén, Récépissé d'entrepôt, 倉庫証券, Recibo de armazém, إيصال المستودع, Skladištní list, Ricevuta di magazzino, 창고증권, Opslagbewijs, 仓单"),
-    ("Equipment Interchange Receipt", "Containerübergabeschein, Recibo de intercambio de equipo, Reçu d'échange d'équipement, 機器受渡証, Recibo de intercâmbio de equipamento, إيصال تبادل المعدات, Předávací protokol kontejneru, Ricevuta di interscambio container, 기기인수도증, Containerwisselbewijs, 设备交接单"),
     ("Proof of Delivery", "Liefernachweis, Zustellnachweis, Comprobante de entrega, Preuve de livraison, 配達証明, Comprovante de entrega, إثبات التسليم, Doklad o doručení, Prova di consegna, 배송완료증명, Afleverbewijs, 签收单"),
-    ("CMR Consignment Note", "CMR-Frachtbrief, Carta de porte CMR, Lettre de voiture CMR, CMR運送状, بوليصة شحن CMR, Nákladní list CMR, Lettera di vettura CMR, 국제도로화물운송장, CMR-vrachtbrief, 国际公路运单"),
-    ("Rail Waybill", "Eisenbahnfrachtbrief, Carta de porte ferroviario, Lettre de voiture ferroviaire, 鉄道運送状, Carta de porte ferroviário, بوليصة الشحن بالسكك الحديدية, Železniční nákladní list, Lettera di vettura ferroviaria, 철도화물운송장, Spoorvrachtbrief, 铁路运单"),
-    ("Forwarder's Cargo Receipt", "Spediteurübernahmebescheinigung, Recibo de carga del transitario, Récépissé de transitaire, 貨物受取証, Recibo de carga do transitário, إيصال استلام البضائع من وكيل الشحن, Potvrzení zasílatele o převzetí, Ricevuta di carico dello spedizioniere, 운송주선인 화물수취증, Expediteursontvangstbewijs, 货代收货证明"),
+    ("Forwarder Certificate of Receipt", "Spediteurübernahmebescheinigung, Recibo de carga del transitario, Récépissé de transitaire, 貨物受取証, Recibo de carga do transitário, إيصال استلام البضائع من وكيل الشحن, Potvrzení zasílatele o převzetí, Ricevuta di carico dello spedizioniere, 운송주선인 화물수취증, Expediteursontvangstbewijs, 货代收货证明"),
     ("Bill of Exchange", "Wechsel, Letra de cambio, Lettre de change, 為替手形, Letra de câmbio, كمبيالة, Směnka, Cambiale, 환어음, Wisselbrief, 汇票"),
-    ("Quotation", "Angebot, Cotización, Devis commercial, Offre de prix, 見積書, Cotação, Orçamento, عرض سعر, Cenová nabídka, Preventivo, 견적서, Offerte, 报价单"),
-    ("Order Confirmation", "Auftragsbestätigung, Confirmación de pedido, Confirmation de commande, 注文確認書, Confirmação de pedido, تأكيد الطلب, Potvrzení objednávky, Conferma d'ordine, 주문확인서, Orderbevestiging, 订单确认"),
-    ("Delivery Note", "Lieferschein, Albarán, Nota de entrega, Bon de livraison, 納品書, مذكرة التسليم, Dodací list, Bolla di consegna, Documento di trasporto, 납품서, Pakbon, 送货单"),
+    ("Proforma Invoice", "Angebot, Cotización, Devis commercial, Offre de prix, 見積書, Cotação, Orçamento, عرض سعر, Cenová nabídka, Preventivo, 견적서, Offerte, 报价单"),
+    ("Purchase Order", "Auftragsbestätigung, Confirmación de pedido, Confirmation de commande, 注文確認書, Confirmação de pedido, تأكيد الطلب, Potvrzení objednávky, Conferma d'ordine, 주문확인서, Orderbevestiging, 订单确认"),
+    ("Proof of Delivery", "Lieferschein, Albarán, Nota de entrega, Bon de livraison, 納品書, مذكرة التسليم, Dodací list, Bolla di consegna, Documento di trasporto, 납품서, Pakbon, 送货单"),
     ("Cargo Manifest", "Ladungsmanifest, Manifiesto de carga, Manifeste de cargaison, 積荷目録, Manifesto de carga, بيان الشحنة, Manifest nákladu, Manifesto di carico, 적하목록, Ladingmanifest, 载货清单"),
-    ("Shipping Bill", "Ausfuhrschein, Póliza de exportación, Déclaration d'expédition, 船積申告書, Guia de exportação, بوليصة الشحن الجمركية, Vývozní celní doklad, Bolletta di esportazione, 선적신고서, Uitvoerdocument, 出口装运单"),
-    ("Bill of Entry", "Einfuhrschein, Declaración de entrada, Déclaration d'entrée, 輸入申告, Declaração de entrada, بيان الدخول الجمركي, Celní prohlášení, Bolletta doganale, 수입통관신고서, Invoerdocument, 进口报关单"),
-    ("Remittance Advice", "Zahlungsavis, Aviso de remesa, Avis de paiement, 送金通知書, Aviso de remessa, إشعار التحويل, Avízo o platbě, Avviso di pagamento, 송금통지서, Betalingsadvies, 汇款通知"),
-    ("Payment Receipt", "Zahlungsbeleg, Quittung, Recibo de pago, Reçu de paiement, 領収書, Recibo de pagamento, إيصال الدفع, Doklad o zaplacení, Ricevuta di pagamento, 영수증, Betalingsbewijs, 付款收据"),
-    ("Bank Guarantee", "Bankgarantie, Garantía bancaria, Garantie bancaire, 銀行保証状, Garantia bancária, ضمان بنكي, Bankovní záruka, Garanzia bancaria, 은행보증서, 银行保函"),
+    ("Export Declaration", "Ausfuhrschein, Póliza de exportación, Déclaration d'expédition, 船積申告書, Guia de exportação, بوليصة الشحن الجمركية, Vývozní celní doklad, Bolletta di esportazione, 선적신고서, Uitvoerdocument, 出口装运单"),
+    ("Import Declaration", "Einfuhrschein, Declaración de entrada, Déclaration d'entrée, 輸入申告, Declaração de entrada, بيان الدخول الجمركي, Celní prohlášení, Bolletta doganale, 수입통관신고서, Invoerdocument, 进口报关单"),
+    ("Letter of Guarantee", "Garantiebrief, Bankgarantie, Carta de garantía, Garantía bancaria, Lettre de garantie, Garantie bancaire, 保証状, 銀行保証状, Carta de garantia, Garantia bancária, خطاب ضمان, ضمان بنكي, Záruční list, Bankovní záruka, Lettera di garanzia, Garanzia bancaria, 수입화물선취보증서, 은행보증서, 提货担保书, 银行保函"),
     ("Statement of Account", "Kontoauszug, Estado de cuenta, Relevé de compte, 取引明細書, Extrato de conta, كشف حساب, Výpis z účtu, Estratto conto, 거래명세서, Rekeningoverzicht, 对账单"),
-    ("Survey Report", "Havariebericht, Schadensgutachten, Informe de peritaje, Rapport d'expertise, 鑑定報告書, Laudo de vistoria, تقرير المعاينة, Znalecký posudek, Perizia, 검정보고서, Expertiserapport, 鉴定报告"),
+    ("Cargo Damage Survey Report", "Schadensbericht, Havariebericht, Schadensgutachten, Informe de daños de la carga, Informe de peritaje, Rapport d'avarie, Rapport d'expertise, 貨物損害検査報告書, 鑑定報告書, Relatório de avaria, Laudo de vistoria, تقرير أضرار البضائع, تقرير المعاينة, Protokol o škodě na nákladu, Znalecký posudek, Rapporto di avaria, Perizia, 화물손해검정보고서, 검정보고서, Schaderapport, Expertiserapport, 货损检验报告, 鉴定报告"),
+    ("Consular Invoice", "Konsulatsfaktura, Factura consular, Facture consulaire, 領事送り状, Fatura consular, فاتورة قنصلية, Konzulární faktura, Fattura consolare, 영사송장, Consulaire factuur, 领事发票"),
+    ("Shipping Advice", "Versandanzeige, Verschiffungsanzeige, Aviso de embarque, Avis d'expédition, 船積通知書, إشعار الشحن, Avízo o odeslání, Avviso di spedizione, 선적통지서, Verschepingsbericht, 装运通知"),
+    ("Certificate of Non Manipulation", "Nichtmanipulationsbescheinigung, Certificado de no manipulación, Certificat de non-manipulation, 非加工証明書, Certificado de não manipulação, شهادة عدم التلاعب, Osvědčení o nemanipulaci, Certificato di non manipolazione, 비가공증명서, Certificaat van niet-manipulatie, 未再加工证明"),
+    ("Customs Clearance Certificate", "Zollabfertigungsbescheinigung, Certificado de despacho aduanero, Certificat de dédouanement, 通関証明書, Certificado de desembaraço aduaneiro, شهادة التخليص الجمركي, Osvědčení o celním odbavení, Certificato di sdoganamento, 통관증명서, Douane-inklaringscertificaat, 清关证明"),
+    ("Export License", "Ausfuhrgenehmigung, Ausfuhrlizenz, Licencia de exportación, Licence d'exportation, 輸出許可証, Licença de exportação, رخصة تصدير, Vývozní licence, Licenza di esportazione, 수출허가서, 수출승인서, Uitvoervergunning, 出口许可证"),
+    ("Beneficiary Certificate", "Begünstigtenbescheinigung, Certificado del beneficiario, Certificat du bénéficiaire, 受益者証明書, Certificado do beneficiário, شهادة المستفيد, Osvědčení příjemce, Certificato del beneficiario, 수익자증명서, Verklaring van de begunstigde, 受益人证明"),
+    ("Material Safety Data Sheet", "Sicherheitsdatenblatt, Hoja de datos de seguridad, Fiche de données de sécurité, 安全データシート, Ficha de dados de segurança, صحيفة بيانات السلامة, Bezpečnostní list, Scheda di dati di sicurezza, 물질안전보건자료, Veiligheidsinformatieblad, 化学品安全技术说明书"),
+    ("Power of Attorney", "Vollmacht, Poder notarial, Procuration, 委任状, Procuração, توكيل رسمي, Plná moc, Procura, 위임장, Volmacht, 授权委托书"),
+    ("Business License", "Gewerbeerlaubnis, Gewerbeschein, Licencia comercial, Licence commerciale, 営業許可証, Alvará de funcionamento, رخصة تجارية, Živnostenský list, Licenza commerciale, 사업자등록증, Bedrijfsvergunning, 营业执照"),
+    ("Insurance Claim Form", "Schadensmeldung, Formulario de reclamación de seguro, Formulaire de déclaration de sinistre, 保険金請求書, Formulário de sinistro, نموذج مطالبة التأمين, Formulář pojistné události, Modulo di denuncia di sinistro, 보험금청구서, Schadeclaimformulier, 保险索赔单"),
+    ("Local Letter of Credit", "Inlandsakkreditiv, Carta de crédito local, Lettre de crédit locale, 国内信用状, خطاب اعتماد محلي, Tuzemský akreditiv, Lettera di credito locale, 내국신용장, Binnenlandse kredietbrief, 国内信用证"),
+    ("Purchase Confirmation", "Einkaufsbestätigung, Confirmación de compra, Confirmation d'achat, 購入確認書, Confirmação de compra, تأكيد الشراء, Potvrzení o nákupu, Conferma di acquisto, 구매확인서, Aankoopbevestiging, 购买确认书"),
+    ("Trust Receipt", "Treuhandquittung, Recibo fiduciario, Reçu fiduciaire, 輸入担保荷物保管証, Recibo fiduciário, إيصال أمانة, Svěřenecká stvrzenka, Ricevuta fiduciaria, 수입화물대도, Trustontvangstbewijs, 信托收据"),
 ];
 
 /// 🌟 [TRADE GROUPS / 12 LANGUAGES]
@@ -2476,12 +2506,13 @@ pub fn trade_field_category(field: &str) -> &'static str {
 
 pub const TRADE_ENUM_VALUE_ANCHORS: &[(&str, &[(&str, &str)])] = &[
     ("currency", &[
-        ("USD", "USD, US dollar, United States dollar"),
-        ("EUR", "EUR, euro"),
-        ("JPY", "JPY, Japanese yen"),
-        ("CNY", "CNY, Chinese yuan renminbi"),
-        ("KRW", "KRW, South Korean won"),
-        ("GBP", "GBP, British pound sterling"),
+        ("USD", "USD, US dollar, US dollars, United States dollar, U.S. dollar, US$, US-Dollar, dólar estadounidense, dollar américain, dollaro statunitense, dólar americano, Amerikaanse dollar, americký dolar, دولار أمريكي, 米ドル, USドル, 美元, 美金, 미국 달러, 미 달러, 미화"),
+        ("EUR", "EUR, euro, euros, €, 欧元, ユーロ, 유로, 유로화, يورو"),
+        ("JPY", "JPY, Japanese yen, yen, Japanischer Yen, yen japonés, yen japonais, yen giapponese, iene japonês, Japanse yen, japonský jen, ين ياباني, 日本円, 日元, 엔화, 일본 엔"),
+        ("CNY", "CNY, Chinese yuan renminbi, Chinese yuan, renminbi, RMB, Chinesischer Yuan, yuan chino, yuan chinois, yuan cinese, yuan chinês, čínský jüan, يوان صيني, 人民元, 人民币, 위안화, 인민폐"),
+        ("KRW", "KRW, South Korean won, Korean won, ₩, Südkoreanischer Won, won surcoreano, won sud-coréen, won sudcoreano, won sul-coreano, Zuid-Koreaanse won, jihokorejský won, وون كوري جنوبي, 韓国ウォン, 韩元, 원화, 한국 원"),
+        ("GBP", "GBP, British pound sterling, British pound, pound sterling, £, Britisches Pfund, libra esterlina, livre sterling, sterlina britannica, Brits pond, britská libra, جنيه إسترليني, 英ポンド, 英镑, 영국 파운드"),
+        ("CZK", "CZK, Czech koruna, Kč, koruna česká, tschechische Krone, corona checa, couronne tchèque, corona ceca, coroa checa, Tsjechische kroon, كرونة تشيكية, チェココルナ, 捷克克朗, 체코 코루나"),
     ]),
     ("incoterms", &[
         ("EXW", "EXW, ex works"),
@@ -2497,6 +2528,33 @@ pub const TRADE_ENUM_VALUE_ANCHORS: &[(&str, &[(&str, &str)])] = &[
         ("DDP", "DDP, delivered duty paid"),
     ]),
 ];
+
+pub fn canonical_currency_code(raw: &str) -> Option<&'static str> {
+    fn fold(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric() || matches!(*c, '$' | '€' | '£' | '₩'))
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+    let key = fold(raw);
+    if key.is_empty() {
+        return None;
+    }
+    for (axis, table) in TRADE_ENUM_VALUE_ANCHORS.iter() {
+        if *axis != "currency" {
+            continue;
+        }
+        for (code, phrases) in table.iter() {
+            if phrases.split(',').any(|p| {
+                let a = fold(p);
+                !a.is_empty() && a == key
+            }) {
+                return Some(*code);
+            }
+        }
+    }
+    None
+}
 
 pub const TRADE_ARRAY_CATEGORIES: &[&str] = &["items", "containers"];
 pub const TRADE_IDENTITY_CATEGORY: &str = "header";
@@ -2621,6 +2679,11 @@ pub fn is_trade_array_category(category: &str) -> bool {
             | "test_results" | "findings_and_damage" | "account_ledger"
     )
 }
+
+pub const TRADE_FLATTEN_GROUPS: [&str; 8] = [
+    "header", "parties", "other_parties", "logistics",
+    "financials", "conditions", "settlement", "cargo",
+];
 
 pub const TRADE_EXTRACTION_CATEGORIES: [&str; 20] = [
     // ── base (전 서식 공통) ──

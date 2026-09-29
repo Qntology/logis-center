@@ -9,6 +9,45 @@ fn translit_cache_key(word: &str, lang: &str) -> String {
     format!("{}\u{1}{}", lang.trim().to_lowercase(), word.trim())
 }
 
+static TRANSLIT_RECHECKED: once_cell::sync::Lazy<std::sync::Mutex<Option<std::collections::HashSet<String>>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+
+fn recheck_ledger_path() -> std::path::PathBuf {
+    crate::utils::get_app_dir().join("cache").join("translit_recheck.json")
+}
+
+fn first_recheck(word: &str, lang: &str, engine: &str) -> bool {
+    let key = format!("{}\u{1}{}", translit_cache_key(word, lang), engine);
+    let mut guard = match TRANSLIT_RECHECKED.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if guard.is_none() {
+        let loaded: std::collections::HashSet<String> = std::fs::read_to_string(recheck_ledger_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        *guard = Some(loaded);
+    }
+    let set = match guard.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+    if !set.insert(key) {
+        return false;
+    }
+    let path = recheck_ledger_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let list: Vec<&String> = set.iter().collect();
+    if let Ok(body) = serde_json::to_string(&list) {
+        let _ = std::fs::write(&path, body);
+    }
+    true
+}
+
 // =====================================================================
 // 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
 // ---------------------------------------------------------------------
@@ -149,7 +188,8 @@ fn save_translit_cache(
         "word": word,
         "lang": lang,
         "native": native,
-        "roman": roman
+        "roman": roman,
+        "engine": crate::model::lang_llm::engine_tag(lang)
     }));
 }
 
@@ -206,6 +246,7 @@ pub async fn transliterate_cross_language(
             .await
             .unwrap_or_default();
         let (_t, native) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
+        let native = crate::nl_convert::gate_native_alias(&src, native, "ANALYTIC");
         let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
         if native.is_empty() {
             println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 문서언어 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
@@ -269,31 +310,34 @@ pub async fn generate_transliteration_aliases(
     let mut made = 0usize;
     let mut reused = 0usize;
     let mut skipped = 0usize;
+    let mut phonetic_dropped = 0usize;
+    let lang_engine_ready = crate::model::lang_llm::lang_engine_available(doc_lang);
+    let recheck_engine = crate::model::lang_llm::engine_tag(doc_lang);
 
-    // 🌟 [CROSSOVER / LAZY SWITCH] Qwen3.5(2B) 를 '실제로 부를 때' 만 올립니다.
-    //
-    //  ── 왜 지연시키는가 ──
-    //   이 함수는 캐시 히트가 대부분입니다. (메모리 → Dexie 2단 캐시)
-    //   함수 진입부에서 무조건 생성 페이즈로 전환하면,
-    //   LLM 을 한 번도 부르지 않는 아이템에서도 임베딩을 내리고
-    //   2GB 를 올렸다 내리는 순수 낭비가 발생합니다.
-    //   첫 캐시 미스 시점에 단 한 번만 전환하고, 이후 미스는 재사용합니다.
     let mut generation_ready = false;
+    let mut engine_label = String::from("Qwen3.5-2B");
+    let mut _translit_binding = crate::model::lang_llm::TranslitBinding::none();
     macro_rules! ensure_generation {
         () => {
             if !generation_ready {
-                if let Err(e) = model
-                    .switch_to_generation(
-                        crate::model::ModelSize::Qwen3_5,
+                match model
+                    .enter_translit_generation(
+                        doc_lang,
                         Some(cancel.clone()),
-                        None,
                         "transliteration (first cache miss)",
+                        task_id,
                     )
                     .await
                 {
-                    println!("  ⚠️ [CROSSOVER] 음차용 Qwen3.5 전환 실패: {}. 이번 값은 건너뜁니다.", e);
-                } else {
-                    generation_ready = true;
+                    Ok((engine, binding)) => {
+                        engine_label = engine.label();
+                        _translit_binding = binding;
+                        generation_ready = true;
+                        emit(&format!("  🔤 [TRANSLIT ENGINE] 이번 아이템의 음차 엔진: {}", engine_label));
+                    }
+                    Err(e) => {
+                        println!("  ⚠️ [CROSSOVER] 음차용 Qwen3.5 전환 실패: {}. 이번 값은 건너뜁니다.", e);
+                    }
                 }
             }
         };
@@ -320,7 +364,21 @@ pub async fn generate_transliteration_aliases(
             continue;
         }
 
-        if let Some(dexie_hit) = query_translit_cache(app_handle, &src, doc_lang).await {
+        let cached_hit = query_translit_cache(app_handle, &src, doc_lang).await.filter(|hit| {
+            match crate::nl_convert::cached_translit_recheck(&src, &hit.0, doc_lang, lang_engine_ready)
+                .filter(|_| first_recheck(&src, doc_lang, &recheck_engine))
+            {
+                Some(why) => {
+                    emit(&format!(
+                        "  🔁 [TRANSLIT CACHE / RECHECK] '{}' 캐시 별칭 native='{}' 을 다시 만듭니다: {} (엔진 {} 기준 최초 1회 · 결과가 같아도 이 엔진으로는 다시 만들지 않습니다)",
+                        src, hit.0, why, recheck_engine
+                    ));
+                    false
+                }
+                None => true,
+            }
+        });
+        if let Some(dexie_hit) = cached_hit {
             // 🌟 [NEGATIVE CACHE] 빈 값도 '음차 불가로 이미 확정된 사실' 이므로 히트로 인정합니다.
             //    기존 구현은 빈 값을 미스로 보고 Qwen3.5 를 매번 다시 호출했습니다.
             let is_negative = dexie_hit.0.trim().is_empty() && dexie_hit.1.trim().is_empty();
@@ -501,6 +559,16 @@ pub async fn generate_transliteration_aliases(
             //    native(비라틴 통일) = 원본 비라틴 단어 + 라틴 단어의 문서 언어 음차
             //    roman(라틴 통일)   = 비라틴 단어의 로마자 음차 + 원본 라틴 단어
             //    Qwen3.5 가 일부 단어를 잘못 음차해도 언어 그룹 자체는 유지됩니다.
+            if !track_b_transliteration.is_empty() && !latin_words.is_empty() {
+                track_b_transliteration = crate::nl_convert::gate_native_alias(
+                    &latin_words.join(" "),
+                    track_b_transliteration,
+                    "TRACK-B",
+                );
+                if track_b_transliteration.is_empty() {
+                    phonetic_dropped += 1;
+                }
+            }
             let mut korean_unified_parts: Vec<String> = Vec::new();
             for w in &non_latin_words {
                 korean_unified_parts.push(w.clone());
@@ -508,7 +576,11 @@ pub async fn generate_transliteration_aliases(
             if !track_b_transliteration.is_empty() {
                 korean_unified_parts.push(track_b_transliteration.clone());
             }
-            let korean_unified = korean_unified_parts.join(" ");
+            let korean_unified = if !latin_words.is_empty() && track_b_transliteration.is_empty() {
+                String::new()
+            } else {
+                korean_unified_parts.join(" ")
+            };
 
             let mut english_unified_parts: Vec<String> = Vec::new();
             if !track_a_transliteration.is_empty() {
@@ -535,7 +607,15 @@ pub async fn generate_transliteration_aliases(
                 .unwrap_or_default();
             println!("    PASS-1 RAW   = '{}'", raw1.replace('\n', "\n"));
             let (_t, tr) = crate::nl_convert::sanitize_transliteration_dual(&raw1, &src);
-            tr
+            if crate::nl_convert::is_latin_dominant(&src) && !tr.is_empty() {
+                let gated = crate::nl_convert::gate_native_alias(&src, tr, "PASS-1");
+                if gated.is_empty() {
+                    phonetic_dropped += 1;
+                }
+                gated
+            } else {
+                tr
+            }
         };
 
         // 🌟 [MIXED SCRIPT RE-TRANSLITERATION]
@@ -720,18 +800,18 @@ pub async fn generate_transliteration_aliases(
         out[i] = final_pair;
     }
 
-    if made > 0 || reused > 0 {
+    if made > 0 || reused > 0 || phonetic_dropped > 0 {
         emit(&format!(
-            "  🔤 [SYNONYM EXPANSION / Qwen3.5-2B] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건",
-            made, reused, skipped
+            "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음 게이트 폐기 {}건",
+            if generation_ready { engine_label.as_str() } else { "캐시" },
+            made, reused, skipped, phonetic_dropped
         ));
     }
 
-    // 🌟 [CROSSOVER] LLM 을 한 번도 부르지 않았다면 전환 자체가 없었습니다.
-    //    부른 경우에만 진단을 남겨, '캐시만으로 끝난 아이템' 과 구분합니다.
     if generation_ready {
         emit(&format!(
-            "  🔁 [CROSSOVER] 음차 구간에서 Qwen3.5 를 1회 올려 {}건을 처리했습니다. {}",
+            "  🔁 [CROSSOVER] 음차 구간에서 {} 를 1회 올려 {}건을 처리했습니다. {}",
+            engine_label,
             made,
             model.crossover_report()
         ));

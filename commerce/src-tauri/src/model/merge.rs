@@ -665,12 +665,16 @@ pub fn reconcile_weight_basis(
     if rows.is_empty() { return 0; }
 
     let mut net_sum = 0.0f64;
+    let mut line_sum = 0.0f64;
     let mut missing = 0usize;
     for r in rows.iter() {
         let unit = r.get("item_net_weight").and_then(num_of);
         let qty = r.get("quantity").and_then(num_of).unwrap_or(1.0);
         match unit {
-            Some(u) => net_sum += u * qty,
+            Some(u) => {
+                net_sum += u * qty;
+                line_sum += u;
+            }
             None => missing += 1,
         }
     }
@@ -683,24 +687,111 @@ pub fn reconcile_weight_basis(
         return 0;
     }
 
+    let mut row_money = 0.0f64;
+    let mut money_rows = 0usize;
+    for r in rows.iter() {
+        if let Some(t) = r.get("total_price").and_then(num_of) {
+            row_money += t;
+            money_rows += 1;
+        }
+    }
+    if money_rows == rows.len() && row_money > 0.0 {
+        let subtotal = read(merged, "amount_subtotal").filter(|v| *v > 0.0);
+        let total = read(merged, "amount")
+            .or_else(|| read(merged, "grand_total_amount"))
+            .filter(|v| *v > 0.0);
+        let verdict: Option<(&str, f64, f64, f64)> = match (subtotal, total) {
+            (Some(s), _) => Some(("amount_subtotal", s, s - row_money, row_money - s)),
+            (None, Some(t)) => {
+                let extras: f64 = [
+                    "freight_charge",
+                    "freight_amount",
+                    "insurance",
+                    "insurance_amount",
+                    "amount_tax",
+                    "local_charges",
+                ]
+                .iter()
+                .filter_map(|f| read(merged, f))
+                .filter(|v| *v > 0.0 && *v < t)
+                .sum();
+                Some(("amount", t, t - (row_money + extras), row_money - t))
+            }
+            _ => None,
+        };
+        if let Some((axis, t, short, over)) = verdict {
+            let tol = t.abs() * 1e-6;
+            let broken = short > tol || over > tol;
+            crate::utils::score_dynamics::record_baseline(
+                "vision.weight_basis_rows_incomplete",
+                if broken { 1.0 } else { 0.0 },
+            );
+            if broken {
+                emit(&format!(
+                    "  👁️ [WEIGHT BASIS / ROWS INCOMPLETE] 품목 {}행의 금액 합 {} 이 문서 '{}' = {} 와 산술로 맞지 않습니다 ({}). 행 집합이 빠졌거나 겹쳤다는 근거이므로 품목 순중량 합 {} 도 믿을 수 없습니다. 이 합으로 중량 축을 옮기면 정상 값을 오답으로 바꾸므로 이번 회차는 판정하지 않습니다.",
+                    rows.len(),
+                    row_money,
+                    axis,
+                    t,
+                    if short > tol { format!("{} 모자람", short) } else { format!("{} 초과", over) },
+                    net_sum
+                ));
+                return 0;
+            }
+        }
+    }
     let net = read(merged, "weight_net");
     let gross = read(merged, "weight_gross");
-    let eps = net_sum.abs() * 1e-6;
+    let near = |a: f64, b: f64| (a - b).abs() <= a.abs().max(b.abs()) * 1e-6;
+    let printed: Vec<f64> = [net, gross].iter().filter_map(|v| *v).collect();
+    let unit_hit = printed.iter().any(|t| near(*t, net_sum));
+    let line_hit = printed.iter().any(|t| near(*t, line_sum));
+    let (low, high) = if near(net_sum, line_sum) || (unit_hit && !line_hit) {
+        (net_sum, net_sum)
+    } else if line_hit && !unit_hit {
+        (line_sum, line_sum)
+    } else {
+        (net_sum.min(line_sum), net_sum.max(line_sum))
+    };
+    if !near(net_sum, line_sum) {
+        crate::utils::score_dynamics::record_baseline(
+            "vision.weight_basis_ambiguous",
+            if low == high { 0.0 } else { 1.0 },
+        );
+        emit(&format!(
+            "  ⚖️ [WEIGHT BASIS / UNIT OR LINE] 품목 중량 칸이 단위 중량(수량을 곱해야 하는 값)인지 행 중량인지는 라벨로 가릴 수 없습니다. 스키마가 이 칸을 'UNIT WEIGHT' 와 'NET WEIGHT' 로 함께 받기 때문입니다. 단위×수량 합 {} · 행 합 {} | 인쇄 총계 {:?} → {}",
+            net_sum,
+            line_sum,
+            printed,
+            if low == high {
+                format!("인쇄 총계와 산술로 맞는 해석 하나로 확정합니다 (합 {}).", low)
+            } else {
+                format!(
+                    "{} 두 해석 모두에서 성립하는 판정만 적용합니다 (합 {} ~ {}). 한쪽 해석만 믿고 옮기면 행 중량 서식에서 정상 총중량이 지워집니다.",
+                    if unit_hit && line_hit { "두 해석이 모두 인쇄 총계와 맞아," } else { "어느 해석도 인쇄 총계와 맞지 않아," },
+                    low,
+                    high
+                )
+            }
+        ));
+    }
+    let eps_high = high.abs() * 1e-6;
+    let eps_low = low.abs() * 1e-6;
     let mut fixed = 0usize;
 
     if let Some(n) = net {
-        if n > net_sum + eps {
+        if n > high + eps_high {
             let v = json!(n);
             if gross.is_none() {
                 emit(&format!(
                     "  🧮 [WEIGHT BASIS] 'weight_net' = {} 이 품목 순중량 합 {} 을 넘습니다. 순중량 총계는 자기 구성 항목의 합을 넘을 수 없으므로 이 자리에 인쇄된 것은 총중량입니다. 비어 있는 'weight_gross' 로 옮깁니다. 이 판정은 라벨이 아니라 산술이므로 'TOTAL WEIGHT' 처럼 총/순 표지가 없는 라벨에서도 성립합니다.",
-                    n, net_sum
+                    n, high
                 ));
                 move_axis(merged, "weight_net", "weight_gross", v);
             } else {
                 emit(&format!(
                     "  🧮 [WEIGHT BASIS] 'weight_net' = {} 이 품목 순중량 합 {} 을 넘는데 'weight_gross' 도 이미 {} 로 차 있습니다. 옮길 자리가 없으므로 비웁니다.",
-                    n, net_sum, gross.unwrap_or(0.0)
+                    n, high, gross.unwrap_or(0.0)
                 ));
                 merged.remove("weight_net");
                 let cats: Vec<String> = merged.keys().cloned().collect();
@@ -721,18 +812,18 @@ pub fn reconcile_weight_basis(
 
     if fixed == 0 {
         if let Some(g) = gross {
-            if g + eps < net_sum {
+            if g + eps_low < low {
                 let v = json!(g);
                 if net.is_none() {
                     emit(&format!(
                         "  🧮 [WEIGHT BASIS] 'weight_gross' = {} 이 품목 순중량 합 {} 보다 작습니다. 포장재는 더해질 뿐 빠지지 않으므로 총중량이 순중량 합보다 작을 수 없습니다. 비어 있는 'weight_net' 으로 옮깁니다.",
-                        g, net_sum
+                        g, low
                     ));
                     move_axis(merged, "weight_gross", "weight_net", v);
                 } else {
                     emit(&format!(
                         "  🧮 [WEIGHT BASIS] 'weight_gross' = {} 이 품목 순중량 합 {} 보다 작은데 'weight_net' 도 이미 차 있습니다. 비웁니다.",
-                        g, net_sum
+                        g, low
                     ));
                     merged.remove("weight_gross");
                     let cats: Vec<String> = merged.keys().cloned().collect();
@@ -753,10 +844,17 @@ pub fn reconcile_weight_basis(
     }
 
     if fixed == 0 {
-        emit(&format!(
-            "  ✅ [WEIGHT BASIS] 중량 축이 품목 순중량 합 {} 과 산술로 정합합니다.",
-            net_sum
-        ));
+        if low == high {
+            emit(&format!(
+                "  ✅ [WEIGHT BASIS] 중량 축이 품목 순중량 합 {} 과 산술로 정합합니다.",
+                low
+            ));
+        } else {
+            emit(&format!(
+                "  👁️ [WEIGHT BASIS] 두 해석의 합 {} 과 {} 어느 쪽으로 보아도 중량 축을 옮길 산술 근거가 없어 현재 배정을 그대로 둡니다.",
+                low, high
+            ));
+        }
     }
     crate::utils::score_dynamics::record_baseline("vision.weight_basis", fixed as f32);
     fixed
@@ -1140,10 +1238,152 @@ fn field_name_contains(a: &str, b: &str) -> bool {
     small.iter().all(|t| big.iter().any(|x| x == t))
 }
 
+pub fn label_axis_scores(
+    label_emb: &[f32],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> Vec<(String, f32)> {
+    if label_emb.is_empty() || banks.is_empty() {
+        return Vec::new();
+    }
+    let purged = purge_self_poisoned_anchors(banks);
+    let mut pool: Vec<f32> = Vec::new();
+    let mut per: Vec<(String, f32, usize)> = Vec::new();
+    for (f, bank, w) in purged.iter() {
+        let mut mx = f32::MIN;
+        let mut live = 0usize;
+        for (i, e) in bank.iter().enumerate() {
+            if e.is_empty() || e.iter().all(|&x| x == 0.0) { continue; }
+            let s = crate::utils::ai_utils::cosine_similarity(label_emb, e) * w.get(i).copied().unwrap_or(1.0);
+            pool.push(s);
+            live += 1;
+            if s > mx { mx = s; }
+        }
+        if live > 0 {
+            per.push((f.clone(), mx, live));
+        }
+    }
+    if per.len() < 2 || pool.len() < 2 {
+        return Vec::new();
+    }
+    let n = pool.len() as f32;
+    let mean = pool.iter().sum::<f32>() / n;
+    let sd = (pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+    let mut scored: Vec<(String, f32)> = per
+        .into_iter()
+        .map(|(f, mx, cnt)| (f, (mx - mean) / sd - crate::utils::ai_utils::gumbel_expected_z(cnt)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+pub const AGGREGATE_LABEL_MARKERS: &str =
+    "total, grand total, sum, overall, aggregate, \
+     gesamt, insgesamt, summe, \
+     totale, somme, \
+     suma, \
+     complessivo, complessiva, \
+     soma, \
+     totaal, \
+     celkem, celkový, celková, celkové, součet, \
+     إجمالي, الإجمالي, مجموع, المجموع, الكلي, الكلية, \
+     합계, 총계, 총합, 총, 전체, \
+     合計, 総計, 総, \
+     合计, 总计, 共计, 总";
+
+pub fn label_has_aggregate_marker(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() { return false; }
+    for raw in AGGREGATE_LABEL_MARKERS.split(',') {
+        let marker = raw.trim().to_lowercase();
+        if marker.is_empty() { continue; }
+        let parts: Vec<&str> = marker.split_whitespace().collect();
+        if parts.len() > 1 {
+            if tokens.windows(parts.len()).any(|w| w == parts.as_slice()) { return true; }
+            continue;
+        }
+        let ascii = marker.chars().all(|c| c.is_ascii());
+        for t in tokens.iter() {
+            if *t == marker.as_str() { return true; }
+            if ascii && marker.chars().count() < 5 { continue; }
+            if t.starts_with(marker.as_str()) { return true; }
+        }
+    }
+    false
+}
+
+pub fn row_axis_aggregate_related(row_field: &str, scalar_field: &str) -> bool {
+    const QUALIFIERS: [&str; 3] = ["item", "line", "container"];
+    const GENERIC: [&str; 5] = ["code", "number", "no", "date", "name"];
+    const MONEY: [&str; 6] = ["amount", "price", "value", "charge", "fee", "cost"];
+    let toks = |s: &str| -> Vec<String> {
+        s.split('_')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .filter(|t| !QUALIFIERS.iter().any(|q| q == t) && !GENERIC.iter().any(|g| g == t))
+            .collect()
+    };
+    let (r, s) = (toks(row_field), toks(scalar_field));
+    if r.is_empty() || s.is_empty() { return false; }
+    if s.iter().any(|t| r.contains(t)) { return true; }
+    let money = |f: &str| MONEY.iter().any(|m| f.contains(m));
+    money(row_field) && money(scalar_field)
+}
+
+pub fn printed_number(s: &str) -> Option<f64> {
+    let t: String = s
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    if !t.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+pub fn is_aggregate_axis(doc_type: &str, field: &str) -> bool {
+    let cat = crate::logic::trade_field_category(field);
+    if cat.is_empty() || crate::logic::is_trade_array_category(cat) {
+        return false;
+    }
+    let ts = match crate::parsing::BIAS_DICT.get("trade_schema") {
+        Some(t) => t,
+        None => return false,
+    };
+    let desc = ts
+        .get("overlay")
+        .and_then(|o| o.get(doc_type))
+        .and_then(|o| o.get(cat))
+        .and_then(|o| o.get(field))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            ts.get("base")
+                .and_then(|b| b.get(cat))
+                .and_then(|o| o.get(field))
+                .and_then(|v| v.as_str())
+        });
+    match desc {
+        Some(d) => label_has_aggregate_marker(d),
+        None => false,
+    }
+}
+
 pub fn recovery_label_gate(
     label_emb: &[f32],
     field: &str,
     banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> (bool, f32, f32, String) {
+    recovery_label_gate_guarded(label_emb, field, banks, false)
+}
+
+pub fn recovery_label_gate_guarded(
+    label_emb: &[f32],
+    field: &str,
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+    aggregate_label: bool,
 ) -> (bool, f32, f32, String) {
     if label_emb.is_empty() || banks.is_empty() {
         return (true, 0.0, 0.0, String::new());
@@ -1235,12 +1475,30 @@ pub fn recovery_label_gate(
                         b, bs_, bn, a, as_, an
                     );
                 } else if bs_ > as_ {
-                    println!(
-                        "      🔬 [DISCRIMINATIVE ANCHOR] 라벨 argmax 는 '{}'({:+.4}) 였지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 '{}' {:.4}({}구) > '{}' {:.4}({}구) 로 뒤집힙니다. 이름이 서로를 품는 두 축(총중량⊃중량, 소계⊃총계)은 뱅크 성분을 공유하므로 그 공유분의 미세차가 승패를 가릅니다. 변별 구만 남긴 쪽을 1위로 확정합니다.",
-                        a, scored[0].1, b, bs_, bn, a, as_, an
-                    );
-                    crate::utils::score_dynamics::record_confusion(&b, &a, bs_ - as_);
-                    scored.swap(0, 1);
+                    let row_axis_of = |f: &str| {
+                        let c = crate::logic::trade_field_category(f);
+                        crate::logic::TRADE_ARRAY_CATEGORIES.iter().any(|x| *x == c)
+                    };
+                    let hold = aggregate_label && !row_axis_of(&a) && row_axis_of(&b);
+                    if aggregate_label {
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.discriminative_aggregate_hold",
+                            if hold { 1.0 } else { 0.0 },
+                        );
+                    }
+                    if hold {
+                        println!(
+                            "      🧮 [DISCRIMINATIVE HOLD / AGGREGATE] 변별 구만 남기면 '{}' {:.4}({}구) 가 '{}' {:.4}({}구) 를 앞서지만, 인쇄 라벨에 총계 표지(total·합계·총·合計·gesamt 등)가 있습니다. 총계 표지는 문서 전체의 값을 말하므로 스칼라 축 '{}' 를 표 행 열 '{}' 로 뒤집지 않습니다. 뒤집으면 이 쌍은 행 축으로 막혀 미뤄진 경로를 돌고, 혼동 사전에는 표 행 열이 이겼다는 기록이 남습니다.",
+                            b, bs_, bn, a, as_, an, a, b
+                        );
+                    } else {
+                        println!(
+                            "      🔬 [DISCRIMINATIVE ANCHOR] 라벨 argmax 는 '{}'({:+.4}) 였지만, 두 뱅크의 공유 성분을 걷어내고 각자의 변별 구만으로 다시 재면 '{}' {:.4}({}구) > '{}' {:.4}({}구) 로 뒤집힙니다. 이름이 서로를 품는 두 축(총중량⊃중량, 소계⊃총계)은 뱅크 성분을 공유하므로 그 공유분의 미세차가 승패를 가릅니다. 변별 구만 남긴 쪽을 1위로 확정합니다.",
+                            a, scored[0].1, b, bs_, bn, a, as_, an
+                        );
+                        crate::utils::score_dynamics::record_confusion(&b, &a, bs_ - as_);
+                        scored.swap(0, 1);
+                    }
                 }
             }
         }
@@ -1307,10 +1565,87 @@ pub fn route_pairs_to_fields(
     window_fields: &[String],
     banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
 ) -> (Vec<PairRoute>, Vec<String>) {
+    let (out, logs, _) = route_pairs_to_fields_detailed(pairs, pair_embs, window_fields, banks);
+    (out, logs)
+}
+
+pub type LabelExactIndex = std::collections::HashMap<String, Vec<String>>;
+
+pub fn build_label_exact_index(per_field: &[(String, Vec<String>)]) -> LabelExactIndex {
+    let mut idx: LabelExactIndex = std::collections::HashMap::new();
+    for (field, phrases) in per_field.iter() {
+        for p in phrases.iter() {
+            let k = crate::utils::ai_utils::trade_title_key(p);
+            if k.chars().count() < 2 {
+                continue;
+            }
+            let slot = idx.entry(k).or_insert_with(Vec::new);
+            if !slot.iter().any(|f| f == field) {
+                slot.push(field.clone());
+            }
+        }
+    }
+    idx
+}
+
+pub fn label_exact_field(
+    label: &str,
+    exact: &LabelExactIndex,
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> Option<String> {
+    let live = |fields: &Vec<String>| -> Vec<String> {
+        fields
+            .iter()
+            .filter(|f| banks.iter().any(|(bf, b, _)| bf == *f && !b.is_empty()))
+            .cloned()
+            .collect()
+    };
+    let common: Vec<String> = match exact.get(&crate::utils::ai_utils::trade_title_key(label)) {
+        Some(fields) => live(fields),
+        None => {
+            let parts = crate::utils::ai_utils::split_bias_phrases_full(label);
+            if parts.len() < 2 {
+                return None;
+            }
+            let mut acc: Option<Vec<String>> = None;
+            for p in parts.iter() {
+                let l = live(exact.get(&crate::utils::ai_utils::trade_title_key(p))?);
+                acc = Some(match acc {
+                    None => l,
+                    Some(prev) => prev.into_iter().filter(|f| l.contains(f)).collect(),
+                });
+            }
+            acc?
+        }
+    };
+    if common.len() == 1 {
+        common.into_iter().next()
+    } else {
+        None
+    }
+}
+
+pub fn route_pairs_to_fields_detailed(
+    pairs: &[(String, String)],
+    pair_embs: &[Vec<f32>],
+    window_fields: &[String],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> (Vec<PairRoute>, Vec<String>, Vec<(usize, String, f32)>) {
+    route_pairs_to_fields_exact(pairs, pair_embs, window_fields, banks, &LabelExactIndex::new())
+}
+
+pub fn route_pairs_to_fields_exact(
+    pairs: &[(String, String)],
+    pair_embs: &[Vec<f32>],
+    window_fields: &[String],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+    exact: &LabelExactIndex,
+) -> (Vec<PairRoute>, Vec<String>, Vec<(usize, String, f32)>) {
     let mut out: Vec<PairRoute> = Vec::new();
     let mut logs: Vec<String> = Vec::new();
-    if pairs.is_empty() || banks.is_empty() { return (out, logs); }
-    if pair_embs.len() != pairs.len() { return (out, logs); }
+    let mut row_axis: Vec<(usize, String, f32)> = Vec::new();
+    if pairs.is_empty() || banks.is_empty() { return (out, logs, row_axis); }
+    if pair_embs.len() != pairs.len() { return (out, logs, row_axis); }
 
     for (pi, (label, value)) in pairs.iter().enumerate() {
         let e = &pair_embs[pi];
@@ -1319,7 +1654,60 @@ pub fn route_pairs_to_fields(
 
         // field 를 빈 문자열로 넘기면 recovery_label_gate 는 argmax 축과 그 점수만 돌려줍니다.
         // 변별 앵커 재검사(패치 B-2)도 이 경로에서 함께 수행됩니다.
-        let (_, _, rz, rf) = recovery_label_gate(e, "", banks);
+        let mut exact_route: Option<(f32, String)> = None;
+        if let Some(ef) = label_exact_field(label, exact, banks) {
+            let ranking = label_axis_scores(e, banks);
+            let own = ranking.iter().find(|(f, _)| *f == ef).map(|(_, z)| *z);
+            if let (Some((tf, tz)), Some(oz)) = (ranking.first().cloned(), own) {
+                let row_axis_of = |f: &str| {
+                    let c = crate::logic::trade_field_category(f);
+                    crate::logic::TRADE_ARRAY_CATEGORIES.iter().any(|x| *x == c)
+                };
+                let gap = tz - oz;
+                let level_change = row_axis_of(&tf) != row_axis_of(&ef);
+                if tf != ef {
+                    crate::utils::score_dynamics::record_baseline("vision.pair_exact_gap", gap);
+                }
+                if oz > 0.0 && gap <= 1.0 && !level_change {
+                    if tf != ef {
+                        crate::utils::score_dynamics::record_confusion(&ef, &tf, gap);
+                        logs.push(format!(
+                            "      🎯 [PAIR EXACT LABEL] \"{}\" → '{}' | 인쇄 라벨(또는 '/' 로 나뉜 각 부분)이 이 축 라벨 뱅크의 구와 대소문자·기호만 다르고 글자가 같으며, 그 글자를 모두 설명하는 축은 이 축 하나뿐입니다. 코사인 1위 '{}'({:+.4}) 와 이 축({:+.4})의 차 {:.4} 가 pooled σ 한 칸 안이라 코사인 순위는 잡음 폭 안에 있고, 완전일치가 직접 근거입니다. 혼동 사전에는 인덱싱 CONFIRM FLAG 와 같은 규약으로 이 축을 승자, 코사인 1위를 패자로 남깁니다.",
+                            label, ef, tf, tz, oz, gap
+                        ));
+                    }
+                    exact_route = Some((oz, ef));
+                } else if tf != ef {
+                    let why = if oz <= 0.0 {
+                        format!("이 축의 중립점수 {:+.4} 가 양수가 아닙니다", oz)
+                    } else if level_change && row_axis_of(&tf) {
+                        format!("코사인 1위 '{}' 가 표 행 열이라, 표를 다 읽은 뒤 표 칸 에코를 확인하는 미뤄진 경로에 맡깁니다", tf)
+                    } else if level_change {
+                        format!("이 축은 표 행 열이고 코사인 1위 '{}' 는 문서 스칼라 축입니다. 라벨↔값 쌍 하나에는 어느 행인지 말해 주는 근거가 없어, 글자 일치만으로 행 열로 보내면 스칼라로 쓰일 수 있던 쌍이 막힙니다", tf)
+                    } else {
+                        format!("코사인 1위 '{}'({:+.4}) 와의 차 {:.4} 가 pooled σ 한 칸을 넘습니다", tf, tz, gap)
+                    };
+                    logs.push(format!(
+                        "      ⚪ [PAIR EXACT LABEL / HELD] \"{}\" 는 '{}' 라벨 뱅크의 구와 글자가 같지만 {} — 기존 코사인 경로로 판정합니다.",
+                        label, ef, why
+                    ));
+                }
+            }
+        }
+        if !exact.is_empty() {
+            crate::utils::score_dynamics::record_baseline(
+                "vision.pair_exact_route",
+                if exact_route.is_some() { 1.0 } else { 0.0 },
+            );
+        }
+        let (rz, rf) = match exact_route {
+            Some(v) => v,
+            None => {
+                let (_, _, rz, rf) =
+                    recovery_label_gate_guarded(e, "", banks, label_has_aggregate_marker(label));
+                (rz, rf)
+            }
+        };
 
         if rf.is_empty() {
             logs.push(format!(
@@ -1348,6 +1736,7 @@ pub fn route_pairs_to_fields(
                 "      🚫 [PAIR ROW AXIS] \"{}\" → \"{}\" | 최강 축 '{}' 는 표 행 카테고리 '{}' 의 열입니다. 라벨↔값 쌍 하나에는 어느 행인지를 말해 주는 근거가 없어 배정할 수 없습니다. 루트에 꽂으면 표에서 읽은 행 값과 서로 다른 사실이 한 이름에 공존합니다.",
                 label, value, rf, cat
             ));
+            row_axis.push((pi, rf.clone(), rz));
             continue;
         }
         let fmt = crate::utils::ai_utils::query_value_format(&rf);
@@ -1382,7 +1771,207 @@ pub fn route_pairs_to_fields(
     }
 
     out.sort_by(|a, b| b.own.partial_cmp(&a.own).unwrap_or(std::cmp::Ordering::Equal));
-    (out, logs)
+    (out, logs, row_axis)
+}
+
+pub struct PairRowRebuild {
+    pub rows: Vec<serde_json::Map<String, Value>>,
+    pub columns: Vec<(String, String, f32)>,
+    pub segments: usize,
+    pub lead: usize,
+    pub format_drops: Vec<String>,
+}
+
+pub fn rows_from_pair_sequence(
+    pairs: &[(String, String)],
+    pair_embs: &[Vec<f32>],
+    ident_label: &str,
+    ident_field: &str,
+    category: &str,
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+) -> Option<PairRowRebuild> {
+    if pairs.len() != pair_embs.len() || banks.is_empty() {
+        return None;
+    }
+    let key = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    };
+    let keys: Vec<String> = pairs.iter().map(|(l, _)| key(l)).collect();
+    let ident_key = key(ident_label);
+    if ident_key.is_empty() {
+        return None;
+    }
+    let occ: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k == ident_key)
+        .map(|(i, _)| i)
+        .collect();
+    if occ.len() < 2 {
+        return None;
+    }
+    let mut lead = 0usize;
+    loop {
+        let k = lead + 1;
+        let first = match occ[0].checked_sub(k) {
+            Some(i) => i,
+            None => break,
+        };
+        let ok = occ.iter().enumerate().all(|(m, &o)| {
+            let i = match o.checked_sub(k) {
+                Some(i) => i,
+                None => return false,
+            };
+            if m > 0 && i <= occ[m - 1] {
+                return false;
+            }
+            !keys[i].is_empty() && keys[i] != ident_key && keys[i] == keys[first]
+        });
+        if !ok {
+            break;
+        }
+        lead = k;
+    }
+    let starts: Vec<usize> = occ.iter().map(|o| o - lead).collect();
+    let segs: Vec<(usize, usize)> = starts
+        .iter()
+        .enumerate()
+        .map(|(m, &s)| (s, if m + 1 < starts.len() { starts[m + 1] } else { pairs.len() }))
+        .collect();
+    let mut seg_hits: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut repeated: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (s, e) in segs.iter() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for i in *s..*e {
+            let k = keys[i].as_str();
+            if k.is_empty() {
+                continue;
+            }
+            if !seen.insert(k) {
+                repeated.insert(k);
+            }
+        }
+        for k in seen {
+            *seg_hits.entry(k).or_insert(0) += 1;
+        }
+    }
+    let mut cols: Vec<&str> = Vec::new();
+    for (s, e) in segs.iter() {
+        for i in *s..*e {
+            let k = keys[i].as_str();
+            if k.is_empty() || repeated.contains(k) || cols.contains(&k) {
+                continue;
+            }
+            if seg_hits.get(k).copied().unwrap_or(0) >= 2 {
+                cols.push(k);
+            }
+        }
+    }
+    let ident_ci = cols.iter().position(|k| *k == ident_key.as_str())?;
+    if cols.len() < 2 {
+        return None;
+    }
+    let first_of = |k: &str| -> Option<usize> { keys.iter().position(|x| x == k) };
+    let mut col_field: Vec<Option<(String, f32)>> = vec![None; cols.len()];
+    let ident_z = first_of(&ident_key)
+        .map(|i| {
+            label_axis_scores(&pair_embs[i], banks)
+                .into_iter()
+                .find(|(f, _)| f == ident_field)
+                .map(|(_, z)| z)
+                .unwrap_or(0.0)
+        })
+        .unwrap_or(0.0);
+    col_field[ident_ci] = Some((ident_field.to_string(), ident_z));
+    let mut cands: Vec<(usize, String, f32)> = Vec::new();
+    for (ci, k) in cols.iter().enumerate() {
+        if ci == ident_ci {
+            continue;
+        }
+        let i = match first_of(k) {
+            Some(i) => i,
+            None => continue,
+        };
+        if pair_embs[i].is_empty() {
+            continue;
+        }
+        for (f, z) in label_axis_scores(&pair_embs[i], banks) {
+            if z <= 0.0 || f == ident_field {
+                continue;
+            }
+            if crate::logic::trade_field_category(&f) != category {
+                continue;
+            }
+            cands.push((ci, f, z));
+        }
+    }
+    cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    used.insert(ident_field.to_string());
+    for (ci, f, z) in cands.into_iter() {
+        if col_field[ci].is_some() || used.contains(&f) {
+            continue;
+        }
+        used.insert(f.clone());
+        col_field[ci] = Some((f, z));
+    }
+    if col_field.iter().filter(|c| c.is_some()).count() < 2 {
+        return None;
+    }
+    let mut rows: Vec<serde_json::Map<String, Value>> = Vec::new();
+    let mut format_drops: Vec<String> = Vec::new();
+    for (s, e) in segs.iter() {
+        let mut row = serde_json::Map::new();
+        for i in *s..*e {
+            let ci = match cols.iter().position(|k| *k == keys[i].as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let f = match col_field[ci].as_ref() {
+                Some((f, _)) => f,
+                None => continue,
+            };
+            let v = pairs[i].1.trim();
+            if v.is_empty() || is_schema_echo(v) {
+                continue;
+            }
+            let fmt = crate::utils::ai_utils::query_value_format(f);
+            if !crate::utils::ai_utils::value_matches_format(fmt, v) {
+                format_drops.push(format!("{}=\"{}\"", f, v));
+                continue;
+            }
+            row.insert(f.clone(), Value::String(v.to_string()));
+        }
+        let has_ident = row
+            .get(ident_field)
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| !s.trim().is_empty());
+        if has_ident && row.len() >= 2 {
+            rows.push(row);
+        }
+    }
+    if rows.len() < 2 {
+        return None;
+    }
+    let columns: Vec<(String, String, f32)> = cols
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, k)| {
+            let (f, z) = col_field[ci].clone()?;
+            let label = first_of(k).map(|i| pairs[i].0.clone()).unwrap_or_default();
+            Some((label, f, z))
+        })
+        .collect();
+    Some(PairRowRebuild {
+        rows,
+        columns,
+        segments: segs.len(),
+        lead,
+        format_drops,
+    })
 }
 
 /// 🌟 [RECOVERY WINDOW MERGE] 겹치는 복구 창을 하나로 합칩니다.
@@ -1532,12 +2121,22 @@ pub fn plan_recovery_windows(
     let out: Vec<((u32, u32, u32, u32), Vec<(String, String, f32)>)> = slots
         .into_iter()
         .map(|s| {
-            let bbox = to_px(
-                s.row.saturating_sub(1),
-                (s.row + 1).min(rows.saturating_sub(1)),
-                s.c_lo,
-                s.c_hi,
-            );
+            let block = s
+                .fields
+                .iter()
+                .any(|(_, f, _)| matches!(crate::logic::trade_field_category(f), "parties" | "other_parties"));
+            let (r1, c_hi) = if block {
+                ((s.row + 3).min(rows.saturating_sub(1)), (s.c_hi + 2).min(cols.saturating_sub(1)))
+            } else {
+                ((s.row + 1).min(rows.saturating_sub(1)), s.c_hi)
+            };
+            if block {
+                println!(
+                    "    🧱 [RECOVERY WINDOW / PARTY BLOCK] {:?} 는 캡션 아래로 이름·주소·세번이 여러 줄 쌓이는 당사자 상자라, 봉우리 아래 1행 대신 3행·오른쪽 2열까지 창을 넓힙니다.",
+                    s.fields.iter().map(|(_, f, _)| f.clone()).collect::<Vec<_>>()
+                );
+            }
+            let bbox = to_px(s.row.saturating_sub(1), r1, s.c_lo, c_hi);
             (bbox, s.fields)
         })
         .collect();
@@ -1740,7 +2339,7 @@ pub fn record_claim_violations(
             hits += 1;
             crate::utils::score_dynamics::record_field_seen(field);
             crate::utils::score_dynamics::record_near_miss(field);
-            crate::utils::score_dynamics::record_confusion(owner, field, 0.0);
+            crate::utils::score_dynamics::record_confusion(owner, field, f32::NAN);
             emit(&format!(
                 "    ⚠️ [CLAIM VIOLATION] [{}] '{}' = \"{}\" 는 이미 '{}' 가 확정한 값입니다. 금지 목록으로 지시했으나 모델이 되돌려주었습니다.",
                 category, field, value, owner

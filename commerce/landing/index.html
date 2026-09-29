@@ -1,1376 +1,271 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
-    <!-- https://www.backend.ai/rss/blog-rss.xml -->
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Qntology / logis center</title>
-
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Noto+Sans+KR:wght@100..900&display=swap" rel="stylesheet">
-
+    <link href="https://fonts.googleapis.com/css2?family=Gowun+Batang&display=swap" rel="stylesheet">
+    <title>commerce.logis.center</title>
     <style>
-        *{margin: 0; padding: 0; line-height: 1; font-size: 15px; font-weight: normal; list-style: none; text-decoration: none; outline: none; color: #000;}
-
-        html{overflow-x: hidden;}
-
-        .temp{height: 50vh;}
-
-        .gowun-batang-regular { font-family: "Gowun Batang", serif; font-weight: 400; font-style: normal; -webkit-text-stroke: 0.1px; }
-        .gowun-batang-bold,
-        .gowun-batang-bold span { font-family: "Gowun Batang", serif; font-weight: 700; font-style: normal; -webkit-text-stroke: 0.1px; }
-
-        /* Noto Sans KR Weights */
-        .noto-sans-kr-thin { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 100; font-style: normal; }
-        .noto-sans-kr-extralight { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 200; font-style: normal; }
-        .noto-sans-kr-light { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 300; font-style: normal; }
-        .noto-sans-kr-regular { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 400; font-style: normal; }
-        .noto-sans-kr-medium { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 500; font-style: normal; }
-        .noto-sans-kr-semibold { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 600; font-style: normal; }
-        .noto-sans-kr-bold { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 700; font-style: normal; }
-        .noto-sans-kr-extrabold { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 800; font-style: normal; }
-        .noto-sans-kr-black { font-family: "Noto Sans KR", sans-serif; font-optical-sizing: auto; font-weight: 900; font-style: normal; }
-
-
-        #footer{padding: 0 7rem;}
-        #footer .area{overflow: hidden; padding: 0 0 3rem;}
-        #footer .copyright{float: right; font-size: 0.9rem; color: #222;}
-        #footer .createBy{float: left; font-size: 0.9rem; color: #bbb;}
-
-        #header{
-            position: fixed;
-            left: 1.5rem; right: 1.5rem; top: 1.5rem;
-            padding: 1.5rem; border-radius: 1rem; z-index: 10;
-        }
-
-        .sticky{position: sticky; top:10px; left:0;}
-        #header.sticky{ left: 7rem; right: 7rem; background-color: hsl(0deg 0% 100%); opacity: 0.9; -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); box-shadow: 0 0 10px 10px #00000008; transition: background-color 0.2s; }
-        #header.sticky h1 a{color: #000;}
-        #header h1{position: relative; display: inline-block; color: #fff; z-index: 2; opacity: 0; transition-duration: 0.8s; transition-delay: 1.5s;}
-        #header h1 a{font-weight: 900; color: #fff;}
-        #header.sticky h1 img{filter: invert(1);}
-        #header.sticky #nav a span{color: #000;}
-
-        #nav .dp1 ul li a[target] span{text-decoration: underline;}
-        #header.sticky #nav .dp1 ul li a i:after,
-        #header.sticky #nav .dp1 ul li a i:before{background-color: #000;}
-
-
-        #header.on.sticky h1,
-        #header.on.sticky #nav{transition-delay: 0s; transition-duration: 0s;}
-
-        #header.on h1,
-        #header.on #nav{opacity: 1;}
-
-        #nav{position: absolute; top: 1.1rem; left: 0; right: 0; z-index: 0; text-align: center; opacity: 0; transition-duration: 0.8s; transition-delay: 1.5s;}
-        #nav .dp1 ul{display: inline-block;}
-        #nav .dp1 ul li{float: left;}
-        #nav .dp1 ul li+li{margin-left: 1rem;}
-        #nav .dp1 ul li a{position: relative; display: block; padding: 5px 15px 5px 5px; }
-        #nav .dp1 ul li a span{font-size: 1rem; color: #fff;}
-        #nav .dp1 ul li a i{position: absolute; right: 10px; top: 14px;}
-        #nav .dp1 ul li a i:after{content: ""; position: absolute; left: 0; top: 0; width: 5px; height: 1px; transform: rotate(45deg); background-color: #fff;}
-        #nav .dp1 ul li a i:before{content: ""; position: absolute; left: 3px; top: 0; width: 5px; height: 1px; transform: rotate(-45deg); background-color: #fff;}
-
-        /* =========================================
-           Flexbox 레이아웃 
-           ========================================= */
-        .tb.outer, .tb.inner { width: 100%; height: 100%; }
-        .tb { display: flex; flex-direction: row; width: 100%; height: 100%; }
-        .tc { flex: 1; display: flex; flex-direction: column; justify-content: center; text-align: center; }
-        .tc.left{text-align: left;}
-
-        /* =========================================
-           섹션 스타일링
-           ========================================= */
-        .section{}
-        #vanta{overflow: hidden; position: absolute; left: 0; top: 0; width: 100%; height: 100%; border-radius: 2rem; z-index: 0;}
-        .main_section{position: relative; margin: 1rem 1rem -2rem 1rem; z-index: 1;}
-        .main_section .area{transition-duration: 0.7s; transform: scale(0.95); opacity: 0;}
-        .main_section .area:before{content: ""; position: absolute; top: 0; bottom: 0; left: 0; right: 0; border-radius: 2rem; background-color: rgb(0, 41, 38); z-index: 0;}
-        .main_section:after{content: ""; position: absolute; bottom: 0; left: 1rem; right: 1rem; height: 50%; border-radius: 1rem; box-shadow: 0px 0 10px 10px #b8b8b8; z-index: -1; opacity: 0; transition-duration: 0.3s; transition-delay: 2s;}
-
-        .main_section.on:after{opacity: 1;}
-
-        .sub_section{opacity: 0;}
-        body.ready .sub_section{opacity: 1; transition-duration: 0.3s; transition-delay: 2.5s;}
-
-
-        .main_section.on .title_style01{opacity: 1; transition-duration: 0.3s; transition-delay: 0.7s;}
-
-        /*.main_section .media{}*/
-        .main_section.on .area{transform: scale(1.0); opacity: 1;}
-        .main_section.on .media iframe{top: 2px; opacity: 1; cursor: none; pointer-events: none;}
-        .main_section .media iframe{position: relative; overflow: hidden; border: 1px solid #000; border-top-left-radius: 1rem; border-top-right-radius: 1rem; border-bottom: 0; width: 100%; height: 290px; top: 50px; opacity: 0; transition-duration: 2.0s; transition-delay: 1.0s;}
-
-        .main_section .tc{ justify-content: flex-start; } 
-        .main_section .title_style01{position: relative; padding: 6rem 0 0 0; z-index: 0; opacity: 0;}
-        .main_section .title_style01 *{color: #000;}
-        .main_section .title_style01 .title{margin-bottom: 2.5rem;}
-        .main_section .title_style01 .title h2 span{letter-spacing: 0.3px; font-size: 3.5rem; font-weight: 700; color: #fff; text-shadow: 0 0 10px #00000080;}
-        .main_section .title_style01 .desc p+p{margin-top: 1rem;}
-        .main_section .title_style01 .desc p{letter-spacing: 0.7px; font-size: 1.6rem; font-weight: 400;}
-        .main_section .title_style01 .desc p span{font-size: 1.6rem; font-weight: 400; color: #fff; text-shadow: 0 0 10px #00000080;}
-        .main_section .title_style01 .desc p u{font-size: 1.6rem; font-weight: 900; color: #fff;}
-
-        .main_section .media{position: relative; overflow: hidden; display: block; margin:6rem 6rem 0; z-index: 0;}
-
-        .sub_section{position: relative; margin: 0 7rem; border:1px solid #efefef; border-bottom: 0;}
-        .sub_section:after{content: ""; position: absolute; left: -7rem; right: -7rem; bottom: -1px; height: 1px; background-color: #efefef;}
-
-        .section02 .title_style01{padding: 6rem 0 5rem;}
-        .section02 .title_style01 p+p{margin-top: 4rem;}
-        .section02 .title_style01 p i{font-size: 2rem;}
-        .section02 .title_style01 p i span{position: relative; font-size: 2rem; z-index: 0;}
-        .section02 .title_style01 p i span:after{content: ""; position: absolute; left: -0.5rem; bottom: 0.3rem; width: 0; height: 0.7rem; background-color: orange; z-index: -1; transition-duration: 0.5s;}
-        .section02 .title_style01 p i span.on:after{width: 105%;}
-
-        .section02 .title_style01 p i br+span:after{transition-delay: 0.3s;}
-
-
-        .section02 .title_style01 p{font-size: 1.8rem; line-height: 1.5;}
-        .section02 .title_style01 p.gowun-batang-bold span{font-size: 2rem;}
-
-        .title_style02{margin: 5rem 0; text-align: center;}
-        .title_style02 h3 strong{font-size: 2.5rem;}
-        .title_style02 .title h3{font-size: 2.5rem; font-weight: 600;}
-        .section02 .title_style02 .title h3 span{font-size: 2.5rem !important;}
-
-
-        .section06{padding-bottom: 2rem;}
-
-        .section05 img{max-width: 100%; width: 100%; height: auto;}
-
-        .section07{position: relative; overflow: hidden; display: block; margin-top:5rem; margin-bottom:3rem; border-radius: 2rem; height: 400px;}
-        .section07 .title_style02 .title h3{font-weight: 700;}
-        .section07 svg{position: absolute; left: 0; right: 0; top: 0; height:700px;}
-
-        .section07 i:after,
-        .section07 i:before{content: ""; position: absolute; bottom: -300px; width: 100%; height: 400px; z-index: 13; box-shadow: 0 0 80px 80px #ffffffde; background-color: #ffffffde; -webkit-backdrop-filter: blur(1.5px); backdrop-filter: blur(1.5px);}
-
-        .section07 i:after{left: -50%; transform: rotate(-340deg)}
-        .section07 i:before{right: -50%; transform: rotate(340deg);}
-
-        .section07 .title_style02{position: absolute; left: 0; top: 0; width: 100%; height: 100%; margin: 0; z-index: 13;}
-
-
-        #cloud {
-            position: absolute;
-            left: 0; top: -200px;
-            overflow: hidden;
-            width: 1px; height: 1px;
-            transform: translate(-100%, -100%);
-            border-radius: 50%;
-            filter: url(#filter);
-            opacity: 0.6;
-            z-index: 11;
-        }
-        .section07:after{left: -50px; right: -50px; top: -50px; bottom: -50px; height: 500px; background-color: #008cff14; border-radius: 1rem; opacity: 0.9; -webkit-backdrop-filter: blur(1.5px); backdrop-filter: blur(1.5px); z-index: 12;}
-
-        .title_style02.sticky {
-            position: -webkit-sticky; 
-            position: sticky;
-            text-align: center;
-            top: 100px; 
-            z-index: 10;
-        }
-
-        .title_style02 .desc{margin-top: 1.3rem;}
-        .title_style02 .desc p{line-height: 1.3;}
-        .title_style02 .desc p span{font-size: 1.3rem; font-weight: 400; line-height: 1.3; opacity: 0.8;}
-        .title_style02 .desc p span+span{margin-left: 0.5rem;}
-
-        .section03 { position: relative; padding-bottom: 5rem; }
-        /*.section03 .tc, .sub_section.temp .tc { justify-content: flex-start; padding-top: 5rem; }*/
-
-        .section03 .title_style02{margin-bottom: 3rem;}
-
-        .section04{ margin: 0; padding:5rem 7rem 5rem; border:0; background-color: rgb(0, 41, 38); }
-        .section04:after{display: none;}
-        .section04 *{color: #fff;}
-        .section04 .tc{justify-content:initial;}
-        .section04 .tc .title_style02{margin: 0; text-align: left;}
-
-        .section04 .tc:first-child{max-width: 420px; min-width: 360px;}
-
-        .section04 .tc .title_style02 .desc{margin-top: 0; padding: 0 2rem;}
-        .section04 .tc .title_style02 .desc p{line-height: 1.5; letter-spacing: 1px; font-size: 2rem;}
-
-
-        .section04 .items{position: relative; text-align: left;}
-
-        .section04 .items:after{content: ""; position: absolute; left: 0; right: 0; top: 0; width: 100%; height: 0.5px; background-color: #fff; opacity: 0.1;}
-
-        .section04 .items li{position: relative; padding: 3rem;}
-
-        .section04 .items li:after{content: ""; position: absolute; left: 0; right: 0; bottom: 0; width: 100%; height: 0.5px; background-color: #fff; opacity: 0.1;}
-
-        .section04 .items li span{position: absolute; left: 0.5rem; top: 50%; margin-top:-0.75rem; opacity: 0.5; font-family: 'arial';}
-
-        .section04 .items li p{line-height: 1.5; letter-spacing: 0.5px; font-size: 1.5rem; font-weight: 700; word-break: keep-all;}
-
-
-        .aside.aside01{position: relative; margin: 0 0 5rem;}
-
-
-        .section05 .title_style02{margin-bottom: 3rem;}
-        .section05 .title_style02.staggered.active .char{color: rgb(40, 171, 108);}
-        .section05 .tab_container{overflow: hidden; position: relative; padding-top: 3rem;}
-        .section05 .tab_container .tab_area{position: relative; margin: 2rem; padding: 2rem 2rem 0.5rem; border-radius: 1rem; background-color: rgb(0, 41, 38);}
-        .section05 .tab_container .scroll{position: absolute; left: 1rem; top: 0; right: 1rem; overflow-x:scroll;}
-        .section05 .tab_container .tab_nav{white-space: nowrap; text-align: center; z-index: 1;}
-        .section05 .tab_container .tab_nav a{display: inline-block; padding: 0.5rem; font-size: 1.1rem; cursor: pointer; vertical-align: top;}
-        .section05 .tab_container .tab_nav a+a{margin-left: 1rem;}
-        .section05 .tab_container .base_img{max-width: 100%; width: 100%; height: auto; opacity: 0;}
-        .section05 .tab_container .tab_item{position: absolute; left: 0; right: 0; top: 0.5rem; opacity: 0; transition-duration: 0.5s;}
-        .section05 .tab_container .tab_item.on{opacity: 1;}
-
-        /* =========================================
-           1. 기존: 부드럽게 순차적으로 스르륵 (staggered)
-           ========================================= */
-        .title_style02.staggered .title h3 { display: block; flex-wrap: wrap; overflow: hidden; }
-        .title_style02.staggered .char {
-            display: inline-block; transform: translateY(100%); opacity: 0; color:#000;
-            transition: transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.6s ease;
-        }
-        .title_style02.staggered .char.space { width: 0.3em; }
-        .title_style02.staggered.active .char { font-weight: 900; transform: translateY(0); opacity: 1; color: rgb(0, 41, 38); }
-
-        /* 추가: word 단위 스르륵 효과 분기 처리용 스타일 */
-        .staggered .word {
-            display: inline-block; transform: translateY(100%); opacity: 0; 
-            transition: transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.6s ease;
-        }
-        .staggered.active .word { transform: translateY(0); opacity: 1; }
-
-        /* =========================================
-           2. 신규: 불규칙하고 매우 빠른 교차 깜빡임 (random-flicker)
-           ========================================= */
-        .title_style02.random-flicker .title h3 {
-            display: block;
-            flex-wrap: wrap; 
-        }
-        .title_style02.random-flicker .char {
-            display: inline-block;
-            opacity: 0; /* 초기 숨김 상태 */
-        }
-        .title_style02.random-flicker .char.space { width: 0.3em; }
-        
-        .title_style02.random-flicker.active .char {
-            /* duration과 delay는 JS에서 랜덤으로 덮어씌움 */
-            animation-name: chaoticBlink;
-            animation-fill-mode: forwards;
-            animation-timing-function: linear;
-            font-weight: 900;
-        }
-
-        /* 미세하게 여러 번 껐다 켜지는 글리치 키프레임 */
-        @keyframes chaoticBlink {
-            0%   { opacity: 0; }
-            10%  { opacity: 1; }
-            25%  { opacity: 0; }
-            40%  { opacity: 1; }
-            55%  { opacity: 0; }
-            70%  { opacity: 1; }
-            85%  { opacity: 0; }
-            100% { opacity: 1; }
-        }
-
-
-        .talks{margin: auto; max-width: 480px;}
-
-        .talks .talk{position: relative;}
-        .talks .talk.left{text-align: left;}
-        .talks .talk.left p{background-color: #eee; margin-right: 5rem;}
-        .talks .talk.right{text-align: right; margin-bottom: 3rem;}
-        .talks .talk.right p{background-color: #78c2ff; margin-left: 5rem; max-width: 300px; text-align: left; color: #000000;}
-        .talks .talk p{display: inline-block; margin: 0 2rem; padding: 1.3rem 1.5rem 1.5rem; border-radius: 1rem; line-height: 1.7; letter-spacing: 0.4px; font-weight: 600; word-break: keep-all;}
-
-        .talks .talk + .talk{margin-top: 1.5rem;}
-
-
-        :root {
-            --item-bg: #080e1d;
-            --item-surface: #15223f;
-            --item-text: #f8fafc;
-            --item-border: #334155;
-            --item-gap: 16px;
-            --item-radius: 18px;
-        }
-
-
-        .item-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); grid-auto-rows:minmax(110px, auto); grid-auto-flow:row; gap:var(--item-gap); }
-        .item-card { min-width:0; padding:1.5rem; border:1px solid var(--item-border); border-radius:var(--item-radius); }
-        .item-card--feature { grid-column: span 2; grid-row: span 2; }
-        .item-card--card2 { grid-column: span 1; grid-row: span 1; }
-        .item-card--card3 { grid-column: span 1; grid-row: span 1; }
-
-        @media(max-width:900px){
-            .item-grid{grid-template-columns:repeat(2, minmax(0, 1fr))}
-            .item-card--feature { grid-column: span 1; grid-row: span 1; }
-            .item-card--card2 { grid-column: span 1; grid-row: span 1; }
-            .item-card--card3 { grid-column: span 1; grid-row: span 1; }
-        }
-        @media(max-width:600px){
-            .item-grid{grid-template-columns:repeat(1, minmax(0, 1fr))}
-            .item-card--feature { grid-column: span 1; grid-row: span 1; }
-            .item-card--card2 { grid-column: span 1; grid-row: span 1; }
-            .item-card--card3 { grid-column: span 1; grid-row: span 1; }
-        }
-
-
-
-        .cols{  }
-        .section03 .col3{ position: relative; margin: 0 2rem; }
-        .section03 .col3 .tc{ width: 33.33%; justify-content: initial; }
-        .section03 .media{ position: relative; overflow: hidden; border-radius: 1rem;}
-
-        .section03 .info{ margin: 1rem; }
-        .section03 .info svg{ position:absolute; left: 0; top: 0; width: 100%; height: 100%; z-index: -1; }
-        .section03 .info canvas{ display: block; width: 100%; }
-        .section03 .info .box{ margin: 1.5rem 1rem 0; text-align: left; }
-
-        .section03 .info .box .title{margin-bottom: 1rem;}
-        .section03 .info .box .title strong{ font-size: 2.2rem; font-weight: 700; }
-        .section03 .info .box .desc p{ font-size: 1.6rem; line-height: 1.5; word-break: keep-all; }
-
-        .section03 .info svg{ background-color: #fee440; }
-
-        .out-top { transform-origin: 13px 25px; }
-        .in-top { transform-origin: 13px 25px; }
-        .out-bottom { transform-origin: 84px 93px; }
-        .in-bottom { transform-origin: 84px 93px; }
-
-        #readme{ margin: 0 auto; padding: 0 2rem 3rem; max-width: 740px; }
-        #readme .title_style02{}
-        #readme h2,
-        #readme .octicon-link{display: none;}
-
-        .readme_section .title_style02{margin-bottom: 3rem;}
-
-        #readme * { color: inherit; line-height: 1.6; }
-        #readme h1, #readme h2 { font-weight: 700; font-size: 2rem; margin: 2rem 0 1rem; padding-bottom: 0.5rem; }
-        #readme h1:first-child, #readme h2:first-child { margin-top: 0; }
-        #readme h3 { font-weight: 700; font-size: 1.5rem; margin: 2rem 0 0.8rem; }
-        #readme p { margin-bottom: 1rem; font-size: 1.05rem; }
-        #readme ul, #readme ol { margin-left: 2rem; margin-bottom: 1.5rem; }
-        #readme li { list-style: inherit; font-size: 1.05rem; margin-bottom: 0.3rem; }
-        #readme a { color: #008cff; text-decoration: underline; }
-        
-        /* --- Code Schema CSS --- */
-        #readme .code-schema { background: #1e1e1e; border-radius: 8px; box-shadow: 0 6px 16px rgba(0,0,0,0.15); margin: 2rem 0 3rem; overflow: hidden; }
-        #readme .code-schema-header { padding: 0.5rem; display: flex; align-items: center; justify-content: space-between; }
-        /*#readme .code-schema-dots { display: flex; gap: 8px; }*/
-        #readme .code-schema-dots{ opacity: 0; }
-        #readme .code-schema-dots span { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
-        #readme .code-copy-btn { background: transparent; border: 0; color: #ccc; border-radius: 4px; padding: 4px 12px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s; font-family: sans-serif; font-weight: bold; }
-        #readme .code-copy-btn:hover { background: #fff; color: #000; }
-        #readme .code-schema-body { padding: 0; overflow-x: auto; }
-        #readme .code-schema-body pre { background: transparent; color: #e6e6e6; padding: 0 1.5rem 1.2rem; margin: 0; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.95rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all;}
-        #readme .code-schema-body .highlight { margin: 0; padding: 0; }
-        
-        #readme code:not(pre code) { background: #00000010; padding: 0.2rem 0.4rem; border-radius: 0.3rem; font-family: monospace; font-size: 0.95rem; }
-        #readme blockquote { border-left: 4px solid #ddd; padding-left: 1rem; color: #666; margin-bottom: 1rem; }
-        #readme img { max-width: 100%; height: auto; }
-
-
-        #toggle-nav{display: none; position: absolute; top: 1.5rem; right: 1.5rem; width: 20px; height: 16px; z-index: 4; cursor: pointer;}
-        #toggle-nav i{display: block; height: 1.5px; background-color: #fff;}
-        #toggle-nav i+i{margin-top: 6px;}
-
-        #header.sticky #toggle-nav i{background-color: #000;}
-
-        @media (max-width: 880px) {
-            :root{font-size: 12px;}
-
-            .title_style02 .title h3,
-            .title_style02.staggered.active .char{ font-size: 1.6rem !important; }
-            .title_style02 .desc p{ font-size: 1rem !important; }
-            .title_style02 .desc p span{display: block;}
-            .title_style02 .desc p span+span{margin-left: 0; margin-top: 0.5rem;}
-
-            .section02 .title_style01 p,
-            .section02 .title_style01 p.gowun-batang-bold span,
-            .section02 .title_style01 p i span{font-size: 1.6rem !important; }
-
-            .main_section .title_style01{padding-top: 7rem; padding-bottom: 1rem; padding-left: 2rem; text-align: left;}
-            .main_section .title_style01 .title{margin-bottom: 1.5rem;}
-
-            
-            .main_section .title_style01 .title h2 span{font-size: 2rem !important; }
-            .main_section .title_style01 .title h2 span{display: block;}
-
-            .section03 .info .box .title strong,
-            .main_section .title_style01 .desc p,
-            .main_section .title_style01 .desc p u,
-            .main_section .title_style01 .desc p span{font-size: 1.6rem; word-break: keep-all;}
-            .main_section .title_style01 .desc p span{display: block;}
-            .main_section .title_style01 .desc p span+span{margin-top: 0.5rem;}
-
-            #footer{ padding-left: 3rem; padding-right: 3rem; }
-
-            #header.sticky{left: 3rem; right: 3rem;}
-
-
-            .sub_section{ margin-left: 3rem; margin-right: 3rem; }
-
-            .main_section .media{ margin: 3rem 0 0 2rem; }
-            .main_section .media iframe{ border-top-right-radius: 0; border-bottom-right-radius: 2rem; }
-
-
-            .section03 .info .box .desc p,
-            .section04 .items li p{font-size: 1.3rem;}
-
-            .section04 .tc .title_style02.sticky{position: static; background-color: transparent;}
-
-            .section04 .tc .title_style02.sticky .title{ padding: 1.7rem 0 1rem; }
-
-            .section04 .tc .title_style02.sticky{ margin-left: -7rem; top: 60px; left: 0; right: 0; z-index: 3; text-align: center; white-space: nowrap; width: calc(100vw - 7.25rem); background: rgb(0 41 38 / 70%); border-radius: 1rem; }
-            .section04 .tc .title_style02.sticky h3,
-            .section04 .tc .title_style02.sticky h3 strong,
-            .section04 .tc .title_style02.sticky h3 strong span{display: inline !important; font-size: 1.5rem !important;}
-
-            .section04 .tc .title_style02.sticky br{ display: none; }
-
-            .section04.sub_section{ margin-left: 0; margin-right: 0; padding: 3rem 7rem 3rem; }
-
-            .section04 .tc:first-child+.tc{padding: 6rem 0 6rem;}
-
-            .section04 .tc:first-child{ width: 0; min-width: 0; max-width: 0; }
-
-            .section07{ height: 240px;}
-        }
-
-
-        @media (max-width: 660px) {
-            #footer{ padding-left: 1rem; padding-right: 1rem; }
-            #header.sticky{left: 1rem; right: 1rem; padding-left: 2rem; padding-right: 2rem;}
-
-
-            #header #toggle-nav{display: block; right: 1.5rem;}
-            #header.sticky #toggle-nav{right: 2rem;}
-
-            #nav,
-            #header.on #nav{opacity: 0; top: 1rem; z-index: -1; transition-delay: 0s;}
-
-
-
-
-
-            .sub_section{ margin-left: 1rem; margin-right: 1rem; }
-
-            .section03 .col3{display: block;}
-            .section03 .info{ margin-left: 0; margin-right: 0; }
-            .section03 .tc+.tc{margin-top: 4rem;}
-
-            .section03 .col3 .tb,
-            .section03 .col3 .tc{display: block; width: 100%;}
-            .section04.sub_section{ padding: 3rem 1rem 3rem; }
-
-            .section04 .tc .title_style02.sticky{ margin-left: 0rem; top: 60px; left: 0; right: 0; z-index: 3; text-align: center; white-space: nowrap; width: calc(100vw - 5.25rem); background: rgb(0 41 38 / 70%); border-radius: 1rem; }
-
-            #readme{ padding: 0 1rem 3rem; }
-
-            .talks .talk p{  }
-
-            
-        }
-
-        @media (max-width: 600px) {
-            #nav{position: fixed;}
-        }
-
-        @media (max-width: 500px) {
-            .createBy{display: none;}
-            #footer .copyright{float: none; text-align: center;}
-        }
-
-        @media (max-width: 360px) {
-
-        }
-
-        /* Language Toggle Styles */
-        body.en .lang-ko { display: none !important; }
-        body.ko .lang-en { display: none !important; }
-
-        #lang-toggle {
-            position: absolute; top: 1.3rem; right: 1.5rem;
-            background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(255, 255, 255, 0.5);
-            color: #fff; padding: 0.4rem 0.8rem; border-radius: 20px;
-            font-size: 0.9rem; cursor: pointer; z-index: 10; font-weight: bold; transition: 0.3s;
-        }
-        #header.sticky #lang-toggle {
-            color: #000; border-color: rgba(0, 0, 0, 0.5); background: transparent;
-        }
-        @media (max-width: 660px) {
-            #lang-toggle { right: 4.5rem; }
-            #header.sticky #lang-toggle { right: 4.5rem; }
-        }
+        *{ font-family: "Gowun Batang", serif; }
+        .area { display: block; margin-left:auto; margin-right:auto; padding: 1em; max-width: 380px; box-sizing:border-box; }
+        .nav a,
+        .nav h1,
+        .nav select { display: inline-block; vertical-align: bottom; font-size:16px; }
+        .nav select { position: absolute; margin-left: 11em; border:0; text-decoration: underline; }
+        h1{margin: 0;}
+        p{ margin-left: 1.1em; }
+
+        h2[data-i18n="how_it_works_title"]:before{content: "[Beta version] ";}
+
+        .language{overflow: hidden; overflow-y: scroll; height: 120px;}
+        .language ul{margin: 0;}
     </style>
-
-
-<body class="ko">
+</head>
+<body>
     <div class="wrap">
-        <header id="header">
+        <!-- Navigation -->
+        <div class="nav">
             <div class="area">
-                <h1>
-                    <a href="/">Qntology</a>
-                </h1>
+                <h1><a href="/">commerce.logis.center</a></h1>
+                <select id="lang" name="lang" onchange="changeLanguage(this.value)">
+                    <option value="en">en</option>
+                    <option value="ja">ja</option>
+                </select>
+            </div>
+        </div>
 
-                <button id="lang-toggle">EN</button>
-                <a id="toggle-nav">
-                    <i></i>
-                    <i></i>
-                    <i></i>
-                </a>
-                <nav id="nav">
-                    <div class="dp1">
+        <div class="section">
+            <div class="area">
+                <div>
+                    <h2 data-i18n="how_it_works_title">Quick Start</h2>
+                    <div></div>
+                </div>
+                
+                <div>
+                    <div>
+                        <div>
+                            <h4 data-i18n="down_title">1. Download</h4>
+                            <p data-i18n="down_desc">
+                                <a onclick="executeDownload()" style="cursor: pointer; text-decoration: underline;">Download</a>
+                            </p>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div>
+                            <h4 data-i18n="scan_title">2. Scan</h4>
+                            <p data-i18n="scan_desc">
+                                Scan goods, order, tracking to automatically extract data.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div>
+                        <div>
+                            <h4 data-i18n="drag_title">3. Drag & Drop</h4>
+                            <p data-i18n="drag_desc">
+                                Drag and drop files(jpg,png,pdf,csv) onto the screen to start AI analysis instantly.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="area">
+                <div>
+                    <h2 data-i18n="intro_title">Introduction</h2>
+                    <div></div>
+                </div>
+                
+                <div>
+                    <div>
+                        <h4 data-i18n="spec_speed">Easy Data Collection</h4>
+                        <p>
+                            One-Click Integration
+                        </p>
+                    </div>
+
+                    <div>
+                        <h4 data-i18n="spec_security">Commerce Domain Inference</h4>
+                        <p>
+                            Edge, On Premise
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+
+        <div class="section">
+            <div class="area">
+                <div>
+                    <h2>Support Language</h2>
+                    <div class="language">
                         <ul>
-                            <li><a class="menu menu_" href="#get-started"><span>Get Started</span></a></li>
-                            <li><a class="menu menu_" href="#performance"><span>Performance</span></a></li>
-                            <li><a class="menu menu_fulfillment" href="https://github.com/Qntology/logis-center" target="_blank"><span>Github</span></a></li>
+                            <li>Albanian</li>
+                            <li>Arabic</li>
+                            <li>Azerbaijani</li>
+                            <li>Bengali</li>
+                            <li>Bulgarian</li>
+                            <li>Catalan</li>
+                            <li>Chinese</li>
+                            <li>Croatian</li>
+                            <li>Czech</li>
+                            <li>Danish</li>
+                            <li>Dutch</li>
+                            <li>English</li>
+                            <li>Estonian</li>
+                            <li>Finnish</li>
+                            <li>French</li>
+                            <li>Georgian</li>
+                            <li>German</li>
+                            <li>Greek</li>
+                            <li>Hebrew</li>
+                            <li>Hindi</li>
+                            <li>Hungarian</li>
+                            <li>Icelandic</li>
+                            <li>Indonesian</li>
+                            <li>Italian</li>
+                            <li>Japanese</li>
+                            <li>Kazakh</li>
+                            <li>Khmer</li>
+                            <li>Korean</li>
+                            <li>Latvian</li>
+                            <li>Lithuanian</li>
+                            <li>Malay</li>
+                            <li>Marathi</li>
+                            <li>Norwegian</li>
+                            <li>Persian</li>
+                            <li>Polish</li>
+                            <li>Portuguese</li>
+                            <li>Romanian</li>
+                            <li>Russian</li>
+                            <li>Serbian</li>
+                            <li>Slovak</li>
+                            <li>Slovenian</li>
+                            <li>Spanish</li>
+                            <li>Swahili</li>
+                            <li>Swedish</li>
+                            <li>Tagalog</li>
+                            <li>Telugu</li>
+                            <li>Thai</li>
+                            <li>Turkish</li>
+                            <li>Ukrainian</li>
+                            <li>Urdu</li>
+                            <li>Uzbek</li>
+                            <li>Vietnamese</li>
                         </ul>
                     </div>
-                </nav>
+                </div>
+                
+                <div>
+                    <div>
+                        <p style="line-height:1.8;"></p>
+                    </div>
+                </div>
             </div>
-        </header>
+        </div>
 
-        <main id="main">
-            <section class="section main_section">
-                <div class="area">
-                    <div class="tb outer">
-                        <div class="tc">
-                            <div id="vanta"></div>
-                            <div class="title_style01">
-                                <div class="title">
-                                    <h2><span>Scan, Drag, Drop</span></h2>
-                                </div>
-                                <div class="desc lang-ko">
-                                    <p><span>Instantly extract and analyze data</span></p>
-                                </div>
-                                <div class="desc lang-en">
-                                    <p><span>Start from a single laptop, </span> <span>expand seamlessly to an entire office Mesh.</span></p>
-                                </div>
-                            </div>
-                            <a class="media" href="https://github.com/Qntology/logis-center" target="_blank">
-                                <iframe src="iframe.html" frameborder="0"></iframe>
-                            </a>
-                        </div>
-                    </div>
-                </div>
-            </section>
 
-            <section class="section section02 sub_section">
-                <div class="tb outer">
-                    <div class="tc">
-                        <div class="title_style01 lang-ko">
-                            <p class="gowun-batang-regular"><br></p>
-                            <p class="gowun-batang-regular"><i>"<span class="underline"></span><br><span class="underline"></span>"</i></p>
-                            <p class="gowun-batang-bold staggered"><span class="word"></span><br><span class="word"></span></p>
-                        </div>
-                        <div class="title_style01 lang-en">
-                            <p class="gowun-batang-regular">Extensive Open-Source Model Support<br>80+ Model Architectures & 20+ VLM/OCR Supported</p>
-                            <p class="gowun-batang-regular"><i>"<span class="underline">Designed for performance,</span><br><span class="underline">simplicity, scalability, and compatibility</span>"</i></p>
-                            <p class="gowun-batang-bold staggered"><span class="word"></span><br><span class="word"></span></p>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <section class="section aside02 readme_section sub_section">
-                <div class="title_style02 staggered" id="get-started">
-                    <div class="title lang-ko">
-                        <h3 class="noto-sans-kr-bold"></h3>
-                    </div>
-                    <div class="title lang-en">
-                        <h3 class="noto-sans-kr-bold"></h3>
-                    </div>
-                    <div class="desc lang-ko">
-                        <p></p>
-                    </div>
-                    <div class="desc lang-en">
-                        <p></p>
-                    </div>
-                </div>
-                
-            </section>
-
-            <section class="section section04 sub_section">
-                <!-- 
-                  추가요청하신 불규칙하고 매우 빠른 교차 깜빡임 (random-flicker) 
-                -->
-                <div class="tb outer">
-                    <div class="tc">
-                        <div class="title_style02 random-flicker sticky">
-                            <div class="title lang-ko">
-                                <h3>고성능과 호환성,<br><br><strong>고급 기능 완벽 지원</strong></h3>
-                            </div>
-                            <div class="title lang-en">
-                                <h3>High Performance & Compatibility,<br><br><strong>Advanced Features fully supported</strong></h3>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="tc">
-                        <div class="items">
-                            <ul>
-                                <li>
-                                    <span>1</span>
-                                    <p class="lang-ko">80+ 오픈소스 모델: Llama, Qwen, Gemma, Phi, Mistral, DeepSeek 등 지원</p>
-                                    <p class="lang-en">80+ Open-Source Models: Support for Llama, Qwen, Gemma, Phi, Mistral, DeepSeek, etc.</p>
-                                </li>
-                                    
-                                <li>
-                                    <span>2</span>
-                                    <p class="lang-ko">20+ VLM/OCR 모델: Qwen3-Omni, Llama 3.2 Vision, GLM-4V, Hunyuan-VL 지원</p>
-                                    <p class="lang-en">20+ VLM/OCR Models: Support for Qwen3-Omni, Llama 3.2 Vision, GLM-4V, Hunyuan-VL.</p>
-                                </li>
-                                    
-                                <li>
-                                    <span>3</span>
-                                    <p class="lang-ko">TurboQuant KV 캐시: KV 캐시를 3~4.25 bits/value로 압축하여 메모리 74% 절약</p>
-                                    <p class="lang-en">TurboQuant KV Cache: Compress KV cache to 3~4.25 bits/value, saving 74% of memory.</p>
-                                </li>
-                                    
-                                <li>
-                                    <span>4</span>
-                                    <p class="lang-ko">모델 서저리: YAML 기반 가중치 변환으로 재학습 없이 확장, 추가, 제거, 보간 가능</p>
-                                    <p class="lang-en">Model Surgery: YAML-based weight transformation enables expansion, addition, removal, and interpolation without retraining.</p>
-                                </li>
-                                    
-                                <li>
-                                    <span>5</span>
-                                    <p class="lang-ko">분산 추론 지원: 텐서 병렬(TP) 및 파이프라인 병렬(PP), mDNS 자동 검색 내장</p>
-                                    <p class="lang-en">Distributed Inference: Built-in support for Tensor Parallelism (TP) and Pipeline Parallelism (PP) with mDNS auto-discovery.</p>
-                                </li>
-                                    
-                                <li>
-                                    <span>6</span>
-                                    <p class="lang-ko"></p>
-                                    <p class="lang-en"></p>
-                                </li>
-                                    
-                                <li>
-                                    <span>7</span>
-                                    <p class="lang-ko"></p>
-                                    <p class="lang-en"></p>
-                                </li>
-                                    
-                                <li>
-                                    <span>8</span>
-                                    <p class="lang-ko"></p>
-                                    <p class="lang-en"></p>
-                                </li>
-                            </ul>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <section class="section section03 sub_section" id="performance">
-                <div class="title_style02 staggered">
-                    <div class="title lang-ko">
-                        <h3 class="noto-sans-kr-bold"></h3>
-                    </div>
-                    <div class="title lang-en">
-                        <h3 class="noto-sans-kr-bold"></h3>
-                    </div>
-                </div>
-
-                <div class="col3">
-                    <div class="tb outer">
-                        <div class="tc">
-                            <div class="info">
-                                <div class="media">
-                                    <canvas width="4" height="3"></canvas>
-                                    <svg preserveAspectRatio="xMidYMid slice" viewBox="10 10 80 80">
-                                        <path style="transform-origin: 13px 25px;" fill="#9b5de5" class="out-top" d="M37-5C25.1-14.7,5.7-19.1-9.2-10-28.5,1.8-32.7,31.1-19.8,49c15.5,21.5,52.6,22,67.2,2.3C59.4,35,53.7,8.5,37-5Z"/>
-                                        <path style="transform-origin: 13px 25px;" fill="#f15bb5" class="in-top" d="M20.6,4.1C11.6,1.5-1.9,2.5-8,11.2-16.3,23.1-8.2,45.6,7.4,50S42.1,38.9,41,24.5C40.2,14.1,29.4,6.6,20.6,4.1Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00bbf9" class="out-bottom" d="M105.9,48.6c-12.4-8.2-29.3-4.8-39.4.8-23.4,12.8-37.7,51.9-19.1,74.1s63.9,15.3,76-5.6c7.6-13.3,1.8-31.1-2.3-43.8C117.6,63.3,114.7,54.3,105.9,48.6Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00f5d4" class="in-bottom" d="M102,67.1c-9.6-6.1-22-3.1-29.5,2-15.4,10.7-19.6,37.5-7.6,47.8s35.9,3.9,44.5-12.5C115.5,92.6,113.9,74.6,102,67.1Z"/>
-                                    </svg>
-                                </div>
-                                <div class="box">
-                                    <div class="title">
-                                        <strong class="lang-ko">Python 불필요</strong>
-                                        <strong class="lang-en">No Python Required</strong>
-                                    </div>
-                                    <div class="desc">
-                                        <p class="lang-ko">Rust로 작성된 단일 네이티브 바이너리로 모델 로드, 스케줄링, 추론이 하나의 프로세스에서 완료됩니다.</p>
-                                        <p class="lang-en">A single native binary written in Rust handles model loading, scheduling, and inference entirely in one process.</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="tc">
-                            <div class="info">
-                                <div class="media">
-                                    <canvas width="4" height="3"></canvas>
-                                    <svg preserveAspectRatio="xMidYMid slice" viewBox="10 10 80 80">
-                                        <path style="transform-origin: 13px 25px;" fill="#9b5de5" class="out-top" d="M37-5C25.1-14.7,5.7-19.1-9.2-10-28.5,1.8-32.7,31.1-19.8,49c15.5,21.5,52.6,22,67.2,2.3C59.4,35,53.7,8.5,37-5Z"/>
-                                        <path style="transform-origin: 13px 25px;" fill="#f15bb5" class="in-top" d="M20.6,4.1C11.6,1.5-1.9,2.5-8,11.2-16.3,23.1-8.2,45.6,7.4,50S42.1,38.9,41,24.5C40.2,14.1,29.4,6.6,20.6,4.1Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00bbf9" class="out-bottom" d="M105.9,48.6c-12.4-8.2-29.3-4.8-39.4.8-23.4,12.8-37.7,51.9-19.1,74.1s63.9,15.3,76-5.6c7.6-13.3,1.8-31.1-2.3-43.8C117.6,63.3,114.7,54.3,105.9,48.6Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00f5d4" class="in-bottom" d="M102,67.1c-9.6-6.1-22-3.1-29.5,2-15.4,10.7-19.6,37.5-7.6,47.8s35.9,3.9,44.5-12.5C115.5,92.6,113.9,74.6,102,67.1Z"/>
-                                    </svg>
-                                </div>
-
-                                <div class="box">
-                                    <div class="title">
-                                        <strong class="lang-ko">OpenAI 호환 API</strong>
-                                        <strong class="lang-en">OpenAI Compatible API</strong>
-                                    </div>
-                                    <div class="desc">
-                                        <p class="lang-ko">/v1/chat/completions 및 SSE 스트리밍을 지원하는 내장 서버. OpenAI SDK와 호환됩니다.</p>
-                                        <p class="lang-en">Built-in server supporting /v1/chat/completions and SSE streaming. Fully compatible with OpenAI SDK.</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="tc">
-                            <div class="info">
-                                <div class="media">
-                                    <canvas width="4" height="3"></canvas>
-                                    <svg preserveAspectRatio="xMidYMid slice" viewBox="10 10 80 80">
-                                        <path style="transform-origin: 13px 25px;" fill="#9b5de5" class="out-top" d="M37-5C25.1-14.7,5.7-19.1-9.2-10-28.5,1.8-32.7,31.1-19.8,49c15.5,21.5,52.6,22,67.2,2.3C59.4,35,53.7,8.5,37-5Z"/>
-                                        <path style="transform-origin: 13px 25px;" fill="#f15bb5" class="in-top" d="M20.6,4.1C11.6,1.5-1.9,2.5-8,11.2-16.3,23.1-8.2,45.6,7.4,50S42.1,38.9,41,24.5C40.2,14.1,29.4,6.6,20.6,4.1Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00bbf9" class="out-bottom" d="M105.9,48.6c-12.4-8.2-29.3-4.8-39.4.8-23.4,12.8-37.7,51.9-19.1,74.1s63.9,15.3,76-5.6c7.6-13.3,1.8-31.1-2.3-43.8C117.6,63.3,114.7,54.3,105.9,48.6Z"/>
-                                        <path style="transform-origin: 84px 93px;" fill="#00f5d4" class="in-bottom" d="M102,67.1c-9.6-6.1-22-3.1-29.5,2-15.4,10.7-19.6,37.5-7.6,47.8s35.9,3.9,44.5-12.5C115.5,92.6,113.9,74.6,102,67.1Z"/>
-                                    </svg>
-                                </div>
-
-                                <div class="box">
-                                    <div class="title">
-                                        <strong class="lang-ko">연속 배치 처리</strong>
-                                        <strong class="lang-en">Continuous Batching</strong>
-                                    </div>
-                                    <div class="desc">
-                                        <p class="lang-ko">기본값 parallel=4, 배치 프리필과 프롬프트 접두사 캐싱을 기본적으로 완벽하게 지원합니다.</p>
-                                        <p class="lang-en">Default parallel=4, with out-of-the-box full support for batched prefill and prompt prefix caching.</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <section class="section section05 sub_section">
-                <div class="title_style02 staggered">
-                    <div class="title">
-                        <h3>Optional GUI</h3>
-                    </div>
-                    <div class="desc">
-                        <p></p>
-                    </div>
-                </div>
-
-                <div class="tab_container">
-                    <div class="scroll">
-                        <div class="tab_nav"></div>
-                    </div>
-                    <div class="tab_area">
-                        <img src="bgo-chat-dark.webp" alt="" class="base_img">
-                        <div class="tab_item on">
-                            <img src="bgo-chat-dark.webp" alt="Chat">
-                        </div>
-                        <div class="tab_item">
-                            <img src="bgo-models-list-dark.webp" alt="Models">
-                        </div>
-                        <div class="tab_item">
-                            <img src="bgo-agent-squad-dark.webp" alt="Agent Squad">
-                        </div>
-                        <div class="tab_item">
-                            <img src="bgo-agent-team-dark.webp" alt="Agent Team">
-                        </div>
-                        <div class="tab_item">
-                            <img src="bgo-dashboard-dark.webp" alt="Dashboard">
-                        </div>
-                        <div class="tab_item">
-                            <img src="bgo-engines-dark.webp" alt="Engines">
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            <section class="section section06 sub_section">
-                <div class="title_style02 staggered">
-                    <div class="title lang-ko">
-                        <h3>자주 묻는 질문</h3>
-                    </div>
-                    <div class="title lang-en">
-                        <h3>Frequently Asked Questions</h3>
-                    </div>
-                    <div class="desc lang-ko">
-                        <p>궁금한 점이 있으신가요?</p>
-                    </div>
-                    <div class="desc lang-en">
-                        <p>Any questions?</p>
-                    </div>
-                </div>
-
-                <div class="talks">
-                    <ul>
-                        <li class="talk left">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk right">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk left">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk right">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk left">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk right">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk left">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                        <li class="talk right">
-                            <p class="typo lang-ko"></p>
-                            <p class="typo lang-en"></p>
-                        </li>
-                    </ul>
-                </div>
-            </section>
-
-            <a href="https://github.com/Qntology/logis-center" target="_blank" class="section section07 sub_section">
-                <svg id="halftonePattern" width="100%" height="100%" viewBox="0 0 100% 100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="position:absolute; pointer-events:none;">
-                    <defs>
-                        <!-- 1. Radial Gradient for Circles -->
-                        <radialGradient id="radialBlackToTransparent" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
-                            <stop offset="5%" style="stop-color:black; stop-opacity:0.5" />
-                            <stop offset="100%" style="stop-color:black; stop-opacity:0" />
-                        </radialGradient>
-
-                        <!-- 2. Circle Pattern -->
-                        <pattern id="circlesPattern" x="0" y="0" width="24" height="24" patternUnits="userSpaceOnUse">
-                            <circle cx="6" cy="6" r="6" fill="url(#radialBlackToTransparent)" />
-                        </pattern>
-
-                        <!-- 3. Linear Gradient Overlay (아래에서 위로) -->
-                        <linearGradient id="linearBlackToTransparent" x1="0%" y1="0%" x2="0%" y2="100%">
-                            <stop offset="0%" style="stop-color:black; stop-opacity:0" />
-                            <stop offset="100%" style="stop-color:black; stop-opacity:0.5" />
-                        </linearGradient>
-
-                        <rect id="circlesSourceLayer" width="100%" height="100%" fill="url(#circlesPattern)" />
-                        <rect id="overlaySourceLayer" width="100%" height="100%" fill="url(#linearBlackToTransparent)" />
-
-                        <!-- 4. SVG Filter -->
-                        <filter id="blendAndThresholdFilter" x="0" y="0" width="100%" height="100%" filterUnits="userSpaceOnUse">
-                            <feImage xlink:href="#circlesSourceLayer" result="circlesInput" x="0" y="0" width="100%" height="100%"/>
-                            <feImage xlink:href="#overlaySourceLayer" result="overlayInput" x="0" y="0" width="100%" height="100%"/>
-
-                            <!-- Blend them using 'multiply' -->
-                            <feBlend mode="multiply" in="circlesInput" in2="overlayInput" result="multiplied" />
-
-                            <!-- 임계값을 적용하여 형태 생성 -->
-                            <feColorMatrix in="multiplied" result="thresholded" type="matrix"
-                                values="
-                                    1 0 0 0 0
-                                    0 1 0 0 0
-                                    0 0 1 0 0
-                                    0 0 0 255 -128" />
-
-                            <!-- ========================================== -->
-                            <!-- 여기서 원하는 색상으로 조정할 수 있습니다! -->
-                            <!-- ========================================== -->
-                            <feFlood flood-color="white" result="colorLayer" />
-                            <feComposite in="colorLayer" in2="thresholded" operator="in" />
-                            
-                        </filter>
-                    </defs>
-                </svg>
-
-                <!-- 임시로 어두운 배경(#333)을 주어 흰색 점이 보이도록 했습니다 -->
-                <div style="background-color: #008cff; box-shadow:0 0 0 0px red;margin:0;padding:0;">
-                    <div style="width:100%;height:700px;opacity: 0.5;filter:url(#blendAndThresholdFilter)"></div>
-                </div>
-
-                <div id="cloud"></div>
-
-                <svg width="0">
-                    <filter id="filter">
-                        <feTurbulence type="fractalNoise"
-                            baseFrequency=".01" numOctaves="10" />
-                        <feDisplacementMap
-                            in="SourceGraphic" scale="240" />
-                    </filter>
-                </svg>
-                
-                <i></i>
-
-                <div class="title_style02">
-                    <div class="tb">
-                        <div class="tc">
-                            <div class="title lang-ko" id="install">
-                                <h3>빠른 시작, 단 몇 초 안에 경험하세요</h3>
-                            </div>
-                            <div class="title lang-en" id="install_en">
-                                <h3>Get Started, Experience it in seconds</h3>
-                            </div>
-                            <div class="desc lang-ko">
-                                <p class="typo"><span>Homebrew를 통해 쉽게 설치하고</span><span>Apple Silicon에서</span><span>강력한 성능을 즉시 누려보세요.</span></p>
-                            </div>
-                            <div class="desc lang-en">
-                                <p class="typo"><span>Install easily via Homebrew</span><span>and instantly enjoy</span><span>powerful performance on Apple Silicon.</span></p>
-                            </div>
-                        </div>
-                    </div>
-                    
-                </div>
-            </a>
-        </main>
-
-        <footer id="footer">
+        <!-- Footer -->
+        <div class="footer">
             <div class="area">
-                <p class="copyright">PopupLink All rights reserved.</p>
-                <p class="createBy">Design By Superlandinghero</p>
+                <div>
+                    <h2>
+                        <a href="https://www.linkedin.com/in/flankton/" data-i18n="btn_contact">
+                            <span>Contact Us</span>
+                        </a>
+                    </h2>
+                </div>
+                <div>
+                    <div>
+                        <h4>* Required</h4>
+                        <p style="margin-left: 0.8em;">
+                            Business Registration Certificate
+                        </p>
+                    </div>
+                </div>
             </div>
-        </footer>
+        </div>
     </div>
 
-    <script src="p5.min.js"></script>
-    <script src="vanta.topology.min.js"></script>
     <script>
-    VANTA.TOPOLOGY({
-        el: "#vanta",
-        mouseControls: true,
-        touchControls: true,
-        gyroControls: false,
-        minHeight: 200.00,
-        minWidth: 200.00,
-        scale: 1.00,
-        scaleMobile: 1.00
-    })
-    </script>
-
-    <script>
-        (function () {
-            // 헤더 Sticky 토글
-            document.addEventListener('DOMContentLoaded', () => {
-                var $main_section = document.querySelector('.main_section');
-                    $main_section.classList.add('on');
-
-                var header = document.getElementById('header');
-                header.classList.toggle('sticky', window.scrollY > 0);
-                header.classList.add('on');
-
-                window.addEventListener('scroll', () => {
-                    header.classList.toggle('sticky', window.scrollY > 0);
-                });
-            });
-
-
-            document.addEventListener('DOMContentLoaded', () => {
-                var $body = document.querySelector('body');
-                    $body.classList.add('ready')
-
-                var $items = document.querySelectorAll('.tab_container .tab_item img');
-                var $target = document.querySelector('.tab_container .tab_nav');
-
-                var nav_body = '';
-
-                for(var i = 0; i < $items.length; i++){
-                    var $item = $items[i]
-
-                    nav_body += '<a class="tab_nav_item" data-index="'+i+'">'+$item.alt+'</a>';
-                }
-
-                $target.innerHTML = nav_body;
-
-                var $tab_item = document.querySelectorAll('.tab_container .tab_item');
-
-                $body.addEventListener('click', (e) => {
-                    var $this = e.target;
-
-                    if($this.classList.contains('tab_nav_item')){
-                        var index = $this.dataset.index;
-
-                        console.log(index);
-                        for(var i = 0; i < $tab_item.length; i++){
-                            var $item = $tab_item[i];
-
-                            $item.classList.remove('on');
-                        }
-
-                        $tab_item[index].classList.add('on');
-                    }
-                });
-            });
-
-            document.addEventListener('DOMContentLoaded', () => {
-                function rn(from, to) {
-                    return ~~(Math.random() * (to - from + 1)) + from;
-                }
-
-                function rs() {
-                    return arguments[rn(1, arguments.length) - 1];
-                }
-
-                function boxShadows(max) {
-                    let ret = [];
-                    for (let i = 0; i < max; ++i) {
-                        ret.push(`
-                            ${ rn(1, 100) }vw ${ rn(1, 100) }vh ${ rn(20, 40) }vmin ${ rn(1, 20) }vmin
-                            ${ rs('#ffffff', '#ffffff', '#ffffff', '#ffffff') }
-                        `)
-                    }
-                    return ret.join(',');
-                }
-
-                const cloud = document.querySelector('#cloud');
-                function update() {
-                    cloud.style.boxShadow = boxShadows(100); 
-                }
-
-                window.addEventListener('load', update); 
-                document.addEventListener('click', update); 
-            });
-
-            document.addEventListener('DOMContentLoaded', () => {
-                // 1. 기존: 부드러운 스르륵 효과 (staggered)
-                // 분기 처리: h3 안의 텍스트는 글자(char) 단위로 쪼개고, .word 클래스가 있으면 단어 단위로 딜레이 적용
-                const staggeredElements = document.querySelectorAll('.staggered');
-                staggeredElements.forEach(el => {
-                    
-                    // 기존: 내부에 h3가 있는 경우 (글자 단위 처리)
-                    const h3 = el.tagName.toLowerCase() === 'h3' ? el : el.querySelector('h3');
-                    if (h3) {
-                        const text = h3.innerText;
-                        h3.innerHTML = ''; 
-                        text.split('').forEach((char, index) => {
-                            const span = document.createElement('span');
-                            span.className = char === ' ' ? 'char space' : 'char';
-                            span.innerText = char;
-                            span.style.transitionDelay = `${index * 0.05}s`;
-                            span.style['font-size'] = `2.5rem`;
-                            h3.appendChild(span);
-                        });
-                    }
-                    
-                    // 신규: 내부에 .word 클래스가 있는 경우 (단어 단위 처리)
-                    const words = el.querySelectorAll('.word');
-                    if (words.length > 0) {
-                        words.forEach((word, index) => {
-                            // 단어는 글자보다 애니메이션 간격을 조금 길게 설정 (0.1s 간격)
-                            word.style.transitionDelay = `${index * 0.1}s`;
-                        });
-                    }
-                });
-
-                // 2. 신규: 불규칙하고 빠른 깜빡임 효과 (random-flicker)
-                const flickerTitles = document.querySelectorAll('.random-flicker h3');
-                flickerTitles.forEach(title => {
-                    // strong 태그가 내부에 있으면 strong 영역만, 없으면 h3 텍스트 전체에 적용되도록 유연하게 분기처리
-                    const targetEl = title.querySelector('strong') || title;
-                    const text = targetEl.innerText;
-                    targetEl.innerHTML = ''; 
-                    text.split('').forEach((char) => {
-                        const span = document.createElement('span');
-                        span.className = char === ' ' ? 'char space' : 'char';
-                        span.innerText = char;
-                        
-                        // ✨ 핵심 포인트: 시작 시간(delay)과 깜빡이는 시간(duration)을 완전 랜덤으로 설정!
-                        // 시작 시간을 0초 ~ 0.4초 사이에서 무작위로 분산 (교차 물결 느낌)
-                        const randomDelay = Math.random() * 0.4; 
-                        
-                        // 애니메이션 속도를 0.2초 ~ 0.5초 사이로 무작위로 분산 (매우 빠름 ~ 빠름)
-                        const randomDuration = 0.2 + (Math.random() * 0.3); 
-
-                        span.style.animationDelay = `${randomDelay}s`;
-                        span.style.animationDuration = `${randomDuration}s`;
-                        span.style['font-size'] = `2.5rem`;
-                        
-                        targetEl.appendChild(span);
-                    });
-                });
-
-                // 3. 스크롤 감지 설정 (Intersection Observer)
-                const observerOptions = {
-                    root: null,
-                    rootMargin: '0px 0px -10% 0px', // 요소가 화면 아래에서 10% 정도 올라왔을 때 미리 트리거되도록 조정
-                    threshold: 0.1 // 10%만 화면에 노출되어도 애니메이션이 시작되도록 완화
-                };
-
-                const observer = new IntersectionObserver((entries, observer) => {
-                    entries.forEach(entry => {
-                        if (entry.isIntersecting) {
-                            // underline 클래스를 가진 요소면 'on' 클래스를 추가하고, 아니면 'active' 클래스를 추가합니다.
-                            if (entry.target.classList.contains('underline')) {
-                                entry.target.classList.add('on');
-                            } else {
-                                entry.target.classList.add('active');
-                            }
-                            observer.unobserve(entry.target); // 1회 재생 후 감시 해제
-                        }
-                    });
-                }, observerOptions);
-
-                // 애니메이션 클래스와 밑줄 요소를 모두 감시 대상으로 등록
-                const observeElements = document.querySelectorAll('.staggered, .random-flicker, .underline');
-                observeElements.forEach(el => observer.observe(el));
-            });
-
-            // 전역 복사 함수 등록 (Copied! 피드백 포함)
-            if (!window.copyReadmeCode) {
-                window.copyReadmeCode = function(btn) {
-                    const code = decodeURIComponent(btn.getAttribute('data-code'));
-                    const textarea = document.createElement('textarea');
-                    textarea.value = code;
-                    document.body.appendChild(textarea);
-                    textarea.select();
-                    document.execCommand('copy');
-                    document.body.removeChild(textarea);
-
-                    const originalText = btn.innerText;
-                    btn.innerText = 'Copied!';
-                    btn.style.background = '#fff';
-                    btn.style.color = '#000';
-                    setTimeout(() => {
-                        btn.innerText = originalText;
-                        btn.style.background = 'transparent';
-                        btn.style.color = '#ccc';
-                    }, 2000);
-                };
+        const i18n = {
+            "en": {
+                "how_it_works_title": "Quick Start",
+                "down_title": "1. Download",
+                "down_desc": "<a onclick=\"executeDownload()\" style=\"cursor:pointer; text-decoration:underline;\">Download</a>",
+                "scan_title": "2. Scan",
+                "scan_desc": "Scan goods, order, tracking to automatically extract data.",
+                "drag_title": "3. Drag & Drop",
+                "drag_desc": "Drag and drop files(jpg,png,pdf,csv) onto the screen to start AI analysis instantly.",
+                "intro_title": "Introduction",
+                "spec_speed": "Easy Data Collection",
+                "spec_security": "Privacy Filter",
+                "spec_capability": "Chat Directly with AI",
+                "btn_contact": "Contact Us"
+            },
+            "ja": {
+                "how_it_works_title": "クイックスタート",
+                "down_title": "1. ダウンロード",
+                "down_desc": "<a onclick=\"executeDownload()\" style=\"cursor:pointer; text-decoration:underline;\">ダウンロード</a>",
+                "scan_title": "2. スキャン",
+                "scan_desc": "文書、画像、またはウェブページをスキャンして、データを自動的に抽出します。",
+                "drag_title": "3. ドラッグ＆ドロップ",
+                "drag_desc": "ファイルを画面にドラッグ＆ドロップするだけで、すぐにAI分析を開始します。",
+                "intro_title": "イントロダクション",
+                "spec_speed": "簡単なデータ収集",
+                "spec_security": "プライバシーフィルター",
+                "spec_capability": "AIと直接チャット",
+                "btn_contact": "お問い合わせ"
             }
+        };
 
-            // README Fetch & Caching (24시간 기준)
-            document.addEventListener('DOMContentLoaded', async () => {
-                const owner = '';
-                const repo = '';
-                const cacheKey = `gh_readme_${owner}_${repo}`;
-                const cacheTimeKey = `${cacheKey}_time`;
-                const CACHE_TTL = 24 * 60 * 60 * 1000; // 24시간
-                const readmeContainer = document.getElementById('readme');
-                
-                if (!readmeContainer) return;
+        const langOrder = ['en', 'ja'];
+        let currentLangIndex = 0; // Default: 'en'
+        let currentLang = langOrder[currentLangIndex];
 
-                const renderReadme = (htmlContent) => {
-                    // 1. 임시 DOM 파싱
-                    const tempDiv = document.createElement('div');
-                    tempDiv.innerHTML = htmlContent;
+        const OS_TYPES = {
+            WIN: { id: 'win', name: 'Windows', file: 'logis_setup.exe', available: true },
+            MAC: { id: 'mac', name: 'macOS', file: '#', available: false },
+            LINUX: { id: 'linux', name: 'Linux', file: '#', available: false }
+        };
+        let detectedOS = OS_TYPES.WIN;
 
-                    // 2. Quick start 섹션만 추출
-                    const headings = Array.from(tempDiv.querySelectorAll('h1, h2, h3, h4, h5, h6'));
-                    const qsHeading = headings.find(h => /quick\s*start/i.test(h.textContent));
-                    
-                    let extractedHtml = '';
-                    if (qsHeading) {
-                        const headingLevel = parseInt(qsHeading.tagName.substring(1));
-                        let sectionRoot = qsHeading;
-                        if (qsHeading.parentElement && qsHeading.parentElement.classList.contains('markdown-heading')) {
-                            sectionRoot = qsHeading.parentElement;
-                        }
+        function changeLanguage(langCode) {
+            currentLang = langCode;
+            currentLangIndex = langOrder.indexOf(langCode);
+            applyLanguage();
+        }
 
-                        extractedHtml = sectionRoot.outerHTML;
-                        let currentNode = sectionRoot.nextElementSibling;
-                        
-                        while (currentNode) {
-                            let currentHeading = currentNode.tagName.match(/^H[1-6]$/i) ? currentNode : currentNode.querySelector('h1, h2, h3, h4, h5, h6');
-                            if (currentHeading) {
-                                const currentLevel = parseInt(currentHeading.tagName.substring(1));
-                                if (currentLevel <= headingLevel) break; // 동등하거나 더 큰 챕터를 만나면 중단
-                            }
-                            extractedHtml += currentNode.outerHTML;
-                            currentNode = currentNode.nextElementSibling;
-                        }
-                    } else {
-                        extractedHtml = '<p style="text-align:center;">README에서 Quick start 섹션을 찾을 수 없습니다.</p>';
-                    }
-
-                    // 3. 추출된 영역 내 코드 블록 스키마 래핑 처리
-                    const styleDiv = document.createElement('div');
-                    styleDiv.innerHTML = extractedHtml;
-                    
-                    // [추가] 앵커 태그(a) 상대 경로를 GitHub 절대 경로로 변환
-                    const githubRepoUrl = `https://github.com/${owner}/${repo}`;
-                    styleDiv.querySelectorAll('a').forEach(a => {
-                        const href = a.getAttribute('href');
-                        if (href) {
-                            // 절대 경로(http/https)나 메일(mailto)이 아닌 경우
-                            if (!/^https?:\/\//i.test(href) && !/^mailto:/i.test(href)) {
-                                if (href.startsWith('#')) {
-                                    // 페이지 내 앵커 이동인 경우
-                                    a.setAttribute('href', `${githubRepoUrl}${href}`);
-                                } else {
-                                    // 파일이나 디렉토리 링크인 경우 (blob/main 기준)
-                                    a.setAttribute('href', `${githubRepoUrl}/blob/main/${href}`);
-                                }
-                            }
-                            // 모든 링크가 새 창에서 열리도록 타겟 속성 추가
-                            a.setAttribute('target', '_blank');
-                            a.setAttribute('rel', 'noopener noreferrer');
-                        }
-                    });
-
-                    styleDiv.querySelectorAll('.highlight, pre').forEach(block => {
-                        if (block.closest('.code-schema')) return;
-                        const pre = block.tagName === 'PRE' ? block : block.querySelector('pre');
-                        if (!pre) return;
-
-                        // 안전한 텍스트 추출 및 인코딩
-                        const codeText = encodeURIComponent(pre.textContent);
-
-                        const schemaWrapper = document.createElement('div');
-                        schemaWrapper.className = 'code-schema';
-                        schemaWrapper.innerHTML = `
-                            <div class="code-schema-header">
-                                <div class="code-schema-dots"></div>
-                                <button class="code-copy-btn" onclick="copyReadmeCode(this)" data-code="${codeText}">Copy</button>
-                            </div>
-                            <div class="code-schema-body"></div>
-                        `;
-                        
-                        block.parentNode.insertBefore(schemaWrapper, block);
-                        schemaWrapper.querySelector('.code-schema-body').appendChild(block);
-                    });
-
-                    // 4. 최종 화면에 삽입 (Schema CSS 포함)
-                    readmeContainer.innerHTML = `
-                        <div>
-                            ${styleDiv.innerHTML}
-                        </div>
-                    `;
-                };
-
-                try {
-                    const cachedData = localStorage.getItem(cacheKey);
-                    const cachedTime = localStorage.getItem(cacheTimeKey);
-
-                    if (cachedData && cachedTime && (Date.now() - parseInt(cachedTime) < CACHE_TTL)) {
-                        console.log('✅ README 데이터를 캐시에서 불러옵니다.');
-                        renderReadme(cachedData);
-                        return;
-                    }
-
-                    console.log('🔄 README 데이터를 GitHub API에서 새로 불러옵니다.');
-                    const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/readme`, {
-                        headers: {
-                            'Accept': 'application/vnd.github.v3.html'
-                        }
-                    });
-
-                    if (!response.ok) throw new Error(`README fetch failed: ${response.status}`);
-                    
-                    const htmlContent = await response.text();
-
-                    localStorage.setItem(cacheKey, htmlContent);
-                    localStorage.setItem(cacheTimeKey, Date.now().toString());
-                    renderReadme(htmlContent);
-
-                } catch (error) {
-                    console.error('Error fetching README:', error);
-                    readmeContainer.innerHTML = '<p style="text-align:center; padding: 2rem; color:#666;">README 데이터를 불러오지 못했습니다.</p>';
+        function applyLanguage() {
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (i18n[currentLang][key]) {
+                    el.innerHTML = i18n[currentLang][key].replace(/\n/g, '<br>');
                 }
             });
+        }
 
-            // [추가] 블로그 피드(JSON)를 고정값으로 하드코딩하여 #performance 영역(.info)에 덮어씌우는 로직
-            document.addEventListener('DOMContentLoaded', () => {
-                function renderBlogFeed() {
-                    try {
-                        // 요청하신 고정 JSON 데이터를 자바스크립트 변수에 직접 할당 (CORS 에러 방지)
-                        const data = {
-                            "items": []
-                        };
-                        
-                        const items = data.items;
-                        
-                        // #performance 섹션 안의 3개의 .info 카드 가져오기
-                        const infoBlocks = document.querySelectorAll('#performance .info');
-                        
-                        // #performance 섹션의 최상단 타이틀 수정
-                        const mainTitle = document.querySelector('#performance .title h3');
-                        if (mainTitle) mainTitle.innerText = "Latest";
-                        
-                        items.forEach((item, i) => {
-                            if (infoBlocks[i]) {
-                                const info = infoBlocks[i];
-                                const box = info.querySelector('.box');
-                                const media = info.querySelector('.media');
-                                
-                                // 1. 텍스트 업데이트 (제목이 길기 때문에 폰트 사이즈 조정)
-                                const titleEl = box.querySelector('.title strong');
-                                const descEl = box.querySelector('.desc p');
-                                if (titleEl) {
-                                    titleEl.innerText = item.title;
-                                    titleEl.style.fontSize = '1.4rem'; 
-                                    titleEl.style.lineHeight = '1.3';
-                                    titleEl.style.display = '-webkit-box';
-                                    titleEl.style.webkitLineClamp = '2';
-                                    titleEl.style.webkitBoxOrient = 'vertical';
-                                    titleEl.style.overflow = 'hidden';
-                                }
-                                if (descEl) {
-                                    descEl.innerText = item.summary;
-                                    descEl.style.fontSize = '1rem';
-                                    descEl.style.opacity = '0.8';
-                                    descEl.style.display = '-webkit-box';
-                                    descEl.style.webkitLineClamp = '3';
-                                    descEl.style.webkitBoxOrient = 'vertical';
-                                    descEl.style.overflow = 'hidden';
-                                }
-                                
-                                // 2. 기존 미디어 영역(SVG) 보존하며 이미지 오버레이 추가
-                                const img = document.createElement('img');
-                                img.src = item.image;
-                                // opacity 0.85로 설정하여 뒤의 SVG 컬러풀한 배경이 살짝 비치도록 연출
-                                img.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; z-index:1; opacity:0.85; transition: transform 0.3s ease;';
-                                
-                                // 호버 시 이미지 살짝 확대 효과 (생동감 추가)
-                                info.addEventListener('mouseenter', () => img.style.transform = 'scale(1.05)');
-                                info.addEventListener('mouseleave', () => img.style.transform = 'scale(1)');
-                                
-                                // 3. 클릭 시 해당 블로그 글로 새창 열기
-                                info.style.cursor = 'pointer';
-                                info.addEventListener('click', () => window.open(item.url, '_blank'));
-                                
-                                media.appendChild(img);
-                            }
-                        });
-                    } catch (err) {
-                        console.error('Failed to parse fixed blog feed:', err);
-                    }
-                }
-                renderBlogFeed();
-            });
+        function detectOS() {
+            const ua = window.navigator.userAgent;
+            if (ua.indexOf("Win") !== -1) detectedOS = OS_TYPES.WIN;
+            else if (ua.indexOf("Mac") !== -1) detectedOS = OS_TYPES.MAC;
+            else if (ua.indexOf("Linux") !== -1) detectedOS = OS_TYPES.LINUX;
+        }
 
-            // [추가] 언어 전환(Toggle) 로직
-            document.addEventListener('DOMContentLoaded', () => {
-                const langToggleBtn = document.getElementById('lang-toggle');
-                const body = document.body;
+        function executeDownload() {
+            if (detectedOS.available) alert(`Downloading ${detectedOS.file}...`);
+            else alert(`Coming Soon!`);
+        }
 
-                if(langToggleBtn) {
-                    langToggleBtn.addEventListener('click', (e) => {
-                        e.preventDefault();
-                        if (body.classList.contains('ko')) {
-                            body.classList.remove('ko');
-                            body.classList.add('en');
-                            langToggleBtn.innerText = 'KO';
-                        } else {
-                            body.classList.remove('en');
-                            body.classList.add('ko');
-                            langToggleBtn.innerText = 'EN';
-                        }
-                    });
-                }
-            });
-        })();
+        // Initialize
+        detectOS();
+        applyLanguage();
     </script>
-
-
 </body>
 </html>
