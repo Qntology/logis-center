@@ -413,6 +413,15 @@ pub fn resolve_engine(
             ),
         );
     }
+    if let Some(why) = transient_shortage(code) {
+        return (
+            TranslitEngine::Base2B,
+            format!(
+                "⏳ [TRANSLIT ENGINE] Qwen3.5-4B-{} 는 방금 VRAM 이 모자라 잠시 쉬고 있습니다 ({}). 이번 호출만 Qwen3.5-2B + 발음 게이트로 음차하고, 세션 전체를 2B 로 묶지 않습니다.",
+                code, why
+            ),
+        );
+    }
     if !is_ready(code) {
         let phase = if fetch {
             request_download(code, app, task_id)
@@ -490,7 +499,7 @@ pub fn resolve_engine(
 
 pub fn lang_engine_available(doc_lang: &str) -> bool {
     match alphaedge_code(doc_lang) {
-        Some(c) => loader().is_some() && runtime_failure(c).is_none() && is_ready(c),
+        Some(c) => loader().is_some() && runtime_failure(c).is_none() && transient_shortage(c).is_none() && is_ready(c),
         None => false,
     }
 }
@@ -1343,4 +1352,567 @@ pub fn status_report(doc_lang: Option<&str>) -> Value {
         "languages": langs,
         "loader_linked": loader().is_some(),
     })
+}
+
+const ROUTE_MIN_LETTERS: usize = 8;
+const ROUTE_MIN_NATIVE: f32 = 0.60;
+const ROUTE_MAX_OTHER: f32 = 0.02;
+const ROUTE_MAX_EXPANSION: f32 = 1.50;
+const ROUTE_MAX_LOST: usize = 0;
+const ROUTE_PASS_FLOOR: f32 = 0.55;
+const ROUTE_BASE_MARGIN: f32 = 0.10;
+const ROUTE_PROBE_EVERY: u64 = 10;
+const ROUTE_SAMPLE_CHARS: usize = 4000;
+const SHORTAGE_COOLDOWN_SECS: i64 = 120;
+
+static SHORTAGE: Lazy<Mutex<HashMap<String, (i64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static ROUTE_TOKENIZERS: Lazy<Mutex<HashMap<String, Option<std::sync::Arc<tokenizers::Tokenizer>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static ROUTE_SKIPS: Lazy<Mutex<HashMap<String, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static QUERY_ROUTE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn mark_transient_shortage(code: &str, why: &str) {
+    if let Ok(mut m) = SHORTAGE.lock() {
+        m.insert(code.to_string(), (now_ms() + SHORTAGE_COOLDOWN_SECS * 1000, why.to_string()));
+    }
+}
+
+pub fn transient_shortage(code: &str) -> Option<String> {
+    let mut m = SHORTAGE.lock().ok()?;
+    let now = now_ms();
+    let active = m.get(code).map(|(until, why)| (*until, why.clone()));
+    match active {
+        Some((until, why)) if until > now => Some(format!(
+            "{} · 약 {}초 뒤 다시 시도합니다",
+            why,
+            ((until - now) / 1000).max(1)
+        )),
+        Some(_) => {
+            m.remove(code);
+            None
+        }
+        None => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScriptKind {
+    Latin,
+    Hangul,
+    Kana,
+    Han,
+    Cyrillic,
+    Thai,
+    Arabic,
+    Devanagari,
+    Bengali,
+    Greek,
+    Hebrew,
+    Other,
+}
+
+pub fn script_kind(c: char) -> Option<ScriptKind> {
+    if !c.is_alphabetic() {
+        return None;
+    }
+    Some(match c as u32 {
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F | 0x1E00..=0x1EFF => ScriptKind::Latin,
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF => ScriptKind::Hangul,
+        0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9F => ScriptKind::Kana,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => ScriptKind::Han,
+        0x0400..=0x052F => ScriptKind::Cyrillic,
+        0x0E00..=0x0E7F => ScriptKind::Thai,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => ScriptKind::Arabic,
+        0x0900..=0x097F => ScriptKind::Devanagari,
+        0x0980..=0x09FF => ScriptKind::Bengali,
+        0x0370..=0x03FF => ScriptKind::Greek,
+        0x0590..=0x05FF => ScriptKind::Hebrew,
+        _ => ScriptKind::Other,
+    })
+}
+
+pub fn native_scripts(doc_lang: &str) -> std::collections::BTreeSet<ScriptKind> {
+    let sample = crate::nl_convert::native_script_sample(doc_lang, "", "");
+    let mut set: std::collections::BTreeSet<ScriptKind> = sample.chars().filter_map(script_kind).collect();
+    if set.contains(&ScriptKind::Kana) {
+        set.insert(ScriptKind::Han);
+    }
+    set
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptMix {
+    pub letters: usize,
+    pub native: usize,
+    pub latin: usize,
+    pub other: usize,
+}
+
+impl ScriptMix {
+    fn share(&self, n: usize) -> f32 {
+        if self.letters == 0 {
+            0.0
+        } else {
+            n as f32 / self.letters as f32
+        }
+    }
+    pub fn native_share(&self) -> f32 {
+        self.share(self.native)
+    }
+    pub fn latin_share(&self) -> f32 {
+        self.share(self.latin)
+    }
+    pub fn other_share(&self) -> f32 {
+        self.share(self.other)
+    }
+}
+
+pub fn script_mix(text: &str, native: &std::collections::BTreeSet<ScriptKind>) -> ScriptMix {
+    let mut m = ScriptMix::default();
+    for c in text.chars() {
+        let k = match script_kind(c) {
+            Some(k) => k,
+            None => continue,
+        };
+        m.letters += 1;
+        if native.contains(&k) {
+            m.native += 1;
+        } else if k == ScriptKind::Latin {
+            m.latin += 1;
+        } else {
+            m.other += 1;
+        }
+    }
+    m
+}
+
+fn route_tokenizer(path: &Path) -> Option<std::sync::Arc<tokenizers::Tokenizer>> {
+    let key = path.to_string_lossy().to_string();
+    if let Ok(m) = ROUTE_TOKENIZERS.lock() {
+        if let Some(t) = m.get(&key) {
+            return t.clone();
+        }
+    }
+    let loaded = tokenizers::Tokenizer::from_file(path).ok().map(std::sync::Arc::new);
+    if let Ok(mut m) = ROUTE_TOKENIZERS.lock() {
+        m.insert(key, loaded.clone());
+    }
+    loaded
+}
+
+fn char_loss(expected: &str, got: &str) -> usize {
+    let mut counts: HashMap<char, i64> = HashMap::new();
+    for c in expected.chars().filter(|c| !c.is_whitespace()) {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    for c in got.chars().filter(|c| !c.is_whitespace()) {
+        *counts.entry(c).or_insert(0) -= 1;
+    }
+    counts.values().filter(|v| **v > 0).map(|v| *v as usize).sum()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TokenFit {
+    pub lang_tokens: usize,
+    pub ref_tokens: usize,
+    pub lost_chars: usize,
+}
+
+impl TokenFit {
+    pub fn expansion(&self) -> f32 {
+        self.lang_tokens as f32 / self.ref_tokens.max(1) as f32
+    }
+}
+
+pub fn token_fit_with(lang_tok: &tokenizers::Tokenizer, ref_tok: &tokenizers::Tokenizer, sample: &str) -> Result<TokenFit, String> {
+    let text: String = sample.chars().take(ROUTE_SAMPLE_CHARS).collect();
+    let enc = lang_tok
+        .encode(text.as_str(), false)
+        .map_err(|e| format!("4B 토크나이저 인코딩 실패: {}", e))?;
+    let ids: Vec<u32> = enc.get_ids().to_vec();
+    let back = lang_tok
+        .decode(&ids, false)
+        .map_err(|e| format!("4B 토크나이저 디코딩 실패: {}", e))?;
+    let enc_ref = ref_tok
+        .encode(text.as_str(), false)
+        .map_err(|e| format!("기준 토크나이저 인코딩 실패: {}", e))?;
+    let ref_ids: Vec<u32> = enc_ref.get_ids().to_vec();
+    let ref_back = ref_tok
+        .decode(&ref_ids, false)
+        .map_err(|e| format!("기준 토크나이저 디코딩 실패: {}", e))?;
+    Ok(TokenFit {
+        lang_tokens: ids.len(),
+        ref_tokens: ref_ids.len(),
+        lost_chars: char_loss(&ref_back, &back),
+    })
+}
+
+pub fn token_fit(code: &str, sample: &str, reference: &Path) -> Result<TokenFit, String> {
+    let lang_path = model_dir(code).join("tokenizer.json");
+    let lang_tok = route_tokenizer(&lang_path)
+        .ok_or_else(|| format!("{} 를 읽지 못했습니다", lang_path.display()))?;
+    let ref_tok = route_tokenizer(reference)
+        .ok_or_else(|| format!("기준 토크나이저 {} 를 읽지 못했습니다", reference.display()))?;
+    token_fit_with(&lang_tok, &ref_tok, sample)
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteVerdict {
+    pub code: Option<String>,
+    pub line: String,
+}
+
+fn bump_skip(axis: &str) -> u64 {
+    match ROUTE_SKIPS.lock() {
+        Ok(mut m) => {
+            let e = m.entry(axis.to_string()).or_insert(0);
+            *e += 1;
+            *e
+        }
+        Err(_) => 1,
+    }
+}
+
+pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) -> RouteVerdict {
+    crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_route.{}", track, step), 0.0);
+    RouteVerdict {
+        code: None,
+        line: format!(
+            "🧭 [LANG ROUTE] {}.{} | 기존 모델 유지 ({}) — {}",
+            track,
+            step,
+            code.map(|c| format!("4B-{} 후보", c)).unwrap_or_else(|| "대응 4B 없음".to_string()),
+            why
+        ),
+    }
+}
+
+pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, reference: &Path) -> RouteVerdict {
+    let code = match alphaedge_code(doc_lang) {
+        Some(c) => c,
+        None => {
+            return closed_verdict(track, step, None, &format!("문서 언어 '{}' 에 대응하는 alphaedge-ai 4B 모델이 없습니다", doc_lang))
+        }
+    };
+    let native = native_scripts(doc_lang);
+    if native.is_empty() {
+        return closed_verdict(track, step, Some(code), "bias.json 에 이 언어의 문자 샘플이 없어 단일 언어를 판정할 수 없습니다");
+    }
+    if native.contains(&ScriptKind::Latin) {
+        return closed_verdict(
+            track,
+            step,
+            Some(code),
+            &format!("문서 언어 '{}' 는 라틴 문자를 쓰므로 문자 비율로는 영어 등 다른 라틴 언어와 섞였는지 가를 수 없습니다. 단일 언어를 확인할 수 없는 문서는 기존 모델로 둡니다", doc_lang),
+        );
+    }
+    if let Some(why) = runtime_failure(code) {
+        return closed_verdict(track, step, Some(code), &format!("이번 세션에서 쓸 수 없는 모델입니다 ({})", why));
+    }
+    if let Some(why) = transient_shortage(code) {
+        return closed_verdict(track, step, Some(code), &format!("직전 적재가 VRAM 부족으로 물러났습니다 ({})", why));
+    }
+    if loader().is_none() || !is_ready(code) {
+        return closed_verdict(track, step, Some(code), "모델 파일·실행용 변환이 준비되지 않았습니다. 이 단계는 모델을 받거나 기다리지 않습니다");
+    }
+    let mix = script_mix(sample, &native);
+    if mix.letters < ROUTE_MIN_LETTERS {
+        return closed_verdict(track, step, Some(code), &format!("판정할 글자가 {}자뿐입니다 (기준 {}자)", mix.letters, ROUTE_MIN_LETTERS));
+    }
+    if mix.other_share() > ROUTE_MAX_OTHER {
+        return closed_verdict(
+            track,
+            step,
+            Some(code),
+            &format!("문서 언어도 라틴도 아닌 제3 문자 체계가 {:.1}% 섞였습니다 (기준 {:.1}%)", mix.other_share() * 100.0, ROUTE_MAX_OTHER * 100.0),
+        );
+    }
+    if mix.native_share() < ROUTE_MIN_NATIVE {
+        return closed_verdict(
+            track,
+            step,
+            Some(code),
+            &format!("문서 언어 문자 비율 {:.1}% 가 기준 {:.1}% 미만입니다 (라틴 {:.1}%)", mix.native_share() * 100.0, ROUTE_MIN_NATIVE * 100.0, mix.latin_share() * 100.0),
+        );
+    }
+    let fit = match token_fit(code, sample, reference) {
+        Ok(f) => f,
+        Err(why) => return closed_verdict(track, step, Some(code), &why),
+    };
+    if fit.lost_chars > ROUTE_MAX_LOST {
+        return closed_verdict(
+            track,
+            step,
+            Some(code),
+            &format!("4B 토크나이저가 이 문서 글자 {}자를 원래대로 되돌리지 못합니다 (어휘 16,384 에 없는 글자)", fit.lost_chars),
+        );
+    }
+    crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_expansion", track), fit.expansion());
+    if fit.expansion() > ROUTE_MAX_EXPANSION {
+        return closed_verdict(
+            track,
+            step,
+            Some(code),
+            &format!(
+                "같은 글을 4B 는 {}토큰, 기준 토크나이저는 {}토큰으로 읽습니다 ({:.2}배 > {:.2}배). 라틴 단어가 잘게 쪼개지는 문서라 4B 의 약점 구간입니다",
+                fit.lang_tokens,
+                fit.ref_tokens,
+                fit.expansion(),
+                ROUTE_MAX_EXPANSION
+            ),
+        );
+    }
+    let pass_axis = format!("{}.lang4b_pass.{}", track, step);
+    let base_axis = format!("{}.qwen3_pass.{}", track, step);
+    let mut probe = String::new();
+    if let Some((recent, _, n)) = crate::utils::score_dynamics::adaptive_recent(&pass_axis) {
+        let (floor, basis) = match crate::utils::score_dynamics::adaptive_recent(&base_axis) {
+            Some((_, base_mean, base_n)) => (
+                base_mean - ROUTE_BASE_MARGIN,
+                format!("같은 검증을 거친 Qwen3 통과율 {:.2} (관측 {}건) - {:.2}", base_mean, base_n, ROUTE_BASE_MARGIN),
+            ),
+            None => (ROUTE_PASS_FLOOR, format!("Qwen3 비교 관측이 아직 없어 고정 하한 {:.2}", ROUTE_PASS_FLOOR)),
+        };
+        if recent < floor {
+            let k = bump_skip(&pass_axis);
+            if k % ROUTE_PROBE_EVERY != 0 {
+                return closed_verdict(
+                    track,
+                    step,
+                    Some(code),
+                    &format!(
+                        "SDS {} 최근 통과율 {:.2} < 기준 {:.2} ({}) · 관측 {}건. 관측용 재시도까지 {}회 남았습니다",
+                        pass_axis,
+                        recent,
+                        floor,
+                        basis,
+                        n,
+                        ROUTE_PROBE_EVERY - k % ROUTE_PROBE_EVERY
+                    ),
+                );
+            }
+            probe = format!(" | SDS 통과율 {:.2} < 기준 {:.2} 로 닫힌 경로를 관측용으로 한 번 엽니다", recent, floor);
+        }
+    }
+    RouteVerdict {
+        code: Some(code.to_string()),
+        line: format!(
+            "🧭 [LANG ROUTE] {}.{} | Qwen3.5-4B-{} (alphaedge-ai) 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}",
+            track,
+            step,
+            code,
+            mix.native_share() * 100.0,
+            mix.latin_share() * 100.0,
+            mix.other_share() * 100.0,
+            mix.letters,
+            fit.lang_tokens,
+            fit.ref_tokens,
+            fit.expansion(),
+            probe
+        ),
+    }
+}
+
+pub fn record_engine_outcome(track: &str, step: &str, lang: bool, pass: bool) {
+    let engine = if lang { "lang4b" } else { "qwen3" };
+    crate::utils::score_dynamics::record_baseline(&format!("{}.{}_pass.{}", track, engine, step), if pass { 1.0 } else { 0.0 });
+}
+
+pub fn record_route_outcome(track: &str, step: &str, pass: bool) {
+    record_engine_outcome(track, step, true, pass);
+}
+
+pub fn synthesis_drop_axis(lang: bool) -> &'static str {
+    if lang {
+        "commerce.synthesis_sentence_drop.lang4b"
+    } else {
+        "commerce.synthesis_sentence_drop"
+    }
+}
+
+pub struct LangSession {
+    code: String,
+    _binding: TranslitBinding,
+}
+
+impl LangSession {
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub fn label(&self) -> String {
+        format!("Qwen3.5-4B-{} (alphaedge-ai)", self.code)
+    }
+}
+
+pub fn open_session(code: &str) -> Option<LangSession> {
+    let binding = bind_translit(code);
+    if !binding.is_bound() {
+        return None;
+    }
+    Some(LangSession {
+        code: code.to_string(),
+        _binding: binding,
+    })
+}
+
+pub struct QueryRoute {
+    _session: Option<LangSession>,
+}
+
+impl QueryRoute {
+    pub fn open(code: Option<String>) -> QueryRoute {
+        let session = code.as_deref().and_then(open_session);
+        if let Ok(mut g) = QUERY_ROUTE.lock() {
+            *g = session.as_ref().map(|s| s.code.clone());
+        }
+        QueryRoute { _session: session }
+    }
+}
+
+impl Drop for QueryRoute {
+    fn drop(&mut self) {
+        if let Ok(mut g) = QUERY_ROUTE.lock() {
+            *g = None;
+        }
+    }
+}
+
+pub fn query_route() -> Option<String> {
+    QUERY_ROUTE.lock().ok().and_then(|g| g.clone())
+}
+
+pub fn close_query_route(why: &str) {
+    if let Ok(mut g) = QUERY_ROUTE.lock() {
+        if let Some(code) = g.take() {
+            println!(
+                "[LANG ROUTE] ⚠️ 이번 질의의 Qwen3.5-4B-{} 검증 경로를 닫고 Qwen3 로 이어 갑니다: {}",
+                code, why
+            );
+        }
+    }
+}
+
+pub fn record_query_value(pass: bool) {
+    record_engine_outcome("search", "commerce_verify", query_route().is_some(), pass);
+}
+
+pub fn query_engine_label() -> String {
+    match query_route() {
+        Some(code) => format!("Qwen3.5-4B-{}", code),
+        None => "Qwen3".to_string(),
+    }
+}
+
+fn key_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.trim().to_lowercase().chars().collect();
+    let b: Vec<char> = b.trim().to_lowercase().chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn key_tolerance(expected: &str) -> usize {
+    let n = expected.chars().count();
+    if n >= 10 {
+        2
+    } else if n >= 4 {
+        1
+    } else {
+        0
+    }
+}
+
+fn repair_keys_into(v: &mut Value, expected: &[String], fixed: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if expected.iter().any(|e| e == &k) {
+                    continue;
+                }
+                let mut best: Option<(usize, &String)> = None;
+                let mut tie = false;
+                for e in expected.iter() {
+                    if map.contains_key(e) {
+                        continue;
+                    }
+                    let d = key_distance(&k, e);
+                    if d > key_tolerance(e) {
+                        continue;
+                    }
+                    match best {
+                        Some((bd, _)) if d > bd => {}
+                        Some((bd, _)) if d == bd => tie = true,
+                        _ => {
+                            best = Some((d, e));
+                            tie = false;
+                        }
+                    }
+                }
+                if let (Some((_, e)), false) = (best, tie) {
+                    if let Some(val) = map.remove(&k) {
+                        map.insert(e.clone(), val);
+                        fixed.push((k.clone(), e.clone()));
+                    }
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                repair_keys_into(child, expected, fixed);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter_mut() {
+                repair_keys_into(child, expected, fixed);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn repair_json_keys(v: &mut Value, expected: &[String]) -> Vec<(String, String)> {
+    let mut fixed: Vec<(String, String)> = Vec::new();
+    repair_keys_into(v, expected, &mut fixed);
+    fixed
+}
+
+pub fn prompt_json_keys(prompt: &str) -> Vec<String> {
+    let re = match regex::Regex::new(r#""([A-Za-z_][A-Za-z0-9_]{0,48})"\s*:"#) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for cap in re.captures_iter(prompt) {
+        let k = cap[1].to_string();
+        if !out.contains(&k) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+pub fn json_structured(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => !m.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        _ => false,
+    }
+}
+
+pub fn normalize_lang_json(raw: &str, expected: &[String]) -> (String, Vec<(String, String)>) {
+    let mut v = crate::parsing::parse_json_from_llm(raw);
+    if !json_structured(&v) {
+        return (raw.to_string(), Vec::new());
+    }
+    let fixed = if expected.is_empty() { Vec::new() } else { repair_json_keys(&mut v, expected) };
+    let text = serde_json::to_string(&v).unwrap_or_else(|_| raw.to_string());
+    (text, fixed)
 }

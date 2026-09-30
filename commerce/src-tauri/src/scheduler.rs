@@ -49,6 +49,62 @@ fn best_thead_th_dbg(sel: &str, html: &str) -> usize {
     doc.select(&q).next().map(|e| e.select(&th).count()).unwrap_or(0)
 }
 
+fn derive_thead_selector(html: &str, target_selector: &str) -> Option<(String, String)> {
+    let doc = scraper::Html::parse_document(html);
+    let row_q = scraper::Selector::parse(target_selector).ok()?;
+    let row_el = doc.select(&row_q).next()?;
+    let mut table_el: Option<scraper::ElementRef> = None;
+    let mut cur = row_el.parent();
+    while let Some(node) = cur {
+        if let Some(e) = node.value().as_element() {
+            let n = e.name().to_lowercase();
+            if n == "table" {
+                table_el = scraper::ElementRef::wrap(node);
+                break;
+            }
+            if n == "body" || n == "html" {
+                break;
+            }
+        }
+        cur = node.parent();
+    }
+    let tbl = table_el?;
+    let tv = tbl.value();
+    let tsel = match tv.id() {
+        Some(id) => format!("table#{}", id),
+        None => {
+            let mut s = String::from("table");
+            for c in tv.classes().take(3) {
+                s.push('.');
+                s.push_str(c);
+            }
+            s
+        }
+    };
+    let th_q = scraper::Selector::parse("th").ok()?;
+    let td_q = scraper::Selector::parse("td").ok()?;
+    let own_head = scraper::Selector::parse("thead").ok().and_then(|q| tbl.select(&q).next());
+    let (cand, own) = match own_head {
+        Some(h) => (format!("{} thead", tsel), h),
+        None => {
+            let tr_q = scraper::Selector::parse("tr").ok()?;
+            (format!("{} tr", tsel), tbl.select(&tr_q).next()?)
+        }
+    };
+    let cand_q = scraper::Selector::parse(&cand).ok()?;
+    let first = doc.select(&cand_q).next()?;
+    if first.id() != own.id() {
+        return None;
+    }
+    let th = first.select(&th_q).count();
+    let td = first.select(&td_q).count();
+    if th >= 2 && th > td {
+        Some((cand, tsel))
+    } else {
+        None
+    }
+}
+
 /// 🌟 [PREJUDICE PAIR] 영어 편견 문장 벡터에 문서 언어 편견 문장 벡터를 더합니다.
 ///  두 벡터 중 최댓값(max_pool_sim)으로 재므로 단일 문장 코사인에 맞춰 둔 임계 눈금이 그대로 유지됩니다.
 ///  수십 구의 뱅크로 바꾸면 최댓값이 구조적으로 올라가 0.35 / 0.38 / 0.50 / 0.55 임계가 한꺼번에 어긋납니다.
@@ -333,8 +389,7 @@ pub async fn process_task(
     let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
-    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap_or_default();
-    let tokenizer_path = base_path.join("Qwen3-0.6B-Instruct-gguf").to_string_lossy().to_string();
+    let tokenizer_path = model.qwen3_tokenizer_dir().to_string();
  
     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", light_pug);
 
@@ -2814,11 +2869,11 @@ pub async fn process_task(
                         }
                     } else if let Some(census) = list_census.as_ref() {
                         match census.shadow_agreement(&clean_html_content, &boa_items) {
-                            Some((jac, g, n)) => {
-                                crate::utils::score_dynamics::record_baseline("commerce.census_shadow_jaccard", jac);
+                            Some((jac, g, rows, records)) => {
+                                crate::utils::score_dynamics::record_baseline("commerce.census_shadow_record_jaccard", jac);
                                 emit_term(&format!(
-                                    "  🧮 [CENSUS SHADOW] Boa '{}' {}개 ↔ 전수 조사 1위 '{}' {}개 | 겹침(Jaccard) {:.2} — 관측만 합니다. 이 분포가 쌓이면 둘이 어긋난 문서에서 어느 쪽이 맞았는지를 숫자로 보고 승격 여부를 정합니다.",
-                                    boa_items, n, g.item_selector, g.members, jac
+                                    "  🧮 [CENSUS SHADOW] Boa '{}' 행 {}개 → 레코드 {}개 ↔ 전수 조사 1위 '{}' {}개 | 레코드 겹침(Jaccard) {:.2} — 관측만 합니다. rowspan 으로 이어진 행은 목록 분해(split_doc_to_pug_list_advanced)와 같은 규칙으로 한 레코드로 셉니다. 이 분포가 쌓이면 둘이 어긋난 문서에서 어느 쪽이 맞았는지를 숫자로 보고 승격 여부를 정합니다.",
+                                    boa_items, rows, records, g.item_selector, g.members, jac
                                 ));
                             }
                             None => {
@@ -2868,6 +2923,28 @@ pub async fn process_task(
             }
         } 
         
+
+        if final_thead_selector.is_empty() {
+            match derive_thead_selector(&clean_html_content, &target_selector) {
+                Some((head, table)) => {
+                    emit_term(&format!(
+                        "  🧭 [DETERMINISTIC THEAD / DOM FIRST] 목록 첫 행 '{}' 의 조상 표 '{}' 에서 머리행 '{}' (th {}개) 을 LLM 없이 확정했습니다. LLM 셀렉터 수확도 같은 DOM 검증(th 2개 이상 · th 가 td 보다 많음)을 통과해야 채택되므로, DOM 이 먼저 답을 가지면 2B 프리필을 쓰지 않습니다.",
+                        target_selector,
+                        table,
+                        head,
+                        best_thead_th_dbg(&head, &clean_html_content)
+                    ));
+                    crate::utils::score_dynamics::record_baseline("commerce.thead_dom_first", 1.0);
+                    selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(head.clone()));
+                    selector_info.as_object_mut().unwrap().insert("wrapper".to_string(), json!(table));
+                    final_thead_selector = head;
+                    cache_updated = true;
+                }
+                None => {
+                    crate::utils::score_dynamics::record_baseline("commerce.thead_dom_first", 0.0);
+                }
+            }
+        }
 
         if final_thead_selector.is_empty() {
 
@@ -3016,92 +3093,10 @@ pub async fn process_task(
                 }
             }
         }
-
-        
-        
-        
-        
-        
-        
-        
-        
-        //
-        
-        
-        
-        
-        
-        
-        
-        
         
         if final_thead_selector.is_empty() || final_thead_selector == "..." {
-            let derived = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut out = String::new();
-                if let Ok(row_q) = scraper::Selector::parse(&target_selector) {
-                    if let Some(row_el) = doc.select(&row_q).next() {
-                        
-                        let mut table_el: Option<scraper::ElementRef> = None;
-                        let mut cur = row_el.parent();
-                        while let Some(node) = cur {
-                            if let Some(e) = node.value().as_element() {
-                                let n = e.name().to_lowercase();
-                                if n == "table" {
-                                    table_el = scraper::ElementRef::wrap(node);
-                                    break;
-                                }
-                                if n == "body" || n == "html" { break; }
-                            }
-                            cur = node.parent();
-                        }
-                        if let Some(tbl) = table_el {
-                            
-                            let tv = tbl.value();
-                            let mut tsel = String::from("table");
-                            if let Some(id) = tv.id() {
-                                tsel = format!("table#{}", id);
-                            } else {
-                                let classes: Vec<&str> = tv.classes().collect();
-                                for c in classes.iter().take(3) {
-                                    tsel.push('.');
-                                    tsel.push_str(c);
-                                }
-                            }
-                            
-                            let has_thead = scraper::Selector::parse("thead").ok()
-                                .map(|q| tbl.select(&q).next().is_some())
-                                .unwrap_or(false);
-                            let cand = if has_thead {
-                                format!("{} thead", tsel)
-                            } else {
-                                format!("{} tr", tsel)
-                            };
-                            
-                            let ok = scraper::Selector::parse(&cand).ok().and_then(|q| {
-                                doc.select(&q).next().map(|e| {
-                                    let th = scraper::Selector::parse("th").ok()
-                                        .map(|tq| e.select(&tq).count()).unwrap_or(0);
-                                    th >= 2
-                                })
-                            }).unwrap_or(false);
-                            if ok { out = cand; }
-                        }
-                    }
-                }
-                out
-            };
-            if !derived.is_empty() {
-                final_thead_selector = derived.clone();
-                selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(derived.clone()));
-                cache_updated = true;
-                emit_term(&format!(
-                    "  🧭 [DETERMINISTIC THEAD] LLM 응답에서 헤더를 얻지 못해 DOM 구조로 직접 유도했습니다: '{}'",
-                    derived
-                ));
-            } else {
-                emit_term("  ⚠️ [DETERMINISTIC THEAD] target_selector 조상에서 헤더 행(th 2개 이상)을 찾지 못했습니다. 헤더 없이 진행합니다.");
-            }
+            final_thead_selector.clear();
+            emit_term("  ⚠️ [DETERMINISTIC THEAD] 목록 첫 행의 조상 표에서도, LLM 셀렉터 수확에서도 헤더 행(th 2개 이상 · th 가 td 보다 많음)을 찾지 못했습니다. 헤더 없이 진행합니다.");
         }
         model.deep_purge_resources().await;
         
@@ -3988,9 +3983,20 @@ pub async fn process_task(
             //  이 판정이 하드코딩이 아니라 실측이므로 GPU 가 바뀌어도 유효합니다.
             const SYNTHESIS_SKIP_DROP: f32 = 0.8;
             let mut qwen3_ready = false;
-            let synthesis_gate: Option<(f32, u64)> = crate::utils::score_dynamics::adaptive_recent("commerce.synthesis_sentence_drop")
-                .filter(|(recent, _, _)| *recent >= SYNTHESIS_SKIP_DROP)
-                .map(|(recent, _, n)| (recent, n));
+            let list_route: Option<String> = {
+                let verdict = model.lang_route("commerce", "list_field", &doc_lang, &lang_probe_text).await;
+                emit_term(&format!("  {}", verdict.line));
+                verdict.code
+            };
+            let mut field_lang: Option<crate::model::lang_llm::LangSession> = None;
+            let synthesis_gate_for = |lang: bool| -> Option<(f32, u64)> {
+                crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(lang))
+                    .filter(|(recent, _, _)| *recent >= SYNTHESIS_SKIP_DROP)
+                    .map(|(recent, _, n)| (recent, n))
+            };
+            let synthesis_gate_lang = synthesis_gate_for(true);
+            let synthesis_gate_base = synthesis_gate_for(false);
+            let synthesis_gate: Option<(f32, u64)> = if list_route.is_some() { synthesis_gate_lang } else { synthesis_gate_base };
             let mut synthesis_probe_item: Option<usize> = None;
             if let Some((recent, n)) = synthesis_gate {
                 emit_term(&format!(
@@ -5105,7 +5111,14 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
-                    if field_is_analytic[f_idx] && synthesis_gate.is_some() {
+                    let active_synthesis_gate = if qwen3_ready {
+                        if field_lang.is_some() { synthesis_gate_lang } else { synthesis_gate_base }
+                    } else if list_route.is_some() {
+                        synthesis_gate_lang
+                    } else {
+                        synthesis_gate_base
+                    };
+                    if field_is_analytic[f_idx] && active_synthesis_gate.is_some() {
                         let last_chance = idx + 1 == total_items && synthesis_probe_item.is_none();
                         if synthesis_probe_item.map_or(qwen3_ready || last_chance, |p| p == idx) {
                             synthesis_probe_item = Some(idx);
@@ -5241,107 +5254,147 @@ pub async fn process_task(
                     let metadata_str = metadata_str.trim();
                     let target_data_str = target_data_str.trim();
 
-                    let task_question = if field_name.contains("status") {
-                        parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
-                    } else if field_is_analytic[f_idx] {
-                        
-                        parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
-                    } else {
-                        parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
-                    };
-                    
-                    let mut ignore_list: Vec<String> = global_ignore_list.clone();
-                    let mut miss_counter = 0;
                     if !qwen3_ready {
-                        vram_probe.phase(format!("item {}/{} · Qwen3 load", idx + 1, total_items));
-                        model
-                            .enter_generation_phase(
-                                crate::model::ModelSize::Qwen3,
-                                None,
-                                Some(cancellation_token.clone()),
-                                false,
-                                Some("inference".to_string()),
-                                "list item extraction loop (first LLM field)",
-                            )
-                            .await?;
+                        vram_probe.phase(format!("item {}/{} · generator load", idx + 1, total_items));
+                        if let Some(code) = list_route.as_deref() {
+                            field_lang = model.enter_lang_generation(code, "list item extraction loop (first LLM field)").await;
+                        }
+                        if field_lang.is_none() {
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen3,
+                                    None,
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    Some("inference".to_string()),
+                                    "list item extraction loop (first LLM field)",
+                                )
+                                .await?;
+                        }
+                        let engine_label = field_lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string());
                         emit_term(&format!(
-                            "  💡 [LAZY GENERATOR] Item {}/{} · Field '{}' 에서 처음으로 LLM 이 필요해 Qwen3 를 올렸습니다. {}",
-                            idx + 1, total_items, field_name, model.crossover_report()
+                            "  💡 [LAZY GENERATOR] Item {}/{} · Field '{}' 에서 처음으로 LLM 이 필요해 {} 를 올렸습니다. {}",
+                            idx + 1, total_items, field_name, engine_label, model.crossover_report()
                         ));
                         qwen3_ready = true;
                     }
+                    let mut task_question = if field_name.contains("status") {
+                        parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
+                    } else if field_is_analytic[f_idx] {
+                        if field_lang.is_some() {
+                            parsing::extract_synthesis_field_prompt_native(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                        } else {
+                            parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                        }
+                    } else {
+                        parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
+                    };
+                    let field_keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
+
+                    let mut ignore_list: Vec<String> = global_ignore_list.clone();
+                    let mut miss_counter = 0;
                     vram_probe.phase(format!("item {}/{} · field '{}'", idx + 1, total_items, field_name));
                     
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                        let q3_gen = model.qwen3_generator.clone();
-                        let cancel_clone = cancellation_token.clone();
-                        let sys_msg = system_message.clone();
-                        
                         let field_name_clone = field_name.clone();
-                        let bias_target_for_closure = bias_target.clone();
-                        
+                        let used_lang = field_lang.is_some();
+                        let res = if let Some(sess) = field_lang.as_ref() {
+                            let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                name: None,
+                            });
+                            model
+                                .generate_lang_json(
+                                    sess.code(),
+                                    vec![system_message.clone(), user_msg],
+                                    512,
+                                    0.0,
+                                    Some(ignore_list.as_slice()),
+                                    &field_keys,
+                                    Some(cancellation_token.clone()),
+                                )
+                                .await
+                                .map(|(text, fixed)| {
+                                    if !fixed.is_empty() {
+                                        crate::utils::score_dynamics::record_baseline("commerce.lang4b_key_repair", fixed.len() as f32);
+                                        emit_term(&format!("    🩹 [LANG4B KEY REPAIR] {:?} — 어휘 16,384 개인 4B 가 영문 스키마 키를 한두 글자 틀리게 옮긴 것을 철자 거리로 되돌립니다. 값은 아래 검증을 그대로 거칩니다.", fixed));
+                                    }
+                                    text
+                                })
+                        } else {
+                            let q3_gen = model.qwen3_generator.clone();
+                            let cancel_clone = cancellation_token.clone();
+                            let sys_msg = system_message.clone();
+                            let prejudice_target_for_closure = dynamic_prej_str.clone();
+                            let task_q = task_question.clone();
+                            let ignore_list_clone = ignore_list.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                let mut gen_guard = q3_gen.blocking_lock();
+                                if let Some(gen) = gen_guard.as_mut() {
+                                    let params = ChatCompletionParameters {
+                                        messages: vec![
+                                            sys_msg,
+                                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                                content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                                name: None,
+                                            })
+                                        ],
+                                        model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                        ..Default::default()
+                                    };
 
-                        let prejudice_target_for_closure = dynamic_prej_str.clone();
-                        
-                        let task_q = task_question.clone();
-                        let ignore_list_clone = ignore_list.clone();
-                        
-                        let res = tokio::task::spawn_blocking(move || {
-                            let mut gen_guard = q3_gen.blocking_lock();
-                            if let Some(gen) = gen_guard.as_mut() {
-                                let params = ChatCompletionParameters {
-                                    messages: vec![
-                                        sys_msg,
-                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
-                                            name: None,
-                                        })
-                                    ],
-                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
-                                    ..Default::default()
-                                };
-                                
-                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-                                
-                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                    let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
+
+                                    gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                } else {
+                                    Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                                }
+                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                            let q3_clear_arc = model.qwen3_generator.clone();
+                            let dev_for_sync = if model.is_cpu_mode {
+                                None
                             } else {
-                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                            }
-                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
-                        // 🌟 [PEAK SAMPLER] 재시도 회차를 라벨에 반영합니다.
-                        //    'color' 처럼 3회 재시도하는 필드가 피크의 주범인지
-                        //    이 라벨 하나로 판별됩니다.
+                                Some(model.device_config.device.clone())
+                            };
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                    gen.clear_kv_cache();
+                                }
+                                if let Some(dev) = dev_for_sync {
+                                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                                }
+                            }).await;
+                            res
+                        };
                         if miss_counter > 0 {
                             vram_probe.phase(format!(
                                 "item {}/{} · field '{}' · retry {}",
                                 idx + 1, total_items, field_name, miss_counter
                             ));
                         }
-                        // 🌟 [MERGED CLEANUP] clear_kv_cache 와 synchronize 를 한 번의
-                        //    spawn_blocking 으로 합칩니다.
-                        //
-                        //  ── 왜 합치는가 ──
-                        //   기존에는 필드마다 스레드 홉이 2회 발생했습니다.
-                        //   13아이템 × 10필드 × 2 = 260회입니다.
-                        //   더 중요한 것은 '해제와 동기화 사이의 창' 이 사라진다는 점입니다.
-                        //   그 사이에 다른 태스크가 끼어들면 동기화가 해제분을
-                        //   반영하지 못한 채 지나갑니다.
-                        let q3_clear_arc = model.qwen3_generator.clone();
-                        let dev_for_sync = if model.is_cpu_mode {
-                            None
-                        } else {
-                            Some(model.device_config.device.clone())
-                        };
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                                gen.clear_kv_cache();
+                        if used_lang {
+                            if let Err(e) = &res {
+                                emit_term(&format!("    ⚠️ [LANG4B FALLBACK] Field '{}' | 4B 생성이 실패해 이 태스크의 남은 필드는 Qwen3 로 진행합니다: {}", field_name, e));
+                                crate::model::lang_llm::record_route_outcome("commerce", "list_field", false);
+                                field_lang = None;
+                                if field_is_analytic[f_idx] && !field_name.contains("status") {
+                                    task_question = parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str);
+                                }
+                                model
+                                    .enter_generation_phase(
+                                        crate::model::ModelSize::Qwen3,
+                                        None,
+                                        Some(cancellation_token.clone()),
+                                        false,
+                                        Some("inference".to_string()),
+                                        "list item extraction loop (4B fallback)",
+                                    )
+                                    .await?;
+                                continue;
                             }
-                            if let Some(dev) = dev_for_sync {
-                                if dev.is_cuda() { let _ = dev.synchronize(); }
-                            }
-                        }).await;
+                        }
 
                         match res {
                             Ok(res_text) => {
@@ -5409,7 +5462,7 @@ pub async fn process_task(
                                             if is_synthesis_field && !extracted_str.is_empty() {
                                                 let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
                                                 crate::utils::score_dynamics::record_baseline(
-                                                    "commerce.synthesis_sentence_drop",
+                                                    crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                     if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                                 );
                                                 if !gate.dropped.is_empty() {
@@ -5583,6 +5636,7 @@ pub async fn process_task(
                                 if !found_valid_value {
                                     requires_retry = true;
                                 }
+                                crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, !requires_retry);
 
                                 if requires_retry {
                                     miss_counter += 1;
@@ -6112,6 +6166,12 @@ pub async fn process_task(
 
             let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
+            let detail_route: Option<String> = {
+                let verdict = model.lang_route("commerce", "detail_field", &doc_lang, &lang_probe_text).await;
+                emit_term(&format!("  {}", verdict.line));
+                verdict.code
+            };
+            let mut field_lang: Option<crate::model::lang_llm::LangSession> = None;
 
             let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": format!("Extracting {} detail fields sequentially...", total_fields), "spinner": "⠋" });
             let _ = app_handle.emit("extraction-progress", &payload);
@@ -7078,16 +7138,16 @@ pub async fn process_task(
                         }
                         model.deep_purge_resources().await;
                         model.mark_crossover_idle();
-                        // 🌟 이 뒤로는 다시 임베딩(vector_assignment 재료)이 아니라
-                        //    필드 추출 루프로 이어지므로 생성 페이즈를 유지합니다.
-                        model
-                            .switch_to_generation(
-                                crate::model::ModelSize::Qwen3,
-                                Some(cancellation_token.clone()),
-                                Some("inference".to_string()),
-                                "detail field extraction (after enum fallback)",
-                            )
-                            .await?;
+                        if detail_route.is_none() {
+                            model
+                                .switch_to_generation(
+                                    crate::model::ModelSize::Qwen3,
+                                    Some(cancellation_token.clone()),
+                                    Some("inference".to_string()),
+                                    "detail field extraction (after enum fallback)",
+                                )
+                                .await?;
+                        }
 
                         if !picked.is_empty() && picked != "null" {
                             if let Some(pos) = select_groups.iter().position(|g| g.selector == picked) {
@@ -7332,17 +7392,26 @@ pub async fn process_task(
             //    ENUM SELECT 폴백이 발동한 경우 이미 생성 페이즈이므로
             //    enter_generation_phase 는 no-op 에 가깝고,
             //    발동하지 않은 경우에만 실제 전환이 일어납니다.
-            model
-                .enter_generation_phase(
-                    crate::model::ModelSize::Qwen3,
-                    None,
-                    Some(cancellation_token.clone()),
-                    false,
-                    Some("inference".to_string()),
-                    "detail field extraction loop",
-                )
-                .await?;
-            emit_term(&format!("  {}", model.crossover_report()));
+            if let Some(code) = detail_route.as_deref() {
+                field_lang = model.enter_lang_generation(code, "detail field extraction loop").await;
+            }
+            if field_lang.is_none() {
+                model
+                    .enter_generation_phase(
+                        crate::model::ModelSize::Qwen3,
+                        None,
+                        Some(cancellation_token.clone()),
+                        false,
+                        Some("inference".to_string()),
+                        "detail field extraction loop",
+                    )
+                    .await?;
+            }
+            emit_term(&format!(
+                "  {} | 필드 생성 엔진: {}",
+                model.crossover_report(),
+                field_lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string())
+            ));
 
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -7598,13 +7667,18 @@ pub async fn process_task(
                 let metadata_str = metadata_str.trim();
                 let target_data_str = target_data_str.trim();
 
-                let task_question = if field_name.contains("status") {
+                let mut task_question = if field_name.contains("status") {
                     parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
                 } else if field_is_analytic[idx] {
-                    parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    if field_lang.is_some() {
+                        parsing::extract_synthesis_field_prompt_native(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    } else {
+                        parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    }
                 } else {
                     parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                 };
+                let field_keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
                 
 
                 let mut ignore_list: Vec<String> = global_ignore_list.clone();
@@ -7613,56 +7687,97 @@ pub async fn process_task(
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                    let q3_gen = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    let sys_msg = system_message.clone();
-                    
                     let field_name_clone = field_name.clone();
-                    let bias_target_for_closure = bias_target.clone(); 
-                    let prejudice_target_for_closure = dynamic_prej_str.clone();
-                    
-                    let task_q = task_question.clone();
-                    let ignore_list_clone = ignore_list.clone();
-                    
-                    let res = tokio::task::spawn_blocking(move || {
-                        let mut gen_guard = q3_gen.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            let params = ChatCompletionParameters {
-                                messages: vec![
-                                    sys_msg,
-                                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                        content: ChatCompletionRequestUserMessageContent::Text(task_q),
-                                        name: None,
-                                    })
-                                ],
-                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
-                                ..Default::default()
-                            };
-                            
+                    let used_lang = field_lang.is_some();
+                    let res = if let Some(sess) = field_lang.as_ref() {
+                        let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        });
+                        model
+                            .generate_lang_json(
+                                sess.code(),
+                                vec![system_message.clone(), user_msg],
+                                512,
+                                0.0,
+                                Some(ignore_list.as_slice()),
+                                &field_keys,
+                                Some(cancellation_token.clone()),
+                            )
+                            .await
+                            .map(|(text, fixed)| {
+                                if !fixed.is_empty() {
+                                    crate::utils::score_dynamics::record_baseline("commerce.lang4b_key_repair", fixed.len() as f32);
+                                    emit_term(&format!("  🩹 [LANG4B KEY REPAIR] {:?} — 어휘 16,384 개인 4B 가 영문 스키마 키를 한두 글자 틀리게 옮긴 것을 철자 거리로 되돌립니다. 값은 아래 검증을 그대로 거칩니다.", fixed));
+                                }
+                                text
+                            })
+                    } else {
+                        let q3_gen = model.qwen3_generator.clone();
+                        let cancel_clone = cancellation_token.clone();
+                        let sys_msg = system_message.clone();
+                        let prejudice_target_for_closure = dynamic_prej_str.clone();
+                        let task_q = task_question.clone();
+                        let ignore_list_clone = ignore_list.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            let mut gen_guard = q3_gen.blocking_lock();
+                            if let Some(gen) = gen_guard.as_mut() {
+                                let params = ChatCompletionParameters {
+                                    messages: vec![
+                                        sys_msg,
+                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                            name: None,
+                                        })
+                                    ],
+                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                    ..Default::default()
+                                };
 
-                            let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
 
-                            
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
-                        } else {
-                            Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                        }
-                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
 
 
-
-                    let q3_clear_arc = model.qwen3_generator.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                            gen.clear_kv_cache();
-                        }
-                    }).await;
-
-                    if !model.is_cpu_mode {
-                        let dev = model.device_config.device.clone();
+                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            } else {
+                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                            }
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                        let q3_clear_arc = model.qwen3_generator.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            if dev.is_cuda() { let _ = dev.synchronize(); }
+                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                gen.clear_kv_cache();
+                            }
                         }).await;
+
+                        if !model.is_cpu_mode {
+                            let dev = model.device_config.device.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if dev.is_cuda() { let _ = dev.synchronize(); }
+                            }).await;
+                        }
+                        res
+                    };
+                    if used_lang {
+                        if let Err(e) = &res {
+                            emit_term(&format!("  ⚠️ [LANG4B FALLBACK] Field '{}' | 4B 생성이 실패해 이 문서의 남은 필드는 Qwen3 로 진행합니다: {}", field_name, e));
+                            crate::model::lang_llm::record_route_outcome("commerce", "detail_field", false);
+                            field_lang = None;
+                            if field_is_analytic[idx] && !field_name.contains("status") {
+                                task_question = parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str);
+                            }
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen3,
+                                    None,
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    Some("inference".to_string()),
+                                    "detail field extraction loop (4B fallback)",
+                                )
+                                .await?;
+                            continue;
+                        }
                     }
 
                     match res {
@@ -7722,7 +7837,7 @@ pub async fn process_task(
                                         if is_synthesis_field && !extracted_str.is_empty() {
                                             let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
                                             crate::utils::score_dynamics::record_baseline(
-                                                "commerce.synthesis_sentence_drop",
+                                                crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                 if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                             );
                                             if !gate.dropped.is_empty() {
@@ -7847,6 +7962,7 @@ pub async fn process_task(
                             if !found_valid_value {
                                 requires_retry = true;
                             }
+                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, !requires_retry);
 
                             if requires_retry {
                                 miss_counter += 1;
@@ -8195,16 +8311,28 @@ pub async fn process_task(
 
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
-        
+
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
-        
-        model.deep_purge_resources().await;
-        // 🌟 [CROSSOVER] 퍼지 사실을 페이즈 원장에 반영합니다.
-        model.mark_crossover_idle();
-        
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        
-        crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+
+        let kept_lang = if crate::model::lang_llm::translit_demand(&extracted_data) > 0 {
+            model.deep_purge_keep_lang(&doc_lang).await
+        } else {
+            model.deep_purge_resources().await;
+            None
+        };
+        match kept_lang.as_deref() {
+            Some(code) => emit_term(&format!(
+                "[Scheduler] 🔁 [HANDOVER KEEP] 필드 추출에 쓴 Qwen3.5-4B-{} 를 음차 단계까지 둡니다. 음차가 같은 언어 모델을 쓰므로 내렸다가 다시 올리는 적재 한 번을 줄입니다. 임베딩 적재가 동시 상주를 허용하지 않으면 그 자리에서 기존 교차 규칙대로 내립니다.",
+                code
+            )),
+            None => {
+                model.mark_crossover_idle();
+
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+                crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+            }
+        }
         emit_term(&format!("[Scheduler] {}", model.crossover_report()));
     }
 
@@ -8225,11 +8353,19 @@ pub async fn process_task(
 
         let free_mb = model.get_free_vram_mb();
         let embed_need = model.embedding_budget_mb();
+        let gen_resident = translit_engine.code().is_some()
+            && crate::model::lang_llm::resident_variant().as_deref() == translit_engine.code()
+            && model.qwen3_5_generator.lock().await.is_some();
         let gen_need = match translit_engine.code() {
+            Some(_) if gen_resident => 0,
             Some(code) => crate::model::lang_llm::resident_estimate_mb(code),
             None => model.generation_budget_mb(crate::model::ModelSize::Qwen3_5),
         };
-        let gen_label = translit_engine.label();
+        let gen_label = if gen_resident {
+            format!("{} (이미 상주)", translit_engine.label())
+        } else {
+            translit_engine.label()
+        };
         if free_mb >= embed_need + gen_need {
             emit_term(&format!(
                 "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + {} {}MB. 스왑 없이 진행할 수 있습니다.",

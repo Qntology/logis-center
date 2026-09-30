@@ -81,6 +81,7 @@ impl LogisModel {
                 g.clear_kv_cache();
                 drop(g);
             }
+            crate::model::lang_llm::set_resident_variant(None);
         }
         {
             *self.current_size.lock().await = None;
@@ -140,10 +141,11 @@ impl LogisModel {
         {
             let mut q35_gen = self.qwen3_5_generator.lock().await;
             if let Some(mut g) = q35_gen.take() {
-                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator..."); //
+                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator...");
                 g.clear_kv_cache();
                 drop(g);
             }
+            crate::model::lang_llm::set_resident_variant(None);
         }
         
         println!("[DIAG-PURGE] Step 2: Clearing Embedding Model & Cache...");
@@ -757,12 +759,41 @@ impl LogisModel {
     }
 
     pub async fn call_qwen3_verification_model(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        if let Some(code) = crate::model::lang_llm::query_route() {
+            let keys = crate::model::lang_llm::prompt_json_keys(prompt);
+            let messages = vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: "You are a precise evaluation assistant. Return strictly the requested JSON format.".to_string(),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
+                    name: None,
+                }),
+            ];
+            match self.generate_lang_json(&code, messages, 256, 0.1, None, &keys, cancel_token.clone()).await {
+                Ok((text, fixed)) => {
+                    if !crate::model::lang_llm::json_structured(&crate::parsing::parse_json_from_llm(&text)) {
+                        crate::model::lang_llm::record_engine_outcome("search", "commerce_verify", true, false);
+                    }
+                    if !fixed.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("search.lang4b_key_repair", fixed.len() as f32);
+                        println!("      🩹 [LANG4B KEY REPAIR] {:?}", fixed);
+                    }
+                    return Ok(text);
+                }
+                Err(e) => {
+                    crate::model::lang_llm::record_engine_outcome("search", "commerce_verify", true, false);
+                    crate::model::lang_llm::close_query_route(&format!("4B 검증 생성 실패: {}", e));
+                }
+            }
+        }
         self.ensure_qwen3().await?;
-        
+
         let gen_arc = self.qwen3_generator.clone();
         let cancel_clone = cancel_token.clone();
         let prompt_string = prompt.to_string();
-        
+
         let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
@@ -772,7 +803,7 @@ impl LogisModel {
                             content: "You are a precise evaluation assistant. Return strictly the requested JSON format.".to_string(),
                             name: None,
                         }),
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage { 
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
                             content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt_string),
                             name: None,
                         })
@@ -785,7 +816,10 @@ impl LogisModel {
                 Err(anyhow::anyhow!("Qwen3 Generator is missing"))
             }
         }).await??;
-        
+
+        if !crate::model::lang_llm::json_structured(&crate::parsing::parse_json_from_llm(&res)) {
+            crate::model::lang_llm::record_engine_outcome("search", "commerce_verify", false, false);
+        }
         Ok(res)
     }
     pub async fn call_qwen3_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
@@ -896,6 +930,9 @@ impl LogisModel {
         if let Some(why) = lang_llm::runtime_failure(code) {
             return Err(anyhow!("Qwen3.5-4B-{} 는 이번 세션에서 쓸 수 없습니다: {}", code, why));
         }
+        if let Some(why) = lang_llm::transient_shortage(code) {
+            return Err(anyhow!("Qwen3.5-4B-{} 는 잠시 쉬는 중입니다: {}", code, why));
+        }
         let loader = lang_llm::loader()
             .ok_or_else(|| anyhow!("Qwen3.5-4B safetensors 런타임 로더가 연결되지 않았습니다"))?;
         if !lang_llm::is_ready(code) {
@@ -904,6 +941,9 @@ impl LogisModel {
 
         let need = lang_llm::resident_estimate_mb(code)
             + super::ACTIVATION_HEADROOM_MB.load(std::sync::atomic::Ordering::SeqCst);
+        if self.siglip2_model.lock().await.is_some() {
+            self.release_siglip2("Qwen3.5-4B 언어 모델 로드").await;
+        }
         let gen_resident = self.generation_resident().await;
         let embed_resident = self.embedding_resident().await;
         if !self.is_cpu_mode {
@@ -912,7 +952,8 @@ impl LogisModel {
             let ceiling = self.get_free_vram_mb() + reclaimable;
             if ceiling < need {
                 let why = format!("VRAM 부족 (확보 가능 {}MB < 4B 예산 {}MB)", ceiling, need);
-                lang_llm::mark_runtime_failure(code, &why);
+                lang_llm::mark_transient_shortage(code, &why);
+                crate::utils::score_dynamics::record_baseline("model.lang4b_vram_short", 1.0);
                 return Err(anyhow!("{}", why));
             }
         }
@@ -924,10 +965,7 @@ impl LogisModel {
         );
         let _load_hold = self.hold_generation();
         if gen_resident {
-            self.unload_generation_slots("Qwen3.5-4B 음차 전용 모델 로드").await;
-        }
-        if self.siglip2_model.lock().await.is_some() {
-            self.release_siglip2("Qwen3.5-4B 음차 전용 모델 로드").await;
+            self.unload_generation_slots("Qwen3.5-4B 언어 모델 로드").await;
         }
         if !self.is_cpu_mode {
             let free = self.get_free_vram_mb();
@@ -954,6 +992,7 @@ impl LogisModel {
         }
         let dev = self.device_config.device.clone();
         let load_dir = dir.clone();
+        let started = Instant::now();
         let load = tokio::time::timeout(
             Duration::from_secs(900),
             tokio::task::spawn_blocking(move || loader(&load_dir, &dev)),
@@ -963,7 +1002,12 @@ impl LogisModel {
             Ok(Ok(Ok(g))) => g,
             Ok(Ok(Err(e))) => {
                 *self.current_size.lock().await = None;
-                lang_llm::mark_runtime_failure(code, &e.to_string());
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("out of memory") {
+                    lang_llm::mark_transient_shortage(code, &msg);
+                } else {
+                    lang_llm::mark_runtime_failure(code, &msg);
+                }
                 return Err(anyhow!("Qwen3.5-4B-{} load failed: {}", code, e));
             }
             Ok(Err(join_err)) => {
@@ -982,9 +1026,12 @@ impl LogisModel {
         }
         lang_llm::set_resident_variant(Some(code.to_string()));
         self.observe_generation_cost_strict(before, pre_empty);
+        let load_ms = started.elapsed().as_millis() as f32;
+        crate::utils::score_dynamics::record_baseline("model.lang4b_load_ms", load_ms);
         println!(
-            "[MODEL] 🎉 Qwen3.5-4B-{} 로드 완료. 자유 {}MB",
+            "[MODEL] 🎉 Qwen3.5-4B-{} 로드 완료 ({:.2}초). 자유 {}MB",
             code,
+            load_ms / 1000.0,
             self.get_free_vram_mb()
         );
         Ok(())
@@ -1032,6 +1079,173 @@ impl LogisModel {
         }
         self.switch_to_generation(ModelSize::Qwen3_5, cancel, None, reason).await?;
         Ok((TranslitEngine::Base2B, TranslitBinding::none()))
+    }
+
+    pub fn qwen3_tokenizer_dir(&self) -> &str {
+        &self.qwen3_model_path
+    }
+
+    fn route_reference_tokenizer(&self) -> std::path::PathBuf {
+        [self.qwen3_5_model_path.as_str(), self.qwen3_model_path.as_str()]
+            .iter()
+            .map(|d| std::path::Path::new(d).join("tokenizer.json"))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| std::path::Path::new(&self.qwen3_model_path).join("tokenizer.json"))
+    }
+
+    pub async fn lang_route(&self, track: &str, step: &str, doc_lang: &str, sample: &str) -> crate::model::lang_llm::RouteVerdict {
+        use crate::model::lang_llm;
+        if self.is_cpu_mode {
+            return lang_llm::closed_verdict(
+                track,
+                step,
+                lang_llm::alphaedge_code(doc_lang),
+                "CPU 모드입니다. 4B 는 0.6B 보다 토큰당 연산이 여러 배 많아 아이템·질의마다 반복되는 이 단계에는 쓰지 않습니다. 문서당 몇 건뿐인 음차는 기존대로 4B 를 씁니다",
+            );
+        }
+        let reference = self.route_reference_tokenizer();
+        let verdict = lang_llm::route_verdict(track, step, doc_lang, sample, &reference);
+        let code = match verdict.code.clone() {
+            Some(c) => c,
+            None => return verdict,
+        };
+        let embed_resident = self.embedding_resident().await;
+        let gen_resident = self.generation_resident().await;
+        let need = lang_llm::resident_estimate_mb(&code)
+            + super::ACTIVATION_HEADROOM_MB.load(std::sync::atomic::Ordering::SeqCst)
+            + if embed_resident { 0 } else { self.embedding_budget_mb() };
+        let available = self.get_free_vram_mb()
+            + if gen_resident { super::GEN_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 };
+        if available < need {
+            return lang_llm::closed_verdict(
+                track,
+                step,
+                Some(&code),
+                &format!(
+                    "임베딩과 4B 를 함께 둘 VRAM 이 없습니다 (확보 가능 {}MB < 필요 {}MB). 이 단계는 아이템마다 임베딩과 생성을 오가므로 동시 상주가 안 되면 아이템 수만큼 교체가 일어납니다",
+                    available, need
+                ),
+            );
+        }
+        crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_route.{}", track, step), 1.0);
+        verdict
+    }
+
+    pub async fn enter_lang_generation(&self, code: &str, reason: &str) -> Option<crate::model::lang_llm::LangSession> {
+        let session = match crate::model::lang_llm::open_session(code) {
+            Some(s) => s,
+            None => {
+                println!(
+                    "[CROSSOVER] ⚪ 다른 언어의 4B 가 생성 슬롯을 쓰고 있어 {} 는 기존 모델로 진행합니다. (요청 4B-{})",
+                    reason, code
+                );
+                return None;
+            }
+        };
+        let _hold = self.hold_generation();
+        match self.ensure_qwen3_5_lang(code).await {
+            Ok(()) => {
+                let phase = self.sync_crossover_phase().await;
+                println!(
+                    "[CROSSOVER] 🧠 [GENERATION PHASE] {} | Qwen3.5-4B-{} 상주 확정 (phase={} | 자유 {}MB)",
+                    reason,
+                    code,
+                    phase,
+                    self.get_free_vram_mb()
+                );
+                Some(session)
+            }
+            Err(e) => {
+                println!(
+                    "[CROSSOVER] ⚠️ Qwen3.5-4B-{} 로 전환하지 못해 {} 는 기존 모델로 진행합니다: {}",
+                    code, reason, e
+                );
+                None
+            }
+        }
+    }
+
+    pub async fn generate_lang_json(
+        &self,
+        code: &str,
+        messages: Vec<ChatCompletionRequestMessage>,
+        max_tokens: u32,
+        temperature: f64,
+        ignore_list: Option<&[String]>,
+        expected_keys: &[String],
+        cancel_token: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<(String, Vec<(String, String)>)> {
+        self.ensure_qwen3_5_lang(code).await?;
+        let params = ChatCompletionParameters {
+            messages,
+            model: "qwen3.5".to_string(),
+            max_tokens: Some(max_tokens),
+            temperature: Some(temperature),
+            top_p: Some(0.95),
+            ..Default::default()
+        };
+        let raw = {
+            let mut guard = self.qwen3_5_generator.lock().await;
+            let gen = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("Qwen3.5-4B-{} 생성기가 슬롯에 없습니다", code))?;
+            let r = gen.generate(params, cancel_token, None, None, ignore_list, None).await;
+            let _ = gen.clear_kv_cache();
+            r
+        };
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() {
+                    let _ = dev.synchronize();
+                }
+            })
+            .await;
+        }
+        let raw = match raw {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("out of memory") {
+                    crate::model::lang_llm::mark_transient_shortage(code, &msg);
+                } else {
+                    crate::model::lang_llm::mark_runtime_failure(code, &format!("필드·검증 생성 실패: {}", msg));
+                }
+                return Err(anyhow!("Qwen3.5-4B-{} generation failed: {}", code, e));
+            }
+        };
+        Ok(crate::model::lang_llm::normalize_lang_json(&raw, expected_keys))
+    }
+
+    pub async fn ensure_query_engine(&self) -> anyhow::Result<()> {
+        if let Some(code) = crate::model::lang_llm::query_route() {
+            match self.ensure_qwen3_5_lang(&code).await {
+                Ok(()) => return Ok(()),
+                Err(e) => crate::model::lang_llm::close_query_route(&format!("4B 적재 실패: {}", e)),
+            }
+        }
+        self.ensure_qwen3().await
+    }
+
+    pub async fn deep_purge_keep_lang(&self, doc_lang: &str) -> Option<String> {
+        use crate::model::lang_llm;
+        let code = lang_llm::alphaedge_code(doc_lang).map(|c| c.to_string());
+        let kept = match code.as_deref() {
+            Some(c) if lang_llm::resident_variant().as_deref() == Some(c) => self.qwen3_5_generator.lock().await.take(),
+            _ => None,
+        };
+        self.deep_purge_resources().await;
+        match (kept, code) {
+            (Some(mut g), Some(c)) => {
+                let _ = g.clear_kv_cache();
+                *self.qwen3_5_generator.lock().await = Some(g);
+                *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
+                lang_llm::set_resident_variant(Some(c.clone()));
+                self.sync_crossover_phase().await;
+                Some(c)
+            }
+            _ => None,
+        }
     }
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {

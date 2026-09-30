@@ -5194,6 +5194,7 @@ struct SynSource {
     times: std::collections::HashSet<(u32, u32)>,
     text_key: String,
     roman_key: String,
+    anchors: Vec<(String, Vec<String>)>,
 }
 
 fn syn_clock(core: &str) -> Option<(u32, u32)> {
@@ -5306,6 +5307,33 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
                         s.month_days.insert((n, d));
                     }
                 }
+            }
+        }
+    }
+    for line in source.lines() {
+        let value = match line.rfind('|') {
+            Some(p) => &line[p + 1..],
+            None => match line.find(": ") {
+                Some(p) => &line[p + 2..],
+                None => line,
+            },
+        };
+        let words: Vec<&str> = value.split_whitespace().map(syn_core).filter(|w| !w.is_empty()).collect();
+        let companions: Vec<String> = words
+            .iter()
+            .filter(|w| w.chars().any(|c| c.is_alphabetic() && !c.is_ascii()))
+            .map(|w| w.to_lowercase())
+            .collect();
+        if companions.is_empty() {
+            continue;
+        }
+        for w in words.iter() {
+            let code_like = w.chars().count() >= 3
+                && w.chars().any(|c| c.is_ascii_alphabetic())
+                && w.chars().any(|c| c.is_ascii_digit())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if code_like && !s.anchors.iter().any(|(c, _)| c.eq_ignore_ascii_case(w)) {
+                s.anchors.push((w.to_string(), companions.clone()));
             }
         }
     }
@@ -5491,6 +5519,20 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
         }
         if !src.text_key.contains(&k) && !src.roman_key.contains(&k) {
             bad.push(format!("인용 '{}'", span));
+        }
+    }
+    if !src.anchors.is_empty() {
+        let lower = sentence.to_lowercase();
+        let cores: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        for (code, companions) in src.anchors.iter() {
+            let code_lower = code.to_lowercase();
+            if !cores.iter().any(|t| *t == code_lower) {
+                continue;
+            }
+            let found = companions.iter().filter(|w| lower.contains(w.as_str())).count();
+            if found * 2 < companions.len() {
+                bad.push(format!("번역된 이름 {} (원문 표기 {}개 중 {}개)", code, companions.len(), found));
+            }
         }
     }
     bad

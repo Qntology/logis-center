@@ -1718,7 +1718,7 @@ impl Qwen3_5TextModel {
                         // Qwen3.5 는 KV 블록을 F8E4M3(1바이트)로 압축 보관합니다.
                         bytes_per_elem: 1,
                         planned_tokens: planned,
-                        label: "Qwen3.5(2B)",
+                        label: if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B(alphaedge)" } else { "Qwen3.5(2B)" },
                     },
                 );
 

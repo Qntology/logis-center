@@ -318,8 +318,9 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     }
 
     for (chunk_text, property, confirmed) in &chunks {
-        if chunk_text.chars().count() > 150 {
-            // 콤마 기준으로 분할 시도
+        let synthesis = crate::utils::ai_utils::detect_field_format(property)
+            == crate::utils::ai_utils::FieldFormat::Synthesis;
+        if chunk_text.chars().count() > 150 && !synthesis {
             let parts: Vec<&str> = split_clause_commas(chunk_text)
                 .into_iter()
                 .map(|p| p.trim())
@@ -327,24 +328,13 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
                 .collect();
 
             if parts.len() > 1 {
-                // 🌟 [라벨 접두어 추출]
                 let label_prefix = extract_label_prefix(chunk_text);
-                let merge_fragments = crate::utils::ai_utils::detect_field_format(property)
-                    == crate::utils::ai_utils::FieldFormat::Synthesis;
 
                 for (pi, part) in parts.iter().enumerate() {
                     if pi == 0 {
                         expanded.push((part.to_string(), property.clone(), *confirmed));
                         continue;
                     }
-                    if merge_fragments && is_clause_fragment(part) {
-                        if let Some(last) = expanded.last_mut() {
-                            last.0.push_str(", ");
-                            last.0.push_str(part);
-                            continue;
-                        }
-                    }
-                    // 후속 조각에 라벨 접두어 복원
                     let restored = if let Some(prefix) = &label_prefix {
                         let clean_part = part
                             .trim_start_matches("and ")
@@ -354,7 +344,6 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
                     } else {
                         part.to_string()
                     };
-                    // 라벨 접두어가 복원되면 구조가 유지되므로 confirmed 유지
                     let sub_confirmed = *confirmed && label_prefix.is_some();
                     expanded.push((restored, property.clone(), sub_confirmed));
                 }
@@ -1085,11 +1074,6 @@ pub fn can_transliterate(
     }
 }
 
-/// [SYNONYM EXPANSION] 특수문자를 공백으로 치환하여 음차용 순수 텍스트를 생성합니다.
-/// (), {}, [], /, -, &, !, @, # 등 모든 비영숫자·비공백 문자를 공백으로 대체하고
-/// 연속 공백을 하나로 압축합니다. 다국어 문자(한글, 일본어, 중국어 등)는 유지합니다.
-/// 이 함수의 출력은 LLM 프롬프트 키와 sanitize 매칭 양쪽에 동일하게 사용되므로
-/// 키 불일치로 인한 맥락 끊김을 원천 차단합니다.
 pub fn strip_special_chars_for_transliteration(value: &str) -> String {
     value
         .chars()
@@ -1106,10 +1090,46 @@ pub fn strip_special_chars_for_transliteration(value: &str) -> String {
         .join(" ")
 }
 
-/// [LANGUAGE TRACK SPLIT] Source 단어를 표기 체계별로 분리합니다.
-/// 반환: (비라틴 단어 목록, 라틴 단어 목록)
-/// 판정 기준은 is_latin_dominant() — 각 단어의 알파벳 문자 중
-/// ASCII 알파벳 비율이 50% 이상이면 라틴, 그렇지 않으면 비라틴.
+pub fn reglue_native_alias(source: &str, native: &str) -> String {
+    let mut glue: Vec<bool> = Vec::new();
+    let mut runs = 0usize;
+    let mut in_run = false;
+    let mut gap_has_space = false;
+    for c in source.chars() {
+        if c.is_alphanumeric() {
+            if !in_run {
+                if runs > 0 {
+                    glue.push(!gap_has_space);
+                }
+                runs += 1;
+                in_run = true;
+            }
+        } else {
+            if in_run {
+                in_run = false;
+                gap_has_space = false;
+            }
+            if c.is_whitespace() {
+                gap_has_space = true;
+            }
+        }
+    }
+    let parts: Vec<&str> = native.split_whitespace().collect();
+    if runs < 2 || parts.len() != runs || !glue.iter().any(|g| *g) {
+        return native.to_string();
+    }
+    let latin = |s: &str| s.chars().any(|c| c.is_ascii_alphabetic());
+    let mut out = String::from(parts[0]);
+    for i in 1..parts.len() {
+        let glued = glue[i - 1] && !latin(parts[i - 1]) && !latin(parts[i]);
+        if !glued {
+            out.push(' ');
+        }
+        out.push_str(parts[i]);
+    }
+    out
+}
+
 pub fn split_words_by_script(source: &str) -> (Vec<String>, Vec<String>) {
     let cleaned = strip_special_chars_for_transliteration(source);
     let mut non_latin: Vec<String> = Vec::new();
@@ -1125,18 +1145,12 @@ pub fn split_words_by_script(source: &str) -> (Vec<String>, Vec<String>) {
     (non_latin, latin)
 }
 
-/// [LANGUAGE TRACK PROMPT] 특정 단어 목록만으로 음차 프롬프트를 생성합니다.
-/// build_transliteration_prompt 의 단어 제한 버전입니다.
-/// mixed-script 소스에서 트랙별로 분리 호출할 때 사용합니다.
 pub fn build_transliteration_prompt_for_words(words: &[String], target_language: &str) -> String {
     let full_lang = lang_code_to_full_name(target_language);
     let joined = words.join(" ");
     crate::prompts::transliteration_prompt(&joined, &full_lang)
 }
 
-/// [LANGUAGE TRACK SANITIZE] 특정 단어 목록에 대한 LLM 응답만 파싱합니다.
-/// sanitize_transliteration_dual 의 단어 제한 버전입니다.
-/// source_value 대신 명시적 words 목록을 사용하여 응답 매핑을 수행합니다.
 const TRANSLIT_SCHEMA_KEYS: [&str; 2] = ["transcription", "transliteration"];
 
 fn edit_distance(a: &[char], b: &[char]) -> usize {

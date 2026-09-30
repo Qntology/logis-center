@@ -2919,7 +2919,7 @@ Column labels (LABELS, never answers): {METADATA}
 // LLM 이 어쩔 수 없이 셀 하나("89000", "본사")를 그대로 뱉게 됩니다.
 // 또한 원문 언어(doc_lang)를 명시적으로 전달하여, 한국어 문서에서도
 // 고유명사/코드/숫자는 원문 그대로 보존하고 문장만 영어로 합성하도록 강제합니다.
-pub fn extract_synthesis_field_prompt(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str) -> String {
+fn synthesis_field_prompt_with(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str, language_rule: &str) -> String {
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
         dynamic_output_keys.push_str(&format!("  \"{}\": <one sentence written by you, or null>,\n", key.trim()));
@@ -2944,7 +2944,7 @@ Source Document Language: {DOC_LANG}
 2. The sentence MUST combine at least two different facts taken from [SOURCE DATA].
 3. Do NOT invent facts. Only restate and connect what is present in [SOURCE DATA].
 4. Keep every proper noun, product name, code, identifier, and number EXACTLY as written in [SOURCE DATA]. Never translate, transliterate, or reformat them, whatever the source language is.
-5. Write the connecting sentence in English, while keeping the copied literals in their original script.
+5. {LANGUAGE_RULE}
 6. If [SOURCE DATA] has no usable content for this field, return null. A null summary is correct; a fabricated one is corrupted data.
 
 [OUTPUT FORMAT]
@@ -2952,11 +2952,34 @@ Source Document Language: {DOC_LANG}
 
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
 
-    template.replace("{TYPE}", page_type)
+    template.replace("{LANGUAGE_RULE}", language_rule)
+            .replace("{TYPE}", page_type)
             .replace("{DOC_LANG}", doc_lang)
             .replace("{FIELDS}", field_desc)
             .replace("{SOURCE_DATA}", source_data)
             .replace("{DYNAMIC_KEYS}", &dynamic_output_keys)
+}
+
+pub fn extract_synthesis_field_prompt(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str) -> String {
+    synthesis_field_prompt_with(
+        page_type,
+        field_name,
+        field_desc,
+        doc_lang,
+        source_data,
+        "Write the connecting sentence in English, while keeping the copied literals in their original script.",
+    )
+}
+
+pub fn extract_synthesis_field_prompt_native(page_type: &str, field_name: &str, field_desc: &str, doc_lang: &str, source_data: &str) -> String {
+    synthesis_field_prompt_with(
+        page_type,
+        field_name,
+        field_desc,
+        doc_lang,
+        source_data,
+        "Write the whole sentence in the same language as [SOURCE DATA] (document language code: {DOC_LANG}). Do not translate any product name, person name, status word, or value into English or any other language.",
+    )
 }
 
 // 🌟 [NEW] 상태(status) 컨트롤의 CSS selector 를 찾는 전용 프롬프트.

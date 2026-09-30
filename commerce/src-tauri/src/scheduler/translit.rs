@@ -5,8 +5,16 @@ use crate::scheduler::TRANSLIT_MEM_CACHE;
 use tauri::Emitter;
 
 
+fn translit_lang(lang: &str) -> String {
+    let t = lang.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    crate::utils::bias_schema::lang_code_of(t)
+}
+
 fn translit_cache_key(word: &str, lang: &str) -> String {
-    format!("{}\u{1}{}", lang.trim().to_lowercase(), word.trim())
+    format!("{}\u{1}{}", translit_lang(lang), word.trim())
 }
 
 static TRANSLIT_RECHECKED: once_cell::sync::Lazy<std::sync::Mutex<Option<std::collections::HashSet<String>>>> =
@@ -48,54 +56,11 @@ fn first_recheck(word: &str, lang: &str, engine: &str) -> bool {
     true
 }
 
-// =====================================================================
-// 🌟 [SYNONYM EXPANSION] 청크 값의 2-pass 음차 별칭 생성 / 저장
-// ---------------------------------------------------------------------
-// 흐름:
-//   원문 "Cable Knit Cardigan"
-//     → 1차: 문서 언어 표기로 음차   "케이블 니트 카디건"   (transliteration_native)
-//     → 2차: 원문 표기로 역음차      "keibeul nit kadigeon" (transliteration_roman)
-//   두 별칭을 동일 item_id / 동일 property 로 item_chunks 에 추가 저장합니다.
-//   store.rs 의 search_chunks() 가 item_id 기준으로 점수를 합산하므로,
-//   별칭 하나만 매칭돼도 원본 item 이 그대로 상위 랭크됩니다.
-//
-// 언어 하드코딩이 없는 이유:
-//   1차 목표 표기 = native_script_sample()  → detect_document_language 결과 + bias.json
-//   2차 목표 표기 = 원문 값 그 자체          → 언어 테이블 자체가 불필요
-// =====================================================================
-
-// =====================================================================
-// 🌟 [TRANSLIT CACHE HELPER] Dexie 캐시 조회 / 저장 (프론트 경유)
-// =====================================================================
-
-/// 음차 캐시를 조회합니다. ① 프로세스 전역 메모리 → ② 프론트엔드 Dexie 순서입니다.
-///
-/// 반환값 계약:
-///   Some(("네이티브", "로마자")) → 캐시 히트
-///   Some(("", ""))              → 네거티브 캐시 히트 ('음차 불가' 로 이미 확정된 값)
-///   None                        → 캐시 미스 (레코드 자체가 없음 / 통신 실패)
-///
-/// ⚠️ 호출부는 Some 이면 값이 비어 있어도 '히트' 로 취급해야 합니다.
-///    기존 구현은 빈 값을 미스로 보고 매번 LLM 을 다시 불렀습니다.
-async fn query_translit_cache(
+async fn dexie_translit_lookup(
     app_handle: &tauri::AppHandle,
     word: &str,
     lang: &str,
-) -> Option<(String, String)> {
-    let key = translit_cache_key(word, lang);
-
-    // ── ① 프로세스 전역 메모리 캐시 ──
-    if let Ok(map) = TRANSLIT_MEM_CACHE.lock() {
-        if let Some(hit) = map.get(&key) {
-            println!(
-                "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
-                word, lang, hit.0, hit.1
-            );
-            return Some(hit.clone());
-        }
-    }
-
-    // ── ② 프론트엔드 Dexie 영구 캐시 ──
+) -> Option<Vec<(String, String)>> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
 
@@ -115,29 +80,10 @@ async fn query_translit_cache(
         rx
     ).await;
 
-    // 어떤 경로로 끝나든 pending 엔트리는 반드시 회수합니다. (누수 방지)
     let _ = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id);
 
     match result {
-        Ok(Ok(candidates)) => {
-            if candidates.is_empty() {
-                println!(
-                    "  🔍 [TRANSLIT CACHE / MISS] '{}' (lang='{}') — Dexie 에 레코드가 없습니다.",
-                    word, lang
-                );
-                None
-            } else {
-                let hit = candidates[0].clone();
-                if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
-                    map.insert(key, hit.clone());
-                }
-                println!(
-                    "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
-                    word, lang, hit.0, hit.1
-                );
-                Some(hit)
-            }
-        },
+        Ok(Ok(candidates)) => Some(candidates),
         Ok(Err(_)) => {
             println!(
                 "  ⚠️ [TRANSLIT CACHE] '{}' (lang='{}') 응답 채널이 닫혔습니다. 캐시 미스로 처리합니다.",
@@ -155,11 +101,64 @@ async fn query_translit_cache(
     }
 }
 
-/// 음차 결과를 캐시에 저장합니다.
-/// ① 프로세스 전역 메모리에 즉시 반영 ② 프론트엔드 Dexie 에 영구 저장 요청(fire-and-forget)
-///
-/// native / roman 이 모두 빈 문자열이면 '음차 불가' 라는 판정 자체를 저장합니다(네거티브 캐시).
-/// 이 값이 없으면 다음 태스크에서 같은 판정을 위해 LLM 을 또 호출하게 됩니다.
+async fn query_translit_cache(
+    app_handle: &tauri::AppHandle,
+    word: &str,
+    lang: &str,
+) -> Option<(String, String)> {
+    let key = translit_cache_key(word, lang);
+    let canon = translit_lang(lang);
+
+    if let Ok(map) = TRANSLIT_MEM_CACHE.lock() {
+        if let Some(hit) = map.get(&key) {
+            println!(
+                "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                word, canon, hit.0, hit.1
+            );
+            return Some(hit.clone());
+        }
+    }
+
+    let raw = lang.trim().to_lowercase();
+    let mut langs: Vec<String> = vec![canon.clone()];
+    if !raw.is_empty() && raw != canon {
+        langs.push(raw);
+    }
+    for name in crate::utils::bias_schema::lang_names_of(&canon) {
+        if !langs.iter().any(|l| l == name) {
+            langs.push(name.to_string());
+        }
+    }
+    for (li, q_lang) in langs.iter().enumerate() {
+        let candidates = dexie_translit_lookup(app_handle, word, q_lang).await?;
+        let hit = match candidates.first() {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
+            map.insert(key.clone(), hit.clone());
+        }
+        if li == 0 {
+            println!(
+                "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
+                word, canon, hit.0, hit.1
+            );
+        } else {
+            println!(
+                "  🔁 [TRANSLIT CACHE / LEGACY LANG] '{}' 는 예전 언어 키 '{}' 로 저장되어 있었습니다 → 정규 언어 코드 '{}' 로 옮겨 저장합니다. 이미지 문서(언어 이름 'korean')와 텍스트 문서(언어 코드 'ko')가 같은 값의 별칭을 서로 다른 캐시 줄로 나눠 갖지 않게 합니다.",
+                word, q_lang, canon
+            );
+            save_translit_cache(app_handle, word, &canon, &hit.0, &hit.1);
+        }
+        return Some(hit);
+    }
+    println!(
+        "  🔍 [TRANSLIT CACHE / MISS] '{}' (lang='{}') — Dexie 에 레코드가 없습니다.",
+        word, canon
+    );
+    None
+}
+
 fn save_translit_cache(
     app_handle: &tauri::AppHandle,
     word: &str,
@@ -168,6 +167,7 @@ fn save_translit_cache(
     roman: &str,
 ) {
     let key = translit_cache_key(word, lang);
+    let canon = translit_lang(lang);
     if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
         map.insert(key, (native.to_string(), roman.to_string()));
     }
@@ -175,31 +175,24 @@ fn save_translit_cache(
     if native.trim().is_empty() && roman.trim().is_empty() {
         println!(
             "  💾 [TRANSLIT CACHE / SAVE-NEGATIVE] '{}' (lang='{}') — 음차 불가 판정을 영구 저장합니다.",
-            word, lang
+            word, canon
         );
     } else {
         println!(
             "  💾 [TRANSLIT CACHE / SAVE] '{}' (lang='{}') → native='{}' | roman='{}'",
-            word, lang, native, roman
+            word, canon, native, roman
         );
     }
 
     let _ = app_handle.emit("translit-cache-save", json!({
         "word": word,
-        "lang": lang,
+        "lang": canon,
         "native": native,
         "roman": roman,
         "engine": crate::model::lang_llm::engine_tag(lang)
     }));
 }
 
-/// 🌟 [CROSS-LANGUAGE TRANSLITERATION] 전처리 단계에서 사용하는 교차 언어 음차.
-///    방향: 영어 단어 → 문서 언어(한글/일어/중어 등)
-///    한글→한글 같은 동일 언어 음차는 수행하지 않습니다.
-///    한글→영어(로마자) 역방향도 함께 생성합니다.
-///
-///    이 함수는 `run_analytic_structuring` 에서 호출되며,
-///    Qwen3.5 가 이미 로드되어 있어야 합니다.
 pub async fn transliterate_cross_language(
     model: &LogisModel,
     text: &str,
@@ -411,9 +404,16 @@ pub async fn generate_transliteration_aliases(
                 None => true,
             }
         });
-        if let Some(dexie_hit) = cached_hit {
-            // 🌟 [NEGATIVE CACHE] 빈 값도 '음차 불가로 이미 확정된 사실' 이므로 히트로 인정합니다.
-            //    기존 구현은 빈 값을 미스로 보고 Qwen3.5 를 매번 다시 호출했습니다.
+        if let Some(mut dexie_hit) = cached_hit {
+            let reglued = crate::nl_convert::reglue_native_alias(&src, &dexie_hit.0);
+            if reglued != dexie_hit.0 {
+                emit(&format!(
+                    "  🔗 [TRANSLIT REGLUE] '{}' 캐시 별칭 '{}' → '{}' | 원문에서 공백 없이 이어진 단어('-' 등으로 붙은 합성어)는 문서 언어 표기에서도 붙여 씁니다. 띄어 쓴 별칭은 붙여 쓴 질의('티셔츠')와 FTS 로 만나지 않고 청크 코사인도 낮아집니다.",
+                    src, dexie_hit.0, reglued
+                ));
+                dexie_hit.0 = reglued;
+                save_translit_cache(app_handle, &src, doc_lang, &dexie_hit.0, &dexie_hit.1);
+            }
             let is_negative = dexie_hit.0.trim().is_empty() && dexie_hit.1.trim().is_empty();
             cache.insert(src.clone(), dexie_hit.clone());
             out[i] = dexie_hit;
@@ -430,18 +430,12 @@ pub async fn generate_transliteration_aliases(
             continue;
         }
 
-        // 1차 음차 가능 여부 판정.
-        // 원문과 같은 표기 체계로만 변환 가능한 환경이면 스킵합니다.
         if !crate::nl_convert::can_transliterate(&src, doc_lang) {
             cache.insert(src.clone(), (String::new(), String::new()));
             save_translit_cache(app_handle, &src, doc_lang, "", "");
             skipped += 1;
             continue;
         }
-        // 🌟 [SAME-SCRIPT BLOCK] 원문과 대상이 같은 문자 체계면 음차가 성립하지 않습니다.
-        //    한글 문서를 한글로 음차하는 것은 오음차(수용자←사용자)만 양산합니다.
-        //    이 경우 영어 단어가 포함되어 있으면 영어→한글 방향으로 전환하고,
-        //    순수 한글이면 음차 자체를 스킵합니다.
         let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
         let target_is_latin = crate::nl_convert::is_latin_dominant(
             &crate::nl_convert::native_script_sample(doc_lang, "", "")
@@ -817,8 +811,8 @@ pub async fn generate_transliteration_aliases(
             crate::nl_convert::assign_transliterations(&src, &s1, &s2)
         };
 
-        let final_pair = pair;
-        
+        let final_pair = (crate::nl_convert::reglue_native_alias(&src, &pair.0), pair.1);
+
         if final_pair.0.is_empty() && final_pair.1.is_empty() {
             emit(&format!(
                 "      ⚪ [SYNONYM SKIP] '{}' | 표기 체계가 뒤집히지 않아 별칭을 폐기했습니다. (property='{}')",
@@ -830,7 +824,6 @@ pub async fn generate_transliteration_aliases(
                 "      🔤 [SYNONYM EXPANSION] '{}' → native='{}' | roman='{}' (property='{}')",
                 src, final_pair.0, final_pair.1, cm.property
             ));
-            // 🌟 [LANG-CONSISTENCY LOG] 혼용 소스에서 언어 통일 별칭이 생성된 경우 추가 로그
             if is_mixed && (!final_pair.0.is_empty() || !final_pair.1.is_empty()) {
                 emit(&format!(
                     "      🔤 [LANG-UNIFIED] 원본 혼용 → ko='{}' / en='{}' 로 언어별 분리 저장",
@@ -840,9 +833,6 @@ pub async fn generate_transliteration_aliases(
         }
         cache.insert(src.clone(), final_pair.clone());
 
-        // 🌟 [DEXIE CACHE SAVE] LLM 으로 생성한 결과를 Dexie 에 영구 저장합니다.
-        //    다음 태스크(또는 앱 재시작 후)부터는 Qwen3.5 호출 없이 캐시 히트됩니다.
-        //    ⚠️ out[i] 할당(move) '전에' 호출해야 borrow-after-move 를 피합니다.
         save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
 
         out[i] = final_pair;

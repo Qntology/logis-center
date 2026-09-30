@@ -629,19 +629,40 @@ impl ListCensus {
         best.map(|(g, _)| g)
     }
 
-    pub fn shadow_agreement(&self, html: &str, selector: &str) -> Option<(f32, &CensusGroup, usize)> {
+    pub fn shadow_agreement(&self, html: &str, selector: &str) -> Option<(f32, &CensusGroup, usize, usize)> {
         let top = self.groups.iter().find(|g| g.structural_grade())?;
         let sel = Selector::parse(selector).ok()?;
+        let cell_q = Selector::parse("td, th").ok()?;
         let doc = Html::parse_document(html);
-        let mut order = HashMap::new();
+        let mut rows = 0usize;
+        let mut pending = 0usize;
+        let mut boa: HashSet<usize> = HashSet::new();
         for (i, n) in doc.tree.root().descendants().enumerate() {
-            order.insert(n.id(), i);
+            let e = match ElementRef::wrap(n) {
+                Some(e) => e,
+                None => continue,
+            };
+            if !sel.matches(&e) {
+                continue;
+            }
+            rows += 1;
+            if pending > 0 {
+                pending -= 1;
+                continue;
+            }
+            let span = e
+                .select(&cell_q)
+                .filter_map(|c| c.value().attr("rowspan"))
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .max()
+                .unwrap_or(1);
+            pending = span.saturating_sub(1);
+            boa.insert(i);
         }
-        let boa: HashSet<usize> = doc.select(&sel).filter_map(|e| order.get(&e.id()).copied()).collect();
         let mine: HashSet<usize> = top.member_order.iter().copied().collect();
         let inter = boa.intersection(&mine).count();
         let uni = boa.union(&mine).count().max(1);
-        Some((inter as f32 / uni as f32, top, boa.len()))
+        Some((inter as f32 / uni as f32, top, rows, boa.len()))
     }
 
     pub fn report_lines(&self) -> Vec<String> {
