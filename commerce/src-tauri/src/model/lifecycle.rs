@@ -1109,6 +1109,18 @@ impl LogisModel {
             Some(c) => c,
             None => return verdict,
         };
+        if matches!(step, "list_field" | "detail_field") && crate::utils::resources::free_ram_bytes() <= 6_000_000_000 {
+            return lang_llm::closed_verdict(
+                track,
+                step,
+                Some(&code),
+                &format!(
+                    "디코딩 동안 층 가중치를 상주시키는 조건(여유 RAM 6GB 초과, Qwen3.5 모델 코드의 keep_weights_resident 기준)이 안 됩니다 (여유 RAM {:.1}GB). 이 상태의 4B 는 토큰마다 층 가중치 약 {}MB 를 다시 올리므로, 아이템·필드마다 반복되는 이 단계의 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 문서당 몇 건뿐인 음차만 4B 를 씁니다",
+                    crate::utils::resources::free_ram_bytes() as f64 / 1_000_000_000.0,
+                    lang_llm::resident_estimate_mb(&code)
+                ),
+            );
+        }
         let embed_resident = self.embedding_resident().await;
         let gen_resident = self.generation_resident().await;
         let need = lang_llm::resident_estimate_mb(&code)

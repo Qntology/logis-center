@@ -5195,6 +5195,79 @@ struct SynSource {
     text_key: String,
     roman_key: String,
     anchors: Vec<(String, Vec<String>)>,
+    bindings: Vec<(String, Vec<SynLit>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SynLit {
+    Num(String),
+    Date(Option<u32>, u32, u32),
+}
+
+fn syn_glued_tail(tail: &str) -> bool {
+    let rest = tail.trim_start_matches(|c: char| c == '\'' || c == '\u{2019}');
+    let apostrophe = rest.len() != tail.len();
+    !rest.is_empty() && rest.chars().all(|c| c.is_alphabetic() && (apostrophe || !c.is_ascii()))
+}
+
+const SYN_SCALE_CHARS: [char; 14] = ['십', '백', '천', '만', '억', '조', '十', '百', '千', '万', '萬', '億', '亿', '兆'];
+
+fn syn_numeric_head(core: &str) -> Option<&str> {
+    let cut = core
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '/')))
+        .map(|(i, _)| i)?;
+    let head = core[..cut].trim_end_matches(|c: char| matches!(c, ',' | '.' | '-' | '/'));
+    let tail = &core[cut..];
+    if head.is_empty()
+        || !head.chars().any(|c| c.is_ascii_digit())
+        || tail.starts_with(|c: char| SYN_SCALE_CHARS.contains(&c))
+        || !syn_glued_tail(tail)
+    {
+        return None;
+    }
+    Some(head)
+}
+
+fn syn_label_word(token: &str, word: &str) -> bool {
+    match token.strip_prefix(word) {
+        Some(tail) => tail.is_empty() || syn_glued_tail(tail),
+        None => false,
+    }
+}
+
+fn syn_literal(value: &str) -> Option<SynLit> {
+    let first = value.split_whitespace().next()?;
+    let core = syn_core(first);
+    let date_part = match core.split_once('T') {
+        Some((d, _)) if syn_date_literal(d).is_some() => d,
+        _ => core,
+    };
+    if let Some((y, m, d)) = syn_date_literal(date_part) {
+        return Some(SynLit::Date(y, m, d));
+    }
+    if !core.is_empty() && core.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+        return syn_number_key(core).map(SynLit::Num);
+    }
+    None
+}
+
+fn syn_lit_matches(bound: &SynLit, got: &SynLit) -> bool {
+    match (bound, got) {
+        (SynLit::Num(a), SynLit::Num(b)) => a == b,
+        (SynLit::Date(ya, ma, da), SynLit::Date(yb, mb, db)) => {
+            ma == mb && da == db && (ya.is_none() || yb.is_none() || ya == yb)
+        }
+        _ => false,
+    }
+}
+
+fn syn_lit_text(lit: &SynLit) -> String {
+    match lit {
+        SynLit::Num(n) => n.clone(),
+        SynLit::Date(Some(y), m, d) => format!("{}-{:02}-{:02}", y, m, d),
+        SynLit::Date(None, m, d) => format!("{:02}-{:02}", m, d),
+    }
 }
 
 fn syn_clock(core: &str) -> Option<(u32, u32)> {
@@ -5260,10 +5333,14 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
             s.currencies.insert(c);
         }
         let core = syn_core(raw);
-        if let Some(t) = syn_clock(core) {
+        let (date_core, clock_core) = match core.split_once('T') {
+            Some((d, t)) if syn_date_literal(d).is_some() => (d, t),
+            _ => (core, core),
+        };
+        if let Some(t) = syn_clock(clock_core) {
             s.times.insert(t);
         }
-        if let Some((y, m, d)) = syn_date_literal(core) {
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
             if let Some(y) = y {
                 s.years.insert(y);
             }
@@ -5337,6 +5414,31 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
             }
         }
     }
+    for line in source.lines() {
+        let (label, value) = match line.rfind('|') {
+            Some(p) => (&line[..p], &line[p + 1..]),
+            None => match line.find(": ") {
+                Some(p) => (&line[..p], &line[p + 2..]),
+                None => continue,
+            },
+        };
+        let label = label.rsplit('>').next().unwrap_or("").trim().to_lowercase();
+        if label.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+            continue;
+        }
+        let lit = match syn_literal(value) {
+            Some(l) => l,
+            None => continue,
+        };
+        match s.bindings.iter().position(|(l, _)| *l == label) {
+            Some(p) => {
+                if !s.bindings[p].1.contains(&lit) {
+                    s.bindings[p].1.push(lit);
+                }
+            }
+            None => s.bindings.push((label, vec![lit])),
+        }
+    }
     s
 }
 
@@ -5375,10 +5477,11 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
             used[i] = true;
             continue;
         }
-        if let Some((y, m, d)) = syn_date_literal(core) {
+        let date_core = syn_numeric_head(core).unwrap_or(core);
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
             used[i] = true;
             if !src.month_days.contains(&(m, d)) {
-                bad.push(format!("날짜 {}", core));
+                bad.push(format!("날짜 {}", date_core));
             } else if let Some(y) = y {
                 if !src.years.contains(&y) {
                     bad.push(format!("연도 {}", y));
@@ -5473,6 +5576,7 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
         let core = syn_core(raw);
         let letters = core.chars().filter(|c| c.is_alphabetic()).count();
         let currency_letters = !cur.is_empty();
+        let mut num_core = core;
         if letters > 0 && !currency_letters {
             let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
             let rest = &core[kd.len()..];
@@ -5482,10 +5586,14 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
                         bad.push(format!("연도 {}", y));
                     }
                 }
+                continue;
             }
-            continue;
+            match syn_numeric_head(core) {
+                Some(head) => num_core = head,
+                None => continue,
+            }
         }
-        let digit_part: String = core
+        let digit_part: String = num_core
             .chars()
             .skip_while(|c| !c.is_ascii_digit())
             .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
@@ -5532,6 +5640,60 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
             let found = companions.iter().filter(|w| lower.contains(w.as_str())).count();
             if found * 2 < companions.len() {
                 bad.push(format!("번역된 이름 {} (원문 표기 {}개 중 {}개)", code, companions.len(), found));
+            }
+        }
+    }
+    if !src.bindings.is_empty() {
+        let lowers: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (bi, (label, _)) in src.bindings.iter().enumerate() {
+            let words: Vec<&str> = label.split_whitespace().collect();
+            let n = words.len();
+            if n == 0 {
+                continue;
+            }
+            let mut i = 0usize;
+            while i + n <= lowers.len() {
+                let hit = (0..n).all(|w| {
+                    if w + 1 == n {
+                        syn_label_word(&lowers[i + w], words[w])
+                    } else {
+                        lowers[i + w] == words[w]
+                    }
+                });
+                if hit {
+                    spans.push((i, i + n, bi, label.chars().count()));
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for &(s, e, bi, len) in spans.iter() {
+            let outranked = spans
+                .iter()
+                .any(|&(s2, e2, _, len2)| s2 < e && s < e2 && (e2 - s2, len2) > (e - s, len));
+            if outranked || e >= toks.len() {
+                continue;
+            }
+            let core = syn_core(toks[e]);
+            let head = syn_numeric_head(core).unwrap_or(core);
+            let full_date = syn_date_literal(head).map(|(y, m, d)| SynLit::Date(y, m, d));
+            if full_date.is_none() && (used[e] || core[head.len()..].starts_with('년')) {
+                continue;
+            }
+            let lit = match full_date.or_else(|| syn_literal(head)) {
+                Some(l) => l,
+                None => continue,
+            };
+            let (label, lits) = &src.bindings[bi];
+            if !lits.iter().any(|b| syn_lit_matches(b, &lit)) {
+                bad.push(format!(
+                    "바인딩 {} {} ≠ {}",
+                    label,
+                    head,
+                    lits.iter().map(syn_lit_text).collect::<Vec<_>>().join("/")
+                ));
             }
         }
     }

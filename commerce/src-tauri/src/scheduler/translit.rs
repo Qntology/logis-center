@@ -408,7 +408,7 @@ pub async fn generate_transliteration_aliases(
             let reglued = crate::nl_convert::reglue_native_alias(&src, &dexie_hit.0);
             if reglued != dexie_hit.0 {
                 emit(&format!(
-                    "  🔗 [TRANSLIT REGLUE] '{}' 캐시 별칭 '{}' → '{}' | 원문에서 공백 없이 이어진 단어('-' 등으로 붙은 합성어)는 문서 언어 표기에서도 붙여 씁니다. 띄어 쓴 별칭은 붙여 쓴 질의('티셔츠')와 FTS 로 만나지 않고 청크 코사인도 낮아집니다.",
+                    "  🔗 [TRANSLIT REGLUE] '{}' 캐시 별칭 '{}' → '{}' | 원문에서 공백 없이 이어진 단어('-' 등으로 붙은 합성어)는 문서 언어 표기에서도 붙여 씁니다. 띄어 쓴 별칭은 붙여 쓴 질의('티셔츠')와 공백 단위 FTS 토큰이 달라 만나지 않습니다. 청크 코사인은 띄어쓰기로 크게 달라지지 않으므로 이 교정의 목적은 FTS 입니다.",
                     src, dexie_hit.0, reglued
                 ));
                 dexie_hit.0 = reglued;

@@ -5465,6 +5465,7 @@ pub async fn process_task(
                                                     crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                     if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                                 );
+                                                crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, gate.dropped.is_empty());
                                                 if !gate.dropped.is_empty() {
                                                     emit_term(&format!(
                                                         "    🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
@@ -5636,7 +5637,9 @@ pub async fn process_task(
                                 if !found_valid_value {
                                     requires_retry = true;
                                 }
-                                crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, !requires_retry);
+                                if !is_synthesis_field || requires_retry {
+                                    crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, !requires_retry);
+                                }
 
                                 if requires_retry {
                                     miss_counter += 1;
@@ -7840,6 +7843,7 @@ pub async fn process_task(
                                                 crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                 if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                             );
+                                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, gate.dropped.is_empty());
                                             if !gate.dropped.is_empty() {
                                                 emit_term(&format!(
                                                     "  🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
@@ -7962,7 +7966,9 @@ pub async fn process_task(
                             if !found_valid_value {
                                 requires_retry = true;
                             }
-                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, !requires_retry);
+                            if !is_synthesis_field || requires_retry {
+                                crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, !requires_retry);
+                            }
 
                             if requires_retry {
                                 miss_counter += 1;

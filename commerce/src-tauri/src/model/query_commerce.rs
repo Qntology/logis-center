@@ -2704,6 +2704,17 @@ impl crate::model::LogisModel {
                             }
                         }
 
+                        if picked.is_none() && owner_margin < 0.05 {
+                            emit_term(&format!(
+                                "      ⚖️ [UNCONFIRMED ASSIGN DROP] '{}' → [{}] | 검증 응답이 이 배정도 형식이 맞는 대안도 확인해 주지 못했고, 벡터 마진 {:+.4} 도 0.05 미만입니다. 근소한 배정을 확인 없이 하드 조건으로 걸면 회수한 문서 전부를 막을 수 있어 조건에서 빼고 FTS 검색어로 보존합니다.",
+                                pm.chunk, owner_prop, owner_margin
+                            ));
+                            crate::utils::score_dynamics::record_baseline("search.verify_unconfirmed_drop", 1.0);
+                            claimed_props.remove(&owner_prop);
+                            unassigned_chunks.push(pm.chunk.clone());
+                            continue;
+                        }
+
                         if let Some(new_prop) = picked {
                             if new_prop != owner_prop {
                                 let chunk_emb_verify = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);

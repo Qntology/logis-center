@@ -1587,6 +1587,15 @@ pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) ->
     }
 }
 
+pub fn step_contract_block(track: &str, step: &str) -> Option<&'static str> {
+    match (track, step) {
+        ("search", "commerce_verify") => Some(
+            "이 단계의 답은 후보 목록에 있는 영문 이름(카테고리·속성)과 영문 JSON 키·연산자를 글자 그대로 옮겨야 합니다. 어휘 16,384 의 4B 는 영문 식별자를 옮길 때 글자를 바꾸거나 줄입니다(goods→good, transcription→trancription, condition→con). 다국어 어휘의 Qwen3 로 둡니다",
+        ),
+        _ => None,
+    }
+}
+
 pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, reference: &Path) -> RouteVerdict {
     let code = match alphaedge_code(doc_lang) {
         Some(c) => c,
@@ -1594,6 +1603,9 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             return closed_verdict(track, step, None, &format!("문서 언어 '{}' 에 대응하는 alphaedge-ai 4B 모델이 없습니다", doc_lang))
         }
     };
+    if let Some(why) = step_contract_block(track, step) {
+        return closed_verdict(track, step, Some(code), why);
+    }
     let native = native_scripts(doc_lang);
     if native.is_empty() {
         return closed_verdict(track, step, Some(code), "bias.json 에 이 언어의 문자 샘플이 없어 단일 언어를 판정할 수 없습니다");
@@ -1648,6 +1660,15 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
         );
     }
     crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_expansion", track), fit.expansion());
+    let prompt_probe = format!(
+        "{}\n{}",
+        crate::prompts::extract_synthesis_field_prompt_native("", "general_insight", "", doc_lang, ""),
+        sample
+    );
+    let prompt_fit = token_fit(code, &prompt_probe, reference).ok();
+    if let Some(pf) = prompt_fit.as_ref() {
+        crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_prompt_expansion", track), pf.expansion());
+    }
     if fit.expansion() > ROUTE_MAX_EXPANSION {
         return closed_verdict(
             track,
@@ -1694,10 +1715,20 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             probe = format!(" | SDS 통과율 {:.2} < 기준 {:.2} 로 닫힌 경로를 관측용으로 한 번 엽니다", recent, floor);
         }
     }
+    let prompt_note = prompt_fit
+        .map(|pf| {
+            format!(
+                " | 영문 지시문을 붙인 프롬프트 기준 4B {} / 기준 {} = {:.2}배 (관측만)",
+                pf.lang_tokens,
+                pf.ref_tokens,
+                pf.expansion()
+            )
+        })
+        .unwrap_or_default();
     RouteVerdict {
         code: Some(code.to_string()),
         line: format!(
-            "🧭 [LANG ROUTE] {}.{} | Qwen3.5-4B-{} (alphaedge-ai) 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}",
+            "🧭 [LANG ROUTE] {}.{} | Qwen3.5-4B-{} (alphaedge-ai) 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}{}",
             track,
             step,
             code,
@@ -1708,6 +1739,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             fit.lang_tokens,
             fit.ref_tokens,
             fit.expansion(),
+            prompt_note,
             probe
         ),
     }
