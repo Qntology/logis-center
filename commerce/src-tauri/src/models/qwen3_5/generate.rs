@@ -428,8 +428,15 @@ impl Qwen3_5GenerateModel {
             
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
 
-            // 🌟 오답 진영의 단어들은 아예 생성되지 못하도록 억제력(Sub)을 가합니다!
-            let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+            let logits = if let Some(prej) = semantic_prejudice_tensor.as_mut() {
+                if !prej.device().same_device(logits.device()) {
+                    println!(
+                        "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
+                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
+                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                    );
+                    *prej = prej.to_device(logits.device())?;
+                }
                 logits.broadcast_sub(prej)?
             } else {
                 logits
@@ -859,8 +866,15 @@ impl Qwen3_5GenerateModel {
             
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-            // 🌟 오답 진영 억제력(Sub) 적용
-            let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+            let logits = if let Some(prej) = semantic_prejudice_tensor.as_mut() {
+                if !prej.device().same_device(logits.device()) {
+                    println!(
+                        "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
+                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
+                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                    );
+                    *prej = prej.to_device(logits.device())?;
+                }
                 logits.broadcast_sub(prej)?
             } else {
                 logits

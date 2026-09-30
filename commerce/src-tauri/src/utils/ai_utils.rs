@@ -5191,11 +5191,65 @@ struct SynSource {
     month_days: std::collections::HashSet<(u32, u32)>,
     months: std::collections::HashSet<u32>,
     currencies: std::collections::HashSet<&'static str>,
+    times: std::collections::HashSet<(u32, u32)>,
+    text_key: String,
+    roman_key: String,
+}
+
+fn syn_clock(core: &str) -> Option<(u32, u32)> {
+    let lower = core.to_lowercase();
+    let body = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '.');
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if parts[0].len() > 2 || parts[1].len() != 2 {
+        return None;
+    }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+fn syn_text_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn syn_quoted_spans(sentence: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 6] = [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’'), ('「', '」'), ('『', '』')];
+    let chars: Vec<char> = sentence.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let open_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+        let close = PAIRS.iter().find(|(o, _)| *o == chars[i]).map(|(_, c)| *c);
+        if let (Some(close), true) = (close, open_ok) {
+            let end = (i + 1..chars.len()).find(|&j| chars[j] == close && (j + 1 >= chars.len() || !chars[j + 1].is_alphanumeric()));
+            if let Some(j) = end {
+                let span: String = chars[i + 1..j].iter().collect();
+                if span.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                    out.push(span.trim().to_string());
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn syn_source(source: &str, doc_lang: &str) -> SynSource {
     let mut s = SynSource::default();
     s.currencies.insert(default_currency_for_lang(doc_lang));
+    s.text_key = syn_text_key(source);
+    s.roman_key = syn_text_key(&any_ascii::any_ascii(source));
     let toks: Vec<&str> = source
         .split(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']' || c == '=')
         .filter(|t| !t.is_empty())
@@ -5205,6 +5259,9 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
             s.currencies.insert(c);
         }
         let core = syn_core(raw);
+        if let Some(t) = syn_clock(core) {
+            s.times.insert(t);
+        }
         if let Some((y, m, d)) = syn_date_literal(core) {
             if let Some(y) = y {
                 s.years.insert(y);
@@ -5376,6 +5433,12 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
                 .trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '\'' | '"'));
             bad.push(format!("통화 {}", shown));
         }
+        if let Some((h, m)) = syn_clock(syn_core(raw)) {
+            if !src.times.iter().any(|(sh, sm)| *sm == m && sh % 12 == h % 12) {
+                bad.push(format!("시각 {:02}:{:02}", h, m));
+            }
+            continue;
+        }
         if used[i] || raw.contains(':') {
             continue;
         }
@@ -5419,6 +5482,15 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
         }
         if !src.numbers.contains(&key) {
             bad.push(format!("수치 {}", digit_part.trim_end_matches(|c: char| c == ',' || c == '.')));
+        }
+    }
+    for span in syn_quoted_spans(sentence) {
+        let k = syn_text_key(&span);
+        if k.chars().count() < 2 {
+            continue;
+        }
+        if !src.text_key.contains(&k) && !src.roman_key.contains(&k) {
+            bad.push(format!("인용 '{}'", span));
         }
     }
     bad
@@ -6693,6 +6765,17 @@ pub fn country_code_of(value: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+pub fn country_code_exact(value: &str) -> Option<&'static str> {
+    let joined = country_norm(value);
+    if joined.is_empty() {
+        return None;
+    }
+    COUNTRY_NAMES_ML
+        .iter()
+        .find(|(_, raw)| raw.split(',').any(|name| country_norm(name) == joined))
+        .map(|(code, _)| *code)
 }
 
 pub fn is_multi_value_field(field_name: &str) -> bool {

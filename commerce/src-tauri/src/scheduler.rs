@@ -19,6 +19,7 @@ mod worker;
 mod entity;
 pub mod relay_ledger;
 pub mod trading;
+pub mod list_census;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
 use crate::scheduler::indexing::{upsert_alias_chunks, index_item_chunks, save_item};
@@ -2546,10 +2547,19 @@ pub async fn process_task(
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    let mut census_selector_used = false;
+    let list_census: Option<crate::scheduler::list_census::ListCensus> = if !is_detail && !skip_ai_analysis {
+        let mut census = crate::scheduler::list_census::run(&clean_html_content);
+        crate::scheduler::list_census::score_content(&mut census, &model, &page_type, &doc_lang).await;
+        for line in census.report_lines() {
+            emit_term(&line);
+        }
+        crate::utils::score_dynamics::record_baseline("commerce.census_data_groups", census.data_grade_count() as f32);
+        Some(census)
+    } else {
+        None
+    };
     model.deep_purge_resources().await;
-    // 🌟 [CROSSOVER] 직접 퍼지한 경로는 페이즈 상태를 되돌려야 합니다.
-    //    이 줄이 없으면 다음 enter_*_phase 가 '아직 상주 중' 으로 오판해
-    //    불필요한 스왑을 하거나, 반대로 로드를 생략해 버립니다.
     model.mark_crossover_idle();
  
     {
@@ -2597,8 +2607,7 @@ pub async fn process_task(
 
 
 
-                let mut titles = Vec::new();
-                {
+                let (titles, titles_well_formed): (Vec<String>, bool) = {
                     let params = ChatCompletionParameters {
                         messages: vec![
                             ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -2610,7 +2619,7 @@ pub async fn process_task(
                                 name: None,
                             })
                         ],
-                        model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
+                        model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3.5".to_string() }, 
                         max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
                         ..Default::default()
                     };
@@ -2645,74 +2654,87 @@ pub async fn process_task(
                     } else {
                         model
                             .switch_to_generation(
-                                crate::model::ModelSize::Qwen3,
+                                crate::model::ModelSize::Qwen3_5,
                                 Some(cancellation_token.clone()),
-                                None,
-                                "title extraction (Qwen3)",
+                                kv_name.clone(),
+                                "title extraction (Qwen3.5-2B)",
                             )
                             .await?;
-                        let q3_gen_arc = model.qwen3_generator.clone();
-                        let cancel_clone = cancellation_token.clone();
                         let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                            let mut gen_guard = q3_gen_arc.blocking_lock();
-                            if let Some(gen) = gen_guard.as_mut() {
-                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone), None, Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
-                            } else {
-                                Err(anyhow::anyhow!("Qwen3 generator missing"))
-                            }
-                        }).await??
+                        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                            println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3.5-2B)...");
+                            gen.generate(
+                                params,
+                                Some(cancellation_token.clone()),
+                                Some(snapshot_id.clone()),
+                                kv_name.clone(),
+                                None,
+                                Some(&title_prej),
+                            ).await?
+                        } else {
+                            return Err(anyhow::anyhow!("Qwen3.5 generator missing"));
+                        }
                     };
                     
                     println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
 
-
                     let title_info = parsing::parse_json_from_llm(&res);
-                        
-                    if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
-                        return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                    let well_formed = title_info.as_object().map_or(false, |obj| !obj.is_empty());
+                    let harvested = crate::scheduler::list_census::harvest_titles(&title_info, &res);
+                    crate::utils::score_dynamics::record_baseline("commerce.title_llm_count", harvested.len() as f32);
+                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", harvested);
+                    (harvested, well_formed)
+                };
+
+                if base_model_size == crate::model::ModelSize::Qwen {
+                    model.deep_purge_resources().await;
+                }
+
+                let mut census_selector: Option<serde_json::Value> = None;
+                if titles.is_empty() {
+                    let census = list_census.as_ref();
+                    if let Some(empty) = census.filter(|_| titles_well_formed).and_then(|c| c.empty_verdict()) {
+                        emit_term(&format!(
+                            "  📭 [EMPTY LIST VERDICT] LLM 이 정상 JSON 으로 빈 제목 목록을 돌려주었고 DOM 전수 조사도 같은 결론입니다: 표 '{}' 는 머리행 {}칸 · 본문 {}행이며 본문에 데이터 행이 없습니다 (\"{}\"). 폼·랜드마크 밖에서 여러 칸짜리 반복 구조도 0개입니다. 서로 독립인 두 근거가 일치하므로 오류로 중단하지 않고 '0건 목록' 으로 완료합니다. 셀렉터는 캐시하지 않으므로 행이 생긴 뒤 같은 페이지를 넣으면 처음부터 분석합니다.",
+                            empty.selector, empty.header_cells, empty.body_rows, empty.notice
+                        ));
+                        crate::utils::score_dynamics::record_baseline("commerce.census_empty_verdict", 1.0);
+                        let payload = json!({
+                            "task_id": task.id,
+                            "category": "Done",
+                            "summary": "Extraction complete. The list has no rows (0 items).",
+                            "spinner": "✅",
+                            "data": null
+                        });
+                        let _ = app_handle.emit("extraction-progress", &payload);
+                        log_task_progress(app_handle, &task.id, &payload);
+                        emit_term(&format!("[PROCESS] {}", crate::utils::score_dynamics::report()));
+                        crate::utils::score_dynamics::flush();
+                        crate::utils::score_dynamics::leave_scope();
+                        return Ok(());
                     }
-
-                    let items_opt = title_info.get("order")
-                        .or(title_info.get("goods"))
-                        .or(title_info.get("title"))
-                        .or(title_info.get("titles"))
-                        .or(title_info.get("product"))
-                        .and_then(|v| v.as_array());
-
-                    if let Some(items) = items_opt {
-                        for item in items {
-                            let t_val = if let Some(t) = item.as_str() {
-                                Some(t)
-                            } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                                Some(t)
-                            } else {
-                                None
-                            };
-                            
-                            if let Some(t) = t_val {
-                                
-                                let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
-                                let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
-                                
-                                if !is_only_numbers {
-                                    titles.push(t.to_string());
-                                }
-                            }
+                    match census.and_then(|c| c.decisive_fallback()) {
+                        Some(g) => {
+                            emit_term(&format!(
+                                "  🧮 [CENSUS FALLBACK / NO TITLES] LLM 제목이 비어 Boa 가 기준으로 삼을 텍스트가 없지만, DOM 전수 조사가 결정적인 목록 1개를 찾았습니다: '{}' | 행 {} · 칸 평균 {:.1} · 내용마진 {:+.4} · 2위 대비 구조점수 2배 이상. 이 셀렉터로 이어 가되 페이지 캐시에는 남기지 않습니다.",
+                                g.item_selector, g.members, g.avg_cells, g.content_margin.unwrap_or(0.0)
+                            ));
+                            crate::utils::score_dynamics::record_baseline("commerce.census_fallback", 1.0);
+                            census_selector = Some(g.selector_json());
+                        }
+                        None if !titles_well_formed => {
+                            return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
                         }
                     }
-                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
                 }
 
-                model.deep_purge_resources().await;
-
-                if titles.is_empty() {
-                    
-                    return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
-                }
-
-                {
+                if let Some(sel) = census_selector.take() {
+                    selector_info = sel;
+                    census_selector_used = true;
+                } else {
                     println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
                     let mut context = Context::default();
                     
@@ -2764,13 +2786,44 @@ pub async fn process_task(
 
                     match context.eval(Source::from_bytes(js_code.as_bytes())) {
                         Ok(val) => {
-                            let res_str = val.as_string().unwrap().to_std_string_escaped();
+                            let res_str = val.as_string().map(|s| s.to_std_string_escaped()).unwrap_or_default();
                             println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
 
                             selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
                         },
                         Err(e) => {
                             println!("[JS-BRIDGE] Error executing JS: {:?}", e);
+                        }
+                    }
+                    let boa_count = selector_info.get("matchCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let boa_items = selector_info.get("itemSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if boa_count == 0 {
+                        match list_census.as_ref().and_then(|c| c.anchor_titles(&titles).or_else(|| c.decisive_fallback())) {
+                            Some(g) => {
+                                emit_term(&format!(
+                                    "  🧮 [CENSUS FALLBACK / BOA MISS] Boa 가 제목 {:?} 로 반복 구조를 찾지 못했습니다 (matchCount 0 이면 기본값 'body div' 가 페이지의 모든 div 를 아이템으로 만듭니다). DOM 전수 조사에서 제목을 품은 반복 구조 '{}' (행 {} · 칸 평균 {:.1}) 로 대신하고, 페이지 캐시에는 남기지 않습니다.",
+                                    titles, g.item_selector, g.members, g.avg_cells
+                                ));
+                                crate::utils::score_dynamics::record_baseline("commerce.census_fallback", 1.0);
+                                selector_info = g.selector_json();
+                                census_selector_used = true;
+                            }
+                            None => {
+                                return Err(anyhow::anyhow!("[JS-BRIDGE] Boa found no repeated structure for titles {:?} and the DOM census has no candidate that contains them. Aborting task to prevent invalid DOM fallback ('body div').", titles));
+                            }
+                        }
+                    } else if let Some(census) = list_census.as_ref() {
+                        match census.shadow_agreement(&clean_html_content, &boa_items) {
+                            Some((jac, g, n)) => {
+                                crate::utils::score_dynamics::record_baseline("commerce.census_shadow_jaccard", jac);
+                                emit_term(&format!(
+                                    "  🧮 [CENSUS SHADOW] Boa '{}' {}개 ↔ 전수 조사 1위 '{}' {}개 | 겹침(Jaccard) {:.2} — 관측만 합니다. 이 분포가 쌓이면 둘이 어긋난 문서에서 어느 쪽이 맞았는지를 숫자로 보고 승격 여부를 정합니다.",
+                                    boa_items, n, g.item_selector, g.members, jac
+                                ));
+                            }
+                            None => {
+                                emit_term("  🧮 [CENSUS SHADOW] 전수 조사에 여러 칸짜리 반복 구조가 없어 Boa 결과와 비교하지 않습니다.");
+                            }
                         }
                     }
                 }
@@ -3155,7 +3208,9 @@ pub async fn process_task(
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
             
-            if !is_detail {
+            if census_selector_used {
+                emit_term("  🧮 [CENSUS SELECTOR / NO CACHE] 이번 목록 셀렉터는 'LLM 제목 → Boa 검증' 이 아니라 DOM 전수 조사에서 왔습니다. 페이지 캐시에 저장하지 않으므로, 다음 실행은 처음부터 다시 분석해 Boa 가 확인한 셀렉터만 캐시에 남습니다.");
+            } else if !is_detail {
                 let mut page_data: serde_json::Value = selector_info.clone();
                 if let Some(obj) = page_data.as_object_mut() {
                     obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
@@ -3931,22 +3986,20 @@ pub async fn process_task(
             //    · 여유가 없으면 임베딩만 반환시킨 뒤 Qwen3 를 올립니다.
             //  Qwen3 는 0.6B 라 임베딩과 함께 있어도 대부분 여유가 남습니다.
             //  이 판정이 하드코딩이 아니라 실측이므로 GPU 가 바뀌어도 유효합니다.
-            model
-                .enter_generation_phase(
-                    crate::model::ModelSize::Qwen3,
-                    None,
-                    Some(cancellation_token.clone()),
-                    false,
-                    Some("inference".to_string()),
-                    "list item extraction loop",
-                )
-                .await?;
-            emit_term(&format!("  {}", model.crossover_report()));
+            const SYNTHESIS_SKIP_DROP: f32 = 0.8;
+            let mut qwen3_ready = false;
+            let synthesis_gate: Option<(f32, u64)> = crate::utils::score_dynamics::adaptive_recent("commerce.synthesis_sentence_drop")
+                .filter(|(recent, _, _)| *recent >= SYNTHESIS_SKIP_DROP)
+                .map(|(recent, _, n)| (recent, n));
+            let mut synthesis_probe_item: Option<usize> = None;
+            if let Some((recent, n)) = synthesis_gate {
+                emit_term(&format!(
+                    "  ⏭️ [SYNTHESIS GATE / SDS] 이 스코프에서 최근 요약 문장의 {:.0}% 가 원문 대조(연도·날짜·시각·금액·통화·인용)에서 폐기되었습니다 (누적 관측 {}건, 기준 {:.0}%). 이번 목록의 요약 필드는 아이템 하나에서만 관측용으로 만들고 나머지 아이템은 LLM 을 부르지 않고 비워 둡니다. 관측 아이템은 다른 필드 때문에 Qwen3 가 이미 올라온 첫 아이템이고, 그런 아이템이 끝까지 없으면 마지막 아이템입니다.",
+                    recent * 100.0, n, SYNTHESIS_SKIP_DROP * 100.0
+                ));
+            }
+            emit_term("  💤 [LAZY GENERATOR] 목록 루프의 Qwen3 는 LLM 이 실제로 필요한 첫 필드에서 올립니다. 모든 필드가 헤더 코사인 · Enum · 상태 어휘로 확정되면 이 태스크는 Qwen3 를 올리지 않습니다.");
 
-            // 🌟 [PEAK SAMPLER] 아이템 루프 전 구간의 순간 점유를 추적합니다.
-            //    KV-PLAN 의 free 값은 generate '전' 스냅샷이라 연산 도중의
-            //    전이를 잡지 못합니다. 50ms 폴링이 그 사각지대를 메웁니다.
-            //    루프가 끝나면 Drop 이 자동으로 결과를 출력합니다.
             let vram_probe = model.spawn_vram_sampler("list item extraction loop");
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
@@ -5052,6 +5105,23 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
+                    if field_is_analytic[f_idx] && synthesis_gate.is_some() {
+                        let last_chance = idx + 1 == total_items && synthesis_probe_item.is_none();
+                        if synthesis_probe_item.map_or(qwen3_ready || last_chance, |p| p == idx) {
+                            synthesis_probe_item = Some(idx);
+                            emit_term(&format!(
+                                "    🔬 [SYNTHESIS PROBE] Field: '{}' | 게이트가 닫힌 스코프에서도 목록마다 아이템 하나(Qwen3 가 이미 올라온 첫 아이템, 없으면 마지막 아이템)에서는 관측용으로 요약을 만듭니다. 결과는 같은 원문 대조 게이트를 거쳐 SDS 에 쌓이므로, 요약 품질이 좋아지면 이 게이트는 스스로 다시 열립니다.",
+                                field_name
+                            ));
+                        } else {
+                            emit_term(&format!(
+                                "    ⏭️ [SYNTHESIS SKIP / SDS] Field: '{}' | 이 스코프에서 원문에 없는 사실로 폐기되는 비율이 기준을 넘은 요약 축이라 LLM 을 부르지 않고 비워 둡니다.",
+                                field_name
+                            ));
+                            crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+                            continue;
+                        }
+                    }
                     let synthesis_sheet: Option<String> = if field_is_analytic[f_idx] {
                         crate::utils::ai_utils::synthesis_value_sheet(&item_val, &page_type, &doc_lang)
                     } else {
@@ -5182,7 +5252,24 @@ pub async fn process_task(
                     
                     let mut ignore_list: Vec<String> = global_ignore_list.clone();
                     let mut miss_counter = 0;
-                    // 🌟 [PEAK SAMPLER] 최저점이 어느 필드에서 나왔는지 귀속시킵니다.
+                    if !qwen3_ready {
+                        vram_probe.phase(format!("item {}/{} · Qwen3 load", idx + 1, total_items));
+                        model
+                            .enter_generation_phase(
+                                crate::model::ModelSize::Qwen3,
+                                None,
+                                Some(cancellation_token.clone()),
+                                false,
+                                Some("inference".to_string()),
+                                "list item extraction loop (first LLM field)",
+                            )
+                            .await?;
+                        emit_term(&format!(
+                            "  💡 [LAZY GENERATOR] Item {}/{} · Field '{}' 에서 처음으로 LLM 이 필요해 Qwen3 를 올렸습니다. {}",
+                            idx + 1, total_items, field_name, model.crossover_report()
+                        ));
+                        qwen3_ready = true;
+                    }
                     vram_probe.phase(format!("item {}/{} · field '{}'", idx + 1, total_items, field_name));
                     
                     loop {

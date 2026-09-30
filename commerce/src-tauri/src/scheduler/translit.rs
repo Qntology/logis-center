@@ -211,6 +211,13 @@ pub async fn transliterate_cross_language(
     let _ = (app_handle, task_id);
     let src = text.trim().to_string();
     if src.is_empty() { return (String::new(), String::new()); }
+    if let Some((native, roman, code)) = crate::nl_convert::canonical_entity_alias(&src, doc_lang) {
+        println!(
+            "[ANALYTIC] 🌐 [CANONICAL ALIAS] '{}' → native='{}' | roman='{}' (국가 코드 {}) — 국가명은 언어마다 정해진 이름이 있는 닫힌 어휘라 음차 대신 국가명 표의 표기를 씁니다.",
+            src, native, roman, code
+        );
+        return (native, roman);
+    }
 
     let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
     let sample = crate::nl_convert::native_script_sample(doc_lang, "", "");
@@ -311,8 +318,11 @@ pub async fn generate_transliteration_aliases(
     let mut reused = 0usize;
     let mut skipped = 0usize;
     let mut phonetic_dropped = 0usize;
+    let mut canonical_made = 0usize;
+    let mut mixed_dropped = 0usize;
     let lang_engine_ready = crate::model::lang_llm::lang_engine_available(doc_lang);
     let recheck_engine = crate::model::lang_llm::engine_tag(doc_lang);
+    let recheck_key = format!("{}@{}", recheck_engine, crate::nl_convert::TRANSLIT_GATE_REV);
 
     let mut generation_ready = false;
     let mut engine_label = String::from("Qwen3.5-2B");
@@ -364,14 +374,37 @@ pub async fn generate_transliteration_aliases(
             continue;
         }
 
+        if let Some((native, roman, code)) = crate::nl_convert::canonical_entity_alias(&src, doc_lang) {
+            let pair = (native, roman);
+            let same_cached = TRANSLIT_MEM_CACHE
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&translit_cache_key(&src, doc_lang)).cloned())
+                .map_or(false, |c| c == pair);
+            if same_cached {
+                reused += 1;
+            } else {
+                emit(&format!(
+                    "      🌐 [CANONICAL ALIAS] '{}' → native='{}' | roman='{}' (국가 코드 {} · property='{}') | 국가명은 소리를 옮기는 값이 아니라 언어마다 정해진 이름이 있는 닫힌 어휘입니다. LLM 음차('China'→'신화', 'Germany'→'게르만이') 대신 국가명 표의 문서 언어 표기를 쓰고, 캐시에 남은 이전 음차도 이 값으로 덮어씁니다.",
+                    src, pair.0, pair.1, code, cm.property
+                ));
+                crate::utils::score_dynamics::record_baseline("indexing.translit_canonical", 1.0);
+                canonical_made += 1;
+                save_translit_cache(app_handle, &src, doc_lang, &pair.0, &pair.1);
+            }
+            cache.insert(src.clone(), pair.clone());
+            out[i] = pair;
+            continue;
+        }
+
         let cached_hit = query_translit_cache(app_handle, &src, doc_lang).await.filter(|hit| {
             match crate::nl_convert::cached_translit_recheck(&src, &hit.0, doc_lang, lang_engine_ready)
-                .filter(|_| first_recheck(&src, doc_lang, &recheck_engine))
+                .filter(|_| first_recheck(&src, doc_lang, &recheck_key))
             {
                 Some(why) => {
                     emit(&format!(
-                        "  🔁 [TRANSLIT CACHE / RECHECK] '{}' 캐시 별칭 native='{}' 을 다시 만듭니다: {} (엔진 {} 기준 최초 1회 · 결과가 같아도 이 엔진으로는 다시 만들지 않습니다)",
-                        src, hit.0, why, recheck_engine
+                        "  🔁 [TRANSLIT CACHE / RECHECK] '{}' 캐시 별칭 native='{}' 을 다시 만듭니다: {} (엔진 {} · 게이트 {} 기준 최초 1회 · 결과가 같아도 이 조합으로는 다시 만들지 않습니다)",
+                        src, hit.0, why, recheck_engine, crate::nl_convert::TRANSLIT_GATE_REV
                     ));
                     false
                 }
@@ -689,6 +722,21 @@ pub async fn generate_transliteration_aliases(
 
         // 🌟 [MIXED MODE FAST PATH] 혼용 모드에서는 언어 통일 문자열이 이미 생성되어 있으므로
         //    PASS-2 를 건너뛰고 직접 pair 를 조립합니다.
+        if !s1_transliteration.contains("|||") {
+            let leftover: Vec<String> = crate::nl_convert::find_mixed_script_words(&s1)
+                .into_iter()
+                .filter(|w| !src.split_whitespace().any(|sw| sw == w))
+                .collect();
+            if !leftover.is_empty() {
+                emit(&format!(
+                    "    🚫 [MIXED SCRIPT LEFTOVER] '{}' → '{}' | 재음차 뒤에도 한 단어 안에 두 문자 체계가 섞인 조각 {:?} 이 남았습니다. 이런 별칭은 어느 언어의 질의와도 맞지 않고 FTS 에 깨진 토큰만 남기므로 쓰지 않습니다.",
+                    src, s1, leftover
+                ));
+                mixed_dropped += 1;
+                s1 = String::new();
+            }
+        }
+
         let pair: (String, String) = if s1_transliteration.contains("|||") {
             let mut parts = s1_transliteration.splitn(2, "|||");
             let native_candidate = parts.next().unwrap_or("").trim().to_string();
@@ -800,11 +848,11 @@ pub async fn generate_transliteration_aliases(
         out[i] = final_pair;
     }
 
-    if made > 0 || reused > 0 || phonetic_dropped > 0 {
+    if made > 0 || reused > 0 || phonetic_dropped > 0 || canonical_made > 0 || mixed_dropped > 0 {
         emit(&format!(
-            "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음 게이트 폐기 {}건",
+            "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 국가명 정규 별칭 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음·글자읽기 게이트 폐기 {}건 | 혼용 조각 폐기 {}건",
             if generation_ready { engine_label.as_str() } else { "캐시" },
-            made, reused, skipped, phonetic_dropped
+            made, canonical_made, reused, skipped, phonetic_dropped, mixed_dropped
         ));
     }
 
