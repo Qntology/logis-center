@@ -890,6 +890,8 @@ impl VectorStore {
                                 crate::logic::parse_status(t) as f64
                             } else if let Some(ms) = iso_to_epoch_ms(t) {
                                 ms as f64
+                            } else if crate::utils::ai_utils::numeric_run_count(t) > 1 {
+                                continue;
                             } else {
                                 let cleaned: String = t.chars()
                                     .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')

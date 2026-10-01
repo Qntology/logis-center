@@ -108,6 +108,323 @@ fn derive_thead_selector(html: &str, target_selector: &str) -> Option<(String, S
 /// 🌟 [PREJUDICE PAIR] 영어 편견 문장 벡터에 문서 언어 편견 문장 벡터를 더합니다.
 ///  두 벡터 중 최댓값(max_pool_sim)으로 재므로 단일 문장 코사인에 맞춰 둔 임계 눈금이 그대로 유지됩니다.
 ///  수십 구의 뱅크로 바꾸면 최댓값이 구조적으로 올라가 0.35 / 0.38 / 0.50 / 0.55 임계가 한꺼번에 어긋납니다.
+const SYNTHESIS_SKIP_DROP: f32 = 0.8;
+
+async fn run_synthesis_pass(
+    model: &LogisModel,
+    items: &mut Vec<Value>,
+    jobs: &[(usize, String, String)],
+    item_pos: &std::collections::HashMap<usize, usize>,
+    page_type: &str,
+    doc_lang: &str,
+    probe_text: &str,
+    skip_drop: f32,
+    cancel: &Arc<AtomicBool>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+    step: &str,
+) -> Result<()> {
+    use crate::openai_types::{
+        ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    };
+    const STREAK_LIMIT: usize = 4;
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let pass_reason = format!("{} pass", step.replace('_', " "));
+    let verdict = model.lang_route("commerce", step, doc_lang, probe_text).await;
+    emit_term(&format!("  {}", verdict.line));
+    let mut lang: Option<crate::model::lang_llm::LangSession> = match verdict.code.as_deref() {
+        Some(code) => model.enter_lang_generation(code, &pass_reason).await,
+        None => None,
+    };
+    if lang.is_none() {
+        model
+            .enter_generation_phase(
+                crate::model::ModelSize::Qwen3,
+                None,
+                Some(cancel.clone()),
+                false,
+                Some("inference".to_string()),
+                &pass_reason,
+            )
+            .await?;
+    }
+    let sds_gate = |is_lang: bool| -> Option<(f32, u64)> {
+        crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(is_lang))
+            .filter(|(recent, _, _)| *recent >= skip_drop)
+            .map(|(recent, _, n)| (recent, n))
+    };
+    let total_items = items.len();
+    emit_term(&format!(
+        "  🧠 [SYNTHESIS PASS] 요약 {}건을 {} 로 만듭니다 | 값이 모두 확정된 아이템의 값표만 넘기고, 추출 단계의 디코딩 제약(확정된 다른 필드 값의 금지 목록 · 다른 필드 의미 편견)을 걸지 않습니다. 결과는 같은 원문 대조 게이트를 거치고, 연속 {}건이 게이트를 통과하지 못하면 다음 엔진으로 넘기거나 멈춥니다.",
+        jobs.len(),
+        lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string()),
+        STREAK_LIMIT
+    ));
+    let announce_gate = |g: Option<(f32, u64)>| {
+        if let Some((recent, n)) = g {
+            emit_term(&format!(
+                "    🔬 [SYNTHESIS PASS / SDS] 이 엔진의 최근 요약 문장 {:.0}% 가 원문 대조에서 폐기되었습니다 (관측 {}건, 기준 {:.0}%). 이번 목록은 첫 요약 하나만 관측용으로 만들고 나머지는 비워 둡니다.",
+                recent * 100.0,
+                n,
+                skip_drop * 100.0
+            ));
+        }
+    };
+    let mut gate = sds_gate(lang.is_some());
+    announce_gate(gate);
+    let mut observed = false;
+    let mut streak = 0usize;
+    let lang_label = lang.as_ref().map(|s| s.label());
+    let mut stats: [(usize, usize, u128); 2] = [(0, 0, 0); 2];
+    for (done, (item_idx, field_name, field_desc)) in jobs.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Task cancelled"));
+        }
+        let pos = match item_pos.get(item_idx) {
+            Some(p) => *p,
+            None => continue,
+        };
+        if gate.is_some() && observed {
+            crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+            continue;
+        }
+        let item = match items.get(pos) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        let sheet = match crate::utils::ai_utils::synthesis_value_sheet(&item, page_type, doc_lang) {
+            Some(s) => s,
+            None => {
+                emit_term(&format!(
+                    "    ⏭️ [SYNTHESIS PASS] Item {}/{} · '{}' | 확정된 값이 2개 미만이라 요약 재료가 없습니다.",
+                    pos + 1,
+                    total_items,
+                    field_name
+                ));
+                continue;
+            }
+        };
+        crate::utils::score_dynamics::record_baseline("commerce.synthesis_sheet_fields", sheet.lines().count() as f32);
+        emit_term(&format!(
+            "    🧠 [SYNTHESIS PASS / VALUE SHEET] Item {}/{} · '{}' | 확정된 값 {}개를 요약 재료로 넘깁니다.",
+            pos + 1,
+            total_items,
+            field_name,
+            sheet.lines().count()
+        ));
+        let used_lang = lang.is_some();
+        let question = if used_lang {
+            parsing::extract_synthesis_field_prompt_native(page_type, field_name, field_desc, doc_lang, &sheet)
+        } else {
+            parsing::extract_synthesis_field_prompt(page_type, field_name, field_desc, doc_lang, &sheet)
+        };
+        let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: format!(
+                "[JSON CONTEXT]\n{}\n\n[SYNTHESIS FIELD NOTICE]\nThis field is NOT a value to copy. Read the WHOLE [JSON CONTEXT] above and write ONE short sentence that summarizes it. Never return a single cell value such as a bare number, a status word, a person name, or a branch name. If [JSON CONTEXT] is empty, return null.",
+                sheet
+            ),
+            name: None,
+        });
+        let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(question),
+            name: None,
+        });
+        let keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
+        let started = std::time::Instant::now();
+        let res = if let Some(sess) = lang.as_ref() {
+            model
+                .generate_lang_json(sess.code(), vec![system_message, user_msg], 512, 0.0, None, &keys, Some(cancel.clone()))
+                .await
+                .map(|(text, _)| text)
+        } else {
+            let q3_gen = model.qwen3_generator.clone();
+            let cancel_clone = cancel.clone();
+            let params = ChatCompletionParameters {
+                messages: vec![system_message, user_msg],
+                model: "qwen3".to_string(),
+                max_tokens: Some(512),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let r = tokio::task::spawn_blocking(move || {
+                let mut guard = q3_gen.blocking_lock();
+                match guard.as_mut() {
+                    Some(gen) => gen
+                        .generate(params, Some(cancel_clone), None, None)
+                        .map_err(|e| anyhow::anyhow!("Qwen 3 synthesis failed: {}", e)),
+                    None => Err(anyhow::anyhow!("Qwen 3 Generator not available")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+            let q3_clear = model.qwen3_generator.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(gen) = q3_clear.blocking_lock().as_mut() {
+                    gen.clear_kv_cache();
+                }
+            })
+            .await;
+            if !model.is_cpu_mode {
+                let dev = model.device_config.device.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() {
+                        let _ = dev.synchronize();
+                    }
+                })
+                .await;
+            }
+            r
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Task cancelled"));
+        }
+        let call_ms = started.elapsed().as_millis();
+        crate::utils::score_dynamics::record_baseline(
+            if used_lang { "commerce.synthesis_call_ms.lang4b" } else { "commerce.synthesis_call_ms.qwen3" },
+            call_ms as f32,
+        );
+        observed = true;
+        let mut lang_failed = false;
+        let found: Option<(String, String)> = match res {
+            Ok(raw) => {
+                let mut parsed = parsing::parse_json_from_llm(&raw);
+                let parsed_val = if let Some(inner) = parsed.get_mut(page_type) { inner.take() } else { parsed };
+                let sheet_values: Vec<String> = sheet
+                    .lines()
+                    .filter_map(|l| l.split_once(": ").map(|(_, v)| v.trim().to_lowercase()))
+                    .collect();
+                let not_summary = |s: &str| -> bool {
+                    let t = s.trim().trim_matches(|c: char| c == '.' || c == '"' || c == '\'').trim().to_lowercase();
+                    !t.chars().any(|c| c.is_alphanumeric())
+                        || ["null", "string", "n/a", "none", "undefined"].contains(&t.as_str())
+                        || sheet_values.iter().any(|v| *v == t)
+                };
+                let hit = keys.iter().find_map(|k| {
+                    parsed_val
+                        .get(k.as_str())
+                        .and_then(|v| v.as_str())
+                        .map(|s| strip_markup_prefix(s.trim()))
+                        .filter(|s| !not_summary(s))
+                        .map(|s| (k.clone(), s))
+                });
+                if hit.is_none() {
+                    emit_term(&format!(
+                        "    ⏭️ [SYNTHESIS PASS] Item {}/{} · '{}' | 응답에 요약 문장이 없습니다 (빈 값 · 자리표시 · 값표의 값 하나를 그대로 돌려준 응답). 요약 필드의 답은 값 둘 이상을 잇는 문장이어야 합니다.",
+                        pos + 1,
+                        total_items,
+                        field_name
+                    ));
+                }
+                hit
+            }
+            Err(e) => {
+                emit_term(&format!(
+                    "    ⚠️ [SYNTHESIS PASS] Item {}/{} · '{}' | 생성에 실패했습니다: {}",
+                    pos + 1,
+                    total_items,
+                    field_name,
+                    e
+                ));
+                lang_failed = used_lang;
+                None
+            }
+        };
+        let pass = match found {
+            Some((key, text)) => {
+                let g = crate::utils::ai_utils::synthesis_fact_gate(&text, &sheet, doc_lang);
+                if g.total > 0 {
+                    crate::utils::score_dynamics::record_baseline(
+                        crate::model::lang_llm::synthesis_drop_axis(used_lang),
+                        g.dropped.len() as f32 / g.total as f32,
+                    );
+                }
+                if !g.dropped.is_empty() {
+                    emit_term(&format!(
+                        "    🧪 [SYNTHESIS GROUNDING] Item {}/{} · '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                        pos + 1,
+                        total_items,
+                        key,
+                        g.total,
+                        g.dropped.len(),
+                        g.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                        g.kept
+                    ));
+                }
+                if !g.kept.is_empty() {
+                    if let Some(obj) = items.get_mut(pos).and_then(|v| v.as_object_mut()) {
+                        obj.insert(key.clone(), json!(g.kept.clone()));
+                    }
+                    emit_term(&format!("    ✅ [SYNTHESIS PASS] Item {}/{} · \"{}\": \"{}\"", pos + 1, total_items, key, g.kept));
+                }
+                g.dropped.is_empty() && !g.kept.is_empty()
+            }
+            None => false,
+        };
+        crate::model::lang_llm::record_engine_outcome("commerce", step, used_lang, pass);
+        let slot = &mut stats[usize::from(used_lang)];
+        slot.0 += 1;
+        slot.1 += usize::from(pass);
+        slot.2 += call_ms;
+        streak = if pass { 0 } else { streak + 1 };
+        if lang_failed || streak >= STREAK_LIMIT {
+            if used_lang {
+                emit_term(&format!(
+                    "    🔁 [SYNTHESIS ENGINE FALLBACK] {} 의 요약이 연속 {}건 원문 대조를 통과하지 못했거나 생성에 실패해, 남은 {}건은 Qwen3 로 만듭니다.",
+                    lang.as_ref().map(|s| s.label()).unwrap_or_default(),
+                    streak,
+                    jobs.len() - done - 1
+                ));
+                crate::utils::score_dynamics::record_baseline("commerce.synthesis_engine_fallback", 1.0);
+                lang = None;
+                model
+                    .enter_generation_phase(
+                        crate::model::ModelSize::Qwen3,
+                        None,
+                        Some(cancel.clone()),
+                        false,
+                        Some("inference".to_string()),
+                        &format!("{} (fallback)", pass_reason),
+                    )
+                    .await?;
+                streak = 0;
+                gate = sds_gate(false);
+                announce_gate(gate);
+                observed = false;
+            } else {
+                emit_term(&format!(
+                    "    ⛔ [SYNTHESIS PASS STOP] Qwen3 요약이 연속 {}건 원문 대조를 통과하지 못해 남은 {}건은 비워 둡니다. 확인되지 않은 요약을 색인하지 않는 쪽이 전처리 결과를 지킵니다.",
+                    streak,
+                    jobs.len() - done - 1
+                ));
+                crate::utils::score_dynamics::record_baseline("commerce.synthesis_pass_stop", 1.0);
+                for _ in (done + 1)..jobs.len() {
+                    crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+                }
+                break;
+            }
+        }
+    }
+    let summary: Vec<String> = [(1usize, lang_label.unwrap_or_default()), (0usize, "Qwen3".to_string())]
+        .iter()
+        .filter(|(i, _)| stats[*i].0 > 0)
+        .map(|(i, label)| {
+            let (calls, passes, ms) = stats[*i];
+            format!("{} 호출 {}건 · 통과 {}건 · 호출당 평균 {:.1}초", label, calls, passes, ms as f64 / calls as f64 / 1000.0)
+        })
+        .collect();
+    if !summary.is_empty() {
+        emit_term(&format!(
+            "  📊 [SYNTHESIS PASS / SUMMARY] {} | 원문 대조를 통과한 문장만 아이템에 들어갑니다. 같은 목록에서 엔진별 통과율과 시간을 나란히 봅니다.",
+            summary.join(" | ")
+        ));
+    }
+    crate::utils::score_dynamics::flush();
+    Ok(())
+}
+
 async fn prejudice_pair(model: &LogisModel, en_text: &str, doc_lang: &str) -> Vec<Vec<f32>> {
     let mut out: Vec<Vec<f32>> = Vec::new();
     if let Ok(e) = model.get_embedding(en_text.to_string()).await {
@@ -3981,7 +4298,6 @@ pub async fn process_task(
             //    · 여유가 없으면 임베딩만 반환시킨 뒤 Qwen3 를 올립니다.
             //  Qwen3 는 0.6B 라 임베딩과 함께 있어도 대부분 여유가 남습니다.
             //  이 판정이 하드코딩이 아니라 실측이므로 GPU 가 바뀌어도 유효합니다.
-            const SYNTHESIS_SKIP_DROP: f32 = 0.8;
             let mut qwen3_ready = false;
             let list_route: Option<String> = {
                 let verdict = model.lang_route("commerce", "list_field", &doc_lang, &lang_probe_text).await;
@@ -3996,14 +4312,9 @@ pub async fn process_task(
             };
             let synthesis_gate_lang = synthesis_gate_for(true);
             let synthesis_gate_base = synthesis_gate_for(false);
-            let synthesis_gate: Option<(f32, u64)> = if list_route.is_some() { synthesis_gate_lang } else { synthesis_gate_base };
             let mut synthesis_probe_item: Option<usize> = None;
-            if let Some((recent, n)) = synthesis_gate {
-                emit_term(&format!(
-                    "  ⏭️ [SYNTHESIS GATE / SDS] 이 스코프에서 최근 요약 문장의 {:.0}% 가 원문 대조(연도·날짜·시각·금액·통화·인용)에서 폐기되었습니다 (누적 관측 {}건, 기준 {:.0}%). 이번 목록의 요약 필드는 아이템 하나에서만 관측용으로 만들고 나머지 아이템은 LLM 을 부르지 않고 비워 둡니다. 관측 아이템은 다른 필드 때문에 Qwen3 가 이미 올라온 첫 아이템이고, 그런 아이템이 끝까지 없으면 마지막 아이템입니다.",
-                    recent * 100.0, n, SYNTHESIS_SKIP_DROP * 100.0
-                ));
-            }
+            let mut synthesis_jobs: Vec<(usize, String, String)> = Vec::new();
+            let mut synthesis_item_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
             emit_term("  💤 [LAZY GENERATOR] 목록 루프의 Qwen3 는 LLM 이 실제로 필요한 첫 필드에서 올립니다. 모든 필드가 헤더 코사인 · Enum · 상태 어휘로 확정되면 이 태스크는 Qwen3 를 올리지 않습니다.");
 
             let vram_probe = model.spawn_vram_sampler("list item extraction loop");
@@ -5111,6 +5422,15 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
+                    if field_is_analytic[f_idx] {
+                        synthesis_jobs.push((idx, field_name.clone(), field_desc.clone()));
+                        emit_term(&format!(
+                            "    ⏳ [SYNTHESIS DEFERRED] Field: '{}' | 요약 필드는 이 목록의 추출이 끝난 뒤 요약 패스에서 만듭니다. 값이 모두 확정된 아이템의 값표를 쓰고, 추출용 디코딩 제약 없이 요약에 맞는 엔진으로 생성합니다.",
+                            field_name
+                        ));
+                        continue;
+                    }
+
                     let active_synthesis_gate = if qwen3_ready {
                         if field_lang.is_some() { synthesis_gate_lang } else { synthesis_gate_base }
                     } else if list_route.is_some() {
@@ -5785,6 +6105,7 @@ pub async fn process_task(
                     }
                     
                     emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&item_val).unwrap_or_default()));
+                    synthesis_item_pos.insert(idx, all_extracted_items.len());
                     all_extracted_items.push(item_val);
                     
                     all_item_raw_lines.push(item_lines.clone());
@@ -5824,7 +6145,23 @@ pub async fn process_task(
                 //   dirty 가 아니거나 최소 간격(5초) 미만이면 실제 쓰기는 생략됩니다.
                 crate::utils::score_dynamics::flush();
             }
-            
+
+            drop(field_lang);
+            run_synthesis_pass(
+                &model,
+                &mut all_extracted_items,
+                &synthesis_jobs,
+                &synthesis_item_pos,
+                &page_type,
+                &doc_lang,
+                &lang_probe_text,
+                SYNTHESIS_SKIP_DROP,
+                cancellation_token,
+                &emit_term,
+                "list_synthesis",
+            )
+            .await?;
+
             {
                 let total_extracted_items = all_extracted_items.len();
                 let mut retry_count = 0usize;
@@ -6532,7 +6869,19 @@ pub async fn process_task(
 
             
             
-            let line_is_non_value: Vec<bool> = line_parts.iter().map(|p| is_non_value_role_tag(&p.1)).collect();
+            let control_noise = detail_control_noise_lines(&pug_lines_ref);
+            if !control_noise.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_control_noise", control_noise.len() as f32);
+                emit_term(&format!(
+                    "  🎛️ [DETAIL CONTROL CELL] 입력 컨트롤이 값을 쥔 셀 안의 다른 라인 {}개(선택 안 된 옵션 · 체크 안 된 항목 · 버튼 · 도움말)를 값 후보에서 뺍니다. 이런 셀의 값은 컨트롤이 쥔 값(입력값 · 선택된 옵션 · 체크된 항목의 이름)뿐입니다.",
+                    control_noise.len()
+                ));
+            }
+            let line_is_non_value: Vec<bool> = line_parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| is_non_value_role_tag(&p.1) || control_noise.contains(&i))
+                .collect();
             
             let line_is_selected_option: Vec<bool> = line_parts.iter()
                 .map(|p| p.1 == "option" && pug_attr_flag(&p.2, "selected"))
@@ -6565,10 +6914,19 @@ pub async fn process_task(
             emit_term(&format!("  🔑 [ID/LINK COSINE BANK] 라벨 구 {}개 | 편견 구 {}개 준비 완료.", idlink_label_embs.len(), idlink_prej_embs.len()));
 
             let mut det_id_link: Option<(String, String)> = None;
-
-            
-            
-            {
+            if let Some((tok, role, ev)) = url_typed_self_token(&url, &page_type) {
+                let page_link = match url::Url::parse(&url) {
+                    Ok(u) => format!("{}{}", u.path(), u.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase(),
+                    Err(_) => url.clone(),
+                };
+                crate::utils::score_dynamics::record_baseline("commerce.detail_url_type_identity", 1.0);
+                emit_term(&format!(
+                    "  🔑 [PAGE-URL ID / TYPE EVIDENCE] 추출 주소의 '{}' (역할 '{}' · 타입 근거 {}) 를 이 상세 문서의 식별자로 먼저 확정합니다 → link '{}' | 주소 매개변수 이름이 이 문서 타입의 별칭이라 저장 단계의 URL 자기 식별자와 같은 근거입니다. 라벨 코사인이나 본문 링크(이미지 · 미리보기 버튼)로 정하면 목록 행의 link 를 덮고 식별자 문장도 어긋납니다.",
+                    tok, role, ev, page_link
+                ));
+                det_id_link = Some((tok, page_link));
+            }
+            if det_id_link.is_none() {
                 let url_cands = collect_id_link_candidates_from_url(&url);
                 if !url_cands.is_empty() && !idlink_label_embs.is_empty() {
                     let role_texts: Vec<String> = url_cands.iter().map(|c| c.role_phrase.clone()).collect();
@@ -6662,20 +7020,19 @@ pub async fn process_task(
 
             let mut det_consumed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             if let Some((det_id, _)) = &det_id_link {
+                let whole_only = det_id.chars().count() < 4;
                 for (l, v) in line_values.iter().enumerate() {
                     if v.is_empty() { continue; }
-                    let matched = v.split(|c: char| !c.is_alphanumeric())
-                        .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(det_id.as_str()));
+                    let matched = if whole_only {
+                        v.trim().eq_ignore_ascii_case(det_id.as_str())
+                    } else {
+                        v.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(det_id.as_str()))
+                    };
                     if matched { det_consumed_lines.insert(l); }
                 }
             }
 
-            
-            
-            
-            
-            
-            
             let mut header_forced_assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut pair_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             
@@ -7283,6 +7640,7 @@ pub async fn process_task(
             
             
             
+            let mut family_shared: std::collections::HashSet<usize> = std::collections::HashSet::new();
             {
                 let mut shared = 0usize;
                 for f in 0..vector_assignment.len() {
@@ -7320,6 +7678,7 @@ pub async fn process_task(
                     if let Some(l) = best_line {
                         vector_assignment[f] = Some((l, best_raw, 0.0));
                         shared += 1;
+                        family_shared.insert(f);
                         emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 같은 형식 필드가 확정한 라인을 공유합니다.",
                             fields[f].0, fmt, l + 1, best_raw));
                     }
@@ -7415,7 +7774,7 @@ pub async fn process_task(
                 model.crossover_report(),
                 field_lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string())
             ));
-
+            let mut detail_synthesis_jobs: Vec<(usize, String, String)> = Vec::new();
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -7494,7 +7853,7 @@ pub async fn process_task(
                     if let Some((det_id, det_link)) = det_id_link.clone() {
                         extracted_data.as_object_mut().unwrap().insert("id".to_string(), json!(det_id.clone()));
                         extracted_data.as_object_mut().unwrap().insert("link".to_string(), json!(det_link.clone()));
-                        if !global_ignore_list.contains(&det_id) {
+                        if det_id.chars().count() >= 5 && !global_ignore_list.contains(&det_id) {
                             global_ignore_list.push(det_id.clone());
                             global_ignore_list.push(format!(" {}", det_id));
                             global_ignore_list.push(det_id.to_lowercase());
@@ -7567,6 +7926,20 @@ pub async fn process_task(
                         field_format,
                         FieldFormat::Phone | FieldFormat::Address | FieldFormat::TrackingCode | FieldFormat::Numeric
                     );
+                    let shared_line = family_shared.contains(&idx);
+                    let multi_number = field_format == FieldFormat::Numeric && numeric_run_count(&line_values[best_idx]) > 1;
+                    if copyable && (shared_line || multi_number) {
+                        crate::utils::score_dynamics::record_baseline("commerce.value_copy_refused", 1.0);
+                        emit_term(&format!(
+                            "  ⛔ [VALUE COPY REFUSED] Field: '{}' ({:?}) | Line {} \"{}\" | {} 값을 비워 둡니다. 다른 필드의 라인을 그대로 옮기거나 여러 수치를 한 값으로 붙이면 틀린 값이 확정되고 저장 단계가 그 값을 숫자로 굳힙니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                            field_name,
+                            field_format,
+                            best_idx + 1,
+                            line_values[best_idx].trim(),
+                            if shared_line { "같은 형식의 다른 필드가 확정한 라인을 공유받은 배정이라" } else { "라인에 수치가 여럿 있어 이 필드의 값을 하나로 정할 수 없어" }
+                        ));
+                        continue;
+                    }
                     if copyable {
                         let raw_val = line_values[best_idx].trim().to_string();
                         if !raw_val.is_empty() && value_matches_format(field_format, &raw_val) {
@@ -7590,6 +7963,14 @@ pub async fn process_task(
                     }
                 }
 
+                if field_is_analytic[idx] {
+                    detail_synthesis_jobs.push((0usize, field_name.clone(), field_desc.clone()));
+                    emit_term(&format!(
+                        "    ⏳ [SYNTHESIS DEFERRED] Field: '{}' | 상세 요약 필드는 이 문서의 추출이 끝난 뒤 요약 패스(commerce.detail_synthesis)에서 만듭니다. 문서 전체 대신 확정된 값의 값표를 쓰고, 엔진은 그 단계에서 따로 판정합니다.",
+                        field_name
+                    ));
+                    continue;
+                }
                 let targeted_pug = if field_is_analytic[idx] {
                     emit_term(&format!("  🧠 [SYNTHESIS FIELD] Field: '{}' | 단일 라인 환원 불가 → 전체 컨텍스트 요약 모드", field_name));
                     content_pug.clone()
@@ -7682,9 +8063,9 @@ pub async fn process_task(
                     parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                 };
                 let field_keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
-                
 
-                let mut ignore_list: Vec<String> = global_ignore_list.clone();
+
+                let mut ignore_list: Vec<String> = if field_is_analytic[idx] { Vec::new() } else { global_ignore_list.clone() };
                 let mut miss_counter = 0;
                 
                 loop {
@@ -7719,7 +8100,7 @@ pub async fn process_task(
                         let q3_gen = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
                         let sys_msg = system_message.clone();
-                        let prejudice_target_for_closure = dynamic_prej_str.clone();
+                        let prejudice_target_for_closure = if field_is_analytic[idx] { String::new() } else { dynamic_prej_str.clone() };
                         let task_q = task_question.clone();
                         let ignore_list_clone = ignore_list.clone();
                         let res = tokio::task::spawn_blocking(move || {
@@ -7838,12 +8219,28 @@ pub async fn process_task(
                                         };
 
                                         if is_synthesis_field && !extracted_str.is_empty() {
+                                            let answer_key = extracted_str.trim().trim_matches(|c: char| c == '.' || c == '"' || c == '\'').trim().to_lowercase();
+                                            let bare_value = !answer_key.chars().any(|c| c.is_alphanumeric())
+                                                || extracted_data.as_object().map_or(false, |o| {
+                                                    o.iter().any(|(ok, ov)| ok.as_str() != *k && ov.as_str().map_or(false, |s| s.trim().to_lowercase() == answer_key))
+                                                })
+                                                || targeted_pug.lines().any(|l| l.split_once('|').map_or(false, |(_, v)| v.trim().to_lowercase() == answer_key));
+                                            if bare_value {
+                                                emit_term(&format!(
+                                                    "  ⏭️ [SYNTHESIS NOT A SUMMARY] '{}' | 응답 \"{}\" 은 문서의 값 하나를 그대로 옮겼거나 글자가 없는 응답이라 요약으로 받지 않고 다시 묻습니다. 다시 물을 때는 다른 필드 값 전체가 아니라 이 응답만 금지 목록에 넣습니다.",
+                                                    k,
+                                                    extracted_str
+                                                ));
+                                                requires_retry = true;
+                                                extracted_values_for_retry.push(extracted_str.clone());
+                                                continue;
+                                            }
                                             let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
                                             crate::utils::score_dynamics::record_baseline(
                                                 crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                 if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                             );
-                                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, gate.dropped.is_empty());
+                                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_synthesis", used_lang, gate.dropped.is_empty());
                                             if !gate.dropped.is_empty() {
                                                 emit_term(&format!(
                                                     "  🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
@@ -7967,7 +8364,12 @@ pub async fn process_task(
                                 requires_retry = true;
                             }
                             if !is_synthesis_field || requires_retry {
-                                crate::model::lang_llm::record_engine_outcome("commerce", "detail_field", used_lang, !requires_retry);
+                                crate::model::lang_llm::record_engine_outcome(
+                                    "commerce",
+                                    if is_synthesis_field { "detail_synthesis" } else { "detail_field" },
+                                    used_lang,
+                                    !requires_retry,
+                                );
                             }
 
                             if requires_retry {
@@ -8042,6 +8444,28 @@ pub async fn process_task(
                             break;
                         }
                     }
+                }
+            }
+            drop(field_lang);
+            if !detail_synthesis_jobs.is_empty() {
+                let mut detail_items: Vec<Value> = vec![extracted_data.clone()];
+                let detail_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::from([(0usize, 0usize)]);
+                run_synthesis_pass(
+                    &model,
+                    &mut detail_items,
+                    &detail_synthesis_jobs,
+                    &detail_pos,
+                    &page_type,
+                    &doc_lang,
+                    &lang_probe_text,
+                    SYNTHESIS_SKIP_DROP,
+                    cancellation_token,
+                    &emit_term,
+                    "detail_synthesis",
+                )
+                .await?;
+                if let Some(done) = detail_items.pop() {
+                    extracted_data = done;
                 }
             }
         }
@@ -8394,22 +8818,7 @@ pub async fn process_task(
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
     let url_self_token: Option<(String, String, u8)> = if is_detail {
-        let self_aliases = crate::logic::relay_type_aliases(&page_type);
-        let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(&url)
-            .into_iter()
-            .map(|c| {
-                let ev = candidate_type_evidence(&c, self_aliases);
-                (c.token, c.role_phrase, ev)
-            })
-            .filter(|(_, _, ev)| *ev >= 1)
-            .collect();
-        typed.sort_by(|a, b| b.2.cmp(&a.2));
-        match typed.first() {
-            Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
-                Some((tok.clone(), role.clone(), *ev))
-            }
-            _ => None,
-        }
+        url_typed_self_token(&url, &page_type)
     } else {
         None
     };
@@ -8576,7 +8985,24 @@ pub async fn process_task(
                 existing_json_found = Some(json_val);
             }
         }
-
+        if let Some(prior) = existing_json_found.as_ref() {
+            let relay_kept = crate::utils::canonical::keep_relay_index(prior, &mut extracted_data, &page_type);
+            if !relay_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_relay_kept", relay_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / RELAY KEEP] {} '{}' | 목록이 확정한 연결 index {:?} 를 상세 병합 뒤에도 유지합니다. 상세 페이지가 같은 키에 글자 값(상품명 등)을 가져와 index 를 덮으면, 저장 직전 정리 단계가 그 글자를 {{키}}_title 로 옮기면서 연결이 0 으로 사라져 기간 연결 검색이 이 문서를 찾지 못합니다. 상세의 글자 값은 {{키}}_title 이 비어 있을 때만 그 자리에 둡니다.",
+                    page_type, target_id, relay_kept
+                ));
+            }
+            let shape_kept = crate::utils::canonical::keep_value_shapes(prior, &mut extracted_data);
+            if !shape_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_shape_kept", shape_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / SHAPE KEEP] {} '{}' | 필드 {:?} 는 기존 값의 모양(주소 · 코드 · 수치·날짜)과 상세 값의 모양이 달라 기존 값을 유지합니다. 상세 폼의 버튼 글자('미리보기')나 라디오 코드('0')가 상품코드 · 대표 이미지 주소를 덮지 않게 합니다. 글자 값끼리의 교체는 막지 않습니다.",
+                    page_type, target_id, shape_kept
+                ));
+            }
+        }
         let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
         let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
 

@@ -869,20 +869,7 @@ impl LogisModel {
             None => self.ensure_qwen3_5(false).await?,
         }
 
-        let make_params = || crate::openai_types::ChatCompletionParameters {
-            messages: vec![
-                crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                    content: "You respell each word of the source text into the target writing system by sound only. You never translate meaning. You process every word independently. Return strictly the requested JSON format.".to_string(),
-                    name: None,
-                }),
-                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
-                    name: None,
-                })
-            ],
-            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
-            ..Default::default()
-        };
+        let make_params = || Self::translit_params(prompt);
 
         let lang_variant = crate::model::lang_llm::resident_variant();
         let first = {
@@ -915,8 +902,36 @@ impl LogisModel {
             .map_err(|e| anyhow::anyhow!("Qwen3.5 transliteration failed: {}", e))?;
         let _ = gen.clear_kv_cache();
         drop(gen_guard);
-
         Ok(res)
+    }
+
+    fn translit_params(prompt: &str) -> crate::openai_types::ChatCompletionParameters {
+        crate::openai_types::ChatCompletionParameters {
+            messages: vec![
+                crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                    content: "You respell each word of the source text into the target writing system by sound only. You never translate meaning. You process every word independently. Return strictly the requested JSON format.".to_string(),
+                    name: None,
+                }),
+                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt.to_string()),
+                    name: None,
+                })
+            ],
+            model: "qwen3.5".to_string(), max_tokens: Some(256), temperature: Some(0.0), top_p: Some(0.95),
+            ..Default::default()
+        }
+    }
+
+    pub async fn call_base_transliteration(&self, prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        self.ensure_qwen3_5(false).await?;
+        let mut gen_guard = self.qwen3_5_generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
+        let res = gen
+            .generate(Self::translit_params(prompt), cancel_token, None, None, None, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Qwen3.5-2B transliteration failed: {}", e));
+        let _ = gen.clear_kv_cache();
+        res
     }
 
     pub async fn ensure_qwen3_5_lang(&self, code: &str) -> anyhow::Result<()> {
@@ -1110,14 +1125,20 @@ impl LogisModel {
             None => return verdict,
         };
         if matches!(step, "list_field" | "detail_field") && crate::utils::resources::free_ram_bytes() <= 6_000_000_000 {
+            let synthesis_note = match step {
+                "list_field" => "목록의 요약 필드는 목록 끝 요약 패스(commerce.list_synthesis)에서 엔진을 따로 판정합니다",
+                "detail_field" => "상세의 요약 필드는 상세 추출이 끝난 뒤 요약 패스(commerce.detail_synthesis)에서 엔진을 따로 판정합니다",
+                _ => "이 단계도 같은 이유로 Qwen3 로 둡니다",
+            };
             return lang_llm::closed_verdict(
                 track,
                 step,
                 Some(&code),
                 &format!(
-                    "디코딩 동안 층 가중치를 상주시키는 조건(여유 RAM 6GB 초과, Qwen3.5 모델 코드의 keep_weights_resident 기준)이 안 됩니다 (여유 RAM {:.1}GB). 이 상태의 4B 는 토큰마다 층 가중치 약 {}MB 를 다시 올리므로, 아이템·필드마다 반복되는 이 단계의 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 문서당 몇 건뿐인 음차만 4B 를 씁니다",
+                    "디코딩 동안 층 가중치를 상주시키는 조건(여유 RAM 6GB 초과, Qwen3.5 모델 코드의 keep_weights_resident 기준)이 안 됩니다 (여유 RAM {:.1}GB). 이 상태의 4B 는 토큰마다 층 가중치 약 {}MB 를 다시 올려 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 원문 값을 글자 그대로 옮기는 필드 추출은 다국어 Qwen3 로 둡니다. {}",
                     crate::utils::resources::free_ram_bytes() as f64 / 1_000_000_000.0,
-                    lang_llm::resident_estimate_mb(&code)
+                    lang_llm::resident_estimate_mb(&code),
+                    synthesis_note
                 ),
             );
         }

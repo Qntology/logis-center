@@ -365,3 +365,122 @@ pub fn relay_edges(doc: &serde_json::Value) -> Vec<(String, u32)> {
     }
     out
 }
+
+pub fn keep_relay_index(
+    prior: &serde_json::Value,
+    merged: &mut serde_json::Value,
+    page_type: &str,
+) -> Vec<(String, u32)> {
+    let own = relay_type_family(page_type);
+    let mut kept: Vec<(String, u32)> = Vec::new();
+    let obj = match merged.as_object_mut() {
+        Some(o) => o,
+        None => return kept,
+    };
+    for key in RELAY_LINK_KEYS.iter() {
+        if *key == own.as_str() {
+            continue;
+        }
+        let idx = match relay_ref_index(prior.get(*key)) {
+            Some(i) => i,
+            None => continue,
+        };
+        let text = match obj.get(*key) {
+            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
+            Some(v) if relay_ref_index(Some(v)).is_some() => continue,
+            Some(serde_json::Value::String(s)) if relay_text_is_content(s) => Some(s.trim().to_string()),
+            _ => None,
+        };
+        if let Some(t) = text {
+            let companion = format!("{}_title", key);
+            let companion_empty = obj
+                .get(&companion)
+                .and_then(|v| v.as_str())
+                .map_or(true, |s| s.trim().is_empty());
+            if companion_empty {
+                obj.insert(companion, serde_json::Value::String(t));
+            }
+        }
+        obj.insert(key.to_string(), serde_json::Value::from(idx));
+        kept.push((key.to_string(), idx));
+    }
+    kept
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueShape {
+    Url,
+    Code,
+    Quantity,
+    Text,
+}
+
+pub fn value_shape(key: &str, v: &serde_json::Value) -> Option<ValueShape> {
+    let t = match v {
+        serde_json::Value::Number(_) => {
+            return Some(if kind_of(key) == CanonKind::Identifier { ValueShape::Code } else { ValueShape::Quantity });
+        }
+        serde_json::Value::String(s) => s.trim(),
+        _ => return None,
+    };
+    if t.is_empty() || t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("n/a") {
+        return None;
+    }
+    let spaced = t.chars().any(|c| c.is_whitespace());
+    if (t.starts_with("http://") || t.starts_with("https://") || t.starts_with('/')) && !spaced {
+        return Some(ValueShape::Url);
+    }
+    if kind_of(key) == CanonKind::Identifier {
+        let code = !spaced && t.chars().count() >= 3 && t.chars().any(|c| c.is_ascii_digit());
+        return Some(if code { ValueShape::Code } else { ValueShape::Text });
+    }
+    if iso_to_epoch_ms(t).is_some() {
+        return Some(ValueShape::Quantity);
+    }
+    let runs = t
+        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+        .filter(|r| r.chars().any(|c| c.is_ascii_digit()))
+        .count();
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    if runs == 1 && letters <= 3 {
+        return Some(ValueShape::Quantity);
+    }
+    Some(ValueShape::Text)
+}
+
+pub const SHAPE_GUARD_SKIP: &[&str] = &[
+    "id", "index", "type", "mode", "status", "text", "masked_text", "digest", "ledger",
+    "currency", "flag", "embed", "detail", "updated_at", "created_at",
+];
+
+pub fn keep_value_shapes(prior: &serde_json::Value, merged: &mut serde_json::Value) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let (p, m) = match (prior.as_object(), merged.as_object_mut()) {
+        (Some(p), Some(m)) => (p, m),
+        _ => return kept,
+    };
+    for (k, pv) in p.iter() {
+        let lk = k.to_lowercase();
+        if SHAPE_GUARD_SKIP.iter().any(|s| *s == lk)
+            || is_relay_index_key(&lk)
+            || lk.starts_with("rel_")
+            || lk.starts_with('_')
+            || lk.contains("insight")
+        {
+            continue;
+        }
+        let before = match value_shape(&lk, pv) {
+            Some(ValueShape::Text) | None => continue,
+            Some(s) => s,
+        };
+        let after = match m.get(k).and_then(|mv| value_shape(&lk, mv)) {
+            Some(s) => s,
+            None => continue,
+        };
+        if after != before {
+            m.insert(k.clone(), pv.clone());
+            kept.push(k.clone());
+        }
+    }
+    kept
+}

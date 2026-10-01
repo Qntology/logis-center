@@ -76,7 +76,13 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                             let curr_str = if curr.is_empty() { String::new() } else { format!(" {}", curr) };
                             sentences.push(format!("The {} is {}{}.", clean_key, val_str, curr_str));
                         } else if key == "status" {
-                            sentences.push(format!("It is currently in '{}' status.", val_str));
+                            let shown = match v {
+                                serde_json::Value::Number(n) => n.as_i64().and_then(crate::logic::status_name).map(|s| s.to_string()),
+                                _ => Some(val_str.clone()),
+                            };
+                            if let Some(s) = shown {
+                                sentences.push(format!("It is currently in '{}' status.", s));
+                            }
                         } else {
                             sentences.push(format!("Its {} is {}.", clean_key, val_str));
                         }
@@ -1638,7 +1644,7 @@ fn letter_name_reading(src: &str) -> Option<String> {
 
 pub const SPELLED_OUT_MIN: f32 = 0.90;
 
-pub const TRANSLIT_GATE_REV: &str = "g2";
+pub const TRANSLIT_GATE_REV: &str = "g3";
 
 fn letter_reading_key(romanized: &str) -> String {
     let compact: String = romanized.split_whitespace().collect::<String>().replace("eu", "").replace("ou", "o");

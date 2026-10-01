@@ -3655,6 +3655,18 @@ impl crate::model::LogisModel {
                         
                         // 🌟 [CRITICAL FIX] LLM이 배열이 아닌 단일 객체로 반환했을 때 필터가 망가지는 현상을 막기 위해 파싱을 배열 폼으로 통일합니다.
                         let condition_json = final_numeric_json.get("condition");
+                        if condition_json.is_none() {
+                            let got_keys: Vec<String> = final_numeric_json
+                                .as_object()
+                                .map(|o| o.keys().cloned().collect())
+                                .unwrap_or_default();
+                            emit_term(&format!(
+                                "      🧾 [NUMERIC FORMAT MISS] {} 의 수치 조건 응답에 'condition' 키가 없습니다 (응답 키 {:?}). 형식을 지키지 못한 응답도 검증 실패로 세어야 엔진별 일관성 비교가 한쪽으로 기울지 않습니다.",
+                                crate::model::lang_llm::query_engine_label(),
+                                got_keys
+                            ));
+                            crate::model::lang_llm::record_query_value(false);
+                        }
                         let mut cond_items = Vec::new();
 
                         if let Some(arr) = condition_json.and_then(|v| v.as_array()) {
@@ -3713,7 +3725,10 @@ impl crate::model::LogisModel {
                                     }
 
                                     if !prop_to_op.contains_key(&k) {
-                                        emit_term(&format!("      ⚠️ [DISCARD] LLM hallucinated invalid property name: [{}]. Discarding.", k));
+                                        emit_term(&format!(
+                                            "      ⚠️ [DISCARD] 수치 조건 응답의 속성 [{}] 은 이번 질의의 벡터 가이드(확정된 청크 속성)에 없어 버립니다. 스키마에 있는 속성이어도 가이드 밖이면 이 단계의 답이 아니며, 같은 축은 추상 수식어 라우팅이 따로 물질화할 수 있습니다.",
+                                            k
+                                        ));
                                         crate::model::lang_llm::record_query_value(false);
                                         continue;
                                     }

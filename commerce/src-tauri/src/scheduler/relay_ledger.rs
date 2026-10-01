@@ -999,12 +999,22 @@ pub async fn relay_join(
 
         if hits.is_empty() {
             crate::utils::score_dynamics::record_baseline("search.relay_period_empty", 1.0);
+            let pre_void = results.len();
+            if !void_only.is_empty() {
+                results.retain(|r| {
+                    let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    !void_only.iter().any(|x| x == id)
+                });
+            }
+            let void_dropped = pre_void - results.len();
+            rep.dropped += void_dropped;
+            crate::utils::score_dynamics::record_baseline("search.relay_void_only_dropped", void_dropped as f32);
             emit(&format!(
-                "[AI-SEARCH] ⚪ [RELAY PERIOD / EMPTY] '{}' 의 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축으로 옮겨 보았지만 기간 안에서 '{}' 를 가리키는 문서가 없습니다. 결과를 줄이지 않고 표시만 합니다.",
-                primary, start, end, partner_types, key
+                "[AI-SEARCH] ⚪ [RELAY PERIOD / EMPTY] '{}' 의 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축으로 옮겨 보았지만 기간 안에서 '{}' 를 가리키는 성립 문서가 없습니다. 기간으로는 결과를 줄이지 않고, 취소·환불·반품 문서로만 가리켜진 {}건만 결과에서 뺐습니다. 연결이 없다는 것은 연결 축이 비어 있을 수 있다는 뜻이라 좁히지 않지만, 취소 건만 있다는 것은 그 기간에 팔리지 않았다는 직접 근거입니다.",
+                primary, start, end, partner_types, key, void_dropped
             ));
             if let Some(o) = plan.as_object_mut() {
-                o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "applied": false }));
+                o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "void_only": void_only, "applied": false, "void_only_applied": void_dropped > 0 }));
             }
             crate::utils::score_dynamics::leave_scope();
             continue;

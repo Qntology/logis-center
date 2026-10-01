@@ -319,6 +319,8 @@ pub async fn generate_transliteration_aliases(
 
     let mut generation_ready = false;
     let mut engine_label = String::from("Qwen3.5-2B");
+    let mut lang_engine_used = false;
+    let mut second_read: Vec<String> = Vec::new();
     let mut _translit_binding = crate::model::lang_llm::TranslitBinding::none();
     macro_rules! ensure_generation {
         () => {
@@ -334,6 +336,7 @@ pub async fn generate_transliteration_aliases(
                 {
                     Ok((engine, binding)) => {
                         engine_label = engine.label();
+                        lang_engine_used = engine.is_lang();
                         _translit_binding = binding;
                         generation_ready = true;
                         emit(&format!("  🔤 [TRANSLIT ENGINE] 이번 아이템의 음차 엔진: {}", engine_label));
@@ -408,7 +411,7 @@ pub async fn generate_transliteration_aliases(
             let reglued = crate::nl_convert::reglue_native_alias(&src, &dexie_hit.0);
             if reglued != dexie_hit.0 {
                 emit(&format!(
-                    "  🔗 [TRANSLIT REGLUE] '{}' 캐시 별칭 '{}' → '{}' | 원문에서 공백 없이 이어진 단어('-' 등으로 붙은 합성어)는 문서 언어 표기에서도 붙여 씁니다. 띄어 쓴 별칭은 붙여 쓴 질의('티셔츠')와 공백 단위 FTS 토큰이 달라 만나지 않습니다. 청크 코사인은 띄어쓰기로 크게 달라지지 않으므로 이 교정의 목적은 FTS 입니다.",
+                    "  🔗 [TRANSLIT REGLUE] '{}' 캐시 별칭 '{}' → '{}' | 원문에서 공백 없이 이어진 단어('-' 등으로 붙은 합성어)는 문서 언어 표기에서도 붙여 씁니다. 같은 원문 단어가 언제나 같은 별칭 표기로 색인되게 하는 표기 일관성 교정입니다. 별칭은 item_chunks 의 벡터 청크로만 저장되고 FTS 색인(items 의 text·masked_text·data)에는 들어가지 않으므로, 이 교정이 바꾸는 것은 별칭 청크의 임베딩 문장뿐입니다.",
                     src, dexie_hit.0, reglued
                 ));
                 dexie_hit.0 = reglued;
@@ -832,12 +835,85 @@ pub async fn generate_transliteration_aliases(
             }
         }
         cache.insert(src.clone(), final_pair.clone());
-
-        save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
-
+        let latin_left = !crate::nl_convert::split_words_by_script(&src).1.is_empty();
+        if lang_engine_used && final_pair.0.is_empty() && latin_left && !second_read.contains(&src) {
+            second_read.push(src.clone());
+        } else {
+            save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
+        }
         out[i] = final_pair;
     }
 
+    if !second_read.is_empty() {
+        emit(&format!(
+            "  🔁 [TRANSLIT SECOND READ] {} 가 원문 라틴 단어를 게이트를 통과하는 문서 언어 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘)로 한 번 더 읽습니다: {:?} | 단일 언어 모델이 외국어 단어 읽기에 실패한 자리만 다국어 모델로 넘기고, 이 결과까지 게이트를 통과하지 못해야 음차 불가로 저장합니다.",
+            engine_label,
+            second_read.len(),
+            second_read
+        ));
+    }
+    for src in second_read.iter() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let slots: Vec<usize> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.value_part.trim() == src.as_str())
+            .map(|(j, _)| j)
+            .collect();
+        let mut pair = match slots.first() {
+            Some(&j) => out[j].clone(),
+            None => continue,
+        };
+        let (non_latin, latin) = crate::nl_convert::split_words_by_script(src);
+        let latin_src = latin.join(" ");
+        let prompt = if non_latin.is_empty() {
+            crate::nl_convert::build_transliteration_prompt(src, doc_lang)
+        } else {
+            crate::nl_convert::build_transliteration_prompt_for_words(&latin, doc_lang)
+        };
+        let raw = model
+            .call_base_transliteration(&prompt, Some(cancel.clone()))
+            .await
+            .unwrap_or_default();
+        println!("    SECOND-READ RAW (Qwen3.5-2B) = '{}'", raw.trim());
+        let (_t, tr) = if non_latin.is_empty() {
+            crate::nl_convert::sanitize_transliteration_dual(&raw, src)
+        } else {
+            crate::nl_convert::sanitize_transliteration_dual_for_words(&raw, &latin)
+        };
+        let gated = crate::nl_convert::gate_native_alias(&latin_src, tr, "SECOND-READ");
+        if !gated.trim().is_empty()
+            && !crate::nl_convert::is_latin_dominant(&gated)
+            && crate::nl_convert::find_mixed_script_words(&gated).is_empty()
+        {
+            let native = if non_latin.is_empty() { gated.clone() } else { format!("{} {}", non_latin.join(" "), gated) };
+            let native = crate::nl_convert::reglue_native_alias(src, &native);
+            if pair.1.is_empty() {
+                let roman = crate::nl_convert::try_any_ascii_transliteration(&native).unwrap_or_default();
+                pair = crate::nl_convert::assign_transliterations(src, &native, &roman);
+            } else {
+                pair.0 = native;
+            }
+            made += 1;
+            crate::utils::score_dynamics::record_baseline("indexing.translit_second_read", 1.0);
+            emit(&format!(
+                "      🔤 [SYNONYM EXPANSION / SECOND READ] '{}' → native='{}' | roman='{}' | Qwen3.5-2B 가 읽은 표기가 발음·글자읽기 게이트를 통과했습니다.",
+                src, pair.0, pair.1
+            ));
+        } else {
+            crate::utils::score_dynamics::record_baseline("indexing.translit_second_read", 0.0);
+            emit(&format!(
+                "      ⚪ [TRANSLIT SECOND READ / NONE] '{}' | Qwen3.5-2B 의 표기도 게이트를 통과하지 못해 지금 결과(native='{}' · roman='{}')를 저장합니다.",
+                src, pair.0, pair.1
+            ));
+        }
+        save_translit_cache(app_handle, src, doc_lang, &pair.0, &pair.1);
+        for j in slots {
+            out[j] = pair.clone();
+        }
+    }
     if made > 0 || reused > 0 || phonetic_dropped > 0 || canonical_made > 0 || mixed_dropped > 0 {
         emit(&format!(
             "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 국가명 정규 별칭 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음·글자읽기 게이트 폐기 {}건 | 혼용 조각 폐기 {}건",

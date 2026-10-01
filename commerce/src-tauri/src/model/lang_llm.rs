@@ -1660,11 +1660,14 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
         );
     }
     crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_expansion", track), fit.expansion());
-    let prompt_probe = format!(
-        "{}\n{}",
-        crate::prompts::extract_synthesis_field_prompt_native("", "general_insight", "", doc_lang, ""),
-        sample
-    );
+    let sheet_like: String = sample
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(9)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt_probe = crate::prompts::extract_synthesis_field_prompt_native("", "general_insight", "", doc_lang, &sheet_like);
     let prompt_fit = token_fit(code, &prompt_probe, reference).ok();
     if let Some(pf) = prompt_fit.as_ref() {
         crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_prompt_expansion", track), pf.expansion());
@@ -1718,7 +1721,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
     let prompt_note = prompt_fit
         .map(|pf| {
             format!(
-                " | 영문 지시문을 붙인 프롬프트 기준 4B {} / 기준 {} = {:.2}배 (관측만)",
+                " | 요약 프롬프트 모양(영문 지시문 + 값 9줄) 기준 4B {} / 기준 {} = {:.2}배 (관측만)",
                 pf.lang_tokens,
                 pf.ref_tokens,
                 pf.expansion()
